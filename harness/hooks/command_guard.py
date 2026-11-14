@@ -34,6 +34,7 @@ interpreter one-liners (python -c, node -e): their code text is scanned, not exe
 from __future__ import annotations
 
 import argparse
+import bisect
 import errno
 import fnmatch
 import hashlib
@@ -9114,213 +9115,333 @@ def extract_command(payload):
     return None, False
 
 
-INSTALL_FILES_FLAGS = {'--host': 1, '--from-ref': 1, '--file': 1, '--ticket': 1, '--dry-run': 0, '--resume': 1, '--rollback': 1,
-                       '--force-file': 1, '--agent': 1}
 INSTALL_FILES_FORM = ('the sanctioned form is `python3 -I ~/.claude/hooks/ah.py install-files --host HOST --from-ref SHA --file '
                       'NAME ... --ticket "GoodQA project#N"` (or `--resume RUN` / `--rollback RUN`), run by the main agent from '
-                      'the INSTALLED copy as a plain command: first in the command line, with no environment assignment, '
-                      'wrapper or shell -c around it')
+                      'the INSTALLED copy as the whole command: one plain line, nothing before or after it but a plain redirection')
+
+# goodqa#15913 (final round). The rule no longer looks for the install command inside arbitrary shell text and then judges
+# what it found: every earlier round patched one place where that search read the text differently from the shell (a
+# wrapper, a builtin, a line continuation, a quote splice ...). It now fails closed:
+#   1. TRIGGER, parse-free. PLAIN is the text with line continuations joined and every quote and backslash removed;
+#      SQUASHED also loses every `$`, backquote, brace, comma and whitespace, in lower case (the Mac's file system ignores
+#      case). The rule applies when the text names install-files or ah_install (as a word of PLAIN, or more often in
+#      SQUASHED than in PLAIN: a spliced name), or names ah.py. Anything else is not its business.
+#   2. NAME VISIBLE (install-files or ah_install): the WHOLE text must fullmatch a regular grammar: the sanctioned install
+#      line itself, character for character (main only), or a plain text (one line of ah calls whose subcommand is a
+#      literal word other than install-files, fixed viewers, or `python3 -m unittest`, with plain words, '...' and "..."
+#      without `$`, backquote, backslash or `!`; no glob, brace, paren, assignment, wrapper, newline or heredoc), or a
+#      `git commit -F - <<'TAG'` heredoc. Nothing else passes.
+#   3. NAME HIDDEN: otherwise only the ah entry is named, and its subcommand could be built at run time. SQUASHED may not
+#      hold more `ah.py` than PLAIN (a spliced script name); ah.py may not appear in code a second program runs (the word
+#      after python/perl/node/bash ... -c|-e, a heredoc or here-string into one, a pipe into a bare interpreter, eval);
+#      and every ah entry that may run must be followed by a literal subcommand word (or `--text WORD`, `-h`, `--help`).
+#      "May run" errs towards running: the entry is its command's first word or the value of an assignment, follows a
+#      runner (env, xargs, timeout, a shell ...), is python's script (after python and its options), follows
+#      `python -m`/`-c`, or its command holds `-exec` or an embedded python word (git -c alias.x='!python3 ...'). It may
+#      not run only as an argument of another program (cat, grep, git diff, another python script).
+# The views over-approximate on purpose (PLAIN treats quoted text as words): a false positive costs a rewrite (put the
+# text in a file, spell the script literally), a false negative a deploy.
+# a triggered text longer than this is refused unread: the views and scopes below are linear or close to it, and a
+# hook timeout is only a warning, so the work must stay far inside the hook's time limit
+INSTALL_TEXT_MAX = 8192
+INSTALL_ENTRY_MAX = 32  # ah.py entries in one text; more is refused unread (each is judged on its own segment)
+_INSTALL_TRIGGER_STRIP = re.compile(r'[\'"\\$`{},\s]')
+# each install name with its word in PLAIN; the word also matches a name glued from pieces ('install-'+'files', 'ah_' 'install')
+_INSTALL_NAMES = (('install-files', re.compile(r'(?<![A-Za-z0-9_.-])install[^\w\s]{1,6}files(?![A-Za-z0-9_.-])', re.IGNORECASE)),
+                  ('ah_install', re.compile(r'(?<![A-Za-z0-9_])ah_\W{0,6}install', re.IGNORECASE)))
+_IF_Q = r'''(?:'[^'\n\r]*'|"[^"$`\\\n\r!]*")'''
+_IF_WORD = r'(?:[A-Za-z0-9_./:@%%+,~-][A-Za-z0-9_./:@%%+,~=#-]*|%s)(?:%s[A-Za-z0-9_./:@%%+,~=#-]*)*' % (_IF_Q, _IF_Q)
+_IF_REDIR = r'(?:[12]?>>?|&>|<)[ ]?[A-Za-z0-9_./~-]+|[12]>&[12]'
+_IF_ARGS = r'(?:[ ]+(?:%s|%s))*' % (_IF_REDIR, _IF_WORD)
+_IF_PY = r'python3?(?:\.[0-9]+)?'
+_IF_COMMAND = (r'(?:(?:%s(?:[ ]+-[BEIsSu]+)*[ ]+)?(?:[A-Za-z0-9_.~-]*/)*ah(?:\.py)?[ ]+(?!install-files(?![a-z-]))[a-z][a-z-]*'
+               r'|(?:cat|head|tail|wc|ls|grep|egrep|fgrep|diff|shasum|sha256sum|stat|cd|echo|jq|uniq|cut|tr|pwd|true|false)'
+               r'|sed[ ]+-n[ ]+[0-9]+(?:,[0-9]+)?p'
+               r'|git[ ]+(?:log|show|diff|status|add|commit|blame|rev-parse|ls-files)'
+               r'|%s(?:[ ]+-[BEIsS]+)*[ ]+-m[ ]+unittest)%s') % (_IF_PY, _IF_PY, _IF_ARGS)
+_INSTALL_PLAIN_TEXT = re.compile(r'%s(?:[ ]*(?:&&|\|\||;|\|)[ ]*%s)*' % (_IF_COMMAND, _IF_COMMAND))
+_INSTALL_COMMIT_HEREDOC = re.compile(r"git[ ]+commit(?:[ ]+-[A-Za-z]+)*[ ]+-F[ ]+-[ ]+<<[ ]?'([A-Za-z_]+)'\n((?:[^\n]*\n)*)\1\n?")
+_INSTALL_ENTRY = re.compile(r'(?<![A-Za-z0-9_])ah\.py(?![A-Za-z0-9_])', re.IGNORECASE)
+_INSTALL_SUBCOMMAND = re.compile(r'(?:[ \t]+--text)?[ \t]+(-h|--help|[a-z][a-z-]*)(?=[ \t;&|)<>\n]|\Z)')  # ah's one global flag
+_INSTALL_WORDS = re.compile(r'[^\s;&|(){}<>`]+|[;&|(){}`\n<>]')
+_INSTALL_PYTHON = re.compile(r'(?:python|pypy|ipython|jython|py)[0-9.]*(?:-[A-Za-z0-9.]+)?', re.IGNORECASE)
+_INSTALL_ASSIGN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')
+# words that run the rest of their command (an ah entry after one may run)
+_INSTALL_RUNNERS = frozenset({'env', 'exec', 'command', 'builtin', 'nohup', 'time', 'sudo', 'doas', 'nice', 'ionice', 'timeout',
+                              'gtimeout', 'stdbuf', 'xargs', 'parallel', 'caffeinate', 'script', 'watch', 'unbuffer', 'chronic',
+                              'flock', 'setsid', 'arch', 'eval', 'then', 'do', 'else', 'elif', 'if', 'while', 'until', '!',
+                              'noglob', 'nocorrect', '-', 'coproc', 'entr', 'strace', 'dtruss', 'ltrace', 'source', '.',
+                              'bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'uv', 'uvx', 'pipx', 'poetry', 'pdm', 'hatch', 'conda',
+                              'run', 'osascript', 'perl', 'ruby', 'node', 'deno', 'bun', 'php', 'lua', 'tclsh', 'awk', 'gawk'})
+
+# inline code of a second program; the named group picks how far its code reaches (see _install_inline_scopes). After an
+# interpreter word the regex stops (`seg`): the rest of its command segment is searched once per text (linear), not per word
+_INSTALL_INTERP = r'(?<![A-Za-z0-9_.-])(?:python|pypy)[0-9.]*|(?<![A-Za-z0-9_.-])(?:perl|ruby|node|deno|bun|php|lua|tclsh|osascript|g?awk|bash|sh|zsh|dash|ksh|fish)'
+_INSTALL_INLINE_TAIL = (
+    r'(?P<stdin>\|[ \t]*(?:[^\s/|;&]*/)*(?:(?:python|pypy)[0-9.]*(?:[ \t]+-[A-Za-z]+)*(?:[ \t]+-)?(?=[ \t]*(?:[\n;&|)]|\Z))'
+    r'|(?:bash|sh|zsh|dash|ksh|fish|perl|ruby|node|php|lua|osascript)(?![A-Za-z0-9_.-])(?![ \t]+-[A-Za-z]*[ceEr](?![A-Za-z]))))'
+    r'|(?P<awk>(?<![A-Za-z0-9_.-])[gmn]?awk(?![A-Za-z0-9_.-]))'
+    r'|(?P<eval>(?<![A-Za-z0-9_.-])eval(?![A-Za-z0-9_.-]))')
+_INSTALL_INLINE = re.compile(r'(?:%s)(?:(?P<word>(?:[ \t]+-[A-Za-z]+)*?[ \t]+-[A-Za-z]*[ceEprx][ \t]+)|(?P<seg>))|%s'
+                             % (_INSTALL_INTERP, _INSTALL_INLINE_TAIL))
+_INSTALL_INLINE_TAIL_AT = re.compile(_INSTALL_INLINE_TAIL)
+_INSTALL_STDIN_DASH = re.compile(r'[ \t]+-(?=[ \t\n;&|)]|\Z)')
 
 
-INSTALL_FILES_FLAGS['--allow-older'] = 0
-INSTALL_FILES_VIEWERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'cat', 'less', 'more', 'head', 'tail', 'git', 'ls', 'sed', 'awk', 'echo',
-                         'printf', 'diff', 'wc', 'tee', 'man', 'find', 'vi', 'vim', 'nano', 'open', 'test', 'true', 'false', 'wal_note.py'}
-# precommand words that run the rest of the segment (builtin, command, noglob, nocorrect and `-` are shell modifiers: the
-# word after them can still be a builtin such as export)
-INSTALL_FILES_WRAPPERS = {'env', 'sudo', 'nohup', 'time', 'command', 'exec', 'stdbuf', 'nice', 'xargs', 'builtin', 'noglob',
-                          'nocorrect', '-'}
-# shell grammar words that open a compound command around the rest of the segment
-INSTALL_FILES_KEYWORDS = {'{', '(', '!', 'if', 'then', 'else', 'elif', 'while', 'until', 'do', 'coproc'}
-INSTALL_FILES_SHELLS = {'bash', 'sh', 'zsh', 'dash', 'ksh'}
-# a segment that changes what a later segment of the same text runs or sees (HOME for `~`, PATH, the directory, shell options,
-# a function or alias named python3)
-INSTALL_FILES_ENV_CHANGERS = {'export', 'unset', 'declare', 'typeset', 'local', 'readonly', 'source', '.', 'eval', 'alias', 'hash',
-                              'function', 'cd', 'chdir', 'pushd', 'popd', 'set', 'setopt', 'unsetopt', 'shopt', 'emulate', 'enable',
-                              'disable', 'unalias', 'unfunction', 'functions', 'autoload', 'zmodload', 'read', 'getopts', 'mapfile',
-                              'readarray', 'vared', 'let', 'integer', 'float', 'trap', 'umask', 'rehash', 'fc', 'zparseopts'}
-INSTALL_FILES_ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=.*')
-INSTALL_FILES_REDIRECT = re.compile(r'^(?:[0-9]*[<>]{1,2}&?[0-9-]*|[0-9]*[<>]{1,2}.+|&>.*|\|&)$')
+def _install_word_end(raw, i):
+    """End of the shell word that starts at raw[i]. It reads plain characters, '...' and "..." without a backslash, `$` or
+    backquote inside; at anything else it answers len(raw), so an unsure end only widens the scope (fail closed)."""
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch in ' \t\n;&|()<>':
+            return i
+        if ch in '\'"':
+            j = raw.find(ch, i + 1)
+            if j < 0 or (ch == '"' and any(c in raw[i + 1:j] for c in '\\$`')):
+                return n
+            i = j + 1
+        elif ch in '\\$`{':
+            return n
+        else:
+            i += 1
+    return n
 
 
-def _install_files_segments(text):
-    """[(tokens, raw segment)] for the simple commands of `text`. Quote-aware first (a `;` or `&` inside a quoted commit message
-    does not split it); when the whole text does not tokenize (a heredoc body, an odd quote) it falls back to a plain split,
-    and a segment that does not tokenize comes back as (None, segment)."""
-    separators = set(';&|\n')
-    try:
-        lex = shlex.shlex(re.sub(r'([<>])&', r'\1@AMP@', text), posix=True, punctuation_chars=';&|')  # `2>&1` is not a separator
-        lex.whitespace = ' \t\r'
-        lex.commenters = ''
-        lex.wordchars += '=:,./~$-+@%^<>'
-        out, current = [], []
-        for token in lex:
-            token = token.replace('@AMP@', '&')
-            if token and all(ch in separators for ch in token):
-                if current:
-                    out.append((current, ' '.join(current)))
-                current = []
+def _install_inline_markers(text):
+    """[(kind, match start, code start)] for each second-program marker in `text`, in order. kind is word (-c/-e),
+    here (`<<`, code start after it), herestr (`<<<`), rest (`<(` or a `-` operand: the whole text), stdin, awk or eval.
+    After an interpreter word, its command segment (to the next newline, `|`, `;` or `&`) is searched for the first
+    `<<` not followed by `<`, else the first `<<<`, else the first `<(`, else a `-` operand right after the word; the
+    positions are found once per text, so the work stays linear."""
+    stops = [i for i, ch in enumerate(text) if ch in '\n|;&']
+    here = [i for i in range(len(text) - 1) if text.startswith('<<', i) and not text.startswith('<', i + 2)]
+    herestr = [i for i in range(len(text) - 2) if text.startswith('<<<', i)]
+    procsub = [i for i in range(len(text) - 1) if text.startswith('<(', i)]
+
+    def first(positions, lo, hi):
+        k = bisect.bisect_left(positions, lo)
+        return positions[k] if k < len(positions) and positions[k] < hi else None
+
+    found = []
+    pos = 0
+    while True:
+        m = _INSTALL_INLINE.search(text, pos)
+        if not m:
+            return found
+        pos = max(m.end(), m.start() + 1)
+        kind = m.lastgroup
+        if kind != 'seg':
+            found.append((kind, m.start(), m.end()))
+            continue
+        k = bisect.bisect_left(stops, m.end())
+        seg_end = stops[k] if k < len(stops) else len(text)
+        at = first(here, m.end(), seg_end)
+        if at is not None:
+            found.append(('here', m.start(), at + 2))
+            continue
+        at = first(herestr, m.end(), seg_end)
+        if at is not None:
+            found.append(('herestr', m.start(), re.compile(r'<<<[ \t]*').match(text, at).end()))
+            continue
+        if first(procsub, m.end(), seg_end) is not None or _INSTALL_STDIN_DASH.match(text, m.end()):
+            found.append(('rest', m.start(), m.end()))
+            continue
+        # no marker after this interpreter word: like a failed regex match, try the other alternatives here, then go on
+        # from the next character
+        t = _INSTALL_INLINE_TAIL_AT.match(text, m.start())
+        if t:
+            found.append((t.lastgroup, t.start(), t.end()))
+            pos = max(t.end(), m.start() + 1)
+        else:
+            pos = m.start() + 1
+
+
+def _install_inline_scopes(text, plain):
+    """[(start, end)] of `text` that a second program may run as code: the word after python/perl/node/bash ... -c|-e,
+    a heredoc body (to its tag line), a here-string, everything after awk, eval's words (to the end of its line, or of the text when a quote
+    stays open), and the whole text for a process substitution, `-` (stdin) or a pipe into an interpreter that reads
+    its program from stdin (python with no script, a shell without -c, perl/ruby/node without -e: the code is the
+    earlier output). When `plain` shows more markers than `text` (a
+    spliced interpreter name), the whole text."""
+    found = _install_inline_markers(text)
+    if len(_install_inline_markers(plain)) > len(found):
+        return [(0, len(text))]
+    scopes = []
+    for kind, start, at in found:
+        if kind in ('word', 'herestr'):
+            scopes.append((at, _install_word_end(text, at)))
+        elif kind == 'here':
+            tag = re.match(r'-?[ \t]*([\'"]?)([A-Za-z0-9_]+)\1', text[at:])
+            body = text.find('\n', at)
+            if not tag or body < 0:
+                scopes.append((0, len(text)))
+                continue
+            close = re.search(r'^\t*%s$' % re.escape(tag.group(2)), text[body + 1:], re.M)
+            scopes.append((body, body + 1 + close.start() if close else len(text)))
+        elif kind == 'eval':
+            line = text.find('\n', at)
+            end = len(text) if line < 0 else line
+            if text[at:end].count("'") % 2 or text[at:end].count('"') % 2:
+                end = len(text)  # a quote that the line does not close: the words may reach further
+            scopes.append((at, end))
+        elif kind == 'awk':
+            scopes.append((at, len(text)))  # awk's program is its first operand: everything after the word
+        else:
+            scopes.append((0, len(text)))
+    return scopes
+
+
+def _install_files_line(home):
+    """The sanctioned install line as one compiled regular grammar (fullmatch only)."""
+    script = r'(?:~|\$HOME|%s)/\.claude/hooks/ah\.py' % re.escape(home)
+    name = r'[A-Za-z0-9_][A-Za-z0-9_.-]*'
+    ticket = r'''(?:"GoodQA [A-Za-z0-9_-]+#[0-9]+"|'GoodQA [A-Za-z0-9_-]+#[0-9]+')'''
+    flag = (r'(?:--host (?:t2-dev|ah-mac-mini|local|local-codex)|--from-ref [0-9a-f]{40}|--file %s|--force-file %s|--ticket %s'
+            r'|--resume ins-[0-9a-f]{12}|--rollback ins-[0-9a-f]{12}|--agent [A-Za-z0-9_-]+|--dry-run|--allow-older)') % (name, name, ticket)
+    redir = r'(?:[12]?>>?|&>) ?[A-Za-z0-9_./][A-Za-z0-9_./-]*|2>&1'
+    return re.compile(r'python3((?: -[IBEsS])+) %s install-files(?: %s)+(?: (?:%s))*' % (script, flag, redir))
+
+
+def _install_views(text):
+    """(plain, squashed) views of `text` (see step 1)."""
+    plain = re.sub(r'[\'"\\]', '', text.replace('\\\n', ''))
+    return plain, _INSTALL_TRIGGER_STRIP.sub('', text).lower()
+
+
+def _install_name_visible(plain, squashed):
+    """The install name (install-files or ah_install) that `text` shows as a word or splices, else None."""
+    low = plain.lower()
+    for name, word in _INSTALL_NAMES:
+        if word.search(plain) or squashed.count(name) > low.count(name):
+            return name
+    return None
+
+
+def install_files_trigger(text):
+    """True when `text` may run install-files or the ah entry, in any spelling the text shows (parse-free, step 1)."""
+    plain, squashed = _install_views(text)
+    return bool(_install_name_visible(plain, squashed) or 'ah.py' in squashed)
+
+
+def _install_commit_heredoc(text):
+    """True for `git commit -F - <<'TAG'` with a literal (quoted-tag) body that holds no line equal to TAG before the end."""
+    m = _INSTALL_COMMIT_HEREDOC.fullmatch(text)
+    return bool(m) and m.group(1) not in m.group(2).split('\n')
+
+
+def _install_entry_may_run(before):
+    """How an ah entry may run, from the words of its own command before it: None (only as an argument of another
+    program: cat, grep PATTERN, git diff --, another python script), 'runs' (it is the command word, python's script,
+    or follows a runner or an assignment: its subcommand must be a literal word) or 'hidden' (its words come from a
+    variable, an alias or another program's option, so no literal word after it can be trusted)."""
+    i = len(before)
+    while i and not (before[i - 1].isspace() or before[i - 1] in ';&|(){}<>`'):
+        i -= 1
+    partial = before[i:]  # the start of the word that holds the entry
+    if '=' in partial or '!' in partial:
+        return 'hidden'  # A=~/.claude/hooks/ah.py (the script kept in a variable) or alias.x=!...ah.py
+    words = _INSTALL_WORDS.findall(before[:len(before) - len(partial)])
+    cut = max([i for i, w in enumerate(words) if w in (';', '&', '|', '(', ')', '{', '}', '`', '\n')] + [-1])
+    words = words[cut + 1:]
+    if words and words[-1] in ('<', '>'):
+        return None  # a redirection target
+    while words and _INSTALL_ASSIGN.match(words[0]):
+        words = words[1:]
+    if not words or words[0].rsplit('/', 1)[-1] in _INSTALL_RUNNERS:
+        return 'runs'  # the entry is the command word, or its command is a runner (env -u X, timeout -s KILL 60, xargs -a F)
+    if _INSTALL_PYTHON.fullmatch(words[0].rsplit('/', 1)[-1]):
+        j = 1
+        while j < len(words):
+            word = words[j]
+            if word in ('-W', '-X', '--check-hash-based-pycs'):
+                j += 2
+            elif word.startswith('-') and not word.startswith('--') and word[-1] in 'mc':
+                return 'runs'  # python -m MODULE (cProfile, pdb, runpy ...) or -c CODE may run the entry
+            elif word.startswith('-'):
+                j += 1
             else:
-                current.append(token)
-        if current:
-            out.append((current, ' '.join(current)))
-        # newlines are plain characters inside this tokenizer: a multi-line text is split on them first
-        if '\n' in text:
-            raise ValueError('multi-line text')
-        return out
-    except ValueError:
-        out = []
-        for segment in re.split(r'[;&|\n]+', text):
-            try:
-                out.append((shlex.split(segment, comments=False, posix=True), segment))
-            except ValueError:
-                out.append((None, segment))
-        return out
+                return None  # another script runs first; the entry is its argument
+        return 'runs'  # the entry is python's script
+    for word in words:
+        if word in ('-exec', '-execdir', '-ok', '-okdir'):
+            return 'runs'  # find -exec
+        if any(_INSTALL_PYTHON.fullmatch(part.rsplit('/', 1)[-1]) or part in _INSTALL_RUNNERS for part in re.split(r'[=!:]', word)[1:]):
+            return 'hidden'  # git -c alias.x='!python3 ...': the command string ends where a quote ends, not at a word
+    return None
 
 
-def _install_files_words(tokens):
-    """(words, prefixed): the command words of one segment once every assignment prefix, compound-command keyword and
-    wrapper (with its options) in front is removed, in any order and nesting: `HOME=/x builtin command export Y=1` is
-    `export Y=1` (goodqa#15913 r6 F1: classify only after this, or `builtin export` hides an export)."""
-    prefixed = False
-    while tokens:
-        first = tokens[0]
-        if first[:1] in '({!' and len(first) > 1 and first not in INSTALL_FILES_KEYWORDS:
-            tokens, prefixed = [first.lstrip('({!')] + tokens[1:], True  # `(export` from the per-line fallback split
-        elif INSTALL_FILES_ASSIGNMENT.fullmatch(first) or first in INSTALL_FILES_KEYWORDS:
-            tokens, prefixed = tokens[1:], True
-        elif os.path.basename(first) in INSTALL_FILES_WRAPPERS:
-            tokens, prefixed = tokens[1:], True
-            while tokens and (tokens[0].startswith('-') or INSTALL_FILES_ASSIGNMENT.fullmatch(tokens[0])):
-                tokens = tokens[1:]
+def _install_entry_refusal(text, plain, squashed):
+    """Step 3: None, or why an ah entry may run with a subcommand the text does not show as a literal word."""
+    if squashed.count('ah.py') > plain.lower().count('ah.py'):
+        return 'the name ah.py is spelled with quotes, escapes, braces or expansions'
+    merged = []
+    for start, end in sorted(_install_inline_scopes(text, plain)):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
         else:
-            break
-    return tokens, prefixed
-
-
-def _install_files_changes_env(tokens):
-    """True for a segment that can change what a later segment runs or sees: an environment-changing builtin behind any
-    prefix or wrapper, a bare assignment, a function definition, or `printf -v` / `print -v`."""
-    if not tokens:
-        return False
-    words, _prefixed = _install_files_words(tokens)
-    if not words:
-        return any(INSTALL_FILES_ASSIGNMENT.fullmatch(t) for t in tokens)  # `HOME=/x` alone sets it for the rest of the text
-    first = os.path.basename(words[0])
-    return (first in INSTALL_FILES_ENV_CHANGERS or words[0].endswith('()') or words[1:3] == ['(', ')']
-            or (first in ('printf', 'print') and any(w.startswith('-') and 'v' in w for w in words[1:])))
-
-
-def _install_files_segment(text, is_main, home, literal, depth=0):
-    """None, or the refusal for one command string (recursing into `bash -c` bodies, at most three levels). Any run of
-    install-files found inside a shell -c body (depth > 0), behind an environment assignment or a wrapper, or in a text with a
-    segment that changes the environment of later segments is refused, for main too (goodqa#15913: HOME= moves `~` and
-    the audit file, PYTHONPATH= or a function named python3 replaces the code that holds the merged-code proof). Segments
-    are classified only after their prefixes and wrappers are removed, the install command must be the first segment of the
-    text, and none of its words but the script may hold a `$` expansion or a backquote (r6 F1)."""
-    flat = re.sub(r'[\'"\\]', '', text)
-    if re.search(r'(?:^|\n)\s*(?:import|from)\s+ah_install\b|(?<![A-Za-z0-9_])ah_\W{0,6}install', flat) and not re.match(
-            r'\s*(?:git|cat|grep|egrep|rg|less|head|tail|ls|sed|awk|diff|wc|echo|printf|find|vi|vim|nano|man)\b', text):
-        if re.search(r'python|importlib|(?:^|\n)\s*(?:import|from)\s', flat):
-            return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
-    segments = _install_files_segments(text)
-    changes_env = any(_install_files_changes_env(tokens) for tokens, _segment in segments)  # `name() {` tokenizes as name ( ) {
-    seen = False  # a non-empty segment came before this one
-    for tokens, segment in segments:
-        earlier, seen = seen, seen or tokens is None or bool(tokens)
-        if tokens is None:
-            if 'install' in segment and ('install-files' in segment or 'ah_install' in segment):
-                return 'ah install-files: the command could not be parsed; ' + INSTALL_FILES_FORM
+            merged.append([start, end])
+    for start, end in merged:
+        if 'ah.py' in _INSTALL_TRIGGER_STRIP.sub('', text[start:end]).lower():
+            return 'ah.py is named in the inline code of a second program (python -c, a heredoc, a pipe into an interpreter ...)'
+    entries = list(_INSTALL_ENTRY.finditer(plain))
+    if len(entries) > INSTALL_ENTRY_MAX:
+        return 'the text names ah.py more than %d times' % INSTALL_ENTRY_MAX
+    cuts = [i for i, ch in enumerate(plain) if ch in ';&|(){}`\n']
+    for m in entries:
+        k = bisect.bisect_left(cuts, m.start())
+        how = _install_entry_may_run(plain[cuts[k - 1] + 1 if k else 0:m.start()])  # its own command segment
+        if how is None:
             continue
-        tokens, prefixed = _install_files_words(tokens)
-        if not tokens:
-            continue
-        first = os.path.basename(tokens[0])
-        if first in INSTALL_FILES_SHELLS and depth < 3:
-            for pos, tok in enumerate(tokens[1:], 1):
-                if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and pos + 1 < len(tokens):
-                    inner = _install_files_segment(tokens[pos + 1], is_main, home, literal, depth + 1)
-                    if inner:
-                        return inner
-        if first in INSTALL_FILES_VIEWERS:
-            continue
-        interpreter = re.fullmatch(r'python[0-9.]*', first) is not None
-        code_import = False
-        if interpreter:
-            for pos, tok in enumerate(tokens[1:], 1):
-                nxt = tokens[pos + 1] if pos + 1 < len(tokens) else ''
-                if tok == '-m' and nxt == 'ah_install':
-                    code_import = True
-                if tok.startswith('-') and not tok.startswith('--') and 'c' in tok[1:] and re.search(
-                        r'\b(?:import|from)\s+ah_install\b|__import__\(\s*[\'"]ah_install|importlib[^\n]*install|(?<![A-Za-z0-9_])ah_\W{0,6}install', nxt):
-                    code_import = True
-        if code_import:
-            return 'ah install-files: importing ah_install from python is refused; ' + INSTALL_FILES_FORM
-        if 'install-files' not in tokens:
-            if interpreter and any(os.path.basename(t) == 'ah_install.py' for t in tokens[1:]):
-                return 'ah install-files: running ah_install.py directly is refused; ' + INSTALL_FILES_FORM
-            continue
-        index = tokens.index('install-files')
-        head = tokens[:index]
-        if interpreter:
-            rest = [t for t in head[1:] if t not in ('-I', '-B', '-E', '-s', '-S')]
-            if len(rest) != 1 or rest[0] not in literal:
-                return 'ah install-files: only the installed ~/.claude/hooks/ah.py may run it (not %s); %s' % (os.path.basename(rest[0]) if rest else 'this script', INSTALL_FILES_FORM)
-            if head[-1] != rest[0] or '-I' not in head[1:-1]:
-                return ('ah install-files: the interpreter needs -I before the script (isolated mode: no PYTHON* variables, no user '
-                        'site, no script directory first on the path); ' + INSTALL_FILES_FORM)
-        elif first == 'ah':
-            return ('ah install-files: a bare `ah` is refused (its PATH lookup and interpreter flags are not the pinned form); '
-                    + INSTALL_FILES_FORM)
-        else:
-            return 'ah install-files: only the installed ah may run it; ' + INSTALL_FILES_FORM
-        if depth or prefixed or changes_env:
-            return ('ah install-files: run it as a plain command: no environment assignment, no wrapper (env, sudo, nohup, time, '
-                    'xargs, builtin, command ...), no shell -c around it and no segment that changes the environment (export, '
-                    'unset, source, cd, set, a function ...) in the same command; ' + INSTALL_FILES_FORM)
-        if earlier:
-            # fail closed (goodqa#15913 r6 F1): no earlier segment is treated as inert, since a builtin behind any spelling,
-            # an alias or an assigning expansion there can change HOME, PATH or what `python3` means for this one
-            return ('ah install-files: run it as the first command of the text: nothing may come before it in the same command '
-                    'line (an earlier command can change HOME, PATH or the functions the shell uses to run it); ' + INSTALL_FILES_FORM)
-        if any('$' in t or '`' in t for t in tokens if t != rest[0]):
-            # zsh `${HOME::=/x}` or `$((HOME=1))` assigns while the words are expanded, and python3 inherits the new HOME
-            return ('ah install-files: no $ expansion or backquote in its words (only the script may be spelled '
-                    '$HOME/.claude/hooks/ah.py); ' + INSTALL_FILES_FORM)
-        args = [t for t in tokens[index + 1:] if not INSTALL_FILES_REDIRECT.match(t)]  # redirections (`> out.json`, `2>&1`) are not flags
-        i = 0
-        while i < len(args):
-            flag = args[i]
-            if flag not in INSTALL_FILES_FLAGS:
-                # a redirection target (`> out.json` leaves `out.json`) is the only bare word allowed
-                if i > 0 and not flag.startswith('-') and tokens[tokens.index(flag) - 1] in ('>', '>>', '2>', '&>'):
-                    i += 1
-                    continue
-                return 'ah install-files: the flag %s is not part of the install grammar; %s' % (re.sub(r'[^\w=-]', '?', flag)[:40], INSTALL_FILES_FORM)
-            i += 1 + INSTALL_FILES_FLAGS[flag]
-            if i > len(args):
-                return 'ah install-files: %s needs a value; %s' % (flag, INSTALL_FILES_FORM)
-        if not is_main:
-            return 'ah install-files: only the main agent may run it (a sub-agent may not deploy hook files); ' + INSTALL_FILES_FORM
+        if how == 'hidden':
+            return 'an ah entry may run from a variable, an alias or another program\'s option, so its subcommand is not a literal word'
+        sub = _INSTALL_SUBCOMMAND.match(plain, m.end())
+        if not sub or sub.group(1) == 'install-files':  # (-h and --help print the usage)
+            shown = re.sub(r'[^\w.-]', '?', plain[m.end():m.end() + 24].strip())[:24]
+            return 'an ah entry may run with a subcommand that is not a literal word (%s)' % (shown or 'none')
     return None
 
 
 def install_files_refusal(command, is_main, home=None):
-    """None, or the refusal text for a command that runs `ah install-files` (goodqa#15742) outside its exact literal form:
-    `python3 -I` (more of -B -E -s -S allowed) on the INSTALLED ah.py, the flags of the install grammar only (redirections
-    allowed), as a plain command, and only for main. A bare `ah`, an environment assignment, a wrapper (env, sudo, nohup,
-    time ...), a shell -c body or an environment-changing segment in the same text is refused for main too (goodqa#15913).
-    Quotes are removed before matching (`install-file""s` is still the command), `bash -c` bodies are inspected, a python
-    import of ah_install is refused for any caller, and programs that only VIEW the name (grep, cat, git ...) pass.
-    ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a script that imports ah_install
-    through sys.path, or any program that speaks ssh itself, is invisible to it; the controls that hold are the merged-code
+    """None, or the refusal text for a command that may run `ah install-files` (goodqa#15742) outside its exact form.
+
+    FAIL CLOSED (goodqa#15913), see the comment above: a text that names install-files or ah_install (as a word, or
+    spliced) must be exactly the sanctioned install line (main only), one plain line of ah calls with another literal
+    subcommand, fixed viewers or `python3 -m unittest`, or a `git commit -F - <<'TAG'` heredoc; in a text that names only
+    the ah entry, its name may not be spliced and every ah entry that may run must be followed by a literal subcommand.
+
+    ACCIDENT PREVENTION, NOT AN ACCESS CONTROL: the guard sees command text only, so a program that computes the script
+    path and the subcommand at run time (a script file, a test module, a glob or brace that builds the name ah.py, string
+    building in another program that names neither) is invisible to it; the controls that hold are the merged-code
     proof, the allowlists and the audit inside ah_install."""
     text = command if isinstance(command, str) else ' '.join(map(str, command))
-    flat = re.sub(r'[\'"\\]', '', text)
-    if 'install' not in flat:
+    if not install_files_trigger(text):
         return None
+    if len(text) > INSTALL_TEXT_MAX:
+        return ('ah install-files: a command that names install-files, ah_install or ah.py may be at most %d characters (this '
+                'one has %d); put long text in a file (ah ticket comment --body-file FILE, git commit -F FILE); %s'
+                % (INSTALL_TEXT_MAX, len(text), INSTALL_FILES_FORM))
     home = home or os.path.expanduser('~')
-    literal = ('~/.claude/hooks/ah.py', '$HOME/.claude/hooks/ah.py', os.path.join(home, '.claude', 'hooks', 'ah.py'))
-    return _install_files_segment(text, is_main, home, literal)
+    line = _install_files_line(home).fullmatch(text)
+    if line and 'I' in line.group(1):
+        if not is_main:
+            return 'ah install-files: only the main agent may run it (a sub-agent may not deploy hook files); ' + INSTALL_FILES_FORM
+        return None
+    plain, squashed = _install_views(text)
+    if _install_name_visible(plain, squashed):
+        if _INSTALL_PLAIN_TEXT.fullmatch(text) or _install_commit_heredoc(text):
+            return None
+        return ('ah install-files: a command that names install-files or ah_install (in any spelling) must be the sanctioned '
+                'line itself or one plain line (no $ expansion, backquote, backslash, glob, brace, paren, assignment, '
+                'wrapper, pipe after install-files, newline or heredoc; only ah calls with another literal subcommand, cat, '
+                'grep, sed -n Np, git log/show/diff/add/commit ..., and python3 -m unittest, joined by && || ; or |); put '
+                'free text in a file (ah ticket comment --body-file FILE, git commit -F FILE, the Write tool); '
+                + INSTALL_FILES_FORM)
+    reason = _install_entry_refusal(text, plain, squashed)
+    if reason:
+        return ('ah install-files: %s; spell the script literally and name the ah subcommand as a plain word right after it '
+                '(python3 ~/.claude/hooks/ah.py status ...); %s' % (reason, INSTALL_FILES_FORM))
+    return None
 
 
 def payload_cwd(payload):
@@ -9375,7 +9496,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         if command is None:
             return 0
         install_text = command if isinstance(command, str) else ' '.join(map(str, command))
-        if 'install' in re.sub(r'[\'"\\]', '', install_text):  # after quote removal: install-file""s is still the command
+        if install_files_trigger(install_text):  # goodqa#15913: parse-free, before any tokenizing (install_files_refusal)
             try:
                 import caller_identity  # noqa: PLC0415 - positive main proof from the hook payload, never an environment variable
                 is_main = bool(caller_identity.is_main(payload))

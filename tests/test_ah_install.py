@@ -1405,9 +1405,9 @@ class LocalTarget(LocalBase):
 
     def test_a_guard_that_refuses_mains_recovery_form_is_rolled_back(self):  # AC-10, R1 (M2)
         src = self.base_bytes("command_guard.py").decode()
-        anchor = "    if 'install' not in flat:\n        return None\n"
+        anchor = "    if not install_files_trigger(text):\n        return None\n"
         self.assertEqual(src.count(anchor), 1)
-        variant = src.replace(anchor, anchor + "    if '--rollback' in flat:\n        return 'ah install-files: refused by a test variant'\n")
+        variant = src.replace(anchor, anchor + "    if '--rollback' in text:\n        return 'ah install-files: refused by a test variant'\n")
         ref = self.push({"command_guard.py": variant.encode()}, "refuse-main-recovery")
         before = self.live("command_guard.py")
         baseline = self.install(ref=ref, files=("command_guard.py",), dry_run=True)["selftest_baseline"]["hook"]
