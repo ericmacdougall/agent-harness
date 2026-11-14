@@ -115,9 +115,11 @@ class ResolveTests(Base):
         with self.assertRaises(core.Refused):
             core.resolve(self.request(), Fake(live_pr(state="MERGED")))
 
-    def test_base_mismatch_refused(self):
-        with self.assertRaises(core.Refused):
-            core.resolve(self.request(), Fake(live_pr(baseRefOid="d" * 40)))
+    def test_base_moved_is_repaired_with_a_note(self):
+        # D4 ruling: main advancing after submit is not the owner's error; the live base wins and is recorded.
+        got = core.resolve(self.request(), Fake(live_pr(baseRefOid="d" * 40)))
+        self.assertEqual(got["base"], "d" * 40)
+        self.assertIn(BASE[:12], got["base_repaired_from"])
 
     def test_gh_failure_is_retryable_not_pass(self):
         with self.assertRaises(core.Retry):
@@ -162,6 +164,26 @@ class ReceiptTests(Base):
 
     def test_nonzero_exit_never_pass(self):
         self.assertEqual(self.check(report(packet_sha=self.sha), rc=1)["verdict"], "ERROR")
+
+    def test_pass_with_tickets_is_not_pass(self):
+        got = self.check(report(packet_sha=self.sha, verdict="PASS-WITH-TICKETS"))
+        self.assertEqual(got["verdict"], "PASS-WITH-TICKETS")
+
+    def test_real_block_exit_3_is_block_not_error(self):
+        self.assertEqual(self.check(report(packet_sha=self.sha, verdict="BLOCK"), rc=3)["verdict"], "BLOCK")
+
+    def test_pass_verdict_with_exit_3_is_never_pass(self):
+        self.assertEqual(self.check(report(packet_sha=self.sha), rc=3)["verdict"], "ERROR")
+
+    def test_advisory_exit_4_is_advisory(self):
+        self.assertEqual(self.check(report(packet_sha=self.sha), rc=4)["verdict"], "ADVISORY")
+
+    def test_exit_2_is_error_even_with_a_report(self):
+        self.assertEqual(self.check(report(packet_sha=self.sha), rc=2)["verdict"], "ERROR")
+
+    def test_block_with_wrong_head_is_invalid(self):
+        self.assertEqual(self.check(report(head="c" * 40, packet_sha=self.sha, verdict="BLOCK"), rc=3)["verdict"],
+                         "INVALID")
 
     def test_missing_report_is_error(self):
         self.assertEqual(core.verify_receipt(0, self.work / "none.md", HEAD, self.packet)["verdict"], "ERROR")

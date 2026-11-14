@@ -43,9 +43,17 @@ _HEADING = re.compile(r'^#{1,6} \S')
 _RW_LOCATED = re.compile(r'^\s*\S[^\n]*:\d+: ResourceWarning: ')
 _RW_HINT = re.compile(r'^\s*ResourceWarning: Enable tracemalloc to get the object allocation traceback\s*$')
 NOTE_RE = re.compile(r'^> ahc-fixer: removed (\d+) Python ResourceWarning noise line\(s\) from fenced output; '
-                     r'original packet sha256 ([0-9a-f]{64})$')
+                     r'original packet sha256 ([0-9a-f]{64}) at ([A-Za-z0-9_./~+-]{1,512}|\(unnamed\))$')
 NOTE_TEMPLATE = ('> ahc-fixer: removed {n} Python ResourceWarning noise line(s) from fenced output; '
-                 'original packet sha256 {sha}')
+                 'original packet sha256 {sha} at {path}')
+# The note sits outside every fence, so a path with a backtick or a "$ " could look like a command to lint.
+_SAFE_PATH = re.compile(r'^[A-Za-z0-9_./~+-]{1,512}$')
+
+
+def _note_path(path):
+    text = str(path) if path else ''
+    return text if _SAFE_PATH.match(text) else '(unnamed)'
+
 
 LOOKBEHIND = 4   # non-blank lines searched above a fence for its command
 
@@ -208,7 +216,7 @@ def _insert_note(lines, note):
     return [note] + lines
 
 
-def fix_packet(text, expected_head=None):
+def fix_packet(text, expected_head=None, source_path=None):
     """Repair the packet layout. Returns a dict:
 
     status   'clean' (already passes), 'fixed' (repaired, conserved, passes) or 'unfixable'
@@ -245,7 +253,7 @@ def fix_packet(text, expected_head=None):
                 if moved is None:
                     break
                 lines, moves = moved, moves + 1
-            note = NOTE_TEMPLATE.format(n=len(noise), sha=sha256_text(text))
+            note = NOTE_TEMPLATE.format(n=len(noise), sha=sha256_text(text), path=_note_path(source_path))
             candidate = '\n'.join(_insert_note(lines, note))
             actions = ['moved a command line and its result line into the output fence'] * moves
             actions.append('removed %d ResourceWarning noise line(s), disclosed in the header' % len(noise))
@@ -273,7 +281,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     source = Path(args.packet)
     text = source.read_text(encoding='utf-8')
-    result = fix_packet(text, args.expected_head)
+    result = fix_packet(text, args.expected_head, source_path=str(source.resolve()))
     print('status: %s' % result['status'])
     for action in result['actions']:
         print('action: %s' % action)

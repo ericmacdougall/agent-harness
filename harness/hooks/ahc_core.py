@@ -152,19 +152,29 @@ def resolve(req, run):
         raise Retry("gh pr view returned no full head or base SHA")
     if head != req["head"]:
         raise Stale(f"the PR head is now {head[:12]}; resubmit at the new head with a fresh packet")
+    facts = {"head": head, "base": base, "base_ref": pr.get("baseRefName"),
+             "cross_repo": bool(pr.get("isCrossRepository"))}
     if base != req["base"]:
-        raise Refused(f"the PR base is {base[:12]}, not the submitted {req['base'][:12]}; resubmit")
-    return {"head": head, "base": base, "base_ref": pr.get("baseRefName"), "cross_repo": bool(pr.get("isCrossRepository"))}
+        # The base branch advanced after submit (spec AC-2 repair, D4 ruling): the live base wins and is recorded.
+        facts["base_repaired_from"] = f"submitted base {req['base'][:12]} replaced by live base {base[:12]}"
+    return facts
 
 
 _HEADER = re.compile(r"^(Stage|Reviewed HEAD|Reviewed packet SHA-256):[ \t]*(\S+)[ \t]*$", re.M)
-_VERDICT = re.compile(r"^(?:VERDICT|PR_RESULT):[ \t]*(PASS|BLOCK)\b", re.M)
+_VERDICT = re.compile(r"^(?:VERDICT|PR_RESULT):[ \t]*(PASS-WITH-TICKETS|PASS|BLOCK)(?![A-Za-z0-9_-])", re.M)
+EXIT_PASS, EXIT_ERROR, EXIT_BLOCK, EXIT_ADVISORY = 0, 2, 3, 4   # peer_review.py main()
 
 
 def verify_receipt(rc, report_path, head, packet_path):
-    """{"verdict": PASS|BLOCK|INVALID|ERROR, "reason"}. PASS only with exit 0, stage pr, the exact head and the
-    raw-byte SHA-256 of the packet that was passed (spec AC-5, NEG-5)."""
-    if rc != 0:
+    """{"verdict": PASS|PASS-WITH-TICKETS|BLOCK|ADVISORY|INVALID|ERROR, "reason"} (spec AC-5, NEG-5).
+
+    PASS needs exit 0, stage pr, the exact head, the raw-byte SHA-256 of the packet that was passed and an exact
+    `VERDICT: PASS`. PASS-WITH-TICKETS is its own non-pass verdict. A BLOCK verdict with exit 0 or 3 is BLOCK (the
+    safe direction). Exit 4 is advisory, never a pass; exit 2 or anything else is ERROR even when a report exists,
+    because peer_review can leave a digest-bound historical report after a failed final publication check."""
+    if rc == EXIT_ADVISORY:
+        return {"verdict": "ADVISORY", "reason": "peer_review published an advisory opinion, not a signoff"}
+    if rc not in (EXIT_PASS, EXIT_BLOCK):
         return {"verdict": "ERROR", "reason": f"peer_review exited {rc}"}
     try:
         text = Path(report_path).read_text(encoding="utf-8", errors="replace")
@@ -183,4 +193,9 @@ def verify_receipt(rc, report_path, head, packet_path):
     match = _VERDICT.search(text)
     if not match:
         return {"verdict": "INVALID", "reason": "no verdict line"}
-    return {"verdict": match.group(1), "reason": ""}
+    verdict = match.group(1)
+    if verdict == "BLOCK":
+        return {"verdict": "BLOCK", "reason": ""}
+    if rc != EXIT_PASS:
+        return {"verdict": "ERROR", "reason": f"verdict {verdict} with exit {rc}"}
+    return {"verdict": verdict, "reason": ""}

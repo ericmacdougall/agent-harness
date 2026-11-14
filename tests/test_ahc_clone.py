@@ -53,6 +53,18 @@ class CloneTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_clone_local_config_disables_hooks_for_plain_git(self):
+        # D2: peer_review runs its own git in the clone without our -c flags, so the local config must carry them.
+        path = ahc_clone.prepare(self.clones, "o/n", str(self.remote), self.head, self.base, env=ENV)
+        self.assertEqual(git("config", "--local", "core.hooksPath", cwd=path), "/dev/null")
+        self.assertEqual(git("config", "--local", "core.fsmonitor", cwd=path), "false")
+        (Path(path) / ".git" / "hooks").mkdir(exist_ok=True)
+        hook = Path(path) / ".git" / "hooks" / "post-checkout"
+        hook.write_text(self.trap.read_text())
+        hook.chmod(0o755)
+        git("checkout", "-q", "--detach", self.base, cwd=path)  # plain git, no -c flags
+        self.assertFalse(self.marker.exists(), "a hook ran under plain git in the daemon clone")
+
     def test_full_clone_at_exact_head_runs_no_hook(self):
         path = ahc_clone.prepare(self.clones, "o/n", str(self.remote), self.head, self.base, env=ENV)
         self.assertEqual(git("rev-parse", "HEAD", cwd=path), self.head)

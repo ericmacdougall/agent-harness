@@ -38,6 +38,7 @@ def _git(args, cwd=None, env=None, timeout=GIT_TIMEOUT, check=True):
 def _canonical_config(path, url):
     """The only local config the daemon's clone may carry."""
     text = ("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n"
+            "\thooksPath = /dev/null\n\tfsmonitor = false\n\tuntrackedCache = false\n"
             f"[remote \"origin\"]\n\turl = {url}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n")
     config = Path(path) / ".git" / "config"
     tmp = config.with_name("config.ahc-tmp")

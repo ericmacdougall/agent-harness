@@ -229,9 +229,22 @@ class NoiseTests(unittest.TestCase):
         self.assertEqual(result["status"], "fixed", result)
         text = result["text"]
         self.assertNotIn("ResourceWarning: unclosed", text)
-        self.assertEqual(text.splitlines()[1], ahc_packet.NOTE_TEMPLATE.format(n=7, sha=ahc_packet.sha256_text(NOISY)))
+        self.assertEqual(text.splitlines()[1], ahc_packet.NOTE_TEMPLATE.format(
+            n=7, sha=ahc_packet.sha256_text(NOISY), path="(unnamed)"))
         self.assertTrue(ahc_packet.conserved(NOISY, text))
         self.assertEqual(review_diagnostics.lint_packet("pr", text, FULL_HEAD), [])
+
+    def test_note_names_the_original_packet_path(self):
+        result = ahc_packet.fix_packet(NOISY, FULL_HEAD, source_path="/w/s/agent-x/packet-pr9.md")
+        self.assertIn("original packet sha256 %s at /w/s/agent-x/packet-pr9.md" % ahc_packet.sha256_text(NOISY),
+                      result["text"])
+        self.assertTrue(ahc_packet.conserved(NOISY, result["text"]))
+
+    def test_unsafe_path_is_not_written_into_the_note(self):
+        result = ahc_packet.fix_packet(NOISY, FULL_HEAD, source_path="/w/`x` exit 0.md")
+        self.assertIn(" at (unnamed)", result["text"])
+        self.assertNotIn("`x`", result["text"])
+        self.assertTrue(ahc_packet.conserved(NOISY, result["text"]))
 
     def test_undisclosed_noise_removal_is_rejected(self):
         text = ahc_packet.fix_layout(NOISY)
