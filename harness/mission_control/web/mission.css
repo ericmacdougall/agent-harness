@@ -187,9 +187,21 @@ body[data-tab="topology"] #scene-layer { display: block; }
 /* ---- owners */
 .owners-list { padding: 0 12px 4px; max-height: 460px; }
 .owner-row { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 10px; width: 100%; text-align: left; padding: 10px 6px; border-bottom: 1px solid var(--line); border-left: 3px solid transparent; }
-.owner-row:hover, .owner-row.is-highlighted { background: var(--panel-2); }
-.owner-row.owner-severe { border-left-color: var(--bad); }
-.owner-row.owner-held { border-left-color: var(--warn); }
+.owner-row:hover, .owner-row.is-highlighted, .helper-row:hover, .helper-row.is-highlighted { background: var(--panel-2); }
+.owner-row.owner-severe, .helper-row.owner-severe { border-left-color: var(--bad); }
+/* goodqa#15920: helpers sit under the owner they serve, indented and smaller; groups fold their parked/history rows */
+.helper-row { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; width: calc(100% - 28px); margin-left: 28px; text-align: left; padding: 6px 6px; border-bottom: 1px dashed var(--line); border-left: 3px solid transparent; font-size: 13px; }
+.helper-row .owner-name { font-size: 13px; font-weight: 500; }
+.owner-group { padding: 4px 0 8px; border-bottom: 1px solid var(--line); }
+.owner-group-title { font-size: 13px; font-weight: 700; margin: 10px 6px 4px; color: var(--text); overflow-wrap: anywhere; }
+.owner-group-empty { font-size: 12px; color: var(--muted); margin: 2px 6px 6px; }
+.owner-summary { font-weight: 600; }
+.owner-fold { display: block; width: 100%; text-align: left; margin: 4px 0 0; padding: 8px 6px; font-size: 12px; font-weight: 600; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+.owner-fold::before { content: '▸ '; }
+.owner-fold[aria-expanded="true"]::before { content: '▾ '; }
+.owner-fold.needs-attention { color: var(--bad); border-color: var(--bad); }
+.owner-fold-body { padding-top: 4px; }
+.owner-row.owner-held, .helper-row.owner-held { border-left-color: var(--warn); }
 .runtime-avatar { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; border: 1px solid var(--line-strong); color: var(--muted); font-size: 14px; }
 .owner-info { min-width: 0; display: grid; gap: 2px; }
 .owner-name-row { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }

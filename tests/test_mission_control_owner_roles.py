@@ -55,6 +55,13 @@ FIXTURE = [
     ("a0000000000000018", "red-team", False, "handoff", 10, None, False, "a000000000000000c", None),
     ("a0000000000000019", "", False, "live", 10, None, False, None, None),
     ("a000000000000001a", "invented-type", False, "live", 10, None, False, None, None),
+    # idle-helper boundary (30 min), unknown idle, None type, closed+decision_required, a task-named WAL owner
+    ("a000000000000001b", "general-purpose", False, "idle-helper", 1799, None, False, None, None),
+    ("a000000000000001c", "general-purpose", False, "idle-helper", 1801, None, False, None, None),
+    ("a000000000000001d", "general-purpose", False, "idle-helper", None, None, False, None, None),
+    ("a000000000000001e", None, False, "live", 10, None, False, None, None),
+    ("a000000000000001f", "task-owner", True, "SILENT", 4000, CLOSED, True, None, None),
+    ("deploy-fix-wal", "task-wal", True, "working", 50, None, False, None, None),
 ]
 
 
@@ -106,7 +113,7 @@ class CapParity(Base):
         self.assertLess(len(live), len(mc), "the old panel counted every row; the cap counts only live owners")
         # pinned by hand too, so a change in tier_gate shows up here as a reviewed diff, not silently
         self.assertEqual(sorted(a[-2:] for a in live),
-                         ["01", "02", "03", "04", "07", "08", "09", "14", "19", "1a"])
+                         ["01", "02", "03", "04", "07", "08", "09", "14", "19", "1a", "1b", "1e", "1f", "al"])
 
     def test_every_row_has_a_role_and_helpers_are_not_live(self):
         mc = {r["agent_id"]: r for r in self.collect(ah_rows())}
@@ -114,8 +121,10 @@ class CapParity(Base):
         for helper in ("11", "12", "13", "15", "16", "17", "18"):
             self.assertEqual(mc["a00000000000000" + helper]["role"], "helper", helper)
         self.assertEqual(mc["a0000000000000014"]["role"], "live", "an owner-flagged helper type is an owner (cap rule)")
-        for parked in ("05", "06", "0a", "0b", "0c", "0d", "0e", "0f", "10"):
+        for parked in ("05", "06", "0a", "0b", "0c", "0d", "0e", "0f", "10", "1c"):
             self.assertEqual(mc["a00000000000000" + parked]["role"], "parked", parked)
+        self.assertNotIn("a000000000000001d", mc, "an idle-helper with unknown idle is terminal history (6 h rule)")
+        self.assertEqual(mc["deploy-fix-wal"]["role"], "live", "a task-named WAL owner counts, whatever its runtime")
 
 
 class Serves(Base):
@@ -142,9 +151,12 @@ class Truncation(Base):
                 for i in range(100, 180)]
         rows.append({"agent_id": "a00000000000beef", "type": "task-owner", "owner": True, "state": "SILENT-HIGH",
                      "idle_s": 50_000})
+        rows.append({"agent_id": "a00000000000dead", "type": "task-owner", "owner": True, "state": "DROPPED",
+                     "idle_s": 60_000})
         mc = self.collect(rows)
         self.assertEqual(len(mc), 60)
         self.assertIn("a00000000000beef", {r["agent_id"] for r in mc if r["role"] == "live"})
+        self.assertIn("a00000000000dead", {r["agent_id"] for r in mc}, "an alarm row is not cut by the cap either")
 
 
 class CodexRoles(unittest.TestCase):

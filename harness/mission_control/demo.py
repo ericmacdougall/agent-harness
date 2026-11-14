@@ -178,6 +178,13 @@ OWNERS = [
     ("a7retd0demo", "returned", "Spec review for demo#107", "demo#107", 3600, None, "handoff: review posted"),
     ("a8done0demo", "done", "Docs typo sweep", "demo#108", 4000, None, "result: merged"),
 ]
+# Helpers (goodqa#15920): they nest under the owner they serve and never count. agent, type, state, ticket, idle, parent
+HELPERS = [
+    ("a9redt0demo", "red-team", "live", "demo#101", 40, "a1live0demo"),
+    ("aarevw0demo", "reviewer", "done", "demo#102", 600, None),
+    ("abclck0demo", "click-tester", "handoff", "demo#107", 3000, "a7retd0demo"),
+    ("acfixr0demo", "fixer", "DROPPED", None, 7000, None),
+]
 
 INITIATIVES = [
     {"id": "demo#101", "initiative": "Checkout redesign", "state": "In progress", "milestones_done": 5,
@@ -334,6 +341,9 @@ def owners_payload(now: float) -> dict:
         if disposition:
             row["disposition"] = {**disposition, "until": now + 6 * 3600}
         rows.append(row)
+    for agent, kind, state, ticket, idle, parent in HELPERS:
+        rows.append({"agent_id": agent, "state": state, "task": f"{kind} pass", "ticket": ticket, "idle_s": idle,
+                     "type": kind, "owner": False, "parent": parent, "last_activity": _iso(now - idle)})
     return {"session": DEMO_SESSION, "owners": rows}
 
 

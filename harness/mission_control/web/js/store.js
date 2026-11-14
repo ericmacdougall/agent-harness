@@ -25,7 +25,7 @@ let state = {
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
   motion: savedMotion && !media.matches, motionPreference: savedMotion, reducedMotion: media.matches,
-  feedPaused: false, feedSnapshot: [], buffered: 0, ownerFilter: 'active', fallback: false, showQuiet: false,
+  feedPaused: false, feedSnapshot: [], buffered: 0, ownerFilter: 'active', ownerFolds: {}, fallback: false, showQuiet: false,
   theme: savedTheme,
   chatAvailability: { claude: {}, codex: { state: 'unavailable', blockedUntil: null, reason: 'Checking Codex…' } },
 };

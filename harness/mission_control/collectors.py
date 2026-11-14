@@ -113,7 +113,9 @@ def _serves(rows: list[dict]) -> None:
                 break
             parent = by_id[parent].get("parent")
         if r["serves"] is None and r.get("ticket") in by_ticket:
-            candidates = sorted(by_ticket[r["ticket"]], key=lambda o: o.get("role") != "live")
+            candidates = sorted(by_ticket[r["ticket"]], key=lambda o: (o.get("role") != "live",
+                                                                    o.get("idle_s") if isinstance(o.get("idle_s"), (int, float)) else 1e12,
+                                                                    str(o.get("agent_id"))))
             r["serves"] = candidates[0].get("agent_id")
 
 
@@ -772,7 +774,7 @@ class Owners(Collector):
                     "owner": row.get("owner") is True, "decision_required": row.get("decision_required") is True,
                     "parent": parent if isinstance(parent := row.get("parent"), str)
                     and re.fullmatch(r"[A-Za-z0-9_-]{1,40}", parent) else None,
-                    "source": "ah"}
+                    "source": "ah", "session": ev.short(self.session, 64)}
             item["role"] = owner_role(item)
             rows.append(item)
             previous = self.states.get(agent)
@@ -784,7 +786,9 @@ class Owners(Collector):
                                          severity="high" if state.startswith(("DROPPED", "SILENT")) else "info"))
             self.states[agent] = state
         # classified before the cap: an owner holding a slot (SILENT, quiet, idle-helper) is never cut by the 60-row limit
-        rows.sort(key=lambda r: ({"live": 0, "parked": 1}.get(r["role"], 2), r["idle_s"] or 0))
+        # then rows that need attention (DROPPED, SILENT, decision required), so an alarm is not cut either
+        rows.sort(key=lambda r: (0 if r["role"] == "live" else 1 if r["decision_required"] or r["state"].startswith(("DROPPED", "SILENT"))
+                                 else 2 if r["role"] == "parked" else 3, r["idle_s"] or 0))
         self.claude_rows = rows[:60]
         self.publish()
         return f"{len(rows)} owners"

@@ -1,6 +1,7 @@
 // Pure mapping from the Mission Control server's JSON (GoodQA #15585) to the view model the panels render.
 // No DOM, no network: tested with `node --test harness/mission_control/web/tests/`.
 // Every string stays a string; panels render with textContent only.
+import { ownerCounts } from './owner-groups.js';
 
 const str = (value, max = 4000) => (typeof value === 'string' ? value : value == null ? '' : String(value)).slice(0, max);
 const isoFromEpoch = seconds => (typeof seconds === 'number' && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null);
@@ -50,7 +51,7 @@ export function ownerHold(r, last) {
 
 export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
-  return rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
+  const out = rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
     const id = str(r.agent_id, 80);
     const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket === r.ticket));
     const last = r.last_item && typeof r.last_item === 'object' ? r.last_item : null;
@@ -67,8 +68,17 @@ export function owners(rows, items = []) {
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
       progress: validIso(last?.progress_at) ? { at: last.progress_at, event: str(last.progress_event, 40), note: str(last.progress_note, 160) } : null,
       initiative_id: linked ? linked.id : null,
+      // goodqa#15920: the server's cap role; anything unknown is parked (shown, never counted)
+      role: ['live', 'parked', 'helper'].includes(r.role) ? r.role : 'parked', source: r.source === 'ah' ? 'ah' : str(r.source, 20),
+      serves: r.serves ? str(r.serves, 80) : null,
+      decision_required: r.decision_required === true,
+      session: str(r.session, 64),
     };
   });
+  // a helper takes the initiative of the owner it serves
+  const byId = new Map(out.map(o => [o.agent_id, o]));
+  for (const o of out) if (o.role === 'helper' && o.serves && byId.has(o.serves)) o.initiative_id = byId.get(o.serves).initiative_id;
+  return out;
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
@@ -402,15 +412,15 @@ export function missionTiles(state) {
   const led = state.ledger || ledger(null);
   const goals = led.goals.items;
   const tested = goals.filter(g => g.state === 'LIVE_TESTED').length;
-  const live = (state.owners || []).filter(o => o.state === 'live').length;
-  const attention = (state.owners || []).filter(o => o.severe).length;
+  const counts = ownerCounts(state.owners || []);
+  const live = counts.live, attention = counts.attention;
   const waiting = (state.asks || []).filter(ask => waitingOnUser(state.messages, ask) && state.decisions?.[ask.id]?.status !== 'sending').length;
   const blockers = blockerRows(led.status, state.asksFlagged || [], state.owners || [], state.initiatives || []).length;
   const reqs = led.requirements.summary;
   const risky = (state.initiatives || []).filter(i => /at risk|blocked/i.test(i.state)).length;
   const tiles = [
     { id: 'goals', label: 'Goals live and tested', value: `${tested} / ${goals.length}`, note: led.goals.error ? 'ledger error' : `${goals.length - tested} still open`, target: 'mission-panel' },
-    { id: 'owners', label: 'Owners live', value: String(live), note: attention ? `${attention} need attention` : 'none need attention', target: 'owners-panel' },
+    { id: 'owners', label: 'Owners live', value: String(live), note: [counts.codexLive ? `${counts.codexLive} live Codex` : '', attention ? `${attention} need attention` : 'none need attention'].filter(Boolean).join(' · '), target: 'owners-panel' },
     { id: 'asks', label: 'Needs you', value: String(waiting), note: waiting ? 'waiting on your answer' : 'nothing waiting', target: 'needs-panel' },
     { id: 'blockers', label: 'Blockers', value: String(blockers), note: risky ? `${risky} initiatives at risk` : 'across status, asks, owners', target: 'blockers-panel' },
     { id: 'requirements', label: 'Requirements live', value: String(reqs.live), note: `${reqs.archived} archived`, target: 'requirements' },
