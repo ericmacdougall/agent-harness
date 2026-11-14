@@ -18,3 +18,15 @@ Not covered by this evidence (pending, honestly listed in the PR packet): AC-44 
 remote install check (S1-NESTED-INSTALL), live behaviour of the real ports (ticket adapter, task register, session log
 routing, session environment), and the items not implemented (AC-6 stubs, AC-9 installed-digest refusal, NEG-36 plan stub,
 refresh authorization, grant lookup).
+
+## Round 2 (review r2 at 6f5ef181; Opus rescue owner)
+
+Code head for this round: 8fd0e309513f99bcdab2dbdfedcba1396368441c. Later commits change only `notes/goodqa-15946/`;
+check the logs against any later head with `git rev-parse <head>:harness <head>:tests <head>:install.py` (the trees are
+in each log header).
+
+- `r2-failing-first-prefix.txt`: raw `-v` output of the new r2 tests (tests/test_lane_r2.py, tests/test_spec_flow.py
+  LaneSpecState) run against the pre-fix code at 6f5ef181: 7 failures and 5 errors, each the defect r2 named.
+- `suites-r2-8fd0e309.txt`: raw `-v` unittest output of every touched suite (`run_suites_r2.py`), in a clean clone
+  detached at the code head on t2-dev (Linux, Python 3.12), per the heavy-jobs-off-the-Mac rule.
+- `run_suites_r2.py`: the runner.
