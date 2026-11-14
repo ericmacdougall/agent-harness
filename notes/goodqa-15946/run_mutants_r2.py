@@ -16,10 +16,12 @@ MUTANTS = [
      "        except lanes.LaneRefusal as error:  # a definite refusal",
      "        except KeyboardInterrupt as error:  # a definite refusal",
      ["tests.test_lane_r2.RealTaskRegisterTests.test_bind_of_a_stream_registered_to_another_holder_is_refused_not_partial"]),
-    ("F2: comment sends no persisted id", "harness/hooks/lane/commands.py",
-     "cid = ports.ticket.comment(m[\"ticket\"], body, op, attachment_ids=ids)",
-     "cid = ports.ticket.comment(m[\"ticket\"], body, op, attachment_ids=[])",
-     ["tests.test_lane_r2.NewCrashTests"]),
+    ("F2: comments never send the persisted id (the pre-fix in-process list is lost on restart)",
+     "harness/hooks/lane/commands.py",
+     [("cid = ports.ticket.comment(m[\"ticket\"], body, op, attachment_ids=ids)",
+       "cid = ports.ticket.comment(m[\"ticket\"], body, op, attachment_ids=[])"),
+      ("attachment_ids=[persisted])", "attachment_ids=[])")],
+     None, ["tests.test_lane_r2.NewCrashTests"]),
     ("F3: spec_state falls back to ready", "harness/hooks/ah_lane.py",
      'verified, accepted = data.get("spec_verified"), data.get("reviews_accepted")',
      'verified, accepted = bool(data.get("ready")), bool(data.get("ready"))',
@@ -44,11 +46,14 @@ def main():
         p = Path(path)
         original = p.read_bytes()
         text = original.decode()
-        if text.count(old) != 1:
+        pairs = old if isinstance(old, list) else [(old, new)]
+        if any(text.count(a) != 1 for a, _ in pairs):
             print("== %s: anchor not found exactly once; NOT RUN" % label)
             continue
+        for a, b in pairs:
+            text = text.replace(a, b)
         try:
-            p.write_text(text.replace(old, new))
+            p.write_text(text)
             code, out = run(tests)
         finally:
             p.write_bytes(original)

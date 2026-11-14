@@ -301,7 +301,11 @@ class FileTicket:
             return out
 
     def find_comment(self, ref, key):
-        return self._io(lambda d: ("c-" + key) if key in d else None)
+        found = self._io(lambda d: ("c-" + key) if key in d else None)
+        if not found:
+            import time  # noqa: PLC0415
+            time.sleep(0.3)  # tracker latency: two unserialised runs would both miss and both post
+        return found
 
     def comment(self, ref, body, key, attachment_ids=()):
         def post(d):
