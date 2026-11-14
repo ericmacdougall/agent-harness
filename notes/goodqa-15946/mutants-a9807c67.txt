@@ -1,0 +1,11 @@
+clean    M1: ran 1, failed 0 | race: ran 1, failed 0 | source: ran 1, failed 0 | no-exec: ran 1, failed 0
+mutant   M1 (caller claim trusted): ran 1, failed 3
+mutant   root race (unguarded mkdir): ran 1, failed 1
+mutant   manifest source class (old regex): ran 1, failed 1
+mutant   identity via git exec: ran 1, failed 1
+mutant   checkpoint consumes the stamp twice: ran 1, failed 1
+clean    F1: ran 1, failed 0 | ran 1, failed 0
+mutant   F1 (None == None passes): ran 1, failed 1 | ran 1, failed 2
+clean    F2: ['ran 1, failed 0', 'ran 1, failed 0', 'ran 1, failed 0', 'ran 1, failed 0', 'ran 1, failed 0', 'ran 1, failed 0']
+mutant   F2 (existing path accepted): ['ran 1, failed 1', 'ran 1, failed 1', 'ran 1, failed 1', 'ran 1, failed 1', 'ran 1, failed 1', 'ran 1, failed 1']
+restored M1: ran 1, failed 0 | race: ran 1, failed 0 | source: ran 1, failed 0 | no-exec: ran 1, failed 0
