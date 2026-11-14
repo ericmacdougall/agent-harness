@@ -15,7 +15,7 @@ function shortModel(model) {
   return String(model).replace(/^claude-/, '').replace(/-\d{8}$/, '');
 }
 function labelText(node) {
-  if (node.kind === 'user') return `You · ${node.inbox ?? 0} open ask${node.inbox === 1 ? '' : 's'}`;
+  if (node.kind === 'user') return node.inbox == null ? 'You · asks loading…' : `You · ${node.inbox} open ask${node.inbox === 1 ? '' : 's'}`;
   if (node.kind === 'coordinator') return `Main · ${shortModel(node.model)} · ${node.effort}`;
   if (node.kind === 'work') return `${node.ref}${node.done ? ' ✓' : ''}`;
   if (node.kind === 'repo') return `⌘ ${node.label}`;
@@ -306,7 +306,7 @@ export async function mountScene() {
     const g = state.orggraph;
     if (!g) { meta.textContent = 'Waiting for the org graph from the server…'; return; }
     const c = g.counts || {};
-    meta.textContent = `${c.live_owners ?? 0} live of ${c.owner ?? 0} owners · ${c.subagent ?? 0} sub-agents · ${c.reviewer ?? 0} reviewers · ${c.work ?? 0} work items${c.hidden_agents ? ` · ${c.hidden_agents} older agents not drawn` : ''} · graph last changed ${ageText(g.generated, state.now)} · from ah owners, transcripts and GoodQA`;
+    meta.textContent = `${c.live_owners ?? 0} live of ${c.owner ?? 0} owners · ${c.subagent ?? 0} sub-agents · ${c.reviewer ?? 0} reviewers · ${c.work ?? 0} work items${c.hidden_agents ? ` · ${c.hidden_agents} older agents not drawn` : ''} · graph last changed ${ageText(g.generated, state.now)} · session ${g.session ? String(g.session).slice(0, 8) : 'unknown'} · from ah owners, transcripts and GoodQA`;
     const gaps = document.getElementById('org-gaps');
     gaps.replaceChildren(...(g.gaps || []).map(text => el('li', '', text)));
   }

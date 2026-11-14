@@ -153,7 +153,8 @@ export function describe(node, byId = new Map()) {
   if (node.severity && node.severity !== 'info') alarm.push(['Severity', node.severity]);
   if (node.escalation) alarm.push(['Escalation', `${node.escalation} step${node.escalation > 1 ? 's' : ''}${node.escalation_to ? ` to ${node.escalation_to}` : ''}${node.escalation_reason ? ` · ${node.escalation_reason}` : ''}`]);
   switch (node.kind) {
-    case 'user': return [['Open asks (Needs you)', String(node.inbox ?? 0)], ['Stale asks, still open', String(node.inbox_stale ?? 0)]];
+    case 'user': return node.inbox == null ? [['Open asks (Needs you)', 'loading…']]
+      : [['Open asks (Needs you)', String(node.inbox)], ['Stale asks, still open', String(node.inbox_stale ?? 0)]];
     case 'coordinator': return [['State', node.state], ...agent];
     case 'owner': return [['Mission', node.mission || UNKNOWN], ['State', node.state], ...agent, ['Ticket', node.ticket || '—'], ...alarm];
     case 'subagent': return [['Task', node.task || UNKNOWN], ['Owner', name(node.owner)], ['State', node.state], ...agent, ['Ticket', node.ticket || '—'], ...alarm];

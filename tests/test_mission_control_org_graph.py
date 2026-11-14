@@ -350,6 +350,36 @@ class FeedAdditions(unittest.TestCase):
         user = nodes(graph.snapshot())["user"]
         self.assertEqual((user["inbox"], user["inbox_stale"]), (3, 1))
 
+    def test_inbox_before_asks_report_is_loading_not_zero(self):  # startup race: never a false 0 on the user node
+        fx = Fixture()
+        hub = Hub()
+        graph = og.OrgGraph(hub, col.Health(hub), Runner(), owners_fn=lambda: [], session_fn=lambda: SESSION,
+                            transcripts=og.Transcripts(fx.root), escalation_root=None, host="h", inbox_fn=lambda: None)
+        graph.tick(1.0)
+        user = nodes(graph.snapshot())["user"]
+        self.assertIsNone(user["inbox"])
+        self.assertIsNone(user["inbox_stale"])
+
+    def test_session_without_claude_transcript_is_named_not_silent(self):  # goodqa#15961: newest WAL may be Codex
+        fx = Fixture()
+        hub = Hub()
+        other = "01a1d873-d7c9-7752-83a9-b10a1cb85371"
+        graph = og.OrgGraph(hub, col.Health(hub), Runner(), owners_fn=lambda: [], session_fn=lambda: other,
+                            transcripts=og.Transcripts(fx.root), escalation_root=None, host="h")
+        graph.tick(1.0)
+        snap = graph.snapshot()
+        self.assertEqual(snap["session"], other)
+        self.assertTrue(any(other[:8] in g and "goodqa#15961" in g for g in snap["gaps"]), snap["gaps"])
+        empty = og.OrgGraph(hub, col.Health(hub), Runner(), owners_fn=lambda: [], session_fn=lambda: "",
+                            transcripts=og.Transcripts(fx.root), escalation_root=None, host="h")
+        empty.tick(1.0)
+        self.assertTrue(any("No session" in g for g in empty.snapshot()["gaps"]))
+        # the coordinating session with a transcript carries no such line
+        fx.main([assistant(model="claude-opus-5-5")])
+        graph2, _, _ = collector(fx, [])
+        graph2.tick(1.0)
+        self.assertFalse(any("goodqa#15961" in g for g in graph2.snapshot()["gaps"]))
+
     def test_initiatives_snapshot_keeps_the_file_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "initiatives.json")

@@ -580,7 +580,8 @@ class OrgGraph:
         main_path = self.transcripts.main_path(session) if session else None
         coordinator = self.transcripts.facts(main_path)
         inbox = self.inbox_fn()
-        open_asks, stale_asks = inbox if isinstance(inbox, tuple) else (int(inbox or 0), 0)
+        # None: the asks source has not reported yet; the page says "loading", never a false 0.
+        open_asks, stale_asks = (None, None) if inbox is None else inbox if isinstance(inbox, tuple) else (int(inbox or 0), 0)
         coordinator = dict(coordinator, inbox=open_asks, inbox_stale=stale_asks)
         agents = []
         for row in rows:
@@ -607,6 +608,12 @@ class OrgGraph:
         snapshot = build(session=session, coordinator=coordinator, agents=agents, tickets=self.tickets,
                          escalation=self.escalation_cache[1], host=self.host, now=now, helpers=self.helpers,
                          stale=self.ticket_stale)
+        if not session:
+            snapshot["gaps"].insert(0, "No session is selected yet: ah owners has not reported one.")
+        elif main_path is None:
+            # ah owners follows the newest main WAL, Codex sessions included (goodqa#15961): say so, never a silent 0.
+            snapshot["gaps"].insert(0, f"Following session {session[:8]}, which has no Claude transcript (likely a Codex "
+                                       "session that wrote the newest WAL); owners and asks may read 0 (goodqa#15961).")
         changes = diff(self.snapshot_data, snapshot, now)
         # Messages from the coordinator and owners, read from their transcripts' SendMessage targets.
         senders = [("coordinator", coordinator)] + [(a["agent_id"], a) for a in agents]

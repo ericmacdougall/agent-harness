@@ -375,7 +375,10 @@ class App:
             self.start()
 
     def _open_asks(self) -> tuple:
-        """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them."""
+        """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them;
+        None until the asks source has run once, so the page never shows a false 0 at startup."""
+        if getattr(self.asks, "ran_at", None) is None:
+            return None
         return len(getattr(self.asks, "items", None) or []), len(getattr(self.asks, "stale", None) or [])
 
     def tracked_tickets(self):
