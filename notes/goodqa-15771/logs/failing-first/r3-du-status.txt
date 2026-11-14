@@ -1,0 +1,61 @@
+2e8d6f29ada41c58f041ea7adfbf01c231398ad6
+FFFFFF
+======================================================================
+FAIL: test_a_status_without_its_subtotal_or_a_duplicate_subtotal_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 571, in test_a_status_without_its_subtotal_or_a_duplicate_subtotal_is_unknown
+    self.assertIn(self.VMUNK + "103", self.run_check((0, dup))[0])
+AssertionError: 'disk:vmunknown:<pve-host>:/var/lib/vz:103' not found in {}
+
+======================================================================
+FAIL: test_du_that_fails_but_prints_a_plausible_subtotal_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 546, in test_du_that_fails_but_prints_a_plausible_subtotal_is_unknown
+    self.assert_103_unknown(got, sample)
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 534, in assert_103_unknown
+    self.assertIn(self.VMUNK + "103", got)
+AssertionError: 'disk:vmunknown:<pve-host>:/var/lib/vz:103' not found in {}
+
+======================================================================
+FAIL: test_du_that_times_out_after_a_valid_prefix_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 557, in test_du_that_times_out_after_a_valid_prefix_is_unknown
+    self.assert_103_unknown(got, sample)
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 534, in assert_103_unknown
+    self.assertIn(self.VMUNK + "103", got)
+AssertionError: 'disk:vmunknown:<pve-host>:/var/lib/vz:103' not found in {}
+
+======================================================================
+FAIL: test_du_with_missing_status_is_unknown (tests.test_ops_watch_proxmox.DuStatusTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 553, in test_du_with_missing_status_is_unknown
+    self.assert_103_unknown(got, sample)
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 534, in assert_103_unknown
+    self.assertIn(self.VMUNK + "103", got)
+AssertionError: 'disk:vmunknown:<pve-host>:/var/lib/vz:103' not found in {}
+
+======================================================================
+FAIL: test_every_remote_command_reports_its_own_status (tests.test_ops_watch_proxmox.DuStatusTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 577, in test_every_remote_command_reports_its_own_status
+    self.assertEqual(len(timed), 5)  # pvesm status, pvesm list, find, du 102, du 103
+AssertionError: 4 != 5
+
+======================================================================
+FAIL: test_failed_du_does_not_feed_vm_growth (tests.test_ops_watch_proxmox.DuStatusTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "~/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/rescue-15771/tests/test_ops_watch_proxmox.py", line 564, in test_failed_du_does_not_feed_vm_growth
+    self.assertIsNone(got[KEY]["detail"]["vms"]["103"]["growth_gib_day"])
+AssertionError: 18.0 is not None
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.010s
+
+FAILED (failures=6)
+exit 1

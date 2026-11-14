@@ -1,0 +1,2 @@
+7bb3aa29 run: rc=0 returned_bytes=8388608 peak_alloc_mib=24.0 cap_kw=none
+new run: rc=-1000 returned_bytes=0 peak_alloc_mib=1.4 cap_kw={'max_bytes': 1048576}
