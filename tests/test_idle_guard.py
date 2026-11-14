@@ -475,6 +475,103 @@ class OwnersAgreementPropertyTests(Base):
         self.assertEqual({s["agent"] for s in a["returned"]}, {"done1", "h_own", "h_fresh", "r_later"})
 
 
+class OwnersAckOrderingTests(Base):
+    """Receipt r5: ah.owners() direct cases from raw WAL and ledger records (assess() consumes owners(), so the
+    agreement property cannot catch an ordering bug). F1: only a disposition at or after the specific result takes
+    it. F2: the result's own time, not the owner's latest activity, orders the ack and ages the result."""
+
+    def owner(self, agent, rows, stop_at):
+        first = min(ah.parse_ts(r["at"]) for r in rows)
+        jl(self.w / "main.jsonl", [{"at": iso(first - 30), "event": "subagent", "agent_id": agent, "agent_type": "task-owner"},
+                                   {"at": iso(stop_at), "event": "subagent_stop", "agent_id": agent, "agent_type": "task-owner"}])
+        jl(self.w / f"agent-{agent}.jsonl", rows)
+
+    def rows(self):
+        return {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+
+    def test_a_disposition_before_the_result_never_takes_it(self):  # F1 boundaries
+        result = NOW - 2 * HOUR
+        cases = {"b1": (-1, "result"), "b5": (-5, "result"), "b10": (-10, "result"), "h5": (-5, "handoff"),
+                 "a0": (0, "result"), "a1": (1, "result"), "ha0": (0, "handoff")}
+        for agent, (delta, event) in cases.items():
+            self.owner(agent, [{"at": iso(result - 3600), "event": "intent", "note": "GoodQA goodqa#15951 work"},
+                               {"at": iso(result), "event": event, "note": "to main: ready"}], stop_at=result + 20)
+            self.dispose(agent, "resumed", f"{agent}-res-ack-1", at=iso(result + delta))
+        rows = self.rows()
+        for agent, (delta, event) in cases.items():
+            with self.subTest(agent=agent, delta=delta, event=event):
+                r = rows[agent]
+                self.assertEqual(r["state"], "done" if event == "result" else "handoff")
+                if delta < 0:
+                    self.assertIn("result-unacked", r["attention"])
+                    if event == "handoff":
+                        self.assertTrue(r["decision_required"])
+                else:
+                    self.assertNotIn("result-unacked", r["attention"])
+                    self.assertFalse(r["decision_required"])
+        streams = {s["agent"] for s in self.assess()["streams"]}
+        self.assertTrue({"b1", "b5", "b10", "h5"} <= streams)
+        self.assertFalse({"a0", "a1", "ha0"} & streams)
+
+    def test_a_later_owner_note_does_not_revoke_mains_ack(self):  # F2
+        t = NOW - 2 * HOUR
+        self.owner("acked", [{"at": iso(t - 3600), "event": "intent", "note": "GoodQA goodqa#15952 work"},
+                             {"at": iso(t), "event": "result", "note": "to main: ready"},
+                             {"at": iso(t + 60), "event": "status", "note": "notes tidied"}], stop_at=t + 65)
+        self.dispose("acked", "resumed", "acked-res-ack-1", at=iso(t + 30))
+        r = self.rows()["acked"]
+        self.assertEqual(r["state"], "done")
+        self.assertEqual(r["attention"], [])
+        self.assertEqual(r["result_at"], ah.iso(t))
+        self.assertNotIn("acked", {s["agent"] for s in self.assess()["streams"]})
+
+    def test_a_later_owner_note_does_not_revoke_mains_handoff_ack(self):  # F2 for a handoff and main's --ack-handoff
+        import caller_identity  # noqa: PLC0415
+        t = NOW - 2 * HOUR
+        self.owner("hacked", [{"at": iso(t - 3600), "event": "intent", "note": "GoodQA goodqa#15953 work"},
+                              {"at": iso(t), "event": "handoff", "note": "to main: PR"},
+                              {"at": iso(t + 60), "event": "check", "note": "lint ok"}], stop_at=t + 65)
+        jl(self.w / "main.jsonl", [{"at": iso(t - 600), "event": "ask", "id": "wa5b0000000d", "owner": "hacked",
+                                    "note": "need approval", "source": "user:x/y \"w\""}])
+        caller_identity.put_stamp("ack-handoff", ["hacked"], home=self.home)
+        self.dispose("hacked", "waiting", "hacked-ack-1", at=iso(t + 30), until=iso(NOW + HOUR), ref="wa5b0000000d",
+                     ack_handoff=True)
+        r = self.rows()["hacked"]
+        self.assertEqual(r["attention"], [])
+        self.assertFalse(r["decision_required"])
+
+    def test_an_old_result_stays_old_after_a_later_note(self):  # F2: the 24 h window runs from the result
+        t = NOW - 30 * HOUR
+        self.owner("stale", [{"at": iso(t - 3600), "event": "intent", "note": "GoodQA goodqa#15954 work"},
+                             {"at": iso(t), "event": "result", "note": "to main: ready"},
+                             {"at": iso(NOW - HOUR), "event": "status", "note": "still here"}], stop_at=NOW - HOUR + 5)
+        r = self.rows()["stale"]
+        self.assertEqual(r["state"], "done")
+        self.assertNotIn("result-unacked", r["attention"])
+
+    def test_a_cached_summary_from_before_result_at_is_rebuilt(self):  # an upgrade keeps no stale index
+        t = NOW - 2 * HOUR
+        self.owner("cached", [{"at": iso(t - 3600), "event": "intent", "note": "GoodQA goodqa#15955 work"},
+                              {"at": iso(t), "event": "result", "note": "to main: ready"}], stop_at=t + 20)
+        self.rows()
+        for f in ah.state_dir(self.home, "ah-index").glob("wal-*.json"):
+            s = json.loads(f.read_text())
+            s.pop("outcome_at", None)
+            f.write_text(json.dumps(s))
+        self.assertEqual(self.rows()["cached"]["result_at"], ah.iso(t))
+
+    def test_sub_second_result_time_is_compared_at_ledger_precision(self):  # like with like (ledger: whole seconds)
+        t = NOW - 2 * HOUR
+        for agent, delta in (("same_sec", 0), ("prev_sec", -1)):
+            self.owner(agent, [{"at": iso(t - 3600), "event": "intent", "note": "GoodQA goodqa#15956 work"},
+                               {"at": iso(t).replace("+00:00", ".700000+00:00"), "event": "result", "note": "ready"}],
+                       stop_at=t + 20)
+            self.dispose(agent, "resumed", f"{agent}-res-1", at=iso(t + delta))
+        rows = self.rows()
+        self.assertEqual(rows["same_sec"]["attention"], [])  # same second: cannot be ordered, counts as after
+        self.assertIn("result-unacked", rows["prev_sec"]["attention"])
+
+
 class DisposeNarrowTests(Base):
     def test_ask_naming_another_owner_is_refused(self):  # AC-5
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 50), "event": "ask", "id": "wa5b00000002", "owner": "done1",

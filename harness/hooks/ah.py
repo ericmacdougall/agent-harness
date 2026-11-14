@@ -208,9 +208,11 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
+    if "outcome_at" not in summary:
+        meta.clear()  # an index written before outcome_at existed: rescan from the start (goodqa#15943 r5)
     lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary:
-        summary.update(first=None, last_at=0.0, outcome=None, last_note="", tickets=[], events=0)
+    if rebuilt or "first" not in summary or "outcome_at" not in summary:
+        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0)
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
@@ -224,11 +226,13 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         summary["events"] += 1
         event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
         if event == "intent":
-            summary["outcome"] = None  # new work after an earlier result/handoff: not finished
+            summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
             if summary["first"] is None and note:
                 summary["first"] = note[:160]
         if event in ("handoff", "result"):
-            summary["outcome"] = event
+            # outcome_at is the time of this result record itself, never later activity (receipt r5 F2): it orders
+            # main's acknowledgement and ages the result
+            summary["outcome"], summary["outcome_at"] = event, at
         if event in ("handoff", "result", "status", "blocker", "decision") and note:
             summary["last_note"] = note[:300]
         for match in TICKET_IN_NOTE.findall(note):
@@ -340,7 +344,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
-            "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
+            "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent, sub_dirs)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
@@ -364,6 +368,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
                "ticket_comment_age_s": None,
+               "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
@@ -387,6 +392,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "state": verdict["state"], "severity": verdict["severity"],
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
+                     "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                      "active_1h": now - summary["last_at"] <= 3600})
     asks = ask_states(main)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
@@ -492,14 +498,21 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     # result, and an owner's own wait (no --ack-handoff) never takes it.
     for r in rows:
         if r["owner"] and r["state"] in RESULT_STATES:
-            handed = parse_ts(r["last_activity"]) or 0.0
+            # receipt r5: the result's own WAL time, not last_activity (a later note must not revoke an ack or make an
+            # old result fresh). A row with no recorded result time (a helper's `returned`) falls back to its activity.
+            handed = parse_ts(r.get("result_at")) or parse_ts(r["last_activity"]) or 0.0
+            handed = float(int(handed))  # like with like: ledger stamps (server_now) and result_at carry whole seconds
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
             # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
             acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
                 kind == "waiting" and d.get("ack_handoff") is True
                 and liveness.disposition_live(d, now, last_activity=handed))
-            acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
+            # strictly at or after this result (receipt r5 F1): the old 10 s slack let an earlier disposition take a
+            # later result. Both are UTC from the same host clock; the WAL time is floored to the ledger's whole
+            # seconds, so an ack in the same second as the result counts (it cannot be ordered) and one a second
+            # earlier never does.
+            acked = bool(acknowledged and float(d.get("at") or 0) >= handed)
             # A helper spawned by another agent hands its result back to that parent, which takes it by design. The
             # claim is honoured only when it is believable and the parent is plainly receiving: the child is a nested
             # spawn (meta spawnDepth >= 2; main's own spawns are depth 1 and never carry a parent), the parent is
