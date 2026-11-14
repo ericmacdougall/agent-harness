@@ -158,6 +158,13 @@ class Errors(unittest.TestCase):
         down = (255, b"", "reset")
         self.assertEqual(run(Remote(down, down, None, b"ALL PASSED\n"), max_infra_polls=5)[0], 0)
 
+    def test_a_line_written_while_the_link_was_down_counts_as_existing(self):
+        # NEG-15, second half: pinned both ways
+        down = (255, b"", "reset")
+        steps = (down, down, b"run started\nALL PASSED\n")
+        self.assertEqual(run(Remote(*steps), max_infra_polls=5, timeout=1.0)[0], 3)
+        self.assertEqual(run(Remote(*steps), max_infra_polls=5, include_existing=True)[0], 0)
+
     def test_from_offset_finds_a_line_written_before_the_first_poll(self):
         old = b"earlier ALL PASSED\n"
         remote = Remote(old + b"new run\nALL PASSED\n")

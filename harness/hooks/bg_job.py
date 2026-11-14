@@ -24,7 +24,7 @@ wrote atomically to a status file. Anything unproven fails closed.
       command (retried once on a connection failure). Exit 0 LINE_FOUND; 1 FAIL_LINE_FOUND; 2 UNPROVEN (remote command
       failed, file unreadable, ssh refused: auth, host key, name); 3 TIMEOUT; 5 INFRA (the link kept failing); 64 usage
       (bad arguments, or the file is a path command_guard refuses to read). Baseline: only bytes appended after the first
-      look count, so a run launched BEFORE the wait can finish first and be missed. Give the run its own fresh log and use
+      successful look count (a line written before it, including while the link was down, counts as existing), so a run launched BEFORE the wait can finish first and be missed. Give the run its own fresh log and use
       --include-existing, or for a log appended across runs take its size before the launch and pass --from-offset N.
       Limits: wait on an append-only log; a path command_guard does not know is not judged; ssh config ProxyCommand, LocalCommand
       and RemoteCommand apply as for plain ssh; the remote needs a POSIX login shell.
