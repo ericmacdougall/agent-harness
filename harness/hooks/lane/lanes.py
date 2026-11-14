@@ -1,11 +1,20 @@
-"""Lane creation, kit regeneration (canary and rollback) and verify over the store (S1).
+"""Lane creation, kit regeneration (canary and rollback), crash reconciliation and verify over the store (S1).
 
-``create_lane`` is atomic from the caller's view: the kit is rendered in memory, then the lane directory is built under
-a temporary name inside the store root, then renamed into place, then the index claim is written last. A failure
-removes only that temporary directory (resolved inside the store root). ``verify_lane`` is read-only.
+Crash contract (a process may be killed between any two steps; no exception cleanup runs):
+
+* create: the kit is rendered in memory, the lane directory is built under ``.tmp-<lane id>`` inside the store root
+  (manifest r0001, journal ``created``), renamed into place, and only then claimed in the index. The rename is the
+  commit point; the index claim is derived from it. ``reconcile`` (run under the lock at the start of every create)
+  removes uncommitted ``.tmp-*`` directories and claims any committed lane whose key is not yet indexed, so a retry
+  yields one lane per key.
+* regenerate: the new kit is staged in ``.kit-new``, the old kit is kept as ``.kit-old`` until the new manifest
+  revision (the commit point) and its head are written; ``reconcile_lane`` restores a missing kit from ``.kit-old``,
+  discards a stale ``.kit-new`` and repairs a head left one revision behind. A retry of the same regeneration
+  finishes the job; the kit and manifest are never left describing different bytes after a retry.
 
 Disclosed: a kit regeneration is recorded as a numbered manifest revision (reason ``canary`` or ``rollback``); the
-journal's closed kind set (design D-3) has no kind for it, so the journal records only the creation override.
+journal's closed kind set (design D-3) has no kind for it, so the journal records only the creation override. Every
+revision is chained by digest and anchored by ``manifest.head`` (accidental-damage protection, same-user limit).
 """
 from __future__ import annotations
 
@@ -14,6 +23,8 @@ import hashlib
 import os
 import random
 import shutil
+import stat
+import time
 from pathlib import Path
 
 from . import identity as ident
@@ -22,6 +33,10 @@ from . import manifest as mf
 from . import store as st
 
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _crash_hook(point: str) -> None:  # tests replace this to terminate the process at a publication boundary
+    return None
 
 
 class LaneRefusal(Exception):
@@ -36,7 +51,6 @@ class HeldTarget(LaneRefusal):
 
 def new_lane_id(now_ms=None, rng=random.SystemRandom()) -> str:
     """``lane_<ULID>``: 48-bit time and 80 random bits in Crockford base32."""
-    import time
     t = int(now_ms if now_ms is not None else time.time() * 1000) & ((1 << 48) - 1)
     value = (t << 80) | rng.getrandbits(80)
     chars = []
@@ -60,8 +74,32 @@ def _inside(root: Path, path: Path) -> bool:
 
 
 def _cleanup(root: Path, path: Path) -> None:
-    if path.exists() and _inside(root, path):
+    """Remove a directory this module made, only when it is a real directory inside the store root."""
+    if os.path.lexists(str(path)) and not os.path.islink(str(path)) and _inside(root, path):
         shutil.rmtree(str(path), ignore_errors=True)
+
+
+def reconcile(store: st.Store) -> list:
+    """Under the lock: complete or discard interrupted creations. Returns what it did."""
+    done = []
+    if not store.root.exists():
+        return done
+    with store.lock():
+        index = store.load_index()["lanes"]
+        indexed = set(index.values())
+        for entry in sorted(store.root.iterdir()):
+            if entry.name.startswith(".tmp-"):
+                _cleanup(store.root, entry)
+                done.append("removed uncommitted " + entry.name)
+            elif entry.name.startswith("lane_") and entry.is_dir() and not entry.is_symlink() \
+                    and entry.name not in indexed:
+                try:
+                    key = mf.read_current(entry)["key"]
+                except (mf.ManifestError, st.StoreError):
+                    continue  # damaged: left in place and reported by verify, never guessed
+                if store.claim_key(key, entry.name) == entry.name:
+                    done.append("claimed " + entry.name)
+    return done
 
 
 def create_lane(store: st.Store, *, ticket, repo, profile, host_alias, branch, worktree, session, now, new_id,
@@ -89,20 +127,18 @@ def create_lane(store: st.Store, *, ticket, repo, profile, host_alias, branch, w
     stream = ident.stream_key(key)
     version, overridden = kit.select_version(ticket_ref, {"default": default_version}, env)
 
-    existing = None
-    if store.root.exists():
-        existing = store.load_index()["lanes"].get(key)
-    if dry_run and not existing and not store.root.exists():
-        return {"created": False, "dry_run": True, "lane_id": "(new)", "key": key, "stream_key": stream,
-                "kit_version": version, "plan": ["render kit %s" % version, "write manifest r0001 and journal created",
-                                                 "claim key in index"]}
-    if dry_run:
+    if dry_run:  # reads only: not even the store root is created
+        existing = store.load_index()["lanes"].get(key) if store.root.exists() else None
         return {"created": False, "dry_run": True, "lane_id": existing or "(new)", "key": key, "stream_key": stream,
-                "kit_version": version, "plan": ["lane exists" if existing else "render kit %s" % version]}
+                "kit_version": version,
+                "plan": ["lane exists" if existing else "render kit %s" % version]
+                + ([] if existing else ["write manifest r0001 and journal created", "claim key in index"])}
 
     problems = kit.lint_version(version, templates_root)
     if problems:
         raise LaneRefusal("kit version %s refused by lint: %s" % (version, "; ".join(problems[:3])))
+    store.ensure_root()
+    reconcile(store)
     with store.lock():
         existing = store.load_index()["lanes"].get(key)
         if existing:
@@ -123,18 +159,42 @@ def create_lane(store: st.Store, *, ticket, repo, profile, host_alias, branch, w
                 target = tmp / "kit" / name
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 st.atomic_write(target, data)
+            _crash_hook("create:after_render")
             mf.write_revision(tmp, m)
             m1 = (tmp / "manifest.r0001.json").read_bytes()
             store.journal_append(tmp, kind="created", lane=lane_id, generation=0,
                                  writer={"id": "main", "session": session}, idem="created", source=source, ts=now,
                                  data={"kit_version": version, "kit_override": overridden, "host_alias": host_alias,
                                        "manifest_sha256": hashlib.sha256(m1).hexdigest()})
-            os.rename(str(tmp), str(store.lane_dir(lane_id)))
+            _crash_hook("create:after_journal")
+            os.rename(str(tmp), str(store.lane_dir(lane_id)))  # commit point
+            _crash_hook("create:after_rename")
             store.claim_key(key, lane_id)
+            _crash_hook("create:after_claim")
         except BaseException:
             _cleanup(store.root, tmp)
             raise
         return {"created": True, "lane_id": lane_id, "key": key, "stream_key": stream, "kit_version": version}
+
+
+def reconcile_lane(store: st.Store, lane_id) -> list:
+    """Under the lock: finish or discard an interrupted regeneration of one lane."""
+    lane_dir = store.lane_dir(lane_id)
+    done = []
+    with store.lock():
+        new_dir, old_dir, kit_dir = lane_dir / ".kit-new", lane_dir / ".kit-old", lane_dir / "kit"
+        if not os.path.lexists(str(kit_dir)) and old_dir.is_dir() and not old_dir.is_symlink():
+            os.rename(str(old_dir), str(kit_dir))
+            done.append("restored kit from .kit-old")
+        if os.path.lexists(str(new_dir)):
+            _cleanup(store.root, new_dir)
+            done.append("discarded stale .kit-new")
+        if mf.repair_head(lane_dir):
+            done.append("repaired manifest.head")
+        if os.path.lexists(str(old_dir)) and os.path.lexists(str(kit_dir)):
+            _cleanup(store.root, old_dir)  # the replacement committed (kit present, manifest written)
+            done.append("removed committed .kit-old")
+    return done
 
 
 def regenerate_kit(store: st.Store, lane_id, *, version, now, templates_root, reason) -> dict:
@@ -147,42 +207,72 @@ def regenerate_kit(store: st.Store, lane_id, *, version, now, templates_root, re
             raise LaneRefusal("kit version %s refused by lint: %s" % (version, "; ".join(problems[:3])))
     lane_dir = store.lane_dir(lane_id)
     with store.lock():
+        reconcile_lane(store, lane_id)
         try:
             m = mf.read_current(lane_dir)
         except mf.ManifestError as error:
             raise LaneRefusal(str(error))
         files = kit.render_files(version, _inputs(m, version), templates_root)
-        new_dir = lane_dir / (".kit-new-%d" % os.getpid())
-        old_dir = lane_dir / (".kit-old-%d" % os.getpid())
-        for leftover in (new_dir, old_dir):
-            _cleanup(store.root, leftover)
-        new_dir.mkdir(mode=0o700)
-        try:
+        new_digests = kit.digests(files)
+        on_disk, tree_problems = _tree(lane_dir / "kit")
+        if tree_problems:
+            raise LaneRefusal("kit directory is unsafe: %s" % tree_problems[0])
+        if kit.digests(on_disk) != new_digests:
+            new_dir, old_dir = lane_dir / ".kit-new", lane_dir / ".kit-old"
+            new_dir.mkdir(mode=0o700)
             for name, data in files.items():
                 target = new_dir / name
                 target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 st.atomic_write(target, data)
-            os.rename(str(lane_dir / "kit"), str(old_dir))
+            _crash_hook("regen:after_staged")
+            os.rename(str(lane_dir / "kit"), str(old_dir))  # prior kit retained until the manifest commits
+            _crash_hook("regen:after_old_moved")
             os.rename(str(new_dir), str(lane_dir / "kit"))
-        except BaseException:
-            if old_dir.exists() and not (lane_dir / "kit").exists():
-                os.rename(str(old_dir), str(lane_dir / "kit"))
-            _cleanup(store.root, new_dir)
-            raise
-        _cleanup(store.root, old_dir)
-        m2 = dict(m, kit_version=version, kit_digests=kit.digests(files),
-                  template_digest=kit.template_digest(version, templates_root), revision_reason=reason)
-        number = mf.write_revision(lane_dir, m2)
+            _crash_hook("regen:after_swapped")
+        if m["kit_version"] == version and m["kit_digests"] == new_digests:
+            number = m["revision"]  # an earlier attempt already committed the manifest
+        else:
+            m2 = dict(m, kit_version=version, kit_digests=new_digests,
+                      template_digest=kit.template_digest(version, templates_root), revision_reason=reason)
+            number = mf.write_revision(lane_dir, m2)  # commit point
+        _crash_hook("regen:after_manifest")
+        _cleanup(store.root, lane_dir / ".kit-old")
         return {"lane_id": lane_id, "kit_version": version, "revision": number}
 
 
-def _tree(path: Path) -> dict:
-    out = {}
-    if path.is_dir():
-        for p in sorted(path.rglob("*")):
-            if p.is_file() and not p.is_symlink():
-                out[str(p.relative_to(path))] = p.read_bytes()
-    return out
+def _tree(path: Path):
+    """``(files, problems)`` of a kit directory using the bounded no-follow reader; never raises on unsafe entries."""
+    files, problems = {}, []
+    path = Path(path)
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return files, ["kit directory is missing"]
+    if not stat.S_ISDIR(info.st_mode):
+        return files, ["kit directory is a symlink or not a directory"]
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        for entry in sorted(os.scandir(str(current)), key=lambda e: e.name):
+            rel = str(Path(entry.path).relative_to(path))
+            mode = entry.stat(follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                stack.append(Path(entry.path))
+            elif stat.S_ISREG(mode):
+                try:
+                    data = st.read_input(entry.path)
+                except st.StoreError as error:
+                    problems.append("kit/%s refused: %s" % (rel, error))
+                    continue
+                total += len(data)
+                if total > st.MAX_LANE_DIR:
+                    problems.append("kit exceeds the %d byte lane limit" % st.MAX_LANE_DIR)
+                    return files, problems
+                files[rel] = data
+            else:
+                problems.append("kit/%s is a symlink or special file" % rel)
+    return files, problems
 
 
 def verify_lane(store: st.Store, lane_id, *, templates_root, default_version, policy_files=None) -> dict:
@@ -197,6 +287,7 @@ def verify_lane(store: st.Store, lane_id, *, templates_root, default_version, po
     except (mf.ManifestError, st.StoreError) as error:
         report.update(state="damaged", problems=["manifest: %s" % error])
         return report
+    report["problems"].extend(mf.verify_chain(lane_dir))
     try:
         ok, seq, reason = store.verify_journal(lane_dir)
     except st.StoreError as error:
@@ -211,7 +302,8 @@ def verify_lane(store: st.Store, lane_id, *, templates_root, default_version, po
                 report["problems"].append("manifest r0001 was edited in place")
         except (IndexError, KeyError, st.StoreError):
             report["problems"].append("manifest r0001 cannot be compared with the journal")
-    on_disk = _tree(lane_dir / "kit")
+    on_disk, tree_problems = _tree(lane_dir / "kit")
+    report["problems"].extend(tree_problems)
     recorded = m["kit_digests"]
     for name, digest in recorded.items():
         if name not in on_disk:
@@ -221,6 +313,9 @@ def verify_lane(store: st.Store, lane_id, *, templates_root, default_version, po
     for name in on_disk:
         if name not in recorded:
             report["problems"].append("kit/%s is not in the manifest" % name)
+    for name in (".kit-new", ".kit-old"):
+        if os.path.lexists(str(lane_dir / name)):
+            report["problems"].append("interrupted kit regeneration (%s present); rerun the regeneration" % name)
     for name, digest in _policy_digests(policy_files).items():
         if m["policy_digests"].get(name) != digest:
             report["problems"].append("policy file %s changed since generation" % name)

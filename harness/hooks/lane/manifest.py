@@ -30,7 +30,7 @@ DOMAINS = ("auth", "delete", "devices", "money", "release", "blockchain")
 REPO_KINDS = ("remote", "remote-origin", "local")
 REASONS = ("initial", "canary", "rollback", "regenerate")
 LIVE_KINDS = ("web-origin", "install-hosts")
-FIELDS = ("schema", "revision", "revision_reason", "lane_id", "key", "ticket", "repo_identity", "repo_kind",
+FIELDS = ("schema", "revision", "revision_reason", "prev_sha256", "lane_id", "key", "ticket", "repo_identity", "repo_kind",
           "host_alias", "branch", "worktree", "profile", "domains", "session", "stream_key", "predecessor",
           "live_target", "generation", "kit_version", "kit_digests", "template_digest", "policy_digests",
           "spec_path", "scope_paths", "brief_version", "budget", "created_at")
@@ -67,6 +67,8 @@ def validate(m: dict) -> dict:
     _need(schema == SCHEMA, "schema")
     _need(_int(m["revision"], 1, 9999), "revision")
     _need(m["revision_reason"] in REASONS, "revision_reason")
+    _need(m["prev_sha256"] is None or (isinstance(m["prev_sha256"], str) and DIGEST.match(m["prev_sha256"])),
+          "prev_sha256")
     _need(isinstance(m["lane_id"], str) and ID.match(m["lane_id"]), "lane_id")
     _need(isinstance(m["key"], str) and KEY.match(m["key"]), "key")
     _need(isinstance(m["ticket"], str) and TICKET.match(m["ticket"]), "ticket")
@@ -107,7 +109,7 @@ def validate(m: dict) -> dict:
 def new_manifest(*, lane_id, key, ticket, repo_identity, repo_kind, host_alias, branch, worktree, profile, domains,
                  session, stream_key, kit_version, kit_digests, template_digest, policy_digests, created_at,
                  live_target=None, spec_path=None, scope_paths=(), predecessor=None, reason="initial") -> dict:
-    m = {"schema": SCHEMA, "revision": 1, "revision_reason": reason, "lane_id": lane_id, "key": key, "ticket": ticket,
+    m = {"schema": SCHEMA, "revision": 1, "revision_reason": reason, "prev_sha256": None, "lane_id": lane_id, "key": key, "ticket": ticket,
          "repo_identity": repo_identity, "repo_kind": repo_kind, "host_alias": host_alias, "branch": branch,
          "worktree": worktree, "profile": profile, "domains": list(domains), "session": session,
          "stream_key": stream_key, "predecessor": predecessor, "live_target": live_target, "generation": 0,
@@ -124,21 +126,87 @@ def _revisions(lane_dir):
     return sorted(found)
 
 
+def _sha(data: bytes) -> str:
+    return st.sha256_hex(data)
+
+
+def _head_path(lane_dir):
+    return Path(lane_dir) / "manifest.head"
+
+
 def write_revision(lane_dir, m: dict, number=None) -> int:
-    """Write the next numbered revision; an existing revision is never replaced."""
+    """Write the next numbered revision, chained to the previous one; an existing revision is never replaced.
+
+    Commit order: the revision file (atomic create-if-absent), then ``manifest.head``. A crash between the two is
+    repaired by ``repair_head``; ``verify_chain`` reports it until then.
+    """
     lane_dir = Path(lane_dir)
     revs = _revisions(lane_dir)
     number = number if number is not None else (revs[-1][0] + 1 if revs else 1)
-    m = dict(m, revision=number)
+    prev = _sha(st.read_input(revs[-1][1])) if revs and number == revs[-1][0] + 1 else None
+    m = dict(m, revision=number, prev_sha256=prev)
     validate(m)
     final = lane_dir / ("manifest.r%04d.json" % number)
     tmp = lane_dir / (".manifest.%d.tmp" % os.getpid())
-    st.atomic_write(tmp, (st.canonical_json(m) + "\n").encode())
+    data = (st.canonical_json(m) + "\n").encode()
+    st.atomic_write(tmp, data)
     try:
         os.link(str(tmp), str(final))  # atomic create-if-absent
     finally:
         os.unlink(str(tmp))
+    st.atomic_write(_head_path(lane_dir), (_sha(data) + "\n").encode())
     return number
+
+
+def repair_head(lane_dir) -> bool:
+    """Complete an interrupted write_revision (revision present, head one behind). True when it changed the head."""
+    revs = _revisions(lane_dir)
+    if not revs:
+        return False
+    top = st.read_input(revs[-1][1])
+    head_file = _head_path(lane_dir)
+    head = st.read_input(head_file).decode().strip() if os.path.lexists(str(head_file)) else None
+    if head == _sha(top):
+        return False
+    try:
+        prev = json.loads(top.decode()).get("prev_sha256")
+    except ValueError:
+        return False
+    if prev is not None and head == prev:
+        st.atomic_write(head_file, (_sha(top) + "\n").encode())
+        return True
+    return False
+
+
+def verify_chain(lane_dir) -> list:
+    """Problems with the revision chain (empty when intact). Read-only."""
+    lane_dir = Path(lane_dir)
+    revs = _revisions(lane_dir)
+    if not revs:
+        return ["lane has no manifest"]
+    problems = []
+    expected_number, prev_sha = 1, None
+    for number, path in revs:
+        if number != expected_number:
+            problems.append("manifest revision %d is missing" % expected_number)
+            expected_number = number
+        try:
+            raw = st.read_input(path)
+            value = json.loads(raw.decode())
+        except (ValueError, st.StoreError):
+            problems.append("manifest r%04d is unreadable" % number)
+            return problems
+        if value.get("revision") != number:
+            problems.append("manifest r%04d claims another revision number" % number)
+        if value.get("prev_sha256") != prev_sha:
+            problems.append("manifest r%04d does not follow r%04d (chain broken)" % (number, number - 1))
+        prev_sha = _sha(raw)
+        expected_number = number + 1
+    head_file = _head_path(lane_dir)
+    head = st.read_input(head_file).decode().strip() if os.path.lexists(str(head_file)) else None
+    if head != prev_sha:
+        problems.append("manifest.head does not match the newest revision (edited, deleted or interrupted write)")
+    return problems
 
 
 def read_current(lane_dir) -> dict:
