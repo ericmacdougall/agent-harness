@@ -212,6 +212,13 @@ class CoorddTest(unittest.TestCase):
         self.assertEqual(coordd.parse_receipt(ok, head), ("BLOCK", ""))
         self.assertIsNone(coordd.parse_receipt(ok, "c" * 40)[0])           # a receipt for another head counts for nothing
         self.assertIsNone(coordd.parse_receipt("VERDICT: PASS", head)[0])  # no head line
+        tickets = ok.replace("VERDICT: BLOCK", "VERDICT: PASS-WITH-TICKETS")
+        self.assertEqual(coordd.parse_receipt(tickets, head)[0], "PASS-WITH-TICKETS")  # never reported as plain PASS
+        self.assertIsNone(coordd.parse_receipt(ok.replace("VERDICT: BLOCK", "VERDICT: PASSED maybe"), head)[0])
+        early = "VERDICT: PASS\n" + ok  # a marker before the head line (quoted text) does not win
+        self.assertEqual(coordd.parse_receipt(early, head)[0], "BLOCK")
+        with self.assertRaises(ValueError):  # a trailing newline is not part of a ticket reference
+            coordd.submit(self.con, "agent", "x", "goodqa#1\n", "cli:t", None)
         self.assertIsNone(coordd.parse_receipt(f"Reviewed HEAD: {head}\nlooks fine", head)[0])
         # No packet stored: the review is blocked, never run on nothing.
         coordd.run_one(self.con, self.root, chat_only=False)

@@ -201,7 +201,7 @@ def login_pending(con, now: float | None = None) -> list[dict]:
 def login_approve(con, code: str, approver: str, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     code = (code or "").strip().upper()
-    if not CODE_RE.match(code):
+    if not CODE_RE.fullmatch(code):
         raise ValueError("a code looks like ABCD-EFGH")
     cur = con.execute("UPDATE logins SET state='approved', approved_by=? WHERE code=? AND state='pending' AND created >= ?",
                       (approver[:80], code, now - LOGIN_TTL_S))
@@ -277,7 +277,7 @@ def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str 
                              (WEB_ORIGIN, datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))).fetchone()[0]
         if recent >= WEB_TASKS_PER_HOUR:
             raise PermissionError("too many messages from browser sessions this hour")
-    if ticket and TICKET_RE.match(ticket) and not ticket_allowed(ticket):
+    if ticket and TICKET_RE.fullmatch(ticket) and not ticket_allowed(ticket):
         raise ValueError("ticket project is not on this service's allowlist")
     if kind == "review":
         spec = parse_review(text)  # raises ValueError with the reason
@@ -292,9 +292,9 @@ def submit(con, kind: str, text: str, ticket: str | None, origin: str, key: str 
     text = (text or "").strip()
     if not text or len(text) > MAX_TEXT:
         raise ValueError("text is empty or too long")
-    if ticket and not TICKET_RE.match(ticket):
+    if ticket and not TICKET_RE.fullmatch(ticket):
         raise ValueError("ticket must look like slug#123")
-    if key and not KEY_RE.match(key):
+    if key and not KEY_RE.fullmatch(key):
         raise ValueError("bad key")
     if key:
         key = ("web:" if origin == WEB_ORIGIN else "host:") + key  # a browser session cannot pre-claim a host key
@@ -324,23 +324,23 @@ def parse_review(text: str) -> dict:
     if not isinstance(spec, dict):
         raise ValueError("review text must be a JSON object")
     repo, pr, owner = spec.get("repo"), spec.get("pr"), spec.get("owner") or "unknown"
-    if not isinstance(repo, str) or not REPO_RE.match(repo):
+    if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
         raise ValueError("repo must look like owner/name")
     if repo not in review_repos():
         raise ValueError("repo is not on COORD_REVIEW_REPOS for this service")
     if not isinstance(pr, int) or isinstance(pr, bool) or not 0 < pr < 10**7:
         raise ValueError("pr must be a positive number")
-    if not isinstance(owner, str) or not re.match(r"^[A-Za-z0-9._:-]{1,80}$", owner):
+    if not isinstance(owner, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,80}", owner):
         raise ValueError("owner must be a short identifier")
     return {"repo": repo, "pr": pr, "owner": owner}
 
 
 def parse_receipt(text: str, head: str) -> tuple[str | None, str]:
     """(verdict, why). A receipt counts only when it names the exact head that was requested."""
-    m = re.search(r"^Reviewed HEAD: ([0-9a-f]{40})\s*$", text, re.M)
-    v = re.search(r"^VERDICT: (PASS|BLOCK)\b", text, re.M)
+    m = re.search(r"^Reviewed HEAD: ([0-9a-f]{40})[ \t]*$", text, re.M)
+    v = re.search(r"^VERDICT: (PASS-WITH-TICKETS|PASS|BLOCK)[ \t]*$", text[m.end():] if m else "", re.M)
     if not m or not v:
-        return None, "the reviewer output has no Reviewed HEAD or VERDICT line"
+        return None, "the reviewer output has no Reviewed HEAD line followed by a whole VERDICT line"
     if m.group(1) != head:
         return None, f"the receipt names head {m.group(1)[:12]}, not the requested {head[:12]}"
     return v.group(1), ""
@@ -409,7 +409,7 @@ def lane_review(con, task: dict, root: Path) -> tuple[bool, str]:
         return False, f"cannot read the PR (gh exit {code}): {err.strip()[-200:]}"
     info = json.loads(out)
     head, base_ref = info.get("headRefOid") or "", info.get("baseRefName") or ""
-    if info.get("state") != "OPEN" or not SHA_RE.match(head) or not re.match(r"^[A-Za-z0-9._/-]{1,100}$", base_ref):
+    if info.get("state") != "OPEN" or not SHA_RE.match(head) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", base_ref):
         return False, f"blocked-unavailable: PR is {info.get('state')} or its head or base could not be read"
     key = f"receipt:{repo}#{pr}@{head}:{_h(packet.read_text(errors='replace'))[:16]}"
     prior = con.execute("SELECT state, detail FROM effects WHERE key=?", (key,)).fetchone()
@@ -424,7 +424,7 @@ def lane_review(con, task: dict, root: Path) -> tuple[bool, str]:
         code, _, err = run_cmd([gh, "repo", "clone", repo, str(clone), "--", "--quiet"], 900)
         if code != 0:
             return False, f"clone failed: {err.strip()[-200:]}"
-    code, _, err = run_cmd(["git", "-C", str(clone), "fetch", "--quiet", "origin", base_ref,
+    code, _, err = run_cmd(["git", "-C", str(clone), "fetch", "--quiet", "origin", "--", base_ref,
                             f"+refs/pull/{pr}/head:refs/coordd/pr-{pr}"], 900)
     if code != 0:
         return False, f"fetch failed: {err.strip()[-200:]}"
@@ -854,7 +854,7 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _addr(self) -> str:
-        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[-1].strip()
+        return (",".join(self.headers.get_all("X-Forwarded-For") or []) or self.client_address[0]).split(",")[-1].strip()
 
     def _host(self) -> str:
         return (self.headers.get("Host") or "").rsplit(":", 1)[0].lower()
@@ -899,7 +899,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(415, {"error": "json only"})
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n <= 0 or n > 400_000:
+            if n <= 0 or n > (400_000 if self._bearer() else 16_000):
                 raise ValueError("bad length")
             body = json.loads(self.rfile.read(n))
             if not isinstance(body, dict):
