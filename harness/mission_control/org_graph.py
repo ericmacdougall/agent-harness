@@ -559,16 +559,15 @@ class OrgGraph:
         except Exception as exc:  # noqa: BLE001 - shown, never fatal
             self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}")
 
-    def _ticket(self, ref: str, now: float) -> None:
+    def _ticket(self, ref: str, now: float) -> bool:
+        """Read one ticket; True when a payload was stored. The caller backs off on False (PR 243 review F3)."""
         code, out = self.runner.run("ah-ticket-get", ref, timeout=20)
         if code != 0:
-            self.ticket_stale[ref] = True            # NEG-5: keep the last good copy, mark it stale
-            return
+            return False                             # NEG-5: the last good copy is kept; the caller marks it stale
         data = json.loads(out)
         issue = data.get("issue") if isinstance(data, dict) else None
         if not isinstance(issue, dict):
-            self.ticket_stale[ref] = True
-            return
+            return False
         project = ref.split("#")[0]
 
         def refs(values):
@@ -592,6 +591,7 @@ class OrgGraph:
                              "parent": parent_ref}
         self.ticket_at[ref] = now
         self.ticket_stale[ref] = False
+        return True
 
     def _refresh_tickets(self, wanted: list, now: float) -> None:
         """One ticket read per tick, oldest first: about 40 tickets refresh in 3 minutes at the 5 s cadence."""
@@ -605,10 +605,15 @@ class OrgGraph:
         due = [r for r in candidates if now - self.ticket_at.get(r, 0.0) >= TICKET_TTL_S]
         if due:
             try:
-                self._ticket(due[0], now)
+                read = self._ticket(due[0], now)
             except (ValueError, OSError, RecursionError, Refused):
+                read = False
+            if not read:
+                # Every failure path (nonzero exit, no issue, bad JSON, refusal) counts as an attempt: retry after
+                # half the TTL, so one unavailable ticket never starves the others (PR 243 review F3). The last good
+                # payload in self.tickets stays and is shown stale.
                 self.ticket_stale[due[0]] = True
-                self.ticket_at[due[0]] = now - TICKET_TTL_S / 2   # retry after half the TTL, not every tick
+                self.ticket_at[due[0]] = now - TICKET_TTL_S / 2
 
     def tick(self, now: float):
         session = self.session_fn() or ""
@@ -712,13 +717,24 @@ STATUS_LABELS = {"in_progress": "In progress", "in_review": "In review", "todo":
                  "blocked": "Blocked", "done": "Done", "closed": "Done", "canceled": "Done"}
 
 
-def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now: float) -> dict:
+def _ticket_key(text):
+    """`GoodQA goodqa#N`, `goodqa#N` and `#N` name one ticket (as server._same_ticket_in), or None."""
+    match = re.search(r"([a-z0-9-]*)#(\d+)", str(text or "").lower())
+    return (match.group(1) or "goodqa", match.group(2)) if match else None
+
+
+def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now: float,
+                       restricted_tickets=frozenset()) -> dict:
     """The Initiatives panel from live data: one row per GoodQA ticket a live owner holds (the owner cap's role, from
     `ah owners`), titled and stated from GoodQA when read. A file row with the same ticket adds its plan fields; other
-    file rows stay only while the hand-written file is under a day old, and the hidden count is reported."""
+    file rows stay only while the hand-written file is under a day old, and the hidden count is reported.
+    A file row on a ticket restricted work holds (`restricted_tickets`, from the last owner read) is dropped before
+    anything is merged or published (PR 243 review F1): its title, ticket and plan never reach the page."""
     snap = file_snapshot or {}
     mtime = snap.get("mtime")
-    file_items = [i for i in (snap.get("items") or []) if isinstance(i, dict)]
+    hidden_keys = {_ticket_key(t) for t in restricted_tickets or ()} - {None}
+    file_items = [i for i in (snap.get("items") or []) if isinstance(i, dict)
+                  and _ticket_key(i.get("ticket")) not in hidden_keys]
     by_ticket = {ticket_ref(i.get("ticket")): i for i in file_items if ticket_ref(i.get("ticket"))}
     derived, seen, untracked = [], set(), 0
     for row in owner_rows or []:
@@ -737,7 +753,7 @@ def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now
                             "note": "This live owner holds no GoodQA ticket."})
             untracked += 1
             continue
-        if not ref or ref in seen or row.get("restricted") or RESTRICTED.search(task):
+        if not ref or ref in seen or row.get("restricted") or RESTRICTED.search(task) or _ticket_key(ref) in hidden_keys:
             continue
         seen.add(ref)
         info = tickets.get(ref) or {}

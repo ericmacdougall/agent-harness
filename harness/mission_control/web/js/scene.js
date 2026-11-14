@@ -163,17 +163,28 @@ export async function mountScene() {
         if (node.kind === 'repo') select('repo', node.repo); else select('org', node.id);
       });
       label.dataset.nodeId = node.id; label.dataset.kind = node.kind;
-      if (node.severity && node.severity !== 'info') label.dataset.sev = node.severity;
-      label.append(el('span', 'node-full', labelText(node)));
-      if (node.escalation) { const esc = el('span', 'org-esc', `⇡${node.escalation}`); esc.setAttribute('aria-hidden', 'true'); label.append(esc); }
-      label.title = labelText(node);
-      label.setAttribute('aria-label', node.kind === 'repo' ? `Open repository ${node.repo}` : `Open ${ariaText(node, byId)}`);
+      fillLabel(label, node);
       label.addEventListener('pointerenter', () => highlight(node.id));
       label.addEventListener('pointerleave', () => highlight(null));
       label.addEventListener('focus', () => highlight(node.id));
       label.addEventListener('blur', () => highlight(null));
       labels.append(label);
       labelNodes.set(node.id, { label, node });
+    }
+  }
+  // A label's visible and accessible text, refreshed in place on every update so focus and highlight survive.
+  function fillLabel(label, node) {
+    if (node.severity && node.severity !== 'info') label.dataset.sev = node.severity; else delete label.dataset.sev;
+    label.replaceChildren(el('span', 'node-full', labelText(node)));
+    if (node.escalation) { const esc = el('span', 'org-esc', `⇡${node.escalation}`); esc.setAttribute('aria-hidden', 'true'); label.append(esc); }
+    label.title = labelText(node);
+    label.setAttribute('aria-label', node.kind === 'repo' ? `Open repository ${node.repo}` : `Open ${ariaText(node, byId)}`);
+  }
+  function refreshLabels() {
+    const current = new Map([...(graph?.nodes || []), ...repoNodes()].map(node => [node.id, node]));
+    for (const entry of labelNodes.values()) {
+      const node = current.get(entry.node.id);
+      if (node) { entry.node = node; fillLabel(entry.label, node); }
     }
   }
   function repoNodes() { return recentRepos(getState().events).map(repo => ({ id: `repo:${repo}`, kind: 'repo', label: repo.split('/').pop(), repo })); }
@@ -293,7 +304,15 @@ export async function mountScene() {
     extent = Math.max(3, ...[...positions.entries()].filter(([id]) => { const n = byId.get(id); return !(n?.kind === 'owner' && !isLive(n)) && !id.startsWith('repo:'); }).map(([, p]) => Math.hypot(p[0], p[2])));
     const sig = signature();
     renderMeta(state);
-    if (sig === modelSig) return false;
+    if (sig === modelSig) {
+      // The geometry is unchanged, so the 3D scene is not rebuilt; the displayed details (task, mission, ticket, work
+      // title and status, advisor, last activity, restricted) still change, so the list and labels follow every
+      // update (PR 243 review F2).
+      refreshLabels();
+      if (listMode) renderList();
+      if (!available) positionStatic();
+      return false;
+    }
     modelSig = sig;
     rebuildLabels();
     if (listMode) renderList();

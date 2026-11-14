@@ -240,6 +240,45 @@ class Structure(unittest.TestCase):
         self.assertFalse([c for c in self.graph.snapshot()["changes"] if c.get("node") == "work:goodqa#11"])
         del snap
 
+    def test_one_failing_ticket_does_not_starve_the_others(self):  # PR 243 review F3
+        rows = [row(f"own{n}", ticket=f"goodqa#{n}", kind="task-owner") for n in (1, 2, 3)]
+        for n in (1, 2, 3):
+            self.fx.agent(f"own{n}", kind="task-owner")
+        runner = Runner({f"goodqa#{n}": {"title": f"T{n}", "status": "in_progress"} for n in (1, 2, 3)})
+        graph, _, _ = collector(self.fx, rows, runner)
+        base = 1_000_000.0
+        for i in range(3):                       # every ticket read once while healthy
+            graph.tick(base + 5.0 * i)
+        self.assertEqual(set(graph.tickets), {"goodqa#1", "goodqa#2", "goodqa#3"})
+        runner.fail.update({"goodqa#1"})        # then #1 fails persistently: a nonzero `ah ticket get`
+        runner.calls.clear()
+        t = 0.0
+        for step in range(400):                  # about 33 minutes at the 5 s cadence, over six ticket TTLs
+            t = base + og.TICKET_TTL_S + 5.0 * step
+            graph.tick(t)
+        reads = {n: sum(1 for _, args in runner.calls if args[0] == f"goodqa#{n}") for n in (1, 2, 3)}
+        self.assertGreaterEqual(reads[2], 5, reads)    # healthy tickets keep refreshing about once per TTL
+        self.assertGreaterEqual(reads[3], 5, reads)
+        self.assertGreaterEqual(reads[1], 2, reads)    # the failing one is retried, with backoff, not every tick
+        self.assertLess(reads[1], 100, reads)
+        self.assertTrue(graph.ticket_stale["goodqa#1"])
+        self.assertEqual(graph.tickets["goodqa#1"]["title"], "T1")   # the last good payload is kept
+        self.assertGreaterEqual(t - graph.ticket_at["goodqa#2"], 0)
+        self.assertLess(t - graph.ticket_at["goodqa#2"], og.TICKET_TTL_S + 30)
+
+    def test_a_response_without_an_issue_backs_off_too(self):  # PR 243 review F3: the no-issue path
+        rows = [row(f"own{n}", ticket=f"goodqa#{n}", kind="task-owner") for n in (1, 2)]
+        for n in (1, 2):
+            self.fx.agent(f"own{n}", kind="task-owner")
+        runner = Runner({"goodqa#2": {"title": "T2", "status": "todo"}})   # goodqa#1 answers {"issue": {}}
+        runner.run = (lambda real: lambda kind, *a, **k: (0, "{}") if a[0] == "goodqa#1" else real(kind, *a, **k))(
+            runner.run)
+        graph, _, _ = collector(self.fx, rows, runner)
+        for step in range(200):
+            graph.tick(5.0 * step)
+        self.assertIn("goodqa#2", graph.tickets)
+        self.assertTrue(graph.ticket_stale["goodqa#1"])
+
 
 class Changes(unittest.TestCase):
     def test_spawn_state_assign_and_message_changes(self):  # AC-4
@@ -604,6 +643,55 @@ class RestrictedProducerShape(unittest.TestCase):
         owners = col.Owners(hub, self.Health(), runner=None, tailer=None)
         owners._rows({"session": "s", "owners": [dict(self.ROWS[0], state="live", idle_s=5)]}, 1.0)
         self.assertEqual(owners.restricted_tickets, frozenset({"goodqa#777"}))
+
+
+class RestrictedFileRowIntegration(unittest.TestCase):
+    """PR 243 review F1: a fresh initiatives-file row on a restricted owner's ticket must not publish its title, ticket
+    or plan through /api/state or the SSE initiatives snapshot. Runs the real App wiring (owners -> initiatives)."""
+
+    def test_fresh_file_row_on_a_restricted_ticket_never_reaches_state_or_sse(self):
+        from unittest import mock
+        sys.path.insert(0, str(REPO / "tests"))
+        import server as mcs
+        from test_mission_control import FakeRunner
+        from test_mission_control_session_pin import MAIN, Home
+        h = Home()
+        self.addCleanup(h.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {"MC_HOME": str(h.home / "mc")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        (h.home / "mc").mkdir()
+        path = h.home / "mc" / "initiatives.json"
+        path.write_text(json.dumps([
+            {"id": "hush", "initiative": "SECRET-TITLE interview loop", "ticket": "GoodQA goodqa#777",
+             "next_step": "SECRET-PLAN call the candidate", "note": "SECRET-NOTE", "milestones_done": 1,
+             "milestones_total": 3, "owner": "a1234567890abcdef"},
+            {"id": "plain", "initiative": "Visible plan row", "ticket": "goodqa#15950", "next_step": "ship PR"}]))
+        owner = {"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True,
+                 "owner": True, "state": "live", "severity": "info", "idle_s": 5, "ticket": "goodqa#777",
+                 "last_activity": "", "role": "live"}
+        runner = FakeRunner({"ah-owners": lambda *a: (0, json.dumps({"session": a[0], "owners": [owner]})),
+                             "ah-ticket-get": (0, json.dumps({"issue": {"title": "SECRET-TICKET", "status": "todo"}}))})
+        app = mcs.App(port=47998, root=h.home / "mc", initiatives=str(path), remote=False, fabric_bin=None,
+                      runner=runner, wal_roots=[(h.home / "nowals", "claude")], start_threads=False, session=MAIN,
+                      wals_root=h.claude, projects_root=h.home / "projects")
+        frames = []
+        real = app.hub.snapshot
+        app.hub.snapshot = lambda name, data: (frames.append((name, json.loads(json.dumps(data, default=str)))),
+                                               real(name, data))[1]
+        now = time.time()
+        app.owners.run(now)
+        self.assertEqual(app.owners.restricted_tickets, frozenset({"goodqa#777"}))
+        app.initiatives.run(now)
+        app.org.run(now)
+        state = json.dumps(app.state(), default=str)
+        sse = json.dumps([d for n, d in frames if n == "initiatives"])
+        self.assertIn("Visible plan row", state)   # the check is not vacuous: unrestricted file rows still show
+        self.assertIn("Visible plan row", sse)
+        for text in (state, sse):
+            for secret in ("SECRET-TITLE", "SECRET-PLAN", "SECRET-NOTE", "SECRET-TICKET", "goodqa#777"):
+                self.assertNotIn(secret, text)
+
 
 if __name__ == "__main__":
     unittest.main()
