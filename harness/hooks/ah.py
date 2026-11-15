@@ -75,17 +75,12 @@ def home_dir() -> Path:
     return Path(os.environ.get("AH_HOME") or Path.home())
 
 
-def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, outside: int = 0) -> dict:
-    """What a read-only view actually read (goodqa#15920; the same block provenance.read_block writes). A consumer
-    must not take "nothing found" for "nothing there": state is "failed" when no source could be read, "partial" when
-    a source was unread, a line inside the view's window could not be parsed or a cap or time budget stopped the
-    read, else "ok". `outside_window` (PR 234 v9, main's decision): lines that could not be parsed but lie outside the
-    window the view covers. They do not make it partial, and they are never hidden: a reader discloses the count."""
-    state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
-    return {"schema": "harness.read/1", "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
-            "unread": [{"source": str(u.get("source") or u.get("wal") or "")[:120], "reason": str(u.get("reason") or "")[:200]}
-                       for u in unread[:50]],
-            "skipped": int(skipped), "limited": bool(limited), "outside_window": max(0, int(outside))}
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, window=None) -> dict:
+    """What a read-only view actually read (goodqa#15920): provenance.read_block, the one builder of the block, with
+    ah's unread entries (which may name a `wal`). `window` is a provenance.LostWindow: the only source of
+    outside_window (lost lines the shared rule places before the view's cutoff: disclosed, never partial)."""
+    return _prov().read_block(read_ok, [{"source": u.get("source") or u.get("wal") or "", "reason": u.get("reason") or ""}
+                                        for u in unread], skipped, limited, window)
 
 
 class ReadTally:
@@ -95,20 +90,18 @@ class ReadTally:
 
     def __init__(self):
         self.read_ok, self.unread, self.skipped, self.limited = 0, [], 0, False
-        self.outside = 0   # lost lines outside the view's window: disclosed, never partial (PR 234 v9)
-        self.lost_by = {}  # agent or task WAL name -> lost lines; placed inside or outside once its row is known
+        self.window = _prov().LostWindow()   # owners() sets its cutoff; the shared rule places every lost WAL line
+        self.trails = {}  # agent or task WAL name -> (provenance.LostTrail, mtime), placed once its row is known
 
-    def wal_lost(self, name: str, count: int) -> None:
-        if count:
-            self.lost_by[name] = self.lost_by.get(name, 0) + int(count)
+    def wal_trail(self, name: str, trail, mtime) -> None:
+        self.trails[name] = (trail, mtime)
 
     def place(self, name: str, shown: bool) -> None:
-        """The lost lines of one owner WAL: inside the window when its row is shown, else outside (disclosed)."""
-        count = self.lost_by.pop(name, 0)
-        if shown:
-            self.skipped += count
-        else:
-            self.outside += count
+        """The lost lines of one owner WAL, by the shared rule (provenance.lost_outside); a row the view shows claims
+        its WAL whole, so its lost lines are inside whatever their dates (the user's v10 rule: owners also needs the
+        row hidden)."""
+        trail, mtime = self.trails.pop(name, (None, None))
+        self.window.place(trail, mtime, hidden=not shown)
 
     def missed(self, source: str, error) -> None:
         """A place that is not there holds nothing; any other failure to read it is an unread source."""
@@ -122,8 +115,9 @@ class ReadTally:
             self.skipped += 1
 
     def block(self) -> dict:
-        lost = sum(self.lost_by.values())   # a WAL with no row to place it by: inside, never dropped
-        return read_block(self.read_ok, self.unread, self.skipped + lost, self.limited, self.outside)
+        for name in list(self.trails):   # a WAL with no row to place it by: claimed as shown, so inside
+            self.place(name, True)
+        return read_block(self.read_ok, self.unread, self.skipped, self.limited, self.window)
 
 
 def is_secret_path(path) -> bool:
@@ -259,14 +253,16 @@ def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" =
             tally.missed(f"WAL {path.name[:60]}", error)
             return {"first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         tally.read_ok += 1
-        tally.wal_lost(path.name, int(summary.get("skipped") or 0))
+        trail = (_prov().LostTrail.from_state(summary.get("lost_trail")) or _prov().LostTrail()).copy()
         try:   # an unterminated last line read_new_lines leaves for later: torn unless it is still being written
             st = path.stat()
             if (summary.get("meta") or {}).get("offset", 0) < st.st_size \
                     and not _prov().tail_in_progress(True, st.st_mtime):
-                tally.wal_lost(path.name, 1)
+                trail.lost()   # this call's evidence only: no dated record after it, so the shared rule keeps it inside
+            tally.wal_trail(path.name, trail, st.st_mtime)
         except OSError as error:
             tally.missed(f"WAL {path.name[:60]}", error)
+            tally.wal_trail(path.name, trail, None)
         return summary
     return _summarize_agent_wal(path, index_dir)
 
@@ -282,7 +278,8 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
-    if "outcome_at" not in summary or "skipped" not in summary or summary.get("skipped_to") != meta.get("offset"):
+    if "outcome_at" not in summary or "skipped" not in summary or summary.get("skipped_to") != meta.get("offset") \
+            or _prov().LostTrail.from_state(summary.get("lost_trail")) is None:   # PR 234 v10: no lost-line evidence
         # an index written before outcome_at (goodqa#15943 r5) or skipped (PR 234 v8) existed, or one an older ah
         # advanced without counting the lines it skipped (skipped_to is where the count was last brought up to): rescan
         meta.clear()
@@ -290,17 +287,21 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     if rebuilt or "first" not in summary or "outcome_at" not in summary or "skipped" not in summary \
             or not meta.get("offset"):
         summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0,
-                       skipped=0)
+                       skipped=0, lost_trail=_prov().LostTrail().state())
+    trail = _prov().LostTrail.from_state(summary.get("lost_trail")) or _prov().LostTrail()
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
         except ValueError:
             summary["skipped"] += 1  # a complete line that is not a record: kept with the summary, counted every call
+            trail.lost()
             continue
         if not isinstance(rec, dict):
             summary["skipped"] += 1
+            trail.lost()
             continue
         at = parse_ts(rec.get("at"))
+        trail.dated(at)
         if not rec.get("by") or rec.get("by") == own:  # a record another actor wrote on this owner's behalf is not its activity (review H2)
             summary["last_at"] = max(summary["last_at"], at)
         summary["events"] += 1
@@ -319,6 +320,7 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
             if match not in summary["tickets"] and len(summary["tickets"]) < 8:
                 summary["tickets"].append(match)
     summary["skipped_to"] = meta.get("offset", 0)   # the skipped count covers every line before this offset
+    summary["lost_trail"] = trail.state()   # and the evidence for each lost line, for the shared window rule
     atomic_json(cache, summary)
     return summary
 
@@ -410,6 +412,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     index_dir = state_dir(home, "ah-index")
     spawned, stopped, named, stop_at = {}, set(), [], {}
     tally = ReadTally()   # PR 234 v8: what this view actually read; the read block is built from it alone
+    tally.window = _prov().LostWindow(now - OWNERS_RECENT_S)   # the default view's window (shown_owner)
     with open(main, "rb") as handle:
         main_mtime = os.fstat(handle.fileno()).st_mtime
         for raw in handle:
@@ -657,9 +660,11 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         counts[r["state"]] = counts.get(r["state"], 0) + 1
     dls = deadlines(home, session, now, led)
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
-    # PR 234 v9 (main's decision): the read covers the rows the default view shows. A line lost from the WAL of a row
-    # it shows makes the read partial; one lost from a hidden row's WAL (terminal, idle over OWNERS_RECENT_S) is
-    # outside the window and disclosed as a count. The main WAL and the ledger are always inside.
+    # PR 234 v10 (receipt v9 F1; the user's last-round rule): a lost line in an owner WAL is outside the window only
+    # when its row is hidden (terminal, idle over OWNERS_RECENT_S) AND the shared rule (provenance.lost_outside) dates
+    # the line itself before the window: the file was last written before it, or the first dated record after the
+    # line, in a file whose dates are in order, is before it. A shown row, or a line with no such evidence (a torn
+    # tail, a recent lost intent after an old result), is inside. The main WAL and the ledger are always inside.
     for r in rows:
         tally.place(f"{r['agent_id']}.jsonl" if r.get("type") == "task-wal" else f"agent-{r['agent_id']}.jsonl",
                     shown_owner(r))
@@ -2632,7 +2637,8 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     supplied = given is not None
     row_index = {id(rec): i for i, (_agent, rec) in enumerate(given)} if supplied else {}
     rows, unread = [], list(unread or [])
-    read_ok, skipped, outside = 0, 0, 0
+    read_ok, skipped = 0, 0
+    window = _prov().LostWindow(cutoff) if given is None else None   # ah export passes rows: no window (see its output)
 
     def consider(agent, rec):
         if not isinstance(rec, dict) or not rec.get("event"):
@@ -2660,11 +2666,9 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             lines = text.splitlines()
             # the last line may still be being written: only while the file was written within the grace window
             open_tail = bool(lines) and not text.endswith("\n") and _prov().tail_in_progress(True, mtime, now)
-            # PR 234 v9 (main's decision): a lost line is inside the window unless it was provably written before the
-            # cutoff. WALs are append-only, so a line followed by a record dated before the cutoff was written before
-            # it, and so was every line of a file last written before the cutoff. Inside: skipped (partial). Outside:
-            # counted and disclosed, never partial. A line followed by a record dated at or after the cutoff is inside.
-            pending = 0
+            # PR 234 v10: each lost line's evidence goes into a LostTrail, and the shared rule (provenance.lost_outside)
+            # places it inside (skipped, partial) or outside the window (disclosed, never partial)
+            trail = _prov().LostTrail()
             for index, raw in enumerate(lines):
                 if not raw.strip():
                     continue
@@ -2672,24 +2676,14 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                     rec = json.loads(raw)
                 except ValueError:
                     if not (open_tail and index == len(lines) - 1):
-                        pending += 1  # a complete line that is not a record: what it held is missing from this report
+                        trail.lost()  # a complete line that is not a record: what it held is missing from this report
                     continue
                 if not isinstance(rec, dict) or not rec.get("event"):
-                    pending += 1  # parsed, but not a WAL record (PR 234 v8): nothing in it can be reported
+                    trail.lost()  # parsed, but not a WAL record (PR 234 v8): nothing in it can be reported
                     continue
-                at = parse_ts(rec.get("at"))
-                if pending and at:
-                    if at < cutoff:
-                        outside += pending
-                    else:
-                        skipped += pending
-                    pending = 0
+                trail.dated(parse_ts(rec.get("at")))
                 consider(agent, rec)
-            if pending:
-                if mtime >= cutoff:
-                    skipped += pending
-                else:
-                    outside += pending
+            window.place(trail, mtime)
     else:
         read_ok = len({agent for agent, _rec in given}) if sources_read is None else int(sources_read)
         skipped = int(skipped_rows)
@@ -2795,7 +2789,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             "claimed": claimed, "blockers": blockers, "commits": commits,
             "asks_open": [a for k, a in asks.items() if k not in resolved],
             "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
-            "read": read_block(read_ok, unread, skipped, outside=outside),
+            "read": read_block(read_ok, unread, skipped, window=window),
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
 
 

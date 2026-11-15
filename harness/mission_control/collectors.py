@@ -104,9 +104,18 @@ def producer_read(label: str, code: int, out, *, cap: int | None = None, ok_code
         notes.append(f"{skipped} lines could not be parsed" if isinstance(skipped, int) else "skipped lines unknown")
     if block.get("limited") is not False:
         notes.append("stopped at a cap or time budget")
+    outside = block.get("outside_window", 0)
+    window = block.get("window")
+    if outside != 0 and not (isinstance(outside, int) and not isinstance(outside, bool) and outside > 0
+                             and isinstance(window, dict) and window.get("rule") == LOST_WINDOW_RULE):
+        # a count of lines left out of the read that no shared window rule placed: they are lost lines, so partial
+        notes.append("unreadable records outside a window no rule stated")
     if block["state"] == "partial" and not notes:
         notes.append("the producer reported a partial read")
     return data, notes
+
+
+LOST_WINDOW_RULE = "harness.lost-window/1"   # provenance.LOST_WINDOW_RULE: the shared lost-line rule
 
 
 def outside_window(data) -> str:
@@ -115,6 +124,11 @@ def outside_window(data) -> str:
     block = data.get("read") if isinstance(data, dict) else None
     count = block.get("outside_window") if isinstance(block, dict) else None
     if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return ""
+    window = block.get("window")
+    if not isinstance(window, dict) or window.get("rule") != LOST_WINDOW_RULE:
+        # receipt v9 F3: the words "older ... outside this window" are true only for a count the shared rule made;
+        # producer_read makes such a read partial instead
         return ""
     return f"{count} older unreadable record{'s' if count != 1 else ''} outside this window"
 

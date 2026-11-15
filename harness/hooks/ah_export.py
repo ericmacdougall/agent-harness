@@ -365,6 +365,11 @@ def _evidence_rows(entries, columns):
     return "".join(out)
 
 
+# PR 234 v10 (receipt v9 F3): the export counts every malformed row of the WALs it read, whatever its date; it does
+# not split the count by window, so its report never carries outside_window or the window rule
+SKIPPED_SCOPE = "every malformed row in the WALs read, not split by window"
+
+
 def _render(session, generated, report, tree, counts, timeline, omitted, unread, skipped, agent_filter, since_label):
     parts = ["<!doctype html><html lang=\"en\"><head>",
              '<meta http-equiv="Content-Security-Policy" content="%s">' % _e(CSP),
@@ -373,8 +378,8 @@ def _render(session, generated, report, tree, counts, timeline, omitted, unread,
              "<header><h1>Session export</h1>",
              '<p class="banner">%s</p>' % _e(BANNER),
              '<p class="muted">Session <code>%s</code>; generated %s; window %s; %d rows rendered, %d omitted, '
-             '%d malformed rows skipped.</p></header><main>' % (_e(session), _e(generated), _e(since_label),
-                                                                 len(timeline), omitted, skipped)]
+             '%d malformed rows skipped (%s).</p></header><main>' % (_e(session), _e(generated), _e(since_label),
+                                                                      len(timeline), omitted, skipped, _e(SKIPPED_SCOPE))]
     if omitted:
         parts.append("<p>%d older rows omitted to stay under %d; %s rows were kept first.</p>"
                      % (omitted, MAX_ROWS, _e(", ".join(sorted(PRIORITY)))))
@@ -551,7 +556,8 @@ def export(ah, home, args) -> dict:
         _prepare_default_dir(ah, directory)
     _write(ah, directory, final, data)
     result = {"ok": True, "path": str(final), "bytes": len(data), "rows_rendered": len(candidates),
-              "rows_omitted": omitted, "rows_skipped": skipped, "agents": len(agents_read),
+              "rows_omitted": omitted, "rows_skipped": skipped, "rows_skipped_scope": SKIPPED_SCOPE,
+              "agents": len(agents_read),
               "redactions": scrub.redactions, "unread": unread,
               "note": "local file only; ah never uploads or shares it. The harness log backup copies the work dir "
                       "(and the raw WALs) to your private backup; use --out for a folder outside it."}

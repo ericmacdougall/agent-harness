@@ -426,7 +426,162 @@ class OutsideTheWindow(unittest.TestCase):
         self.assertEqual(col.outside_window({"read": {"outside_window": 0}}), "")
         self.assertEqual(col.outside_window({"read": {}}), "")
         self.assertEqual(col.outside_window({"read": {"outside_window": True}}), "")
-        self.assertEqual(col.outside_window({"read": {"outside_window": 1}}), "1 older unreadable record outside this window")
+        self.assertEqual(col.outside_window({"read": {"outside_window": 1}}), "")   # no rule stated: never "older"
+        self.assertEqual(col.outside_window({"read": {"outside_window": 1, "window": {"rule": prov.LOST_WINDOW_RULE}}}),
+                         "1 older unreadable record outside this window")
+
+
+class RecentLostLineOfAHiddenRow(unittest.TestCase):
+    """Receipt v9 F1: a hidden row is hidden by the lines that parsed, so the row alone never places a lost line outside.
+    The reviewer's cases: a result 7 h ago, then a lost line written 5 minutes ago, in an agent WAL and in a task WAL,
+    cold and warm. The lost line is inside: partial, skipped 1, outside_window 0."""
+
+    def old_result_then(self, home, path, tail, recent=300, ended=7 * 3600):
+        at = iso_at(time.time() - ended)
+        path.write_text(line({"event": "intent", "note": "Build goodqa#1", "at": at}) + line({"event": "result", "note": "done", "at": at})
+                        + tail)
+        os.utime(path, (time.time() - recent, time.time() - recent))   # written 5 minutes ago, past the append grace
+        return at
+
+    def check(self, home):
+        for call in ("cold", "warm"):
+            with self.subTest(call=call):
+                read = ah.owners(home.home, SID)["read"]
+                self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("partial", 1, 0), read)
+
+    def test_agent_wal_torn_tail_after_an_old_result(self):
+        home = Home(self)
+        at = self.old_result_then(home, home.agent, '{"event":"intent","note":"reopened')
+        home.append(home.main, line({"event": "subagent_stop", "agent_id": AGENT, "at": at}))
+        os.utime(home.meta, (time.time() - 7 * 3600, time.time() - 7 * 3600))
+        rows = {r["agent_id"]: r for r in ah.owners(home.home, SID)["owners"]}
+        self.assertFalse(ah.shown_owner(rows[AGENT]), rows[AGENT])   # the case needs the row hidden
+        self.check(home)
+
+    def test_agent_wal_complete_lost_line_after_an_old_result(self):
+        home = Home(self)
+        at = self.old_result_then(home, home.agent, '{"event":"intent","note":"reopened\n')
+        home.append(home.main, line({"event": "subagent_stop", "agent_id": AGENT, "at": at}))
+        os.utime(home.meta, (time.time() - 7 * 3600, time.time() - 7 * 3600))
+        self.check(home)
+
+    def test_task_wal_torn_tail_after_an_old_result(self):
+        home = Home(self)
+        task = home.folder / "goodqa-1-build.jsonl"
+        self.old_result_then(home, task, '{"event":"intent","note":"reopened')
+        rows = {r["agent_id"]: r for r in ah.owners(home.home, SID)["owners"]}
+        self.assertFalse(ah.shown_owner(rows["goodqa-1-build"]), rows["goodqa-1-build"])
+        self.check(home)
+
+    def test_each_condition_alone_and_neither(self):
+        """(b) the file was last written before the window: outside. (a) the next dated record, in an ordered file, is
+        before it: outside. Neither: inside. The row is hidden in every case."""
+        ended = 8 * 3600
+        cases = {
+            "(b) file last written before the window": (ended, '{"event":"note","torn\n', None, ("ok", 0, 1)),
+            "(a) next dated record before the window": (300, '{"event":"note","torn\n', ended - 60, ("ok", 0, 1)),
+            "neither: next dated record inside the window": (300, '{"event":"note","torn\n', 600, ("partial", 1, 0)),
+        }
+        for name, (recent, lost, next_ago, want) in cases.items():
+            with self.subTest(case=name):
+                home = Home(self)
+                task = home.folder / "goodqa-2-build.jsonl"
+                early = iso_at(time.time() - ended)
+                text = line({"event": "intent", "note": "x", "at": early}) + lost
+                if next_ago is not None:   # a record another actor wrote later; its date is the evidence
+                    text += line({"event": "result", "note": "done", "at": iso_at(time.time() - next_ago), "by": "main"})
+                else:
+                    text += line({"event": "result", "note": "done", "at": early})
+                task.write_text(text)
+                os.utime(task, (time.time() - recent, time.time() - recent))
+                rows = {r["agent_id"]: r for r in ah.owners(home.home, SID)["owners"]}
+                if want[0] == "ok":
+                    self.assertFalse(ah.shown_owner(rows["goodqa-2-build"]))
+                read = ah.owners(home.home, SID)["read"]
+                self.assertEqual((read["state"], read["skipped"], read["outside_window"]), want, read)
+
+
+class OutOfOrder(unittest.TestCase):
+    """Receipt v9 F2: dates in a WAL are written by whoever makes the record, so a later line can carry an earlier date.
+    A file whose dated records go back in time proves nothing about where a lost line sits: (a) does not apply."""
+
+    def test_status_out_of_order_is_inside(self):
+        now = int(time.time())
+        home = Home(self)
+        path = home.folder / "agent-a0000000000000004.jsonl"
+        path.write_text(line({"event": "status", "note": "fresh", "at": iso_at(now - 600)}) + TORN
+                        + line({"event": "status", "note": "backdated", "at": iso_at(now - WINDOW - 3600)}))
+        read = ah.status_report(home.home, SID, WINDOW, now=now)["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("partial", 1, 0), read)
+
+    def test_status_in_order_control_is_outside(self):
+        now = int(time.time())
+        home = Home(self)
+        path = home.folder / "agent-a0000000000000004.jsonl"
+        path.write_text(line({"event": "status", "note": "old", "at": iso_at(now - WINDOW - 7200)}) + TORN
+                        + line({"event": "status", "note": "older", "at": iso_at(now - WINDOW - 3600)}))
+        read = ah.status_report(home.home, SID, WINDOW, now=now)["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("ok", 0, 1), read)
+
+    def test_owners_out_of_order_is_inside(self):
+        home = Home(self)
+        task = home.folder / "goodqa-3-build.jsonl"
+        task.write_text(line({"event": "intent", "note": "x", "at": iso_at(time.time() - 7 * 3600)}) + TORN
+                        + line({"event": "result", "note": "done", "at": iso_at(time.time() - 9 * 3600), "by": "main"}))
+        os.utime(task, (time.time() - 300, time.time() - 300))
+        read = ah.owners(home.home, SID)["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("partial", 1, 0), read)
+
+    def test_the_trail_records_order_and_survives_the_index(self):
+        trail = prov.LostTrail()
+        trail.dated(100.0)
+        trail.lost()
+        trail.dated(50.0)   # back in time
+        self.assertEqual((trail.nexts, trail.ordered), ([50.0], False))
+        again = prov.LostTrail.from_state(json.loads(json.dumps(trail.state())))
+        self.assertEqual((again.nexts, again.ordered), ([50.0], False))
+        self.assertIsNone(prov.LostTrail.from_state({"nexts": ["x"]}))
+        self.assertFalse(prov.lost_outside(50.0, False, 10 ** 10, 60.0))
+        self.assertTrue(prov.lost_outside(50.0, True, 10 ** 10, 60.0))
+        self.assertTrue(prov.lost_outside(None, False, 40.0, 60.0))
+        self.assertFalse(prov.lost_outside(None, True, 10 ** 10, 60.0))
+        self.assertFalse(prov.lost_outside(50.0, True, 40.0, None))   # no window: always inside
+
+
+class OneSharedRule(unittest.TestCase):
+    """The user's v10 rule: ONE function decides inside or outside for every producer. Fails if a producer counts
+    outside_window itself, calls the rule directly, or passes an outside count to a read block."""
+
+    def test_only_the_shared_window_counts_outside(self):
+        import re
+        sources = {name: (HOOKS / name).read_text() for name in ("ah.py", "provenance.py", "ah_export.py")}
+        sources["collectors.py"] = (REPO / "harness" / "mission_control" / "collectors.py").read_text()
+        for name, text in sources.items():
+            with self.subTest(file=name):
+                counted = re.findall(r"\.outside\s*\+=", text)
+                self.assertEqual(len(counted), 2 if name == "provenance.py" else 0, "only LostWindow.place counts outside")
+                calls = re.findall(r"(?<!def )\blost_outside\(", text)
+                self.assertEqual(len(calls), 2 if name == "provenance.py" else 0, "only LostWindow.place calls the rule")
+                self.assertNotRegex(text, r"read_block\([^)]*\boutside\s*=", "an outside count is never passed in")
+                built = re.findall(r'"outside_window"\s*:', text)
+                self.assertEqual(len(built), 1 if name == "provenance.py" else 0, "outside_window is built in one place")
+
+    def test_an_outside_count_without_the_rule_is_partial(self):
+        good = {"schema": col.READ_SCHEMA, "state": "ok", "sources_read": 1, "unread": [], "unread_total": 0,
+                "skipped": 0, "limited": False}
+        for block, partial in ((dict(good, outside_window=2), True),
+                               (dict(good, outside_window=2, window={"rule": "something else"}), True),
+                               (dict(good, outside_window=2, window={"rule": prov.LOST_WINDOW_RULE}), False),
+                               (dict(good, outside_window=0), False)):
+            with self.subTest(block=block):
+                data, notes = col.producer_read("x", 0, json.dumps({"read": block}))
+                self.assertEqual(bool(notes), partial, notes)
+                self.assertEqual(bool(col.outside_window(data)), not partial and block["outside_window"] > 0)
+
+    def test_export_says_it_does_not_split_by_window(self):
+        import ah_export
+        self.assertIn("not split by window", ah_export.SKIPPED_SCOPE)
+        self.assertNotIn("window", ah.status_report(Home(self).home, SID, WINDOW, rows=[], sources_read=1)["read"])
 
 
 class NoLiteralWholeRead(unittest.TestCase):

@@ -46,6 +46,105 @@ APPEND_GRACE_S = 60.0
 
 def tail_in_progress(at_tail: bool, mtime: float, now: float | None = None) -> bool:
     return bool(at_tail) and (time.time() if now is None else now) - mtime <= APPEND_GRACE_S
+
+
+# ---- lost lines and the window a read covers (PR 234 v10; receipts v9 F1/F2; the user's last-round decision)
+# A read covers a window (ah status: its --since window; ah owners: the rows its default view shows). A line that
+# could not be used is inside the window unless the evidence about that line itself places it before the cutoff.
+# This is the ONLY place that decides it, for every producer: lost_outside is called by LostWindow.place alone,
+# and only LostWindow counts outside_window (tests/test_mission_control_producer_reads.py guards both).
+LOST_WINDOW_RULE = "harness.lost-window/1"
+MAX_LOST_KEPT = 2000   # per file: lost lines past this keep no evidence, so they are inside
+
+
+def lost_outside(next_date, ordered: bool, mtime, cutoff) -> bool:
+    """Whether one lost line was provably written before `cutoff` (a Unix time; None: the read has no window, so
+    every lost line is inside). Outside only if (b) its file was last written before the cutoff, or (a) the first
+    dated record after it in the same file is dated before the cutoff AND the file's dated records never go back in
+    time (receipt v9 F2: a file whose dates are out of order proves nothing about position, so (a) does not apply).
+    Everything else, including a torn tail or a lost line with no dated record after it, is inside."""
+    if cutoff is None:
+        return False
+    if isinstance(mtime, (int, float)) and mtime < cutoff:
+        return True
+    return bool(ordered) and isinstance(next_date, (int, float)) and 0 < next_date < cutoff
+
+
+class LostTrail:
+    """The evidence for the lost lines of one file, in file order: for each, the date of the first dated record after
+    it (None until one is read), and whether the file's dated records are in time order. It can be kept in an index
+    (state()/from_state) so an incremental reader places a line seen in an earlier call with the same evidence."""
+
+    def __init__(self, nexts=None, ordered=True, last=0.0, extra=0):
+        self.nexts, self.ordered, self.last, self.extra = list(nexts or []), bool(ordered), float(last or 0.0), int(extra or 0)
+
+    @classmethod
+    def from_state(cls, state):
+        if not isinstance(state, dict):
+            return None
+        nexts = state.get("nexts")
+        if not isinstance(nexts, list) or not all(n is None or isinstance(n, (int, float)) for n in nexts):
+            return None
+        return cls(nexts, state.get("ordered", False) is True, state.get("last") or 0.0, state.get("extra") or 0)
+
+    def state(self) -> dict:
+        return {"nexts": self.nexts, "ordered": self.ordered, "last": self.last, "extra": self.extra}
+
+    def copy(self):
+        return LostTrail(self.nexts, self.ordered, self.last, self.extra)
+
+    def lost(self) -> None:
+        if len(self.nexts) < MAX_LOST_KEPT:
+            self.nexts.append(None)
+        else:
+            self.extra += 1
+
+    def dated(self, at) -> None:
+        """A record in file order with date `at` (0 or None: undated, which proves nothing and is ignored)."""
+        if not isinstance(at, (int, float)) or at <= 0:
+            return
+        if at < self.last:
+            self.ordered = False
+        self.last = max(self.last, at)
+        i = len(self.nexts) - 1
+        while i >= 0 and self.nexts[i] is None:   # the lost lines just before this record
+            self.nexts[i] = float(at)
+            i -= 1
+
+    def count(self) -> int:
+        return len(self.nexts) + self.extra
+
+
+class LostWindow:
+    """One read's window: how many lost lines are inside it (they make the read partial) and outside it (disclosed as
+    outside_window, never partial). `cutoff` None: no window, every lost line is inside."""
+
+    def __init__(self, cutoff=None):
+        self.cutoff, self.inside, self.outside = cutoff, 0, 0
+
+    def place(self, trail, mtime, hidden: bool = True) -> None:
+        """Place every lost line of one file. `hidden` False (an owner row the view shows): all inside, whatever the
+        evidence, since the read claims that row."""
+        if trail is None:
+            return
+        for nxt in trail.nexts:
+            if hidden and lost_outside(nxt, trail.ordered, mtime, self.cutoff):
+                self.outside += 1
+            else:
+                self.inside += 1
+        for _ in range(trail.extra):
+            if hidden and lost_outside(None, False, mtime, self.cutoff):
+                self.outside += 1
+            else:
+                self.inside += 1
+
+    def fields(self) -> dict:
+        """The read-block fields: the outside count, and the rule that produced it (only a read with a window)."""
+        out = {"outside_window": self.outside}
+        if self.cutoff is not None:
+            out["window"] = {"rule": LOST_WINDOW_RULE,
+                             "cutoff": datetime.datetime.fromtimestamp(self.cutoff, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        return out
 SMALL_FILE = 1 << 20              # policy, cache and similar small files
 MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
@@ -1355,15 +1454,17 @@ def packet_gate(text: str, mode=None, ctx=None):
 READ_SCHEMA = "harness.read/1"
 
 
-def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, outside: int = 0) -> dict:
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, window: "LostWindow | None" = None) -> dict:
     """What a read-only view actually read, for a consumer that must not take "nothing found" for "nothing there"
     (goodqa#15920). state: "failed" when no source could be read, "partial" when a source was unread, a matching line
     could not be parsed or a cap or time budget stopped the read, else "ok". `unread` names each source and why."""
+    window = window if window is not None else LostWindow()
+    skipped = int(skipped) + window.inside   # lost lines inside the window are skipped lines like any other
     state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
     return {"schema": READ_SCHEMA, "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
             "unread": [{"source": clip(str(u.get("source", "")), 120), "reason": clip(str(u.get("reason", "")), 200)}
                        for u in unread[:50]],
-            "skipped": int(skipped), "limited": bool(limited), "outside_window": max(0, int(outside))}
+            "skipped": skipped, "limited": bool(limited), **window.fields()}
 
 
 def session_wals_read(session: str, home=None) -> tuple:
