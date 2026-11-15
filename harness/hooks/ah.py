@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -125,6 +126,15 @@ def is_secret_path(path) -> bool:
 
 def iso(ts):
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
+
+
+def _iso_or_none(ts):
+    """iso() of a value read from a WAL, an index or a cache: None, never an exception, for a value that is not a
+    representable time (PR 245 m3 receipt: one bad timestamp must not abort ah owners after recovery has run)."""
+    try:
+        return iso(ts)
+    except (OverflowError, ValueError, OSError, TypeError):
+        return None
 
 
 def parse_ts(value):
@@ -496,12 +506,21 @@ OWNERS_CACHE_SAVE_GAP_S = 1.5  # and saves it at most this often (tier_gate's de
 _NUM = (int, float)
 
 
+_TIME_MAX = 253402300799.0   # 9999-12-31T23:59:59Z: every summary number is a time or a count well below it
+
+
 def _num(v) -> bool:
-    return isinstance(v, _NUM) and not isinstance(v, bool)
+    """A finite number in range (PR 245 m3 receipt): inf, nan, 1e300 and ints float() cannot hold are not."""
+    if not isinstance(v, _NUM) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(float(v)) and abs(v) <= _TIME_MAX
+    except OverflowError:
+        return False
 
 
 def _count(v) -> bool:
-    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 2 ** 63
 
 
 # every field a summary (a per-WAL index file or an owners-cache entry) may hold, with the type its readers assume
@@ -550,20 +569,21 @@ def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
         fp = _fingerprint(os.stat(path))
     except OSError:
         fp = None
-    entry = cache["wal"].get(key)
-    if fp and isinstance(entry, dict) and entry.get("fp") == fp and _cached_summary_ok(entry.get("s")):
-        return entry["s"]
-    # PR 245 cold path: a WAL the owners cache already summarised (it changed since) continues from that summary and
-    # skips the per-WAL index file, read and write; only a WAL the cache has never held goes through the index file
-    prior = entry["s"] if isinstance(entry, dict) and _cached_summary_ok(entry.get("s")) else None
-    try:
+    try:   # PR 245 m3 receipt: the validation of cached state runs inside the miss handler too
+        entry = cache["wal"].get(key)
+        if fp and isinstance(entry, dict) and entry.get("fp") == fp and _cached_summary_ok(entry.get("s")):
+            return entry["s"]
+        # PR 245 cold path: a WAL the owners cache already summarised (it changed since) continues from that summary
+        # and skips the per-WAL index file, read and write; only a WAL the cache has never held goes through the index
+        prior = entry["s"] if isinstance(entry, dict) and _cached_summary_ok(entry.get("s")) else None
         summary = _summarize_agent_wal(path, index_dir, prior) if prior is not None else _summarize_agent_wal(path, index_dir)
         if not _cached_summary_ok(summary):
             raise ValueError("summary failed its own shape check")
-    except (TypeError, ValueError, KeyError, AttributeError, RecursionError):
-        # PR 245 m2 receipt: anything that goes wrong using cached state is a cache miss: the entry is dropped and the
-        # WAL is read again from the start, and the rebuilt summary replaces the entry (an OSError is the file's own
-        # failure and still reaches the tally; AhError, a newer schema, is never swallowed)
+    except (AhError, OSError):
+        raise   # a newer schema is never swallowed; an unreadable WAL is the file's own failure and reaches the tally
+    except Exception:  # noqa: BLE001 - PR 245 m2/m3 receipts: any other failure using cached state is a cache miss
+        # the entry is dropped, the WAL is read again from the start (an empty prior: no index file, no cache) and the
+        # rebuilt summary replaces the entry, so a corrupt entry costs one rescan and never fails a later call
         cache["wal"].pop(key, None)
         summary = _summarize_agent_wal(path, index_dir, {})
     if fp:
@@ -719,10 +739,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "owner": bool(is_owner), "registered": agent in registered,
                "flags": (["unregistered-owner"] if is_owner and agent not in registered else []),
                "state": verdict["state"], "severity": verdict["severity"],
-               "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
+               "last_activity": _iso_or_none(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
                "ticket_comment_age_s": None,
-               "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+               "result_at": _iso_or_none(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
@@ -748,9 +768,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         rows.append({"agent_id": name, "type": "task-wal", "task": None if restricted else text, "restricted": restricted,
                      "parent": None, "owner": True, "registered": name in registered, "flags": ["task-wal"],
                      "state": verdict["state"], "severity": verdict["severity"],
-                     "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
+                     "last_activity": _iso_or_none(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
-                     "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+                     "result_at": _iso_or_none(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                      "active_1h": now - summary["last_at"] <= 3600})
     asks = ask_states(main, tally)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session

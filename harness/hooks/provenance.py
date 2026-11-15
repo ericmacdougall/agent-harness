@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import re
 import sys
@@ -149,7 +150,13 @@ class LostTrail:
                 or not (extra is None or (isinstance(extra, int) and not isinstance(extra, bool) and extra >= 0)) \
                 or not isinstance(ordered, bool):
             return None
-        return cls(nexts, ordered, last or 0.0, extra or 0)
+        try:   # PR 245 m3 receipt: a value float() cannot hold (10**309) or a non-finite one is no state either
+            trail = cls(nexts, ordered, last or 0.0, extra or 0)
+            if not all(math.isfinite(v) for v in [trail.last] + [n for n in trail.nexts if n is not None]):
+                return None
+        except (OverflowError, ValueError, TypeError):
+            return None
+        return trail
 
     def state(self) -> dict:
         return {"nexts": self.nexts, "ordered": self.ordered, "last": self.last, "extra": self.extra}

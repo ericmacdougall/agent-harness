@@ -247,6 +247,16 @@ class Counts(Base):
         "schema text": lambda e: e.__setitem__("schema", "bad"),
         "events text": lambda e: e.__setitem__("events", "bad"),
         "skipped_to text": lambda e: e.__setitem__("skipped_to", "bad"),
+        # PR 245 m3 receipt: numbers that pass a type check and still raise on use
+        "lost_trail last 10**309": lambda e: e["lost_trail"].__setitem__("last", 10 ** 309),
+        "lost_trail last inf": lambda e: e["lost_trail"].__setitem__("last", float("inf")),
+        "lost_trail next 10**309": lambda e: e["lost_trail"].__setitem__("nexts", [10 ** 309]),
+        "last_at 1e309": lambda e: e.__setitem__("last_at", 1e309),
+        "last_at 1e300": lambda e: e.__setitem__("last_at", 1e300),
+        "last_at 10**309": lambda e: e.__setitem__("last_at", 10 ** 309),
+        "outcome_at 1e309": lambda e: (e.__setitem__("outcome", "done"), e.__setitem__("outcome_at", 1e309)),
+        "outcome_at nan": lambda e: (e.__setitem__("outcome", "done"), e.__setitem__("outcome_at", float("nan"))),
+        "events 10**400": lambda e: e.__setitem__("events", 10 ** 400),
     }
 
     def corrupt_and_check(self, where):
@@ -303,6 +313,18 @@ class Counts(Base):
         self.assertEqual(again[aid], fresh[aid], "rebuilt from the start, not a crash")
         self.assertIn(True, calls)
         self.assertNotEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)   # the append is shown on later calls
+
+    def test_owner_rows_format_an_unrepresentable_time_as_none(self):  # PR 245 m3 receipt: the safe helper
+        for bad in (1e309, 1e300, 10 ** 309, float("nan"), -1e20):
+            self.assertIsNone(ah._iso_or_none(bad), bad)
+        self.assertEqual(ah._iso_or_none(NOW), ah.iso(NOW))
+
+    def test_lost_trail_state_out_of_range_is_none_not_an_exception(self):  # PR 245 m3 receipt, at the source
+        LT = ah._prov().LostTrail
+        for bad in ({"nexts": [10 ** 309]}, {"nexts": [float("nan")]}, {"nexts": [], "last": 10 ** 309},
+                    {"nexts": [], "last": float("inf")}, {"nexts": [], "extra": "2"}, {"nexts": [True]}):
+            self.assertIsNone(LT.from_state(bad), bad)
+        self.assertIsNotNone(LT.from_state({"nexts": [None, 5.0], "last": 3.0, "extra": 2, "ordered": True}))
 
     def test_a_deeply_nested_meta_file_is_skipped(self):  # delta review follow-up (discover_agents meta read)
         aid = "a" + f"{5:016x}"
