@@ -122,6 +122,32 @@ QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
+# goodqa#16124: an operand that is only a file name (test/qac-kill-switch-ceiling.test.ts) is not signalling.
+PATH_OPERAND_EXTS = ('.ts', '.tsx', '.js', '.mjs', '.py', '.go', '.rs')
+PATH_OPERAND_CHARS = re.compile(r'[A-Za-z0-9_.@+/-]+')
+# The value of these options is the program itself (code or a module), so the words after it are its arguments.
+PROGRAM_OPTS = frozenset(('-c', '-m', '-e', '-E', '-p', '--eval', '--print'))
+PYTHON_NOVALUE_OPT = re.compile(r'-[IuBsSOqbPdER]+')  # python3 -I, -u, -IB ...: no value follows
+
+
+def path_operand(word, kill_re):
+    """True when `word` is a plain path-shaped operand whose kill word, if any, is only part of a file name: a literal
+    word (unquoted, no expansion, glob or substitution) of path characters, not an option, whose last component ends
+    in a listed test or source extension, or which has a '/' and whose last component holds no kill word. So
+    `test/qac-kill-switch.test.ts` and `kill-notes/README` pass; `pkill`, `/usr/bin/pkill`, `bin/kill`,
+    `scripts/kill-all.sh`, `'kill 4242'` and `--script=x/kill.py` do not. Where the word sits is decided by the
+    caller (path_operand_indexes); this only judges its shape."""
+    text = word.text
+    if word.dynamic or word.subs or word.glob or word.quoted or word.raw != text:
+        return False
+    if not text or text.startswith('-') or not PATH_OPERAND_CHARS.fullmatch(text):
+        return False
+    base = text.rsplit('/', 1)[-1]
+    if not base:
+        return False
+    if base.lower().endswith(PATH_OPERAND_EXTS):
+        return True
+    return '/' in text and not kill_re.search(base)
 RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
@@ -1518,7 +1544,49 @@ def make_analyzer_class(cg):
                 return False  # delta red-team D-F2: main may not use another session's spawns or asks
             return '--pid' in seen and '--reason' in seen
 
+        def path_operand_indexes(self, name, args):
+            """goodqa#16124: indexes of the arguments of an interpreter's program that are only file names, so a kill
+            word inside them (test/qac-kill-switch-ceiling.test.ts) is not read as signalling. The program operand
+            (the script, or the value of -c/-m/-e ...) is never one of them. A word right after an option is not one
+            either (it may be that option's value, as in `node --require ./x.js`), nor the word after `--` or after a
+            shell or interpreter name (a runner executes it), and the option scan gives up on `--` or a cluster it
+            cannot read (`perl -le CODE`), which leaves every word scanned."""
+            if self.script_kill is None or not args:
+                return set()
+            texts = [a.text for a in args]
+            python = name.startswith(('python', 'pypy'))
+            program, i = None, 0
+            while i < len(texts):
+                t = texts[i]
+                if python and PYTHON_NOVALUE_OPT.fullmatch(t):
+                    i += 1
+                elif t in PROGRAM_OPTS:
+                    program = i + 1
+                    break
+                elif t.startswith('-'):
+                    return set()  # `--`, an option that may take a value, or a glued cluster: ambiguous
+                else:
+                    program = i
+                    break
+            if program is None or program >= len(texts):
+                return set()
+            out = set()
+            for j in range(program + 1, len(texts)):
+                prev = texts[j - 1]
+                prev_name = cg.norm_name(prev)
+                if prev.startswith('-') or prev_name in cg.SHELLS or prev_name in cg.INTERPRETERS \
+                        or INTERPRETER_NAME.fullmatch(prev_name):
+                    continue
+                if path_operand(args[j], self.script_kill):
+                    out.add(j)
+            return out
+
         def check_interpreter(self, name, texts, cmd, args=None):
+            if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
+                skip = self.path_operand_indexes(name, args)
+                if skip:
+                    keep = [k for k in range(len(args)) if k not in skip]
+                    texts, args = [texts[k] for k in keep], [args[k] for k in keep]
             texts = self.drop_script_arguments(texts, args)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
