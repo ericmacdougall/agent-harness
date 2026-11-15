@@ -1211,9 +1211,18 @@ class Worker:
                                     "WHERE key=?", ("handed to mail command at %.0f" % got, now, row["key"]))
                 self.led.event(iid, "email-handed", now, n=n, alert_key=payload["alert_key"], delivered_at=got)
                 if payload.get("undelivered_key"):
+                    # adv-4 F3: a failed send stays queued in ops-watch and may land late; the undelivered alert is
+                    # cleared and the ticket gets one note saying so
                     self._insert_effect("clear:" + payload["undelivered_key"], iid, "clear",
                                         {"alert_key": payload["undelivered_key"],
                                          "key": "ahc-clear-" + payload["undelivered_key"]}, now)
+                    item = self.led.item(iid)
+                    if item is not None:
+                        body = ("Escalation %s (critical alert %s) was handed to the mail command late, %d min after "
+                                "it was raised; the email-undelivered alert is cleared." % (
+                                    n, payload["alert_key"], int((got - float(raised_at)) // 60)))
+                        self._insert_notice(iid, json.loads(item["request"]), "email-late-%s" % n, "record", body,
+                                            False, now)
             return
         waited = now - float(raised_at)
         with self.led.tx():

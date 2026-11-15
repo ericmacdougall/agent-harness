@@ -180,5 +180,8 @@ Each escalation that can be mailed gets a `mail` effect.
 - A failed, timed-out, malformed or mismatched answer counts as not delivered.
 - With no receipt 30 minutes after the raise, the escalation fires `email-undelivered` once: a ticket comment and a
   high alert `ahc:email-undelivered:<item>:<n>`.
-- That alert is cleared if the receipt arrives later. Checks stop after 7 days.
+- A failed send stays in ops-watch's `pending_deadman`, and each ops-watch run retries at most 3 sends, oldest
+  first. So a mail can land late, and the daemon keeps re-reading the receipt after `email-undelivered` fires.
+  When the receipt arrives, the alert is cleared and the ticket gets one note saying the mail was handed over
+  late. Checks stop after 7 days.
 - Delivery is at-least-once. An ops-watch crash after the send but before its state save re-sends the mail once.

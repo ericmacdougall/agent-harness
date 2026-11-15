@@ -2010,6 +2010,68 @@ class EmailRouteTests(Base):
                    and a[a.index("--alert-key") + 1].startswith(runner.UNDELIVERED_PREFIX)]
         self.assertEqual(len(cleared), 1)
 
+    def test_failed_oldest_sends_retry_and_land_late_while_newer_keys_wait(self):
+        """adv-4 F3 / v6e AC-19: ops-watch drains at most 3 sends per run, oldest first, and a failed send stays in
+        pending_deadman. Four escalations; the oldest three keep failing, so the fourth is never even tried. When
+        mail recovers, every key lands on a later run: each late one clears its email-undelivered alert with a
+        ticket note, send attempts outnumber deliveries, and no key is delivered twice."""
+        deps = self.deps()
+        gh = deps.gh
+
+        def gh_any_pr(argv, timeout):
+            rc, out, err = gh(argv, timeout)
+            pr = json.loads(out)
+            pr["number"] = int(argv[3])
+            return rc, json.dumps(pr), err
+        deps.gh = gh_any_pr
+        items = []
+        for pr in (11, 12, 13, 14):
+            req = {"repo": REPO, "pr": pr, "head": HEAD, "base": BASE, "packet": str(self.packet),
+                   "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123", "submitted": deps.now + pr}
+            items.append(core.submit(self.paths, self.config, req)["id"])
+            self.run_all(deps)
+        deps.now += runner.bounds(self.config)["block_ack_seconds"] + 1
+        self.run_all(deps)
+        keys = ["ahc:%s:1" % iid for iid in items]
+        sent = []   # (key, ok) per send attempt
+
+        def deadman(argv, t, stdin):
+            key = next((k for k in keys if k in argv[-1]), None)
+            ok = self.mail_mode == "ok"
+            sent.append((key, ok))
+            return (0 if ok else 1, "")
+        cfg = dict(self.cfg, sinks=self.sinks)
+        run = lambda: self.ow.run_once(cfg, self.ops_home, runner=_OpsRunner({("fake-deadman",): deadman}),  # noqa
+                                       checks={}, now=deps.now)
+        self.mail_mode = "fail"
+        for _ in range(3):
+            deps.now += 60
+            run()
+        queued = [e["key"] for e in self.ow.load_state(self.ops_home).get("pending_deadman", [])]
+        self.assertEqual(sorted(queued), sorted(keys), "all four stay queued after failed sends")
+        self.assertEqual({k for k, _ok in sent}, set(queued[:3]), "oldest first, at most 3 per run")
+        self.assertNotIn(queued[3], {k for k, _ok in sent}, "the newest key is never tried while 3 older fail")
+        self.assertEqual(len(sent), 9, "3 attempts per run over 3 runs")
+        deps.now += runner.EMAIL_UNDELIVERED_SECONDS + 1
+        self.run_all(deps)
+        self.run_all(deps)
+        self.assertEqual(len(self.high_raises(deps, runner.UNDELIVERED_PREFIX)), 4, "all four are undelivered")
+        self.mail_mode = "ok"
+        for _ in range(3):
+            deps.now += 60
+            run()
+            self.run_all(deps)
+        delivered = [k for k, ok in sent if ok]
+        self.assertEqual(sorted(delivered), sorted(keys), "every key lands, each exactly once")
+        self.assertGreater(len(sent), len(delivered), "send attempts are counted apart from deliveries")
+        for iid in items:
+            self.assertEqual(self.mail_effect(iid)["status"], "done")
+        cleared = {a[a.index("--alert-key") + 1] for a in deps.ah_calls if a[:3] == ["ah", "alert", "clear"]
+                   and a[a.index("--alert-key") + 1].startswith(runner.UNDELIVERED_PREFIX)}
+        self.assertEqual(len(cleared), 4)
+        late = [b for b in self.bodies(deps) if "handed to the mail command late" in b]
+        self.assertEqual(len(late), 4, "one ticket note per late delivery")
+
     def test_mail_command_timeout_is_not_delivery(self):
         iid, deps, key = self.escalate()
         self.mail_mode = "timeout"
