@@ -921,8 +921,8 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
                    "localappdata": _clip(lad, MAX_CMD) if isinstance(lad, str) else ""})
         base = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
         agent_names, agent_roots = WINDOWS_AGENT_ALLOWED.get(host, (set(), ()))
-        agent = base in agent_names
-        if base not in WINDOWS_ALLOWED and not agent:
+        installed_agent = base in agent_names  # not `agent`: that is the caller's id, used in the notice below
+        if base not in WINDOWS_ALLOWED and not installed_agent:
             rec.update(status="refused", detail="only an orphaned %s%s is stopped on %s, not %s" % (
                 "/".join(sorted(WINDOWS_ALLOWED)),
                 (" or an installed " + "/".join(sorted(agent_names))) if agent_names else "", host,
@@ -931,8 +931,8 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
             rec.update(status="refused", detail="owned by another user (%s)" % (rec["owner"] or "unknown"))
         elif ident["self"]:
             rec.update(status="refused", detail="part of the ssh session running this check")
-        elif agent:
-            leaf = exe.rsplit("\\", 1)[-1].lower() if isinstance(exe, str) else ""
+        elif installed_agent:
+            leaf =exe.rsplit("\\", 1)[-1].lower() if isinstance(exe, str) else ""
             if leaf != base + ".exe" or not _win_under(exe, agent_roots, ident.get("lad")):
                 rec.update(status="refused", detail="%s is not running from a GoodQA agent install directory (%s)" % (
                     base, rec["exe"] or "no executable path"))
