@@ -348,11 +348,15 @@ SAFE_READS = {
     ("org-graph", "asks", "stale"): "fail closed: inbox counts only from a current asks read for the pin, else none",
     ("org-graph", "asks", "ran_at"): "fail closed: no inbox counts before the first asks read",
     ("org-graph", "asks", "health_truth"): "fail closed: no inbox counts unless the asks read is current",
-    ("org-graph", "owners", "restricted_known"): "a change signal only: decides when initiatives republish, not what",
-    ("org-graph", "owners", "restricted_tickets"): "a change signal only: decides when initiatives republish, not what",
+    # PR 262 review F1: also the graph's one ticket visibility rule (org_graph.ticket_visibility), fail closed
+    ("org-graph", "owners", "restricted_known"): "covered: owners is a feed of orggraph (before its read no ticket shows)",
+    ("org-graph", "owners", "restricted_tickets"): "covered: owners is a feed of orggraph (restricted tickets never show)",
     ("org-graph", "initiatives", "publish"): "a change signal only: asks initiatives to republish, reads nothing",
     # the derived Initiatives panel (T243-1)
     ("initiatives", "org-graph", "tickets"): "covered: org-graph (its GoodQA ticket reads) is a feed of initiatives",
+    ("initiatives", "org-graph", "visible_tickets"): "covered: org-graph is a feed of initiatives (visible tickets only)",
+    ("initiatives", "org-graph", "visible"): "covered: org-graph is a feed of initiatives (its visibility rule)",
+    ("initiatives", "org-graph", "visibility_fn"): "covered: org-graph is a feed of initiatives (its visibility rule)",
     ("initiatives", "owners", "rows"): "covered: owners is a feed of initiatives (one row per live owner's ticket)",
     ("initiatives", "owners", "restricted_known"): "covered: owners is a feed of initiatives (before its read, ticketed rows wait)",
     ("initiatives", "owners", "restricted_tickets"): "covered: owners is a feed of initiatives (restricted rows are dropped)",
