@@ -13,6 +13,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -127,6 +128,15 @@ def iso(ts):
     return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
 
 
+def _iso_or_none(ts):
+    """iso() of a value read from a WAL, an index or a cache: None, never an exception, for a value that is not a
+    representable time (PR 245 m3 receipt: one bad timestamp must not abort ah owners after recovery has run)."""
+    try:
+        return iso(ts)
+    except (OverflowError, ValueError, OSError, TypeError):
+        return None
+
+
 def parse_ts(value):
     if not isinstance(value, str):
         return 0.0
@@ -146,7 +156,8 @@ def state_dir(home: Path, *parts) -> Path:
 
 
 def atomic_json(path: Path, data) -> None:
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    # pid first (the stale-tmp cleanup reads it), then a random tag, so two threads of one process never share a tmp
+    tmp = path.with_name(path.name + f".{os.getpid()}.{os.urandom(4).hex()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
         json.dump(data, handle)
@@ -241,13 +252,13 @@ def newest_session(home: Path):
     return best
 
 
-def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" = None) -> dict:
+def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" = None, cache: dict | None = None) -> dict:
     """The owner facts of one agent or task WAL, read incrementally from a cached offset. `tally` (ah owners): lines
     that could not be used are kept in the summary (`skipped`), so a torn line seen once still counts on every later
     call, and a read that fails is an unread source instead of an exception (PR 234 v8, receipt v7 F1)."""
     if tally is not None:
         try:
-            summary = _summarize_agent_wal(path, index_dir)
+            summary = _summarize_cached(path, index_dir, cache)
         except OSError as error:
             tally.missed(f"WAL {path.name[:60]}", error)
             return {"first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
@@ -263,16 +274,25 @@ def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" =
             tally.missed(f"WAL {path.name[:60]}", error)
             tally.wal_trail(path.name, trail, None)
         return summary
-    return _summarize_agent_wal(path, index_dir)
+    return _summarize_cached(path, index_dir, cache)
 
 
-def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
+def _summarize_agent_wal(path: Path, index_dir: Path, prior: dict | None = None) -> dict:
+    """`prior` (PR 245 cold path): the owners cache's last summary of this WAL. It is the starting state in place of the
+    per-WAL index file, and the index file is then not rewritten: the owners cache holds the result. Every check below
+    (schema, record contract, offset, inode and tail hash) applies to it exactly as to an index file."""
     own = path.name[len("agent-"):-len(".jsonl")] if path.name.startswith("agent-") else path.name[:-len(".jsonl")]
     cache = index_dir / ("wal-" + hashlib.sha256(str(path).encode()).hexdigest()[:16] + ".json")
-    try:
-        summary = json.loads(_bounded(cache))
-    except (OSError, ValueError):
-        summary = {}
+    if prior is not None:
+        summary = json.loads(json.dumps(prior))   # a private copy: the cached entry is replaced, never edited in place
+    else:
+        try:
+            summary = json.loads(_bounded(cache))
+        except (OSError, ValueError, RecursionError):
+            summary = {}
+    if not _summary_types_ok(summary):
+        summary = {}   # PR 245 m2 receipt: a field of the wrong type is a corrupt index: rescanned from the start
+    before = json.dumps(summary, sort_keys=True)  # goodqa#15963: rewrite the index only when it changed
     if summary.get("schema", 1) > SCHEMA:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
@@ -293,7 +313,7 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):   # goodqa#15963: a deeply nested line is a lost line, never a crash
             summary["skipped"] += 1  # a complete line that is not a record: kept with the summary, counted every call
             trail.lost()
             continue
@@ -323,7 +343,8 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     summary["skipped_to"] = meta.get("offset", 0)   # the skipped count covers every line before this offset
     summary["lost_trail"] = trail.state()   # and the evidence for each lost line, for the shared window rule
     summary["record_rule"] = _prov().RECORD_RULE   # every record in this summary passed this contract
-    atomic_json(cache, summary)
+    if prior is None and json.dumps(summary, sort_keys=True) != before:
+        atomic_json(cache, summary)
     return summary
 
 
@@ -339,8 +360,40 @@ def subagent_dirs(home: Path, session: str) -> list:
     return out
 
 
-def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = None,
+def transcript_mtimes(home: Path, session: str, dirs: list | None = None, tally: "ReadTally | None" = None) -> dict:
+    """agent id -> newest mtime of its `agent-<id>.jsonl` transcript across every project's subagents directory.
+    One scandir per directory that exists (goodqa#15963): the per-agent probe was agents x project dirs stat
+    calls (about 1.4M, 9.8 s, on a 2,373-agent session over 590 project dirs). DirEntry.stat follows symlinks, as
+    the os.stat it replaces did, so the values are identical. `tally`: a transcript that is listed but cannot be
+    stat'ed is unread (its activity time is unknown), as in transcript_mtime; a folder that cannot be listed is
+    reported by discover_agents, which lists the same folders, so it is not named twice."""
+    out: dict = {}
+    for directory in (dirs if dirs is not None else subagent_dirs(home, session)):
+        try:
+            with os.scandir(directory) as it:
+                for e in it:
+                    name = e.name
+                    if not (name.startswith("agent-") and name.endswith(".jsonl")):
+                        continue
+                    agent = name[6:-6]
+                    try:
+                        mtime = e.stat().st_mtime
+                    except OSError as error:
+                        if tally is not None:
+                            tally.missed(f"transcript {agent[:40]}", error)
+                        continue
+                    if mtime > out.get(agent, 0.0):
+                        out[agent] = mtime
+        except OSError:
+            continue
+    return out
+
+
+def transcript_mtime(home: Path, session: str, agent: str, dirs=None,
                      tally: "ReadTally | None" = None) -> float:
+    """One agent's newest transcript mtime; `dirs` may be the transcript_mtimes() map (the fast path)."""
+    if isinstance(dirs, dict):
+        return dirs.get(agent, 0.0)
     best = 0.0
     for directory in (dirs if dirs is not None else subagent_dirs(home, session)):
         try:
@@ -354,7 +407,200 @@ def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = N
 RESTRICTED = re.compile(r"\b(solve|interview)", re.I)  # fail-closed: show liveness only, never the task text
 
 
-def discover_agents(home: Path, session: str, wal: Path, unread: list | None = None) -> dict:
+# ---- one combined, fingerprinted read cache per session (goodqa#15963)
+# Each agent WAL and transcript meta file keeps its own per-file state (the per-file index above, keyed on inode,
+# offset and tail hash). This cache only lets an UNCHANGED file (same inode, size and mtime_ns) skip being opened:
+# one read of one file instead of ~2.4k index reads, 2.4k WAL tail checks and 2.4k meta reads per call.
+OWNERS_CACHE_SCHEMA = 2  # 2: fingerprints carry ctime_ns; the summary carries PR 234's lost-line evidence
+# Bump SUMMARY_FORMAT whenever summarize_agent_wal or the meta fields change shape: unchanged files would otherwise
+# keep serving old-shape summaries from this cache (review B-2). The cache is valid only for the same pair.
+# PR 234 merge: the summary also carries skipped, skipped_to, lost_trail and record_rule, and the cache key includes the
+# record contract (provenance.RECORD_RULE), so a summary built under another contract is never served from here.
+SUMMARY_FORMAT = ("wal:first,last_at,outcome,outcome_at,last_note,tickets,events,skipped,skipped_to,lost_trail,record_rule;"
+                  "meta:type,description,parent,finished,depth")
+
+
+def _cache_format() -> list:
+    return [SCHEMA, SUMMARY_FORMAT, _prov().RECORD_RULE]
+
+
+def _fingerprint(st) -> list:
+    # ctime too (PR 234 merge): chmod 0 changes neither size nor mtime, and a file this call can no longer read must be
+    # read (and reported unread), never served from the cache as a whole read
+    return [st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
+
+
+def _owners_cache_path(index_dir: Path, session: str) -> Path:
+    return index_dir / ("owners-" + hashlib.sha256(session.encode()).hexdigest()[:16] + ".json")
+
+
+def _load_owners_cache(path: Path) -> dict:
+    try:
+        data = json.loads(_bounded(path))
+    except (OSError, ValueError, RecursionError):   # review B-5: a nested cache file is rebuilt, never fatal
+        data = None
+    if not isinstance(data, dict) or data.get("schema") != OWNERS_CACHE_SCHEMA \
+            or data.get("format") != _cache_format():
+        data = {}  # missing, corrupt or another version: rebuilt from the per-file state, never trusted
+    return {"schema": OWNERS_CACHE_SCHEMA, "wal": data.get("wal") if isinstance(data.get("wal"), dict) else {},
+            "meta": data.get("meta") if isinstance(data.get("meta"), dict) else {}, "dirty": False, "seen": set(),
+            "path": path, "misses": 0, "started": time.monotonic()}
+
+
+def _save_owners_cache(path: Path, cache: dict, prune: bool = True) -> None:
+    """prune=False is the in-run progress save (R8): a deadline that interrupts a cold run still leaves the files
+    read so far cached; only the final save drops entries for files this call no longer saw."""
+    seen = cache["seen"]
+    stale = [k for part in ("wal", "meta") for k in cache[part] if k not in seen] if prune else []
+    if not cache["dirty"] and not stale:
+        return
+    if prune:
+        for part in ("wal", "meta"):
+            cache[part] = {k: v for k, v in cache[part].items() if k in seen}
+    cache["dirty"] = False
+    try:
+        atomic_json(path, {"schema": OWNERS_CACHE_SCHEMA, "format": _cache_format(), "wal": cache["wal"],
+                           "meta": cache["meta"]})
+    except OSError:
+        pass  # a cache that cannot be saved costs time on the next call, never correctness
+
+
+def _cleanup_stale_tmp(index_dir: Path, now: float) -> None:
+    """Remove `<name>.json.<pid>[.<tag>].tmp` left by an interrupted atomic_json: over an hour old and its pid gone
+    (M1). Best effort: nothing in here may fail the owners read (review B-1: an out-of-range pid raised OverflowError)."""
+    try:
+        _cleanup_stale_tmp_inner(index_dir, now)
+    except Exception:  # noqa: BLE001 - cleanup is housekeeping, never a reason to fail `ah owners`
+        pass
+
+
+def _cleanup_stale_tmp_inner(index_dir: Path, now: float) -> None:
+    try:
+        entries = list(os.scandir(index_dir))
+    except OSError:
+        return
+    for e in entries:
+        m = re.fullmatch(r".+\.json\.(\d{1,7})(?:\.[0-9a-f]{1,32})?\.tmp", e.name)
+        if not m:
+            continue
+        try:
+            if now - e.stat(follow_symlinks=False).st_mtime < 3600:
+                continue
+            pid = int(m.group(1))
+            try:
+                os.kill(pid, 0)
+                continue  # still running: its write may be in flight
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue
+            os.unlink(e.path)
+        except (OSError, ValueError):
+            continue
+
+
+OWNERS_CACHE_SAVE_EVERY = 300  # a cold run interrupted by tier_gate's deadline still keeps its progress (R8)
+OWNERS_CACHE_SAVE_GAP_S = 1.5  # and saves it at most this often (tier_gate's deadline is 4 s)
+
+
+_NUM = (int, float)
+
+
+_TIME_MAX = 253402300799.0   # 9999-12-31T23:59:59Z: every summary number is a time or a count well below it
+
+
+def _num(v) -> bool:
+    """A finite number in range (PR 245 m3 receipt): inf, nan, 1e300 and ints float() cannot hold are not."""
+    if not isinstance(v, _NUM) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(float(v)) and abs(v) <= _TIME_MAX
+    except OverflowError:
+        return False
+
+
+def _count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 2 ** 63
+
+
+# every field a summary (a per-WAL index file or an owners-cache entry) may hold, with the type its readers assume
+_SUMMARY_FIELDS = {
+    "schema": _count, "first": lambda v: v is None or isinstance(v, str), "last_at": _num,
+    "outcome": lambda v: v is None or isinstance(v, str), "outcome_at": _num, "last_note": lambda v: isinstance(v, str),
+    "tickets": lambda v: isinstance(v, list) and all(isinstance(t, str) for t in v), "events": _count,
+    "skipped": _count, "skipped_to": _count, "record_rule": lambda v: isinstance(v, str),
+    "lost_trail": lambda v: _prov().LostTrail.from_state(v) is not None,
+    "meta": lambda m: isinstance(m, dict) and all(k not in m or check(m[k]) for k, check in (
+        ("offset", _count), ("inode", _count), ("tail", lambda t: isinstance(t, str)))),
+}
+_SUMMARY_REQUIRED = ("first", "last_at", "outcome", "outcome_at", "last_note", "tickets", "events", "skipped", "meta",
+                     "lost_trail", "record_rule")
+
+
+def _summary_types_ok(s) -> bool:
+    """Every field present has the type its readers assume (PR 245 m2 receipt). A loaded index or cache entry that
+    fails is evidence of nothing: it is rebuilt from the WAL, never a TypeError or ValueError on every later call."""
+    return isinstance(s, dict) and all(k not in s or check(s[k]) for k, check in _SUMMARY_FIELDS.items())
+
+
+def _cached_summary_ok(s) -> bool:
+    """A cached summary is served only with every field owners() and the tally read, each of its type (PR 245 m1 F2,
+    m2): an empty, partial or hand-edited entry is rebuilt from the WAL."""
+    return _summary_types_ok(s) and all(k in s for k in _SUMMARY_REQUIRED) and s.get("record_rule") == _prov().RECORD_RULE
+
+
+_META_FIELDS = ("type", "description", "parent", "finished", "depth")
+
+
+def _cached_meta_ok(m) -> bool:
+    """The cached meta fields are exactly what a fresh read stores (values as the meta file gave them)."""
+    return isinstance(m, dict) and set(m) == set(_META_FIELDS) and isinstance(m.get("finished"), bool)
+
+
+def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
+    """_summarize_agent_wal, served from the owners cache while the file is unchanged (same inode, size, mtime_ns).
+    Only the file's own facts are cached: what depends on the time of this call (an unterminated tail still inside
+    the append grace) is decided by summarize_agent_wal on every call, cache hit or not."""
+    if cache is None:
+        return _summarize_agent_wal(path, index_dir)
+    key = str(path)
+    cache["seen"].add(key)
+    try:
+        fp = _fingerprint(os.stat(path))
+    except OSError:
+        fp = None
+    try:   # PR 245 m3 receipt: the validation of cached state runs inside the miss handler too
+        entry = cache["wal"].get(key)
+        if fp and isinstance(entry, dict) and entry.get("fp") == fp and _cached_summary_ok(entry.get("s")):
+            return entry["s"]
+        # PR 245 cold path: a WAL the owners cache already summarised (it changed since) continues from that summary
+        # and skips the per-WAL index file, read and write; only a WAL the cache has never held goes through the index
+        prior = entry["s"] if isinstance(entry, dict) and _cached_summary_ok(entry.get("s")) else None
+        summary = _summarize_agent_wal(path, index_dir, prior) if prior is not None else _summarize_agent_wal(path, index_dir)
+        if not _cached_summary_ok(summary):
+            raise ValueError("summary failed its own shape check")
+    except (AhError, OSError):
+        raise   # a newer schema is never swallowed; an unreadable WAL is the file's own failure and reaches the tally
+    except Exception:  # noqa: BLE001 - PR 245 m2/m3 receipts: any other failure using cached state is a cache miss
+        # the entry is dropped, the WAL is read again from the start (an empty prior: no index file, no cache) and the
+        # rebuilt summary replaces the entry, so a corrupt entry costs one rescan and never fails a later call
+        cache["wal"].pop(key, None)
+        summary = _summarize_agent_wal(path, index_dir, {})
+    if fp:
+        cache["wal"][key] = {"fp": fp, "s": summary}
+        cache["dirty"] = True
+        cache["misses"] += 1
+        # R8 progress save, at most one per OWNERS_CACHE_SAVE_GAP_S: each save writes the whole cache, so a count-only
+        # trigger made a fresh 2,400-agent run write it 7 times (3.5 s of 8.6 s on t2-dev)
+        if cache["misses"] % OWNERS_CACHE_SAVE_EVERY == 0 \
+                and time.monotonic() - cache.get("saved_at", cache["started"]) >= OWNERS_CACHE_SAVE_GAP_S:
+            _save_owners_cache(cache["path"], cache, prune=False)
+            cache["saved_at"] = time.monotonic()
+    return summary
+
+
+def discover_agents(home: Path, session: str, wal: Path, unread: list | None = None,
+                    cache: dict | None = None) -> dict:
     """agent id -> {type, description, parent, finished, tmtime} from the two sources that exist for every
     sub-agent (the main WAL only lists the few types whose spawn is hooked): task WALs and transcript meta files.
     `unread` collects each place that exists but could not be read, so the caller can say its list may be short."""
@@ -383,15 +629,28 @@ def discover_agents(home: Path, session: str, wal: Path, unread: list | None = N
                             agent = e.name[6:-10]
                             info = found.setdefault(agent, {})
                             try:  # the meta file only: transcript content is never read here
-                                if e.stat().st_size > 65536:   # PR 234 v8: not read is unread, never silently typeless
+                                st = e.stat()
+                                if st.st_size > 65536:   # PR 234 v8: not read is unread, never silently typeless
                                     unread.append({"source": f"agent meta {agent[:40]}", "reason": "over 64 KiB: not read"})
                                     continue
-                                meta = json.loads(_bounded(Path(e.path), 65536))
-                                if not isinstance(meta, dict):
-                                    raise ValueError("not an object")
-                                info.update(type=meta.get("agentType"), description=meta.get("description"),
-                                            parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
-                                            depth=meta.get("spawnDepth"))
+                                fields = None
+                                if cache is not None:   # goodqa#15963: an unchanged meta file is not opened again
+                                    cache["seen"].add(e.path)
+                                    hit = cache["meta"].get(e.path)
+                                    if isinstance(hit, dict) and hit.get("fp") == _fingerprint(st) \
+                                            and _cached_meta_ok(hit.get("m")):
+                                        fields = hit["m"]
+                                if fields is None:   # only a meta file read whole is cached; a failure is read again
+                                    meta = json.loads(_bounded(Path(e.path), 65536))
+                                    if not isinstance(meta, dict):
+                                        raise ValueError("not an object")
+                                    fields = dict(type=meta.get("agentType"), description=meta.get("description"),
+                                                  parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
+                                                  depth=meta.get("spawnDepth"))
+                                    if cache is not None:
+                                        cache["meta"][e.path] = {"fp": _fingerprint(st), "m": fields}
+                                        cache["dirty"] = True
+                                info.update(fields)
                             except (OSError, ValueError, RecursionError) as error:
                                 missed(f"agent meta {agent[:40]}", error)
                 except OSError as error:
@@ -412,6 +671,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     if not main.is_file():
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
     index_dir = state_dir(home, "ah-index")
+    cache_path = _owners_cache_path(index_dir, session)
+    cache = _load_owners_cache(cache_path)
+    _cleanup_stale_tmp(index_dir, now)
     spawned, stopped, named, stop_at = {}, set(), [], {}
     tally = ReadTally()   # PR 234 v8: what this view actually read; the read block is built from it alone
     tally.window = _prov().LostWindow(now - OWNERS_RECENT_S)   # the default view's window (shown_owner)
@@ -439,20 +701,20 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                 stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
     tally.read_ok += 1
     unread = tally.unread  # places that exist but could not be read: the owner list may be short (goodqa#15920)
-    for agent, meta in discover_agents(home, session, wal, unread).items():
+    for agent, meta in discover_agents(home, session, wal, unread, cache).items():
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished", "depth") if k in meta})
     led = _ledger(home, tally=tally)  # one read per call
     registered = {r["args"].get("owner_agent") for r in led if r.get("op") == "task.register"}
     pending = pending_stops(home, session, led)
-    sub_dirs = subagent_dirs(home, session)
+    sub_dirs = transcript_mtimes(home, session, tally=tally)  # one scan of the subagents dirs, not one stat per agent per dir
     named_text = "\n".join(named)
     rows = []
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
         if path.is_file():
-            summary = summarize_agent_wal(path, index_dir, tally)
+            summary = summarize_agent_wal(path, index_dir, tally, cache)
         else:
             if os.path.lexists(path):   # PR 234 v8: there, but not a WAL that can be read (a directory, a link)
                 tally.unread.append({"source": f"WAL {path.name[:60]}", "reason": "not a regular file"})
@@ -477,10 +739,10 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "owner": bool(is_owner), "registered": agent in registered,
                "flags": (["unregistered-owner"] if is_owner and agent not in registered else []),
                "state": verdict["state"], "severity": verdict["severity"],
-               "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
+               "last_activity": _iso_or_none(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
                "ticket_comment_age_s": None,
-               "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+               "result_at": _iso_or_none(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
@@ -498,7 +760,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         except OSError as error:
             unread.append({"source": f.name, "reason": f"file-unreadable: {type(error).__name__}"})
             continue
-        summary = summarize_agent_wal(f, index_dir, tally)
+        summary = summarize_agent_wal(f, index_dir, tally, cache)
         verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
         idle = verdict["idle_s"]
         text = summary["first"] or ""
@@ -506,9 +768,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         rows.append({"agent_id": name, "type": "task-wal", "task": None if restricted else text, "restricted": restricted,
                      "parent": None, "owner": True, "registered": name in registered, "flags": ["task-wal"],
                      "state": verdict["state"], "severity": verdict["severity"],
-                     "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
+                     "last_activity": _iso_or_none(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
-                     "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+                     "result_at": _iso_or_none(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                      "active_1h": now - summary["last_at"] <= 3600})
     asks = ask_states(main, tally)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
@@ -670,6 +932,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for r in rows:
         tally.place(f"{r['agent_id']}.jsonl" if r.get("type") == "task-wal" else f"agent-{r['agent_id']}.jsonl",
                     shown_owner(r))
+    _save_owners_cache(cache_path, cache)
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
             "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
             "deadlines": dls,

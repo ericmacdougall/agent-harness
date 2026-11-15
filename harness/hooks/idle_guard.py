@@ -112,7 +112,7 @@ def assess(home: Path, session: str, now: float | None = None, idle_minutes: flo
     limit = (idle_min() if idle_minutes is None else idle_minutes) * 60
     data = ah.owners(home, session, now=now)
     rows = data.get("owners") or []
-    dirs = ah.subagent_dirs(home, session)
+    dirs = ah.transcript_mtimes(home, session)  # goodqa#15963: one scan, not agents x project dirs stat calls
     progress = main_progress(ah.session_dir(home, session))
     streams, returned, user_waiters, active = [], [], 0, 0
     for r in rows:
