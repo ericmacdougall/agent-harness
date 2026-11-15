@@ -151,6 +151,28 @@ test('a load begun before a later reopen is superseded at once: its answer insta
   assert.equal(store.getState().connection, 'live');
 });
 
+test('review v3 F5: after the install, a stream message the snapshot already covers is dropped, a newer one applies', async () => {
+  const es = sources[0];
+  es.emit('error');
+  es.emit('open');
+  const load = await nextFetch();
+  // the state answer overtakes stream frames still on their way on the other connection: its stamp is ahead of them
+  const ahead = { generation: server.generation, revision: server.revision + 5 };
+  load.answer(snapshot('snap-ahead', ahead));
+  await wait(20);
+  assert.equal(store.getState().connection, 'live');
+  es.send('ledger', ledger('older-frame', 'BLOCKED'), `${server.generation}.${ahead.revision - 1}`);
+  assert.deepEqual(goals(), ['snap-ahead'], 'an older frame delivered after the install regressed the page');
+  es.send('ledger', ledger('equal-frame', 'BLOCKED'), `${server.generation}.${ahead.revision}`);
+  assert.deepEqual(goals(), ['snap-ahead'], 'a frame at the snapshot revision is already in it');
+  es.send('ledger', ledger('unstamped-frame', 'BLOCKED'), '');
+  assert.deepEqual(goals(), ['snap-ahead'], 'an unstamped frame was applied');
+  assert.equal(store.getState().connection, 'live');
+  es.send('ledger', ledger('newer-frame', 'BLOCKED'), `${server.generation}.${ahead.revision + 1}`);
+  assert.deepEqual(goals(), ['newer-frame']);
+  server.revision = ahead.revision + 1;
+});
+
 test('a live stream message from another server process marks the page not live and re-reads the state', async () => {
   const es = sources[0];
   assert.equal(store.getState().connection, 'live');

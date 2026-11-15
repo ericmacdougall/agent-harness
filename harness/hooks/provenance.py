@@ -723,7 +723,9 @@ def _lost_line(line: bytes, needles) -> int:
     if len(line) > MAX_LINE:
         return 1
     try:
-        return 0 if isinstance(loads_line(line), dict) else 1
+        # review PR 257 v3 F6: a JSON value is a record only when the shared validator accepts it. An object with no
+        # event, a non-string or empty event, or a bad `at` is lost to every reader, as wal_record_problem says.
+        return 1 if wal_record_problem(loads_line(line)) else 0
     except ValueError:
         pass
     # A broken line whose first field names its event can be classified: a whole other event name (`"event":"result"`)

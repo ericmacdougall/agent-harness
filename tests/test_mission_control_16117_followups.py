@@ -27,7 +27,11 @@ TORN = ('{"event":"a', '{"event":"req', "not-json")
 LOST = {'{"event":"a': ("asks",), '{"event":"req': ("requirements",), "not-json": ("requirements", "asks"),
         '{"event":"': ("requirements", "asks"), '{"at":"2026-11-15T00:00:00Z","event":"as': ("requirements", "asks"),
         '{"event":"ask_res': ("asks",), '{"event":"result","note":"x': (), '{"event":"res': (),
-        '{"event":"requirement_x","n': (), '{"event":"asking': ()}
+        '{"event":"requirement_x","n': (), '{"event":"asking': (),
+        # review v3 F6: a JSON object the shared record validator rejects is lost to every producer, as a torn line is
+        "{}": ("requirements", "asks"), '{"event":null}': ("requirements", "asks"), '{"event":3}': ("requirements", "asks"),
+        '{"event":""}': ("requirements", "asks"), '{"ok":1}': ("requirements", "asks"),
+        '{"event":"note","at":"not-a-time"}': ("requirements", "asks")}
 
 
 class LostLinesWithoutTheNeedle(unittest.TestCase):
@@ -101,7 +105,16 @@ class LostLinesWithoutTheNeedle(unittest.TestCase):
         home = Home(self)
         path = home.main
         home.append(path, "[1,2]\n7\n{\"ok\":1}\n" + "x" * 64 + "\n", age=OLD)
-        self.assertEqual(prov.lost_lines_without(path, (b'"requirement"',)), 3)  # a list, a number, a non-JSON line
+        # a list, a number, an object with no event (review v3 F6: it fails the shared validator), a non-JSON line
+        self.assertEqual(prov.lost_lines_without(path, (b'"requirement"',)), 4)
+
+    def test_an_invalid_object_in_an_agent_wal_is_lost_for_asks(self):  # review v3 F6, producer level
+        for text in ('{}', '{"event":null}', '{"agent":"a","note":"n","status":"s"}'):
+            with self.subTest(line=text):
+                home = Home(self)
+                home.append(home.agent, text + "\n", age=OLD)
+                read = self.asks(home)
+                self.assertEqual((read["state"], read["skipped"]), ("partial", 1), read)
 
 
 class InitiativesRecoverWithoutAChange(unittest.TestCase):

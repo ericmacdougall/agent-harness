@@ -7,6 +7,8 @@ const listeners = new Map();
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }), addEventListener() {} };
 globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 globalThis.document.getElementById = () => null;
+// Stamped as the server stamps them (goodqa#16117, PR 257 v3 F5: an unstamped message is never applied).
+const GENERATION = '0123456789abcdef'; let revision = 0;
 const fetches = []; const sources = [];
 let timers = 0;
 const realSet = globalThis.setTimeout;
@@ -16,10 +18,10 @@ class FakeES {
   constructor(url) { this.url = url; this.readyState = 1; this.l = {}; sources.push(this); }
   addEventListener(t, f) { this.l[t] = f; }
   close() { this.readyState = 2; }
-  emit(t, data) { this.l[t]?.(data === undefined ? {} : { data: JSON.stringify(data) }); }
+  emit(t, data) { this.l[t]?.(data === undefined ? {} : { data: JSON.stringify(data), lastEventId: `${GENERATION}.${++revision}` }); }
 }
 globalThis.EventSource = FakeES;
-const state = { version: '1', host: 'h', csrf: 'c', initiatives: { items: [] }, owners: [], health: [], events: [], chat: { messages: [], replies: [], targets: [] }, asks: { items: [] },
+const state = { version: '1', host: 'h', csrf: 'c', stream: { generation: GENERATION, revision: 0 }, initiatives: { items: [] }, owners: [], health: [], events: [], chat: { messages: [], replies: [], targets: [] }, asks: { items: [] },
   ledger: { goals: { items: [{ id: 'g', title: 'T', state: 'LIVE_TESTED' }] }, requirements: { items: [] }, status: {} } };
 globalThis.fetch = async url => { fetches.push(String(url)); return { ok: true, status: 200, json: async () => state }; };
 

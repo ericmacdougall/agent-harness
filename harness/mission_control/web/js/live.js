@@ -38,52 +38,80 @@ function snapshotStamp(stream) {
   const generation = stream?.generation, revision = stream?.revision;
   return typeof generation === 'string' && generation && Number.isSafeInteger(revision) && revision >= 0 ? { generation, revision } : null;
 }
-// Newer than the installed snapshot: same server process, later revision. Without both stamps nothing is newer.
-function supersedes(stamp, snapshot) {
-  return !!stamp && !!snapshot && stamp.generation === snapshot.generation && stamp.revision > snapshot.revision;
-}
-
-// `snapshot` is the stamp of the snapshot just installed: only what supersedes it replays. Without one (the load
-// failed, timed out or was refused, so nothing was installed) everything held is still the newest data and replays.
-function replayHeld(gen, snapshot) {
-  if (gen !== loadGen) return;  // a newer load holds the stream now; it replays what it holds
-  const queue = held || [];
-  held = null;
-  for (const [apply, data, stamp] of queue) {
-    if (snapshot === undefined || supersedes(stamp, snapshot)) apply(data);
+// review PR 257 v3 F5: the one ordering check, for every stream message, held or not, against the installed
+// snapshot. A message from the snapshot's process applies only when its revision is higher; one at or below it is
+// already in the snapshot (the state answer can overtake frames still on their way on the other connection). A
+// message from another process applies, and the page is not live until that process's state is read. With no stamp
+// on either side there is no ordering, and nothing applies.
+function offer(apply, data, stamp) {
+  if (!stamp || !installed) return;
+  if (stamp.generation === installed.generation) {
+    if (stamp.revision > installed.revision) apply(data);
+    return;
+  }
+  apply(data);
+  if (!otherProcess) {
+    otherProcess = true;
+    setConnection('reconnecting');
+    resync();
   }
 }
 
+// What a load held goes through offer() against whatever snapshot is installed now: the new one after an install, the
+// previous one when the load failed, timed out or was refused.
+function replayHeld(gen) {
+  if (gen !== loadGen) return;  // a newer load holds the stream now; it replays what it holds
+  const queue = held || [];
+  held = null;
+  for (const [apply, data, stamp] of queue) offer(apply, data, stamp);
+}
+
+async function readState(signal) {
+  const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' }, signal });
+  if (response.status === 401 || response.status === 403) return { expired: true };
+  if (!response.ok) throw new Error(`state ${response.status}`);
+  return { state: await response.json() };
+}
+
+// review PR 257 v3 F3: the deadline is authoritative. The whole read (fetch and body) is raced against it, so a fetch
+// or json() that ignores the abort, or a browser without AbortController, still ends the load at the deadline: it
+// throws, and the caller's retry and backoff run. A timed-out load is superseded (loadGen moves on), so its late
+// answer is never looked at. A superseded load returns false and never throws, so it never schedules a retry.
 async function loadState() {
   const gen = ++loadGen;
   held = [];  // a superseded load's buffer is dropped: this snapshot is taken after all of it arrived
-  let state;
   const abort = typeof AbortController === 'function' ? new AbortController() : null;
-  const timer = setTimeout(() => {
-    abort?.abort();
-    if (gen === loadGen) replayHeld(gen);  // even when the fetch ignores the abort, the stream is released
-  }, stateTimeoutMs);
+  let timer = 0;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => { abort?.abort(); reject(new Error('state load timed out')); }, stateTimeoutMs);
+  });
+  const reading = readState(abort?.signal);
+  reading.catch(() => {});  // a read that lost the race settles, or not, unobserved
+  let result;
   try {
-    const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' }, signal: abort?.signal });
-    if (gen !== loadGen) return false;  // superseded while in flight
-    if (response.status === 401 || response.status === 403) { replayHeld(gen); setConnection('expired'); return false; }
-    if (!response.ok) throw new Error(`state ${response.status}`);
-    state = await response.json();
-    if (gen !== loadGen) return false;
-    if (!held) throw new Error('state load timed out');  // released by the timeout: this answer is older than what was shown
-    installState(state);
+    result = await Promise.race([reading, deadline]);
   } catch (error) {
-    replayHeld(gen);  // the held stream updates are still the newest data; the stream is never left held
+    if (gen !== loadGen) return false;
+    replayHeld(gen);  // nothing installed: the held updates go through the ordering check against what is shown
+    loadGen += 1;     // and this load is over: whatever it answers later is superseded
     throw error;
   } finally {
     clearTimeout(timer);
   }
-  replayHeld(gen, installed);  // then what the stream sent after the snapshot was taken, in order
+  if (gen !== loadGen) return false;  // superseded while in flight
+  if (result.expired) { replayHeld(gen); setConnection('expired'); return false; }
+  try {
+    installState(result.state);
+  } catch (error) {
+    replayHeld(gen);
+    throw error;
+  }
+  replayHeld(gen);  // then what the stream sent after the snapshot was taken, in order
   return true;
 }
 
 function installState(state) {
-  installed = snapshotStamp(state.stream);  // null (unstamped) replays nothing held
+  installed = snapshotStamp(state.stream);  // null (unstamped): no stream message applies until a stamped install
   otherProcess = false;
   csrf = typeof state.csrf === 'string' ? state.csrf : '';
   setHost(state.host);
@@ -104,14 +132,9 @@ function deliver(apply) {
     if (!data) return;
     const stamp = messageStamp(message);
     if (held) { held.push([apply, data, stamp]); return; }
-    apply(data);
-    // The server restarted between the state read and this stream (or the stream reopened on a new process without a
-    // drop the page saw): the rest of the page is the old process's. Not live until this process's state is read.
-    if (stamp && installed && stamp.generation !== installed.generation && !otherProcess) {
-      otherProcess = true;
-      setConnection('reconnecting');
-      resync();
-    }
+    // A message from another process: the server restarted between the state read and this stream (or the stream
+    // reopened on a new process without a drop the page saw). offer() applies it and re-reads the state.
+    offer(apply, data, stamp);
   };
 }
 
@@ -166,7 +189,8 @@ function resync(delay = 300) {
     try {
       if (await loadState() && failures === 0) setConnection('live');
     } catch {
-      if (failures === 0 && source) resync(Math.min(30000, delay * 4));
+      // a failed or timed-out read: the page is not live, and it tries again, backing off, while the stream stays open
+      if (failures === 0 && source) { setConnection('reconnecting'); resync(Math.min(30000, delay * 4)); }
     }
   }, delay);
 }
