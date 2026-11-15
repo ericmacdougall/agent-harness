@@ -50,6 +50,7 @@ export function mountActivity() {
       }
     });
     if (previousScroll > 16) list.scrollTop = previousScroll + list.scrollHeight - previousHeight;
+    // held: the first sentence is about this page's filters over events on hand
     if (!events.length) list.append(el('p', 'empty-state', source.length ? 'No work items match. Choose an event kind above, or show tool activity.' : feedEmpty(state)));
     quiet.setAttribute('aria-pressed', String(state.showQuiet));
     quiet.textContent = state.showQuiet ? 'Hide tool activity' : 'Show tool activity';
@@ -67,6 +68,7 @@ export function mountActivity() {
       pending.push(state.lastEvent);
       if (!announceTimer) announceTimer = setTimeout(() => {
         const latest = pending.at(-1);
+        // held: the events this page received since the last announcement
         if (!document.hidden && !getState().feedPaused) document.getElementById('activity-announcer').textContent = `${pending.length} new ${pending.length === 1 ? 'signal' : 'signals'}. Latest: ${latest.summary}`;
         pending = []; announceTimer = null;
       }, 4500);

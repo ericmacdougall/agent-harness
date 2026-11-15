@@ -1,5 +1,6 @@
 // Views: layout order, hostile text, bounded rows, coverage, no innerHTML (goodqa#15920 AC-3, AC-4, AC-7, AC-8, AC-9).
 import test from 'node:test';
+import { withReads, healthRows } from './reads.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { created, text, walk } from './dom-shim.mjs';
@@ -225,8 +226,10 @@ test('the scene loads only through a guarded dynamic import, so a missing WebGL 
 });
 
 test('a repaint never pulls a focused control away or loses an open details element', () => {
+  // review PR 234 v6 F3: the section is rebuilt and focus goes back to the same control; no path skips the repaint
   const views = readFileSync(`${here}js/views.js`, 'utf8');
-  assert.match(views, /box\.contains\(document\.activeElement\)[^\n]*return/);
+  assert.doesNotMatch(views, /box\.contains\(document\.activeElement\)[^\n]*return/);
+  assert.match(views, /refocus\(box, key, caret\)/);
   assert.match(views, /details\[open\]/);
 });
 
@@ -278,8 +281,8 @@ test('textual evidence from the producer is shown on the requirement row', () =>
 
 
 // review PR 234 v2 F2: a status read that missed WALs never reads as healthy, and never says "No blockers recorded" bare.
-const HEALTHY = sources(['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'].map(name => ({ name, status: 'ok', checked: NOW / 1000, ok_at: NOW / 1000, truth: 'current' })));
-const partial = (unread, extra = {}) => ({ now: NOW, connection: 'live', events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
+const HEALTHY = sources(healthRows(NOW / 1000));
+const partial = (unread, extra = {}) => withReads({ now: NOW, connection: 'live', events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
   asksStale: [], asksSweptAt: '', initiativesStale: false, initiativesError: '', sessions: [], sources: HEALTHY,
   ledger: ledger({ status: { blockers: [], verified: [], incomplete: unread.count !== 0, unread, at: iso(1), truth: unread.count !== 0 ? 'partial' : 'current', ...extra } }) });
 

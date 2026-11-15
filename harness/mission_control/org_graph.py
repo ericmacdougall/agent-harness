@@ -26,6 +26,7 @@ import stat
 import time
 from pathlib import Path
 
+import collectors as col
 import events as ev
 from safeio import Refused, TICKET_RE
 
@@ -510,17 +511,17 @@ def diff(previous: dict | None, current: dict, now: float) -> list:
 
 # ---------------------------------------------------------------- the collector
 
-class OrgGraph:
-    """Collector-shaped (name, interval, run via collectors.Collector) so server.py ticks it with the others."""
+class OrgGraph(col.Collector):
+    """A Collector (PR 234 v7): its Health row is its read envelope and FEEDS names what its snapshot rests on."""
     name = "org-graph"
     interval = 5.0
     idle_interval = 60.0
+    read_budget = 25.0   # one `ah ticket get` (20 s) plus the transcript and escalation reads
 
     def __init__(self, hub, health, runner, *, owners_fn, session_fn, transcripts: Transcripts,
                  escalation_root: Path | None, host: str, inbox_fn=None):
-        from collectors import Collector  # noqa: PLC0415 - avoid an import cycle at module load
-        self._base = Collector(hub, health)
-        self.hub, self.health, self.runner = hub, health, runner
+        super().__init__(hub, health)
+        self.runner = runner
         self.owners_fn, self.session_fn = owners_fn, session_fn
         self.transcripts, self.escalation_root, self.host = transcripts, escalation_root, host
         self.inbox_fn = inbox_fn or (lambda: (0, 0))
@@ -537,28 +538,6 @@ class OrgGraph:
         self.escalation_cache: tuple[float, dict] = (0.0, {})
         self.seq = 0
         self.helpers = helper_types()
-
-    # Collector protocol, delegated so `due`, `wake` and `run` keep one implementation.
-    @property
-    def next_at(self):
-        return self._base.next_at
-
-    def due(self, now):
-        return self._base.due(now)
-
-    def wake(self, now):
-        self._base.wake(now)
-
-    def run(self, now):
-        base = self._base
-        base.next_at = now + (self.interval if base.watched() else max(self.interval, self.idle_interval))
-        base.ran_at = now
-        try:
-            self.health.ok(self.name, self.tick(now))
-        except Refused as exc:
-            self.health.error(self.name, f"refused: {exc}")
-        except Exception as exc:  # noqa: BLE001 - shown, never fatal
-            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}")
 
     def _ticket(self, ref: str, now: float) -> bool:
         """Read one ticket; True when a payload was stored. The caller backs off on False (PR 243 review F3)."""

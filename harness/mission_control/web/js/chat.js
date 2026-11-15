@@ -42,7 +42,7 @@ export function mountChat() {
     send.disabled = access.disabled || !input.value.trim() || input.value.length > 4000;
     input.setAttribute('aria-describedby', `${access.notice ? 'chat-notice ' : ''}composer-hint chat-counter approval-description`);
     input.placeholder = access.disabled ? 'Sending unavailable · draft kept' : 'Give your fleet a direction…';
-    counter.textContent = `${input.value.length.toLocaleString()} / 4000`;
+    counter.textContent = `${input.value.length.toLocaleString()} / 4000`;  // held: the characters the user typed
     counter.classList.toggle('at-limit', input.value.length >= 4000);
     notice.hidden = !access.notice;
     if (notice.textContent !== access.notice) notice.textContent = access.notice;

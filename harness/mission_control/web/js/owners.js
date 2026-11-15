@@ -1,7 +1,7 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
-import { ownerGroups, ownerCounts, foldLabel, summaryLine, isHelper, ownersStale } from './owner-groups.js';
-import { ownersEmpty, ownerCount, workItemText } from './adapt.js';
+import { ownerGroups, ownerCounts, foldLabel, summaryLine, groupHeading, groupEmpty, isHelper } from './owner-groups.js';
+import { ownersEmpty, ownerCount, workItemText, countText, claim, gate } from './adapt.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -100,7 +100,7 @@ export function mountOwners() {
       .slice(0, state.ownersAll ? all.length : OWNERS_SHOWN);
     const more = document.getElementById('owners-more');
     more.hidden = all.length <= OWNERS_SHOWN;
-    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${all.length} rows`;
+    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${countText(all.length, claim(state, 'owners'))} rows`;
     more.setAttribute('aria-expanded', String(!!state.ownersAll));
     const nodes = owners.map(owner => { used.add(owner.agent_id); return rowFor(owner, state, null); });
     emptyState.textContent = ownersEmpty(state, state.owners.length > 0);
@@ -112,6 +112,7 @@ export function mountOwners() {
     document.getElementById('owners-more').hidden = true;
     const folds = state.ownerFolds || {};
     const layout = ownerGroups(state.owners, state.initiatives);
+    const g = gate(state, 'owners');
     const place = (owner, group, servedBy) => { used.add(owner.agent_id); placed.set(owner.agent_id, group.id); return rowFor(owner, state, servedBy); };
     const sections = layout.map(group => {
       let parts = groups.get(group.id);
@@ -121,7 +122,7 @@ export function mountOwners() {
         heading.id = `owner-group-${n}`;
         section.setAttribute('aria-labelledby', heading.id);
         section.dataset.group = id;
-        const liveBox = el('div', 'owner-group-live'), empty = el('p', 'owner-group-empty', 'No live owner in this initiative.');
+        const liveBox = el('div', 'owner-group-live'), empty = el('p', 'owner-group-empty');
         const fold = button('owner-fold', '', () => {
           const current = getState().ownerFolds || {};
           update({ ownerFolds: { ...current, [id]: !current[id] } }, 'owner-filter');
@@ -134,12 +135,13 @@ export function mountOwners() {
         parts = { section, heading, liveBox, empty, fold, body };
         groups.set(id, parts);
       }
-      parts.heading.textContent = `${group.label} · ${group.liveCount} live${group.codexLive ? ` · ${group.codexLive} live Codex` : ''}${group.decide.length ? ` · ${group.decide.length} need a decision` : ''}`;
+      parts.heading.textContent = groupHeading(group, g);
+      parts.empty.textContent = groupEmpty(g);
       const liveNodes = [...group.live, ...group.decide].flatMap(entry => [place(entry.owner, group, null), ...entry.helpers.map(h => place(h, group, entry.owner))]);
       syncChildren(parts.liveBox, liveNodes.length ? liveNodes : [parts.empty]);
       const open = Boolean(folds[group.id]) && group.foldCount > 0;
       parts.fold.hidden = group.foldCount === 0;
-      parts.fold.textContent = foldLabel(group);
+      parts.fold.textContent = foldLabel(group, g);
       parts.fold.setAttribute('aria-expanded', String(open));
       parts.fold.classList.toggle('needs-attention', group.attention > 0);
       parts.body.hidden = !open;
@@ -181,12 +183,12 @@ export function mountOwners() {
     }
     lastPlaced = placed.size ? placed : lastPlaced;
     const counts = ownerCounts(state.owners);
-    const stale = ownersStale(state);
+    const g = gate(state, 'owners');
     const session = state.owners.find(owner => owner.source === 'ah' && owner.session)?.session || '';
     const count = document.getElementById('owner-count');
     count.textContent = ownerCount(state, counts.live);
-    count.title = summaryLine(counts, { session, stale });
-    if (summary) summary.textContent = summaryLine(counts, { session, stale });
+    count.title = summaryLine(counts, g, { session });
+    if (summary) summary.textContent = summaryLine(counts, g, { session });
   }
   render(getState());
   subscribe((state, reason) => {

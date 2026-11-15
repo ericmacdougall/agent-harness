@@ -159,6 +159,7 @@ function renderInspector(state) {
   } else if (kind === 'source') {
     const source = state.sources.find(entry => entry.id === id); if (!source) return select(null);
     title.textContent = source.name;
+    // held: this source row carries no detail text
     content.append(title, el('span', `state-badge ${source.state}`, source.label), el('p', 'detail-intro', source.note || 'No detail.'));
     fields.append(field('Last checked', `${age(source.checked, state.now)} · ${new Date(source.checked).toLocaleString()}`), field('Connection', state.connection));
     content.append(fields);
@@ -214,7 +215,7 @@ const visual = window.visualViewport;
 function viewport() {
   const height = visual?.height || window.innerHeight;
   document.documentElement.style.setProperty('--viewport-height', `${height}px`);
-  document.documentElement.style.setProperty('--viewport-top', `${visual?.offsetTop || 0}px`);
+  document.documentElement.style.setProperty('--viewport-top', `${visual?.offsetTop || 0}px`);  // held: a layout offset
   const editing = document.activeElement === document.getElementById('chat-input');
   document.body.classList.toggle('keyboard-open', window.innerWidth < 768 && editing && window.innerHeight - height > 110);
 }

@@ -1,0 +1,20 @@
+HEAD a3b054087e8a5e74417c508d30f7f3572a39c4de
+$ python3 -B mutate.py <worktree>   (in-memory mutants of ops_watch.py; each must fail tests.test_ops_watch_proxmox)
+M1-images-only: KILLED (1 failures, 0 errors of 73)
+M2-no-file-crosscheck: KILLED (4 failures, 0 errors of 73)
+M3-zero-size-ok: KILLED (4 failures, 0 errors of 73)
+M4-ignore-vols-rc: KILLED (4 failures, 0 errors of 73)
+M5-ignore-files-rc: KILLED (3 failures, 0 errors of 73)
+M6-trust-partial-listing: KILLED (8 failures, 0 errors of 73)
+M8-trust-subtotals-without-files: KILLED (7 failures, 0 errors of 73)
+M9-ignore-du-rc: KILLED (4 failures, 0 errors of 73)
+M10-du-duplicates-ok: KILLED (1 failures, 0 errors of 73)
+M11-du-without-rc-line: KILLED (2 failures, 0 errors of 73)
+M12-no-stdout-cap: KILLED (3 failures, 1 errors of 73)
+M13-no-stderr-cap: KILLED (2 failures, 1 errors of 73)
+M16-overflow-not-sticky: KILLED (4 failures, 0 errors of 73)
+M14-no-kill-on-overflow: KILLED (4 failures, 0 errors of 73)
+M15-pool-uncapped: KILLED (1 failures, 0 errors of 73)
+M7-backup-counts: KILLED (23 failures, 0 errors of 73)
+16 of 16 mutations killed
+exit 0

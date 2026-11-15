@@ -128,7 +128,7 @@ class Wiring(unittest.TestCase):
 
         def owners(*args):
             calls.append(args)
-            return 0, json.dumps({"session": args[0] if args else CODEX, "owners": []})
+            return 0, json.dumps({"read": col.whole_read(), "session": args[0] if args else CODEX, "owners": []})
         runner = FakeRunner({"ah-goals": (0, json.dumps(goals)), "ah-owners": owners})
         (self.h.home / "mc").mkdir(exist_ok=True)
         app = mcs.App(port=47999, root=self.h.home / "mc", initiatives=None, remote=False, fabric_bin=None,
@@ -137,7 +137,7 @@ class Wiring(unittest.TestCase):
         return app, calls
 
     def test_owners_reads_the_ledger_session_even_when_codex_wrote_last(self):  # AC-4
-        app, calls = self.app({"state": "ok", "mission_session": MAIN, "goals": []})
+        app, calls = self.app({"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []})
         app.owners.run(time.time())
         self.assertEqual(app.health.rows["owners"]["status"], "error", "unpinned before the ledger is read")
         self.assertEqual(calls, [])
@@ -150,7 +150,7 @@ class Wiring(unittest.TestCase):
                          (MAIN, "ledger", True))   # AC-5
 
     def test_a_failed_goals_read_drops_write_rights(self):  # D1
-        app, _ = self.app({"state": "ok", "mission_session": MAIN, "goals": []})
+        app, _ = self.app({"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []})
         app.ledger.run(time.time())
         self.assertTrue(app.pin()["write"])
         app.runner.outputs["ah-goals"] = (1, "")
@@ -159,7 +159,7 @@ class Wiring(unittest.TestCase):
         self.assertEqual((pin["display"], pin["write"], pin["source"]), (MAIN, "", "kept"))
 
     def test_flag_pin_is_used_and_a_mismatch_is_flagged(self):  # AC-3, NEG-8
-        app, calls = self.app({"state": "ok", "mission_session": MAIN, "goals": []}, session=OTHER)
+        app, calls = self.app({"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []}, session=OTHER)
         app.ledger.run(time.time())
         app.owners.run(time.time())
         self.assertEqual(calls, [(OTHER,)])
@@ -169,16 +169,16 @@ class Wiring(unittest.TestCase):
 
     # review A-1 (red-team of 85fe28f2): the requirement list must be the pinned session's, never a lagging read's
     def _reqs(self, app):
-        app.runner.outputs["ah-requirements"] = lambda s: (0, json.dumps({"requirements": [
+        app.runner.outputs["ah-requirements"] = lambda s: (0, json.dumps({"read": col.whole_read(), "requirements": [
             {"id": "w" + s[:11].replace("-", "0"), "session": s, "text": "req of " + s, "at": "2026-11-13T00:00:00Z"}]}))
-        app.runner.outputs["ah-status"] = (0, "{}")
+        app.runner.outputs["ah-status"] = (0, json.dumps({"read": col.whole_read(), **{key: [] for key in col.Ledger.STATUS_LISTS}, "owners": {"counts": {}}}))
 
     def _archive(self, app, item, shown):
         return app.post_requirement({"req_id": item["id"], "action": "archive", "reason": "done",
                                      "digest": item["digest"], "client_key": "k" * 12, "session": shown})
 
     def test_the_ledger_rereads_for_the_new_pin_in_the_same_tick(self):
-        goals = {"state": "ok", "mission_session": MAIN, "goals": []}
+        goals = {"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []}
         app, _ = self.app(goals)
         self._reqs(app)
         app.ledger.run(time.time())
@@ -193,7 +193,7 @@ class Wiring(unittest.TestCase):
         self.assertEqual(app.actions.all()[-1]["session"], OTHER)
 
     def test_a_failed_read_for_the_new_pin_never_keeps_the_old_sessions_list(self):
-        goals = {"state": "ok", "mission_session": MAIN, "goals": []}
+        goals = {"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []}
         app, _ = self.app(goals)
         self._reqs(app)
         app.ledger.run(time.time())
@@ -212,7 +212,7 @@ class Wiring(unittest.TestCase):
         self.assertEqual(app.actions.all(), [])
 
     def test_a_list_read_for_another_session_is_refused(self):
-        goals = {"state": "ok", "mission_session": MAIN, "goals": []}
+        goals = {"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []}
         app, _ = self.app(goals)
         self._reqs(app)
         app.ledger.run(time.time())
@@ -227,8 +227,8 @@ class Wiring(unittest.TestCase):
 
     def test_restricted_owners_asks_never_reach_any_asks_list(self):  # review P-2 (items, resolved, cleared, archive)
         text = "Please approve the rubric for candidate Jane D"
-        app, _ = self.app({"state": "ok", "mission_session": MAIN, "goals": []})
-        app.runner.outputs["ah-owners"] = lambda s: (0, json.dumps({"session": s, "owners": [
+        app, _ = self.app({"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []})
+        app.runner.outputs["ah-owners"] = lambda s: (0, json.dumps({"read": col.whole_read(), "session": s, "owners": [
             {"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True, "owner": True,
              "state": "live", "idle_s": 5, "ticket": "goodqa#777"},
             {"agent_id": "a0000000000000001", "type": "task-owner", "task": "x", "restricted": False, "owner": True,
@@ -239,7 +239,7 @@ class Wiring(unittest.TestCase):
                              "at": "2026-11-14T00:00:00Z"}],
                   "resolved": [{"id": "w2", "owner": "agent-a1234567890abcdef", "note": text,
                                 "at": "2026-11-14T00:00:00Z", "resolved_at": "2026-11-14T00:01:00Z"}]}
-        app.runner.outputs["provenance-asks"] = lambda s: (0, json.dumps(ledger))
+        app.runner.outputs["provenance-asks"] = lambda s: (0, json.dumps({"read": col.whole_read(), **ledger}))
         try:
             app.asks.refresh(MAIN)
         except Exception:  # noqa: BLE001 - a sweep that cannot run still must not show the text

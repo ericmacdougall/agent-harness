@@ -243,7 +243,7 @@ class Safety(Base):
         code = ("import sys,json;sys.path[:0]=[%r,%r];import needs_sweep as ns;from pathlib import Path;"
                 "ns.sweep(Path(%r),%r,json.loads(sys.stdin.read()),now=%r)"
                 % (str(REPO / "harness" / "hooks"), str(REPO / "harness" / "mission_control"), str(self.root), SID, NOW))
-        data = json.dumps({"items": [ask(f"wproc{i:07d}", f"q{i}", age_h=100) for i in range(20)], "resolved": [], "blocked": []})
+        data = json.dumps({"read": col.whole_read(), "items": [ask(f"wproc{i:07d}", f"q{i}", age_h=100) for i in range(20)], "resolved": [], "blocked": []})
         procs = [subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, text=True, env=dict(os.environ))
                  for _ in range(4)]
         for proc in procs:
@@ -278,7 +278,7 @@ class Collector(Base):
                 self.calls.append(kind)
                 if kind == "ah-ticket-get":
                     return 0, json.dumps({"issue": {"closedAt": "2026-11-11T00:00:00Z" if "101" in args[0] else None}})
-                return 0, json.dumps(payload)
+                return 0, json.dumps({"read": col.whole_read(), "blocked": [], "resolved": [], **payload})
         hub = ev.Hub()
         asks = col.Asks(hub, col.Health(hub), Runner(), lambda: SID, root=self.root, owners_fn=lambda: list(owners))
         return asks

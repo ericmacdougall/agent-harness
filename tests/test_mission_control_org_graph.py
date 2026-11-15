@@ -515,7 +515,7 @@ class RestrictedProducerShape(unittest.TestCase):
     Run it end to end (collector, initiatives, graph): no ticket title or task text may reach the UI."""
 
     class Health:
-        def ok(self, *a):
+        def ok(self, *a, **k):
             pass
         error = off = ok
 
@@ -552,6 +552,7 @@ class RestrictedProducerShape(unittest.TestCase):
         # PR 234 v6: ah status always sends every list; a payload missing one is refused, so the fixture sends them all
         payload = {key: [] for key in col.Ledger.STATUS_LISTS}
         payload["verified"] = entries
+        payload["owners"] = {"counts": {}}   # PR 234 v7: ah status always sends its owners view
         return {r["id"]: r["note"] for r in ledger._status(payload, 0)["verified"]}
 
     ROWS = [{"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True, "owner": True,
@@ -672,7 +673,7 @@ class RestrictedFileRowIntegration(unittest.TestCase):
              "next_step": "SECRET-PLAN call the candidate", "note": "SECRET-NOTE", "milestones_done": 1,
              "milestones_total": 3},
             {"id": "plain", "initiative": "Visible plan row", "ticket": "goodqa#15950", "next_step": "ship PR"}]))
-        runner = FakeRunner({"ah-owners": lambda *a: (0, json.dumps({"session": a[0], "owners": list(owners)})),
+        runner = FakeRunner({"ah-owners": lambda *a: (0, json.dumps({"read": col.whole_read(), "session": a[0], "owners": list(owners)})),
                              "ah-ticket-get": (0, json.dumps({"issue": {"title": "SECRET-TICKET", "status": "todo"}}))})
         app = mcs.App(port=47998, root=h.home / "mc", initiatives=str(path), remote=False, fabric_bin=None,
                       runner=runner, wal_roots=[(h.home / "nowals", "claude")], start_threads=False, session=MAIN,

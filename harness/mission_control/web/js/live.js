@@ -1,6 +1,6 @@
 // Transport to the local Mission Control server: GET /api/state, SSE /api/events, POST /api/chat, POST /api/approve.
 // Same-origin only; the session cookie is HttpOnly and the CSRF token lives in memory, never in storage.
-import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport, setOrgGraph } from './store.js';
+import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport, setOrgGraph, setReads } from './store.js';
 
 let shownSession = null;
 
@@ -20,6 +20,7 @@ async function loadState() {
   const state = await response.json();
   csrf = typeof state.csrf === 'string' ? state.csrf : '';
   setHost(state.host);
+  setReads(state.reads);  // first: the rows below are never shown ahead of the server's read of them
   setInitiatives(state.initiatives);
   setOwners(state.owners);
   setSources(state.health);
@@ -83,6 +84,7 @@ function connect() {
     }
   });
   source.addEventListener('orggraph', message => { const data = parse(message); if (data) setOrgGraph(data); });
+  source.addEventListener('reads', message => { const data = parse(message); if (data) setReads(data); });
 }
 
 // Re-read the state after a reopened stream, then show live, unless the stream dropped again meanwhile. A failed

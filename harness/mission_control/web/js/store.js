@@ -22,6 +22,8 @@ let state = {
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
   asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '', asksArchive: [], asksArchiveTotal: 0,
   ledger: adapt.ledger(null), lastData: 0, orggraph: null,
+  reads: {},  // dataset -> the server's read of it (collectors.Truth): the only thing a count or a "none" may rest on
+  loss: {},   // dataset -> rows the server sent that this page could not show (the gate reads that as partial)
   decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
@@ -36,7 +38,17 @@ let transport;
 export const getState = () => state;
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
 // A server message (a snapshot or an event) is what "last update" counts; ticks and local clicks are not.
-const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability', 'orggraph']);
+const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability', 'reads', 'orggraph']);
+const lost = (dataset, sent, kept) => ({ ...state.loss, [dataset]: Array.isArray(sent) ? Math.max(0, sent.length - kept) : sent == null ? 0 : 1 });
+// The server's read of every dataset. It is applied before the rows that changed with it, and every panel that
+// states a count or a "none" repaints ('truth').
+let readsSig = '';
+export function setReads(reads) {
+  const map = reads && typeof reads === 'object' && !Array.isArray(reads) ? reads : {};
+  update({ reads: map }, 'reads');
+  const sig = JSON.stringify(map);
+  if (sig !== readsSig) { readsSig = sig; update({}, 'truth'); }
+}
 export function update(patch, reason = 'update') {
   state = DATA_REASONS.has(reason) ? { ...state, ...patch, lastData: Date.now() } : { ...state, ...patch };
   listeners.forEach(fn => { try { fn(state, reason); } catch (error) { reportError(error, reason); } });
@@ -81,10 +93,13 @@ media.addEventListener('change', event => update({ reducedMotion: event.matches,
 // ---- server snapshots
 export function setInitiatives(snapshot) {
   const { items, stale, error, mtime, derived, untracked, hiddenFileRows } = adapt.initiatives(snapshot);
-  update({ initiatives: items, initiativesStale: stale, initiativesError: error, initiativesMtime: mtime, initiativesDerived: derived, initiativesUntracked: untracked, initiativesHidden: hiddenFileRows, owners: adapt.owners(state.ownerRows, items) }, 'initiatives');
+  update({ initiatives: items, initiativesStale: stale, initiativesError: error, initiativesMtime: mtime, initiativesDerived: derived, initiativesUntracked: untracked, initiativesHidden: hiddenFileRows, owners: adapt.owners(state.ownerRows, items), loss: lost('initiatives', snapshot?.items, items.length) }, 'initiatives');
   update({}, 'owners');
 }
-export function setOwners(rows) { update({ ownerRows: Array.isArray(rows) ? rows : [], owners: adapt.owners(rows, state.initiatives) }, 'owners'); }
+export function setOwners(rows) {
+  const owners = adapt.owners(rows, state.initiatives);
+  update({ ownerRows: Array.isArray(rows) ? rows : [], owners, loss: { ...state.loss, owners: adapt.ownersLoss(rows, owners) } }, 'owners');
+}
 // 'truth' fires only when a source's status or truth changed: the panels whose zero claims rest on it repaint then, not
 // on every health snapshot (a failing source re-reports every tick).
 let truthSig = '';
@@ -99,14 +114,14 @@ export function seedEvents(list) {
   const events = (Array.isArray(list) ? list : []).map(adapt.event).filter(e => e && KINDS[e.kind]);
   events.forEach(e => seen.add(e.id));
   events.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
-  update({ events: events.slice(0, 150) }, 'seed');
+  update({ events: events.slice(0, adapt.EVENTS_HELD) }, 'seed');
 }
 export function ingestEvent(raw) {
   const event = adapt.event(raw);
   if (!event || !KINDS[event.kind] || seen.has(event.id)) return;
   seen.add(event.id);
   if (seen.size > 2000) seen.delete(seen.values().next().value);
-  const events = [event, ...state.events].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 150);
+  const events = [event, ...state.events].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, adapt.EVENTS_HELD);
   let owners = state.owners;
   // A quiet event (tool call, prompt, subagent start/stop) refreshes the owner's activity age, never its work item.
   if (!event.historic && event.actor.agent) owners = owners.map(o => o.agent_id !== event.actor.agent ? o : event.quiet
@@ -218,7 +233,10 @@ export function setAsks(snapshot) {
   // an expired ask is archived by the archive rule, so it leaves the stale section: it is shown once, with its reason
   const archive = adapt.archiveRows(Array.isArray(snapshot?.archive) ? snapshot.archive.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [], []);
   const archived = new Set(archive.map(a => a.id));
-  update({ asks: items, asksResolved: resolved, asksStale: list('stale').filter(a => !archived.has(a.id)), asksFlagged: list('flagged'), asksCleared: list('cleared'), asksArchive: archive, asksArchiveTotal: Number.isInteger(snapshot?.archive_total) ? snapshot.archive_total : archive.length,
+  const sent = ['items', 'resolved', 'stale', 'flagged', 'cleared'].map(key => snapshot?.[key]);
+  const kept = [items, resolved, list('stale'), list('flagged'), list('cleared')];
+  const dropped = sent.reduce((sum, rows, i) => sum + (Array.isArray(rows) ? Math.max(0, rows.length - kept[i].length) : snapshot ? 1 : 0), 0);
+  update({ loss: { ...state.loss, asks: dropped }, asks: items, asksResolved: resolved, asksStale: list('stale').filter(a => !archived.has(a.id)), asksFlagged: list('flagged'), asksCleared: list('cleared'), asksArchive: archive, asksArchiveTotal: Number.isInteger(snapshot?.archive_total) ? snapshot.archive_total : archive.length,
     asksSweptAt: typeof snapshot?.swept_at === 'string' ? snapshot.swept_at : '', asksSession: String(snapshot?.session || '') }, 'asks');
 }
 export function askReplyAccess(ask, current = state) { return chatAccess(current, 'claude', ask?.session || current.asksSession); }

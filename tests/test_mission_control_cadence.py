@@ -28,7 +28,7 @@ class Runner:
 
     def run(self, kind, *args, timeout=20.0, limit=0):
         self.calls.append(kind)
-        return 0, json.dumps({"items": [], "resolved": [], "owners": []})
+        return 0, json.dumps({"read": col.whole_read(), "state": "ok", "warnings": [], "goals": [], "requirements": [], "items": [], "blocked": [], "resolved": [], "owners": []})
 
 
 class Cadence(unittest.TestCase):

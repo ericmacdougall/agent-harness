@@ -149,6 +149,7 @@ class Hub:
         self.window = [time.monotonic(), 0]
         self.suppressed = self.suppressed_quiet = 0
         self.snapshots: dict[str, object] = {}
+        self.before = None  # called before any data snapshot is pushed (Truth pushes the dataset reads first)
 
     def frame(self, seq: int, name: str, data) -> bytes:
         body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
@@ -189,6 +190,8 @@ class Hub:
 
     def snapshot(self, name: str, data) -> None:
         """Replace a named snapshot (initiatives, owners, health, chat, targets) and push it to clients."""
+        if self.before is not None and name not in ("reads", "health"):
+            self.before(name)  # outside the lock: the dataset reads go out first, so rows never arrive ahead of their truth
         with self.lock:
             self.snapshots[name] = data
             self.seq += 1

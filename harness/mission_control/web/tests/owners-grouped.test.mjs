@@ -3,14 +3,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { owners as adaptOwners, initiatives as adaptInitiatives, missionTiles, ledger, sources } from '../js/adapt.js';
-import { ownerGroups, ownerCounts, foldLabel, summaryLine, UNLINKED, ownersStale } from '../js/owner-groups.js';
+import { owners as adaptOwners, initiatives as adaptInitiatives, missionTiles, ledger, sources, gate, ownersLoss } from '../js/adapt.js';
+import { ownerGroups, ownerCounts, foldLabel, summaryLine, groupHeading, groupEmpty, HISTORY_WINDOW, UNLINKED } from '../js/owner-groups.js';
 import { inventory } from '../js/ledger-views.js';
 import { text } from './dom-shim.mjs';
+import { withReads, healthRows } from './reads.mjs';
 
 const here = new URL('..', import.meta.url).pathname;
 // PR 234 status truth: a count is stated plainly only while its source is current
-const CURRENT = sources(['owners', 'codex-owners', 'initiatives'].map(name => ({ name, status: 'ok', checked: Date.now() / 1000, ok_at: Date.now() / 1000, truth: 'current' })));
+// PR 234 v7: every source the server declares, current, and the dataset reads composed from them (reads.mjs)
+const CURRENT = sources(healthRows(Date.now() / 1000));
+// PR 234 v7 audit T242-2..4: the owners panel states its counts through the owners gate, in every truth
+const ownersGate = rows => gate(withReads({ connection: 'live', sources: rows }), 'owners');
+const G = { current: ownersGate(CURRENT), unknown: ownersGate([]),
+  partial: ownersGate(sources(healthRows(Date.now() / 1000).map(r => (r.name === 'owners' ? { ...r, truth: 'partial', detail: 'cap' } : r)))),
+  stale: ownersGate(sources(healthRows(Date.now() / 1000).map(r => (r.name === 'owners' ? { ...r, status: 'error', truth: 'stale', detail: 'ah owners exited 1' } : r)))) };
 const NOW = '2026-11-13T12:00:00Z';
 const row = (agent_id, role, state, extra = {}) => ({ agent_id, role, state, runtime: 'claude', source: 'ah', ticket: '', last_item: { at: NOW }, ...extra });
 
@@ -49,8 +56,8 @@ test('headline counts live ah owners only, any runtime; Codex live is a separate
   assert.equal(counts.parked, 7, 'parked rows plus the unknown role (NEG-7) and the idle supervisor');
   assert.equal(counts.total, RAW.length);
   assert.ok(counts.total > counts.live * 3, 'the bug: the old panel showed every row as an owner');
-  assert.match(summaryLine(counts, { session: 'baab765b-xyz' }), /^6 live owners per ah owners \(session baab765b\) · 1 live Codex/);
-  assert.match(summaryLine(counts, { stale: true }), /STALE/);
+  assert.match(summaryLine(counts, G.current, { session: 'baab765b-xyz' }), /^6 live owners per ah owners \(session baab765b\) · 1 live Codex/);
+  assert.match(summaryLine(counts, G.stale), /not current: last good read/);
 });
 
 test('an unknown role from the server is parked: shown, never counted (NEG-7)', () => {
@@ -59,10 +66,10 @@ test('an unknown role from the server is parked: shown, never counted (NEG-7)', 
 });
 
 test('the Owners live tile and the inventory use the live count, not the row count (AC-2)', () => {
-  const state = { owners: OWNERS, asks: [], messages: [], decisions: {}, asksFlagged: [], initiatives: INITS, ledger: null, sources: CURRENT, connection: 'live' };
+  const state = withReads({ owners: OWNERS, asks: [], messages: [], decisions: {}, asksFlagged: [], initiatives: INITS, ledger: null, sources: CURRENT, connection: 'live' });
   const tile = missionTiles(state).find(t => t.id === 'owners');
   assert.equal(tile.value, '6');
-  assert.equal(missionTiles({ ...state, sources: [] }).find(t => t.id === 'owners').value, '6+');  // owners source not read: not a plain count
+  assert.equal(missionTiles(withReads({ ...state, sources: [] })).find(t => t.id === 'owners').value, '6+');  // owners source not read: not a plain count
   assert.match(tile.note, /1 live Codex/);
   assert.match(tile.note, /need attention/);
 });
@@ -101,9 +108,9 @@ test('helpers nest under the owner they serve and never add to a count (AC-4, NE
 
 test('the fold names its size and how many rows need attention (NEG-8)', () => {
   const g = byGroup(ownerGroups(OWNERS, INITS));
-  assert.equal(foldLabel(g.checkout), 'Parked / history (3) · 1 need attention', 'handoff, DROPPED, finished reviewer');
-  assert.equal(foldLabel(g.reports), 'Parked / history (2)', 'the decision-required owner is not folded');
-  assert.match(foldLabel(g[UNLINKED]), /need attention/, 'a DROPPED helper with no owner still raises attention');
+  assert.equal(foldLabel(g.checkout, G.current), 'Parked / history (3) · 1 need attention', 'handoff, DROPPED, finished reviewer');
+  assert.equal(foldLabel(g.reports, G.current), 'Parked / history (2)', 'the decision-required owner is not folded');
+  assert.match(foldLabel(g[UNLINKED], G.current), /need attention/, 'a DROPPED helper with no owner still raises attention');
 });
 
 test('a parked owner that needs a decision stays visible, uncounted (M5)', () => {
@@ -126,7 +133,7 @@ test('helpers of a decision-required owner: working ones shown under it, finishe
   assert.equal(group.liveCount, 0);
   assert.equal(group.foldCount, 1, 'only the finished helper folds');
   assert.equal(group.attention, 1, 'the DROPPED helper in the fold raises attention');
-  assert.equal(foldLabel(group), 'Parked / history (1) · 1 need attention');
+  assert.equal(foldLabel(group, G.current), 'Parked / history (1) · 1 need attention');
 });
 
 test('zero live owners still shows the count 0 and an expandable fold (NEG-4)', () => {
@@ -138,8 +145,8 @@ test('zero live owners still shows the count 0 and an expandable fold (NEG-4)', 
 });
 
 test('the inventory row reports live owners, not rows', () => {
-  const state = { ledger: ledger(null), now: Date.parse(NOW), chat: null, messages: [], decisions: {}, asksArchive: [], events: [],
-    initiatives: INITS, initiativesStale: false, initiativesError: '', owners: OWNERS, asks: [], asksStale: [], asksFlagged: [], asksSweptAt: '', sessions: [], health: [], sources: CURRENT, connection: 'live' };
+  const state = withReads({ ledger: ledger(null), now: Date.parse(NOW), chat: null, messages: [], decisions: {}, asksArchive: [], events: [],
+    initiatives: INITS, initiativesStale: false, initiativesError: '', owners: OWNERS, asks: [], asksStale: [], asksFlagged: [], asksSweptAt: '', sessions: [], health: [], sources: CURRENT, connection: 'live' });
   const out = inventory(state, () => {});
   assert.match(text(out), /6 live owners, 1 live Codex, 7 parked or history, 6 helpers/);
 });
@@ -150,11 +157,53 @@ test('the default filter is the grouped live view and the panel has a summary li
   assert.match(html, /id="owner-summary"/);
 });
 
-test('a failed first ah read with no rows is shown as stale, not as a current 0', () => {
-  assert.equal(ownersStale({ owners: [], sources: [{ id: 'owners', state: 'error' }] }), true);
-  assert.equal(ownersStale({ owners: [], sources: [{ id: 'owners', state: 'ok' }] }), false);
-  assert.equal(ownersStale({ owners: adaptOwners([row('a1', 'live', 'live', { ah_stale: true })], []), sources: [] }), true);
-  assert.match(summaryLine(ownerCounts([]), { stale: ownersStale({ owners: [], sources: [{ id: 'owners', state: 'error' }] }) }), /^0 live owners per ah owners, STALE/);
+test('a failed first ah read with no rows is unknown, not a current 0 (T242-3)', () => {
+  const line = summaryLine(ownerCounts([]), G.unknown);
+  assert.doesNotMatch(line, /(^|· )0 /, 'no plain zero while the owners read is unknown');
+  assert.match(line, /^\? live owners per ah owners/);
+  assert.match(line, /unknown: not read yet/);
+});
+
+test('T242-3: the summary line states every count through the owners gate', () => {
+  const counts = ownerCounts(OWNERS);
+  assert.match(summaryLine(counts, G.partial), /^6\+ live owners per ah owners · 1\+ live Codex · 7\+ parked or history · 6\+ helpers/);
+  assert.match(summaryLine(counts, G.partial), /partial read: there may be more/);
+  assert.doesNotMatch(summaryLine(counts, G.current), /partial|unknown|not current/);
+});
+
+test('T242-3: group headings and folds count through the owners gate', () => {
+  const g = byGroup(ownerGroups(OWNERS, INITS));
+  assert.equal(groupHeading(g.checkout, G.current), 'Checkout · 2 live');
+  assert.equal(groupHeading(g.checkout, G.partial), 'Checkout · 2+ live');
+  assert.equal(foldLabel(g.checkout, G.partial), 'Parked / history (3+) · 1+ need attention');
+  const [empty] = ownerGroups(adaptOwners([row('a2park000000000009', 'parked', 'done')], []), []);
+  assert.equal(groupHeading(empty, G.unknown), 'Not linked to an initiative · ? live');
+});
+
+test('T242-4: "No live owner in this initiative" only while the owners read is current', () => {
+  assert.equal(groupEmpty(G.current), 'No live owner in this initiative.');
+  for (const truth of ['partial', 'stale', 'unknown']) {
+    assert.notEqual(groupEmpty(G[truth]), 'No live owner in this initiative.', truth);
+    assert.match(groupEmpty(G[truth]), /live owners in this initiative/, truth);
+  }
+});
+
+test('T242-2: a row whose role the server did not send makes the owners claim partial', () => {
+  const bogus = RAW.filter(r => r.agent_id === 'a9bogus0000000001');
+  assert.equal(ownersLoss(bogus, adaptOwners(bogus, [])), 1, 'shown as parked, but not a counted row');
+  assert.equal(ownersLoss(RAW.filter(r => r.role === 'live'), adaptOwners(RAW.filter(r => r.role === 'live'), [])), 0);
+  const state = withReads({ owners: OWNERS, asks: [], messages: [], decisions: {}, asksFlagged: [], initiatives: INITS, ledger: null, sources: CURRENT, connection: 'live',
+    loss: { owners: ownersLoss(RAW, OWNERS) } });
+  assert.equal(gate(state, 'owners').truth, 'partial');
+  assert.equal(missionTiles(state).find(t => t.id === 'owners').value, '6+');
+});
+
+test('T242-5: finished owners older than 6 h are a declared window, said on the summary and the inventory', () => {
+  assert.match(HISTORY_WINDOW, /6 h/);
+  assert.ok(summaryLine(ownerCounts(OWNERS), G.current).includes(HISTORY_WINDOW));
+  const state = withReads({ ledger: ledger(null), now: Date.parse(NOW), chat: null, messages: [], decisions: {}, asksArchive: [], events: [],
+    initiatives: INITS, initiativesStale: false, initiativesError: '', owners: OWNERS, asks: [], asksStale: [], asksFlagged: [], asksSweptAt: '', sessions: [], health: [], sources: CURRENT, connection: 'live' });
+  assert.ok(text(inventory(state, () => {})).includes(HISTORY_WINDOW));
 });
 
 test('group headings count ah slot holders, with live Codex apart, so they sum to the headline', () => {

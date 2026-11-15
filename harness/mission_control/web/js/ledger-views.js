@@ -3,7 +3,7 @@
 // Each long text is clamped with a disclosure, and each list is bounded with "show more", so volume never takes over.
 import { el, button, age, stateClass } from './ui.js';
 import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine, claim, truthLines, noneText, countText, hiddenBlockers, hiddenDeals, statusCount } from './adapt.js';
-import { ownerCounts } from './owner-groups.js';
+import { ownerCounts, HISTORY_WINDOW } from './owner-groups.js';
 
 export const PAGE = 25;  // default rows per list; "show more" adds one page
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
@@ -18,6 +18,7 @@ export function longText(text, className = 'text', max = 240) {
   const details = el('details', 'more');
   const full = el('p', 'full', text);
   full.setAttribute('dir', 'auto');
+  // held: the length of the text on hand
   details.append(el('summary', '', `${clip(text, max)} Show all ${text.length} characters`), full);
   wrap.append(details);
   return wrap;
@@ -69,6 +70,7 @@ export function goalCard(goal, now) {
     details.append(el('summary', '', `Evidence · latest ${newest.verdict || newest.kind} ${when(newest.at, now)}`));
     const list = el('ul', 'evidence-list');
     goal.evidence.forEach(row => list.append(evidenceItem(row, now)));
+    // held: the ledger's own total less the rows on hand
     if (goal.evidence_total > goal.evidence.length) list.append(el('li', 'evidence-more', `${goal.evidence_total - goal.evidence.length} older records are in the ledger (ah goals).`));
     details.append(list);
     card.append(details);
@@ -91,9 +93,10 @@ export function goals(state, ui) {
   const part = state.ledger.goals;
   const c = claim(state, 'goals');
   const out = notices(c);
-  if (part.total > part.items.length) out.push(el('p', 'notice', `Showing ${part.items.length} of ${part.total} goals.`));
+  if (part.total > part.items.length) out.push(el('p', 'notice', `Showing ${part.items.length} of ${countText(part.total, c)} goals.`));
   if (!part.items.length) out.push(el('p', 'empty', noneText(c, 'No goals in the ledger yet.', 'goals')));
   part.items.slice(0, ui.goalsLimit).forEach(goal => out.push(goalCard(goal, state.now)));
+  // held: rows on hand that are folded away
   if (part.items.length > ui.goalsLimit) out.push(button('more-button', `Show ${part.items.length - ui.goalsLimit} more goals`, () => ui.more('goalsLimit')));
   return out;
 }
@@ -106,7 +109,7 @@ export function deals(state, ui) {
   const hidden = hiddenDeals(status);
   if (hidden) out.push(el('p', 'notice', `${hidden} more deploy and test records are in the ledger than Mission Control holds (ah status lists them all).`));
   if (!all.length && !hidden) out.push(el('p', 'empty', noneText(c, 'No deploys or live tests recorded in the last 12 hours.', 'deploys or live tests')));
-  if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${all.length + hidden} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
+  if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${countText(all.length + hidden, c)} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
   const list = el('ul', 'deals');
   all.slice(0, ui.dealsLimit).forEach(row => {
     const item = el('li', `deal tone-${row.tone}`);
@@ -115,6 +118,7 @@ export function deals(state, ui) {
     list.append(item);
   });
   out.push(list);
+  // held: rows on hand that are folded away
   if (all.length > ui.dealsLimit) out.push(button('more-button', `Show ${all.length - ui.dealsLimit} more`, () => ui.more('dealsLimit')));
   return out;
 }
@@ -148,6 +152,7 @@ export function blockers(state, ui) {
     list.append(item);
   });
   out.push(list);
+  // held: rows on hand that are folded away
   if (all.length > ui.blockersLimit) out.push(button('more-button', `Show ${all.length - ui.blockersLimit} more`, () => ui.more('blockersLimit')));
   return out;
 }
@@ -193,6 +198,7 @@ function actionArea(row, ui) {
   form.append(label, input, buttons);
   form.addEventListener('submit', event => { event.preventDefault(); if (!confirm.disabled) ui.submit?.(row); });
   area.append(form);
+  // held: an explanation of the action, not a claim about any list
   const status = el('p', 'req-status', ui.busy ? 'Recording…' : ui.error || 'Nothing is deleted. The row moves between Requirements and Archive, and the click is logged.');
   status.setAttribute('role', 'status');
   area.append(status);
@@ -205,7 +211,7 @@ export function requirementItem(row, now, ui = {}) {
   const top = el('div', 'req-top');
   top.append(badge(ruleLine(row), manualUser(row) ? 'manual-user' : row.bucket === 'archived' ? 'archived' : 'live'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
-  if (row.clipped) item.append(el('p', 'notice warn', `Showing the first ${row.text.length} of ${row.text_len || 'more'} characters. The rest is in the session WAL; Mission Control does not read it.`));
+  if (row.clipped) item.append(el('p', 'notice warn', /* held: the characters on hand */ `Showing the first ${row.text.length} of ${row.text_len || 'more'} characters. The rest is in the session WAL; Mission Control does not read it.`));
   const meta = [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket || 'no ticket'].join(' · ');
   item.append(el('p', 'req-meta', meta));
   item.append(el('p', 'req-why', `${row.bucket === 'archived' ? 'Archived because' : 'Live because'}: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
@@ -238,13 +244,14 @@ export function requirements(state, ui) {
   const out = [];
   out.push(filterBar('req-filter', 'Show requirements', [['live', `Live ${countText(summary.live, c)}`], ['archived', `Archived ${countText(summary.archived, c)}`], ['all', `All ${countText(part.items.length, c)}`]], ui.reqFilter, key => ui.set('reqFilter', key)));
   out.push(...notices(c));
-  if (part.truncated) out.push(el('p', 'notice', `Showing the newest ${part.items.length} of ${part.total} recorded requirements.`));
+  if (part.truncated) out.push(el('p', 'notice', `Showing the newest ${part.items.length} of ${countText(part.total, c)} recorded requirements.`));
   const query = ui.reqQuery.trim().toLowerCase();
   const matches = part.items.filter(r => (ui.reqFilter === 'all' || r.bucket === ui.reqFilter) && (!query || r.text.toLowerCase().includes(query) || r.id.toLowerCase().includes(query)));
   if (!matches.length) out.push(el('p', 'empty', part.items.length ? noneText(c, 'No requirements match.', 'matching requirements') : noneText(c, 'No requirements recorded.', 'requirements')));
   const list = el('ul', 'req-list');
   matches.slice(0, ui.reqLimit).forEach(row => list.append(requirementItem(row, state.now, ui)));
   out.push(list);
+  // held: rows on hand that are folded away
   if (matches.length > ui.reqLimit) out.push(button('more-button', `Show ${Math.min(PAGE, matches.length - ui.reqLimit)} more of ${matches.length - ui.reqLimit}`, () => ui.more('reqLimit')));
   return out;
 }
@@ -255,7 +262,7 @@ export function archiveItem(row, now, ui = {}) {
   const top = el('div', 'req-top');
   top.append(badge(row.kind === 'ask' ? 'Ask' : 'Requirement', 'kind'), badge(manualUser(row) ? 'Archived from the dashboard · your own words' : `${row.rule} ${row.rule_title || ''}`.trim(), manualUser(row) ? 'manual-user' : 'archived'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
-  if (row.clipped) item.append(el('p', 'notice warn', `Showing the first ${row.text.length} of ${row.text_len || 'more'} characters. The rest is in the session WAL; Mission Control does not read it.`));
+  if (row.clipped) item.append(el('p', 'notice warn', /* held: the characters on hand */ `Showing the first ${row.text.length} of ${row.text_len || 'more'} characters. The rest is in the session WAL; Mission Control does not read it.`));
   item.append(el('p', 'req-why', `Archived because: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
   const prov = row.kind === 'ask'
     ? [`registered by ${row.owner || 'unknown'}`, row.ticket, row.decision ? `decision ${row.decision}` : '', row.resolution ? `resolution: ${row.resolution}` : '', row.ask_reason ? `asked because: ${row.ask_reason}` : '']
@@ -273,7 +280,7 @@ export function archive(state, ui) {
   const c = claim(state, 'archive');
   const askTruth = claim(state, 'needs'), reqTruth = claim(state, 'requirements');
   const out = [];
-  if (state.asksArchiveTotal > state.asksArchive.length) out.push(el('p', 'notice', `Showing the newest ${state.asksArchive.length} of ${state.asksArchiveTotal} archived asks. The rest are in the asks ledger (provenance.py asks).`));
+  if (state.asksArchiveTotal > state.asksArchive.length) out.push(el('p', 'notice', `Showing the newest ${state.asksArchive.length} of ${countText(state.asksArchiveTotal, askTruth)} archived asks. The rest are in the asks ledger (provenance.py asks).`));
   out.push(filterBar('archive-kind', 'Show archived items', [['all', `All ${countText(kinds.all, c)}`], ['ask', `Asks ${countText(kinds.ask, askTruth)}`], ['requirement', `Requirements ${countText(kinds.requirement, reqTruth)}`], ['manual-user', `Dashboard-archived, your words ${countText(kinds['manual-user'], reqTruth)}`]], ui.archiveKind, key => ui.set('archiveKind', key)));
   out.push(...notices(c));
   const matches = rows.filter(r => ui.archiveKind === 'all' || (ui.archiveKind === 'manual-user' ? manualUser(r) : r.kind === ui.archiveKind));
@@ -282,6 +289,7 @@ export function archive(state, ui) {
   const list = el('ul', 'req-list');
   matches.slice(0, ui.archiveLimit).forEach(row => list.append(archiveItem(row, state.now, ui)));
   out.push(list);
+  // held: rows on hand that are folded away
   if (matches.length > ui.archiveLimit) out.push(button('more-button', `Show ${Math.min(PAGE, matches.length - ui.archiveLimit)} more of ${matches.length - ui.archiveLimit}`, () => ui.more('archiveLimit')));
   return out;
 }
@@ -299,22 +307,21 @@ const TRUTH_WORD = { current: 'ok', partial: 'partial', stale: 'stale', unknown:
 export function inventory(state, go) {
   const led = state.ledger;
   const st = led.status;
-  const n = (count, c) => countText(count, c);
   const sc = key => statusCount(st, key);  // the ledger's whole count, not the 30 rows held
   const unread = st.incomplete ? `incomplete: ${unreadCount(st)}; ` : '';
   // [name, claim, holds, shown in, tab]: each row's Health is its claim's truth, its counts follow the same rule
   const spec = [
-    ['Goals', 'goals', c => `${n(led.goals.items.length, c)} goals`, 'Overview', 'overview'],
-    ['Initiatives', 'initiatives', c => `${n(state.initiatives.length, c)} initiatives`, 'Overview', 'overview'],
-    ['Owners', 'owners', c => (k => `${n(k.live, c)} live owners, ${n(k.codexLive, c)} live Codex, ${n(k.parked, c)} parked or history, ${n(k.helpers, c)} helpers`)(ownerCounts(state.owners)), 'Overview', 'overview'],
-    ['Open asks', 'needs', c => `${n(state.asks.length, c)} open, ${n(state.asksStale.length, c)} stale, ${n(state.asksFlagged.length, c)} untraceable`, 'Overview', 'overview'],
-    ['Deploys and live tests', 'deploys', c => `${unread}${n(sc('live'), c)} deploys, ${n(sc('verified'), c)} tested, ${n(sc('failed'), c)} failed, ${n(sc('pending'), c)} pending`, 'Overview', 'overview'],
-    ['Blockers', 'blockers', c => `${unread}${n(sc('blockers'), c)} recorded in status`, 'Overview', 'overview'],
-    ['Requirements', 'requirements', c => `${n(led.requirements.summary.live, c)} live, ${n(led.requirements.summary.archived, c)} archived of ${n(led.requirements.total, c)}`, 'Requirements', 'requirements'],
-    ['Archived asks', 'needs', c => `${n(state.asksArchive.length, c)} archived`, 'Archive', 'archive'],
-    ['Activity feed', 'activity', c => `${n(state.events.length, c)} events held`, 'Activity', 'activity'],
-    ['Chat', 'chat', c => `${n(state.messages.length, c)} messages, ${n(state.sessions.length, c)} sessions`, 'Chat panel', 'chat'],
-    ['Decisions and commits', 'decisions', c => `${unread}${n(sc('decisions'), c)} decisions, ${n(sc('commits'), c)} commits, ${n(sc('claimed'), c)} claimed, ${n(sc('assumptions'), c)} assumptions`, 'Sources', 'sources'],
+    ['Goals', 'goals', c => `${countText(led.goals.items.length, c)} goals`, 'Overview', 'overview'],
+    ['Initiatives', 'initiatives', c => `${countText(state.initiatives.length, c)} initiatives`, 'Overview', 'overview'],
+    ['Owners', 'owners', c => (k => `${countText(k.live, c)} live owners, ${countText(k.codexLive, c)} live Codex, ${countText(k.parked, c)} parked or history, ${countText(k.helpers, c)} helpers (${HISTORY_WINDOW})`)(ownerCounts(state.owners)), 'Overview', 'overview'],
+    ['Open asks', 'needs', c => `${countText(state.asks.length, c)} open, ${countText(state.asksStale.length, c)} stale, ${countText(state.asksFlagged.length, c)} untraceable`, 'Overview', 'overview'],
+    ['Deploys and live tests', 'deploys', c => `${unread}${countText(sc('live'), c)} deploys, ${countText(sc('verified'), c)} tested, ${countText(sc('failed'), c)} failed, ${countText(sc('pending'), c)} pending`, 'Overview', 'overview'],
+    ['Blockers', 'blockers', c => `${unread}${countText(sc('blockers'), c)} recorded in status`, 'Overview', 'overview'],
+    ['Requirements', 'requirements', c => `${countText(led.requirements.summary.live, c)} live, ${countText(led.requirements.summary.archived, c)} archived of ${countText(led.requirements.total, c)}`, 'Requirements', 'requirements'],
+    ['Archived asks', 'needs', c => `${countText(state.asksArchive.length, c)} archived`, 'Archive', 'archive'],
+    ['Activity feed', 'activity', c => `${countText(state.events.length, c)} events held`, 'Activity', 'activity'],
+    ['Chat', 'chat', c => `${countText(state.messages.length, c)} messages, ${countText(state.sessions.length, c)} sessions`, 'Chat panel', 'chat'],
+    ['Decisions and commits', 'decisions', c => `${unread}${countText(sc('decisions'), c)} decisions, ${countText(sc('commits'), c)} commits, ${countText(sc('claimed'), c)} claimed, ${countText(sc('assumptions'), c)} assumptions`, 'Sources', 'sources'],
   ];
   const rowsOut = spec.map(([name, id, holds, where, tab]) => {
     const c = claim(state, id);

@@ -75,6 +75,17 @@ def home_dir() -> Path:
     return Path(os.environ.get("AH_HOME") or Path.home())
 
 
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False) -> dict:
+    """What a read-only view actually read (goodqa#15920; the same block provenance.read_block writes). A consumer
+    must not take "nothing found" for "nothing there": state is "failed" when no source could be read, "partial" when
+    a source was unread, a line could not be parsed or a cap or time budget stopped the read, else "ok"."""
+    state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
+    return {"schema": "harness.read/1", "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
+            "unread": [{"source": str(u.get("source") or u.get("wal") or "")[:120], "reason": str(u.get("reason") or "")[:200]}
+                       for u in unread[:50]],
+            "skipped": int(skipped), "limited": bool(limited)}
+
+
 def is_secret_path(path) -> bool:
     return bool(SECRET_NAMES.search(Path(path).name))
 
@@ -208,9 +219,11 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
+    if "outcome_at" not in summary:
+        meta.clear()  # an index written before outcome_at existed: rescan from the start (goodqa#15943 r5)
     lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary:
-        summary.update(first=None, last_at=0.0, outcome=None, last_note="", tickets=[], events=0)
+    if rebuilt or "first" not in summary or "outcome_at" not in summary:
+        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0)
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
@@ -224,11 +237,13 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         summary["events"] += 1
         event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
         if event == "intent":
-            summary["outcome"] = None  # new work after an earlier result/handoff: not finished
+            summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
             if summary["first"] is None and note:
                 summary["first"] = note[:160]
         if event in ("handoff", "result"):
-            summary["outcome"] = event
+            # outcome_at is the time of this result record itself, never later activity (receipt r5 F2): it orders
+            # main's acknowledgement and ages the result
+            summary["outcome"], summary["outcome_at"] = event, at
         if event in ("handoff", "result", "status", "blocker", "decision") and note:
             summary["last_note"] = note[:300]
         for match in TICKET_IN_NOTE.findall(note):
@@ -263,17 +278,23 @@ def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = N
 RESTRICTED = re.compile(r"\b(solve|interview)", re.I)  # fail-closed: show liveness only, never the task text
 
 
-def discover_agents(home: Path, session: str, wal: Path) -> dict:
+def discover_agents(home: Path, session: str, wal: Path, unread: list | None = None) -> dict:
     """agent id -> {type, description, parent, finished, tmtime} from the two sources that exist for every
-    sub-agent (the main WAL only lists the few types whose spawn is hooked): task WALs and transcript meta files."""
+    sub-agent (the main WAL only lists the few types whose spawn is hooked): task WALs and transcript meta files.
+    `unread` collects each place that exists but could not be read, so the caller can say its list may be short."""
     found = {}
+    unread = unread if unread is not None else []
+
+    def missed(source, error):
+        if not isinstance(error, FileNotFoundError):  # a place that is not there holds no agents
+            unread.append({"source": source, "reason": f"file-unreadable: {type(error).__name__}"})
     try:
         with os.scandir(wal) as it:
             for e in it:
                 if e.name.startswith("agent-") and e.name.endswith(".jsonl"):
                     found.setdefault(e.name[6:-6], {})
-    except OSError:
-        pass
+    except OSError as error:
+        missed("session WAL folder", error)
     try:
         with os.scandir(home / ".claude" / "projects") as projects:
             for proj in projects:
@@ -291,12 +312,13 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
                                     info.update(type=meta.get("agentType"), description=meta.get("description"),
                                                 parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
                                                 depth=meta.get("spawnDepth"))
-                            except (OSError, ValueError):
-                                pass
-                except OSError:
+                            except (OSError, ValueError) as error:
+                                missed(f"agent meta {agent[:40]}", error)
+                except OSError as error:
+                    missed("subagents folder", error)
                     continue
-    except OSError:
-        pass
+    except OSError as error:
+        missed("transcript projects folder", error)
     return found
 
 
@@ -327,7 +349,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
                 stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
-    for agent, meta in discover_agents(home, session, wal).items():
+    unread = []  # places that exist but could not be read: the owner list may be short (goodqa#15920)
+    for agent, meta in discover_agents(home, session, wal, unread).items():
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished", "depth") if k in meta})
@@ -340,7 +363,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
         summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
-            "first": None, "last_at": 0.0, "outcome": None, "last_note": "", "tickets": []}
+            "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
         tmtime = transcript_mtime(home, session, agent, sub_dirs)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
@@ -363,7 +386,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                "state": verdict["state"], "severity": verdict["severity"],
                "last_activity": iso(last_wal), "idle_s": None if idle == float("inf") else int(idle),
                "ticket": summary["tickets"][0] if summary["tickets"] else None,
-               "ticket_comment_age_s": None}
+               "ticket_comment_age_s": None,
+               "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+               "active_1h": now - max(last_wal, tmtime) <= 3600}  # WAL or transcript write in the hour (goodqa#15943)
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
@@ -374,7 +399,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         try:
             if now - f.stat().st_mtime > TASK_WAL_WINDOW_S:
                 continue  # history, not an owner (same window ahd uses for sessions)
-        except OSError:
+        except OSError as error:
+            unread.append({"source": f.name, "reason": f"file-unreadable: {type(error).__name__}"})
             continue
         summary = summarize_agent_wal(f, index_dir)
         verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
@@ -385,7 +411,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "parent": None, "owner": True, "registered": name in registered, "flags": ["task-wal"],
                      "state": verdict["state"], "severity": verdict["severity"],
                      "last_activity": iso(summary["last_at"]), "idle_s": None if idle == float("inf") else int(idle),
-                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None})
+                     "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
+                     "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
+                     "active_1h": now - summary["last_at"] <= 3600})
     asks = ask_states(main)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
         target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
@@ -450,16 +478,61 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             label = "unverified-legacy" if d["kind"] == "legacy" else d["kind"]
             r["state"], r["severity"] = label, "info"  # ended, never "done"
             r["flags"] = list(r.get("flags") or []) + [label]
-    for r in rows:  # I9: a handoff is real only once someone takes it (a disposition at/after the handoff)
-        if r["owner"] and r["state"] == "handoff":
-            handed = parse_ts(r["last_activity"]) or 0.0
+    # goodqa#15943 (receipt r1 F2): a wait on a user ask excuses only the owner the ask belongs to, whether it is a
+    # note or a disposition. A wait on another owner's ask, or a second holder of one unowned ask, is reported in
+    # `attention` (it never sets decision_required: the owner is not dropped, its wait is simply not its own).
+    # `wait_on` is the one reading of what an owner waits on (a live waiting disposition, else a `waiting-on-<x>`
+    # state from its last WAL note); idle_guard reads it instead of re-deriving it. A wait on anything but a user ask
+    # (a ticket, an agent, main) is a next step main can take: `attention: wait-not-user` (never decision_required).
+    owned, holders = ask_owners(main), {}
+    for r in rows:
+        r["wait_on"] = None
+        if not r["owner"]:
+            continue
+        d = r.get("disposition") or {}
+        if d.get("kind") in liveness.ENDING_DISPOSITIONS:
+            continue  # a terminal disposition stays terminal, whatever the owner's last note says
+        ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
+            (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
+        if not ref and d.get("kind") == "waiting" and d.get("live"):
+            ref = "a ticket"
+        if not ref:
+            continue
+        r["wait_on"] = ref
+        if ASK_ID_RE.match(ref) and asks.get(ref) == "open":
+            holders.setdefault(ref, []).append(r)
+        elif not ASK_ID_RE.match(ref):
+            r["attention"] = list(r.get("attention") or []) + ["wait-not-user"]
+    for ref, held in holders.items():
+        held.sort(key=lambda r: (parse_ts(r["last_activity"]) or 0.0, r["agent_id"]))
+        for i, r in enumerate(held):
+            own = owned.get(ref)
+            flag = "wait-ask-foreign" if own and own != r["agent_id"] else "wait-ask-shared" if not own and i > 0 else None
+            if flag:
+                r["flags"] = list(r.get("flags") or []) + [flag]
+                r["attention"] = list(r.get("attention") or []) + ["wait-invalid"]
+    # I9: a handoff is real only once someone takes it (a disposition at/after the handoff). goodqa#15943 (receipts r2
+    # and r4): the same rule decides whether ANY returned result (done, handoff, returned) was taken, so ah owners and
+    # idle_guard agree. An untaken result younger than RESULT_ACK_WINDOW_S is `attention: result-unacked`; a handoff
+    # untaken for HANDOFF_ACK_S is also decision_required (unchanged). An earlier disposition never takes a later
+    # result, and an owner's own wait (no --ack-handoff) never takes it.
+    for r in rows:
+        if r["owner"] and r["state"] in RESULT_STATES:
+            # receipt r5: the result's own WAL time, not last_activity (a later note must not revoke an ack or make an
+            # old result fresh). A row with no recorded result time (a helper's `returned`) falls back to its activity.
+            handed = parse_ts(r.get("result_at")) or parse_ts(r["last_activity"]) or 0.0
+            handed = float(int(handed))  # like with like: ledger stamps (server_now) and result_at carry whole seconds
             d = disp.get(r["agent_id"])
             kind = d.get("kind") if d else None
             # #134 red-team P4: only main's wait acknowledges, marked --ack-handoff (an owner cannot set it)
             acknowledged = kind in ("resumed", "reassigned") + GUARDED_KINDS or (
                 kind == "waiting" and d.get("ack_handoff") is True
                 and liveness.disposition_live(d, now, last_activity=handed))
-            acked = bool(acknowledged and float(d.get("at") or 0) >= handed - 10)
+            # strictly at or after this result (receipt r5 F1): the old 10 s slack let an earlier disposition take a
+            # later result. Both are UTC from the same host clock; the WAL time is floored to the ledger's whole
+            # seconds, so an ack in the same second as the result counts (it cannot be ordered) and one a second
+            # earlier never does.
+            acked = bool(acknowledged and float(d.get("at") or 0) >= handed)
             # A helper spawned by another agent hands its result back to that parent, which takes it by design. The
             # claim is honoured only when it is believable and the parent is plainly receiving: the child is a nested
             # spawn (meta spawnDepth >= 2; main's own spawns are depth 1 and never carry a parent), the parent is
@@ -472,7 +545,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                     and (parse_ts(prow["last_activity"]) or 0.0) >= handed:
                 acked = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-to-parent"]
-            if not acked and now - handed >= HANDOFF_ACK_S:
+            if not acked and now - handed <= RESULT_ACK_WINDOW_S:
+                r["attention"] = list(r.get("attention") or []) + ["result-unacked"]
+            if not acked and r["state"] == "handoff" and now - handed >= HANDOFF_ACK_S:
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + ["handoff-unacked"]
     # a wait on another agent holds only while that agent is live; a wait on a DROPPED, done or unknown agent is a drop
@@ -492,10 +567,12 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     dls = deadlines(home, session, now, led)
     missed = [d for d in dls if d["state"] == "missed" and not liveness.disposition_live(disp.get(d["id"]), now)]
     return {"session": session, "generated": iso(now), "counts": counts, "owners": rows, "source": "direct",
+            "agents_active_1h": sum(1 for r in rows if r.get("active_1h")),
             "deadlines": dls,
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
             "attention": sorted(r["agent_id"] for r in rows if r.get("attention")),
-            "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy")}
+            "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy"),
+            "read": read_block(1, unread)}
 
 
 # ------------------------------------------------------------------ user-msg
@@ -1498,6 +1575,8 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             state = ask_states(main_wal).get(ref)
             raise AhError("bad_request", f"task.dispose waiting: ask {ref} " + ("is already answered (ask_resolved)"
                           if state == "resolved" else "is not in this session's WAL"), 3)
+        if args["kind"] == "waiting" and ASK_ID_RE.match(ref):
+            narrow_wait(home, main_wal, args["session"], args["agent"], ref)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
@@ -1623,6 +1702,53 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
     return found
 
 
+def ask_owners(main_wal: Path) -> dict:
+    """{ask id: owner agent id} for the asks of the session main WAL that name an owner (wal_note --owner)."""
+    out = {}
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"owner"' not in raw or b'"ask"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
+                        and isinstance(rec.get("owner"), str) and rec["owner"]:
+                    out[rec["id"]] = rec["owner"]
+    except OSError:
+        pass
+    return out
+
+
+def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) -> None:
+    """goodqa#15943: a wait on a user ask excuses only the owner whose stream the ask belongs to. Refused when the ask
+    names another owner (`owner` field, wal_note --owner) or is already the live wait of another owner; an ask that
+    names nobody and is unused stays allowed (back-compat)."""
+    try:
+        with open(main_wal, "rb") as handle:
+            for raw in handle:
+                if b'"ask"' not in raw:
+                    continue
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == "ask" and rec.get("id") == ref:
+                    owner = rec.get("owner")
+                    if isinstance(owner, str) and owner and owner != agent:
+                        raise AhError("bad_request", f"waiting: ask {ref} belongs to {owner}, not {agent}; "
+                                                     "a wait on one ask excuses only its own owner", 3)
+    except OSError:
+        pass
+    now = time.time()
+    for other, d in dispositions(home, session).items():
+        if other != agent and d.get("kind") == "waiting" and d.get("ref") == ref and float(d.get("until") or 0.0) > now:
+            raise AhError("bad_request", f"waiting: ask {ref} is already {other}'s wait; one ask excuses one "
+                                         "owner. Raise a separate ask for this owner (wal_note --event ask --owner)", 3)
+
+
 def ask_states(main_wal: Path) -> dict:
     """{ask id: "open" | "resolved"} from the session main WAL (an `ask` entry, closed by `ask_resolved --ref`)."""
     states = {}
@@ -1693,6 +1819,8 @@ def deadlines(home: Path, session: str, now: float, ledger=None) -> list:
 
 
 HANDOFF_ACK_S = 3600  # a handoff nobody acknowledged within this window is a drop in disguise (I9)
+RESULT_STATES = ("done", "handoff", "returned")  # an owner that returned something main must take
+RESULT_ACK_WINDOW_S = 24 * 3600  # an untaken result older than this is history, not attention (goodqa#15943)
 
 
 def pending_stops(home: Path, session: str, ledger=None) -> dict:
@@ -2393,6 +2521,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     supplied = given is not None
     row_index = {id(rec): i for i, (_agent, rec) in enumerate(given)} if supplied else {}
     rows, unread = [], list(unread or [])
+    read_ok, skipped = 0, 0
 
     def consider(agent, rec):
         if not isinstance(rec, dict) or not rec.get("event"):
@@ -2412,13 +2541,25 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
                 unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
                 continue
-            for raw in text.splitlines():
+            read_ok += 1
+            try:
+                in_window = path.stat().st_mtime >= cutoff  # a file not written since the cutoff holds nothing in the window
+            except OSError:
+                in_window = True
+            lines = text.splitlines()
+            open_tail = bool(lines) and not text.endswith("\n")  # the last line may still be being written
+            for index, raw in enumerate(lines):
+                if not raw.strip():
+                    continue
                 try:
                     rec = json.loads(raw)
                 except ValueError:
+                    if in_window and not (open_tail and index == len(lines) - 1):
+                        skipped += 1  # a complete line that is not a record: what it held is missing from this report
                     continue
                 consider(agent, rec)
     else:
+        read_ok = 1
         for agent, rec in given:
             consider(agent, rec)
     rows.sort(key=lambda r: r[1])
@@ -2502,6 +2643,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             raise LookupError("owners view not computed for supplied rows")
         data = owners(home, session, now=now)
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
+                          "agents_active_1h": data.get("agents_active_1h"),
                           "attention": data.get("attention"),
                           "live": sorted(r["agent_id"] for r in data.get("owners") or []
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
@@ -2515,6 +2657,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             "claimed": claimed, "blockers": blockers, "commits": commits,
             "asks_open": [a for k, a in asks.items() if k not in resolved],
             "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
+            "read": read_block(read_ok, unread, skipped),
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
 
 
@@ -2541,7 +2684,7 @@ def status_text(data: dict) -> str:
     if "counts" in o:
         lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "
                      f"undisposed: {', '.join(o.get('undisposed') or []) or 'none'}; "
-                     f"attention (silent, wait expired or none): {', '.join(o.get('attention') or []) or 'none'}")
+                     f"attention (silent, wait expired, wait not on a user ask, result untaken, or none): {', '.join(o.get('attention') or []) or 'none'}")
     else:
         lines.append("## OWNERS " + str(o.get("error", "")))
     lines.append("(" + data["rule"] + ")")
@@ -2924,6 +3067,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
     prov = _prov()
     now = time.time() if now is None else now
     rows, total, limited = [], 0, False
+    unread, read_ok, skipped = [], 0, 0
     deadline = time.monotonic() + VIEW_BUDGET_S
     for s in _view_sessions(home, session, every):
         if time.monotonic() > deadline:
@@ -2931,18 +3075,31 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             break
         path = wal_dirs(home) / s / "main.jsonl"
         try:
+            if not os.path.lexists(path):
+                raise prov.Problem("missing", "no main WAL for this session")
             lines = list(prov._lines_containing(path, b'"event":"requirement"'))
-        except Exception:
+        except prov.Problem as problem:
+            # review PR 234 v6 F1: an unreadable WAL is an unread source, named with its reason, never zero requirements
+            unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"{problem.code}: {problem.message}"})
             continue
+        except Exception as error:  # noqa: BLE001
+            unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"file-unreadable: {type(error).__name__}"})
+            continue
+        read_ok += 1
         limited = limited or len(lines) >= prov.MAX_HITS  # the shared reader stops at MAX_HITS lines: say so
         for line in lines:
             if line is None:
+                skipped += 1  # an oversized line that names a requirement
                 continue
             try:
                 rec = prov.loads_line(line)
             except ValueError:
+                skipped += 1
                 continue
-            if not isinstance(rec, dict) or rec.get("event") != "requirement" or not isinstance(rec.get("id"), str) or not rec["id"]:
+            if not isinstance(rec, dict) or rec.get("event") != "requirement":
+                continue  # the words inside another record's text
+            if not isinstance(rec.get("id"), str) or not rec["id"]:
+                skipped += 1  # a requirement record with no id cannot be listed
                 continue
             total += 1
             if len(rows) >= VIEW_ROW_CAP:
@@ -2959,7 +3116,8 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 "state": str(rec.get("state") or "recorded")[:20],
                 "ticket": _clean_field(rec.get("ticket")), "owner": _clean_field(rec.get("owner")),
                 "evidence": _clean_field(rec.get("evidence"))})
-    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows)}
+    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows),
+            "read": read_block(read_ok, unread, skipped, limited)}
 
 
 def build_parser():
