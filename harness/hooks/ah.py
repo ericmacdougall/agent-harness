@@ -486,6 +486,32 @@ def _cleanup_stale_tmp_inner(index_dir: Path, now: float) -> None:
 OWNERS_CACHE_SAVE_EVERY = 300  # a cold run interrupted by tier_gate's deadline still keeps its progress (R8)
 
 
+_NUM = (int, float)
+
+
+def _cached_summary_ok(s) -> bool:
+    """A cached summary is served only with every field owners() and the tally read, each of its type (PR 245 m1 F2):
+    an empty or hand-edited entry is rebuilt from the WAL, never a KeyError on every call while the WAL is unchanged."""
+    if not isinstance(s, dict):
+        return False
+    num = lambda v: isinstance(v, _NUM) and not isinstance(v, bool)  # noqa: E731
+    text_or_none = lambda v: v is None or isinstance(v, str)  # noqa: E731
+    return (text_or_none(s.get("first")) and "first" in s and num(s.get("last_at")) and text_or_none(s.get("outcome"))
+            and "outcome" in s and num(s.get("outcome_at")) and isinstance(s.get("last_note"), str)
+            and num(s.get("events")) and num(s.get("skipped"))
+            and isinstance(s.get("tickets"), list) and all(isinstance(t, str) for t in s["tickets"])
+            and isinstance(s.get("meta"), dict) and _prov().LostTrail.from_state(s.get("lost_trail")) is not None
+            and s.get("record_rule") == _prov().RECORD_RULE)
+
+
+_META_FIELDS = ("type", "description", "parent", "finished", "depth")
+
+
+def _cached_meta_ok(m) -> bool:
+    """The cached meta fields are exactly what a fresh read stores (values as the meta file gave them)."""
+    return isinstance(m, dict) and set(m) == set(_META_FIELDS) and isinstance(m.get("finished"), bool)
+
+
 def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
     """_summarize_agent_wal, served from the owners cache while the file is unchanged (same inode, size, mtime_ns).
     Only the file's own facts are cached: what depends on the time of this call (an unterminated tail still inside
@@ -499,7 +525,7 @@ def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
     except OSError:
         fp = None
     entry = cache["wal"].get(key)
-    if fp and isinstance(entry, dict) and entry.get("fp") == fp and isinstance(entry.get("s"), dict):
+    if fp and isinstance(entry, dict) and entry.get("fp") == fp and _cached_summary_ok(entry.get("s")):
         return entry["s"]
     summary = _summarize_agent_wal(path, index_dir)
     if fp:
@@ -550,7 +576,7 @@ def discover_agents(home: Path, session: str, wal: Path, unread: list | None = N
                                     cache["seen"].add(e.path)
                                     hit = cache["meta"].get(e.path)
                                     if isinstance(hit, dict) and hit.get("fp") == _fingerprint(st) \
-                                            and isinstance(hit.get("m"), dict):
+                                            and _cached_meta_ok(hit.get("m")):
                                         fields = hit["m"]
                                 if fields is None:   # only a meta file read whole is cached; a failure is read again
                                     meta = json.loads(_bounded(Path(e.path), 65536))

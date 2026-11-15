@@ -176,6 +176,30 @@ class Counts(Base):
         cache.write_text("[" * 20000 + "]" * 20000)   # review B-5: RecursionError is not a ValueError
         self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
 
+    def test_a_matching_fingerprint_with_a_wrong_shape_is_rebuilt(self):  # PR 245 m1 receipt F2
+        good = strip(ah.owners(self.home, SESSION, now=NOW))
+        path = ah._owners_cache_path(ah.state_dir(self.home, "ah-index"), SESSION)
+        saved = json.loads(path.read_text())
+        wal_key = next(iter(saved["wal"]))
+        meta_key = next(iter(saved["meta"]))
+        bad_summaries = {"empty": {}, "last_at text": dict(saved["wal"][wal_key]["s"], last_at="soon"),
+                         "tickets a string": dict(saved["wal"][wal_key]["s"], tickets="goodqa#1"),
+                         "no first": {k: v for k, v in saved["wal"][wal_key]["s"].items() if k != "first"}}
+        for name, bad in bad_summaries.items():
+            with self.subTest(summary=name):
+                data = json.loads(json.dumps(saved))
+                data["wal"][wal_key]["s"] = bad   # the fingerprint still matches the unchanged WAL
+                path.write_text(json.dumps(data))
+                for _ in range(2):   # rebuilt, and not served again on the next call
+                    self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
+        for name, bad in {"empty": {}, "finished text": dict(saved["meta"][meta_key]["m"], finished="yes"),
+                          "no type": {k: v for k, v in saved["meta"][meta_key]["m"].items() if k != "type"}}.items():
+            with self.subTest(meta=name):
+                data = json.loads(json.dumps(saved))
+                data["meta"][meta_key]["m"] = bad
+                path.write_text(json.dumps(data))
+                self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
+
     def test_a_deeply_nested_meta_file_is_skipped(self):  # delta review follow-up (discover_agents meta read)
         aid = "a" + f"{5:016x}"
         meta = self.home / ".claude" / "projects" / "-p0" / SESSION / "subagents" / f"agent-{aid}.meta.json"
