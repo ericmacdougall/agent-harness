@@ -839,6 +839,123 @@ class OperationTests(Base):
         self.assertFalse(hasattr(C, "B54_LATE_SECONDS"), "there is no late-request horizon")
 
 
+class WatchAttributionTests(Base):
+    """Spec v2g4 (core 71971fc8), Late-apply watch: each activity entry id is attributed to at most one op; an
+    entry is explained when it confirmed an op (E3/E12/E14/E10) or was named by an E16 incident. The watch fires
+    only on an unexplained (B, H) entry, or on tip == H with no confirmed (or E16) op at the same
+    (repo, pr, B, H, revision). Every poll goes through watched(), as the runner's would."""
+
+    @staticmethod
+    def e(eid, before=BASE, after=H1):
+        return {"id": eid, "before": before, "after": after, "type": "push"}
+
+    def poll(self, read):
+        """One watch poll over the repo: late_apply on every watched abandoned op; returns the keys that raised."""
+        raised = []
+        for w in self.c.watched("o/r"):
+            if w["state"] == "abandoned" and self.c.late_apply(w["key"], read, event_id=self.ev()) is not None:
+                raised.append(w["key"])
+        return raised
+
+    def e8_abandoned(self):
+        g, op = self.absent_p("p1")
+        return self.after(op, self.read(tip=B2))
+
+    def incidents(self, op):
+        return self.c._row("operations", "key", op["key"])["incident"]
+
+    def test_a_abandoned_g_then_g1_confirmed_at_the_same_b_h_raises_nothing(self):
+        g0 = self.e8_abandoned()
+        self.assertEqual((g0["state"], g0["proof"]), ("abandoned", "all-sends-absent"))
+        g1, op1 = self.dispatched()
+        self.assertEqual(op1["generation"], g0["generation"] + 1)
+        self.c.confirm(op1["key"], self.readback(), expected_version=op1["version"], event_id=self.ev())
+        for _ in range(2):
+            self.assertEqual(self.poll(self.read(tip=H1, entries=[self.e("ev-gh-1")])), [])
+            self.assertEqual(self.poll(self.readback()), [], "tip == H is explained by the confirmed g+1")
+        self.assertFalse(self.c.merging_off("o/r"))
+        self.assertEqual(self.incidents(g0), 0)
+
+    def test_a_the_entry_read_at_confirm_is_attributed_there(self):
+        g0 = self.e8_abandoned()
+        g1, op1 = self.dispatched()
+        confirm_read = self.read(tip=H1, entries=[self.e("ev-gh-1")], pr_merged=True)
+        op1 = self.c.confirm(op1["key"], confirm_read, expected_version=op1["version"], event_id=self.ev())
+        self.assertEqual(self.db.execute("SELECT op_key, how FROM attributions WHERE entry_id='ev-gh-1'").fetchone(),
+                         (op1["key"], "confirm"))
+        self.assertEqual(self.poll(self.read(tip=H1, entries=[self.e("ev-gh-1")])), [])
+        self.assertFalse(self.c.merging_off("o/r"))
+
+    def test_b_an_e16_op_raises_once_and_not_again_on_the_next_poll(self):
+        g, op = self.absent_p("p1")
+        op = self.after(op, self.read(tip=H1))                     # E16: something else integrated H
+        self.assertEqual((op["state"], op["incident"]), ("abandoned", 1))
+        for read in (self.read(tip=H1, entries=[self.e("ev-gh-7")]), self.read(tip=H1, entries=[self.e("ev-gh-7")]),
+                     self.readback()):
+            self.assertEqual(self.poll(read), [])
+        self.assertEqual(self.incidents(op), 1, "the E16 incident is the only one")
+        self.assertFalse(self.c.merging_off("o/r"))
+
+    def test_b_an_e16_op_with_its_entry_holds_that_entry(self):
+        g, op = self.absent_p("p1")
+        op = self.after(op, self.read(tip=OTHER, entries=[self.e("ev-gh-8")]))
+        self.assertEqual(self.db.execute("SELECT op_key, how FROM attributions WHERE entry_id='ev-gh-8'").fetchone(),
+                         (op["key"], "E16"))
+        self.assertEqual(self.poll(self.read(entries=[self.e("ev-gh-8")])), [])
+        self.assertEqual(self.incidents(op), 1)
+
+    def test_c_a_second_unexplained_b_h_entry_after_a_rewind_raises_once(self):
+        g0 = self.e8_abandoned()
+        g1, op1 = self.dispatched()
+        self.c.confirm(op1["key"], self.read(tip=H1, entries=[self.e("ev-gh-1")], pr_merged=True),
+                       expected_version=op1["version"], event_id=self.ev())
+        self.assertEqual(self.poll(self.read(tip=H1, entries=[self.e("ev-gh-1")])), [])
+        # the branch is rewound to B and the (B, H) update applies a second time: g+1 explains only its own entry
+        again = self.read(tip=H1, entries=[self.e("ev-gh-1"), self.e("ev-gh-2", before=H1, after=BASE),
+                                           self.e("ev-gh-3")])
+        self.assertEqual(self.poll(again), [g0["key"]])
+        self.assertTrue(self.c.merging_off("o/r"))
+        self.assertEqual(self.incidents(g0), 1)
+        self.assertEqual(self.db.execute("SELECT op_key, how FROM attributions WHERE entry_id='ev-gh-3'").fetchone(),
+                         (g0["key"], "late-apply"))
+        self.assertEqual(self.poll(again), [], "the same entry never raises twice")
+        self.assertEqual(self.incidents(g0), 1)
+
+    def test_c_a_tip_confirmed_op_claims_one_entry_only_when_two_arrive_in_one_read(self):
+        g0 = self.e8_abandoned()
+        g1, op1 = self.dispatched()
+        self.c.confirm(op1["key"], self.readback(), expected_version=op1["version"], event_id=self.ev())
+        two = self.read(tip=H1, entries=[self.e("ev-gh-1"), self.e("ev-gh-3")])
+        self.assertEqual(self.poll(two), [g0["key"]], "g+1 explains one application of (B, H), not two")
+        self.assertEqual(dict(self.db.execute("SELECT entry_id, how FROM attributions").fetchall()),
+                         {"ev-gh-1": "confirm", "ev-gh-3": "late-apply"})
+
+    def test_an_entry_without_an_id_is_never_explained(self):
+        g0 = self.e8_abandoned()
+        g1, op1 = self.dispatched()
+        self.c.confirm(op1["key"], self.readback(), expected_version=op1["version"], event_id=self.ev())
+        anonymous = self.read(tip=H1, entries=[self.entry()])
+        self.assertEqual(self.poll(anonymous), [g0["key"]], "no id: it cannot be attributed (fail closed)")
+
+    def test_tip_h_with_no_explainer_raises_once_per_op(self):
+        g0 = self.e8_abandoned()
+        self.assertEqual(self.poll(self.readback()), [g0["key"]])
+        self.assertEqual(self.poll(self.readback()), [])
+        self.assertEqual(self.incidents(g0), 1)
+
+    def test_an_explainer_at_another_revision_or_pr_explains_nothing(self):
+        g0 = self.e8_abandoned()
+        g1, op1 = self.dispatched(pr=6)
+        self.c.confirm(op1["key"], self.readback(), expected_version=op1["version"], event_id=self.ev())
+        self.assertEqual(self.poll(self.read(tip=H1, entries=[self.e("ev-gh-1")])), [g0["key"]])
+
+    def test_an_incomplete_read_still_raises_and_claims_nothing(self):
+        g0 = self.e8_abandoned()
+        with self.assertRaises(C.ContractError):
+            self.c.late_apply(g0["key"], self.read(entries=[self.e("ev-gh-1")], complete=False), event_id=self.ev())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM attributions").fetchone()[0], 0)
+
+
 class LegacyTests(Base):
     def test_unsettled_legacy_rows_are_reported(self):
         self.db.execute("CREATE TABLE grants_v3_legacy (id TEXT, state TEXT, repo TEXT)")
