@@ -355,5 +355,38 @@ class PolicyReadIsBounded(Base):
         self.assertEqual(self.health.rows["owner-policy"]["status"], "ok")
 
 
+class PolicyShape(PolicyReadIsBounded):
+    """PR 260 v2 F4: valid JSON of the wrong shape is the same "policy unreadable" fallback, never an exception that
+    aborts owner collection."""
+
+    CASES = {
+        "a list": [{"caps": {}}],
+        "caps a list": {"caps": ["owner_types"]},
+        "caps a string": {"caps": "task-owner"},
+        "a nested wrong type": {"caps": {"owner_types": ["task-owner", {"x": 1}], "helper_types": ["red-team"]}},
+        "helper_types a string": {"caps": {"owner_types": ["task-owner"], "helper_types": "red-team"}},
+        "a negative count": {"caps": {"owner_types": ["task-owner"], "helper_types": ["red-team"], "session_owner_agents": -1}},
+        "a boolean count": {"caps": {"owner_types": ["task-owner"], "helper_types": ["red-team"], "live_ttl_seconds": True}},
+    }
+
+    def test_every_wrong_shape_is_a_fallback_row_not_an_exception(self):
+        for name, value in self.CASES.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                self.health = col.Health(self.hub)
+                path = Path(tmp) / "tiers.json"
+                path.write_text(json.dumps(value))
+                with mock.patch.dict(os.environ, {"AGENT_HARNESS_TIER_POLICY": str(path)}):
+                    policy = col.owner_policy()
+                self.assertTrue(policy["fallback"], name)
+                self.assertIn("red-team", policy["helper_types"], "the documented defaults")
+                self.assertTrue(policy["error"], name)
+                self.assertIn(policy["error"].split(" ")[0], self.tick_with_policy(path)["detail"])
+
+    def test_a_whole_good_shape_is_not_a_fallback(self):  # control: the shipped table passes the validator
+        policy = col.owner_policy(REPO / "harness" / "hooks")
+        self.assertFalse(policy["fallback"])
+        self.assertEqual(policy["error"], "")
+
+
 if __name__ == "__main__":
     unittest.main()
