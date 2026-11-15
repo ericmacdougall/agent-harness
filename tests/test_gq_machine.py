@@ -55,6 +55,7 @@ class FakeMachines:
         self.drop = set()
         self.drop_once = set()
         self.hold = set()
+        self.hold_after = set()  # {(method, suffix)}: the route runs (the server applied it), then the answer waits
         self.held = threading.Event()
         self.unhold = threading.Event()
         self.command_status = "ok"
@@ -99,6 +100,10 @@ class FakeMachines:
                 return api.route(self, method, path[len("/v1"):], body)
 
             def _json(self, status, obj):
+                for (m, suffix) in list(api.hold_after):
+                    if m == self.command and re.search(suffix, urllib.parse.urlparse(self.path).path):
+                        api.held.set()
+                        api.unhold.wait(20)
                 if api.mutate:
                     status, obj = api.mutate(self.command, urllib.parse.urlparse(self.path).path, status, obj)
                 data = json.dumps(obj).encode()
@@ -187,6 +192,7 @@ class FakeMachines:
 
     def release(self):
         self.hold.clear()
+        self.hold_after.clear()
         self.unhold.set()
 
     def close(self):
@@ -742,6 +748,211 @@ class Interrupts(Base):
         self.assertEqual([r["handle"] for r in rows], [h])
         self.e.run("close", h, check=0)
         self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
+
+
+DRIVER = r'''
+"""Test driver: load gq_browser from argv[1], pause at one point (GQ_TEST_PAUSE=kind:arg), then run its main()."""
+import importlib.util, json, os, re, sys, time
+spec = importlib.util.spec_from_file_location("gq_browser_under_test", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+marker = os.environ.get("GQ_TEST_MARKER")
+
+
+def pause():
+    open(marker, "w").close()
+    for _ in range(400):  # a signal raises out of sleep; inside a release shield it is deferred, so stop waiting
+        if getattr(mod, "_PENDING", None):
+            return
+        time.sleep(0.05)
+
+
+kind, _, arg = (os.environ.get("GQ_TEST_PAUSE") or "none:").partition(":")
+if kind == "send":  # before the first request whose "METHOD path" matches arg is sent
+    orig_call = mod.Api.call
+
+    def call(self, method, path, *a, **k):
+        if re.search(arg, method + " " + path) and not os.path.exists(marker):
+            pause()
+        return orig_call(self, method, path, *a, **k)
+    mod.Api.call = call
+elif kind == "save":  # inside the arg-th state write, after the temp file is written and before the rename
+    orig_save, count = mod.save_state, [0]
+
+    def save_state(d, state):
+        count[0] += 1
+        if count[0] != int(arg):
+            return orig_save(d, state)
+        tmp = os.path.join(d, ".state.test.tmp")
+        mod.write_new(tmp, json.dumps(state, sort_keys=True).encode())
+        pause()
+        os.replace(tmp, os.path.join(d, "state.json"))
+    mod.save_state = save_state
+elif kind == "write":  # before writing a file whose name ends with arg
+    orig_write = mod.write_new
+
+    def write_new(path, data, *a, **k):
+        if path.endswith(arg):
+            pause()
+        return orig_write(path, data, *a, **k)
+    mod.write_new = write_new
+sys.exit(mod.main(sys.argv[2:]))
+'''
+
+CMD = r"/machines/[^/]+/commands$"
+POINTS = {
+    "open": [("send", r"^POST .*/leases$"), ("hold", ("POST", r"/leases$")), ("hold_after", ("POST", r"/leases$")), ("save", "3")],
+    "renew": [("send", r"^POST .*/renew$"), ("hold", ("POST", r"/renew$")), ("hold_after", ("POST", r"/renew$")), ("save", "1")],
+    "click": [("send", r"^POST .*/commands$"), ("hold", ("POST", CMD)), ("hold_after", ("POST", CMD)), ("hold", ("GET", r"/machine-commands/[^/]+$"))],
+    "type": [("send", r"^POST .*/commands$"), ("hold", ("POST", CMD)), ("hold_after", ("POST", CMD)), ("hold", ("GET", r"/machine-commands/[^/]+$"))],
+    "key": [("send", r"^POST .*/commands$"), ("hold", ("POST", CMD)), ("hold_after", ("POST", CMD)), ("hold", ("GET", r"/machine-commands/[^/]+$"))],
+    "shot": [("send", r"^POST .*/commands$"), ("hold_after", ("POST", CMD)), ("hold", ("GET", r"/machine-artifacts/")), ("write", ".png")],
+    "close": [("send", r"^POST .*/release$"), ("hold", ("POST", r"/release$")), ("hold_after", ("POST", r"/release$"))],
+}
+ARGV = {"open": lambda h: ["open", MACHINE], "renew": lambda h: ["renew", h], "click": lambda h: ["click", h, "--x", "1", "--y", "2"],
+        "type": lambda h: ["type", h, "--text", "hello"], "key": lambda h: ["key", h, "--keys", "Return"], "shot": lambda h: ["shot", h],
+        "close": lambda h: ["close", h]}
+SIGS = {signal.SIGINT: "SIGINT", signal.SIGTERM: "SIGTERM"}
+
+
+class InterruptTable(Base):
+    """PR 250 v3 receipt F1, as a class: verb x interrupt point x signal x release outcome. Every cell must end in a
+    confirmed release or an open lease listed by list --orphans, and the message must state that outcome. Ground truth
+    is the fake's lease row, not the client's words."""
+
+    def setUp(self):
+        super().setUp()
+        self.driver = Path(self.e.tmp.name) / "driver.py"
+        self.driver.write_text(DRIVER)
+
+    def live(self, h):
+        return any(r["holder"] == "gq-machine:" + h and not r["released"] for r in self.api.lease_rows.values())
+
+    def orphans(self):
+        return [r["handle"] for r in json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]]
+
+    def run_cell(self, argv, point, sig, outcome, n):
+        api = self.api
+        api.fail.clear()
+        api.held.clear()
+        api.unhold.clear()
+        env = dict(self.e.env)
+        marker = Path(self.e.tmp.name) / ("marker-%d" % n)
+        kind, arg = point
+        if outcome == "fail":
+            api.fail[("POST", r"/release$")] = (500, "internal_error")
+        if kind in ("send", "save", "write"):
+            env["GQ_TEST_PAUSE"], env["GQ_TEST_MARKER"] = "%s:%s" % (kind, arg), str(marker)
+        elif kind == "hold":
+            api.hold.add(arg)
+        else:
+            api.hold_after.add(arg)
+        proc = subprocess.Popen([sys.executable, "-I", str(self.driver), str(CLIENT), "machine", *argv], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env=env)
+        deadline, reached = time.time() + 15, False
+        while time.time() < deadline and not reached:
+            reached = marker.exists() if kind in ("send", "save", "write") else api.held.is_set()
+            time.sleep(0.02)
+        if reached:
+            proc.send_signal(sig)
+            time.sleep(0.2)
+        api.release()
+        out, err = proc.communicate(timeout=60)
+        api.unhold.clear()
+        api.fail.clear()
+        self.e.outputs += [out, err]
+        return reached, proc.returncode, out, err
+
+    def check(self, verb, h, reached, rc, err, sig, cmds_before, cancels_before, command_done=False):
+        problems = []
+        if not reached:
+            return ["pause point never reached"]
+        if rc != 128 + sig:
+            problems.append("rc %s" % rc)
+        if "interrupted (%s)" % SIGS[sig] not in err:
+            problems.append("no interrupt message")
+        closed = self.e.state(h)["closed"]
+        if closed != (not self.live(h)):
+            problems.append("local closed=%s but server live=%s" % (closed, self.live(h)))
+        if closed and "NOT released" in err:
+            problems.append("closed yet reported NOT released")
+        if closed and not re.search(r"released \(|already closed|nothing_to_release", err):
+            problems.append("closed without a stated release")
+        if not closed and ("NOT released" not in err or h not in self.orphans()):
+            problems.append("open lease not reported or not listed")
+        queued = len(self.api.commands) > cmds_before
+        cancelled = len(self.api.calls("POST", r"/cancel$")) > cancels_before
+        if queued and not command_done and not cancelled and "may still run" not in err:
+            problems.append("a queued command was neither cancelled nor reported")
+        if not closed:  # the orphan must still be releasable
+            p = self.e.run("close", h)
+            if p.returncode != 0 or self.live(h):
+                problems.append("retry close did not release (%s)" % p.returncode)
+        return problems
+
+    def test_every_verb_point_signal_and_release_outcome(self):
+        failures, n = [], 0
+        for verb, points in POINTS.items():
+            for point in points:
+                for sig in SIGS:
+                    for outcome in ("ok", "fail"):
+                        n += 1
+                        h = None if verb == "open" else self.e.seed(self.api)
+                        before = set(os.listdir(self.e.root)) if self.e.root.exists() else set()
+                        cmds, cancels = len(self.api.commands), len(self.api.calls("POST", r"/cancel$"))
+                        reached, rc, out, err = self.run_cell(ARGV[verb](h), point, sig, outcome, n)
+                        if h is None:
+                            new = set(os.listdir(self.e.root)) - before
+                            if len(new) != 1:
+                                failures.append("%s %s %s %s: %d new handles" % (verb, point, SIGS[sig], outcome, len(new)))
+                                continue
+                            h = new.pop()
+                        # shot's artifact fetch and file write come after the command reached a terminal state
+                        done = verb == "shot" and point[0] in ("write",) or point == ("hold", ("GET", r"/machine-artifacts/"))
+                        problems = self.check(verb, h, reached, rc, err, sig, cmds, cancels, command_done=done)
+                        if problems:
+                            failures.append("%s %s %s %s: %s | %s" % (verb, point[0], SIGS[sig], outcome, "; ".join(problems), err.strip()[-160:]))
+        self.assertEqual(n, 108)
+        self.assertEqual(failures, [], "%d of %d cells failed:\n%s" % (len(failures), n, "\n".join(failures)))
+
+    def test_mcp_renew_on_a_handle_it_did_not_open(self):
+        for sig in SIGS:
+            for outcome in ("ok", "fail"):
+                h = self.e.seed(self.api)
+                self.api.held.clear()
+                if outcome == "fail":
+                    self.api.fail[("POST", r"/release$")] = (500, "internal_error")
+                self.api.hold_after.add(("POST", r"/renew$"))
+                proc = self.e.popen(mcp=True)
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                             "params": {"name": "gq_machine_renew", "arguments": {"handle": h}}}) + "\n")
+                proc.stdin.flush()
+                self.assertTrue(self.api.held.wait(15))
+                proc.send_signal(sig)
+                time.sleep(0.2)
+                self.api.release()
+                out, err = proc.communicate(timeout=60)
+                self.api.unhold.clear()
+                self.api.fail.clear()
+                self.e.outputs += [out, err]
+                problems = self.check("renew", h, True, proc.returncode, err, sig, len(self.api.commands), len(self.api.calls("POST", r"/cancel$")))
+                self.assertEqual(problems, [], (SIGS[sig], outcome, err))
+
+    def test_unexpected_local_error_after_a_renew_reports_the_lease_still_open(self):
+        h = self.e.seed(self.api)
+        d = self.e.root / h
+        os.chmod(d, 0o500)  # the server applies the renew; the state write then fails
+        try:
+            p = self.e.run("renew", h)
+        finally:
+            os.chmod(d, 0o700)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("is still open", p.stderr)
+        self.assertFalse(self.e.state(h)["closed"])
+        self.assertTrue(self.live(h))
+        self.assertIn(h, self.orphans())
+        self.e.run("close", h, check=0)
+        self.assertFalse(self.live(h))
 
 
 class Mcp(Base):

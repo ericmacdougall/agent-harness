@@ -738,17 +738,46 @@ SECRET_SHAPES = [re.compile(p) for p in (
 
 
 class Interrupted(BaseException):
-    """SIGTERM, raised like KeyboardInterrupt so every finally and cleanup path runs."""
+    """SIGINT, SIGTERM or SIGHUP, raised like KeyboardInterrupt so every finally runs. The lease cleanup itself runs once,
+    at the entrypoint (main or mcp), from the record in _ACTIVE (PR 250 rescue r4)."""
+
+    def __init__(self, signum=None, report=None):
+        super().__init__(signum)
+        self.signum, self.report = signum, report
+
+
+# Signal handling for the machine verbs and the MCP server (PR 250 v3 receipt F1, as a class):
+#   - the first SIGINT, SIGTERM or SIGHUP raises Interrupted; every later one is ignored, so nothing can cut the cleanup
+#     short (SIGKILL still can; the server's lease TTL bounds that);
+#   - inside _Quiet (a release in progress) a signal is deferred, never dropped: it is raised when the shield ends.
+SIGNALS = tuple(s for s in (getattr(signal, n, None) for n in ("SIGINT", "SIGTERM", "SIGHUP")) if s is not None)
+SIGNAL_NAMES = {getattr(signal, n): n for n in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, n)}
+_SHUTDOWN = [False]
+_PENDING = []
+_QUIET_DEPTH = [0]
+
+
+def _on_signal(signum, frame):
+    if _SHUTDOWN[0]:
+        return
+    _SHUTDOWN[0] = True
+    raise Interrupted(signum)
+
+
+def _defer_signal(signum, frame):
+    if not _SHUTDOWN[0] and not _PENDING:
+        _PENDING.append(signum)
 
 
 class _Quiet:
-    """Ignore SIGINT and SIGTERM while a cleanup runs, so a second signal cannot cut a release short."""
+    """Shield a release: a signal that lands inside it is deferred and raised when the outermost shield ends."""
 
     def __enter__(self):
         self.saved = []
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        _QUIET_DEPTH[0] += 1
+        for sig in SIGNALS:
             try:
-                self.saved.append((sig, signal.signal(sig, signal.SIG_IGN)))
+                self.saved.append((sig, signal.signal(sig, _defer_signal)))
             except (ValueError, OSError):
                 pass
         return self
@@ -759,7 +788,64 @@ class _Quiet:
                 signal.signal(sig, old)
             except (ValueError, OSError):
                 pass
+        _QUIET_DEPTH[0] -= 1
+        if _QUIET_DEPTH[0] == 0 and _PENDING and not _SHUTDOWN[0] and exc[0] is None:
+            signum = _PENDING.pop()
+            _SHUTDOWN[0] = True
+            raise Interrupted(signum)
         return False
+
+
+# The lease a machine verb is working on, so the entrypoint can end it after an interrupt: {"handle", "base", "d",
+# "state", "cmd": None | "sent" | <command id>}. The state dict is the verb's own, so the cleanup sees its newest values.
+_ACTIVE = {}
+
+
+def _track(handle, base=None, d=None, state=None):
+    _ACTIVE.clear()
+    _ACTIVE.update({"handle": handle, "base": base, "d": d, "state": state, "cmd": None})
+
+
+def _cleanup_active():
+    """End the tracked lease after an interrupt. Returns the outcome as local text, or None when no lease verb ran.
+    The text says what happened (released, kept open and listed, not attempted), never more."""
+    a = dict(_ACTIVE)
+    _ACTIVE.clear()
+    if not a:
+        return None
+    with _Quiet():
+        parts = []
+        d, state, base = a.get("d"), a.get("state"), a.get("base")
+        if state is None:
+            try:
+                d, state, base = _mstate(a["handle"], allow_closed=True, need_lease=False)
+                _ACTIVE.clear()
+            except (Refused, OSError, ValueError):
+                _ACTIVE.clear()
+                return "machine lease %s: cleanup not attempted (its state could not be read); check: machine list --orphans" % a["handle"]
+        try:
+            api = Api(base, read_token())
+        except (Refused, OSError):
+            return "machine lease %s: cleanup not attempted (the user token could not be read); it stays listed in machine list --orphans" % a["handle"]
+        cmd = a.get("cmd")
+        if cmd == "sent":
+            parts.append("the command may have been queued (no command id was received); it may still run while the lease lives")
+        elif cmd:
+            try:
+                api.call("POST", "/machine-commands/%s/cancel" % cmd, api.user)
+                parts.append("command %s cancelled" % cmd)
+            except ApiError:
+                parts.append("command %s cancel failed; it may still run while the lease lives" % cmd)
+        if state.get("closed"):
+            parts.append("machine lease %s already closed" % a["handle"])
+        else:
+            state["endReason"] = "interrupted"
+            report = _mrelease(api, d, state, recover=True)
+            if state.get("closed"):
+                parts.append("machine lease %s released (%s)" % (a["handle"], report))
+            else:
+                parts.append("machine lease %s NOT released (%s)" % (a["handle"], report))
+        return "; ".join(parts)
 
 
 def machine_root():
@@ -812,6 +898,7 @@ def _check_ttl(ttl):
 
 
 def _mstate(handle, allow_closed=False, need_lease=True):
+    _track(handle)  # an interrupt from here on ends this handle's lease (_cleanup_active)
     d = machine_dir(handle)
     state = load_state(d)
     if state.get("handle") != handle or state.get("kind") != "machine":
@@ -834,6 +921,7 @@ def _mstate(handle, allow_closed=False, need_lease=True):
     if need_lease and not state.get("closed") and lid is None:
         # The create answer was lost, so no lease id is confirmed: a command or renew would name no lease (PR 250 rescue).
         raise Refused("machine lease %s has no confirmed lease (its create answer was lost); nothing sent. Run: machine close %s" % (handle, handle))
+    _track(handle, base, d, state)
     return d, state, base
 
 
@@ -941,9 +1029,10 @@ def op_machine_open(machine_id, ttl=MACHINE_TTL_DEFAULT):
     # Preflight: the grant decides whether this token sees the machine; a 403 or 404 stops here, nothing else is sent.
     obj(api.call("GET", "/machines/%s" % machine_id, token), "GET machine")
     handle = secrets.token_hex(8)
-    d = machine_dir(handle, create=True)
     state = {"kind": "machine", "handle": handle, "machineId": machine_id, "base": base, "holder": "gq-machine:" + handle,
              "ttl": ttl, "leaseId": None, "leaseRequested": False, "closed": False, "createdAt": iso(time.time())}
+    d = machine_dir(handle, create=True)
+    _track(handle, base, d, state)  # from here an interrupt ends in a confirmed release or a listed orphan
     save_state(d, state)
     try:
         state["leaseRequested"] = True
@@ -951,7 +1040,7 @@ def op_machine_open(machine_id, ttl=MACHINE_TTL_DEFAULT):
         lid, expires = _lease_from(api.call("POST", "/machines/%s/leases" % machine_id, token, _lease_body(state)), "POST leases")
         state["leaseId"], state["expiresAt"] = lid, expires
         save_state(d, state)
-    except BaseException as e:
+    except Exception as e:  # an interrupt is ended by the entrypoint (_cleanup_active), with its report
         if (isinstance(e, ApiError) and not e.lost and isinstance(e.status, int)
                 and (e.status == 202 or (400 <= e.status < 500 and e.status != 408)) and not state.get("leaseId")):
             # The server answered this one create with a refusal (4xx) or a 202 approval ask: acquireLease throws or
@@ -961,9 +1050,7 @@ def op_machine_open(machine_id, ttl=MACHINE_TTL_DEFAULT):
         cleanup = _mrelease(api, d, state)
         if isinstance(e, ApiError):
             raise ApiError(e.what, e.status, e.code, e.lost, detail="%s; cleanup: %s" % (e, cleanup)) from None
-        if isinstance(e, Exception):
-            raise ApiError("open", 0, "local_error", detail="open failed (%s); cleanup: %s" % (type(e).__name__, cleanup)) from None
-        raise
+        raise ApiError("open", 0, "local_error", detail="open failed (%s); cleanup: %s" % (type(e).__name__, cleanup)) from None
     return {"handle": handle, "machineId": machine_id, "leaseId": lid, "expiresAt": expires, "ttlSeconds": ttl}
 
 
@@ -983,61 +1070,53 @@ def _wait_seconds():
 
 
 def _command(handle, kind, args, d, state, base, token):
-    """Queue one command under the lease and poll it to a terminal state. SIGINT or SIGTERM cancels it and releases the lease."""
+    """Queue one command under the lease and poll it to a terminal state. An interrupt is ended by the entrypoint
+    (_cleanup_active): it cancels the command when its id is known and releases the lease."""
     api = Api(base, token)
-    cid = None
     request_id = "gq-machine:%s:%s" % (handle, secrets.token_hex(8))
+    _ACTIVE["cmd"] = "sent"  # from here the server may hold a queued command
     try:
-        try:
-            got = obj(api.call("POST", "/machines/%s/commands" % state["machineId"], token,
-                               {"kind": kind, "args": args, "leaseId": state["leaseId"], "clientRequestId": request_id}), "POST commands")
-        except ApiError as e:
-            _ended(d, state, e)
-            if e.lost:
-                raise ApiError(e.what, detail="%s; never re-sent (clientRequestId %s): look before acting again" % (e, request_id)) from None
-            raise
-        cmd = obj(got.get("command"), "POST commands")
-        cid = cmd.get("id")
-        if not isinstance(cid, str) or not STRICT_UUID.match(cid):
-            raise ApiError("POST commands", 0, "unexpected_response")
-        deadline = time.time() + _wait_seconds()
-        while True:
-            status = cmd.get("status")
-            if status in MACHINE_TERMINAL:
-                break
-            if status == "awaiting_approval":
-                with _Quiet():
-                    try:
-                        api.call("POST", "/machine-commands/%s/cancel" % cid, token)
-                    except ApiError:
-                        pass
-                    state["endReason"] = "approval_required"
-                    cleanup = _mrelease(api, d, state, recover=False)
-                raise ApiError("command", 0, "awaiting_approval",
-                               detail="command %s is awaiting_approval; cancelled, never approved by this tool; lease: %s" % (cid, cleanup))
-            left = deadline - time.time()
-            if left <= 0:
-                return {"untrusted": True, "notice": NOTICE, "commandId": cid, "state": "unknown",
-                        "retry": "never re-sent; the command may still run"}
-            cmd = obj(obj(api.call("GET", "/machine-commands/%s?wait=%d" % (cid, int(min(left, 10) * 1000)), token), "GET command").get("command"), "GET command")
-        err = cmd.get("error")
-        code = known_code(err.get("code")) if isinstance(err, dict) else None
-        if status != "ok":
-            if code == "lease_ended":  # the server cancelled it because the lease ended (service.ts serializeCommand)
-                state["closed"], state["endReason"] = True, "lease_ended"
-                save_state(d, state)
-            raise ApiError("command", 0, code or status, detail="command %s ended %s (%s)" % (cid, status, code or "no code"))
-        return {"commandId": cid, "cmd": cmd}
-    except (KeyboardInterrupt, Interrupted):
-        with _Quiet():
-            if cid:
+        got = obj(api.call("POST", "/machines/%s/commands" % state["machineId"], token,
+                           {"kind": kind, "args": args, "leaseId": state["leaseId"], "clientRequestId": request_id}), "POST commands")
+    except ApiError as e:
+        _ended(d, state, e)
+        if e.lost:
+            raise ApiError(e.what, detail="%s; never re-sent (clientRequestId %s): look before acting again" % (e, request_id)) from None
+        raise
+    cmd = obj(got.get("command"), "POST commands")
+    cid = cmd.get("id")
+    if not isinstance(cid, str) or not STRICT_UUID.match(cid):
+        raise ApiError("POST commands", 0, "unexpected_response")
+    _ACTIVE["cmd"] = cid
+    deadline = time.time() + _wait_seconds()
+    while True:
+        status = cmd.get("status")
+        if status in MACHINE_TERMINAL:
+            break
+        if status == "awaiting_approval":
+            with _Quiet():
                 try:
                     api.call("POST", "/machine-commands/%s/cancel" % cid, token)
                 except ApiError:
                     pass
-            state["endReason"] = "interrupted"
-            _mrelease(api, d, state, recover=False)
-        raise
+                state["endReason"] = "approval_required"
+                cleanup = _mrelease(api, d, state, recover=False)
+            raise ApiError("command", 0, "awaiting_approval",
+                           detail="command %s is awaiting_approval; cancelled, never approved by this tool; lease: %s" % (cid, cleanup))
+        left = deadline - time.time()
+        if left <= 0:
+            return {"untrusted": True, "notice": NOTICE, "commandId": cid, "state": "unknown",
+                    "retry": "never re-sent; the command may still run"}
+        cmd = obj(obj(api.call("GET", "/machine-commands/%s?wait=%d" % (cid, int(min(left, 10) * 1000)), token), "GET command").get("command"), "GET command")
+    _ACTIVE["cmd"] = None  # terminal: nothing left to cancel
+    err = cmd.get("error")
+    code = known_code(err.get("code")) if isinstance(err, dict) else None
+    if status != "ok":
+        if code == "lease_ended":  # the server cancelled it because the lease ended (service.ts serializeCommand)
+            state["closed"], state["endReason"] = True, "lease_ended"
+            save_state(d, state)
+        raise ApiError("command", 0, code or status, detail="command %s ended %s (%s)" % (cid, status, code or "no code"))
+    return {"commandId": cid, "cmd": cmd}
 
 
 def _action_out(done):
@@ -1106,13 +1185,7 @@ def op_machine_shot(handle):
     if not isinstance(ids, list) or not ids or not isinstance(ids[0], str) or not STRICT_UUID.match(ids[0]):
         raise ApiError("screenshot", 0, "no_artifact")
     artifact = ids[0]
-    try:
-        data = Api(base, token).call("GET", "/machine-artifacts/%s/content" % artifact, token, raw=True)
-    except (KeyboardInterrupt, Interrupted):
-        with _Quiet():
-            state["endReason"] = "interrupted"
-            _mrelease(Api(base, token), d, state, recover=False)
-        raise
+    data = Api(base, token).call("GET", "/machine-artifacts/%s/content" % artifact, token, raw=True)
     if len(data) > MAX_SHOT:
         raise ApiError("screenshot", 0, "artifact_too_large")
     if holds_credential(data):
@@ -1151,7 +1224,7 @@ def op_machine_renew(handle, ttl=MACHINE_TTL_DEFAULT):
         _ended(d, state, e)
         raise
     state["expiresAt"] = expires
-    save_state(d, state)
+    save_state(d, state)  # an OSError here leaves the lease open and listed; main says so
     return {"handle": handle, "leaseId": state["leaseId"], "expiresAt": expires}
 
 
@@ -1187,10 +1260,6 @@ def op_machine_list(orphans=False):
 
 def _shape(value, pattern):
     return value if isinstance(value, str) and pattern.match(value) else None
-
-
-def _on_sigterm(signum, frame):
-    raise Interrupted()
 
 
 # ------------------------------------------------------------------ MCP
@@ -1290,16 +1359,31 @@ def call_tool(name, args):
 
 
 def mcp(stdin=sys.stdin, stdout=sys.stdout):
-    """The stdio loop. Machine leases this server opened are released when it ends (EOF, SIGINT or SIGTERM)."""
+    """The stdio loop. On a signal it first ends the lease of the call in flight (_cleanup_active), then, as on EOF,
+    releases every lease this server opened. The Interrupted it re-raises carries what really happened."""
+    interrupted = None
     try:
         _mcp_loop(stdin, stdout)
-    finally:
-        with _Quiet():
-            for handle in _MCP_OPENED:
-                try:
-                    op_machine_close(handle)
-                except Exception:  # noqa: BLE001 - every handle gets its try; list --orphans shows what is left
-                    pass
+    except (KeyboardInterrupt, Interrupted) as e:
+        interrupted = e
+    _SHUTDOWN[0] = True  # from here every signal is ignored: nothing may cut the releases short
+    with _Quiet():
+        parts = []
+        if interrupted is not None:
+            parts.append(_cleanup_active() or "no machine verb was in flight")
+        released, kept = [], []
+        for handle in _MCP_OPENED:
+            try:
+                op_machine_close(handle)
+                released.append(handle)
+            except Exception:  # noqa: BLE001 - every handle gets its try; list --orphans shows what is left
+                kept.append(handle)
+            _ACTIVE.clear()
+        if _MCP_OPENED:
+            parts.append("leases this server opened: %d released, %d NOT released%s" % (
+                len(released), len(kept), " (%s; listed in machine list --orphans)" % ", ".join(kept) if kept else ""))
+    if interrupted is not None:
+        raise Interrupted(getattr(interrupted, "signum", None) or signal.SIGINT, "; ".join(parts))
 
 
 def _mcp_loop(stdin, stdout):
@@ -1328,7 +1412,8 @@ def _mcp_loop(stdin, stdout):
             except (Refused, ApiError) as e:
                 text, failed = "refused: %s" % e, True
             except Exception as e:  # noqa: BLE001 - one bad call must never end the stdio server
-                text, failed = "error: %s" % _local_error(e), True
+                text, failed = "error: %s%s" % (_local_error(e), _still_open()), True
+            _ACTIVE.clear()  # the call is over: a later signal no longer belongs to its lease
             guarded = _guard(text)  # the MCP output choke point
             res = {"content": [{"type": "text", "text": guarded}]}
             if failed or guarded != text:
@@ -1420,7 +1505,8 @@ def main(argv=None):
     ml.add_argument("--orphans", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd in ("machine", "mcp"):
-        signal.signal(signal.SIGTERM, _on_sigterm)
+        for sig in SIGNALS:
+            signal.signal(sig, _on_signal)
     try:
         if args.cmd == "mcp":
             mcp()
@@ -1448,20 +1534,43 @@ def main(argv=None):
         print(_guard("gq_browser: %s" % e), file=sys.stderr)
         return 1
     except Exception as e:  # noqa: BLE001 - a short message, never a traceback that could carry state
-        print("gq_browser: error: %s" % _local_error(e), file=sys.stderr)
+        print("gq_browser: error: %s%s" % (_local_error(e), _still_open()), file=sys.stderr)
         return 1
-    except Interrupted:
-        print("gq_browser: interrupted (SIGTERM); cleanup ran where a lease or command was in flight; check: machine list --orphans", file=sys.stderr)
-        return 143
-    except KeyboardInterrupt:
-        print("gq_browser: interrupted (SIGINT); cleanup ran where a lease or command was in flight; check: machine list --orphans", file=sys.stderr)
-        return 130
-    text = json.dumps(out)
-    if holds_credential(text):  # the CLI output choke point
-        print("gq_browser: %s" % WITHHELD, file=sys.stderr)
-        return 1
-    print(text)
+    except (Interrupted, KeyboardInterrupt) as e:
+        return _interrupted_exit(e)
+    try:
+        text = json.dumps(out)
+        if holds_credential(text):  # the CLI output choke point
+            print("gq_browser: %s" % WITHHELD, file=sys.stderr)
+            return 1
+        print(text)
+        sys.stdout.flush()
+        _ACTIVE.clear()
+    except (Interrupted, KeyboardInterrupt) as e:  # after the verb returned, before its output was written
+        return _interrupted_exit(e)
     return 0
+
+
+def _still_open():
+    """For an unexpected local error in a machine verb: the lease it was using is still open (nothing released it)."""
+    state = _ACTIVE.get("state")
+    if isinstance(state, dict) and not state.get("closed"):
+        return "; machine lease %s is still open: machine list --orphans lists it, machine close releases it" % _ACTIVE["handle"]
+    return ""
+
+
+def _interrupted_exit(e):
+    """The one interrupt exit of the CLI: end the tracked lease, then say exactly what happened."""
+    _SHUTDOWN[0] = True
+    signum = getattr(e, "signum", None) or signal.SIGINT
+    report = getattr(e, "report", None)
+    if report is None:
+        report = _cleanup_active()
+    name = SIGNAL_NAMES.get(signum, "signal %s" % signum)
+    if report is None:
+        report = "no machine lease was in use by this command; check: list --orphans"
+    print(_guard("gq_browser: interrupted (%s): %s" % (name, report)), file=sys.stderr)
+    return 128 + int(signum)
 
 
 if __name__ == "__main__":

@@ -93,7 +93,9 @@ MCP tools: `gq_machine_open`, `gq_machine_screenshot`, `gq_machine_click`, `gq_m
 
 ### Release (AC-5)
 
-- **open** releases in `try/finally` on any failure, Ctrl-C or SIGTERM.
-- **SIGINT or SIGTERM during an action** cancels the command in flight and releases the lease (exit 130 or 143). The lease is marked closed only if the release is confirmed; otherwise it stays in `list --orphans`.
-- **The MCP server** releases every lease it opened when it ends (EOF, SIGINT or SIGTERM).
+- **open** releases on any failure.
+- **SIGINT, SIGTERM or SIGHUP during any machine verb** (open, shot, click, type, key, renew, close), at any point (before a request is sent, while it is in flight, after the server applied it but before the answer, while state is written), ends in one of two outcomes: the lease is released and confirmed, or it stays open and listed in `machine list --orphans`. The command in flight is cancelled when its id is known; otherwise the message says it may still run. One handler at the entrypoint does this, and its message (exit 130, 143 or 129) states the outcome; it never claims a release that did not happen.
+  - The first signal starts the shutdown and later ones are ignored, so a second Ctrl-C cannot cut a release short. A signal that lands while a release is running is deferred to its end, not dropped.
+  - An unexpected local error (for example a state file that cannot be written) releases nothing; the message says the lease is still open.
+- **The MCP server** first ends the lease of the call in flight, then releases every lease it opened when it ends (EOF or a signal), and reports how many it could not release.
 - **SIGKILL** runs no cleanup code. The bound is the server's lease TTL (300 s by default). `machine list --orphans` shows what is still open, and `machine close` releases it.
