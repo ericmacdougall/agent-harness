@@ -31,7 +31,8 @@ export function initiatives(snapshot) {
   // mtime: when the hand-written file was last edited (seconds), so the page can say how old it is (goodqa#15950).
   const mtime = Number.isFinite(snapshot?.mtime) && snapshot.mtime > 0 ? snapshot.mtime * 1000 : null;
   // derived: rows built from live owners + GoodQA; hiddenFileRows: file rows dropped because the file is over a day old
-  const count = v => (Number.isInteger(v) && v >= 0 ? v : 0);
+  // T243-7: a count the server did not send, or sent malformed, is unknown (null), never 0 (initiativesLoss)
+  const count = v => (Number.isInteger(v) && v >= 0 ? v : null);
   return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300), mtime, derived: count(snapshot?.derived), untracked: count(snapshot?.untracked), hiddenFileRows: count(snapshot?.hidden_file_rows) };
 }
 
@@ -151,6 +152,7 @@ export const STATE_DATASETS = Object.freeze({
   asks: 'asks', asksResolved: 'asks', asksStale: 'asks', asksFlagged: 'asks', asksCleared: 'asks', asksArchive: 'asks',
   asksArchiveTotal: 'asks', asksSession: 'asks', asksSweptAt: 'asks',
   initiatives: 'initiatives', initiativesStale: 'initiatives', initiativesError: 'initiatives',
+  initiativesDerived: 'initiatives', initiativesUntracked: 'initiatives', initiativesHidden: 'initiatives', initiativesMtime: 'initiatives',
   events: 'events', lastEvent: 'events', feedSnapshot: 'events',
   messages: 'chat', chat: 'chat', sessions: 'chat', mainSession: 'chat', chatAvailability: 'chat', pending: 'chat',
   'ledger.goals': 'goals', 'ledger.requirements': 'requirements', 'ledger.status': 'status', 'ledger.generated': null,
@@ -244,6 +246,7 @@ export function noneText(c, current, noun) {
 // A count: a bare 0 is itself a claim, so an unknown zero is "?" and a partial count says there may be more. A stale
 // count is the last good read's; `bare` marks a count with no note beside it, which then says so itself.
 export function countText(n, c, bare = false) {
+  if (n == null) return '?';   // a count that is not known (T243-7) is never stated, whatever the claim's truth
   const truth = typeof c === 'string' ? truthOf(c) : c.truth;
   if (truth === 'unknown') return n ? `${n}+` : '?';
   if (truth === 'stale' && bare) return `${n} (stale)`;
@@ -628,6 +631,21 @@ export const ownerCount = (state, n) => padded(countText(n, claim(state, 'owners
 export function initiativesEmpty(state) {
   if ((state.sources || []).find(s => s.id === 'initiatives')?.status === 'off') return 'No initiatives file is configured.';
   return noneText(claim(state, 'initiatives'), 'No initiatives in the file.', 'initiatives');
+}
+// T243-7: one per derived count the server did not send (or sent malformed), so the initiatives read is partial
+export function initiativesLoss(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return 0;
+  const ok = v => Number.isInteger(v) && v >= 0;
+  return ['derived', 'untracked', 'hidden_file_rows'].filter(key => !ok(snapshot[key])).length;
+}
+// T243-1: the panel's source line. Its rows are derived from live owners, the org graph's GoodQA ticket reads and the
+// file, all of which the initiatives read rests on (collectors.FEEDS), so every count goes through that gate.
+export function initiativesLine(state, fileText = '') {
+  const g = gate(state, 'initiatives');
+  const untracked = state.initiativesUntracked, hidden = state.initiativesHidden;
+  return `${g.count(state.initiativesDerived)} from live owners and GoodQA${untracked ? ` (${g.count(untracked)} with no ticket)` : ''}`
+    + (fileText ? `; ${fileText}` : '')
+    + (hidden ? `, so its other ${g.count(hidden)} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : '') + '.';
 }
 export const initiativeCount = (state, n) => padded(countText(n, claim(state, 'initiatives'), true));
 export const atRiskEmpty = state => noneText(claim(state, 'initiatives'), 'Nothing open to rank.', 'open initiatives to rank');

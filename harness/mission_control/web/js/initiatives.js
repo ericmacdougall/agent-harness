@@ -1,6 +1,6 @@
 import { getState, subscribe, select, highlight } from './store.js';
 import { el, button, progress, checklist, eta, stateClass, age } from './ui.js';
-import { liveFields, atRisk, atRiskEmpty, noProgress, noAction, updatedText, initiativesEmpty, initiativeCount, ownerLineText, claim, noneText, countText } from './adapt.js';
+import { liveFields, atRisk, atRiskEmpty, noProgress, noAction, updatedText, initiativesEmpty, initiativeCount, initiativesLine, ownerLineText, claim, noneText } from './adapt.js';
 
 const LABEL = { uncovered: 'UNCOVERED', unknown: 'UNKNOWN', stalled: 'STALLED', moving: 'moving' };
 function sinceText(row, now, state) {
@@ -82,16 +82,14 @@ export function mountInitiatives() {
     // hidden once it is over a day old (goodqa#15950). Say both, with the file's age.
     const ageMs = state.initiativesMtime ? state.now - state.initiativesMtime : null;
     const old = ageMs !== null && ageMs > 24 * 3600 * 1000;
-    const derived = state.initiativesDerived || 0, hidden = state.initiativesHidden || 0, untracked = state.initiativesUntracked || 0;
     const fileText = state.initiativesMtime ? `the hand-written file was last edited ${age(new Date(state.initiativesMtime).toISOString(), state.now)}` : 'the hand-written file has no known edit time';
-    const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`,
-      `${countText(derived, claim(state, 'owners'))} from live owners and GoodQA${untracked ? ` (${untracked} with no ticket)` : ''}; ${fileText}${hidden ? `, so its other ${hidden} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : ''}.`);
+    const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`, initiativesLine(state, fileText));
     fileAge.id = 'initiatives-file-age';
     fragment.prepend(fileAge);
     // PR 234 status truth: "none" only while both sources of these rows (the file and the owner read) are current
     if (!state.initiatives.length) fragment.append(el('p', 'empty-state', state.initiativesError ? `Initiatives file: ${state.initiativesError}`
       : claim(state, 'initiatives').truth !== 'current' ? initiativesEmpty(state)
-        : noneText(claim(state, 'owners'), 'No live owner holds a ticket yet, and the hand-written file has no current rows.', 'initiatives from live owners')));
+        : noneText(claim(state, 'initiatives'), 'No live owner holds a ticket yet, and the hand-written file has no current rows.', 'initiatives from live owners')));
     list.replaceChildren(fragment);
     document.getElementById('initiatives-panel').classList.toggle('stale', state.initiativesStale);
     document.getElementById('initiative-count').textContent = initiativeCount(state, state.initiatives.length);

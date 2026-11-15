@@ -225,11 +225,14 @@ FEEDS = {
     "asks": ("asks", "session-pin"),
     # owner-policy: the owner/helper type table the roles (live, parked, helper) are decided by (T242-1)
     "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams", "owner-policy", "session-pin"),
-    "initiatives": ("initiatives",),
+    # T243-1: the panel is derived (org_graph.derive_initiatives) from live owner rows, the org graph's GoodQA ticket
+    # reads and the owner read's restricted set, as well as the hand-written file
+    "initiatives": ("initiatives", "org-graph", "owners", "codex-owners", "wals", "native-projects", "native-streams",
+                    "owner-policy", "session-pin"),
     # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
     # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
     "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "owner-policy", "initiatives", "github",
-               "goodqa", "t2-dev", "sources", "session-pin"),
+               "goodqa", "t2-dev", "sources", "session-pin", "org-graph"),
     "chat": ("chat", "session-pin"),  # the chat snapshot names the pinned session as main's
     # the Topology tab's org graph (goodqa#15950): its own transcript, escalation and ticket reads (partial when one
     # fails, T243-2), the owner rows it draws and everything they rest on, for the pinned session (T243-6)
@@ -276,6 +279,11 @@ SAFE_READS = {
     ("org-graph", "owners", "restricted_known"): "a change signal only: decides when initiatives republish, not what",
     ("org-graph", "owners", "restricted_tickets"): "a change signal only: decides when initiatives republish, not what",
     ("org-graph", "initiatives", "publish"): "a change signal only: asks initiatives to republish, reads nothing",
+    # the derived Initiatives panel (T243-1)
+    ("initiatives", "org-graph", "tickets"): "covered: org-graph (its GoodQA ticket reads) is a feed of initiatives",
+    ("initiatives", "owners", "rows"): "covered: owners is a feed of initiatives (one row per live owner's ticket)",
+    ("initiatives", "owners", "restricted_known"): "covered: owners is a feed of initiatives (before its read, ticketed rows wait)",
+    ("initiatives", "owners", "restricted_tickets"): "covered: owners is a feed of initiatives (restricted rows are dropped)",
 }
 
 

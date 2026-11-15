@@ -154,7 +154,8 @@ test('initiatives snapshot carries live-derived and hidden file row counts', asy
   const out = adapt.initiatives({ items: [{ id: 'live-goodqa_15950', initiative: 'Live org graph', ticket: 'goodqa#15950', source: 'live' }, { id: 'x', initiative: 'Old' }], mtime: 1, derived: 1, hidden_file_rows: 11 });
   assert.deepEqual([out.derived, out.hiddenFileRows], [1, 11]);
   assert.deepEqual(out.items.map(i => i.source), ['live', 'file']);
-  assert.deepEqual([adapt.initiatives({ derived: -3 }).derived, adapt.initiatives({ hidden_file_rows: 'x' }).hiddenFileRows], [0, 0]);
+  // T243-7: a malformed count is unknown (null), never 0
+  assert.deepEqual([adapt.initiatives({ derived: -3 }).derived, adapt.initiatives({ hidden_file_rows: 'x' }).hiddenFileRows], [null, null]);
 });
 
 test('normalize keeps the followed session for the meta line (goodqa#15961)', () => {
