@@ -9,6 +9,12 @@
   gq_browser.py list [--orphans]
   gq_browser.py keys --orphans | --delete KEY_ID        (CLI only)
   gq_browser.py mcp                                       (stdio MCP server)
+  gq_browser.py machine open MACHINE_ID [--ttl 300]       (goodqa#16051: remote control of your own enrolled machine)
+  gq_browser.py machine shot|close HANDLE
+  gq_browser.py machine click HANDLE --x X --y Y [--button left|right|middle] [--double]
+  gq_browser.py machine type HANDLE --text TEXT            (literal text only; token or secret shapes are refused)
+  gq_browser.py machine key HANDLE --keys ctrl+l
+  gq_browser.py machine renew HANDLE [--ttl 300] | machine list [--orphans]
 
 The user token (~/.config/goodqa/user-token, 0600) mints a short-lived key (scopes agents + write, name gq-browser:LEASE),
 an exact-origin grant and a lease. The key lives in ~/.agent-harness/gq-browser/LEASE/key (0600). Neither value is ever
@@ -23,6 +29,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import stat
 import sys
 import time
@@ -540,6 +547,8 @@ def _own_keys(api, token, org):
     for k in rows:
         if not isinstance(k, dict) or "createdBy" not in k or "name" not in k:
             raise ApiError("key lookup", 0, "fields_missing_refusing")
+        if k.get("revokedAt") is not None:
+            continue  # DELETE revokes; GET api-keys still lists revoked rows (bugtracker api-keys/routes.ts)
         if k["createdBy"] == me and isinstance(k["name"], str) and k["name"].startswith(KEY_PREFIX):
             own.append({"id": k["id"], "name": k["name"], "expiresAt": k.get("expiresAt")})
     return own
@@ -556,6 +565,416 @@ def op_keys(orphans=False, delete=None, org=None, base=None):
         api.call("DELETE", "/orgs/%s/api-keys/%s" % (org, delete), token)
         return {"deleted": delete}
     return {"keys": own}
+
+
+# ------------------------------------------------------------------ machines (goodqa#16051)
+#
+# Remote control of the user's own enrolled machine (for example a test desktop) with the user token as the Bearer, read
+# in process by read_token() like every other verb. No key is minted and no grant is created: the #15941 enrollment grant
+# is bound to the token and opens exactly these routes (bugtracker token-grants.ts ENROLLMENT_GRANT_ROUTES):
+#   GET /machines/:id, POST /machines/:id/leases, POST /machine-leases/:id/renew|release, POST /machines/:id/commands,
+#   GET /machine-commands/:id, POST /machine-commands/:id/cancel, GET /machine-artifacts/:id/content.
+# Only four command kinds exist here (screenshot, click, type, key); there is no generic kind. Commands always name the
+# lease this tool opened (never autoLease, never takeOver), and a refusal is surfaced, never retried with a wider scope.
+
+STRICT_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+MACHINE_TERMINAL = {"ok", "error", "refused", "expired", "cancelled", "denied"}  # bugtracker service.ts TERMINAL
+MACHINE_TTL_DEFAULT, MACHINE_TTL_MAX = 300, 7200  # the server's LEASE_MAX_SECONDS is two hours
+COORD = 65536
+KEYS_RE = re.compile(r"^[A-Za-z0-9_+\- ]{1,64}$")  # catalogue.ts key.keys
+BUTTONS = ("left", "right", "middle")
+MAX_TEXT = 10000
+MAX_SHOT = 12 * 1024 * 1024
+CODE_RE = re.compile(r"^[a-z0-9_.-]{1,79}$")
+# Text a tester may never type: GoodQA token and key shapes plus a subset of kimi_review.SECRET_PATTERNS.
+SECRET_SHAPES = [re.compile(p) for p in (
+    r"gq[a-z]{1,4}_[A-Za-z0-9_-]{16,}", r"bt_k[a-z]_[A-Za-z0-9_-]{16,}", r"sk-ant-", r"sk-or-", r"\bsk-[A-Za-z0-9]{20,}",
+    r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{12,}", r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}",
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", r"-----BEGIN [A-Z ]*PRIVATE KEY", r"\bxox[abposr]-[A-Za-z0-9-]{8,}",
+    r"\bAIza[0-9A-Za-z_-]{30,}", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}")]
+
+
+class Interrupted(BaseException):
+    """SIGTERM, raised like KeyboardInterrupt so every finally and cleanup path runs."""
+
+
+class _Quiet:
+    """Ignore SIGINT and SIGTERM while a cleanup runs, so a second signal cannot cut a release short."""
+
+    def __enter__(self):
+        self.saved = []
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self.saved.append((sig, signal.signal(sig, signal.SIG_IGN)))
+            except (ValueError, OSError):
+                pass
+        return self
+
+    def __exit__(self, *exc):
+        for sig, old in self.saved:
+            try:
+                signal.signal(sig, old)
+            except (ValueError, OSError):
+                pass
+        return False
+
+
+def machine_root():
+    root = os.path.join(ensure_root(), "machines")
+    if not os.path.lexists(root):
+        os.mkdir(root, 0o700)
+    st = os.lstat(root)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise Refused("machine state root %s must be a directory owned by you" % root)
+    os.chmod(root, 0o700)
+    return root
+
+
+def machine_dir(handle, create=False):
+    if not isinstance(handle, str) or not LEASE_RE.match(handle):
+        raise Refused("handle must be 16 lowercase hex characters")
+    root = machine_root()
+    path = os.path.join(root, handle)
+    if create:
+        os.mkdir(path, 0o700)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise Refused("no local state for machine lease %s; nothing sent" % handle)
+    if not stat.S_ISDIR(st.st_mode) or os.path.realpath(path) != path:
+        raise Refused("machine lease directory %s is not a plain directory; nothing sent" % handle)
+    return path
+
+
+def _machine_defaults(base=None):
+    defaults = load_defaults()
+    allowed = defaults.get("allowedBases")
+    first = allowed[0] if isinstance(allowed, list) and allowed and isinstance(allowed[0], str) else DEFAULT_BASE
+    return defaults, check_base(base or defaults.get("base") or first, defaults)
+
+
+def _check_machine_allowed(machine_id, defaults):
+    if not isinstance(machine_id, str) or not STRICT_UUID.match(machine_id):
+        raise Refused("machine id must be a lowercase uuid")
+    allow = defaults.get("allowedMachines")
+    if allow is not None and (not isinstance(allow, list) or machine_id not in allow):
+        raise Refused("machine %s is not in allowedMachines of browser-defaults.json" % machine_id)
+
+
+def _check_ttl(ttl):
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 30 <= ttl <= MACHINE_TTL_MAX:
+        raise Refused("ttl must be 30 to %d seconds" % MACHINE_TTL_MAX)
+
+
+def _mstate(handle, allow_closed=False):
+    d = machine_dir(handle)
+    state = load_state(d)
+    if state.get("handle") != handle or state.get("kind") != "machine":
+        raise Refused("state for %s does not match; nothing sent" % handle)
+    defaults, base = _machine_defaults(state.get("base"))
+    _check_machine_allowed(state.get("machineId"), defaults)
+    if state.get("closed") and not allow_closed:
+        raise Refused("machine lease %s is closed (%s); open a new one" % (handle, state.get("endReason") or "released"))
+    return d, state, base
+
+
+def _code(e):
+    return e.code if isinstance(e.code, str) and CODE_RE.match(e.code) else None
+
+
+def _lease_body(state):
+    return {"mode": "control", "ttlSeconds": state["ttl"], "holder": state["holder"]}
+
+
+def _lease_from(got, what):
+    got = obj(got, what)
+    lease = got.get("lease")
+    if not isinstance(lease, dict):
+        if "approval" in got:
+            raise ApiError(what, 202, "approval_pending")
+        raise ApiError(what, 0, "unexpected_response")
+    lid = lease.get("id")
+    if not isinstance(lid, str) or not STRICT_UUID.match(lid):
+        raise ApiError(what, 0, "unexpected_response")
+    return lid, lease.get("expiresAt") if isinstance(lease.get("expiresAt"), str) else None
+
+
+def _mrelease(api, d, state, recover=True):
+    """Release the lease with its holder. A lease whose create answer was lost is found again by re-asking with the SAME
+    holder (the server adopts that holder's live lease; never a wider scope). The state is closed unless the release failed."""
+    with _Quiet():
+        report = []
+        lid = state.get("leaseId")
+        if not lid and state.get("leaseRequested") and recover:
+            try:
+                lid, _ = _lease_from(api.call("POST", "/machines/%s/leases" % state["machineId"], api.user, _lease_body(state)), "POST leases")
+                state["leaseId"] = lid
+                report.append("lease_recovered")
+            except ApiError as e:
+                report.append("no_lease_to_recover (%s)" % (_code(e) or ("no response" if e.lost else e.status)))
+        failed = False
+        if lid:
+            try:
+                api.call("POST", "/machine-leases/%s/release" % lid, api.user, {"holder": state["holder"]})
+                report.append("released")
+            except ApiError as e:
+                if e.status in (404, 409):
+                    report.append("already_ended (%s)" % (_code(e) or e.status))
+                else:
+                    failed = True
+                    report.append("release_failed (%s); retry with: machine close %s" % (_code(e) or ("no response" if e.lost else e.status), state["handle"]))
+        state["closed"] = not failed
+        state.setdefault("endReason", "released")
+        try:
+            save_state(d, state)
+        except OSError:
+            report.append("state_save_failed")
+        return ", ".join(report) or "nothing_to_release"
+
+
+def op_machine_open(machine_id, ttl=MACHINE_TTL_DEFAULT):
+    defaults, base = _machine_defaults()
+    _check_machine_allowed(machine_id, defaults)
+    _check_ttl(ttl)
+    token = read_token()
+    api = Api(base, token)
+    # Preflight: the grant decides whether this token sees the machine; a 403 or 404 stops here, nothing else is sent.
+    obj(api.call("GET", "/machines/%s" % machine_id, token), "GET machine")
+    handle = secrets.token_hex(8)
+    d = machine_dir(handle, create=True)
+    state = {"kind": "machine", "handle": handle, "machineId": machine_id, "base": base, "holder": "gq-machine:" + handle,
+             "ttl": ttl, "leaseId": None, "leaseRequested": False, "closed": False, "createdAt": iso(time.time())}
+    save_state(d, state)
+    try:
+        state["leaseRequested"] = True
+        save_state(d, state)
+        lid, expires = _lease_from(api.call("POST", "/machines/%s/leases" % machine_id, token, _lease_body(state)), "POST leases")
+        state["leaseId"], state["expiresAt"] = lid, expires
+        save_state(d, state)
+    except BaseException as e:
+        if isinstance(e, ApiError) and not e.lost and e.status and not state.get("leaseId"):
+            # The server answered with an HTTP refusal (or a 202 approval ask): it made no lease, so nothing is re-asked.
+            # A lost or malformed answer (status 0) may hide a lease, so cleanup re-asks with the same holder.
+            state["leaseRequested"] = False
+        cleanup = _mrelease(api, d, state)
+        if isinstance(e, ApiError):
+            raise ApiError(e.what, e.status, e.code, e.lost, detail="%s; cleanup: %s" % (e, cleanup)) from None
+        if isinstance(e, Exception):
+            raise ApiError("open", 0, "local_error", detail="open failed (%s); cleanup: %s" % (type(e).__name__, cleanup)) from None
+        raise
+    return {"handle": handle, "machineId": machine_id, "leaseId": lid, "expiresAt": expires, "ttlSeconds": ttl}
+
+
+def _ended(d, state, e):
+    if _code(e) in ("lease_ended", "lease_not_yours"):
+        state["closed"], state["endReason"] = True, _code(e)
+        save_state(d, state)
+
+
+def _wait_seconds():
+    try:
+        return min(600.0, max(1.0, float(os.environ.get("GQ_MACHINE_WAIT_SECONDS") or 60)))
+    except ValueError:
+        return 60.0
+
+
+def _command(handle, kind, args, d, state, base, token):
+    """Queue one command under the lease and poll it to a terminal state. SIGINT or SIGTERM cancels it and releases the lease."""
+    api = Api(base, token)
+    cid = None
+    request_id = "gq-machine:%s:%s" % (handle, secrets.token_hex(8))
+    try:
+        try:
+            got = obj(api.call("POST", "/machines/%s/commands" % state["machineId"], token,
+                               {"kind": kind, "args": args, "leaseId": state["leaseId"], "clientRequestId": request_id}), "POST commands")
+        except ApiError as e:
+            _ended(d, state, e)
+            if e.lost:
+                raise ApiError(e.what, detail="%s; never re-sent (clientRequestId %s): look before acting again" % (e, request_id)) from None
+            raise
+        cmd = obj(got.get("command"), "POST commands")
+        cid = cmd.get("id")
+        if not isinstance(cid, str) or not STRICT_UUID.match(cid):
+            raise ApiError("POST commands", 0, "unexpected_response")
+        deadline = time.time() + _wait_seconds()
+        while True:
+            status = cmd.get("status")
+            if status in MACHINE_TERMINAL:
+                break
+            if status == "awaiting_approval":
+                with _Quiet():
+                    try:
+                        api.call("POST", "/machine-commands/%s/cancel" % cid, token)
+                    except ApiError:
+                        pass
+                raise ApiError("command", 0, "awaiting_approval", detail="command %s is awaiting_approval; cancelled, never approved by this tool" % cid)
+            left = deadline - time.time()
+            if left <= 0:
+                return {"untrusted": True, "notice": NOTICE, "commandId": cid, "state": "unknown",
+                        "retry": "never re-sent; the command may still run"}
+            cmd = obj(obj(api.call("GET", "/machine-commands/%s?wait=%d" % (cid, int(min(left, 10) * 1000)), token), "GET command").get("command"), "GET command")
+        err = cmd.get("error")
+        code = err.get("code") if isinstance(err, dict) and isinstance(err.get("code"), str) and CODE_RE.match(err["code"]) else None
+        if status != "ok":
+            if code in ("lease_ended", "lease_not_yours"):
+                state["closed"], state["endReason"] = True, code
+                save_state(d, state)
+            raise ApiError("command", 0, code or status, detail="command %s ended %s (%s)" % (cid, status, code or "no code"))
+        return {"commandId": cid, "cmd": cmd}
+    except (KeyboardInterrupt, Interrupted):
+        with _Quiet():
+            if cid:
+                try:
+                    api.call("POST", "/machine-commands/%s/cancel" % cid, token)
+                except ApiError:
+                    pass
+            state["endReason"] = "interrupted"
+            _mrelease(api, d, state, recover=False)
+        raise
+
+
+def _action_out(done, with_result=True):
+    out = {"untrusted": True, "notice": NOTICE, "commandId": done["commandId"], "state": done.get("cmd", {}).get("status", "unknown")}
+    if "cmd" not in done:
+        return done
+    if with_result:
+        out["result"] = done["cmd"].get("result")
+    return out
+
+
+def op_machine_click(handle, x, y, button=None, double=False):
+    for v in (x, y):
+        if isinstance(v, bool) or not isinstance(v, int) or not -COORD <= v <= COORD:
+            raise Refused("x and y must be integers from %d to %d" % (-COORD, COORD))
+    if button is not None and button not in BUTTONS:
+        raise Refused("button must be one of %s" % ", ".join(BUTTONS))
+    if not isinstance(double, bool):
+        raise Refused("double must be true or false")
+    d, state, base = _mstate(handle)
+    args = {"x": x, "y": y}
+    if button:
+        args["button"] = button
+    if double:
+        args["double"] = True
+    return _action_out(_command(handle, "click", args, d, state, base, read_token()))
+
+
+def op_machine_key(handle, keys):
+    if not isinstance(keys, str) or not KEYS_RE.match(keys):
+        raise Refused("keys must be a named key or chord such as ctrl+l (letters, digits, _ + - and space, 1 to 64)")
+    d, state, base = _mstate(handle)
+    return _action_out(_command(handle, "key", {"keys": keys}, d, state, base, read_token()))
+
+
+def _refuse_secret_text(text, token):
+    if any(token[i:i + 12] in text for i in range(max(1, len(token) - 11))):
+        raise Refused("text contains the GoodQA user token; nothing typed")
+    if any(p.search(text) for p in SECRET_SHAPES):
+        raise Refused("text matches a token or secret pattern; nothing typed (the text is not shown)")
+
+
+def op_machine_type(handle, text):
+    if not isinstance(text, str) or not 1 <= len(text) <= MAX_TEXT:
+        raise Refused("text must be 1 to %d characters" % MAX_TEXT)
+    d, state, base = _mstate(handle)
+    token = read_token()
+    _refuse_secret_text(text, token)
+    return _action_out(_command(handle, "type", {"text": text}, d, state, base, token), with_result=False)
+
+
+def op_machine_shot(handle):
+    d, state, base = _mstate(handle)
+    shots = os.path.join(d, "shots")
+    if not os.path.lexists(shots):
+        os.mkdir(shots, 0o700)
+    if os.path.islink(shots) or not os.path.isdir(shots):
+        raise Refused("shots directory is not a plain directory; nothing written")
+    token = read_token()
+    done = _command(handle, "screenshot", {}, d, state, base, token)
+    if "cmd" not in done:
+        raise ApiError("screenshot", 0, "state_unknown", detail="screenshot command %s did not finish in time; never re-sent" % done["commandId"])
+    ids = done["cmd"].get("artifactIds")
+    if not isinstance(ids, list) or not ids or not isinstance(ids[0], str) or not STRICT_UUID.match(ids[0]):
+        raise ApiError("screenshot", 0, "no_artifact")
+    artifact = ids[0]
+    try:
+        data = Api(base, token).call("GET", "/machine-artifacts/%s/content" % artifact, token, raw=True)
+    except (KeyboardInterrupt, Interrupted):
+        with _Quiet():
+            state["endReason"] = "interrupted"
+            _mrelease(Api(base, token), d, state, recover=False)
+        raise
+    if len(data) > MAX_SHOT:
+        raise ApiError("screenshot", 0, "artifact_too_large")
+    ext = "png" if data.startswith(b"\x89PNG\r\n\x1a\n") else "jpg" if data.startswith(b"\xff\xd8\xff") else None
+    if not ext:
+        raise ApiError("screenshot", 0, "not_an_image")
+    index = os.path.join(d, "shots.jsonl")
+    try:
+        with open(index, encoding="utf-8") as f:
+            n = sum(1 for _ in f) + 1
+    except FileNotFoundError:
+        n = 1
+    now = dt.datetime.now(dt.timezone.utc)
+    target = os.path.join(shots, "%s-%s-%d.%s" % (now.strftime("%Y%m%dT%H%M%SZ"), state["machineId"], n, ext))
+    write_new(target, data)
+    row = {"at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "machineId": state["machineId"], "leaseId": state["leaseId"],
+           "commandId": done["commandId"], "artifactId": artifact, "path": target, "size": len(data),
+           "sha256": hashlib.sha256(data).hexdigest()}
+    fd = os.open(index, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+    out = {"untrusted": True, "notice": NOTICE}
+    out.update(row)
+    return out
+
+
+def op_machine_renew(handle, ttl=MACHINE_TTL_DEFAULT):
+    _check_ttl(ttl)
+    d, state, base = _mstate(handle)
+    token = read_token()
+    try:
+        _, expires = _lease_from(Api(base, token).call("POST", "/machine-leases/%s/renew" % state["leaseId"], token,
+                                                       {"holder": state["holder"], "ttlSeconds": ttl}), "POST renew")
+    except ApiError as e:
+        _ended(d, state, e)
+        raise
+    state["expiresAt"] = expires
+    save_state(d, state)
+    return {"handle": handle, "leaseId": state["leaseId"], "expiresAt": expires}
+
+
+def op_machine_close(handle):
+    d, state, base = _mstate(handle, allow_closed=True)
+    if state.get("closed"):
+        return {"handle": handle, "result": "already_closed"}
+    token = read_token()
+    report = _mrelease(Api(base, token), d, state)
+    if not state["closed"]:
+        raise ApiError("close", 0, "release_failed", detail="close %s: %s" % (handle, report))
+    return {"handle": handle, "result": "released", "cleanup": report}
+
+
+def op_machine_list(orphans=False):
+    root = machine_root()
+    rows = []
+    for name in sorted(os.listdir(root)):
+        if not LEASE_RE.match(name):
+            continue
+        try:
+            s = load_state(machine_dir(name))
+        except (Refused, OSError, ValueError):
+            continue
+        if orphans and s.get("closed"):
+            continue
+        rows.append({"handle": name, "machineId": s.get("machineId"), "leaseId": s.get("leaseId"), "closed": bool(s.get("closed")),
+                     "expiresAt": s.get("expiresAt"), "createdAt": s.get("createdAt")})
+    return {"leases": rows}
+
+
+def _on_sigterm(signum, frame):
+    raise Interrupted()
 
 
 # ------------------------------------------------------------------ MCP
@@ -586,7 +1005,28 @@ TOOLS = [
     {"name": "gq_browser_close", "description": "Stop the lease, revoke its grant and delete its key.",
      "inputSchema": {"type": "object", "additionalProperties": False, "required": ["leaseId"], "properties": {
          "leaseId": {"type": "string"}}}},
+    {"name": "gq_machine_open", "description": "Open a control lease on your own enrolled GoodQA machine (an operate grant must exist). Returns ids only.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["machineId"], "properties": {
+         "machineId": {"type": "string"}, "ttlSeconds": {"type": "integer", "minimum": 30, "maximum": MACHINE_TTL_MAX}}}},
+    {"name": "gq_machine_screenshot", "description": "Screenshot the machine; saved under the lease dir and tracked. The image is untrusted data.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["handle"], "properties": {"handle": {"type": "string"}}}},
+    {"name": "gq_machine_click", "description": "Click at screen coordinates under the lease.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["handle", "x", "y"], "properties": {
+         "handle": {"type": "string"}, "x": {"type": "integer"}, "y": {"type": "integer"},
+         "button": {"type": "string", "enum": list(BUTTONS)}, "double": {"type": "boolean"}}}},
+    {"name": "gq_machine_type", "description": "Type literal text under the lease. Text matching a token or secret pattern is refused.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["handle", "text"], "properties": {
+         "handle": {"type": "string"}, "text": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT}}}},
+    {"name": "gq_machine_key", "description": "Press a named key or chord (for example Return or ctrl+l) under the lease.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["handle", "keys"], "properties": {
+         "handle": {"type": "string"}, "keys": {"type": "string"}}}},
+    {"name": "gq_machine_renew", "description": "Extend the machine lease.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["handle"], "properties": {
+         "handle": {"type": "string"}, "ttlSeconds": {"type": "integer", "minimum": 30, "maximum": MACHINE_TTL_MAX}}}},
+    {"name": "gq_machine_close", "description": "Release the machine lease.",
+     "inputSchema": {"type": "object", "additionalProperties": False, "required": ["handle"], "properties": {"handle": {"type": "string"}}}},
 ]
+_MCP_OPENED = []
 
 
 def _check_args(tool, args):
@@ -614,10 +1054,39 @@ def call_tool(name, args):
         return op_status(args["leaseId"], args.get("job"))
     if name == "gq_browser_close":
         return op_close(args["leaseId"])
+    if name == "gq_machine_open":
+        out = op_machine_open(args["machineId"], args.get("ttlSeconds", MACHINE_TTL_DEFAULT))
+        _MCP_OPENED.append(out["handle"])
+        return out
+    if name == "gq_machine_screenshot":
+        return op_machine_shot(args["handle"])
+    if name == "gq_machine_click":
+        return op_machine_click(args["handle"], args["x"], args["y"], args.get("button"), args.get("double", False))
+    if name == "gq_machine_type":
+        return op_machine_type(args["handle"], args["text"])
+    if name == "gq_machine_key":
+        return op_machine_key(args["handle"], args["keys"])
+    if name == "gq_machine_renew":
+        return op_machine_renew(args["handle"], args.get("ttlSeconds", MACHINE_TTL_DEFAULT))
+    if name == "gq_machine_close":
+        return op_machine_close(args["handle"])
     raise Refused("unknown tool")
 
 
 def mcp(stdin=sys.stdin, stdout=sys.stdout):
+    """The stdio loop. Machine leases this server opened are released when it ends (EOF, SIGINT or SIGTERM)."""
+    try:
+        _mcp_loop(stdin, stdout)
+    finally:
+        with _Quiet():
+            for handle in _MCP_OPENED:
+                try:
+                    op_machine_close(handle)
+                except Exception:  # noqa: BLE001 - every handle gets its try; list --orphans shows what is left
+                    pass
+
+
+def _mcp_loop(stdin, stdout):
     for line in stdin:
         line = line.strip()
         if not line:
@@ -654,6 +1123,24 @@ def mcp(stdin=sys.stdin, stdout=sys.stdout):
 
 # ------------------------------------------------------------------ CLI
 
+def _machine_cli(a):
+    if a.mcmd == "open":
+        return op_machine_open(a.machine, a.ttl)
+    if a.mcmd == "shot":
+        return op_machine_shot(a.handle)
+    if a.mcmd == "click":
+        return op_machine_click(a.handle, a.x, a.y, a.button, a.double)
+    if a.mcmd == "type":
+        return op_machine_type(a.handle, a.text)
+    if a.mcmd == "key":
+        return op_machine_key(a.handle, a.keys)
+    if a.mcmd == "renew":
+        return op_machine_renew(a.handle, a.ttl)
+    if a.mcmd == "close":
+        return op_machine_close(a.handle)
+    return op_machine_list(a.orphans)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="gq_browser.py", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -687,12 +1174,40 @@ def main(argv=None):
     g.add_argument("--delete")
     k.add_argument("--org")
     sub.add_parser("mcp")
+    m = sub.add_parser("machine", help="remote control of your own enrolled GoodQA machine (goodqa#16051)")
+    ms = m.add_subparsers(dest="mcmd", required=True)
+    mo = ms.add_parser("open")
+    mo.add_argument("machine")
+    mo.add_argument("--ttl", type=int, default=MACHINE_TTL_DEFAULT)
+    ms.add_parser("shot").add_argument("handle")
+    mc = ms.add_parser("click")
+    mc.add_argument("handle")
+    mc.add_argument("--x", type=int, required=True)
+    mc.add_argument("--y", type=int, required=True)
+    mc.add_argument("--button", choices=BUTTONS)
+    mc.add_argument("--double", action="store_true")
+    mt = ms.add_parser("type", allow_abbrev=False)
+    mt.add_argument("handle")
+    mt.add_argument("--text", required=True, help="literal text only; there is no file, stdin or env source")
+    mk = ms.add_parser("key")
+    mk.add_argument("handle")
+    mk.add_argument("--keys", required=True)
+    mr = ms.add_parser("renew")
+    mr.add_argument("handle")
+    mr.add_argument("--ttl", type=int, default=MACHINE_TTL_DEFAULT)
+    ms.add_parser("close").add_argument("handle")
+    ml = ms.add_parser("list")
+    ml.add_argument("--orphans", action="store_true")
     args = ap.parse_args(argv)
+    if args.cmd in ("machine", "mcp"):
+        signal.signal(signal.SIGTERM, _on_sigterm)
     try:
         if args.cmd == "mcp":
             mcp()
             return 0
-        if args.cmd == "open":
+        if args.cmd == "machine":
+            out = _machine_cli(args)
+        elif args.cmd == "open":
             out = op_open(args.origin, args.hours, args.ttl, args.org, args.base, args.project)
         elif args.cmd == "act":
             out = op_act(args.lease, args.action, url=args.url, selector=args.selector, text=args.text, index=args.index)
@@ -715,6 +1230,12 @@ def main(argv=None):
     except Exception as e:  # noqa: BLE001 - a short message, never a traceback that could carry state
         print("gq_browser: error: %s" % _local_error(e), file=sys.stderr)
         return 1
+    except Interrupted:
+        print("gq_browser: interrupted (SIGTERM); any command was cancelled and the lease released", file=sys.stderr)
+        return 143
+    except KeyboardInterrupt:
+        print("gq_browser: interrupted (SIGINT); any command was cancelled and the lease released", file=sys.stderr)
+        return 130
     print(json.dumps(out))
     return 0
 

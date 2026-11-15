@@ -610,6 +610,18 @@ class OrphanTest(Base):
         self.e.run("keys", "--delete", mine["id"], check=0)
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + mine["id"])), 1)
 
+    def test_keys_orphans_omits_a_deleted_key(self):
+        # The server's DELETE revokes (sets revokedAt) and GET api-keys keeps listing the row (api-keys/routes.ts):
+        # a deleted key is no orphan, and deleting it again is refused locally instead of answering 404 (lead, 21:52Z).
+        mine = {"id": "77777777-7777-4777-8777-777777777777", "name": "gq-browser:aaaaaaaaaaaaaaaa", "createdBy": ME, "revokedAt": None}
+        self.api.api_keys = [mine]
+        self.e.run("keys", "--delete", mine["id"], check=0)
+        mine["revokedAt"] = "2026-11-14T21:52:00.000Z"
+        out = json.loads(self.e.run("keys", "--orphans", check=0).stdout)
+        self.assertEqual(out["keys"], [])
+        self.e.run("keys", "--delete", mine["id"], check=2)
+        self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + mine["id"])), 1)
+
     def test_neg9_keys_lookup_failure_or_missing_fields_shows_nothing(self):
         self.api.api_keys = [{"id": "77777777-7777-4777-8777-777777777777", "name": "gq-browser:aaaaaaaaaaaaaaaa"}]
         p = self.e.run("keys", "--orphans")
@@ -636,7 +648,10 @@ class McpTest(Base):
                         {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
                         {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "gq_browser_open", "arguments": {"origins": ["https://example.com"]}}}])
         names = sorted(t["name"] for t in out[1]["result"]["tools"])
-        self.assertEqual(names, ["gq_browser_act", "gq_browser_close", "gq_browser_open", "gq_browser_screenshot", "gq_browser_status"])
+        self.assertEqual(names, ["gq_browser_act", "gq_browser_close", "gq_browser_open", "gq_browser_screenshot", "gq_browser_status",
+                                 # goodqa#16051 machine verbs (tests/test_gq_machine.py)
+                                 "gq_machine_click", "gq_machine_close", "gq_machine_key", "gq_machine_open", "gq_machine_renew",
+                                 "gq_machine_screenshot", "gq_machine_type"])
         for t in out[1]["result"]["tools"]:
             props = t["inputSchema"].get("properties", {})
             self.assertNotIn("base", props)
