@@ -61,6 +61,28 @@ def read_regular(path, limit: int) -> bytes:
     return data
 
 
+POLICY_COUNT_CAPS = ("session_live_agents", "session_owner_agents", "live_ttl_seconds", "top_assent_max_age_seconds")
+
+
+def policy_caps(data) -> dict:
+    """The `caps` object of a parsed tier policy, or ValueError naming the first part with the wrong shape (PR 260 v2
+    F4): the policy must be an object; `caps`, when present, an object; owner_types and helper_types, when present,
+    lists of strings; the count caps, when present, non-negative integers. Nothing past this is trusted."""
+    if not isinstance(data, dict):
+        raise ValueError("the policy is not a JSON object")
+    caps = data.get("caps", {})
+    if not isinstance(caps, dict):
+        raise ValueError("caps is not an object")
+    for name in ("owner_types", "helper_types"):
+        if name in caps and not (isinstance(caps[name], list) and all(isinstance(v, str) for v in caps[name])):
+            raise ValueError(f"caps.{name} is not a list of strings")
+    for name in POLICY_COUNT_CAPS:
+        value = caps.get(name)
+        if name in caps and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"caps.{name} is not a non-negative integer")
+    return caps
+
+
 def owner_policy(hooks_dir=None) -> dict:
     """caps.owner_types / caps.helper_types from the table tier_gate reads (AGENT_HARNESS_TIER_POLICY, else the hooks'
     model_tiers.json), re-read when the file changes; defaults when unreadable, with `fallback` set so it is visible."""
@@ -76,8 +98,8 @@ def owner_policy(hooks_dir=None) -> dict:
     if key not in _owner_policy_cache:
         caps, fallback, error = {}, False, ""
         try:
-            caps = json.loads(read_regular(path, POLICY_MAX_BYTES)).get("caps") or {}
-        except (OSError, ValueError, AttributeError, RecursionError) as exc:
+            caps = policy_caps(json.loads(read_regular(path, POLICY_MAX_BYTES)))
+        except (OSError, ValueError, RecursionError) as exc:
             caps, fallback = {}, True
             error = ev.short(str(exc), 120) if type(exc) is ValueError else type(exc).__name__
         owner = caps.get("owner_types") if isinstance(caps.get("owner_types"), list) else None
