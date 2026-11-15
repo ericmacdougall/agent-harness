@@ -115,7 +115,13 @@ export function ingestEvent(raw) {
   update({ events, owners, lastEvent: event, buffered: counted ? state.buffered + 1 : state.buffered }, 'event');
 }
 export function setLedger(snapshot) { update({ ledger: adapt.ledger(snapshot) }, 'ledger'); }
-export function setConnection(connection) { if (state.connection !== connection) update({ connection }, 'connection'); }
+export function setConnection(connection) {
+  if (state.connection === connection) return;
+  const wasLive = state.connection === 'live';
+  update({ connection }, 'connection');
+  // every zero or "none" claim also rests on the link (adapt.claim): the panels that state them repaint when it drops or returns
+  if (wasLive !== (connection === 'live')) update({}, 'truth');
+}
 export function setChat(chat) {
   if (!chat || typeof chat !== 'object') return;
   const sessions = adapt.sessions(chat.targets, chat.main_session);

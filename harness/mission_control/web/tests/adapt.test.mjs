@@ -242,7 +242,8 @@ test('slowest / at risk: uncovered first, then stalled by oldest real progress; 
     owner('h1', 'goodqa#5', 'DROPPED', null, { disposition: { kind: 'waiting', reason: 'on user Stripe step' } }),
     owner('c1', 'goodqa#6', 'DROPPED', '2026-11-10T05:50:00Z', { disposition: { kind: 'closed', reason: 'done with slice' } }),
   ];
-  const rows = adapt.atRisk(initiatives, owners, [], now);
+  const sure = { owners: 'current', progress: 'current' };  // review PR 234 v5 F2: no truth passed is unknown
+  const rows = adapt.atRisk(initiatives, owners, [], now, null, 6, sure);
   assert.deepEqual(rows.map(r => [r.id, r.status]), [
     ['leads', 'uncovered'], ['closed', 'uncovered'], ['held', 'stalled'], ['pay', 'stalled'], ['docs', 'moving']]);
   assert.match(rows[0].reason, /no owner and no recorded decision/);
@@ -250,10 +251,10 @@ test('slowest / at risk: uncovered first, then stalled by oldest real progress; 
   assert.equal(rows[2].action, 'waiting: on user Stripe step');
   assert.match(rows[3].reason, /commit by p1/);
   // a push to the ticket's branch is progress
-  const pushed = adapt.atRisk(initiatives, owners, [{ kind: 'push', ts: '2026-11-10T05:55:00Z', subject: { branch: 'feat/x-2' } }], now);
+  const pushed = adapt.atRisk(initiatives, owners, [{ kind: 'push', ts: '2026-11-10T05:55:00Z', subject: { branch: 'feat/x-2' } }], now, null, 6, sure);
   assert.equal(pushed.find(r => r.id === 'pay').status, 'moving');
   // the harness coverage check, once it publishes, overrides the derived verdict
-  const override = adapt.atRisk(initiatives, owners, [], now, { docs: { status: 'stalled', reason: 'coverage check', action: 'reassigning' } });
+  const override = adapt.atRisk(initiatives, owners, [], now, { docs: { status: 'stalled', reason: 'coverage check', action: 'reassigning' } }, 6, sure);
   const docs = override.find(r => r.id === 'docs');
   assert.deepEqual([docs.status, docs.action], ['stalled', 'reassigning']);
 });
@@ -274,7 +275,7 @@ test('named OpenAI owner with merged WAL result remains moving in the at-risk st
   const owners=adapt.owners([{agent_id:'openai:mission-control',name:'mission-control',runtime:'codex',state:'live',ticket:'goodqa#15585',
     last_item:{at:'2026-11-10T03:00:00Z',active_at:'2026-11-10T03:00:00Z',note:'next step',
       progress_at:'2026-11-10T02:58:00Z',progress_event:'check',progress_note:'REALLY_TESTED fixture passed'}}],items);
-  const [risk]=adapt.atRisk(items,owners,[],Date.parse('2026-11-10T03:01:00Z'));
+  const [risk]=adapt.atRisk(items,owners,[],Date.parse('2026-11-10T03:01:00Z'),null,6,{owners:'current',progress:'current'});
   assert.equal(risk.status,'moving');
   assert.match(risk.reason,/check by mission-control/);
 });
