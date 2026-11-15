@@ -214,35 +214,44 @@ and is recorded in `transitions` in the same transaction.
   Anything else is `unverified-producer` and authorizes nothing. A `spec` row passes only from `required`, on its
   attach record. A new head supersedes every open row, and a running row goes through `cancelling` first so its
   unit is stopped. A receipt that arrives later for a superseded row authorizes nothing. There is no waiver path.
-- **Grant** rows (spec ahc-m1 G1-G9) are issued only by the `ahc-policy` principal, straight to `validated`.
-  Each has a scope (repo, pr, head, base), one use and a 24 h expiry, and a partial unique index allows at most
-  one non-terminal grant per (kind, repo, pr, head, base). Every move is written first to an append-only, fsynced
-  authority log. The log is **local, not off-host**, a stated deviation from 3.9. If the write fails, nothing
-  changes. A grant is reserved only for an intent with exactly its scope and policy revision, and only after the
-  mirror comment was read back. It is consumed when its operation is confirmed, or abandoned after an unknown
-  dispatch. It is released (back to `active`, or `expired` past expiry) when the operation was abandoned unsent or
-  after a definite refusal, and then only the same operation key may reserve it again. Main revokes it (G8); the
-  kill switch revokes it as `ahc-core` (G9). A grant reserved past its expiry has no transition until its operation
-  settles.
-- **Operation** rows (E1-E12) are merge-commit only. The key is derived by core from (repo, pr, H, B, policy
-  revision, g). The generation g rises only after the previous operation for that tuple was abandoned without ever
-  being sent; a tuple whose operation was sent never gets a fresh key. The same key with other parameters is an
-  `OperationConflict`, never a new row. Dispatch re-reads every guard on an observation under 2 min old (PR open at
-  H, default branch at B, checks green, kill switch read off, M built with parents (B, H) and no conflict), the
-  lease and the mirror, and counts before the push leaves; at most 3 are allowed (B10). Confirmation needs the
-  branch at M with parents (B, H). If the PR is not shown merged 10 min after the push it is still confirmed and
-  flagged (E12). Absence needs a typed refusal (non-fast-forward, stale or transient) and a closed request, never
-  "not there now". After it: revoked grant or third dispatch gives `held` (E11), non-fast-forward or stale gives
-  `abandoned` (E8), and a transient refusal retries the same key (E7). Twenty inconclusive readbacks give `held`,
-  with an incident, and only main or the reconcile read settles a held row. A settled row becomes a tombstone 30
-  days after settlement, and its key is refused for good.
+- **Grant** rows (spec ahc-m1-v2e G1-G9) are issued only by the `ahc-policy` principal, straight to `validated`,
+  for one candidate merge commit M: scope (repo, pr, H, B, M), one use, a 24 h expiry, the authority epoch and the
+  kill epoch read at issue. A partial unique index allows at most one non-terminal grant per (kind, repo, pr, M).
+  Issuing reserves a CAP1 slot (10 per repo per UTC day); retiring (G5) and expiry (G7) release it, consumption and
+  revocation keep it, so the count never goes down. Every move is written first to an append-only, fsynced
+  authority log, **local, not off-host** (a stated deviation from 3.9); if the write fails, nothing changes. A grant
+  is reserved only for an intent with exactly its scope and policy revision, under the current epochs, and only
+  after the mirror comment was read back. It is consumed when its operation is confirmed, or abandoned after a send
+  whose outcome stayed unknown, and retired when the operation was abandoned with nothing sent or every send proven
+  absent. Main revokes it (G8; the caller verifies main's stamp); the kill switch revokes it as `ahc-core` (G9). A
+  grant reserved past its expiry has no transition until its operation settles.
+- **Operation** rows (E1-E12) are merge-commit only, keyed by (repo, pr, M, policy revision, g). The generation g
+  rises only after the previous operation for the same M was abandoned with every send proven absent; an
+  operation with a send not proven absent never yields a new g. Dispatch re-reads every guard on an observation
+  under 2 min old (tip at B, candidate ref at M, M's parents (B, H), PR open and not a draft at H, checks green,
+  kill switch off at the grant's kill epoch), the lease and the mirror, and counts before the request leaves; at
+  most 3 are allowed (B10). Confirmation is by ancestry: M reachable from the tip (identical or ahead) with parents
+  (B, H), so a later advance does not hide a success. If the PR is not shown merged 10 min after the dispatch it is
+  still confirmed and flagged (E12). Absence needs one of three proofs: p1 a typed server refusal, p2 an error to a
+  completed request plus a fresh readback showing the tip left B and M unreachable, p3 a failure before any request
+  byte was written. An error while the tip is still B is never absence: the operation stays unknown with its grant
+  reserved. After a proof, a revoked grant or the third dispatch gives `held` (E11); p1 or p2, or a tip that left B,
+  gives `abandoned` (E8); only p3 with the tip still at B retries the same key (E7). Twenty inconclusive readbacks
+  give `held`; main settles a held row with evidence, and the reconcile confirms it when M is reachable or
+  abandons it after the 24 h late-request horizon with M unreachable and the tip off B. For 30 days after an
+  operation is abandoned, a readback that finds its M reachable raises an incident and turns the repo's merging
+  off (`repo_flags`) until main turns it back on (late-apply watch, L5). A settled row becomes a tombstone 30 days
+  after settlement, and its key is refused for good.
 
 The runner does not use these rows yet, and automatic merging is off.
 
-**Ledger schema v3.** The ledger now carries these tables, plus `items.cause` (why an item is in its state: a
+**Ledger schema v4.** The ledger carries these tables, plus `items.cause` (why an item is in its state: a
 dependency or budget name). A same-state settle keeps the cause, and a state change without one clears it. A fresh
-ledger and a v2 ledger migrated to v3 have the same tables and columns. The migration is forward-only: older ahc
-code refuses a v3 ledger, and rollback means restoring the `ledger.sqlite3.pre-v3.*.bak` copy made before the step.
+ledger and a v2 ledger migrated to v4 have the same tables and columns. A v3 ledger (either committed v3 layout)
+keeps its grant and operation rows untouched in `grants_v3_legacy` and `operations_v3_legacy`; every unsettled
+legacy row is reported by `Contracts.legacy_unsettled()` for main to reconcile. Migrations are forward-only: older
+ahc code refuses a newer ledger, and rollback means restoring the `ledger.sqlite3.pre-v4.*.bak` copy made before
+the step, which the previous release (21357968) reads.
 
 **The daemon's review is bound and unstamped.** It runs `peer_review.py pr ... --github-repo OWNER/NAME --pr N
 --no-main-stamp`, so the FINAL carries the PR binding that `merge_gate.pr_pass_evidence` checks. It never takes or

@@ -2639,12 +2639,11 @@ class SchemaTests(Base):
         import sqlite3
         self.paths.ensure()
         db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"), isolation_level=None)
+        contract_statements = set(runner._statements(runner.ahc_contracts.SCHEMA))
         for statement in runner._statements(runner.SCHEMA):
             if statement.startswith("CREATE TABLE IF NOT EXISTS items"):
                 statement = statement.replace(", cause TEXT)", ")")
-            if any(statement.startswith("CREATE TABLE IF NOT EXISTS " + n) for n in
-                   ("reviews", "grants", "operations", "transitions")) or \
-                    statement.startswith("CREATE UNIQUE INDEX IF NOT EXISTS grants_"):
+            if statement in contract_statements:
                 continue
             db.execute(statement)
         db.execute("INSERT INTO meta(k, v) VALUES ('schema_version', '2')")
@@ -2670,7 +2669,7 @@ class SchemaTests(Base):
         finally:
             ledger.close()
 
-    def test_v2_migrates_to_v3_with_the_fresh_shape_and_rows_intact(self):
+    def test_v2_migrates_to_current_with_the_fresh_shape_and_rows_intact(self):
         fresh_paths = core.Paths(self.home / "fresh")
         runner.Ledger(fresh_paths).close()
         self.make_v2()
@@ -2685,7 +2684,7 @@ class SchemaTests(Base):
                          ("block-delivered", 40.0, 2, None), "state and D20 clock survive; cause starts empty")
         self.assertEqual(self.shape(self.paths.root / "ledger.sqlite3"),
                          self.shape(fresh_paths.root / "ledger.sqlite3"), "migrated shape equals fresh shape")
-        self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v3.*.bak"))), 1)
+        self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v%d.*.bak" % runner.SCHEMA_VERSION))), 1)
         import sqlite3
         for path in (self.paths.root, fresh_paths.root):
             db = sqlite3.connect(str(path / "ledger.sqlite3"))
@@ -2695,6 +2694,132 @@ class SchemaTests(Base):
                                  [("grants_one_live_per_scope",)], "the one-grant-per-scope index exists")
             finally:
                 db.close()
+
+    # --- v4 (spec ahc-m1-v2e, Codex F5/F6): a populated ledger of the committed v3 layout (21357968, and the
+    # earlier d398d7fb layout) upgrades with its grant and operation rows kept intact and reported, restarts cleanly,
+    # and the pre-v4 backup is still readable by the previous release.
+    V3_LAYOUTS = {
+        "21357968": (
+            "CREATE TABLE grants (id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT "
+            "NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL, policy_revision "
+            "TEXT NOT NULL, uses INTEGER NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL, operation TEXT, "
+            "bound_key TEXT, authority_seq INTEGER, version INTEGER NOT NULL, created REAL NOT NULL, updated REAL "
+            "NOT NULL)",
+            "CREATE UNIQUE INDEX grants_one_live_per_scope ON grants(kind, repo, pr, head, base) WHERE state IN "
+            "('validated', 'active', 'reserved')",
+            "CREATE TABLE operations (key TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, repo TEXT NOT NULL, pr "
+            "INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL, policy_revision TEXT NOT NULL, generation "
+            "INTEGER NOT NULL, params TEXT, params_sha256 TEXT NOT NULL, grant_id TEXT, state TEXT NOT NULL, "
+            "dispatch_count INTEGER NOT NULL DEFAULT 0, dispatched_at REAL, request_id TEXT, built_sha TEXT, refusal "
+            "TEXT, probe_at REAL, escalate_at REAL, readbacks INTEGER NOT NULL DEFAULT 0, proof TEXT, evidence TEXT, "
+            "incident INTEGER NOT NULL DEFAULT 0, pr_unmarked INTEGER NOT NULL DEFAULT 0, settled_at REAL, tombstone "
+            "INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL)"),
+        "d398d7fb": (
+            "CREATE TABLE grants (id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT "
+            "NULL, scope TEXT NOT NULL, policy_revision TEXT NOT NULL, uses INTEGER NOT NULL, expires_at REAL NOT "
+            "NULL, state TEXT NOT NULL, operation TEXT, authority_seq INTEGER, version INTEGER NOT NULL, created REAL "
+            "NOT NULL, updated REAL NOT NULL)",
+            "CREATE TABLE operations (key TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, params TEXT, params_sha256 "
+            "TEXT NOT NULL, grant_id TEXT, state TEXT NOT NULL, dispatch_count INTEGER NOT NULL DEFAULT 0, "
+            "dispatched_at REAL, request_id TEXT, probe_at REAL, escalate_at REAL, readbacks INTEGER NOT NULL DEFAULT "
+            "0, proof TEXT, evidence TEXT, incident INTEGER NOT NULL DEFAULT 0, settled_at REAL, tombstone INTEGER "
+            "NOT NULL DEFAULT 0, version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL)"),
+    }
+
+    def make_v3(self, layout):
+        import sqlite3
+        self.make_v2()
+        db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"), isolation_level=None)
+        db.execute("ALTER TABLE items ADD COLUMN cause TEXT")
+        for statement in runner._statements(runner.ahc_contracts.SCHEMA):
+            if not any(statement.startswith(p) for p in ("CREATE TABLE IF NOT EXISTS grants",
+                                                         "CREATE UNIQUE INDEX IF NOT EXISTS grants_",
+                                                         "CREATE TABLE IF NOT EXISTS operations",
+                                                         "CREATE TABLE IF NOT EXISTS contract_meta",
+                                                         "INSERT OR IGNORE INTO contract_meta",
+                                                         "CREATE TABLE IF NOT EXISTS repo_flags")):
+                db.execute(statement)
+        for statement in self.V3_LAYOUTS[layout]:
+            db.execute(statement)
+        if layout == "21357968":
+            grant = "INSERT INTO grants VALUES (?,'merge','queue:x','ahc-policy','o/r',5,?,?,'p',1,?,?,?,NULL,1,2,1,1)"
+            db.execute(grant, ("gr-live", "a" * 40, "c" * 40, 9e9, "reserved", "op-live"))
+            db.execute(grant, ("gr-done", "b" * 40, "c" * 40, 9e9, "consumed", "op-done"))
+            op = ("INSERT INTO operations(key, kind, repo, pr, head, base, policy_revision, generation, params, "
+                  "params_sha256, grant_id, state, dispatch_count, built_sha, version, created, updated) "
+                  "VALUES (?,'merge','o/r',5,?,?,'p',0,'{}','s',?,?,1,?,3,1,2)")
+            db.execute(op, ("op-live", "a" * 40, "c" * 40, "gr-live", "outcome-unknown", "e" * 40))
+            db.execute(op, ("op-done", "b" * 40, "c" * 40, "gr-done", "confirmed", "f" * 40))
+        else:
+            db.execute("INSERT INTO grants VALUES ('gr-live','merge','queue:x','ahc-policy','{}','p',1,9e9,"
+                       "'reserved','op-live',1,2,1,1)")
+            db.execute("INSERT INTO operations(key, kind, params, params_sha256, grant_id, state, version, created, "
+                       "updated) VALUES ('op-live','merge','{}','s','gr-live','dispatched',2,1,1)")
+        db.execute("UPDATE meta SET v='3' WHERE k='schema_version'")
+        before = {t: sorted(db.execute("SELECT * FROM %s" % t).fetchall()) for t in ("grants", "operations")}
+        db.close()
+        return before
+
+    def test_populated_v3_upgrades_keeping_unsettled_rows_and_restarts(self):
+        import sqlite3
+        for layout in self.V3_LAYOUTS:
+            with self.subTest(layout=layout):
+                self.setUp()
+                before = self.make_v3(layout)
+                for _ in range(2):        # the second open is a restart: a no-op on a v4 ledger
+                    ledger = runner.Ledger(self.paths)
+                    ledger.close()
+                db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"))
+                try:
+                    self.assertEqual(db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()[0],
+                                     str(runner.SCHEMA_VERSION))
+                    for t in ("grants", "operations"):
+                        self.assertEqual(sorted(db.execute("SELECT * FROM %s_v3_legacy" % t).fetchall()), before[t],
+                                         "%s rows are kept byte for byte" % t)
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0], 0)
+                    self.assertIn("merge_sha", [r[1] for r in db.execute("PRAGMA table_info(grants)")])
+                    index = db.execute("SELECT sql FROM sqlite_master WHERE name='grants_one_live_per_scope'")
+                    self.assertIn("merge_sha", index.fetchone()[0], "the v4 index, not the renamed v3 one")
+                    db.row_factory = sqlite3.Row
+                    contracts = runner.ahc_contracts.Contracts(db, None)
+                    unsettled = {(u["table"], u["id"]) for u in contracts.legacy_unsettled()}
+                    self.assertEqual(unsettled, {("grants_v3_legacy", "gr-live"), ("operations_v3_legacy", "op-live")})
+                finally:
+                    db.close()
+                self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v4.*.bak"))), 1)
+
+    def test_previous_release_still_reads_the_pre_v4_backup(self):
+        """Rollback before cutover restores the pre-v4 backup and runs the previous release (21357968) on it."""
+        import shutil as _shutil
+        import subprocess
+        repo = Path(__file__).resolve().parent.parent
+        old = self.home / "release-prev"
+        old.mkdir(parents=True)
+        archive = subprocess.run(["git", "-C", str(repo), "archive", "21357968", "harness/hooks"],
+                                 capture_output=True)
+        if archive.returncode != 0:
+            self.skipTest("commit 21357968 is not in this checkout")
+        subprocess.run(["tar", "-x", "-C", str(old)], input=archive.stdout, check=True)
+        self.make_v3("21357968")
+        runner.Ledger(self.paths).close()
+        backup = next(self.paths.root.glob("ledger.sqlite3.pre-v4.*.bak"))
+        restored = self.home / "restored"
+        (restored / ".agent-harness" / "coordinator").mkdir(parents=True)
+        _shutil.copyfile(backup, restored / ".agent-harness" / "coordinator" / "ledger.sqlite3")
+        script = ("import sys; sys.path.insert(0, sys.argv[1]); import ahc_core, ahc_runner; "
+                  "l = ahc_runner.Ledger(ahc_core.Paths(sys.argv[2])); "
+                  "print(l.db.execute(\"SELECT v FROM meta WHERE k='schema_version'\").fetchone()[0], "
+                  "l.db.execute(\"SELECT state FROM operations WHERE key='op-live'\").fetchone()[0]); l.close()")
+        proc = subprocess.run([sys.executable, "-B", "-c", script, str(old / "harness" / "hooks"), str(restored)],
+                              capture_output=True, text=True, env=dict(os.environ, AH_HOME=str(self.home)))
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertEqual(proc.stdout.split(), ["3", "outcome-unknown"])
+        # and the previous release refuses the migrated v4 ledger rather than misreading it
+        proc = subprocess.run([sys.executable, "-B", "-c", script, str(old / "harness" / "hooks"),
+                               str(self.paths.home)], capture_output=True, text=True,
+                              env=dict(os.environ, AH_HOME=str(self.home)))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("not supported", proc.stderr)
 
     def test_unverified_backup_never_starts_the_migration(self):
         held = self.make_v1()
