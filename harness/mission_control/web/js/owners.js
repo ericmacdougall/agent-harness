@@ -1,6 +1,7 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
 import { ownerGroups, ownerCounts, foldLabel, summaryLine, isHelper, ownersStale } from './owner-groups.js';
+import { ownersEmpty, ownerCount, workItemText } from './adapt.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -78,12 +79,12 @@ export function mountOwners() {
       : `Native observation stale/unknown (${new Date(owner.observed_at).toLocaleTimeString()})`;
     const role = helper ? helperLine(owner, servedBy) : owner.role === 'live' ? '' : owner.decision_required ? 'Parked, decision required' : '';
     parts.task.textContent = [role, owner.stream || owner.task, owner.ticket, native, owner.source_stale ? 'STALE SOURCE' : ''].filter(Boolean).join(' · ');
-    parts.note.textContent = owner.last_item.note;
+    parts.note.textContent = workItemText(state, owner.last_item.note);
     parts.time.dateTime = owner.last_item.active || '';
-    parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : 'No work item yet';
+    parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : workItemText(state, 'No work item yet');
     parts.time.textContent = age(owner.last_item.active, state.now);
     parts.time.className = `owner-age ${freshness(owner.last_item.active, state.now)}`;
-    parts.row.setAttribute('aria-label', `${role ? `${role}. ` : ''}${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. ${holdText ? `${holdText}. ` : ''}Last work item: ${owner.last_item.note}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
+    parts.row.setAttribute('aria-label', `${role ? `${role}. ` : ''}${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. ${holdText ? `${holdText}. ` : ''}Last work item: ${workItemText(state, owner.last_item.note)}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
     return parts.row;
   }
 
@@ -102,7 +103,7 @@ export function mountOwners() {
     more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${all.length} rows`;
     more.setAttribute('aria-expanded', String(!!state.ownersAll));
     const nodes = owners.map(owner => { used.add(owner.agent_id); return rowFor(owner, state, null); });
-    emptyState.textContent = state.owners.length ? 'No owners in this state.' : 'Waiting for the owner list…';
+    emptyState.textContent = ownersEmpty(state, state.owners.length > 0);
     syncChildren(list, nodes.length ? nodes : [emptyState]);
   }
 
@@ -151,7 +152,7 @@ export function mountOwners() {
       return parts.section;
     });
     for (const id of [...groups.keys()]) if (!layout.some(group => group.id === id)) groups.delete(id);
-    emptyState.textContent = 'Waiting for the owner list…';
+    emptyState.textContent = ownersEmpty(state, false);
     syncChildren(list, sections.length ? sections : [emptyState]);
   }
 
@@ -183,13 +184,13 @@ export function mountOwners() {
     const stale = ownersStale(state);
     const session = state.owners.find(owner => owner.source === 'ah' && owner.session)?.session || '';
     const count = document.getElementById('owner-count');
-    count.textContent = String(counts.live).padStart(2, '0');
+    count.textContent = ownerCount(state, counts.live);
     count.title = summaryLine(counts, { session, stale });
     if (summary) summary.textContent = summaryLine(counts, { session, stale });
   }
   render(getState());
   subscribe((state, reason) => {
-    if (['event', 'owners', 'owner-filter', 'initiatives', 'health'].includes(reason)) render(state);
+    if (['event', 'owners', 'owner-filter', 'initiatives', 'health', 'truth'].includes(reason)) render(state);
     if (reason === 'tick') rows.forEach(({ time }) => { time.textContent = age(time.dateTime, state.now); time.className = `owner-age ${freshness(time.dateTime, state.now)}`; });
     if (reason === 'highlight') rows.forEach(({ row }, id) => row.classList.toggle('is-highlighted', id === state.highlight));
   });

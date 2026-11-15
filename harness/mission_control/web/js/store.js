@@ -84,7 +84,15 @@ export function setInitiatives(snapshot) {
   update({}, 'owners');
 }
 export function setOwners(rows) { update({ ownerRows: Array.isArray(rows) ? rows : [], owners: adapt.owners(rows, state.initiatives) }, 'owners'); }
-export function setSources(rows) { update({ sources: adapt.sources(rows) }, 'health'); }
+// 'truth' fires only when a source's status or truth changed: the panels whose zero claims rest on it repaint then, not
+// on every health snapshot (a failing source re-reports every tick).
+let truthSig = '';
+export function setSources(rows) {
+  const list = adapt.sources(rows);
+  update({ sources: list }, 'health');
+  const sig = list.map(s => `${s.id}:${s.status}:${s.truth}`).join('|');
+  if (sig !== truthSig) { truthSig = sig; update({}, 'truth'); }
+}
 export function setHost(host) { update({ host: String(host || '') }, 'host'); }
 export function seedEvents(list) {
   const events = (Array.isArray(list) ? list : []).map(adapt.event).filter(e => e && KINDS[e.kind]);
