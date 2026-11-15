@@ -319,35 +319,49 @@ class Health:
     def __init__(self, hub):
         self.hub, self.rows = hub, {}
         self.on_change = None  # called after every pushed change (Truth republishes the dataset reads)
+        # Receipt v7 F3: collector threads, the ledger thread and the session-watch thread (expire) all change rows.
+        # Every read-modify-write of a row happens under this lock, so a fresh read written while expire runs is never
+        # overwritten by the aged copy. The push runs after the lock is released: on_change -> Truth.reads ->
+        # Ledger.view takes the ledger lock, and the ledger thread holds that lock while it pushes, so pushing under
+        # this lock could deadlock. Readers that need every row take snapshot(), a copy made under the lock.
+        self.lock = threading.RLock()
 
     def _push(self):
-        self.hub.snapshot("health", list(self.rows.values()))
+        self.hub.snapshot("health", self.snapshot())
         if self.on_change:
             self.on_change()
 
     def beat(self, name) -> None:
         """The source was checked and nothing changed: only its checked time moves (no push)."""
-        row = self.rows.get(name)
-        if row and not row.get("aged"):
-            row["checked"] = time.time()
+        with self.lock:
+            row = self.rows.get(name)
+            if row and not row.get("aged"):
+                self.rows[name] = dict(row, checked=time.time())
 
     def expire(self, max_ages: dict, now: float | None = None) -> list:
         """Age out rows whose reader has stopped: a row not checked within its max age is no longer a current read. It
         turns into an error (stale after a good read, else unknown) until its reader reports again. Returns the names."""
         now = time.time() if now is None else now
         aged = []
-        for name, limit in max_ages.items():
-            row = self.rows.get(name)
-            if not row or row.get("status") == "off" or row.get("aged") or now - row.get("checked", now) <= limit:
-                continue
-            self.rows[name] = dict(row, status="error", aged=True, truth=read_truth(row.get("ok_at"), "aged"),
-                                   detail=ev.short(f"not checked for {int(now - row['checked'])} s: its reader may have stopped", 160))
-            aged.append(name)
+        with self.lock:   # each row is read and replaced under the lock: a write in between waits, then wins
+            for name, limit in max_ages.items():
+                row = self.rows.get(name)
+                if not row or row.get("status") == "off" or row.get("aged") or now - row.get("checked", now) <= limit:
+                    continue
+                self.rows[name] = dict(row, status="error", aged=True, truth=read_truth(row.get("ok_at"), "aged"),
+                                       detail=ev.short(f"not checked for {int(now - row['checked'])} s: its reader may have stopped", 160))
+                aged.append(name)
         if aged:
             self._push()
         return aged
 
     def _set(self, name, status, detail, truth=None, session=None):
+        with self.lock:
+            pushed = self._set_locked(name, status, detail, truth, session)
+        if pushed:
+            self._push()
+
+    def _set_locked(self, name, status, detail, truth, session) -> bool:
         now = time.time()
         previous = self.rows.get(name, {})
         # off reads nothing, so no earlier good read stands for what follows it: an error after off is unknown, not
@@ -364,8 +378,7 @@ class Health:
             row["session"] = str(session)[:64]
         changed = (previous.get("status"), previous.get("truth"), previous.get("session")) != (status, truth, row.get("session"))
         self.rows[name] = row
-        if changed or status != "ok":
-            self._push()
+        return changed or status != "ok"
 
     def ok(self, name, detail="", truth=None, session=None):
         self._set(name, "ok", detail, truth, session)
@@ -382,15 +395,17 @@ class Health:
         """The source's last good read no longer applies: main's session changed, so nothing has been read for the
         session it follows now. The row turns unknown with no good-read time at once, before the slow read starts,
         and keeps its status so the tick that then reads well still reports ok. An off row has nothing to forget."""
-        previous = self.rows.get(name)
-        if not previous or previous.get("status") == "off":
-            return
-        self.rows[name] = dict(previous, checked=time.time(), detail=ev.short(detail or "", 160), ok_at=None,
-                               truth="unknown")
+        with self.lock:
+            previous = self.rows.get(name)
+            if not previous or previous.get("status") == "off":
+                return
+            self.rows[name] = dict(previous, checked=time.time(), detail=ev.short(detail or "", 160), ok_at=None,
+                                   truth="unknown")
         self._push()
 
     def snapshot(self):
-        return list(self.rows.values())
+        with self.lock:
+            return [dict(row) for row in self.rows.values()]
 
 
 class Truth:
