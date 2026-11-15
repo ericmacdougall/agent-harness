@@ -66,6 +66,9 @@ def prepare(root, repo, url, head, base, env=None):
         raise CloneError("bad clone URL")
     path = clone_dir(root, repo)
     Path(root).mkdir(parents=True, exist_ok=True, mode=0o700)
+    for real in (Path(root), path, path / ".git"):     # git must never write through a link (PR 258 v1 BLOCK)
+        if os.path.islink(str(real)) or (os.path.lexists(str(real)) and not os.path.isdir(str(real))):
+            raise CloneError("clone path %s is a symlink or not a directory" % real.name)
     if not (path / ".git").is_dir():
         _git(["clone", "--quiet", "--no-checkout", "--", url, str(path)], cwd=str(root), env=env)
     _canonical_config(path, url)

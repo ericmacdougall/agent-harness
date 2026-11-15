@@ -279,24 +279,20 @@ INVENTORY = {
            "_in_tx=True (late_apply and watch_confirm, both inside tx bodies); durable at contracts.commit"),
     ("ahc_contracts", "apply_schema", "sql:DYNAMIC"): (
         1, "exempt:idempotent DDL (CREATE ... IF NOT EXISTS, INSERT OR IGNORE), re-run at every open; no data"),
-    ("ahc_runner", "Ledger.__init__", "sqlite3.connect"): (
-        1, "exempt:opens or creates the database file; its first rows commit at runner.commit"),
+    # connect_nofollow (PR 258 v1 BLOCK) is the one sqlite open for the ledger, its pre-migration backup and the
+    # reopen after a restore: the file is opened or created by an O_NOFOLLOW descriptor and fchmod'ed first.
+    ("ahc_runner", "connect_nofollow", "sqlite3.connect"): (
+        1, "exempt:opens or creates a database file (ledger: first rows commit at runner.commit; backup: inside the "
+           "runner.backup seam; restore reopen: after the runner.restore_copy seam)"),
     ("ahc_runner", "Ledger.__init__", "sql:PRAGMA"): (
         2, "exempt:connection settings (journal_mode=WAL, synchronous=FULL), re-applied at every open"),
-    ("ahc_runner", "Ledger.__init__", "os.chmod"): (1, "exempt:permission metadata, re-applied at every open"),
     ("ahc_runner", "Ledger._schema", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
-    ("ahc_runner", "Ledger.backup", "sqlite3.connect"): (1, "seam:runner.backup"),
     ("ahc_runner", "Ledger.backup", "sqlite.backup"): (1, "seam:runner.backup"),
-    ("ahc_runner", "Ledger.backup", "os.chmod"): (1, "seam:runner.backup"),
-    ("ahc_runner", "Ledger.restore", "open(write)"): (1, "seam:runner.restore_intent"),
     ("ahc_runner", "Ledger.restore", "handle.write"): (1, "seam:runner.restore_intent"),
     ("ahc_runner", "Ledger.restore", "os.fsync"): (1, "seam:runner.restore_intent"),
     ("ahc_runner", "Ledger.restore", "os.replace"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger.restore", "sqlite3.connect"): (
-        1, "exempt:reopens the restored file after the runner.restore_copy seam; no write"),
     ("ahc_runner", "Ledger._finish_restore", "os.rename"): (1, "seam:runner.restore_move"),
-    ("ahc_runner", "Ledger._finish_restore", "shutil.copyfile"): (1, "seam:runner.restore_copy"),
-    ("ahc_runner", "Ledger._finish_restore", "os.chmod"): (1, "seam:runner.restore_copy"),
+    ("ahc_runner", "Ledger._finish_restore", "handle.write"): (1, "seam:runner.restore_copy"),
     ("ahc_runner", "Ledger._finish_restore", "os.fsync"): (1, "seam:runner.restore_copy"),
     ("ahc_runner", "Ledger._finish_restore", "os.replace"): (1, "seam:runner.restore_copy"),
     ("ahc_runner", "Ledger._finish_restore", "os.unlink"): (1, "seam:runner.restore_copy"),

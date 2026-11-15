@@ -847,6 +847,190 @@ class RootOwnershipTests(unittest.TestCase):
             self.assertIn("token", err.getvalue(), argv)
         self.assertEqual(self.snapshot(self.paths.root), before)
 
+    # PR 258 v1 BLOCK (Codex, High): a marked root was validated by entry name only, so `ledger.sqlite3 -> another
+    # program's database` or a symlinked `clones/` passed and ahc then wrote through the link. Every allowed name,
+    # as a symlink to an external file or directory in an otherwise valid marked root, must be refused before any
+    # state is touched, by ensure() and by the CLI (exit 3), with the external target byte-identical and its mode
+    # unchanged. Names that ahc creates by pattern are covered by one concrete instance each.
+    ROOT_DIR_NAMES = ("staging", "queue", "items", "inbox", "clones", "reports", "rejected")
+
+    def allowed_instances(self):
+        names = sorted(n for n in core.ROOT_NAMES if n != core.ROOT_MARKER)
+        concrete = {"ledger.sqlite3-*": "ledger.sqlite3-wal", "ledger.sqlite3.*": "ledger.sqlite3.pre-v4.1.bak",
+                    core.ROOT_MARKER_TEMP: ".ahc-root.1.2.tmp"}
+        for pattern in core.ROOT_PATTERNS:
+            names.append(concrete.get(pattern) or pattern.replace("*", "77"))
+        for name in names:
+            self.assertTrue(core._ahc_root_name(name), name)
+        return names
+
+    def external(self, as_dir):
+        outside = self.home / "other-program"
+        outside.mkdir(exist_ok=True)
+        if as_dir:
+            target = outside / "dir"
+            target.mkdir(exist_ok=True)
+            (target / "keep").write_bytes(b"external dir file\n")
+        else:
+            target = outside / "file.sqlite"
+            if not target.exists():
+                import sqlite3        # a real database of the other program: a write through the link is visible
+                db = sqlite3.connect(str(target))
+                db.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT)")
+                db.execute("INSERT INTO tasks(name) VALUES ('belongs to the other program')")
+                db.commit()
+                db.close()
+                os.chmod(str(target), 0o644)
+        return target
+
+    def external_state(self):
+        outside = self.home / "other-program"
+        return {str(p): (p.read_bytes() if p.is_file() else None, os.lstat(p).st_mode)
+                for p in sorted(outside.rglob("*"))}
+
+    def marked_root(self):
+        self.paths.ensure()
+        for child in self.paths.root.iterdir():
+            if child.name != core.ROOT_MARKER and child.is_dir() and not child.is_symlink():
+                os.rmdir(str(child))     # leave only the marker: an otherwise valid, marked, empty root
+
+    def assert_refused_everywhere(self, label):
+        import contextlib
+        import io
+        from unittest import mock
+        sys.path.insert(0, str(HOOKS))
+        import ahc_runner as runner
+        before = self.external_state()
+        with self.assertRaises(core.ForeignRoot, msg=label):
+            self.paths.ensure()
+        with self.assertRaises(core.ForeignRoot, msg=label):
+            runner.Ledger(self.paths)
+        for argv in (["run", "--role", "core", "--once"], ["status"]):
+            err = io.StringIO()
+            with mock.patch.object(Path, "home", return_value=self.home), mock.patch.object(
+                    runner, "claim_main", return_value=False), contextlib.redirect_stderr(err):
+                rc = runner.main(argv)
+            self.assertEqual(rc, runner.ROOT_EXIT, "%s %s" % (label, argv))
+        self.assertEqual(self.external_state(), before, "%s: the external target changed" % label)
+
+    def test_every_allowed_name_as_a_symlink_is_refused(self):
+        names = self.allowed_instances()
+        self.assertGreaterEqual(len(names), 20, "the generated list covers every allowed name and pattern")
+        for name in names:
+            for as_dir in (False, True):
+                with self.subTest(name=name, target="dir" if as_dir else "file"):
+                    self.tearDown()
+                    self.setUp()
+                    self.marked_root()
+                    os.symlink(str(self.external(as_dir)), str(self.paths.root / name))
+                    self.assert_refused_everywhere("%s -> external %s" % (name, "dir" if as_dir else "file"))
+
+    def test_every_allowed_name_with_the_wrong_file_type_is_refused(self):
+        for name in self.allowed_instances():
+            with self.subTest(name=name):
+                self.tearDown()
+                self.setUp()
+                self.marked_root()
+                path = self.paths.root / name
+                if name in self.ROOT_DIR_NAMES:
+                    path.write_bytes(b"a file where ahc keeps a directory\n")
+                else:
+                    path.mkdir()
+                with self.assertRaises(core.ForeignRoot):
+                    self.paths.ensure()
+
+    def test_a_symlink_one_level_down_in_an_ahc_only_tree_is_refused(self):
+        """Nested, strict tier: a symlink inside items/ (the item journals) or clones/ (a clone directory) is
+        refused before any state is touched. Only ahc writes there."""
+        self.assertEqual(core.STRICT_TREES, {"items", "clones"})
+        nested = {"items": "x.jsonl", "clones": "o__r"}
+        for directory, name in sorted(nested.items()):
+            for as_dir in (False, True):
+                with self.subTest(directory=directory, name=name, target="dir" if as_dir else "file"):
+                    self.tearDown()
+                    self.setUp()
+                    self.paths.ensure()
+                    (self.paths.root / directory).mkdir(exist_ok=True)
+                    os.symlink(str(self.external(as_dir)), str(self.paths.root / directory / name))
+                    self.assert_refused_everywhere("%s/%s -> external" % (directory, name))
+
+    def test_a_symlink_two_levels_down_in_an_ahc_only_tree_is_refused(self):
+        self.paths.ensure()
+        (self.paths.items / "sub").mkdir()
+        os.symlink(str(self.external(False)), str(self.paths.items / "sub" / "x.jsonl"))
+        self.assert_refused_everywhere("items/sub/x.jsonl -> external")
+
+    def test_a_link_in_a_shared_directory_never_stops_ahc_and_is_never_followed_at_open(self):
+        """Shared tier: other processes write into queue/, inbox/, staging/, reports/ and rejected/ by design, so a
+        link there must not halt ahc (any submitter could). ahc still starts, and opening the linked name the way
+        the runner does (O_NOFOLLOW, regular file required) is refused, leaving the external target unchanged. The
+        per-operation behaviour is pinned by IngestValidationTests, UntrustedReadTests and PacketRetentionTests."""
+        sys.path.insert(0, str(HOOKS))
+        import ahc_runner as runner
+        self.assertEqual(core.SHARED_DIRS, {"queue", "inbox", "staging", "reports", "rejected"})
+        nested = {"staging": "a" * 64 + ".md", "inbox": "agent-abc123", "reports": "x-a1.md", "rejected": "x.json",
+                  "queue": "x.json"}
+        for directory, name in sorted(nested.items()):
+            with self.subTest(directory=directory):
+                self.tearDown()
+                self.setUp()
+                self.paths.ensure()
+                (self.paths.root / directory).mkdir(exist_ok=True)
+                link = self.paths.root / directory / name
+                os.symlink(str(self.external(False)), str(link))
+                before = self.external_state()
+                self.paths.ensure()
+                runner.Ledger(self.paths).close()
+                with self.assertRaises(OSError):
+                    runner._open_private(link, os.O_WRONLY | os.O_APPEND)
+                with self.assertRaises(core.Unreadable):
+                    core.read_regular(link, 1000)
+                self.assertEqual(self.external_state(), before)
+
+    def test_a_shared_directory_itself_must_be_real(self):
+        for directory in sorted(core.SHARED_DIRS):
+            with self.subTest(directory=directory):
+                self.tearDown()
+                self.setUp()
+                self.marked_root()
+                os.symlink(str(self.external(True)), str(self.paths.root / directory))
+                self.assert_refused_everywhere("%s -> external dir" % directory)
+
+    def test_content_inside_a_clone_is_not_ahc_state(self):
+        """A clone's work tree may hold symlinks committed in the repo; only the clone directory itself and its .git
+        must be real. A symlinked .git is refused."""
+        self.paths.ensure()
+        clone = self.paths.clones / "o__r"
+        (clone / ".git").mkdir(parents=True)
+        os.symlink("README.md", str(clone / "link-in-repo"))
+        self.paths.ensure()
+        os.rmdir(str(clone / ".git"))
+        os.symlink(str(self.external(True)), str(clone / ".git"))
+        self.assert_refused_everywhere("clones/o__r/.git -> external")
+
+    def test_a_ledger_swapped_for_a_symlink_after_the_check_is_caught_at_open(self):
+        """The window between claim_root and sqlite's own open: the ledger path is replaced by a link to another
+        program's database after the check. The open is through an O_NOFOLLOW descriptor and the path's device and
+        inode are compared with it after sqlite opens, so the swap is refused and the external file keeps its mode."""
+        sys.path.insert(0, str(HOOKS))
+        import sqlite3
+        from unittest import mock
+        import ahc_runner as runner
+        runner.Ledger(self.paths).close()
+        target = self.external(False)
+        before = self.external_state()
+        real_connect = sqlite3.connect
+
+        def swap_then_connect(path, *args, **kwargs):
+            if str(path) == str(self.paths.root / "ledger.sqlite3"):
+                os.replace(str(path), str(self.paths.root / "ledger.sqlite3.moved-aside"))
+                os.symlink(str(target), str(path))
+            return real_connect(path, *args, **kwargs)
+        with mock.patch.object(runner.sqlite3, "connect", swap_then_connect):
+            with self.assertRaises(core.ForeignRoot):
+                runner.Ledger(self.paths)
+        self.assertEqual(self.external_state(), before)
+
     def test_the_names_ahc_writes_are_its_own(self):
         """Every top-level name ahc's code writes under the root passes the ownership check, so ahc never refuses
         its own root; the list is the one place a new top-level file must be added."""

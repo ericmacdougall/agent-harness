@@ -29,8 +29,12 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ahc_core as core  # noqa: E402
+
 UNITS = ("ahc-core", "ahc-review")
 RECORD = "install.json"
+RECORD_MAX_BYTES = 1_000_000
 DEFAULT_OPS_TICKET = "GoodQA goodqa#16034"
 WRAPPER_MARK = "# ahc wrapper (goodqa#16034)"
 MEMORY = {"ahc-core": "512M", "ahc-review": "2G"}   # spec footprint: daemon < 100 MB (cap 512 MB); a review ~600 MB
@@ -109,8 +113,8 @@ def _record_path(paths) -> Path:
 
 def read_record(paths) -> dict | None:
     try:
-        data = json.loads(_record_path(paths).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(core.read_regular(_record_path(paths), RECORD_MAX_BYTES).decode("utf-8"))
+    except (OSError, ValueError, core.Unreadable):
         return None
     return data if isinstance(data, dict) else None
 

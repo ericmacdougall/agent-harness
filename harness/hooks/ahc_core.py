@@ -145,6 +145,59 @@ ROOT_PATTERNS = ("ledger.sqlite3-*", "ledger.sqlite3.*", ROOT_MARKER_TEMP) + tup
     pattern for name in ROOT_FILES for pattern in (".%s.tmp" % name, ".%s.*.tmp" % name))
 
 
+ROOT_DIRS = frozenset(("staging", "queue", "items", "inbox", "clones", "reports", "rejected"))
+# Two tiers below the top level (every top-level entry is always lstat-checked for its type):
+#   STRICT_TREES: written only by ahc's own code, so a link or special file anywhere in them refuses the start.
+#   SHARED_DIRS: other processes write into them by design (submitters drop queue entries, owners read and may
+#     plant entries in their inbox, quarantine moves links from queue/ into rejected/, the review child writes its
+#     report, `ahc submit --packet -` stages packets). A link there must never stop ahc (anyone who can submit
+#     could then halt it); instead every open of an entry in them is O_NOFOLLOW and regular-file checked at the
+#     operation, each with its own test (IngestValidationTests, UntrustedReadTests, PacketRetentionTests).
+STRICT_TREES = frozenset(("items", "clones"))
+SHARED_DIRS = ROOT_DIRS - STRICT_TREES
+TREE_PROBLEM_LIMIT = 50
+
+
+def _entry_problem(path, want_dir):
+    """Why `path` is not an ahc entry of the expected type, or None. Uses lstat: a symlink is never ahc's."""
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return "a symlink"
+    if want_dir and not stat.S_ISDIR(info.st_mode):
+        return "not a directory"
+    if not want_dir and not stat.S_ISREG(info.st_mode):
+        return "not a regular file"
+    return None
+
+
+def _tree_problems(directory, clones=False):
+    """Symlinks and special files inside a state directory, found without following any link. A clone's work tree
+    is repository content (it may hold symlinks committed in the repo), so under clones/ only each clone directory
+    and its .git must be real directories; git itself never follows a symlinked .git there once this holds."""
+    out = []
+    if clones:
+        for name in sorted(os.listdir(str(directory))):
+            for path, want_dir in ((directory / name, True), (directory / name / ".git", True)):
+                problem = _entry_problem(path, want_dir)
+                if problem:
+                    out.append("%s (%s)" % (path.relative_to(directory.parent), problem))
+                    break
+        return out
+    for dirpath, dirnames, filenames in os.walk(str(directory), followlinks=False):
+        for name in sorted(dirnames) + sorted(filenames):
+            path = Path(dirpath) / name
+            problem = _entry_problem(path, name in dirnames)
+            if problem:
+                out.append("%s (%s)" % (path.relative_to(directory.parent), problem))
+                if len(out) >= TREE_PROBLEM_LIMIT:
+                    return out
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+    return out
+
+
 def _ahc_root_name(name):
     return name in ROOT_NAMES or any(fnmatch.fnmatchcase(name, p) for p in ROOT_PATTERNS)
 
@@ -171,6 +224,9 @@ class Paths:
         self.claim_root()
         for path in (self.queue, self.items, self.inbox, self.clones, self.reports):
             path.mkdir(exist_ok=True, mode=0o700)
+            problem = _entry_problem(path, True)     # a link placed between the claim and the mkdir
+            if problem:
+                raise ForeignRoot("ahc state directory %s is %s; refusing to start" % (path, problem))
 
     def claim_root(self):
         """Create or verify ahc's own root; raise ForeignRoot naming the conflict. Never writes into a root that is
@@ -196,6 +252,19 @@ class Paths:
         if foreign:
             raise ForeignRoot("ahc root %s holds entries ahc did not create: %s; refusing to start"
                               % (root, _named(foreign)))
+        # PR 258 v1 BLOCK: a name alone proves nothing. Every entry is lstat-checked for its type (a symlink is
+        # never ahc's), and the state directories are walked without following links, so no write can be steered
+        # into another program's file through a link placed under a valid marker.
+        bad = []
+        for name in sorted(os.listdir(str(root))):
+            problem = _entry_problem(root / name, name in ROOT_DIRS)
+            if problem:
+                bad.append("%s (%s)" % (name, problem))
+            elif name in STRICT_TREES:
+                bad.extend(_tree_problems(root / name, clones=(name == "clones")))
+        if bad:
+            raise ForeignRoot("ahc root %s holds entries ahc did not create: %s; refusing to start"
+                              % (root, _named(bad)))
 
     def _write_marker(self):
         """The marker appears whole or not at all: written and fsynced under a private temp name, then hard-linked

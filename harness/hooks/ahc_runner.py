@@ -408,6 +408,55 @@ class SchemaError(RuntimeError):
     """The ledger's schema is unknown or newer than this code; the daemon must not start."""
 
 
+SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+RESTORE_MAX_BYTES = 2 * 1024 ** 3     # a verified ledger backup read back during restore
+
+
+def _check_sidecars(path):
+    for extra in SQLITE_SIDECARS:
+        problem = core._entry_problem(Path(str(path) + extra), False)
+        if problem:
+            raise core.ForeignRoot("ledger file %s%s is %s; refusing to open" % (Path(path).name, extra, problem))
+
+
+def connect_nofollow(path, exclusive=False, **kwargs):
+    """Open a ledger database without following a link (PR 258 v1 BLOCK). Python's sqlite3 cannot take
+    SQLITE_OPEN_NOFOLLOW, so: the sidecar files must not be links; the database file is opened (or created) first
+    by an O_NOFOLLOW descriptor, which must be a regular file and gets its mode by fchmod; sqlite then opens the
+    path, and the path's device and inode are compared with the descriptor's right after. A mismatch or a link
+    closes the connection and raises ForeignRoot before any statement runs (sqlite reads nothing until the first
+    statement). Remaining window, stated: a process with write access to the 0700 root (the same uid, L10) could
+    swap the path to a link and back between sqlite's open and the comparison; the sidecars that sqlite creates at
+    the first WAL statement are re-checked after it (_check_sidecars), not before their creation."""
+    path = Path(path)
+    _check_sidecars(path)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if exclusive:
+        flags |= os.O_EXCL
+    try:
+        fd = os.open(str(path), flags, 0o600)
+    except OSError as error:
+        raise core.ForeignRoot("ledger file %s cannot be opened without following a link (%s); refusing to open"
+                               % (path.name, type(error).__name__))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise core.ForeignRoot("ledger file %s is not a regular file; refusing to open" % path.name)
+        os.fchmod(fd, 0o600)
+        db = sqlite3.connect(str(path), **kwargs)
+        try:
+            after = os.lstat(str(path))
+        except OSError:
+            after = None
+        if after is None or stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+            db.close()
+            raise core.ForeignRoot("ledger file %s was replaced while it was being opened; refusing to open"
+                                   % path.name)
+        return db
+    finally:
+        os.close(fd)
+
+
 class Ledger:
     """migrate=False (status, ack, the journal facade, the review role) refuses a ledger at an older schema instead
     of migrating it: only ahc-core, holding its lock, migrates, so a failed migration can never move the database
@@ -423,17 +472,17 @@ class Ledger:
         elif self._intent_path().exists():
             raise SchemaError("the ledger has an interrupted restore; ahc-core completes it at start, this process "
                               "does not")
-        fresh = not self.path.exists()
-        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        fresh = not os.path.lexists(str(self.path))
+        self.db = connect_nofollow(self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         try:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
+            _check_sidecars(self.path)
             self._schema(fresh)
         except Exception:
             self.db.close()
             raise
-        os.chmod(self.path, 0o600)
 
     def _version(self):
         has_meta = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
@@ -494,14 +543,13 @@ class Ledger:
         Returns the copy path; raises SchemaError (and the migration does not start) if the copy is not proven."""
         target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, time.time_ns()))
         crash_before("runner.backup")
-        copy = sqlite3.connect(str(target))
+        copy = connect_nofollow(target, exclusive=True)      # a new name, created by this call, never a link
         try:
             self.db.backup(copy)
             check = copy.execute("PRAGMA integrity_check").fetchall()
             source, copied = self._counts(self.db), self._counts(copy)
         finally:
             copy.close()
-        os.chmod(target, 0o600)
         crash_after("runner.backup")
         if [tuple(row) for row in check] != [("ok",)] or source != copied:
             raise SchemaError("ledger backup %s failed verification (integrity %r, rows %r vs %r); not migrating"
@@ -519,14 +567,14 @@ class Ledger:
         intent = self._intent_path()
         temp = Path(str(intent) + ".tmp")
         crash_before("runner.restore_intent")
-        with open(str(temp), "w") as handle:
+        with os.fdopen(_open_private(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "w") as handle:
             handle.write(json.dumps({"backup": copy.name, "suffix": suffix}, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(str(temp), str(intent))
         crash_after("runner.restore_intent")
         moved = self._finish_restore(copy, suffix)
-        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        self.db = connect_nofollow(self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         return moved
 
@@ -547,9 +595,12 @@ class Ledger:
         crash_after("runner.restore_move")
         crash_before("runner.restore_copy")
         temp = Path(str(self.path) + ".restoring")
-        shutil.copyfile(str(copy), str(temp))
-        os.chmod(temp, 0o600)
-        with open(str(temp), "rb") as handle:
+        source = core.read_regular(copy, RESTORE_MAX_BYTES)         # the backup, read without following a link
+        fd = _open_private(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)   # never through a link (PR 258 v1)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(source)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o600)
             os.fsync(handle.fileno())
         os.replace(str(temp), str(self.path))
         os.unlink(str(self._intent_path()))

@@ -941,17 +941,24 @@ class UntrustedReadTests(Base):
     def test_fifo_digest_and_lock_never_block(self):
         import os
         self.paths.ensure()
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
         os.mkfifo(self.paths.digest)
         self.assertFalse(runner._digest_has(self.paths.digest, "x"))
         with self.assertRaises(OSError):
             runner._append_private(self.paths.digest, "line\n")
-        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        # PR 258 v1 BLOCK: a FIFO at a top-level ahc name is not ahc's file, so the start is refused (exit 3 from
+        # the CLI) instead of running around it; nothing blocks either way.
+        with self.assertRaises(core.ForeignRoot):
+            self.run_all(deps)
+        os.unlink(self.paths.digest)
         self.run_all(deps)
         self.assertEqual(self.state(iid), "block-delivered")
         self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
         lock = self.paths.root / "ahc-core.lock"
+        if os.path.lexists(str(lock)):
+            os.unlink(str(lock))
         os.mkfifo(lock)
-        with self.assertRaises(OSError):
+        with self.assertRaises((OSError, core.ForeignRoot)):
             runner.acquire_lock(self.paths, "core")
 
     def test_digest_readback_reads_only_a_bounded_tail(self):

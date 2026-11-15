@@ -98,5 +98,31 @@ class CloneTests(unittest.TestCase):
             ahc_clone.prepare(self.clones, "../evil", str(self.remote), self.head, self.base, env=ENV)
 
 
+class CloneLinkTests(CloneTests):
+    """PR 258 v1 BLOCK: git must never write through a link placed at the clones root, the clone directory or its
+    .git; each is refused before any git command runs, and the link's target is left untouched."""
+
+    def test_a_linked_clone_root_clone_dir_or_git_dir_is_refused(self):
+        outside = Path(self.tmp.name) / "other-program"
+        for where in ("root", "clone", "git"):
+            with self.subTest(where=where):
+                target = outside / where
+                target.mkdir(parents=True)
+                clones = Path(self.tmp.name) / ("clones-" + where)
+                if where == "root":
+                    os.symlink(str(target), str(clones))
+                else:
+                    clones.mkdir()
+                    clone = ahc_clone.clone_dir(clones, "o/n")
+                    if where == "clone":
+                        os.symlink(str(target), str(clone))
+                    else:
+                        clone.mkdir()
+                        os.symlink(str(target), str(clone / ".git"))
+                with self.assertRaises(ahc_clone.CloneError):
+                    ahc_clone.prepare(clones, "o/n", str(self.remote), self.head, self.base, env=ENV)
+                self.assertEqual(os.listdir(str(target)), [], "nothing was written through the link")
+
+
 if __name__ == "__main__":
     unittest.main()

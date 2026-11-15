@@ -20,6 +20,26 @@ hard-linked into place, so it is never torn. On every start, before reading anyt
 - Every subcommand turns a refusal into exit 3, which is in the units' `RestartPreventExitStatus`, so a foreign
   root stops the unit instead of looping.
 
+A name alone proves nothing (PR 258 v1 BLOCK). The checks run in two tiers:
+- Top level: every entry is checked with lstat for the type ahc gives it. A symlink, or a file where ahc keeps a
+  directory, refuses the start.
+- `items/` and `clones/` (`STRICT_TREES`): only ahc writes these. They are walked without following links, and a
+  link or special file anywhere in them refuses the start. Under `clones/`, only each clone directory and its `.git`
+  must be real, because a clone's work tree may hold symlinks committed in the repository.
+- `queue/`, `inbox/`, `staging/`, `reports/` and `rejected/` (`SHARED_DIRS`): other processes write into these by
+  design. A link inside them never stops ahc, since anyone who can submit could then halt it. Instead, every open
+  of an entry there uses `O_NOFOLLOW` and requires a regular file.
+
+The ledger, its pre-migration backups and the reopen after a restore all go through
+`ahc_runner.connect_nofollow`:
+- the sidecars must not be links;
+- the file is opened or created by an `O_NOFOLLOW` descriptor and gets its mode by `fchmod`;
+- the path's device and inode are compared with that descriptor right after sqlite opens it, before any statement
+  runs.
+
+Python's sqlite3 cannot pass `SQLITE_OPEN_NOFOLLOW`, so one window remains. A process that can write the 0700
+root (the same uid, L10) could swap the path to a link and back between sqlite's open and the comparison.
+
 A change that adds a top-level file under the root must add its name to `ROOT_NAMES` in the same commit.
 
 ## Ledger and migrations
