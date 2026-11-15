@@ -14,7 +14,7 @@ os.environ.setdefault("MC_HOOKS", str(REPO / "harness" / "hooks"))
 
 import collectors as col  # noqa: E402
 import events as ev  # noqa: E402
-from safeio import Refused, Runner  # noqa: E402
+from safeio import Reader, Refused, Runner  # noqa: E402
 
 SID = "baab765b-d85c-46b4-b7b9-588eb912c770"
 NOW = time.time()
@@ -377,6 +377,24 @@ class StatusTruth(unittest.TestCase):
         self.assertEqual((snap["goals"]["truth"], snap["requirements"]["truth"], snap["status"]["truth"]), ("current", "unknown", "unknown"))
         self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("ok", "unknown"))
 
+    def test_v5_F1_a_session_that_goes_away_leaves_no_current_rows(self):
+        """review PR 234 v5 F1: a good read for A, then main's session drops to "" (the owners snapshot has none)."""
+        session = {"id": SID}
+        hub = ev.Hub()
+        health = col.Health(hub)
+        ledger = col.Ledger(hub, health, Fake(), lambda: session["id"])
+        ledger.run(1000.0)
+        self.assertEqual((hub.snapshots["ledger"]["status"]["truth"], hub.snapshots["ledger"]["requirements"]["truth"]), ("current", "current"))
+        session["id"] = ""
+        ledger.run(1060.0)
+        for snap in (hub.snapshots["ledger"], ledger.snapshot()):  # what is pushed to the page and what /api/state serves
+            for name in ("requirements", "status"):
+                self.assertEqual((snap[name]["truth"], snap[name]["at"], snap[name]["session"]), ("unknown", "", ""), name)
+            self.assertEqual((snap["requirements"]["items"], snap["status"]["blockers"]), ([], []))
+            self.assertEqual(snap["goals"]["truth"], "current")
+        self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("ok", "unknown"))
+        self.assertEqual(ledger.req_session, "")  # no archive or restore click pairs a row with the old session
+
     def test_a_failed_read_for_a_new_session_is_unknown_and_drops_the_old_sessions_rows(self):
         session = {"id": SID}
         runner = Fake()
@@ -501,6 +519,23 @@ class ServerIntegration(unittest.TestCase):
         self.assertEqual(state["ledger"]["goals"]["items"][0]["id"], "leads")
         self.assertIn("ledger", [r["name"] for r in state["health"]])
 
+    def test_v6_D40_the_session_watch_unshows_the_old_sessions_rows_while_the_ledger_read_still_runs(self):
+        """D40 [defect] review PR 234 v6: main moves while the ledger thread is inside a slow read; the page is told."""
+        app = self.h.app
+        app.ledger.run(time.time())
+        self.assertEqual(app.hub.snapshots["ledger"]["status"]["truth"], "current")
+        app.owners.session = SID_B  # the ledger thread has not ticked since (it may be inside a read for SID)
+        getattr(app, "follow_sessions", lambda: None)()  # one pass of the session watch (none at ec6d0edd)
+        snap = app.hub.snapshots["ledger"]
+        self.assertEqual((snap["requirements"]["truth"], snap["status"]["truth"], snap["status"]["blockers"]), ("unknown", "unknown", []))
+        self.assertEqual((app.health.rows["ledger"]["status"], app.health.rows["ledger"]["truth"]), ("ok", "unknown"))
+        app.ledger.run(time.time())  # the ledger thread's next tick reads the new session
+        self.assertEqual(app.hub.snapshots["ledger"]["status"]["truth"], "current")
+
+    def test_v6_D41_the_session_watch_runs_on_its_own_thread(self):
+        import inspect  # noqa: PLC0415
+        self.assertIn("self.session_loop", inspect.getsource(type(self.h.app).start))
+
     def test_the_ledger_is_a_woken_collector_not_a_poll(self):
         self.assertIn(self.h.app.ledger, self.h.app.collectors + [self.h.app.ledger])
         self.h.app.ledger.run(time.time())
@@ -569,6 +604,375 @@ class Coverage(unittest.TestCase):
         live = (REPO / "harness" / "mission_control" / "web" / "js" / "live.js").read_text()
         self.assertNotIn("setInterval", live)
         self.assertEqual(live.count("'/api/state'"), 1)
+
+
+
+# ---- review PR 234 v6: the status-truth table. Every source a zero or "none" claim on the page rests on, in each state
+# and transition, observed where the page gets it: the pushed snapshot (SSE), the served one (/api/state) and the Health
+# row. The invariant: a source is "current" only when its last attempted read succeeded, was whole, and was for the
+# session main is in now. Row ids: D = the defect this fix removes (fails at ec6d0edd), G = a guard (passes there too),
+# C = a deliberate change that was not a defect there (old head: stale, never current). One test per row (TruthTable).
+SID_B = "ffffffff-0000-4000-8000-000000000000"
+PARTS = ("goals", "requirements", "status")
+
+
+class World:
+    """One Ledger over a fake `ah`, with a main session the test can move."""
+
+    def __init__(self, session=SID):
+        self.main = {"id": session}
+        self.runner = Fake()
+        self.hub = ev.Hub()
+        self.health = col.Health(self.hub)
+        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.main["id"])
+        self.t = 1000.0
+        self.held = None   # the pushed snapshot at a moment inside a tick (see hold)
+
+    def tick(self):
+        self.ledger.run(self.t)
+        self.t += 60.0
+
+    def fail(self, *kinds, mode="nonzero"):
+        code, out = FAILURES[mode]
+        for kind in kinds:
+            self.runner.codes[kind], self.runner.payload[kind] = code, out
+
+    def move(self, session):
+        self.main["id"] = session
+
+    def hook(self, kind, before=None, after=None):
+        real = self.runner.run
+
+        def run(k, *args, **kw):
+            if k == kind and before:
+                before()
+            out = real(k, *args, **kw)
+            if k == kind and after:
+                after()
+            return out
+        self.runner.run = run
+
+    def hold(self):
+        self.held = json.loads(json.dumps(self.hub.snapshots.get("ledger") or {}))
+
+    def seen(self, published=None):
+        published = (self.hub.snapshots.get("ledger") or {}) if published is None else published
+        served = self.ledger.snapshot()
+
+        def truths(snap):
+            return {p: (snap.get(p) or {}).get("truth", "unknown") for p in PARTS}
+
+        def rows(snap):  # session-scoped rows on hand: requirement items and status blockers
+            return len((snap.get("requirements") or {}).get("items") or []) + len((snap.get("status") or {}).get("blockers") or [])
+        row = self.health.rows.get("ledger") or {}
+        return {"published": truths(published), "served": truths(served), "rows": (rows(published), rows(served)),
+                "health": (row.get("status", ""), row.get("truth", "")), "due": self.ledger.due(self.t - 59.0)}
+
+
+def _parts(goals, requirements, status):
+    return {"goals": goals, "requirements": requirements, "status": status}
+
+
+def _ledger_row(rid, kind, what, run, published, served=None, rows=None, health=None, due=False):
+    expected = {"published": published, "served": served or published}
+    if rows is not None:
+        expected["rows"] = rows
+    if health is not None:
+        expected["health"] = health
+    expected["due"] = due
+    return rid, kind, what, run, expected
+
+
+def _scenario(*steps):
+    def run(w):
+        for step in steps:
+            step(w)
+        return w.seen()
+    return run
+
+
+def tick(w):
+    w.tick()
+
+
+def to(session):
+    return lambda w: w.move(session)
+
+
+def fail(*kinds, mode="nonzero"):
+    return lambda w: w.fail(*kinds, mode=mode)
+
+
+def heal(w):
+    w.runner.codes.clear()
+    w.runner.payload.update({"ah-goals": GOALS, "ah-requirements": REQS, "ah-status": STATUS})
+
+
+def partial(w):
+    w.runner.payload["ah-status"] = dict(STATUS, unread=[{"wal": "agent-x.jsonl", "agent": "x", "reason": "denied"}])
+
+
+def _restart(w):
+    w.tick()               # a good read in the process that then stops
+    return World().seen()  # the new process: nothing it shows comes from the old one
+
+
+def _during_next_goals_read(w):
+    w.tick()
+    w.move(SID_B)
+    w.hook("ah-goals", before=w.hold)
+    w.tick()
+    return w.seen(published=w.held)
+
+
+def _moves_during_status_read(w):
+    w.hook("ah-status", after=lambda: w.move(SID_B))
+    w.tick()  # read for A; main moved to B before it finished
+    return w.seen()
+
+
+def watch(w):
+    """One pass of the server's session watch for this source (follow(); there is none at ec6d0edd)."""
+    getattr(w.ledger if hasattr(w, "ledger") else w.asks, "follow", lambda: None)()
+
+
+def _watch_during_status_read(w):
+    w.tick()
+
+    def moved():
+        w.move(SID_B)
+        watch(w)
+        w.hold()
+    w.hook("ah-status", before=moved)  # main moves while the next tick is inside its reads for A
+    w.tick()
+    return w.seen(published=w.held)
+
+
+def _click_after_move(w):
+    w.tick()
+    w.move(SID_B)
+    w.ledger.reclassify()  # an archive or restore click on an HTTP thread, before the ledger thread's next tick
+    return w.seen()
+
+
+CUR, UNK, STA, PAR = "current", "unknown", "stale", "partial"
+ROWS_A = len(REQS["requirements"]) + len(STATUS["blockers"])
+LEDGER_TABLE = [
+    _ledger_row("G01", "guard", "never read (process start)", lambda w: w.seen(), _parts(UNK, UNK, UNK), rows=(0, 0), health=("", ""), due=True),
+    _ledger_row("G02", "guard", "process restart after a good read", _restart, _parts(UNK, UNK, UNK), rows=(0, 0), health=("", ""), due=True),
+    _ledger_row("G03", "guard", "good read for main's session (the zero claims are not vacuous)", _scenario(tick), _parts(CUR, CUR, CUR), rows=(ROWS_A, ROWS_A), health=("ok", CUR)),
+    _ledger_row("G04", "guard", "initial status timeout", _scenario(fail("ah-status", mode="timeout"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
+    _ledger_row("G05", "guard", "initial status nonzero exit", _scenario(fail("ah-status"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
+    _ledger_row("G06", "guard", "initial status invalid JSON", _scenario(fail("ah-status", mode="invalid_json"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
+    _ledger_row("G07", "guard", "status read fails after a good read", _scenario(tick, fail("ah-status"), tick), _parts(CUR, CUR, STA), health=("error", STA)),
+    _ledger_row("G08", "guard", "partial status read (unread WALs)", _scenario(partial, tick), _parts(CUR, CUR, PAR), health=("ok", PAR)),
+    _ledger_row("G09", "guard", "failure after a partial read", _scenario(partial, tick, fail("ah-status"), tick), _parts(CUR, CUR, STA), health=("error", STA)),
+    _ledger_row("G10", "guard", "recovery after a failure", _scenario(tick, fail("ah-status"), tick, heal, tick), _parts(CUR, CUR, CUR), health=("ok", CUR)),
+    _ledger_row("G11", "guard", "no main session yet: goals only", _scenario(to(""), tick), _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK)),
+    _ledger_row("D01", "defect", "v5 F1: main's session set -> empty, then a tick", _scenario(tick, to(""), tick), _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK)),
+    _ledger_row("D02", "defect", "session set -> empty, before the next tick (served, and due at once)", _scenario(tick, to("")), _parts(CUR, CUR, CUR), served=_parts(CUR, UNK, UNK), due=True),
+    _ledger_row("D03", "defect", "session A -> B, before the next tick (served, and due at once)", _scenario(tick, to(SID_B)), _parts(CUR, CUR, CUR), served=_parts(CUR, UNK, UNK), due=True),
+    _ledger_row("D04", "defect", "session A -> B: what the page holds while the next tick's first read runs", _during_next_goals_read, _parts(CUR, UNK, UNK), served=_parts(CUR, CUR, CUR)),
+    _ledger_row("D05", "defect", "session moves A -> B while the status read for A runs", _moves_during_status_read, _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK), due=True),
+    _ledger_row("D06", "defect", "an archive click (reclassify) after A -> B, before the next tick", _click_after_move, _parts(CUR, UNK, UNK), rows=(0, 0), due=True),
+    _ledger_row("D07", "defect", "session A -> B while the ledger thread is inside a read: what the session watch pushes", _watch_during_status_read, _parts(CUR, UNK, UNK), served=_parts(CUR, UNK, UNK), health=("ok", UNK), due=True),
+    _ledger_row("G12", "guard", "session A -> B, B's reads fail", _scenario(tick, to(SID_B), fail("ah-requirements", "ah-status"), tick), _parts(CUR, UNK, UNK), rows=(0, 0), health=("error", UNK)),
+    _ledger_row("G13", "guard", "session A -> B, B's reads succeed", _scenario(tick, to(SID_B), tick), _parts(CUR, CUR, CUR), rows=(ROWS_A, ROWS_A), health=("ok", CUR)),
+    _ledger_row("C01", "change", "session A -> empty -> A, then A's status read fails (no good read since the gap)", _scenario(tick, to(""), tick, to(SID), fail("ah-status"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
+]
+# D04 serves the finished tick's result (current for B) and checks only what was pushed while its first read ran.
+
+
+class AsksRunner:
+    def __init__(self):
+        self.code, self.items = 0, [ask_row(1)]
+
+    def run(self, kind, *args, timeout=20.0, limit=0):
+        if self.code:
+            return self.code, ""
+        return 0, json.dumps({"items": self.items, "blocked": [], "resolved": []})
+
+
+def ask_row(n, ident=None):
+    return {"id": ident or f"wa{n:04d}", "owner": "x", "note": f"ask {n}", "reason": "r", "at": iso(60), "kind": "ask"}
+
+
+class AsksWorld:
+    def __init__(self, session=SID):
+        self.main = {"id": session}
+        self.runner = AsksRunner()
+        self.hub = ev.Hub()
+        self.health = col.Health(self.hub)
+        self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.main["id"])
+        self.t = 1000.0
+
+    def tick(self):
+        self.asks.run(self.t)
+        self.t += 300.0
+
+    def move(self, session):
+        self.main["id"] = session
+
+    def seen(self):
+        row = self.health.rows.get("asks") or {}
+        published = self.hub.snapshots.get("asks") or {}
+        return {"health": (row.get("status", ""), row.get("truth", "")), "items": len(published.get("items") or []),
+                "due": self.asks.due(self.t - 299.0)}
+
+
+def _asks(*steps):
+    def run(w):
+        for step in steps:
+            step(w)
+        return w.seen()
+    return run
+
+
+def a_fail(w):
+    w.runner.code = 1
+
+
+def a_many(n=101):
+    def step(w):
+        w.runner.items = [ask_row(i) for i in range(n)]
+    return step
+
+
+def a_malformed(w):
+    w.runner.items = [ask_row(1), ask_row(2, ident="bad id with spaces")]
+
+
+ASKS_TABLE = [
+    ("G20", "guard", "asks never read", _asks(), {"health": ("", ""), "items": 0, "due": True}),
+    ("G21", "guard", "asks good read for main's session", _asks(tick), {"health": ("ok", CUR), "items": 1, "due": False}),
+    ("G22", "guard", "asks read fails after a good read, same session", _asks(tick, a_fail, tick), {"health": ("error", STA), "items": 1, "due": False}),
+    ("G23", "guard", "asks session A -> B, B's read succeeds", _asks(tick, to(SID_B), tick), {"health": ("ok", CUR), "items": 1, "due": False}),
+    ("D20", "defect", "asks session A -> empty: A's asks are not shown", _asks(tick, to(""), tick), {"health": ("off", UNK), "items": 0, "due": False}),
+    ("D21", "defect", "asks session A -> B, B's read fails: unknown, not A's last good read", _asks(tick, to(SID_B), a_fail, tick), {"health": ("error", UNK), "items": 0, "due": False}),
+    ("D22", "defect", "asks session A -> B, before the next tick: due at once (the cadence is 300 s)", _asks(tick, to(SID_B)), {"health": ("ok", CUR), "items": 1, "due": True}),
+    ("D23", "defect", "asks session A -> empty -> B, B's read fails", _asks(tick, to(""), tick, to(SID_B), a_fail, tick), {"health": ("error", UNK), "items": 0, "due": False}),
+    ("D24", "defect", "asks: more open asks than the 100 kept is partial", _asks(a_many(), tick), {"health": ("ok", PAR), "items": 100, "due": False}),
+    ("D25", "defect", "asks: a row dropped for its shape is partial", _asks(a_malformed, tick), {"health": ("ok", PAR), "items": 1, "due": False}),
+    ("D26", "defect", "asks session A -> B while a read holds the lock: the session watch turns Health unknown at once", _asks(tick, to(SID_B), watch), {"health": ("ok", UNK), "items": 1, "due": True}),
+]
+
+
+def _owners(rows, then_fail=False):
+    def run(_):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        answer = {"code": 0}
+
+        class R:
+            def run(self, kind, *args, **kw):
+                return answer["code"], json.dumps({"session": SID, "owners": rows})
+        owners = col.Owners(hub, health, R(), None)
+        owners.run(1000.0)
+        if then_fail:
+            answer["code"] = 1
+            owners.run(1060.0)
+        row = health.rows["owners"]
+        return {"health": (row["status"], row["truth"])}
+    return run
+
+
+def owner_row(n, ident=None):
+    return {"agent_id": ident or f"a{n:016x}", "state": "live", "idle_s": 5, "type": "task-owner"}
+
+
+def _initiatives(rows=None, configured=True):
+    def run(case):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        path = None
+        if configured:
+            path = case.tmp / "initiatives.json"
+            path.write_text(json.dumps({"initiatives": rows}))
+        col.Initiatives(hub, health, Reader([case.tmp]), str(path) if path else None).run(1000.0)
+        row = health.rows["initiatives"]
+        return {"health": (row["status"], row["truth"])}
+    return run
+
+
+def _wals(layout, cap=None):
+    def run(case):
+        root = case.tmp / "wals"
+        layout(root)
+        hub = ev.Hub()
+        health = col.Health(hub)
+        tailer = col.WalTailer(hub, health, Reader([case.tmp]), [(root, "claude"), (case.tmp / "codex-wals-missing", "codex")])
+        if cap:
+            tailer.MAX_FILES = cap
+        tailer.run(time.time())
+        row = health.rows["wals"]
+        return {"health": (row["status"], row["truth"])}
+    return run
+
+
+def two_wals(root):
+    (root / SID).mkdir(parents=True)
+    for name in ("main.jsonl", "agent-a1.jsonl"):
+        (root / SID / name).write_text("")
+
+
+def unreadable_root(root):
+    root.mkdir()
+    root.chmod(0)
+
+
+def _off_then_error(_):
+    health = col.Health(ev.Hub())
+    health.ok("asks", "fine")
+    health.off("asks", "no main session known yet")
+    health.error("asks", "provenance asks exited 1")
+    row = health.rows["asks"]
+    return {"health": (row["status"], row["truth"])}
+
+
+OTHER_TABLE = [
+    ("G30", "guard", "owners: a whole read is current", _owners([owner_row(i) for i in range(3)]), {"health": ("ok", CUR)}),
+    ("G31", "guard", "owners: a failure after a good read is stale", _owners([owner_row(1)], then_fail=True), {"health": ("error", STA)}),
+    ("D30", "defect", "owners: more owners than the 60 kept is partial", _owners([owner_row(i) for i in range(61)]), {"health": ("ok", PAR)}),
+    ("D31", "defect", "owners: a row dropped for a malformed id is partial", _owners([owner_row(1), owner_row(2, ident="bad id!")]), {"health": ("ok", PAR)}),
+    ("G32", "guard", "initiatives: a whole file is current", _initiatives([{"id": f"i{i}", "initiative": "x"} for i in range(3)]), {"health": ("ok", CUR)}),
+    ("G33", "guard", "initiatives: no file configured is off with nothing to report", _initiatives(configured=False), {"health": ("off", CUR)}),
+    ("D32", "defect", "initiatives: more than the 100 kept is partial", _initiatives([{"id": f"i{i}", "initiative": "x"} for i in range(101)]), {"health": ("ok", PAR)}),
+    ("G34", "guard", "WALs: readable roots (one missing: that runtime has none here) are current", _wals(two_wals), {"health": ("ok", CUR)}),
+    ("D33", "defect", "WALs: a root that exists but cannot be listed is partial", _wals(unreadable_root), {"health": ("ok", PAR)}),
+    ("D34", "defect", "WALs: the file cap reached is partial", _wals(two_wals, cap=1), {"health": ("ok", PAR)}),
+    ("D35", "defect", "Health: an error after off (nothing was read in between) is unknown, not stale", _off_then_error, {"health": ("error", UNK)}),
+]
+
+
+class TruthTable(unittest.TestCase):
+    """The table above, one test per row (generated below), so a failing-first run names each row."""
+
+    def setUp(self):
+        import tempfile  # noqa: PLC0415
+        tmp = tempfile.TemporaryDirectory(prefix="mc-truth-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        # an unreadable directory made by a row must be readable again for the cleanup
+        self.addCleanup(lambda: [p.chmod(0o700) for p in self.tmp.rglob("*") if p.is_dir()] if self.tmp.exists() else None)
+
+    def check(self, run, world, expected):
+        got = run(world)
+        self.assertEqual({k: got.get(k) for k in expected}, expected)
+
+
+def _add(rid, kind, what, run, expected, world):
+    def test(self):
+        self.check(run, world() if world else self, expected)
+    test.__doc__ = f"{rid} [{kind}] {what}"
+    setattr(TruthTable, f"test_{rid}_{kind}", test)
+
+
+for _row in LEDGER_TABLE:
+    _add(*_row, world=World)
+for _row in ASKS_TABLE:
+    _add(*_row, world=AsksWorld)
+for _row in OTHER_TABLE:
+    _add(*_row, world=None)
 
 
 if __name__ == "__main__":

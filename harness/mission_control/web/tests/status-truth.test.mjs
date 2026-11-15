@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { text, walk } from './dom-shim.mjs';
-import { ledger, sources, missionTiles, atRisk } from '../js/adapt.js';
+import { ledger, sources, missionTiles, atRisk, ownersEmpty } from '../js/adapt.js';
 import * as v from '../js/ledger-views.js';
 
 const SCRIPT = fileURLToPath(new URL('./truth_scenarios.py', import.meta.url));
@@ -18,7 +18,7 @@ const SCENARIOS = JSON.parse(run.stdout);
 const NOW = Date.parse('2027-01-15T09:00:00Z');
 const LAST_GOOD = '2027-01-15 08:00 UTC';  // T0 in truth_scenarios.py: the empty read before the failure
 const ui = { goalsLimit: 6, dealsLimit: 8, blockersLimit: 8, reqFilter: 'all', reqQuery: '', reqLimit: v.PAGE, archiveKind: 'all', archiveLimit: v.PAGE, set() {}, more() {} };
-const base = { now: NOW, events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0, asksStale: [], asksSweptAt: '', sessions: [] };
+const base = { now: NOW, connection: 'live', events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0, asksStale: [], asksSweptAt: '', sessions: [] };
 const stateOf = sc => ({ ...base, ledger: ledger(sc.ledger), sources: sources(sc.health) });
 const tile = (s, id) => missionTiles(s).find(t => t.id === id);
 const ledgerHealth = s => s.sources.find(r => r.id === 'ledger');
@@ -114,11 +114,40 @@ test('Blockers rest on four sources: an asks source that never read keeps the ze
   assert.equal(tile(s, 'asks').value, '?');
 });
 
+// ---- review PR 234 v6 (v5 F1 and its class): main's session moves. Whatever the page gets after the move (pushed after a
+// tick, served by /api/state before the next tick, pushed by the session watch, or after a failed read for the new
+// session) states no zero from the previous session's requirements or status. Reading the new session states them again.
+for (const [name, health] of [['session_dropped', 'unknown'], ['session_moved_served', null], ['session_moved_watched', 'unknown'], ['session_moved_failed', 'error · unknown']]) {
+  test(`v6 ${name}: no zero or "none" from the previous session's requirements or status`, () => {
+    const s = stateOf(SCENARIOS[name]);
+    const blockers = text(v.blockers(s, ui));
+    assert.doesNotMatch(blockers, /No blockers recorded/);
+    assert.match(blockers, /Not known: Status \(ah status\) (has not been read yet|could not be read)/);
+    assert.doesNotMatch(text(v.deals(s, ui)), /No deploys or live tests recorded/);
+    assert.equal(tile(s, 'blockers').value, '?');
+    assert.match(tile(s, 'blockers').note, /unknown/);
+    assert.match(text([inventoryRow(s, 'Blockers')]), /unknown/);
+    if (name !== 'session_moved_failed') {  // there the new session's requirements read succeeded
+      assert.doesNotMatch(text(v.requirements(s, { ...ui, reqFilter: 'live' })), /No requirements recorded/);
+      assert.equal(tile(s, 'requirements').value, '?');
+    }
+    if (health) assert.equal(ledgerHealth(s).label, health);
+  });
+}
+
+test('v6: moving to a session and reading it states the zeros again (the checks above are not vacuous)', () => {
+  const s = stateOf(SCENARIOS.session_moved_read);
+  assert.match(text(v.blockers(s, ui)), /^No blockers recorded\.$/m);
+  assert.equal(tile(s, 'blockers').value, '0');
+  assert.equal(tile(s, 'requirements').value, '0');
+  assert.equal(ledgerHealth(s).label, 'ok');
+});
+
 // ---- the audit: every zero or "none" claim of the ledger panels, with the sources it now depends on (CLAIM_SOURCES).
 // Each test breaks one source at a time and checks the plain zero disappears, and that it is stated when all are current.
 const at = '2027-01-15T08:00:00.000Z';
 const row = (name, truth = 'current', status = 'ok') => ({ name, status, checked: NOW / 1000, ok_at: truth === 'unknown' ? null : Date.parse(at) / 1000, truth, detail: status === 'ok' ? '' : `${name} read failed` });
-const NAMES = ['asks', 'owners', 'initiatives', 'wals', 'chat'];
+const NAMES = ['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'];
 const LEDGER = ['goals', 'requirements', 'status'];
 // world(): every source current. world(dep, 'failed'): dep's reads all failed. world(dep, 'never'): dep has not been
 // read at all and reports no error (before the first read, or no main session yet).
@@ -155,6 +184,46 @@ for (const [name, deps, render, zero] of AUDIT) {
     for (const dep of deps) for (const how of ['failed', 'never']) assert.doesNotMatch(render(world(dep, how)), zero, `not stated while ${dep} is unknown (${how})`);
   });
 }
+
+// review PR 234 v6: every claim also rests on the link. With every source current, a page that is not live (connecting,
+// reconnecting, offline, signed out, or with no connection state at all) states none of the audited zeros; the live
+// world() above states each of them, so this is not vacuous.
+for (const connection of ['connecting', 'reconnecting', 'offline', 'expired', undefined]) {
+  test(`v6: a page that is ${connection || 'without a connection state'} states no zero from what it last received`, () => {
+    const s = { ...world(), connection, lastData: Date.parse(at) };
+    for (const [name, , render, zero] of AUDIT) assert.doesNotMatch(render(s), zero, `${name} while ${connection}`);
+    const blockers = text(v.blockers(s, ui));
+    assert.match(blockers, new RegExp(`No blockers as of the last good read \\(${LAST_GOOD}\\)`));
+    assert.match(blockers, /Connection to Mission Control: not connected/);
+    assert.equal(tile({ ...s, lastData: 0 }, 'blockers').value, '?');  // nothing received yet: unknown, not stale
+  });
+}
+
+test('v6: an owner claim with no OpenAI supervised owners row is unknown (a source that has not reported is never skipped)', () => {
+  const s = world();
+  assert.match(`${tile(s, 'owners').value} · ${tile(s, 'owners').note}`, /^0 · none need attention$/);
+  const missing = { ...s, sources: s.sources.filter(r => r.id !== 'codex-owners') };
+  assert.doesNotMatch(`${tile(missing, 'owners').value} · ${tile(missing, 'owners').note}`, /none need attention/);
+  assert.doesNotMatch(ownersEmpty(missing, false), /^No owners are running\.$/);
+  // an instance without OpenAI supervisors reports the row as off with nothing to report: the zero stands
+  const off = { ...s, sources: sources([...NAMES.filter(n => n !== 'codex-owners').map(n => row(n)), { name: 'codex-owners', status: 'off', truth: 'current', detail: 'not configured' }]) };
+  assert.equal(ownersEmpty(off, false), 'No owners are running.');
+});
+
+test('v6 (v5 F2): at-risk with no source truth passed gives no UNCOVERED or STALLED verdict', () => {
+  const item = [{ id: 'i1', initiative: 'Ship', state: 'Active', ticket: 'goodqa#1' }];
+  const working = [{ name: 'o', state: 'live', ticket: 'goodqa#1', progress: { at: '2027-01-15T06:00:00Z', event: 'commit' } }];
+  for (const known of [undefined, {}, { progress: 'current' }, { owners: 'bogus' }]) {
+    const row = atRisk(item, [], [], NOW, null, 6, known)[0];
+    assert.equal(row.status, 'unknown', JSON.stringify(known));
+    assert.doesNotMatch(row.reason, /no owner/);
+  }
+  for (const known of [undefined, {}, { owners: 'current' }, { owners: 'current', progress: 'later' }]) {
+    const row = atRisk(item, working, [], NOW, null, 6, known)[0];
+    assert.equal(row.status, 'unknown', JSON.stringify(known));
+    assert.doesNotMatch(row.reason, /no real progress/);
+  }
+});
 
 test('audit: Source health rows show the truth, not plain ok, for partial, stale and never-read sources', () => {
   const [ok, part, stale, never, off, odd] = sources([row('owners'), row('ledger', 'partial'), row('asks', 'stale', 'error'), row('wals', 'unknown', 'error'),
@@ -209,8 +278,9 @@ test('audit: at-risk gives no UNCOVERED or STALLED verdict ("no owner", "no prog
   const item = [{ id: 'i1', initiative: 'Ship', state: 'Active', ticket: 'goodqa#1' }];
   const old = Date.parse('2027-01-15T06:00:00Z');
   const working = [{ name: 'o', state: 'live', ticket: 'goodqa#1', progress: { at: new Date(old).toISOString(), event: 'commit' } }];
-  assert.equal(atRisk(item, [], [], NOW)[0].status, 'uncovered');  // current sources: the verdict stands
-  assert.equal(atRisk(item, working, [], NOW)[0].status, 'stalled');
+  const sure = { owners: 'current', progress: 'current' };
+  assert.equal(atRisk(item, [], [], NOW, null, 6, sure)[0].status, 'uncovered');  // current sources: the verdict stands
+  assert.equal(atRisk(item, working, [], NOW, null, 6, sure)[0].status, 'stalled');
   for (const truth of ['unknown', 'stale', 'partial']) {
     const uncovered = atRisk(item, [], [], NOW, null, 6, { owners: truth, progress: 'current' })[0];
     assert.notEqual(uncovered.status, 'uncovered', truth);

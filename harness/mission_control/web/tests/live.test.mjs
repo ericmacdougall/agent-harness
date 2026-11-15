@@ -73,3 +73,15 @@ test('a flood of 500 events in one burst keeps the store bounded and fast', asyn
   assert.ok(store.getState().events.length <= 150);
   assert.ok(performance.now() - start < 500, `took ${performance.now() - start} ms`);
 });
+
+test('review PR 234 v6: the claim panels repaint when the link drops or returns, not on every connection word', () => {
+  const reasons = [];
+  const off = store.subscribe((_, reason) => reasons.push(reason));
+  store.setConnection('live');
+  reasons.length = 0;
+  store.setConnection('reconnecting');
+  store.setConnection('offline');      // still not live: no second repaint
+  store.setConnection('live');
+  off();
+  assert.deepEqual(reasons, ['connection', 'truth', 'connection', 'connection', 'truth']);
+});

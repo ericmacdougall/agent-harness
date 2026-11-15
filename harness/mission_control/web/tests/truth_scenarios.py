@@ -37,7 +37,7 @@ class Runner:
         return 0, json.dumps(GOALS if kind == "ah-goals" else REQS)
 
 
-def scenario(steps, other_health=("asks", "owners", "initiatives", "wals", "chat"), failed=()):
+def scenario(steps, other_health=("asks", "owners", "initiatives", "wals", "chat", "codex-owners"), failed=()):
     hub = ev.Hub()
     health = col.Health(hub)
     runner = Runner()
@@ -52,6 +52,31 @@ def scenario(steps, other_health=("asks", "owners", "initiatives", "wals", "chat
     return {"ledger": ledger.snapshot(), "health": health.snapshot()}
 
 
+SID_B = "ffffffff-0000-4000-8000-000000000000"
+OTHERS = ("asks", "owners", "initiatives", "wals", "chat", "codex-owners")
+
+
+def moved(steps, served=False, watch=False):
+    """review PR 234 v6: main's session moves. `steps` are (session, status) pairs; a status of None moves main without
+    a ledger tick. The page gets what was pushed (the hub snapshot), or with `served` what /api/state serves; `watch`
+    runs one pass of the server's session watch first (follow(); there is none at ec6d0edd, so nothing happens)."""
+    hub = ev.Hub()
+    health = col.Health(hub)
+    runner = Runner()
+    main = {"id": SID}
+    ledger = col.Ledger(hub, health, runner, lambda: main["id"])
+    for name in OTHERS:
+        health.ok(name, "fixture")
+    for n, (session, status) in enumerate(steps):
+        main["id"] = session
+        if status is not None:
+            runner.status = status
+            ledger.run(T0 + 60 * n)
+    if watch:
+        getattr(ledger, "follow", lambda: None)()
+    return {"ledger": ledger.snapshot() if served else hub.snapshots.get("ledger"), "health": health.snapshot()}
+
+
 def main():
     good = (0, json.dumps(EMPTY))
     out = {}
@@ -64,7 +89,14 @@ def main():
     out["partial"] = scenario([(0, json.dumps(PARTIAL))])
     out["stale_after_partial"] = scenario([(0, json.dumps(PARTIAL)), FAILS["nonzero"]])
     # the status read is fine, but the asks source never read: Blockers also rest on asks, so it is unknown
-    out["asks_never_read"] = scenario([good], other_health=("owners", "initiatives", "wals", "chat"), failed=("asks",))
+    out["asks_never_read"] = scenario([good], other_health=("owners", "initiatives", "wals", "chat", "codex-owners"), failed=("asks",))
+    # v5 F1: a good read for main's session, then the owners snapshot drops main's session to "" and the ledger ticks
+    out["session_dropped"] = moved([(SID, good), ("", good)])
+    # main moved to another session; the ledger thread has not ticked since (inside a slow read, or between cadences)
+    out["session_moved_served"] = moved([(SID, good), (SID_B, None)], served=True)
+    out["session_moved_watched"] = moved([(SID, good), (SID_B, None)], watch=True)
+    out["session_moved_failed"] = moved([(SID, good), (SID_B, FAILS["nonzero"])])
+    out["session_moved_read"] = moved([(SID, good), (SID_B, good)])
     print(json.dumps(out, sort_keys=True, default=str))
 
 
