@@ -68,18 +68,21 @@ gq_browser.py machine list [--orphans]
 MCP tools: `gq_machine_open`, `gq_machine_screenshot`, `gq_machine_click`, `gq_machine_type`, `gq_machine_key`, `gq_machine_renew` and `gq_machine_close`.
 
 - **open** first reads the machine (`GET /machines/:id`). A 403 or 404 there (no grant, a read-only grant, someone else's machine) is printed with its code, and nothing else is sent. It then takes a control lease with a unique holder `gq-machine:HANDLE` and a short TTL (300 s by default, 30 to 7200). It prints a local 16-hex handle.
-  - `allowedMachines` in `browser-defaults.json` is optional. When it is set, any other machine id is refused before a request is sent.
+  - `allowedMachines` in `browser-defaults.json` is **required**: list each test machine id. A machine outside it, or a file without it, is refused before any request is sent. The token acts as the machine's owner, so without the list a grant over all of your machines would let an agent drive your own computer without approval.
+  - The holder separates this tool's leases from yours, but the server checks a command's lease by principal (the user). Two agents sharing one token can therefore command under each other's lease, so give each tester its own machine.
 - **Scope.** Every command names the lease this tool opened, and nothing is retried with a wider scope: never `autoLease`, never `takeOver`, never another machine. A `lease_held`, `machines_token_grant_level`, `lease_ended` or `lease_not_yours` answer is printed with its code. An ended lease is marked closed locally.
 - **Only four kinds exist:** screenshot, click, type and key. There is no generic kind, so `fill_login`, shell and clipboard cannot be reached.
 - **shot** writes `shots/<UTC yyyymmddTHHMMSSZ>-<machineId>-<n>.png` (or `.jpg`) under `~/.agent-harness/gq-browser/machines/HANDLE/`, mode 0600, never overwriting and never through a symlink. The bytes must be a PNG or JPEG of at most 12 MB.
   - Each shot is tracked in `shots.jsonl` with the UTC time, machine, lease, command and artifact ids, size, sha256 and path.
   - Screenshots and command results are untrusted data.
+- **key** refuses the token and secret shapes like type does, since key arguments are stored on the server too.
 - **type** takes literal text only, from `--text` or the MCP argument. There is no file, stdin, environment or vault source.
   - It refuses text that holds the user token (or any 12-character piece of it) or matches a token or secret shape: GoodQA `gq*_` and `bt_k*_`, `sk-`, GitHub, AWS, Slack, Google, JWT, bearer or private key.
   - A refusal never repeats the text, and typed text is never echoed in the output.
-- **Approvals.** A lease that needs approval (202) or a command `awaiting_approval` is reported. The command is cancelled; the tool never waits on it or approves it.
+- **Approvals.** A lease that needs approval (202) or a command `awaiting_approval` is reported. The command is cancelled and the lease released; the tool never waits on it or approves it.
+- **State files are checked.** The lease id, holder and ttl in `state.json` are validated before they reach a request.
 - **Lost answers.** A command whose answer was lost is never re-sent (each send carries a fresh `clientRequestId`). Look at the screen before acting again.
-  - If the lease answer is lost, open asks once more with the same holder; the server returns that holder's lease, never a new scope. It then releases that lease and fails.
+  - If the lease answer is lost, open asks once more with the same holder; the server returns that holder's lease, never a new scope. It then releases that lease and fails. If that answer is lost too, the lease stays open locally (`list --orphans`), and `close` retries.
 
 ### Release (AC-5)
 

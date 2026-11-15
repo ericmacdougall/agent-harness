@@ -151,7 +151,7 @@ class FakeMachines:
 
 
 class Env:
-    def __init__(self, api, defaults=None):
+    def __init__(self, api, defaults=None, allow=True):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
         cfg = self.home / ".config" / "goodqa"
@@ -160,6 +160,8 @@ class Env:
         self.token.write_text(USER_TOKEN + "\n")
         os.chmod(self.token, 0o600)
         d = {"allowedBases": [api.base]}
+        if allow:
+            d["allowedMachines"] = [MACHINE]
         d.update(defaults or {})
         (cfg / "browser-defaults.json").write_text(json.dumps(d))
         os.chmod(cfg / "browser-defaults.json", 0o600)
@@ -312,6 +314,7 @@ class Refusals(Base):
         self.assertEqual(self.api.requests, [])
 
     def test_machine_outside_the_grant_is_surfaced_and_no_lease_is_tried(self):
+        self.e = Env(self.api, {"allowedMachines": [MACHINE, OTHER]})  # allowed locally, refused by the server's grant
         p = self.e.run("open", OTHER, check=1)
         self.assertIn("404", p.stderr)
         self.assertIn("not_found", p.stderr)
@@ -353,6 +356,27 @@ class Refusals(Base):
         self.e.run("click", h, "--x", "1", "--y", "1", check=2)
         self.assertEqual(len(self.api.requests), n)
 
+    def test_no_allowed_machines_list_fails_closed(self):
+        # red-team r1 F3: without allowedMachines any machine the token's grants reach (the user's own Mac) could be driven.
+        self.e = Env(self.api, allow=False)
+        p = self.e.run("open", MACHINE, check=2)
+        self.assertIn("allowedMachines", p.stderr)
+        self.assertEqual(self.api.requests, [])
+
+    def test_forged_state_fields_are_refused_before_any_request(self):
+        # red-team r1 F4: leaseId, holder and ttl from state.json must never steer an authenticated request.
+        h = self.e.open()
+        good = self.e.state(h)
+        n = len(self.api.requests)
+        for field, value in (("leaseId", "../../api-keys/%s/revoke" % LEASE), ("holder", "gq-machine:0000000000000000"),
+                             ("ttl", 999999), ("leaseId", 7), ("machineId", OTHER)):
+            bad = dict(good)
+            bad[field] = value
+            (self.e.root / h / "state.json").write_text(json.dumps(bad))
+            for args in (["click", h, "--x", "1", "--y", "1"], ["renew", h], ["close", h]):
+                self.e.run(*args, check=2)
+        self.assertEqual(len(self.api.requests), n)
+
     def test_bad_arguments_are_refused_before_any_request(self):
         h = self.e.open()
         n = len(self.api.requests)
@@ -379,6 +403,14 @@ class Refusals(Base):
         self.assertIn("awaiting_approval", p.stderr)
         self.assertEqual(len(self.api.calls("POST", r"/cancel$")), 1)
         self.assertEqual(self.api.calls("POST", r"/approve$"), [])
+        # NEG-8 (red-team r1 F6): the lease is released too
+        self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
+        self.assertTrue(self.e.state(h)["closed"])
+
+    def test_error_code_holding_the_token_is_never_printed(self):
+        # red-team r1 F5: a hostile error.code is not a safe code; tearDown's leak scan fails if it reaches stderr.
+        self.api.fail[("GET", r"/machines/")] = (403, USER_TOKEN)
+        self.e.run("open", MACHINE, check=1)
 
     def test_lost_command_response_is_never_resent(self):
         h = self.e.open()
@@ -416,6 +448,24 @@ class TypingRestriction(Base):
         for text in self.SHAPES:
             p = self.e.run("type", h, "--text", text, check=2)
             self.assertNotIn(text, p.stderr + p.stdout)
+        self.assertEqual(len(self.api.requests), n)
+
+    def test_key_refuses_the_token_and_secret_shapes(self):
+        # red-team r1 F2: key args are stored server-side like type text.
+        h = self.e.open()
+        n = len(self.api.requests)
+        for keys in (USER_TOKEN, "gqu_" + "A" * 30, "x " + USER_TOKEN[3:15]):
+            p = self.e.run("key", h, "--keys", keys, check=2)
+            self.assertNotIn(keys, p.stderr + p.stdout)
+        self.assertEqual(len(self.api.requests), n)
+
+    def test_more_secret_shapes_are_refused(self):
+        # red-team r1 F10
+        h = self.e.open()
+        n = len(self.api.requests)
+        for text in ("sk-proj-" + "a" * 24, "dop_v1_" + "b" * 40, "glpat-" + "c" * 20, "whsec_" + "d" * 24, "ya29." + "e" * 30,
+                     "npm_" + "f" * 36, "xapp-1-" + "g" * 20):
+            self.e.run("type", h, "--text", text, check=2)
         self.assertEqual(len(self.api.requests), n)
 
     def test_type_has_no_file_stdin_or_env_source(self):
@@ -512,6 +562,18 @@ class Interrupts(Base):
         self.assertEqual(leases[0]["body"], leases[1]["body"])
         self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
         self.assertEqual(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"], [])
+
+    def test_lease_answer_lost_twice_stays_an_orphan_that_close_recovers(self):
+        # red-team r1 F1: with both the create and the recovery answer lost, a server lease may exist: never mark it closed.
+        self.api.drop.add(("POST", r"/leases$"))
+        self.e.run("open", MACHINE, check=1)
+        self.assertEqual(self.api.calls("POST", r"/release$"), [])
+        rows = json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]
+        self.assertEqual(len(rows), 1)
+        self.api.drop.clear()
+        p = self.e.run("close", rows[0]["handle"], check=0)
+        self.assertEqual(json.loads(p.stdout)["result"], "released")
+        self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
 
     def test_sigkill_leaves_an_orphan_that_close_releases(self):
         h = self.e.open()

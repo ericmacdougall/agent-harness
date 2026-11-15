@@ -230,7 +230,7 @@ class Api:
                 code = (json.loads(e.read(65536) or b"{}").get("error") or {}).get("code")
             except Exception:
                 pass
-            raise ApiError(what, e.code, code if isinstance(code, str) and len(code) < 80 else None)
+            raise ApiError(what, e.code, code if isinstance(code, str) and re.match(r"^[a-z0-9_.-]{1,79}$", code) else None)
         except (urllib.error.URLError, OSError, TimeoutError):
             raise ApiError(what, lost=True)
         if len(payload) > MAX_BODY:
@@ -592,7 +592,8 @@ SECRET_SHAPES = [re.compile(p) for p in (
     r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{12,}", r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}",
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", r"-----BEGIN [A-Z ]*PRIVATE KEY", r"\bxox[abposr]-[A-Za-z0-9-]{8,}",
     r"\bAIza[0-9A-Za-z_-]{30,}", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}")]
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}", r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{16,}", r"\bdop_v1_[A-Za-z0-9]{20,}", r"\bglpat-[A-Za-z0-9_-]{16,}",
+    r"\bwhsec_[A-Za-z0-9+/=]{16,}", r"\bya29\.[A-Za-z0-9_-]{20,}", r"\bnpm_[A-Za-z0-9]{30,}", r"\bxapp-[A-Za-z0-9-]{10,}")]
 
 
 class Interrupted(BaseException):
@@ -658,8 +659,10 @@ def _check_machine_allowed(machine_id, defaults):
     if not isinstance(machine_id, str) or not STRICT_UUID.match(machine_id):
         raise Refused("machine id must be a lowercase uuid")
     allow = defaults.get("allowedMachines")
-    if allow is not None and (not isinstance(allow, list) or machine_id not in allow):
-        raise Refused("machine %s is not in allowedMachines of browser-defaults.json" % machine_id)
+    # Fail closed (red-team r1 F3): the token acts as the machine OWNER, so without a list a grant over all of the user's
+    # machines would let an agent drive his own computer with no approval.
+    if not isinstance(allow, list) or machine_id not in allow:
+        raise Refused("machine %s is not in allowedMachines of browser-defaults.json (required; list each test machine id)" % machine_id)
 
 
 def _check_ttl(ttl):
@@ -674,6 +677,16 @@ def _mstate(handle, allow_closed=False):
         raise Refused("state for %s does not match; nothing sent" % handle)
     defaults, base = _machine_defaults(state.get("base"))
     _check_machine_allowed(state.get("machineId"), defaults)
+    # Every state field that reaches a request is checked (red-team r1 F4): a forged state file must not steer one.
+    lid = state.get("leaseId")
+    if lid is not None and (not isinstance(lid, str) or not STRICT_UUID.match(lid)):
+        raise Refused("state for %s has a malformed lease id; nothing sent" % handle)
+    if state.get("holder") != "gq-machine:" + handle:
+        raise Refused("state for %s has a foreign holder; nothing sent" % handle)
+    try:
+        _check_ttl(state.get("ttl"))
+    except Refused:
+        raise Refused("state for %s has a malformed ttl; nothing sent" % handle) from None
     if state.get("closed") and not allow_closed:
         raise Refused("machine lease %s is closed (%s); open a new one" % (handle, state.get("endReason") or "released"))
     return d, state, base
@@ -705,6 +718,7 @@ def _mrelease(api, d, state, recover=True):
     holder (the server adopts that holder's live lease; never a wider scope). The state is closed unless the release failed."""
     with _Quiet():
         report = []
+        unknown = False
         lid = state.get("leaseId")
         if not lid and state.get("leaseRequested") and recover:
             try:
@@ -713,7 +727,13 @@ def _mrelease(api, d, state, recover=True):
                 report.append("lease_recovered")
             except ApiError as e:
                 report.append("no_lease_to_recover (%s)" % (_code(e) or ("no response" if e.lost else e.status)))
+                # Only a definite HTTP answer proves there is no lease (red-team r1 F1). A lost or malformed answer may
+                # hide one, so the state stays open: list --orphans shows it and close retries.
+                unknown = not e.status
         failed = False
+        if not lid and unknown:
+            failed = True
+            report.append("lease_state_unknown; retry with: machine close %s" % state["handle"])
         if lid:
             try:
                 api.call("POST", "/machine-leases/%s/release" % lid, api.user, {"holder": state["holder"]})
@@ -808,7 +828,10 @@ def _command(handle, kind, args, d, state, base, token):
                         api.call("POST", "/machine-commands/%s/cancel" % cid, token)
                     except ApiError:
                         pass
-                raise ApiError("command", 0, "awaiting_approval", detail="command %s is awaiting_approval; cancelled, never approved by this tool" % cid)
+                    state["endReason"] = "approval_required"
+                    cleanup = _mrelease(api, d, state, recover=False)
+                raise ApiError("command", 0, "awaiting_approval",
+                               detail="command %s is awaiting_approval; cancelled, never approved by this tool; lease: %s" % (cid, cleanup))
             left = deadline - time.time()
             if left <= 0:
                 return {"untrusted": True, "notice": NOTICE, "commandId": cid, "state": "unknown",
@@ -864,7 +887,9 @@ def op_machine_key(handle, keys):
     if not isinstance(keys, str) or not KEYS_RE.match(keys):
         raise Refused("keys must be a named key or chord such as ctrl+l (letters, digits, _ + - and space, 1 to 64)")
     d, state, base = _mstate(handle)
-    return _action_out(_command(handle, "key", {"keys": keys}, d, state, base, read_token()))
+    token = read_token()
+    _refuse_secret_text(keys, token)  # red-team r1 F2: key args are stored server-side like typed text
+    return _action_out(_command(handle, "key", {"keys": keys}, d, state, base, token))
 
 
 def _refuse_secret_text(text, token):
@@ -1231,10 +1256,10 @@ def main(argv=None):
         print("gq_browser: error: %s" % _local_error(e), file=sys.stderr)
         return 1
     except Interrupted:
-        print("gq_browser: interrupted (SIGTERM); any command was cancelled and the lease released", file=sys.stderr)
+        print("gq_browser: interrupted (SIGTERM); cleanup ran where a lease or command was in flight; check: machine list --orphans", file=sys.stderr)
         return 143
     except KeyboardInterrupt:
-        print("gq_browser: interrupted (SIGINT); any command was cancelled and the lease released", file=sys.stderr)
+        print("gq_browser: interrupted (SIGINT); cleanup ran where a lease or command was in flight; check: machine list --orphans", file=sys.stderr)
         return 130
     print(json.dumps(out))
     return 0
