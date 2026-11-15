@@ -1235,5 +1235,65 @@ class ClaudeSessionTrailerTests(unittest.TestCase):
         self.assertEqual({cp.trailer_harness(t) for t in trailers if t.lower().startswith("co-authored-by")}, {"claude"})
 
 
+class ClaudeSessionParagraphTests(unittest.TestCase):
+    """goodqa#16106 follow-up: a trailer-only paragraph directly before the final trailer paragraph."""
+
+    # verbatim `git log -1 --format=%B 0ca0731e` of agent-harness PR 234 (already pushed; must not be reworded)
+    PR234 = """fix(ah): keep the read block buildable for a window before the epoch
+
+Why: e7bf3ecf names its window's cutoff in the read block. ah export
+asks status_report for "every row", so the cutoff falls before 1970
+and datetime raised OverflowError on t2-dev; test_ah_export
+FullExport.test_classes_match_ah_status errored in the v10 packet.
+
+What: LostWindow.fields clamps the shown cutoff at the epoch and
+falls back to "" if it is still out of range. The rule's decision
+uses the real cutoff, unchanged. New test covers far-past, negative
+and far-future cutoffs and a status read with a 10^12 s window.
+
+Testing: on the Mac,
+`python3 -W ignore -m unittest tests.test_mission_control_producer_reads.OneSharedRule`
+4 OK; at e7bf3ecf the export test errored on t2-dev (v10 packet).
+Full suites: see the v10 packet at this head.
+
+Refs: GoodQA goodqa#15920
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"""
+    BODY = ("fix(hooks): keep pushed attribution shapes passing\n\nWhy: published commits must still pass.\n"
+            "What: accept the trailer-only paragraph.\nTesting: `python3 -m pytest tests/test_commit_policy.py -q` -> 3 passed\n"
+            "Refs: GoodQA #16106\n\n")
+    COAUTH = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+    SESSION = next(line for line in PR234.splitlines() if line.startswith("Claude-Session:"))
+
+    def problems(self, message):
+        old = cp.HARNESS_OVERRIDE
+        cp.HARNESS_OVERRIDE = "claude"
+        try:
+            return cp.validate(message + "\n", policy=cp.load_policy())
+        finally:
+            cp.HARNESS_OVERRIDE = old
+
+    def test_the_real_pr234_message_passes(self):
+        self.assertEqual(self.problems(self.PR234), [])
+        self.assertEqual(cp.parse_message(cp.normalize(self.PR234))[5][-1], self.COAUTH)
+
+    def test_the_same_paragraph_shape_still_passes(self):
+        self.assertEqual(self.problems(self.BODY + self.COAUTH + "\n" + self.SESSION), [])
+
+    def test_unknown_key_in_either_paragraph_still_fails(self):
+        self.assertTrue(self.problems(self.BODY + self.SESSION + "\n\n" + self.COAUTH + "\nX-Foo: bar"))
+        found = self.problems(self.BODY + self.SESSION + "\nX-Foo: bar\n\n" + self.COAUTH)
+        self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+
+    def test_a_trailer_in_the_middle_of_the_body_still_fails(self):
+        found = self.problems(self.BODY.replace("Refs: GoodQA #16106\n\n", "")
+                              + self.COAUTH + "\n\nRefs: GoodQA #16106\n\nsome closing prose.\n\n" + self.COAUTH)
+        self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+        found = self.problems(self.BODY + self.COAUTH + "\n\nnormal text after it.\n\n" + self.SESSION)
+        self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+
+
 if __name__ == "__main__":
     unittest.main()
