@@ -296,9 +296,9 @@ def escalations(root: Path | None, *, max_files: int = 200, max_age_s: float = 8
             fresh.append((info.st_mtime, entry.path))
     for _, path in sorted(fresh, reverse=True)[:max_files]:
         try:
-            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            with os.fdopen(fd, "rb") as handle:
-                state = json.loads(handle.read(limit))
+            # PR 260 review F2: a bounded regular-file read; a FIFO swapped in after the scan is refused, never opened
+            # blocking, and a file grown past the cap is refused, not read in part
+            state = json.loads(col.read_regular(path, limit))
         except FileNotFoundError:
             continue
         except (OSError, ValueError, RecursionError) as exc:

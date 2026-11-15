@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -308,6 +309,51 @@ class PolicyIsAFeed(Base):
 
     def test_owners_collector_writes_and_ages_its_policy_row(self):
         self.assertIn("owner-policy", col.Owners.rows_written)
+
+class PolicyReadIsBounded(Base):
+    """PR 260 review F2: the policy file is read as a bounded regular file. A FIFO at the policy path, an oversized file
+    or a directory never blocks or floods the shared collector thread: the collector finishes its tick and the owners
+    read is not current (owner-policy is a feed of owners)."""
+
+    def tick_with_policy(self, path):
+        with mock.patch.dict(os.environ, {"AGENT_HARNESS_TIER_POLICY": str(path)}):
+            for name in col.FEEDS["owners"]:
+                if name != "owner-policy":
+                    self.health.ok(name, "read")
+            truth = col.Truth(self.hub, self.health)
+            done = []
+            worker = threading.Thread(target=lambda: done.append(self.collect(ah_rows())),
+                                      daemon=True)
+            worker.start()
+            worker.join(10)
+            self.assertTrue(done, "the collector tick returned (a FIFO would block it for ever)")
+            policy_row = self.health.rows["owner-policy"]
+            self.assertEqual(policy_row["status"], "error", policy_row)
+            self.assertNotEqual(truth.reads()["owners"]["truth"], "current")
+            return policy_row
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_a_fifo_at_the_policy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "tiers.json"
+            os.mkfifo(fifo)
+            self.assertIn("not a regular file", self.tick_with_policy(fifo)["detail"])
+
+    def test_an_oversized_policy_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / "tiers.json"
+            big.write_bytes(b" " * (col.POLICY_MAX_BYTES + 1))
+            self.assertIn("over", self.tick_with_policy(big)["detail"])
+
+    def test_a_directory_at_the_policy_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tick_with_policy(Path(tmp))
+
+    def test_a_good_policy_still_reads(self):  # control
+        with mock.patch.dict(os.environ, {"AGENT_HARNESS_TIER_POLICY": str(REPO / "harness" / "hooks" / "model_tiers.json")}):
+            self.collect(ah_rows())
+        self.assertEqual(self.health.rows["owner-policy"]["status"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

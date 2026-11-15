@@ -824,6 +824,33 @@ class ReadFailures(unittest.TestCase):
         self.assertEqual(health["truth"], "partial", health)
 
 
+class EscalationReadIsBounded(unittest.TestCase):
+    """PR 260 review F2 applied to 243: an escalation file swapped for a FIFO after the directory scan is refused, never
+    opened blocking (the collector thread would hang), and is reported as a failed read."""
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_a_fifo_swapped_in_after_the_scan_is_refused(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            fifo = Path(tmp) / "a.json"
+            os.mkfifo(fifo)
+            now = time.time()
+            # what the scan saw a moment earlier: a small regular file
+            entry = SimpleNamespace(name="a.json", path=str(fifo), is_file=lambda follow_symlinks=True: True,
+                                    stat=lambda follow_symlinks=True: SimpleNamespace(st_mtime=now, st_size=10))
+            problems, done = [], []
+            with mock.patch.object(og.os, "scandir", return_value=[entry]):
+                worker = threading.Thread(target=lambda: done.append(og.escalations(Path(tmp), now=now, problems=problems)),
+                                          daemon=True)
+                worker.start()
+                worker.join(10)
+            self.assertTrue(done, "the escalation read returned (a blocking FIFO open would hang it)")
+            self.assertEqual(done[0], {})
+            self.assertTrue(problems, "the refused file is a failed read, so the graph read is partial")
+
+
 class NodeTruthFromOwnerRows(unittest.TestCase):
     """PR 243 on main: an agent node whose ah owners row is the last good copy (a failed ah read) says so."""
 
