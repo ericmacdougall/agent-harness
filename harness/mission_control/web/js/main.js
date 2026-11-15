@@ -1,9 +1,10 @@
 import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, cycleTheme, KINDS, TABS } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
 import { mountInitiatives } from './initiatives.js';
-import { liveFields, updatedText, ownerLineText, hubCounts, sceneText } from './adapt.js';
+import { liveFields, updatedText, ownerLineText, hubCounts, sceneText, countText, claim } from './adapt.js';
 import { mountActivity } from './activity.js';
 import { mountOwners } from './owners.js';
+import { ownerCounts } from './owner-groups.js';
 import { mountChat } from './chat.js';
 import { mountNeeds } from './needs.js';
 import { mountHealth } from './health.js';
@@ -158,7 +159,7 @@ function renderInspector(state) {
   } else if (kind === 'hub') {
     title.textContent = 'Main coordinator';
     content.append(title, el('p', 'detail-intro', 'Every initiative and owner reports into the coordinating session.'));
-    fields.append(field('Session', state.mainSession || '—'), field('Host', state.host || '—'), field('Owners', hubCounts(state).owners), field('Initiatives', hubCounts(state).initiatives));
+    fields.append(field('Session', state.mainSession || '—'), field('Host', state.host || '—'), field('Live owners', countText(ownerCounts(state.owners).live, claim(state, 'owners'), true)), field('Initiatives', hubCounts(state).initiatives));
     content.append(fields);
   }
   if (!inspector.open) inspector.showModal();

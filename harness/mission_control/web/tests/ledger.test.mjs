@@ -82,7 +82,7 @@ test('blocker rows gather ledger blockers, untraceable asks and dropped owners w
 });
 
 test('mission tiles count goals, live owners, open asks, blockers and requirements', () => {
-  const tiles = missionTiles(withReads({ connection: 'live', sources: HEALTHY, ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false }, { state: 'done', severe: false }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] }));
+  const tiles = missionTiles(withReads({ connection: 'live', sources: HEALTHY, ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false, role: 'live', source: 'ah' }, { state: 'done', severe: false, role: 'parked', source: 'ah' }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] }));
   const by = Object.fromEntries(tiles.map(t => [t.id, t]));
   assert.equal(by.goals.value, '0 / 2');  // g1 is LIVE_TESTED: live, not done (review PR 234 v2 F1)
   assert.match(by.goals.note, /1 live, not done · 1 open/);

@@ -27,7 +27,7 @@ let state = {
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
   motion: savedMotion && !media.matches, motionPreference: savedMotion, reducedMotion: media.matches,
-  feedPaused: false, feedSnapshot: [], buffered: 0, ownerFilter: 'active', fallback: false, showQuiet: false,
+  feedPaused: false, feedSnapshot: [], buffered: 0, ownerFilter: 'active', ownerFolds: {}, fallback: false, showQuiet: false,
   theme: savedTheme,
   chatAvailability: { claude: {}, codex: { state: 'unavailable', blockedUntil: null, reason: 'Checking Codex…' } },
 };
@@ -97,7 +97,7 @@ export function setInitiatives(snapshot) {
 }
 export function setOwners(rows) {
   const owners = adapt.owners(rows, state.initiatives);
-  update({ ownerRows: Array.isArray(rows) ? rows : [], owners, loss: lost('owners', rows, owners.length) }, 'owners');
+  update({ ownerRows: Array.isArray(rows) ? rows : [], owners, loss: { ...state.loss, owners: adapt.ownersLoss(rows, owners) } }, 'owners');
 }
 // 'truth' fires only when a source's status or truth changed: the panels whose zero claims rest on it repaint then, not
 // on every health snapshot (a failing source re-reports every tick).
