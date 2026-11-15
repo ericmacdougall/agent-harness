@@ -200,3 +200,24 @@ Each escalation that can be mailed gets a `mail` effect.
   When the receipt arrives, the alert is cleared and the ticket gets one note saying the mail was handed over
   late. Checks stop after 7 days.
 - Delivery is at-least-once. An ops-watch crash after the send but before its state save re-sends the mail once.
+
+## Review, Grant and Operation contracts (M-1, goodqa#16049)
+
+`harness/hooks/ahc_contracts.py` holds the design v3 transition contracts for three entities. A transition that is
+not listed there does not exist. Every transition checks the expected version, a new event id and an allowed actor,
+and is recorded in `transitions` in the same transaction.
+
+- **Review** rows (3.3) are bound to (kind, repo, pr, head, packet SHA-256, policy revision). `passed` and
+  `findings` need a receipt bound to that exact subject, with a matching verdict. A new head supersedes queued rows,
+  moves running rows to `cancelling`, and leaves `outcome-unknown` rows for their readback.
+- **Grant** rows (3.9a) are proposed only by the `ahc-policy` principal. Each has a scope (repo, pr, head, base), one
+  use and a 24 h expiry. Every move after validation is written first to an append-only, fsynced authority log.
+  The log is **local, not off-host**, a stated deviation from 3.9. If the write fails, nothing changes. A grant
+  reserved past its expiry has no transition until its operation settles.
+- **Operation** rows (2.5, 3.9a) carry a key derived by core from the operation's identity fields. The same key
+  with other parameters is an `OperationConflict`, never a new row. A dispatch counts before the request leaves,
+  and at most 3 are allowed (B10). Absence needs the 2.5 proof, never "not there now". Twenty inconclusive
+  readbacks give `held`, with an incident, and only an operator or the reconcile read settles a held row. A
+  settled row becomes a tombstone 30 days after settlement, and its key is refused for good.
+
+The runner does not use these rows yet, and automatic merging is off.
