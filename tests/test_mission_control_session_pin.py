@@ -266,7 +266,16 @@ class PinTruth(unittest.TestCase):
     every session-scoped dataset. A read for another session, or no pin, is never shown as current or stale."""
 
     GOALS = {"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []}
-    setUp, app, _reqs = Wiring.setUp, Wiring.app, Wiring._reqs
+    app, _reqs = Wiring.app, Wiring._reqs
+
+    def setUp(self):
+        Wiring.setUp(self)
+        # the App reads supervised owners under Path.home(): a disposable home, so the result never depends on the
+        # host (an empty codex-owners root is a whole read of none)
+        (self.h.home / ".agent-harness" / "codex-owners").mkdir(parents=True, exist_ok=True)
+        patcher = mock.patch.object(Path, "home", return_value=self.h.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def ready(self):
         app, _ = self.app(dict(self.GOALS))
