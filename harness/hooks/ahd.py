@@ -735,6 +735,9 @@ class Daemon:
             self.hold_ticks -= 1
         # owners unreadable or session blocked: never clear on missing data
         missing = {s[:8] for s in sessions if s not in docs} | {s[:8] for s in blocked}
+        # PR 234 v8: an owners doc that read only part of its WALs (read.state partial or failed, or no read block)
+        # still raises what it saw, but an owner it did not see is not recovered: its alert is held, never cleared
+        missing |= {s[:8] for s, d in docs.items() if ((d or {}).get("read") or {}).get("state") != "ok"}
         hold |= {k for k in ring if k.startswith("liveness:") and k[9:17] in missing and k not in desired}
         bad = set(summary["skipped"]) | {e.split(":", 1)[0] for e in summary.get("errors", [])}
         if bad & {"sessions", "owners"}:
