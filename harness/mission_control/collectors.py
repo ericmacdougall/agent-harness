@@ -199,16 +199,28 @@ class WalTailer(Collector):
         self.last_scan = 0.0
         self.last_items: dict[tuple, dict] = {}
         self.max_events_per_tick = 60
-        self.unreadable: set[str] = set()  # roots that exist but could not be listed at the last scan
+        self.unreadable: set[str] = set()  # roots and session directories that exist but could not be listed at the last scan
+        self.unopened: set[str] = set()    # WAL files that exist but could not be opened, until a read of them succeeds
 
     def health_truth(self):
-        """partial when the last scan could not see every WAL: a root that exists but could not be listed, or the file
-        cap reached. A missing root is not partial: that runtime has no WALs here (review PR 234 v6: every silent cap
-        on a read the page counts from reports partial)."""
-        return "partial" if self.unreadable or len(self.files) >= self.MAX_FILES else None
+        """partial when the tailer cannot see every WAL: a root or session directory that exists but could not be
+        listed, a WAL that exists but could not be opened, or the file cap reached. Something missing is not partial: a
+        runtime with no WALs here, or a WAL removed (review PR 234 v6: every silent cap on a read the page counts from
+        reports partial)."""
+        return "partial" if self.unreadable or self.unopened or len(self.files) >= self.MAX_FILES else None
+
+    def _still_unopened(self, path: str, now: float) -> bool:
+        """A WAL stays unread while it is watched, or exists inside the window; a removed or aged-out one is not unread."""
+        if path in self.files:
+            return True
+        try:
+            return now - os.stat(path, follow_symlinks=False).st_mtime <= self.WINDOW_S
+        except OSError:
+            return False  # gone; a stat refused on its directory marks that directory unreadable below
 
     def _discover(self, now: float, initial: bool) -> None:
         self.unreadable = set()
+        self.unopened = {path for path in self.unopened if self._still_unopened(path, now)}
         for root, runtime in self.roots:
             try:
                 sessions = list(os.scandir(root))
@@ -226,14 +238,20 @@ class WalTailer(Collector):
                     if now - entry.stat(follow_symlinks=False).st_mtime > self.WINDOW_S and not initial:
                         pass  # appends do not touch the directory mtime, so old directories are still listed
                     names = os.scandir(entry.path)
+                except FileNotFoundError:
+                    continue  # removed since the root was listed
                 except OSError:
+                    self.unreadable.add(entry.path)
                     continue
                 for item in names:
                     if not item.name.endswith(".jsonl") or item.path in self.files:
                         continue
                     try:
                         info = item.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
                     except OSError:
+                        self.unreadable.add(item.path)
                         continue
                     if not stat.S_ISREG(info.st_mode) or now - info.st_mtime > self.WINDOW_S:
                         continue
@@ -252,7 +270,10 @@ class WalTailer(Collector):
             with self.reader.open(path) as handle:
                 handle.seek(max(0, info.st_size - 16384))
                 lines = handle.read(16384).split(b"\n")
+        except FileNotFoundError:
+            return
         except (OSError, Refused):
+            self.unopened.add(path)  # its newest line is not known: partial until a read of it succeeds
             return
         newest = None
         found_item = found_progress = False
@@ -305,8 +326,13 @@ class WalTailer(Collector):
         for path, tail in list(self.files.items()):
             try:
                 info = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                self.files.pop(path, None)
+                self.unopened.discard(path)
+                continue
             except OSError:
                 self.files.pop(path, None)
+                self.unopened.add(path)
                 continue
             if info.st_ino != tail.ino or info.st_size < tail.offset:  # replaced or truncated: start over
                 tail.ino, tail.offset, tail.partial = info.st_ino, 0, b""
@@ -317,9 +343,15 @@ class WalTailer(Collector):
                 with self.reader.open(path) as handle:
                     handle.seek(tail.offset)
                     data = handle.read(self.READ_CAP)
+            except FileNotFoundError:
+                self.files.pop(path, None)
+                self.unopened.discard(path)
+                continue
             except (OSError, Refused):
                 self.files.pop(path, None)
+                self.unopened.add(path)  # it exists but its lines are not seen: partial until a read of it succeeds
                 continue
+            self.unopened.discard(path)
             tail.offset += len(data)
             emitted = self._lines(tail, split_lines(tail, data), budget)
             budget -= emitted[0]
@@ -1119,7 +1151,7 @@ class Ledger(Collector):
         self.runner, self.session_fn, self.root = runner, session_fn, root
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
-        self.raw_total, self.raw_truncated = 0, False
+        self.raw_total, self.raw_truncated, self.raw_dropped = 0, False, 0
         # the session the requirement rows on hand were read for: set only by a successful read (review PR 234 F3)
         self.req_session = ""
         self.parts = {name: self._empty(name) for name in ("goals", "requirements", "status")}
@@ -1156,7 +1188,7 @@ class Ledger(Collector):
         """A new session never inherits the previous session's requirements or status, even when its own first read
         fails: an empty, unread part is shown instead (and no archive or restore click is accepted until it reads)."""
         with self.lock:
-            self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
+            self.raw_requirements, self.raw_total, self.raw_truncated, self.raw_dropped = [], 0, False, 0
             self.req_session = ""
             self.parts["requirements"] = self._empty("requirements")
             self.parts["status"] = self._empty("status")
@@ -1232,7 +1264,7 @@ class Ledger(Collector):
                     # rows (or a failure) recorded for another session: not this session's last good read
                     previous = self._empty(part)
                     if part == "requirements":
-                        self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
+                        self.raw_requirements, self.raw_total, self.raw_truncated, self.raw_dropped = [], 0, False, 0
                 truth = read_truth(previous.get("at"), message)
                 # the failure is this session's: view() shows it (with its error) only while main is still in it
                 self.parts[part] = dict(previous, stale=truth == "stale", error=message, truth=truth, session=session,
@@ -1278,10 +1310,11 @@ class Ledger(Collector):
         return value if isinstance(value, int) and not isinstance(value, bool) else default
 
     def _goals(self, data: dict, now: float) -> dict:
-        items = []
+        items, dropped = [], 0
         listed = data.get("goals") if isinstance(data.get("goals"), list) else []
         for raw in listed[:self.MAX_GOALS]:
             if not isinstance(raw, dict) or not raw.get("id"):
+                dropped += 1
                 continue
             evidence = [self._evidence_row(e) for e in raw.get("evidence") or [] if isinstance(e, dict)]
             evidence.sort(key=lambda e: e["at"], reverse=True)
@@ -1297,8 +1330,9 @@ class Ledger(Collector):
                 "deferral": ev.short(json.dumps(deferral, sort_keys=True), 300) if deferral else "",
                 "problems": {k: len(raw[k]) if isinstance(raw.get(k), list) else 0 for k in ("missing", "tampered", "unpinned")},
                 "evidence": evidence[:self.MAX_EVIDENCE], "evidence_total": len(evidence)})
-        # more goals than are kept: the counts the page shows would be short, so the read is partial
-        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS}
+        # more goals than are kept, or goals dropped for their shape: the counts the page shows would be short, so the
+        # read is partial (review PR 234 v6)
+        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS or dropped > 0}
 
     def overrides(self) -> dict:
         """The user's latest archive or restore click per requirement (signed rows only; see req_actions)."""
@@ -1337,9 +1371,10 @@ class Ledger(Collector):
         return closed
 
     def _requirements(self, data: dict, now: float) -> dict:
-        rows = []
+        rows, dropped = [], 0
         for raw in (data.get("requirements") if isinstance(data.get("requirements"), list) else []):
             if not isinstance(raw, dict) or not raw.get("id"):
+                dropped += 1  # a row the page cannot show: the counts would be short (review PR 234 v6)
                 continue
             ticket = str(raw.get("ticket") or "")
             evidence = raw.get("evidence")
@@ -1373,13 +1408,14 @@ class Ledger(Collector):
         self.raw_requirements = rows
         self.raw_total = self._int(data.get("total"), len(rows))
         self.raw_truncated = data.get("truncated") is True
+        self.raw_dropped = dropped
         truncated = len(rows) > self.MAX_REQUIREMENTS or self.raw_truncated
         tickets = [r["ticket"] for r in rows if r["ticket"] and not archive.TERMINAL_STATES.intersection({r["state"].lower()})]
         classified = archive.classify_all(rows, "requirement", time.time(), self._ticket_closed(tickets), self.overrides())
         truncated = truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
         return {"items": classified, "total": self._int(data.get("total"), len(rows)), "truncated": truncated,
-                "summary": archive.summary(classified), "incomplete": truncated}
+                "summary": archive.summary(classified), "incomplete": truncated or dropped > 0}
 
     def _status(self, data: dict, now: float) -> dict:
         def entry(raw):
@@ -1425,17 +1461,19 @@ class Ledger(Collector):
         Runs on an HTTP thread: when a read or a session change replaced the part meanwhile, that newer part stands."""
         with self.lock:
             part, raw, total, raw_truncated = self.parts["requirements"], self.raw_requirements, self.raw_total, self.raw_truncated
+            dropped = self.raw_dropped
         if not raw and not part.get("at"):
             return
         classified = archive.classify_all(raw, "requirement", time.time(), self._ticket_closed(), self.overrides())
         truncated = raw_truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
+        incomplete = truncated or dropped > 0
         with self.lock:
             if self.parts["requirements"] is not part:
                 return
-            self.parts["requirements"] = dict(part, items=classified, truncated=truncated, incomplete=truncated,
+            self.parts["requirements"] = dict(part, items=classified, truncated=truncated, incomplete=incomplete,
                                               total=total, summary=archive.summary(classified),
-                                              truth=read_truth(part.get("at"), part.get("error"), truncated))
+                                              truth=read_truth(part.get("at"), part.get("error"), incomplete))
         self.publish()
 
     # -- publication

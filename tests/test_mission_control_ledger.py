@@ -715,6 +715,15 @@ def partial(w):
     w.runner.payload["ah-status"] = dict(STATUS, unread=[{"wal": "agent-x.jsonl", "agent": "x", "reason": "denied"}])
 
 
+def misshapen(kind):
+    """One more row the parser cannot show (no id): the counts the page states from that part would be short."""
+    key, base = {"ah-goals": ("goals", GOALS), "ah-requirements": ("requirements", REQS)}[kind]
+
+    def step(w):
+        w.runner.payload[kind] = dict(base, **{key: base[key] + [{"title": "a row without an id"}]})
+    return step
+
+
 def _restart(w):
     w.tick()               # a good read in the process that then stops
     return World().seen()  # the new process: nothing it shows comes from the old one
@@ -773,14 +782,21 @@ LEDGER_TABLE = [
     _ledger_row("G10", "guard", "recovery after a failure", _scenario(tick, fail("ah-status"), tick, heal, tick), _parts(CUR, CUR, CUR), health=("ok", CUR)),
     _ledger_row("G11", "guard", "no main session yet: goals only", _scenario(to(""), tick), _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK)),
     _ledger_row("D01", "defect", "v5 F1: main's session set -> empty, then a tick", _scenario(tick, to(""), tick), _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK)),
-    _ledger_row("D02", "defect", "session set -> empty, before the next tick (served, and due at once)", _scenario(tick, to("")), _parts(CUR, CUR, CUR), served=_parts(CUR, UNK, UNK), due=True),
-    _ledger_row("D03", "defect", "session A -> B, before the next tick (served, and due at once)", _scenario(tick, to(SID_B)), _parts(CUR, CUR, CUR), served=_parts(CUR, UNK, UNK), due=True),
+    _ledger_row("D02", "defect", "session set -> empty, then one session-watch pass before the next tick: pushed, served, Health, due at once", _scenario(tick, to(""), watch), _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK), due=True),
+    _ledger_row("D03", "defect", "session A -> B, then one session-watch pass before the next tick: pushed, served, Health, due at once", _scenario(tick, to(SID_B), watch), _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK), due=True),
     _ledger_row("D04", "defect", "session A -> B: what the page holds while the next tick's first read runs", _during_next_goals_read, _parts(CUR, UNK, UNK), served=_parts(CUR, CUR, CUR)),
     _ledger_row("D05", "defect", "session moves A -> B while the status read for A runs", _moves_during_status_read, _parts(CUR, UNK, UNK), rows=(0, 0), health=("ok", UNK), due=True),
     _ledger_row("D06", "defect", "an archive click (reclassify) after A -> B, before the next tick", _click_after_move, _parts(CUR, UNK, UNK), rows=(0, 0), due=True),
     _ledger_row("D07", "defect", "session A -> B while the ledger thread is inside a read: what the session watch pushes", _watch_during_status_read, _parts(CUR, UNK, UNK), served=_parts(CUR, UNK, UNK), health=("ok", UNK), due=True),
     _ledger_row("G12", "guard", "session A -> B, B's reads fail", _scenario(tick, to(SID_B), fail("ah-requirements", "ah-status"), tick), _parts(CUR, UNK, UNK), rows=(0, 0), health=("error", UNK)),
     _ledger_row("G13", "guard", "session A -> B, B's reads succeed", _scenario(tick, to(SID_B), tick), _parts(CUR, CUR, CUR), rows=(ROWS_A, ROWS_A), health=("ok", CUR)),
+    _ledger_row("G14", "guard", "initial goals nonzero exit", _scenario(fail("ah-goals"), tick), _parts(UNK, CUR, CUR), health=("error", UNK)),
+    _ledger_row("G15", "guard", "goals timeout after a good read", _scenario(tick, fail("ah-goals", mode="timeout"), tick), _parts(STA, CUR, CUR), health=("error", STA)),
+    _ledger_row("G16", "guard", "initial requirements timeout", _scenario(fail("ah-requirements", mode="timeout"), tick), _parts(CUR, UNK, CUR), health=("error", UNK)),
+    _ledger_row("G17", "guard", "requirements nonzero exit after a good read", _scenario(tick, fail("ah-requirements"), tick), _parts(CUR, STA, CUR), health=("error", STA)),
+    _ledger_row("G18", "guard", "requirements invalid JSON after a good read", _scenario(tick, fail("ah-requirements", mode="invalid_json"), tick), _parts(CUR, STA, CUR), health=("error", STA)),
+    _ledger_row("D08", "defect", "goals: a row dropped for its shape is partial", _scenario(misshapen("ah-goals"), tick), _parts(PAR, CUR, CUR), health=("ok", PAR)),
+    _ledger_row("D09", "defect", "requirements: a row dropped for its shape is partial", _scenario(misshapen("ah-requirements"), tick), _parts(CUR, PAR, CUR), health=("ok", PAR)),
     _ledger_row("C01", "change", "session A -> empty -> A, then A's status read fails (no good read since the gap)", _scenario(tick, to(""), tick, to(SID), fail("ah-status"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
 ]
 # D04 serves the finished tick's result (current for B) and checks only what was pushed while its first read ran.
@@ -820,7 +836,7 @@ class AsksWorld:
         row = self.health.rows.get("asks") or {}
         published = self.hub.snapshots.get("asks") or {}
         return {"health": (row.get("status", ""), row.get("truth", "")), "items": len(published.get("items") or []),
-                "due": self.asks.due(self.t - 299.0)}
+                "due": self.asks.due(self.t - 299.0), "watch_blocked": getattr(self, "blocked", False)}
 
 
 def _asks(*steps):
@@ -845,6 +861,17 @@ def a_malformed(w):
     w.runner.items = [ask_row(1), ask_row(2, ident="bad id with spaces")]
 
 
+def held_watch(w):
+    """One session-watch pass (on its own thread, as the server runs it) while another thread holds the asks lock, as
+    a click's read does. The watch must not wait for the lock; the join bounds the test if it ever does."""
+    import threading  # noqa: PLC0415
+    with w.asks.lock:
+        thread = threading.Thread(target=watch, args=(w,), daemon=True)
+        thread.start()
+        thread.join(2.0)
+        w.blocked = thread.is_alive()
+
+
 ASKS_TABLE = [
     ("G20", "guard", "asks never read", _asks(), {"health": ("", ""), "items": 0, "due": True}),
     ("G21", "guard", "asks good read for main's session", _asks(tick), {"health": ("ok", CUR), "items": 1, "due": False}),
@@ -852,11 +879,11 @@ ASKS_TABLE = [
     ("G23", "guard", "asks session A -> B, B's read succeeds", _asks(tick, to(SID_B), tick), {"health": ("ok", CUR), "items": 1, "due": False}),
     ("D20", "defect", "asks session A -> empty: A's asks are not shown", _asks(tick, to(""), tick), {"health": ("off", UNK), "items": 0, "due": False}),
     ("D21", "defect", "asks session A -> B, B's read fails: unknown, not A's last good read", _asks(tick, to(SID_B), a_fail, tick), {"health": ("error", UNK), "items": 0, "due": False}),
-    ("D22", "defect", "asks session A -> B, before the next tick: due at once (the cadence is 300 s)", _asks(tick, to(SID_B)), {"health": ("ok", CUR), "items": 1, "due": True}),
+    ("D22", "defect", "asks session A -> B, then one session-watch pass before the next tick: Health unknown, due at once (the cadence is 300 s)", _asks(tick, to(SID_B), watch), {"health": ("ok", UNK), "items": 1, "due": True}),
     ("D23", "defect", "asks session A -> empty -> B, B's read fails", _asks(tick, to(""), tick, to(SID_B), a_fail, tick), {"health": ("error", UNK), "items": 0, "due": False}),
     ("D24", "defect", "asks: more open asks than the 100 kept is partial", _asks(a_many(), tick), {"health": ("ok", PAR), "items": 100, "due": False}),
     ("D25", "defect", "asks: a row dropped for its shape is partial", _asks(a_malformed, tick), {"health": ("ok", PAR), "items": 1, "due": False}),
-    ("D26", "defect", "asks session A -> B while a read holds the lock: the session watch turns Health unknown at once", _asks(tick, to(SID_B), watch), {"health": ("ok", UNK), "items": 1, "due": True}),
+    ("D26", "defect", "asks session A -> B while a click's read holds the lock: the session watch turns Health unknown at once", _asks(tick, to(SID_B), held_watch), {"health": ("ok", UNK), "items": 1, "due": True, "watch_blocked": False}),
 ]
 
 
@@ -923,6 +950,29 @@ def unreadable_root(root):
     root.chmod(0)
 
 
+def unreadable_session_dir(root):
+    two_wals(root)
+    (root / SID_B).mkdir()
+    (root / SID_B / "main.jsonl").write_text("")
+    (root / SID_B).chmod(0)
+
+
+def _wal_unopenable(case):
+    """A WAL that grows after the first scan but can no longer be opened: its new lines are not seen."""
+    root = case.tmp / "wals"
+    two_wals(root)
+    hub = ev.Hub()
+    health = col.Health(hub)
+    tailer = col.WalTailer(hub, health, Reader([case.tmp]), [(root, "claude")])
+    tailer.run(time.time())
+    path = root / SID / "agent-a1.jsonl"
+    path.write_text(json.dumps({"event": "check", "note": "a line the page never sees"}) + "\n")
+    path.chmod(0)
+    tailer.run(time.time() + 5)
+    row = health.rows["wals"]
+    return {"health": (row["status"], row["truth"])}
+
+
 def _off_then_error(_):
     health = col.Health(ev.Hub())
     health.ok("asks", "fine")
@@ -943,6 +993,8 @@ OTHER_TABLE = [
     ("G34", "guard", "WALs: readable roots (one missing: that runtime has none here) are current", _wals(two_wals), {"health": ("ok", CUR)}),
     ("D33", "defect", "WALs: a root that exists but cannot be listed is partial", _wals(unreadable_root), {"health": ("ok", PAR)}),
     ("D34", "defect", "WALs: the file cap reached is partial", _wals(two_wals, cap=1), {"health": ("ok", PAR)}),
+    ("D36", "defect", "WALs: a session directory that exists but cannot be listed is partial", _wals(unreadable_session_dir), {"health": ("ok", PAR)}),
+    ("D37", "defect", "WALs: a WAL that exists but cannot be opened is partial", _wal_unopenable, {"health": ("ok", PAR)}),
     ("D35", "defect", "Health: an error after off (nothing was read in between) is unknown, not stale", _off_then_error, {"health": ("error", UNK)}),
 ]
 

@@ -587,8 +587,12 @@ export const workItemText = (state, note) => (NO_ITEM.has(note) && claim(state, 
 export const sceneText = (state, text) => (state.connection === 'live' && claim(state, 'progress').truth !== 'current'
   ? 'Connected. Some owner or work-log sources are not current; see Source health.' : text);
 
-// The ledger blockers beyond the rows the server sends (it keeps 30 per list but counts them all).
-export const hiddenBlockers = status => Math.max(0, int(status?.counts?.blockers) - (status?.blockers || []).length);
+// The ledger rows beyond the ones the server sends (it keeps 30 per status list but counts them all). Every count the
+// page states from a status list uses statusCount, never the list's length (review PR 234 v6).
+export const hiddenRows = (status, key) => Math.max(0, int(status?.counts?.[key]) - (status?.[key] || []).length);
+export const statusCount = (status, key) => (status?.[key] || []).length + hiddenRows(status, key);
+export const hiddenBlockers = status => hiddenRows(status, 'blockers');
+export const hiddenDeals = status => ['pending', 'failed', 'live', 'verified'].reduce((sum, key) => sum + hiddenRows(status, key), 0);
 export function missionTiles(state) {
   const led = state.ledger || ledger(null);
   const view = { ...state, ledger: led };

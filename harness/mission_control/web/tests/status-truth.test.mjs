@@ -257,6 +257,26 @@ test('audit: ledger blockers beyond the 30 the server holds are counted, not dro
   assert.match(text(v.blockers(s, ui)), /15 more ledger blockers/);
 });
 
+test('v6: every count the page states from a status list is the ledger\'s whole count, not the 30 rows held', () => {
+  const s = world();
+  const held = key => Array.from({ length: 30 }, (_, i) => ({ id: `${key}${i}`, note: 'x', at }));
+  const lists = ['live', 'verified', 'failed', 'pending', 'decisions', 'commits', 'claimed', 'assumptions', 'blockers'];
+  s.ledger = ledger({ status: { at, truth: 'current', counts: Object.fromEntries(lists.map((key, i) => [key, 40 + i])), ...Object.fromEntries(lists.map(key => [key, held(key)])) } });
+  assert.equal(text([inventoryRow(s, 'Deploys and live tests')]), 'ok | 40 deploys, 41 tested, 42 failed, 43 pending');
+  assert.equal(text([inventoryRow(s, 'Decisions and commits')]), 'ok | 44 decisions, 45 commits, 46 claimed, 47 assumptions');
+  assert.equal(text([inventoryRow(s, 'Blockers')]), 'ok | 48 recorded in status');
+  const deals = text(v.deals(s, ui));
+  assert.match(deals, /46 more deploy and test records are in the ledger than Mission Control holds/);
+  assert.match(deals, /Showing 8 of 166 records/);
+  // only rows the server did not send: a whole list adds nothing, and the empty sentence stays when nothing is hidden
+  const whole = world();
+  whole.ledger = ledger({ status: { at, truth: 'current', counts: { live: 1 }, live: [{ id: 'l', note: 'x', at }] } });
+  assert.doesNotMatch(text(v.deals(whole, ui)), /more deploy and test records/);
+  const hiddenOnly = world();
+  hiddenOnly.ledger = ledger({ status: { at, truth: 'current', counts: { verified: 3 } } });
+  assert.doesNotMatch(text(v.deals(hiddenOnly, ui)), /No deploys or live tests recorded/);
+});
+
 // The modules that render these claims build no zero sentence of their own: the text comes from the helpers above.
 const SRC = name => readFileSync(new URL(`../js/${name}`, import.meta.url), 'utf8');
 const LITERALS = {
