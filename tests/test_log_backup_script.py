@@ -1073,10 +1073,12 @@ class Failure(Case):
             live = argv[-2].startswith(str(stage))
             self.assertNotIn("--min-age", argv)  # live sources are snapshots; a bulk chunk carries no filter flags
             self.assertEqual("--files-from-raw" in argv, not live, argv)
-        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
+        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf" and "--min-size" not in c["argv"]]
         self.assertTrue(lists)
         for argv in lists:
             self.assertIn("--min-age", argv)  # static sources skip young files when their pass is listed
+        # the large-file tier lists live sources (--min-size) and sends a clone of the file, so it needs no --min-age
+        self.assertTrue([c for c in self.recorded() if c["argv"][0] == "lsf" and "--min-size" in c["argv"]])
 
     def test_snapshot_temp_files_live_outside_every_uploaded_tree(self):
         stage = self.home / ".agent-harness/backup-stage"
