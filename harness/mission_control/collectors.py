@@ -340,6 +340,7 @@ SAFE_READS = {
     ("ledger", "owners", "unrestricted"): "a redaction filter: unknown shows main's notes only; no row is dropped",
     ("wals", "owners", "unrestricted"): "a redaction filter: hides sub-agent notes not shown unrestricted",
     ("goodqa", "owners", "restricted_tickets"): "a privacy filter: restricted tickets are never polled or shown",
+    ("goodqa", "owners", "restricted_known"): "a privacy filter: before the owner read, no ticket is polled (fail closed)",
     # the org graph (Topology tab, goodqa#15950): owners and their transcripts for the pin, and the user's inbox (T243-2/4)
     ("org-graph", "session-pin", "pin"): "covered: session-pin is a feed of orggraph",
     ("org-graph", "owners", "rows"): "covered: owners is a feed of orggraph",

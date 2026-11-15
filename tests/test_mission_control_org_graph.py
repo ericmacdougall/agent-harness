@@ -732,6 +732,39 @@ class RestrictedFileRowIntegration(unittest.TestCase):
         app.org.run(now)
         self.assert_hidden(app, frames)
 
+    def polled(self, app):
+        """Run the comment collector a few times; the refs it asked GoodQA for and the ticket events it published."""
+        events = []
+        real = app.hub.publish
+        app.hub.publish = lambda event, *a, **k: (events.append(json.loads(json.dumps(event, default=str))),
+                                                  real(event, *a, **k))[1]
+        app.runner.outputs["ah-ticket-comments"] = lambda ref: (0, json.dumps({"comments": [
+            {"id": f"c-{ref[-3:]}", "createdAt": "2026-11-14T04:00:00Z", "body": f"SECRET-COMMENT on {ref}"}]}))
+        for i in range(4):
+            try:
+                app.tickets.run(time.time() + i)
+            except Exception:  # noqa: BLE001 - a failed read is the collector's own business here
+                pass
+        asked = [args[0] for kind, args, _t in app.runner.calls if kind == "ah-ticket-comments"]
+        return asked, [e for e in events if e.get("kind") == "ticket"]
+
+    def test_comment_polling_fails_closed_before_the_owner_read(self):  # PR 262 v2 receipt F2
+        app, _frames = self.app([self.owner()])
+        app.initiatives.run(time.time())   # the file names goodqa#777 and goodqa#15950; no owner read yet
+        self.assertEqual(app.tracked_tickets(), [])
+        asked, events = self.polled(app)
+        self.assertEqual((asked, events), ([], []), "nothing is polled while restriction is unknown")
+
+    def test_comment_polling_skips_restricted_tickets_after_the_owner_read(self):  # F2, and the control
+        app, _frames = self.app([self.owner()])
+        now = time.time()
+        app.owners.run(now)
+        app.initiatives.run(now)
+        asked, events = self.polled(app)
+        self.assertNotIn("goodqa#777", asked)
+        self.assertIn("goodqa#15950", asked, "an unrestricted ticket is still polled (not vacuous)")
+        self.assertFalse(any("777" in json.dumps(e) for e in events), events)
+
     def test_a_restricted_owner_appearing_later_republishes_without_the_row(self):  # not live: the org sig is unchanged
         owners = []
         app, frames = self.app(owners)
@@ -984,6 +1017,27 @@ class RestrictedTicketRoutes(unittest.TestCase):
         self.assertNotIn("9001", blob)
         self.assertNotIn("SECRET", blob)
         self.assertEqual(nodes(graph.snapshot())["o1"]["task"], "restricted")
+
+    def test_a_cue_for_a_node_already_gone_is_filtered_by_the_set(self):  # PR 262 v2 receipt F1
+        snap = {"nodes": [{"id": "o1", "kind": "owner", "ticket": "", "task": "x", "live": True},
+                          {"id": "work:goodqa#1", "kind": "work", "ref": "goodqa#1"},
+                          {"id": f"work:{SECRET_REF}", "kind": "work", "ref": SECRET_REF}],
+                "edges": [{"from": "work:goodqa#1", "to": f"work:{SECRET_REF}", "kind": "next"}],
+                "counts": {"owner": 1, "subagent": 0, "reviewer": 0, "work": 2, "live_owners": 1, "hidden_agents": 0},
+                "changes": [{"type": "removed", "node": f"work:{SECRET_REF}", "kind": "work"},
+                            {"type": "assigned", "node": "o1", "ticket": SECRET_REF},
+                            {"type": "dag", "edge": {"from": "work:goodqa#1", "to": f"work:{SECRET_REF}", "kind": "next"}},
+                            {"type": "message", "from": "coordinator", "to": "o1"}]}
+        visible = og.ticket_visibility(True, (SECRET_REF,))
+        gone_first = dict(snap, nodes=snap["nodes"][:2], counts=dict(snap["counts"], work=1))   # node already absent
+        for name, case in (("node present", snap), ("node already gone", gone_first)):
+            with self.subTest(case=name):
+                out = og._without_hidden(case, visible)
+                self.assertNotIn("9001", json.dumps(out), name)
+                self.assertEqual(out["counts"]["work"], 1, name)
+                self.assertEqual([c["type"] for c in out["changes"]], ["message"], name)
+        hidden_only = dict(snap, nodes=snap["nodes"][:1] + snap["nodes"][2:], counts=dict(snap["counts"], work=1))
+        self.assertEqual(og._without_hidden(hidden_only, visible)["counts"]["work"], 0, "counts follow the filter")
 
     def test_initiatives_get_only_visible_tickets(self):
         graph, _hub, _runner = self.run_route(self.ROUTES["blocks link"], restricted=())

@@ -372,6 +372,7 @@ body[data-tab="topology"] #scene-layer { display: block; }
 .org-list, .org-list ul { list-style: none; margin: 0; padding: 0; }
 .org-list ul { padding-left: 18px; border-left: 1px dashed var(--line); margin-left: 6px; }
 .org-list [role="treeitem"] { margin: 2px 0; }
+.org-list [role="treeitem"][aria-expanded="false"] > [role="group"], .org-list [role="group"][hidden] { display: none; }
 .org-list [role="treeitem"] > .org-row { display: block; padding: 6px 8px; border-radius: 4px; border-left: 4px solid var(--kind, var(--line-strong)); }
 .org-list [role="treeitem"]:focus { outline: none; }
 .org-list [role="treeitem"]:focus > .org-row { outline: 2px solid var(--focus); outline-offset: 1px; }

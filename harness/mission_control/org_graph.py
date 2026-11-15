@@ -537,32 +537,51 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
             "nodes": nodes, "edges": edges, "counts": counts, "gaps": gaps}
 
 
+def _work_ref(node_id) -> str:
+    """The ticket ref a `work:<ref>` node id names, else ""."""
+    return node_id[5:] if isinstance(node_id, str) and node_id.startswith("work:") else ""
+
+
 def _without_hidden(snapshot: dict | None, visible) -> dict | None:
-    """A snapshot built before a ticket became hidden, with every trace of it left out: its work node, the edges and
-    change cues that name that node, and an agent's ticket, task and mission (the agent is then drawn restricted)."""
+    """A snapshot built under an earlier restriction set, judged by the set of this moment (PR 262 v2 receipt F1): every
+    node, edge and change cue is checked against `visible` itself, never against which nodes happen to be present, so
+    a cue naming a work node that is already gone (a `removed` cue) is dropped too. Agents on a hidden ticket are drawn
+    restricted, and the counts are recomputed from what is left."""
     if not snapshot:
         return snapshot
-    gone = {n["id"] for n in snapshot.get("nodes") or [] if n.get("kind") == "work" and not visible(n.get("ref") or "")}
-    exposed = [n for n in snapshot.get("nodes") or [] if n.get("kind") in ("owner", "subagent", "reviewer")
-               and (not _ticket_ok(n.get("ticket"), visible) or _names_hidden_ticket(n.get("task"), visible)
-                    or _names_hidden_ticket(n.get("mission"), visible))]
-    if not gone and not exposed:
-        return snapshot
-    hidden_agents = {n["id"] for n in exposed}
+
+    def hidden_id(node_id) -> bool:
+        ref = _work_ref(node_id)
+        return bool(ref) and not visible(ref)
+
+    def agent_exposes(node) -> bool:
+        return node.get("kind") in ("owner", "subagent", "reviewer") and (
+            not _ticket_ok(node.get("ticket"), visible) or _names_hidden_ticket(node.get("task"), visible)
+            or _names_hidden_ticket(node.get("mission"), visible))
 
     def clean(node):
-        if node["id"] not in hidden_agents:
+        if not agent_exposes(node):
             return node
         return dict(node, ticket="", task="restricted", restricted=True,
                     mission=("idle" if node.get("mission") == "idle" else UNKNOWN) if node.get("kind") == "owner" else "")
 
     def cue_ok(change):
-        edge = change.get("edge") or {}
-        return change.get("node") not in gone and edge.get("from") not in gone and edge.get("to") not in gone \
-            and not (change.get("type") == "assigned" and not visible(change.get("ticket") or ""))
-    return dict(snapshot, nodes=[clean(n) for n in snapshot["nodes"] if n["id"] not in gone],
-                edges=[e for e in snapshot.get("edges") or [] if e.get("from") not in gone and e.get("to") not in gone],
-                changes=[c for c in snapshot.get("changes") or [] if cue_ok(c)])
+        edge = change.get("edge") if isinstance(change.get("edge"), dict) else {}
+        ticket = change.get("ticket")
+        return not any(hidden_id(x) for x in (change.get("node"), change.get("from"), change.get("to"),
+                                              edge.get("from"), edge.get("to"))) \
+            and not (ticket and not visible(str(ticket)))
+    nodes = [clean(n) for n in snapshot.get("nodes") or []
+             if not (n.get("kind") == "work" and not visible(n.get("ref") or _work_ref(n.get("id"))))]
+    edges = [e for e in snapshot.get("edges") or [] if not hidden_id(e.get("from")) and not hidden_id(e.get("to"))]
+    out = dict(snapshot, nodes=nodes, edges=edges, changes=[c for c in snapshot.get("changes") or [] if cue_ok(c)])
+    if isinstance(snapshot.get("counts"), dict):
+        counts = dict(snapshot["counts"])
+        for kind in ("owner", "subagent", "reviewer", "work"):
+            counts[kind] = sum(1 for n in nodes if n.get("kind") == kind)
+        counts["live_owners"] = sum(1 for n in nodes if n.get("kind") == "owner" and n.get("live"))
+        out["counts"] = counts
+    return out
 
 
 def _ticket_ok(value, visible) -> bool:

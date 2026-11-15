@@ -590,9 +590,12 @@ class App:
         return len(getattr(asks, "items", None) or []), len(getattr(asks, "stale", None) or [])
 
     def tracked_tickets(self):
+        """The tickets whose comments are polled. PR 262 v2 receipt F2: through the org graph's one visibility rule,
+        fail closed: before an owner read has said which tickets are restricted, no ticket is polled at all."""
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]
-        hidden = getattr(self.owners, "restricted_tickets", frozenset())
-        return [r for r in refs + self.owners.tickets() if not _same_ticket_in(r, hidden)]
+        visible = org_graph.ticket_visibility(getattr(self.owners, "restricted_known", False),
+                                              getattr(self.owners, "restricted_tickets", frozenset()))
+        return [r for r in refs + self.owners.tickets() if visible(str(r))]
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),

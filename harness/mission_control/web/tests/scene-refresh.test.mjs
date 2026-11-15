@@ -3,6 +3,7 @@
 // and leaves the geometry signature alone. Mounts the real scene.js on a small DOM (the #gl=off static view).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // ---- a DOM just big enough for scene.js: ids, attributes, a few selectors, focus and layout stubs
 const byIdRegistry = new Map();
@@ -162,4 +163,37 @@ test('a details-only update keeps the list\'s collapsed subtrees and focused row
   assert.ok(tree.textContent.includes('Mission-Beta') && tree.textContent.includes('Title-Beta'), 'the text still updates');
   assert.ok(!tree.textContent.includes('Mission-Alpha'));
   document.getElementById('org-view-toggle').click();
+});
+
+test('PR 262 v2 F5: collapsing a row hides its descendants, keyboard navigation skips them, and expanding shows them', () => {
+  store.setOrgGraph(snapshot(8, BEFORE));
+  document.getElementById('org-view-toggle').click();   // Show as list
+  const tree = document.getElementById('org-list');
+  const items = () => tree.querySelectorAll('[role="treeitem"]');
+  const item = id => items().find(i => i.dataset.nodeId === id);
+  const group = li => li.children.find(c => c.getAttribute?.('role') === 'group');
+  const key = (target, name) => (tree.listeners.keydown || []).forEach(f => f({ key: name, target, preventDefault() {}, stopPropagation() {} }));
+  const owner = item('own1');
+  if (owner.getAttribute('aria-expanded') === 'false') key(owner, 'ArrowRight');   // the test above left it collapsed
+  assert.equal(owner.getAttribute('aria-expanded'), 'true');
+  assert.equal(group(owner).hidden, false, 'expanded: the child group is shown');
+  owner.focus();
+  key(owner, 'ArrowLeft');
+  assert.equal(owner.getAttribute('aria-expanded'), 'false');
+  assert.equal(group(owner).hidden, true, 'collapsed: the child group is hidden, not only announced as collapsed');
+  key(owner, 'ArrowDown');
+  const landed = document.activeElement;
+  assert.ok(!group(owner).descendants().includes(landed), 'arrow down skips the hidden descendants');
+  store.setOrgGraph(snapshot(9, AFTER));                // a refresh keeps it collapsed and hidden
+  assert.equal(group(item('own1')).hidden, true);
+  assert.equal(item('own1').getAttribute('aria-expanded'), 'false');
+  key(item('own1'), 'ArrowRight');
+  assert.equal(item('own1').getAttribute('aria-expanded'), 'true');
+  assert.equal(group(item('own1')).hidden, false, 'expanded again: the descendants are shown');
+  document.getElementById('org-view-toggle').click();
+});
+
+test('PR 262 v2 F5: the stylesheet hides a collapsed row\'s group too', () => {
+  const css = readFileSync(new URL('../mission.css', import.meta.url), 'utf8');
+  assert.match(css, /\.org-list \[role="treeitem"\]\[aria-expanded="false"\] > \[role="group"\][^{]*\{ display: none; \}/);
 });

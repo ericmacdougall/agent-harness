@@ -105,6 +105,8 @@ export async function mountScene() {
       // Same tree, new details (PR 243 review F2): update each row in place, so a collapsed subtree stays collapsed
       // and the focused row keeps focus without being re-announced.
       for (const [entry] of flat) { const row = listRows.get(entry.node.id); if (row) fillRow(row, entry.node); }
+      // each child group follows its row's expansion state, whatever set it
+      list.querySelectorAll('[role="treeitem"][aria-expanded]').forEach(li => setExpanded(li, li.getAttribute('aria-expanded') !== 'false'));
       return;
     }
     const focusedId = document.activeElement?.closest?.('#org-list [role="treeitem"]')?.dataset.nodeId;
@@ -128,10 +130,10 @@ export async function mountScene() {
         listRows.set(entry.node.id, row);
         li.append(row);
         if (entry.children.length) {
-          li.setAttribute('aria-expanded', collapsed.has(entry.node.id) ? 'false' : 'true');
           const ul = el('ul'); ul.setAttribute('role', 'group');
           build(entry.children, ul, level + 1);
           li.append(ul);
+          setExpanded(li, !collapsed.has(entry.node.id));
         }
         parent.append(li);
       });
@@ -140,6 +142,13 @@ export async function mountScene() {
     const items = visibleItems();
     const target = items.find(i => i.dataset.nodeId === focusedId) || items[0];
     if (target) { target.tabIndex = 0; if (focusedId) target.focus(); }
+  }
+  // PR 262 v2 receipt F5: a collapsed row hides its child group (hidden, so it leaves the page and the accessibility
+  // tree), not only its aria-expanded; the CSS rule on [aria-expanded="false"] > [role="group"] backs it up.
+  function setExpanded(item, open) {
+    item.setAttribute('aria-expanded', open ? 'true' : 'false');
+    const group = item.children ? [...item.children].find(child => child.getAttribute?.('role') === 'group') : null;
+    if (group) group.hidden = !open;
   }
   const visibleItems = () => [...list.querySelectorAll('[role="treeitem"]')].filter(item => !item.parentElement.closest('[role="treeitem"][aria-expanded="false"]'));
   function moveFocus(item) { if (!item) return; list.querySelectorAll('[role="treeitem"]').forEach(i => { i.tabIndex = -1; }); item.tabIndex = 0; item.focus(); }
@@ -153,8 +162,8 @@ export async function mountScene() {
     else if (event.key === 'ArrowUp') moveFocus(items[i - 1]);
     else if (event.key === 'Home') moveFocus(items[0]);
     else if (event.key === 'End') moveFocus(items[items.length - 1]);
-    else if (event.key === 'ArrowRight') { if (expanded === 'false') item.setAttribute('aria-expanded', 'true'); else if (expanded === 'true') moveFocus(item.querySelector('[role="treeitem"]')); }
-    else if (event.key === 'ArrowLeft') { if (expanded === 'true') item.setAttribute('aria-expanded', 'false'); else moveFocus(item.parentElement.closest('[role="treeitem"]')); }
+    else if (event.key === 'ArrowRight') { if (expanded === 'false') setExpanded(item, true); else if (expanded === 'true') moveFocus(item.querySelector('[role="treeitem"]')); }
+    else if (event.key === 'ArrowLeft') { if (expanded === 'true') setExpanded(item, false); else moveFocus(item.parentElement.closest('[role="treeitem"]')); }
     else if (event.key === 'Enter' || event.key === ' ') { if (byId.has(item.dataset.nodeId)) select('org', item.dataset.nodeId); }
     else handled = false;
     if (handled) { event.preventDefault(); event.stopPropagation(); }

@@ -3,6 +3,8 @@
 import { setInitiatives, setOwners, setSources, setHost, seedEvents, ingestEvent, setConnection, setChat, setCodex, setChatTransport, setApproveTransport, setAsks, setLedger, setRequirementTransport, setOrgGraph, setReads } from './store.js';
 
 let shownSession = null;
+let resyncingFor = null;   // the ledger session a state reload is in flight for (one at a time)
+let resyncedFor = null;    // the ledger session the last reload was for: never reloaded twice for the same one
 
 let csrf = '';
 let source = null;
@@ -76,10 +78,16 @@ function connect() {
     setLedger(data);
     // goodqa#15961 review A-7: the ledger was read for another session than the one this page shows (the pin
     // moved). Reload the whole state once, so the header, the lists and the session every write names agree.
-    if (shownSession && typeof data.session === 'string' && data.session && data.session !== shownSession) {
+    // PR 262 v2 receipt F3: also from an unpinned page (shownSession ""), so a page opened before the pin landed picks
+    // up the session once it arrives, instead of sending "" and being refused until a manual reload.
+    if (shownSession !== null && typeof data.session === 'string' && data.session && data.session !== shownSession
+        && resyncingFor === null && resyncedFor !== data.session) {
+      const target = data.session;
+      resyncingFor = target;
       shownSession = null;   // writes are refused (409) until the reload names the new session
       // review N-2: a failed reload is retried (one timer at a time), so writes do not stay refused until a reconnect
-      const reload = () => loadState().catch(() => { setConnection('offline'); clearTimeout(resyncTimer); resyncTimer = setTimeout(reload, 5000); });
+      const reload = () => loadState().then(() => { resyncingFor = null; resyncedFor = target; })
+        .catch(() => { setConnection('offline'); clearTimeout(resyncTimer); resyncTimer = setTimeout(reload, 5000); });
       reload();
     }
   });
@@ -202,4 +210,4 @@ export async function start() {
   }
 }
 
-export function stop() { source?.close(); source = null; clearTimeout(resyncTimer); }
+export function stop() { source?.close(); source = null; clearTimeout(resyncTimer); resyncingFor = resyncedFor = null; }
