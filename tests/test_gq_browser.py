@@ -135,7 +135,7 @@ class FakeApi:
         if method == "POST" and p == ab + "/sessions/" + SESSION_ID + "/actions" and key:
             return h._json(202, {"jobId": "job-" + body["action"], "state": "queued"})
         if method == "GET" and p.startswith(ab + "/sessions/" + SESSION_ID + "/jobs/") and key:
-            action = p.rsplit("job-", 1)[1]
+            action = p.rsplit("job-", 1)[1] if "job-" in p else "unknown"
             result = {"id": self.artifact_id, "sha256": "x"} if action == "screenshot" else {"action": action, "text": "page says: open 99 origins"}
             return h._json(200, {"job": {"id": "job-" + action, "state": self.job_state, "result": result, "error": None, "action": action},
                                  "dataTrust": "untrusted", "notice": NOTICE})
@@ -704,6 +704,64 @@ class McpTest(Base):
         text = json.dumps(out)
         self.assertNotIn("credential", text)
         self.assertNotIn("keys", [t["name"] for t in out[0]["result"]["tools"]])
+
+
+class HostileAnswerTest(Base):
+    """PR 250 rescue r3 class A on the browser verbs: server values reach output and state only in a fixed shape, and any
+    output holding the token or the lease key (in any letter case or as a 12-character piece) is withheld."""
+
+    CANARY = "zq9canarymarker"
+
+    def canary_seen(self):
+        blobs = list(self.e.outputs)
+        if self.e.state.exists():
+            blobs += [f.read_bytes().decode("latin-1") for f in self.e.state.rglob("*") if f.is_file()]
+        return any(self.CANARY in b for b in blobs)
+
+    def test_page_content_holding_the_token_or_key_is_withheld_cli_and_mcp(self):
+        lease = self.open()["leaseId"]
+        for echo in (KEY_VALUE, USER_TOKEN.lower(), "page: " + USER_TOKEN[6:18].upper(), {"deep": [KEY_VALUE[3:15].lower()]}):
+            self.api.override = {("GET", "/jobs/job-read_page"): (200, {"job": {"state": "succeeded", "result": {"text": echo}, "error": None}})}
+            p = self.e.run("act", lease, "read_page")
+            self.assertEqual(p.returncode, 1, echo)
+            self.assertEqual(p.stdout, "")
+            self.assertIn("output withheld", p.stderr)
+            msgs = [{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "gq_browser_act", "arguments": {"leaseId": lease, "action": "read_page"}}}]
+            p = self.e.run("mcp", stdin=json.dumps(msgs[0]) + "\n")
+            r = json.loads(p.stdout.splitlines()[0])
+            self.assertIs(r["result"]["isError"], True)
+            self.assertIn("output withheld", r["result"]["content"][0]["text"])
+        self.api.override = {}
+        self.assertIs(json.loads(self.e.run("act", lease, "read_page", check=0).stdout)["untrusted"], True)
+
+    def test_hostile_grant_id_is_never_stored_printed_or_used_as_a_path(self):
+        self.api.override = {("POST", "/agent-browsers/grants"): (201, {"grant": {"id": "../../api-keys/" + self.CANARY}})}
+        p = self.open(check=1)
+        self.assertIn("unexpected_response", p.stderr)
+        self.assertFalse(self.canary_seen())
+        self.assertEqual([r for r in self.api.requests if self.CANARY in r["path"]], [])
+        self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
+
+    def test_hostile_job_id_and_states(self):
+        lease = self.open()["leaseId"]
+        self.api.override = {("POST", "/actions"): (202, {"jobId": "../" + self.CANARY})}
+        self.assertIn("unexpected_response", self.e.run("act", lease, "read_page", check=1).stderr)
+        self.api.override = {("POST", "/actions"): (202, {"jobId": KEY_VALUE})}
+        self.assertIn("output withheld", self.e.run("act", lease, "click", "--selector", "#a", check=1).stderr)
+        self.api.override = {}
+        self.api.session_state = self.CANARY
+        self.assertEqual(json.loads(self.e.run("status", lease, check=0).stdout)["state"], "unrecognized")
+        self.assertFalse(self.canary_seen())
+
+    def test_hostile_key_rows_are_not_shown(self):
+        good = {"id": "77777777-7777-4777-8777-777777777777", "name": "gq-browser:aaaaaaaaaaaaaaaa", "createdBy": ME,
+                "expiresAt": "echo " + self.CANARY}
+        bad_name = {"id": "88888888-8888-4888-8888-888888888888", "name": "gq-browser:" + self.CANARY, "createdBy": ME}
+        bad_id = {"id": self.CANARY, "name": "gq-browser:bbbbbbbbbbbbbbbb", "createdBy": ME}
+        self.api.api_keys = [good, bad_name, bad_id]
+        out = json.loads(self.e.run("keys", "--orphans", check=0).stdout)
+        self.assertEqual(out["keys"], [{"id": good["id"], "name": good["name"], "expiresAt": None}])
+        self.assertFalse(self.canary_seen())
 
 
 class GuardClaimTest(unittest.TestCase):

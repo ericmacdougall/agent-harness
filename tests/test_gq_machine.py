@@ -30,11 +30,26 @@ TERMINAL = {"ok", "error", "refused", "expired", "cancelled", "denied"}
 HANDLE_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
+RELEASED_AT = "2026-11-14T22:00:00.000Z"
+
+
+def lease_id(n):
+    """The n-th lease the fake makes: LEASE first, then other strict uuids."""
+    return LEASE if n == 0 else "%08x-9999-4999-8999-999999999999" % (0x99999999 - n)
+
+
 class FakeMachines:
     """Mirrors routes.ts for a user token with an enrollment grant on MACHINE. Knobs: fail[(method, suffix)] = (status, code),
-    drop = {(method, suffix)} closes the connection without an answer, hold = {(method, suffix)} blocks until release()."""
+    drop = {(method, suffix)} closes the connection without an answer, hold = {(method, suffix)} blocks until release(),
+    mutate(method, path, status, body) -> (status, body) rewrites every JSON answer (the hostile-server tests).
 
-    def __init__(self):
+    Leases follow service.ts (bugtracker dbb83448): the same holder adopts its live lease (acquireLease); release checks the
+    holder first (requireLeaseHolder: 409 lease_holder_mismatch), then answers 200 with releasedAt, also for a lease that
+    had already ended (releaseLease returns row ?? lease); renew of an ended lease is 409 lease_ended (renewLease)."""
+
+    def __init__(self, token=USER_TOKEN):
+        self.token = token
+        self.mutate = None
         self.requests = []
         self.fail = {}
         self.drop = set()
@@ -44,10 +59,12 @@ class FakeMachines:
         self.unhold = threading.Event()
         self.command_status = "ok"
         self.lease_status = 201
+        self.lease_reason = None
         self.lease_expires = "2026-11-14T23:00:00.000Z"
         self.artifact_bytes = PNG
         self.artifact_ids = [ARTIFACT]
-        self.leases = {}  # holder -> lease id
+        self.leases = {}  # holder -> live lease id
+        self.lease_rows = {}  # lease id -> {"holder": h, "released": bool}
         self.commands = {}
         self.lock = threading.Lock()
         api = self
@@ -76,12 +93,14 @@ class FakeMachines:
                 for (m, suffix), (status, code) in api.fail.items():
                     if m == method and re.search(suffix, path):
                         # A hostile error body that echoes the token: the client must never print it.
-                        return self._json(status, {"error": {"code": code, "message": "denied for " + USER_TOKEN}})
-                if self.headers.get("authorization") != "Bearer " + USER_TOKEN:
+                        return self._json(status, {"error": {"code": code, "message": "denied for " + api.token}})
+                if self.headers.get("authorization") != "Bearer " + api.token:
                     return self._json(401, {"error": {"code": "unauthorized", "message": "no"}})
                 return api.route(self, method, path[len("/v1"):], body)
 
             def _json(self, status, obj):
+                if api.mutate:
+                    status, obj = api.mutate(self.command, urllib.parse.urlparse(self.path).path, status, obj)
                 data = json.dumps(obj).encode()
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
@@ -106,13 +125,32 @@ class FakeMachines:
             return h._json(404, {"error": {"code": "not_found", "message": "Machine not found"}})
         if method == "POST" and p == "/machines/%s/leases" % MACHINE:
             if self.lease_status == 202:
-                return h._json(202, {"approval": {"id": "ask"}, "status": "awaiting_approval"})
+                body202 = {"approval": {"askId": "ask", "status": "pending"}}
+                if self.lease_reason:
+                    body202["reason"] = self.lease_reason
+                return h._json(202, body202)
             holder = (body or {}).get("holder")
-            lid = self.leases.setdefault(holder, LEASE)  # service.ts:871: the same holder adopts its live lease
-            return h._json(201, {"lease": {"id": lid, "machineId": MACHINE, "mode": "control", "expiresAt": self.lease_expires}})
-        if method == "POST" and p in ("/machine-leases/%s/release" % LEASE, "/machine-leases/%s/renew" % LEASE):
-            return h._json(200, {"lease": {"id": LEASE, "machineId": MACHINE, "releasedAt": "x" if p.endswith("release") else None,
-                                           "expiresAt": self.lease_expires}})
+            with self.lock:
+                lid = self.leases.get(holder)
+                if lid is None or self.lease_rows[lid]["released"]:  # service.ts:871: the same holder adopts its live lease
+                    lid = lease_id(len(self.lease_rows))
+                    self.leases[holder] = lid
+                    self.lease_rows[lid] = {"holder": holder, "released": False}
+            return h._json(201, {"lease": {"id": lid, "machineId": MACHINE, "mode": "control", "expiresAt": self.lease_expires,
+                                           "releasedAt": None}})
+        m = re.match(r"^/machine-leases/([0-9a-f-]{36})/(release|renew)$", p)
+        if method == "POST" and m:
+            row = self.lease_rows.get(m.group(1))
+            if row is None:
+                return h._json(404, {"error": {"code": "not_found", "message": "Lease not found"}})
+            if m.group(2) == "renew" and row["released"]:
+                return h._json(409, {"error": {"code": "lease_ended", "message": "This lease was released"}})
+            if (body or {}).get("holder") != row["holder"]:
+                return h._json(409, {"error": {"code": "lease_holder_mismatch", "message": "send its matching holder"}})
+            if m.group(2) == "release":
+                row["released"] = True
+            return h._json(200, {"lease": {"id": m.group(1), "machineId": MACHINE, "mode": "control",
+                                           "releasedAt": RELEASED_AT if row["released"] else None, "expiresAt": self.lease_expires}})
         if method == "POST" and p == "/machines/%s/commands" % MACHINE:
             cid = "c%07d-0000-4000-8000-000000000000" % (len(self.commands) + 1)
             self.commands[cid] = body
@@ -138,6 +176,12 @@ class FakeMachines:
             return
         return h._json(404, {"error": {"code": "not_found", "message": "no route"}})
 
+    def seed(self, holder, lid=LEASE):
+        """Register a live lease made outside the fake's create route (the tests that write state.json directly)."""
+        with self.lock:
+            self.leases[holder] = lid
+            self.lease_rows[lid] = {"holder": holder, "released": False}
+
     def calls(self, method=None, pattern=None):
         return [r for r in self.requests if (method is None or r["method"] == method) and (pattern is None or re.search(pattern, r["path"]))]
 
@@ -158,7 +202,8 @@ class Env:
         cfg = self.home / ".config" / "goodqa"
         cfg.mkdir(parents=True)
         self.token = cfg / "user-token"
-        self.token.write_text(USER_TOKEN + "\n")
+        self.token_value = api.token
+        self.token.write_text(api.token + "\n")
         os.chmod(self.token, 0o600)
         d = {"allowedBases": [api.base]}
         if allow:
@@ -199,9 +244,26 @@ class Env:
         for f in self.home.rglob("*"):
             if f.is_file() and f != self.token:
                 blobs.append(f.read_bytes().decode("latin-1"))
-        forms = {USER_TOKEN, base64.b64encode(USER_TOKEN.encode()).decode(), urllib.parse.quote(USER_TOKEN, safe="")}
-        forms |= {USER_TOKEN[i:i + 12] for i in range(len(USER_TOKEN) - 11)}
+        t = self.token_value
+        forms = {t, base64.b64encode(t.encode()).decode(), urllib.parse.quote(t, safe="")}
+        forms |= {t[i:i + 12] for i in range(len(t) - 11)}
         return [f for f in forms if any(f in b for b in blobs)]
+
+    def seed(self, api, lease=LEASE):
+        """A local open lease without a request: the state op_machine_open writes after a 201 (hostile-server tests)."""
+        handle = os.urandom(8).hex()
+        self.root.mkdir(parents=True, exist_ok=True)
+        for p in (self.root.parent, self.root):
+            os.chmod(p, 0o700)
+        d = self.root / handle
+        d.mkdir(mode=0o700)
+        holder = "gq-machine:" + handle
+        state = {"kind": "machine", "handle": handle, "machineId": MACHINE, "base": api.base, "holder": holder, "ttl": 300,
+                 "leaseId": lease, "leaseRequested": True, "closed": False, "createdAt": "2026-11-14T21:00:00.000Z",
+                 "expiresAt": "2026-11-14T23:00:00.000Z"}
+        (d / "state.json").write_text(json.dumps(state))
+        api.seed(holder, lease)
+        return handle
 
     def close(self):
         self.tmp.cleanup()
@@ -345,6 +407,16 @@ class Refusals(Base):
         self.e = Env(self.api, {"allowedMachines": [OTHER]})
         self.e.run("open", MACHINE, check=2)
         self.assertEqual(self.api.requests, [])
+
+    def test_lease_not_yours_on_command_or_renew_does_not_close_the_lease(self):
+        # rescue r3 class B: lease_not_yours (service.ts createCommand) is no termination signal.
+        h = self.e.open()
+        for args, route in ((["click", h, "--x", "1", "--y", "1"], ("POST", r"/commands$")), (["renew", h], ("POST", r"/renew$"))):
+            self.api.fail[route] = (409, "lease_not_yours")
+            self.e.run(*args, check=1)
+            del self.api.fail[route]
+            self.assertFalse(self.e.state(h)["closed"], args[0])
+        self.assertEqual([r["handle"] for r in json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]], [h])
 
     def test_ended_lease_on_command_is_marked_closed_and_not_retried(self):
         h = self.e.open()
@@ -618,23 +690,30 @@ class Interrupts(Base):
         self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
 
     def test_recovery_refusal_other_than_absent_keeps_the_lease_listed(self):
-        # PR 250 receipt F1: after a lost create, only not-found or not-yours proves there is no lease.
-        for status, code in ((500, "internal_error"), (429, "rate_limited"), (403, "forbidden"), (409, "lease_held")):
+        # PR 250 receipt F1 and rescue r3 class B: after a lost create, a re-ask answer proves there is no lease of ours
+        # only when it is a 202 with reason access_mode (service.ts acquireLease asks only when this principal holds no
+        # live control lease). A 404 may be the machines switch or the grant (routes.ts machineFor), lease_held may be our
+        # own holderless lease, lease_not_yours is never sent by acquireLease: all of them keep the lease listed.
+        for status, code in ((500, "internal_error"), (429, "rate_limited"), (403, "forbidden"), (409, "lease_held"),
+                             (404, "not_found"), (409, "lease_not_yours"), (409, "conflict"), (409, "zz_new_code"), (401, "unauthorized")):
             before = len(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"])
             self.api.drop_once.add(("POST", r"/leases$"))
             self.api.fail[("POST", r"/leases$")] = (status, code)
-            self.e.run("open", MACHINE, check=1)
+            p = self.e.run("open", MACHINE, check=1)
+            self.assertIn("lease kept open", p.stderr, (status, code))
             del self.api.fail[("POST", r"/leases$")]
             rows = json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]
             self.assertEqual(len(rows), before + 1, (status, code))
-        for status, code in ((404, "not_found"), (409, "lease_not_yours")):
+
+    def test_recovery_approval_ask_proves_absence_only_for_access_mode(self):
+        for reason, listed in (("access_mode", 0), ("machine_paused", 1), (None, 1)):
             before = len(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"])
             self.api.drop_once.add(("POST", r"/leases$"))
-            self.api.fail[("POST", r"/leases$")] = (status, code)
+            self.api.lease_status, self.api.lease_reason = 202, reason
             self.e.run("open", MACHINE, check=1)
-            del self.api.fail[("POST", r"/leases$")]
+            self.api.lease_status, self.api.lease_reason = 201, None
             rows = json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]
-            self.assertEqual(len(rows), before, (status, code))
+            self.assertEqual(len(rows), before + listed, reason)
 
     def test_create_5xx_is_treated_like_a_lost_answer(self):
         # A 5xx on create does not prove the server made no lease: recover with the same holder and release.
@@ -662,7 +741,9 @@ class Mcp(Base):
     def _rpc(self, p, mid, method, params=None):
         p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}}) + "\n")
         p.stdin.flush()
-        return json.loads(p.stdout.readline())
+        line = p.stdout.readline()
+        self.e.outputs.append(line)  # every MCP answer is scanned by tearDown too
+        return json.loads(line)
 
     def test_mcp_tools_drive_a_lease_and_release_it_when_the_server_exits(self):
         p = self.e.popen(mcp=True)
@@ -685,6 +766,362 @@ class Mcp(Base):
         self.e.outputs += [out, err]
         self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
         self.assertTrue(self.e.state(h)["closed"])
+
+
+class ReleaseUncertainty(Base):
+    """Rescue r3 class B: only a positive end signal closes a lease. Anything else keeps it open, listed, retryable, and
+    the verb reports failure. Server contract: bugtracker dbb83448 machines/routes.ts release (leaseFor, machineFor) and
+    service.ts releaseLease / requireLeaseHolder / leaseEndedError; openapi.ts documents 200 {lease} and 409
+    lease_holder_mismatch for release."""
+
+    def orphans(self):
+        return [r["handle"] for r in json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]]
+
+    def assert_open_then_retry_releases(self, h):
+        self.assertFalse(self.e.state(h)["closed"])
+        self.assertIn(h, self.orphans())
+        self.api.fail.clear()
+        self.api.drop.clear()
+        self.api.mutate = None
+        p = self.e.run("close", h, check=0)
+        self.assertEqual(json.loads(p.stdout)["result"], "released")
+        self.assertTrue(self.e.state(h)["closed"])
+        self.assertNotIn(h, self.orphans())
+
+    def test_unrelated_409_on_release_keeps_the_lease_then_retry_releases(self):
+        # v2 receipt F2: a lease_holder_mismatch 409 says the lease is live under another holder, not that it ended.
+        h = self.e.open()
+        self.api.fail[("POST", r"/release$")] = (409, "lease_holder_mismatch")
+        p = self.e.run("close", h, check=1)
+        self.assertIn("release_failed (HTTP 409 lease_holder_mismatch)", p.stderr)
+        self.assertIn("lease kept open", p.stderr)
+        self.assert_open_then_retry_releases(h)
+
+    def test_unrecognized_409_code_on_release_keeps_the_lease(self):
+        for code in ("conflict", "zz_brand_new_code", "already_released", "lease_held"):
+            h = self.e.open()
+            self.api.fail[("POST", r"/release$")] = (409, code)
+            self.e.run("close", h, check=1)
+            self.assert_open_then_retry_releases(h)
+
+    def _sigterm_mid_click(self, h):
+        self.api.hold.add(("GET", r"/machine-commands/[^/]+$"))
+        self.api.held.clear()
+        proc = self.e.popen("click", h, "--x", "1", "--y", "1")
+        reached = self.api.held.wait(5)
+        if reached:
+            proc.send_signal(signal.SIGTERM)
+            time.sleep(0.3)
+        self.api.release()
+        out, err = proc.communicate(timeout=30)
+        self.e.outputs += [out, err]
+        self.api.unhold.clear()
+        return proc.returncode, err
+
+    def test_release_errors_at_every_entry_point_keep_the_lease_open(self):
+        # 5xx, 429, 403, 404 (machineFor and leaseFor share it), 401 and a lost answer, through close, the cleanup of a
+        # failed open, the awaiting-approval cleanup, SIGTERM mid-action and the MCP server's exit.
+        failures = [(500, "internal_error"), (503, "database_busy"), (429, "rate_limited"), (403, "forbidden"),
+                    (404, "not_found"), (401, "user_token_expired"), "lost"]
+
+        def arm(f):
+            if f == "lost":
+                self.api.drop.add(("POST", r"/release$"))
+            else:
+                self.api.fail[("POST", r"/release$")] = f
+
+        for f in failures:
+            with self.subTest(entry="close", failure=f):
+                h = self.e.open()
+                arm(f)
+                self.e.run("close", h, check=1)
+                self.assert_open_then_retry_releases(h)
+            with self.subTest(entry="open cleanup", failure=f):
+                before = set(self.orphans())
+                self.api.drop_once.add(("POST", r"/leases$"))
+                arm(f)
+                p = self.e.run("open", MACHINE, check=1)
+                self.assertIn("lease_recovered", p.stderr)
+                new = set(self.orphans()) - before
+                self.assertEqual(len(new), 1)
+                self.assert_open_then_retry_releases(new.pop())
+            with self.subTest(entry="awaiting approval", failure=f):
+                h = self.e.open()
+                self.api.command_status = "awaiting_approval"
+                arm(f)
+                self.e.run("click", h, "--x", "1", "--y", "1", check=1)
+                self.api.command_status = "ok"
+                self.assert_open_then_retry_releases(h)
+            with self.subTest(entry="sigterm", failure=f):
+                h = self.e.open()
+                arm(f)
+                rc, _ = self._sigterm_mid_click(h)
+                self.assertNotEqual(rc, 0)
+                self.assert_open_then_retry_releases(h)
+            with self.subTest(entry="mcp exit", failure=f):
+                proc = self.e.popen(mcp=True)
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                             "params": {"name": "gq_machine_open", "arguments": {"machineId": MACHINE}}}) + "\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                self.e.outputs.append(line)
+                h = json.loads(json.loads(line)["result"]["content"][0]["text"])["handle"]
+                arm(f)
+                out, err = proc.communicate(timeout=30)
+                self.e.outputs += [out, err]
+                self.assert_open_then_retry_releases(h)
+
+    def test_a_2xx_release_that_does_not_name_the_lease_released_is_no_proof(self):
+        # service.ts releaseLease returns `row ?? lease`: a stale row can come back with releasedAt null.
+        bodies = [{}, {"lease": {"id": LEASE, "releasedAt": None}}, {"lease": {"id": OTHER, "releasedAt": RELEASED_AT}},
+                  {"lease": {"id": LEASE, "releasedAt": "yes"}}, {"ok": True}]
+        for b in bodies:
+            h = self.e.open()
+
+            def mutate(method, path, status, body, b=b):
+                return (200, b) if path.endswith("/release") else (status, body)
+            self.api.mutate = mutate
+            p = self.e.run("close", h, check=1)
+            self.assertIn("release_unconfirmed", p.stderr, b)
+            self.assert_open_then_retry_releases(h)
+
+    def test_lease_ended_on_release_closes(self):
+        # The contract's ended code (service.ts leaseEndedError) is the one 409 that proves the end.
+        h = self.e.open()
+        self.api.fail[("POST", r"/release$")] = (409, "lease_ended")
+        p = self.e.run("close", h, check=0)
+        self.assertIn("already_ended (lease_ended)", p.stdout)
+        self.assertTrue(self.e.state(h)["closed"])
+        self.assertNotIn(h, self.orphans())
+
+    def test_orphan_without_a_lease_id_refuses_actions_and_an_interrupt_never_hides_it(self):
+        # _mrelease(recover=False) with leaseRequested and no leaseId used to fall through to closed.
+        self.api.drop.add(("POST", r"/leases$"))
+        self.e.run("open", MACHINE, check=1)
+        self.api.drop.clear()
+        (h,) = self.orphans()
+        self.assertIsNone(self.e.state(h)["leaseId"])
+        n = len(self.api.requests)
+        rc, err = self._sigterm_mid_click(h)
+        self.assertEqual(rc, 2, err)  # refused locally: there is no confirmed lease to name
+        self.assertEqual(len(self.api.requests), n)
+        self.e.run("renew", h, check=2)
+        self.e.run("shot", h, check=2)
+        self.assertEqual(len(self.api.requests), n)
+        self.assertEqual(self.orphans(), [h])
+        p = self.e.run("close", h, check=0)  # close re-asks with the same holder and releases
+        self.assertEqual(json.loads(p.stdout)["result"], "released")
+
+
+# ------------------------------------------------------------------ hostile server (rescue r3 class A)
+
+HOSTILE_TOKEN = "gqu_sentinelhostiletoken_q1w2e3r4t5y6u7i8"  # lowercase, so no letter case can save a leak
+FRAG = HOSTILE_TOKEN[5:17]
+CANARY = "zq9canarymarker"  # no credential: only a closed output schema keeps it out (the backstop cannot see it)
+KINDS = {"token": HOSTILE_TOKEN, "frag": FRAG, "canary": CANARY,
+         "nest": {"v": CANARY, "t": HOSTILE_TOKEN, "l": [FRAG, {"d": [CANARY, HOSTILE_TOKEN]}]}}
+NORM = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def route_of(method, path):
+    return "%s %s" % (method, NORM.sub(":id", path))
+
+
+def leaf_paths(obj, prefix=()):
+    if isinstance(obj, dict):
+        if not obj:
+            yield prefix
+        for k, v in obj.items():
+            yield from leaf_paths(v, prefix + (k,))
+    elif isinstance(obj, list):
+        if not obj:
+            yield prefix
+        for i, v in enumerate(obj):
+            yield from leaf_paths(v, prefix + (i,))
+    else:
+        yield prefix
+
+
+def set_leaf(obj, path, value):
+    obj = json.loads(json.dumps(obj))
+    if not path:
+        return value
+    cur = obj
+    for k in path[:-1]:
+        cur = cur[k]
+    cur[path[-1]] = value
+    return obj
+
+
+def add_extras(obj):
+    if isinstance(obj, dict):
+        out = {k: add_extras(v) for k, v in obj.items()}
+        out["zz_extra"] = KINDS["nest"]
+        out["message"] = HOSTILE_TOKEN
+        return out
+    if isinstance(obj, list):
+        return [add_extras(v) for v in obj] + [KINDS["nest"]]
+    return obj
+
+
+def leaks(text):
+    low = text.lower()
+    found = [f for f in {HOSTILE_TOKEN, CANARY} | {HOSTILE_TOKEN[i:i + 12] for i in range(len(HOSTILE_TOKEN) - 11)} if f in low]
+    for form in (base64.b64encode(HOSTILE_TOKEN.encode()).decode(), urllib.parse.quote(HOSTILE_TOKEN, safe=""),
+                 base64.b64encode(CANARY.encode()).decode()):
+        if form in text:
+            found.append(form)
+    return found
+
+
+class HostileServer(unittest.TestCase):
+    """Every JSON answer field of every machine verb carries the lowercase token, a 12-character piece of it, a
+    non-credential canary or a nested mix of them (plus extra keys at every level and hostile error bodies). Neither the
+    token, any piece of it, nor the canary may reach CLI stdout or stderr, MCP output or any state file."""
+
+    VERBS = {
+        "open": lambda h: ["open", MACHINE],
+        "shot": lambda h: ["shot", h],
+        "click": lambda h: ["click", h, "--x", "1", "--y", "2"],
+        "type": lambda h: ["type", h, "--text", "hello"],
+        "key": lambda h: ["key", h, "--keys", "ctrl+l"],
+        "renew": lambda h: ["renew", h],
+        "close": lambda h: ["close", h],
+    }
+    MCP = {
+        "open": lambda h: ("gq_machine_open", {"machineId": MACHINE}),
+        "shot": lambda h: ("gq_machine_screenshot", {"handle": h}),
+        "click": lambda h: ("gq_machine_click", {"handle": h, "x": 1, "y": 2}),
+        "type": lambda h: ("gq_machine_type", {"handle": h, "text": "hello"}),
+        "key": lambda h: ("gq_machine_key", {"handle": h, "keys": "ctrl+l"}),
+        "renew": lambda h: ("gq_machine_renew", {"handle": h}),
+        "close": lambda h: ("gq_machine_close", {"handle": h}),
+    }
+
+    def setUp(self):
+        self.api = FakeMachines(token=HOSTILE_TOKEN)
+        self.e = Env(self.api)
+        self.e.env["GQ_MACHINE_WAIT_SECONDS"] = "1"
+
+    def tearDown(self):
+        self.api.close()
+        self.e.close()
+
+    def record(self, verb):
+        """The JSON answers a clean run of the verb gets: {route: (status, body)}."""
+        seen = {}
+
+        def rec(method, path, status, body):
+            seen.setdefault(route_of(method, path), (status, body))
+            return status, body
+        self.api.mutate = rec
+        self.e.run(*self.VERBS[verb](self.e.seed(self.api)), check=0)
+        self.api.mutate = None
+        self.assertTrue(seen, verb)
+        return seen
+
+    def cases(self, verb):
+        for route, (status, body) in sorted(self.record(verb).items()):
+            for path in sorted(set(leaf_paths(body)), key=repr):
+                for kind, value in KINDS.items():
+                    yield "%s %s=%s" % (route, "/".join(map(str, path)), kind), route, (lambda b, p=path, v=value, st=status: (st, set_leaf(b, p, v)))
+            yield "%s +extras" % route, route, (lambda b, st=status: (st, add_extras(b)))
+            for est in (409, 500, 429):
+                err = {"error": {"code": HOSTILE_TOKEN, "message": CANARY, "details": KINDS["nest"]}, "lease": add_extras(body)}
+                yield "%s error %d" % (route, est), route, (lambda b, est=est, err=err: (est, err))
+            yield "%s error frag" % route, route, (lambda b: (409, {"error": {"code": FRAG, "message": FRAG}}))
+
+    def arm(self, route, fn):
+        def mutate(method, path, status, body):
+            return fn(body) if route_of(method, path) == route else (status, body)
+        self.api.mutate = mutate
+
+    def state_leaks(self):
+        """Leaks in any state file (screenshots excluded: they are image bytes the fake never alters). Each leaking file
+        version is reported once, not again by every later case."""
+        bad = []
+        seen = self.__dict__.setdefault("_reported", set())
+        for f in self.e.root.rglob("*"):
+            if f.is_file() and not f.name.endswith((".png", ".jpg")):
+                data = f.read_bytes()
+                found = leaks(data.decode("latin-1"))
+                if found and (str(f), data) not in seen:
+                    seen.add((str(f), data))
+                    bad += ["%s:%s" % (f.name, x) for x in found]
+        return bad
+
+    def test_cli_never_prints_or_stores_server_text(self):
+        failures, n = [], 0
+        for verb in self.VERBS:
+            for name, route, fn in self.cases(verb):
+                h = self.e.seed(self.api)
+                self.arm(route, fn)
+                p = subprocess.run(self.e.argv(*self.VERBS[verb](h)), capture_output=True, text=True, env=self.e.env, timeout=60)
+                self.api.mutate = None
+                n += 1
+                found = leaks(p.stdout + p.stderr) + self.state_leaks()
+                if found:
+                    failures.append("%s %s: %s" % (verb, name, sorted(set(found))[:3]))
+        p = self.e.run("list")  # every handle the cases left behind, open or closed
+        self.assertGreater(len(json.loads(p.stdout)["leases"]), 200)
+        if leaks(p.stdout + p.stderr):
+            failures.append("list: %s" % leaks(p.stdout + p.stderr))
+        self.assertGreater(n, 200)
+        self.assertEqual(failures, [], "%d of %d hostile cases leaked:\n%s" % (len(failures), n, "\n".join(failures[:40])))
+
+    def test_mcp_never_returns_server_text(self):
+        cases = []
+        for verb in self.MCP:
+            cases += [(verb, name, route, fn) for name, route, fn in self.cases(verb)]
+        proc = self.e.popen(mcp=True)
+        failures = []
+        try:
+            for i, (verb, name, route, fn) in enumerate(cases):
+                h = self.e.seed(self.api)
+                tool, args = self.MCP[verb](h)
+                self.arm(route, fn)
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call",
+                                             "params": {"name": tool, "arguments": args}}) + "\n")
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                self.api.mutate = None
+                found = leaks(line) + self.state_leaks()
+                if found:
+                    failures.append("%s %s: %s" % (verb, name, sorted(set(found))[:3]))
+        finally:
+            out, err = proc.communicate(timeout=60)
+        if leaks(out + err):
+            failures.append("mcp exit: %s" % leaks(out + err))
+        self.assertGreater(len(cases), 200)
+        self.assertEqual(failures, [], "%d of %d hostile cases leaked:\n%s" % (len(failures), len(cases), "\n".join(failures[:40])))
+
+    def test_screenshot_bytes_holding_the_token_are_never_stored(self):
+        # The one server body written under HOME: a PNG that carries the token (a tEXt chunk, say) is refused unsaved.
+        for blob in (HOSTILE_TOKEN.encode(), HOSTILE_TOKEN.upper()[4:20].encode(), base64.b64encode(HOSTILE_TOKEN.encode())):
+            h = self.e.seed(self.api)
+            self.api.artifact_bytes = PNG + b"tEXt" + blob
+            p = self.e.run("shot", h, check=1)
+            self.assertIn("credential_in_response", p.stderr)
+            self.assertEqual(leaks(p.stdout + p.stderr), [])
+            shots = self.e.root / h / "shots"
+            self.assertEqual(list(shots.iterdir()) if shots.exists() else [], [])
+            self.assertFalse((self.e.root / h / "shots.jsonl").exists())
+
+    def test_successful_command_result_is_never_echoed(self):
+        # v2 receipt F1 as a direct case: an ok click or key whose result carries the token and nested copies of it.
+        h = self.e.seed(self.api)
+
+        def mutate(method, path, status, body):
+            if "/machine-commands/" in path and isinstance(body.get("command"), dict):
+                body = json.loads(json.dumps(body))
+                body["command"]["result"] = {"note": HOSTILE_TOKEN, "nested": {"x": [HOSTILE_TOKEN, CANARY]}}
+            return status, body
+        self.api.mutate = mutate
+        for args in (["click", h, "--x", "1", "--y", "2"], ["key", h, "--keys", "Return"]):
+            p = self.e.run(*args)
+            self.assertEqual(leaks(p.stdout + p.stderr), [], args)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(json.loads(p.stdout)["state"], "ok")
 
 
 if __name__ == "__main__":
