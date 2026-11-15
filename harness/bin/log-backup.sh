@@ -393,6 +393,36 @@ lane_gate() { # 0: clear to copy (state is copying); 1: the lane's time ran out 
   done
 }
 
+# goodqa#16123: Dropbox refuses a few file names outright. rclone's backend/dropbox rule is
+#   (?i)(^|/)(desktop\.ini|thumbs\.db|\.ds_store|icon\r|\.dropbox|\.dropbox.attr)$
+# and each refused file is a hard error ("Failed to copy: file name ... is disallowed - not uploading", no retry), so one
+# .DS_Store failed every copy of the work tree for two days. The names are filtered out of every list (log-backup.excludes
+# for the stage, the plain copies and the checkpoint listing; REFUSED_RE for a checkpoint list made before an edit). A refusal
+# that still reaches the remote is counted and reported, and fails the run only when something else failed with it.
+REFUSED_RE=$'(^|/)(desktop\\.ini|thumbs\\.db|\\.ds_store|icon\r|\\.dropbox|\\.dropbox\\.attr)$'
+REFUSED_N=0
+refused_only() { # refused_only LOG-OFFSET: 0 (and the count on stdout) when the copy's log lines since LOG-OFFSET hold
+  # name refusals and no other error; 1 otherwise (including a log with no "Failed to copy" line at all)
+  tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null | LC_ALL=C awk '
+    / ERROR : / {
+      if ($0 ~ /: Failed to copy: file name ".*" is disallowed - not uploading$/) { d++; next }
+      if ($0 ~ / ERROR : Can.t retry any of the errors - not attempting retries$/) next
+      if ($0 ~ / ERROR : Attempt [0-9]+\/[0-9]+ failed with [0-9]+ errors and: file name ".*" is disallowed - not uploading$/) next
+      other++; next
+    }
+    / NOTICE: Failed to copy: / { seen++; if ($0 !~ /Failed to copy: file name ".*" is disallowed - not uploading$/) other++; next }
+    / NOTICE: Failed to copy with [0-9]+ errors: last error was: / {
+      seen++; n = $0; sub(/.*Failed to copy with /, "", n); sub(/ errors.*/, "", n); need = n + 0
+      if ($0 !~ /last error was: file name ".*" is disallowed - not uploading$/) other++
+      next
+    }
+    END { if (d > 0 && seen > 0 && !other && d >= need) { print d; exit 0 } exit 1 }'
+}
+note_refused() { # note_refused SRC-REL COUNT WHAT
+  REFUSED_N=$(( REFUSED_N + $2 ))
+  say "$1: $2 file(s) $3 by the remote by name; not backed up, and the run is not failed for them"
+}
+
 upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   local p="$1" rel="$2" dst
   shift 2
@@ -485,6 +515,10 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
       # --max-transfer (8) or --max-duration (10) reached: partial progress is kept, the next run continues.
       say "budget reached for $rel (rclone exit $rc); partial, last-ok withheld"; rate_limit_note "$log_mark"; ok=1; budget_hit=1; return
     fi
+    if [ $rc -eq 1 ] || [ $rc -eq 6 ]; then
+      # Only name refusals in this copy's log: the rest of the copy went through, so it counts as copied (goodqa#16123).
+      if refused=$(refused_only "$log_mark"); then note_refused "$rel" "$refused" "refused"; copied=1; break; fi
+    fi
     attempt=$((attempt + 1))
     [ $attempt -le "${LOG_BACKUP_RETRIES:-2}" ] || break
     say "copy of $rel failed; retry $attempt after ${LOG_BACKUP_RETRY_SLEEP:-30}s (file changed mid-copy or rate limit)"
@@ -571,10 +605,34 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     size=$BULK_CHUNK fit=$(( $(time_left) * TPSLIMIT / 2 ))
     [ "$fit" -ge "$size" ] || size=$fit
     [ "$size" -ge 1 ] || size=1
-    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk"
-    n=$(wc -l < "$st/chunk" | tr -d ' ')
-    cut -f1 "$st/chunk" > "$st/chunk.paths"
-    upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk" \
+      || { say "cannot read the $rel chunk"; ok=1; hard_fail=1; return 1; }
+    n=$(wc -l < "$st/chunk"); n=${n//[[:space:]]/}
+    printf '%s' "$n" | grep -Eq '^[0-9]+$' || { say "cannot count the $rel chunk"; ok=1; hard_fail=1; return 1; }
+    cut -f1 "$st/chunk" > "$st/chunk.paths" || { say "cannot read the $rel chunk"; ok=1; hard_fail=1; return 1; }
+    # A pass listed before the exclude lists changed still holds names the remote refuses: drop them from the chunk
+    # (counted, and the cursor still moves past them) so the copy never offers them (goodqa#16123). Every status is
+    # checked: grep exits 0 (some paths kept) or 1 (all excluded); any other status, or counts that do not add up, means
+    # the list may be short, and a short list must never be sent, replace the chunk or move the cursor (PR #259 review).
+    LC_ALL=C grep -Eiv -- "$REFUSED_RE" "$st/chunk.paths" > "$st/chunk.paths.tmp"; grc=$?
+    kept=$(wc -l < "$st/chunk.paths.tmp"); wrc=$?; kept=${kept//[[:space:]]/}
+    LC_ALL=C grep -Eic -- "$REFUSED_RE" "$st/chunk.paths" > "$st/chunk.refused.tmp"; crc=$?
+    dropped=$(cat "$st/chunk.refused.tmp" 2>/dev/null)
+    rm -f "$st/chunk.refused.tmp"
+    if [ $grc -gt 1 ] || [ $crc -gt 1 ] || [ $wrc -ne 0 ] \
+       || ! printf '%s' "$kept" | grep -Eq '^[0-9]+$' || ! printf '%s' "$dropped" | grep -Eq '^[0-9]+$' \
+       || [ $(( kept + dropped )) -ne "$n" ] || { [ $grc -eq 0 ] && [ "$kept" -eq 0 ]; } || { [ $grc -eq 1 ] && [ "$kept" -ne 0 ]; }; then
+      say "cannot filter the $rel chunk (grep exit $grc/$crc, kept=${kept:-?} refused=${dropped:-?} of $n); nothing sent, the cursor stays at $cur"
+      rm -f "$st/chunk.paths.tmp"
+      ok=1; hard_fail=1; return 1
+    fi
+    if [ "$dropped" -gt 0 ]; then note_refused "$rel" "$dropped" "left out of the chunk, refused"; fi
+    mv "$st/chunk.paths.tmp" "$st/chunk.paths" || { say "cannot filter the $rel chunk"; ok=1; hard_fail=1; return 1; }
+    if [ -s "$st/chunk.paths" ]; then
+      upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+    else
+      copied=1 yielded=0   # nothing left in this chunk to send
+    fi
     # A chunk stopped for tier 1 never advances the cursor: the same lines are sent again whole (goodqa#15147 NEG-2).
     [ "$yielded" -eq 0 ] || continue
     [ "$copied" -eq 1 ] || { say "$rel: pass at $cur of $total files; the next run resumes there"; return 1; }
@@ -777,6 +835,9 @@ if [ "$throttled" = 1 ]; then
     && mv "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" "$LOGDIR/log-backup${TAG}.throttled"
   say "run stopped early on the Dropbox write rate limit (log-backup${TAG}.throttled); the next scheduled run continues"
 fi
+# How many files the remote refused by name in this run (goodqa#16123): not failures, and not backed up.
+echo "$STARTED refused=$REFUSED_N" > "$LOGDIR/log-backup${TAG}.refused.tmp.$$" \
+  && mv "$LOGDIR/log-backup${TAG}.refused.tmp.$$" "$LOGDIR/log-backup${TAG}.refused"
 rc=0
 { [ $transcripts_ok -eq 0 ] && [ $bulk_ok -eq 0 ]; } || rc=1
 case "$TIER" in
