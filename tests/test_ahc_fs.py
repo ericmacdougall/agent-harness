@@ -313,6 +313,65 @@ class RootFsTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.fs.make_fresh_dir(self.root, self.root / "linked", reuse_empty=True)
 
+    def test_copy_to_temp_streams_in_chunks_and_publishes_nothing_itself(self):
+        """PR 258 v4 F1: the restore copy reads in fixed chunks, never the whole file, and leaves `dst` alone."""
+        src, dst = self.root / "src.bak", self.root / "live.db"
+        body = os.urandom(3 * 4096 + 17)
+        src.write_bytes(body)
+        dst.write_bytes(b"live\n")
+        reads = []
+        real_read = os.read
+
+        def counted(fd, n):
+            reads.append(n)
+            return real_read(fd, n)
+        with mock.patch.object(self.fs.os, "read", counted):
+            staged = self.fs.copy_to_temp(self.root, src, dst, max_bytes=1 << 20, chunk=4096)
+        self.assertEqual(max(reads), 4096, "a read asked for more than one chunk")
+        self.assertEqual(staged.read_bytes(), body)
+        self.assertEqual(stat.S_IMODE(os.stat(str(staged)).st_mode), 0o600)
+        self.assertEqual(dst.read_bytes(), b"live\n", "copy_to_temp must not publish")
+        self.assertRegex(staged.name, r"^\.live\.db\.[0-9a-f]{16}\.tmp$")
+
+    def test_copy_to_temp_refuses_an_oversized_or_linked_source_and_leaves_no_temp(self):
+        src, dst = self.root / "src.bak", self.root / "live.db"
+        src.write_bytes(b"x" * 100)
+        dst.write_bytes(b"live\n")
+        with self.assertRaises(self.fs.TooLarge):
+            self.fs.copy_to_temp(self.root, src, dst, max_bytes=99)
+        linked = self.root / "linked.bak"
+        os.symlink(str(self.outside), str(linked))
+        with self.assertRaises(self.fs.UnsafePath):
+            self.fs.copy_to_temp(self.root, linked, dst, max_bytes=1 << 20)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["linked.bak", "live.db", "src.bak"],
+                         "a refused copy left a temp file behind")
+        self.assertEqual(dst.read_bytes(), b"live\n")
+        self.external_unchanged()
+
+    def test_copy_to_temp_stops_a_source_that_grows_past_the_cap(self):
+        src, dst = self.root / "src.bak", self.root / "live.db"
+        src.write_bytes(b"x" * 10)
+        real_read = os.read
+
+        def growing(fd, n):
+            return real_read(fd, n) or (b"y" * n)        # the file keeps producing bytes after its fstat size
+        with mock.patch.object(self.fs.os, "read", growing):
+            with self.assertRaises(self.fs.TooLarge):
+                self.fs.copy_to_temp(self.root, src, dst, max_bytes=64, chunk=16)
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["src.bak"])
+
+    def test_remove_temps_removes_only_unpublished_temps_of_that_name(self):
+        dst = self.root / "live.db"
+        keep = ["live.db", "live.db-wal", ".live.db.short.tmp", ".other.0123456789abcdef.tmp"]
+        gone = [".live.db.0123456789abcdef.tmp", ".live.db.fedcba9876543210.tmp"]
+        for name in keep + gone:
+            (self.root / name).write_bytes(b"")
+        os.symlink(str(self.outside), str(self.root / ".live.db.aaaaaaaaaaaaaaaa.tmp"))
+        removed = self.fs.remove_temps(self.root, dst)
+        self.assertEqual(sorted(removed), sorted(gone + [".live.db.aaaaaaaaaaaaaaaa.tmp"]))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), sorted(keep))
+        self.external_unchanged()
+
     def test_ancestor_rule(self):
         base = Path(self.tmp.name) / "anc"
         (base / "home").mkdir(parents=True, mode=0o700)

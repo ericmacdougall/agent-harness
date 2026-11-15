@@ -2772,6 +2772,132 @@ class SchemaTests(Base):
         runner.Ledger(self.paths).close()
         self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], (str(runner.SCHEMA_VERSION), 3))
 
+    # --- PR 258 v4 F1: the restore streams the backup and never moves the live database aside before the copy
+    def failing_migration(self, step):
+        saved = dict(runner.MIGRATIONS)
+        runner.MIGRATIONS[2] = [step] + list(saved[2])
+
+        def undo():
+            runner.MIGRATIONS.clear()
+            runner.MIGRATIONS.update(saved)
+        return undo
+
+    def test_restore_memory_does_not_grow_with_the_backup(self):
+        """A backup far larger than a small memory budget restores within it. The old restore read the whole backup
+        into memory (read_regular joins its chunks, about twice the size) after moving the live database aside, so
+        under the unit's MemoryMax a large ledger could not be restored. tracemalloc measures Python allocations
+        while the restore runs; the copy must hold no more than a few chunks."""
+        import tracemalloc
+        held = self.make_v1()
+        size = 8 * 1024 * 1024
+        held.execute("CREATE TABLE ballast(b BLOB)")
+        held.execute("INSERT INTO ballast(b) VALUES (randomblob(?))", (size,))
+        held.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        peaks = {}
+
+        def boom(db):
+            raise RuntimeError("injected migration failure")
+        real_restore = runner.Ledger.restore
+
+        def measured(ledger, copy):
+            tracemalloc.start()
+            try:
+                return real_restore(ledger, copy)
+            finally:
+                peaks["restore"] = tracemalloc.get_traced_memory()[1]
+                tracemalloc.stop()
+        undo = self.failing_migration(boom)
+        try:
+            with mock.patch.object(runner.Ledger, "restore", measured):
+                with self.assertRaises(runner.SchemaError) as caught:
+                    runner.Ledger(self.paths)
+        finally:
+            undo()
+            held.close()
+        self.assertIn("restored", str(caught.exception))
+        budget = 4 * 1024 * 1024
+        self.assertLess(peaks["restore"], budget, "the restore held %d bytes for an %d-byte backup"
+                        % (peaks["restore"], size))
+        cols, version, count = self.columns(self.paths.root / "ledger.sqlite3")
+        self.assertEqual((version, count), ("1", 3), "the restored ledger is the v1 copy")
+        import sqlite3
+        db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"))
+        try:
+            self.assertEqual(db.execute("SELECT length(b) FROM ballast").fetchone()[0], size)
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            db.close()
+
+    def test_a_restore_whose_copy_fails_leaves_the_live_database_in_place(self):
+        """The backup vanishes during the failed migration, so the restore cannot copy it. The old restore had
+        already moved the live database aside, which left no ledger and a pending intent, so every restart failed
+        the same way. Now the live database is never moved before the copy succeeds. It stays in place, unchanged,
+        the intent is dropped, and the next start migrates it."""
+        held = self.make_v1()
+
+        def lose_backup(db):
+            for backup in self.paths.root.glob("ledger.sqlite3.pre-v*.bak"):
+                backup.unlink()
+            raise RuntimeError("injected migration failure")
+        undo = self.failing_migration(lose_backup)
+        try:
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+        finally:
+            undo()
+            held.close()
+        self.assertIn("left in place", str(caught.exception))
+        live = self.paths.root / "ledger.sqlite3"
+        self.assertTrue(live.is_file(), "the live database was moved aside before the copy succeeded")
+        self.assertEqual(self.columns(live)[1:], ("1", 3), "the live database is the unchanged v1 ledger")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "nothing was moved aside")
+        self.assertFalse(Path(str(live) + ".restore-intent").exists(), "a stale intent would repeat the restore")
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "the partial copy is removed")
+        runner.Ledger(self.paths).close()                    # the next start migrates the intact ledger
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3))
+
+    def test_a_ledger_over_the_cap_is_never_migrated(self):
+        """The size cap is enforced before the migration starts: no backup, no intent, nothing moved."""
+        held = self.make_v1()
+        held.close()
+        with mock.patch.object(runner, "RESTORE_MAX_BYTES", 1024):
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+        self.assertIn("migration cap", str(caught.exception))
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak")), "a backup was made")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")))
+        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], ("1", 3))
+
+    def test_an_interrupted_streaming_copy_is_discarded_and_the_restore_completes(self):
+        """A crash in the middle of the copy leaves a partial temp file. With the live file already gone (the
+        crash came between move and publish on an earlier attempt), the intent stays. The next start removes the
+        partial copy, streams a full one and publishes it."""
+        held = self.make_v1()
+        held.close()
+        live = self.paths.root / "ledger.sqlite3"
+        backup = live.with_name("ledger.sqlite3.pre-v9.1.bak")
+        import sqlite3
+        src = sqlite3.connect(str(live))
+        dst = sqlite3.connect(str(backup))
+        src.backup(dst)
+        src.close()
+        dst.close()
+        os.chmod(str(backup), 0o600)
+        os.rename(str(live), str(live) + ".failed-1")
+        for extra in ("-wal", "-shm"):
+            if os.path.lexists(str(live) + extra):
+                os.rename(str(live) + extra, str(live) + ".failed-1" + extra)
+        partial = self.paths.root / ".ledger.sqlite3.0123456789abcdef.tmp"
+        with open(str(backup), "rb") as handle:
+            partial.write_bytes(handle.read(4096))
+        os.chmod(str(partial), 0o600)
+        Path(str(live) + ".restore-intent").write_text(json.dumps({"backup": backup.name, "suffix": ".failed-1"}))
+        os.chmod(str(live) + ".restore-intent", 0o600)
+        runner.Ledger(self.paths).close()
+        self.assertFalse(partial.exists(), "the partial copy was left behind")
+        self.assertFalse(Path(str(live) + ".restore-intent").exists())
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3), "restored, then migrated")
+
     # --- v3 (goodqa#16049 M-1): the v2 -> v3 step adds items.cause and the contract tables, keeping every row and
     # its D20 clock; a migrated ledger has exactly the fresh ledger's tables and columns
     def shape(self, path):

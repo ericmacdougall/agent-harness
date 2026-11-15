@@ -411,7 +411,10 @@ class SchemaError(RuntimeError):
 
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 REPORT_NAME = "report.md"
-RESTORE_MAX_BYTES = 2 * 1024 ** 3     # a verified ledger backup read back during restore
+# The largest ledger ahc migrates, and so the largest backup it may have to restore. Checked before a migration
+# starts (nothing changes if it is over) and again on the backup's descriptor before the restore copies anything.
+# The copy streams in ahc_fs.COPY_CHUNK pieces, so memory use does not grow with this cap (MemoryMax=512M).
+RESTORE_MAX_BYTES = 2 * 1024 ** 3
 
 
 def _check_sidecars(path):
@@ -514,6 +517,11 @@ class Ledger:
         if not self.migrate:
             raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
                               "this process does not" % (version, SCHEMA_VERSION))
+        size = sum(os.lstat(str(self.path) + extra).st_size for extra in ("", "-wal")
+                   if os.path.lexists(str(self.path) + extra))
+        if size > RESTORE_MAX_BYTES:
+            raise SchemaError("ledger %s is %d bytes, over the %d-byte migration cap; refusing to migrate from "
+                              "v%d (nothing was changed)" % (self.path.name, size, RESTORE_MAX_BYTES, version))
         copy = self.backup("pre-v%d" % SCHEMA_VERSION)
         try:
             with self.tx():
@@ -577,8 +585,27 @@ class Ledger:
         return Path(str(self.path) + ".restore-intent")
 
     def _finish_restore(self, copy, suffix):
-        """Move whatever live database files exist aside under `suffix`, copy the verified backup into place and
-        drop the intent. Idempotent, so a restart after a crash at any step completes the same restore."""
+        """Copy the verified backup into a fresh temp file beside the ledger, and only then move the live database
+        files aside under `suffix`, publish the copy and drop the intent (PR 258 v4 F1). Idempotent, so a restart
+        after a crash at any step completes the same restore.
+          * The copy streams in fixed chunks (ahc_fs.copy_to_temp), so memory does not grow with the ledger.
+          * If the copy fails while the live database is still in place, nothing was moved. The intent is dropped,
+            so the next start opens that database instead of repeating the restore, and the error is raised. If the
+            live file is already gone (a crash between move and publish), the intent stays and the next start
+            retries."""
+        fs.remove_temps(self.paths.root, self.path)                 # an earlier attempt's unpublished copy
+        crash_before("runner.restore_copy")
+        try:
+            staged = fs.copy_to_temp(self.paths.root, copy, self.path, RESTORE_MAX_BYTES)
+        except OSError as error:
+            if os.path.lexists(str(self.path)):
+                fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)
+                state = "left in place, unchanged"
+            else:
+                state = "absent; the restore intent is kept so the next start retries"
+            raise SchemaError("could not copy the backup %s back (%s: %s); the live database is %s"
+                              % (Path(copy).name, type(error).__name__, error, state)) from None
+        crash_after("runner.restore_copy")
         moved = []
         crash_before("runner.restore_move")
         for extra in ("", "-wal", "-shm"):
@@ -587,12 +614,9 @@ class Ledger:
                 target = Path(str(self.path) + suffix + extra)
                 fs.rename(self.paths.root, source, target)          # moves a name; never follows it
                 moved.append(target.name)
-        crash_after("runner.restore_move")
-        crash_before("runner.restore_copy")
-        source = core.read_regular(copy, RESTORE_MAX_BYTES)         # the backup, read without following a link
-        fs.write_file(self.paths.root, self.path, source)           # temp + rename by directory descriptor
+        fs.rename(self.paths.root, staged, self.path)               # publish the complete, fsynced copy
         fs.unlink(self.paths.root, self._intent_path())
-        crash_after("runner.restore_copy")
+        crash_after("runner.restore_move")
         return moved
 
     def _resume_restore(self):

@@ -47,8 +47,8 @@ SEAMS = (
     "runner.prune",            # Worker.prune_packets: a staged packet removal
     "runner.backup",           # Ledger.backup: the verified pre-migration copy
     "runner.restore_intent",   # Ledger.restore: the durable interrupted-restore record written first
-    "runner.restore_move",     # Ledger.restore: the failed database files renamed aside
-    "runner.restore_copy",     # Ledger.restore: the verified backup copied back into place
+    "runner.restore_move",     # Ledger.restore: the failed database files renamed aside, the copy published
+    "runner.restore_copy",     # Ledger.restore: the verified backup streamed into a temp file beside the ledger
 )
 
 
@@ -101,6 +101,7 @@ def crash_after(name):
 
 SQL_READS = ("SELECT", "BEGIN", "ROLLBACK", "SAVEPOINT", "RELEASE", "EXPLAIN", "WITH")
 FS_WRITE_OPS = frozenset(("write_file", "append_file", "rename", "unlink", "link_exclusive", "make_dirs",
+                          "copy_to_temp", "remove_temps",
                           "make_fresh_dir", "touch", "open_file"))
 FILE_OPS = {
     ("os", "write"), ("os", "rename"), ("os", "replace"), ("os", "remove"), ("os", "unlink"), ("os", "rmdir"),
@@ -293,9 +294,12 @@ INVENTORY = {
     ("ahc_runner", "Ledger._schema", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
     ("ahc_runner", "Ledger.backup", "sqlite.backup"): (1, "seam:runner.backup"),
     ("ahc_runner", "Ledger.restore", "fs.write_file"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger._finish_restore", "fs.rename"): (1, "seam:runner.restore_move"),
-    ("ahc_runner", "Ledger._finish_restore", "fs.write_file"): (1, "seam:runner.restore_copy"),
-    ("ahc_runner", "Ledger._finish_restore", "fs.unlink"): (1, "seam:runner.restore_copy"),
+    ("ahc_runner", "Ledger._finish_restore", "fs.rename"): (2, "seam:runner.restore_move"),
+    ("ahc_runner", "Ledger._finish_restore", "fs.copy_to_temp"): (1, "seam:runner.restore_copy"),
+    # two unlinks of the intent: after the publish, and after a copy failure with the live file still in place
+    ("ahc_runner", "Ledger._finish_restore", "fs.unlink"): (2, "seam:runner.restore_move"),
+    ("ahc_runner", "Ledger._finish_restore", "fs.remove_temps"): (
+        1, "exempt:removes only an unpublished temp copy of the ledger left by an interrupted restore"),
     ("ahc_runner", "_Tx.__exit__", "sql:COMMIT"): (1, "seam:runner.commit"),
     ("ahc_runner", "_migrate_v2", "sql:ALTER"): (1, _MIG),
     ("ahc_runner", "_migrate_v2", "sql:UPDATE"): (1, _MIG),

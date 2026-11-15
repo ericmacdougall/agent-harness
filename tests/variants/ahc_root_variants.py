@@ -18,7 +18,8 @@ FS = "harness/hooks/ahc_fs.py"
 CLONE = "harness/hooks/ahc_clone.py"
 T = ["tests.test_ahc_core.RootOwnershipTests", "tests.test_ahc_clone", "tests.test_ahc_fs",
      "tests.test_ahc_runner.IngestValidationTests",
-     "tests.test_ahc_runner.UntrustedReadTests", "tests.test_ahc_runner.FileTransportOptInTests"]
+     "tests.test_ahc_runner.UntrustedReadTests", "tests.test_ahc_runner.FileTransportOptInTests",
+     "tests.test_ahc_runner.SchemaTests"]
 V = [
     ("the root ownership check dropped (ensure only makes directories)", [
         ("    def ensure(self):\n        self.claim_root()\n", "    def ensure(self):\n        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)\n")]),
@@ -154,6 +155,29 @@ V = [
          "            moved = None\n")], RUNNER),
     ("v3 clone: the file transport opt-in is honoured for the production root", [
         ("        if allow_file and file_transport_refused(self.paths):\n", "        if False:\n")], RUNNER),
+    # PR 258 v4 F1: the restore streams the backup and never moves the live database aside before the copy
+    ("v4 restore: the copy reads the whole backup at once", [
+        ("                    block = os.read(ifd, chunk)\n", "                    block = os.read(ifd, max_bytes + 1)\n")],
+     FS),
+    ("v4 restore: the live database is moved aside before the copy", [
+        ("        fs.remove_temps(self.paths.root, self.path)                 # an earlier attempt's unpublished copy\n",
+         "        for extra in (\"\", \"-wal\", \"-shm\"):\n"
+         "            if os.path.lexists(str(self.path) + extra):\n"
+         "                fs.rename(self.paths.root, Path(str(self.path) + extra), Path(str(self.path) + suffix + extra))\n"
+         "        fs.remove_temps(self.paths.root, self.path)\n")], RUNNER),
+    ("v4 restore: the intent is kept after a copy failure with the live file in place", [
+        ("                fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)\n", "                pass\n")],
+     RUNNER),
+    ("v4 restore: no size check before the migration", [
+        ("        if size > RESTORE_MAX_BYTES:\n", "        if False:\n")], RUNNER),
+    ("v4 restore: an interrupted copy's partial temp is not removed", [
+        ("        fs.remove_temps(self.paths.root, self.path)                 # an earlier attempt's unpublished copy\n",
+         "        pass\n")], RUNNER),
+    ("v4 fs: copy_to_temp enforces no cap (both the descriptor and the running checks dropped)", [
+        ("            if info.st_size > max_bytes:\n", "            if False:\n"),
+        ("                    if total > max_bytes:\n", "                    if False:\n")], FS),
+    ("v4 fs: remove_temps matches any name", [
+        ("            if pattern.match(entry):\n", "            if entry.endswith(\".tmp\"):\n")], FS),
 ]
 out, survivors = [], []
 for entry in V:

@@ -136,7 +136,12 @@ def state(root, *, normalize_times=False, skip_backups=False):
         if skip_backups and (".bak" in rel or ".failed-" in rel):
             continue
         name = re.sub(r"\d{9,}", "N", rel)
-        if _is_sqlite(path):
+        staged = re.search(r"\.ledger\.sqlite3\.[0-9a-f]{16}\.tmp$", path.name)
+        if staged:
+            # a restore's staged copy (PR 258 v4): its name is random by design, and opening it with SQLite here
+            # would create -wal/-shm files beside it that outlive its rename, so it is compared by bytes only
+            name = re.sub(r"\.[0-9a-f]{16}\.tmp$", ".H.tmp", name)
+        if not staged and _is_sqlite(path):
             content = _db_dump(path)
         else:
             content = path.read_bytes().decode("utf-8", "replace")

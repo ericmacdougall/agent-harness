@@ -117,14 +117,26 @@ Version 2 adds the D20 timing columns on `items`:
 
 A migration runs only after a proven backup:
 
+0. A ledger larger than `RESTORE_MAX_BYTES` (2 GiB, counting its `-wal` file) is never migrated: ahc refuses
+   with a `SchemaError` before anything is copied or changed.
 1. The SQLite online backup API copies the database to `ledger.sqlite3.pre-v<N>.<ns>.bak`. The copy includes
    committed rows that are still only in the `-wal` file.
 2. The copy must pass `PRAGMA integrity_check` and have the same row count as the source in every table.
    Otherwise the migration does not start.
 3. All steps run in one transaction.
-4. If any step fails, the daemon restores the backup. The live `.db`, `-wal` and `-shm` files are moved aside
-   together as `ledger.sqlite3.failed-<ns>[-wal|-shm]`; they are never deleted. The daemon then refuses to start
-   with a `SchemaError` that names both files.
+4. If any step fails, the daemon restores the backup (PR 258 v4 F1). The steps, in order:
+   - A durable restore intent is written first.
+   - The backup is streamed through a directory descriptor, in 1 MiB chunks (`ahc_fs.copy_to_temp`), into a
+     new temp file beside the ledger, and fsynced. Memory use does not grow with the ledger under the unit's
+     `MemoryMax`.
+   - Only after the copy succeeds are the live `.db`, `-wal` and `-shm` files moved aside together as
+     `ledger.sqlite3.failed-<ns>[-wal|-shm]`. They are never deleted.
+   - The copy is renamed into place and the intent is dropped.
+   - The daemon then refuses to start with a `SchemaError` that names both files.
+
+   If the copy fails while the live database is still in place, nothing has been moved. The intent is dropped,
+   so the next start opens that unchanged database instead of repeating the restore. A restart after a crash
+   removes any partial temp copy and completes the same restore.
 
 ## Admission and staged packets
 

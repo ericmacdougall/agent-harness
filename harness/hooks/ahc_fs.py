@@ -28,6 +28,7 @@ run git itself. Within this model that is not a separate attack.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import stat
 from contextlib import contextmanager
@@ -208,6 +209,86 @@ def write_file(root, path, data, mode=FILE_MODE, exclusive=False, create_dirs=Fa
                     pass
         os.fsync(dfd)
         return info.st_dev, info.st_ino
+
+
+COPY_CHUNK = 1024 * 1024   # copy_to_temp holds at most one chunk in memory, whatever the file's size
+TEMP_RE_TEMPLATE = r"^%s\.[0-9a-f]{16}\.tmp$"
+
+
+class TooLarge(UnsafePath):
+    """copy_to_temp refused a source over its byte cap. Nothing was published."""
+
+
+def copy_to_temp(root, src, dst, max_bytes, mode=FILE_MODE, chunk=COPY_CHUNK):
+    """Stream the regular file `src` into a new exclusive temp file beside `dst`, in `chunk`-sized pieces, and
+    fsync it. It returns the temp's path, and the caller publishes it with rename(). Nothing at `dst` changes
+    here. So a failure here (TooLarge, a link, a vanished or foreign source, ENOSPC) leaves every published name
+    as it was. The temp is removed on failure.
+      * src is opened relative to its checked directory with O_NOFOLLOW|O_NONBLOCK. The OPENED descriptor must
+        be a regular file owned by this uid.
+      * max_bytes is enforced on the descriptor's size before any byte is copied, and again while copying, in case
+        the file grows."""
+    sparent, sname = Path(src).parent, Path(src).name
+    dparent, dname = Path(dst).parent, Path(dst).name
+    with directory(root, sparent) as sfd, directory(root, dparent) as dfd:
+        try:
+            ifd = os.open(sname, os.O_RDONLY | NOFOLLOW | NONBLOCK, dir_fd=sfd)
+        except OSError as error:
+            raise UnsafePath("%s cannot be opened as a regular file (%s)" % (sname, type(error).__name__)) from None
+        try:
+            info = os.fstat(ifd)
+            if not stat.S_ISREG(info.st_mode):
+                raise UnsafePath("%s is not a regular file" % sname)
+            if info.st_uid != _uid():
+                raise UnsafePath("%s is owned by uid %d" % (sname, info.st_uid))
+            if info.st_size > max_bytes:
+                raise TooLarge("%s is %d bytes, over the %d-byte cap" % (sname, info.st_size, max_bytes))
+            tmp, ofd = _create_temp(dfd, dname, mode)
+            done = False
+            try:
+                total = 0
+                while True:
+                    block = os.read(ifd, chunk)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > max_bytes:
+                        raise TooLarge("%s grew past the %d-byte cap while it was copied" % (sname, max_bytes))
+                    view = memoryview(block)
+                    while view:
+                        view = view[os.write(ofd, view):]
+                    del view, block
+                os.fchmod(ofd, mode)
+                os.fsync(ofd)
+                done = True
+            finally:
+                os.close(ofd)
+                if not done:
+                    try:
+                        os.unlink(tmp, dir_fd=dfd)
+                    except FileNotFoundError:
+                        pass
+        finally:
+            os.close(ifd)
+        os.fsync(dfd)
+        return Path(dparent) / tmp
+
+
+def remove_temps(root, dst):
+    """Remove every unpublished temp file of `dst` (`.<name>.<16 hex>.tmp`, the names write_file and copy_to_temp
+    create), as names, never followed. A process that died between creating a temp and publishing it leaves one
+    behind. Returns the removed names."""
+    parent, name = Path(dst).parent, Path(dst).name
+    pattern = re.compile(TEMP_RE_TEMPLATE % re.escape(("" if name.startswith(".") else ".") + name))
+    removed = []
+    with directory(root, parent) as dfd:
+        for entry in sorted(os.listdir(dfd)):
+            if pattern.match(entry):
+                os.unlink(entry, dir_fd=dfd)
+                removed.append(entry)
+        if removed:
+            os.fsync(dfd)
+    return removed
 
 
 def open_file(root, path, flags, mode=FILE_MODE, create_dirs=False):
