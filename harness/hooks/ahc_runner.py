@@ -41,6 +41,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ahc_core as core  # noqa: E402
+import ahc_fs as fs  # noqa: E402
 import ahc_contracts  # noqa: E402
 import ahc_packet  # noqa: E402
 from ahc_crash import crash_after, crash_before  # noqa: E402
@@ -409,6 +410,7 @@ class SchemaError(RuntimeError):
 
 
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+REPORT_NAME = "report.md"
 RESTORE_MAX_BYTES = 2 * 1024 ** 3     # a verified ledger backup read back during restore
 
 
@@ -419,7 +421,7 @@ def _check_sidecars(path):
             raise core.ForeignRoot("ledger file %s%s is %s; refusing to open" % (Path(path).name, extra, problem))
 
 
-def connect_nofollow(path, exclusive=False, **kwargs):
+def connect_nofollow(root, path, exclusive=False, **kwargs):
     """Open a ledger database without following a link (PR 258 v1 BLOCK). Python's sqlite3 cannot take
     SQLITE_OPEN_NOFOLLOW, so: the sidecar files must not be links; the database file is opened (or created) first
     by an O_NOFOLLOW descriptor, which must be a regular file and gets its mode by fchmod; sqlite then opens the
@@ -430,20 +432,18 @@ def connect_nofollow(path, exclusive=False, **kwargs):
     the first WAL statement are re-checked after it (_check_sidecars), not before their creation."""
     path = Path(path)
     _check_sidecars(path)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDWR | os.O_CREAT
     if exclusive:
         flags |= os.O_EXCL
     try:
-        fd = os.open(str(path), flags, 0o600)
+        fd = fs.open_file(root, path, flags)          # checked directories, O_NOFOLLOW, regular, our uid, fchmod
     except OSError as error:
         raise core.ForeignRoot("ledger file %s cannot be opened without following a link (%s); refusing to open"
-                               % (path.name, type(error).__name__))
+                               % (path.name, error if isinstance(error, fs.UnsafePath) else type(error).__name__))
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise core.ForeignRoot("ledger file %s is not a regular file; refusing to open" % path.name)
         os.fchmod(fd, 0o600)
-        db = sqlite3.connect(str(path), **kwargs)
+        db = sqlite3.connect(str(path), **kwargs)     # sqlite takes only a path: the inode compare below binds it
         try:
             after = os.lstat(str(path))
         except OSError:
@@ -473,7 +473,7 @@ class Ledger:
             raise SchemaError("the ledger has an interrupted restore; ahc-core completes it at start, this process "
                               "does not")
         fresh = not os.path.lexists(str(self.path))
-        self.db = connect_nofollow(self.path, timeout=30, isolation_level=None)
+        self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         try:
             self.db.execute("PRAGMA journal_mode=WAL")
@@ -543,7 +543,7 @@ class Ledger:
         Returns the copy path; raises SchemaError (and the migration does not start) if the copy is not proven."""
         target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, time.time_ns()))
         crash_before("runner.backup")
-        copy = connect_nofollow(target, exclusive=True)      # a new name, created by this call, never a link
+        copy = connect_nofollow(self.paths.root, target, exclusive=True)   # a new name, never a link
         try:
             self.db.backup(copy)
             check = copy.execute("PRAGMA integrity_check").fetchall()
@@ -564,17 +564,12 @@ class Ledger:
         suffix = ".failed-%d" % time.time_ns()
         # A durable intent first: a crash between the move-aside and the copy-back leaves no live file, and the next
         # open would otherwise create an empty ledger over it (AC-18 found this). Ledger.__init__ finishes it.
-        intent = self._intent_path()
-        temp = Path(str(intent) + ".tmp")
         crash_before("runner.restore_intent")
-        with os.fdopen(_open_private(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), "w") as handle:
-            handle.write(json.dumps({"backup": copy.name, "suffix": suffix}, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(intent))
+        fs.write_file(self.paths.root, self._intent_path(),
+                      json.dumps({"backup": copy.name, "suffix": suffix}, sort_keys=True) + "\n")
         crash_after("runner.restore_intent")
         moved = self._finish_restore(copy, suffix)
-        self.db = connect_nofollow(self.path, timeout=30, isolation_level=None)
+        self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         return moved
 
@@ -590,20 +585,13 @@ class Ledger:
             source = Path(str(self.path) + extra)
             if os.path.lexists(str(source)):
                 target = Path(str(self.path) + suffix + extra)
-                os.rename(str(source), str(target))
+                fs.rename(self.paths.root, source, target)          # moves a name; never follows it
                 moved.append(target.name)
         crash_after("runner.restore_move")
         crash_before("runner.restore_copy")
-        temp = Path(str(self.path) + ".restoring")
         source = core.read_regular(copy, RESTORE_MAX_BYTES)         # the backup, read without following a link
-        fd = _open_private(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)   # never through a link (PR 258 v1)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(source)
-            handle.flush()
-            os.fchmod(handle.fileno(), 0o600)
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(self.path))
-        os.unlink(str(self._intent_path()))
+        fs.write_file(self.paths.root, self.path, source)           # temp + rename by directory descriptor
+        fs.unlink(self.paths.root, self._intent_path())
         crash_after("runner.restore_copy")
         return moved
 
@@ -733,7 +721,7 @@ class Journal:
 
 def _mirror(paths, iid, event, at, data):
     try:
-        _append_private(paths.items / (iid + ".jsonl"),
+        _append_private(paths.root, paths.items / (iid + ".jsonl"),
                         json.dumps({"event": event, "at": at, **data}, sort_keys=True, default=str) + "\n")
     except OSError:
         log.warning("journal mirror write failed for %s", iid)
@@ -757,8 +745,8 @@ def acquire_lock(paths, role="all"):
                 return None
             held.append(handle)
         return held
-    handle = os.fdopen(_open_private(paths.root / ("ahc-%s.lock" % role), os.O_WRONLY | os.O_CREAT | os.O_APPEND),
-                       "a")
+    lock_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    handle = os.fdopen(fs.open_file(paths.root, paths.root / ("ahc-%s.lock" % role), lock_flags), "a")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -938,7 +926,7 @@ class Worker:
         except Exception as error:  # noqa: BLE001 - fail closed: unknown diff counts as protected
             protected_note = "protected-path: unknown (diff failed: %s); main merge only" % _short(error)
         fixed_path = self.paths.reports / (iid + ".packet.md")
-        _write_private(fixed_path, fix["text"])
+        _write_private(self.paths.root, fixed_path, fix["text"])
         return self.review(iid, token, req, facts, clone, merge_base, fixed_path, fix, protected_note)
 
     def review(self, iid, token, req, facts, clone, merge_base, fixed_path, fix, protected_note):
@@ -968,9 +956,19 @@ class Worker:
                 reason = "review budget exhausted for this head: push a new head or ask main"
                 return self.settle(iid, token, "needs-attention", event="needs-attention:head-budget", reason=reason,
                                    notice=_owner_notice("needs-attention", reason))
-        report = self.paths.reports / ("%s-a%d.md" % (iid, attempt))
-        if os.path.lexists(str(report)):
-            reason = "report path already exists; refusing to overwrite a receipt"
+        # PR 258 v3: the review child (peer_review) writes its report itself, so ahc cannot hand it an open file.
+        # peer_review refuses an existing report path, and it writes with an O_EXCL temp file plus link through
+        # its own directory descriptor. ahc therefore creates a private directory for this one attempt,
+        # exclusively, at 0700, and records the directory's (dev, ino). After the child exits, ahc reads the report
+        # only through a descriptor for that same directory, checked by inode (Worker._read_report). A name planted
+        # in reports/ cannot become the report.
+        report_dir = self.paths.reports / ("%s-a%d" % (iid, attempt))
+        report = report_dir / REPORT_NAME
+        try:
+            report_dir_id = list(fs.make_fresh_dir(self.paths.root, report_dir, reuse_empty=True))
+        except (FileExistsError, fs.UnsafePath) as error:
+            reason = "report path already exists or is not private; refusing to overwrite a receipt (%s)" % (
+                type(error).__name__)
             return self.settle(iid, token, "needs-attention", event="report-path-taken", reason=reason,
                                notice=_owner_notice("needs-attention", reason))
         argv = [sys.executable, str(self.config.get("peer_review", Path.home() / ".claude/hooks/peer_review.py")),
@@ -993,7 +991,8 @@ class Worker:
             self.led.db.execute("INSERT INTO effects(key, item, kind, status, attempts, next_action_at, payload,"
                                 " updated) VALUES (?,?,?,?,?,?,?,?)",
                                 (key, iid, "review", "intent", 1, None, json.dumps({"argv": argv}), now))
-        self.settle(iid, token, "reviewing", now + REVIEW_WALL, report=str(report), packet=str(fixed_path),
+        self.settle(iid, token, "reviewing", now + REVIEW_WALL, report=str(report), report_dir_id=report_dir_id,
+                    packet=str(fixed_path),
                     review_key=key, clone=clone, merge_base=merge_base, base_note=facts.get("base_repaired_from", ""),
                     fix_actions=fix["actions"], protected=protected_note, attempt=attempt,
                     repeat_reason=None, relaunch_ok=None)  # a declared repeat is spent by this launch
@@ -1014,6 +1013,34 @@ class Worker:
             return "the repo is no longer on the coordinator allowlist"
         return None
 
+    def _read_report(self, data):
+        """(bytes or None, problem or None). The report is read only through a descriptor for the attempt
+        directory ahc created for it, and that directory must have the (dev, ino) recorded at creation. The report
+        must be a regular file owned by this uid. None bytes with no problem means no report was written."""
+        want = data.get("report_dir_id")
+        report = Path(str(data.get("report")))
+        if not want:
+            return None, "no report directory identity was recorded for this attempt"
+        try:
+            with fs.directory(self.paths.root, report.parent) as dfd:
+                info = os.fstat(dfd)
+                if [info.st_dev, info.st_ino] != list(want):
+                    return None, "the report directory was replaced after the review was launched"
+                try:
+                    entry = os.stat(report.name, dir_fd=dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None, None
+                if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.geteuid():
+                    return None, "the report is not a regular file owned by ahc"
+                try:
+                    return core.read_regular(report.name, core.REPORT_MAX_BYTES, dir_fd=dfd), None
+                except core.Unreadable as error:
+                    return None, None if error.kind == "absent" else "report unreadable: %s" % error
+        except FileNotFoundError:
+            return None, None
+        except fs.UnsafePath as error:
+            return None, "the report directory is not private: %s" % error
+
     def conclude(self, iid, token, req, key):
         row = self.led.item(iid)
         data = json.loads(row["data"])
@@ -1029,7 +1056,12 @@ class Worker:
         stale = stale_tickets(result.get("stderr", ""), result["rc"])
         if stale:
             return self.freshness(iid, token, req, data, stale)
-        verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"])
+        report_bytes, problem = self._read_report(data)
+        if problem:
+            verdict = {"verdict": "INVALID", "reason": problem}
+        else:
+            verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"],
+                                          report_bytes=report_bytes)
         name = verdict["verdict"]
         if name == "PASS" or name == "PASS-WITH-TICKETS":
             reason = "pass-gate1" + ("; " + data["protected"] if data.get("protected") else "")
@@ -1043,7 +1075,7 @@ class Worker:
                 self.led.db.execute("UPDATE lineage SET block_rounds=block_rounds+1 WHERE lineage=?",
                                     (row["lineage"],))
             self.settle(iid, token, "block-delivered", event="block-delivered", verdict="BLOCK",
-                        notice=_owner_notice("block-delivered", _report_body(data["report"])))
+                        notice=_owner_notice("block-delivered", _report_body(data["report"], report_bytes)))
             return "block-delivered"
         if name == "ADVISORY":
             return self.fail(iid, token, "advisory", "peer_review returned an advisory opinion, not a signoff")
@@ -1250,7 +1282,7 @@ class Worker:
                 if now < until:
                     continue
                 crash_before("runner.prune")
-                os.unlink(str(entry))
+                fs.unlink(self.paths.root, entry)
                 crash_after("runner.prune")
                 removed.append(entry.name)
             except OSError:
@@ -1635,7 +1667,7 @@ class Worker:
                 return True, "written"
             if kind == "digest":
                 if not self.readback("digest", payload):
-                    _append_private(self.paths.digest, payload["line"])
+                    _append_private(self.paths.root, self.paths.digest, payload["line"])
                 return True, "appended"
             if kind == "alert":
                 rc, _out, err = self.deps.ah(["ah", "alert", "raise", "--severity", payload.get("severity", "high"),
@@ -1701,15 +1733,15 @@ def _quarantine(paths, qfile, reason):
     file. Returns the quarantined name, which keys the one alert for it, or None if it could not be moved."""
     target_dir = paths.root / "rejected"
     try:
-        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fs.make_dirs(paths.root, target_dir)
         target = target_dir / qfile.name
         if os.path.lexists(str(target)):
             target = target_dir / ("%s.%d.json" % (qfile.stem, time.time_ns()))
         # the reason first (AC-18): a crash after the rename must still leave the reason beside the quarantined
         # file, because the alert below is best effort and the queue entry is gone after the rename
-        _write_private(target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
+        _write_private(paths.root, target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
         crash_before("runner.quarantine")
-        os.rename(str(qfile), str(target))  # same filesystem: atomic; renames the link, not its referent
+        fs.rename(paths.root, qfile, target)  # atomic; renames the link, never its referent
         crash_after("runner.quarantine")
         return target.name
     except OSError as error:
@@ -1904,9 +1936,11 @@ def _is_protected(path):
     return any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED) or path.startswith(".claude/")
 
 
-def _report_body(report_path):
+def _report_body(report_path, raw=None):
     try:
-        text = core.read_regular(report_path, core.REPORT_MAX_BYTES).decode("utf-8", errors="replace")
+        if raw is None:
+            raw = core.read_regular(report_path, core.REPORT_MAX_BYTES)
+        text = raw.decode("utf-8", errors="replace")
     except core.Unreadable:
         return "(the report could not be read)"
     head, _sep, body = text.partition("\n\n")
@@ -2005,43 +2039,25 @@ def _write_inbox(inbox, owner, name, text):
     opened with O_NOFOLLOW|O_DIRECTORY and the file is created relative to the owner directory's fd with
     O_EXCL|O_NOFOLLOW, then renamed within that directory. A symlink swapped in after inbox_path's check makes the open
     fail; nothing is ever written through it. An existing notice is left as is (idempotent)."""
+    root = Path(inbox).parent                # paths.inbox is always <ahc root>/inbox
+    notice = Path(inbox) / owner / name
     try:
-        root_fd = os.open(str(inbox), _DIR_FLAGS)
-    except OSError as error:
-        raise _InboxRefused("inbox directory is not a real directory: %s" % type(error).__name__) from None
-    try:
-        try:
-            os.mkdir(owner, 0o700, dir_fd=root_fd)
-        except FileExistsError:
-            pass
-        try:
-            owner_fd = os.open(owner, _DIR_FLAGS, dir_fd=root_fd)
-        except OSError as error:
-            raise _InboxRefused("owner inbox is not a real directory: %s" % type(error).__name__) from None
-        try:
+        with fs.directory(root, notice.parent, create=True) as owner_fd:
             present = _notice_state(owner_fd, name, text)
-            if present == "match":
-                return  # already delivered with exactly this content
-            if present != "absent":
-                raise _InboxRefused("notice name is occupied by a %s entry" % present)
-            tmp = "." + name + ".tmp"
-            try:
-                os.unlink(tmp, dir_fd=owner_fd)
-            except FileNotFoundError:
-                pass
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
-                         dir_fd=owner_fd)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            crash_before("runner.inbox")
-            os.rename(tmp, name, src_dir_fd=owner_fd, dst_dir_fd=owner_fd)
-            crash_after("runner.inbox")
-        finally:
-            os.close(owner_fd)
-    finally:
-        os.close(root_fd)
+    except fs.UnsafePath as error:
+        raise _InboxRefused("owner inbox is not a private directory: %s" % error) from None
+    if present == "match":
+        return  # already delivered with exactly this content
+    if present != "absent":
+        raise _InboxRefused("notice name is occupied by a %s entry" % present)
+    crash_before("runner.inbox")
+    try:
+        fs.write_file(root, notice, text, exclusive=True)   # first writer wins; a name planted since is kept
+    except FileExistsError:
+        raise _InboxRefused("notice name was taken while it was being written") from None
+    except fs.UnsafePath as error:
+        raise _InboxRefused("owner inbox is not a private directory: %s" % error) from None
+    crash_after("runner.inbox")
 
 
 def _notice_state(owner_fd, name, text):
@@ -2112,29 +2128,17 @@ def _digest_has(path, key):
     return ("[k:%s]" % key).encode("utf-8") in tail
 
 
-def _write_private(path, text):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name("." + path.name + ".tmp")
+def _write_private(root, path, text):
+    """Replace `path` under the ahc root whole: an unpredictable O_EXCL temp file, then rename by descriptor."""
     crash_before("runner.write_private")
-    fd = _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    fs.write_file(root, Path(path), text, create_dirs=True)
     crash_after("runner.write_private")
 
 
-def _append_private(path, text):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+def _append_private(root, path, text):
+    """Append to `path` under the ahc root through checked directory descriptors (O_NOFOLLOW, regular, our uid)."""
     crash_before("runner.append_private")
-    fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-    with os.fdopen(fd, "a", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
+    fs.append_file(root, Path(path), text, create_dirs=True)
     crash_after("runner.append_private")
 
 
@@ -2184,7 +2188,9 @@ class LiveDeps:
         if shutil.disk_usage(str(self.paths.clones)).free < floor:
             raise RuntimeError("disk floor: less than %d GiB free for clones" % (floor // 1024 ** 3))
         url = self.config.get("clone_urls", {}).get(repo, "https://github.com/%s.git" % repo)
-        return ahc_clone.prepare(self.paths.clones, repo, url, head, base)
+        # https only, unless the operator's config.json (inside the 0700 root) opts into local file remotes
+        return ahc_clone.prepare(self.paths.clones, repo, url, head, base,
+                                 allow_file=self.config.get("clone_file_transport") is True)
 
     def merge_base(self, clone, head, base):
         import ahc_clone
@@ -2273,21 +2279,15 @@ def stage_packet(paths, stream, expect_sha=None):
         raise core.Refused("the packet received has SHA-256 %s, not the expected %s; nothing was queued"
                            % (sha, expect_sha.strip()))
     paths.ensure()                       # ahc's own root first (marker); a foreign root refuses before any write
-    paths.packets.mkdir(exist_ok=True, mode=0o700)
-    os.chmod(str(paths.packets), 0o700)
     target = paths.packets / (sha + ".md")
     crash_before("runner.stage_packet")
     try:
-        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fs.write_file(paths.root, target, data, exclusive=True, create_dirs=True)
     except FileExistsError:
         if core.read_regular(target, core.PACKET_MAX_BYTES) != data:
             raise core.Refused("a different staged packet already has this name; refusing") from None
-        os.utime(str(target))  # restart the orphan clock so prune_packets cannot remove it before admission
+        fs.touch(paths.root, target)  # restart the orphan clock so prune_packets cannot remove it before admission
         return target, sha
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
     crash_after("runner.stage_packet")
     return target, sha
 

@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ahc_core as core  # noqa: E402
+import ahc_fs as fs  # noqa: E402
 
 UNITS = ("ahc-core", "ahc-review")
 RECORD = "install.json"
@@ -119,7 +120,14 @@ def read_record(paths) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _write_in_root(paths, path: Path, text: str) -> None:
+    """A file under the ahc root (install.json, config.json): through ahc_fs, never a path-based write."""
+    fs.write_file(paths.root, path, text)
+
+
 def _write_private(path: Path, text: str, mode=0o600) -> None:
+    """A file OUTSIDE the ahc root: a systemd user unit or the ~/.local/bin wrapper. These locations belong to the
+    user's own configuration, not to ahc's root. They are allowlisted in tests/test_ahc_fs.py with this reason."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(".%s.%d.tmp" % (path.name, os.getpid()))
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), mode)
@@ -158,7 +166,7 @@ def install(paths, home: Path, apply: bool, run=default_run, system=None, out=pr
         out("%srecord install state %s (lingering was %s)" % (verb, _record_path(paths),
                                                              {True: "on", False: "off", None: "unknown"}[linger]))
         if apply:
-            _write_private(_record_path(paths), json.dumps(record, sort_keys=True) + "\n")
+            _write_in_root(paths, _record_path(paths), json.dumps(record, sort_keys=True) + "\n")
     else:
         out("keep the first install record %s (lingering was %s before ahc)"
             % (_record_path(paths), {True: "on", False: "off", None: "unknown"}[record.get("linger_before")]))
@@ -178,16 +186,17 @@ def install(paths, home: Path, apply: bool, run=default_run, system=None, out=pr
         _write_private(wrapper, wrapper_text(), 0o755)
     config = paths.root / "config.json"
     try:
-        current = json.loads(config.read_text(encoding="utf-8")) if config.exists() else {}
-    except (OSError, ValueError):
+        current = json.loads(core.read_regular(config, RECORD_MAX_BYTES).decode("utf-8")) \
+            if os.path.lexists(str(config)) else {}
+    except (OSError, ValueError, core.Unreadable):
         current = None
     if current is None:
         out("leave %s alone: it is not valid JSON (fix it by hand)" % config)
     elif "ops_ticket" not in current:
         out("%sset ops_ticket=%s in %s" % (verb, DEFAULT_OPS_TICKET, config))
         if apply:
-            _write_private(config, json.dumps(dict(current, ops_ticket=DEFAULT_OPS_TICKET), indent=1,
-                                              sort_keys=True) + "\n")
+            _write_in_root(paths, config, json.dumps(dict(current, ops_ticket=DEFAULT_OPS_TICKET), indent=1,
+                                                     sort_keys=True) + "\n")
     cmds = []
     if linger is not True:
         cmds.append(["loginctl", "enable-linger", _user()])
@@ -254,7 +263,7 @@ def uninstall(paths, home: Path, apply: bool, run=default_run, system=None, out=
     if record is not None:
         out("%sremove the install record %s" % (verb, _record_path(paths)))
         if apply:
-            _record_path(paths).unlink()
+            fs.unlink(paths.root, _record_path(paths))
     out("kept for audit (delete only after a verified backup):")
     for label, path in kept_paths(paths):
         out("  %s: %s" % (label, path))

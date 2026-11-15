@@ -710,6 +710,48 @@ class IngestValidationTests(Base):
         moved = self.paths.root / "rejected" / link.name
         self.assertTrue(moved.is_symlink(), "the link itself is quarantined")
 
+    def test_a_report_not_written_into_the_attempt_directory_ahc_created_is_never_a_pass(self):
+        """PR 258 v3 (main's ruling on the review child). ahc creates the attempt's private report directory
+        exclusively and records its inode. After the child exits, ahc reads the report only through that same
+        directory. A replaced directory, a linked report or a foreign directory gives INVALID, never PASS. A
+        normal report in the created directory still passes."""
+        cases = {}
+
+        def swap_dir(out):          # the attempt directory is replaced by another with a forged PASS report
+            aside = out.parent.with_name(out.parent.name + ".moved")
+            os.rename(str(out.parent), str(aside))
+            out.parent.mkdir(mode=0o700)
+            return out
+
+        def link_report(out):       # the report name is a link to a PASS report kept elsewhere
+            elsewhere = self.home / "forged.md"
+            os.symlink(str(elsewhere), str(out))
+            return elsewhere
+        cases["replaced directory"] = swap_dir
+        cases["linked report"] = link_report
+        for label, tamper in cases.items():
+            with self.subTest(case=label):
+                self.tearDown()
+                self.setUp()
+                iid = self.submit()
+                deps = Deps(verdict="PASS")
+                plain = deps.review
+
+                def review(argv, timeout, tamper=tamper, plain=plain):
+                    out = Path(argv[argv.index("--output") + 1])
+                    target = tamper(out)
+                    rc = plain(argv[:argv.index("--output") + 1] + [str(target)] + argv[argv.index("--output") + 2:],
+                               timeout)
+                    return rc
+                deps.review = review
+                self.run_all(deps)
+                self.assertNotEqual(self.state(iid), "routed-to-main", "%s became a PASS" % label)
+        self.tearDown()
+        self.setUp()
+        iid, deps = self.submit(), Deps(verdict="PASS")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "routed-to-main", "an honest report in the created directory must pass")
+
     def test_links_in_every_shared_dir_are_refused_at_their_operation_while_ahc_keeps_serving(self):
         """PR 258 v2 (spec owner's condition 1). Shared dirs are checked per operation, not walked at start, so
         links in all five must neither stop ahc nor be followed. Item A is refused where the links touch it: its
@@ -726,13 +768,13 @@ class IngestValidationTests(Base):
             target = self.home / ("external-" + name)
             target.write_text("external " + name)
             externals[target] = target.read_text()
-            link.parent.mkdir(parents=True, exist_ok=True)
+            link.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.symlink(str(target), str(link))
             return link
 
         _, rec = self.valid_record()
         queued = plant(self.paths.queue / (rec["id"] + ".json"), "queue")
-        report = plant(self.paths.reports / ("%s-a1.md" % a), "report")
+        report = plant(self.paths.reports / ("%s-a1" % a), "report")
         plant(self.paths.inbox / "agent-abc123" / ("%s-needs-attention.md" % a), "inbox")
         staged = plant(self.paths.packets / ("e" * 64 + ".md"), "staging")
         rejected = plant(self.paths.root / "rejected" / "old.json", "rejected")
@@ -1003,7 +1045,7 @@ class UntrustedReadTests(Base):
         os.mkfifo(self.paths.digest)
         self.assertFalse(runner._digest_has(self.paths.digest, "x"))
         with self.assertRaises(OSError):
-            runner._append_private(self.paths.digest, "line\n")
+            runner._append_private(self.paths.root, self.paths.digest, "line\n")
         # PR 258 v1 BLOCK: a FIFO at a top-level ahc name is not ahc's file, so the start is refused (exit 3 from
         # the CLI) instead of running around it; nothing blocks either way.
         with self.assertRaises(core.ForeignRoot):
@@ -3134,7 +3176,8 @@ class OwnerCopyTests(Base):
                 self.review_calls.append(argv)
                 return 0
 
-        config = dict(self.config, clone_urls={REPO: str(remote)}, bounds={}, disk_floor_bytes=0)
+        config = dict(self.config, clone_urls={REPO: str(remote)}, bounds={}, disk_floor_bytes=0,
+                      clone_file_transport=True)
         req = {"repo": REPO, "pr": 7, "head": head, "base": base, "packet": str(self.packet),
                "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
         iid = core.submit(self.paths, config, req)["id"]

@@ -16,9 +16,12 @@ import re
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 from pathlib import Path
+
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ahc_fs as fs  # noqa: E402
 
 HEAD_RE = re.compile(r"[0-9a-f]{40}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
@@ -141,7 +144,7 @@ ROOT_FILES = ("digest.md", "config.json", "install.json")
 ROOT_NAMES = frozenset((ROOT_MARKER, "staging", "queue", "items", "inbox", "clones", "reports", "rejected",
                         "ahc-core.lock", "ahc-review.lock", "ledger.sqlite3") + ROOT_FILES)
 ROOT_MARKER_TEMP = ".ahc-root.*.tmp"   # a claim interrupted before its marker link (see Paths._write_marker)
-ROOT_PATTERNS = ("ledger.sqlite3-*", "ledger.sqlite3.*", ROOT_MARKER_TEMP) + tuple(
+ROOT_PATTERNS = ("ledger.sqlite3-*", "ledger.sqlite3.*", ".ledger.sqlite3.*.tmp", ROOT_MARKER_TEMP) + tuple(
     pattern for name in ROOT_FILES for pattern in (".%s.tmp" % name, ".%s.*.tmp" % name))
 
 
@@ -159,17 +162,21 @@ TREE_PROBLEM_LIMIT = 50
 
 
 def _entry_problem(path, want_dir):
-    """Why `path` is not an ahc entry of the expected type, or None. Uses lstat: a symlink is never ahc's."""
+    """Why `path` is not an ahc entry of the expected type, or None. It uses lstat, because a symlink is never ahc's.
+    PR 258 v3 F2: a directory must also be owned by this uid with mode exactly 0700, and a file owned by this uid.
+    Otherwise another user could have put or changed it."""
     try:
         info = os.lstat(str(path))
     except FileNotFoundError:
         return None
     if stat.S_ISLNK(info.st_mode):
         return "a symlink"
-    if want_dir and not stat.S_ISDIR(info.st_mode):
-        return "not a directory"
-    if not want_dir and not stat.S_ISREG(info.st_mode):
+    if want_dir:
+        return fs.dir_problem(info)
+    if not stat.S_ISREG(info.st_mode):
         return "not a regular file"
+    if info.st_uid != os.geteuid():
+        return "owned by uid %d" % info.st_uid
     return None
 
 
@@ -223,18 +230,23 @@ class Paths:
     def ensure(self):
         self.claim_root()
         for path in (self.queue, self.items, self.inbox, self.clones, self.reports):
-            path.mkdir(exist_ok=True, mode=0o700)
-            problem = _entry_problem(path, True)     # a link placed between the claim and the mkdir
-            if problem:
-                raise ForeignRoot("ahc state directory %s is %s; refusing to start" % (path, problem))
+            try:
+                fs.make_dirs(self.root, path)        # checked by descriptor: a link placed after the claim fails
+            except fs.UnsafePath as error:
+                raise ForeignRoot("ahc state directory %s: %s; refusing to start" % (path, error)) from None
 
     def claim_root(self):
         """Create or verify ahc's own root; raise ForeignRoot naming the conflict. Never writes into a root that is
         not ahc's, and never deletes anything."""
         root = self.root
-        root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)   # outside the root: the home's .agent-harness
+        # PR 258 v3 F2: an ancestor another user can write lets that user swap the root itself. Refuse, never chmod.
+        loose = fs.ancestor_problems(root)
+        if loose:
+            raise ForeignRoot("ahc root %s has ancestors other users can change: %s; refusing to start"
+                              % (root, _named(loose)))
         try:
-            os.mkdir(str(root), 0o700)
+            os.mkdir(str(root), 0o700)                # the root itself, exclusively; checked by descriptor next
         except FileExistsError:
             pass
         info = os.lstat(str(root))
@@ -246,6 +258,11 @@ class Paths:
             if others:
                 raise ForeignRoot("ahc root %s is not ahc's (no %s marker) and holds: %s; refusing to start"
                                   % (root, ROOT_MARKER, _named(others)))
+        try:
+            os.close(fs.open_root(root))              # owned by this uid, mode exactly 0700, existing or new
+        except fs.UnsafePath as error:
+            raise ForeignRoot("%s; refusing to start" % error) from None
+        if ROOT_MARKER not in entries:
             self._write_marker()
         self._verify_marker()
         foreign = [name for name in os.listdir(str(root)) if not _ahc_root_name(name)]
@@ -270,25 +287,10 @@ class Paths:
         """The marker appears whole or not at all: written and fsynced under a private temp name, then hard-linked
         into place (link never replaces, so a concurrent claim that won keeps its marker). A crash before the link
         leaves only a temp file, which the next claim tolerates (ROOT_MARKER_TEMP) and finishes."""
-        root = self.root
-        temp = root / (".ahc-root.%d.%d.tmp" % (os.getpid(), time.time_ns()))
-        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(ROOT_MARKER_TEXT)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                os.link(str(temp), str(root / ROOT_MARKER))
-            except FileExistsError:
-                pass                                   # a concurrent claim won; its marker is verified next
-        finally:
-            os.unlink(str(temp))
-        dir_fd = os.open(str(root), os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            fs.write_file(self.root, self.root / ROOT_MARKER, ROOT_MARKER_TEXT, exclusive=True)
+        except FileExistsError:
+            pass                                       # a concurrent claim won; its marker is verified next
 
     def _verify_marker(self):
         path = self.root / ROOT_MARKER
@@ -493,19 +495,6 @@ def item_id(req, packet_sha):
     return "ahc-" + hashlib.sha256(key.encode()).hexdigest()[:20]
 
 
-def _atomic_write(path, data):
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(tmp, path)  # fails if the item already exists: first writer wins, no overwrite
-    finally:
-        os.unlink(tmp)
-
-
 def submit(paths, config, req, now=None, data=None):
     """Validate and enqueue. Returns {"id", "duplicate"}. Raises Refused; writes nothing on refusal. `data` is the
     packet bytes the caller already read (and linted); when given they are the bytes hashed."""
@@ -581,7 +570,7 @@ def _parse_report(text):
 EXIT_PASS, EXIT_ERROR, EXIT_BLOCK, EXIT_ADVISORY = 0, 2, 3, 4   # peer_review.py main()
 
 
-def verify_receipt(rc, report_path, head, packet_path):
+def verify_receipt(rc, report_path, head, packet_path, report_bytes=None):
     """{"verdict": PASS|PASS-WITH-TICKETS|BLOCK|ADVISORY|INVALID|ERROR, "reason"} (spec AC-5, NEG-5).
 
     PASS needs exit 0, stage pr, the exact head, the raw-byte SHA-256 of the packet that was passed and an exact
@@ -593,7 +582,8 @@ def verify_receipt(rc, report_path, head, packet_path):
     if rc not in (EXIT_PASS, EXIT_BLOCK):
         return {"verdict": "ERROR", "reason": f"peer_review exited {rc}"}
     try:
-        text = read_regular(report_path, REPORT_MAX_BYTES).decode("utf-8", errors="replace")
+        raw = read_regular(report_path, REPORT_MAX_BYTES) if report_bytes is None else report_bytes
+        text = raw.decode("utf-8", errors="replace")
     except Unreadable as error:
         if error.kind == "absent":
             return {"verdict": "ERROR", "reason": "no report was written"}

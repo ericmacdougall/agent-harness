@@ -706,7 +706,7 @@ class RootOwnershipTests(unittest.TestCase):
         """The layout another program keeps at a root: its own ledger, clones/, runs/ and a credential file. The
         token here is a placeholder word, never a credential shape."""
         root = self.paths.root
-        root.mkdir(parents=True)
+        root.mkdir(parents=True, mode=0o700)
         (root / "ledger.sqlite").write_bytes(b"not ahc")
         (root / "ledger.sqlite-wal").write_bytes(b"")
         (root / "clones" / "x").mkdir(parents=True)
@@ -737,14 +737,14 @@ class RootOwnershipTests(unittest.TestCase):
         self.paths.ensure()                       # idempotent on its own root
 
     def test_an_empty_unmarked_root_is_claimed(self):
-        self.paths.root.mkdir(parents=True)       # a claim that stopped between the mkdir and the marker
+        self.paths.root.mkdir(parents=True, mode=0o700)       # a claim that stopped between the mkdir and the marker
         self.paths.ensure()
         self.assertTrue((self.paths.root / core.ROOT_MARKER).is_file())
 
     def test_a_claim_interrupted_before_the_marker_link_is_finished(self):
         """A crash after the temp marker was written and before the link leaves only that temp file; the next
         start finishes the claim instead of refusing ahc's own root."""
-        self.paths.root.mkdir(parents=True)
+        self.paths.root.mkdir(parents=True, mode=0o700)
         (self.paths.root / ".ahc-root.4242.1.tmp").write_text(core.ROOT_MARKER_TEXT[:5])   # torn temp
         self.paths.ensure()
         self.assertEqual((self.paths.root / core.ROOT_MARKER).read_text(), core.ROOT_MARKER_TEXT)
@@ -760,9 +760,9 @@ class RootOwnershipTests(unittest.TestCase):
         opened = []
         real_open = os.open
 
-        def spy(path, flags, *args):
+        def spy(path, flags, *args, **kwargs):
             opened.append((os.path.basename(str(path)), flags))
-            return real_open(path, flags, *args)
+            return real_open(path, flags, *args, **kwargs)
         with mock.patch.object(core.os, "open", spy):
             self.paths.ensure()
         writes = [name for name, flags in opened if flags & (os.O_WRONLY | os.O_RDWR)]
@@ -770,12 +770,12 @@ class RootOwnershipTests(unittest.TestCase):
         self.assertNotIn(core.ROOT_MARKER, writes)
 
     def test_a_foreign_ledger_is_refused(self):
-        self.paths.root.mkdir(parents=True)
+        self.paths.root.mkdir(parents=True, mode=0o700)
         (self.paths.root / "ledger.sqlite").write_bytes(b"not ahc")
         self.refused("ledger.sqlite", "no .ahc-root marker")
 
     def test_a_foreign_token_file_is_refused(self):
-        self.paths.root.mkdir(parents=True)
+        self.paths.root.mkdir(parents=True, mode=0o700)
         (self.paths.root / "token").write_text("placeholder\n")
         self.refused("token")
 
@@ -802,7 +802,7 @@ class RootOwnershipTests(unittest.TestCase):
         self.assertEqual(os.listdir(str(elsewhere)), [], "nothing was written through the link")
 
     def test_a_wrong_or_symlinked_marker_is_refused(self):
-        self.paths.root.mkdir(parents=True)
+        self.paths.root.mkdir(parents=True, mode=0o700)
         (self.paths.root / core.ROOT_MARKER).write_text('{"owner": "coordd"}\n')
         self.refused("does not name ahc")
         (self.paths.root / core.ROOT_MARKER).unlink()
@@ -975,14 +975,14 @@ class RootOwnershipTests(unittest.TestCase):
                 self.tearDown()
                 self.setUp()
                 self.paths.ensure()
-                (self.paths.root / directory).mkdir(exist_ok=True)
+                (self.paths.root / directory).mkdir(exist_ok=True, mode=0o700)
                 link = self.paths.root / directory / name
                 os.symlink(str(self.external(False)), str(link))
                 before = self.external_state()
                 self.paths.ensure()
                 runner.Ledger(self.paths).close()
                 with self.assertRaises(OSError):
-                    runner._open_private(link, os.O_WRONLY | os.O_APPEND)
+                    runner._append_private(self.paths.root, link, "x\n")
                 with self.assertRaises(core.Unreadable):
                     core.read_regular(link, 1000)
                 self.assertEqual(self.external_state(), before)
@@ -996,12 +996,149 @@ class RootOwnershipTests(unittest.TestCase):
                 os.symlink(str(self.external(True)), str(self.paths.root / directory))
                 self.assert_refused_everywhere("%s -> external dir" % directory)
 
+    # PR 258 v3 F2: the private-root assumption is enforced for an existing root too. The root and every
+    # directory ahc owns below it must be owned by this uid with mode exactly 0700; an ancestor another user can
+    # change is refused. Each refusal happens before any write: the root's listing is unchanged.
+
+    def root_listing(self):
+        return sorted((str(p.relative_to(self.paths.root)), os.lstat(str(p)).st_mode)
+                      for p in self.paths.root.rglob("*"))
+
+    def assert_refused_before_any_write(self, label):
+        before = self.root_listing()
+        sys.path.insert(0, str(HOOKS))
+        import ahc_runner as runner
+        with self.subTest(label=label):
+            with self.assertRaises(core.ForeignRoot):
+                self.paths.ensure()
+            with self.assertRaises(core.ForeignRoot):
+                runner.Ledger(self.paths)
+            self.assertEqual(self.root_listing(), before, "%s: something was written before the refusal" % label)
+
+    def test_an_existing_root_that_is_not_private_is_refused(self):
+        for mode in (0o777, 0o755, 0o750, 0o711, 0o770):
+            self.tearDown()
+            self.setUp()
+            self.paths.ensure()
+            os.chmod(str(self.paths.root), mode)
+            self.assert_refused_before_any_write("root mode %o" % mode)
+            os.chmod(str(self.paths.root), 0o700)
+
+    def test_an_existing_empty_root_that_is_not_private_is_refused(self):
+        self.paths.root.mkdir(parents=True, mode=0o700)
+        os.chmod(str(self.paths.root), 0o777)
+        self.assert_refused_before_any_write("empty unmarked root 0777")
+        self.assertEqual(os.listdir(str(self.paths.root)), [], "no marker may be written into a 0777 root")
+
+    def test_a_root_owned_by_another_uid_is_refused(self):
+        """No test can chown without root, so the process's uid is reported as another one. Everything on disk then
+        belongs to someone else, which is what a root owned by another user looks like from here."""
+        from unittest import mock
+        self.paths.ensure()
+        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+            self.assert_refused_before_any_write("root owned by another uid")
+
+    def test_a_group_or_other_writable_ahc_directory_is_refused(self):
+        for name in sorted(core.ROOT_DIRS):
+            for mode in (0o770, 0o755, 0o707):
+                self.tearDown()
+                self.setUp()
+                self.paths.ensure()
+                (self.paths.root / name).mkdir(exist_ok=True, mode=0o700)
+                os.chmod(str(self.paths.root / name), mode)
+                self.assert_refused_before_any_write("%s mode %o" % (name, mode))
+
+    def test_a_loose_directory_inside_an_ahc_only_tree_is_refused(self):
+        self.paths.ensure()
+        (self.paths.items / "sub").mkdir(mode=0o700)
+        os.chmod(str(self.paths.items / "sub"), 0o775)
+        self.assert_refused_before_any_write("items/sub mode 775")
+
+    def test_a_foreign_owned_file_at_an_ahc_name_is_refused(self):
+        from unittest import mock
+        self.paths.ensure()
+        runner_ledger = self.paths.root / "digest.md"
+        runner_ledger.write_text("line\n")
+        real = os.lstat
+
+        def lstat(p, *a, **k):
+            info = real(p, *a, **k)
+            if str(p) == str(runner_ledger):
+                fields = list(info)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return info
+        with mock.patch("os.lstat", lstat):
+            self.assert_refused_before_any_write("digest.md owned by another uid")
+
+    def test_an_ancestor_other_users_can_change_is_refused(self):
+        self.paths.ensure()
+        parent = self.paths.root.parent              # ~/.agent-harness
+        os.chmod(str(parent), 0o777)
+        self.assert_refused_before_any_write("parent 0777, not sticky")
+        os.chmod(str(parent), 0o1777)
+        self.paths.ensure()                          # sticky, like /tmp: accepted
+        os.chmod(str(parent), 0o775)
+        self.assert_refused_before_any_write("parent group-writable")
+        os.chmod(str(parent), 0o755)
+        self.paths.ensure()
+
+    def test_a_link_at_any_temp_name_ahc_writes_is_never_followed(self):
+        """Every writer under the root uses an unpredictable O_EXCL|O_NOFOLLOW temp name. With the name made
+        predictable here, a link planted at it is refused, never written through, and the external file keeps its
+        bytes and mode."""
+        from unittest import mock
+        import io
+        import secrets
+        sys.path.insert(0, str(HOOKS))
+        import ahc_runner as runner
+        import ahc_install
+        external = self.external(False)
+        before = self.external_state()
+
+        def plant(directory, name):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            stem = name if name.startswith(".") else "." + name
+            os.symlink(str(external), str(directory / ("%s.%s.tmp" % (stem, "feedfacefeedface"))))
+
+        writers = {
+            "marker": (lambda: (self.paths.root.mkdir(parents=True, mode=0o700),
+                                plant(self.paths.root, core.ROOT_MARKER), self.paths.claim_root())),
+            "private file": (lambda: (self.paths.ensure(), plant(self.paths.reports, "x.packet.md"),
+                                      runner._write_private(self.paths.root, self.paths.reports / "x.packet.md",
+                                                            "text\n"))),
+            "owner notice": (lambda: (self.paths.ensure(), plant(self.paths.inbox / "agent-abc123", "n.md"),
+                                      runner._write_inbox(self.paths.inbox, "agent-abc123", "n.md", "text\n"))),
+            "staged packet": (lambda: (self.paths.ensure(),
+                                       plant(self.paths.packets, __import__("hashlib").sha256(b"p\n").hexdigest()
+                                             + ".md"),
+                                       runner.stage_packet(self.paths, io.BytesIO(b"p\n")))),
+            "install record": (lambda: (self.paths.ensure(), plant(self.paths.root, "install.json"),
+                                        ahc_install._write_in_root(self.paths, self.paths.root / "install.json",
+                                                                   "{}\n"))),
+            "restore intent": (lambda: (self.paths.ensure(), plant(self.paths.root, "ledger.sqlite3.restore-intent"),
+                                        runner.Ledger(self.paths).restore(self.paths.root / "none.bak"))),
+        }
+        for label, write in writers.items():
+            with self.subTest(writer=label):
+                self.tearDown()
+                self.setUp()
+                external = self.external(False)
+                before = self.external_state()
+                with mock.patch.object(secrets, "token_hex", return_value="feedfacefeedface"):
+                    try:
+                        write()
+                    except Exception:
+                        pass                          # refused is the expected outcome; following is the failure
+                self.assertEqual(self.external_state(), before, "%s wrote through a link" % label)
+
     def test_content_inside_a_clone_is_not_ahc_state(self):
         """A clone's work tree may hold symlinks committed in the repo; only the clone directory itself and its .git
         must be real. A symlinked .git is refused."""
         self.paths.ensure()
         clone = self.paths.clones / "o__r"
-        (clone / ".git").mkdir(parents=True)
+        clone.mkdir(mode=0o700)
+        (clone / ".git").mkdir(mode=0o700)
         os.symlink("README.md", str(clone / "link-in-repo"))
         self.paths.ensure()
         os.rmdir(str(clone / ".git"))

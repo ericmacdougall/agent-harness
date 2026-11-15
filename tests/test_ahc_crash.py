@@ -284,7 +284,7 @@ def scenario_files(root, clock):
     mirror = paths.items / "crash-item.jsonl"
     if not (mirror.exists() and '"event": "probe"' in mirror.read_text()):
         runner._mirror(paths, "crash-item", "probe", clock.t, {})
-    runner._write_private(Path(root) / "status.json", '{"ok": true}\n')
+    runner._write_private(paths.root, paths.items / "status.json", '{"ok": true}\n')
     paths.inbox.mkdir(parents=True, exist_ok=True, mode=0o700)
     runner._write_inbox(paths.inbox, "owner1", "notice-1.md", "a notice\n")
     runner.stage_packet(paths, io.BytesIO(b"packet one\n"))
@@ -292,7 +292,7 @@ def scenario_files(root, clock):
     q = paths.queue / "ahc-q1.json"
     rejected = paths.root / "rejected" / "ahc-q1.json"
     if not rejected.exists():
-        paths.queue.mkdir(parents=True, exist_ok=True)
+        paths.queue.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not q.exists():
             q.write_text("{}\n")
         runner._quarantine(paths, q, "not a valid request")
@@ -405,7 +405,7 @@ class CrashPointTests(unittest.TestCase):
 
     def reference(self, scenario):
         root = self.base / ("ref-" + scenario)
-        root.mkdir()
+        root.mkdir(mode=0o700)
         points = counting_pass(root, scenario)
         final = state(root, normalize_times=True, skip_backups=True)
         return points, final, root
@@ -420,7 +420,7 @@ class CrashPointTests(unittest.TestCase):
                 name_when, _, k = point.rpartition("@")
                 reached.add(name_when)
                 root = self.base / ("%s-%d" % (scenario, crash_points))
-                root.mkdir()
+                root.mkdir(mode=0o700)
                 with self.subTest(scenario=scenario, point=point):
                     died = run_child(root, scenario, seam=point)
                     self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT,
@@ -461,7 +461,7 @@ class CrashPointTests(unittest.TestCase):
     def test_the_seam_is_not_honoured_outside_unittest(self):
         """The env var alone never arms a seam: a plain (non-unittest) process runs the scenario to the end."""
         root = self.base / "plain"
-        root.mkdir()
+        root.mkdir(mode=0o700)
         env = {k: v for k, v in os.environ.items() if not k.startswith("AHC_CRASH_")}
         env.update({ahc_crash.ENV_SEAM: "contracts.commit:before@1", ahc_crash.ENV_UNDER_TEST: "1"})
         code = ("import sys; sys.path.insert(0, %r); import ahc_crash, sys; "
@@ -473,7 +473,7 @@ class CrashPointTests(unittest.TestCase):
 
     def test_under_unittest_without_the_test_flag_the_seam_is_not_honoured(self):
         root = self.base / "noflag"
-        root.mkdir()
+        root.mkdir(mode=0o700)
         done = run_child(root, "contracts", seam="contracts.commit:before@1", under_test=False)
         self.assertEqual(done.returncode, 0, done.stderr[-2000:])
 
@@ -574,7 +574,7 @@ class InventoryTests(unittest.TestCase):
 
     def test_a_changed_count_and_a_stale_entry_fail(self):
         found = self.found()
-        key = ("ahc_runner", "_write_private", "os.replace")
+        key = ("ahc_runner", "_write_private", "fs.write_file")
         changed = dict(found)
         changed[key] = 2
         self.assertIn("count changed", " ".join(ahc_crash.check_inventory(changed)))
