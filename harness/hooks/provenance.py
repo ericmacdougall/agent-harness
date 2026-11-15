@@ -142,8 +142,11 @@ class LostWindow:
         """The read-block fields: the outside count, and the rule that produced it (only a read with a window)."""
         out = {"outside_window": self.outside}
         if self.cutoff is not None:
-            out["window"] = {"rule": LOST_WINDOW_RULE,
-                             "cutoff": datetime.datetime.fromtimestamp(self.cutoff, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+            try:   # `ah status --since` with a very long window puts the cutoff before the epoch, or out of range
+                cutoff = datetime.datetime.fromtimestamp(max(0.0, float(self.cutoff)), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (OverflowError, OSError, ValueError):
+                cutoff = ""
+            out["window"] = {"rule": LOST_WINDOW_RULE, "cutoff": cutoff}
         return out
 SMALL_FILE = 1 << 20              # policy, cache and similar small files
 MAX_RESOLVES = 40                 # sources resolved per top-level claim

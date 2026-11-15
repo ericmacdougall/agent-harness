@@ -578,6 +578,14 @@ class OneSharedRule(unittest.TestCase):
                 self.assertEqual(bool(notes), partial, notes)
                 self.assertEqual(bool(col.outside_window(data)), not partial and block["outside_window"] > 0)
 
+    def test_a_window_reaching_before_the_epoch_still_builds_its_block(self):  # ah export's "every row" window
+        for cutoff in (-10.0 ** 12, -1.0, 10.0 ** 15):
+            with self.subTest(cutoff=cutoff):
+                fields = prov.LostWindow(cutoff).fields()
+                self.assertEqual(fields["window"]["rule"], prov.LOST_WINDOW_RULE)
+        read = ah.status_report(Home(self).home, SID, 10.0 ** 12)["read"]
+        self.assertEqual(read["window"]["cutoff"], "1970-01-01T00:00:00Z")
+
     def test_export_says_it_does_not_split_by_window(self):
         import ah_export
         self.assertIn("not split by window", ah_export.SKIPPED_SCOPE)
