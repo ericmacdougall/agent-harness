@@ -197,7 +197,7 @@ class SupervisedOwners(unittest.TestCase):
         self.assertNotIn('progress_at', c.rows[0]['last_item'], 'do not mutate the raw supervisor snapshot')
 
     def test_claude_snapshot_retained_on_failure_is_visibly_stale_and_recovers(self):
-        runner=mock.Mock(); runner.run.return_value=(0,json.dumps({'session':'main-sess','owners':[
+        runner=mock.Mock(); runner.run.return_value=(0,json.dumps({'read':col.whole_read(),'session':'main-sess','owners':[
             {'agent_id':'claude123','state':'live','model':'recorded-model','task':'work'}]}))
         owners=col.Owners(self.hub,self.health,runner,None); owners.run(1)
         runner.run.return_value=(4,'{}'); owners.run(2)
@@ -206,7 +206,7 @@ class SupervisedOwners(unittest.TestCase):
         runner.run.return_value=(0,'{}'); owners.run(2.5)
         self.assertEqual(len(owners.rows),1)
         self.assertTrue(owners.rows[0].get('source_stale'))
-        runner.run.return_value=(0,json.dumps({'session':'main-sess','owners':[
+        runner.run.return_value=(0,json.dumps({'read':col.whole_read(),'session':'main-sess','owners':[
             {'agent_id':'claude123','state':'live'}]})); owners.run(3)
         self.assertFalse(owners.rows[0].get('source_stale',False))
 

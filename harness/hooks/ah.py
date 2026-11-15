@@ -75,6 +75,17 @@ def home_dir() -> Path:
     return Path(os.environ.get("AH_HOME") or Path.home())
 
 
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False) -> dict:
+    """What a read-only view actually read (goodqa#15920; the same block provenance.read_block writes). A consumer
+    must not take "nothing found" for "nothing there": state is "failed" when no source could be read, "partial" when
+    a source was unread, a line could not be parsed or a cap or time budget stopped the read, else "ok"."""
+    state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
+    return {"schema": "harness.read/1", "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
+            "unread": [{"source": str(u.get("source") or u.get("wal") or "")[:120], "reason": str(u.get("reason") or "")[:200]}
+                       for u in unread[:50]],
+            "skipped": int(skipped), "limited": bool(limited)}
+
+
 def is_secret_path(path) -> bool:
     return bool(SECRET_NAMES.search(Path(path).name))
 
@@ -263,17 +274,23 @@ def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = N
 RESTRICTED = re.compile(r"\b(solve|interview)", re.I)  # fail-closed: show liveness only, never the task text
 
 
-def discover_agents(home: Path, session: str, wal: Path) -> dict:
+def discover_agents(home: Path, session: str, wal: Path, unread: list | None = None) -> dict:
     """agent id -> {type, description, parent, finished, tmtime} from the two sources that exist for every
-    sub-agent (the main WAL only lists the few types whose spawn is hooked): task WALs and transcript meta files."""
+    sub-agent (the main WAL only lists the few types whose spawn is hooked): task WALs and transcript meta files.
+    `unread` collects each place that exists but could not be read, so the caller can say its list may be short."""
     found = {}
+    unread = unread if unread is not None else []
+
+    def missed(source, error):
+        if not isinstance(error, FileNotFoundError):  # a place that is not there holds no agents
+            unread.append({"source": source, "reason": f"file-unreadable: {type(error).__name__}"})
     try:
         with os.scandir(wal) as it:
             for e in it:
                 if e.name.startswith("agent-") and e.name.endswith(".jsonl"):
                     found.setdefault(e.name[6:-6], {})
-    except OSError:
-        pass
+    except OSError as error:
+        missed("session WAL folder", error)
     try:
         with os.scandir(home / ".claude" / "projects") as projects:
             for proj in projects:
@@ -291,12 +308,13 @@ def discover_agents(home: Path, session: str, wal: Path) -> dict:
                                     info.update(type=meta.get("agentType"), description=meta.get("description"),
                                                 parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
                                                 depth=meta.get("spawnDepth"))
-                            except (OSError, ValueError):
-                                pass
-                except OSError:
+                            except (OSError, ValueError) as error:
+                                missed(f"agent meta {agent[:40]}", error)
+                except OSError as error:
+                    missed("subagents folder", error)
                     continue
-    except OSError:
-        pass
+    except OSError as error:
+        missed("transcript projects folder", error)
     return found
 
 
@@ -327,7 +345,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
                 stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
-    for agent, meta in discover_agents(home, session, wal).items():
+    unread = []  # places that exist but could not be read: the owner list may be short (goodqa#15920)
+    for agent, meta in discover_agents(home, session, wal, unread).items():
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished", "depth") if k in meta})
@@ -374,7 +393,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         try:
             if now - f.stat().st_mtime > TASK_WAL_WINDOW_S:
                 continue  # history, not an owner (same window ahd uses for sessions)
-        except OSError:
+        except OSError as error:
+            unread.append({"source": f.name, "reason": f"file-unreadable: {type(error).__name__}"})
             continue
         summary = summarize_agent_wal(f, index_dir)
         verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
@@ -495,7 +515,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             "deadlines": dls,
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
             "attention": sorted(r["agent_id"] for r in rows if r.get("attention")),
-            "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy")}
+            "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy"),
+            "read": read_block(1, unread)}
 
 
 # ------------------------------------------------------------------ user-msg
@@ -2393,6 +2414,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     supplied = given is not None
     row_index = {id(rec): i for i, (_agent, rec) in enumerate(given)} if supplied else {}
     rows, unread = [], list(unread or [])
+    read_ok, skipped = 0, 0
 
     def consider(agent, rec):
         if not isinstance(rec, dict) or not rec.get("event"):
@@ -2412,13 +2434,21 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
                 unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
                 continue
-            for raw in text.splitlines():
+            read_ok += 1
+            lines = text.splitlines()
+            if lines and not text.endswith("\n"):
+                lines.pop()  # a line still being written is not a record yet
+            for raw in lines:
+                if not raw.strip():
+                    continue
                 try:
                     rec = json.loads(raw)
                 except ValueError:
+                    skipped += 1  # a complete line that is not a record: what it held is missing from this report
                     continue
                 consider(agent, rec)
     else:
+        read_ok = 1
         for agent, rec in given:
             consider(agent, rec)
     rows.sort(key=lambda r: r[1])
@@ -2515,6 +2545,7 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             "claimed": claimed, "blockers": blockers, "commits": commits,
             "asks_open": [a for k, a in asks.items() if k not in resolved],
             "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
+            "read": read_block(read_ok, unread, skipped),
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
 
 
@@ -2924,6 +2955,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
     prov = _prov()
     now = time.time() if now is None else now
     rows, total, limited = [], 0, False
+    unread, read_ok, skipped = [], 0, 0
     deadline = time.monotonic() + VIEW_BUDGET_S
     for s in _view_sessions(home, session, every):
         if time.monotonic() > deadline:
@@ -2931,18 +2963,31 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             break
         path = wal_dirs(home) / s / "main.jsonl"
         try:
+            if not os.path.lexists(path):
+                raise prov.Problem("missing", "no main WAL for this session")
             lines = list(prov._lines_containing(path, b'"event":"requirement"'))
-        except Exception:
+        except prov.Problem as problem:
+            # review PR 234 v6 F1: an unreadable WAL is an unread source, named with its reason, never zero requirements
+            unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"{problem.code}: {problem.message}"})
             continue
+        except Exception as error:  # noqa: BLE001
+            unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"file-unreadable: {type(error).__name__}"})
+            continue
+        read_ok += 1
         limited = limited or len(lines) >= prov.MAX_HITS  # the shared reader stops at MAX_HITS lines: say so
         for line in lines:
             if line is None:
+                skipped += 1  # an oversized line that names a requirement
                 continue
             try:
                 rec = prov.loads_line(line)
             except ValueError:
+                skipped += 1
                 continue
-            if not isinstance(rec, dict) or rec.get("event") != "requirement" or not isinstance(rec.get("id"), str) or not rec["id"]:
+            if not isinstance(rec, dict) or rec.get("event") != "requirement":
+                continue  # the words inside another record's text
+            if not isinstance(rec.get("id"), str) or not rec["id"]:
+                skipped += 1  # a requirement record with no id cannot be listed
                 continue
             total += 1
             if len(rows) >= VIEW_ROW_CAP:
@@ -2959,7 +3004,8 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 "state": str(rec.get("state") or "recorded")[:20],
                 "ticket": _clean_field(rec.get("ticket")), "owner": _clean_field(rec.get("owner")),
                 "evidence": _clean_field(rec.get("evidence"))})
-    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows)}
+    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows),
+            "read": read_block(read_ok, unread, skipped, limited)}
 
 
 def build_parser():

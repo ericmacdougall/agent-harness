@@ -1340,28 +1340,66 @@ def packet_gate(text: str, mode=None, ctx=None):
 
 # --------------------------------------------------------------------------- asks ledger
 
-def session_wals(session: str, home=None) -> list:
+READ_SCHEMA = "harness.read/1"
+
+
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False) -> dict:
+    """What a read-only view actually read, for a consumer that must not take "nothing found" for "nothing there"
+    (goodqa#15920). state: "failed" when no source could be read, "partial" when a source was unread, a matching line
+    could not be parsed or a cap or time budget stopped the read, else "ok". `unread` names each source and why."""
+    state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
+    return {"schema": READ_SCHEMA, "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
+            "unread": [{"source": clip(str(u.get("source", "")), 120), "reason": clip(str(u.get("reason", "")), 200)}
+                       for u in unread[:50]],
+            "skipped": int(skipped), "limited": bool(limited)}
+
+
+def session_wals_read(session: str, home=None) -> tuple:
+    """(paths, unread): the session's main and agent WALs, and why the folder or its main WAL could not be listed. A
+    folder that is missing or cannot be listed is an unread source, never an empty session."""
     if not SESSION_RE.match(session):
         raise Problem("user-session-invalid", "bad session id")
     folder = wals_root(home) / session
     try:
-        return sorted(p for p in folder.glob("*.jsonl") if p.name == "main.jsonl" or p.name.startswith("agent-"))
-    except OSError:
-        return []
+        with os.scandir(folder) as entries:
+            names = sorted(e.name for e in entries if e.name == "main.jsonl" or (e.name.startswith("agent-") and e.name.endswith(".jsonl")))
+    except FileNotFoundError:
+        return [], [{"source": "session WAL folder", "reason": "missing: no WAL folder for this session"}]
+    except OSError as error:
+        return [], [{"source": "session WAL folder", "reason": f"file-unreadable: cannot list it ({type(error).__name__})"}]
+    unread = [] if "main.jsonl" in names else [{"source": "main.jsonl", "reason": "missing: no main WAL for this session"}]
+    return [folder / name for name in names], unread
+
+
+def session_wals(session: str, home=None) -> list:
+    return session_wals_read(session, home)[0]
 
 
 def ledger(session: str, home=None) -> list:
     """Asks and their resolutions across the main and agent WALs of a session."""
+    return ledger_read(session, home)[0]
+
+
+def ledger_read(session: str, home=None) -> tuple:
+    """(records, read): the ledger, and what was actually read for it (read_block). One unreadable WAL does not hide
+    the other WALs' asks, but it is named in `read`, so a reader never takes the rest for the whole ledger."""
     asks, closed = {}, {}
-    for path in session_wals(session, home):
+    paths, unread = session_wals_read(session, home)
+    read_ok, skipped, limited = 0, 0, False
+    for path in paths:
+        failed = None
         for needle in (b'"event":"ask"', b'"event":"ask_resolved"'):
+            hits = 0
             try:
                 for line in _lines_containing(path, needle, LEDGER_MAX_HITS):
+                    hits += 1
                     if line is None:
+                        skipped += 1  # an oversized line that names an ask: its ask is not in the result
                         continue
                     try:
                         record = loads_line(line)
                     except ValueError:
+                        skipped += 1
                         continue
                     if not isinstance(record, dict):
                         continue
@@ -1371,11 +1409,20 @@ def ledger(session: str, home=None) -> list:
                         asks[record["id"]] = record
                     elif record.get("event") == "ask_resolved" and isinstance(record.get("ref"), str):
                         closed[record["ref"]] = record
-            except Exception:  # one unreadable WAL must not hide every other ask
-                continue
+            except Problem as problem:  # one unreadable WAL must not hide every other ask; it is reported as unread
+                failed = f"{problem.code}: {problem.message}"
+            except Exception as error:  # noqa: BLE001
+                failed = f"file-unreadable: {type(error).__name__}"
+            limited = limited or hits >= LEDGER_MAX_HITS
+        if failed:
+            unread.append({"source": path.name, "reason": failed})
+        else:
+            read_ok += 1
     for ident, record in asks.items():
         record["_closed"] = closed.get(ident)
-    return sorted(asks.values(), key=lambda r: r["at"])
+    if any(u["source"] in ("main.jsonl", "session WAL folder") for u in unread):
+        read_ok = 0  # without the main WAL the session's ledger was not read
+    return sorted(asks.values(), key=lambda r: r["at"]), read_block(read_ok, unread, skipped, limited)
 
 
 def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
@@ -1405,7 +1452,7 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
     """The open asks a person may be shown, as data (Mission Control's "Needs you" list).
 
     Blocked asks (no resolvable source) are left out, exactly as the text ledger says not to present them."""
-    entries = ledger(session, home)
+    entries, read = ledger_read(session, home)
     traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx, entries)
     items = []
     for kind, rows in (("traced", traced), ("unverified", unverified), ("assumption", assumptions)):
@@ -1425,7 +1472,7 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
                         "problem": f"{problem['code']}: {clip(problem['message'], 200)}"})
     return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
                        "blocked": len(blocked), "closed": closed}, "items": items, "blocked": flagged,
-            "resolved": resolved_items(session, home, entries=entries)}
+            "resolved": resolved_items(session, home, entries=entries), "read": read}
 
 
 def resolved_items(session: str, home=None, days: float = 7.0, limit: int = 100, entries=None) -> list:

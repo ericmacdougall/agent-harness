@@ -45,7 +45,7 @@ class Runner:
     def run(self, kind, *args, timeout=20.0, limit=0):
         if kind == "ah-requirements":
             return 0, json.dumps(self.view)
-        return 0, json.dumps({"goals": [], "generated": ev.iso()}) if kind == "ah-goals" else json.dumps({})
+        return 0, json.dumps({"state": "ok", "warnings": [], "goals": [], "generated": ev.iso()}) if kind == "ah-goals" else json.dumps({})
 
 
 def read(view):

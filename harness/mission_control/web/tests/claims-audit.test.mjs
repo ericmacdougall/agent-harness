@@ -2,17 +2,18 @@
 // the at-risk strip, initiative activity lines and the activity feed. Their text is built by pure functions in adapt.js
 // from the one status truth, so each is tested here without a DOM; the modules that render them may not hard-code it.
 import test from 'node:test';
+import { withReads, readsFor, SOURCES } from './reads.mjs';
 import assert from 'node:assert/strict';
 import { ledger, sources, needsSummary, ownersEmpty, ownerCount, initiativesEmpty, initiativeCount, atRiskEmpty, noProgress, noAction,
-  updatedText, feedEmpty, feedCount, ownerLineText, ownerCountTitle, hubCounts, workItemText, sceneText, claim, worst, truthOf, CLAIM_SOURCES } from '../js/adapt.js';
+  updatedText, feedEmpty, feedCount, ownerLineText, ownerCountTitle, hubCounts, workItemText, sceneText, claim, worst, truthOf, CLAIMS } from '../js/adapt.js';
 
 const NOW = Date.parse('2027-01-15T09:00:00Z');
 const at = '2027-01-15T08:00:00.000Z';
 const row = (name, truth = 'current', status = 'ok') => ({ name, status, checked: NOW / 1000, ok_at: truth === 'unknown' ? null : Date.parse(at) / 1000, truth, detail: status === 'ok' ? '' : `${name} read failed` });
-const NAMES = ['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'];
+const NAMES = SOURCES;
 function world(broken = '', truth = 'unknown') {
   const health = NAMES.map(name => (name === broken ? row(name, truth, truth === 'stale' ? 'error' : truth === 'partial' ? 'ok' : 'error') : row(name)));
-  return { now: NOW, connection: 'live', ledger: ledger({ status: { at, truth: 'current' } }), sources: sources(health), owners: [], asks: [], initiatives: [], events: [] };
+  return withReads({ now: NOW, connection: 'live', ledger: ledger({ status: { at, truth: 'current' } }), sources: sources(health), owners: [], asks: [], initiatives: [], events: [] });
 }
 const AUDIT = [
   ['Needs-you header count, label, title and "Nothing needs you right now."', ['asks'], s => { const n = needsSummary(s, 0, 0); return `${n.count}|${n.label}|${n.title}|${n.empty}`; },
@@ -60,6 +61,7 @@ test('audit: an unknown Needs-you count is "?" in the header, its label and the 
 test('audit: an initiatives file that is not configured is said so, and is not a reason to doubt other claims', () => {
   const s = world();
   s.sources = sources(NAMES.map(name => (name === 'initiatives' ? { name, status: 'off', truth: 'current', detail: 'no initiatives file configured' } : row(name))));
+  s.reads = readsFor(s);
   assert.equal(initiativesEmpty(s), 'No initiatives file is configured.');
   assert.equal(claim(s, 'blockers').truth, 'current');
 });
@@ -72,6 +74,6 @@ test('audit: the truth vocabulary is closed and worst() fails closed', () => {
   assert.equal(worst(), 'unknown');
   assert.equal(claim({}, 'blockers').truth, 'unknown');
   assert.equal(claim({}, 'no-such-claim').truth, 'unknown');
-  for (const [id, deps] of Object.entries(CLAIM_SOURCES)) assert.ok(deps.length > 0, id);
+  for (const [id, deps] of Object.entries(CLAIMS)) assert.ok(deps.length > 0, id);
 });
 // The source checks that the DOM modules no longer hard-code these sentences are in status-truth.test.mjs (old exports only).

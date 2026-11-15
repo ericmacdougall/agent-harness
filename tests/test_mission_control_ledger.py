@@ -24,20 +24,20 @@ def iso(age):
     return ev.iso(NOW - age)
 
 
-GOALS = {"generated": iso(0), "session": SID, "state": "OK", "warnings": [], "goals": [
+GOALS = {"generated": iso(0), "session": SID, "state": "ok", "warnings": [], "goals": [
     {"id": "leads", "title": "1000 leads in the CRM", "ticket": "goodqa#15533", "ledger_status": "imported",
      "state": "LIVE_TESTED", "priority": 3, "target": "1000 leads", "owners": ["a1"], "deferral": None,
      "missing": [], "tampered": [], "unpinned": [],
      "evidence": [{"id": "w1", "kind": "live_test", "verdict": "PASS", "at": iso(5000), "check": "crm", "note": "ok"}]},
     {"id": "x", "title": "<img src=x onerror=alert(1)>", "state": "UNKNOWN", "evidence": []}]}
-REQS = {"generated": iso(0), "total": 3, "truncated": False, "requirements": [
+REQS = {"read": col.whole_read(), "generated": iso(0), "total": 3, "truncated": False, "requirements": [
     {"id": "wr1", "session": SID, "text": "keep chat live", "source": "user:s/u \"x\"", "at": iso(3600), "state": "recorded",
      "ticket": None, "owner": None, "evidence": None},
     {"id": "wr2", "session": SID, "text": "old thing", "source": "user:s/u \"y\"", "at": iso(40 * 86400), "state": "recorded",
      "ticket": None, "owner": None, "evidence": None},
     {"id": "wr3", "session": SID, "text": "done thing", "source": "user:s/u \"z\"", "at": iso(3600), "state": "done",
      "ticket": None, "owner": None, "evidence": None}]}
-STATUS = {"session": SID, "since_s": 43200, "generated": iso(0), "entries": 10, "asks_open": [], "decisions": [],
+STATUS = {"read": col.whole_read(), "session": SID, "since_s": 43200, "generated": iso(0), "entries": 10, "asks_open": [], "decisions": [],
           "assumptions": [], "commits": [], "claimed": [],
           "verified": [{"agent": "a1", "at": iso(60), "id": "wv1", "event": "check", "note": "REALLY_TESTED t: ok", "check": "t", "verdict": "PASS"}],
           "live": [{"agent": "a1", "at": iso(30), "id": "wl1", "event": "deploy", "note": "DEPLOYED x", "check": "", "verdict": ""}],
@@ -95,6 +95,8 @@ class StatusUnread(unittest.TestCase):
         import ah  # noqa: PLC0415 - the real producer, fed rows so it opens no file
         rows = [("a1", {"event": "check", "at": iso(60), "id": "wv1", "note": "REALLY_TESTED t: ok"})]
         report = ah.status_report(Path("/nonexistent"), SID, 43200, now=NOW, rows=rows, unread=unread)
+        # fed rows, the producer skips its owners view and says so; `ah status` itself computes it
+        report["owners"] = {"counts": {}, "undisposed": [], "attention": [], "live": []}
         return json.loads(json.dumps(report, default=str))
 
     def test_unread_wals_mark_the_status_incomplete_with_a_bounded_redacted_list(self):
@@ -193,7 +195,7 @@ class LedgerCollector(unittest.TestCase):
         reqs = dict(REQS, total=9000, requirements=[
             {"id": f"w{i:06d}", "session": SID, "text": "t%d " % i + "A" * 620, "at": iso(i), "state": "recorded"}
             for i in range(col.Ledger.MAX_REQUIREMENTS + 50)])
-        goals = {"goals": [{"id": f"g{i}", "title": "T", "state": "UNKNOWN",
+        goals = {"state": "ok", "warnings": [], "goals": [{"id": f"g{i}", "title": "T", "state": "UNKNOWN",
                             "evidence": [{"id": f"e{j}", "kind": "live_test", "verdict": "PASS", "at": iso(j)} for j in range(100)]}
                            for i in range(col.Ledger.MAX_GOALS + 20)]}
         ledger, hub, _ = make(Fake(goals=goals, reqs=reqs))
@@ -556,7 +558,7 @@ class AsksArchive(unittest.TestCase):
         class R:
             def run(self, kind, *args, timeout=20.0, limit=0):
                 if kind == "provenance-asks":
-                    return 0, json.dumps({"items": [
+                    return 0, json.dumps({"read": col.whole_read(), "blocked": [], "resolved": [], "items": [
                         {"id": "wlive0000001", "kind": "traced", "at": iso(60), "note": "Keep?", "owner": "main"},
                         {"id": "wuntil000001", "kind": "traced", "at": iso(3600), "note": "Expired?", "owner": "main",
                          "until": ev.iso(now - 60)}],
@@ -828,7 +830,7 @@ class AsksRunner:
     def run(self, kind, *args, timeout=20.0, limit=0):
         if self.code:
             return self.code, ""
-        return 0, json.dumps({"items": self.items, "blocked": [], "resolved": []})
+        return 0, json.dumps({"read": col.whole_read(), "items": self.items, "blocked": [], "resolved": []})
 
 
 def ask_row(n, ident=None):
@@ -914,7 +916,7 @@ def _owners(rows, then_fail=False):
 
         class R:
             def run(self, kind, *args, **kw):
-                return answer["code"], json.dumps({"session": SID, "owners": rows})
+                return answer["code"], json.dumps({"read": col.whole_read(), "session": SID, "owners": rows})
         owners = col.Owners(hub, health, R(), None)
         owners.run(1000.0)
         if then_fail:

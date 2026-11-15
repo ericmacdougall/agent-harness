@@ -12,7 +12,8 @@
   "ledger": "mission-panel",
   "limits": "chat-panel",
   "csrf": "internal",
-  "requirement_actions": "requirements-body"
+  "requirement_actions": "requirements-body",
+  "reads": "internal"
  },
  "sse": {
   "event": "activity-panel",
@@ -22,7 +23,8 @@
   "chat": "chat-panel",
   "codex": "chat-panel",
   "asks": "needs-panel",
-  "ledger": "mission-panel"
+  "ledger": "mission-panel",
+  "reads": "internal"
  },
  "asks": {
   "items": "needs-panel",
