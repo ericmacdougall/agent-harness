@@ -811,15 +811,25 @@ large_pass() {
     idx=$((idx + 1)); base=${key##*/}
     LARGE_CUR="$LARGE_RUN/$idx" LARGE_FILE="$LARGE_RUN/$idx/$base"
     if ! mkdir -- "$LARGE_CUR" 2>/dev/null; then large_fail "cannot create the snapshot directory for $key"; LARGE_CUR= LARGE_FILE=; continue; fi
-    # cp -n never replaces anything (the directory is new, so nothing is there); -c clones on APFS and costs no space.
-    if [ "$(uname)" = Darwin ]; then
-      bounded "$left" cp -n -c -p -- "$HOME/$key" "$LARGE_FILE" 2>/dev/null; rc=$?
-      if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then bounded "$(time_left)" cp -n -p -- "$HOME/$key" "$LARGE_FILE"; rc=$?; fi
-    else
-      bounded "$left" cp -n --reflink=auto -p -- "$HOME/$key" "$LARGE_FILE"; rc=$?
+    # cp -n never replaces anything (the directory is new, so nothing is there). The first attempt clones (APFS -c, or a
+    # reflink: no space and no data copied) and may leave a partial file when it fails; that file is removed by name
+    # before the plain copy, which would otherwise accept it as already there (PR #261 review v2 F2).
+    if [ "$(uname)" = Darwin ]; then clone=-c; else clone=--reflink=always; fi
+    bounded "$left" cp -n "$clone" -p -- "$HOME/$key" "$LARGE_FILE" 2>/dev/null; rc=$?
+    if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then
+      if no_link_below "$LARGE_STAGE" "$LARGE_FILE"; then rm -f -- "$LARGE_FILE"; fi
+      if [ -e "$LARGE_FILE" ] || [ -L "$LARGE_FILE" ]; then large_fail "cannot clear the failed snapshot of $key"; large_cleanup; continue; fi
+      left=$(time_left)
+      if [ "$left" -lt "$MIN_SLICE" ]; then large_fail "its budget is used up; $key stays pending"; large_cleanup; break; fi
+      bounded "$left" cp -n -p -- "$HOME/$key" "$LARGE_FILE"; rc=$?
     fi
     if [ $rc -eq 124 ]; then large_fail "the snapshot of $key ran out of time; it stays pending"; large_cleanup; break; fi
     if [ $rc -ne 0 ] || [ ! -f "$LARGE_FILE" ] || [ -L "$LARGE_FILE" ]; then large_fail "cannot snapshot $key"; large_cleanup; continue; fi
+    # The file can only have grown since it was listed: a shorter snapshot is a truncated copy, never uploaded or recorded.
+    snapsize=$(size_of "$LARGE_FILE")
+    if ! printf '%s' "$snapsize" | grep -Eq '^[0-9]+$' || [ "$snapsize" -lt "$size" ]; then
+      large_fail "the snapshot of $key is shorter than the listed ${size} bytes; it is not uploaded and stays pending"; large_cleanup; continue
+    fi
     before=$REFUSED_N
     upload "$LARGE_FILE" "$key" --tpslimit "$LARGE_TPS" --transfers 1
     if [ "$copied" -eq 1 ] && [ "$REFUSED_N" -eq "$before" ]; then
@@ -841,6 +851,16 @@ large_pass() {
 }
 large_tier() {
   local try="$LOGDIR/log-backup.large-last-try" age saved_end=$WALL_END lend rc
+  # The completion state belongs to one destination ($R: remote, path and host), like the bulk checkpoint (PR #261
+  # review v2 F1). When it changes, nothing sent elsewhere counts: the record, the pass gap and the marker are reset
+  # so the first pass to the new destination starts now and no old marker vouches for it.
+  private_dir "$LARGE_STATE" || { large_fail "its state directory is not a private directory of ours; nothing was sent"; return 1; }
+  if [ "$(cat "$LARGE_STATE/remote" 2>/dev/null)" != "$R" ]; then
+    [ ! -e "$LARGE_STATE/remote" ] || say "large tier: the destination changed; its completion record, pass gap and marker are reset"
+    rm -f -- "$LARGE_STATE/done.tsv" "$try" "$LOGDIR/log-backup.large-last-ok" \
+      && printf '%s\n' "$R" > "$LARGE_STATE/remote.tmp.$$" && mv "$LARGE_STATE/remote.tmp.$$" "$LARGE_STATE/remote" \
+      || { large_fail "cannot reset its state for the new destination"; return 1; }
+  fi
   if [ -e "$try" ]; then
     age=$(raw_age "$try")
     if [ -n "$age" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$LARGE_EVERY" ]; then
