@@ -42,9 +42,12 @@ function connect() {
   source?.close();
   source = new EventSource('/api/events');
   source.addEventListener('open', () => {
-    if (failures > 0) resync();
+    // review PR 234 v6: after a drop the server may be a new process, and what the page holds came from the old one.
+    // The page is live again only once it holds this server's state, never on the stream opening alone.
+    const reopened = failures > 0;
     failures = 0;
-    setConnection('live');
+    if (reopened) resync();
+    else setConnection('live');
   });
   source.addEventListener('error', () => {
     failures += 1;
@@ -82,9 +85,17 @@ function connect() {
   source.addEventListener('orggraph', message => { const data = parse(message); if (data) setOrgGraph(data); });
 }
 
-function resync() {
+// Re-read the state after a reopened stream, then show live, unless the stream dropped again meanwhile. A failed
+// read leaves the page not live (every claim at best stale) and tries again, backing off, while the stream stays open.
+function resync(delay = 300) {
   clearTimeout(resyncTimer);
-  resyncTimer = setTimeout(() => { loadState().catch(() => {}); }, 300);
+  resyncTimer = setTimeout(async () => {
+    try {
+      if (await loadState() && failures === 0) setConnection('live');
+    } catch {
+      if (failures === 0 && source) resync(Math.min(30000, delay * 4));
+    }
+  }, delay);
 }
 
 async function post(item) {

@@ -549,7 +549,10 @@ class RestrictedProducerShape(unittest.TestCase):
             owners._rows({"session": "s", "owners": owner_rows}, 1.0)
         ledger = col.Ledger(Hub(), self.Health(), runner=None, session_fn=lambda: "s",
                             visible_fn=lambda: owners.unrestricted[1] if owners.unrestricted[0] == "s" else None)
-        return {r["id"]: r["note"] for r in ledger._status({"verified": entries}, 0)["verified"]}
+        # PR 234 v6: ah status always sends every list; a payload missing one is refused, so the fixture sends them all
+        payload = {key: [] for key in col.Ledger.STATUS_LISTS}
+        payload["verified"] = entries
+        return {r["id"]: r["note"] for r in ledger._status(payload, 0)["verified"]}
 
     ROWS = [{"agent_id": "a1234567890abcdef", "type": "task-owner", "task": None, "restricted": True, "owner": True,
              "state": "done", "severity": "info", "idle_s": 7 * 3600, "ticket": "goodqa#777", "last_activity": ""},

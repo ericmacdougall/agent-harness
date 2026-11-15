@@ -208,8 +208,10 @@ class Health:
     def _set(self, name, status, detail, truth=None):
         now = time.time()
         previous = self.rows.get(name, {})
-        ok_at = now if status == "ok" else previous.get("ok_at")
-        derived = read_truth(ok_at if status != "off" else None, status == "error")
+        # off reads nothing, so no earlier good read stands for what follows it: an error after off is unknown, not
+        # stale (review PR 234 v5 F1 class: a session that went away and came back has not been read since)
+        ok_at = now if status == "ok" else None if status == "off" else previous.get("ok_at")
+        derived = read_truth(ok_at, status == "error")
         if status == "off":
             truth = truth if truth in TRUTHS else "unknown"  # off says why there is nothing to read
         else:
@@ -231,6 +233,17 @@ class Health:
         """`truth="current"` only for a source that is deliberately absent, so it has nothing to report (no
         initiatives file configured); a source that cannot read yet (no main session) stays unknown."""
         self._set(name, "off", detail, truth)
+
+    def forget(self, name, detail):
+        """The source's last good read no longer applies: main's session changed, so nothing has been read for the
+        session it follows now. The row turns unknown with no good-read time at once, before the slow read starts,
+        and keeps its status so the tick that then reads well still reports ok. An off row has nothing to forget."""
+        previous = self.rows.get(name)
+        if not previous or previous.get("status") == "off":
+            return
+        self.rows[name] = dict(previous, checked=time.time(), detail=ev.short(detail or "", 160), ok_at=None,
+                               truth="unknown")
+        self.hub.snapshot("health", list(self.rows.values()))
 
     def snapshot(self):
         return list(self.rows.values())
@@ -292,12 +305,35 @@ class WalTailer(Collector):
         self.max_events_per_tick = 60
         # review R-2: fn(runtime, session, agent) -> may this agent's WAL note text be shown? None shows main only.
         self.note_visible = None
+        self.unreadable: set[str] = set()  # roots and session directories that exist but could not be listed at the last scan
+        self.unopened: set[str] = set()    # WAL files that exist but could not be opened, until a read of them succeeds
+
+    def health_truth(self):
+        """partial when the tailer cannot see every WAL: a root or session directory that exists but could not be
+        listed, a WAL that exists but could not be opened, or the file cap reached. Something missing is not partial: a
+        runtime with no WALs here, or a WAL removed (review PR 234 v6: every silent cap on a read the page counts from
+        reports partial)."""
+        return "partial" if self.unreadable or self.unopened or len(self.files) >= self.MAX_FILES else None
+
+    def _still_unopened(self, path: str, now: float) -> bool:
+        """A WAL stays unread while it is watched, or exists inside the window; a removed or aged-out one is not unread."""
+        if path in self.files:
+            return True
+        try:
+            return now - os.stat(path, follow_symlinks=False).st_mtime <= self.WINDOW_S
+        except OSError:
+            return False  # gone; a stat refused on its directory marks that directory unreadable below
 
     def _discover(self, now: float, initial: bool) -> None:
+        self.unreadable = set()
+        self.unopened = {path for path in self.unopened if self._still_unopened(path, now)}
         for root, runtime in self.roots:
             try:
                 sessions = list(os.scandir(root))
+            except FileNotFoundError:
+                continue
             except OSError:
+                self.unreadable.add(str(root))
                 continue
             for entry in sessions:
                 if len(self.files) >= self.MAX_FILES:
@@ -308,14 +344,20 @@ class WalTailer(Collector):
                     if now - entry.stat(follow_symlinks=False).st_mtime > self.WINDOW_S and not initial:
                         pass  # appends do not touch the directory mtime, so old directories are still listed
                     names = os.scandir(entry.path)
+                except FileNotFoundError:
+                    continue  # removed since the root was listed
                 except OSError:
+                    self.unreadable.add(entry.path)
                     continue
                 for item in names:
                     if not item.name.endswith(".jsonl") or item.path in self.files:
                         continue
                     try:
                         info = item.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
                     except OSError:
+                        self.unreadable.add(item.path)
                         continue
                     if not stat.S_ISREG(info.st_mode) or now - info.st_mtime > self.WINDOW_S:
                         continue
@@ -334,8 +376,12 @@ class WalTailer(Collector):
             with self.reader.open(path) as handle:
                 handle.seek(max(0, info.st_size - 16384))
                 lines = handle.read(16384).split(b"\n")
-        except (OSError, Refused):
+        except FileNotFoundError:
             return
+        except (OSError, Refused):
+            self.unopened.add(path)  # its newest line is not known: partial until a read of it succeeds
+            return
+        self.unopened.discard(path)
         newest = None
         found_item = found_progress = False
         for raw in reversed(lines):
@@ -387,21 +433,34 @@ class WalTailer(Collector):
         for path, tail in list(self.files.items()):
             try:
                 info = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                self.files.pop(path, None)
+                self.unopened.discard(path)
+                continue
             except OSError:
                 self.files.pop(path, None)
+                self.unopened.add(path)
                 continue
             if info.st_ino != tail.ino or info.st_size < tail.offset:  # replaced or truncated: start over
                 tail.ino, tail.offset, tail.partial = info.st_ino, 0, b""
                 tail.generation += 1
             if info.st_size == tail.offset:
+                if path in self.unopened:
+                    self._seed_last(path, tail, info)  # its newest line was never seen: retried until it reads
                 continue
             try:
                 with self.reader.open(path) as handle:
                     handle.seek(tail.offset)
                     data = handle.read(self.READ_CAP)
+            except FileNotFoundError:
+                self.files.pop(path, None)
+                self.unopened.discard(path)
+                continue
             except (OSError, Refused):
                 self.files.pop(path, None)
+                self.unopened.add(path)  # it exists but its lines are not seen: partial until a read of it succeeds
                 continue
+            self.unopened.discard(path)
             tail.offset += len(data)
             emitted = self._lines(tail, split_lines(tail, data), budget)
             budget -= emitted[0]
@@ -576,6 +635,12 @@ class Initiatives(Collector):
         self.items: list[dict] = []
         self.stale = False
         self.error = ""
+        self.partial = False  # the file holds more initiatives than the MAX_ROWS kept
+
+    MAX_ROWS = 100
+
+    def health_truth(self):
+        return "partial" if self.partial else None
 
     def tick(self, now: float):
         if not self.path:
@@ -599,8 +664,8 @@ class Initiatives(Collector):
         rows = data.get("initiatives") if isinstance(data, dict) else data
         if not isinstance(rows, list):
             return self._fail("initiatives file must be a list")
-        self.items = [clean_initiative(r, n) for n, r in enumerate(rows[:100])]
-        self.stale, self.error = False, ""
+        self.items = [clean_initiative(r, n) for n, r in enumerate(rows[:self.MAX_ROWS])]
+        self.stale, self.error, self.partial = False, "", len(rows) > self.MAX_ROWS
         self.publish(info.st_mtime)
         if previous is not None:
             self.hub.publish(ev.make("initiative", "initiatives", f"{len(self.items)} initiatives updated",
@@ -783,6 +848,12 @@ class Owners(Collector):
         # scrubs on restricted text; and whether any owner read has landed (before one, ticketed file rows are hidden)
         self.read_restricted_tickets: frozenset = frozenset()
         self.restricted_known = False
+        self.partial = False  # the last good read held more owners than MAX_ROWS, or rows it could not show
+
+    MAX_ROWS = 60
+
+    def health_truth(self):
+        return "partial" if self.partial else None
 
     def publish(self):
         managed = []
@@ -891,7 +962,7 @@ class Owners(Collector):
         return self._rows(data, now)
 
     def _rows(self, data: dict, now: float):
-        rows = []
+        rows, dropped = [], 0
         self.unrestricted = (str(data.get("session") or ""), frozenset(
             str(r.get("agent_id")) for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is False and isinstance(r.get("agent_id"), str)))
@@ -905,6 +976,7 @@ class Owners(Collector):
         self.restricted_known = True
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
+                dropped += 1
                 continue
             state = str(row.get("state") or "")
             idle = row.get("idle_s") if isinstance(row.get("idle_s"), (int, float)) else None
@@ -912,6 +984,7 @@ class Owners(Collector):
                 continue
             agent = str(row.get("agent_id") or "")
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", agent):
+                dropped += 1
                 continue  # a malformed id is dropped, never rewritten into a different-looking one
             ticket = str(row.get("ticket") or "")
             explicit = ('codex' if row.get('runtime') == 'codex' or row.get('harness') == 'openai' or agent.startswith('codex-')
@@ -955,7 +1028,8 @@ class Owners(Collector):
         # then rows that need attention (DROPPED, SILENT, decision required), so an alarm is not cut either
         rows.sort(key=lambda r: (0 if r["role"] == "live" else 1 if r["decision_required"] or r["state"].startswith(("DROPPED", "SILENT"))
                                  else 2 if r["role"] == "parked" else 3, r["idle_s"] or 0))
-        self.claude_rows = rows[:60]
+        self.claude_rows = rows[:self.MAX_ROWS]
+        self.partial = dropped > 0 or len(rows) > self.MAX_ROWS  # the owner counts would be short: never shown as whole
         self.publish()
         if owner_policy().get("fallback"):
             # the panel still counts, but by default owner/helper types: say so instead of drifting silently
@@ -1095,20 +1169,56 @@ class Asks(Collector):
         self.lock = threading.Lock()  # one ledger read at a time, and its view is published before the next starts
         self.dirty = False      # set when a WAL ask or ask_resolved line was seen: read the ledger at the next tick
         self.read_at = 0.0
+        # Status truth across sessions (review PR 234 v5 F1 class): the rows and the Health truth belong to the session
+        # of the last good read alone. `followed` is the session the last tick followed, so a change is due at once.
+        self.read_session = ""
+        self.followed = ""
+        self.moved_to = None    # the session follow() last saw main move to (its Health row is forgotten once)
+        self.partial = False    # the last good read held rows it could not show (over the 100 kept, or malformed)
+
+    def _session(self) -> str:
+        try:
+            return str(self.session_fn() or "")
+        except Exception:  # noqa: BLE001 - an unknown session shows nothing session-scoped
+            return ""
+
+    def health_truth(self):
+        """unknown unless the last good read was for the session main is in now (rows of another session are not this
+        session's last good read, so never stale either); partial when that read could not show every row."""
+        if not self.read_session or self.read_session != self._session():
+            return "unknown"
+        return "partial" if self.partial else None
 
     def tick(self, now: float):
-        session = self.session_fn() or ""
+        session = self._session()
+        self.followed = session
         if self.session and session != self.session:
-            # the pin moved: never keep showing the previous session's asks while the new read runs or fails (A-1)
+            # main's session moved: never keep showing the previous session's asks while the new read runs or fails.
+            # The Health row turns unknown first, so the page claims nothing even while a click's read holds the lock.
+            self.health.forget(self.name, "main session changed; reading the new session's asks")
             with self.lock:
-                self.publish({"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": [], "swept_at": ""},
-                             session)
-        if not session:   # unpinned: nothing is shown (review N-1: the clear above runs first)
+                self._reset_session(session)
+        if not session:   # no main session: nothing is shown (the clear above runs first)
             self.next_at = now + 10  # the owners collector learns main's session shortly after start
             self.health.off(self.name, "no main session known yet")
             return "off"
         self.refresh(session, now)
         return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
+
+    def follow(self) -> None:
+        """From the server's session watch: the Health row turns unknown the moment main's session moves, even while a
+        read holds the lock; the tick (due at once) then drops the old rows and reads the new session."""
+        session = self._session()
+        if session == self.followed:
+            self.moved_to = None
+        elif self.moved_to != session:
+            self.moved_to = session
+            self.health.forget(self.name, "main session changed; reading the new session's asks")
+
+    def _reset_session(self, session: str) -> None:
+        """Drop the previous session's rows (called with the lock held)."""
+        self.read_session, self.partial = "", False
+        self.publish({"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": [], "swept_at": ""}, session)
 
     def refresh(self, session: str, now: float | None = None) -> dict:
         """Read, sweep and publish as one step, so a decision click and the sweeper thread never run two ledger
@@ -1116,6 +1226,7 @@ class Asks(Collector):
         with self.lock:
             view = self.read(session, now)
             self.publish(view, session)
+            self.read_session, self.partial = session, view.get("partial") is True
             return view
 
     def read(self, session: str, now: float | None = None) -> dict:
@@ -1127,11 +1238,14 @@ class Asks(Collector):
         if code not in (0, 2) or not isinstance(data, dict) or not isinstance(data.get("items"), list):
             raise RuntimeError(f"provenance asks exited {code}")
         self.dirty, self.read_at = False, now
-        raw = [r for r in data["items"][:100] if isinstance(r, dict) and ASK_ID_RE.match(str(r.get("id", "")))]
-        blocked = [r for r in (data.get("blocked") if isinstance(data.get("blocked"), list) else [])[:100]
+        listed = data["items"]
+        listed_blocked = data.get("blocked") if isinstance(data.get("blocked"), list) else []
+        listed_resolved = data.get("resolved") if isinstance(data.get("resolved"), list) else []
+        raw = [r for r in listed[:self.MAX_ROWS] if isinstance(r, dict) and ASK_ID_RE.match(str(r.get("id", "")))]
+        blocked = [r for r in listed_blocked[:self.MAX_ROWS]
                    if isinstance(r, dict) and ASK_ID_RE.match(str(r.get("id", "")))]
         resolved = []
-        for row in (data.get("resolved") if isinstance(data.get("resolved"), list) else [])[:100]:
+        for row in listed_resolved[:self.MAX_ROWS]:
             if not isinstance(row, dict) or not ASK_ID_RE.match(str(row.get("id", ""))):
                 continue
             note = ev.short(str(row.get("note", "")), 400)
@@ -1143,7 +1257,11 @@ class Asks(Collector):
                              "resolved_at": str(row.get("resolved_at", ""))[:40],
                              "resolution": ev.short(str(row.get("resolution", "")), 300),
                              "decision": ev.short(str(row.get("decision", "")), 40)})
-        view = {"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": resolved, "swept_at": ""}
+        # more rows than are kept, or rows dropped for their shape: the counts would be short, so the read is partial
+        partial = any(len(listed_rows) > self.MAX_ROWS or len(kept) < len(listed_rows[:self.MAX_ROWS])
+                      for listed_rows, kept in ((listed, raw), (listed_blocked, blocked), (listed_resolved, resolved)))
+        view = {"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": resolved, "swept_at": "",
+                "partial": partial}
         status = {}
         if self.root is not None:
             import needs_sweep  # noqa: PLC0415
@@ -1192,8 +1310,11 @@ class Asks(Collector):
     def mark_dirty(self) -> None:
         self.dirty = True
 
+    MAX_ROWS = 100
+
     def due(self, now: float) -> bool:
-        return now >= self.next_at or (self.dirty and now - self.read_at >= self.DEBOUNCE_S)
+        return (now >= self.next_at or (self.dirty and now - self.read_at >= self.DEBOUNCE_S)
+                or self._session() != self.followed)  # main's session moved: clear its rows now, not in 300 s
 
     def ticket_status(self, ref: str):
         """'closed', 'open' or None (unknown) for one ticket: a read-only lookup through the allowlisted runner."""
@@ -1325,22 +1446,76 @@ class Ledger(Collector):
         self.visible_fn = visible_fn
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
-        self.raw_total, self.raw_truncated = 0, False
+        self.raw_total, self.raw_truncated, self.raw_dropped = 0, False, 0
         # the session the requirement rows on hand were read for: set only by a successful read (review PR 234 F3)
         self.req_session = ""
         self.parts = {name: self._empty(name) for name in ("goals", "requirements", "status")}
         self.mission: dict = {}
         self.sig = None
         self.published_at = ""
-        self.read_session = ""   # the session the requirements and status parts were read for
+        self.read_session = ""   # the session the requirements and status parts are being read for
+        self.moved_to = None     # the session follow() last saw main move to (its Health row is forgotten once)
+        # parts and raw rows are written by the ledger thread and by a click's reclassify on an HTTP thread
+        self.lock = threading.RLock()
+
+    # Status truth across sessions (review PR 234 v5 F1 class): requirements and status are read for main's session.
+    # A part is shown as read only while main is in the session it was read for; otherwise it is shown never read
+    # (unknown, no rows), whatever wrote it last. That is decided in one place, view(), for publish, snapshot and the
+    # Health row alike, so a session that moves between ticks, mid-read or to none never leaves another's rows current.
+    SESSION_PARTS = ("requirements", "status")
+
+    def _session(self) -> str:
+        try:
+            return str(self.session_fn() or "")
+        except Exception:  # noqa: BLE001 - an unknown session shows nothing session-scoped
+            return ""
+
+    def view(self, session=None) -> dict:
+        """The parts as they may be shown while main is in `session` (default: now)."""
+        session = self._session() if session is None else session
+        with self.lock:
+            parts = dict(self.parts)
+        for name in self.SESSION_PARTS:
+            if not session or parts[name].get("session") != session:
+                parts[name] = self._empty(name)
+        return parts
 
     def _reset_session_parts(self) -> None:
-        """A new pinned session never inherits the previous session's requirements or status, even when its own
-        first read fails (review A-1): an empty, unread part is shown instead."""
-        self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
-        # PR 234 status truth: an unread part is truth "unknown", so the page claims no zero or "none" from it
-        self.parts["requirements"] = self._empty("requirements")
-        self.parts["status"] = self._empty("status")
+        """A new session never inherits the previous session's requirements or status, even when its own first read
+        fails: an empty, unread part is shown instead (and no archive or restore click is accepted until it reads)."""
+        with self.lock:
+            self.raw_requirements, self.raw_total, self.raw_truncated, self.raw_dropped = [], 0, False, 0
+            self.req_session = ""
+            self.parts["requirements"] = self._empty("requirements")
+            self.parts["status"] = self._empty("status")
+
+    def _follow_session(self) -> str:
+        """Follow main's session. On a change the old session's parts are dropped, the Health row turns unknown and
+        the page is told at once, before the slow reads; returns the session to read for."""
+        session = self._session()
+        if session != self.read_session:
+            self._reset_session_parts()
+            self.read_session = session
+            self.health.forget(self.name, "main session changed; reading its requirements and status")
+            self.publish()
+        return session
+
+    def due(self, now: float) -> bool:
+        return now >= self.next_at or self._session() != self.read_session
+
+    def follow(self) -> None:
+        """From the server's session watch, on its own thread, never waiting on a read: while main is in a session other
+        than the one the parts are being read for, the Health row turns unknown and the pushed view shows the parts
+        unread, even while this source's thread is still inside a slow read for the old session."""
+        session = self._session()
+        if session == self.read_session:
+            self.moved_to = None  # back in the session being read: a later move is a new one
+            return
+        if self.moved_to == session:
+            return  # once per move: every later publish, from any thread, goes through view() as well
+        self.moved_to = session
+        self.health.forget(self.name, "main session changed; reading its requirements and status")
+        self.publish()
 
     def _empty(self, name: str) -> dict:
         """A part before any good read: no rows, and truth unknown, so the page claims nothing from it.
@@ -1357,7 +1532,7 @@ class Ledger(Collector):
         return part
 
     def health_truth(self):
-        return worst_truth(*(part["truth"] for part in self.parts.values()))
+        return worst_truth(*(part["truth"] for part in self.view().values()))
 
     # -- one source
     def _read(self, part: str, label: str, kind: str, args: tuple, parse, now: float) -> str:
@@ -1378,30 +1553,31 @@ class Ledger(Collector):
                 raise ValueError(f"{label} returned an unexpected shape")
             value = parse(data, now)
         except Exception as exc:  # noqa: BLE001 - a failed source keeps its last good rows
-            previous = self.parts[part]
             message = ev.short(str(exc), 160)
-            if previous.get("at") and previous.get("session", "") != session:
-                # the rows on hand were read for another session: they are not this session's last good read
-                previous = self._empty(part)
-                if part == "requirements":
-                    self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
-            truth = read_truth(previous.get("at"), message)
-            self.parts[part] = dict(previous, stale=truth == "stale", error=message, truth=truth,
-                                    failed_at=previous.get("failed_at") or ev.iso(now))
+            with self.lock:
+                previous = self.parts[part]
+                if previous.get("session", "") != session:
+                    # rows (or a failure) recorded for another session: not this session's last good read
+                    previous = self._empty(part)
+                    if part == "requirements":
+                        self.raw_requirements, self.raw_total, self.raw_truncated, self.raw_dropped = [], 0, False, 0
+                truth = read_truth(previous.get("at"), message)
+                # the failure is this session's: view() shows it (with its error) only while main is still in it
+                self.parts[part] = dict(previous, stale=truth == "stale", error=message, truth=truth, session=session,
+                                        failed_at=previous.get("failed_at") or ev.iso(now))
             return message
         at = ev.iso(now)
-        self.parts[part] = dict(value, stale=False, error="", at=at, failed_at="", session=session,
-                                truth=read_truth(at, "", value.get("incomplete") is True))
+        with self.lock:
+            self.parts[part] = dict(value, stale=False, error="", at=at, failed_at="", session=session,
+                                    truth=read_truth(at, "", value.get("incomplete") is True))
         return ""
 
     def tick(self, now: float):
+        self._follow_session()  # a moved session is shown unread now, not after the reads below
         errors = [self._read("goals", "ah goals", "ah-goals", (), self._goals, now)]
         if errors[0]:
             self.mission = {"state": "error", "mission_session": ""}   # a failed read never keeps a writable pin (D1)
-        session = self.session_fn() or ""
-        if session != self.read_session:
-            self._reset_session_parts()
-            self.read_session = session
+        session = self._follow_session()  # again: the session can move during the goals read
         if session:
             failed = self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now)
             if not failed:
@@ -1435,10 +1611,13 @@ class Ledger(Collector):
         # goodqa#15961: the session pin reads the ledger's own session here, never the ledger file itself
         self.mission = {"state": str(data.get("state") or "")[:20],
                         "mission_session": str(data.get("mission_session") or "")[:64]}
-        items = []
-        listed = data.get("goals") if isinstance(data.get("goals"), list) else []
+        items, dropped = [], 0
+        listed = data.get("goals")
+        if not isinstance(listed, list):  # `ah goals --json` always sends the list: without it nothing was read
+            raise ValueError("ah goals returned no goals list")
         for raw in listed[:self.MAX_GOALS]:
             if not isinstance(raw, dict) or not raw.get("id"):
+                dropped += 1
                 continue
             evidence = [self._evidence_row(e) for e in raw.get("evidence") or [] if isinstance(e, dict)]
             evidence.sort(key=lambda e: e["at"], reverse=True)
@@ -1454,8 +1633,9 @@ class Ledger(Collector):
                 "deferral": ev.short(json.dumps(deferral, sort_keys=True), 300) if deferral else "",
                 "problems": {k: len(raw[k]) if isinstance(raw.get(k), list) else 0 for k in ("missing", "tampered", "unpinned")},
                 "evidence": evidence[:self.MAX_EVIDENCE], "evidence_total": len(evidence)})
-        # more goals than are kept: the counts the page shows would be short, so the read is partial
-        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS}
+        # more goals than are kept, or goals dropped for their shape: the counts the page shows would be short, so the
+        # read is partial (review PR 234 v6)
+        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS or dropped > 0}
 
     def overrides(self) -> dict:
         """The user's latest archive or restore click per requirement (signed rows only; see req_actions)."""
@@ -1494,9 +1674,12 @@ class Ledger(Collector):
         return closed
 
     def _requirements(self, data: dict, now: float) -> dict:
-        rows = []
-        for raw in (data.get("requirements") if isinstance(data.get("requirements"), list) else []):
+        rows, dropped = [], 0
+        if not isinstance(data.get("requirements"), list):  # the producer always sends it: without it nothing was read
+            raise ValueError("ah requirements returned no requirements list")
+        for raw in data["requirements"]:
             if not isinstance(raw, dict) or not raw.get("id"):
+                dropped += 1  # a row the page cannot show: the counts would be short (review PR 234 v6)
                 continue
             ticket = str(raw.get("ticket") or "")
             evidence = raw.get("evidence")
@@ -1530,13 +1713,14 @@ class Ledger(Collector):
         self.raw_requirements = rows
         self.raw_total = self._int(data.get("total"), len(rows))
         self.raw_truncated = data.get("truncated") is True
+        self.raw_dropped = dropped
         truncated = len(rows) > self.MAX_REQUIREMENTS or self.raw_truncated
         tickets = [r["ticket"] for r in rows if r["ticket"] and not archive.TERMINAL_STATES.intersection({r["state"].lower()})]
         classified = archive.classify_all(rows, "requirement", time.time(), self._ticket_closed(tickets), self.overrides())
         truncated = truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
         return {"items": classified, "total": self._int(data.get("total"), len(rows)), "truncated": truncated,
-                "summary": archive.summary(classified), "incomplete": truncated}
+                "summary": archive.summary(classified), "incomplete": truncated or dropped > 0}
 
     def _status(self, data: dict, now: float) -> dict:
         visible = self.visible_fn() if self.visible_fn else None
@@ -1553,7 +1737,14 @@ class Ledger(Collector):
                     "check": ev.short(raw.get("check"), 80), "verdict": ev.short(raw.get("verdict"), 12)}
         out: dict = {"counts": {}}
         for key in self.STATUS_LISTS:
-            rows = [r for r in (data.get(key) if isinstance(data.get(key), list) else []) if isinstance(r, dict)]
+            # `ah status` always sends every list, as rows: a list missing or holding a row that is not one means the
+            # counts would be short, so the read fails closed, never a "none recorded" (review PR 234 v6)
+            listed = data.get(key)
+            if not isinstance(listed, list):
+                raise ValueError(f"ah status returned no {key} list")
+            rows = [r for r in listed if isinstance(r, dict)]
+            if len(rows) != len(listed):
+                raise ValueError(f"ah status returned a {key} list with rows it could not read")
             out["counts"][key] = len(rows)
             rows.sort(key=lambda r: str(r.get("at", "")), reverse=True)
             out[key] = [entry(r) for r in rows[:self.MAX_STATUS]]
@@ -1586,37 +1777,48 @@ class Ledger(Collector):
         return {"count": len(value), "items": items[:self.MAX_UNREAD]}
 
     def reclassify(self) -> None:
-        """Apply the user's latest archive and restore clicks to the rows already read: no `ah` run, one publish."""
-        if not self.raw_requirements and not self.parts["requirements"].get("at"):
+        """Apply the user's latest archive and restore clicks to the rows already read: no `ah` run, one publish.
+        Runs on an HTTP thread: when a read or a session change replaced the part meanwhile, that newer part stands."""
+        with self.lock:
+            part, raw, total, raw_truncated = self.parts["requirements"], self.raw_requirements, self.raw_total, self.raw_truncated
+            dropped = self.raw_dropped
+        if not raw and not part.get("at"):
             return
-        classified = archive.classify_all(self.raw_requirements, "requirement", time.time(), self._ticket_closed(), self.overrides())
-        truncated = self.raw_truncated or len(classified) > self.MAX_REQUIREMENTS
+        classified = archive.classify_all(raw, "requirement", time.time(), self._ticket_closed(), self.overrides())
+        truncated = raw_truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
-        part = self.parts["requirements"]
-        self.parts["requirements"] = dict(part, items=classified, truncated=truncated, incomplete=truncated,
-                                          total=self.raw_total, summary=archive.summary(classified),
-                                          truth=read_truth(part.get("at"), part.get("error"), truncated))
+        incomplete = truncated or dropped > 0
+        with self.lock:
+            if self.parts["requirements"] is not part:
+                return
+            self.parts["requirements"] = dict(part, items=classified, truncated=truncated, incomplete=incomplete,
+                                              total=total, summary=archive.summary(classified),
+                                              truth=read_truth(part.get("at"), part.get("error"), incomplete))
         self.publish()
 
     # -- publication
-    def snapshot(self) -> dict:
-        return {"goals": self.parts["goals"], "requirements": self.parts["requirements"], "status": self.parts["status"],
+    def snapshot(self, parts=None) -> dict:
+        parts = self.view() if parts is None else parts
+        return {"goals": parts["goals"], "requirements": parts["requirements"], "status": parts["status"],
                 "session": self.read_session, "generated": self.published_at}
 
     def publish(self) -> None:
-        """Push the snapshot only when its content changed; the read time alone is not a change."""
+        """Push the snapshot only when its content changed; the read time alone is not a change. What is compared and
+        pushed is view(), so a part shown unread for a moved session is a change that reaches the page."""
         def strip(value):
             if isinstance(value, dict):
                 return {k: strip(v) for k, v in value.items() if not (k == "at" and "stale" in value)}
             if isinstance(value, list):
                 return [strip(v) for v in value]
             return value
-        sig = json.dumps(strip(self.parts), sort_keys=True, default=str)
-        if sig == self.sig:
-            return
-        self.sig = sig
-        self.published_at = ev.iso()
-        self.hub.snapshot("ledger", self.snapshot())
+        with self.lock:  # held through the push (Hub.snapshot never blocks), so an older view is never pushed last
+            parts = self.view()
+            sig = json.dumps(strip(parts), sort_keys=True, default=str)
+            if sig == self.sig:
+                return
+            self.sig = sig
+            self.published_at = ev.iso()
+            self.hub.snapshot("ledger", self.snapshot(parts))
 
 
 class GitHub(Collector):

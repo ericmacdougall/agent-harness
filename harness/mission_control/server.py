@@ -362,6 +362,10 @@ class App:
             self.supervised = col.SupervisedOwners(self.hub, self.health, Reader([owner_root]), owner_root,
                                                    on_change=self.owners.publish, tailer=self.tailer)
             self.owners.supervised = self.supervised
+        else:
+            # Every source an owner claim rests on reports a row (review PR 234 v6): a missing row is unknown on the page,
+            # so an instance without OpenAI supervisors says so, as an unconfigured initiatives file does.
+            self.health.off("codex-owners", "OpenAI supervised owners are not configured on this instance", truth="current")
         self.github = col.GitHub(self.hub, self.health, self.runner)
         self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
@@ -446,7 +450,7 @@ class App:
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
-                 (self.asks_loop, "asks"), (self.ledger_loop, "ledger")]
+                 (self.asks_loop, "asks"), (self.ledger_loop, "ledger"), (self.session_loop, "session-watch")]
         if self.supervised:
             loops.append((self.supervised_loop, 'supervised-owners'))
         if self.demo:
@@ -468,6 +472,20 @@ class App:
         now = time.time()
         for collector in self.collectors + [self.ledger]:
             collector.wake(now)
+
+    def follow_sessions(self) -> None:
+        """One pass of the session watch (review PR 234 v6): main's session can move while the ledger and asks threads
+        are inside slow reads, so their own ticks would notice late. Each is told now; neither waits on a read."""
+        for source in (self.ledger, self.asks):
+            try:
+                source.follow()
+            except Exception as exc:  # noqa: BLE001 - shown, never fatal; the source's next tick still follows
+                self.health.error("session-watch", f"{source.name}: {type(exc).__name__}: {str(exc)[:120]}")
+
+    def session_loop(self) -> None:
+        while not self.stop.is_set():
+            self.follow_sessions()
+            self.stop.wait(0.5)
 
     def asks_loop(self) -> None:
         """The Needs-you sweeper, on its own thread: the ledger read takes seconds and must not delay the live
@@ -569,6 +587,7 @@ class App:
                           "busy": self.codex.busy}}
 
     def state(self) -> dict:
+        self.follow_sessions()  # a page that loads between two passes of the session watch gets the same truth
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows, "orggraph": self.org.snapshot(),
                 "pin": {k: v for k, v in self.pin().items() if k in ("display", "source", "reason", "warnings")} | {"writable": bool(self.pin()["write"])},

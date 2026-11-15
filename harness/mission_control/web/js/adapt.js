@@ -121,8 +121,9 @@ export function worst(...values) {
 // an absolute time: a relative age in a panel that is not repainted on the clock would freeze
 export const clock = iso => (validIso(iso) ? `${new Date(iso).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time');
 const LEDGER_PARTS = { 'ledger:goals': ['goals', 'Goal ledger (ah goals)'], 'ledger:requirements': ['requirements', 'Requirements (ah requirements)'], 'ledger:status': ['status', 'Status (ah status)'] };
-// Every zero or "none" claim the page makes, and the sources it rests on. A trailing ? marks a source that counts only
-// when the server reports it (OpenAI supervised owners run only where configured).
+// Every zero or "none" claim the page makes, and the sources it rests on. Every source must have reported: one the page
+// has not heard from is unknown (review PR 234 v6). The server reports a row for every source, including one that is not
+// configured on the instance (off, with nothing to report: OpenAI supervised owners, the initiatives file).
 export const CLAIM_SOURCES = Object.freeze({
   blockers: ['ledger:status', 'asks', 'owners', 'initiatives'],
   deploys: ['ledger:status'],
@@ -130,34 +131,45 @@ export const CLAIM_SOURCES = Object.freeze({
   requirements: ['ledger:requirements'],
   archive: ['ledger:requirements', 'asks'],
   needs: ['asks'],
-  owners: ['owners', 'codex-owners?'],
+  owners: ['owners', 'codex-owners'],
   initiatives: ['initiatives'],
   activity: ['wals'],
-  progress: ['wals', 'owners', 'codex-owners?'],
+  progress: ['wals', 'owners', 'codex-owners'],
   decisions: ['ledger:status'],
   chat: ['chat'],
 });
-function fact(state, key) {
-  const optional = key.endsWith('?');
-  const id = optional ? key.slice(0, -1) : key;
+function fact(state, id) {
   if (LEDGER_PARTS[id]) {
     const [name, label] = LEDGER_PARTS[id];
     const part = state.ledger?.[name] || {};
     return { id, name: label, truth: truthOf(part.truth), at: part.at || '', error: str(part.error, 300) };
   }
   const row = (state.sources || []).find(s => s.id === id);
-  if (!row) return optional ? null : { id, name: SOURCE_NAMES[id] || id, truth: 'unknown', at: '', error: '' };
-  return { id, name: row.name, truth: row.truth, at: row.okAt, error: row.status === 'ok' ? '' : row.detail || row.status };
+  if (!row) return { id, name: SOURCE_NAMES[id] || id, truth: 'unknown', at: '', error: '' };
+  return { id, name: row.name, truth: truthOf(row.truth), at: row.okAt, error: row.status === 'ok' ? '' : row.detail || row.status };
+}
+// Every claim also rests on the link to the server: while the page is not live (connecting, reconnecting, offline,
+// signed out, or a state it does not know) nothing newer can arrive, so what it shows is at best the data received up
+// to the last message (stale), or unknown when none came. Only 'live' adds nothing.
+const LINK_WORDS = { connecting: 'connecting', reconnecting: 'reconnecting', offline: 'offline', expired: 'signed out' };
+function linkFact(state) {
+  if (state.connection === 'live') return null;
+  const at = Number.isFinite(state.lastData) && state.lastData > 0 ? new Date(state.lastData).toISOString() : '';
+  return { id: 'connection', name: 'Connection to Mission Control', truth: at ? 'stale' : 'unknown', at,
+    error: `not connected (${LINK_WORDS[state.connection] || 'no live stream'})` };
 }
 export function claim(state, id) {
-  const facts = (CLAIM_SOURCES[id] || []).map(key => fact(state || {}, key)).filter(Boolean);
-  const truth = facts.length ? worst(facts.map(f => f.truth)) : 'unknown';
+  const s = state || {};
+  const facts = [...(CLAIM_SOURCES[id] || []).map(key => fact(s, key)), linkFact(s)].filter(Boolean);
+  const truth = (CLAIM_SOURCES[id] || []).length ? worst(facts.map(f => f.truth)) : 'unknown';
   return { id, truth, facts, bad: facts.filter(f => f.truth !== 'current') };
 }
 const names = list => list.map(f => f.name).join(', ').replace(/, ([^,]*)$/, ' and $1');
 // One line per source that is not current, for the notice beside the claim.
 export function truthLines(c) {
-  return c.bad.map(f => f.truth === 'unknown'
+  return c.bad.map(f => f.id === 'connection'
+    ? `${f.name}: ${f.error}. ${f.at ? `Showing what was received up to ${clock(f.at)}; nothing newer is known.` : 'Nothing has been received yet.'}`
+    : f.truth === 'unknown'
     ? `${f.name}: not read successfully yet${f.error ? ` (${f.error})` : ''}. Nothing from it is shown as zero.`
     : f.truth === 'stale'
       ? `${f.name}: showing the last good read from ${clock(f.at)}. Later reads failed${f.error ? `: ${f.error}` : ''}.`
@@ -373,7 +385,8 @@ const FINISHED = /\b(done|live|complete|completed|shipped|cancel+ed|parked|on ho
 // `known` is the truth of the owner and progress sources (claim 'owners' and 'progress'): a verdict of no owner or no
 // progress is given only from current sources; otherwise the row is UNKNOWN with the reason (review PR 234 v3 F1 audit).
 export function atRisk(initiatives = [], owners = [], events = [], now = Date.now(), coverage = null, limit = 6, known = {}) {
-  const ownersKnown = truthOf(known.owners ?? 'current'), progressKnown = truthOf(known.progress ?? 'current');
+  // review PR 234 v5 F2: a caller that passes no truth gets no verdict of no owner or no progress (unknown, like the rest)
+  const ownersKnown = truthOf(known?.owners), progressKnown = truthOf(known?.progress);
   const rows = [];
   for (const item of initiatives) {
     if (!item || FINISHED.test(item.state || '')) continue;
@@ -591,8 +604,12 @@ export const workItemText = (state, note) => (NO_ITEM.has(note) && claim(state, 
 export const sceneText = (state, text) => (state.connection === 'live' && claim(state, 'progress').truth !== 'current'
   ? 'Connected. Some owner or work-log sources are not current; see Source health.' : text);
 
-// The ledger blockers beyond the rows the server sends (it keeps 30 per list but counts them all).
-export const hiddenBlockers = status => Math.max(0, int(status?.counts?.blockers) - (status?.blockers || []).length);
+// The ledger rows beyond the ones the server sends (it keeps 30 per status list but counts them all). Every count the
+// page states from a status list uses statusCount, never the list's length (review PR 234 v6).
+export const hiddenRows = (status, key) => Math.max(0, int(status?.counts?.[key]) - (status?.[key] || []).length);
+export const statusCount = (status, key) => (status?.[key] || []).length + hiddenRows(status, key);
+export const hiddenBlockers = status => hiddenRows(status, 'blockers');
+export const hiddenDeals = status => ['pending', 'failed', 'live', 'verified'].reduce((sum, key) => sum + hiddenRows(status, key), 0);
 export function missionTiles(state) {
   const led = state.ledger || ledger(null);
   const view = { ...state, ledger: led };

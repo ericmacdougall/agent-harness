@@ -121,7 +121,13 @@ export function setOrgGraph(snapshot) {
   if (graph) update({ orggraph: graph }, 'orggraph');
 }
 export function setLedger(snapshot) { update({ ledger: adapt.ledger(snapshot) }, 'ledger'); }
-export function setConnection(connection) { if (state.connection !== connection) update({ connection }, 'connection'); }
+export function setConnection(connection) {
+  if (state.connection === connection) return;
+  const wasLive = state.connection === 'live';
+  update({ connection }, 'connection');
+  // every zero or "none" claim also rests on the link (adapt.claim): the panels that state them repaint when it drops or returns
+  if (wasLive !== (connection === 'live')) update({}, 'truth');
+}
 export function setChat(chat) {
   if (!chat || typeof chat !== 'object') return;
   const sessions = adapt.sessions(chat.targets, chat.main_session);

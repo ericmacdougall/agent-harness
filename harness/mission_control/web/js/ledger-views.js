@@ -2,7 +2,7 @@
 // the data inventory. Builders are pure: state in, nodes out, textContent only (no HTML is ever parsed from data).
 // Each long text is clamped with a disclosure, and each list is bounded with "show more", so volume never takes over.
 import { el, button, age, stateClass } from './ui.js';
-import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine, claim, truthLines, noneText, countText, hiddenBlockers } from './adapt.js';
+import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine, claim, truthLines, noneText, countText, hiddenBlockers, hiddenDeals, statusCount } from './adapt.js';
 import { ownerCounts } from './owner-groups.js';
 
 export const PAGE = 25;  // default rows per list; "show more" adds one page
@@ -103,8 +103,10 @@ export function deals(state, ui) {
   const all = dealRows(status, state.events, 500);
   const c = claim(state, 'deploys');
   const out = notices(c, unreadNotice(status));
-  if (!all.length) out.push(el('p', 'empty', noneText(c, 'No deploys or live tests recorded in the last 12 hours.', 'deploys or live tests')));
-  if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${all.length} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
+  const hidden = hiddenDeals(status);
+  if (hidden) out.push(el('p', 'notice', `${hidden} more deploy and test records are in the ledger than Mission Control holds (ah status lists them all).`));
+  if (!all.length && !hidden) out.push(el('p', 'empty', noneText(c, 'No deploys or live tests recorded in the last 12 hours.', 'deploys or live tests')));
+  if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${all.length + hidden} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
   const list = el('ul', 'deals');
   all.slice(0, ui.dealsLimit).forEach(row => {
     const item = el('li', `deal tone-${row.tone}`);
@@ -298,6 +300,7 @@ export function inventory(state, go) {
   const led = state.ledger;
   const st = led.status;
   const n = (count, c) => countText(count, c);
+  const sc = key => statusCount(st, key);  // the ledger's whole count, not the 30 rows held
   const unread = st.incomplete ? `incomplete: ${unreadCount(st)}; ` : '';
   // [name, claim, holds, shown in, tab]: each row's Health is its claim's truth, its counts follow the same rule
   const spec = [
@@ -305,13 +308,13 @@ export function inventory(state, go) {
     ['Initiatives', 'initiatives', c => `${n(state.initiatives.length, c)} initiatives`, 'Overview', 'overview'],
     ['Owners', 'owners', c => (k => `${n(k.live, c)} live owners, ${n(k.codexLive, c)} live Codex, ${n(k.parked, c)} parked or history, ${n(k.helpers, c)} helpers`)(ownerCounts(state.owners)), 'Overview', 'overview'],
     ['Open asks', 'needs', c => `${n(state.asks.length, c)} open, ${n(state.asksStale.length, c)} stale, ${n(state.asksFlagged.length, c)} untraceable`, 'Overview', 'overview'],
-    ['Deploys and live tests', 'deploys', c => `${unread}${n(st.live.length, c)} deploys, ${n(st.verified.length, c)} tested, ${n(st.failed.length, c)} failed, ${n(st.pending.length, c)} pending`, 'Overview', 'overview'],
-    ['Blockers', 'blockers', c => `${unread}${n(st.blockers.length + hiddenBlockers(st), c)} recorded in status`, 'Overview', 'overview'],
+    ['Deploys and live tests', 'deploys', c => `${unread}${n(sc('live'), c)} deploys, ${n(sc('verified'), c)} tested, ${n(sc('failed'), c)} failed, ${n(sc('pending'), c)} pending`, 'Overview', 'overview'],
+    ['Blockers', 'blockers', c => `${unread}${n(sc('blockers'), c)} recorded in status`, 'Overview', 'overview'],
     ['Requirements', 'requirements', c => `${n(led.requirements.summary.live, c)} live, ${n(led.requirements.summary.archived, c)} archived of ${n(led.requirements.total, c)}`, 'Requirements', 'requirements'],
     ['Archived asks', 'needs', c => `${n(state.asksArchive.length, c)} archived`, 'Archive', 'archive'],
     ['Activity feed', 'activity', c => `${n(state.events.length, c)} events held`, 'Activity', 'activity'],
     ['Chat', 'chat', c => `${n(state.messages.length, c)} messages, ${n(state.sessions.length, c)} sessions`, 'Chat panel', 'chat'],
-    ['Decisions and commits', 'decisions', c => `${unread}${n(st.decisions.length, c)} decisions, ${n(st.commits.length, c)} commits, ${n(st.claimed.length, c)} claimed, ${n(st.assumptions.length, c)} assumptions`, 'Sources', 'sources'],
+    ['Decisions and commits', 'decisions', c => `${unread}${n(sc('decisions'), c)} decisions, ${n(sc('commits'), c)} commits, ${n(sc('claimed'), c)} claimed, ${n(sc('assumptions'), c)} assumptions`, 'Sources', 'sources'],
   ];
   const rowsOut = spec.map(([name, id, holds, where, tab]) => {
     const c = claim(state, id);

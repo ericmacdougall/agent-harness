@@ -87,3 +87,46 @@ test('a flood of 500 events in one burst keeps the store bounded and fast', asyn
   assert.ok(store.getState().events.length <= 150);
   assert.ok(performance.now() - start < 500, `took ${performance.now() - start} ms`);
 });
+
+test('review PR 234 v6: the claim panels repaint when the link drops or returns, not on every connection word', () => {
+  const reasons = [];
+  const off = store.subscribe((_, reason) => reasons.push(reason));
+  store.setConnection('live');
+  reasons.length = 0;
+  store.setConnection('reconnecting');
+  store.setConnection('offline');      // still not live: no second repaint
+  store.setConnection('live');
+  off();
+  assert.deepEqual(reasons, ['connection', 'truth', 'connection', 'connection', 'truth']);
+});
+
+test('review PR 234 v6: after a drop the page is live again only once it re-read the state (a restarted server)', async () => {
+  const { claim } = await import('../js/adapt.js');
+  const at = new Date().toISOString();
+  const before = { ...state, ledger: { goals: { at, truth: 'current', items: [{ id: 'old', title: 'Old', state: 'LIVE_TESTED' }] }, requirements: { items: [] }, status: {} } };
+  const restarted = { ...state, ledger: { goals: { at: '', truth: 'unknown', items: [] }, requirements: { items: [] }, status: {} } };
+  let answer = before;
+  globalThis.fetch = async url => {
+    fetches.push(String(url));
+    return answer ? { ok: true, status: 200, json: async () => answer } : { ok: false, status: 503, json: async () => ({}) };
+  };
+  await live.start();
+  const stream = sources.at(-1);
+  stream.emit('open');
+  assert.equal(store.getState().connection, 'live');
+  assert.equal(claim(store.getState(), 'goals').truth, 'current');
+  stream.emit('error');                       // the server process stops; the browser retries
+  answer = null;                              // the new process is not serving state yet
+  stream.emit('open');                        // the stream reopens on the new process
+  assert.notEqual(store.getState().connection, 'live', 'live on the stream opening alone, with the old process\'s rows');
+  await new Promise(r => realSet(r, 450));    // the re-read failed
+  assert.notEqual(store.getState().connection, 'live', 'live after a failed re-read');
+  assert.notEqual(claim(store.getState(), 'goals').truth, 'current');
+  assert.equal(store.getState().ledger.goals.items[0].id, 'old');
+  answer = restarted;
+  await new Promise(r => realSet(r, 1300));   // the re-read is tried again and succeeds
+  assert.equal(store.getState().connection, 'live');
+  assert.deepEqual(store.getState().ledger.goals.items, [], 'the new process\'s state replaced the old rows');
+  assert.equal(claim(store.getState(), 'goals').truth, 'unknown');
+  live.stop();
+});

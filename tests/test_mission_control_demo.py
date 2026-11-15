@@ -115,6 +115,13 @@ class Guards(Base):
         self.assertTrue(states["a4held0demo"]["disposition"]["live"], "a held owner is in the fixture")
         self.assertEqual(app.health.rows["github"]["status"], "error", "the failing source is in the fixture")
 
+    def test_v6_D42_an_instance_without_openai_supervisors_reports_that_source(self):
+        """D42 [defect] review PR 234 v6: every source an owner claim rests on has a row; a missing one is unknown."""
+        app = mcs.build_app(demo_args(free_port()))
+        self.assertIsNone(app.supervised)
+        row = app.health.rows.get("codex-owners", {})
+        self.assertEqual((row.get("status"), row.get("truth")), ("off", "current"))
+
     def test_demo_app_refuses_without_its_fixture(self):
         with self.assertRaises(demo.DemoError):
             mcs.App(port=1, root=self.root, initiatives=None, remote=False, fabric_bin=None, demo=True,
