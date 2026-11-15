@@ -117,6 +117,68 @@ class LostLinesWithoutTheNeedle(unittest.TestCase):
                 self.assertEqual((read["state"], read["skipped"]), ("partial", 1), read)
 
 
+DAY = 86400
+# synthetic objects with the two shapes found in real agent WALs (no event field): not copies of any WAL line
+REAL_SHAPES = ('{"agent":"fixture-agent","note":"fixture note","status":"fixture"}',
+               '{"role":"fixture","verdict":"fixture","findings":[],"probes":[],"pr":1}')
+
+
+class AsksAndRequirementsHaveALostWindow(unittest.TestCase):
+    """Main's ruling on review v3 F6 (goodqa#16117): asks and requirements read a 24 h window through the shared rule
+    (provenance.LostWindow, harness.lost-window/1). A rejected record is inside, and the read partial, unless the rule
+    places it before the cutoff; one outside never changes the state and is disclosed as outside_window."""
+
+    def reads(self, home):
+        return (("requirements", ah.requirements_view(home.home, SID)["read"]),
+                ("asks", prov.ask_items(SID, home.home / ".claude")["read"]))
+
+    def test_a_rejected_object_written_now_is_inside(self):
+        for text in ('{}',) + REAL_SHAPES:
+            with self.subTest(line=text):
+                home = Home(self)
+                home.append(home.main, text + "\n")
+                for name, read in self.reads(home):
+                    self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("partial", 1, 0), (name, read))
+                    self.assertEqual(read["window"]["rule"], prov.LOST_WINDOW_RULE, name)
+
+    def test_the_same_object_in_a_file_last_written_two_days_ago_is_outside(self):
+        for text in ('{}',) + REAL_SHAPES:
+            with self.subTest(line=text):
+                home = Home(self)
+                home.append(home.main, text + "\n", age=2 * DAY)
+                for name, read in self.reads(home):
+                    self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("ok", 0, 1), (name, read))
+                    self.assertEqual(read["window"]["rule"], prov.LOST_WINDOW_RULE, name)
+
+    def test_an_agent_wal_object_in_a_two_day_old_file_is_outside_for_asks(self):
+        for text in REAL_SHAPES:
+            with self.subTest(line=text):
+                home = Home(self)
+                home.append(home.agent, text + "\n", age=2 * DAY)
+                read = prov.ask_items(SID, home.home / ".claude")["read"]
+                self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("ok", 0, 1), read)
+
+    def test_a_later_dated_record_before_the_cutoff_places_it_outside_in_an_ordered_file(self):
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * DAY))
+        home = Home(self)
+        home.agent.write_text('{}\n' + json.dumps({"event": "note", "note": "x", "at": old}) + "\n")  # written now
+        read = prov.ask_items(SID, home.home / ".claude")["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("ok", 0, 1), read)
+
+    def test_dates_out_of_order_prove_nothing(self):  # control: rule (a) needs a time-ordered file
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * DAY))
+        home = Home(self)
+        home.append(home.agent, '{}\n' + json.dumps({"event": "note", "note": "x", "at": old}) + "\n")  # after "now"
+        read = prov.ask_items(SID, home.home / ".claude")["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("partial", 1, 0), read)
+
+    def test_a_torn_line_needs_the_same_rule(self):  # the window covers every line the integrity pass counts
+        home = Home(self)
+        home.append(home.main, '{"event":"a', age=2 * DAY)
+        read = prov.ask_items(SID, home.home / ".claude")["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("ok", 0, 1), read)
+
+
 class InitiativesRecoverWithoutAChange(unittest.TestCase):
     def setUp(self):
         import tempfile

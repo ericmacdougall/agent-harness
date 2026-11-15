@@ -3214,6 +3214,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
     now = time.time() if now is None else now
     rows, total, limited = [], 0, False
     unread, read_ok, skipped = [], 0, 0
+    window = prov.LostWindow(now - prov.LEDGER_LOST_WINDOW_S)
     deadline = time.monotonic() + VIEW_BUDGET_S
     for s in _view_sessions(home, session, every):
         if time.monotonic() > deadline:
@@ -3226,7 +3227,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             # PR 234 v8: the JSON string value alone, so a spaced `"event": "requirement"` is read too
             lines = list(prov._lines_containing(path, b'"requirement"', tails=True))
             # goodqa#16117 F1: a line torn before the needle, or one that is not JSON, may have been a requirement
-            skipped += prov.lost_lines_without(path, (b'"requirement"',))
+            trail, trail_mtime = prov.lost_trail_without(path, (b'"requirement"',))
         except prov.Problem as problem:
             # review PR 234 v6 F1: an unreadable WAL is an unread source, named with its reason, never zero requirements
             unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"{problem.code}: {problem.message}"})
@@ -3235,6 +3236,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"file-unreadable: {type(error).__name__}"})
             continue
         read_ok += 1
+        window.place(trail, trail_mtime)  # main's ruling on PR 257 v3 F6: the shared rule, a 24 h window
         limited = limited or len(lines) >= prov.MAX_HITS  # the shared reader stops at MAX_HITS lines: say so
         for line, in_progress in lines:
             if line is None:
@@ -3277,7 +3279,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
     # rows past VIEW_ROW_CAP are not sent: the list is limited, so the read says so (PR 234 v8)
     limited = limited or total > len(rows)
     return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited,
-            "read": read_block(read_ok, unread, skipped, limited)}
+            "read": read_block(read_ok, unread, skipped, limited, window)}
 
 
 def build_parser():

@@ -1192,6 +1192,7 @@ class Asks(Collector):
         super().__init__(hub, health)
         self.runner, self.session_fn = runner, session_fn
         self.root, self.owners_fn = root, owners_fn  # with a root, every ledger read is also a sweep (needs_sweep)
+        self.disclosed = ""  # outside_window(): lost lines before the read's window, said on the health row
         self.items: list[dict] = []
         self.resolved: list[dict] = []
         self.stale: list[dict] = []
@@ -1242,7 +1243,9 @@ class Asks(Collector):
             self.health.off(self.name, "no main session known yet")
             return "off"
         self.refresh(session, now)
-        return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
+        # main's ruling on PR 257 v3 F6: lost lines the shared rule places before the 24 h window are disclosed here
+        return "; ".join(filter(None, [f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged",
+                                       self.disclosed]))
 
     def follow(self) -> None:
         """From the server's session watch: the Health row turns unknown the moment main's session moves, even while a
@@ -1275,6 +1278,7 @@ class Asks(Collector):
         code, out = self.runner.run("provenance-asks", session, timeout=60, limit=4 * 1024 * 1024 + 1)
         # exit 2 with a ledger on stdout means "some asks are untraceable"; anything else is a failed read
         data, notes = producer_read("provenance asks", code, out, cap=4 * 1024 * 1024, ok_codes=(0, 2))
+        self.disclosed = outside_window(data)
         if not isinstance(data.get("items"), list) or not isinstance(data.get("blocked"), list) \
                 or not isinstance(data.get("resolved"), list):
             raise ReadFailed("provenance asks returned no asks list")

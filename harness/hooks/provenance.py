@@ -670,15 +670,14 @@ def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS, *, ta
         os.close(fd)
 
 
-def lost_lines_without(path: Path, needles) -> int:
-    """goodqa#16117 F1: lines of path that hold no needle and are not a JSON object (torn, not JSON, or oversized).
-    A search for an event's needle never sees a line torn before the needle (`{"event":"a`), so a needle scan alone
-    reads such a file as whole. Each of these lines may have held the searched record, so the caller counts every
-    one as skipped. Only the file's unterminated last line inside the append grace (tail_in_progress) is a write in
-    progress, not lost. Lines holding a needle are left to the caller's own scan, which counts them already."""
-    needles = tuple(needles)
+LEDGER_LOST_WINDOW_S = 24 * 3600   # main's ruling on PR 257 v3 F6: the window the asks and requirements reads cover
+
+
+def _each_line(path: Path, visit) -> float:
+    """Call visit(line, oversized) for each line of path in file order, and return its mtime. An oversized line is
+    visited once with its head; the unterminated last line is visited only when it is not a write in progress
+    (tail_in_progress)."""
     fd = open_regular(path)
-    lost = 0
     try:
         info = os.fstat(fd)
         size = info.st_size
@@ -697,20 +696,66 @@ def lost_lines_without(path: Path, needles) -> int:
             carry = parts.pop()
             for line in parts:
                 if oversized:
-                    oversized = False  # the end of a line already counted as oversized
+                    oversized = False  # the end of a line already visited as oversized
                     continue
-                lost += _lost_line(line, needles)
+                visit(line, False)
             if len(carry) > MAX_LINE:
-                if not oversized and not any(n in carry for n in needles):
-                    lost += 1
+                if not oversized:
+                    visit(carry, True)
                 carry, oversized = b"", True
         if carry and not oversized and not tail_in_progress(True, info.st_mtime):
-            lost += _lost_line(carry, needles)
+            visit(carry, False)
+        return info.st_mtime
     except (OSError, ValueError) as error:
         raise Problem("file-unreadable", f"cannot read {clip(path.name, 60)} ({type(error).__name__})")
     finally:
         os.close(fd)
-    return lost
+
+
+def _lost(line: bytes, oversized: bool, needles) -> int:
+    if oversized:
+        return 0 if any(n in line for n in needles) else 1
+    return _lost_line(line, needles)
+
+
+def lost_lines_without(path: Path, needles) -> int:
+    """goodqa#16117 F1: lines of path that hold no needle and are not a WAL record (torn, not JSON, oversized, or an
+    object the shared validator rejects). A search for an event's needle never sees a line torn before the needle
+    (`{"event":"a`), so a needle scan alone reads such a file as whole. Each of these lines may have held the searched
+    record. Only the file's unterminated last line inside the append grace is a write in progress, not lost. Lines
+    holding a needle are left to the caller's own scan, which counts them already."""
+    needles, lost = tuple(needles), [0]
+
+    def visit(line, oversized):
+        lost[0] += _lost(line, oversized, needles)
+    _each_line(path, visit)
+    return lost[0]
+
+
+def lost_trail_without(path: Path, needles) -> tuple:
+    """(trail, mtime): the lost lines of lost_lines_without as a LostTrail, for the caller's LostWindow.place (the
+    shared rule harness.lost-window/1 places each inside or outside the read's window). trail is None when nothing is
+    lost. Only a file with a lost line is read a second time, in full, for the dates of its records."""
+    needles = tuple(needles)
+    count = lost_lines_without(path, needles)
+    if not count:
+        return None, None
+    trail = LostTrail()
+
+    def visit(line, oversized):
+        if _lost(line, oversized, needles):
+            trail.lost()
+            return
+        if oversized:
+            return
+        try:
+            rec = loads_line(line.strip())
+        except ValueError:
+            return  # a line holding a needle that is not a record: the caller's needle scan counts it
+        if isinstance(rec, dict) and not wal_record_problem(rec):
+            trail.dated(_record_time(rec.get("at")))
+    mtime = _each_line(path, visit)
+    return trail, mtime
 
 
 _LEADING_EVENT = re.compile(rb'\A\{\s*"event"\s*:\s*"([A-Za-z0-9_.:-]*)(")?')
@@ -1629,6 +1674,8 @@ def ledger_read(session: str, home=None) -> tuple:
     asks, closed = {}, {}
     paths, unread = session_wals_read(session, home)
     read_ok, skipped, limited = 0, 0, False
+    # main's ruling on PR 257 v3 F6: the read covers 24 h; the shared rule places each lost line inside or outside
+    window = LostWindow(time.time() - LEDGER_LOST_WINDOW_S)
     for path in paths:
         failed = None
         # PR 234 v8: the needle is the JSON string value alone, so `"event": "ask"` (spaced) is read as well as the
@@ -1670,7 +1717,7 @@ def ledger_read(session: str, home=None) -> tuple:
             limited = limited or hits >= LEDGER_MAX_HITS
         if not failed:
             try:
-                skipped += lost_lines_without(path, (b'"ask"', b'"ask_resolved"'))  # goodqa#16117 F1
+                window.place(*lost_trail_without(path, (b'"ask"', b'"ask_resolved"')))  # goodqa#16117 F1, F6
             except Problem as problem:
                 failed = f"{problem.code}: {problem.message}"
             except Exception as error:  # noqa: BLE001
@@ -1683,7 +1730,7 @@ def ledger_read(session: str, home=None) -> tuple:
         record["_closed"] = closed.get(ident)
     if any(u["source"] in ("main.jsonl", "session WAL folder") for u in unread):
         read_ok = 0  # without the main WAL the session's ledger was not read
-    return sorted(asks.values(), key=lambda r: r["at"]), read_block(read_ok, unread, skipped, limited)
+    return sorted(asks.values(), key=lambda r: r["at"]), read_block(read_ok, unread, skipped, limited, window)
 
 
 def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
