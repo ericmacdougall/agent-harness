@@ -403,10 +403,13 @@ class App:
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote, self.org]
         # One read per dataset, composed from the sources that feed it (collectors.FEEDS) and pushed before any rows.
-        self.truth = col.Truth(self.hub, self.health, self.ledger, lambda: self.owners.session)
+        # the session-scoped reads are for the pinned session (goodqa#15961), so Truth judges them against the pin
+        self.truth = col.Truth(self.hub, self.health, self.ledger, lambda: self.pin()["display"])
         self.health.on_change = self.truth.publish
         self.hub.before = self.truth.publish
         self.max_ages = {"chat": 60.0}
+        # the pin is re-resolved on every session-scoped read; the ledger thread resolves it at least once per tick
+        self.max_ages["session-pin"] = self.ledger.max_age(0.0)
         # the sources in self.collectors share one thread: each waits for every other's read before its next turn
         loop_budget = sum(source.read_budget for source in self.collectors)
         for source in self.collectors + [self.asks, self.ledger] + ([self.supervised] if self.supervised else []):
@@ -434,7 +437,9 @@ class App:
             if pin["source"] in ("config", "ledger"):
                 self.pin_last_good = pin["display"]   # memory only: a restart starts unpinned until the ledger reads
         key = (pin["display"], pin["source"], tuple(pin["warnings"]))
-        if key != self.pin_reason:
+        if key == self.pin_reason:
+            self.health.beat("session-pin")   # resolved again, unchanged: the row is checked, not aged out
+        else:
             self.pin_reason = key
             detail = f"{pin['display'][:8] or 'none'}: {pin['reason']}" + (f"; {pin['warnings'][0]}" if pin["warnings"] else "")
             (self.health.ok if pin["write"] and not pin["warnings"] else self.health.error)("session-pin", detail)

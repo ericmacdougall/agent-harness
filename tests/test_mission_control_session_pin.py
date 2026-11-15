@@ -139,7 +139,8 @@ class Wiring(unittest.TestCase):
     def test_owners_reads_the_ledger_session_even_when_codex_wrote_last(self):  # AC-4
         app, calls = self.app({"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []})
         app.owners.run(time.time())
-        self.assertEqual(app.health.rows["owners"]["status"], "error", "unpinned before the ledger is read")
+        # unpinned before the ledger is read: off and unknown, never an error that could later read as stale (T243-5)
+        self.assertEqual((app.health.rows["owners"]["status"], app.health.rows["owners"]["truth"]), ("off", "unknown"))
         self.assertEqual(calls, [])
         app.ledger.run(time.time())
         app.owners.run(time.time())
@@ -257,6 +258,58 @@ class Wiring(unittest.TestCase):
         app.asks.session, app.asks.items = MAIN, [{"id": "wabc", "text": "old ask"}]
         self.assertEqual(app.asks.tick(time.time()), "off")
         self.assertEqual((app.asks.items, app.asks.session), ([], ""))
+
+
+class PinTruth(unittest.TestCase):
+    """PR 234 v7 audit T243-5 and T243-6: the owners read is for the pinned session, and the pin itself is a feed of
+    every session-scoped dataset. A read for another session, or no pin, is never shown as current or stale."""
+
+    GOALS = {"state": "ok", "mission_session": MAIN, "goals": [], "warnings": []}
+    setUp, app, _reqs = Wiring.setUp, Wiring.app, Wiring._reqs
+
+    def ready(self):
+        app, _ = self.app(dict(self.GOALS))
+        self._reqs(app)
+        app.runner.outputs["provenance-asks"] = lambda s: (0, json.dumps({"read": col.whole_read(), "items": [], "blocked": [], "resolved": []}))
+        app.ledger.run(time.time())
+        now = time.time()
+        for source in app.collectors + [app.asks, app.ledger] + ([app.supervised] if app.supervised else []):
+            source.run(now)
+        app.chat_once()
+        return app
+
+    def test_t243_5_owners_unpinned_after_a_good_read_is_unknown_not_stale(self):
+        app = self.ready()
+        self.assertEqual(app.truth.reads()["owners"]["truth"], "current")
+        (self.h.claude / MAIN / "main.jsonl").unlink()   # the pin no longer names a Claude session: unpinned
+        app.owners.next_at = 0
+        app.owners.run(time.time())
+        self.assertEqual(app.pin()["display"], "")
+        self.assertEqual(app.truth.reads()["owners"]["truth"], "unknown",
+                         "no owner rows and no pin: not the last good read of anything shown")
+
+    def test_t243_5_owners_rows_of_the_old_pin_are_unknown_after_it_moves(self):
+        app = self.ready()
+        app.runner.outputs["ah-goals"] = (0, json.dumps(dict(self.GOALS, mission_session=OTHER)))
+        app.ledger.next_at = 0
+        app.ledger.run(time.time())   # the pin moved; the owners collector has not read the new session yet
+        self.assertEqual((app.pin()["display"], app.owners.session), (OTHER, MAIN))
+        self.assertEqual(app.truth.reads()["owners"]["truth"], "unknown")
+
+    def test_t243_6_a_kept_pin_makes_every_session_scoped_read_not_current(self):
+        app = self.ready()
+        reads = app.truth.reads()
+        for dataset in ("owners", "asks", "requirements", "chat"):   # the fixture reads these whole
+            self.assertEqual(reads[dataset]["truth"], "current", dataset)
+        app.runner.outputs["ah-goals"] = (1, "")   # the mission ledger cannot be read: the pin is only kept
+        app.ledger.next_at = 0
+        app.ledger.run(time.time())
+        self.assertEqual(app.pin()["source"], "kept")
+        reads = app.truth.reads()
+        for dataset in ("owners", "asks", "requirements", "chat"):
+            self.assertNotEqual(reads[dataset]["truth"], "current", dataset)
+        for dataset in ("owners", "asks", "requirements", "status", "chat"):
+            self.assertIn("session-pin", [f["id"] for f in reads[dataset]["facts"]], dataset)
 
 if __name__ == "__main__":
     unittest.main()

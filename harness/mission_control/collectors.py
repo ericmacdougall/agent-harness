@@ -218,17 +218,19 @@ def producer_read(label: str, code: int, out, *, cap: int | None = None, ok_code
 # so a new collector, snapshot or cross-read cannot ship without its line here.
 FEEDS = {
     "goals": ("ledger:goals",),
-    "requirements": ("ledger:requirements", "main-session"),
-    "status": ("ledger:status", "main-session"),
-    "asks": ("asks", "main-session"),
+    # session-pin (goodqa#15961): the session every session-scoped read is for. A pin that is only kept for display (the
+    # mission ledger unreadable), unpinned or flagged makes these datasets not current (PR 234 v7 audit T243-6).
+    "requirements": ("ledger:requirements", "session-pin"),
+    "status": ("ledger:status", "session-pin"),
+    "asks": ("asks", "session-pin"),
     # owner-policy: the owner/helper type table the roles (live, parked, helper) are decided by (T242-1)
-    "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams", "owner-policy"),
+    "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams", "owner-policy", "session-pin"),
     "initiatives": ("initiatives",),
     # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
     # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
     "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "owner-policy", "initiatives", "github",
                "goodqa", "t2-dev", "sources"),
-    "chat": ("chat", "main-session"),  # the chat snapshot names which session is main's
+    "chat": ("chat", "session-pin"),  # the chat snapshot names the pinned session as main's
 }
 # Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
 NOT_A_FEED = {
@@ -246,9 +248,19 @@ SAFE_READS = {
     ("codex-owners", "wals", "last_items"): "a change signal only: decides when to republish, not what",
     ("goodqa", "initiatives", "items"): "covered: names the tickets to poll; initiatives is a feed of events",
     ("goodqa", "owners", "tickets"): "covered: names the tickets to poll; owners and its feeds are feeds of events",
-    ("ledger", "owners", "session"): "covered: main-session is a feed of the session-scoped datasets",
-    ("asks", "owners", "session"): "covered: main-session is a feed of asks",
-    ("chat", "owners", "session"): "covered: main-session is a feed of chat",
+    # the pinned session (goodqa#15961): every reader of it rests on session-pin, a feed of the datasets it reads for
+    ("ledger", "session-pin", "pin"): "covered: session-pin is a feed of the session-scoped ledger parts",
+    ("asks", "session-pin", "pin"): "covered: session-pin is a feed of asks",
+    ("chat", "session-pin", "pin"): "covered: session-pin is a feed of chat",
+    ("owners", "session-pin", "pin"): "covered: session-pin is a feed of owners",
+    ("session-pin", "ledger", "mission"): "the pin's own input: a pin the mission read does not confirm is an error row",
+    # redaction filters (reviews P-2, R-2, A-2b, F1): they hide text or skip a fetch and fail closed when the owner read
+    # is unknown; no row is dropped from a count, so they change what is shown of a row, never how many there are
+    ("asks", "owners", "restricted"): "a redaction filter: hides restricted owners' ask text; no row is dropped",
+    ("asks", "owners", "unrestricted"): "a redaction filter: unknown hides owner ask text; no row is dropped",
+    ("ledger", "owners", "unrestricted"): "a redaction filter: unknown shows main's notes only; no row is dropped",
+    ("wals", "owners", "unrestricted"): "a redaction filter: hides sub-agent notes not shown unrestricted",
+    ("goodqa", "owners", "restricted_tickets"): "a privacy filter: restricted tickets are never polled or shown",
 }
 
 
@@ -1061,7 +1073,7 @@ class Owners(Collector):
         self.partial = False  # the last good read held more owners than MAX_ROWS, or rows it could not show
 
     MAX_ROWS = 60
-    rows_written = ("native-projects", "native-streams", "main-session", "owner-policy")
+    rows_written = ("native-projects", "native-streams", "owner-policy")
     read_budget = 30.0
 
     def health_truth(self):
@@ -1138,8 +1150,6 @@ class Owners(Collector):
         try:
             return self._tick(now)
         except Exception as exc:
-            # main's session is whatever the last good read named: after a failed read it may have moved
-            self.health.error("main-session", "the owners read that names main's session failed")
             # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
             self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}", truth=self.health_truth())
             self.claude_rows = [{**row, 'source_stale': True} for row in self.claude_rows]
@@ -1155,7 +1165,6 @@ class Owners(Collector):
             if not isinstance(data.get('owners'), list):
                 raise ValueError('invalid Claude owner snapshot')
             self.session = str(data.get("session") or "")
-            self._main_session_row()
             return self._rows(data, now, notes)
         pinned = self.pin_fn()
         if not pinned:
@@ -1163,8 +1172,11 @@ class Owners(Collector):
             self.session, self.claude_rows = "", []
             self.unrestricted = ("", frozenset())
             self.next_at = min(self.next_at, now + 5)   # the ledger read pins it seconds after start
+            # T243-5: off, not an error. No rows are shown and none of them is a last good read of this pin, so the
+            # owners read is unknown, never "stale" with an empty list.
+            self.health.off(self.name, "unpinned: no Claude session is pinned yet (waiting for the mission ledger)")
             self.publish()
-            raise RuntimeError("unpinned: no Claude session is pinned yet (waiting for the mission ledger)")
+            return "unpinned"
         code, out = self.runner.run("ah-owners", pinned, timeout=30)
         data, notes = producer_read("ah owners", code, out)
         if not isinstance(data.get('owners'), list):
@@ -1172,14 +1184,11 @@ class Owners(Collector):
         if str(data.get("session") or "") != pinned:   # a guard only: ah echoes --session back
             raise ValueError("ah owners answered for a different session than the pin")
         self.session = pinned
-        self._main_session_row()
         return self._rows(data, now, notes)
 
-    def _main_session_row(self) -> None:
-        if self.session:
-            self.health.ok("main-session", f"main is in session {self.session[:8]}")
-        else:
-            self.health.off("main-session", "the owners read named no main session")
+    def health_session(self):
+        """The pinned session this read was for: Truth shows it unknown once the pin has moved (T243-5)."""
+        return self.session or None
 
     def _rows(self, data: dict, now: float, notes=()):
         rows, dropped = [], len(notes)  # a producer that could not read everything: the owner list may be short
