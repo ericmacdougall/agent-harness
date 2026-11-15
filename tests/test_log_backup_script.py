@@ -1276,7 +1276,7 @@ class LargeTierLane(LargeTier):
         self.assertLessEqual(big_rate, 0.25 + 1e-9)
         for argv in tier1:
             self.assertLessEqual(self.rate(argv) + big_rate, 1.0 + 1e-9, "together they stay inside the share of 1: " + str(argv))
-        self.assertIn("large-file upload is in flight", (self.logs / "log-backup.log").read_text())
+        self.assertIn("is in flight in the bulk lane at 0.25/s", (self.logs / "log-backup.log").read_text())
         self.lane_over()
         self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes(), "the large upload finished")
         self.assertTrue(self.last_ok().exists() and self.large_marker().exists() and self.bulk_ok().exists())
