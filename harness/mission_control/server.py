@@ -105,7 +105,7 @@ def mint_code(key: bytes, now: float | None = None, purpose: str = "launch") -> 
 
 def normal_code(code) -> str | None:
     """The canonical XXXX-XXXX form of a sign-in code, or None. Only case is folded; nothing else is coerced."""
-    if not isinstance(code, str) or len(code) != 9 or code[4] != "-":
+    if not isinstance(code, str) or len(code) != 9 or code[4] != "-" or not code.isascii():
         return None
     code = code.upper()
     body = code[:4] + code[5:]
@@ -132,6 +132,9 @@ class Auth:
         self.sessions: dict[str, dict] = {}
         # Sign-in codes (GoodQA #16047), keyed by sha256(pending id); the id itself lives only in the browser cookie.
         self.pending: dict[str, dict] = {}
+        # code -> created time of entries already claimed, kept until their window ends, so a retried approval after
+        # a lost response reports already-approved, not unknown-code. Bounded at 2 * MAX_PENDING.
+        self.claimed: dict[str, float] = {}
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.loopback_hosts = frozenset(self.hosts)  # sign-in codes are offered and approved on these hosts only
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
@@ -157,6 +160,7 @@ class Auth:
         if current != self.key:
             self.sessions.clear()
             self.pending.clear()
+            self.claimed.clear()
             self.key = current
             self._save_locked()
         return True
@@ -314,6 +318,7 @@ class Auth:
         with self.lock:
             self.sessions.clear()
             self.pending.clear()
+            self.claimed.clear()
             self._save_locked()
 
     # -- sign-in codes (GoodQA #16047): the browser shows a code; the host approves it; only that browser signs in
@@ -321,6 +326,8 @@ class Auth:
     def _prune_pending_locked(self, now: float) -> None:
         for key in [k for k, v in self.pending.items() if now - v["created"] > SIGNIN_TTL_S or v["gen"] != self.key]:
             self.pending.pop(key, None)
+        for code in [c for c, created in self.claimed.items() if now - created > SIGNIN_TTL_S]:
+            self.claimed.pop(code, None)
 
     def signin_start(self, pid: str | None, now: float | None = None) -> tuple[str | None, str | None]:
         """(pending id, code) for this browser: its live entry when the cookie names one, else a new entry.
@@ -334,7 +341,7 @@ class Auth:
                 row = self.pending.get(self._hash(pid))
                 if row is not None:
                     return pid, row["code"]
-            live = {row["code"] for row in self.pending.values()}
+            live = {row["code"] for row in self.pending.values()} | set(self.claimed)
             while True:
                 raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
                 code = raw[:4] + "-" + raw[4:]
@@ -372,6 +379,8 @@ class Auth:
                         return "already-approved"
                     row["approved"] = True
                     return "approved"
+            if wanted in self.claimed:
+                return "already-approved"
             return "unknown-code"
 
     def signin_claim(self, pid: str | None, now: float | None = None) -> str | None:
@@ -388,6 +397,9 @@ class Auth:
             if row is None or not row["approved"]:
                 return None
             self.pending.pop(key)
+            self.claimed[row["code"]] = row["created"]
+            while len(self.claimed) > 2 * MAX_PENDING:
+                self.claimed.pop(min(self.claimed, key=self.claimed.get))
             return self._new_session_locked(now)
 
 
@@ -835,10 +847,13 @@ class Handler(BaseHTTPRequestHandler):
         auth = self.app.auth
         code = None
         extra = {}
-        if (self.headers.get("Host") or "") in auth.loopback_hosts:
+        proxied = any(k.lower() in ("x-forwarded-for", "x-forwarded-host", "forwarded") or k.lower().startswith("tailscale-")
+                      for k in self.headers.keys())
+        if (self.headers.get("Host") or "") in auth.loopback_hosts and not proxied:
             pid = self.cookie("mc_pending")
             sid = auth.signin_claim(pid)
             if sid:
+                self.server.log.info("signin claimed")  # no code, id or address: a lost race shows up as two lines
                 return self.send_secure(303, b"", "text/plain", {"Location": "/", "Set-Cookie": [
                     f"mc_sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_S}",
                     "mc_pending=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"]})
@@ -886,6 +901,7 @@ class Handler(BaseHTTPRequestHandler):
         result = self.app.auth.signin_approve(body.get("proof"), body.get("code"))
         status = {"approved": 200, "already-approved": 409, "unknown-code": 404, "bad-code": 400}.get(result, 401)
         if status == 200:
+            self.server.log.info("signin approved")
             return self.send_json(200, {"approved": True})
         return self.deny(status, result)
 

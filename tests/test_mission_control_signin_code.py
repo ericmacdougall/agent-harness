@@ -66,18 +66,32 @@ class AuthUnit(unittest.TestCase):
 
     def test_wrong_and_look_alike_codes_are_refused_not_coerced(self):  # NEG-3
         _, code = self.auth.signin_start(None, now=1000)
-        bad = [code.replace("-", ""), code.lower(), code + "A", code[:-1], "", "x" * 400, None, 12345678,
-               code.replace(code[0], "O" if code[0] != "O" else "0", 1), code.replace("-", "_")]
-        results = {}
-        for n, guess in enumerate(bad):
+        swap = code.replace(code[0], "O" if code[0] != "O" else "0", 1)
+        malformed = [code.replace("-", ""), code + "A", code[:-1], "", "x" * 400, None, 12345678, swap,
+                     code.replace("-", "_"), "0OOO-1III", code[:8] + "0", "IL10-OOOO", " " + code[1:], code[:4] + "\u2010" + code[5:], "\u017f" + code[1:]]
+        for n, guess in enumerate(malformed):
             proof = mcs.mint_code(KEY, now=1001 + n, purpose="approve")
-            results[repr(guess)[:20]] = self.auth.signin_approve(proof, guess, now=1001 + n)
-        # Only exact case-insensitive matches of the shown code count: lower case is the same code, the rest are not.
-        accepted = [k for k, v in results.items() if v == "approved"]
-        self.assertLessEqual(len(accepted), 1, results)
-        for guess in ("0OOO-1III", "ABCD-EFG0", "IL10-OOOO"):
-            self.assertEqual(self.auth.signin_approve(mcs.mint_code(KEY, now=1100, purpose="approve"), guess, now=1100),
-                             "bad-code", guess)
+            self.assertEqual(self.auth.signin_approve(proof, guess, now=1001 + n), "bad-code", repr(guess)[:40])
+        self.assertFalse(next(iter(self.auth.pending.values()))["approved"], "a malformed code approved the entry")
+        # Lower case is the same code (only case is folded), checked on its own fresh entry.
+        fresh = mcs.Auth(lambda: KEY, 49999)
+        pid, code2 = fresh.signin_start(None, now=2000)
+        self.assertEqual(fresh.signin_approve(mcs.mint_code(KEY, now=2001, purpose="approve"), code2.lower(), now=2001), "approved")
+        self.assertTrue(fresh.signin_claim(pid, now=2002))
+
+    def test_retry_after_claim_still_reports_already_approved(self):  # NEG-6 (lost CLI response, then retry)
+        pid, code = self.auth.signin_start(None, now=1000)
+        self.assertEqual(self.auth.signin_approve(mcs.mint_code(KEY, now=1001, purpose="approve"), code, now=1001), "approved")
+        self.assertTrue(self.auth.signin_claim(pid, now=1002))
+        self.assertEqual(self.auth.signin_approve(mcs.mint_code(KEY, now=1003, purpose="approve"), code, now=1003), "already-approved")
+        late = 1000 + mcs.SIGNIN_TTL_S + 1
+        self.assertEqual(self.auth.signin_approve(mcs.mint_code(KEY, now=late, purpose="approve"), code, now=late), "unknown-code",
+                         "completion metadata must expire with the entry window")
+        for n in range(mcs.MAX_PENDING * 3):  # completion metadata stays bounded
+            p2, c2 = self.auth.signin_start(None, now=2000 + n)
+            self.auth.signin_approve(mcs.mint_code(KEY, now=2000 + n, purpose="approve"), c2, now=2000 + n)
+            self.auth.signin_claim(p2, now=2000 + n)
+        self.assertLessEqual(len(self.auth.claimed), mcs.MAX_PENDING * 2)
 
     def test_approval_needs_a_fresh_single_use_approve_proof(self):  # NEG-4, NEG-6
         _, code = self.auth.signin_start(None, now=1000)
@@ -183,6 +197,8 @@ class Http(fixtures.ServerHarness):
         code = CODE_RE.search(body).group(1).decode()
         self.assertEqual(self.approve(code, headers={"Origin": self.origin})[0].status, 403, "a page could call approve")
         self.assertEqual(self.approve(code, headers={"Sec-Fetch-Site": "same-origin"})[0].status, 403)
+        self.assertEqual(self.approve(code, headers={"Sec-Fetch-Mode": "cors"})[0].status, 403)
+        self.assertEqual(self.approve(code, headers={"Cookie": "mc_pending=x"})[0].status, 403)
         self.assertEqual(self.approve(code, proof=mcs.mint_code(b"k" * 32, purpose="approve"))[0].status, 401)
         self.assertEqual(self.approve(code, headers={"Content-Type": "text/plain"})[0].status, 415)
         self.assertEqual(self.request("POST", "/signin/approve", {"Content-Type": "application/json"}, b"{")[0].status, 400)
@@ -205,6 +221,15 @@ class Http(fixtures.ServerHarness):
         self.assertIsNone(CODE_RE.search(body))
         self.assertEqual(self.app.auth.pending, {})
 
+    def test_proxied_requests_never_get_a_code(self):  # NEG-10 (a proxy that keeps a loopback Host)
+        for header in ({"X-Forwarded-For": "198.51.100.7"}, {"Forwarded": "for=198.51.100.7"},
+                       {"X-Forwarded-Host": "demo.example"}, {"Tailscale-Funnel-Request": "?1"}):
+            resp, body = self.request("GET", "/", dict(header, **{"Sec-Fetch-Site": "none"}))
+            self.assertEqual(resp.status, 401, header)
+            self.assertIsNone(cookie_value(resp, "mc_pending")[0], header)
+            self.assertIsNone(CODE_RE.search(body), header)
+        self.assertEqual(self.app.auth.pending, {})
+
     def test_log_holds_neither_code_nor_proof_nor_pending_id(self):  # AC-4
         resp, body = self.page()
         pending, _ = cookie_value(resp, "mc_pending")
@@ -216,6 +241,8 @@ class Http(fixtures.ServerHarness):
             handler.flush()
         log = (self.root / "log" / "server.log").read_text()
         self.assertIn("/signin/approve", log)
+        self.assertIn("signin approved", log)
+        self.assertIn("signin claimed", log)
         for value in (code, proof, pending.split("=", 1)[1]):
             self.assertNotIn(value, log)
 
