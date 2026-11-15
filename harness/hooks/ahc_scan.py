@@ -8,7 +8,8 @@ no finding ever holds matched text. `verdict(findings)` gives the tier (clean, r
 
 Rules (spec harvest idea 4):
 - Encodings: each value is scanned raw, and again after decoding the hex, base64 (standard and URL-safe) and
-  URL-encoded (percent) runs it contains, one level deep.
+  URL-encoded (percent) runs it contains, one level deep, with every rule (entropy included) on the decoded bytes.
+  A base64 run that decodes to printable prose is judged by its decoded content, not by the run's own entropy.
 - Window: after a known prefix, the following token characters are stripped to alphanumerics; 8 or more
   alphanumerics is an exposure (the value is there). Separators inside a value do not hide it.
 - A public prefix alone (fewer than 8 alphanumerics after it) is a block finding but not an exposure: the
@@ -155,9 +156,27 @@ def _raw_hits(data, *, entropy=True):
     if entropy:
         covered = {o for o, _, _ in hits}
         for m in _RUN_RE.finditer(data):
-            if _high_entropy(m.group(0)) and not any(m.start() <= o < m.end() for o in covered):
+            if _high_entropy(m.group(0)) and not any(m.start() <= o < m.end() for o in covered) \
+                    and not _encoded_prose(m.group(0)):
                 hits.append((m.start(), "high-entropy", True))
     return hits
+
+
+_PRINTABLE = frozenset(range(0x20, 0x7f)) | {0x09, 0x0a, 0x0d}
+
+
+def _encoded_prose(run):
+    """True when `run` is base64 of printable text with word spaces in it. Such a run is judged by its decoded
+    content instead (scan_report applies every rule, entropy included, to decoded runs), so encoded prose is not
+    an incident while a token inside it still is. Random bytes, and a token with no spaces, keep the raw rule."""
+    bare = run.rstrip(b"=")
+    for alt in (b"+/", b"-_"):
+        try:
+            text = base64.b64decode(bare + b"=" * (-len(bare) % 4), altchars=alt, validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        return text.count(b" ") >= 2 and all(b in _PRINTABLE for b in text)
+    return False
 
 
 def _decoded(data):
@@ -201,7 +220,7 @@ def scan_report(data, path="report"):
     for offset, rule, exposure in _raw_hits(data):
         found.append((offset, rule, "raw", exposure))
     for offset, encoding, blob in _decoded(data):
-        for _, rule, exposure in _raw_hits(blob, entropy=False):
+        for _, rule, exposure in _raw_hits(blob):     # every rule, the bounded entropy rule included
             found.append((offset, rule, encoding, exposure))    # reported at the encoded run's (or line's) start
     # one finding per (line, rule, exposure); the raw form wins over a decoded copy of the same hit
     best = {}

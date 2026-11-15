@@ -166,6 +166,27 @@ class EntropyTests(unittest.TestCase):
         f = S.scan_report(blob.encode())
         self.assertIn(("high-entropy", True), [(x["rule"], x["exposure"]) for x in f])
 
+    def test_an_encoded_opaque_value_is_an_exposure(self):
+        """v2g9 adversarial round 3 F4: entropy applies to decoded content, so encoding cannot hide a value."""
+        for n in (32, 64):
+            value = self.s.body(n).encode()
+            for name, blob in (("hex", binascii.hexlify(value)), ("hex-upper", binascii.hexlify(value).upper()),
+                               ("base64", base64.b64encode(value)), ("base64url", base64.urlsafe_b64encode(value)),
+                               ("url", urllib.parse.quote_from_bytes(b"k=" + value + b"&", safe="").encode())):
+                with self.subTest(n=n, encoding=name):
+                    f = S.scan_report(b"value: " + blob + b"\n")
+                    self.assertEqual(S.verdict(f)["action"], S.QUARANTINE, f)
+
+    def test_benign_encoded_data_stays_clean(self):
+        import hashlib
+        digest = hashlib.sha256(self.s.body(40).encode()).digest()
+        prose = (b"the release notes say the queue drains in order and every owner is told when its item "
+                 b"settles, which is what the reviewers asked for")
+        for name, blob in (("sha256 hex", binascii.hexlify(digest)), ("sha256 HEX", binascii.hexlify(digest).upper()),
+                           ("base64 prose", base64.b64encode(prose)), ("hex prose", binascii.hexlify(prose))):
+            with self.subTest(case=name):
+                self.assertEqual(S.scan_report(b"x " + blob + b"\n"), [])
+
     def test_ordinary_shapes_are_not_high_entropy(self):
         hexsha = "".join(self.s.rng.choice("0123456789abcdef") for _ in range(64))
         cases = {
