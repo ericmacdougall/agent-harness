@@ -853,7 +853,9 @@ class Handler(BaseHTTPRequestHandler):
             pid = self.cookie("mc_pending")
             sid = auth.signin_claim(pid)
             if sid:
-                self.server.log.info("signin claimed")  # no code, id or address: a lost race shows up as two lines
+                # No code, id or address. A claim by a cookie-planting attacker logs the same line, so the log cannot
+                # show a lost race; the sign is this browser never signing in and showing a new code (spec M1).
+                self.server.log.info("signin claimed")
                 return self.send_secure(303, b"", "text/plain", {"Location": "/", "Set-Cookie": [
                     f"mc_sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_S}",
                     "mc_pending=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"]})
