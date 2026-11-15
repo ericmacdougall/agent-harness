@@ -213,6 +213,10 @@ def parse_message(message: str):
     trailers, unrecognised = [], []
     if paragraphs and all(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
         trailers = paragraphs.pop()
+        # published commits put Claude-Session in its own paragraph before Co-Authored-By: a paragraph made only
+        # of trailer lines directly before the trailer block belongs to it (goodqa#16106)
+        while paragraphs and all(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
+            trailers = paragraphs.pop() + trailers
     elif paragraphs and any(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
         # a mixed final paragraph is not a trailer block: name the lines that are not trailers (goodqa#16106)
         unrecognised = [line for line in paragraphs[-1] if not TRAILER_LINE.match(line) or SECTION_LINE.match(line)]
