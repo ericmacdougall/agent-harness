@@ -653,16 +653,16 @@ class Contracts:
             return self._op_move(key, "intent", expected_version, event_id, "ahc-core")
 
     def abandon_unsent(self, key, *, expected_version, event_id, reason):
-        """E9 intent -> abandoned: the owning item left merge-ready before dispatch. The grant is released (G5/G6)
-        and the next W7 for the tuple uses generation g+1."""
+        """E9 intent -> abandoned: the owning item left merge-ready before (re)dispatch. The grant is released
+        (G5/G6). Never sent: the next W7 for the tuple uses generation g+1. Back in intent through E7 (every earlier
+        dispatch was a typed refusal on a closed request): released too, but the tuple never gets a fresh key."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None:
                 raise ContractError("no operation %s" % key)
-            if row["dispatch_count"] != 0:
-                raise ContractError("an operation that was ever sent cannot be abandoned as unsent")
+            proof = "never-sent" if row["dispatch_count"] == 0 else "refused-then-left"
             return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
-                                 {"proof": "never-sent"}, reason=reason)
+                                 {"proof": proof}, reason=reason)
 
     def settle_held(self, key, outcome, evidence, *, expected_version, event_id, actor):
         """E10 held -> abandoned by main or the reconcile, with evidence. The outcome stayed unknown, so the grant

@@ -2686,6 +2686,15 @@ class SchemaTests(Base):
         self.assertEqual(self.shape(self.paths.root / "ledger.sqlite3"),
                          self.shape(fresh_paths.root / "ledger.sqlite3"), "migrated shape equals fresh shape")
         self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v3.*.bak"))), 1)
+        import sqlite3
+        for path in (self.paths.root, fresh_paths.root):
+            db = sqlite3.connect(str(path / "ledger.sqlite3"))
+            try:
+                self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='index' AND "
+                                            "name='grants_one_live_per_scope'").fetchall(),
+                                 [("grants_one_live_per_scope",)], "the one-grant-per-scope index exists")
+            finally:
+                db.close()
 
     def test_unverified_backup_never_starts_the_migration(self):
         held = self.make_v1()

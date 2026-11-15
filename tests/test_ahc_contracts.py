@@ -536,13 +536,25 @@ class OperationTests(Base):
         self.assertEqual((op["state"], op["dispatch_count"]), ("intent", 1))
         self.assertEqual(self.gstate(g), "reserved")
 
-    def test_e09_only_an_unsent_operation_is_abandoned_as_unsent(self):
+    def test_e09_only_an_intent_is_abandoned_and_a_dispatched_one_is_not(self):
         g, op = self.dispatched()
         with self.assertRaises(C.ContractError):
             self.c.abandon_unsent(op["key"], expected_version=op["version"], event_id=self.ev(), reason="W4")
         g2, op2 = self.reserved(pr=6)
         op2 = self.c.abandon_unsent(op2["key"], expected_version=op2["version"], event_id=self.ev(), reason="W4")
         self.assertEqual((op2["state"], op2["proof"]), ("abandoned", "never-sent"))
+
+    def test_e09_after_e7_releases_the_grant_but_never_mints_a_fresh_key(self):
+        g, op = self.dispatched()
+        op = self.c.refused(op["key"], "transient", {"stderr": "reset"}, expected_version=op["version"],
+                            event_id=self.ev(), request_closed=True)
+        op = self.c.after_refusal(op["key"], self.params(), expected_version=op["version"], event_id=self.ev(),
+                                  lease_ok=True)
+        op = self.c.abandon_unsent(op["key"], expected_version=op["version"], event_id=self.ev(), reason="W5")
+        self.assertEqual((op["state"], op["proof"]), ("abandoned", "refused-then-left"))
+        self.assertEqual(self.gstate(g), "active", "every dispatch was proven absent: the grant is released")
+        with self.assertRaisesRegex(C.ContractError, "never gets a fresh key"):
+            self.c.intend(self.params(), lease_ok=True, event_id=self.ev())
 
     def test_retention_tombstones_settled_rows_only_and_refuses_the_key_after(self):
         g, op = self.dispatched()
