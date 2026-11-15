@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ledger, sources, needsSummary, ownersEmpty, ownerCount, initiativesEmpty, initiativeCount, atRiskEmpty, noProgress, noAction,
-  updatedText, feedEmpty, claim, worst, truthOf, CLAIM_SOURCES } from '../js/adapt.js';
+  updatedText, feedEmpty, feedCount, ownerLineText, ownerCountTitle, hubCounts, workItemText, sceneText, claim, worst, truthOf, CLAIM_SOURCES } from '../js/adapt.js';
 
 const NOW = Date.parse('2027-01-15T09:00:00Z');
 const at = '2027-01-15T08:00:00.000Z';
@@ -27,6 +27,14 @@ const AUDIT = [
   ['Initiative card and inspector "No activity recorded"', ['wals', 'owners', 'codex-owners'], s => updatedText(s, { updated: null }, () => '5 min ago'), /^No activity recorded$/],
   ['Initiative "no activity for over 30 min"', ['wals', 'owners', 'codex-owners'], s => updatedText(s, { updated: at, stale: true }, () => '1 h ago', 'Updated '), /no activity for over 30 min/],
   ['Activity feed "Listening for signals…"', ['wals'], s => feedEmpty(s), /^Listening for signals…$/],
+  ['Activity summary "0 work items"', ['wals'], s => `${feedCount(s, 0)} work items`, /^0 work items$/],
+  ['Initiative owner "no live owner" (card and inspector)', ['owners', 'codex-owners'], s => ownerLineText(s, null, { owner: 'a095f32d' }), /^a095f32d · no live owner$/],
+  ['Initiative owner "no owner" / "—"', ['owners', 'codex-owners'], s => `${ownerLineText(s, null, {})}|${ownerLineText(s, null, {}, { full: false, none: '—' })}`, /^no owner\|—$/],
+  ['Owner count title "0 owners in all"', ['owners', 'codex-owners'], s => ownerCountTitle(s, 0, 0), /^0 shown of 0 matching, 0 owners in all$/],
+  ['Hub inspector "Owners 0"', ['owners', 'codex-owners'], s => hubCounts(s).owners, /^0$/],
+  ['Hub inspector "Initiatives 0"', ['initiatives'], s => hubCounts(s).initiatives, /^0$/],
+  ['Owner row "No work item recorded yet" (note, title and label)', ['wals'], s => `${workItemText(s, 'No work item recorded yet')}|${workItemText(s, 'No work item yet')}`, /^No work item recorded yet\|No work item yet$/],
+  ['Topology "Owners linked. Signals flowing."', ['wals', 'owners', 'codex-owners'], s => sceneText({ ...s, connection: 'live' }, 'Owners linked. Signals flowing.'), /^Owners linked\. Signals flowing\.$/],
 ];
 for (const [name, deps, render, zero] of AUDIT) {
   test(`audit: ${name} only when ${deps.join(', ')} ${deps.length > 1 ? 'are' : 'is'} current`, () => {
@@ -36,6 +44,10 @@ for (const [name, deps, render, zero] of AUDIT) {
     }
   });
 }
+
+test('audit: panel count badges say stale or unknown themselves (they have no note beside them)', () => {
+  assert.deepEqual([ownerCount(world(), 5), ownerCount(world('owners', 'stale'), 5), ownerCount(world('owners'), 0), initiativeCount(world('initiatives', 'partial'), 3)], ['05', '5 (stale)', '?', '3+']);
+});
 
 test('audit: an unknown Needs-you count is "?" in the header, its label and the page title', () => {
   const n = needsSummary(world('asks'), 0, 0);

@@ -1073,7 +1073,7 @@ class Ledger(Collector):
         except Exception as exc:  # noqa: BLE001 - a failed source keeps its last good rows
             previous = self.parts[part]
             message = ev.short(str(exc), 160)
-            if previous.get("session", "") != session:
+            if previous.get("at") and previous.get("session", "") != session:
                 # the rows on hand were read for another session: they are not this session's last good read
                 previous = self._empty(part)
                 if part == "requirements":

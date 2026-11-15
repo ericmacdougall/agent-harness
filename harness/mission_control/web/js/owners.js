@@ -1,6 +1,6 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
-import { ownersEmpty, ownerCount } from './adapt.js';
+import { ownersEmpty, ownerCount, ownerCountTitle, workItemText } from './adapt.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -75,21 +75,21 @@ export function mountOwners() {
         ? `Native ${owner.native_status || 'unknown'} observed ${new Date(owner.observed_at).toLocaleTimeString()}`
         : `Native observation stale/unknown (${new Date(owner.observed_at).toLocaleTimeString()})`;
       parts.task.textContent = [owner.stream || owner.task, owner.ticket, native, owner.source_stale ? 'STALE SOURCE' : ''].filter(Boolean).join(' · ');
-      parts.note.textContent = owner.last_item.note;
+      parts.note.textContent = workItemText(state, owner.last_item.note);
       parts.time.dateTime = owner.last_item.active || '';
-      parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : 'No work item yet';
+      parts.time.title = owner.last_item.at ? `Work item written ${new Date(owner.last_item.at).toLocaleString()}` : workItemText(state, 'No work item yet');
       parts.time.textContent = age(owner.last_item.active, state.now);
       parts.time.className = `owner-age ${freshness(owner.last_item.active, state.now)}`;
-      parts.row.setAttribute('aria-label', `${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. ${holdText ? `${holdText}. ` : ''}Last work item: ${owner.last_item.note}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
+      parts.row.setAttribute('aria-label', `${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. ${holdText ? `${holdText}. ` : ''}Last work item: ${workItemText(state, owner.last_item.note)}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
     });
     if (!owners.length) list.append(el('p', 'empty-state', ownersEmpty(state, state.owners.length > 0)));
     const count = document.getElementById('owner-count');
     count.textContent = ownerCount(state, owners.length);
-    count.title = `${owners.length} shown of ${total} matching, ${state.owners.length} owners in all`;
+    count.title = ownerCountTitle(state, owners.length, total);
   }
   render(getState());
   subscribe((state, reason) => {
-    if (['event','owners','owner-filter','health'].includes(reason)) render(state);
+    if (['event','owners','owner-filter','truth'].includes(reason)) render(state);
     if (reason === 'tick') rows.forEach(({ time }) => { time.textContent = age(time.dateTime, state.now); time.className = `owner-age ${freshness(time.dateTime, state.now)}`; });
     if (reason === 'highlight') rows.forEach(({ row }, id) => row.classList.toggle('is-highlighted', id === state.highlight));
   });

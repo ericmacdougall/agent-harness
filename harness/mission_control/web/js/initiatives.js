@@ -1,8 +1,8 @@
 import { getState, subscribe, select, highlight } from './store.js';
 import { el, button, progress, checklist, eta, stateClass, age } from './ui.js';
-import { liveFields, atRisk, atRiskEmpty, noProgress, noAction, updatedText, initiativesEmpty, initiativeCount } from './adapt.js';
+import { liveFields, atRisk, atRiskEmpty, noProgress, noAction, updatedText, initiativesEmpty, initiativeCount, ownerLineText, claim } from './adapt.js';
 
-const LABEL = { uncovered: 'UNCOVERED', stalled: 'STALLED', moving: 'moving' };
+const LABEL = { uncovered: 'UNCOVERED', unknown: 'UNKNOWN', stalled: 'STALLED', moving: 'moving' };
 function sinceText(row, now, state) {
   if (!row.last) return noProgress(state);
   return `progress ${age(row.last, now)}`;
@@ -12,7 +12,7 @@ function sinceText(row, now, state) {
 function renderAtRisk(state) {
   const box = document.getElementById('at-risk-list');
   if (!box) return;
-  const rows = atRisk(state.initiatives, state.owners, state.events, state.now, state.coverage || null);
+  const rows = atRisk(state.initiatives, state.owners, state.events, state.now, state.coverage || null, 6, { owners: claim(state, 'owners').truth, progress: claim(state, 'progress').truth });
   const fragment = document.createDocumentFragment();
   for (const row of rows) {
     const item = el('li', `at-risk-item ${row.status}`);
@@ -52,7 +52,7 @@ export function mountInitiatives() {
       const live = liveFields(item, state.owners, state.asks, state.events, state.now);
       const owner = live.owner;
       const ownerLine = el('div', 'initiative-owner');
-      ownerLine.append(el('span', '', owner?.runtime === 'codex' ? '◇' : '✳'), el('span', '', owner ? `${owner.name} · ${owner.runtime} · ${owner.state}` : (item.owner ? `${item.owner} · no live owner` : 'no owner')));
+      ownerLine.append(el('span', '', owner?.runtime === 'codex' ? '◇' : '✳'), el('span', '', ownerLineText(state, owner, item)));
       const liveBox = el('div', 'initiative-live');
       if (live.note) liveBox.append(el('p', 'initiative-live-note', `“${live.note.text}” · ${live.note.by} · ${age(live.note.at, state.now)}`));
       const facts = [];
@@ -82,7 +82,7 @@ export function mountInitiatives() {
   // ages and the 30-min flag; skipped while the keyboard is inside the list so focus is never lost (L-d)
   setInterval(() => { if (!document.hidden && !list.contains(document.activeElement)) render(getState()); }, 30000);
   subscribe((state, reason) => {
-    if (['initiatives', 'owners', 'asks', 'seed', 'health'].includes(reason)) render(state);
+    if (['initiatives', 'owners', 'asks', 'seed', 'truth'].includes(reason)) render(state);
     if (reason === 'highlight') list.querySelectorAll('article').forEach(card => card.classList.toggle('is-highlighted', card.dataset.id === state.highlight));
   });
 }

@@ -314,6 +314,7 @@ class StatusTruth(unittest.TestCase):
                 self.fail_status(runner, mode)
                 ledger, hub, health = make(runner)
                 ledger.run(1000.0)
+                ledger.run(1060.0)  # a failing streak keeps its first failure time, and is not republished for it
                 part = hub.snapshots["ledger"]["status"]
                 self.assertEqual((part["truth"], part["at"], part["stale"], part["blockers"]), ("unknown", "", False, []))
                 self.assertTrue(part["error"])

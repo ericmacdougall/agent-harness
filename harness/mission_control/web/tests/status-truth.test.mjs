@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { text, walk } from './dom-shim.mjs';
-import { ledger, sources, missionTiles } from '../js/adapt.js';
+import { ledger, sources, missionTiles, atRisk } from '../js/adapt.js';
 import * as v from '../js/ledger-views.js';
 
 const SCRIPT = fileURLToPath(new URL('./truth_scenarios.py', import.meta.url));
@@ -192,10 +192,10 @@ test('audit: ledger blockers beyond the 30 the server holds are counted, not dro
 const SRC = name => readFileSync(new URL(`../js/${name}`, import.meta.url), 'utf8');
 const LITERALS = {
   'needs.js': ['Nothing needs you right now', 'nothing waiting on you'],
-  'owners.js': ['Waiting for the owner list', 'No owners in this state', ".padStart(2, '0')"],
-  'initiatives.js': ['Nothing open to rank', 'no progress recorded', 'no action recorded', 'No activity recorded', 'Waiting for the initiatives file', ".padStart(2, '0')"],
-  'main.js': ['No activity recorded', 'no activity for over 30 min'],
-  'activity.js': ['Listening for signals'],
+  'owners.js': ['Waiting for the owner list', 'No owners in this state', ".padStart(2, '0')", '${state.owners.length} owners in all', ": 'No work item yet';", 'Last work item: ${owner.last_item.note}'],
+  'initiatives.js': ['Nothing open to rank', 'no progress recorded', 'no action recorded', 'No activity recorded', 'Waiting for the initiatives file', ".padStart(2, '0')", 'no live owner', "'no owner'"],
+  'main.js': ['No activity recorded', 'no activity for over 30 min', 'String(state.owners.length)', 'String(state.initiatives.length)', 'no live owner', 'textContent = SCENE_TEXT['],
+  'activity.js': ['Listening for signals', '`${events.length} work items'],
   'ledger-views.js': ["'No blockers recorded.')", "'Nothing is archived.')", 'status.error', 'part.error ?', 'led.status.stale'],
 };
 for (const [file, literals] of Object.entries(LITERALS)) {
@@ -204,3 +204,33 @@ for (const [file, literals] of Object.entries(LITERALS)) {
     for (const literal of literals) assert.ok(!code.includes(literal), `${file} still contains ${literal}`);
   });
 }
+
+test('audit: at-risk gives no UNCOVERED or STALLED verdict ("no owner", "no progress") from sources that are not current', () => {
+  const item = [{ id: 'i1', initiative: 'Ship', state: 'Active', ticket: 'goodqa#1' }];
+  const old = Date.parse('2027-01-15T06:00:00Z');
+  const working = [{ name: 'o', state: 'live', ticket: 'goodqa#1', progress: { at: new Date(old).toISOString(), event: 'commit' } }];
+  assert.equal(atRisk(item, [], [], NOW)[0].status, 'uncovered');  // current sources: the verdict stands
+  assert.equal(atRisk(item, working, [], NOW)[0].status, 'stalled');
+  for (const truth of ['unknown', 'stale', 'partial']) {
+    const uncovered = atRisk(item, [], [], NOW, null, 6, { owners: truth, progress: 'current' })[0];
+    assert.notEqual(uncovered.status, 'uncovered', truth);
+    assert.doesNotMatch(uncovered.reason, /no owner|no working owner/, truth);
+    const stalled = atRisk(item, working, [], NOW, null, 6, { owners: 'current', progress: truth })[0];
+    assert.notEqual(stalled.status, 'stalled', truth);
+    assert.doesNotMatch(stalled.reason, /no real progress|no result, commit or deploy/, truth);
+  }
+});
+
+test('audit: the Needs-you counts in the page shell start unknown ("?"), not 0, before the first read', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.match(html, /id="needs-count" class="needs-count">\?</);
+  assert.match(html, /id="needs-panel-count" class="count-badge">\?</);
+});
+
+test('audit: the panels whose zero claims rest on Source health repaint when a source truth changes', () => {
+  const views = readFileSync(new URL('../js/views.js', import.meta.url), 'utf8');
+  for (const id of ['mission-tiles', 'blockers-list', 'archive-body']) assert.match(views, new RegExp(`id: '${id}'[^\\n]*'truth'`), id);
+  assert.match(readFileSync(new URL('../js/store.js', import.meta.url), 'utf8'), /update\(\{\}, 'truth'\)/);
+  for (const file of ['needs.js', 'owners.js', 'initiatives.js', 'activity.js']) assert.match(SRC(file), /'truth'\]\.includes\(reason\)/, file);
+});
+

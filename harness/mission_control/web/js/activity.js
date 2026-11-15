@@ -1,6 +1,6 @@
 import { getState, subscribe, select, KINDS, pauseFeed, toggleQuiet } from './store.js';
 import { el, button, age, relativeTime } from './ui.js';
-import { feedEmpty } from './adapt.js';
+import { feedEmpty, feedCount } from './adapt.js';
 
 export function mountActivity() {
   const list = document.getElementById('activity-list');
@@ -57,11 +57,11 @@ export function mountActivity() {
     pause.setAttribute('aria-pressed', String(state.feedPaused));
     buffer.hidden = !state.feedPaused;
     resume.textContent = state.buffered ? `${state.buffered} new signals · resume feed ↓` : 'Feed paused · resume ↓';
-    document.getElementById('activity-summary').textContent = `${events.length} work items${hidden ? ` · ${hidden} tool and lifecycle events hidden` : ''}${state.feedPaused ? ' · paused' : ''}`;
+    document.getElementById('activity-summary').textContent = `${feedCount(state, events.length)} work items${hidden ? ` · ${hidden} tool and lifecycle events hidden` : ''}${state.feedPaused ? ' · paused' : ''}`;
   }
   render(getState(), 'initial');
   subscribe((state, reason) => {
-    if (['event', 'filters', 'feed', 'seed', 'health'].includes(reason)) render(state, reason);
+    if (['event', 'filters', 'feed', 'seed', 'truth'].includes(reason)) render(state, reason);
     if (reason === 'tick') list.querySelectorAll('time').forEach(time => { time.textContent = age(time.dateTime, state.now); });
     if (reason === 'event' && state.lastEvent && !state.lastEvent.historic && !state.lastEvent.quiet && !state.feedPaused && state.filters.includes(state.lastEvent.kind)) {
       pending.push(state.lastEvent);

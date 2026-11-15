@@ -21,7 +21,7 @@
       <div class="topbar-tools">
         <span id="connection" class="connection connecting" role="status"><i></i><span>Connecting</span></span>
         <span id="last-update" class="last-update">waiting for data</span>
-        <button id="needs-button" class="quiet-button needs-button" type="button" aria-controls="needs-panel"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">0</span></button>
+        <button id="needs-button" class="quiet-button needs-button" type="button" aria-controls="needs-panel"><span aria-hidden="true">?</span> Needs you <span id="needs-count" class="needs-count">?</span></button>
         <button id="theme-toggle" class="quiet-button theme-control" type="button" data-mode="auto"><svg class="theme-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><path class="theme-half" d="M12 4.5a7.5 7.5 0 0 1 0 15z"/></svg><span id="theme-label">Theme: auto</span></button>
       </div>
     </header>
@@ -60,7 +60,7 @@
             </section>
 
             <section id="needs-panel" class="panel" tabindex="-1" aria-labelledby="needs-heading">
-              <header class="panel-heading"><div><h2 id="needs-heading">Needs you <span id="needs-panel-count" class="count-badge">0</span></h2><p class="panel-sub">Questions your agents have for you. Settled ones are in the Archive.</p></div></header>
+              <header class="panel-heading"><div><h2 id="needs-heading">Needs you <span id="needs-panel-count" class="count-badge">?</span></h2><p class="panel-sub">Questions your agents have for you. Settled ones are in the Archive.</p></div></header>
               <div class="panel-scroll needs-scroll">
                 <p class="needs-intro"><strong>Approve</strong> or <strong>Deny</strong> records your decision on exactly the text shown; a reply sends main your own words. Guarded actions (other sessions’ processes, production deletion, credentials, top-rung models) still get your word in the terminal. The questions are written by agents.</p>
                 <ul id="needs-list" class="needs-list"></ul>

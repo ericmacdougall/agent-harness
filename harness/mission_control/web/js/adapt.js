@@ -157,10 +157,12 @@ export function noneText(c, current, noun) {
   const unknown = c.bad.filter(f => f.truth === 'unknown');
   return `Not known: ${names(unknown)} ${unknown.some(f => f.error) ? 'could not be read' : 'has not been read yet'}, so Mission Control cannot say there are no ${noun}.`;
 }
-// A count: a bare 0 is itself a claim, so an unknown zero is "?" and a partial count says there may be more.
-export function countText(n, c) {
+// A count: a bare 0 is itself a claim, so an unknown zero is "?" and a partial count says there may be more. A stale
+// count is the last good read's; `bare` marks a count with no note beside it, which then says so itself.
+export function countText(n, c, bare = false) {
   const truth = typeof c === 'string' ? truthOf(c) : c.truth;
   if (truth === 'unknown') return n ? `${n}+` : '?';
+  if (truth === 'stale' && bare) return `${n} (stale)`;
   return truth === 'partial' ? `${n}+` : String(n);
 }
 export function tileNote(c, current) {
@@ -351,7 +353,10 @@ export function replyStatus(message, time, gap) {
 // check publishes its own verdicts; `coverage` (id -> {status, reason, action}) overrides when present.
 export const STALLED_AFTER_MS = 90 * 60 * 1000;
 const FINISHED = /\b(done|live|complete|completed|shipped|cancel+ed|parked|on hold)\b/i;
-export function atRisk(initiatives = [], owners = [], events = [], now = Date.now(), coverage = null, limit = 6) {
+// `known` is the truth of the owner and progress sources (claim 'owners' and 'progress'): a verdict of no owner or no
+// progress is given only from current sources; otherwise the row is UNKNOWN with the reason (review PR 234 v3 F1 audit).
+export function atRisk(initiatives = [], owners = [], events = [], now = Date.now(), coverage = null, limit = 6, known = {}) {
+  const ownersKnown = truthOf(known.owners ?? 'current'), progressKnown = truthOf(known.progress ?? 'current');
   const rows = [];
   for (const item of initiatives) {
     if (!item || FINISHED.test(item.state || '')) continue;
@@ -370,9 +375,15 @@ export function atRisk(initiatives = [], owners = [], events = [], now = Date.no
     const last = stamps.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] || null;
     const since = last ? now - Date.parse(last.at) : Infinity;
     let status, reason;
-    if (!working.length && !decided) {
+    if (!working.length && !decided && ownersKnown !== 'current') {
+      status = 'unknown';
+      reason = `owner coverage unknown: the owner sources are ${ownersKnown}`;
+    } else if (!working.length && !decided) {
       status = 'uncovered';
       reason = linked.length ? `no working owner (${linked.map(o => `${o.name} ${o.state}`).join(', ')}) and no recorded decision` : 'no owner and no recorded decision';
+    } else if (since > STALLED_AFTER_MS && progressKnown !== 'current') {
+      status = 'unknown';
+      reason = `progress unknown: the owner and work-log sources are ${progressKnown}`;
     } else if (since > STALLED_AFTER_MS) {
       status = 'stalled';
       reason = last ? `no real progress since ${last.what}` : 'no result, commit or deploy recorded yet';
@@ -388,7 +399,7 @@ export function atRisk(initiatives = [], owners = [], events = [], now = Date.no
     rows.push({ id: item.id, initiative: item.initiative, ticket: item.ticket, status, reason,
       action: (external && str(external.action, 200)) || action, last: last ? last.at : null, since });
   }
-  const order = { uncovered: 0, stalled: 1, moving: 2 };
+  const order = { uncovered: 0, unknown: 1, stalled: 2, moving: 3 };
   return rows.sort((a, b) => order[a.status] - order[b.status] || b.since - a.since).slice(0, limit);
 }
 
@@ -523,12 +534,12 @@ export function ownersEmpty(state, filtered) {
   const c = claim(state, 'owners');
   return filtered ? noneText(c, 'No owners in this state.', 'owners in this state') : noneText(c, 'No owners are running.', 'owners');
 }
-export const ownerCount = (state, n) => padded(countText(n, claim(state, 'owners')));
+export const ownerCount = (state, n) => padded(countText(n, claim(state, 'owners'), true));
 export function initiativesEmpty(state) {
   if ((state.sources || []).find(s => s.id === 'initiatives')?.status === 'off') return 'No initiatives file is configured.';
   return noneText(claim(state, 'initiatives'), 'No initiatives in the file.', 'initiatives');
 }
-export const initiativeCount = (state, n) => padded(countText(n, claim(state, 'initiatives')));
+export const initiativeCount = (state, n) => padded(countText(n, claim(state, 'initiatives'), true));
 export const atRiskEmpty = state => noneText(claim(state, 'initiatives'), 'Nothing open to rank.', 'open initiatives to rank');
 export function noProgress(state) {
   const c = claim(state, 'progress');
@@ -546,6 +557,22 @@ export function updatedText(state, live, ageOf, prefix = '') {
   return `${prefix}${ageOf(live.updated)}${live.stale ? (sure ? ' · no activity for over 30 min' : ' · no newer activity seen; its sources are not current') : ''}`;
 }
 export const feedEmpty = state => noneText(claim(state, 'activity'), 'Listening for signals…', 'work items');
+export const feedCount = (state, n) => countText(n, claim(state, 'activity'), true);
+// The owner of an initiative: "no live owner" and "no owner" only from current owner sources.
+export function ownerLineText(state, owner, item, { full = true, none = 'no owner' } = {}) {
+  if (owner) return full ? `${owner.name} · ${owner.runtime} · ${owner.state}` : `${owner.name} · ${owner.state}`;
+  const sure = claim(state, 'owners').truth === 'current';
+  if (item?.owner) return `${item.owner} · ${sure ? 'no live owner' : 'live owner unknown'}`;
+  return sure ? none : 'owner unknown';
+}
+export const ownerCountTitle = (state, shown, total) => `${shown} shown of ${total} matching, ${countText(state.owners.length, claim(state, 'owners'), true)} owners in all`;
+export const hubCounts = state => ({ owners: countText(state.owners.length, claim(state, 'owners'), true), initiatives: countText(state.initiatives.length, claim(state, 'initiatives'), true) });
+// An owner row's "No work item recorded yet": its work items come from the WAL tailer.
+const NO_ITEM = new Set(['No work item recorded yet', 'No work item yet']);
+export const workItemText = (state, note) => (NO_ITEM.has(note) && claim(state, 'activity').truth !== 'current' ? 'Work items unknown: the work-log source is not current' : note);
+// The topology status line: "Owners linked. Signals flowing." only while owner and work-log sources are current.
+export const sceneText = (state, text) => (state.connection === 'live' && claim(state, 'progress').truth !== 'current'
+  ? 'Connected. Some owner or work-log sources are not current; see Source health.' : text);
 
 // The ledger blockers beyond the rows the server sends (it keeps 30 per list but counts them all).
 export const hiddenBlockers = status => Math.max(0, int(status?.counts?.blockers) - (status?.blockers || []).length);

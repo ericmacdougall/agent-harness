@@ -248,7 +248,7 @@ export function mountNeeds() {
       if (visible() && [...state.asks, ...state.asksStale].some(ask => decisionOf(state.messages, ask)?.status === 'queued')) paint(state);  // the expiry countdown
       return;
     }
-    if (['asks', 'chat', 'connection', 'routing', 'availability', 'update', 'health'].includes(reason)) paint(state);
+    if (['asks', 'chat', 'connection', 'routing', 'availability', 'update', 'truth'].includes(reason)) paint(state);
   });
   paint(getState());
 }
