@@ -7,10 +7,12 @@ import { owners as adaptOwners, initiatives as adaptInitiatives, missionTiles, l
 import { ownerGroups, ownerCounts, foldLabel, summaryLine, UNLINKED, ownersStale } from '../js/owner-groups.js';
 import { inventory } from '../js/ledger-views.js';
 import { text } from './dom-shim.mjs';
+import { withReads, healthRows } from './reads.mjs';
 
 const here = new URL('..', import.meta.url).pathname;
 // PR 234 status truth: a count is stated plainly only while its source is current
-const CURRENT = sources(['owners', 'codex-owners', 'initiatives'].map(name => ({ name, status: 'ok', checked: Date.now() / 1000, ok_at: Date.now() / 1000, truth: 'current' })));
+// PR 234 v7: every source the server declares, current, and the dataset reads composed from them (reads.mjs)
+const CURRENT = sources(healthRows(Date.now() / 1000));
 const NOW = '2026-11-13T12:00:00Z';
 const row = (agent_id, role, state, extra = {}) => ({ agent_id, role, state, runtime: 'claude', source: 'ah', ticket: '', last_item: { at: NOW }, ...extra });
 
@@ -59,10 +61,10 @@ test('an unknown role from the server is parked: shown, never counted (NEG-7)', 
 });
 
 test('the Owners live tile and the inventory use the live count, not the row count (AC-2)', () => {
-  const state = { owners: OWNERS, asks: [], messages: [], decisions: {}, asksFlagged: [], initiatives: INITS, ledger: null, sources: CURRENT, connection: 'live' };
+  const state = withReads({ owners: OWNERS, asks: [], messages: [], decisions: {}, asksFlagged: [], initiatives: INITS, ledger: null, sources: CURRENT, connection: 'live' });
   const tile = missionTiles(state).find(t => t.id === 'owners');
   assert.equal(tile.value, '6');
-  assert.equal(missionTiles({ ...state, sources: [] }).find(t => t.id === 'owners').value, '6+');  // owners source not read: not a plain count
+  assert.equal(missionTiles(withReads({ ...state, sources: [] })).find(t => t.id === 'owners').value, '6+');  // owners source not read: not a plain count
   assert.match(tile.note, /1 live Codex/);
   assert.match(tile.note, /need attention/);
 });
@@ -138,8 +140,8 @@ test('zero live owners still shows the count 0 and an expandable fold (NEG-4)', 
 });
 
 test('the inventory row reports live owners, not rows', () => {
-  const state = { ledger: ledger(null), now: Date.parse(NOW), chat: null, messages: [], decisions: {}, asksArchive: [], events: [],
-    initiatives: INITS, initiativesStale: false, initiativesError: '', owners: OWNERS, asks: [], asksStale: [], asksFlagged: [], asksSweptAt: '', sessions: [], health: [], sources: CURRENT, connection: 'live' };
+  const state = withReads({ ledger: ledger(null), now: Date.parse(NOW), chat: null, messages: [], decisions: {}, asksArchive: [], events: [],
+    initiatives: INITS, initiativesStale: false, initiativesError: '', owners: OWNERS, asks: [], asksStale: [], asksFlagged: [], asksSweptAt: '', sessions: [], health: [], sources: CURRENT, connection: 'live' });
   const out = inventory(state, () => {});
   assert.match(text(out), /6 live owners, 1 live Codex, 7 parked or history, 6 helpers/);
 });

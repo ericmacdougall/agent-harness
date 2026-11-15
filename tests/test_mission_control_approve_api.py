@@ -22,7 +22,8 @@ LONG = "Ship the checkout redesign? " + ("detail " * 120) + "END-OF-ASK"
 
 
 def ledger(items):
-    return 0, json.dumps({"counts": {}, "items": items, "resolved": []})
+    read = {"schema": "harness.read/1", "state": "ok", "sources_read": 1, "unread_total": 0, "unread": [], "skipped": 0, "limited": False}
+    return 0, json.dumps({"read": read, "counts": {}, "items": items, "blocked": [], "resolved": []})
 
 
 def item(ask=ASK, note="May main push branch feat/x to origin?", owner="main", reason="it changes a shared branch"):
@@ -154,7 +155,7 @@ class Approve(ApproveHarness):
                     "wint00000001": "internal: resolver error KeyError"}
         blocked = [dict(item(ident, "May main push feat/%s?" % ident), problem=problem) for ident, problem in problems.items()]
         self.app.runner.outputs["provenance-asks"] = lambda *_a: (0, json.dumps(
-            {"counts": {}, "items": [], "blocked": blocked, "resolved": []}))
+            {"read": {"schema": "harness.read/1", "state": "ok", "sources_read": 1, "unread_total": 0, "unread": [], "skipped": 0, "limited": False}, "counts": {}, "items": [], "blocked": blocked, "resolved": []}))
         self.app.asks.run(time.time())
         for ident in problems:
             with self.subTest(ident):

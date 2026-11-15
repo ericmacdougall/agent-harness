@@ -20,13 +20,17 @@ function renderAtRisk(state) {
     top.append(el('span', `at-risk-badge ${row.status}`, LABEL[row.status]), el('span', 'ticket-id', row.ticket || 'no ticket'),
       el('span', 'at-risk-since', sinceText(row, state.now, state)));
     const title = button('at-risk-title', row.initiative || row.id, () => select('initiative', row.id));
+    title.dataset.riskId = row.id;
     title.setAttribute('aria-label', `${LABEL[row.status]}: ${row.initiative}. Open details`);
     const action = el('p', `at-risk-action${row.action ? '' : ' none'}`, row.action ? `Main: ${row.action}` : noAction(state));
     item.append(top, title, el('p', 'at-risk-reason', row.reason), action);
     fragment.append(item);
   }
   if (!rows.length) fragment.append(el('li', 'empty-state', atRiskEmpty(state)));
+  // review PR 234 v6 F3: a focused row no longer holds the strip's old verdicts on screen; focus goes back to the same row
+  const focused = box.contains(document.activeElement) ? document.activeElement.dataset?.riskId : null;
   box.replaceChildren(fragment);
+  if (focused) [...box.querySelectorAll('.at-risk-title')].find(node => node.dataset.riskId === focused)?.focus({ preventScroll: true });
   const flagged = rows.filter(r => r.status !== 'moving').length;
   document.getElementById('at-risk').classList.toggle('has-risk', flagged > 0);
 }
@@ -34,7 +38,7 @@ function renderAtRisk(state) {
 export function mountInitiatives() {
   const list = document.getElementById('initiatives-list');
   function render(state) {
-    if (!document.getElementById('at-risk')?.contains(document.activeElement)) renderAtRisk(state);
+    renderAtRisk(state);
     const expanded = new Set([...list.querySelectorAll('details[open]')].map(item => item.closest('article').dataset.id));
     const fragment = document.createDocumentFragment();
     state.initiatives.forEach(item => {

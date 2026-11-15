@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { text, walk } from './dom-shim.mjs';
 import { ledger, sources, missionTiles, atRisk, ownersEmpty } from '../js/adapt.js';
 import * as v from '../js/ledger-views.js';
+import { withReads, SOURCES } from './reads.mjs';
 
 const SCRIPT = fileURLToPath(new URL('./truth_scenarios.py', import.meta.url));
 const run = spawnSync(process.env.PYTHON || 'python3', ['-I', SCRIPT], { encoding: 'utf8', timeout: 60000 });
@@ -19,7 +20,7 @@ const NOW = Date.parse('2027-01-15T09:00:00Z');
 const LAST_GOOD = '2027-01-15 08:00 UTC';  // T0 in truth_scenarios.py: the empty read before the failure
 const ui = { goalsLimit: 6, dealsLimit: 8, blockersLimit: 8, reqFilter: 'all', reqQuery: '', reqLimit: v.PAGE, archiveKind: 'all', archiveLimit: v.PAGE, set() {}, more() {} };
 const base = { now: NOW, connection: 'live', events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0, asksStale: [], asksSweptAt: '', sessions: [] };
-const stateOf = sc => ({ ...base, ledger: ledger(sc.ledger), sources: sources(sc.health) });
+const stateOf = sc => ({ ...base, ledger: ledger(sc.ledger), sources: sources(sc.health), reads: sc.reads });  // the real server's reads
 const tile = (s, id) => missionTiles(s).find(t => t.id === id);
 const ledgerHealth = s => s.sources.find(r => r.id === 'ledger');
 // one inventory row as 'health | holds' (cells joined, so a word boundary is real)
@@ -147,7 +148,7 @@ test('v6: moving to a session and reading it states the zeros again (the checks 
 // Each test breaks one source at a time and checks the plain zero disappears, and that it is stated when all are current.
 const at = '2027-01-15T08:00:00.000Z';
 const row = (name, truth = 'current', status = 'ok') => ({ name, status, checked: NOW / 1000, ok_at: truth === 'unknown' ? null : Date.parse(at) / 1000, truth, detail: status === 'ok' ? '' : `${name} read failed` });
-const NAMES = ['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'];
+const NAMES = SOURCES;
 const LEDGER = ['goals', 'requirements', 'status'];
 // world(): every source current. world(dep, 'failed'): dep's reads all failed. world(dep, 'never'): dep has not been
 // read at all and reports no error (before the first read, or no main session yet).
@@ -156,7 +157,7 @@ function world(broken = '', how = 'failed') {
     : how === 'failed' ? { at: '', truth: 'unknown', error: `${name} read failed` } : { at: '', truth: 'unknown', error: '' });
   const snapshot = Object.fromEntries(LEDGER.map(name => [name, part(name)]));
   const health = NAMES.filter(name => !(name === broken && how === 'never')).map(name => (name === broken ? row(name, 'unknown', 'error') : row(name)));
-  return { ...base, ledger: ledger(snapshot), sources: sources(health) };
+  return withReads({ ...base, ledger: ledger(snapshot), sources: sources(health) });
 }
 const AUDIT = [
   ['Goals tile "0 / 0"', ['ledger:goals'], s => `${tile(s, 'goals').value} · ${tile(s, 'goals').note}`, /^0 \/ 0 · 0 live, not done · 0 open$/],
@@ -202,11 +203,11 @@ for (const connection of ['connecting', 'reconnecting', 'offline', 'expired', un
 test('v6: an owner claim with no OpenAI supervised owners row is unknown (a source that has not reported is never skipped)', () => {
   const s = world();
   assert.match(`${tile(s, 'owners').value} · ${tile(s, 'owners').note}`, /^0 · none need attention$/);
-  const missing = { ...s, sources: s.sources.filter(r => r.id !== 'codex-owners') };
+  const missing = withReads({ ...s, sources: s.sources.filter(r => r.id !== 'codex-owners') });
   assert.doesNotMatch(`${tile(missing, 'owners').value} · ${tile(missing, 'owners').note}`, /none need attention/);
   assert.doesNotMatch(ownersEmpty(missing, false), /^No owners are running\.$/);
   // an instance without OpenAI supervisors reports the row as off with nothing to report: the zero stands
-  const off = { ...s, sources: sources([...NAMES.filter(n => n !== 'codex-owners').map(n => row(n)), { name: 'codex-owners', status: 'off', truth: 'current', detail: 'not configured' }]) };
+  const off = withReads({ ...s, sources: sources([...NAMES.filter(n => n !== 'codex-owners').map(n => row(n)), { name: 'codex-owners', status: 'off', truth: 'current', detail: 'not configured' }]) });
   assert.equal(ownersEmpty(off, false), 'No owners are running.');
 });
 
@@ -235,7 +236,7 @@ test('audit: Source health rows show the truth, not plain ok, for partial, stale
 });
 
 test('audit: a snapshot with no truth field, or before any snapshot, claims nothing', () => {
-  const s = { ...base, ledger: ledger({ status: { blockers: [], at } }), sources: sources(NAMES.map(name => row(name))) };
+  const s = withReads({ ...base, ledger: ledger({ status: { blockers: [], at } }), sources: sources(NAMES.map(name => row(name))) });
   assert.equal(s.ledger.status.truth, 'unknown');
   assert.doesNotMatch(text(v.blockers(s, ui)), /No blockers recorded/);
   const empty = { ...base, ledger: ledger(null), sources: [] };
@@ -247,7 +248,7 @@ test('audit: more goals than the server keeps make the goals tile partial, and t
   const s = world();
   s.ledger = ledger({ goals: { items: [{ id: 'g', title: 'one', state: 'DONE_LIVE', evidence: [] }], total: 80, at, truth: 'partial' } });
   assert.equal(tile(s, 'goals').value, '1+ / 80+');
-  assert.match(text(v.goals(s, ui)), /Showing 1 of 80 goals/);
+  assert.match(text(v.goals(s, ui)), /Showing 1 of 80\+ goals/);  // the total is itself a partial read's count
 });
 
 test('audit: ledger blockers beyond the 30 the server holds are counted, not dropped', () => {

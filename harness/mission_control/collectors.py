@@ -152,10 +152,122 @@ def worst_truth(*values) -> str:
     return TRUTHS[max(ranked)] if ranked else "unknown"
 
 
+# ---- the read envelope (review PR 234 v6; goodqa#15920). Three layers, one rule: no layer turns an exception or a
+# missing field into an empty success.
+#   producer   `ah` and `provenance` views say what they read in a `read` block (harness.read/1: ok, partial, failed,
+#              the unread sources, skipped lines, limited). producer_read() is the one parse of a producer run.
+#   source     one Health row per source is its read envelope: never read (no ok_at), ok, partial, failed (stale after
+#              a good read), the session the read was for, and when it was last checked (aged out when its reader stops).
+#   dataset    FEEDS declares which sources feed each dataset the page shows. Truth composes them into one read per
+#              dataset, pushed before the rows. The page states a count or a "none" only through that read.
+READ_SCHEMA = "harness.read/1"
+
+
+def whole_read(sources: int = 1) -> dict:
+    """The `read` block of a producer that read everything it was asked for (demo mode and fixtures use it)."""
+    return {"schema": READ_SCHEMA, "state": "ok", "sources_read": sources, "unread_total": 0, "unread": [], "skipped": 0,
+            "limited": False}
+
+
+class ReadFailed(ValueError):
+    """A producer run that read nothing usable: the source is failed (stale after a good read, else unknown)."""
+
+
+def producer_read(label: str, code: int, out, *, cap: int | None = None, ok_codes=(0,), want_read: bool = True):
+    """(data, notes) from one producer run, or ReadFailed. `notes` lists why the read was partial ([] when whole).
+    Timeout, a refused exit code, oversize output, unreadable output, an unexpected shape, a missing `read` block and a
+    block that says failed are all failures: none of them is an empty result."""
+    if code == 124:  # Runner timeout
+        raise ReadFailed(f"{label} timed out")
+    if code not in ok_codes:
+        raise ReadFailed(f"{label} exited {code}")
+    raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
+    if cap is not None and len(raw) > cap:
+        raise ReadFailed(f"{label} output is over {cap // 1024} KiB")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ReadFailed(f"{label} returned unreadable output") from None
+    if not isinstance(data, dict):
+        raise ReadFailed(f"{label} returned an unexpected shape")
+    if not want_read:
+        return data, []
+    block = data.get("read")
+    if not isinstance(block, dict) or block.get("schema") != READ_SCHEMA or block.get("state") not in ("ok", "partial", "failed"):
+        raise ReadFailed(f"{label} did not say what it read")
+    unread = [u for u in block.get("unread") if isinstance(u, dict)] if isinstance(block.get("unread"), list) else []
+    why = "; ".join(ev.short(f"{u.get('source') or 'a source'}: {u.get('reason') or 'unread'}", 120) for u in unread[:3])
+    if block["state"] == "failed":
+        raise ReadFailed(f"{label} could not read its source" + (f" ({why})" if why else ""))
+    notes = []
+    count = block.get("unread_total") if isinstance(block.get("unread_total"), int) else len(unread)
+    if count or unread:
+        notes.append(f"{max(count, len(unread))} unread: {why}" if why else f"{count} unread")
+    skipped = block.get("skipped")
+    if not isinstance(skipped, int) or isinstance(skipped, bool) or skipped != 0:
+        notes.append(f"{skipped} lines could not be parsed" if isinstance(skipped, int) else "skipped lines unknown")
+    if block.get("limited") is not False:
+        notes.append("stopped at a cap or time budget")
+    if block["state"] == "partial" and not notes:
+        notes.append("the producer reported a partial read")
+    return data, notes
+
+
+# Which sources feed each dataset the page shows. A source is a Health row name, or a ledger part ("ledger:<part>").
+# tests/test_mission_control_truth_chain.py derives this from a traced run of the real App and fails on any difference,
+# so a new collector, snapshot or cross-read cannot ship without its line here.
+FEEDS = {
+    "goals": ("ledger:goals",),
+    "requirements": ("ledger:requirements", "main-session"),
+    "status": ("ledger:status", "main-session"),
+    "asks": ("asks", "main-session"),
+    "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams"),
+    "initiatives": ("initiatives",),
+    # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
+    # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
+    "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "initiatives", "github", "goodqa",
+               "t2-dev", "sources"),
+    "chat": ("chat", "main-session"),  # the chat snapshot names which session is main's
+}
+# Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
+NOT_A_FEED = {
+    "ledger": "the Health strip's summary of the three ledger parts; the parts themselves are the sources",
+    "session-watch": "reports a failure of the watch pass itself; it reads nothing",
+    "codex": "Codex chat availability: decides whether a message can be sent, not what a list holds",
+}
+# Reads between collectors that are not dependencies, each with the reason: the input can only reveal more, never
+# hide. (reader, provider, attribute) as the derivation test observes them.
+SAFE_READS = {
+    ("asks", "owners", "rows"): "the sweep clears an ask only on a recorded live reassignment; missing or stale owner rows clear nothing",
+    ("owners", "wals", "last_for"): "covered: wals is a feed of owners",
+    ("owners", "wals", "last_items"): "covered: wals is a feed of owners",
+    ("owners", "codex-owners", "rows"): "covered: codex-owners is a feed of owners",
+    ("codex-owners", "wals", "last_items"): "a change signal only: decides when to republish, not what",
+    ("goodqa", "initiatives", "items"): "covered: names the tickets to poll; initiatives is a feed of events",
+    ("goodqa", "owners", "tickets"): "covered: names the tickets to poll; owners and its feeds are feeds of events",
+    ("ledger", "owners", "session"): "covered: main-session is a feed of the session-scoped datasets",
+    ("asks", "owners", "session"): "covered: main-session is a feed of asks",
+    ("chat", "owners", "session"): "covered: main-session is a feed of chat",
+}
+
+
 class Collector:
     name = "collector"
     interval = 60.0
     idle_interval = 0.0  # when greater than interval: the cadence while no page is attached (costly sources)
+    read_budget = 5.0    # the longest one tick may take (the sum of its subprocess timeouts): part of max_age
+    rows_written = ()    # other Health rows this collector writes (they age with it)
+
+    def max_age(self, loop_budget: float = 0.0) -> float:
+        """How long this source's Health row may go unchecked before it is aged out (Health.expire): two of its
+        slowest cadences plus the longest its thread can be busy before it comes round again (`loop_budget`: the read
+        budgets of every source that shares its thread). Past that its reader has stopped."""
+        return 2 * max(self.interval, self.idle_interval) + max(self.read_budget, loop_budget) + 30
+
+    def health_session(self):
+        """The session this source's last good read was for (None: not session-scoped). Truth shows a row read for a
+        session other than main's current one as never read."""
+        return None
 
     def __init__(self, hub, health):
         self.hub, self.health = hub, health
@@ -183,11 +295,12 @@ class Collector:
             row = self.health.rows.get(self.name)
             if row is not before and row and row.get("status") == "off":
                 return  # the tick reported itself off (not configured, no session): that is not a good read
-            self.health.ok(self.name, detail, truth=self.health_truth())
+            self.health.ok(self.name, detail, truth=self.health_truth(), session=self.health_session())
         except Refused as exc:
-            self.health.error(self.name, f"refused: {exc}", truth=self.health_truth())
+            self.health.error(self.name, f"refused: {exc}", truth=self.health_truth(), session=self.health_session())
         except Exception as exc:  # noqa: BLE001 - a collector failure is shown, never fatal
-            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}", truth=self.health_truth())
+            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}", truth=self.health_truth(),
+                              session=self.health_session())
 
     def health_truth(self):
         """A collector whose snapshot has parts (the Ledger) reports its own worst truth; None derives it from the row."""
@@ -204,8 +317,36 @@ class Health:
 
     def __init__(self, hub):
         self.hub, self.rows = hub, {}
+        self.on_change = None  # called after every pushed change (Truth republishes the dataset reads)
 
-    def _set(self, name, status, detail, truth=None):
+    def _push(self):
+        self.hub.snapshot("health", list(self.rows.values()))
+        if self.on_change:
+            self.on_change()
+
+    def beat(self, name) -> None:
+        """The source was checked and nothing changed: only its checked time moves (no push)."""
+        row = self.rows.get(name)
+        if row and not row.get("aged"):
+            row["checked"] = time.time()
+
+    def expire(self, max_ages: dict, now: float | None = None) -> list:
+        """Age out rows whose reader has stopped: a row not checked within its max age is no longer a current read. It
+        turns into an error (stale after a good read, else unknown) until its reader reports again. Returns the names."""
+        now = time.time() if now is None else now
+        aged = []
+        for name, limit in max_ages.items():
+            row = self.rows.get(name)
+            if not row or row.get("status") == "off" or row.get("aged") or now - row.get("checked", now) <= limit:
+                continue
+            self.rows[name] = dict(row, status="error", aged=True, truth=read_truth(row.get("ok_at"), "aged"),
+                                   detail=ev.short(f"not checked for {int(now - row['checked'])} s: its reader may have stopped", 160))
+            aged.append(name)
+        if aged:
+            self._push()
+        return aged
+
+    def _set(self, name, status, detail, truth=None, session=None):
         now = time.time()
         previous = self.rows.get(name, {})
         # off reads nothing, so no earlier good read stands for what follows it: an error after off is unknown, not
@@ -218,16 +359,18 @@ class Health:
             truth = worst_truth(derived, truth) if truth is not None else derived
         row = {"name": name, "status": status, "checked": now, "detail": ev.short(detail or "", 160),
                "ok_at": ok_at, "truth": truth}
-        changed = (previous.get("status"), previous.get("truth")) != (status, truth)
+        if session is not None:
+            row["session"] = str(session)[:64]
+        changed = (previous.get("status"), previous.get("truth"), previous.get("session")) != (status, truth, row.get("session"))
         self.rows[name] = row
         if changed or status != "ok":
-            self.hub.snapshot("health", list(self.rows.values()))
+            self._push()
 
-    def ok(self, name, detail="", truth=None):
-        self._set(name, "ok", detail, truth)
+    def ok(self, name, detail="", truth=None, session=None):
+        self._set(name, "ok", detail, truth, session)
 
-    def error(self, name, detail, truth=None):
-        self._set(name, "error", detail, truth)
+    def error(self, name, detail, truth=None, session=None):
+        self._set(name, "error", detail, truth, session)
 
     def off(self, name, detail, truth="unknown"):
         """`truth="current"` only for a source that is deliberately absent, so it has nothing to report (no
@@ -243,10 +386,65 @@ class Health:
             return
         self.rows[name] = dict(previous, checked=time.time(), detail=ev.short(detail or "", 160), ok_at=None,
                                truth="unknown")
-        self.hub.snapshot("health", list(self.rows.values()))
+        self._push()
 
     def snapshot(self):
         return list(self.rows.values())
+
+
+class Truth:
+    """One read per dataset, composed from the sources FEEDS says feed it: its truth is the worst of theirs. This is
+    the only place a dataset's truth is decided. It is pushed as the "reads" snapshot before any rows that changed
+    with it (Hub.before), and served with /api/state. A dataset with no line in FEEDS, a source with no Health row,
+    and a session-scoped row read for another session are all unknown."""
+
+    def __init__(self, hub, health, ledger=None, session_fn=None, feeds=None):
+        self.hub, self.health, self.ledger, self.session_fn = hub, health, ledger, session_fn
+        self.feeds = dict(FEEDS if feeds is None else feeds)
+        self.sig = None
+        self.lock = threading.Lock()
+
+    def _session(self) -> str:
+        try:
+            return str(self.session_fn() or "") if self.session_fn else ""
+        except Exception:  # noqa: BLE001 - an unknown session shows nothing session-scoped
+            return ""
+
+    def fact(self, source: str, parts=None, session: str = "") -> dict:
+        if source.startswith("ledger:"):
+            part = (parts or {}).get(source[7:])
+            if not isinstance(part, dict):
+                return {"id": source, "truth": "unknown", "at": "", "error": ""}
+            notes = "; ".join(part.get("partial_notes") or [])
+            return {"id": source, "truth": part.get("truth") if part.get("truth") in TRUTHS else "unknown",
+                    "at": part.get("at") or "", "error": ev.short(part.get("error") or notes, 300)}
+        row = self.health.rows.get(source)
+        if not row:
+            return {"id": source, "truth": "unknown", "at": "", "error": ""}
+        truth = row.get("truth") if row.get("truth") in TRUTHS else "unknown"
+        error = "" if row.get("status") == "ok" else row.get("detail") or row.get("status") or ""
+        if row.get("session") is not None and row.get("session") != session:
+            truth, error = "unknown", "read for another session"  # never this session's read, so never stale either
+        return {"id": source, "truth": truth, "at": ev.iso(row["ok_at"]) if row.get("ok_at") and truth != "unknown" else "",
+                "error": ev.short(error, 300)}
+
+    def reads(self) -> dict:
+        session = self._session()
+        parts = self.ledger.view(session) if self.ledger is not None else {}
+        out = {}
+        for dataset, sources in self.feeds.items():
+            facts = [self.fact(source, parts, session) for source in sources]
+            out[dataset] = {"truth": worst_truth(*(f["truth"] for f in facts)) if facts else "unknown", "facts": facts}
+        return out
+
+    def publish(self, *_):
+        reads = self.reads()
+        sig = json.dumps(reads, sort_keys=True, default=str)
+        with self.lock:
+            if sig == self.sig:
+                return
+            self.sig = sig
+            self.hub.snapshot("reads", reads)
 
 
 class _Tail:
@@ -629,7 +827,14 @@ class Initiatives(Collector):
             return f"{len(self.items)} initiatives"
         self.sig = sig
         try:
-            data = json.loads(self.reader.read(self.path, 1024 * 1024).decode("utf-8"))
+            raw = self.reader.read(self.path, 1024 * 1024 + 1)
+        except (OSError, Refused) as exc:
+            # the signature is already taken: without this the next tick would see no change and report ok (v7 audit)
+            return self._fail(f"initiatives file could not be read ({type(exc).__name__}); showing the last good copy")
+        if len(raw) > 1024 * 1024:
+            return self._fail("initiatives file is over 1024 KiB; showing the last good copy")
+        try:
+            data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return self._fail("initiatives file is not valid JSON; showing the last good copy")
         rows = data.get("initiatives") if isinstance(data, dict) else data
@@ -645,6 +850,8 @@ class Initiatives(Collector):
 
     def _fail(self, message: str):
         self.stale, self.error = True, message
+        # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
+        self.health.error(self.name, f"ValueError: {message}", truth=self.health_truth())
         self.publish(None)
         raise ValueError(message)
 
@@ -782,8 +989,10 @@ class SupervisedOwners(Collector):
             seen = {row['name'] for row in rows}
             for name in [n for n in self.parsed if n not in seen]:
                 del self.parsed[name]               # an owner that is gone no longer holds its cached status
-        except Exception:
+        except Exception as exc:
             self.rows = [{**row, 'source_stale': True} for row in self.rows]
+            # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
+            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}")
             self._changed()
             raise
         self._changed()
@@ -808,6 +1017,8 @@ class Owners(Collector):
         self.partial = False  # the last good read held more owners than MAX_ROWS, or rows it could not show
 
     MAX_ROWS = 60
+    rows_written = ("native-projects", "native-streams", "main-session")
+    read_budget = 30.0
 
     def health_truth(self):
         return "partial" if self.partial else None
@@ -874,20 +1085,26 @@ class Owners(Collector):
     def tick(self, now: float):
         try:
             return self._tick(now)
-        except Exception:
+        except Exception as exc:
+            # main's session is whatever the last good read named: after a failed read it may have moved
+            self.health.error("main-session", "the owners read that names main's session failed")
+            # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
+            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}", truth=self.health_truth())
             self.claude_rows = [{**row, 'source_stale': True} for row in self.claude_rows]
             self.publish()
             raise
 
     def _tick(self, now: float):
         code, out = self.runner.run("ah-owners", timeout=30)
-        if code != 0:
-            raise RuntimeError(f"ah owners exited {code}")
-        data = json.loads(out)
-        if not isinstance(data, dict) or not isinstance(data.get('owners'), list):
+        data, notes = producer_read("ah owners", code, out)
+        if not isinstance(data.get('owners'), list):
             raise ValueError('invalid Claude owner snapshot')
         self.session = str(data.get("session") or "")
-        rows, dropped = [], 0
+        if self.session:
+            self.health.ok("main-session", f"main is in session {self.session[:8]}")
+        else:
+            self.health.off("main-session", "the owners read named no main session")
+        rows, dropped = [], len(notes)  # a producer that could not read everything: the owner list may be short
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 dropped += 1
@@ -975,7 +1192,11 @@ class Owners(Collector):
             self.health.ok('native-projects', f'{len(projects)} registered projects')
         except FileNotFoundError:
             registry_stale = bool(projects)
-            self.health.off('native-projects', 'Project registry missing; cached names are stale' if projects else 'Project registry not configured')
+            # never configured: deliberately absent, nothing to report. Gone after a good read: its names are stale.
+            if projects:
+                self.health.error('native-projects', 'Project registry missing; cached names are stale')
+            else:
+                self.health.off('native-projects', 'Project registry not configured', truth="current")
         except (OSError, ValueError, TypeError, AttributeError):
             registry_stale = True
             self.health.error('native-projects', 'Native project registry unavailable; WAL streams remain visible')
@@ -1076,6 +1297,11 @@ class Asks(Collector):
         except Exception:  # noqa: BLE001 - an unknown session shows nothing session-scoped
             return ""
 
+    read_budget = 300.0  # the ledger read (60 s) and a sweep's ticket lookups (15 s each, a bounded number)
+
+    def health_session(self):
+        return self.read_session or None
+
     def health_truth(self):
         """unknown unless the last good read was for the session main is in now (rows of another session are not this
         session's last good read, so never stale either); partial when that read could not show every row."""
@@ -1127,10 +1353,12 @@ class Asks(Collector):
         """One fresh ledger read and sweep. Raises when the ledger cannot be read; never returns a partial list
         as whole. The view: active items, stale items, flagged (untraceable) items, cleared-recently rows."""
         now = time.time() if now is None else now
-        code, out = self.runner.run("provenance-asks", session, timeout=60, limit=4 * 1024 * 1024)
-        data = _json(out.encode("utf-8", "replace")) if out else None
-        if code not in (0, 2) or not isinstance(data, dict) or not isinstance(data.get("items"), list):
-            raise RuntimeError(f"provenance asks exited {code}")
+        code, out = self.runner.run("provenance-asks", session, timeout=60, limit=4 * 1024 * 1024 + 1)
+        # exit 2 with a ledger on stdout means "some asks are untraceable"; anything else is a failed read
+        data, notes = producer_read("provenance asks", code, out, cap=4 * 1024 * 1024, ok_codes=(0, 2))
+        if not isinstance(data.get("items"), list) or not isinstance(data.get("blocked"), list) \
+                or not isinstance(data.get("resolved"), list):
+            raise ReadFailed("provenance asks returned no asks list")
         self.dirty, self.read_at = False, now
         listed = data["items"]
         listed_blocked = data.get("blocked") if isinstance(data.get("blocked"), list) else []
@@ -1149,8 +1377,8 @@ class Asks(Collector):
                              "resolution": ev.short(str(row.get("resolution", "")), 300),
                              "decision": ev.short(str(row.get("decision", "")), 40)})
         # more rows than are kept, or rows dropped for their shape: the counts would be short, so the read is partial
-        partial = any(len(listed_rows) > self.MAX_ROWS or len(kept) < len(listed_rows[:self.MAX_ROWS])
-                      for listed_rows, kept in ((listed, raw), (listed_blocked, blocked), (listed_resolved, resolved)))
+        partial = bool(notes) or any(len(listed_rows) > self.MAX_ROWS or len(kept) < len(listed_rows[:self.MAX_ROWS])
+                                     for listed_rows, kept in ((listed, raw), (listed_blocked, blocked), (listed_resolved, resolved)))
         view = {"items": [], "stale": [], "flagged": [], "cleared": [], "resolved": resolved, "swept_at": "",
                 "partial": partial}
         status = {}
@@ -1287,6 +1515,7 @@ class Ledger(Collector):
     MAX_REQ_EVIDENCE = 100
     REQ_LIMIT = 4 * 1024 * 1024  # requirements are the biggest source: a busy session must not stay stale for its size
     MAX_STATUS = 30
+    read_budget = 300.0          # three reads of up to 90 s each
     STATUS_LISTS = ("verified", "live", "pending", "failed", "claimed", "blockers", "commits", "asks_open",
                     "decisions", "assumptions", "live_legacy")
 
@@ -1368,7 +1597,8 @@ class Ledger(Collector):
     def _empty(self, name: str) -> dict:
         """A part before any good read: no rows, and truth unknown, so the page claims nothing from it.
         `at` is the last good read, `failed_at` the first failure since it, `session` the session the rows are for."""
-        part = {"stale": False, "error": "", "at": "", "failed_at": "", "session": "", "truth": "unknown", "incomplete": False}
+        part = {"stale": False, "error": "", "at": "", "failed_at": "", "session": "", "truth": "unknown", "incomplete": False,
+                "partial_notes": []}
         if name == "goals":
             part.update(items=[], total=0)
         elif name == "requirements":
@@ -1388,18 +1618,13 @@ class Ledger(Collector):
         try:
             cap = self.REQ_LIMIT if kind == "ah-requirements" else self.LIMIT
             code, out = self.runner.run(kind, *args, timeout=90, limit=cap + 1)
-            if code != 0:
-                raise ValueError(f"{label} timed out" if code == 124 else f"{label} exited {code}")  # 124: Runner timeout
-            raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
-            if len(raw) > cap:
-                raise ValueError(f"{label} output is over {cap // 1024} KiB")
-            try:
-                data = json.loads(raw)
-            except ValueError:
-                raise ValueError(f"{label} returned unreadable output") from None
-            if not isinstance(data, dict):
-                raise ValueError(f"{label} returned an unexpected shape")
+            # `ah goals` has its own contract (exit 2 unless its state is ok, and `warnings`); the others say what
+            # they read in a `read` block, and a read that was failed or partial is never a whole one
+            data, notes = producer_read(label, code, out, cap=cap, want_read=kind != "ah-goals")
             value = parse(data, now)
+            notes = notes + list(value.get("partial_notes") or [])
+            value["partial_notes"] = [ev.short(n, 160) for n in notes[:5]]
+            value["incomplete"] = value.get("incomplete") is True or bool(notes)
         except Exception as exc:  # noqa: BLE001 - a failed source keeps its last good rows
             message = ev.short(str(exc), 160)
             with self.lock:
@@ -1477,8 +1702,14 @@ class Ledger(Collector):
                 "problems": {k: len(raw[k]) if isinstance(raw.get(k), list) else 0 for k in ("missing", "tampered", "unpinned")},
                 "evidence": evidence[:self.MAX_EVIDENCE], "evidence_total": len(evidence)})
         # more goals than are kept, or goals dropped for their shape: the counts the page shows would be short, so the
-        # read is partial (review PR 234 v6)
-        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS or dropped > 0}
+        # read is partial (review PR 234 v6). So is a report that warns its scan was cut (state stays ok; v7 audit).
+        if data.get("state") != "ok":
+            raise ValueError(f"ah goals reported state {ev.short(data.get('state'), 20) or 'unknown'}")
+        warnings = data.get("warnings")
+        if not isinstance(warnings, list):
+            raise ValueError("ah goals returned no warnings list")
+        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS or dropped > 0,
+                "partial_notes": [ev.short(w, 160) for w in warnings[:3]]}
 
     def overrides(self) -> dict:
         """The user's latest archive or restore click per requirement (signed rows only; see req_actions)."""
@@ -1583,8 +1814,14 @@ class Ledger(Collector):
             out["counts"][key] = len(rows)
             rows.sort(key=lambda r: str(r.get("at", "")), reverse=True)
             out[key] = [entry(r) for r in rows[:self.MAX_STATUS]]
-        owners = data.get("owners") if isinstance(data.get("owners"), dict) else {}
+        if not isinstance(data.get("owners"), dict):
+            raise ValueError("ah status returned no owners summary")
+        owners = data["owners"]
         counts = owners.get("counts") if isinstance(owners.get("counts"), dict) else {}
+        notes = []
+        if owners.get("error") or not isinstance(owners.get("counts"), dict):
+            # the producer could not compute its owners view: the summary is unknown, not empty (v7 audit)
+            notes.append(ev.short(owners.get("error") or "owners summary missing", 120))
 
         def names(key):
             value = owners.get(key)
@@ -1592,8 +1829,10 @@ class Ledger(Collector):
         out["owners"] = {"counts": {ev.short(k, 40): v for k, v in list(counts.items())[:30] if isinstance(v, int) and not isinstance(v, bool)},
                          "attention": names("attention"), "live": names("live"), "undisposed": names("undisposed")}
         out["since_s"], out["entries"] = self._int(data.get("since_s")), self._int(data.get("entries"))
+        out["owners"]["error"] = notes[0] if notes else ""
         out["unread"] = self._unread(data.get("unread"))
         out["incomplete"] = out["unread"]["count"] != 0
+        out["partial_notes"] = notes
         return out
 
     MAX_UNREAD = 10
@@ -1626,6 +1865,7 @@ class Ledger(Collector):
         with self.lock:
             if self.parts["requirements"] is not part:
                 return
+            incomplete = incomplete or bool(part.get("partial_notes"))
             self.parts["requirements"] = dict(part, items=classified, truncated=truncated, incomplete=incomplete,
                                               total=total, summary=archive.summary(classified),
                                               truth=read_truth(part.get("at"), part.get("error"), incomplete))
@@ -1668,6 +1908,13 @@ class GitHub(Collector):
         self.login = None
         self.seen: set[str] = set()
         self.seeded = False
+        self.gap = False  # the last poll returned a full page of unseen events: older ones were missed
+
+    PER_PAGE = 30  # as the allowlisted request asks (safeio)
+    read_budget = 40.0
+
+    def health_truth(self):
+        return "partial" if self.gap else None
 
     def tick(self, now: float):
         if not self.login:
@@ -1683,14 +1930,17 @@ class GitHub(Collector):
         items = json.loads(out)
         if not isinstance(items, list):
             raise RuntimeError("unexpected events payload")
-        fresh = 0
+        fresh = known = 0
         for item in reversed(items[:100]):
             event = self.convert(item, historic=not self.seeded)
+            if event is not None and event["id"] in self.seen:
+                known += 1
             if event is None or event["id"] in self.seen:
                 continue
             self.seen.add(event["id"])
             self.hub.publish(event)
             fresh += 1
+        self.gap = self.seeded and len(items) >= self.PER_PAGE and known == 0 and fresh > 0
         if len(self.seen) > 5000:
             self.seen = set(list(self.seen)[-2000:])
         self.seeded = True
@@ -1728,36 +1978,53 @@ class Tickets(Collector):
     interval = 10.0
     idle_interval = 120.0
     MAX_TICKETS = 12
+    read_budget = 20.0
 
     def __init__(self, hub, health, runner, sources):
         super().__init__(hub, health)
         self.runner, self.sources = runner, sources  # callable -> iterable of ticket refs
         self.seen: dict[str, set] = {}
         self.cursor = 0
+        self.failed: dict[str, str] = {}  # tracked tickets whose last read failed, until a read of them succeeds
+        self.untracked = 0                # tickets beyond MAX_TICKETS: never read
+
+    def health_truth(self):
+        """One ticket is read per tick, so a good read of one says nothing about the others: partial while any
+        tracked ticket's last read failed, or while more tickets are named than are tracked (v7 audit)."""
+        return "partial" if self.failed or self.untracked else None
 
     def tracked(self) -> list[str]:
-        out = []
+        out, extra = [], 0
         for ref in self.sources():
             ref = str(ref or "").replace("GoodQA ", "")
-            if TICKET_RE.match(ref) and ref not in out:
-                out.append(ref)
+            if not TICKET_RE.match(ref) or ref in out:
+                continue
             if len(out) >= self.MAX_TICKETS:
-                break
+                extra += 1
+                continue
+            out.append(ref)
+        self.untracked = extra
         return out
 
     def tick(self, now: float):
         tickets = self.tracked()
+        self.failed = {ref: why for ref, why in self.failed.items() if ref in tickets}
         if not tickets:
             return "no tickets"
         ref = tickets[self.cursor % len(tickets)]
         self.cursor += 1
-        code, out = self.runner.run("ah-ticket-comments", ref, timeout=20)
-        if code != 0:
-            raise RuntimeError(f"ticket read for {ref} exited {code}")
-        data = json.loads(out)
-        comments = data.get("comments") if isinstance(data, dict) else None
-        if not isinstance(comments, list):
-            raise RuntimeError("unexpected comments payload")
+        try:
+            code, out = self.runner.run("ah-ticket-comments", ref, timeout=20)
+            if code != 0:
+                raise RuntimeError(f"ticket read for {ref} exited {code}")
+            data = json.loads(out)
+            comments = data.get("comments") if isinstance(data, dict) else None
+            if not isinstance(comments, list):
+                raise RuntimeError("unexpected comments payload")
+        except Exception as exc:
+            self.failed[ref] = str(exc)[:80]
+            raise
+        self.failed.pop(ref, None)
         seen = self.seen.get(ref)
         first = seen is None
         seen = seen if seen is not None else set()
@@ -1888,19 +2155,28 @@ class Remote(Collector):
         self.seen: dict[str, str] = {}
         self.turn = 0
         self.cursor = ""
+        self.capped = False  # the last probe hit its line or byte cap: some remote WALs were not seen
+
+    PROBE_LINES, PROBE_BYTES = 50, 65536  # as the allowlisted probe cuts its output (safeio)
+    read_budget = 15.0
+
+    def health_truth(self):
+        return "partial" if self.capped else None
 
     def tick(self, now: float):
         if not self.enabled:
-            self.health.off(self.name, "remote probe disabled")
+            # deliberately off on this instance: nothing to report, so nothing rests on it (as an unconfigured file)
+            self.health.off(self.name, "remote probe disabled", truth="current")
             return "off"
         self.turn += 1
         if self.fabric and self.turn % 2 == 0:
             return self.fabric_export()
-        code, out = self.runner.run("remote-wal-probe", timeout=15, limit=65536)
+        code, out = self.runner.run("remote-wal-probe", timeout=15, limit=self.PROBE_BYTES)
         if code != 0:
             raise RuntimeError(f"ssh probe exited {code}")
         fresh = 0
-        for line in out.splitlines()[:50]:
+        self.capped = len(out.splitlines()) >= self.PROBE_LINES or len(out.encode("utf-8", "replace")) >= self.PROBE_BYTES
+        for line in out.splitlines()[:self.PROBE_LINES]:
             path, _, tail = line.partition("\t")
             last = tail.split("\x1e")
             last = [x for x in last if x.strip()]
@@ -1961,24 +2237,38 @@ class FileDrop(Collector):
         self.accepted = 0
         self.seen: set[str] = set()
         self.bad_files: set[str] = set()
+        self.unread: set[str] = set()  # drop files that exist but were not read at the last tick
+
+    MAX_FILES = 32
+
+    def health_truth(self):
+        """partial while a drop file that exists was not read: refused, unreadable, or beyond the file cap (v7 audit)."""
+        return "partial" if self.unread else None
 
     def tick(self, now: float):
         try:
             entries = list(os.scandir(self.drop_dir))
-        except OSError:
+        except FileNotFoundError:
+            self.unread = set()
             return "no drop directory"
-        for entry in entries[:32]:
+        # any other failure to list the directory is a failed read (Collector.run reports it), never "no directory"
+        unread = {entry.path for entry in entries[self.MAX_FILES:] if entry.name.endswith(".jsonl")}
+        for entry in entries[:self.MAX_FILES]:
             name = entry.name
             if not name.endswith(".jsonl") or not re.match(r"^[a-z0-9][a-z0-9_-]{0,31}\.jsonl$", name):
                 continue
             if entry.is_symlink():
+                unread.add(entry.path)
                 if entry.path not in self.bad_files:
                     self.bad_files.add(entry.path)
                     self.skipped += 1
                 continue
             try:
                 info = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
             except OSError:
+                unread.add(entry.path)
                 continue
             if not stat.S_ISREG(info.st_mode):
                 continue
@@ -2003,6 +2293,7 @@ class FileDrop(Collector):
                     data = handle.read(min(512 * 1024, end - tail.offset))
             except (OSError, Refused):
                 self.skipped += 1
+                unread.add(entry.path)
                 continue
             tail.offset += len(data)
             before = tail.dropped
@@ -2022,4 +2313,5 @@ class FileDrop(Collector):
                 self.hub.publish(normalized)
         if len(self.seen) > 20000:
             self.seen = set(list(self.seen)[-5000:])
+        self.unread = unread
         return f"{self.accepted} accepted, {self.skipped} skipped"

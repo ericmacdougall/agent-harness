@@ -360,6 +360,16 @@ class App:
                                  actions=self.actions)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote]
+        # One read per dataset, composed from the sources that feed it (collectors.FEEDS) and pushed before any rows.
+        self.truth = col.Truth(self.hub, self.health, self.ledger, lambda: self.owners.session)
+        self.health.on_change = self.truth.publish
+        self.hub.before = self.truth.publish
+        self.max_ages = {"chat": 60.0}
+        # the sources in self.collectors share one thread: each waits for every other's read before its next turn
+        loop_budget = sum(source.read_budget for source in self.collectors)
+        for source in self.collectors + [self.asks, self.ledger] + ([self.supervised] if self.supervised else []):
+            for name in (source.name,) + tuple(source.rows_written):
+                self.max_ages[name] = source.max_age(loop_budget if source in self.collectors else 0.0)
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -407,6 +417,17 @@ class App:
                 source.follow()
             except Exception as exc:  # noqa: BLE001 - shown, never fatal; the source's next tick still follows
                 self.health.error("session-watch", f"{source.name}: {type(exc).__name__}: {str(exc)[:120]}")
+        self.watch_truth()
+
+    def watch_truth(self, now: float | None = None) -> None:
+        """A source whose reader stopped (a hung or dead thread) is aged out, so its last rows are not shown as
+        current for ever; then the dataset reads are recomposed (a session move changes them with no Health change)."""
+        try:
+            if self.threads:  # with no reader threads (a test driving ticks by hand) nothing can have stopped
+                self.health.expire(self.max_ages, now)
+            self.truth.publish()
+        except Exception as exc:  # noqa: BLE001
+            self.health.error("session-watch", f"truth: {type(exc).__name__}: {str(exc)[:120]}")
 
     def session_loop(self) -> None:
         while not self.stop.is_set():
@@ -446,12 +467,19 @@ class App:
         """One chat-store read. A failure shows in Source health; the next good read clears it (review PR 234 v3 F1:
         the row used to stay "error" for good, and the page had no way to know the chat list was current)."""
         try:
+            # mc_chat lists return [] when a folder cannot be listed; the store's folders exist from start-up, so one
+            # that cannot be listed is a failed read, never an empty chat (v7 audit)
+            chat = mc_chat.chat_dir(self.root)
+            for sub in ("inbox", "outbox", "state", "targets"):
+                os.listdir(chat / sub)
             self.refresh_chat()
         except Exception as exc:  # noqa: BLE001
             self.health.error("chat", f"{type(exc).__name__}: {str(exc)[:160]}")
             return
         if self.health.rows.get("chat", {}).get("status") != "ok":
             self.health.ok("chat", "chat store read")  # once, and again after a recovery: not every second
+        else:
+            self.health.beat("chat")
 
     def refresh_chat(self, force: bool = False) -> None:
         chat = mc_chat.chat_dir(self.root)
@@ -519,6 +547,7 @@ class App:
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
                 "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
+                "reads": self.truth.reads(),
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 

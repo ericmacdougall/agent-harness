@@ -1,7 +1,7 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
 import { ownerGroups, ownerCounts, foldLabel, summaryLine, isHelper, ownersStale } from './owner-groups.js';
-import { ownersEmpty, ownerCount, workItemText } from './adapt.js';
+import { ownersEmpty, ownerCount, workItemText, countText, claim } from './adapt.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -100,7 +100,7 @@ export function mountOwners() {
       .slice(0, state.ownersAll ? all.length : OWNERS_SHOWN);
     const more = document.getElementById('owners-more');
     more.hidden = all.length <= OWNERS_SHOWN;
-    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${all.length} rows`;
+    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${countText(all.length, claim(state, 'owners'))} rows`;
     more.setAttribute('aria-expanded', String(!!state.ownersAll));
     const nodes = owners.map(owner => { used.add(owner.agent_id); return rowFor(owner, state, null); });
     emptyState.textContent = ownersEmpty(state, state.owners.length > 0);

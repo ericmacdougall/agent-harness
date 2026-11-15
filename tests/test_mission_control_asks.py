@@ -26,7 +26,10 @@ class FakeRunner:
 
     def run(self, kind, *args, timeout=20.0, limit=0):
         self.calls.append((kind, args))
-        return self.code, self.payload if isinstance(self.payload, str) else json.dumps(self.payload)
+        if isinstance(self.payload, str):
+            return self.code, self.payload
+        # what the real producer always sends, unless the test sets it
+        return self.code, json.dumps({"read": col.whole_read(), "blocked": [], "resolved": [], **self.payload})
 
 
 def collector(runner, session=SID):
