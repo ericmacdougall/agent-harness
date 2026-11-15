@@ -116,10 +116,10 @@ class PrefixWindowTests(unittest.TestCase):
 class EncodingTests(unittest.TestCase):
     def setUp(self):
         self.s = Secrets()
-        self.secret = self.s.token("github-fine-grained", 40)
+        self.tok = self.s.token("github-fine-grained", 40)
 
     def encoded(self, encoding):
-        b = self.secret.encode()
+        b = self.tok.encode()
         return {"hex": binascii.hexlify(b).decode(), "base64": base64.b64encode(b).decode(),
                 "base64-urlsafe": base64.urlsafe_b64encode(b).decode().rstrip("="),
                 "url": "".join("%%%02X" % c for c in b)}[encoding]       # every byte percent-encoded
@@ -151,7 +151,7 @@ class EntropyTests(unittest.TestCase):
     def test_a_long_random_mixed_run_is_an_exposure(self):
         for n in (32, 40, 64):
             with self.subTest(n=n):
-                f = S.scan_report(("secret: %s\n" % self.s.body(n)).encode())
+                f = S.scan_report(("value: %s\n" % self.s.body(n)).encode())
                 self.assertEqual([(x["rule"], x["exposure"]) for x in f], [("high-entropy", True)])
 
     def test_a_base64_blob_of_random_bytes_is_an_exposure(self):
@@ -178,6 +178,54 @@ class EntropyTests(unittest.TestCase):
         for name, text in cases.items():
             with self.subTest(name):
                 self.assertEqual(S.scan_report(text.encode()), [])
+
+
+class RedactShapeTests(unittest.TestCase):
+    """The spec owner's follow-up: redact.py's specific shapes the first slice left clean. Values are built here."""
+
+    def setUp(self):
+        self.s = Secrets(SEED + 1)
+
+    def rules(self, text):
+        return [(f["rule"], f["exposure"]) for f in S.scan_report(("x " + text + "\n").encode())]
+
+    def test_every_new_prefix_quarantines_with_a_value_and_restricts_alone(self):
+        new = {"aws-key-id", "slack", "stripe", "gitlab"}
+        prefixes = [(k, p) for k, p in S.PREFIXES if k in new]
+        self.assertEqual({k for k, _ in prefixes}, new)
+        self.assertEqual(len(prefixes), 2 + 6 + 4 + 1)
+        for kind, prefix in prefixes:
+            with self.subTest(prefix=kind + ":" + prefix[:2]):
+                self.assertEqual(self.rules(prefix + self.body_for(kind, 16)), [(kind, True)])
+                self.assertEqual(self.rules(prefix + self.body_for(kind, 7)), [(kind, False)])
+                self.assertEqual(self.rules(prefix), [(kind, False)])
+
+    def body_for(self, kind, n):
+        if kind == "aws-key-id":                       # upper case and digits only, as the real shape is
+            return "".join(self.s.rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(n))
+        return self.s.body(n)
+
+    def test_bearer_needs_8_token_characters_and_not_a_plain_word(self):
+        word = "Be" + "arer "
+        self.assertEqual(self.rules("Authorization: " + word + self.s.body(24)), [("bearer", True)])
+        self.assertEqual(self.rules(word.lower() + self.s.body(8)), [("bearer", True)])
+        self.assertEqual(self.rules(word + self.s.body(7)), [("bearer", False)])
+        self.assertEqual(self.rules(word + "authorization"), [("bearer", False)])
+        self.assertEqual(self.rules(word + "Authentication"), [("bearer", False)])
+
+    def test_url_userinfo_and_named_credentials_restrict_only(self):
+        self.assertEqual(self.rules("https://bob:" + self.s.body(12) + "@example.invalid/x"),
+                         [("url-userinfo", False)])
+        self.assertEqual(self.rules("pass" + "word = " + self.s.body(12)), [("named-credential", False)])
+        self.assertEqual(S.verdict(S.scan_report(("pass" + "word = " + self.s.body(12)).encode()))["action"],
+                         S.RESTRICT)
+
+    def test_the_restrict_shapes_are_redacts_own(self):
+        import redact
+        for kind in ("url-userinfo", "named-credential"):
+            ours = sorted(rx.pattern for k, rx in S._RESTRICT_ONLY if k == kind)
+            theirs = sorted(p.pattern.encode() for k, p in redact.PATTERNS if k == kind)
+            self.assertEqual(ours, theirs)
 
 
 class TierTests(unittest.TestCase):

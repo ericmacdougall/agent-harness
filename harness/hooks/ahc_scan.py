@@ -15,8 +15,13 @@ Rules (spec harvest idea 4):
   prefix is public knowledge, the value is not present (see verdict for the tiers).
 - A prefix counts only at a word boundary (not preceded by a letter or digit), so ordinary words that contain a
   prefix's letters do not match.
+- `Bearer` (any case) followed by 8 or more token characters is an exposure; fewer is a block finding, and so is
+  a plain word after it (letters only, at most a leading capital): prose names the scheme, a token is not there.
+- Credential-bearing URLs (user:pass@) and NAME=value credential assignments are block findings only (restrict
+  tier, no excerpt outward): their shapes are redact.py's own, so the two stay in step.
 
-Pure: it reads its argument and writes nothing. Stdlib only; every pattern has bounded repetition.
+Pure: it reads its argument and writes nothing. Stdlib plus redact.py from the same tree; every pattern has
+bounded repetition.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ import binascii
 import math
 import re
 import urllib.parse
+
+import redact
 
 WINDOW = 8                 # alphanumerics after a prefix that make an exposure
 TOKEN_RUN = 256            # how far a value after a prefix is read
@@ -51,7 +58,11 @@ PREFIXES = (
     ("openai-service", _P("sk", "-svcacct-")),
     ("openai-admin", _P("sk", "-admin-")),
     ("openai", _P("sk", "-")),
-)
+    ("aws-key-id", _P("AK", "IA")),
+    ("aws-key-id", _P("AS", "IA")),
+    ("gitlab", _P("gl", "pat-")),
+) + tuple(("slack", _P("xo", "x", c, "-")) for c in "abposr") + tuple(
+    ("stripe", _P(k, "_", env, "_")) for k in ("sk", "rk") for env in ("live", "test"))
 _PREFIX_RE = re.compile(rb"(?<![A-Za-z0-9])(" + b"|".join(
     re.escape(p.encode()) for _, p in sorted(PREFIXES, key=lambda kp: -len(kp[1]))) + rb")")
 _PREFIX_KIND = {p.encode(): k for k, p in PREFIXES}
@@ -62,6 +73,19 @@ _RUN_RE = re.compile(rb"[A-Za-z0-9+/=_-]{%d,4096}" % ENTROPY_MIN_LEN)
 _HEX_RE = re.compile(rb"(?<![0-9A-Fa-f])[0-9A-Fa-f]{%d,8192}(?![0-9A-Fa-f])" % HEX_MIN)
 _B64_RE = re.compile(rb"[A-Za-z0-9+/_-]{%d,8192}={0,2}" % B64_MIN)
 _ALNUM = re.compile(rb"[A-Za-z0-9]")
+_PLAIN_WORD = re.compile(rb"[A-Za-z][a-z]*\Z")
+_BEARER_RE = re.compile(rb"(?i)(?<![A-Za-z0-9])bearer[ \t]+([A-Za-z0-9._~+/=-]{0,%d})" % TOKEN_RUN)
+
+
+def _redact_shapes(kind):
+    """redact.py's patterns of one kind, as byte patterns (their flags are inline). Missing ones fail at import."""
+    out = [re.compile(p.pattern.encode(), p.flags & ~re.UNICODE) for k, p in redact.PATTERNS if k == kind]
+    if not out:
+        raise ImportError("redact.py has no %s pattern" % kind)
+    return out
+
+
+_RESTRICT_ONLY = [(kind, rx) for kind in ("url-userinfo", "named-credential") for rx in _redact_shapes(kind)]
 
 
 def _entropy(run):
@@ -110,6 +134,12 @@ def _raw_hits(data, *, entropy=True):
         hits.append((m.start(), _PREFIX_KIND[m.group(1)], exposure))
     for m in _JWT_RE.finditer(data):
         hits.append((m.start(), "jwt", True))
+    for m in _BEARER_RE.finditer(data):
+        value = m.group(1)
+        hits.append((m.start(), "bearer", len(value) >= WINDOW and not _PLAIN_WORD.match(value)))
+    for kind, rx in _RESTRICT_ONLY:
+        for m in rx.finditer(data):
+            hits.append((m.start(), kind, False))
     if entropy:
         covered = {o for o, _, _ in hits}
         for m in _RUN_RE.finditer(data):
