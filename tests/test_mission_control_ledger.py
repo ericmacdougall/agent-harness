@@ -430,13 +430,15 @@ class HealthTruth(unittest.TestCase):
         health = col.Health(hub)
         asks = col.Asks(hub, health, Fake(), lambda: "")
         asks.run(1000.0)
-        self.assertEqual((health.rows["asks"]["status"], health.rows["asks"]["truth"]), ("off", "unknown"))
+        self.assertEqual(health.rows["asks"]["status"], "off")  # was overwritten as "ok" with detail "off"
+        self.assertEqual(health.rows["asks"]["truth"], "unknown")
 
     def test_an_initiatives_file_that_is_not_configured_is_off_but_current(self):
         hub = ev.Hub()
         health = col.Health(hub)
         col.Initiatives(hub, health, None, None).run(1000.0)
-        self.assertEqual((health.rows["initiatives"]["status"], health.rows["initiatives"]["truth"]), ("off", "current"))
+        self.assertEqual(health.rows["initiatives"]["status"], "off")
+        self.assertEqual(health.rows["initiatives"]["truth"], "current")
 
     def test_an_unreadable_initiatives_file_at_start_is_unknown(self):
         hub = ev.Hub()

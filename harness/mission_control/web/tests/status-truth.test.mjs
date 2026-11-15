@@ -5,6 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { text, walk } from './dom-shim.mjs';
 import { ledger, sources, missionTiles } from '../js/adapt.js';
@@ -119,10 +120,13 @@ const at = '2027-01-15T08:00:00.000Z';
 const row = (name, truth = 'current', status = 'ok') => ({ name, status, checked: NOW / 1000, ok_at: truth === 'unknown' ? null : Date.parse(at) / 1000, truth, detail: status === 'ok' ? '' : `${name} read failed` });
 const NAMES = ['asks', 'owners', 'initiatives', 'wals', 'chat'];
 const LEDGER = ['goals', 'requirements', 'status'];
-function world(broken = '') {
-  const part = name => ({ at, truth: `ledger:${name}` === broken ? 'unknown' : 'current', error: `ledger:${name}` === broken ? `${name} read failed` : '' });
+// world(): every source current. world(dep, 'failed'): dep's reads all failed. world(dep, 'never'): dep has not been
+// read at all and reports no error (before the first read, or no main session yet).
+function world(broken = '', how = 'failed') {
+  const part = name => (`ledger:${name}` !== broken ? { at, truth: 'current', error: '' }
+    : how === 'failed' ? { at: '', truth: 'unknown', error: `${name} read failed` } : { at: '', truth: 'unknown', error: '' });
   const snapshot = Object.fromEntries(LEDGER.map(name => [name, part(name)]));
-  const health = NAMES.map(name => (name === broken ? row(name, 'unknown', 'error') : row(name)));
+  const health = NAMES.filter(name => !(name === broken && how === 'never')).map(name => (name === broken ? row(name, 'unknown', 'error') : row(name)));
   return { ...base, ledger: ledger(snapshot), sources: sources(health) };
 }
 const AUDIT = [
@@ -148,7 +152,7 @@ const AUDIT = [
 for (const [name, deps, render, zero] of AUDIT) {
   test(`audit: ${name} only when ${deps.join(', ')} ${deps.length > 1 ? 'are' : 'is'} current`, () => {
     assert.match(render(world()), zero, 'stated when every source is current');
-    for (const dep of deps) assert.doesNotMatch(render(world(dep)), zero, `not stated while ${dep} is unknown`);
+    for (const dep of deps) for (const how of ['failed', 'never']) assert.doesNotMatch(render(world(dep, how)), zero, `not stated while ${dep} is unknown (${how})`);
   });
 }
 
@@ -183,3 +187,20 @@ test('audit: ledger blockers beyond the 30 the server holds are counted, not dro
   assert.equal(tile(s, 'blockers').value, '45');
   assert.match(text(v.blockers(s, ui)), /15 more ledger blockers/);
 });
+
+// The modules that render these claims build no zero sentence of their own: the text comes from the helpers above.
+const SRC = name => readFileSync(new URL(`../js/${name}`, import.meta.url), 'utf8');
+const LITERALS = {
+  'needs.js': ['Nothing needs you right now', 'nothing waiting on you'],
+  'owners.js': ['Waiting for the owner list', 'No owners in this state', ".padStart(2, '0')"],
+  'initiatives.js': ['Nothing open to rank', 'no progress recorded', 'no action recorded', 'No activity recorded', 'Waiting for the initiatives file', ".padStart(2, '0')"],
+  'main.js': ['No activity recorded', 'no activity for over 30 min'],
+  'activity.js': ['Listening for signals'],
+  'ledger-views.js': ["'No blockers recorded.')", "'Nothing is archived.')", 'status.error', 'part.error ?', 'led.status.stale'],
+};
+for (const [file, literals] of Object.entries(LITERALS)) {
+  test(`audit: ${file} states no zero or "none" of its own (it uses the status-truth helpers)`, () => {
+    const code = SRC(file);
+    for (const literal of literals) assert.ok(!code.includes(literal), `${file} still contains ${literal}`);
+  });
+}

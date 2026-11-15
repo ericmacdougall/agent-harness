@@ -3,7 +3,6 @@
 // from the one status truth, so each is tested here without a DOM; the modules that render them may not hard-code it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { ledger, sources, needsSummary, ownersEmpty, ownerCount, initiativesEmpty, initiativeCount, atRiskEmpty, noProgress, noAction,
   updatedText, feedEmpty, claim, worst, truthOf, CLAIM_SOURCES } from '../js/adapt.js';
 
@@ -63,20 +62,4 @@ test('audit: the truth vocabulary is closed and worst() fails closed', () => {
   assert.equal(claim({}, 'no-such-claim').truth, 'unknown');
   for (const [id, deps] of Object.entries(CLAIM_SOURCES)) assert.ok(deps.length > 0, id);
 });
-
-// The modules that render these claims build no zero sentence of their own: the text comes from the helpers above.
-const SRC = name => readFileSync(new URL(`../js/${name}`, import.meta.url), 'utf8');
-const LITERALS = {
-  'needs.js': ['Nothing needs you right now', 'nothing waiting on you'],
-  'owners.js': ['Waiting for the owner list', 'No owners in this state', ".padStart(2, '0')"],
-  'initiatives.js': ['Nothing open to rank', 'no progress recorded', 'no action recorded', 'No activity recorded', 'Waiting for the initiatives file', ".padStart(2, '0')"],
-  'main.js': ['No activity recorded', 'no activity for over 30 min'],
-  'activity.js': ['Listening for signals'],
-  'ledger-views.js': ["'No blockers recorded.')", "'Nothing is archived.')", 'status.error', 'part.error ?', 'led.status.stale'],
-};
-for (const [file, literals] of Object.entries(LITERALS)) {
-  test(`audit: ${file} states no zero or "none" of its own (it uses the status-truth helpers)`, () => {
-    const code = SRC(file);
-    for (const literal of literals) assert.ok(!code.includes(literal), `${file} still contains ${literal}`);
-  });
-}
+// The source checks that the DOM modules no longer hard-code these sentences are in status-truth.test.mjs (old exports only).
