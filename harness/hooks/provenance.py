@@ -1355,7 +1355,7 @@ def packet_gate(text: str, mode=None, ctx=None):
 READ_SCHEMA = "harness.read/1"
 
 
-def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False) -> dict:
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, outside: int = 0) -> dict:
     """What a read-only view actually read, for a consumer that must not take "nothing found" for "nothing there"
     (goodqa#15920). state: "failed" when no source could be read, "partial" when a source was unread, a matching line
     could not be parsed or a cap or time budget stopped the read, else "ok". `unread` names each source and why."""
@@ -1363,7 +1363,7 @@ def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = Fal
     return {"schema": READ_SCHEMA, "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
             "unread": [{"source": clip(str(u.get("source", "")), 120), "reason": clip(str(u.get("reason", "")), 200)}
                        for u in unread[:50]],
-            "skipped": int(skipped), "limited": bool(limited)}
+            "skipped": int(skipped), "limited": bool(limited), "outside_window": max(0, int(outside))}
 
 
 def session_wals_read(session: str, home=None) -> tuple:

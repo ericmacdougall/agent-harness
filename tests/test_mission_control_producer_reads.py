@@ -329,6 +329,106 @@ class EveryProducerEveryKind(unittest.TestCase):
                 self.assertNotEqual(page(runner), "current")
 
 
+def iso_at(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+WINDOW = 12 * 3600   # the status window Mission Control asks for
+TORN = '{"event":"result","note":"torn\n'
+
+
+class OutsideTheWindow(unittest.TestCase):
+    """PR 234 v9, main's decision: a read covers a window (the status window; the owners the default view shows). A
+    line lost inside it makes the read partial; one lost outside it does not, and is disclosed as a count on the read
+    block and on the page's source-health row, never hidden."""
+
+    def history(self, home, before, after, name="agent-a0000000000000003.jsonl", age=None):
+        """A WAL with a record dated `before`, a lost line, then a record dated `after` (None: the lost line is last)."""
+        path = home.folder / name
+        text = line({"event": "status", "note": "early", "at": iso_at(before)}) + TORN
+        if after is not None:
+            text += line({"event": "status", "note": "next", "at": iso_at(after)})
+        path.write_text(text)
+        if age is not None:
+            os.utime(path, (time.time() - age, time.time() - age))
+        return path
+
+    def status(self, home, now):
+        return ah.status_report(home.home, SID, WINDOW, now=now)["read"]
+
+    def test_status_inside_partial_outside_ok_and_disclosed(self):
+        now = int(time.time())
+        cases = [  # (record before the lost line, record after it, WAL age) -> (state, skipped, outside)
+            ("next record inside the window", now - WINDOW - 7200, now - 600, None, ("partial", 1, 0)),
+            ("next record before the cutoff", now - WINDOW - 7200, now - WINDOW - 3600, None, ("ok", 0, 1)),
+            ("boundary: next record at the cutoff second", now - WINDOW - 7200, now - WINDOW, None, ("partial", 1, 0)),
+            ("boundary: next record one second before it", now - WINDOW - 7200, now - WINDOW - 1, None, ("ok", 0, 1)),
+            ("last line, WAL written since the cutoff", now - WINDOW - 7200, None, None, ("partial", 1, 0)),
+            ("last line, WAL last written before the cutoff", now - WINDOW - 7200, None, WINDOW + 600, ("ok", 0, 1)),
+        ]
+        for name, before, after, age, want in cases:
+            with self.subTest(case=name):
+                home = Home(self)
+                self.history(home, before, after, age=age)
+                read = self.status(home, now)
+                self.assertEqual((read["state"], read["skipped"], read["outside_window"]), want, read)
+
+    def stopped_owner(self, home, ended_ago, torn=True):
+        """The fixture owner returned a result and stopped `ended_ago` seconds ago, with a lost line in its WAL."""
+        at = iso_at(time.time() - ended_ago)
+        home.agent.write_text(line({"event": "intent", "note": "Build goodqa#1", "at": at}) + (TORN if torn else "")
+                              + line({"event": "result", "note": "done", "at": at}))
+        home.append(home.main, line({"event": "subagent_stop", "agent_id": AGENT, "at": at}))
+        for path in (home.agent, home.meta):
+            os.utime(path, (time.time() - ended_ago, time.time() - ended_ago))
+
+    def test_owners_hidden_row_is_outside_shown_row_is_inside(self):
+        home = Home(self)
+        self.stopped_owner(home, ah.OWNERS_RECENT_S + 3600)   # done and idle past the default view: hidden
+        for call in ("cold", "warm"):
+            with self.subTest(call=call):
+                read = ah.owners(home.home, SID)["read"]
+                self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("ok", 0, 1), read)
+        home = Home(self)
+        self.stopped_owner(home, 600)   # done ten minutes ago: still shown, so its lost line is inside
+        read = ah.owners(home.home, SID)["read"]
+        self.assertEqual((read["state"], read["skipped"], read["outside_window"]), ("partial", 1, 0), read)
+
+    def test_owners_window_boundary_is_the_default_view(self):
+        row = {"state": "done", "decision_required": False}
+        self.assertTrue(ah.shown_owner(dict(row, idle_s=ah.OWNERS_RECENT_S)))
+        self.assertFalse(ah.shown_owner(dict(row, idle_s=ah.OWNERS_RECENT_S + 1)))
+        self.assertTrue(ah.shown_owner(dict(row, idle_s=ah.OWNERS_RECENT_S + 1, decision_required=True)))
+        self.assertTrue(ah.shown_owner({"state": "SILENT", "idle_s": 10 ** 6}))   # a silent owner is always shown
+
+    def test_the_page_discloses_the_count_on_the_source_health_row(self):
+        home = Home(self)
+        # ended before the status window too: inside the 12 h status window its lost line would make status partial
+        self.stopped_owner(home, WINDOW + 3600)
+        now = time.time()
+        self.history(home, now - WINDOW - 7200, now - WINDOW - 3600)
+        hub = ev.Hub()
+        health = col.Health(hub)
+        owners = col.Owners(hub, health, CliRunner(home.home), None)
+        owners.run(time.time())
+        row = health.rows["owners"]
+        self.assertEqual((row["status"], row["truth"]), ("ok", "current"))
+        # two: the stopped owner's line, and the history WAL's (an agent WAL too, idle 13 h, so its row is hidden)
+        self.assertIn("2 older unreadable records outside this window", row["detail"])
+        ledger = col.Ledger(hub, health, CliRunner(home.home), lambda: SID)
+        ledger.run(time.time())
+        self.assertEqual(hub.snapshots["ledger"]["status"]["truth"], "current")
+        self.assertIn("status: 2 older unreadable records outside this window", health.rows["ledger"]["detail"])
+        sources = {r["name"]: r for r in hub.snapshots["health"]}
+        self.assertIn("outside this window", sources["owners"]["detail"])
+
+    def test_no_disclosure_when_nothing_is_outside(self):
+        self.assertEqual(col.outside_window({"read": {"outside_window": 0}}), "")
+        self.assertEqual(col.outside_window({"read": {}}), "")
+        self.assertEqual(col.outside_window({"read": {"outside_window": True}}), "")
+        self.assertEqual(col.outside_window({"read": {"outside_window": 1}}), "1 older unreadable record outside this window")
+
+
 class NoLiteralWholeRead(unittest.TestCase):
     def test_no_producer_builds_a_read_block_from_a_literal_count(self):
         import re
