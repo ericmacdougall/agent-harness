@@ -70,6 +70,40 @@ v3 variants:
   attempt;
 - the file transport opt-in honoured for the production root.
 
+## PR 258 v4 BLOCK repair: F1, a streamed restore (heads 0dc0ca99 and 2049e625)
+
+Run on t2-dev (Python 3.12.3, git 2.43.0) by `~/wt/ahc-pr258v4.sh <head> <old head>`, in a fresh blob-filtered
+clone. The script refuses to start under 30 GiB free.
+
+- Focused suites at 2049e6254c300cf57b7491e3097ee770f3799ca5, the eleven above plus
+  `tests.test_install_ahc_modules` (PR 263, now on this branch): `Ran 471 tests`, `OK (skipped=1)`, exit 0.
+  Log `suites.log`, sha256 10ca214a10879f61a478c9d5f5f0d66ad005b71b27dc10565126f4e7617f94e6.
+- Failing first: `tests.test_ahc_runner.SchemaTests` and `tests.test_ahc_fs.RootFsTests` against the hooks at
+  ec1ff5d6, the head the v4 receipt blocked plus PR 263. Result: `Ran 33 tests`,
+  `FAILED (failures=3, errors=5, skipped=1)`, exit 1.
+  Log `failing_first.log`, sha256 5d02188f304c0ddcee42b152cd8d5316e0d4e1a62066b2331219a90a2079b398.
+  - Defects at ec1ff5d6:
+    - the restore held 17,098,290 bytes for an 8,388,608-byte backup, against a 4 MiB budget;
+    - a lost backup raised `Unreadable` from `read_regular` after the live database had already been moved aside;
+    - an over-cap ledger was migrated;
+    - a partial temp copy was left behind.
+  - From new APIs: `copy_to_temp`, `remove_temps` and `TooLarge` (4 errors).
+- Variants: `SUMMARY: 51 variants, 0 did not fail: []`, exit 0, and no variant timed out.
+  Log `variants.out`, sha256 0c5142214e5b339a950008d122834d9de525bea2c291d50d8dafe8a63b1943de.
+  - The run at 0dc0ca99 stopped on a 900 s TimeoutExpired. The "no cap" variant met a test whose mocked read never
+    ended. 2049e625 bounds that mock and records any hang as `rc=timeout`.
+- Mac, Python 3.9.6, at 0dc0ca99 before the fast-forward: `tests.test_ahc_crash`, `tests.test_ahc_fs` and
+  `tests.test_ahc_runner.SchemaTests`. Result: `Ran 48 tests`, `OK (skipped=1)`.
+
+v4 variants:
+- the copy reads the whole backup at once;
+- the live database is moved aside before the copy;
+- the intent is kept after a copy failure;
+- there is no size check before the migration;
+- the partial temp is not removed;
+- copy_to_temp enforces no cap;
+- remove_temps matches any name.
+
 ## What the variants break
 
 Each variant is a unique text swap applied to one source file, and the source is restored after the run.
