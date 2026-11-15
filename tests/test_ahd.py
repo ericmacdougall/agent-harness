@@ -101,8 +101,11 @@ class Scratch(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def owners(self, rows, session=SESSION):
-        (self.fake / f"owners-{session}.json").write_text(json.dumps({"session": session, "owners": rows}))
+    def owners(self, rows, session=SESSION, read="ok"):
+        doc = {"session": session, "owners": rows}
+        if read is not None:
+            doc["read"] = {"schema": "harness.read/1", "state": read}
+        (self.fake / f"owners-{session}.json").write_text(json.dumps(doc))
 
     def calls(self):
         p = self.fake / "calls.jsonl"
@@ -285,6 +288,21 @@ class BadInputs(Scratch):
         self.assertEqual([a["id"] for a in got], ["w1"])
         self.main_wal.write_text("")  # truncated / rotated to empty
         self.assertEqual(ahd.wal_asks(self.policy, [SESSION]), [])
+
+    def test_a_partial_owners_read_never_clears_liveness(self):  # PR 234 v8: the owner may be in what it missed
+        for read in ("partial", "failed", None):
+            with self.subTest(read=read):
+                self.owners([owner("a1111111111111111", "SILENT")])
+                d = self.daemon()
+                d.tick()
+                self.owners([], read=read)   # the owner is not in what was read
+                d.tick()
+                self.assertEqual(self.alert_calls("clear"), [])
+                self.owners([], read="ok")   # a whole read without it: now it is cleared
+                d.tick()
+                self.assertEqual(len(self.alert_calls("clear")), 1)
+                self.tearDown()
+                self.setUp()
 
     def test_owner_doc_unreadable_never_clears_liveness(self):
         self.owners([owner("a1111111111111111", "SILENT")])

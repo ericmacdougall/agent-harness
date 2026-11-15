@@ -86,6 +86,29 @@ def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = Fal
             "skipped": int(skipped), "limited": bool(limited)}
 
 
+class ReadTally:
+    """What one read-only view actually read (PR 234 v8, receipt v7 F1): every source opened and read whole, every
+    source that exists but was not read (with why), every line that could not be used, and whether a cap stopped it.
+    The read block is built from it alone, so no producer states a whole read it did not make."""
+
+    def __init__(self):
+        self.read_ok, self.unread, self.skipped, self.limited = 0, [], 0, False
+
+    def missed(self, source: str, error) -> None:
+        """A place that is not there holds nothing; any other failure to read it is an unread source."""
+        if not isinstance(error, (FileNotFoundError, NotADirectoryError)):
+            reason = error if isinstance(error, str) else f"file-unreadable: {type(error).__name__}"
+            self.unread.append({"source": source, "reason": reason})
+
+    def line_lost(self, at_tail: bool, mtime: float) -> None:
+        """A line that could not be parsed: skipped, unless it is a write in progress (provenance.tail_in_progress)."""
+        if not _prov().tail_in_progress(at_tail, mtime):
+            self.skipped += 1
+
+    def block(self) -> dict:
+        return read_block(self.read_ok, self.unread, self.skipped, self.limited)
+
+
 def is_secret_path(path) -> bool:
     return bool(SECRET_NAMES.search(Path(path).name))
 
@@ -208,7 +231,29 @@ def newest_session(home: Path):
     return best
 
 
-def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
+def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" = None) -> dict:
+    """The owner facts of one agent or task WAL, read incrementally from a cached offset. `tally` (ah owners): lines
+    that could not be used are kept in the summary (`skipped`), so a torn line seen once still counts on every later
+    call, and a read that fails is an unread source instead of an exception (PR 234 v8, receipt v7 F1)."""
+    if tally is not None:
+        try:
+            summary = _summarize_agent_wal(path, index_dir)
+        except OSError as error:
+            tally.missed(f"WAL {path.name[:60]}", error)
+            return {"first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
+        tally.read_ok += 1
+        tally.skipped += int(summary.get("skipped") or 0)
+        try:   # an unterminated last line read_new_lines leaves for later: torn unless it is still being written
+            st = path.stat()
+            if (summary.get("meta") or {}).get("offset", 0) < st.st_size:
+                tally.line_lost(True, st.st_mtime)
+        except OSError as error:
+            tally.missed(f"WAL {path.name[:60]}", error)
+        return summary
+    return _summarize_agent_wal(path, index_dir)
+
+
+def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     own = path.name[len("agent-"):-len(".jsonl")] if path.name.startswith("agent-") else path.name[:-len(".jsonl")]
     cache = index_dir / ("wal-" + hashlib.sha256(str(path).encode()).hexdigest()[:16] + ".json")
     try:
@@ -219,17 +264,23 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
-    if "outcome_at" not in summary:
-        meta.clear()  # an index written before outcome_at existed: rescan from the start (goodqa#15943 r5)
+    if "outcome_at" not in summary or "skipped" not in summary or summary.get("skipped_to") != meta.get("offset"):
+        # an index written before outcome_at (goodqa#15943 r5) or skipped (PR 234 v8) existed, or one an older ah
+        # advanced without counting the lines it skipped (skipped_to is where the count was last brought up to): rescan
+        meta.clear()
     lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary or "outcome_at" not in summary:
-        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0)
+    if rebuilt or "first" not in summary or "outcome_at" not in summary or "skipped" not in summary \
+            or not meta.get("offset"):
+        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0,
+                       skipped=0)
     for _off, raw in lines:
         try:
             rec = json.loads(raw)
         except ValueError:
+            summary["skipped"] += 1  # a complete line that is not a record: kept with the summary, counted every call
             continue
         if not isinstance(rec, dict):
+            summary["skipped"] += 1
             continue
         at = parse_ts(rec.get("at"))
         if not rec.get("by") or rec.get("by") == own:  # a record another actor wrote on this owner's behalf is not its activity (review H2)
@@ -249,6 +300,7 @@ def summarize_agent_wal(path: Path, index_dir: Path) -> dict:
         for match in TICKET_IN_NOTE.findall(note):
             if match not in summary["tickets"] and len(summary["tickets"]) < 8:
                 summary["tickets"].append(match)
+    summary["skipped_to"] = meta.get("offset", 0)   # the skipped count covers every line before this offset
     atomic_json(cache, summary)
     return summary
 
@@ -265,13 +317,15 @@ def subagent_dirs(home: Path, session: str) -> list:
     return out
 
 
-def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = None) -> float:
+def transcript_mtime(home: Path, session: str, agent: str, dirs: list | None = None,
+                     tally: "ReadTally | None" = None) -> float:
     best = 0.0
     for directory in (dirs if dirs is not None else subagent_dirs(home, session)):
         try:
             best = max(best, os.stat(os.path.join(directory, f"agent-{agent}.jsonl")).st_mtime)
-        except OSError:
-            pass
+        except OSError as error:
+            if tally is not None:   # a transcript that exists but cannot be stat'ed: its activity time is unknown
+                tally.missed(f"transcript {agent[:40]}", error)
     return best
 
 
@@ -307,12 +361,16 @@ def discover_agents(home: Path, session: str, wal: Path, unread: list | None = N
                             agent = e.name[6:-10]
                             info = found.setdefault(agent, {})
                             try:  # the meta file only: transcript content is never read here
-                                if e.stat().st_size <= 65536:
-                                    meta = json.loads(_bounded(Path(e.path), 65536))
-                                    info.update(type=meta.get("agentType"), description=meta.get("description"),
-                                                parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
-                                                depth=meta.get("spawnDepth"))
-                            except (OSError, ValueError) as error:
+                                if e.stat().st_size > 65536:   # PR 234 v8: not read is unread, never silently typeless
+                                    unread.append({"source": f"agent meta {agent[:40]}", "reason": "over 64 KiB: not read"})
+                                    continue
+                                meta = json.loads(_bounded(Path(e.path), 65536))
+                                if not isinstance(meta, dict):
+                                    raise ValueError("not an object")
+                                info.update(type=meta.get("agentType"), description=meta.get("description"),
+                                            parent=meta.get("parentAgentId"), finished=bool(meta.get("finished")),
+                                            depth=meta.get("spawnDepth"))
+                            except (OSError, ValueError, RecursionError) as error:
                                 missed(f"agent meta {agent[:40]}", error)
                 except OSError as error:
                     missed("subagents folder", error)
@@ -333,11 +391,18 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
     index_dir = state_dir(home, "ah-index")
     spawned, stopped, named, stop_at = {}, set(), [], {}
+    tally = ReadTally()   # PR 234 v8: what this view actually read; the read block is built from it alone
     with open(main, "rb") as handle:
+        main_mtime = os.fstat(handle.fileno()).st_mtime
         for raw in handle:
             try:
                 rec = json.loads(raw)
             except ValueError:
+                if raw.strip():   # e.g. a torn subagent_stop: a stopped agent could show as running
+                    tally.line_lost(not raw.endswith(b"\n"), main_mtime)
+                continue
+            if not isinstance(rec, dict):
+                tally.skipped += 1
                 continue
             if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
                     and isinstance(rec.get("note"), str):
@@ -349,12 +414,13 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             elif rec.get("event") == "subagent_stop":
                 stopped.add(rec["agent_id"])
                 stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
-    unread = []  # places that exist but could not be read: the owner list may be short (goodqa#15920)
+    tally.read_ok += 1
+    unread = tally.unread  # places that exist but could not be read: the owner list may be short (goodqa#15920)
     for agent, meta in discover_agents(home, session, wal, unread).items():
         info = spawned.setdefault(agent, {"type": None, "at": 0.0})
         info["type"] = info["type"] or meta.get("type")
         info.update({k: meta[k] for k in ("description", "parent", "finished", "depth") if k in meta})
-    led = _ledger(home)  # one read per call
+    led = _ledger(home, tally=tally)  # one read per call
     registered = {r["args"].get("owner_agent") for r in led if r.get("op") == "task.register"}
     pending = pending_stops(home, session, led)
     sub_dirs = subagent_dirs(home, session)
@@ -362,10 +428,14 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     rows = []
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
-        summary = summarize_agent_wal(path, index_dir) if path.is_file() else {
-            "first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
+        if path.is_file():
+            summary = summarize_agent_wal(path, index_dir, tally)
+        else:
+            if os.path.lexists(path):   # PR 234 v8: there, but not a WAL that can be read (a directory, a link)
+                tally.unread.append({"source": f"WAL {path.name[:60]}", "reason": "not a regular file"})
+            summary = {"first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
-        tmtime = transcript_mtime(home, session, agent, sub_dirs)
+        tmtime = transcript_mtime(home, session, agent, sub_dirs, tally)
         if info.get("finished") and agent not in stopped:  # transcript meta says it ended; hook never saw the stop
             stopped.add(agent)
             stop_at[agent] = max(tmtime, last_wal)
@@ -396,13 +466,16 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         name = f.name[:-len(".jsonl")]
         if name == "main" or name.startswith("agent-") or not OWNER_ID_RE.match(name):
             continue
+        if not f.is_file():   # PR 234 v8: a task WAL that is not a regular file is unread, never skipped silently
+            tally.unread.append({"source": f"WAL {f.name[:60]}", "reason": "not a regular file"})
+            continue
         try:
             if now - f.stat().st_mtime > TASK_WAL_WINDOW_S:
                 continue  # history, not an owner (same window ahd uses for sessions)
         except OSError as error:
             unread.append({"source": f.name, "reason": f"file-unreadable: {type(error).__name__}"})
             continue
-        summary = summarize_agent_wal(f, index_dir)
+        summary = summarize_agent_wal(f, index_dir, tally)
         verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
         idle = verdict["idle_s"]
         text = summary["first"] or ""
@@ -572,7 +645,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             "undisposed": sorted([r["agent_id"] for r in rows if r["decision_required"]] + [d["id"] for d in missed]),
             "attention": sorted(r["agent_id"] for r in rows if r.get("attention")),
             "legacy_unverified": sorted(a for a, d in disp.items() if d.get("kind") == "legacy"),
-            "read": read_block(1, unread)}
+            "read": tally.block()}
 
 
 # ------------------------------------------------------------------ user-msg
@@ -1203,25 +1276,35 @@ def _append_line(path: Path, record: dict) -> None:
         os.close(fd)
 
 
-def _ledger(home: Path, include_intents: bool = False) -> list:
-    """Applied rows (rows written before `state` existed count as applied); intents only on request."""
+def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None" = None) -> list:
+    """Applied rows (rows written before `state` existed count as applied); intents only on request. `tally` (the
+    read-only views): an unreadable ledger is an unread source and a torn row a skipped line (PR 234 v8), since the
+    registrations, dispositions and pending stops all come from here."""
     path = store_dir(home) / "ledger.jsonl"
     out = []
     try:
         with open(path, "rb") as handle:
+            mtime = os.fstat(handle.fileno()).st_mtime
             for raw in handle:
                 try:
                     row = json.loads(raw)
                 except ValueError:
+                    if tally is not None:
+                        tally.line_lost(not raw.endswith(b"\n"), mtime)
                     continue  # a torn line from a crash is ignored, never fatal
                 if not isinstance(row, dict):
+                    if tally is not None:
+                        tally.skipped += 1
                     continue
                 if row.get("schema", 1) > SCHEMA:
                     raise AhError("schema_newer", "the ledger was written by a newer ah; update this install", 4)
                 if row.get("state", "applied") == "applied" or include_intents:
                     out.append(row)
-    except OSError:
-        pass
+        if tally is not None:
+            tally.read_ok += 1
+    except OSError as error:
+        if tally is not None:
+            tally.missed("ah ledger", error)
     return out
 
 
@@ -2506,7 +2589,7 @@ def _tokens(note: str) -> set:
 
 
 def status_report(home: Path, session: str, since_s: float, now: float | None = None, *, rows=None,
-                  unread=None) -> dict:
+                  unread=None, sources_read=None, skipped_rows: int = 0) -> dict:
     """What the WALs prove, by class. Narrative is never promoted: VERIFIED needs a REALLY_TESTED entry, LIVE needs a
     deploy/live note, LINKED_LIVE needs both to share a ticket or sha token; a note that only says "done" is CLAIMED.
     Targets changed without a user source are TARGET_MISMATCH; other unsourced decisions are ASSUMPTION.
@@ -2514,7 +2597,8 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
     rows: already-read (agent, record) pairs from a caller that read the WALs itself (ah export, goodqa#15788). The
     report then opens no file and skips the owners view, and every entry carries "row", the index of its source
     pair, so the caller can render the entry from its own redacted copy instead of the report's text cuts.
-    unread: that caller's list of WALs it did not read."""
+    unread: that caller's list of WALs it did not read; sources_read and skipped_rows: what that caller read and the
+    lines it could not use (PR 234 v8: the read block states only what was read, never a literal)."""
     now = time.time() if now is None else now
     cutoff = now - since_s
     given = rows
@@ -2543,11 +2627,13 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                 continue
             read_ok += 1
             try:
-                in_window = path.stat().st_mtime >= cutoff  # a file not written since the cutoff holds nothing in the window
+                mtime = path.stat().st_mtime
             except OSError:
-                in_window = True
+                mtime = now
+            in_window = mtime >= cutoff  # a file not written since the cutoff holds nothing in the window
             lines = text.splitlines()
-            open_tail = bool(lines) and not text.endswith("\n")  # the last line may still be being written
+            # the last line may still be being written: only while the file was written within the grace window
+            open_tail = bool(lines) and not text.endswith("\n") and _prov().tail_in_progress(True, mtime, now)
             for index, raw in enumerate(lines):
                 if not raw.strip():
                     continue
@@ -2557,9 +2643,14 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                     if in_window and not (open_tail and index == len(lines) - 1):
                         skipped += 1  # a complete line that is not a record: what it held is missing from this report
                     continue
+                if not isinstance(rec, dict) or not rec.get("event"):
+                    if in_window:
+                        skipped += 1  # parsed, but not a WAL record (PR 234 v8): nothing in it can be reported
+                    continue
                 consider(agent, rec)
     else:
-        read_ok = 1
+        read_ok = len({agent for agent, _rec in given}) if sources_read is None else int(sources_read)
+        skipped = int(skipped_rows)
         for agent, rec in given:
             consider(agent, rec)
     rows.sort(key=lambda r: r[1])
@@ -2642,13 +2733,18 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
         if supplied:  # the owners view reads WALs itself; a caller that supplied its rows gets none of it
             raise LookupError("owners view not computed for supplied rows")
         data = owners(home, session, now=now)
+        owner_read = data.get("read") or {}
+        if owner_read.get("state") != "ok":   # PR 234 v8: the owners view is part of this report, and part of its read
+            unread.append({"source": "owners view", "reason": f"ah owners read {owner_read.get('state', 'unknown')}"})
         owners_summary = {"counts": data.get("counts"), "undisposed": data.get("undisposed"),
                           "agents_active_1h": data.get("agents_active_1h"),
                           "attention": data.get("attention"),
                           "live": sorted(r["agent_id"] for r in data.get("owners") or []
                                          if r.get("owner") and str(r.get("state")).startswith(("live", "working")))}
-    except Exception:  # noqa: BLE001 - the evidence report must not fail on the owner view
+    except Exception as error:  # noqa: BLE001 - the evidence report must not fail on the owner view
         owners_summary = {"error": "owners view not included (run ah owners)" if supplied else "owners view unavailable"}
+        if not supplied:
+            unread.append({"source": "owners view", "reason": f"ah owners failed: {type(error).__name__}"})
     return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
             "verified": sorted(verified.values(), key=lambda e: e["at"]),
             "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
@@ -3077,7 +3173,8 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
         try:
             if not os.path.lexists(path):
                 raise prov.Problem("missing", "no main WAL for this session")
-            lines = list(prov._lines_containing(path, b'"event":"requirement"'))
+            # PR 234 v8: the JSON string value alone, so a spaced `"event": "requirement"` is read too
+            lines = list(prov._lines_containing(path, b'"requirement"', tails=True))
         except prov.Problem as problem:
             # review PR 234 v6 F1: an unreadable WAL is an unread source, named with its reason, never zero requirements
             unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"{problem.code}: {problem.message}"})
@@ -3087,17 +3184,21 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             continue
         read_ok += 1
         limited = limited or len(lines) >= prov.MAX_HITS  # the shared reader stops at MAX_HITS lines: say so
-        for line in lines:
+        for line, in_progress in lines:
             if line is None:
                 skipped += 1  # an oversized line that names a requirement
                 continue
             try:
                 rec = prov.loads_line(line)
             except ValueError:
-                skipped += 1
+                if not in_progress:   # a last line still being written is not a lost requirement (v7 F4 rule)
+                    skipped += 1
                 continue
-            if not isinstance(rec, dict) or rec.get("event") != "requirement":
-                continue  # the words inside another record's text
+            if not isinstance(rec, dict):
+                skipped += 1  # a line that names a requirement but is not a record
+                continue
+            if rec.get("event") != "requirement":
+                continue  # another record with a "requirement" field
             if not isinstance(rec.get("id"), str) or not rec["id"]:
                 skipped += 1  # a requirement record with no id cannot be listed
                 continue
@@ -3116,7 +3217,9 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 "state": str(rec.get("state") or "recorded")[:20],
                 "ticket": _clean_field(rec.get("ticket")), "owner": _clean_field(rec.get("owner")),
                 "evidence": _clean_field(rec.get("evidence"))})
-    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited or total > len(rows),
+    # rows past VIEW_ROW_CAP are not sent: the list is limited, so the read says so (PR 234 v8)
+    limited = limited or total > len(rows)
+    return {"generated": iso(now), "requirements": rows, "total": total, "truncated": limited,
             "read": read_block(read_ok, unread, skipped, limited)}
 
 
