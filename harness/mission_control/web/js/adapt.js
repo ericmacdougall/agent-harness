@@ -1,6 +1,7 @@
 // Pure mapping from the Mission Control server's JSON (GoodQA #15585) to the view model the panels render.
 // No DOM, no network: tested with `node --test harness/mission_control/web/tests/`.
 // Every string stays a string; panels render with textContent only.
+import { ownerCounts } from './owner-groups.js';
 
 const str = (value, max = 4000) => (typeof value === 'string' ? value : value == null ? '' : String(value)).slice(0, max);
 const isoFromEpoch = seconds => (typeof seconds === 'number' && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null);
@@ -48,11 +49,15 @@ export function ownerHold(r, last) {
   return { severe: SEVERE(r?.state) && !held, held, disposition, waitNote };
 }
 
+// Rows the server sent that the page could not show or place: dropped by shape, or with a role it does not know.
+export const ownersLoss = (rows, owners) => (Array.isArray(rows) ? Math.max(0, rows.length - owners.length) : rows == null ? 0 : 1)
+  + owners.filter(o => o.role_unknown).length;
 export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
-  return rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
+  const out = rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
     const id = str(r.agent_id, 80);
-    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket === r.ticket));
+    // goodqa#15920: tickets compare by key, so "GoodQA goodqa#1" on an owner links to "goodqa#1" on an initiative
+    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket && ticketKey(i.ticket) === ticketKey(r.ticket)));
     const last = r.last_item && typeof r.last_item === 'object' ? r.last_item : null;
     const at = validIso(last?.at) || null;
     const active = [validIso(last?.active_at), at, validIso(r.last_activity)].filter(Boolean).sort().pop() || null;
@@ -67,12 +72,24 @@ export function owners(rows, items = []) {
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
       progress: validIso(last?.progress_at) ? { at: last.progress_at, event: str(last.progress_event, 40), note: str(last.progress_note, 160) } : null,
       initiative_id: linked ? linked.id : null,
+      // goodqa#15920: the server's cap role; anything unknown is parked (shown, never counted)
+      // T242-2: an unknown role is still shown (parked, never counted), and the store counts it as a row the page
+      // could not place, so the owners claim is partial rather than a short count shown as current
+      role: ['live', 'parked', 'helper'].includes(r.role) ? r.role : 'parked', role_unknown: !['live', 'parked', 'helper'].includes(r.role), source: r.source === 'ah' ? 'ah' : str(r.source, 20),
+      serves: r.serves ? str(r.serves, 80) : null,
+      decision_required: r.decision_required === true,
+      session: str(r.session, 64),
+      ah_stale: r.ah_stale === true,
     };
   });
+  // a helper takes the initiative of the owner it serves
+  const byId = new Map(out.map(o => [o.agent_id, o]));
+  for (const o of out) if (o.role === 'helper' && o.serves && byId.has(o.serves)) o.initiative_id = byId.get(o.serves).initiative_id;
+  return out;
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', sources: 'Event drops', 'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', sources: 'Event drops', 'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', 'owner-policy': 'Owner/helper type policy', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
 // A Source health row. `truth` is the server's status truth for the source (collectors.read_truth); `state` is the CSS
 // class and `label` the word shown, both from status and truth together, so a source that reads but is partial or
 // stale is never shown as plain "ok".
@@ -135,7 +152,7 @@ export const STATE_DATASETS = Object.freeze({
   reads: null, loss: null, sources: null, connection: null, lastData: null, host: null, now: null,
   decisions: null, filters: null, selection: null, highlight: null, tab: null, responder: null, session: null,
   motion: null, motionPreference: null, reducedMotion: null, feedPaused: null, buffered: null, ownerFilter: null,
-  ownersAll: null, fallback: null, showQuiet: null, theme: null, coverage: null,
+  ownersAll: null, ownerFolds: null, fallback: null, showQuiet: null, theme: null, coverage: null,
 });
 // Reads that are not dependencies, each with the reason: the data can only reveal more, never hide.
 export const SAFE_READS = Object.freeze({
@@ -658,8 +675,8 @@ export function missionTiles(state) {
   const liveNotDone = goals.filter(g => GOAL_LIVE_NOT_DONE.has(g.state)).length;
   const total = Math.max(goals.length, led.goals.total);
   const open = total - done - liveNotDone;
-  const live = (state.owners || []).filter(o => o.state === 'live').length;
-  const attention = (state.owners || []).filter(o => o.severe).length;
+  const counts = ownerCounts(state.owners || []);
+  const live = counts.live, attention = counts.attention;
   const waiting = (state.asks || []).filter(ask => waitingOnUser(state.messages, ask) && state.decisions?.[ask.id]?.status !== 'sending').length;
   const blockers = blockerRows(led.status, state.asksFlagged || [], state.owners || [], state.initiatives || []).length + hiddenBlockers(led.status);
   const reqs = led.requirements.summary;
@@ -668,7 +685,7 @@ export function missionTiles(state) {
   const off = id => c[id].truth !== 'current';
   const tiles = [
     { id: 'goals', label: 'Goals done live', value: `${countText(done, c.goals)} / ${countText(total, c.goals)}`, note: tileNote(c.goals, `${liveNotDone} live, not done · ${open} open`), target: 'mission-panel', alert: off('goals') },
-    { id: 'owners', label: 'Owners live', value: countText(live, c.owners), note: attention ? `${attention} need attention` : tileNote(c.owners, 'none need attention'), target: 'owners-panel', alert: off('owners') },
+    { id: 'owners', label: 'Owners live', value: countText(live, c.owners), note: [counts.codexLive ? `${countText(counts.codexLive, c.owners)} live Codex` : '', attention ? `${attention} need attention` : tileNote(c.owners, 'none need attention')].filter(Boolean).join(' · '), target: 'owners-panel', alert: off('owners') },
     { id: 'asks', label: 'Needs you', value: countText(waiting, c.needs), note: waiting ? 'waiting on your answer' : tileNote(c.needs, 'nothing waiting'), target: 'needs-panel', alert: off('needs') },
     { id: 'blockers', label: 'Blockers', value: countText(blockers, c.blockers), note: tileNote(c.blockers, risky ? `${risky} initiatives at risk` : 'across status, asks, owners'), target: 'blockers-panel', alert: off('blockers') },
     { id: 'requirements', label: 'Requirements live', value: countText(reqs.live, c.requirements), note: tileNote(c.requirements, `${reqs.archived} archived`), target: 'requirements', alert: off('requirements') },
