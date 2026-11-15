@@ -29,7 +29,7 @@ HOSTS = ("dev2", "t2-dev", "ah-mac-mini")
 # Windows OpenSSH hosts (goodqa#15275): ah.py is not installed there, so ah kill reads and stops the process itself
 # over ssh with PowerShell. Windows OpenSSH does not end a session's processes when the client disconnects, so
 # orphaned remote PowerShell children need this audited path.
-WINDOWS_HOSTS = ("ah-spectre",)
+WINDOWS_HOSTS = ("ah-spectre", "ah-msi")  # ah-msi: the MSI desktop, same audited Windows stop (goodqa#16147)
 # Delta red-team D-F4: a Windows stop is an allowlist, not a deny list. It may stop only an orphaned shell (its parent
 # is gone, or the parent pid now belongs to a newer process) that the ssh login user owns and that is not part of the
 # ssh session running the check. That is exactly the orphaned PowerShell children it exists for. "The login user" is
@@ -37,6 +37,15 @@ WINDOWS_HOSTS = ("ah-spectre",)
 # name (found live, goodqa#15275). Anything else
 # (claude, codex, node, adb, sshd-session, WSL, Defender, ...) is refused.
 WINDOWS_ALLOWED = {"powershell", "pwsh", "cmd"}
+# goodqa#16147: per host, a few more names that may be stopped without the orphan rule, but only from the listed
+# install directories ("{localappdata}" is the login user's own local-appdata folder). Still owned by the login user
+# and outside the checking ssh session. On ah-msi a stale GoodQA agent holds the per-user lock and blocks remote
+# control; the app itself (goodqa.exe) and every other name stay refused. ah-spectre has no entry, so it keeps the
+# shell-only allowlist.
+WINDOWS_AGENT_ALLOWED = {
+    "ah-msi": ({"goodqa-agentd", "goodqa-machine"},
+               ("{localappdata}\\GoodQA\\agent\\bin\\", "C:\\Program Files\\goodqa\\resources\\agent\\")),
+}
 WIN_SENTINEL = "AHK1 "  # D-F5: the answer is the last line with this prefix; profile or CLIXML noise is ignored
 _ISO = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})")
 MAX_PIDS = 64
@@ -811,7 +820,7 @@ $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner
 $owner = if ($o.ReturnValue -eq 0) { "$($o.Domain)\$($o.User)" } else { '' }
 $parent = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$p.ParentProcessId)
 $orphan = (-not $parent) -or ($parent.CreationDate -gt $p.CreationDate)
-'AHK1 ' + ([pscustomobject]@{found=$true; pid=[int]$p.ProcessId; ppid=[int]$p.ParentProcessId; name=[string]$p.Name; created=$p.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$p.CommandLine; owner=$owner; mine=(($owner -ne '') -and ($owner -eq $me)); self=($chain -contains [int]$p.ProcessId); orphan=[bool]$orphan} | ConvertTo-Json -Compress)
+'AHK1 ' + ([pscustomobject]@{found=$true; pid=[int]$p.ProcessId; ppid=[int]$p.ParentProcessId; name=[string]$p.Name; created=$p.CreationDate.ToUniversalTime().ToString('o'); cmd=[string]$p.CommandLine; owner=$owner; mine=(($owner -ne '') -and ($owner -eq $me)); self=($chain -contains [int]$p.ProcessId); orphan=[bool]$orphan; exe=[string]$p.ExecutablePath; lad=[string][Environment]::GetFolderPath('LocalApplicationData')} | ConvertTo-Json -Compress)
 """
 # The stop re-reads the process in the same remote script and re-checks its creation time and owner, so a reused pid
 # or a process of another user is not stopped. Stop-Process -Force is immediate on Windows; there is no grace period.
@@ -827,6 +836,28 @@ try { Stop-Process -Id %d -Force -ErrorAction Stop; 'AHK1 {"status":"stopped"}' 
 """
 
 
+_WIN_ABS = re.compile(r"[A-Za-z]:\\[^/\x00-\x1f]*")
+
+
+def _win_under(path, roots, localappdata):
+    """True when the Windows PATH lies strictly inside one of ROOTS. Both strings come from the host: a missing, empty,
+    relative, UNC, forward-slash or non-normalized ('..', doubled separators) value fails closed, and the comparison is
+    case-insensitive with a separator-terminated prefix so a look-alike directory (bin2\\) does not match."""
+    import ntpath  # noqa: PLC0415
+    if not isinstance(path, str) or not _WIN_ABS.fullmatch(path) or ntpath.normpath(path) != path:
+        return False
+    lad = localappdata if isinstance(localappdata, str) else ""
+    lad_ok = bool(_WIN_ABS.fullmatch(lad)) and ntpath.normpath(lad) == lad.rstrip("\\") and len(lad.rstrip("\\")) > 3
+    for root in roots:
+        if "{localappdata}" in root:
+            if not lad_ok:
+                continue
+            root = root.replace("{localappdata}", lad.rstrip("\\"))
+        if path.casefold().startswith(root.casefold()) and len(path) > len(root):
+            return True
+    return False
+
+
 def _win_call(runner, host, script, timeout):
     try:
         r = runner(_powershell(host, script), capture_output=True, text=True, timeout=timeout)
@@ -839,7 +870,8 @@ def _win_call(runner, host, script, timeout):
 
 def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run,
                         foreign=False, notify=None):
-    """Stop one orphaned shell on a Windows OpenSSH host: main only (kill_guard), --foreign audit and ops-watch notice,
+    """Stop one orphaned shell (or, on a host in WINDOWS_AGENT_ALLOWED, one installed agent binary) on a Windows
+    OpenSSH host: main only (kill_guard), --foreign audit and ops-watch notice,
     one pid per call, owner and identity recorded before the stop and rechecked in the stop script."""
     home = home or Path.home()
     reason = (reason or "").strip()
@@ -878,17 +910,28 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
         rec.update(name=_clip(name, 80), ppid=ident.get("ppid"), created=ident["created"],
                    cmd=_clip(str(ident.get("cmd") or ""), MAX_CMD), owner=_clip(str(ident.get("owner") or ""), 80),
                    orphan=ident["orphan"])
+        exe = ident.get("exe")
+        rec["exe"] = _clip(exe, MAX_CMD) if isinstance(exe, str) else ""
         audit.row({"event": "identity", "run": run_id, "host": host, "pid": pid, "ppid": rec["ppid"],
                    "name": rec["name"], "created": rec["created"], "cmd": rec["cmd"], "owner": rec["owner"],
-                   "orphan": rec["orphan"]})
+                   "orphan": rec["orphan"], "exe": rec["exe"]})
         base = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
-        if base not in WINDOWS_ALLOWED:
-            rec.update(status="refused", detail="only an orphaned %s is stopped on a Windows host, not %s" % (
-                "/".join(sorted(WINDOWS_ALLOWED)), base or "an unnamed process"))
+        agent_names, agent_roots = WINDOWS_AGENT_ALLOWED.get(host, (set(), ()))
+        agent = base in agent_names
+        if base not in WINDOWS_ALLOWED and not agent:
+            rec.update(status="refused", detail="only an orphaned %s%s is stopped on %s, not %s" % (
+                "/".join(sorted(WINDOWS_ALLOWED)),
+                (" or an installed " + "/".join(sorted(agent_names))) if agent_names else "", host,
+                base or "an unnamed process"))
         elif not ident["mine"]:
             rec.update(status="refused", detail="owned by another user (%s)" % (rec["owner"] or "unknown"))
         elif ident["self"]:
             rec.update(status="refused", detail="part of the ssh session running this check")
+        elif agent:
+            leaf = exe.rsplit("\\", 1)[-1].lower() if isinstance(exe, str) else ""
+            if leaf != base + ".exe" or not _win_under(exe, agent_roots, ident.get("lad")):
+                rec.update(status="refused", detail="%s is not running from a GoodQA agent install directory (%s)" % (
+                    base, rec["exe"] or "no executable path"))
         elif not ident["orphan"]:
             rec.update(status="refused", detail="its parent pid %s is still running; stop the parent first" % rec["ppid"])
     if "status" not in rec:

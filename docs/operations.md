@@ -1591,6 +1591,7 @@ record whose path list or tree hash differs from what it sees. Not implemented; 
 ### Audited Windows stop route (B3.10)
 
 Landed in #138 (goodqa#15275) over ssh rather than a GoodQA route: `ah kill --host ah-spectre --pid N` reads the process (owner, creation time, orphan state), and the main-only stop re-checks the creation time and owner before it acts. It was verified live on a self-made orphan.
+goodqa#16147 adds `ah-msi` with the same main-only rules plus a per-host allowlist (`WINDOWS_AGENT_ALLOWED` in `ah_kill.py`): an owned `goodqa-agentd.exe` or `goodqa-machine.exe` whose image path lies under the login user's `%LOCALAPPDATA%\GoodQA\agent\bin\` or `C:\Program Files\goodqa\resources\agent\` may be stopped without the orphan rule, so a stale agent holding the per-user lock can be cleared. The app `goodqa.exe` is never on the list.
 
 ### Owner session scope (B3.10)
 
