@@ -2,7 +2,7 @@
 // the data inventory. Builders are pure: state in, nodes out, textContent only (no HTML is ever parsed from data).
 // Each long text is clamped with a disclosure, and each list is bounded with "show more", so volume never takes over.
 import { el, button, age, stateClass } from './ui.js';
-import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows } from './adapt.js';
+import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine } from './adapt.js';
 
 export const PAGE = 25;  // default rows per list; "show more" adds one page
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
@@ -90,7 +90,8 @@ export function deals(state, ui) {
   const all = dealRows(status, state.events, 500);
   const out = [];
   if (status.error) out.push(el('p', 'notice warn', `${status.stale ? 'Showing the last good read. ' : ''}Status: ${status.error}`));
-  if (!all.length) out.push(el('p', 'empty', 'No deploys or live tests recorded in the last 12 hours.'));
+  if (status.incomplete) out.push(unreadNotice(status));
+  if (!all.length) out.push(el('p', 'empty', status.incomplete ? 'No deploys or live tests in the logs that could be read.' : 'No deploys or live tests recorded in the last 12 hours.'));
   if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${all.length} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
   const list = el('ul', 'deals');
   all.slice(0, ui.dealsLimit).forEach(row => {
@@ -104,10 +105,24 @@ export function deals(state, ui) {
   return out;
 }
 
+// review PR 234 v2 F2: what a partial status read missed, beside every panel that depends on it.
+function unreadNotice(status) {
+  const box = el('div', 'notice warn');
+  box.setAttribute('role', 'status');
+  box.append(el('p', '', unreadLine(status)));
+  if (status.unread.items.length) {
+    const list = el('ul', 'unread');
+    status.unread.items.forEach(r => list.append(el('li', '', [r.wal, r.reason].filter(Boolean).join(': '))));
+    box.append(list);
+  }
+  return box;
+}
+
 export function blockers(state, ui) {
   const all = blockerRows(state.ledger.status, state.asksFlagged, state.owners, state.initiatives);
   const out = [];
-  if (!all.length) out.push(el('p', 'empty', 'No blockers recorded.'));
+  if (state.ledger.status.incomplete) out.push(unreadNotice(state.ledger.status));
+  if (!all.length) out.push(el('p', 'empty', state.ledger.status.incomplete ? 'No blockers in the logs that could be read.' : 'No blockers recorded.'));
   const list = el('ul', 'blockers');
   all.slice(0, ui.blockersLimit).forEach(row => {
     const item = el('li', `blocker src-${row.source}`);
@@ -130,6 +145,11 @@ function actionArea(row, ui) {
   const area = el('div', 'req-actions');
   const action = row.bucket === 'archived' ? 'restore' : 'archive';
   const armed = ui.armed && ui.armed.id === row.id ? ui.armed : null;
+  if (action === 'archive' && row.clipped) {
+    // review PR 234 v2 F3: never offer a confirmation on words the user could not read in full
+    area.append(el('p', 'req-notice', 'This requirement cannot be archived here: Mission Control can show only part of it. Ask main to archive or supersede it.'));
+    return area;
+  }
   if (!armed) {
     const open = button('req-action', action === 'archive' ? 'Archive…' : 'Restore…', () => ui.arm?.(row, action));
     open.setAttribute('aria-label', `${action === 'archive' ? 'Archive' : 'Restore'} requirement ${row.id}`);
@@ -168,6 +188,7 @@ export function requirementItem(row, now, ui = {}) {
   const top = el('div', 'req-top');
   top.append(badge(ruleLine(row), manualUser(row) ? 'manual-user' : row.bucket === 'archived' ? 'archived' : 'live'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
+  if (row.clipped) item.append(el('p', 'notice warn', `Showing the first ${row.text.length} of ${row.text_len || 'more'} characters. The rest is in the session WAL; Mission Control does not read it.`));
   const meta = [`Source: ${row.source || 'unknown'}`, row.owner ? `owner ${row.owner}` : 'no owner recorded', row.ticket || 'no ticket'].join(' · ');
   item.append(el('p', 'req-meta', meta));
   item.append(el('p', 'req-why', `${row.bucket === 'archived' ? 'Archived because' : 'Live because'}: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
@@ -216,6 +237,7 @@ export function archiveItem(row, now, ui = {}) {
   const top = el('div', 'req-top');
   top.append(badge(row.kind === 'ask' ? 'Ask' : 'Requirement', 'kind'), badge(manualUser(row) ? 'Archived from the dashboard · your own words' : `${row.rule} ${row.rule_title || ''}`.trim(), manualUser(row) ? 'manual-user' : 'archived'), el('span', 'req-id', row.id), el('time', 'req-age', when(row.at, now)));
   item.append(top, longText(row.text, 'req-text', 300));
+  if (row.clipped) item.append(el('p', 'notice warn', `Showing the first ${row.text.length} of ${row.text_len || 'more'} characters. The rest is in the session WAL; Mission Control does not read it.`));
   item.append(el('p', 'req-why', `Archived because: ${row.reason}${row.evidence_ref ? ` (evidence ${row.evidence_ref})` : ''}`));
   const prov = row.kind === 'ask'
     ? [`registered by ${row.owner || 'unknown'}`, row.ticket, row.decision ? `decision ${row.decision}` : '', row.resolution ? `resolution: ${row.resolution}` : '', row.ask_reason ? `asked because: ${row.ask_reason}` : '']
@@ -250,6 +272,7 @@ export const GAPS = Object.freeze([
   'Full ticket comment threads: only checkpoint comments arrive, as feed events.',
   'Release-kit deploy records outside the WALs: no read path.',
 ]);
+const unreadCount = status => (status.unread.count > 0 ? `${status.unread.count} logs unread` : 'some logs unread');
 export function inventory(state, go) {
   const led = state.ledger;
   const rowsOut = [
@@ -257,13 +280,13 @@ export function inventory(state, go) {
     ['Initiatives', '', state.initiativesStale, state.initiativesError, `${state.initiatives.length} initiatives`, 'Overview', 'overview'],
     ['Owners', '', false, '', `${state.owners.length} owners`, 'Overview', 'overview'],
     ['Open asks', state.asksSweptAt, false, '', `${state.asks.length} open, ${state.asksStale.length} stale, ${state.asksFlagged.length} untraceable`, 'Overview', 'overview'],
-    ['Deploys and live tests', led.status.at, led.status.stale, led.status.error, `${led.status.live.length} deploys, ${led.status.verified.length} tested, ${led.status.failed.length} failed, ${led.status.pending.length} pending`, 'Overview', 'overview'],
-    ['Blockers', led.status.at, led.status.stale, led.status.error, `${led.status.blockers.length} recorded`, 'Overview', 'overview'],
+    ['Deploys and live tests', led.status.at, led.status.stale || led.status.incomplete, led.status.error, `${led.status.incomplete ? 'incomplete: ' + unreadCount(led.status) + '; ' : ''}${led.status.live.length} deploys, ${led.status.verified.length} tested, ${led.status.failed.length} failed, ${led.status.pending.length} pending`, 'Overview', 'overview'],
+    ['Blockers', led.status.at, led.status.stale || led.status.incomplete, led.status.error, `${led.status.incomplete ? 'incomplete: ' + unreadCount(led.status) + '; ' : ''}${led.status.blockers.length} recorded`, 'Overview', 'overview'],
     ['Requirements', led.requirements.at, led.requirements.stale, led.requirements.error, `${led.requirements.summary.live} live, ${led.requirements.summary.archived} archived of ${led.requirements.total}`, 'Requirements', 'requirements'],
     ['Archived asks', state.asksSweptAt, false, '', `${state.asksArchive.length} archived`, 'Archive', 'archive'],
     ['Activity feed', '', false, '', `${state.events.length} events held`, 'Activity', 'activity'],
     ['Chat', '', false, '', `${state.messages.length} messages, ${state.sessions.length} sessions`, 'Chat panel', 'chat'],
-    ['Decisions and commits', led.status.at, led.status.stale, led.status.error, `${led.status.decisions.length} decisions, ${led.status.commits.length} commits, ${led.status.claimed.length} claimed, ${led.status.assumptions.length} assumptions`, 'Sources', 'sources'],
+    ['Decisions and commits', led.status.at, led.status.stale || led.status.incomplete, led.status.error, `${led.status.incomplete ? 'incomplete: ' + unreadCount(led.status) + '; ' : ''}${led.status.decisions.length} decisions, ${led.status.commits.length} commits, ${led.status.claimed.length} claimed, ${led.status.assumptions.length} assumptions`, 'Sources', 'sources'],
   ];
   const table = el('table', 'inventory');
   const head = el('tr');
@@ -273,7 +296,7 @@ export function inventory(state, go) {
   const body = el('tbody');
   for (const [name, at, stale, error, holds, where, tab] of rowsOut) {
     const row = el('tr');
-    row.append(el('th', '', name), el('td', '', at ? age(at, state.now) : 'live'), el('td', error ? 'bad' : stale ? 'warn' : 'ok', error ? `error: ${error}` : stale ? 'stale' : 'ok'), el('td', '', holds));
+    row.append(el('th', '', name), el('td', '', at ? age(at, state.now) : 'live'), el('td', error ? 'bad' : stale ? 'warn' : 'ok', error ? `error: ${error}` : stale ? (/^incomplete/.test(holds) ? 'incomplete' : 'stale') : 'ok'), el('td', '', holds));
     const cell = el('td');
     cell.append(button('link-button', where, () => go(tab)));
     row.append(cell);

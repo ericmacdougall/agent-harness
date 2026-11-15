@@ -81,15 +81,49 @@ test('blocker rows gather ledger blockers, untraceable asks and dropped owners w
 test('mission tiles count goals, live owners, open asks, blockers and requirements', () => {
   const tiles = missionTiles({ ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false }, { state: 'done', severe: false }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] });
   const by = Object.fromEntries(tiles.map(t => [t.id, t]));
-  assert.equal(by.goals.value, '1 / 2');
+  assert.equal(by.goals.value, '0 / 2');  // g1 is LIVE_TESTED: live, not done (review PR 234 v2 F1)
+  assert.match(by.goals.note, /1 live, not done · 1 open/);
   assert.equal(by.owners.value, '1');
   assert.equal(by.blockers.value, '1');
   assert.equal(by.requirements.value, '1');
   assert.match(by.requirements.note, /2 archived/);
 });
 
+// review PR 234 v2 F1: the producer's own vocabulary (harness/hooks/goals_view.py). Only DONE_LIVE is done.
+const PRODUCER_STATES = ['FAILING', 'UNCONFIRMED', 'UNKNOWN', 'LIVE_UNTESTED', 'IN_PROGRESS', 'VERIFIED', 'DEFERRED', 'LIVE_TESTED', 'DONE_LIVE', 'RETIRED'];
+const goalsOf = states => ledger({ goals: { items: states.map((state, i) => ({ id: `g${i}`, title: `goal ${i}`, state, evidence: [] })), at: iso(1) } });
+const goalTile = states => missionTiles({ ledger: goalsOf(states), owners: [], asks: [], messages: [], decisions: {}, initiatives: [] }).find(t => t.id === 'goals');
+
+test('only DONE_LIVE counts as done; a board of finished goals is not "still open"', () => {
+  const tile = goalTile(['DONE_LIVE', 'DONE_LIVE']);
+  assert.equal(tile.value, '2 / 2');
+  assert.match(tile.label, /done/i);
+  assert.doesNotMatch(tile.note, /[1-9]\d* still open/);
+  for (const state of PRODUCER_STATES.filter(s => s !== 'DONE_LIVE')) {
+    assert.equal(goalTile([state]).value.startsWith('0 /'), true, `${state} is not done`);
+  }
+});
+
+test('LIVE_TESTED and LIVE_UNTESTED are live, not done, and the note says so', () => {
+  const tile = goalTile(['DONE_LIVE', 'LIVE_TESTED', 'LIVE_UNTESTED', 'VERIFIED', 'FAILING', 'UNCONFIRMED']);
+  assert.equal(tile.value, '1 / 6');
+  assert.match(tile.note, /2 live, not done/);
+  assert.match(tile.note, /3 open/);
+});
+
+test('every producer goal state has a plain label, and done or live is never claimed for the wrong one', () => {
+  for (const state of PRODUCER_STATES) assert.ok(GOAL_STATE[state], `label for ${state}`);
+  assert.match(GOAL_STATE.DONE_LIVE, /done/i);
+  for (const state of PRODUCER_STATES.filter(s => s !== 'DONE_LIVE')) assert.doesNotMatch(GOAL_STATE[state], /^done\b/i, state);
+  assert.match(GOAL_STATE.VERIFIED, /not live/i);
+  assert.match(GOAL_STATE.LIVE_UNTESTED, /not tested/i);
+  assert.match(GOAL_STATE.LIVE_TESTED, /no deploy record/i);
+  assert.match(GOAL_STATE.UNCONFIRMED, /not done/i);
+  assert.match(GOAL_STATE.UNKNOWN, /no record/i);
+});
+
 test('goal state labels are words', () => {
-  assert.equal(GOAL_STATE.LIVE_TESTED, 'Live and tested');
+  assert.match(GOAL_STATE.LIVE_TESTED, /^Live and tested/);
   assert.ok(GOAL_STATE.UNKNOWN);
 });
 
