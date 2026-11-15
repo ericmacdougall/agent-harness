@@ -4,6 +4,7 @@ Stdlib only; every test runs in a scratch HOME; no network, no real transcripts.
 import json
 import os
 import subprocess
+import socket
 import sys
 import tempfile
 import threading
@@ -101,8 +102,11 @@ class Scratch(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
-    def owners(self, rows, session=SESSION):
-        (self.fake / f"owners-{session}.json").write_text(json.dumps({"session": session, "owners": rows}))
+    def owners(self, rows, session=SESSION, read="ok"):
+        doc = {"session": session, "owners": rows}
+        if read is not None:
+            doc["read"] = {"schema": "harness.read/1", "state": read}
+        (self.fake / f"owners-{session}.json").write_text(json.dumps(doc))
 
     def calls(self):
         p = self.fake / "calls.jsonl"
@@ -286,6 +290,21 @@ class BadInputs(Scratch):
         self.main_wal.write_text("")  # truncated / rotated to empty
         self.assertEqual(ahd.wal_asks(self.policy, [SESSION]), [])
 
+    def test_a_partial_owners_read_never_clears_liveness(self):  # PR 234 v8: the owner may be in what it missed
+        for read in ("partial", "failed", None):
+            with self.subTest(read=read):
+                self.owners([owner("a1111111111111111", "SILENT")])
+                d = self.daemon()
+                d.tick()
+                self.owners([], read=read)   # the owner is not in what was read
+                d.tick()
+                self.assertEqual(self.alert_calls("clear"), [])
+                self.owners([], read="ok")   # a whole read without it: now it is cleared
+                d.tick()
+                self.assertEqual(len(self.alert_calls("clear")), 1)
+                self.tearDown()
+                self.setUp()
+
     def test_owner_doc_unreadable_never_clears_liveness(self):
         self.owners([owner("a1111111111111111", "SILENT")])
         d = self.daemon()
@@ -365,11 +384,19 @@ class ClockAndDisk(Scratch):
         self.assertEqual(sorted(k for op, k, f, c in plan if op == "clear"), ["ask:w1:due", "liveness:s/agent-a1"])
 
     def test_host_label_is_stable_across_hostname_changes(self):
-        with mock.patch.object(ahd.socket, "gethostname", return_value="Erics-MacBook-Air.local"):
-            a = ahd.host()
-        with mock.patch.object(ahd.socket, "gethostname", return_value="Mac-2.lan"):
-            b = ahd.host()
+        # the rule is macOS's (its hostname flips between names on one machine), so the test states the platform
+        # instead of depending on the host it runs on (it failed on Linux, where the hostname is the label)
+        with mock.patch.object(sys, "platform", "darwin"):
+            with mock.patch.object(socket, "gethostname", return_value="Erics-MacBook-Air.local"):
+                a = ahd.host()
+            with mock.patch.object(socket, "gethostname", return_value="Mac-2.lan"):
+                b = ahd.host()
         self.assertEqual(a, b)
+
+    def test_host_label_off_macos_is_the_short_hostname(self):
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(socket, "gethostname", return_value="t2-dev.lan"):
+            self.assertEqual(ahd.host(), "t2-dev")
 
     def _serve(self, sigs, ticks_max=10, compile_result=False):
         """Run serve_forever with a scripted code_signature sequence (the last value repeats); returns (rc, ticks)."""

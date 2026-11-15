@@ -326,7 +326,7 @@ class TicketPoll(Tmp):
 
 class OwnersPoll(Tmp):
     def rows(self, state="DROPPED"):
-        return {"session": "sess1", "owners": [
+        return {"read": col.whole_read(), "session": "sess1", "owners": [
             {"agent_id": "aaef3bc7aaaa", "state": state, "task": "build tokens", "ticket": "goodqa#15561", "idle_s": 600,
              "disposition": {"kind": "waiting", "ref": "GoodQA goodqa#15561", "reason": "waiting on its own background work",
                              "until": 1794787200.0, "live": True, "evidence": "secret-ish " + GH_TOKEN}},

@@ -3335,6 +3335,20 @@
    "wait_on": null
   }
  ],
+ "read": {
+  "limited": false,
+  "outside_window": 0,
+  "schema": "harness.read/1",
+  "skipped": 0,
+  "sources_read": 121,
+  "state": "ok",
+  "unread": [],
+  "unread_total": 0,
+  "window": {
+   "cutoff": "2026-11-13T14:00:00Z",
+   "rule": "harness.lost-window/1"
+  }
+ },
  "session": "11111111-2222-4333-8444-555555555555",
  "source": "direct",
  "undisposed": [

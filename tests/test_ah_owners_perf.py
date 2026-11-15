@@ -249,26 +249,27 @@ class Counts(Base):
 
     def test_an_interrupted_cold_run_still_leaves_progress(self):  # NEG-6 (R8)
         calls = {"n": 0}
-        real = ah.summarize_agent_wal
+        real = ah._summarize_agent_wal   # PR 234 merge: the uncached reader sits below the cache and the tally
 
         def boom(path, index_dir):
             calls["n"] += 1
             if calls["n"] > 120:
                 raise KeyboardInterrupt  # stands in for tier_gate's deadline alarm
             return real(path, index_dir)
-        with mock.patch.object(ah, "summarize_agent_wal", boom), mock.patch.object(ah, "OWNERS_CACHE_SAVE_EVERY", 50), \
+        with mock.patch.object(ah, "_summarize_agent_wal", boom), mock.patch.object(ah, "OWNERS_CACHE_SAVE_EVERY", 50), \
                 self.assertRaises(KeyboardInterrupt):
             ah.owners(self.home, SESSION, now=NOW)
         cache = json.loads(ah._owners_cache_path(ah.state_dir(self.home, "ah-index"), SESSION).read_text())
         self.assertGreaterEqual(len(cache["wal"]), 100)
 
 
-GOLDEN = REPO / "tests" / "data" / "ah_owners_golden.json"   # origin/main 98e33c5d's owners() on build(140, 60)
+# origin/main feb19d1a's owners() on build(140, 60): the 98e33c5d rows unchanged, plus PR 234's read block
+GOLDEN = REPO / "tests" / "data" / "ah_owners_golden.json"
 
 
 class Golden(Base):
     """Same rows as the previous implementation for the same input, cold, warm and over an index the old code wrote
-    (R5). The frozen rows were produced by origin/main 98e33c5d, so this runs on every test run (review B-3);
+    (R5). The frozen rows were produced by origin/main feb19d1a, so this runs on every test run (review B-3);
     AH_OLD_PY additionally runs a live old copy, which also writes the old-format index for the mixed case."""
 
     def setUp(self):

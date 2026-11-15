@@ -213,8 +213,8 @@ def _read(ah, sd: Path):
             except (ValueError, RecursionError):  # RecursionError: hostile nesting depth
                 skipped += 1
                 continue
-            if not isinstance(rec, dict) or not isinstance(rec.get("event"), str) or not rec.get("event"):
-                skipped += 1  # code inspection 3: a non-string event is malformed, never a crash
+            if ah._prov().wal_record_problem(rec):
+                skipped += 1  # the shared validator (receipt v10 F2): no event, a non-string event, a bad timestamp
                 continue
             if any(isinstance(rec.get(key), (dict, list)) for key in ("id", "ref")):
                 skipped += 1  # PR 223 receipt F2: ids and refs are dict keys in status_report; a container is malformed
@@ -365,6 +365,11 @@ def _evidence_rows(entries, columns):
     return "".join(out)
 
 
+# PR 234 v10 (receipt v9 F3): the export counts every malformed row of the WALs it read, whatever its date; it does
+# not split the count by window, so its report never carries outside_window or the window rule
+SKIPPED_SCOPE = "every malformed row in the WALs read, not split by window"
+
+
 def _render(session, generated, report, tree, counts, timeline, omitted, unread, skipped, agent_filter, since_label):
     parts = ["<!doctype html><html lang=\"en\"><head>",
              '<meta http-equiv="Content-Security-Policy" content="%s">' % _e(CSP),
@@ -373,8 +378,8 @@ def _render(session, generated, report, tree, counts, timeline, omitted, unread,
              "<header><h1>Session export</h1>",
              '<p class="banner">%s</p>' % _e(BANNER),
              '<p class="muted">Session <code>%s</code>; generated %s; window %s; %d rows rendered, %d omitted, '
-             '%d malformed rows skipped.</p></header><main>' % (_e(session), _e(generated), _e(since_label),
-                                                                 len(timeline), omitted, skipped)]
+             '%d malformed rows skipped (%s).</p></header><main>' % (_e(session), _e(generated), _e(since_label),
+                                                                      len(timeline), omitted, skipped, _e(SKIPPED_SCOPE))]
     if omitted:
         parts.append("<p>%d older rows omitted to stay under %d; %s rows were kept first.</p>"
                      % (omitted, MAX_ROWS, _e(", ".join(sorted(PRIORITY)))))
@@ -429,9 +434,9 @@ def _render(session, generated, report, tree, counts, timeline, omitted, unread,
         parts.append("</tbody></table></details>")
     if not by_agent:
         parts.append('<p class="muted">no rows in this window</p>')
-    parts.append("</section><section><h2>Unread WALs (%d)</h2>" % len(unread))
-    if unread:
-        parts.append("<ul>" + "".join("<li><code>%s</code>: %s</li>" % (_e(u.get("wal")), _e(u.get("reason")))
+    parts.append("</section><section><h2>Unread sources (%d)</h2>" % len(unread))
+    if unread:   # receipt v10 F1: entries arrive in the one shape (provenance.unread_entry, applied in export)
+        parts.append("<ul>" + "".join("<li><code>%s</code>: %s</li>" % (_e(u["source"]), _e(u["reason"]))
                                       for u in unread) + "</ul>")
     else:
         parts.append('<p class="muted">none</p>')
@@ -505,7 +510,8 @@ def export(ah, home, args) -> dict:
         return cache[index]
 
     # Classes on the raw rows (same verdicts as `ah status`); display from the redacted copies, matched by index.
-    report = _display(ah, ah.status_report(home, session, since_s, now=now, rows=raw_rows, unread=unread_raw),
+    report = _display(ah, ah.status_report(home, session, since_s, now=now, rows=raw_rows, unread=unread_raw,
+                                         sources_read=len(_read_agents), skipped_rows=skipped),
                       len(raw_rows), redacted)
 
     tree, counts, picked = {a: "" for a in _read_agents}, {}, []
@@ -540,6 +546,7 @@ def export(ah, home, args) -> dict:
     unread = [{k: scrub.text(v) for k, v in u.items()} for u in unread_raw]
     agents_read = {scrub.text(a) for a in _read_agents}
 
+    unread = [ah._prov().unread_entry(u) for u in unread]   # receipt v10 F1: one shape for every renderer
     page = _render(session, _iso(now), report, tree, counts, candidates, omitted, unread, skipped,
                    sorted(scrub.text(a) for a in wanted), "every row" if not args.since else "last " + str(args.since))
     data = page.encode("utf-8", "replace")  # a lone surrogate from a JSON \ud800 escape must not raise
@@ -550,7 +557,8 @@ def export(ah, home, args) -> dict:
         _prepare_default_dir(ah, directory)
     _write(ah, directory, final, data)
     result = {"ok": True, "path": str(final), "bytes": len(data), "rows_rendered": len(candidates),
-              "rows_omitted": omitted, "rows_skipped": skipped, "agents": len(agents_read),
+              "rows_omitted": omitted, "rows_skipped": skipped, "rows_skipped_scope": SKIPPED_SCOPE,
+              "agents": len(agents_read),
               "redactions": scrub.redactions, "unread": unread,
               "note": "local file only; ah never uploads or shares it. The harness log backup copies the work dir "
                       "(and the raw WALs) to your private backup; use --out for a folder outside it."}

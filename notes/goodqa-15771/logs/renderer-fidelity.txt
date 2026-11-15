@@ -1,0 +1,5 @@
+HEAD a3b054087e8a5e74417c508d30f7f3572a39c4de
+$ python3 -B renderer_fidelity.py <worktree>
+live rc=0 rows=25 with_vmid=19 kinds=[('images', 'qcow2'), ('images', 'raw'), ('iso', 'iso'), ('snippets', 'snippet'), ('vztmpl', 'tzst')]
+byte_identical=True live_bytes=2299 rendered_bytes=2299
+exit 0
