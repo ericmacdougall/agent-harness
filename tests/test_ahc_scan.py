@@ -25,6 +25,11 @@ ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 PREFIX = dict(S.PREFIXES)
 
 
+def own(findings):
+    """The scanner's own-rule findings, without the redactor floor (tests of a rule's own semantics)."""
+    return [f for f in findings if not f["rule"].startswith(S.FLOOR)]
+
+
 def corpus_files(root=ROOT):
     """The repo's own .py and .md files: the tracked ones when git is there, else a walk skipping dot dirs."""
     try:
@@ -76,7 +81,7 @@ class PrefixWindowTests(unittest.TestCase):
         self.s = Secrets()
 
     def only(self, text):
-        findings = S.scan_report(text.encode())
+        findings = own(S.scan_report(text.encode()))
         self.assertEqual(len(findings), 1, findings)
         return findings[0]
 
@@ -187,7 +192,15 @@ class RedactShapeTests(unittest.TestCase):
         self.s = Secrets(SEED + 1)
 
     def rules(self, text):
-        return [(f["rule"], f["exposure"]) for f in S.scan_report(("x " + text + "\n").encode())]
+        return [(f["rule"], f["exposure"]) for f in own(S.scan_report(("x " + text + "\n").encode()))]
+
+    def test_the_floor_never_lets_a_tier_fall_below_the_redactor(self):
+        """Where the redactor's own minimum is shorter than the 8-byte window (Slack: 6), its detection wins."""
+        import redact
+        value = "xo" + "xb-" + self.s.body(7)
+        self.assertTrue(redact.find(value))
+        self.assertEqual(self.rules(value), [("slack", False)])                  # own rule: prefix only
+        self.assertEqual(S.verdict(S.scan_report(("x " + value + "\n").encode()))["action"], S.QUARANTINE)
 
     def test_every_new_prefix_quarantines_with_a_value_and_restricts_alone(self):
         new = {"aws-key-id", "slack", "stripe", "gitlab"}
@@ -210,22 +223,146 @@ class RedactShapeTests(unittest.TestCase):
         self.assertEqual(self.rules("Authorization: " + word + self.s.body(24)), [("bearer", True)])
         self.assertEqual(self.rules(word.lower() + self.s.body(8)), [("bearer", True)])
         self.assertEqual(self.rules(word + self.s.body(7)), [("bearer", False)])
-        self.assertEqual(self.rules(word + "authorization"), [("bearer", False)])
-        self.assertEqual(self.rules(word + "Authentication"), [("bearer", False)])
+
+    def test_bearer_own_rule_accepts_every_whitespace_separator(self):
+        """BLOCK F1: the scanner's own rule matches the redactor's \\s+, not just spaces and tabs."""
+        for name, sep in SEPARATORS.items():
+            with self.subTest(sep=name):
+                self.assertEqual(self.rules("Be" + "arer" + sep + self.s.body(12)), [("bearer", True)])
+
+    def test_bearer_letters_only_values_quarantine_whatever_their_case(self):
+        """v2g9 F4: letters-only values are valid token shapes; no plain-word exception, prose fails closed."""
+        letters = "abcdefghijklmnopqrstuvwxyz"
+        word = "Be" + "arer "
+        for n in (8, 20, 32, 40, 64):
+            lower = "".join(self.s.rng.choice(letters) for _ in range(n))
+            cases = {"lower": lower, "title": lower[0].upper() + lower[1:],
+                     "mixed": "".join(c.upper() if self.s.rng.random() < 0.5 else c for c in lower)}
+            for name, value in cases.items():
+                with self.subTest(n=n, case=name):
+                    self.assertEqual(self.rules(word + value), [("bearer", True)])
+                    self.assertEqual(S.verdict(S.scan_report((word + value + "\n").encode()))["action"],
+                                     S.QUARANTINE)
+        self.assertEqual(self.rules(word + "authorization"), [("bearer", True)])   # prose fails closed
+        self.assertEqual(self.rules(word + "abcdefg"), [("bearer", False)])        # 7 characters: prefix only
 
     def test_url_userinfo_and_named_credentials_restrict_only(self):
-        self.assertEqual(self.rules("https://bob:" + self.s.body(12) + "@example.invalid/x"),
-                         [("url-userinfo", False)])
-        self.assertEqual(self.rules("pass" + "word = " + self.s.body(12)), [("named-credential", False)])
+        floor = lambda text: [(f["rule"], f["exposure"]) for f in S.scan_report(("x " + text + "\n").encode())]  # noqa
+        self.assertEqual(floor("https://bob:" + self.s.body(12) + "@example.invalid/x"),
+                         [(S.FLOOR + "url-userinfo", False)])
+        self.assertEqual(floor("pass" + "word = " + self.s.body(12)), [(S.FLOOR + "named-credential", False)])
         self.assertEqual(S.verdict(S.scan_report(("pass" + "word = " + self.s.body(12)).encode()))["action"],
                          S.RESTRICT)
 
-    def test_the_restrict_shapes_are_redacts_own(self):
+    def test_the_restrict_kinds_are_redactor_kinds(self):
         import redact
+        self.assertEqual(S.REDACT_RESTRICT_KINDS, {"url-userinfo", "named-credential"})
+        self.assertTrue(S.REDACT_RESTRICT_KINDS <= {k for k, _ in redact.PATTERNS})
+
+
+def _redact_samples(s, low=False):
+    """{kind: [(label, value)]}: one or more synthetic instances of every shape redact.py knows, built at run time
+    from split literals (this file holds no token-shaped literal). The text scanned is label + SEP + value, so the
+    separator forms below exercise each shape's own whitespace handling where the label is part of the shape."""
+    rng = s.rng
+    up = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    b64 = ALNUM + "/+"
+
+    def r(n, alphabet=ALNUM):
+        if low:     # repeated characters: entropy rules never fire, so only a shape rule (or the floor) catches it
+            return ((alphabet[0] * 3 + alphabet[-1]) * n)[:n]
+        return "".join(rng.choice(alphabet) for _ in range(n))
+
+    begin, end = "-----BEG" + "IN RSA PRIVATE KEY-----", "-----EN" + "D RSA PRIVATE KEY-----"
+    return {
+        "rclone-token": [("to" + "ken =", "{\"access" + "_token\":\"" + r(30) + "\"}")],
+        "oauth-json": [("{\"refresh" + "_token\":", "\"" + r(30) + "\"}")],
+        "anthropic": [("key:", "sk" + "-ant-" + r(32))],
+        "openai": [("key:", "sk" + "-proj-" + r(32))],
+        "github": [("key:", "gh" + "p_" + r(36))],
+        "aws-key-pair": [("AK" + "IA" + r(16, up), r(40, b64))],
+        "aws-key": [("id:", "AK" + "IA" + r(16, up))],
+        "aws-secret": [("aws_sec" + "ret_access_key =", r(40, b64))],
+        "stripe": [("key:", "sk" + "_live_" + r(24))],
+        "stripe-webhook": [("key:", "wh" + "sec_" + r(32))],
+        "huggingface": [("key:", "h" + "f_" + r(34))],
+        "gitlab": [("key:", "gl" + "pat-" + r(24))],
+        "sendgrid": [("key:", "S" + "G." + r(22) + "." + r(43))],
+        "google-oauth": [("key:", "ya" + "29." + r(40))],
+        "google-api": [("key:", "AI" + "za" + r(35))],
+        "google-refresh": [("key:", "1/" + "/" + r(40))],
+        "dropbox": [("key:", "s" + "l." + r(60))],
+        "slack": [("key:", "xo" + "xb-" + r(10, "0123456789") + "-" + r(24))],
+        "npm": [("key:", "np" + "m_" + r(36))],
+        "jwt": [("key:", s.jwt())],
+        "bearer": [("Authorization: Be" + "arer", r(24)), ("Authorization: Be" + "arer", r(24, ALNUM[:52]))],
+        "url-userinfo": [("url:", "https://bob:" + r(12) + "@example.invalid/x")],
+        "named-credential": [("pass" + "word =", r(14)), ("dbPass" + "word =", r(14))],
+        "pem": [(begin, "MIIE" + r(60, b64) + "\n" + r(60, b64) + "\n" + end)],
+    }
+
+
+SEPARATORS = {"space": " ", "tab": "\t", "lf": "\n", "crlf": "\r\n"}
+
+
+def _wrapped(text, width=16):
+    """The text hard-wrapped at spaces to `width` columns, as a pager or a mail client would wrap a report."""
+    out, line = [], ""
+    for word in text.split(" "):
+        if line and len(line) + 1 + len(word) > width:
+            out.append(line)
+            line = word
+        else:
+            line = (line + " " + word) if line else word
+    return "\n".join(out + [line])
+
+
+class RedactParityTests(unittest.TestCase):
+    """Main's direction after code-inspection BLOCK F1/F2: anything redact.py detects can never scan clean, in any
+    whitespace or wrapping form or one encoding level deep. Generated from redact's own pattern table, so a new
+    redactor kind without a sample here fails."""
+
+    def setUp(self):
+        import redact
+        self.redact = redact
+        random_ones, low_ones = _redact_samples(Secrets(SEED + 2)), _redact_samples(Secrets(SEED + 3), low=True)
+        self.samples = {k: random_ones[k] + low_ones[k] for k in random_ones}
+
+    def test_every_redactor_kind_has_a_sample(self):
+        kinds = {kind for kind, _ in self.redact.PATTERNS} | {"pem"}
+        self.assertEqual(sorted(kinds - set(self.samples)), [], "redactor kinds with no scanner parity sample")
+        self.assertEqual(sorted(set(self.samples) - kinds), [], "samples for kinds the redactor no longer has")
+
+    def forms(self, label, value):
+        for name, sep in SEPARATORS.items():
+            yield name, "x " + label + sep + value + " y\n"
+        yield "wrapped", _wrapped("context words before " + label + " " + value + " and after") + "\n"
+
+    def test_every_redactor_kind_is_never_clean_in_any_whitespace_form(self):
+        for kind, instances in sorted(self.samples.items()):
+            for i, (label, value) in enumerate(instances):
+                self.assertTrue(self.redact.find(label + " " + value), "the %s sample is not a %s shape" % (kind, kind))
+                for form, text in self.forms(label, value):
+                    with self.subTest(kind=kind, instance=i, form=form):
+                        findings = S.scan_report(text.encode())
+                        self.assertNotEqual(S.verdict(findings)["action"], S.CLEAN)
+                        self.assertNotEqual(S.outward(findings, text), text, "the excerpt never leaves")
+
+    def test_every_redactor_kind_is_never_clean_one_encoding_deep(self):
+        for kind, instances in sorted(self.samples.items()):
+            for i, (label, value) in enumerate(instances):
+                text = (label + " " + value).encode()
+                for name, blob in (("base64", base64.b64encode(text)), ("hex", binascii.hexlify(text)),
+                                   ("url", urllib.parse.quote_from_bytes(text, safe="").encode())):
+                    with self.subTest(kind=kind, instance=i, encoding=name):
+                        self.assertNotEqual(S.verdict(S.scan_report(b"x " + blob + b"\n"))["action"], S.CLEAN)
+
+    def test_restrict_only_kinds_stay_restrict(self):
         for kind in ("url-userinfo", "named-credential"):
-            ours = sorted(rx.pattern for k, rx in S._RESTRICT_ONLY if k == kind)
-            theirs = sorted(p.pattern.encode() for k, p in redact.PATTERNS if k == kind)
-            self.assertEqual(ours, theirs)
+            label, value = self.samples[kind][0]
+            with self.subTest(kind=kind):
+                self.assertEqual(S.verdict(S.scan_report(("x " + label + " " + value + "\n").encode()))["action"],
+                                 S.RESTRICT)
 
 
 class TierTests(unittest.TestCase):
