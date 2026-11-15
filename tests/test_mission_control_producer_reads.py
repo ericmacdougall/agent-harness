@@ -411,6 +411,7 @@ class OutsideTheWindow(unittest.TestCase):
         hub = ev.Hub()
         health = col.Health(hub)
         owners = col.Owners(hub, health, CliRunner(home.home), None)
+        owners.pin_fn = lambda: SID   # goodqa#15961: App always wires the pinned session
         owners.run(time.time())
         row = health.rows["owners"]
         self.assertEqual((row["status"], row["truth"]), ("ok", "current"))
