@@ -1570,13 +1570,27 @@ def make_analyzer_class(cg):
                     break
             if program is None or program >= len(texts):
                 return set()
-            out = set()
+            from_opt = program > 0 and texts[program - 1] in PROGRAM_OPTS  # -c CODE, -m MODULE: the value is the program
+            if not from_opt and '/' not in texts[program] and '.' not in texts[program]:
+                return set()  # a subcommand (`deno run X`, `bun run X`, `node inspect X`), not a script: scan all
+            out, command_pos, after_wrapper = set(), False, False
             for j in range(program + 1, len(texts)):
-                prev = texts[j - 1]
-                prev_name = cg.norm_name(prev)
-                if prev.startswith('-') or prev_name in cg.SHELLS or prev_name in cg.INTERPRETERS \
-                        or INTERPRETER_NAME.fullmatch(prev_name):
+                t, prev = texts[j], texts[j - 1]
+                name_j = cg.norm_name(t)
+                if t == '--' or name_j in WRAPPER_NAMES or name_j in cg.SHELLS or name_j in cg.INTERPRETERS \
+                        or INTERPRETER_NAME.fullmatch(name_j):
+                    command_pos, after_wrapper = True, name_j in WRAPPER_NAMES  # a command line follows
                     continue
+                if command_pos:  # find the word that runs; it is never exempt
+                    if t.startswith('-') or re.fullmatch(r'[0-9][0-9.]*[smhd]?', t) or ASSIGNMENT_WORD.fullmatch(t):
+                        continue  # `timeout 5`, `env -i`, `env X=1`
+                    if after_wrapper and '/' not in t and '.' not in t:
+                        after_wrapper = False  # the wrapper's tool or subcommand: `npx vitest`, `uv run`
+                        continue
+                    command_pos = after_wrapper = False
+                    continue
+                if prev.startswith('-'):
+                    continue  # may be that option's value (`--require ./x.js`)
                 if path_operand(args[j], self.script_kill):
                     out.add(j)
             return out
