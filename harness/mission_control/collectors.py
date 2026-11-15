@@ -109,6 +109,16 @@ def producer_read(label: str, code: int, out, *, cap: int | None = None, ok_code
     return data, notes
 
 
+def outside_window(data) -> str:
+    """The disclosure for lines a producer could not parse outside the window its read covers (PR 234 v9, main's
+    decision): they do not make the read partial, and they are never hidden. Shown on the source-health row."""
+    block = data.get("read") if isinstance(data, dict) else None
+    count = block.get("outside_window") if isinstance(block, dict) else None
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return ""
+    return f"{count} older unreadable record{'s' if count != 1 else ''} outside this window"
+
+
 # Which sources feed each dataset the page shows. A source is a Health row name, or a ledger part ("ledger:<part>").
 # tests/test_mission_control_truth_chain.py derives this from a traced run of the real App and fails on any difference,
 # so a new collector, snapshot or cross-read cannot ship without its line here.
@@ -1036,7 +1046,7 @@ class Owners(Collector):
         self.claude_rows = rows[:self.MAX_ROWS]
         self.partial = dropped > 0 or len(rows) > self.MAX_ROWS  # the owner counts would be short: never shown as whole
         self.publish()
-        return f"{len(rows)} owners"
+        return "; ".join(filter(None, [f"{len(rows)} owners", outside_window(data)]))
 
     def codex_rows(self, now: float) -> list[dict]:
         rows = []
@@ -1499,6 +1509,7 @@ class Ledger(Collector):
             notes = notes + list(value.get("partial_notes") or [])
             value["partial_notes"] = [ev.short(n, 160) for n in notes[:5]]
             value["incomplete"] = value.get("incomplete") is True or bool(notes)
+            value["disclosed"] = outside_window(data)
         except Exception as exc:  # noqa: BLE001 - a failed source keeps its last good rows
             message = ev.short(str(exc), 160)
             with self.lock:
@@ -1537,8 +1548,10 @@ class Ledger(Collector):
         if not session:
             self.next_at = min(self.next_at, now + 10)  # main's session is learned from the owners read, seconds after start
             return "goals only: no main session known yet"
-        return (f"{len(self.parts['goals']['items'])} goals, {reqs['summary']['live']} live and "
-                f"{reqs['summary']['archived']} archived requirements")
+        told = [f"{part}: {self.parts[part]['disclosed']}" for part in ("requirements", "status")
+                if self.parts[part].get("disclosed") and self.parts[part].get("session") == session]
+        return "; ".join([f"{len(self.parts['goals']['items'])} goals, {reqs['summary']['live']} live and "
+                          f"{reqs['summary']['archived']} archived requirements"] + told)
 
     # -- parsers
     @staticmethod
