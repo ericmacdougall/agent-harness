@@ -144,6 +144,9 @@ export const CLAIMS = Object.freeze({
   progress: ['owners', 'events'],
   decisions: ['status'],
   chat: ['chat'],
+  // the Topology tab (goodqa#15950, T243-3): its counts rest on the org graph read (FEEDS.orggraph: the org-graph
+  // source's transcript, escalation and ticket reads, the owner rows and their feeds, and the pin)
+  topology: ['orggraph'],
 });
 // Which dataset each key of the store's state belongs to. null: page-local (a click, a filter, the clock), or the
 // truth data itself. A key that is missing here fails the gate test, so new server data cannot be shown ungated.
@@ -152,6 +155,7 @@ export const STATE_DATASETS = Object.freeze({
   asks: 'asks', asksResolved: 'asks', asksStale: 'asks', asksFlagged: 'asks', asksCleared: 'asks', asksArchive: 'asks',
   asksArchiveTotal: 'asks', asksSession: 'asks', asksSweptAt: 'asks',
   initiatives: 'initiatives', initiativesStale: 'initiatives', initiativesError: 'initiatives',
+  orggraph: 'orggraph',
   initiativesDerived: 'initiatives', initiativesUntracked: 'initiatives', initiativesHidden: 'initiatives', initiativesMtime: 'initiatives',
   events: 'events', lastEvent: 'events', feedSnapshot: 'events',
   messages: 'chat', chat: 'chat', sessions: 'chat', mainSession: 'chat', chatAvailability: 'chat', pending: 'chat',
@@ -166,7 +170,7 @@ export const SAFE_READS = Object.freeze({
   needs: { chat: 'a reply or decision on its way takes an ask off the waiting count only when its record is on hand; a missing chat read leaves every ask waiting' },
   initiatives: { asks: 'an initiative card adds "N open asks" only when it holds some' },
 });
-const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat' };
+const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat', orggraph: 'Topology' };
 const FACT_NAMES = { 'ledger:goals': 'Goal ledger (ah goals)', 'ledger:requirements': 'Requirements (ah requirements)', 'ledger:status': 'Status (ah status)',
   'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', sources: 'Event drops' };
 const LEDGER_DATASETS = ['goals', 'requirements', 'status'];
@@ -646,6 +650,13 @@ export function initiativesLine(state, fileText = '') {
   return `${g.count(state.initiativesDerived)} from live owners and GoodQA${untracked ? ` (${g.count(untracked)} with no ticket)` : ''}`
     + (fileText ? `; ${fileText}` : '')
     + (hidden ? `, so its other ${g.count(hidden)} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : '') + '.';
+}
+// T243-3: the Topology meta line; every count goes through the topology gate ("?" when the server sent none)
+export function topologyMeta(state, changed) {
+  const g = state.orggraph || {}, c = g.counts || {}, t = gate(state, 'topology');
+  return `${t.count(c.live_owners)} live of ${t.count(c.owner)} owners · ${t.count(c.subagent)} sub-agents · ${t.count(c.reviewer)} reviewers · ${t.count(c.work)} work items`
+    + `${c.hidden_agents ? ` · ${t.count(c.hidden_agents)} older agents not drawn` : ''} · graph last changed ${changed}`
+    + ` · session ${g.session ? String(g.session).slice(0, 8) : 'unknown'} · from ah owners, transcripts and GoodQA`;
 }
 export const initiativeCount = (state, n) => padded(countText(n, claim(state, 'initiatives'), true));
 export const atRiskEmpty = state => noneText(claim(state, 'initiatives'), 'Nothing open to rank.', 'open initiatives to rank');

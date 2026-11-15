@@ -1,5 +1,6 @@
 import { getState, subscribe, select, highlight } from './store.js';
 import { button, el } from './ui.js';
+import { topologyMeta } from './adapt.js';
 import { layout, describe, tree, cueForChange, cueForEvent, repos as recentRepos, nodeColor, severityColor, escalationColor,
   TYPE_COLORS, EVENT_MAP, LEVELS, UNKNOWN, ageText, isLive } from './org.js';
 
@@ -96,6 +97,7 @@ export async function mountScene() {
     const flat = [];
     const walk = (items, level) => items.forEach(entry => { flat.push([entry, level]); walk(entry.children, level + 1); });
     walk(entries, 1);
+    // held: a layout signature of the rows on hand, not a count shown to anyone
     const shape = flat.map(([entry, level]) => `${entry.node.id}:${level}:${entry.children.length}`).join('|');
     if (shape === listShape && listRows.size) {
       // Same tree, new details (PR 243 review F2): update each row in place, so a collapsed subtree stays collapsed
@@ -113,6 +115,7 @@ export async function mountScene() {
         const li = el('li');
         li.setAttribute('role', 'treeitem');
         li.setAttribute('aria-level', String(level));
+        // held: the tree position of a row on hand (ARIA), not a claim about how many there are
         li.setAttribute('aria-setsize', String(entries.length));
         li.setAttribute('aria-posinset', String(index + 1));
         li.dataset.nodeId = entry.node.id;
@@ -344,8 +347,7 @@ export async function mountScene() {
   function renderMeta(state) {
     const g = state.orggraph;
     if (!g) { meta.textContent = 'Waiting for the org graph from the server…'; return; }
-    const c = g.counts || {};
-    meta.textContent = `${c.live_owners ?? 0} live of ${c.owner ?? 0} owners · ${c.subagent ?? 0} sub-agents · ${c.reviewer ?? 0} reviewers · ${c.work ?? 0} work items${c.hidden_agents ? ` · ${c.hidden_agents} older agents not drawn` : ''} · graph last changed ${ageText(g.generated, state.now)} · session ${g.session ? String(g.session).slice(0, 8) : 'unknown'} · from ah owners, transcripts and GoodQA`;
+    meta.textContent = topologyMeta(state, ageText(g.generated, state.now));   // T243-3: through gate('topology')
     const gaps = document.getElementById('org-gaps');
     gaps.replaceChildren(...(g.gaps || []).map(text => el('li', '', text)));
   }
