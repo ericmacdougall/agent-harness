@@ -446,6 +446,8 @@ def with_episodes(home: Path, assessment: dict, prev=None, responses=None) -> di
     for r in assessment["rows"]:
         for a in r["actions"]:
             a["since"] = since.get(a["key"], early.get(a["key"], assessment["at"]))
+    void = prev.get("void")  # a partial view keeps the last full tick's voided responses (receipt v7 F1)
+    assessment["void"] = [v for v in void if isinstance(v, list) and len(v) == 2][:500] if isinstance(void, list) else []
     seen = {a["key"] for r in assessment["rows"] for a in r["actions"]}
     # episodes a cheap partial view cannot see (git conditions) are carried, so the next full tick keeps their start
     assessment["carry"] = dict(list({k: v for k, v in since.items() if k not in seen and isinstance(k, str)}
@@ -453,13 +455,48 @@ def with_episodes(home: Path, assessment: dict, prev=None, responses=None) -> di
     return assessment
 
 
-def tick(home: Path, session: str = "", now=None, owner_rows=None) -> dict:
+def tick(home: Path, session: str = "", now=None, owner_rows=None, ticket_check=None) -> dict:
     session = session or mission_session(home)
     if owner_rows is None and session:
         owner_rows = owner_rows_of(home, session, now)
     a = with_episodes(home, assess(home, session, now, owner_rows))
     a["partial"], a["carry"] = False, {}  # a full tick sees every condition: a key it lacks is resolved
+    a["void"] = lapsed_responses(home, a, read_responses(home), float(a["at"]), session, ticket_check)
     return save_snapshot(home, a)
+
+
+def lapsed_responses(home: Path, snapshot: dict, responses: list, now: float, session: str = "",
+                     ticket_check=None) -> list:
+    """Receipt v7 F1 (class): [[key, ts]] of each live ticket or ask response to a current action whose authority
+    has lapsed since `respond` checked it. A ticket must still be open and still carry the action's marker; an ask must
+    still be an open ask of the mission session (an answered ask is a lapse too: the owner now has to act on the
+    answer). Anything that cannot be told counts as lapsed, so an unreachable tracker re-raises the action rather than
+    hiding it. Owner responses need no re-check: they cite a launch that happened, and a stalled owner is its own
+    condition."""
+    current = {a.get("key") for r in snapshot.get("rows") or [] for a in r.get("actions") or []}
+    facts_of, asks, out = {}, None, []
+    for x in responses:
+        key, kind, ts = x.get("key"), x.get("kind"), x.get("ts")
+        if key not in current or kind not in ("ticket", "ask") or not isinstance(ts, (int, float)) \
+                or now - ts > RESPONSE_TTL_S:
+            continue
+        ok = False
+        with contextlib.suppress(Exception):
+            if kind == "ticket":
+                ref = str(x.get("ref") or "")
+                if ref not in facts_of:
+                    got = (ticket_check or ticket_facts)(ref)
+                    facts_of[ref] = got if isinstance(got, dict) else {"state": None}
+                parts = str(key).split(":", 2)
+                marker = ticket_marker(parts[0], parts[1], parts[2] if len(parts) > 2 else "")
+                ok = facts_of[ref].get("state") == "open" and marker in str(facts_of[ref].get("title") or "")
+            else:
+                mc = _mc()
+                asks = mc.ask_states(home, session or mission_session(home)) if asks is None else asks
+                ok = mc._ask(asks, x.get("ref"))[0] == "open"  # noqa: SLF001
+        if not ok:
+            out.append([key, ts])
+    return out[:500]
 
 
 def owner_rows_of(home: Path, session: str, now=None):
@@ -626,11 +663,12 @@ def respond(home: Path, goal_id: str, cond: str, kind: str, ref: str = "", sourc
 
 def unanswered(snapshot: dict, responses: list, now: float) -> list:
     out = []
+    void = {(v[0], v[1]) for v in snapshot.get("void") or [] if isinstance(v, list) and len(v) == 2}
     for r in snapshot.get("rows") or []:
         for a in r.get("actions") or []:
             since = a.get("since", snapshot.get("at", now))
             ok = [x for x in responses if x.get("key") == a.get("key") and float(x.get("ts", 0)) >= float(since)
-                  and now - float(x.get("ts", 0)) <= RESPONSE_TTL_S]
+                  and now - float(x.get("ts", 0)) <= RESPONSE_TTL_S and (x.get("key"), x.get("ts")) not in void]
             if not ok:
                 out.append({"goal": r["goal"], **a})
     return out
@@ -767,7 +805,8 @@ def ops_alerts(home: Path, now=None) -> list:
     out = []
     with contextlib.suppress(Exception):
         for r in ort.tick(home, now=now):
-            if r.get("action") in ("stuck", "launch-failed", "error"):
+            if r.get("action") in ("stuck", "launch-failed", "error", "bypass-stop-failed",
+                                   "bypass-stop-unconfirmed"):
                 out.append({"check": "drive", "key": f"owner:{r['goal']}:{r['action']}", "severity": "high",
                             "message": f"owner {r['goal']}: {r['action']} ({ort.clean(r.get('reason'), 160)})",
                             "detail": {"stop_block": False}})

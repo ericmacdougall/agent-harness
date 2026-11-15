@@ -774,6 +774,10 @@ class AuthorityBase(Base):
         p = mock.patch.object(mission_coverage, "mission_session_of", return_value=fx.MISSION)
         p.start()
         self.addCleanup(p.stop)
+        import command_guard
+        p = mock.patch.object(command_guard, "_pinned_home", return_value=str(self.home))  # v7 F4: answers home
+        p.start()
+        self.addCleanup(p.stop)
         self.write_runtime({"enabled": True})
 
     def write_runtime(self, data):
@@ -792,7 +796,7 @@ class AuthorityBase(Base):
     def grant_answer(self, scope="*", hours=24, chosen=None, **kw):
         q = ort.bypass_question(scope, hours) if "question" not in kw else kw.pop("question")
         chosen = ort.BYPASS_LABEL if chosen is None else chosen
-        options = kw.pop("options", [ort.BYPASS_LABEL, "No bypass: keep the configured mode"])
+        options = kw.pop("options", ort.bypass_options(scope, hours))
         session = kw.pop("session", fx.MISSION)
         uid = fx.answer(self.home, session, q, chosen, options=options, **kw)
         return f"answer:{session}/{uid}"
@@ -921,7 +925,7 @@ class BypassAuthorityTests(AuthorityBase):
     def test_bypass_ask_text_is_the_question_the_grant_checks(self):
         text = ort.ask_text("bypass", "*", 24)
         self.assertEqual(text["question"], ort.bypass_question("*", 24))
-        self.assertEqual(text["options"][0], ort.BYPASS_LABEL)
+        self.assertEqual(text["options"][0]["label"], ort.BYPASS_LABEL)
         ort.grant_bypass(self.home, "*", 24, self.grant_answer(options=text["options"]))
         self.assertEqual(self.launch_mode(), "bypassPermissions")
 
@@ -931,6 +935,194 @@ class BypassAuthorityTests(AuthorityBase):
             self.assertFalse(hasattr(ort, name), name)
         self.assertNotIn("permission_source", ort.DEFAULT_RUNTIME)
         self.assertNotIn("bypassPermissions", ort.PERMISSION_MODES)
+
+
+class BypassLapseTests(AuthorityBase):
+    """Receipt v7 F1/F2: a bypass session lives only while a grant covers it, and every launch records its mode."""
+    BUSY = {"id": "c9f43044", "sessionId": NEW_SID, "pid": 5, "status": "busy", "state": "working",
+            "name": "owner-solve"}
+
+    def setUp(self):
+        super().setUp()
+        self.calls, self.live, self.stop_code, self.stop_ignored, self.listing_ok = [], [], 0, False, True
+
+    def runner(self, argv, timeout=60, cwd=None):
+        self.calls.append(argv)
+        if argv[1:2] == ["agents"]:
+            if not self.listing_ok:
+                return 1, "Error: listing refused"
+            return 0, json.dumps(self.live)
+        if "--bg" in argv:
+            self.live = [dict(self.BUSY)]
+            return 0, "backgrounded · c9f43044 · owner-solve"
+        if argv[1:2] == ["stop"]:
+            if self.stop_code:
+                return self.stop_code, "stop failed"
+            if not self.stop_ignored:
+                for a in self.live:
+                    if a.get("id") == argv[2]:
+                        a.pop("pid", None)
+        return 0, ""
+
+    def stops(self):
+        return [c for c in self.calls if c[1:2] == ["stop"]]
+
+    def launches(self):
+        return [c for c in self.calls if "--bg" in c]
+
+    def launch_with_bypass(self, hours=2):
+        self.t0 = time.time()
+        self.answer = self.grant_answer(hours=hours)
+        ort.grant_bypass(self.home, "*", hours, self.answer, now=self.t0)
+        out = ort.tick(self.home, now=self.t0, runner=self.runner)
+        self.assertEqual(out[0]["action"], "launch", out)
+        argv = self.launches()[-1]
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "bypassPermissions")
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual(st["bypass"]["answer"], self.answer)
+        entry = st["launches"][-1]  # receipt v7 F2: the launch says its mode and the answer that granted it
+        self.assertEqual((entry["permission_mode"], entry["grant_answer"]), ("bypassPermissions", self.answer))
+        self.assertTrue(entry["grant_expires_at"])
+        self.calls = []
+
+    def test_lapse_expiry_mid_run_stops_busy_session_and_confirms(self):
+        self.launch_with_bypass(hours=2)
+        out = ort.tick(self.home, now=self.t0 + 600, runner=self.runner)  # inside the window: nothing stopped
+        self.assertEqual(self.stops(), [], out)
+        out = ort.tick(self.home, now=self.t0 + 2 * 3600 + 60, runner=self.runner)
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+        self.assertIn("stopped and confirmed", out[0]["reason"])
+        self.assertEqual(self.stops(), [["claude", "stop", "c9f43044"]])
+        self.assertEqual(self.launches(), [])  # nothing relaunches in the same tick
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual(st["bypass"], {})
+        self.assertEqual(st["bypass_history"][-1]["answer"], self.answer)
+        log = [json.loads(x) for x in (self.home / ".agent-harness/owners/solve/launch.log").read_text().splitlines()]
+        self.assertEqual(log[-1]["event"], "bypass-ended")
+        self.assertEqual(log[-1]["grant_answer"], self.answer)
+
+    def test_lapse_revoke_mid_run_stops_busy_session(self):
+        self.launch_with_bypass(hours=24)
+        ort.revoke_bypass(self.home, "*")
+        out = ort.tick(self.home, now=self.t0 + 120, runner=self.runner)
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+        self.assertEqual(self.stops(), [["claude", "stop", "c9f43044"]])
+
+    def test_lapse_answer_unresolvable_fails_closed(self):
+        self.launch_with_bypass(hours=24)
+        empty = Path(tempfile.mkdtemp(dir=self.home))
+        with mock.patch("command_guard._pinned_home", return_value=str(empty)):
+            ort._ANSWER_CACHE.clear()
+            out = ort.tick(self.home, now=self.t0 + 120, runner=self.runner)
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_lapse_stop_failure_reported_never_assumed(self):
+        self.launch_with_bypass(hours=2)
+        for attr, value in (("stop_code", 1), ("stop_ignored", True)):
+            setattr(self, attr, value)
+            self.calls = []
+            out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=self.runner)
+            self.assertEqual(out[0]["action"], "bypass-stop-failed", (attr, out))
+            self.assertEqual(self.launches(), [])
+            st = ort.load_state(self.home, "solve")
+            self.assertEqual(st["bypass"]["answer"], self.answer)  # still held: retried next tick
+            self.assertIn("stop_failed_at", st["bypass"])
+            setattr(self, attr, 0 if attr == "stop_code" else False)
+        self.calls = []
+        out = ort.tick(self.home, now=self.t0 + 4 * 3600, runner=self.runner)  # the retry succeeds
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+
+    def test_lapse_listing_refused_reports_unconfirmed(self):
+        self.launch_with_bypass(hours=2)
+        self.listing_ok = False
+        out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=self.runner)
+        actions = {r["action"] for r in out}
+        self.assertEqual(actions, {"bypass-stop-unconfirmed"}, out)
+        self.assertEqual(self.launches(), [])
+        self.assertTrue(ort.load_state(self.home, "solve")["bypass"])
+
+    def test_lapse_enforced_while_runtime_disabled(self):
+        self.launch_with_bypass(hours=2)
+        self.write_runtime({"enabled": False})
+        out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=self.runner)
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual(self.launches(), [])
+        self.calls = []
+        out = ort.tick(self.home, now=self.t0 + 4 * 3600, runner=self.runner)  # disabled: nothing else runs
+        self.assertEqual(self.calls, [], out)
+
+    def test_lapse_session_already_gone_clears_without_stop(self):
+        self.launch_with_bypass(hours=2)
+        self.live = []
+        out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=self.runner)
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+        self.assertEqual(self.stops(), [])
+
+    def test_launch_audit_records_mode_and_grant(self):
+        out = ort.tick(self.home, now=time.time(), runner=self.runner)  # no grant: configured mode
+        self.assertEqual(out[0]["action"], "launch", out)
+        entry = ort.load_state(self.home, "solve")["launches"][-1]
+        self.assertEqual(entry["permission_mode"], "auto")
+        self.assertIsNone(entry["grant_answer"])
+
+
+class AnswerBindingTests(AuthorityBase):
+    """Receipt v7 F3-F5: options bound exactly, answers read only from the pinned home, resolves cached."""
+
+    def test_options_must_equal_generated_labels_and_descriptions(self):
+        good = ort.bypass_options("*", 24)
+        bad = [[good[0]], [dict(good[0], description="no prompts, forever"), good[1]],
+               [good[0], dict(good[1], label="Maybe")], [good[0], good[1], {"label": "Other", "description": ""}],
+               [good[1], good[0]], [ort.BYPASS_LABEL, "No bypass: keep the configured mode"]]
+        for options in bad:
+            with self.assertRaises(ort.OwnerError, msg=options):
+                ort.grant_bypass(self.home, "*", 24, self.grant_answer(options=options))
+        ort.grant_bypass(self.home, "*", 24, self.grant_answer(options=good))  # control
+        self.assertEqual(self.launch_mode(), "bypassPermissions")
+
+    def test_park_options_bound(self):
+        until = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 86400))
+        q = ort.park_question("solve", until)
+        good = ort.park_options("solve", until)
+        uid = fx.answer(self.home, fx.MISSION, q, good[0]["label"],
+                        options=[dict(good[0], description="park it, and also bypass"), good[1]])
+        with self.assertRaises(ort.OwnerError):
+            ort.park_goal(self.home, "solve", until, f"answer:{fx.MISSION}/{uid}")
+
+    def test_ah_home_never_relocates_where_answers_are_read(self):
+        forged = Path(tempfile.mkdtemp(dir=self.home))
+        uid = fx.answer(forged, fx.MISSION, ort.bypass_question("*", 24), ort.BYPASS_LABEL,
+                        options=ort.bypass_options("*", 24))
+        with mock.patch.dict(os.environ, {"AH_HOME": str(forged)}):
+            # the harness home moved to `forged`, and the answer exists only in its transcripts: refused, because
+            # answers are read from the pinned account home whatever AH_HOME says
+            with self.assertRaises(ort.OwnerError):
+                ort.grant_bypass(forged, "*", 24, f"answer:{fx.MISSION}/{uid}")
+            ort.grant_bypass(forged, "*", 24, self.grant_answer())  # control: the pinned home's answer grants
+
+    def test_resolve_cached_until_transcript_changes(self):
+        import command_guard
+        src = self.grant_answer()
+        real = command_guard.resolve_user_source
+        with mock.patch.object(command_guard, "resolve_user_source", side_effect=real) as spy:
+            ort._ANSWER_CACHE.clear()
+            for _ in range(3):
+                ort.answer_at(self.home, src, ort.bypass_question("*", 24), ort.bypass_options("*", 24), time.time())
+            self.assertEqual(spy.call_count, 1)
+            fx.human_turn(self.home, fx.MISSION, "unrelated")  # transcript grows: read again
+            ort.answer_at(self.home, src, ort.bypass_question("*", 24), ort.bypass_options("*", 24), time.time())
+            self.assertEqual(spy.call_count, 2)
+
+    def test_cached_answer_still_ages_out(self):
+        src = self.grant_answer()
+        q, opts = ort.bypass_question("*", 24), ort.bypass_options("*", 24)
+        ort.answer_at(self.home, src, q, opts, time.time(), ort.ANSWER_MAX_AGE_S)
+        with self.assertRaises(ort.OwnerError):
+            ort.answer_at(self.home, src, q, opts, time.time() + 2 * 86400, ort.ANSWER_MAX_AGE_S)
+        with self.assertRaises(ort.OwnerError):  # future-dated against the caller's clock
+            ort.answer_at(self.home, src, q, opts, time.time() - 3600)
 
 
 class ListingTests(Base):

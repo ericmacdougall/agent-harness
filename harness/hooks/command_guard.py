@@ -8849,8 +8849,10 @@ def resolve_user_source(source, now=None, max_age=None, home=None):
         raise ValueError('the user source is older than %d hours; ask again' % (max_age // 3600))
     if at > now + 300:
         raise ValueError('the user source is dated in the future')
+    options = [{'label': str(o.get('label')), 'description': str(o.get('description') or '')}
+               for o in questions[0].get('options') or [] if isinstance(o, dict)]
     return {'kind': 'answer', 'session': session, 'uid': uid.lower(), 'at': at, 'text': selected,
-            'question': question, 'predefined': predefined}
+            'question': question, 'predefined': predefined, 'options': options}
 
 
 def _canonical_source(source):

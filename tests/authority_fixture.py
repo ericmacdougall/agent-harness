@@ -35,7 +35,8 @@ def answer(home, session, question, chosen, options=None, ts=None, multi=False, 
     uid, use = str(_uuid.uuid4()), "toolu_" + _uuid.uuid4().hex[:20]
     options = options or [chosen, "No"]
     asked = questions or [{"question": question, "header": "Owners", "multiSelect": multi,
-                           "options": [{"label": o, "description": o} for o in options]}]
+                           "options": [o if isinstance(o, dict) else {"label": o, "description": o}
+                                       for o in options]}]
     ask = {"type": "assistant", "uuid": str(_uuid.uuid4()), "timestamp": _stamp(ts), "sessionId": session,
            "isSidechain": sidechain,
            "message": {"role": "assistant", "content": [{"type": "tool_use", "id": use, "name": "AskUserQuestion",

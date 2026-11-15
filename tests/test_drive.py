@@ -280,6 +280,10 @@ class ParkAuthorityTests(Base):
         p = mock.patch.object(mission_coverage, "mission_session_of", return_value=MISSION)
         p.start()
         self.addCleanup(p.stop)
+        import command_guard
+        p = mock.patch.object(command_guard, "_pinned_home", return_value=str(self.home))  # v7 F4: answers home
+        p.start()
+        self.addCleanup(p.stop)
         self.until = time.strftime("%Y-%m-%d", time.gmtime(time.time() + 3 * 86400))
 
     def park_answer(self, goal="solve", until=None, chosen=None, **kw):
@@ -287,8 +291,8 @@ class ParkAuthorityTests(Base):
         q = kw.pop("question", None) or ort.park_question(goal, until)
         chosen = ort.park_label(goal, until) if chosen is None else chosen
         session = kw.pop("session", MISSION)
-        uid = fx.answer(self.home, session, q, chosen, options=[ort.park_label(goal, until), f"Keep {goal} active"],
-                        **kw)
+        options = kw.pop("options", ort.park_options(goal, until))
+        uid = fx.answer(self.home, session, q, chosen, options=options, **kw)
         return f"answer:{session}/{uid}"
 
     def required(self, goal="solve"):
@@ -490,6 +494,49 @@ class TicketAssociationTests(Base):
         with self.assertRaises(drive.DriveError):
             self.respond("MERGED_NOT_RELEASED", "goodqa#43", second[:12])
 
+
+    def test_response_lapse_voids_ticket_at_next_full_tick(self):
+        """Receipt v7 F1 (class): a ticket that answered an action and is later closed, retitled, missing or
+        unknown no longer answers it; the full tick voids the response and the action is required again."""
+        self.tickets["goodqa#30"] = {"state": "open", "title": "[drive:solve:t1] redesign the login flow"}
+        now = time.time()
+        row = drive.respond(self.home, "solve", "REVIEW_LOOP", "ticket", "goodqa#30", detail="t1", now=now,
+                            ticket_check=self.lookup)
+        snap = drive.tick(self.home, MISSION, now=now + 5, owner_rows=[], ticket_check=self.lookup)
+        keys = {a["key"] for r in snap["rows"] for a in r["actions"]}
+        self.assertIn("solve:REVIEW_LOOP:t1", keys)
+        self.assertEqual(snap["void"], [])  # still open with its marker: still answers
+        self.assertNotIn("solve:REVIEW_LOOP:t1", {a["key"] for a in drive.unanswered(snap, [row], now + 6)})
+        for i, lapsed in enumerate(({"state": "closed", "title": "[drive:solve:t1] redesign the login flow"},
+                                    {"state": "open", "title": "redesign the login flow"},
+                                    {"state": "missing"}, {"state": None, "title": "[drive:solve:t1] x"})):
+            self.tickets["goodqa#30"] = lapsed
+            snap = drive.tick(self.home, MISSION, now=now + 10 + i, owner_rows=[], ticket_check=self.lookup)
+            self.assertEqual(snap["void"], [[row["key"], row["ts"]]], lapsed)
+            self.assertTrue(drive._signed_ok(self.home, snap))  # the void list is inside the signature
+            self.assertIn("solve:REVIEW_LOOP:t1",
+                          {a["key"] for a in drive.unanswered(snap, drive.read_responses(self.home), now + 20)})
+
+    def test_response_lapse_voids_ask_no_longer_open(self):
+        import mission_coverage as mc
+        asks = {"w00000000001": {"state": "open", "note": "solve: grant for the deploy key"}}
+        now = time.time()
+        with mock.patch.object(mc, "ask_states", lambda h, s: asks):
+            row = drive.respond(self.home, "solve", "HELP_OPEN", "ask", "w00000000001", detail="t2", now=now)
+            snap = {"at": now, "rows": [{"goal": "solve", "actions": [
+                {"key": row["key"], "cond": "HELP_OPEN", "since": now - 5, "action": "x"}]}]}
+            self.assertEqual(drive.lapsed_responses(self.home, snap, [row], now + 5, MISSION), [])
+            asks["w00000000001"] = {"state": "resolved", "note": ""}
+            void = drive.lapsed_responses(self.home, snap, [row], now + 5, MISSION)
+        self.assertEqual(void, [[row["key"], row["ts"]]])
+        self.assertEqual(len(drive.unanswered(dict(snap, void=void), [row], now + 6)), 1)
+        with mock.patch.object(mc, "ask_states", side_effect=RuntimeError("wal unreadable")):  # unknown: lapsed
+            self.assertEqual(drive.lapsed_responses(self.home, snap, [row], now + 5, MISSION), void)
+
+    def test_partial_view_keeps_the_last_void(self):
+        prev = {"void": [["solve:REVIEW_LOOP:t1", 1.0]], "rows": []}
+        a = drive.with_episodes(self.home, {"at": NOW, "rows": []}, prev=prev, responses=[])
+        self.assertEqual(a["void"], [["solve:REVIEW_LOOP:t1", 1.0]])
 
 class NewConditionTests(Base):
     def test_condition_owners_unknown_never_claims_unowned(self):

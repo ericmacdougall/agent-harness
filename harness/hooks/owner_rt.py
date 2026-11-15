@@ -285,34 +285,81 @@ def park_label(goal: str, until: str) -> str:
     return f"Park {goal} until {until}"
 
 
+def bypass_options(scope: str, hours: int) -> list:
+    """The exact options (label and description) the grant question must offer (receipt v7 F3)."""
+    who = "every owner" if scope == "*" else f"the owner of {scope}"
+    return [{"label": BYPASS_LABEL,
+             "description": f"{who} runs with no permission prompts for {int(hours)} hours from this answer; the "
+                            "runtime stops any such session when the window ends or the grant is revoked"},
+            {"label": "No bypass: keep the configured mode",
+             "description": "owners keep the configured permission mode (auto by default)"}]
+
+
+def park_options(goal: str, until: str) -> list:
+    return [{"label": park_label(goal, until),
+             "description": f"the drive loop shows no required actions for {goal} through {until} (UTC)"},
+            {"label": f"Keep {goal} active", "description": f"the drive loop keeps requiring actions for {goal}"}]
+
+
 def _answer_format(answer) -> None:
     if not isinstance(answer, str) or not ANSWER_RE.match(answer):
         raise OwnerError("--answer must be exactly answer:<session>/<uuid>: the user's AskUserQuestion reply "
                          "(`ah user-msg --recent 3` prints it); a user: turn, an excerpt or any prose never counts")
 
 
-def answer_at(home: Path, answer: str, question: str, label: str, now: float, max_age=None) -> float:
+_ANSWER_CACHE = {}
+
+
+def _resolve_answer(answer: str) -> dict:
+    """command_guard.resolve_user_source, read from the account home pinned from the password database: never $HOME,
+    and never AH_HOME (receipt v7 F4: a relocated harness home cannot relocate the record of the user's answers).
+    Cached per process by the transcript's size and mtime (receipt v7 F5), so one tick or one hook call resolves each
+    answer once; a changed transcript is read again."""
+    import command_guard  # noqa: PLC0415 - installed beside this file
+    import provenance  # noqa: PLC0415
+    session = _answer_session(answer)
+    try:
+        st = provenance.find_transcript(session, Path(command_guard._pinned_home()) / ".claude").stat()  # noqa: SLF001
+        key = (answer, st.st_size, st.st_mtime_ns)
+    except Exception:  # noqa: BLE001 - the resolver below reports why
+        key = None
+    if key is not None and key in _ANSWER_CACHE:
+        return _ANSWER_CACHE[key]
+    # now=inf: neither the age nor the future-date check applies here; answer_at applies both to its own clock, so a
+    # cached result never carries a stale age decision
+    got = command_guard.resolve_user_source(answer, now=float("inf"))
+    if key is not None:
+        if len(_ANSWER_CACHE) > 256:
+            _ANSWER_CACHE.clear()
+        _ANSWER_CACHE[key] = got
+    return got
+
+
+def answer_at(home: Path, answer: str, question: str, options: list, now: float, max_age=None) -> float:
     """The time of the user's answer when `answer` (answer:<session>/<uuid>) is a single-question, single-choice
-    AskUserQuestion reply of the main conversation whose structured answer keys exactly `question` with exactly the
-    predefined option `label`; else OwnerError. Whole-string equality only: nothing in the user's words is parsed."""
+    AskUserQuestion reply of the main conversation that asked exactly `question` with exactly `options` (labels and
+    descriptions, receipt v7 F3) and whose structured answer chose the first option; else OwnerError. Whole-string
+    equality only: nothing in the user's words is parsed."""
     _answer_format(answer)
     try:
-        import command_guard  # noqa: PLC0415 - installed beside this file
-        # The transcripts are read from the same home whose authority.json is being judged. Without AH_HOME that is
-        # the account home pinned from the password database (command_guard's default), never $HOME; with AH_HOME
-        # (tests, a relocated harness) the records and the transcripts move together, so a forged home grants only
-        # inside itself and the real tick never reads it.
-        pinned = None if not os.environ.get("AH_HOME") else str(home)
-        got = command_guard.resolve_user_source(answer, now=now, max_age=max_age, home=pinned)
+        got = _resolve_answer(answer)
     except ValueError as exc:
         raise OwnerError("the answer does not resolve: " + clean(str(exc), 200)) from None
     except Exception as exc:  # noqa: BLE001 - anything that cannot prove the answer refuses
         raise OwnerError("the answer does not resolve: " + clean(type(exc).__name__, 60)) from None
     if got.get("question") != question:
         raise OwnerError("the user answered a different question; ask exactly: " + question)
-    if got.get("text") != label or not got.get("predefined"):
-        raise OwnerError(f"the user did not choose the option {label!r}")
-    return float(got["at"])
+    if got.get("options") != options:
+        raise OwnerError("the question did not offer exactly the generated options (labels and descriptions); "
+                         "ask it with `owner_rt.py ask-text`")
+    if got.get("text") != options[0]["label"] or not got.get("predefined"):
+        raise OwnerError(f"the user did not choose the option {options[0]['label']!r}")
+    at = float(got["at"])
+    if max_age is not None and now - at > max_age:
+        raise OwnerError(f"the answer is older than {int(max_age // 3600)} hours; ask again")
+    if at > now + 300:
+        raise OwnerError("the answer is dated in the future")
+    return at
 
 
 def _answer_session(answer: str) -> str:
@@ -388,7 +435,7 @@ def grant_bypass(home: Path, scope: str, hours: int, answer: str, now=None) -> d
     _check_scope(home, scope)
     hours = _check_hours(hours)
     _mission_answer(home, answer)
-    at = answer_at(home, answer, bypass_question(scope, hours), BYPASS_LABEL, now, ANSWER_MAX_AGE_S)
+    at = answer_at(home, answer, bypass_question(scope, hours), bypass_options(scope, hours), now, ANSWER_MAX_AGE_S)
     if at + hours * 3600 <= now:
         raise OwnerError("that answer's window has already ended")
     row = {"scope": scope, "hours": hours, "answer": answer, "answered_at": now_iso(at),
@@ -420,7 +467,8 @@ def bypass_grant(home: Path, goal: str, now=None):
         try:
             hours = _check_hours(row.get("hours"))
             _mission_answer(home, str(row.get("answer") or ""))  # at use too: a row citing another session is void
-            at = answer_at(home, str(row.get("answer") or ""), bypass_question(row["scope"], hours), BYPASS_LABEL, now)
+            at = answer_at(home, str(row.get("answer") or ""), bypass_question(row["scope"], hours),
+                           bypass_options(row["scope"], hours), now)
         except OwnerError:
             continue
         if at <= now + 300 and now < at + hours * 3600:
@@ -434,7 +482,7 @@ def park_goal(home: Path, goal: str, until: str, answer: str, now=None) -> dict:
         raise OwnerError(f"goal {goal} is not in goals.json")
     end = until_ts(until)
     _mission_answer(home, answer)
-    at = answer_at(home, answer, park_question(goal, until), park_label(goal, until), now, ANSWER_MAX_AGE_S)
+    at = answer_at(home, answer, park_question(goal, until), park_options(goal, until), now, ANSWER_MAX_AGE_S)
     if end <= now:
         raise OwnerError("--until is in the past")
     if end - at > PARK_MAX_DAYS * 86400:
@@ -467,7 +515,7 @@ def active_park(home: Path, goal: str, now=None):
             until = str(row.get("until") or "")
             end = until_ts(until)
             _mission_answer(home, str(row.get("answer") or ""))  # at use too
-            at = answer_at(home, str(row.get("answer") or ""), park_question(goal, until), park_label(goal, until),
+            at = answer_at(home, str(row.get("answer") or ""), park_question(goal, until), park_options(goal, until),
                            now)
         except OwnerError:
             continue
@@ -479,13 +527,13 @@ def active_park(home: Path, goal: str, now=None):
 def ask_text(kind: str, scope: str = "", hours: int = 0, goal: str = "", until: str = "") -> dict:
     """The exact AskUserQuestion main must ask (one question, single choice) for a grant or a park."""
     if kind == "bypass":
-        q, label = bypass_question(scope, _check_hours(hours)), BYPASS_LABEL
-        other = "No bypass: keep the configured mode"
+        q, options = bypass_question(scope, _check_hours(hours)), bypass_options(scope, hours)
     else:
         until_ts(until)
-        q, label, other = park_question(goal, until), park_label(goal, until), f"Keep {goal} active"
-    return {"question": q, "options": [label, other], "multiSelect": False,
-            "rule": "ask this one question alone, word for word; only the first option grants"}
+        q, options = park_question(goal, until), park_options(goal, until)
+    return {"question": q, "options": options, "multiSelect": False,
+            "rule": "ask this one question alone, word for word, with exactly these two options (label and "
+                    "description); only the first option grants"}
 
 
 def claude_bin() -> str:
@@ -975,16 +1023,17 @@ def session_problem(rec) -> str:
     return ""
 
 
-def stop_idle_sessions(cfg: dict, state: dict, runner=_run) -> str:
+def stop_idle_sessions(cfg: dict, state: dict, runner=_run, busy_too: bool = False) -> str:
     """Stop every live session of this owner and prove it: '' when none is left, else why not (receipt v3 F3).
-    Re-lists right before stopping and stops only sessions still idle, checks each `claude stop` exit code, then
-    re-lists and requires that no live session of this owner remains."""
+    Re-lists right before stopping and stops only sessions still idle (every session with busy_too, for a lapsed
+    bypass grant), checks each `claude stop` exit code, then re-lists and requires that no live session of this
+    owner remains."""
     try:
         live = owner_sessions(state, bg_sessions(cfg, runner))
     except Exception as exc:  # noqa: BLE001
         return "could not list sessions before stopping: " + clean(str(exc), 120)
     for a in live:
-        if not (a.get("status") == "idle" and a.get("state") == "done"):
+        if not busy_too and not (a.get("status") == "idle" and a.get("state") == "done"):
             return f"session {clean(a.get('id') or a.get('sessionId'), 40)} is working again"
         if not a.get("id"):
             return f"live session {clean(a.get('sessionId'), 40)} has no id to stop"
@@ -1040,11 +1089,70 @@ def due_reason(home: Path, goal: str, state: dict, now: float) -> str:
     return ""
 
 
+def bypass_lapse(home: Path, state: dict, now: float) -> str:
+    """Why the bypass session this owner was launched with has lost its authority ('' when it has not, or when the
+    owner was not launched with bypass): its grant expired, was revoked, or its answer no longer resolves."""
+    held = state.get("bypass") or {}
+    if not held:
+        return ""
+    if bypass_grant(home, state["goal"], now) is not None:
+        return ""
+    return (f"the bypassPermissions grant for {state['goal']} (answer {clean(held.get('answer'), 120)}, until "
+            f"{held.get('expires_at') or '?'}) no longer holds: expired, revoked, or its answer does not resolve")
+
+
+def end_lapsed_bypass(home: Path, goal: str, state: dict, cfg: dict, sessions, now: float, runner=_run,
+                      dry_run: bool = False):
+    """Receipt v7 F1: a session launched with bypassPermissions lives only while a grant covers its goal. When the
+    grant lapses, every live session of the owner (busy too) is stopped and the stop is confirmed by a fresh
+    listing; a failed or unconfirmed stop is reported every tick until it succeeds, never assumed. None when there is
+    nothing to end; else the tick result. Called with the goal lock held."""
+    lapse = bypass_lapse(home, state, now)
+    if not lapse:
+        return None
+    out = {"goal": goal, "reason": lapse}
+    if sessions is None:
+        out.update(action="bypass-stop-unconfirmed", reason=lapse + "; the session listing is unreadable, so the "
+                   "session cannot be stopped or shown stopped")
+    elif not owner_sessions(state, sessions):
+        out.update(action="bypass-ended", reason=lapse + "; no live session remains")
+    elif dry_run:
+        out.update(action="bypass-stop", reason=lapse)
+        return out
+    elif not cfg.get("claude"):
+        out.update(action="bypass-stop-failed", reason=lapse + "; no claude binary to stop the session with")
+    else:
+        try:
+            problem = stop_idle_sessions(cfg, state, runner, busy_too=True)
+        except Exception as exc:  # noqa: BLE001
+            problem = "stop raised " + clean(f"{type(exc).__name__}: {exc}", 120)
+        out.update(action="bypass-stop-failed" if problem else "bypass-ended",
+                   reason=lapse + ("; stop failed: " + problem if problem else "; stopped and confirmed"))
+    if dry_run:
+        return out
+    row = {"ts": now, "at": now_iso(now), "event": out["action"], "permission_mode": "bypassPermissions",
+           "grant_answer": (state.get("bypass") or {}).get("answer"), "out": clean(out["reason"], 300)}
+    _append(goal_dir(home, goal) / "launch.log", row)
+    if out["action"] == "bypass-ended":
+        state.setdefault("bypass_history", []).append(dict(state["bypass"], ended_at=now_iso(now)))
+        state["bypass_history"] = state["bypass_history"][-20:]
+        state["bypass"] = {}
+    else:
+        state["bypass"]["stop_failed_at"] = now_iso(now)
+    save_state(home, goal, state)
+    return out
+
+
 def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, now: float, runner=_run,
              dry_run: bool = False) -> dict:
     out = {"goal": goal, "action": "none", "reason": ""}
     with locked(home, goal):
         state = load_state(home, goal)
+        ended = end_lapsed_bypass(home, goal, state, cfg, sessions, now, runner, dry_run)
+        if ended is not None and ended["action"] != "bypass-ended":
+            return ended  # a lapsed bypass session not shown stopped: nothing else runs for this owner
+        if ended is not None:
+            return ended  # stopped this tick; the next tick relaunches in the configured mode when work is due
         if goal_done(goal_row):
             out["reason"] = "goal done"
             return out
@@ -1098,8 +1206,13 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
         # receipt v4 F3: the attempt is on disk before any `claude stop` or launch runs, so an exception, a timeout
         # or a killed tick still counts toward min_gap and the hourly brake; it is finalized below
         entry = {"ts": now, "at": now_iso(now), "reason": reason, "fresh": fresh, "code": None, "bg_id": "",
-                 "out": "attempt started"}
+                 "out": "attempt started", "permission_mode": mode,  # receipt v7 F2: every launch says its mode
+                 "grant_answer": grant.get("answer") if grant else None,
+                 "grant_expires_at": now_iso(grant["expires_ts"]) if grant else None}
         state["launches"] = (state.get("launches") or [])[-49:] + [entry]
+        # receipt v7 F1: recorded before the launch runs, so even an uncertain launch is ended when its grant lapses
+        state["bypass"] = ({"answer": grant.get("answer"), "scope": grant.get("scope"), "since": now_iso(now),
+                            "expires_at": now_iso(grant["expires_ts"])} if grant else {})
         save_state(home, goal, state)
 
         def finish(code, text):
@@ -1142,6 +1255,26 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
         return out
 
 
+def _end_lapsed(home: Path, goals, cfg: dict, now: float, runner=_run, dry_run: bool = False, sessions=False):
+    """end_lapsed_bypass for each goal outside the normal tick (runtime disabled, or the listing refused)."""
+    if sessions is False:
+        try:
+            sessions = bg_sessions(cfg, runner) if cfg.get("claude") else None
+        except Exception:  # noqa: BLE001 - reported as unconfirmed below
+            sessions = None
+    out = []
+    for g in goals:
+        try:
+            with locked(home, g):
+                st = load_state(home, g)
+                r = end_lapsed_bypass(home, g, st, cfg, sessions, now, runner, dry_run)
+            if r is not None:
+                out.append(r)
+        except Exception as exc:  # noqa: BLE001
+            out.append({"goal": g, "action": "bypass-stop-failed", "reason": clean(str(exc), 200)})
+    return out
+
+
 def owner_goals(home: Path) -> list:
     root = owners_root(home)
     if not root.is_dir():
@@ -1157,10 +1290,17 @@ def tick(home: Path, now=None, runner=_run, dry_run: bool = False, only: str = "
     names = [g for g in owner_goals(home) if not only or g == only]
     if not names:
         return []
-    if not cfg.get("enabled") or not cfg.get("claude"):  # nothing runs a program while disabled (r1 M1)
+    lapsed = []
+    for g in names:
+        with contextlib.suppress(Exception):
+            if bypass_lapse(home, load_state(home, g), now):
+                lapsed.append(g)
+    if not cfg.get("enabled") or not cfg.get("claude"):  # nothing runs a program while disabled (r1 M1) ...
         why = "runtime disabled" if not cfg.get("enabled") else "claude binary not found in " + ", ".join(CLAUDE_DIRS)
         out = []
-        for g in names:
+        if lapsed:  # ... except stopping a bypass session whose grant lapsed (receipt v7 F1): it only lowers authority
+            out += _end_lapsed(home, lapsed, cfg, now, runner, dry_run)
+        for g in [g for g in names if g not in lapsed]:
             with contextlib.suppress(Exception):
                 st = load_state(home, g)
                 reason = due_reason(home, g, st, now)
@@ -1176,7 +1316,8 @@ def tick(home: Path, now=None, runner=_run, dry_run: bool = False, only: str = "
             with contextlib.suppress(Exception), locked(home, g) as d:
                 _append(d / "launch.log", {"ts": now, "at": now_iso(now), "code": None, "launched": False,
                                            "out": reason})
-        return [{"goal": g, "action": "error", "reason": reason} for g in names]
+        out = _end_lapsed(home, lapsed, cfg, now, runner, dry_run, sessions=None)
+        return out + [{"goal": g, "action": "error", "reason": reason} for g in names if g not in lapsed]
     out = []
     for g in names:
         try:
