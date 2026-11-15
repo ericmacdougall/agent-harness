@@ -27,6 +27,49 @@ Run each from the repo root.
   Result: `Ran 417 tests`, `OK (skipped=1)`, exit 0.
   Log `ev20.log`, sha256 6a3e78b8f281d9d7bdebd70ae87fa68ad91a3535195609e04f6c3b13f4c364c5.
 
+## PR 258 v3 BLOCK repair (heads 675be534 and 8d3b4ae2)
+
+Run on t2-dev (Python 3.12.3, git 2.43.0) by `~/wt/ahc-pr258v3.sh <head> <old head>`. The script makes a fresh
+blob-filtered clone under `~/wt`, refuses to start with less than 30 GiB free, and keeps logs in the run directory.
+
+- Focused suites at 8d3b4ae20f826fe96b0520891b6baec8ec4bd4ef: the nine above plus `tests.test_ahc_fs` and
+  `tests.test_install_ships_modules`. Result: `Ran 461 tests`, `OK (skipped=1)`, exit 0.
+  Log `suites.log`, sha256 c20d7ce5e4c6f0ab37706b6faee2da55115a0e26a074ed121f9decd475af29ec.
+- Failing first: the hooks at 367c6c14 (the head the v3 receipt blocked) with the new tests. The tests are
+  `test_ahc_fs.PathWriteScanTests`, `test_ahc_clone.CloneReuseHardeningTests` and `CloneLinkTests`,
+  `test_ahc_core.RootOwnershipTests`, the runner report-directory test and `FileTransportOptInTests`.
+  Result: `Ran 61 tests`, `FAILED (failures=53, errors=12)`, exit 1.
+  Log `failing_first.log`, sha256 7ae062b80a3cf366d920e9ad4c80779d57bba663a979158508fa7a06d3b20b5c.
+  - Defects at 367c6c14:
+    - `ForeignRoot` not raised (32): loose root and dir modes, a foreign uid, loose ancestors;
+    - the clone not quarantined (11), and git breaking on planted packed-refs, shallow and refs;
+    - a hard-linked report and a report with an extra entry routed as PASS;
+    - the file transport opt-in not honoured or not refused;
+    - path-based writes found by the scan.
+  - From APIs that did not exist at that head:
+    - 5 `_append_private` signature TypeErrors, from the shared-dir regression guard;
+    - 1 missing `canonical_config_text`;
+    - 1 old report path layout.
+- Variants: `SUMMARY: 44 variants, 0 did not fail: []`, exit 0.
+  Log `variants.out`, sha256 b76aad9d2861416cac14732218efd0c5b391ae3f44288c70822eeea6bc8b1174.
+  - The first run at 675be534 (39 variants) left 3 alive, and 8d3b4ae2 fixed all three:
+    - "symlinked root followed" and "a link inside .git is accepted" each had a second layer, so the variants now
+      drop both;
+    - the git-env test was vacuous, because the fixture env already isolated git, so it now passes a hostile env.
+  - That first run's log is `variants.out` at 675be534, sha256
+    6e1f5b2200fe27a3d434341d17c53de45d12e0695e0bd0399025090c18f971a8.
+- Mac, Python 3.9.6, at 8d3b4ae2: `tests.test_ahc_crash`, `CloneReuseHardeningTests`, `FileTransportOptInTests`,
+  `IngestValidationTests` and `tests.test_ahc_fs`. Result: `Ran 60 tests`, `OK (skipped=1)`.
+
+v3 variants:
+- F1: path-based writes in claim_root and in the clone config;
+- F2: no owner or mode check of the root or its dirs, and no ancestor rule;
+- clone (D4): the allowlist, the bounds, quarantine, the hardened env, the umask, the private clone dir and the
+  transports;
+- report: the inode compare, the only-entry check, the single link, the size cap and quarantine of a failed
+  attempt;
+- the file transport opt-in honoured for the production root.
+
 ## What the variants break
 
 Each variant is a unique text swap applied to one source file, and the source is restored after the run.
