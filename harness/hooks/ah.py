@@ -2435,16 +2435,20 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                 unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
                 continue
             read_ok += 1
+            try:
+                in_window = path.stat().st_mtime >= cutoff  # a file not written since the cutoff holds nothing in the window
+            except OSError:
+                in_window = True
             lines = text.splitlines()
-            if lines and not text.endswith("\n"):
-                lines.pop()  # a line still being written is not a record yet
-            for raw in lines:
+            open_tail = bool(lines) and not text.endswith("\n")  # the last line may still be being written
+            for index, raw in enumerate(lines):
                 if not raw.strip():
                     continue
                 try:
                     rec = json.loads(raw)
                 except ValueError:
-                    skipped += 1  # a complete line that is not a record: what it held is missing from this report
+                    if in_window and not (open_tail and index == len(lines) - 1):
+                        skipped += 1  # a complete line that is not a record: what it held is missing from this report
                     continue
                 consider(agent, rec)
     else:

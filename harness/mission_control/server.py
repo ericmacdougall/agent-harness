@@ -365,9 +365,11 @@ class App:
         self.health.on_change = self.truth.publish
         self.hub.before = self.truth.publish
         self.max_ages = {"chat": 60.0}
+        # the sources in self.collectors share one thread: each waits for every other's read before its next turn
+        loop_budget = sum(source.read_budget for source in self.collectors)
         for source in self.collectors + [self.asks, self.ledger] + ([self.supervised] if self.supervised else []):
             for name in (source.name,) + tuple(source.rows_written):
-                self.max_ages[name] = source.max_age()
+                self.max_ages[name] = source.max_age(loop_budget if source in self.collectors else 0.0)
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None

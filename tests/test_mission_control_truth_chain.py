@@ -403,6 +403,7 @@ class Trace:
         self.rows = collections.defaultdict(set)        # collector -> Health rows it wrote
         self.cross = set()                              # (reader, provider, attribute)
         self.session_parts = set()                      # ledger parts read with a session argument
+        self.unattributed = set()                       # ("row" | "snapshot" | "event", name) written with no source on the stack
         self.patches = []
 
     def active(self):
@@ -435,7 +436,7 @@ class Trace:
 
         def spy(self, name):
             reader = trace.active()
-            if reader is not None and reader is not self and isinstance(reader, col.Collector) and not name.startswith("_") \
+            if reader is not None and reader is not self and reader.name != "truth" and not name.startswith("_") \
                     and name not in ("name", "hub", "health"):
                 trace.cross.add((reader.name, object.__getattribute__(self, "name"), name))
             return plain(self, name)
@@ -443,17 +444,23 @@ class Trace:
         real_set, real_snapshot, real_publish, real_read = col.Health._set, ev.Hub.snapshot, ev.Hub.publish, col.Ledger._read
 
         def health_set(health, name, *args, **kwargs):
-            if isinstance(trace.active(), (col.Collector, Named)) and trace.active().name != "truth":
+            if trace.active() is None:
+                trace.unattributed.add(("row", name))
+            elif trace.active().name != "truth":
                 trace.rows[trace.active().name].add(name)
             return real_set(health, name, *args, **kwargs)
 
         def snapshot(hub, name, data):
-            if trace.active() is not None and trace.active().name != "truth":
+            if trace.active() is None:
+                trace.unattributed.add(("snapshot", name))
+            elif trace.active().name != "truth":
                 trace.snapshots[name].add(trace.active().name)
             return real_snapshot(hub, name, data)
 
         def publish(hub, event):
-            if trace.active() is not None:
+            if trace.active() is None:
+                trace.unattributed.add(("event", event.get("kind")))
+            else:
                 trace.events.add(trace.active().name)
             return real_publish(hub, event)
 
@@ -475,6 +482,17 @@ class Trace:
                     trace.stack.pop()
             return wrapped
         self.patches += [mock.patch.object(col.Truth, "publish", outside(real_publish_truth)), mock.patch.object(col.Truth, "reads", outside(real_reads))]
+        # the chat store is read by the App itself, not by a Collector: its methods are traced as the source "chat"
+        for method in ("chat_once", "refresh_chat", "chat_snapshot"):
+            def as_chat(real=getattr(mcs.App, method)):
+                def wrapped(app_, *args, **kwargs):
+                    trace.stack.append(Named("chat"))
+                    try:
+                        return real(app_, *args, **kwargs)
+                    finally:
+                        trace.stack.pop()
+                return wrapped
+            self.patches.append(mock.patch.object(mcs.App, method, as_chat()))
         for patch in self.patches:
             patch.start()
         # callbacks bound before the trace started are bound again, so the work they do is seen as their owner's
@@ -525,7 +543,9 @@ class DerivedFeeds(unittest.TestCase):
         trace = Trace()
         trace.start(app)
         self.addCleanup(trace.stop)
-        sources = app.collectors + [app.supervised, app.asks, app.ledger]
+        # every Collector the App holds, however it is wired: a new one is run and traced without being listed here
+        sources = list({id(c): c for c in vars(app).values() if isinstance(c, col.Collector)}.values())
+        sources += [c for c in app.collectors if c not in sources]
         now = time.time()
         for source in sources:
             source.run(now)
@@ -536,10 +556,8 @@ class DerivedFeeds(unittest.TestCase):
             handle.write(json.dumps({"event": "result", "note": "DEPLOYED to live", "at": stamp(0)}) + "\n")
         for source in sources:
             source.run(now + 400)
-        chat = Named("chat")
-        trace.stack.append(chat)
         app.chat_once()
-        trace.stack.pop()
+        app.follow_sessions()
         state = app.state()
         return app, trace, state
 
@@ -554,13 +572,18 @@ class DerivedFeeds(unittest.TestCase):
             for writer in writers:
                 derived[self.DATA_SNAPSHOTS[snapshot]] |= self.sources_of(writer, trace)
         derived["events"] = set().union(*(self.sources_of(writer, trace) for writer in trace.events))
+        # a ledger part rests on its own read, on anything else the ledger source wrote or read, and on main's session
+        # when its read took one
+        beside = self.sources_of("ledger", trace) - {"ledger"}
         for part in ("goals", "requirements", "status"):
-            derived[part] = {f"ledger:{part}"} | ({"main-session"} if part in trace.session_parts else set())
+            derived[part] = {f"ledger:{part}"} | beside | ({"main-session"} if part in trace.session_parts else set())
         # every read of main's session is declared: the dataset its reader publishes rests on main-session
         for reader, provider, attribute in trace.cross:
             if attribute == "session" and reader in self.DATA_SNAPSHOTS:
                 derived[self.DATA_SNAPSHOTS[reader]].add("main-session")
         self.assertEqual({k: sorted(v) for k, v in derived.items()}, {k: sorted(v) for k, v in col.FEEDS.items()})
+        self.assertEqual(sorted(trace.unattributed), [], "a Health row, snapshot or event written by no traced source: give it a "
+                                                         "Collector (or trace its writer as a named source) and a line in FEEDS")
 
     def sources_of(self, writer, trace):
         """A collector's own row, the other rows it writes, and every collector whose data it reads (unless that read
@@ -614,6 +637,23 @@ class DerivedFeeds(unittest.TestCase):
         self.assertNotEqual(sorted(derived), sorted(col.FEEDS["owners"]))
         trace.snapshots["org"].add("orggraph")
         self.assertNotIn("org", self.DATA_SNAPSHOTS)
+        # the shape of T243-6: a row written while the ledger reads (a session pin) reaches every ledger part
+        trace.rows["ledger"].add("session-pin")
+        self.assertIn("session-pin", self.sources_of("ledger", trace))
+        # and a writer that is no Collector at all is reported, not ignored
+        app.health.error("session-pin", "pin not writable")
+        app.hub.snapshot("org", {})
+        self.assertEqual(sorted(trace.unattributed), [("row", "session-pin"), ("snapshot", "health"), ("snapshot", "org")])
+
+    def test_no_source_is_aged_out_while_its_thread_is_still_reading(self):
+        app, _trace, _state = self.run_app()
+        loop = sum(source.read_budget for source in app.collectors)
+        for source in app.collectors:
+            for name in (source.name,) + tuple(source.rows_written):
+                self.assertGreaterEqual(app.max_ages[name], max(source.interval, source.idle_interval) + loop, name)
+        for source in (app.asks, app.ledger):
+            self.assertGreaterEqual(app.max_ages[source.name], max(source.interval, source.idle_interval) + source.read_budget)
+        self.assertEqual(sorted(set(app.health.rows) - set(app.max_ages) - set(col.NOT_A_FEED)), [], "a row no reader ages out")
 
 
 class Envelope(unittest.TestCase):

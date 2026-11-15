@@ -150,7 +150,7 @@ Two tests compare what is declared with what is observed and fail on a differenc
 `web/tests/truth-gate.test.mjs` renders each panel over a recording state against `CLAIMS` and scans the browser-only
 modules for counts written outside the gate.
 
-Not marked: a single chat record that cannot be read is skipped by the chat store; `ah owners` reports the places it
+Limits of the two tests: the page derivation is per panel, so in a panel that makes several claims (the tiles, the inventory) one claim's declaration can excuse another's read; the browser-only modules are scanned as text, not rendered. Not marked: a single chat record that cannot be read is skipped by the chat store; `ah owners` reports the places it
 could not list, not a WAL it could list but only partly parse; a status list keeps the newest 30 rows and says how many
 more the ledger holds. If every server thread stops while the stream stays open, nothing ages the rows out.
 

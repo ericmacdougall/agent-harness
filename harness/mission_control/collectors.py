@@ -123,7 +123,7 @@ FEEDS = {
     # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
     "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "initiatives", "github", "goodqa",
                "t2-dev", "sources"),
-    "chat": ("chat",),
+    "chat": ("chat", "main-session"),  # the chat snapshot names which session is main's
 }
 # Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
 NOT_A_FEED = {
@@ -143,6 +143,7 @@ SAFE_READS = {
     ("goodqa", "owners", "tickets"): "covered: names the tickets to poll; owners and its feeds are feeds of events",
     ("ledger", "owners", "session"): "covered: main-session is a feed of the session-scoped datasets",
     ("asks", "owners", "session"): "covered: main-session is a feed of asks",
+    ("chat", "owners", "session"): "covered: main-session is a feed of chat",
 }
 
 
@@ -150,13 +151,14 @@ class Collector:
     name = "collector"
     interval = 60.0
     idle_interval = 0.0  # when greater than interval: the cadence while no page is attached (costly sources)
-    read_budget = 60.0   # the longest one tick may take (its subprocess timeouts): part of max_age
+    read_budget = 5.0    # the longest one tick may take (the sum of its subprocess timeouts): part of max_age
     rows_written = ()    # other Health rows this collector writes (they age with it)
 
-    def max_age(self) -> float:
+    def max_age(self, loop_budget: float = 0.0) -> float:
         """How long this source's Health row may go unchecked before it is aged out (Health.expire): two of its
-        slowest cadences plus its longest read. Past that its reader has stopped, and its truth is no longer current."""
-        return 2 * max(self.interval, self.idle_interval) + self.read_budget + 30
+        slowest cadences plus the longest its thread can be busy before it comes round again (`loop_budget`: the read
+        budgets of every source that shares its thread). Past that its reader has stopped."""
+        return 2 * max(self.interval, self.idle_interval) + max(self.read_budget, loop_budget) + 30
 
     def health_session(self):
         """The session this source's last good read was for (None: not session-scoped). Truth shows a row read for a
@@ -744,6 +746,8 @@ class Initiatives(Collector):
 
     def _fail(self, message: str):
         self.stale, self.error = True, message
+        # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
+        self.health.error(self.name, f"ValueError: {message}", truth=self.health_truth())
         self.publish(None)
         raise ValueError(message)
 
@@ -881,8 +885,10 @@ class SupervisedOwners(Collector):
             seen = {row['name'] for row in rows}
             for name in [n for n in self.parsed if n not in seen]:
                 del self.parsed[name]               # an owner that is gone no longer holds its cached status
-        except Exception:
+        except Exception as exc:
             self.rows = [{**row, 'source_stale': True} for row in self.rows]
+            # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
+            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}")
             self._changed()
             raise
         self._changed()
@@ -908,6 +914,7 @@ class Owners(Collector):
 
     MAX_ROWS = 60
     rows_written = ("native-projects", "native-streams", "main-session")
+    read_budget = 30.0
 
     def health_truth(self):
         return "partial" if self.partial else None
@@ -950,9 +957,11 @@ class Owners(Collector):
     def tick(self, now: float):
         try:
             return self._tick(now)
-        except Exception:
+        except Exception as exc:
             # main's session is whatever the last good read named: after a failed read it may have moved
             self.health.error("main-session", "the owners read that names main's session failed")
+            # the Health row turns before the rows are pushed again, so they never arrive ahead of their read
+            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}", truth=self.health_truth())
             self.claude_rows = [{**row, 'source_stale': True} for row in self.claude_rows]
             self.publish()
             raise
@@ -1147,7 +1156,7 @@ class Asks(Collector):
         except Exception:  # noqa: BLE001 - an unknown session shows nothing session-scoped
             return ""
 
-    read_budget = 120.0
+    read_budget = 300.0  # the ledger read (60 s) and a sweep's ticket lookups (15 s each, a bounded number)
 
     def health_session(self):
         return self.read_session or None
@@ -1761,6 +1770,7 @@ class GitHub(Collector):
         self.gap = False  # the last poll returned a full page of unseen events: older ones were missed
 
     PER_PAGE = 30  # as the allowlisted request asks (safeio)
+    read_budget = 40.0
 
     def health_truth(self):
         return "partial" if self.gap else None
@@ -1827,6 +1837,7 @@ class Tickets(Collector):
     interval = 10.0
     idle_interval = 120.0
     MAX_TICKETS = 12
+    read_budget = 20.0
 
     def __init__(self, hub, health, runner, sources):
         super().__init__(hub, health)
@@ -2006,6 +2017,7 @@ class Remote(Collector):
         self.capped = False  # the last probe hit its line or byte cap: some remote WALs were not seen
 
     PROBE_LINES, PROBE_BYTES = 50, 65536  # as the allowlisted probe cuts its output (safeio)
+    read_budget = 15.0
 
     def health_truth(self):
         return "partial" if self.capped else None
