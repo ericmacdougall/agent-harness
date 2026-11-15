@@ -102,7 +102,7 @@ one of two covers:
 - **`ack`** (refused, lint-failed, review-error, stale-head): the owner notice needs
   `ahc_runner.py ack ITEM --owner OWNER`. If the deadline (`block_ack_seconds`, 4 h) passes without one, the notice
   escalates once.
-- **`d20`** (routed-to-main, needs-attention, block-delivered, acknowledged, blocked, outcome-unknown,
+- **`d20`** (routed-to-main, needs-attention, block-delivered, acknowledged, blocked, unsubmitted, outcome-unknown,
   cancel-requested): the item escalates 4 h after entering the state, then every 24 h. This runs from the ledger
   alone, so a GitHub outage cannot suppress it.
 
@@ -116,10 +116,19 @@ one of two covers:
 5. The item leaves `acknowledged` only when:
    - the PR is submitted at a new head. The item closes as `superseded` with reason `superseded-by-head`, linked
      to the new item. A new packet on the same head is not a repair;
+   - the PR moves to a new head and nothing is submitted for it. The daemon reads the PR's live head at most every
+     10 minutes per item. When the head has moved and the PR is open, the item closes as `superseded`
+     (`superseded-by-head`) linked to a new `unsubmitted` item for the new head. That item has its own owner
+     notice and its own D20 clock, so the obligation never disappears. A submission at that head supersedes it
+     with reason `resubmitted`. An unreadable PR changes nothing;
    - the PR merges or closes;
    - main records a disposition.
 
-`blocked` is a different state: a guard or policy refusal, routed to the decision-maker.
+`blocked` is a different state: a guard or policy refusal, routed to the decision-maker. In P0 the guard is the
+repo allowlist: a repo removed from `repos` after admission blocks its items. From `queued` or `deferred` the item
+blocks before any review starts. A refusal noticed while the item is reviewing applies once the child settles: the
+child is never killed, its result stays recorded on the effect row, and the item becomes `blocked` instead of
+routing a verdict.
 
 Every escalation does three things:
 

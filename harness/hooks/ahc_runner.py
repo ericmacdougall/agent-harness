@@ -88,6 +88,9 @@ STATE_TABLE = {
     # it escalates under D20 if the confirmation never comes. cancelled-confirmed: the cancel was read back.
     "cancel-requested": {"settled": False, "waits_on": "daemon", "cover": "d20", "dispose": ("main",)},
     "cancelled-confirmed": {"settled": True, "waits_on": None},
+    # v6e T2: a PR head with no submission (here: the new head that superseded a delivered or acknowledged BLOCK),
+    # waiting on the owner under D20 so the obligation never disappears; a submission at that head supersedes it
+    "unsubmitted": {"settled": True, "waits_on": "owner", "cover": "d20", "notice": True, "dispose": ("main",)},
     "superseded": {"settled": True, "waits_on": None},
     "merged": {"settled": True, "waits_on": None},
     "closed": {"settled": True, "waits_on": None},
@@ -701,6 +704,10 @@ class Worker:
         state = row["state"]
         if state == "routed-to-main":
             return self.recheck_pass(iid, token, req)
+        refusal = self.guard_refusal(req)
+        if refusal:  # T33 from queued or deferred
+            return self.settle(iid, token, "blocked", event="blocked:guard", reason=refusal,
+                               notice=_owner_notice("blocked", refusal))
         if state == "deferred":
             budget = self.led.head_budget(row["lineage"], req["head"])
             first = budget["first_deferred_at"]
@@ -824,9 +831,23 @@ class Worker:
             raise _Stop("reviewing")
         return self.conclude(iid, token, req, key)
 
+    def guard_refusal(self, req):
+        """Why a guard or policy refuses further daemon work on this request now, or None. P0 guard: the repo was
+        removed from the coordinator allowlist after admission."""
+        if str(req.get("repo", "")).lower() not in {str(r).lower() for r in self.config.get("repos", [])}:
+            return "the repo is no longer on the coordinator allowlist"
+        return None
+
     def conclude(self, iid, token, req, key):
         row = self.led.item(iid)
         data = json.loads(row["data"])
+        refusal = self.guard_refusal(req)
+        if refusal:
+            # T33 while reviewing (rescue ruling: hold the child kill): the child has already settled and its
+            # result stays recorded on the effect row; the item becomes blocked, routed to the decision-maker
+            reason = "guard refusal after the review finished: %s" % refusal
+            return self.settle(iid, token, "blocked", event="blocked:guard", reason=reason,
+                               notice=_owner_notice("blocked", reason))
         effect = self.led.db.execute("SELECT * FROM effects WHERE key=?", (key,)).fetchone()
         result = json.loads(effect["result"])
         stale = stale_tickets(result.get("stderr", ""), result["rc"])
@@ -1102,7 +1123,8 @@ class Worker:
         for later in self.led.db.execute("SELECT id, request FROM items WHERE lineage=? AND submitted > ? AND id != ?"
                                          " ORDER BY submitted DESC, id", (row["lineage"], row["submitted"],
                                                                           row["id"])):
-            if json.loads(later["request"]).get("head") != head:
+            later_req = json.loads(later["request"])
+            if later_req.get("head") != head and not later_req.get("discovered"):   # discovery is not a submission
                 return later["id"]
         return None
 
@@ -1120,7 +1142,66 @@ class Worker:
             self.settle(row["id"], token, "superseded", event="superseded-by-head", by=newer,
                         reason="superseded-by-head")
             closed.append((row["id"], newer))
+        closed += self.head_readback()
+        # an `unsubmitted` head is answered by a submission at that head (T1b, reason resubmitted)
+        for row in self.led.db.execute("SELECT * FROM items WHERE state='unsubmitted' ORDER BY id").fetchall():
+            head = json.loads(row["request"]).get("head")
+            for later in self.led.db.execute("SELECT id, request FROM items WHERE lineage=? AND id != ? "
+                                             "ORDER BY submitted, id", (row["lineage"], row["id"])).fetchall():
+                if json.loads(later["request"]).get("head") == head and not json.loads(later["request"]).get(
+                        "discovered"):
+                    token = self.lease(row["id"])
+                    self.settle(row["id"], token, "superseded", event="superseded", by=later["id"],
+                                reason="resubmitted")
+                    closed.append((row["id"], later["id"]))
+                    break
         return closed
+
+    HEAD_READBACK_SECONDS = 600
+
+    def head_readback(self):
+        """v6e T25 + T2 for a delivered or acknowledged BLOCK: read the PR's live head (at most every 10 min per
+        item). If it moved and nothing was submitted for the new head, the BLOCK closes as superseded
+        (superseded-by-head) linked to a new `unsubmitted` item for the new head, which carries its own D20 clock,
+        so the obligation never disappears. An unreadable PR changes nothing (I9)."""
+        now, out = self.now(), []
+        for row in self.led.db.execute("SELECT * FROM items WHERE state IN ('block-delivered', 'acknowledged') "
+                                       "ORDER BY id").fetchall():
+            data = json.loads(row["data"])
+            if now - float(data.get("head_checked_at") or 0) < self.HEAD_READBACK_SECONDS:
+                continue
+            req = json.loads(row["request"])
+            try:
+                rc, text, _err = self.deps.gh(["gh", "pr", "view", str(req["pr"]), "-R", req["repo"], "--json",
+                                               "number,state,headRefOid"], core.GH_TIMEOUT)
+                pr = json.loads(text) if rc == 0 else None
+            except (ValueError, OSError, subprocess.SubprocessError):
+                pr = None
+            with self.led.tx():
+                self.led.db.execute("UPDATE items SET data=? WHERE id=? AND state=?",
+                                    (json.dumps(dict(data, head_checked_at=now), sort_keys=True), row["id"],
+                                     row["state"]))
+            head = pr.get("headRefOid") if isinstance(pr, dict) and pr.get("number") == req["pr"] else None
+            if not core.HEAD_RE.fullmatch(str(head or "")) or head == req["head"] or pr.get("state") != "OPEN":
+                continue
+            new = dict(req, head=head, packet="", packet_sha256="", discovered=True, submitted=now)
+            new["id"] = core.item_id(new, "")
+            with self.led.tx():
+                self.led.db.execute(
+                    "INSERT OR IGNORE INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, "
+                    "request, updated, entered_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (new["id"], row["lineage"], req["owner"], req["ticket"], "unsubmitted", None, now,
+                     json.dumps(new, sort_keys=True), now, now))
+                self.led.event(new["id"], "unsubmitted", now, discovered_from=row["id"])
+                self._insert_notice(new["id"], new, "unsubmitted", "owner",
+                                    _owner_body(new["id"], new, {}, "unsubmitted",
+                                                "PR head moved to %s after a BLOCK; nothing was submitted for it"
+                                                % head), True, now)
+            token = self.lease(row["id"])
+            self.settle(row["id"], token, "superseded", event="superseded-by-head", by=new["id"],
+                        reason="superseded-by-head")
+            out.append((row["id"], new["id"]))
+        return out
 
     def _d20_stop(self, row, req):
         """Why D20 (and an unacked notice's escalation) stops for this item without a disposition, or None: a newer submission for the same PR, or the
@@ -1680,6 +1761,8 @@ def _owner_body(iid, req, data, state, reason):
         "review-error": "No receipt was produced. Read the reason; a quota or provider outage is retried by the "
                         "daemon, anything else needs you.",
         "needs-attention": "The daemon stopped automatic work on this item. Read the reason and resubmit or ask main.",
+        "unsubmitted": "The PR has a new head that superseded a BLOCK, and nothing was submitted for it. Submit the "
+                       "new head with a fresh packet (ahc submit); the escalation clock runs until you do.",
         "review-invalid": "The reviewer's output was unusable twice for this head (the one declared repeat is spent). "
                           "Fix the packet if the cause is inside it, push a new head, or ask main.",
         UNKNOWN_OUTCOME: "The review's outcome is unknown and it will not be relaunched. Reconcile the run with "

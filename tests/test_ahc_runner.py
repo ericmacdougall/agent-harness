@@ -1679,6 +1679,89 @@ class AckInactivityTests(Base):
         self.assertEqual(len(self.acked_escalations(deps)), 1, "a main disposition stops the repair deadline")
 
 
+class GuardAndNewHeadTests(Base):
+    """Spec-owner rulings while the rescue spec is pending: (T33, child kill held) a guard refusal noticed while an
+    item is reviewing applies once the child settles, and from queued it applies at once; (T25 + T2, v6e L5) a new
+    PR head with no submission closes a delivered or acknowledged BLOCK as superseded-by-head and opens an
+    `unsubmitted` item for the new head within one tick, so the obligation never disappears."""
+
+    def items(self):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return {r["id"]: dict(r) for r in ledger.db.execute("SELECT * FROM items")}
+        finally:
+            ledger.close()
+
+    def test_guard_refusal_during_review_applies_after_the_child_settles(self):
+        iid, deps = self.submit(), Deps(verdict="PASS")
+        review = deps.review
+        config = self.config
+
+        def review_then_delist(argv, timeout):
+            rc = review(argv, timeout)
+            config["repos"] = []   # the repo leaves the allowlist while the child runs
+            return rc
+        deps.review = review_then_delist
+        self.run_all(deps)
+        self.assertEqual(len(deps.review_calls), 1, "the child ran to completion, never killed or relaunched")
+        self.assertEqual(self.state(iid), "blocked")
+        ledger = runner.Ledger(self.paths)
+        try:
+            effect = ledger.db.execute("SELECT status, result FROM effects WHERE kind='review' AND item=?",
+                                       (iid,)).fetchone()
+            events = [r["event"] for r in ledger.db.execute("SELECT event FROM events WHERE item=? ORDER BY seq",
+                                                             (iid,))]
+        finally:
+            ledger.close()
+        self.assertEqual(effect["status"], "done", "the child's result is recorded before blocked")
+        self.assertIn("blocked:guard", events)
+        self.assertNotIn("pass", events, "a guard-refused PASS is never routed to main")
+
+    def test_guard_refusal_from_queued_blocks_without_a_review(self):
+        iid, deps = self.submit(), Deps()
+        self.config["repos"] = []
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(deps.review_calls, [])
+
+    def test_new_head_without_a_submit_supersedes_the_block_and_opens_unsubmitted(self):
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.run_all(deps)
+        runner.ack(self.paths, iid, "agent-abc123", now=deps.now)
+        deps.pr_head = "c" * 40          # the owner pushed; nothing submitted
+        deps.now += 60
+        self.run_all(deps)               # one tick
+        rows = self.items()
+        self.assertEqual(rows[iid]["state"], "superseded")
+        data = json.loads(rows[iid]["data"])
+        self.assertEqual(data["reason"], "superseded-by-head")
+        new = rows[data["by"]]
+        self.assertEqual(new["state"], "unsubmitted")
+        self.assertEqual(json.loads(new["request"])["head"], "c" * 40)
+        # its own D20 clock: escalates 4 h after it opened
+        deps.now += 4 * 3600 + 60
+        self.run_all(deps)
+        self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]
+                         and a[a.index("--alert-key") + 1].startswith("ahc:%s:" % new["id"])],
+                        "the unsubmitted head escalates under D20")
+        # the owner's submission at the new head answers it
+        sub = self.submit(head="c" * 40)
+        self.run_all(deps)
+        rows = self.items()
+        self.assertEqual(rows[new["id"]]["state"], "superseded")
+        self.assertEqual(json.loads(rows[new["id"]]["data"])["reason"], "resubmitted")
+        self.assertEqual(json.loads(rows[new["id"]]["data"])["by"], sub)
+
+    def test_unreadable_pr_never_supersedes(self):
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.run_all(deps)
+        deps.pr_head, deps.gh_rc = "c" * 40, 1
+        deps.now += 3600
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "block-delivered")
+        self.assertEqual(len(self.items()), 1)
+
+
 class EffectCrashTests(Base):
     """v6f: a crash during a side effect marks only that effect row outcome-unknown; the item keeps its state, and
     the effect is read back (for a ticket: re-sent under the same idempotency key) before any redispatch."""
