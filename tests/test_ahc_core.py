@@ -657,7 +657,7 @@ class P0SurfaceTests(unittest.TestCase):
             iid, state = ledger.db.execute("SELECT id, state FROM items").fetchone()
         finally:
             ledger.close()
-        self.assertEqual(state, "blocked", "the flow must reach BLOCK for the test to mean anything")
+        self.assertEqual(state, "block-delivered", "the flow must reach BLOCK for the test to mean anything")
         self.runner.ack(self.paths, iid, "agent-abc123", now=rec.now)
         argv = ["ack", iid, "--owner", "main", "--disposition", "x"]
         self.assertFalse(self.runner.claim_main(argv), "no ahc-dispose stamp was put, so not main")

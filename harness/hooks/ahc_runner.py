@@ -63,18 +63,24 @@ STATE_TABLE = {
     "reviewing": {"settled": False, "waits_on": "daemon"},
     "routed-to-main": {"settled": False, "waits_on": "main", "cover": "d20", "dispose": ("main",)},
     "needs-attention": {"settled": True, "waits_on": "owner-or-main", "cover": "d20", "alert": True, "notice": True,
-                        "dispose": ("owner", "main")},
+                        "dispose": ("main",)},
     "refused": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "lint-failed": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "review-error": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "stale-head": {"settled": True, "waits_on": "owner", "cover": "ack", "notice": True},
-    # D26 recovery states (spec v23b). blocked = the receipt's BLOCK verdict: the owner notice needs an ack and the
-    # item is under D20 until the owner resubmits, the PR closes, or a disposition.
-    "blocked": {"settled": True, "waits_on": "owner", "cover": "d20", "notice": True, "dispose": ("owner", "main")},
+    # D14 / v6e M4: a BLOCK verdict delivered to the owner and awaiting the ack. `ahc ack` moves it to
+    # `acknowledged`, which only acknowledges receipt: the repair deadline (D20, timed from the ack) still runs until
+    # a new head (superseded-by-head), the PR closing or merging, or a main disposition (M3: closing a BLOCK without
+    # a repair is main's call, never an owner's).
+    "block-delivered": {"settled": True, "waits_on": "owner", "cover": "d20", "notice": True, "dispose": ("main",)},
+    "acknowledged": {"settled": True, "waits_on": "owner", "cover": "d20", "dispose": ("main",)},
+    # D26 recovery states (spec v23b). blocked = a guard or policy refusal, routed to the decision-maker (v6e M4;
+    # never an alternate path).
+    "blocked": {"settled": True, "waits_on": "main", "cover": "d20", "notice": True, "dispose": ("main",)},
     # outcome-unknown: a step that is not replay-safe (a provider review) was in flight or its result could not be
     # read; nothing is relaunched and no failure or success is recorded until a readback (usage_guard reconcile).
     "outcome-unknown": {"settled": True, "waits_on": "owner-or-main", "cover": "d20", "alert": True, "notice": True,
-                        "dispose": ("owner", "main")},
+                        "dispose": ("main",)},
     # cancel-requested: a cancel the daemon has not yet confirmed (the cancel request arrives with the submit API);
     # it escalates under D20 if the confirmation never comes. cancelled-confirmed: the cancel was read back.
     "cancel-requested": {"settled": False, "waits_on": "daemon", "cover": "d20", "dispose": ("main",)},
@@ -193,7 +199,7 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
     if failure_class == "environment":
         return "needs-attention", None
     if failure_class == "block":
-        return "blocked", None
+        return "block-delivered", None   # v6e M4: a BLOCK verdict; `blocked` is a guard or policy refusal
     if failure_class == "stale":
         return "stale-head", None
     if failure_class == "delivery":
@@ -725,9 +731,9 @@ class Worker:
             with self.led.tx():
                 self.led.db.execute("UPDATE lineage SET block_rounds=block_rounds+1 WHERE lineage=?",
                                     (row["lineage"],))
-            self.settle(iid, token, "blocked", event="blocked", verdict="BLOCK",
-                        notice=_owner_notice("blocked", _report_body(data["report"])))
-            return "blocked"
+            self.settle(iid, token, "block-delivered", event="block-delivered", verdict="BLOCK",
+                        notice=_owner_notice("block-delivered", _report_body(data["report"])))
+            return "block-delivered"
         if name == "ADVISORY":
             return self.fail(iid, token, "advisory", "peer_review returned an advisory opinion, not a signoff")
         if name == "INVALID":
@@ -955,14 +961,39 @@ class Worker:
                            " or ".join(STATE_TABLE[row["state"]].get("dispose", ("main",)))))
                 self.escalate_item(row["id"], req, "d20-%s-%d" % (row["state"], n), body, now, d20=True)
 
+    def newer_head(self, row):
+        """The id of the newest later submission for the same PR at a DIFFERENT head, or None. Only a new head is the
+        owner's repair (v6e M1): a packet-only resubmit on the same head never stops an obligation."""
+        head = json.loads(row["request"]).get("head")
+        for later in self.led.db.execute("SELECT id, request FROM items WHERE lineage=? AND submitted > ? AND id != ?"
+                                         " ORDER BY submitted DESC, id", (row["lineage"], row["submitted"],
+                                                                          row["id"])):
+            if json.loads(later["request"]).get("head") != head:
+                return later["id"]
+        return None
+
+    def supersede_by_head(self):
+        """v6e T25: a delivered or acknowledged BLOCK closes as `superseded` (reason superseded-by-head), linked to
+        the new item, once a submission for the same PR at a new head is admitted. Core-owned (review never leases
+        these states). The full T25 (gh head readback, every non-terminal state) lands with the v6e table."""
+        closed = []
+        for row in self.led.db.execute("SELECT * FROM items WHERE state IN ('block-delivered', 'acknowledged') "
+                                       "ORDER BY id").fetchall():
+            newer = self.newer_head(row)
+            if newer is None:
+                continue
+            token = self.lease(row["id"])
+            self.settle(row["id"], token, "superseded", event="superseded-by-head", by=newer,
+                        reason="superseded-by-head")
+            closed.append((row["id"], newer))
+        return closed
+
     def _d20_stop(self, row, req):
         """Why D20 (and an unacked notice's escalation) stops for this item without a disposition, or None: a newer submission for the same PR, or the
         PR read as MERGED or CLOSED. A failed or unreadable read is None (keep escalating)."""
-        newer = self.led.db.execute("SELECT id FROM items WHERE lineage=? AND submitted > ? AND id != ? "
-                                    "ORDER BY submitted DESC LIMIT 1",
-                                    (row["lineage"], row["submitted"], row["id"])).fetchone()
+        newer = self.newer_head(row)
         if newer is not None:
-            return "superseded by %s" % newer["id"]
+            return "superseded by %s" % newer
         try:
             rc, out, _err = self.deps.gh(["gh", "pr", "view", str(req["pr"]), "-R", req["repo"], "--json", "state"],
                                          core.GH_TIMEOUT)
@@ -1337,6 +1368,7 @@ def _core_intake(worker, ledger, paths, config, deps, summary):
                 log.warning("rejection alert for %s exited %s; the reason file in rejected/ remains", name, rc)
         except Exception:  # noqa: BLE001 - the file is already quarantined with its reason; the alert is best effort
             log.warning("rejection alert failed for %s; the reason file in rejected/ remains", name)
+    summary["superseded_by_head"] = worker.supersede_by_head()
     now = worker.now()
     for row in ledger.db.execute("SELECT * FROM items WHERE state='routed-to-main' AND next_action_at <= ? "
                                  "ORDER BY next_action_at, submitted, id", (now,)).fetchall():
@@ -1397,16 +1429,19 @@ def ack(paths, iid, owner, now=None, disposition=None, main_proven=False, config
             with ledger.tx():
                 cur = ledger.db.execute("UPDATE notices SET acked_at=? WHERE item=? AND audience='owner' AND "
                                         "acked_at IS NULL", (now, iid))
-                ledger.event(iid, "acked", now, owner=owner, notices=cur.rowcount)
-                owner_only = STATE_TABLE.get(row["state"], {}).get("waits_on") == "owner"
-                if row["state"] in D20_STATES and row["disposed_at"] is None and owner_only:
-                    # the only party D20 waits on has acknowledged (a BLOCK): that is its disposition; states that
-                    # also wait on main (routed-to-main, needs-attention, outcome-unknown) need an explicit one
-                    ledger.db.execute("UPDATE items SET disposed_at=? WHERE id=?", (now, iid))
-                    ledger.event(iid, "disposed", now, actor="owner " + owner, reason="owner acknowledged")
-                    row = ledger.item(iid)
+                # v6e M4 / adv-4 F2: an ack acknowledges receipt only. A delivered BLOCK becomes `acknowledged`,
+                # whose D20 repair deadline runs from the ack (entered_at); the guarded UPDATE makes a repeat ack a
+                # no-op that never resets that deadline. No ack is ever a disposition (M3).
+                moved = ledger.db.execute(
+                    "UPDATE items SET state='acknowledged', entered_at=?, updated=? WHERE id=? AND "
+                    "state='block-delivered'", (now, now, iid)).rowcount
+                ledger.event(iid, "acked", now, owner=owner, notices=cur.rowcount,
+                             moved="block-delivered->acknowledged" if moved else None)
+                row = ledger.item(iid)
                 if row["state"] not in D20_STATES or row["disposed_at"] is not None:
                     Worker(paths, config or {}, deps, ledger)._clear_criticals(iid, now)
+            if moved:
+                _mirror(paths, iid, "acknowledged", now, {"owner": owner})
             return cur.rowcount
         reason = " ".join(str(disposition).split())
         if not reason:
@@ -1482,7 +1517,11 @@ def _alert_payload(iid, req, state, body, esc_n=None):
 
 def _owner_body(iid, req, data, state, reason):
     steps = {
-        "blocked": "Fix the findings, push, then submit again at the new head with a fresh packet.",
+        "block-delivered": "Acknowledge receipt (ahc ack <item> --owner <you>), fix the findings, push, then submit "
+                           "again at the new head with a fresh packet. The ack does not close the finding: the repair "
+                           "deadline keeps running until the new head, and only main can close it without one.",
+        "blocked": "A guard or policy refused this step. It is routed to the decision-maker; there is no alternate "
+                   "path.",
         "lint-failed": "Fix the packet layout or add the missing evidence, then submit again. The fixer never adds "
                        "an exit status or a count.",
         "stale-head": "The PR head moved. Submit again at the new head with a fresh packet.",

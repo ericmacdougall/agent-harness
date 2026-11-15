@@ -124,7 +124,7 @@ class FlowTests(Base):
         iid, deps = self.submit(), Deps(verdict="BLOCK")
         self.run_all(deps)
         self.run_all(deps)  # a rerun must not duplicate anything
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
         comments = [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"] or "comment" in a]
         self.assertEqual(len(comments), 1)
         self.assertIn("--key", comments[0])
@@ -231,7 +231,7 @@ class RecoveryTests(Base):
             events = [r["event"] for r in ledger.db.execute("SELECT event FROM events WHERE item=?", (iid,))]
         finally:
             ledger.close()
-        self.assertFalse([e for e in events if e in ("blocked", "pass", "review-error") or e.startswith("review-error")])
+        self.assertFalse([e for e in events if e in ("blocked", "block-delivered", "pass", "review-error") or e.startswith("review-error")])
         criticals = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]
                      and a[a.index("--severity") + 1] == "critical"]
         self.assertEqual(len(criticals), 1, "escalated past main once by 6 h")
@@ -348,7 +348,7 @@ class RetryTests(Base):
         self.assertEqual(runner.retry_policy("quota", 1, now, retry_at=now + 7200), ("deferred", now + 7200))
         self.assertEqual(runner.retry_policy("quota", 3, now + 86400, first_at=now)[0], "needs-attention")
         self.assertEqual(runner.retry_policy("auth", 1, now), ("needs-attention", None))
-        self.assertEqual(runner.retry_policy("block", 1, now), ("blocked", None))
+        self.assertEqual(runner.retry_policy("block", 1, now), ("block-delivered", None))
         self.assertEqual(runner.retry_policy("invalid-output", 1, now)[0], "deferred")
         self.assertEqual(runner.retry_policy("invalid-output", 2, now), ("review-error", None))
         self.assertEqual(runner.retry_policy("invalid-output", 1, now, config={"bounds": {
@@ -457,12 +457,12 @@ class AtomicNoticeTests(Base):
         self.crash_once()
         with self.assertRaises(RuntimeError):
             self.run_all(deps)
-        self.assertNotEqual(self.state(iid), "blocked", "item settled without its notice (F1)")
+        self.assertNotEqual(self.state(iid), "block-delivered", "item settled without its notice (F1)")
         self.assertEqual(self.rows("SELECT * FROM notices WHERE item=?", iid), [])
         for _ in range(3):
             self.run_all(deps)
             deps.now += 120
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
         self.assertEqual(len(deps.review_calls), 1, "the crash must not cause a second review")
         self.assertEqual(len(self.rows("SELECT * FROM notices WHERE item=?", iid)), 1)
         comments = [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]]
@@ -711,7 +711,7 @@ class IngestValidationTests(Base):
         self.addCleanup(setattr, core, "inbox_path", real_check)
         iid, deps = self.submit(), Deps(verdict="BLOCK")
         self.run_all(deps)
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
         self.assertEqual(list(elsewhere.iterdir()), [], "the inbox write followed a swapped-in symlink")
         ledger = runner.Ledger(self.paths)
         try:
@@ -729,10 +729,10 @@ class IngestValidationTests(Base):
         owner_dir.mkdir(mode=0o700)
         decoy = self.home / "decoy.md"
         decoy.write_text("anything")
-        (owner_dir / ("%s-blocked.md" % iid)).symlink_to(decoy)
+        (owner_dir / ("%s-block-delivered.md" % iid)).symlink_to(decoy)
         deps = Deps(verdict="BLOCK")
         self.run_all(deps)
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
         self.assertEqual(decoy.read_text(), "anything", "the decoy target was written through the link")
         ledger = runner.Ledger(self.paths)
         try:
@@ -835,10 +835,10 @@ class UntrustedReadTests(Base):
         self.paths.ensure()
         owner_dir = self.paths.inbox / "agent-abc123"
         owner_dir.mkdir(mode=0o700)
-        os.mkfifo(owner_dir / ("%s-blocked.md" % iid))
+        os.mkfifo(owner_dir / ("%s-block-delivered.md" % iid))
         deps = Deps(verdict="BLOCK")
         self.run_all(deps)
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
         self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
         ledger = runner.Ledger(self.paths)
         try:
@@ -902,7 +902,7 @@ class UntrustedReadTests(Base):
             runner._append_private(self.paths.digest, "line\n")
         iid, deps = self.submit(), Deps(verdict="BLOCK")
         self.run_all(deps)
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
         self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
         lock = self.paths.root / "ahc-core.lock"
         os.mkfifo(lock)
@@ -984,14 +984,16 @@ class DeliveryTests(Base):
         self.assertEqual(len(comments), 2)
         self.assertIn("has not acknowledged", comments[1][comments[1].index("--body") + 1])
 
-    def test_ack_by_owner_stops_escalation(self):
+    def test_ack_by_owner_stops_the_no_ack_escalation_only(self):
         iid, deps = self.block()
         with self.assertRaises(core.Refused):
             runner.ack(self.paths, iid, "agent-someone-else")
-        self.assertEqual(runner.ack(self.paths, iid, "agent-abc123"), 1)
-        deps.now += 5 * 3600
+        self.assertEqual(runner.ack(self.paths, iid, "agent-abc123", now=deps.now), 1)
+        self.assertEqual(self.state(iid), "acknowledged", "v6e M4: an ack moves a delivered BLOCK to acknowledged")
+        deps.now += 3 * 3600
         self.run_all(deps)
-        self.assertEqual(len(self.comments(deps)), 1)
+        self.assertEqual(len(self.comments(deps)), 1, "no 'has not acknowledged' escalation after the ack")
+        # the repair deadline is AckInactivityTests' subject: it still fires 4 h after the ack
 
     def test_ticket_outage_backs_off_and_does_not_storm(self):
         iid = self.submit()
@@ -1145,20 +1147,34 @@ class D20Tests(Base):
         self.assertEqual(self.row(iid)["esc_n"], 2)
         self.assertEqual(self.raises(deps, iid, severity="high"), [], "a user escalation is never only high")
 
-    def test_needs_attention_escalates_and_owner_disposition_stops_and_clears_it(self):
+    def test_needs_attention_escalates_and_main_disposition_stops_and_clears_it(self):
         deps = Deps()
         iid = self.enter(deps, "needs-attention")
         self.hours(deps, 4.5)
         self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid])
-        self.assertEqual(runner.ack(self.paths, iid, "agent-abc123", now=deps.now,
+        self.assertEqual(runner.ack(self.paths, iid, "main", now=deps.now, main_proven=True,
                                     disposition="reconciled with usage_guard; run abc is dead"), 1)
         self.run_all(deps)
         self.assertEqual(self.standing(deps, iid), set(), "no ahc:<item>:* raise may stay open after disposition")
         self.hours(deps, 48, step=12 * 3600)
         self.assertEqual(self.raises(deps, iid), ["ahc:%s:1" % iid], "D20 stopped after the disposition")
         bodies = [a[a.index("--body") + 1] for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]]
-        self.assertTrue(any("Disposition recorded" in b and "owner agent-abc123" in b and "usage_guard" in b
+        self.assertTrue(any("Disposition recorded" in b and "by main" in b and "usage_guard" in b
                             for b in bodies), "the disposition is a ticket comment naming actor and reason")
+
+    def test_owner_disposition_is_refused_in_every_d20_state_and_escalation_continues(self):
+        """v6e M3: every D20 disposition is main's (the ahc-dispose stamp); an owner can only ack and repair."""
+        for state in sorted(runner.D20_STATES):
+            with self.subTest(state=state):
+                self.tearDown()
+                self.setUp()
+                deps = Deps()
+                iid = self.enter(deps, state)
+                with self.assertRaises(core.Refused):
+                    runner.ack(self.paths, iid, "agent-abc123", now=deps.now, disposition="fixed it, trust me")
+                self.assertIsNone(self.row(iid)["disposed_at"])
+                self.hours(deps, 4.5)
+                self.assertIn("ahc:%s:1" % iid, self.raises(deps, iid), "the next escalation must still fire")
 
     def test_subagent_claiming_main_is_refused_and_escalation_continues(self):
         iid, deps = self.routed()
@@ -1206,14 +1222,24 @@ class D20Tests(Base):
         self.assertEqual(self.state(iid), "merged")
         self.assertEqual(self.standing(deps, iid), set())
 
-    def test_newer_submission_or_closed_pr_stops_needs_attention(self):
+    def test_packet_only_resubmit_does_not_stop_needs_attention(self):
+        """v6e M1: only a new head is the owner's repair; a new packet on the same head stops nothing."""
         deps = Deps()
         first = self.enter(deps, "needs-attention")
         newer = self.packet.with_name("p2.md")
         newer.write_text(GOOD_PACKET + "\n")
-        self.submit(packet=newer)
+        second = self.submit(packet=newer)
+        self.assertNotEqual(second, first, "the resubmit must be a new request row, not a dropped duplicate")
         self.hours(deps, 5)
-        self.assertEqual(self.raises(deps, first), [], "a newer submission for the PR stops D20")
+        self.assertEqual(self.raises(deps, first), ["ahc:%s:1" % first])
+        self.assertIsNone(self.row(first)["disposed_at"])
+
+    def test_newer_head_or_closed_pr_stops_needs_attention(self):
+        deps = Deps()
+        first = self.enter(deps, "needs-attention")
+        self.submit(head="c" * 40)
+        self.hours(deps, 5)
+        self.assertEqual(self.raises(deps, first), [], "a submission at a new head stops D20")
         self.assertIsNotNone(self.row(first)["disposed_at"])
         self.tearDown()
         self.setUp()
@@ -1321,6 +1347,122 @@ class MainStampTests(Base):
                          [core.dispose_stamp_parts(self.ARGV)], "the installed `ahc` wrapper is stamped too")
         self.assertEqual(mission_gate.ahc_dispose_stamps("ssh t2-dev ahc ack ahc-x --disposition x"), [],
                          "a command run on another host is never stamped here")
+
+
+class AckInactivityTests(Base):
+    """AC-19 / v6e M4 (adv-4 F2): an ack acknowledges receipt only. A delivered BLOCK moves to `acknowledged`, whose
+    D20 repair deadline runs from the ack (4 h, then every 24 h) until a new head, the PR closing or merging, or a
+    main disposition. A repeat ack never resets it; a restart never moves it."""
+
+    OWNER = "agent-abc123"
+
+    def setUp(self):
+        super().setUp()
+        self.d20 = D20Tests("run")   # borrow its ledger readers only (no setUp of its own runs)
+        self.d20.paths = self.paths
+
+    def blocked(self):
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "block-delivered")
+        return iid, deps
+
+    def at(self, deps, when):
+        deps.now = when
+        self.run_all(deps)
+
+    def acked_escalations(self, deps):
+        return [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]
+                and "-d20-acknowledged-" in a[a.index("--key") + 1]]
+
+    def test_ack_then_inactivity_escalates_at_4h_and_28h(self):
+        iid, deps = self.blocked()
+        t0 = deps.now + 600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        self.assertEqual(self.state(iid), "acknowledged")
+        self.at(deps, t0 + 4 * 3600 - 60)
+        self.assertEqual(self.acked_escalations(deps), [], "nothing before 4 h after the ack")
+        self.at(deps, t0 + 4 * 3600 + 60)
+        self.assertEqual(len(self.acked_escalations(deps)), 1)
+        self.at(deps, t0 + 28 * 3600 - 120)
+        self.assertEqual(len(self.acked_escalations(deps)), 1)
+        self.at(deps, t0 + 28 * 3600 + 120)
+        self.assertEqual(len(self.acked_escalations(deps)), 2)
+        keys = self.d20.raises(deps, iid)
+        self.assertEqual(len(keys), len(set(keys)), "each escalation has its own critical key")
+        self.assertEqual(self.state(iid), "acknowledged", "inactivity never closes the obligation")
+
+    def test_ack_then_restart_keeps_the_deadline(self):
+        iid, deps = self.blocked()
+        t0 = deps.now + 600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        entered = self.d20.row(iid)["entered_at"]
+        for minutes in (30, 90, 200):   # each pass opens a fresh ledger and worker: a daemon restart
+            self.at(deps, t0 + minutes * 60)
+        self.assertEqual(self.d20.row(iid)["entered_at"], entered, "a restart moved the repair deadline")
+        self.assertEqual(self.acked_escalations(deps), [])
+        self.at(deps, t0 + 4 * 3600 + 1)
+        self.assertEqual(len(self.acked_escalations(deps)), 1)
+
+    def test_ack_then_new_head_closes_as_superseded_by_head(self):
+        iid, deps = self.blocked()
+        t0 = deps.now + 600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        self.at(deps, t0 + 4 * 3600 + 60)
+        self.assertEqual(len(self.acked_escalations(deps)), 1)
+        newer = self.submit(head="c" * 40)
+        self.at(deps, t0 + 5 * 3600)
+        self.assertEqual(self.state(iid), "superseded")
+        self.assertEqual(json.loads(self.d20.row(iid)["data"])["reason"], "superseded-by-head")
+        self.assertEqual(json.loads(self.d20.row(iid)["data"])["by"], newer, "linked to the new item")
+        self.assertEqual(self.d20.standing(deps, iid), set(), "its criticals are cleared")
+        self.at(deps, t0 + 60 * 3600)
+        self.assertEqual(len(self.acked_escalations(deps)), 1, "no escalation after the repair")
+
+    def test_packet_only_resubmit_does_not_close_the_block(self):
+        iid, deps = self.blocked()
+        t0 = deps.now + 600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        other = self.packet.with_name("p2.md")
+        other.write_text(GOOD_PACKET + "\n")
+        self.assertNotEqual(self.submit(packet=other), iid)
+        self.at(deps, t0 + 4 * 3600 + 60)
+        self.assertEqual(self.state(iid), "acknowledged")
+        self.assertEqual(len(self.acked_escalations(deps)), 1)
+
+    def test_repeat_ack_does_not_reset_the_deadline(self):
+        iid, deps = self.blocked()
+        t0 = deps.now + 600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        runner.ack(self.paths, iid, self.OWNER, now=t0 + 3 * 3600)
+        self.assertEqual(self.d20.row(iid)["entered_at"], t0)
+        self.at(deps, t0 + 4 * 3600 + 60)
+        self.assertEqual(len(self.acked_escalations(deps)), 1, "the second ack pushed the deadline out")
+
+    def test_escalation_before_the_ack_does_not_push_the_first_repair_escalation_to_24h(self):
+        iid, deps = self.blocked()
+        start = deps.now
+        self.at(deps, start + 4 * 3600 + 60)       # the delivered BLOCK escalates unacked
+        n_before = self.d20.row(iid)["esc_n"]
+        self.assertGreaterEqual(n_before, 1)
+        t0 = start + 5 * 3600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        self.at(deps, t0 + 4 * 3600 + 60)
+        self.assertEqual(len(self.acked_escalations(deps)), 1, "the repair deadline is ack + 4 h, not ack + 24 h")
+        self.assertGreater(self.d20.row(iid)["esc_n"], n_before, "<n> stays monotonic across the ack")
+
+    def test_owner_disposition_cannot_close_an_acknowledged_block(self):
+        iid, deps = self.blocked()
+        t0 = deps.now + 600
+        runner.ack(self.paths, iid, self.OWNER, now=t0)
+        with self.assertRaises(core.Refused):
+            runner.ack(self.paths, iid, self.OWNER, now=t0 + 60, disposition="not a real finding")
+        self.at(deps, t0 + 4 * 3600 + 60)
+        self.assertEqual(len(self.acked_escalations(deps)), 1)
+        self.assertEqual(runner.ack(self.paths, iid, "main", now=deps.now, main_proven=True,
+                                    disposition="false positive, main accepts the risk"), 1)
+        self.at(deps, t0 + 60 * 3600)
+        self.assertEqual(len(self.acked_escalations(deps)), 1, "a main disposition stops the repair deadline")
 
 
 class PacketRetentionTests(Base):
@@ -1944,7 +2086,7 @@ class SchemaTests(Base):
         runner.Ledger(self.paths).close()
         backups = list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak"))
         self.assertEqual(len(backups), 1)
-        self.assertEqual(self.state(iid), "blocked")
+        self.assertEqual(self.state(iid), "block-delivered")
 
     def test_failed_migration_rolls_back_and_keeps_the_copy(self):
         self.submit()

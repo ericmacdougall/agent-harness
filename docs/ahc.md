@@ -62,11 +62,27 @@ at-least-once and the digest is never the only channel. (Accepted by the spec ow
 `STATE_TABLE` in `ahc_runner.py` is the only place an item state is declared. Each state that waits on a person has
 one of two covers:
 
-- **`ack`** (refused, lint-failed, review-error, stale-head, blocked): the owner notice needs
+- **`ack`** (refused, lint-failed, review-error, stale-head): the owner notice needs
   `ahc_runner.py ack ITEM --owner OWNER`. If the deadline (`block_ack_seconds`, 4 h) passes without one, the notice
   escalates once.
-- **`d20`** (routed-to-main, needs-attention): the item escalates 4 h after entering the state, then every 24 h.
-  This runs from the ledger alone, so a GitHub outage cannot suppress it.
+- **`d20`** (routed-to-main, needs-attention, block-delivered, acknowledged, blocked, outcome-unknown,
+  cancel-requested): the item escalates 4 h after entering the state, then every 24 h. This runs from the ledger
+  alone, so a GitHub outage cannot suppress it.
+
+### A BLOCK verdict
+
+1. The verdict puts the item in `block-delivered`. The owner notice needs an ack.
+2. `ahc ack ITEM --owner OWNER` moves it to `acknowledged`. The ack only confirms receipt; it closes nothing.
+3. The repair deadline runs from the ack: a D20 escalation 4 h after it, then every 24 h. An escalation raised
+   before the ack does not push the first repair escalation out to 24 h, and `<n>` keeps counting up.
+4. A second ack is a no-op and never resets the deadline. A restart never moves it.
+5. The item leaves `acknowledged` only when:
+   - the PR is submitted at a new head. The item closes as `superseded` with reason `superseded-by-head`, linked
+     to the new item. A new packet on the same head is not a repair;
+   - the PR merges or closes;
+   - main records a disposition.
+
+`blocked` is a different state: a guard or policy refusal, routed to the decision-maker.
 
 Every escalation does three things:
 
@@ -81,13 +97,14 @@ clocks never raise two criticals for the same wait.
 
 - **A disposition** (required reason text):
   `ahc_runner.py ack ITEM --owner OWNER --disposition "<reason>"`.
-  - needs-attention: the item's owner or main may record it.
-  - routed-to-main: main only.
+  - Every D20 state: main only. An owner can ack and repair, never dispose. Closing a BLOCK without a repair is
+    main's call.
   - `--owner main` counts only when main's own `mission_gate.py pretool` hook stamped that exact command line.
     The stamp is a caller_identity stamp, bound to main's still-running tool call. A sub-agent is refused.
   - The stamp is local to the host. A main session on another host cannot dispose for main over SSH; its
     obligation keeps escalating until the PR merges or closes.
-- **A newer submission** for the same PR. This also skips a pending no-ack escalation.
+- **A newer submission for the same PR at a new head.** This also skips a pending no-ack escalation. A packet-only
+  resubmit on the same head stops nothing.
 - **The PR reads as merged or closed.** This also skips a pending no-ack escalation. An unreadable PR never counts
   as either.
 
