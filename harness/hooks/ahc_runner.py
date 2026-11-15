@@ -67,6 +67,9 @@ STATE_TABLE = {
     "refused": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "lint-failed": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
     "review-error": {"settled": True, "waits_on": "owner", "cover": "ack", "alert": True, "notice": True},
+    # v6e T14: invalid reviewer output with the head's invalid repeat spent, or a cause inside the packet
+    "review-invalid": {"settled": True, "waits_on": "owner-or-main", "cover": "d20", "alert": True, "notice": True,
+                       "dispose": ("main",)},
     "stale-head": {"settled": True, "waits_on": "owner", "cover": "ack", "notice": True},
     # D14 / v6e M4: a BLOCK verdict delivered to the owner and awaiting the ack. `ahc ack` moves it to
     # `acknowledged`, which only acknowledges receipt: the repair deadline (D20, timed from the ack) still runs until
@@ -152,15 +155,20 @@ def bounds(config):
 
 def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, config=None):
     """(state, next_action_at) for a failure. `attempts` counts this class's failures so far, this one included;
-    `first_at` is when this class first failed for the item (for the 24 h quota deadline). Bounds come from D19.
+    For provider-transient, invalid-output and freshness, `attempts` is 1 when the head's one retry of that class
+    was still unused and 2 when it was already spent (v6e retry budget, per (lineage, head), first-come). `first_at`
+    is the head's first deferral (v6f: the 24 h deferred deadline, T8, never reset by re-entry). Bounds from D19.
 
     gh-transient        live PR read failed: capped exponential backoff, then needs-attention after 8
     pre-provider        clone or other deterministic repair: at most pre_provider_runs (2), then needs-attention
-    provider-transient  peer_review already used its primary and fallback: one deferred retry, then review-error
-    invalid-output      reviewer output unusable for a reason outside the packet: one declared repeat when
-                        invalid_output_repeat is on, then the owner; never a second repeat
-    quota               durable retry_at from the reset time (default 1 h), no probing; needs-attention once the
-                        quota deadline (24 h from the first quota failure) passes
+    provider-transient  peer_review already used its primary and fallback: the head's one deferred retry (T11),
+                        then needs-attention (T16)
+    invalid-output      reviewer output unusable for a reason outside the packet: the head's one declared repeat
+                        when invalid_output_repeat is on (T12), then review-invalid (T14); never a second repeat
+    freshness           D24 ticket-freshness STALE (pre-launch, no provider spend): the head's one re-run after the
+                        note (T13), then needs-attention (T16)
+    quota               durable retry_at from the reset time (default 1 h), no probing, no class consumed (T15);
+                        review-error once 24 h have passed since the head's first deferral (T8)
     auth                opens the provider circuit; never retried on a timer
     contention          pool busy (REVIEW_NOT_STARTED on a held pool): wait; waiting is not an attempt
     unknown-outcome     launch or supervision outcome unknown: outcome-unknown until usage_guard reconciliation
@@ -179,14 +187,16 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
     if failure_class == "pre-provider":
         return ("queued", now + 300) if attempts <= limits["pre_provider_runs"] else ("needs-attention", None)
     if failure_class == "provider-transient":
-        return ("deferred", now + 900) if attempts <= 1 else ("review-error", None)
+        return ("deferred", now + 900) if attempts <= 1 else ("needs-attention", None)
     if failure_class == "invalid-output":
         if limits["invalid_output_repeat"] and attempts <= 1:
             return "deferred", now + 60
-        return "review-error", None
+        return "review-invalid", None
+    if failure_class == "freshness":
+        return ("deferred", now + 60) if attempts <= 1 else ("needs-attention", None)
     if failure_class == "quota":
         if first_at is not None and now - first_at >= limits["quota_auth_deadline_seconds"]:
-            return "needs-attention", None
+            return "review-error", None
         return "deferred", max(now + 60, retry_at or now + 3600)
     if failure_class == "auth":
         return "needs-attention", None
@@ -211,6 +221,36 @@ TRANSIENT_CODES = {"PROVIDER_UNAVAILABLE", "PROVIDER_TIMEOUT", "BUDGET_EXHAUSTED
                    "SNAPSHOT_TIMEOUT", "SNAPSHOT_SOURCE_CHANGED", "SNAPSHOT_GIT_FAILED"}
 UNKNOWN_CODES = {"REVIEW_LAUNCH_UNCONFIRMED", "PROVIDER_IO_UNKNOWN", "ISOLATION_FAILED"}
 CONTENTION = re.compile(r"\b(?:pool|reservation|reserved|cooldown|held by)\b", re.I)
+
+
+HEAD_REVIEW_LIMIT = 3     # v6e: packet revisions per (lineage, head) that may reach reviewing
+BUDGET_CLASSES = {"provider-transient": "transient", "invalid-output": "invalid", "freshness": "freshness"}
+HEAD_BUDGET_DEFAULT = {"reviewed": [], "transient": 0, "invalid": 0, "freshness": 0, "first_deferred_at": None}
+D24_LABEL = "coordinator bookkeeping (ahc)"
+TICKET_LINE = re.compile(r"^\s+ticket (.+): ([A-Z]+)\s*$", re.M)
+
+
+def stale_tickets(stderr, rc):
+    """The tickets of a peer_review refusal caused ONLY by commit_policy ticket freshness (D24), or []. Pre-launch:
+    rc 2 and "PR review not started"; every ticket line STALE or UPDATED, at least one STALE, no blocked commit and
+    nothing unverifiable."""
+    text = stderr or ""
+    if rc != 2 or "PR review not started" not in text or "Commit policy BLOCKED" not in text:
+        return []
+    if " BLOCKED: " in text or "could not verify" in text:
+        return []
+    lines = TICKET_LINE.findall(text)
+    if not lines or any(status not in ("STALE", "UPDATED") for _ticket, status in lines):
+        return []
+    return sorted({ticket.strip() for ticket, status in lines if status == "STALE"})
+
+
+def d24_note(req, commits):
+    """The D24 note: facts already in git and nothing else (no test, status or completion claim)."""
+    lines = ["%s: receipt bookkeeping posted by ahc." % D24_LABEL,
+             "PR: https://github.com/%s/pull/%s at head %s" % (req["repo"], req["pr"], req["head"]), "Commits:"]
+    lines += ["- %s %s" % (sha, " ".join(str(subject).split())[:120]) for sha, subject in commits[:50]]
+    return "\n".join(lines)
 
 
 def classify_review_failure(stderr, rc=None):
@@ -442,6 +482,25 @@ class Ledger:
         self.db.execute("INSERT INTO events(item, event, at, data) VALUES (?,?,?,?)",
                         (iid, event, at, json.dumps(data, sort_keys=True, default=str)))
 
+    def head_budget(self, lineage, head):
+        """The v6e retry budget of one (lineage, head): `reviewed` (item ids that reached reviewing, at most
+        HEAD_REVIEW_LIMIT), one use each of transient / invalid / freshness, and `first_deferred_at` (T8). Stored in
+        lineage.attempts["heads"] (a v3 migration moves it to typed columns)."""
+        row = self.db.execute("SELECT attempts FROM lineage WHERE lineage=?", (lineage,)).fetchone()
+        data = json.loads(row["attempts"]) if row else {}
+        budget = dict(HEAD_BUDGET_DEFAULT)
+        budget.update(data.get("heads", {}).get(head, {}))
+        budget["reviewed"] = list(budget.get("reviewed") or [])
+        return budget
+
+    def save_head_budget(self, lineage, head, budget):
+        """Call inside a transaction: the check and the update must commit together (v6e admission rule)."""
+        row = self.db.execute("SELECT attempts FROM lineage WHERE lineage=?", (lineage,)).fetchone()
+        data = json.loads(row["attempts"]) if row else {}
+        data.setdefault("heads", {})[head] = budget
+        self.db.execute("INSERT INTO lineage(lineage, attempts) VALUES (?, ?) ON CONFLICT(lineage) DO UPDATE SET "
+                        "attempts=excluded.attempts", (lineage, json.dumps(data, sort_keys=True)))
+
     def next_token(self):
         row = self.db.execute("SELECT v FROM meta WHERE k='fence'").fetchone()
         token = int(row["v"]) + 1 if row else 1
@@ -594,20 +653,39 @@ class Worker:
             attempts[failure_class] = attempts.get(failure_class, 0) + 1
             self.led.db.execute("UPDATE items SET attempts=? WHERE id=?", (json.dumps(attempts), iid))
             lin = self.led.db.execute("SELECT attempts FROM lineage WHERE lineage=?", (row["lineage"],)).fetchone()
-            lattempts = json.loads(lin["attempts"]) if lin else {}
+            lattempts = json.loads(lin["attempts"]) if lin else {}   # keeps the "heads" budget map as read
             lattempts[failure_class] = lattempts.get(failure_class, 0) + 1
             self.led.db.execute("INSERT OR REPLACE INTO lineage(lineage, attempts, block_rounds) VALUES (?, ?, "
                                 "COALESCE((SELECT block_rounds FROM lineage WHERE lineage=?), 0))",
                                 (row["lineage"], json.dumps(lattempts), row["lineage"]))
         return attempts[failure_class]
 
-    def fail(self, iid, token, failure_class, reason, retry_at=None, **data):
+    def fail(self, iid, token, failure_class, reason, retry_at=None, effects=(), **data):
+        """Settle a failure through retry_policy. The three budgeted classes draw on the head's one retry each
+        (v6e, first-come, shared by every packet revision on the head); quota, auth and contention consume none
+        (T15). A deferral anchors the head's 24 h deadline at its first one (v6f T8). `effects` (key, kind, payload)
+        are inserted with the budget update, before the item settles."""
         count = self.bump(iid, failure_class) if failure_class != "contention" else 0  # waiting is not an attempt
-        first_key = "first_" + failure_class.replace("-", "_") + "_at"
-        first_at = json.loads(self.led.item(iid)["data"]).get(first_key, self.now())
-        data.setdefault(first_key, first_at)
-        state, next_at = retry_policy(failure_class, count, self.now(), retry_at, first_at=first_at,
-                                      config=self.config)
+        row = self.led.item(iid)
+        req = json.loads(row["request"])
+        now = self.now()
+        with self.led.tx():
+            budget = self.led.head_budget(row["lineage"], req["head"])
+            slot = BUDGET_CLASSES.get(failure_class)
+            if slot is not None:
+                count = 2 if budget[slot] else 1
+            state, next_at = retry_policy(failure_class, count, now, retry_at, first_at=budget["first_deferred_at"],
+                                          config=self.config)
+            if slot is not None and count == 1 and state in ("deferred", "queued"):
+                budget[slot] = 1   # the retry is granted, so it is spent
+            if state == "deferred" and budget["first_deferred_at"] is None:
+                budget["first_deferred_at"] = now
+            self.led.save_head_budget(row["lineage"], req["head"], budget)
+            if state in ("deferred", "queued"):
+                for key, kind, payload in effects:
+                    self._insert_effect(key, iid, kind, payload, now)
+        if effects and state in ("deferred", "queued"):
+            data["d24_notes"] = [key for key, _kind, _payload in effects]
         notice = _owner_notice(state, reason) if state in OWNER_NOTICE_STATES else None
         self.settle(iid, token, state, next_at, event="%s:%s" % (state, failure_class), reason=reason,
                     failure_class=failure_class, notice=notice, **data)
@@ -621,6 +699,21 @@ class Worker:
         state = row["state"]
         if state == "routed-to-main":
             return self.recheck_pass(iid, token, req)
+        if state == "deferred":
+            budget = self.led.head_budget(row["lineage"], req["head"])
+            first = budget["first_deferred_at"]
+            if first is not None and self.now() - first >= bounds(self.config)["quota_auth_deadline_seconds"]:
+                reason = ("deferred for 24 h since this head's first deferral (quota, auth, contention or a retry "
+                          "that never ran); no further automatic attempt")
+                return self.settle(iid, token, "review-error", event="review-error:deferred-deadline", reason=reason,
+                                   notice=_owner_notice("review-error", reason))   # T8
+            notes = json.loads(row["data"]).get("d24_notes") or []
+            if notes and self.led.db.execute(
+                    "SELECT COUNT(*) AS n FROM effects WHERE key IN (%s) AND status='done'" % ",".join("?" * len(notes)),
+                    notes).fetchone()["n"] < len(notes):
+                # D24: the re-run waits until every freshness note is posted, so the split roles can never spend the
+                # head's one freshness re-run on a STALE the note would have cleared
+                return self.settle(iid, token, "deferred", self.now() + 60, event="d24-note-wait")
         if self.circuit_open():
             return self.settle(iid, token, state, self.now() + 1800, event="circuit-open-wait")
         # 1. packet integrity: the bytes reviewed must be the bytes submitted
@@ -682,6 +775,22 @@ class Worker:
             reason = "a review attempt already exists for this item"
             return self.settle(iid, token, "needs-attention", event="relaunch-refused", reason=reason,
                                notice=_owner_notice("needs-attention", reason))
+        if attempt == 1:
+            with self.led.tx():
+                budget = self.led.head_budget(row["lineage"], req["head"])
+                if iid not in budget["reviewed"]:
+                    if len(budget["reviewed"]) >= HEAD_REVIEW_LIMIT:
+                        refused = True
+                    else:
+                        refused = False
+                        budget["reviewed"].append(iid)
+                        self.led.save_head_budget(row["lineage"], req["head"], budget)
+                else:
+                    refused = False
+            if refused:  # admission refuses a 4th revision (N-T4); this guards revisions admitted before any ran
+                reason = "review budget exhausted for this head: push a new head or ask main"
+                return self.settle(iid, token, "needs-attention", event="needs-attention:head-budget", reason=reason,
+                                   notice=_owner_notice("needs-attention", reason))
         report = self.paths.reports / ("%s-a%d.md" % (iid, attempt))
         if os.path.lexists(str(report)):
             reason = "report path already exists; refusing to overwrite a receipt"
@@ -718,6 +827,9 @@ class Worker:
         data = json.loads(row["data"])
         effect = self.led.db.execute("SELECT * FROM effects WHERE key=?", (key,)).fetchone()
         result = json.loads(effect["result"])
+        stale = stale_tickets(result.get("stderr", ""), result["rc"])
+        if stale:
+            return self.freshness(iid, token, req, data, stale)
         verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"])
         name = verdict["verdict"]
         if name == "PASS" or name == "PASS-WITH-TICKETS":
@@ -757,6 +869,26 @@ class Worker:
         state = self.fail(iid, token, failure_class, "review error (%s): %s" % (code, verdict["reason"]),
                           retry_at=_reset_time(result.get("stderr", "")), repeat_reason=repeat)
         return state
+
+    def freshness(self, iid, token, req, data, tickets):
+        """D24 (minimal): a receipt refused only for ticket-freshness STALE gets one factual note per (ticket, head)
+        on the STALE tickets, then the head's one re-run (T13); a second STALE goes to needs-attention (T16). The
+        refusal is pre-launch (peer_review.py commit_policy_gate), so it spends no provider budget."""
+        try:
+            commits = list(self.deps.commits(data.get("clone"), data.get("merge_base"), req["head"]))
+        except Exception as error:  # noqa: BLE001 - no commit list, no note: the owner gets it (D20)
+            reason = "ticket freshness STALE and the PR's commits could not be read: %s" % _short(error)
+            return self.settle(iid, token, "needs-attention", event="needs-attention:freshness", reason=reason,
+                               notice=_owner_notice("needs-attention", reason))
+        effects = []
+        for ticket in tickets:
+            digest = hashlib.sha256(("%s|%s" % (ticket, req["head"])).encode()).hexdigest()[:16]
+            effects.append(("ticket:d24:" + digest, "ticket", {
+                "ticket": ticket, "key": "ahc-d24-" + digest, "body": d24_note(req, commits)}))
+        reason = "ticket freshness STALE (%s); %d bookkeeping note(s), then one re-run" % (", ".join(tickets),
+                                                                                          len(effects))
+        return self.fail(iid, token, "freshness", reason, effects=effects,
+                         repeat_reason="D24_FRESHNESS: bookkeeping notes posted to %s" % ", ".join(tickets))
 
     def refuse(self, iid, token, reason):
         self.settle(iid, token, "refused", event="refused", reason=reason, notice=_owner_notice("refused", reason))
@@ -1529,6 +1661,8 @@ def _owner_body(iid, req, data, state, reason):
         "review-error": "No receipt was produced. Read the reason; a quota or provider outage is retried by the "
                         "daemon, anything else needs you.",
         "needs-attention": "The daemon stopped automatic work on this item. Read the reason and resubmit or ask main.",
+        "review-invalid": "The reviewer's output was unusable twice for this head (the one declared repeat is spent). "
+                          "Fix the packet if the cause is inside it, push a new head, or ask main.",
         UNKNOWN_OUTCOME: "The review's outcome is unknown and it will not be relaunched. Reconcile the run with "
                          "usage_guard, then record a disposition (ack --disposition) or resubmit.",
     }
@@ -1739,6 +1873,14 @@ class LiveDeps:
         rc, _out, err = self._run(argv, timeout)
         return rc, err
 
+    def commits(self, clone, merge_base, head):
+        """[(full sha, subject)] of merge_base..head in the daemon clone (D24 note)."""
+        rc, out, err = self._run(["git", "-C", str(clone), "log", "--format=%H%x09%s", "%s..%s" % (merge_base, head)],
+                                 60)
+        if rc != 0:
+            raise RuntimeError("git log failed: %s" % _short(err))
+        return [tuple(line.split("\t", 1)) for line in out.splitlines() if "\t" in line]
+
     def ops_watch(self, argv, timeout):
         """Read-only ops-watch queries only: capabilities, config (emptiness of sinks.deadman), delivered."""
         if not argv or argv[0] not in ("capabilities", "config", "delivered"):
@@ -1807,6 +1949,9 @@ def admit(paths, config, norm, now=None):
             prefix = norm["repo"] + "|"
             recent = ledger.db.execute("SELECT COUNT(*) FROM items WHERE substr(lineage, 1, ?) = ? AND submitted > ?",
                                        (len(prefix), prefix, now - 3600)).fetchone()[0]
+            lineage = "%s|%s" % (norm["repo"], norm["pr"])
+            if len(ledger.head_budget(lineage, norm["head"])["reviewed"]) >= HEAD_REVIEW_LIMIT:  # N-T4
+                raise core.Refused("review budget exhausted for this head: push a new head or ask main")
             if recent >= REPO_HOURLY_LIMIT:  # NEG-52
                 raise core.Refused("%s already has %d submissions in the last hour (limit %d); try again later"
                                    % (norm["repo"], recent, REPO_HOURLY_LIMIT))

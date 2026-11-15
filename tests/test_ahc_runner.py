@@ -43,6 +43,9 @@ class Deps:
     def changed_paths(self, clone, merge_base, head):
         return ["harness/hooks/example.py"]
 
+    def commits(self, clone, merge_base, head):
+        return [(head, "feat(ahc): an example commit")]
+
     def review(self, argv, timeout):
         self.review_calls.append(argv)
         out = Path(argv[argv.index("--output") + 1])
@@ -346,14 +349,17 @@ class RetryTests(Base):
     def test_policy_table(self):
         now = 1000.0
         self.assertEqual(runner.retry_policy("quota", 1, now, retry_at=now + 7200), ("deferred", now + 7200))
-        self.assertEqual(runner.retry_policy("quota", 3, now + 86400, first_at=now)[0], "needs-attention")
+        self.assertEqual(runner.retry_policy("quota", 3, now + 86400, first_at=now)[0], "review-error")  # T8
         self.assertEqual(runner.retry_policy("auth", 1, now), ("needs-attention", None))
         self.assertEqual(runner.retry_policy("block", 1, now), ("block-delivered", None))
         self.assertEqual(runner.retry_policy("invalid-output", 1, now)[0], "deferred")
-        self.assertEqual(runner.retry_policy("invalid-output", 2, now), ("review-error", None))
+        self.assertEqual(runner.retry_policy("invalid-output", 2, now), ("review-invalid", None))  # T14
         self.assertEqual(runner.retry_policy("invalid-output", 1, now, config={"bounds": {
-            "invalid_output_repeat": False}}), ("review-error", None))
-        self.assertEqual(runner.retry_policy("provider-transient", 2, now), ("review-error", None))
+            "invalid_output_repeat": False}}), ("review-invalid", None))
+        self.assertEqual(runner.retry_policy("provider-transient", 1, now), ("deferred", now + 900))  # T11
+        self.assertEqual(runner.retry_policy("provider-transient", 2, now), ("needs-attention", None))  # T16
+        self.assertEqual(runner.retry_policy("freshness", 1, now), ("deferred", now + 60))  # T13
+        self.assertEqual(runner.retry_policy("freshness", 2, now), ("needs-attention", None))  # T16
         self.assertEqual(runner.retry_policy("pre-provider", 3, now), ("needs-attention", None))
         self.assertEqual(runner.retry_policy("delivery", 30, now), ("pending", now + 1800))
         with self.assertRaises(ValueError):
@@ -394,7 +400,7 @@ class RetryTests(Base):
         self.assertEqual(len(deps.review_calls), 2)
         repeat = deps.review_calls[1][deps.review_calls[1].index("--repeat-reason") + 1]
         self.assertTrue(repeat.startswith("PROVIDER_INVALID_OUTPUT"))
-        self.assertEqual(self.state(iid), "review-error")
+        self.assertEqual(self.state(iid), "review-invalid")
 
     def test_invalid_output_without_repeat_flag_goes_to_owner(self):
         self.config["bounds"] = {"invalid_output_repeat": False}
@@ -403,7 +409,7 @@ class RetryTests(Base):
             self.run_all(deps)
             deps.now += 120
         self.assertEqual(len(deps.review_calls), 1)
-        self.assertEqual(self.state(iid), "review-error")
+        self.assertEqual(self.state(iid), "review-invalid")
 
     def test_block_is_never_rerun_for_the_same_head_and_packet(self):
         iid, deps = self.submit(), Deps(verdict="BLOCK")
@@ -1347,6 +1353,196 @@ class MainStampTests(Base):
                          [core.dispose_stamp_parts(self.ARGV)], "the installed `ahc` wrapper is stamped too")
         self.assertEqual(mission_gate.ahc_dispose_stamps("ssh t2-dev ahc ack ahc-x --disposition x"), [],
                          "a command run on another host is never stamped here")
+
+
+STALE_STDERR = ("Commit policy BLOCKED for %s..%s\n  ticket GoodQA goodqa#16034: STALE\n      fix: comment on the "
+                "ticket naming commit %s\n  Fix tickets: comment on each STALE ticket naming the commit SHA or branch;"
+                " reference real tickets for MISSING ones.\nPR review not started: fix the commit policy findings above"
+                " first.\n" % (BASE[:12], HEAD[:12], HEAD[:12]))
+
+
+class ScriptedDeps(Deps):
+    """peer_review outcomes in order: pass, block, transient, invalid, quota, auth, stale (D24, pre-launch)."""
+    OUTCOMES = {
+        "transient": (1, "REVIEW_DIAGNOSTIC code=PROVIDER_UNAVAILABLE reason=x"),
+        "invalid": (1, "REVIEW_DIAGNOSTIC code=PROVIDER_INVALID_OUTPUT reason=x"),
+        "quota": (1, "REVIEW_DIAGNOSTIC code=PROVIDER_USAGE_LIMIT reason=x"),
+        "stale": (2, STALE_STDERR),
+    }
+
+    def __init__(self, script, **kw):
+        super().__init__(**kw)
+        self.script = list(script)
+
+    def review(self, argv, timeout):
+        step = self.script.pop(0) if self.script else "invalid"
+        if step in ("pass", "block"):
+            self.verdict = "PASS" if step == "pass" else "BLOCK"
+            return super().review(argv, timeout)
+        self.review_calls.append(argv)
+        return self.OUTCOMES[step]
+
+
+class MixedFailureTests(Base):
+    """AC-18 (v6e retry budget; v6d red-team M1, M2, L7): per (lineage, head), each of transient / invalid / freshness
+    retries at most once, first-come, shared by every packet revision; quota and auth consume nothing; at most 3
+    revisions reach reviewing and a 4th is refused at admission (N-T4). Each sequence also runs with a daemon restart
+    between steps (`restart=True`: every step is separate core and review unit passes with fresh Deps objects)."""
+
+    def drive(self, deps, iid, restart=False, hours=30):
+        """Advance the clock and tick until the item stops changing (or `hours` pass)."""
+        end = deps.now + hours * 3600
+        while deps.now < end:
+            if restart:
+                fresh = ScriptedDeps(deps.script)
+                fresh.now, fresh.review_calls, fresh.ah_calls = deps.now, deps.review_calls, deps.ah_calls
+                runner.tick(self.paths, self.config, fresh, role="core")
+                runner.tick(self.paths, self.config, fresh, role="review")
+                runner.tick(self.paths, self.config, fresh, role="core")
+                deps.script = fresh.script
+            else:
+                self.run_all(deps)
+            if self.state(iid) in runner.TERMINAL:
+                return self.state(iid)
+            deps.now += 300
+        return self.state(iid)
+
+    def budget(self, head=HEAD):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return ledger.head_budget("%s|7" % REPO, head)
+        finally:
+            ledger.close()
+
+    def notes(self, deps):
+        return [a for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"] and "-d24-" in a[a.index("--key") + 1]]
+
+    def repeat_reasons(self, deps):
+        return [c[c.index("--repeat-reason") + 1].split(":")[0] for c in deps.review_calls if "--repeat-reason" in c]
+
+    def seq_a(self, restart):
+        iid, deps = self.submit(), ScriptedDeps(["transient", "stale", "invalid", "invalid"])
+        self.assertEqual(self.drive(deps, iid, restart), "review-invalid", "T14: the second invalid output")
+        self.assertEqual(len(deps.review_calls), 4, "transient retry, freshness re-run, invalid repeat: once each")
+        self.assertEqual(len(self.notes(deps)), 1, "one D24 note per (ticket, head)")
+        body = self.notes(deps)[0][self.notes(deps)[0].index("--body") + 1]
+        self.assertIn(runner.D24_LABEL, body)
+        self.assertIn(HEAD, body)
+        self.assertEqual(self.repeat_reasons(deps), ["PROVIDER_UNAVAILABLE", "D24_FRESHNESS", "PROVIDER_INVALID_OUTPUT"])
+        budget = self.budget()
+        self.assertEqual((budget["transient"], budget["invalid"], budget["freshness"]), (1, 1, 1))
+        return iid, deps
+
+    def test_a_transient_stale_invalid_invalid(self):
+        self.seq_a(restart=False)
+
+    def test_a_with_restarts(self):
+        self.seq_a(restart=True)
+
+    def seq_b(self, restart):
+        iid, deps = self.submit(), ScriptedDeps(["stale", "stale"])
+        self.assertEqual(self.drive(deps, iid, restart), "needs-attention", "T16: the second STALE")
+        self.assertEqual(len(deps.review_calls), 2)
+        self.assertEqual(len(self.notes(deps)), 1, "the second STALE posts no second note")
+        self.assertEqual(self.budget()["transient"] + self.budget()["invalid"], 0, "STALE spends no provider class")
+
+    def test_b_stale_stale(self):
+        self.seq_b(restart=False)
+
+    def test_b_with_restarts(self):
+        self.seq_b(restart=True)
+
+    def seq_c(self, restart):
+        iid, deps = self.submit(), ScriptedDeps(["quota", "quota", "transient", "transient"])
+        self.assertEqual(self.drive(deps, iid, restart), "needs-attention", "T16: the second transient")
+        self.assertEqual(len(deps.review_calls), 4, "quota consumed no class (T15), so the transient retry ran")
+        self.assertEqual(self.budget()["transient"], 1)
+
+    def test_c_quota_quota_transient_transient(self):
+        self.seq_c(restart=False)
+
+    def test_c_with_restarts(self):
+        self.seq_c(restart=True)
+
+    def revision(self, n):
+        packet = self.packet.with_name("rev%d.md" % n)
+        packet.write_text(GOOD_PACKET + "\n" * n)   # a one-byte-per-revision packet change on the same head
+        return packet
+
+    def seq_d(self, restart):
+        first, deps = self.seq_a(restart)
+        second = self.submit(packet=self.revision(1))
+        self.assertNotEqual(second, first, "the packet change must create a new request row (dedupe not vacuous)")
+        deps.script = ["invalid"]
+        self.assertEqual(self.drive(deps, second, restart), "review-invalid", "no invalid repeat is offered again")
+        self.assertEqual(len(deps.review_calls), 5)
+        third = self.submit(packet=self.revision(2))
+        deps.script = ["transient"]
+        self.assertEqual(self.drive(deps, third, restart), "needs-attention", "no transient retry is offered again")
+        self.assertEqual(len(deps.review_calls), 6)
+        self.assertEqual(len(self.budget()["reviewed"]), 3)
+        with self.assertRaises(core.Refused) as refused:
+            self.submit(packet=self.revision(3))
+        self.assertIn("review budget exhausted for this head", str(refused.exception))
+        fresh_head = self.submit(head="c" * 40, packet=self.revision(4))   # a new head starts a fresh budget
+        self.assertNotIn(fresh_head, self.budget()["reviewed"])
+        self.assertEqual(self.budget("c" * 40)["reviewed"], [])
+
+    def test_d_exhausted_head_then_packet_revisions(self):
+        self.seq_d(restart=False)
+
+    def test_d_with_restarts(self):
+        self.seq_d(restart=True)
+
+    def test_stale_is_reported_before_any_provider_launch_in_the_helper_source(self):
+        """AC-5 / v6e: a freshness STALE spends no provider budget only because peer_review refuses it before any
+        launch. Pin that against the installed helper's source: the commit-policy gate's early return (with the
+        exact text stale_tickets() keys on) comes before main()'s reviewer dispatch."""
+        source = (Path(runner.__file__).parent / "peer_review.py").read_text()
+        main_at = source.index("def main(")
+        gate = source.index("code, text = commit_policy_gate(repo, args.base)", main_at)
+        refusal = source.index("print('PR review not started: fix the commit policy findings above first.'", gate)
+        self.assertLess(refusal - gate, 600, "the refusal is the gate's own early return")
+        launch = source.index("review_snapshot(snapshot,", main_at)   # the only call that starts a reviewer CLI
+        self.assertIn("options['launches'] +=", source[source.index("def review_snapshot("):main_at])
+        self.assertLess(gate, launch, "the gate must precede any launch")
+
+    def test_freshness_rerun_waits_for_the_note(self):
+        """D24: the re-run never starts before every note is posted (split roles cannot spend it on a STALE the
+        note would clear); a ticket outage holds it, and the head's 24 h deferred deadline still bounds the wait."""
+        iid, deps = self.submit(), ScriptedDeps(["stale", "pass"])
+        ah = deps.ah
+
+        def ticket_down(argv, timeout):
+            if argv[:3] == ["ah", "ticket", "comment"] and "-d24-" in argv[argv.index("--key") + 1]:
+                deps.ah_calls.append(argv)
+                return 1, "", "ticket system down"
+            return ah(argv, timeout)
+        deps.ah = ticket_down
+        for _ in range(12):
+            self.run_all(deps)
+            deps.now += 300
+        self.assertEqual(len(deps.review_calls), 1, "the re-run started before the note was posted")
+        self.assertEqual(self.state(iid), "deferred")
+        deps.ah = ah
+        self.assertEqual(self.drive(deps, iid, hours=2), "routed-to-main")
+        self.assertEqual(len(deps.review_calls), 2)
+        self.assertEqual(self.budget()["freshness"], 1)
+
+    def test_quota_flapping_ends_in_review_error_24h_after_the_first_deferral(self):
+        """v6f T8: the 24 h deferred deadline is anchored at the head's FIRST deferral; re-entry never resets it."""
+        iid, deps = self.submit(), ScriptedDeps(["quota"] * 40)
+        start = deps.now
+        state = self.drive(deps, iid, hours=30)
+        self.assertEqual(state, "review-error")
+        self.assertGreater(len(deps.review_calls), 3, "the quota retry_at cycle ran several times first")
+        ledger = runner.Ledger(self.paths)
+        try:
+            entered = ledger.item(iid)["entered_at"]
+        finally:
+            ledger.close()
+        self.assertLess(entered - start, 25 * 3600, "review-error must come at about 24 h, not later")
+        self.assertGreaterEqual(entered - start, 24 * 3600)
 
 
 class AckInactivityTests(Base):

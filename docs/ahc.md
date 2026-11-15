@@ -35,9 +35,40 @@ A migration runs only after a proven backup:
 does three things in order:
 
 1. A duplicate item id returns the existing item.
-2. The submit is refused when 50 items are non-terminal, or when the repo already had 6 submissions in the last
-   hour.
+2. The submit is refused when 50 items are non-terminal, when the repo already had 6 submissions in the last
+   hour, or when 3 packet revisions on this head already reached `reviewing` ("review budget exhausted for this
+   head: push a new head or ask main").
 3. Otherwise the item is inserted.
+
+## Retry budget
+
+The budget is counted per (lineage, head), where the lineage is (repo, PR). Every packet revision on the same head
+shares it; only a new head starts a fresh one. Per head:
+
+- at most 3 revisions reach `reviewing`;
+- one provider-transient retry. A second transient goes to `needs-attention`;
+- one declared invalid-output repeat. A second invalid output goes to `review-invalid`;
+- one ticket-freshness re-run (D24). A second STALE goes to `needs-attention`.
+
+Each class is first-come and used at most once. Quota, auth and pool contention consume nothing.
+
+The head's 24 h deferred deadline starts at its first deferral. Later deferrals never restart it, so a flapping
+quota ends in `review-error` 24 h after the first one.
+
+The budget lives in `lineage.attempts["heads"][head]` and survives restarts and resubmits.
+
+### Ticket-freshness STALE (D24)
+
+peer_review refuses a PR review before any provider launch when commit_policy reports a referenced ticket as
+STALE (rc 2, "PR review not started"). When that refusal is the only problem, the daemon:
+
+1. posts one note per (ticket, head) on the STALE tickets. The note is labelled `coordinator bookkeeping (ahc)`
+   and lists only the PR URL, the head, and each commit's SHA and subject from the daemon clone;
+2. defers the item until every note is posted. The re-run never starts before that, so a ticket outage holds the
+   re-run instead of wasting it;
+3. re-runs the receipt once.
+
+A second STALE on the same head goes to `needs-attention`.
 
 A file placed in the queue directory admits nothing. It is quarantined unread and raises an alert.
 
