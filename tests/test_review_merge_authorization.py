@@ -335,67 +335,101 @@ class PrPassEvidenceTests(AuthorizationTests):
         self.assertEqual(mg._read_waivers(self.state) if self.state.exists() else [], [])
 
 
-class CandidateBindingTests(AuthorizationTests):
-    """merge_gate.ahc_candidate_pass (spec ahc-m1-v2e AC-3, F2): the PASS must be for the candidate M = merge(B, H)
-    itself. BOUNDARY: main merges this and the security review reads it."""
+class BoundPassTests(AuthorizationTests):
+    """merge_gate.ahc_bound_pass (spec ahc-m1-v2g2 R4/E2, v2g6 scope: cross-vendor only): the PASS must be for the
+    reviewed head H, carry B_r, and B_r must be the current default-branch tip B or an ancestor of it. It replaces
+    the withdrawn candidate-M binding. BOUNDARY: main merges this and the security review reads it."""
 
-    B, H, M1, M2, T1, T2 = "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40, "6" * 40
+    H, B, BR, B2, H2 = "2" * 40, "1" * 40, "7" * 40, "8" * 40, "3" * 40
 
-    def final(self, m=None, tree=None, **review):
-        m, tree = m or self.M1, tree or self.T1
-        review.setdefault("head", m)
-        store, reference = self.evidence(review, subject_head=review["head"], subject_tree=tree)
+    def final(self, head=None, snapshot_base=None, **review):
+        review.setdefault("head", head or self.H)
+        if snapshot_base is not False:
+            review["snapshot_base"] = snapshot_base or self.BR
+        store, reference = self.evidence(review, subject_head=review["head"])
         return store.inspect(reference)
 
-    def candidate(self, **changes):
-        c = {"repo": "o/r", "pr": 5, "head": self.H, "base": self.B, "merge_sha": self.M1, "tree": self.T1,
-             "ref": "refs/ahc/candidate/5/" + self.M1, "parents": [self.B, self.H], "pr_head": self.H}
-        c.update(changes)
-        return c
+    @staticmethod
+    def cmp(base, head, status="ahead"):
+        return {"base": base, "head": head, "status": status}
 
-    def test_pass_for_m_binds(self):
-        self.assertEqual(mg.ahc_candidate_pass(self.final(), self.candidate()), ("o/r", 5, self.M1, REPORT_SHA))
-        heads_ref = self.candidate(ref="refs/heads/ahc/candidate/5/" + self.M1)
-        self.assertEqual(mg.ahc_candidate_pass(self.final(), heads_ref)[2], self.M1)
-        self.assertEqual(mg.ahc_candidate_pass(self.final(), self.candidate(repo="O/R"))[0], "o/r")
+    def binding(self, br=None, base_status="ahead", head_status="ahead", **changes):
+        b = {"repo": "o/r", "pr": 5, "head": self.H, "base": self.B, "pr_head": self.H,
+             "base_compare": self.cmp(br or self.BR, self.B, base_status),
+             "head_compare": self.cmp(self.B, self.H, head_status)}
+        b.update(changes)
+        return b
 
-    def test_each_binding_clause_refuses(self):
+    def test_pass_for_h_with_b_r_an_ancestor_of_b_or_equal_binds(self):
+        self.assertEqual(mg.ahc_bound_pass(self.final(), self.binding()), ("o/r", 5, self.H, self.BR, REPORT_SHA))
+        same = self.final(snapshot_base=self.B)
+        self.assertEqual(mg.ahc_bound_pass(same, self.binding(br=self.B, base_status="identical"))[3], self.B)
+        self.assertEqual(mg.ahc_bound_pass(self.final(), self.binding(repo="O/R"))[0], "o/r")
+
+    def test_each_binding_condition_refuses(self):
         final = self.final()
         bad = {
-            "final for H alone": (self.final(m=self.H), self.candidate()),
-            "another M with the same H (substitution)": (self.final(m=self.M2, tree=self.T2), self.candidate()),
-            "candidate M2 given M1's final": (final, self.candidate(merge_sha=self.M2, tree=self.T2,
-                                                                     ref="refs/ahc/candidate/5/" + self.M2)),
-            "tree differs": (final, self.candidate(tree=self.T2)),
-            "parents swapped": (final, self.candidate(parents=[self.H, self.B])),
-            "one parent": (final, self.candidate(parents=[self.B])),
-            "parents unread": (final, self.candidate(parents=None)),
-            "PR head moved": (final, self.candidate(pr_head=self.M2)),
-            "other repo": (final, self.candidate(repo="o/other")),
-            "lookalike repo": (final, self.candidate(repo="o/r\u0435")),
-            "other PR": (final, self.candidate(pr=6, ref="refs/ahc/candidate/6/" + self.M1)),
-            "ref for another M": (final, self.candidate(ref="refs/ahc/candidate/5/" + self.M2)),
-            "ref for another PR": (final, self.candidate(ref="refs/ahc/candidate/6/" + self.M1)),
-            "ref outside the namespace": (final, self.candidate(ref="refs/heads/main/ahc/candidate/5/" + self.M1)),
-            "M equals H": (self.final(m=self.H), self.candidate(merge_sha=self.H, ref="refs/ahc/candidate/5/" + self.H)),
-            "malformed M": (final, self.candidate(merge_sha="xyz")),
+            "legacy receipt without B_r": (self.final(snapshot_base=False), self.binding()),
+            "other repo": (final, self.binding(repo="o/other")),
+            "lookalike repo": (final, self.binding(repo="o/r\u0435")),
+            "other PR": (final, self.binding(pr=6)),
+            "PR as a string": (final, self.binding(pr="5")),
+            "Reviewed HEAD is not H": (self.final(head=self.H2), self.binding()),
+            "PR head read back moved": (final, self.binding(pr_head=self.H2)),
+            "PR head unread": (final, self.binding(pr_head=None)),
+            "B_r diverged from B": (final, self.binding(base_status="diverged")),
+            "B_r ahead of B": (final, self.binding(base_status="behind")),
+            "compare unread": (final, self.binding(base_compare=None)),
+            "compare a bare status": (final, self.binding(base_compare="ahead")),
+            "identical but B_r is not B": (final, self.binding(base_status="identical")),
+            "ahead but B_r is B": (self.final(snapshot_base=self.B), self.binding(br=self.B)),
+            "compare base is not B_r": (final, self.binding(br=self.B2)),
+            "compare head is not B": (final, self.binding(base_compare=self.cmp(self.BR, self.B2))),
+            "compare pair swapped": (final, self.binding(base_compare=self.cmp(self.B, self.BR))),
+            "compare sha short": (final, self.binding(base_compare=self.cmp(self.BR[:12], self.B))),
+            "compare status missing": (final, self.binding(base_compare={"base": self.BR, "head": self.B})),
+            "H not ahead of B": (final, self.binding(head_status="diverged")),
+            "H behind B": (final, self.binding(head_status="behind")),
+            "H identical to B by compare": (final, self.binding(head_status="identical")),
+            "B...H unread": (final, self.binding(head_compare=None)),
+            "B...H base is not B": (final, self.binding(head_compare=self.cmp(self.B2, self.H))),
+            "B...H head is not H": (final, self.binding(head_compare=self.cmp(self.B, self.H2))),
+            "B...H pair swapped": (final, self.binding(head_compare=self.cmp(self.H, self.B))),
+            "malformed H": (final, self.binding(head="xyz")),
+            "malformed B": (final, self.binding(base="B" * 40)),
+            "H equals B": (final, self.binding(base=self.H, head_compare=self.cmp(self.H, self.H),
+                                               base_compare=self.cmp(self.BR, self.H))),
             "not a mapping": (final, None),
         }
-        for name, (evidence, cand) in bad.items():
+        for name, (evidence, binding) in bad.items():
             with self.subTest(name), self.assertRaises(ValueError):
-                mg.ahc_candidate_pass(evidence, cand)
+                mg.ahc_bound_pass(evidence, binding)
 
-    def test_pr_pass_rules_still_apply(self):
+    def test_cross_vendor_only_and_the_author_harness_must_be_known(self):
+        """v2g6 AC-17 scope: no same-vendor fallback in this change; an unknown author harness fails closed."""
+        for name, review in {"same vendor": {"reviewer_harness": "claude", "reviewer": "Claude x"},
+                             "author unknown": {"author_harness": "unknown"},
+                             "reviewer unknown": {"reviewer_harness": "kimi"}}.items():
+            with self.subTest(name), self.assertRaises((ValueError, guard.GuardError)):
+                mg.ahc_bound_pass(self.final(**review), self.binding())
         with self.assertRaises((ValueError, guard.GuardError)):
-            mg.ahc_candidate_pass(self.final(verdict="BLOCK"), self.candidate())
-        with self.assertRaises((ValueError, guard.GuardError)):
-            mg.ahc_candidate_pass(self.final(reviewer_harness="claude", reviewer="Claude x"), self.candidate())
+            mg.ahc_bound_pass(self.final(verdict="BLOCK"), self.binding())
+        self.assertNotIn("same_vendor", mg.ahc_bound_pass.__code__.co_varnames, "no fallback argument yet")
+
+    def test_mains_predicate_still_refuses_a_same_vendor_final(self):
+        """v2g6 AC-17: main's path, pr_pass_evidence, refuses a same-vendor FINAL, with and without B_r."""
+        for with_base in (False, True):
+            with self.subTest(with_base=with_base), self.assertRaises((ValueError, guard.GuardError)):
+                mg.pr_pass_evidence(self.final(reviewer_harness="claude", reviewer="Claude x"), with_base=with_base)
 
     def test_binding_writes_nothing(self):
         evidence = self.final()
         before = sorted(str(p) for p in self.root.rglob("*"))
-        mg.ahc_candidate_pass(evidence, self.candidate())
+        mg.ahc_bound_pass(evidence, self.binding())
         self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+
+    def test_the_withdrawn_candidate_binding_is_gone(self):
+        self.assertFalse(hasattr(mg, "ahc_candidate_pass"), "v2g withdrew the candidate-M binding")
 
 
 class SnapshotBaseTests(AuthorizationTests):
