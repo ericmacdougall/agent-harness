@@ -889,8 +889,10 @@ def comment_age(ref: str, now: float):
         adapter, mod = load_adapter()
         project, number = ticket_ref(ref)
         ticket = ticket_issue(adapter, mod, project, number)
-        data = adapter.call("get_issue_comments", {"issueId": ticket.id, "order": "desc", "limit": 1})
-        items = data.get("comments") or []
+        data = adapter.call("get_issue_comments", {"issueId": ticket.id, "order": "desc", "limit": 20})
+        # goodqa#16034 AC-30: an ahc bookkeeping note is never an owner checkpoint
+        items = [c for c in (data.get("comments") or [])
+                 if not str(c.get("body") or "").lstrip().startswith("coordinator bookkeeping (ahc)")]
         return int(now - parse_ts(items[0].get("createdAt"))) if items else None
     except Exception:
         return None

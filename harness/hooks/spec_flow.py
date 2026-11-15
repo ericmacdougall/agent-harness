@@ -961,9 +961,21 @@ def _nesting_depth(text: str) -> int:
     return deepest
 
 
+BOOKKEEPING_LABEL = "coordinator bookkeeping (ahc)"   # goodqa#16034 D24 / AC-30: the ahc freshness note
+
+
+def is_bookkeeping(body) -> bool:
+    """True for an ahc D24 bookkeeping note (it starts with the label). It states facts already in git and is never
+    owner evidence, a checkpoint, a spec record or a click-test (AC-30)."""
+    return str(body or "").lstrip().startswith(BOOKKEEPING_LABEL)
+
+
 def ticket_records(comments: list, max_bytes: int):
     records, ignored = [], []
     for comment in comments:
+        if is_bookkeeping(comment.get("body")):
+            ignored.append(f"comment {str(comment.get('id', ''))[:8]}: {BOOKKEEPING_LABEL} note, not a record")
+            continue
         for match in RECORD_BLOCK.finditer(str(comment.get("body") or "")):
             raw = match.group(1)
             if len(raw) > max_bytes:
