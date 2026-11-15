@@ -267,13 +267,19 @@ def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" =
     return _summarize_cached(path, index_dir, cache)
 
 
-def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
+def _summarize_agent_wal(path: Path, index_dir: Path, prior: dict | None = None) -> dict:
+    """`prior` (PR 245 cold path): the owners cache's last summary of this WAL. It is the starting state in place of the
+    per-WAL index file, and the index file is then not rewritten: the owners cache holds the result. Every check below
+    (schema, record contract, offset, inode and tail hash) applies to it exactly as to an index file."""
     own = path.name[len("agent-"):-len(".jsonl")] if path.name.startswith("agent-") else path.name[:-len(".jsonl")]
     cache = index_dir / ("wal-" + hashlib.sha256(str(path).encode()).hexdigest()[:16] + ".json")
-    try:
-        summary = json.loads(_bounded(cache))
-    except (OSError, ValueError, RecursionError):
-        summary = {}
+    if prior is not None:
+        summary = json.loads(json.dumps(prior))   # a private copy: the cached entry is replaced, never edited in place
+    else:
+        try:
+            summary = json.loads(_bounded(cache))
+        except (OSError, ValueError, RecursionError):
+            summary = {}
     if not isinstance(summary, dict):
         summary = {}
     before = json.dumps(summary, sort_keys=True)  # goodqa#15963: rewrite the index only when it changed
@@ -327,7 +333,7 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     summary["skipped_to"] = meta.get("offset", 0)   # the skipped count covers every line before this offset
     summary["lost_trail"] = trail.state()   # and the evidence for each lost line, for the shared window rule
     summary["record_rule"] = _prov().RECORD_RULE   # every record in this summary passed this contract
-    if json.dumps(summary, sort_keys=True) != before:
+    if prior is None and json.dumps(summary, sort_keys=True) != before:
         atomic_json(cache, summary)
     return summary
 
@@ -428,7 +434,7 @@ def _load_owners_cache(path: Path) -> dict:
         data = {}  # missing, corrupt or another version: rebuilt from the per-file state, never trusted
     return {"schema": OWNERS_CACHE_SCHEMA, "wal": data.get("wal") if isinstance(data.get("wal"), dict) else {},
             "meta": data.get("meta") if isinstance(data.get("meta"), dict) else {}, "dirty": False, "seen": set(),
-            "path": path, "misses": 0}
+            "path": path, "misses": 0, "started": time.monotonic()}
 
 
 def _save_owners_cache(path: Path, cache: dict, prune: bool = True) -> None:
@@ -484,6 +490,7 @@ def _cleanup_stale_tmp_inner(index_dir: Path, now: float) -> None:
 
 
 OWNERS_CACHE_SAVE_EVERY = 300  # a cold run interrupted by tier_gate's deadline still keeps its progress (R8)
+OWNERS_CACHE_SAVE_GAP_S = 1.5  # and saves it at most this often (tier_gate's deadline is 4 s)
 
 
 _NUM = (int, float)
@@ -527,13 +534,20 @@ def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
     entry = cache["wal"].get(key)
     if fp and isinstance(entry, dict) and entry.get("fp") == fp and _cached_summary_ok(entry.get("s")):
         return entry["s"]
-    summary = _summarize_agent_wal(path, index_dir)
+    # PR 245 cold path: a WAL the owners cache already summarised (it changed since) continues from that summary and
+    # skips the per-WAL index file, read and write; only a WAL the cache has never held goes through the index file
+    prior = entry["s"] if isinstance(entry, dict) and _cached_summary_ok(entry.get("s")) else None
+    summary = _summarize_agent_wal(path, index_dir, prior) if prior is not None else _summarize_agent_wal(path, index_dir)
     if fp:
         cache["wal"][key] = {"fp": fp, "s": summary}
         cache["dirty"] = True
         cache["misses"] += 1
-        if cache["misses"] % OWNERS_CACHE_SAVE_EVERY == 0:
+        # R8 progress save, at most one per OWNERS_CACHE_SAVE_GAP_S: each save writes the whole cache, so a count-only
+        # trigger made a fresh 2,400-agent run write it 7 times (3.5 s of 8.6 s on t2-dev)
+        if cache["misses"] % OWNERS_CACHE_SAVE_EVERY == 0 \
+                and time.monotonic() - cache.get("saved_at", cache["started"]) >= OWNERS_CACHE_SAVE_GAP_S:
             _save_owners_cache(cache["path"], cache, prune=False)
+            cache["saved_at"] = time.monotonic()
     return summary
 
 

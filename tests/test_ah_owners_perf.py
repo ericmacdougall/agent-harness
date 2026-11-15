@@ -144,6 +144,43 @@ class Counts(Base):
             ah.owners(self.home, SESSION, now=NOW)
         self.assertEqual(write.call_count, 0)
 
+    def test_a_changed_wal_the_cache_holds_skips_its_index_file(self):  # PR 245 cold path
+        """The owners cache's own summary is the starting state: the per-WAL index is neither read nor written again,
+        and the result equals a fresh read of the same files (incremental, checked by offset, inode and tail hash)."""
+        ah.owners(self.home, SESSION, now=NOW)
+        aid = "a" + f"{4:016x}"     # mode 4: handoff
+        index = ah.state_dir(self.home, "ah-index")
+        before = {f.name: f.read_bytes() for f in index.glob("wal-*.json")}
+        jl(self.home / ".claude" / "wals" / SESSION / f"agent-{aid}.jsonl",
+           [{"at": iso(NOW - 10), "event": "intent", "note": "back at it GoodQA goodqa#77"}, "{torn"])
+        real = ah._bounded
+        reads = []
+
+        def spy(path, *a, **k):
+            if Path(path).name.startswith("wal-"):
+                reads.append(Path(path).name)
+            return real(path, *a, **k)
+        with mock.patch.object(ah, "_bounded", spy):
+            again = ah.owners(self.home, SESSION, now=NOW)
+        self.assertEqual(reads, [], "no per-WAL index file was read")
+        self.assertEqual({f.name: f.read_bytes() for f in index.glob("wal-*.json")}, before, "no index file changed")
+        fresh = ah.owners(self.home_copy("fresh-changed"), SESSION, now=NOW)
+        row = {r["agent_id"]: r for r in again["owners"]}[aid]
+        self.assertEqual(row, {r["agent_id"]: r for r in fresh["owners"]}[aid])
+        self.assertEqual(again["read"]["skipped"], fresh["read"]["skipped"])
+
+    def test_progress_saves_are_bounded_by_time(self):  # PR 245 cold path: not one whole-cache save per N misses
+        saves = []
+        real = ah._save_owners_cache
+
+        def spy(path, cache, prune=True):
+            saves.append(prune)
+            return real(path, cache, prune)
+        with mock.patch.object(ah, "_save_owners_cache", spy), mock.patch.object(ah, "OWNERS_CACHE_SAVE_EVERY", 20), \
+                mock.patch.object(ah, "OWNERS_CACHE_SAVE_GAP_S", 3600.0, create=True):
+            ah.owners(self.home, SESSION, now=NOW)
+        self.assertEqual(saves, [True], "only the final save inside the gap")
+
     def test_an_appended_wal_is_picked_up(self):  # NEG-2
         first = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
         aid = "a" + f"{4:016x}"     # mode 4: handoff
@@ -281,6 +318,7 @@ class Counts(Base):
                 raise KeyboardInterrupt  # stands in for tier_gate's deadline alarm
             return real(path, index_dir)
         with mock.patch.object(ah, "_summarize_agent_wal", boom), mock.patch.object(ah, "OWNERS_CACHE_SAVE_EVERY", 50), \
+                mock.patch.object(ah, "OWNERS_CACHE_SAVE_GAP_S", 0.0), \
                 self.assertRaises(KeyboardInterrupt):
             ah.owners(self.home, SESSION, now=NOW)
         cache = json.loads(ah._owners_cache_path(ah.state_dir(self.home, "ah-index"), SESSION).read_text())
