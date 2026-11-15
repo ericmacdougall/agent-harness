@@ -276,8 +276,8 @@ test('textual evidence from the producer is shown on the requirement row', () =>
 
 
 // review PR 234 v2 F2: a status read that missed WALs never reads as healthy, and never says "No blockers recorded" bare.
-const HEALTHY = sources(['asks', 'owners', 'initiatives', 'wals', 'chat'].map(name => ({ name, status: 'ok', checked: NOW / 1000, ok_at: NOW / 1000, truth: 'current' })));
-const partial = (unread, extra = {}) => ({ now: NOW, events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
+const HEALTHY = sources(['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'].map(name => ({ name, status: 'ok', checked: NOW / 1000, ok_at: NOW / 1000, truth: 'current' })));
+const partial = (unread, extra = {}) => ({ now: NOW, connection: 'live', events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
   asksStale: [], asksSweptAt: '', initiativesStale: false, initiativesError: '', sessions: [], sources: HEALTHY,
   ledger: ledger({ status: { blockers: [], verified: [], incomplete: unread.count !== 0, unread, at: iso(1), truth: unread.count !== 0 ? 'partial' : 'current', ...extra } }) });
 

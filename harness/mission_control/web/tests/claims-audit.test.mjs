@@ -12,7 +12,7 @@ const row = (name, truth = 'current', status = 'ok') => ({ name, status, checked
 const NAMES = ['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'];
 function world(broken = '', truth = 'unknown') {
   const health = NAMES.map(name => (name === broken ? row(name, truth, truth === 'stale' ? 'error' : truth === 'partial' ? 'ok' : 'error') : row(name)));
-  return { now: NOW, ledger: ledger({ status: { at, truth: 'current' } }), sources: sources(health), owners: [], asks: [], initiatives: [], events: [] };
+  return { now: NOW, connection: 'live', ledger: ledger({ status: { at, truth: 'current' } }), sources: sources(health), owners: [], asks: [], initiatives: [], events: [] };
 }
 const AUDIT = [
   ['Needs-you header count, label, title and "Nothing needs you right now."', ['asks'], s => { const n = needsSummary(s, 0, 0); return `${n.count}|${n.label}|${n.title}|${n.empty}`; },
