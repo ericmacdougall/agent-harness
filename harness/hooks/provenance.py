@@ -136,12 +136,20 @@ class LostTrail:
 
     @classmethod
     def from_state(cls, state):
+        """None for anything that is not a state() of this class, field by field (PR 245 m2 receipt): a hand-edited
+        or corrupt index is evidence of nothing and is rebuilt, never a ValueError or TypeError in a reader."""
         if not isinstance(state, dict):
             return None
         nexts = state.get("nexts")
-        if not isinstance(nexts, list) or not all(n is None or isinstance(n, (int, float)) for n in nexts):
+        if not isinstance(nexts, list) or not all(n is None or (isinstance(n, (int, float)) and not isinstance(n, bool))
+                                                  for n in nexts):
             return None
-        return cls(nexts, state.get("ordered", False) is True, state.get("last") or 0.0, state.get("extra") or 0)
+        last, extra, ordered = state.get("last"), state.get("extra"), state.get("ordered", False)
+        if not (last is None or (isinstance(last, (int, float)) and not isinstance(last, bool))) \
+                or not (extra is None or (isinstance(extra, int) and not isinstance(extra, bool) and extra >= 0)) \
+                or not isinstance(ordered, bool):
+            return None
+        return cls(nexts, ordered, last or 0.0, extra or 0)
 
     def state(self) -> dict:
         return {"nexts": self.nexts, "ordered": self.ordered, "last": self.last, "extra": self.extra}

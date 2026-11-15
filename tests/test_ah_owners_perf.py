@@ -237,6 +237,73 @@ class Counts(Base):
                 path.write_text(json.dumps(data))
                 self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)
 
+    BAD_FIELDS = {   # PR 245 m2 receipt: each passed the m1 check and then raised on use
+        "meta offset text": lambda e: e["meta"].__setitem__("offset", "bad"),
+        "meta inode text": lambda e: e["meta"].__setitem__("inode", "bad"),
+        "meta not a dict": lambda e: e.__setitem__("meta", ["bad"]),
+        "lost_trail last text": lambda e: e["lost_trail"].__setitem__("last", "bad"),
+        "lost_trail extra text": lambda e: e["lost_trail"].__setitem__("extra", "bad"),
+        "lost_trail ordered text": lambda e: e["lost_trail"].__setitem__("ordered", "yes"),
+        "schema text": lambda e: e.__setitem__("schema", "bad"),
+        "events text": lambda e: e.__setitem__("events", "bad"),
+        "skipped_to text": lambda e: e.__setitem__("skipped_to", "bad"),
+    }
+
+    def corrupt_and_check(self, where):
+        """Corrupt one field (in the owners cache, or in every per-WAL index file), then: this call is right, the next
+        call is right, and the stored state was replaced (the corruption is not served again)."""
+        good = strip(ah.owners(self.home, SESSION, now=NOW))
+        index = ah.state_dir(self.home, "ah-index")
+        cache_path = ah._owners_cache_path(index, SESSION)
+        saved_cache = cache_path.read_text()
+        saved_index = {f: f.read_text() for f in index.glob("wal-*.json")}
+        for name, damage in self.BAD_FIELDS.items():
+            with self.subTest(where=where, field=name):
+                cache_path.write_text(saved_cache)
+                for f, text in saved_index.items():
+                    f.write_text(text)
+                if where == "owners cache":
+                    data = json.loads(saved_cache)
+                    for entry in data["wal"].values():
+                        damage(entry["s"])
+                    cache_path.write_text(json.dumps(data))
+                else:   # the per-WAL index files, with no owners cache (an upgrade, or a lost cache)
+                    cache_path.unlink()
+                    for f, text in saved_index.items():
+                        entry = json.loads(text)
+                        damage(entry)
+                        f.write_text(json.dumps(entry))
+                self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good, f"{name}: this call")
+                self.assertEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good, f"{name}: the next call recovers")
+                served = json.loads(cache_path.read_text())["wal"].values()
+                self.assertTrue(all(ah._cached_summary_ok(e["s"]) for e in served), f"{name}: the entry was replaced")
+
+    def test_a_cache_entry_with_a_wrong_field_type_is_rebuilt(self):  # PR 245 m2 receipt
+        self.corrupt_and_check("owners cache")
+
+    def test_an_index_file_with_a_wrong_field_type_is_rebuilt(self):  # PR 245 m2 receipt (the same rule, older store)
+        self.corrupt_and_check("per-WAL index")
+
+    def test_any_failure_using_a_cached_entry_is_a_miss_that_rewrites_it(self):  # PR 245 m2 receipt, defence in depth
+        good = strip(ah.owners(self.home, SESSION, now=NOW))
+        aid = "a" + f"{4:016x}"
+        jl(self.home / ".claude" / "wals" / SESSION / f"agent-{aid}.jsonl",
+           [{"at": iso(NOW - 10), "event": "status", "note": "later"}])   # a miss with a prior entry for this WAL
+        real = ah._summarize_agent_wal
+        calls = []
+
+        def flaky(path, index_dir, prior=None):
+            calls.append(prior is None or bool(prior))
+            if prior:
+                raise TypeError("unexpected state in a cached entry")   # a shape no check foresaw
+            return real(path, index_dir, prior)
+        with mock.patch.object(ah, "_summarize_agent_wal", flaky):
+            again = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=NOW)["owners"]}
+        fresh = {r["agent_id"]: r for r in ah.owners(self.home_copy("fresh-flaky"), SESSION, now=NOW)["owners"]}
+        self.assertEqual(again[aid], fresh[aid], "rebuilt from the start, not a crash")
+        self.assertIn(True, calls)
+        self.assertNotEqual(strip(ah.owners(self.home, SESSION, now=NOW)), good)   # the append is shown on later calls
+
     def test_a_deeply_nested_meta_file_is_skipped(self):  # delta review follow-up (discover_agents meta read)
         aid = "a" + f"{5:016x}"
         meta = self.home / ".claude" / "projects" / "-p0" / SESSION / "subagents" / f"agent-{aid}.meta.json"

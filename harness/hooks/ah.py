@@ -280,8 +280,8 @@ def _summarize_agent_wal(path: Path, index_dir: Path, prior: dict | None = None)
             summary = json.loads(_bounded(cache))
         except (OSError, ValueError, RecursionError):
             summary = {}
-    if not isinstance(summary, dict):
-        summary = {}
+    if not _summary_types_ok(summary):
+        summary = {}   # PR 245 m2 receipt: a field of the wrong type is a corrupt index: rescanned from the start
     before = json.dumps(summary, sort_keys=True)  # goodqa#15963: rewrite the index only when it changed
     if summary.get("schema", 1) > SCHEMA:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
@@ -496,19 +496,38 @@ OWNERS_CACHE_SAVE_GAP_S = 1.5  # and saves it at most this often (tier_gate's de
 _NUM = (int, float)
 
 
+def _num(v) -> bool:
+    return isinstance(v, _NUM) and not isinstance(v, bool)
+
+
+def _count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+# every field a summary (a per-WAL index file or an owners-cache entry) may hold, with the type its readers assume
+_SUMMARY_FIELDS = {
+    "schema": _count, "first": lambda v: v is None or isinstance(v, str), "last_at": _num,
+    "outcome": lambda v: v is None or isinstance(v, str), "outcome_at": _num, "last_note": lambda v: isinstance(v, str),
+    "tickets": lambda v: isinstance(v, list) and all(isinstance(t, str) for t in v), "events": _count,
+    "skipped": _count, "skipped_to": _count, "record_rule": lambda v: isinstance(v, str),
+    "lost_trail": lambda v: _prov().LostTrail.from_state(v) is not None,
+    "meta": lambda m: isinstance(m, dict) and all(k not in m or check(m[k]) for k, check in (
+        ("offset", _count), ("inode", _count), ("tail", lambda t: isinstance(t, str)))),
+}
+_SUMMARY_REQUIRED = ("first", "last_at", "outcome", "outcome_at", "last_note", "tickets", "events", "skipped", "meta",
+                     "lost_trail", "record_rule")
+
+
+def _summary_types_ok(s) -> bool:
+    """Every field present has the type its readers assume (PR 245 m2 receipt). A loaded index or cache entry that
+    fails is evidence of nothing: it is rebuilt from the WAL, never a TypeError or ValueError on every later call."""
+    return isinstance(s, dict) and all(k not in s or check(s[k]) for k, check in _SUMMARY_FIELDS.items())
+
+
 def _cached_summary_ok(s) -> bool:
-    """A cached summary is served only with every field owners() and the tally read, each of its type (PR 245 m1 F2):
-    an empty or hand-edited entry is rebuilt from the WAL, never a KeyError on every call while the WAL is unchanged."""
-    if not isinstance(s, dict):
-        return False
-    num = lambda v: isinstance(v, _NUM) and not isinstance(v, bool)  # noqa: E731
-    text_or_none = lambda v: v is None or isinstance(v, str)  # noqa: E731
-    return (text_or_none(s.get("first")) and "first" in s and num(s.get("last_at")) and text_or_none(s.get("outcome"))
-            and "outcome" in s and num(s.get("outcome_at")) and isinstance(s.get("last_note"), str)
-            and num(s.get("events")) and num(s.get("skipped"))
-            and isinstance(s.get("tickets"), list) and all(isinstance(t, str) for t in s["tickets"])
-            and isinstance(s.get("meta"), dict) and _prov().LostTrail.from_state(s.get("lost_trail")) is not None
-            and s.get("record_rule") == _prov().RECORD_RULE)
+    """A cached summary is served only with every field owners() and the tally read, each of its type (PR 245 m1 F2,
+    m2): an empty, partial or hand-edited entry is rebuilt from the WAL."""
+    return _summary_types_ok(s) and all(k in s for k in _SUMMARY_REQUIRED) and s.get("record_rule") == _prov().RECORD_RULE
 
 
 _META_FIELDS = ("type", "description", "parent", "finished", "depth")
@@ -537,7 +556,16 @@ def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
     # PR 245 cold path: a WAL the owners cache already summarised (it changed since) continues from that summary and
     # skips the per-WAL index file, read and write; only a WAL the cache has never held goes through the index file
     prior = entry["s"] if isinstance(entry, dict) and _cached_summary_ok(entry.get("s")) else None
-    summary = _summarize_agent_wal(path, index_dir, prior) if prior is not None else _summarize_agent_wal(path, index_dir)
+    try:
+        summary = _summarize_agent_wal(path, index_dir, prior) if prior is not None else _summarize_agent_wal(path, index_dir)
+        if not _cached_summary_ok(summary):
+            raise ValueError("summary failed its own shape check")
+    except (TypeError, ValueError, KeyError, AttributeError, RecursionError):
+        # PR 245 m2 receipt: anything that goes wrong using cached state is a cache miss: the entry is dropped and the
+        # WAL is read again from the start, and the rebuilt summary replaces the entry (an OSError is the file's own
+        # failure and still reaches the tally; AhError, a newer schema, is never swallowed)
+        cache["wal"].pop(key, None)
+        summary = _summarize_agent_wal(path, index_dir, {})
     if fp:
         cache["wal"][key] = {"fp": fp, "s": summary}
         cache["dirty"] = True
