@@ -1,5 +1,6 @@
 // Ledger adapters and the archive view model (GoodQA goodqa#15920 AC-4, AC-7, AC-8, AC-9). No DOM: pure functions.
 import test from 'node:test';
+import { withReads, healthRows } from './reads.mjs';
 import assert from 'node:assert/strict';
 import { ledger, archiveRows, dealRows, blockerRows, missionTiles, GOAL_STATE, sources } from '../js/adapt.js';
 
@@ -22,7 +23,7 @@ const snapshot = () => ({
     stale: false, error: '', at: iso(1), truth: 'current' },
 });
 // the Health rows of a page whose every source read well (the server's shape: collectors.Health)
-const HEALTHY = sources(['asks', 'owners', 'initiatives', 'wals', 'chat', 'codex-owners'].map(name => ({ name, status: 'ok', checked: NOW / 1000, ok_at: NOW / 1000, truth: 'current' })));
+const HEALTHY = sources(healthRows(NOW / 1000));
 
 test('ledger adapter keeps every string a string and bounds hostile input', () => {
   const huge = 'A'.repeat(100000);
@@ -81,7 +82,7 @@ test('blocker rows gather ledger blockers, untraceable asks and dropped owners w
 });
 
 test('mission tiles count goals, live owners, open asks, blockers and requirements', () => {
-  const tiles = missionTiles({ connection: 'live', sources: HEALTHY, ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false }, { state: 'done', severe: false }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] });
+  const tiles = missionTiles(withReads({ connection: 'live', sources: HEALTHY, ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false }, { state: 'done', severe: false }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] }));
   const by = Object.fromEntries(tiles.map(t => [t.id, t]));
   assert.equal(by.goals.value, '0 / 2');  // g1 is LIVE_TESTED: live, not done (review PR 234 v2 F1)
   assert.match(by.goals.note, /1 live, not done · 1 open/);
@@ -94,7 +95,7 @@ test('mission tiles count goals, live owners, open asks, blockers and requiremen
 // review PR 234 v2 F1: the producer's own vocabulary (harness/hooks/goals_view.py). Only DONE_LIVE is done.
 const PRODUCER_STATES = ['FAILING', 'UNCONFIRMED', 'UNKNOWN', 'LIVE_UNTESTED', 'IN_PROGRESS', 'VERIFIED', 'DEFERRED', 'LIVE_TESTED', 'DONE_LIVE', 'RETIRED'];
 const goalsOf = states => ledger({ goals: { items: states.map((state, i) => ({ id: `g${i}`, title: `goal ${i}`, state, evidence: [] })), at: iso(1), truth: 'current' } });
-const goalTile = states => missionTiles({ connection: 'live', sources: HEALTHY, ledger: goalsOf(states), owners: [], asks: [], messages: [], decisions: {}, initiatives: [] }).find(t => t.id === 'goals');
+const goalTile = states => missionTiles(withReads({ connection: 'live', sources: HEALTHY, ledger: goalsOf(states), owners: [], asks: [], messages: [], decisions: {}, initiatives: [] })).find(t => t.id === 'goals');
 
 test('only DONE_LIVE counts as done; a board of finished goals is not "still open"', () => {
   const tile = goalTile(['DONE_LIVE', 'DONE_LIVE']);

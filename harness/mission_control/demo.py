@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+import collectors as col
 import mc_chat  # noqa: F401  (importable through server.py's hook-path setup)
 
 DEMO_SESSION = "demo-main-0000-4000-8000-000000000000"
@@ -237,7 +238,7 @@ class DemoRunner:
                 {"id": f"{args[0]}-c1", "body": "Demo comment: looks good, one nit on naming.",
                  "createdAt": _iso(self.started - 3600)}]})
         if kind == "provenance-asks" and len(args) == 1:
-            return 0, json.dumps({"counts": {"traced": len(ASKS), "blocked": 1}, "items": [
+            return 0, json.dumps({"read": col.whole_read(), "counts": {"traced": len(ASKS), "blocked": 1}, "items": [
                 {**ask, "at": _iso(time.time() - age), "owner": "main"} for ask, age in ASKS] + [
                 # four days old with no answer: the sweeper moves it to Stale
                 {"id": "wdemoask0004", "kind": "traced", "owner": "main", "at": _iso(time.time() - 4 * 86400),
@@ -271,7 +272,7 @@ def goals_payload(now: float) -> dict:
     and tested with no deploy record (live, not done), one in progress, one failing, one hostile title."""
     def proof(ident, kind, verdict, age, check, note):
         return {"id": ident, "kind": kind, "verdict": verdict, "at": _iso(now - age), "check": check, "by": "main", "note": note}
-    return {"generated": _iso(now), "session": DEMO_SESSION, "state": "OK", "warnings": [], "goals": [
+    return {"generated": _iso(now), "session": DEMO_SESSION, "state": "ok", "warnings": [], "goals": [
         {"id": "checkout", "title": "Checkout redesign live for everyone", "ticket": "demo#101", "ledger_status": "active",
          "state": "IN_PROGRESS", "priority": 1, "target": "checkout redesign live and click-tested", "owners": ["a1live0demo"],
          "deferral": None, "missing": [], "tampered": [], "unpinned": [],
@@ -299,7 +300,7 @@ def requirements_payload(now: float) -> dict:
     def row(ident, text, age, state="recorded", **extra):
         return {"id": ident, "session": DEMO_SESSION, "text": text, "source": 'user:demo/' + ident + ' "..."',
                 "at": _iso(now - age), "state": state, "ticket": None, "owner": None, "evidence": None, **extra}
-    return {"generated": _iso(now), "total": 7, "truncated": False, "requirements": [
+    return {"read": col.whole_read(), "generated": _iso(now), "total": 7, "truncated": False, "requirements": [
         row("wdemoreq001", "Checkout must show a clear error state when the payment fails.", 3600, ticket="demo#101"),
         row("wdemoreq002", "Back up all transcripts and keep the status of all work in tickets.", 2 * 86400),
         row("wdemoreq003", "Back up all transcripts and keep  the status of all work in tickets.", 5 * 86400),
@@ -313,7 +314,7 @@ def requirements_payload(now: float) -> dict:
 def status_payload(now: float) -> dict:
     def entry(ident, agent, event, note, age, **extra):
         return {"agent": agent, "at": _iso(now - age), "id": ident, "event": event, "note": note, **extra}
-    return {"session": DEMO_SESSION, "since_s": 43200, "generated": _iso(now), "entries": 240, "unread": 0,
+    return {"read": col.whole_read(), "session": DEMO_SESSION, "since_s": 43200, "generated": _iso(now), "entries": 240, "unread": 0,
             "verified": [entry("wst001", "a3fini0demo", "check", "REALLY_TESTED release-0.4-live: PASS on live", 8400,
                                check="release-0.4-live", verdict="PASS")],
             "live": [entry("wst002", "a3fini0demo", "deploy", "DEPLOYED demo/shop 0.4.0 to live", 9000)],
@@ -339,7 +340,7 @@ def owners_payload(now: float) -> dict:
         if disposition:
             row["disposition"] = {**disposition, "until": now + 6 * 3600}
         rows.append(row)
-    return {"session": DEMO_SESSION, "owners": rows}
+    return {"read": col.whole_read(), "session": DEMO_SESSION, "owners": rows}
 
 
 def seed(root: Path) -> dict:

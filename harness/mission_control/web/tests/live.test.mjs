@@ -89,8 +89,9 @@ test('review PR 234 v6: the claim panels repaint when the link drops or returns,
 test('review PR 234 v6: after a drop the page is live again only once it re-read the state (a restarted server)', async () => {
   const { claim } = await import('../js/adapt.js');
   const at = new Date().toISOString();
-  const before = { ...state, ledger: { goals: { at, truth: 'current', items: [{ id: 'old', title: 'Old', state: 'LIVE_TESTED' }] }, requirements: { items: [] }, status: {} } };
-  const restarted = { ...state, ledger: { goals: { at: '', truth: 'unknown', items: [] }, requirements: { items: [] }, status: {} } };
+  const read = truth => ({ goals: { truth, facts: [{ id: 'ledger:goals', truth, at: truth === 'current' ? at : '', error: '' }] } });
+  const before = { ...state, reads: read('current'), ledger: { goals: { at, truth: 'current', items: [{ id: 'old', title: 'Old', state: 'LIVE_TESTED' }] }, requirements: { items: [] }, status: {} } };
+  const restarted = { ...state, reads: read('unknown'), ledger: { goals: { at: '', truth: 'unknown', items: [] }, requirements: { items: [] }, status: {} } };
   let answer = before;
   globalThis.fetch = async url => {
     fetches.push(String(url));

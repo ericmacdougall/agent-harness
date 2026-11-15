@@ -100,6 +100,7 @@ def defaults(host: str) -> dict:
                      "lookback_h": 24, "lookback_active_h": 168, "retire_h": 6, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
+        "idle_guard": {"enabled": True, "idle_min": 30, "wal_root": "~/.claude/wals", "lookback_h": 12},
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
@@ -147,11 +148,89 @@ def now_iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).isoformat()
 
 
-def run(argv, timeout, stdin=None, env=None, cwd=None):
-    """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded."""
-    p = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout,
-                       env=env, cwd=cwd)
-    return p.returncode, p.stdout
+RUN_MAX_BYTES = 64 * 1024 * 1024  # default per-stream bound for every runner call
+RUN_OVERFLOW_RC = -1000  # sentinel return code: output passed max_bytes; the child was killed and reaped
+
+
+def _read_capped(sel, data, deadline, max_bytes, argv, timeout, read=None, write=None):
+    """Drive the selector until every stream is at EOF: (stdout bytes, overflow). Overflow is irreversible: the
+    moment either stream passes max_bytes it returns (out, True) without handling the rest of the batch, so a
+    later small chunk on the other stream cannot hide it. Raises TimeoutExpired at the deadline. read/write are
+    injectable so the event order can be tested without real streams."""
+    read, write = read or os.read, write or os.write
+    out, err, offset = bytearray(), 0, 0
+    while sel.get_map():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        for key, _ in sel.select(left):
+            if key.data == "in":
+                try:
+                    offset += write(key.fd, data[offset:offset + 512])
+                except BrokenPipeError:
+                    offset = len(data)
+                if offset >= len(data):
+                    sel.unregister(key.fileobj)
+                    key.fileobj.close()
+                continue
+            chunk = read(key.fd, 65536)
+            if not chunk:
+                sel.unregister(key.fileobj)
+                continue
+            if key.data == "out":
+                out += chunk
+                if len(out) > max_bytes:
+                    return out, True
+            else:
+                err += len(chunk)  # discarded, but counted against the same cap
+                if err > max_bytes:
+                    return out, True
+    return out, False
+
+
+def run(argv, timeout, stdin=None, env=None, cwd=None, max_bytes=RUN_MAX_BYTES):
+    """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded.
+
+    stdout and stderr are read incrementally and each is capped at max_bytes while reading, so a runaway producer
+    cannot grow this process: on overflow the child is killed and reaped and (RUN_OVERFLOW_RC, "") is returned.
+    On timeout the child is killed and reaped before TimeoutExpired is raised."""
+    import locale
+    import selectors
+    enc = locale.getpreferredencoding(False)
+    data = stdin.encode(enc) if stdin is not None else None
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE if data is not None else None, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, cwd=cwd)
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(p.stdout, selectors.EVENT_READ, "out")
+        sel.register(p.stderr, selectors.EVENT_READ, "err")
+        if data is not None:
+            if data:
+                sel.register(p.stdin, selectors.EVENT_WRITE, "in")
+            else:
+                p.stdin.close()
+        out, overflow = _read_capped(sel, data, deadline, max_bytes, argv, timeout)
+        if overflow:
+            p.kill()
+            p.wait()
+            return RUN_OVERFLOW_RC, ""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        rc = p.wait(timeout=left)
+    except BaseException:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+        raise
+    finally:
+        sel.close()
+        for f in (p.stdin, p.stdout, p.stderr):
+            if f is not None and not f.closed:
+                f.close()
+    text = out.decode(enc, errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return rc, text
 
 
 def alert(check, key, severity, message, detail=None) -> dict:
@@ -1359,26 +1438,34 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
 
 # ---------------------------------------------------------------- 7c. Proxmox storage pool (goodqa#15771)
 # Read-only capacity watch of a dir-type Proxmox pool whose thin guest disks can fill it. One bounded ssh call
-# runs a fixed script (pvesm status, qm list/config, du -sk of the image dirs). The only caller input is a
-# validated host, storage name, mount path and integer VM ids. A failed or unusable read is UNKNOWN, never OK,
-# and nothing the remote side prints is copied into an alert.
+# runs a fixed script (pvesm status, pvesm list, a name-only find of the image dirs, du -sk of the watched VMs'
+# image dirs). The only caller input is a validated host, storage name, mount path and integer VM ids. A failed
+# or unusable read is UNKNOWN, never OK, and nothing the remote side prints is copied into an alert.
 
 POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
 POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
 POOL_LOCAL_FILE = re.compile(r"/[A-Za-z0-9._/-]{1,200}")  # ssh_config / known_hosts on the watching host
-POOL_DISK = re.compile(r"^(?:scsi|virtio|sata|ide|efidisk|tpmstate)\d+:\s*([A-Za-z0-9_-]+):[^,\s]*(?P<rest>.*)$")
-POOL_SIZE = re.compile(r"(?:^|,)size=(\d+(?:\.\d+)?)([KMGT]?)(?:,|$)")
-POOL_UNITS = {"": 1 / GIB, "K": KIB / GIB, "M": KIB ** 2 / GIB, "G": 1.0, "T": 1024.0}
+POOL_VOLS_HEADER = ["Volid", "Format", "Type", "Size", "VMID"]
+POOL_GUEST_TYPES = ("images", "rootdir")  # VM disks (incl. unusedN), container volumes; iso/backup/... never count
 POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
 POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 48 * 3600
 POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
 POOL_UNKNOWN_HIGH_S = 1800
+POOL_MAX_BYTES = 1048576  # the probe prints a few KB; anything near this is not a pvesm answer
 
 
-def pool_script(storage: str, mount: str) -> str:
-    return (f"echo '##PVESM'; pvesm status --storage {storage}; echo '##QM'; "
-            "for v in $(qm list | awk 'NR>1{print $1}'); do echo \"##VM $v\"; qm config \"$v\"; done; "
-            f"echo '##DU'; du -sk {mount}/images/*; echo '##END'")
+def pool_script(storage: str, mount: str, watch=()) -> str:
+    """Every command is bounded by remote `timeout`. `pvesm list` gives the size of every volume on the storage
+    (VM disks, detached unusedN disks and container volumes alike); `find` lists the image files by name only
+    (readdir, no reads), because pvesm skips a file whose size it cannot read with nothing but a stderr warning.
+    Only the watched VMs' image directories are measured with du, one call each."""
+    du = "".join(f"timeout 5 du -sk {mount}/images/{int(v)}; echo \"##RC DU {int(v)} $?\"; " for v in watch)
+    # every command is followed by its own ##RC line: the script's final echo would otherwise make a failed or
+    # timed out command look complete, and du can print a plausible subtotal and still fail
+    return (f"echo '##PVESM'; timeout 8 pvesm status --storage {storage}; echo \"##RC PVESM $?\"; "
+            f"echo '##VOLS'; timeout 8 pvesm list {storage}; echo \"##RC VOLS $?\"; "
+            f"echo '##FILES'; timeout 3 find {mount}/images -mindepth 2 -maxdepth 2; echo \"##RC FILES $?\"; "
+            f"echo '##DU'; {du}echo '##END'")
 
 
 def _pool_num(text):
@@ -1412,49 +1499,85 @@ def parse_pool_status(text: str, storage: str):
     return total * KIB, used * KIB, avail * KIB
 
 
-def parse_pool_probe(text: str, storage: str):
-    """{status, vms: {id: {sizes: gib|None}}, du: {id: bytes}} or None when the output is unusable or truncated."""
-    sections, cur, vm = {}, None, None
+def parse_pool_volumes(vols, files, storage: str, mount: str):
+    """({vmid: {gib, unsized}}, list_ok, files_ok) from `pvesm list` rows (Size in bytes) and the image file names.
+
+    list_ok is False when the listing cannot be trusted as a whole (bad header, or a row that cannot be tied to
+    one VM). A guest volume with an unreadable or zero size (a size-less subvol) flags its VM unsized. files_ok is
+    False when the file names are unusable; an image file that pvesm did not list flags its VM unsized, since pvesm
+    silently skips a file it cannot size. The caller treats every subtotal as unknown unless both are True."""
+    lines = [l for l in vols if l.strip()]
+    list_ok = bool(lines) and lines[0].split() == POOL_VOLS_HEADER
+    vms, listed = {}, set()
+    for line in lines[1:]:
+        cols = line.split()
+        if len(cols) < 4:
+            list_ok = False
+            continue
+        if cols[2] not in POOL_GUEST_TYPES:
+            continue
+        name = cols[0].split(":", 1)[1].split("/") if cols[0].startswith(storage + ":") else []
+        if len(cols) != 5 or not re.fullmatch(r"\d{1,10}", cols[4]) or len(name) < 2 or name[-2] != cols[4]:
+            list_ok = False  # a guest volume this parser cannot tie to one VM
+            continue
+        vm = vms.setdefault(int(cols[4]), {"gib": 0.0, "unsized": False})
+        listed.add((int(cols[4]), name[-1]))
+        if re.fullmatch(r"\d{1,20}", cols[3]) and int(cols[3]) > 0:
+            vm["gib"] += int(cols[3]) / GIB
+        else:
+            vm["unsized"] = True  # never a zero
+    files_ok = True
+    for line in files:
+        m = re.fullmatch(re.escape(mount) + r"/images/(\d{1,10})/([^/\s]+)", line.strip())
+        if not m:
+            if line.strip():
+                files_ok = False
+            continue
+        if (int(m.group(1)), m.group(2)) not in listed:
+            vms.setdefault(int(m.group(1)), {"gib": 0.0, "unsized": False})["unsized"] = True
+    for vm in vms.values():  # a VM whose only volumes are unsized has no known allocation at all
+        if vm["unsized"] and not vm["gib"]:
+            vm["gib"] = None
+    return vms, list_ok, files_ok
+
+
+def parse_pool_probe(text: str, storage: str, mount: str = "/var/lib/vz"):
+    """{status, vms: {id: {gib, unsized}}, du: {id: bytes}, list_ok, files_ok} or None when the output is unusable
+    or truncated."""
+    sections, cur = {}, None
     for line in (text or "").splitlines():
-        m = re.fullmatch(r"##(PVESM|QM|DU|END)", line)
+        m = re.fullmatch(r"##(PVESM|VOLS|FILES|DU|END)", line)
         if m:
-            cur, vm = m.group(1), None
+            cur = m.group(1)
             sections.setdefault(cur, [])
             continue
-        m = re.fullmatch(r"##VM (\d{1,10})", line)
-        if m and cur == "QM":
-            vm = int(m.group(1))
-            sections.setdefault("VM", {}).setdefault(vm, [])
+        m = re.fullmatch(r"##RC (PVESM|VOLS|FILES|DU \d{1,10}) (\d{1,3})", line)
+        if m:
+            sections.setdefault("RC", {})[m.group(1)] = int(m.group(2))
             continue
-        if cur == "QM" and vm is not None:
-            sections["VM"][vm].append(line)
-        elif cur in ("PVESM", "DU"):
+        if cur in ("PVESM", "VOLS", "FILES", "DU"):
             sections[cur].append(line)
     if "END" not in sections:
         return None
-    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage)
+    rcs = sections.get("RC", {})
+    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage) if rcs.get("PVESM") == 0 else None
     if status is None:
         return None
-    vms = {}
-    for vm_id, cfg in sections.get("VM", {}).items():
-        total, unsized = 0.0, False
-        for line in cfg:
-            m = POOL_DISK.match(line.strip())
-            if not m or m.group(1) != storage or "media=cdrom" in m.group("rest"):
-                continue
-            size = POOL_SIZE.search(m.group("rest"))
-            if not size:
-                unsized = True
-                continue
-            total += float(size.group(1)) * POOL_UNITS[size.group(2)]
-        # no config lines at all: unknown, not zero; a disk without a size keeps the sized ones and is flagged
-        vms[vm_id] = {"gib": None if not cfg or (unsized and not total) else total, "unsized": unsized}
-    du = {}
+    vms, list_ok, files_ok = parse_pool_volumes(sections.get("VOLS", []), sections.get("FILES", []), storage, mount)
+    list_ok = list_ok and rcs.get("VOLS") == 0 and "VOLS" in sections  # failed, timed out or cut: partial at best
+    files_ok = files_ok and rcs.get("FILES") == 0 and "FILES" in sections
+    if not (list_ok and files_ok):  # every subtotal is untrusted, including a prefix printed before a failure
+        for vm in vms.values():
+            vm["gib"] = None
+    du_lines = {}
     for line in sections.get("DU", []):
-        m = re.fullmatch(r"(\d+)\s+\S*/images/(\d{1,10})", line.strip())
+        m = re.fullmatch(r"(\d+)\s+" + re.escape(mount) + r"/images/(\d{1,10})", line.strip())
         if m:
-            du[int(m.group(2))] = int(m.group(1)) * KIB
-    return {"status": status, "vms": vms, "du": du}
+            du_lines.setdefault(int(m.group(2)), []).append(int(m.group(1)) * KIB)
+    # a subtotal counts only with its own du status 0 and exactly one line: a failed, timed out or status-less du
+    # is unknown usage however plausible its number
+    du = {vm: vals[0] for vm, vals in du_lines.items() if len(vals) == 1 and rcs.get(f"DU {vm}") == 0}
+    return {"status": status, "vms": vms, "du": du, "list_ok": list_ok, "files_ok": files_ok}
 
 
 def pool_baseline(samples: list, now: float):
@@ -1480,34 +1603,38 @@ def check_proxmox_pool(cfg, state, runner, now):
         mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
         watch = entry.get("watch_vms", [])
         jump, ssh_config, known_hosts = (str(entry.get(k, "")) for k in ("jump", "ssh_config", "known_hosts"))
-        base = f"{host[:64]}:{mount[:100]}"
+        shown = host.rsplit("@", 1)[-1]  # alerts name the host, never the login user
+        base = f"{shown[:64]}:{mount[:100]}"
         if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
                 or ".." in mount or not isinstance(watch, list)
                 or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)
                 or (jump and not REMOTE_HOST.fullmatch(jump))
                 or any(p and (not POOL_LOCAL_FILE.fullmatch(p) or ".." in p) for p in (ssh_config, known_hosts))):
             out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
-                             "proxmox pool entry has an unsafe host, storage, mount or VM id", {"host": host[:64]}))
+                             "proxmox pool entry has an unsafe host, storage, mount, VM id or ssh option",
+                             {"host": shown[:64]}))
             continue
         rec = seen.get(base)
         if not isinstance(rec, dict) or not isinstance(rec.get("first_try"), (int, float)):
             rec = seen[base] = {"first_try": now, "samples": []}  # a corrupt saved record restarts, never crashes
         mark = len(out)
         try:
-            # optional jump host, ssh config and a pinned known_hosts file (host-key checking stays strict)
+            # optional ssh config, jump host and pinned known_hosts file; host-key checking is strict either way
             opts = (["-F", ssh_config] if ssh_config else []) + (["-J", jump] if jump else []) + (
                 ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"] if known_hosts else [])
             try:
-                rc, text = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", *opts, "--", host,
-                                   pool_script(storage, mount)], 25)
+                rc, text = runner(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                                   "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                                   *opts, "--", host, pool_script(storage, mount, watch)], 25, max_bytes=POOL_MAX_BYTES)
             except (subprocess.TimeoutExpired, OSError):
                 rc, text, why = 255, "", "unreachable or timed out"
             else:
-                why = "unreachable or ssh failed" if rc != 0 else "unusable output"
-            parsed = parse_pool_probe(text, storage) if rc == 0 and len(text or "") <= 1048576 else None
+                why = ("output over the size limit" if rc == RUN_OVERFLOW_RC or len(text or "") > POOL_MAX_BYTES
+                       else "unreachable or ssh failed" if rc != 0 else "unusable output")
+            parsed = parse_pool_probe(text, storage, mount) if rc == 0 and len(text or "") <= POOL_MAX_BYTES else None
             if parsed is not None:
                 total, used, avail = parsed["status"]
-                _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now)
+                _pool_alerts(out, rec, base, shown, storage, mount, watch, parsed, total, used, avail, now)
                 rec["ok_at"] = now
                 rec["alerts"] = out[mark:]
                 continue
@@ -1521,8 +1648,8 @@ def check_proxmox_pool(cfg, state, runner, now):
         ok_at = rec.get("ok_at") if isinstance(rec.get("ok_at"), (int, float)) else rec["first_try"]
         stale = now - ok_at > POOL_UNKNOWN_HIGH_S
         out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
-                         f"UNKNOWN: cannot read {host} {storage} pool ({why}); capacity is not being watched",
-                         {"host": host[:64], "reason": why}))
+                         f"UNKNOWN: cannot read {shown} {storage} pool ({why}); capacity is not being watched",
+                         {"host": shown[:64], "reason": why}))
     return out
 
 
@@ -1542,6 +1669,8 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
     def per_day(delta):
         return round(max(delta, 0) / GIB / days, 2) if days else None
 
+    complete = parsed["list_ok"] and parsed["files_ok"] and all(v["gib"] is not None and not v["unsized"]
+                                                                 for v in parsed["vms"].values())
     provisioned = [v["gib"] for v in parsed["vms"].values()]
     unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None or v.get("unsized"))
     prov_gib = round(sum(g for g in provisioned if g), 2)
@@ -1554,8 +1683,9 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
                        "actual_gib": None if actual is None else round(actual / GIB, 2),
                        "growth_gib_day": per_day(actual - old) if actual is not None and old is not None else None}
     detail = {"host": host[:64], "storage": storage, "used_pct": round(pct, 1), "free_bytes": int(avail),
-              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib,
-              "overcommit_ratio": round(prov_gib / (total / GIB), 2), "vms": vms, "unsized_vms": unsized}
+              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib if complete else None,
+              "overcommit_ratio": round(prov_gib / (total / GIB), 2) if complete else None,
+              "allocation_complete": complete, "vms": vms, "unsized_vms": unsized}
     sev = None
     if pct >= POOL_CRIT_PCT or free_gib < POOL_FLOOR_GIB:
         sev = "critical"
@@ -1566,11 +1696,17 @@ def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, use
     if sev:
         out.append(alert("proxmox_pool", f"disk:volume:{base}", sev,
                          f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
-                         f"{detail['overcommit_ratio']}x overcommitted", detail))
+                         f"{detail['overcommit_ratio'] if complete else 'unknown'}x overcommitted", detail))
+    if not complete:  # never a low overcommit figure from a partial inventory
+        out.append(alert("proxmox_pool", f"disk:allocunknown:{base}", "warning",
+                         f"UNKNOWN: VM allocation on the {host} {storage} pool is incomplete; overcommit not computed",
+                         {"host": host[:64], "vms_unreadable": unsized, "list_ok": parsed["list_ok"],
+                          "files_ok": parsed["files_ok"]}))
     for v in watch:  # a watched VM that cannot be read must be visible even when the pool is below every threshold
-        if (parsed["vms"].get(v) or {}).get("gib") is None or parsed["du"].get(v) is None:
+        vm = parsed["vms"].get(v) or {}
+        if vm.get("gib") is None or vm.get("unsized") or parsed["du"].get(v) is None:
             out.append(alert("proxmox_pool", f"disk:vmunknown:{base}:{v}", "warning",
-                             f"UNKNOWN: VM {v} config or disk usage missing from the {host} {storage} probe; "
+                             f"UNKNOWN: VM {v} volume sizes or disk usage missing from the {host} {storage} probe; "
                              "its growth is not being watched", {"host": host[:64], "vm": v}))
     if base_sample:
         rate = per_day(used - base_sample[1])
@@ -1836,6 +1972,44 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_idle_guard(cfg, state, runner, now):
+    """goodqa#15943: one high alert idle-guard:<session8> per recent session whose main and owners made no progress for
+    idle_min minutes while a stream holds a non-user next step (idle_guard.assess). The alert ends when progress
+    resumes or nothing actionable is left. A session that cannot be assessed raises nothing (the Stop hook fails open
+    too)."""
+    ic = cfg["idle_guard"]
+    home = Path(home_of(cfg))
+    root = Path(expand(home, ic["wal_root"]))
+    if root != home / ".claude" / "wals":
+        return []  # the owner view reads the real session root only
+    out = []
+    try:
+        sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []  # no session WALs on this host (a Codex-only install): nothing to assess, nothing to import
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import idle_guard  # noqa: PLC0415 - installed beside this file
+    except ImportError as error:  # a partial install: say so, never a check-error (receipt r3 F1)
+        return [alert("idle_guard", "idle-guard:unavailable", "warning",
+                      f"idle_guard.py is not installed beside ops_watch.py ({type(error).__name__}); main-idle detection is off",
+                      {"fix": "reinstall the harness"})]
+    for sess in sorted(sessions, key=lambda e: e.name):
+        try:
+            if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
+                continue
+            a = idle_guard.assess(home, sess.name, now, float(ic["idle_min"]))
+        except Exception:  # noqa: BLE001 - one unreadable session never hides the others
+            continue
+        if a["idle"]:
+            names = ", ".join(s["agent"] for s in a["streams"][:6])
+            out.append(alert("idle_guard", f"idle-guard:{sess.name[:8]}", "high",
+                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}",
+                             {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
+                              "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}))
+    return out
+
+
 def check_mission(cfg, state, runner, now):
     """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
     (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
@@ -2019,6 +2193,7 @@ DEFAULT_CHECKS = {
     "remote_units": check_remote_units,
     "proxmox_pool": check_proxmox_pool,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
+    "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run

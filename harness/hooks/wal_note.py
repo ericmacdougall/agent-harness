@@ -161,6 +161,7 @@ def main():
     parser.add_argument('--note', required=True)
     parser.add_argument('--source', help='origin: user:<session>/<uuid> "excerpt" | ticket: | wal: | file: | inferred: (see provenance.py)')
     parser.add_argument('--reason', help='why this is asked of the user (required for ask)')
+    parser.add_argument('--owner', help='ask only: the agent id whose stream this ask belongs to (a wait on it excuses only that owner)')
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
     parser.add_argument('--decision', choices=('approved', 'declined'),
                         help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
@@ -195,6 +196,10 @@ def main():
         parser.error('a deploy row names the deployed sha or version (merged is not live)')
     record = {'at': datetime.now(timezone.utc).isoformat(), 'event': args.event, 'note': note,
               'id': 'w' + uuid.uuid4().hex[:11]}
+    if args.owner:
+        if args.event != 'ask' or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', args.owner):
+            parser.error('--owner applies to an ask and names an agent id')
+        record['owner'] = args.owner
     if args.goal:
         record['goal'] = args.goal
     if args.ticket:

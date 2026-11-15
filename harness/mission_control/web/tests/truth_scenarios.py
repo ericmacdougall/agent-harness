@@ -20,9 +20,9 @@ import events as ev  # noqa: E402
 
 SID = "baab765b-d85c-46b4-b7b9-588eb912c770"
 T0 = 1_800_000_000.0  # fixed epoch: 2027-01-15 08:00 UTC
-GOALS = {"goals": []}
-REQS = {"total": 0, "truncated": False, "requirements": []}
-EMPTY = {"session": SID, "since_s": 43200, "entries": 4, "unread": [], "owners": {}, **{k: [] for k in col.Ledger.STATUS_LISTS}}
+GOALS = {"state": "ok", "warnings": [], "goals": []}
+REQS = {"read": col.whole_read(), "total": 0, "truncated": False, "requirements": []}
+EMPTY = {"read": col.whole_read(), "session": SID, "since_s": 43200, "entries": 4, "unread": [], "owners": {"counts": {}}, **{k: [] for k in col.Ledger.STATUS_LISTS}}
 PARTIAL = dict(EMPTY, unread=[{"wal": "agent-x.jsonl", "agent": "x", "reason": "Permission denied"}])
 FAILS = {"timeout": (124, ""), "nonzero": (1, "Traceback: boom"), "invalid_json": (0, "{not json")}
 
@@ -37,7 +37,11 @@ class Runner:
         return 0, json.dumps(GOALS if kind == "ah-goals" else REQS)
 
 
-def scenario(steps, other_health=("asks", "owners", "initiatives", "wals", "chat", "codex-owners"), failed=()):
+# every source a dataset rests on (collectors.FEEDS), so a scenario breaks exactly the one it names
+OTHERS = tuple(sorted({s for sources in col.FEEDS.values() for s in sources if not s.startswith("ledger:")}))
+
+
+def scenario(steps, other_health=OTHERS, failed=()):
     hub = ev.Hub()
     health = col.Health(hub)
     runner = Runner()
@@ -49,11 +53,10 @@ def scenario(steps, other_health=("asks", "owners", "initiatives", "wals", "chat
     for n, status in enumerate(steps):
         runner.status = status
         ledger.run(T0 + 60 * n)
-    return {"ledger": ledger.snapshot(), "health": health.snapshot()}
+    return {"ledger": ledger.snapshot(), "health": health.snapshot(), "reads": col.Truth(hub, health, ledger, lambda: SID).reads()}
 
 
 SID_B = "ffffffff-0000-4000-8000-000000000000"
-OTHERS = ("asks", "owners", "initiatives", "wals", "chat", "codex-owners")
 
 
 def moved(steps, served=False, watch=False):
@@ -74,10 +77,14 @@ def moved(steps, served=False, watch=False):
             ledger.run(T0 + 60 * n)
     if watch:
         getattr(ledger, "follow", lambda: None)()
-    return {"ledger": ledger.snapshot() if served else hub.snapshots.get("ledger"), "health": health.snapshot()}
+    return {"ledger": ledger.snapshot() if served else hub.snapshots.get("ledger"), "health": health.snapshot(),
+            "reads": col.Truth(hub, health, ledger, lambda: main["id"]).reads()}
 
 
 def main():
+    if "--feeds" in sys.argv:
+        print(json.dumps(col.FEEDS))
+        return
     good = (0, json.dumps(EMPTY))
     out = {}
     for name, failure in FAILS.items():
@@ -89,7 +96,7 @@ def main():
     out["partial"] = scenario([(0, json.dumps(PARTIAL))])
     out["stale_after_partial"] = scenario([(0, json.dumps(PARTIAL)), FAILS["nonzero"]])
     # the status read is fine, but the asks source never read: Blockers also rest on asks, so it is unknown
-    out["asks_never_read"] = scenario([good], other_health=("owners", "initiatives", "wals", "chat", "codex-owners"), failed=("asks",))
+    out["asks_never_read"] = scenario([good], other_health=tuple(n for n in OTHERS if n != "asks"), failed=("asks",))
     # v5 F1: a good read for main's session, then the owners snapshot drops main's session to "" and the ledger ticks
     out["session_dropped"] = moved([(SID, good), ("", good)])
     # main moved to another session; the ledger thread has not ticked since (inside a slow read, or between cadences)

@@ -6,12 +6,12 @@ import * as v from './ledger-views.js';
 const SECTIONS = [
   // id, builder, store reasons that repaint it, view that must be showing (null: always)
   { id: 'mission-tiles', build: (s, ui, go) => [v.tiles(s, go)], on: ['ledger', 'owners', 'asks', 'chat', 'initiatives', 'decisions', 'truth'], view: 'overview' },
-  { id: 'goals-list', build: (s, ui) => v.goals(s, ui), on: ['ledger'], view: 'overview', slow: true },
-  { id: 'deploys-list', build: (s, ui) => v.deals(s, ui), on: ['ledger', 'event'], view: 'overview', slow: true },
+  { id: 'goals-list', build: (s, ui) => v.goals(s, ui), on: ['ledger', 'truth'], view: 'overview', slow: true },
+  { id: 'deploys-list', build: (s, ui) => v.deals(s, ui), on: ['ledger', 'event', 'truth'], view: 'overview', slow: true },
   { id: 'blockers-list', build: (s, ui) => v.blockers(s, ui), on: ['ledger', 'asks', 'owners', 'initiatives', 'truth'], view: 'overview' },
-  { id: 'requirements-body', build: (s, ui) => v.requirements(s, ui), on: ['ledger'], view: 'requirements', slow: true },
+  { id: 'requirements-body', build: (s, ui) => v.requirements(s, ui), on: ['ledger', 'truth'], view: 'requirements', slow: true },
   { id: 'archive-body', build: (s, ui) => v.archive(s, ui), on: ['ledger', 'asks', 'truth'], view: 'archive', slow: true },
-  { id: 'inventory-body', build: (s, ui, go) => v.inventory(s, go), on: ['ledger', 'asks', 'owners', 'initiatives', 'chat', 'health', 'seed'], view: 'sources', slow: true },
+  { id: 'inventory-body', build: (s, ui, go) => v.inventory(s, go), on: ['ledger', 'asks', 'owners', 'initiatives', 'chat', 'health', 'seed', 'truth'], view: 'sources', slow: true },
 ];
 
 export function mountViews() {
@@ -66,14 +66,29 @@ export function mountViews() {
   window.mcGo = go;
 
   // A repaint keeps what the reader opened: details elements and the scroll position of the section survive it.
-  function paint(section, state, force) {
+  // review PR 234 v6 F3: a focused control no longer holds the section's old claims on screen. The section is rebuilt
+  // and focus (with the caret) goes back to the same control; a draft lives in `ui`, so it survives the rebuild.
+  const focusKey = node => ({ id: node.id || '', row: node.closest?.('[data-id]')?.dataset.id || '', tag: node.tagName, cls: node.className || '',
+    label: node.getAttribute?.('aria-label') || '' });
+  function refocus(box, key, caret) {
+    const same = n => n.tagName === key.tag && (n.className || '') === key.cls && (n.closest?.('[data-id]')?.dataset.id || '') === key.row;
+    const found = (key.id && document.getElementById(key.id)) || [...box.querySelectorAll('*')].filter(same)
+      .sort((a, b) => Number((b.getAttribute?.('aria-label') || '') === key.label) - Number((a.getAttribute?.('aria-label') || '') === key.label))[0];
+    if (!found) return;
+    found.focus?.({ preventScroll: true });
+    if (caret && found.setSelectionRange) { try { found.setSelectionRange(caret[0], caret[1]); } catch { /* not a text control */ } }
+  }
+  function paint(section, state) {
     const box = document.getElementById(section.id);
     if (!box) return;
-    if (!force && box.contains(document.activeElement) && document.activeElement !== document.body) return;  // never pull a focused control away
+    const active = document.activeElement;
+    const key = active && active !== document.body && box.contains(active) ? focusKey(active) : null;
+    const caret = key && typeof active.selectionStart === 'number' ? [active.selectionStart, active.selectionEnd] : null;
     const open = new Set([...box.querySelectorAll('details[open]')].map(d => `${d.closest('[data-id]')?.dataset.id || ''}:${d.className}`));
     const nodes = section.build(state, ui, go);
     box.replaceChildren(...nodes);
     box.querySelectorAll('details').forEach(d => { if (open.has(`${d.closest('[data-id]')?.dataset.id || ''}:${d.className}`)) d.open = true; });
+    if (key) refocus(box, key, caret);
   }
   const forced = new Set();
   function flush() {
@@ -81,7 +96,7 @@ export function mountViews() {
     const state = getState();
     for (const id of dirty) {
       const section = SECTIONS.find(s => s.id === id);
-      if (section && (section.view === 'overview' || section.view === state.tab)) paint(section, state, forced.has(id));
+      if (section && (section.view === 'overview' || section.view === state.tab)) paint(section, state);
     }
     dirty.clear();
     forced.clear();

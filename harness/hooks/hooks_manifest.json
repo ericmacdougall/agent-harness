@@ -600,6 +600,54 @@
    "rules": []
   },
   {
+   "id": "idle-guard:stop",
+   "script": "idle_guard.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-posttoolusefailure",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "PostToolUseFailure",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-permissiondenied",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "PermissionDenied",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-userpromptsubmit",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "mission-gate:pretool",
    "script": "mission_gate.py",
    "arg": "pretool",

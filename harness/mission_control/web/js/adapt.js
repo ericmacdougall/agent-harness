@@ -72,7 +72,7 @@ export function owners(rows, items = []) {
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', sources: 'Event drops', 'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
 // A Source health row. `truth` is the server's status truth for the source (collectors.read_truth); `state` is the CSS
 // class and `label` the word shown, both from status and truth together, so a source that reads but is partial or
 // stale is never shown as plain "ok".
@@ -103,33 +103,71 @@ export function worst(...values) {
 }
 // an absolute time: a relative age in a panel that is not repainted on the clock would freeze
 export const clock = iso => (validIso(iso) ? `${new Date(iso).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time');
-const LEDGER_PARTS = { 'ledger:goals': ['goals', 'Goal ledger (ah goals)'], 'ledger:requirements': ['requirements', 'Requirements (ah requirements)'], 'ledger:status': ['status', 'Status (ah status)'] };
-// Every zero or "none" claim the page makes, and the sources it rests on. Every source must have reported: one the page
-// has not heard from is unknown (review PR 234 v6). The server reports a row for every source, including one that is not
-// configured on the instance (off, with nothing to report: OpenAI supervised owners, the initiatives file).
-export const CLAIM_SOURCES = Object.freeze({
-  blockers: ['ledger:status', 'asks', 'owners', 'initiatives'],
-  deploys: ['ledger:status'],
-  goals: ['ledger:goals'],
-  requirements: ['ledger:requirements'],
-  archive: ['ledger:requirements', 'asks'],
+// ---- the gate (goodqa#15920, PR 234 v7). The server composes one read per dataset from the sources that feed it
+// (collectors.FEEDS, collectors.Truth) and sends it as `reads`, before the rows. The page declares only which datasets
+// a claim reads (CLAIMS) and states every count and every "none" through claim()/gate(). Nothing here names a source:
+// a new source is added on the server, a new claim is one line in CLAIMS, a new state key one line in STATE_DATASETS.
+// tests/truth-gate.test.mjs derives each panel's datasets with a recording Proxy and fails on any difference.
+export const CLAIMS = Object.freeze({
+  blockers: ['status', 'asks', 'owners', 'initiatives'],
+  deploys: ['status', 'events'],
+  goals: ['goals'],
+  requirements: ['requirements'],
+  archive: ['requirements', 'asks'],
   needs: ['asks'],
-  owners: ['owners', 'codex-owners'],
+  owners: ['owners'],
   initiatives: ['initiatives'],
-  activity: ['wals'],
-  progress: ['wals', 'owners', 'codex-owners'],
-  decisions: ['ledger:status'],
+  activity: ['events'],
+  progress: ['owners', 'events'],
+  decisions: ['status'],
   chat: ['chat'],
 });
-function fact(state, id) {
-  if (LEDGER_PARTS[id]) {
-    const [name, label] = LEDGER_PARTS[id];
-    const part = state.ledger?.[name] || {};
-    return { id, name: label, truth: truthOf(part.truth), at: part.at || '', error: str(part.error, 300) };
+// Which dataset each key of the store's state belongs to. null: page-local (a click, a filter, the clock), or the
+// truth data itself. A key that is missing here fails the gate test, so new server data cannot be shown ungated.
+export const STATE_DATASETS = Object.freeze({
+  owners: 'owners', ownerRows: 'owners',
+  asks: 'asks', asksResolved: 'asks', asksStale: 'asks', asksFlagged: 'asks', asksCleared: 'asks', asksArchive: 'asks',
+  asksArchiveTotal: 'asks', asksSession: 'asks', asksSweptAt: 'asks',
+  initiatives: 'initiatives', initiativesStale: 'initiatives', initiativesError: 'initiatives',
+  events: 'events', lastEvent: 'events', feedSnapshot: 'events',
+  messages: 'chat', chat: 'chat', sessions: 'chat', mainSession: 'chat', chatAvailability: 'chat', pending: 'chat',
+  'ledger.goals': 'goals', 'ledger.requirements': 'requirements', 'ledger.status': 'status', 'ledger.generated': null,
+  reads: null, loss: null, sources: null, connection: null, lastData: null, host: null, now: null,
+  decisions: null, filters: null, selection: null, highlight: null, tab: null, responder: null, session: null,
+  motion: null, motionPreference: null, reducedMotion: null, feedPaused: null, buffered: null, ownerFilter: null,
+  ownersAll: null, fallback: null, showQuiet: null, theme: null, coverage: null,
+});
+// Reads that are not dependencies, each with the reason: the data can only reveal more, never hide.
+export const SAFE_READS = Object.freeze({
+  needs: { chat: 'a reply or decision on its way takes an ask off the waiting count only when its record is on hand; a missing chat read leaves every ask waiting' },
+  initiatives: { asks: 'an initiative card adds "N open asks" only when it holds some' },
+});
+const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat' };
+const FACT_NAMES = { 'ledger:goals': 'Goal ledger (ah goals)', 'ledger:requirements': 'Requirements (ah requirements)', 'ledger:status': 'Status (ah status)',
+  'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', sources: 'Event drops' };
+const LEDGER_DATASETS = ['goals', 'requirements', 'status'];
+// The facts one dataset rests on: the server's read of it, the truth carried inside its own snapshot (ledger parts,
+// which arrive with their rows), and rows this page could not show. No read from the server is unknown, never fine.
+function datasetFacts(state, dataset) {
+  const read = state.reads && typeof state.reads === 'object' ? state.reads[dataset] : null;
+  const list = Array.isArray(read?.facts) ? read.facts.filter(f => f && typeof f === 'object') : [];
+  const facts = list.map(f => ({ id: str(f.id, 40), name: FACT_NAMES[f.id] || SOURCE_NAMES[f.id] || str(f.id, 40), truth: truthOf(f.truth), at: validIso(f.at) || '', error: str(f.error, 300) }));
+  if (!facts.length) facts.push({ id: `dataset:${dataset}`, name: DATASET_NAMES[dataset] || dataset, truth: 'unknown', at: '', error: '' });
+  // the composed truth can only be worse than its facts (a server that says less than its facts is not believed)
+  const composed = truthOf(read?.truth);
+  if (TRUTHS.indexOf(composed) > Math.max(...facts.map(f => TRUTHS.indexOf(f.truth)))) facts.push({ id: `dataset:${dataset}`, name: DATASET_NAMES[dataset] || dataset, truth: composed, at: '', error: '' });
+  if (LEDGER_DATASETS.includes(dataset)) {
+    const part = state.ledger?.[dataset] || {};
+    const id = `ledger:${dataset}`;
+    const mine = { id, name: FACT_NAMES[id], truth: truthOf(part.truth), at: part.at || '', error: str(part.error, 300) };
+    const at = facts.findIndex(f => f.id === id);
+    if (at < 0) facts.push(mine);
+    else if (TRUTHS.indexOf(mine.truth) >= TRUTHS.indexOf(facts[at].truth)) facts[at] = { ...mine, error: mine.error || facts[at].error };
+    if (part.lost > 0) facts.push({ id: `page:${dataset}`, name: 'This page', truth: 'partial', at: '', error: `${part.lost} rows could not be shown` });
   }
-  const row = (state.sources || []).find(s => s.id === id);
-  if (!row) return { id, name: SOURCE_NAMES[id] || id, truth: 'unknown', at: '', error: '' };
-  return { id, name: row.name, truth: truthOf(row.truth), at: row.okAt, error: row.status === 'ok' ? '' : row.detail || row.status };
+  const lost = state.loss?.[dataset];
+  if (lost > 0) facts.push({ id: `page:${dataset}`, name: 'This page', truth: 'partial', at: '', error: `${lost} rows could not be shown` });
+  return facts;
 }
 // Every claim also rests on the link to the server: while the page is not live (connecting, reconnecting, offline,
 // signed out, or a state it does not know) nothing newer can arrive, so what it shows is at best the data received up
@@ -141,11 +179,23 @@ function linkFact(state) {
   return { id: 'connection', name: 'Connection to Mission Control', truth: at ? 'stale' : 'unknown', at,
     error: `not connected (${LINK_WORDS[state.connection] || 'no live stream'})` };
 }
+// A test seam: observe.claim(id) is called for every claim made (tests/truth-gate.test.mjs derives which claims a panel uses).
+export const observe = { claim: null };
 export function claim(state, id) {
+  observe.claim?.(id);
   const s = state || {};
-  const facts = [...(CLAIM_SOURCES[id] || []).map(key => fact(s, key)), linkFact(s)].filter(Boolean);
-  const truth = (CLAIM_SOURCES[id] || []).length ? worst(facts.map(f => f.truth)) : 'unknown';
-  return { id, truth, facts, bad: facts.filter(f => f.truth !== 'current') };
+  const datasets = CLAIMS[id] || [];
+  const seen = new Set();
+  const facts = [...datasets.flatMap(dataset => datasetFacts(s, dataset)), linkFact(s)].filter(f => f && !seen.has(f.id) && seen.add(f.id));
+  const truth = datasets.length ? worst(facts.map(f => f.truth)) : 'unknown';
+  return { id, truth, datasets, facts, bad: facts.filter(f => f.truth !== 'current') };
+}
+// The one way a panel states a count or a "none": gate(state, 'owners').count(n), .none('No owners are running.',
+// 'owners'), .note('none need attention'). Each says what is actually known when the claim is not current.
+export function gate(state, id) {
+  const c = claim(state, id);
+  return { ...c, current: c.truth === 'current', count: (n, bare = false) => countText(n, c, bare), none: (current, noun) => noneText(c, current, noun),
+    note: current => tileNote(c, current), lines: () => truthLines(c) };
 }
 const names = list => list.map(f => f.name).join(', ').replace(/, ([^,]*)$/, ' and $1');
 // One line per source that is not current, for the notice beside the claim.
@@ -156,7 +206,7 @@ export function truthLines(c) {
     ? `${f.name}: not read successfully yet${f.error ? ` (${f.error})` : ''}. Nothing from it is shown as zero.`
     : f.truth === 'stale'
       ? `${f.name}: showing the last good read from ${clock(f.at)}. Later reads failed${f.error ? `: ${f.error}` : ''}.`
-      : `${f.name}: the last read was partial, so some records may be missing.`);
+      : `${f.name}: the last read was partial, so some records may be missing${f.error ? ` (${f.error})` : ''}.`);
 }
 // The empty-list sentence: `current` only when the claim is current, otherwise what is actually known.
 export function noneText(c, current, noun) {
@@ -433,6 +483,8 @@ const LIST_CAP = 2000;
 const rows = value => (Array.isArray(value) ? value.filter(x => x && typeof x === 'object' && !Array.isArray(x)) : []);
 const int = value => (Number.isInteger(value) ? value : 0);
 const part = (raw, extra) => ({ stale: raw?.stale === true, error: str(raw?.error, 300), at: validIso(raw?.at) || '', failed_at: validIso(raw?.failed_at) || '', truth: truthOf(raw?.truth), ...extra });
+// rows the server sent that this page does not show (a shape or a cap it did not expect): the gate reads the part as partial
+const lostOf = (raw, kept) => (raw === undefined ? 0 : Array.isArray(raw) ? Math.max(0, raw.length - kept) : 1);
 
 function evidenceRow(raw) {
   return { id: str(raw.id, 40), kind: str(raw.kind, 20), verdict: str(raw.verdict, 12).toUpperCase(), at: validIso(raw.at) || '', check: str(raw.check, 80), by: str(raw.by, 40), note: str(raw.note, 400) };
@@ -476,6 +528,9 @@ export function ledger(snapshot) {
       ...Object.fromEntries(STATUS_LISTS.map(k => [k, rows(status[k]).slice(0, 60).map(statusRow)])) }),
     generated: validIso(root.generated) || '',
   };
+  out.goals.lost = lostOf(goals.items, out.goals.items.length);
+  out.requirements.lost = lostOf(reqs.items, out.requirements.items.length);
+  out.status.lost = STATUS_LISTS.reduce((sum, k) => sum + lostOf(status[k], out.status[k].length), 0);
   return out;
 }
 function arr(value) { return Array.isArray(value) ? value.slice(0, 20).map(v => str(v, 40)) : []; }
@@ -570,7 +625,9 @@ export function updatedText(state, live, ageOf, prefix = '') {
   return `${prefix}${ageOf(live.updated)}${live.stale ? (sure ? ' · no activity for over 30 min' : ' · no newer activity seen; its sources are not current') : ''}`;
 }
 export const feedEmpty = state => noneText(claim(state, 'activity'), 'Listening for signals…', 'work items');
-export const feedCount = (state, n) => countText(n, claim(state, 'activity'), true);
+// The page holds the newest EVENTS_HELD events: at the cap a count of them is a floor, never the whole feed.
+export const EVENTS_HELD = 150;
+export const feedCount = (state, n) => { const text = countText(n, claim(state, 'activity'), true); return (state.events || []).length >= EVENTS_HELD && /^\d+$/.test(text) ? `${text}+` : text; };
 // The owner of an initiative: "no live owner" and "no owner" only from current owner sources.
 export function ownerLineText(state, owner, item, { full = true, none = 'no owner' } = {}) {
   if (owner) return full ? `${owner.name} · ${owner.runtime} · ${owner.state}` : `${owner.name} · ${owner.state}`;
@@ -582,7 +639,7 @@ export const ownerCountTitle = (state, shown, total) => `${shown} shown of ${tot
 export const hubCounts = state => ({ owners: countText(state.owners.length, claim(state, 'owners'), true), initiatives: countText(state.initiatives.length, claim(state, 'initiatives'), true) });
 // An owner row's "No work item recorded yet": its work items come from the WAL tailer.
 const NO_ITEM = new Set(['No work item recorded yet', 'No work item yet']);
-export const workItemText = (state, note) => (NO_ITEM.has(note) && claim(state, 'activity').truth !== 'current' ? 'Work items unknown: the work-log source is not current' : note);
+export const workItemText = (state, note) => (NO_ITEM.has(note) && claim(state, 'owners').truth !== 'current' ? 'Work items unknown: the work-log source is not current' : note);
 // The topology status line: "Owners linked. Signals flowing." only while owner and work-log sources are current.
 export const sceneText = (state, text) => (state.connection === 'live' && claim(state, 'progress').truth !== 'current'
   ? 'Connected. Some owner or work-log sources are not current; see Source health.' : text);
@@ -595,7 +652,7 @@ export const hiddenBlockers = status => hiddenRows(status, 'blockers');
 export const hiddenDeals = status => ['pending', 'failed', 'live', 'verified'].reduce((sum, key) => sum + hiddenRows(status, key), 0);
 export function missionTiles(state) {
   const led = state.ledger || ledger(null);
-  const view = { ...state, ledger: led };
+  const view = state.ledger ? state : { ...state, ledger: led };
   const goals = led.goals.items;
   const done = goals.filter(g => GOAL_DONE.has(g.state)).length;
   const liveNotDone = goals.filter(g => GOAL_LIVE_NOT_DONE.has(g.state)).length;

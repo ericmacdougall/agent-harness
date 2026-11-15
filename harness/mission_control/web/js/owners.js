@@ -1,6 +1,6 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
-import { ownersEmpty, ownerCount, ownerCountTitle, workItemText } from './adapt.js';
+import { ownersEmpty, ownerCount, ownerCountTitle, workItemText, countText, claim } from './adapt.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -31,7 +31,7 @@ export function mountOwners() {
     const total = state.owners.filter(matches).length;
     const more = document.getElementById('owners-more');
     more.hidden = total <= OWNERS_SHOWN;
-    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${total} owners`;
+    more.textContent = state.ownersAll ? 'Show fewer owners' : `Show all ${countText(total, claim(state, 'owners'))} owners`;
     more.setAttribute('aria-expanded', String(!!state.ownersAll));
     const wanted = new Set(owners.map(owner => owner.agent_id));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); }

@@ -55,7 +55,7 @@ class ProductionIdentity(unittest.TestCase):
     def test_registry_codex_is_not_relabelled_claude(self):
         class Runner:
             def run(self, *args, **kwargs):
-                return 0, json.dumps({"session": "main", "owners": [{"agent_id": "codex-worker",
+                return 0, json.dumps({"read": col.whole_read(), "session": "main", "owners": [{"agent_id": "codex-worker",
                     "harness": "openai", "runtime": "codex", "thread": "thread", "state": "working"}]})
         owners = col.Owners(self.hub, self.health, Runner(), None)
         owners.tick(time.time())
@@ -97,7 +97,7 @@ class ProductionIdentity(unittest.TestCase):
     def test_registry_main_and_two_workers_without_wals_remain_distinct(self):
         class Runner:
             def run(self, *args, **kwargs):
-                return 0, json.dumps({'owners': [{'agent_id': worker, 'agent': worker, 'runtime': 'codex',
+                return 0, json.dumps({'read': col.whole_read(), 'owners': [{'agent_id': worker, 'agent': worker, 'runtime': 'codex',
                     'thread': 'thread-0000', 'state': 'working'} for worker in ('main', 'worker-a', 'worker-b')]})
         owners = col.Owners(self.hub, self.health, Runner(), None)
         owners.tick(time.time())
@@ -106,7 +106,7 @@ class ProductionIdentity(unittest.TestCase):
     def test_codex_registry_cannot_borrow_claude_wal_thread(self):
         class Runner:
             def run(self, *args, **kwargs):
-                return 0, json.dumps({'owners': [{'agent_id': 'worker-a', 'runtime': 'codex', 'state': 'working'}]})
+                return 0, json.dumps({'read': col.whole_read(), 'owners': [{'agent_id': 'worker-a', 'runtime': 'codex', 'state': 'working'}]})
         class Tailer:
             last_items = {('claude', 'claude-thread', 'worker-a'): {'at': ev.iso()}}
             def last_for(self, *args):
