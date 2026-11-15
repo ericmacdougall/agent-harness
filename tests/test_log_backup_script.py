@@ -23,7 +23,7 @@ FAKE = """#!%(python)s
 import json, os, sys, time
 argv = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as h:
-    h.write(json.dumps({"argv": argv, "rclone_env": sorted(k for k in os.environ if k.startswith("RCLONE_"))}) + "\\n")
+    h.write(json.dumps({"argv": argv, "t": time.time(), "rclone_env": sorted(k for k in os.environ if k.startswith("RCLONE_"))}) + "\\n")
 if argv and argv[0] == "listremotes":
     print(os.environ.get("FAKE_REMOTES", "lessons-dropbox: dropbox"))
     sys.exit(0)
@@ -1281,6 +1281,59 @@ class LargeTierLane(LargeTier):
         self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes(), "the large upload finished")
         self.assertTrue(self.last_ok().exists() and self.large_marker().exists() and self.bulk_ok().exists())
         self.assertNotIn("stopped: a tier-1 run started", (self.logs / "log-backup.lane.log").read_text())
+
+    def share(self, n):
+        self.budget.write_text("account 8\nlog-backup.testhost %d\n" % n)
+
+    def large_calls(self):
+        return [c for c in self.recorded() if c["argv"][0] == "copy" and any("backup-stage-large" in a for a in c["argv"])]
+
+    def test_a_tier_1_run_reserves_the_rate_the_running_upload_published_not_its_own_setting(self):
+        """PR #261 review v4 F1: the lane started with LARGE_TPS=99 on a share of 8 uploads at 2/s; a later run with the
+        default LARGE_TPS must reserve that 2, not its own 1, or the two together are 9/s."""
+        self.share(8)
+        self.addCleanup(self.lane_over)
+        hang = dict(FAKE_HANG="45", FAKE_HANG_MATCH="backup-stage-large")
+        first = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="99", **hang))
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        fields = self.lane_state().split()
+        self.assertEqual(len(fields), 3, "the state publishes the rate: 'large PID RATE', got " + repr(self.lane_state()))
+        self.assertEqual(float(fields[2]), 2.0)
+        before = len(self.copies())
+        second = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="1", **hang))   # a different setting from the lane's
+        self.assertEqual(second.returncode, 0, second.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        tier1 = [c for c in self.copies()[before:] if any("backup-stage/" in a for a in c) and "--files-from-raw" not in c]
+        self.assertTrue(tier1)
+        large = self.large_copies()
+        self.assertEqual(len(large), 1)
+        self.assertEqual(self.rate(large[0]), 2.0)
+        for argv in tier1:
+            self.assertLessEqual(self.rate(argv) + 2.0, 8.0 + 1e-9, "the aggregate stays inside the share of 8: " + str(argv))
+        self.lane_over()
+
+    def test_when_the_budget_is_lowered_during_an_upload_tier_1_defers_instead_of_going_over(self):
+        """Same lane (share 8, upload at 2/s); the budget file then drops this host's share to 2, so nothing is left under
+        the new ceiling beside the running upload: tier 1 must wait for it, not copy at 2/s on top of it."""
+        self.share(8)
+        self.addCleanup(self.lane_over)
+        hang = dict(FAKE_HANG="40", FAKE_HANG_MATCH="backup-stage-large")
+        first = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="99", **hang))
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        self.share(2)
+        before = len(self.recorded())
+        second = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="1", **hang))
+        self.assertEqual(second.returncode, 0, second.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        self.assertIn("defers its copies", (self.logs / "log-backup.log").read_text())
+        started = self.large_calls()[0]["t"]
+        tier1 = [c for c in self.recorded()[before:] if c["argv"][0] == "copy" and any("backup-stage/" in a for a in c["argv"])
+                 and "--files-from-raw" not in c["argv"]]
+        self.assertTrue(tier1, "tier 1 copied once the upload was over")
+        for call in tier1:
+            self.assertGreaterEqual(call["t"], started + 40 - 3, "no tier-1 copy while the upload was running")
+            self.assertLessEqual(self.rate(call["argv"]), 2.0)
+        self.lane_over()
 
     def test_a_large_file_does_not_start_while_a_tier_1_run_holds_the_lock(self):
         self.logs.mkdir(parents=True, exist_ok=True)
