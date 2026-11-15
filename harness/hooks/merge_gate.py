@@ -1677,6 +1677,38 @@ def pr_pass_evidence(evidence):
     return review['repo'], review['pr'], review['head'], review['report_sha256']
 
 
+_SHA40 = re.compile(r'[0-9a-f]{40}')
+
+
+def ahc_candidate_pass(evidence, candidate):
+    """Candidate binding for an ahc item (goodqa#16049 spec ahc-m1-v2e AC-3): the PR PASS must be for the candidate
+    merge commit M itself, not for H. Returns (repo, pr, M, report_sha256) or raises ValueError.
+
+    `candidate` is core's record plus a fresh GitHub readback, supplied by the caller (freshness is the caller's
+    guard, T2): repo, pr, head (H), base (B), merge_sha (M), ref (the immutable candidate ref, ending /{pr}/{M}),
+    tree (M's tree), parents (M's parents as read back) and pr_head (the PR head as read back). It requires
+    pr_pass_evidence to hold, the FINAL's repo and PR to be the candidate's, its Reviewed HEAD to equal M, its
+    reviewed tree to equal M's tree, M's parents to be exactly (B, H) and the PR head to be H. A FINAL for H alone,
+    or for another M with the same H, is refused. Pure: it reads its arguments and writes nothing.
+    """
+    repo, pr, reviewed, report = pr_pass_evidence(evidence)
+    if not isinstance(candidate, dict):
+        raise ValueError('candidate binding needs the candidate record')
+    head, base, m = candidate.get('head'), candidate.get('base'), candidate.get('merge_sha')
+    tree, ref = candidate.get('tree'), candidate.get('ref')
+    if not all(isinstance(v, str) and _SHA40.fullmatch(v) for v in (head, base, m, tree)) or len({head, base, m}) != 3:
+        raise ValueError('candidate record is malformed')
+    subject = evidence.get('subject') if isinstance(evidence.get('subject'), dict) else {}
+    if (repo_key(candidate.get('repo')) is None or repo_key(candidate['repo']) != repo_key(repo)
+            or candidate.get('pr') != pr or type(pr) is not int
+            or reviewed != m or subject.get('tree') != tree
+            or not isinstance(ref, str) or not ref.endswith('/ahc/candidate/%d/%s' % (pr, m))
+            or not ref.startswith(('refs/ahc/candidate/', 'refs/heads/ahc/candidate/'))
+            or candidate.get('parents') != [base, head] or candidate.get('pr_head') != head):
+        raise ValueError('PR PASS is not bound to this candidate M = merge(B, H)')
+    return repo, pr, m, report
+
+
 def add_review_waiver(state_dir, reference, *, store=None, now=None):
     """Authorize only a loaded, settled, independent pure PR PASS FINAL.
 

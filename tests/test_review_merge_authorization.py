@@ -165,13 +165,14 @@ class AuthorizationTests(unittest.TestCase):
         self.counter = 0
         self.default_evidence = None
 
-    def evidence(self, review_changes=None, *, result="CHECK_OK", reason="NONE", settle=True, typed=True):
+    def evidence(self, review_changes=None, *, result="CHECK_OK", reason="NONE", settle=True, typed=True,
+                 subject_head=HEAD, subject_tree="f" * 40):
         self.counter += 1
         root = self.root / ("evidence-" + str(self.counter))
         repo = root / "repo"
         repo.mkdir(parents=True)
         store = guard.UsageStore(root / "usage")
-        subject = guard.Subject(schema=1, fingerprint="e" * 64, reusable=True, head=HEAD, tree="f" * 40)
+        subject = guard.Subject(schema=1, fingerprint="e" * 64, reusable=True, head=subject_head, tree=subject_tree)
         subject.repo, subject.manifest = repo, {}
         subject.probe = lambda: subject
         invocation = guard.invocation_identity(
@@ -332,6 +333,69 @@ class PrPassEvidenceTests(AuthorizationTests):
             with self.assertRaisesRegex(ValueError, "refused by predicate"):
                 mg.add_review_waiver(self.state, reference, store=store)
         self.assertEqual(mg._read_waivers(self.state) if self.state.exists() else [], [])
+
+
+class CandidateBindingTests(AuthorizationTests):
+    """merge_gate.ahc_candidate_pass (spec ahc-m1-v2e AC-3, F2): the PASS must be for the candidate M = merge(B, H)
+    itself. BOUNDARY: main merges this and the security review reads it."""
+
+    B, H, M1, M2, T1, T2 = "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40, "6" * 40
+
+    def final(self, m=None, tree=None, **review):
+        m, tree = m or self.M1, tree or self.T1
+        review.setdefault("head", m)
+        store, reference = self.evidence(review, subject_head=review["head"], subject_tree=tree)
+        return store.inspect(reference)
+
+    def candidate(self, **changes):
+        c = {"repo": "o/r", "pr": 5, "head": self.H, "base": self.B, "merge_sha": self.M1, "tree": self.T1,
+             "ref": "refs/ahc/candidate/5/" + self.M1, "parents": [self.B, self.H], "pr_head": self.H}
+        c.update(changes)
+        return c
+
+    def test_pass_for_m_binds(self):
+        self.assertEqual(mg.ahc_candidate_pass(self.final(), self.candidate()), ("o/r", 5, self.M1, REPORT_SHA))
+        heads_ref = self.candidate(ref="refs/heads/ahc/candidate/5/" + self.M1)
+        self.assertEqual(mg.ahc_candidate_pass(self.final(), heads_ref)[2], self.M1)
+        self.assertEqual(mg.ahc_candidate_pass(self.final(), self.candidate(repo="O/R"))[0], "o/r")
+
+    def test_each_binding_clause_refuses(self):
+        final = self.final()
+        bad = {
+            "final for H alone": (self.final(m=self.H), self.candidate()),
+            "another M with the same H (substitution)": (self.final(m=self.M2, tree=self.T2), self.candidate()),
+            "candidate M2 given M1's final": (final, self.candidate(merge_sha=self.M2, tree=self.T2,
+                                                                     ref="refs/ahc/candidate/5/" + self.M2)),
+            "tree differs": (final, self.candidate(tree=self.T2)),
+            "parents swapped": (final, self.candidate(parents=[self.H, self.B])),
+            "one parent": (final, self.candidate(parents=[self.B])),
+            "parents unread": (final, self.candidate(parents=None)),
+            "PR head moved": (final, self.candidate(pr_head=self.M2)),
+            "other repo": (final, self.candidate(repo="o/other")),
+            "lookalike repo": (final, self.candidate(repo="o/r\u0435")),
+            "other PR": (final, self.candidate(pr=6, ref="refs/ahc/candidate/6/" + self.M1)),
+            "ref for another M": (final, self.candidate(ref="refs/ahc/candidate/5/" + self.M2)),
+            "ref for another PR": (final, self.candidate(ref="refs/ahc/candidate/6/" + self.M1)),
+            "ref outside the namespace": (final, self.candidate(ref="refs/heads/main/ahc/candidate/5/" + self.M1)),
+            "M equals H": (self.final(m=self.H), self.candidate(merge_sha=self.H, ref="refs/ahc/candidate/5/" + self.H)),
+            "malformed M": (final, self.candidate(merge_sha="xyz")),
+            "not a mapping": (final, None),
+        }
+        for name, (evidence, cand) in bad.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                mg.ahc_candidate_pass(evidence, cand)
+
+    def test_pr_pass_rules_still_apply(self):
+        with self.assertRaises((ValueError, guard.GuardError)):
+            mg.ahc_candidate_pass(self.final(verdict="BLOCK"), self.candidate())
+        with self.assertRaises((ValueError, guard.GuardError)):
+            mg.ahc_candidate_pass(self.final(reviewer_harness="claude", reviewer="Claude x"), self.candidate())
+
+    def test_binding_writes_nothing(self):
+        evidence = self.final()
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        mg.ahc_candidate_pass(evidence, self.candidate())
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
 
 
 class EndToEndTests(unittest.TestCase):
