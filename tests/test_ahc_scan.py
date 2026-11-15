@@ -404,6 +404,140 @@ class RedactParityTests(unittest.TestCase):
                                  S.RESTRICT)
 
 
+# ---------------------------------------------------------------- generated invariant tests (ahc_scan's I1-I3)
+
+ALL_WHITESPACE = [chr(c) for c in range(0x110000) if re.match(r"\s", chr(c))]   # every character \s matches
+RANK = {S.CLEAN: 0, S.RESTRICT: 1, S.QUARANTINE: 2}
+
+
+def tier(data):
+    return RANK[S.verdict(S.scan_report(data))["action"]]
+
+
+def redactor_tier(text):
+    """The tier the redactor alone implies for `text`: quarantine for any exposure kind, restrict when it finds
+    only restrict-tier kinds, clean when it finds nothing."""
+    kinds = {kind for kind, _s, _e in __import__("redact").find(text)}
+    if not kinds:
+        return 0
+    return 1 if kinds <= S.REDACT_RESTRICT_KINDS else 2
+
+
+def encodings(raw):
+    """Every encoding the scanner decodes, applied once to the bytes `raw`."""
+    return {"base64": base64.b64encode(raw), "base64url": base64.urlsafe_b64encode(raw),
+            "hex": binascii.hexlify(raw), "hex-upper": binascii.hexlify(raw).upper(),
+            "url": urllib.parse.quote_from_bytes(raw, safe="").encode()}
+
+
+def fragment_pool(s):
+    """Fragments of every tier, built at run time: key words with no value (they make overlapping assignments when
+    joined by '=' or ':'), restrict-tier shapes, exposures of every rule family, and clean text."""
+    rng = s.rng
+
+    def r(n, alphabet=ALNUM):
+        return "".join(rng.choice(alphabet) for _ in range(n))
+    return {
+        "key:tok": "to" + "ken", "key:pwd": "pass" + "word", "key:apik": "api" + "_key",
+        "restrict:named": "pass" + "word=" + r(10), "restrict:url": "https://bob:" + r(8) + "@example.invalid/x",
+        "restrict:bare-prefix": "gh" + "p_", "restrict:short-prefix": "gh" + "p_" + r(5),
+        "restrict:short-bearer": "Be" + "arer " + r(5),
+        "exposure:entropy": s.body(64), "exposure:prefix": "gh" + "p_" + r(36),
+        "exposure:floor-low-entropy": "wh" + "sec_" + "aaab" * 8, "exposure:bearer": "Be" + "arer " + r(24),
+        "exposure:jwt": s.jwt(), "exposure:aws": "AK" + "IA" + r(16, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"),
+        "clean:word": "hello", "clean:path": "src/app/main.py",
+    }
+
+
+PAIR_SEPARATORS = [" ", "=", ":", "\n", "\t", " ", " ", "\r\n"]
+
+
+class InvariantTests(unittest.TestCase):
+    """Generated tests for the three scanner invariants (module docstring). No hand-picked expected outcomes: each
+    asserts an ordering against the redactor or against the fragments' own tiers, over every combination."""
+
+    def setUp(self):
+        self.samples = {k: v for k, v in _redact_samples(Secrets(SEED + 2)).items()}
+        low = _redact_samples(Secrets(SEED + 3), low=True)
+        for k in self.samples:
+            self.samples[k] = self.samples[k] + low[k]
+        self.pool = fragment_pool(Secrets(SEED + 4))
+
+    def test_i1_floor_is_never_weaker_than_the_redactor_for_every_unicode_whitespace(self):
+        self.assertGreaterEqual(len(ALL_WHITESPACE), 25)
+        for kind, instances in sorted(self.samples.items()):
+            for i, (label, value) in enumerate(instances):
+                for ws in ALL_WHITESPACE:
+                    text = "x " + label + ws + value + " y\n"
+                    want = redactor_tier(text)
+                    with self.subTest(kind=kind, instance=i, ws="U+%04X" % ord(ws)):
+                        self.assertGreaterEqual(tier(text.encode("utf-8")), want)
+                        for name, blob in encodings(text.encode("utf-8")).items():
+                            self.assertGreaterEqual(tier(b"x " + blob + b"\n"), want, name)
+
+    def test_i1_floor_holds_on_mixed_valid_and_invalid_utf8(self):
+        bad = (b"\xff", b"\xc3", b"\xed\xa0\x80", b"\x80\x80", b"\xa0", b"\x85")   # \xa0, \x85: Latin-1 whitespace
+        for kind, instances in sorted(self.samples.items()):
+            label, value = instances[0]
+            for junk in bad:
+                for where in ("before", "separator", "between", "after"):
+                    plain = {"before": junk + b" " + label.encode() + b" " + value.encode(),
+                             "separator": label.encode() + junk + value.encode(),
+                             "between": label.encode() + b" " + value.encode() + b" " + junk + b" tail",
+                             "after": label.encode() + b" " + value.encode() + junk}[where]
+                    want = max(redactor_tier(plain.decode("utf-8", "surrogateescape")),
+                               redactor_tier(plain.decode("latin-1")))
+                    with self.subTest(kind=kind, junk=junk.hex(), where=where):
+                        self.assertGreaterEqual(tier(b"x " + plain + b"\n"), want)
+
+    def test_i2_the_strongest_tier_wins_for_every_overlapping_pair_in_both_orders(self):
+        names = sorted(self.pool)
+        for a in names:
+            for b in names:
+                for sep in PAIR_SEPARATORS:
+                    text = self.pool[a] + sep + self.pool[b]
+                    want = max(tier(("x " + self.pool[a] + "\n").encode()), tier(("x " + self.pool[b] + "\n").encode()),
+                               redactor_tier(text))
+                    with self.subTest(first=a, second=b, sep="U+%04X" % ord(sep[0])):
+                        self.assertGreaterEqual(tier(("x " + text + "\n").encode("utf-8")), want)
+
+    def test_findings_map_back_to_byte_lines_past_multibyte_text(self):
+        """Character offsets on the decoded text map back to byte offsets, so line numbers stay right."""
+        for prefix_char in ("\u00e9", "\u20ac", "\U0001F600", "\u00a0"):
+            text = (prefix_char * 5 + "\n") * 3 + "Be" + "arer\u2003" + Secrets(SEED + 5).body(16) + "\n"
+            with self.subTest(char="U+%04X" % ord(prefix_char)):
+                lines = {f["line"] for f in S.scan_report(text.encode("utf-8"))}
+                self.assertEqual(lines, {4})
+
+    def test_i3_decode_minimums_admit_every_value_of_the_minimum_length(self):
+        """DECODE_MIN_BYTES of content encode to at least B64_MIN base64 data characters and HEX_MIN hex digits."""
+        n = S.DECODE_MIN_BYTES
+        self.assertGreaterEqual(len(base64.b64encode(b"x" * n).rstrip(b"=")), S.B64_MIN)
+        self.assertGreaterEqual(2 * n, S.HEX_MIN)
+        self.assertLess(n, 11, "below the shortest exposure: a 3-byte prefix plus the 8-byte window")
+
+    def test_i3_decoded_content_gets_every_rule(self):
+        cases = {name: frag for name, frag in self.pool.items()}
+        for a in sorted(self.pool):                         # overlapping assignments, compact and spaced
+            if a.startswith("key:"):
+                for b in sorted(self.pool):
+                    for sep in ("=", " = ", ":"):
+                        cases["%s%s%s" % (a, sep.strip(), b)] = self.pool[a] + sep + self.pool[b]
+        for kind, instances in self.samples.items():
+            for i, (label, value) in enumerate(instances):
+                cases["sample:%s:%d" % (kind, i)] = label + " " + value
+        for name, text in sorted(cases.items()):
+            raw = text.encode("utf-8")
+            want = max(tier(b"x " + raw + b"\n"), redactor_tier(text))
+            if want < 2 and len(raw) < S.DECODE_MIN_BYTES:
+                # below the decode minimum only a public prefix or field name fits, never a value: exposures are
+                # held to I3 at every length (the shortest is 11 bytes, above the minimum)
+                continue
+            for enc, blob in encodings(raw).items():
+                with self.subTest(case=name, encoding=enc):
+                    self.assertGreaterEqual(tier(b"x " + blob + b"\n"), want)
+
+
 class TierTests(unittest.TestCase):
     """The spec owner's tiering ruling: prefix-only restricts the outward text; an exposure quarantines."""
 

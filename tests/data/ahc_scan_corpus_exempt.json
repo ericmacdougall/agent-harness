@@ -589,7 +589,7 @@
    "bearer": 1,
    "github-classic": 3,
    "github-classic:prefix": 1,
-   "high-entropy": 1,
+   "high-entropy": 2,
    "openai:prefix": 1,
    "redact:anthropic": 1,
    "redact:bearer": 1,

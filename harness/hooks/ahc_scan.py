@@ -24,6 +24,21 @@ Rules (spec harvest idea 4):
   credential assignments restrict (no excerpt outward); every other redactor kind quarantines. The scanner's
   own rules only add to the floor (bare prefixes, separators inside values, JWTs, high-entropy runs).
 
+Invariants (each has a generated test in tests/test_ahc_scan.py InvariantTests, not an example test):
+- I1 floor >= redactor on the same text: the tier is never weaker than redact.find() implies for the text as
+  the redactor would see it (UTF-8, every Unicode whitespace; and for bytes that are not valid UTF-8, also a
+  lossless fallback), raw and in every encoding the scanner decodes.
+- I2 strongest tier wins: a weaker finding never suppresses a stronger one, so the tier of joined or
+  overlapping content is never below the strongest tier any part of it has alone.
+- I3 decoded content gets every rule: every hex, base64 (standard and URL-safe) and percent-encoded run of at
+  least the decode minimum is decoded and its content goes through every rule (the floor and entropy
+  included). The minimums sit below the shortest exposure (11 bytes), so an encoded exposure never escapes.
+
+Text: the floor and the text-shaped own rules (Bearer, PEM header) run on the report decoded as UTF-8 with
+surrogateescape (lossless; invalid bytes become lone surrogates, which are neither whitespace nor token
+characters), and, when the bytes are not valid UTF-8, also on a Latin-1 decoding (lossless, one character per
+byte). Never on a lossy reinterpretation of valid UTF-8. Character offsets map back to byte offsets.
+
 Pure: it reads its argument and writes nothing. Stdlib plus redact.py from the same tree; every pattern has
 bounded repetition.
 """
@@ -45,8 +60,10 @@ ENTROPY_BITS = 4.3         # Shannon bits per character at or above which a run 
 SEGMENT_MIN = 32           # a separator-free alphanumeric segment at least this long may be a credential
 SEGMENT_BITS = 4.2         # ... when its entropy per character reaches this (random base62 at 32 chars is ~4.5)
 MONOTONIC = 0.75           # a run whose adjacent pairs mostly step one way is a sorted list, not a secret
-HEX_MIN = 16               # hex runs at least this long are decoded
-B64_MIN = 16               # base64 runs at least this long are decoded
+HEX_MIN = 16               # hex runs at least this long are decoded (8 bytes)
+DECODE_MIN_BYTES = 9       # content this long or longer is decoded from every supported encoding (I3)
+B64_MIN = 12               # base64 runs with at least this many data characters are decoded (9 bytes); the
+#                            shortest exposure (a 3-byte prefix plus the 8-byte window, 11 bytes) is 15 or more
 
 # The prefixes are assembled from parts so this file never holds a contiguous token-shaped literal.
 _P = lambda *parts: "".join(parts)          # noqa: E731
@@ -77,13 +94,13 @@ _RUN_RE = re.compile(rb"[A-Za-z0-9+/=_-]{%d,4096}" % ENTROPY_MIN_LEN)
 _HEX_RE = re.compile(rb"(?<![0-9A-Fa-f])[0-9A-Fa-f]{%d,8192}(?![0-9A-Fa-f])" % HEX_MIN)
 _B64_RE = re.compile(rb"[A-Za-z0-9+/_-]{%d,8192}={0,2}" % B64_MIN)
 _ALNUM = re.compile(rb"[A-Za-z0-9]")
-_BEARER_RE = re.compile(rb"(?i)(?<![A-Za-z0-9])bearer\s{1,64}([A-Za-z0-9._~+/=-]{0,%d})" % TOKEN_RUN)
+_BEARER_RE = re.compile(r"(?i)(?<![A-Za-z0-9])bearer\s{1,64}([A-Za-z0-9._~+/=-]{0,%d})" % TOKEN_RUN)
 
 
 # A private-key header with any whitespace inside it, including a line break (a wrapped report): the redactor's
 # own PEM shape allows spaces only. Built from parts so this file holds no header literal.
-_PEM_RE = re.compile(_P("-----BE", "GIN").encode() + rb"[A-Z0-9\s]{0,60}?(?:" + _P("PRIV", "ATE").encode()
-                     + rb"\s+KEY|PGP\s+" + _P("PRIV", "ATE").encode() + rb"\s+KEY\s+BLOCK)-----")
+_PEM_RE = re.compile(_P("-----BE", "GIN") + r"[A-Z0-9\s]{0,60}?(?:" + _P("PRIV", "ATE")
+                     + r"\s+KEY|PGP\s+" + _P("PRIV", "ATE") + r"\s+KEY\s+BLOCK)-----")
 
 # The redactor floor (code-inspection BLOCK F1/F2): every span redact.find() detects is a finding, so nothing the
 # redactor knows can scan clean. These kinds name a credential's place without proving a value is a secret (spec
@@ -95,11 +112,41 @@ if not REDACT_RESTRICT_KINDS <= _REDACT_KINDS:
     raise ImportError("redact.py no longer has the restrict-tier kinds %s" % sorted(REDACT_RESTRICT_KINDS))
 
 
-def _floor_hits(data):
-    """(offset, rule, exposure) for every redact.find() span. latin-1 maps each byte to one character, so the
-    offsets are byte offsets and no byte is lost to decoding."""
-    return [(start, FLOOR + kind, kind not in REDACT_RESTRICT_KINDS)
-            for kind, start, _end in redact.find(data.decode("latin-1"))]
+def _texts(data):
+    """The texts the floor and the text rules run on, each with its encoding for mapping offsets back to bytes:
+    UTF-8 with surrogateescape (exactly the UTF-8 text when the bytes are valid), plus Latin-1 when they are not.
+    Both are lossless; neither reinterprets valid UTF-8."""
+    out = [(data.decode("utf-8", "surrogateescape"), "utf-8")]
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        out.append((data.decode("latin-1"), "latin-1"))
+    return out
+
+
+def _byte_offsets(text, encoding, char_offsets):
+    """{char offset: byte offset} for the given offsets, walking the text once."""
+    if encoding == "latin-1" or text.isascii():
+        return {c: c for c in char_offsets}
+    out, last_c, last_b = {}, 0, 0
+    for c in sorted(set(char_offsets)):
+        last_b += len(text[last_c:c].encode("utf-8", "surrogateescape"))
+        last_c = c
+        out[c] = last_b
+    return out
+
+
+def _text_hits(data):
+    """(byte offset, rule, exposure) for the floor (every redact.find() span) and the text-shaped own rules
+    (Bearer, PEM header), on every text from _texts(data)."""
+    hits = []
+    for text, encoding in _texts(data):
+        found = [(start, FLOOR + kind, kind not in REDACT_RESTRICT_KINDS) for kind, start, _end in redact.find(text)]
+        found += [(m.start(), "bearer", len(m.group(1)) >= WINDOW) for m in _BEARER_RE.finditer(text)]
+        found += [(m.start(), "pem", True) for m in _PEM_RE.finditer(text)]
+        to_byte = _byte_offsets(text, encoding, [o for o, _, _ in found])
+        hits += [(to_byte[o], rule, exposure) for o, rule, exposure in found]
+    return sorted(set(hits))
 
 
 def _entropy(run):
@@ -148,13 +195,11 @@ def _raw_hits(data, *, entropy=True):
         hits.append((m.start(), _PREFIX_KIND[m.group(1)], exposure))
     for m in _JWT_RE.finditer(data):
         hits.append((m.start(), "jwt", True))
-    for m in _BEARER_RE.finditer(data):
-        hits.append((m.start(), "bearer", len(m.group(1)) >= WINDOW))
-    for m in _PEM_RE.finditer(data):
-        hits.append((m.start(), "pem", True))
-    hits.extend(_floor_hits(data))       # raw and every decoded blob alike: _raw_hits runs on both
+    hits.extend(_text_hits(data))        # raw and every decoded blob alike: _raw_hits runs on both
     if entropy:
-        covered = {o for o, _, _ in hits}
+        # I2: only an exposure may stand in for the entropy finding it overlaps; a restrict-tier finding inside
+        # (or around) a high-entropy run must never lower its tier
+        covered = {o for o, _, exposure in hits if exposure}
         for m in _RUN_RE.finditer(data):
             if _high_entropy(m.group(0)) and not any(m.start() <= o < m.end() for o in covered) \
                     and not _encoded_prose(m.group(0)):
