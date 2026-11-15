@@ -1,6 +1,7 @@
 {
  "state": {
   "version": "internal",
+  "stream": "internal",
   "started": "sources-panel",
   "host": "sources-panel",
   "initiatives": "initiatives-panel",

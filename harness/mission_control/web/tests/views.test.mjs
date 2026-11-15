@@ -114,7 +114,7 @@ test('coverage map names a UI section for every state key, SSE event and ledger 
   const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map(m => m[1]));
   for (const group of Object.values(map)) for (const [key, where] of Object.entries(group)) assert.ok(where === 'internal' || ids.has(where), `${key} -> ${where}`);
   const live = readFileSync(`${here}js/live.js`, 'utf8');
-  const sse = [...live.matchAll(/addEventListener\('([a-z]+)', message/g)].map(m => m[1]);
+  const sse = [...live.matchAll(/addEventListener\('([a-z]+)', (?:message|deliver\()/g)].map(m => m[1]);
   assert.deepEqual(sse.sort(), Object.keys(map.sse).sort());
 });
 

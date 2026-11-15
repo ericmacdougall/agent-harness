@@ -130,3 +130,21 @@ class Page(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AsksDiscloseOlderLostLines(unittest.TestCase):
+    """Main's ruling on PR 257 v3 F6 (goodqa#16117): lost lines the shared rule places before the asks read's 24 h
+    window never make the read partial, and they are always disclosed on the asks health row."""
+
+    def test_an_outside_count_is_disclosed_and_the_read_stays_ok(self):
+        block = dict(col.whole_read(), outside_window=2, window={"rule": col.LOST_WINDOW_RULE, "cutoff": "2026-11-14T00:00:00Z"})
+        source, _hub, health = collector(FakeRunner(0, {"items": [], "read": block}))
+        source.run(0.0)
+        row = health.rows["asks"]
+        self.assertEqual(row["status"], "ok", row)
+        self.assertIn("2 older unreadable records outside this window", row["detail"])
+
+    def test_no_outside_count_adds_nothing(self):  # control
+        source, _hub, health = collector(FakeRunner(0, {"items": []}))
+        source.run(0.0)
+        self.assertNotIn("older", health.rows["asks"]["detail"])

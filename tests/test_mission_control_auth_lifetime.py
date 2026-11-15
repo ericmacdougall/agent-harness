@@ -112,9 +112,10 @@ class StreamBoundary(unittest.TestCase):
             return []
 
         hub = SimpleNamespace(attach=lambda: client, detach=lambda c: detached.append(c), recent=recent,
-                              frame=lambda *args: b"data: fixture-private-replay\n\n")
+                              frame=lambda *args: b"data: fixture-private-replay\n\n", generation="0123456789abcdef")
         h = SimpleNamespace(app=SimpleNamespace(auth=auth, hub=hub, stop=stop),
-                            headers={"Last-Event-ID": "1" if replay else "0"},
+                            # goodqa#16117: a reconnect resumes only from an id of this hub's generation
+                            headers={"Last-Event-ID": "0123456789abcdef.1" if replay else "0"},
                             connection=SimpleNamespace(settimeout=lambda value: None), wfile=Sink(),
                             send_response=lambda status: statuses.append(status), send_header=lambda *args: None,
                             end_headers=lambda: None, deny=lambda status, reason: statuses.append(status),
