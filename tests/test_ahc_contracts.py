@@ -60,42 +60,70 @@ class Base(unittest.TestCase):
 
 
 class ReviewTests(Base):
+    UID = 63595
+
     def row(self, **kw):
-        args = dict(kind="code", repo="O/R", pr=5, head=H1, packet_sha256=PKT, policy_revision=POLICY)
+        args = dict(kind="adversarial", repo="O/R", pr=5, head=H1, packet_sha256=PKT, policy_revision=POLICY)
         args.update(kw)
         return self.c.require_review(**args)
 
     def walk(self, row, *states, **kw):
         for to in states:
-            row = self.c.review(row["id"], to, expected_version=row["version"], event_id=self.ev(), **kw)
+            if to == "running":
+                row = self.c.start_attempt(row["id"], "ahc-review-%s" % row["id"], self.UID,
+                                           expected_version=row["version"], event_id=self.ev())
+            else:
+                row = self.c.review(row["id"], to, expected_version=row["version"], event_id=self.ev(), **kw)
         return row
+
+    def result(self, row, to="passed", **kw):
+        args = dict(expected_version=row["version"], event_id=self.ev(), receipt=self.receipt(), peer_uid=self.UID)
+        args.update(kw)
+        return self.c.review(row["id"], to, **args)
 
     def test_bound_row_is_idempotent_and_reaches_passed_on_a_matching_receipt(self):
         row = self.row()
         self.assertEqual(self.row()["id"], row["id"], "same binding, same row")
         self.assertNotEqual(self.row(policy_revision="policy-r2")["id"], row["id"], "policy revision is bound")
         row = self.walk(row, "queued", "running")
-        row = self.c.review(row["id"], "passed", expected_version=row["version"], event_id=self.ev(),
-                            receipt=self.receipt())
-        self.assertEqual(row["state"], "passed")
+        self.assertEqual((row["producer_unit"], row["producer_uid"]), ("ahc-review-" + row["id"], self.UID))
+        self.assertEqual(self.result(row)["state"], "passed")
+
+    def test_result_from_another_producer_is_unverified_and_authorizes_nothing(self):
+        # spec H2 / NEG-12: only the uid of the unit core started for this row can settle it
+        row = self.walk(self.row(), "queued", "running")
+        for peer in (None, 1000, self.UID + 1, str(self.UID)):
+            with self.subTest(peer=peer), self.assertRaisesRegex(C.ContractError, "unverified-producer"):
+                self.result(row, peer_uid=peer)
+        with self.assertRaises(C.ContractError):
+            self.c.start_attempt(row["id"], "", self.UID, expected_version=row["version"], event_id=self.ev())
+        self.assertEqual(self.state("reviews", "id", row["id"]), "running")
 
     def test_receipt_for_another_subject_or_verdict_is_refused(self):
         row = self.walk(self.row(), "queued", "running")
         for changes in ({"head": H2}, {"packet_sha256": "e" * 64}, {"policy_revision": "policy-r2"}, {"pr": 6},
                         {"repo": "o/other"}, {"verdict": "BLOCK"}):
             with self.subTest(changes), self.assertRaises(C.ContractError):
-                self.c.review(row["id"], "passed", expected_version=row["version"], event_id=self.ev(),
-                              receipt=self.receipt(**changes))
+                self.result(row, receipt=self.receipt(**changes))
         self.assertEqual(self.state("reviews", "id", row["id"]), "running", "nothing was written")
         with self.assertRaises(C.ContractError):
-            self.c.review(row["id"], "findings", expected_version=row["version"], event_id=self.ev(),
-                          receipt=self.receipt())
+            self.result(row, "findings")
+
+    def test_spec_row_passes_from_required_on_its_attach_record_only(self):
+        spec = self.row(kind="spec", packet_sha256="5" * 64)
+        self.c.review(spec["id"], "passed", expected_version=spec["version"], event_id=self.ev(),
+                      receipt=self.receipt(packet_sha256="5" * 64))
+        adversarial = self.row()
+        with self.assertRaises(C.ContractError):   # an attempt kind never passes without running
+            self.result(adversarial)
 
     def test_unlisted_transitions_actors_versions_and_event_reuse_are_refused(self):
         row = self.row()
         with self.assertRaises(C.ContractError):
-            self.c.review(row["id"], "passed", expected_version=row["version"], event_id=self.ev(),
-                          receipt=self.receipt())   # required -> passed does not exist
+            self.c.review(row["id"], "findings", expected_version=row["version"], event_id=self.ev(),
+                          receipt=self.receipt(verdict="BLOCK"))   # required -> findings does not exist
+        with self.assertRaises(C.ContractError):
+            self.c.review(row["id"], "waived", expected_version=row["version"], event_id=self.ev())
         with self.assertRaises(C.ContractError):
             self.c.review(row["id"], "queued", expected_version=row["version"], event_id=self.ev(),
                           actor="worker")
@@ -103,9 +131,11 @@ class ReviewTests(Base):
             self.c.review(row["id"], "queued", expected_version=row["version"] + 1, event_id=self.ev())
         with self.assertRaises(C.VersionConflict):
             self.c.review(row["id"], "queued", expected_version=None, event_id=self.ev())
+        with self.assertRaises(C.ContractError):
+            self.c.require_review("code", "o/r", 5, H1, PKT, POLICY)
         row = self.c.review(row["id"], "queued", expected_version=row["version"], event_id="ev-fixed")
         with self.assertRaises(C.ContractError):
-            self.c.review(row["id"], "running", expected_version=row["version"], event_id="ev-fixed")
+            self.c.start_attempt(row["id"], "u", self.UID, expected_version=row["version"], event_id="ev-fixed")
 
     def test_outcome_unknown_requeues_only_when_the_unit_is_gone(self):
         row = self.walk(self.row(), "queued", "running", "outcome-unknown")
@@ -114,27 +144,24 @@ class ReviewTests(Base):
         row = self.c.review(row["id"], "queued", expected_version=row["version"], event_id=self.ev(), unit_gone=True)
         self.assertEqual(row["state"], "queued")
 
-    def test_new_head_supersedes_queued_cancels_running_and_leaves_unknown_for_readback(self):
-        queued = self.walk(self.row(kind="code"), "queued")
+    def test_new_head_supersedes_rows_and_cancels_running_first(self):
+        queued = self.walk(self.row(kind="adversarial"), "queued")
         running = self.walk(self.row(kind="red-team"), "queued", "running")
-        unknown = self.walk(self.row(kind="spec"), "queued", "running", "outcome-unknown")
-        passed = self.c.review(self.walk(self.row(kind="sign-off"), "queued", "running")["id"], "passed",
-                               expected_version=3, event_id=self.ev(), receipt=self.receipt())
+        unknown = self.walk(self.row(kind="adversarial", packet_sha256="9" * 64), "queued", "running",
+                            "outcome-unknown")
+        spec = self.row(kind="spec")
+        passed = self.result(self.walk(self.row(kind="red-team", packet_sha256="8" * 64), "queued", "running"),
+                             receipt=self.receipt(packet_sha256="8" * 64))
         moved = dict(self.c.supersede_reviews("o/r", 5, H2, lambda rid: "rv-new", "sup"))
-        self.assertEqual(moved, {queued["id"]: "superseded", running["id"]: "cancelling"})
-        self.assertEqual(self.state("reviews", "id", unknown["id"]), "outcome-unknown")
+        self.assertEqual(moved, {queued["id"]: "superseded", running["id"]: "cancelling",
+                                 unknown["id"]: "superseded", spec["id"]: "superseded"})
         self.assertEqual(self.state("reviews", "id", passed["id"]), "passed", "history never changes")
         r = self.db.execute("SELECT version FROM reviews WHERE id=?", (running["id"],)).fetchone()[0]
         self.c.review(running["id"], "superseded", expected_version=r, event_id=self.ev())
-
-    def test_waiver_needs_a_user_or_answer_source(self):
-        row = self.row()
-        with self.assertRaises(C.ContractError):
-            self.c.review(row["id"], "waived", expected_version=row["version"], event_id=self.ev(),
-                          waiver_source="agent:a80eaaad")
-        self.c.review(row["id"], "waived", expected_version=row["version"], event_id=self.ev(),
-                      waiver_source="user:s/u \"waive it\"")
-
+        r = self.c._row("reviews", "id", unknown["id"])
+        with self.assertRaises(C.ContractError):   # a late receipt for a superseded row authorizes nothing
+            self.c.review(unknown["id"], "passed", expected_version=r["version"], event_id=self.ev(),
+                          receipt=self.receipt(packet_sha256="9" * 64), peer_uid=self.UID)
 
 class GrantTests(Base):
     def test_lifecycle_writes_the_authority_record_first(self):

@@ -2589,7 +2589,7 @@ class SchemaTests(Base):
             held.close()
         self.assertEqual(rows, {"ahc-0": (0, 100.0), "ahc-1": (1, 101.0), "ahc-2": (2, 102.0)},
                          "every uncheckpointed row survives; esc_n backfilled from routed_escalations")
-        backups = list(self.paths.root.glob("ledger.sqlite3.pre-v2.*.bak"))
+        backups = list(self.paths.root.glob("ledger.sqlite3.pre-v%d.*.bak" % runner.SCHEMA_VERSION))
         self.assertEqual(len(backups), 1)
         cols, version, count = self.columns(backups[0])
         self.assertEqual((version, count), ("1", 3), "the backup is the v1 ledger with the -wal rows included")
@@ -2621,7 +2621,70 @@ class SchemaTests(Base):
                          "db, -wal and -shm move together under one suffix")
         # the restored ledger opens again and migrates cleanly once the defect is gone
         runner.Ledger(self.paths).close()
-        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], ("2", 3))
+        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], (str(runner.SCHEMA_VERSION), 3))
+
+    # --- v3 (goodqa#16049 M-1): the v2 -> v3 step adds items.cause and the contract tables, keeping every row and
+    # its D20 clock; a migrated ledger has exactly the fresh ledger's tables and columns
+    def shape(self, path):
+        import sqlite3
+        db = sqlite3.connect(str(path))
+        try:
+            tables = sorted(r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                                                      "AND name NOT LIKE 'sqlite_%'"))
+            return {name: sorted(r[1] for r in db.execute("PRAGMA table_info(%s)" % name)) for name in tables}
+        finally:
+            db.close()
+
+    def make_v2(self):
+        import sqlite3
+        self.paths.ensure()
+        db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"), isolation_level=None)
+        for statement in runner._statements(runner.SCHEMA):
+            if statement.startswith("CREATE TABLE IF NOT EXISTS items"):
+                statement = statement.replace(", cause TEXT)", ")")
+            if any(statement.startswith("CREATE TABLE IF NOT EXISTS " + n) for n in
+                   ("reviews", "grants", "operations", "transitions")):
+                continue
+            db.execute(statement)
+        db.execute("INSERT INTO meta(k, v) VALUES ('schema_version', '2')")
+        db.execute("INSERT INTO items(id, lineage, owner, ticket, state, next_action_at, submitted, request, data,"
+                   " updated, entered_at, esc_n) VALUES ('ahc-v2', 'r|1', 'o', 'GoodQA #1', 'block-delivered', NULL,"
+                   " 1.0, '{}', '{}', 50.0, 40.0, 2)")
+        db.close()
+
+    def test_cause_is_kept_within_a_state_and_cleared_when_the_state_changes(self):
+        iid = self.submit()
+        ledger = runner.Ledger(self.paths)
+        worker = runner.Worker(self.paths, self.config, Deps(), ledger)
+        try:
+            def cause():
+                return worker.led.db.execute("SELECT cause FROM items WHERE id=?", (iid,)).fetchone()["cause"]
+            token = worker.lease(iid)
+            worker.settle(iid, token, "deferred", worker.now() + 60, cause="circuit:github-read")
+            self.assertEqual(cause(), "circuit:github-read")
+            worker.settle(iid, token, "deferred", worker.now() + 120)
+            self.assertEqual(cause(), "circuit:github-read", "a same-state settle keeps the cause")
+            worker.settle(iid, token, "queued", worker.now() + 1)
+            self.assertIsNone(cause(), "a new state without a cause clears it")
+        finally:
+            ledger.close()
+
+    def test_v2_migrates_to_v3_with_the_fresh_shape_and_rows_intact(self):
+        fresh_paths = core.Paths(self.home / "fresh")
+        runner.Ledger(fresh_paths).close()
+        self.make_v2()
+        self.assertNotIn("reviews", self.shape(self.paths.root / "ledger.sqlite3"), "fixture is a real v2 ledger")
+        self.assertNotIn("cause", self.shape(self.paths.root / "ledger.sqlite3")["items"])
+        ledger = runner.Ledger(self.paths)
+        try:
+            row = dict(ledger.db.execute("SELECT * FROM items WHERE id='ahc-v2'").fetchone())
+        finally:
+            ledger.close()
+        self.assertEqual((row["state"], row["entered_at"], row["esc_n"], row["cause"]),
+                         ("block-delivered", 40.0, 2, None), "state and D20 clock survive; cause starts empty")
+        self.assertEqual(self.shape(self.paths.root / "ledger.sqlite3"),
+                         self.shape(fresh_paths.root / "ledger.sqlite3"), "migrated shape equals fresh shape")
+        self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v3.*.bak"))), 1)
 
     def test_unverified_backup_never_starts_the_migration(self):
         held = self.make_v1()

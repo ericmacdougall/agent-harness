@@ -29,7 +29,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
   packet_sha256 TEXT NOT NULL, policy_revision TEXT NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL,
-  receipt TEXT, successor TEXT, data TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL, updated REAL NOT NULL,
+  receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER, data TEXT NOT NULL DEFAULT '{}',
+  created REAL NOT NULL, updated REAL NOT NULL,
   UNIQUE(kind, repo, pr, head, packet_sha256, policy_revision));
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL, scope TEXT NOT NULL,
@@ -171,19 +172,33 @@ class Contracts:
 
     # -------------------------------------------------------------- Review (3.3)
 
-    REVIEW_KINDS = ("spec", "spec-adversarial", "code", "red-team", "headed-test", "sign-off", "receipt-final",
-                    "live-test", "adjudication")
-    REVIEW_TERMINAL = ("passed", "findings", "superseded", "waived")
+    # M-1 spec (ahc-m1-v1, Review table R1-R13): kinds adversarial and spec, plus red-team where the class requires
+    # it. `cancelling` is added per the spec owner's ruling (running -> cancelling -> superseded: the attempt unit is
+    # stopped before its row is terminal). There is no waiver path in M-1.
+    REVIEW_KINDS = ("adversarial", "spec", "red-team")
+    ATTEMPT_KINDS = ("adversarial", "red-team")      # produced by a review attempt unit: producer is verified
+    REVIEW_TERMINAL = ("passed", "findings", "superseded")
     D, P = ("ahc-core",), ("ahc-core", "ahc-review")
     REVIEW = {
-        ("required", "queued"): D, ("required", "infra-wait"): D, ("required", "superseded"): D,
-        ("required", "waived"): D,
-        ("queued", "running"): P, ("queued", "infra-wait"): D, ("queued", "superseded"): D, ("queued", "waived"): D,
-        ("running", "passed"): P, ("running", "findings"): P, ("running", "infra-wait"): P,
-        ("running", "outcome-unknown"): D, ("running", "cancelling"): D,
+        ("required", "queued"): D,            # R2 packet built, linted, hashed
+        ("required", "passed"): D,            # R11 spec kind: attach record current
+        ("required", "infra-wait"): D,        # R13 spec kind: no attach record for 4 h; packet build failed
+        ("required", "superseded"): D,        # R12
+        ("queued", "running"): P,             # R3 isolated attempt unit allocated
+        ("queued", "infra-wait"): D,          # NEG-12 review-isolation unavailable at allocation (proposed for R6)
+        ("queued", "superseded"): D,          # R12
+        ("running", "passed"): P,             # R4
+        ("running", "findings"): P,           # R5
+        ("running", "infra-wait"): P,         # R6
+        ("running", "outcome-unknown"): D,    # R7
+        ("running", "cancelling"): D,         # R12 via cancelling (ruling 2)
         ("cancelling", "superseded"): D,
-        ("outcome-unknown", "passed"): D, ("outcome-unknown", "findings"): D, ("outcome-unknown", "queued"): D,
-        ("infra-wait", "queued"): D, ("infra-wait", "superseded"): D, ("infra-wait", "waived"): D,
+        ("outcome-unknown", "passed"): D,     # R8
+        ("outcome-unknown", "findings"): D,   # R8
+        ("outcome-unknown", "queued"): D,     # R9
+        ("outcome-unknown", "superseded"): D,  # R12: a receipt arriving later authorizes nothing
+        ("infra-wait", "queued"): D,          # R10
+        ("infra-wait", "superseded"): D,      # R12
     }
 
     def require_review(self, kind, repo, pr, head, packet_sha256, policy_revision, item=None, event_id=None,
@@ -208,8 +223,21 @@ class Contracts:
             self._a0("review", rid, None, "required", event_id or "ev-" + rid + "-required", actor)
             return self._row("reviews", "id", rid)
 
+    def start_attempt(self, rid, unit, uid, *, expected_version, event_id, actor="ahc-review"):
+        """R3 queued -> running: binds the row to the one attempt unit core started and the uid systemd allocated to
+        it (read by core from the unit, never from the attempt). Only that uid's result can settle the row."""
+        if not isinstance(unit, str) or not unit or type(uid) is not int or uid <= 0:
+            raise ContractError("running needs the attempt's unit name and its allocated uid")
+        with self.tx():
+            self.review(rid, "running", expected_version=expected_version, event_id=event_id, actor=actor)
+            self.db.execute("UPDATE reviews SET producer_unit=?, producer_uid=? WHERE id=?", (unit, uid, rid))
+            return self._row("reviews", "id", rid)
+
     def review(self, rid, to, *, expected_version, event_id, actor="ahc-core", receipt=None, unit_gone=None,
-               successor=None, waiver_source=None, cause=None):
+               successor=None, cause=None, peer_uid=None):
+        """One Review transition. A result (passed or findings) of an attempt kind needs peer_uid, the kernel peer
+        credential of the socket the result arrived on, equal to the uid bound at R3; anything else is
+        unverified-producer and authorizes nothing (spec H2, NEG-12)."""
         with self.tx():
             row = self._row("reviews", "id", rid)
             if row is None:
@@ -217,18 +245,21 @@ class Contracts:
             frm = row["state"]
             self._g0("review", row, expected_version, event_id, actor, self.REVIEW, frm, to)
             if to in ("passed", "findings"):
+                if row["kind"] in self.ATTEMPT_KINDS and (
+                        row["producer_uid"] is None or type(peer_uid) is not int or peer_uid != row["producer_uid"]):
+                    raise ContractError("unverified-producer: the result did not come from the attempt unit bound "
+                                        "to this row")
+                if row["kind"] == "spec" and frm != "required":
+                    raise ContractError("a spec row passes only from required, on its attach record (R11)")
                 self._check_receipt(row, receipt, to)
             if frm == "outcome-unknown" and to == "queued" and unit_gone is not True:
                 raise ContractError("outcome-unknown -> queued needs the unit confirmed gone and no bound receipt")
             if to == "superseded" and not successor and frm != "cancelling":
                 raise ContractError("superseded needs the successor row id")
-            if to == "waived" and not (isinstance(waiver_source, str) and waiver_source.startswith(("user:",
-                                                                                                    "answer:"))):
-                raise ContractError("waived needs an authenticated user: or answer: source")
             self.db.execute("UPDATE reviews SET state=?, version=version+1, updated=?, receipt=COALESCE(?, receipt), "
                             "successor=COALESCE(?, successor) WHERE id=?",
                             (to, self.now(), _canon(receipt) if receipt is not None else None, successor, rid))
-            self._a0("review", rid, frm, to, event_id, actor, cause=cause, waiver_source=waiver_source)
+            self._a0("review", rid, frm, to, event_id, actor, cause=cause, peer_uid=peer_uid)
             return self._row("reviews", "id", rid)
 
     @staticmethod
@@ -247,17 +278,16 @@ class Contracts:
             raise ContractError("receipt verdict %r does not match %s" % (verdict, to))
 
     def supersede_reviews(self, repo, pr, head, successor_of, event_prefix, actor="ahc-core"):
-        """A changed head: every non-terminal row for (repo, pr) at another head is superseded (running rows go to
-        cancelling first; they settle to superseded once the run is stopped). successor_of(row) names the new row."""
+        """R12, a changed head: every non-terminal row for (repo, pr) at another head is superseded; a running row
+        goes to cancelling first and settles to superseded once its unit is stopped. A receipt that arrives for a
+        superseded row authorizes nothing. successor_of(row id) names the new row."""
         out = []
         with self.tx():
             rows = self.db.execute("SELECT id, state, version FROM reviews WHERE repo=? AND pr=? AND head != ? "
-                                   "AND state NOT IN ('passed', 'findings', 'superseded', 'waived', 'cancelling')",
+                                   "AND state NOT IN ('passed', 'findings', 'superseded', 'cancelling')",
                                    (str(repo).lower(), int(pr), head)).fetchall()
             for rid, state, version in rows:
                 to = "cancelling" if state == "running" else "superseded"
-                if to == "superseded" and state == "outcome-unknown":
-                    continue   # may still have produced a receipt: settles by readback first (3.3)
                 self.review(rid, to, expected_version=version, event_id="%s-%s" % (event_prefix, rid), actor=actor,
                             successor=successor_of(rid) if to == "superseded" else None, cause="head-changed")
                 out.append((rid, to))

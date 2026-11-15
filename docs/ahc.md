@@ -207,9 +207,13 @@ Each escalation that can be mailed gets a `mail` effect.
 not listed there does not exist. Every transition checks the expected version, a new event id and an allowed actor,
 and is recorded in `transitions` in the same transaction.
 
-- **Review** rows (3.3) are bound to (kind, repo, pr, head, packet SHA-256, policy revision). `passed` and
-  `findings` need a receipt bound to that exact subject, with a matching verdict. A new head supersedes queued rows,
-  moves running rows to `cancelling`, and leaves `outcome-unknown` rows for their readback.
+- **Review** rows (spec ahc-m1 R1-R13) have the kinds `adversarial`, `spec` and `red-team`. Each is bound to
+  (kind, repo, pr, head, packet or spec core SHA-256, policy revision). `passed` and `findings` need a receipt bound
+  to that exact subject, with a matching verdict. For an attempt kind (`adversarial`, `red-team`), the result must
+  arrive with a kernel peer uid equal to the uid that core bound to the row at `running` (the unit it started).
+  Anything else is `unverified-producer` and authorizes nothing. A `spec` row passes only from `required`, on its
+  attach record. A new head supersedes every open row, and a running row goes through `cancelling` first so its
+  unit is stopped. A receipt that arrives later for a superseded row authorizes nothing. There is no waiver path.
 - **Grant** rows (3.9a) are proposed only by the `ahc-policy` principal. Each has a scope (repo, pr, head, base), one
   use and a 24 h expiry. Every move after validation is written first to an append-only, fsynced authority log.
   The log is **local, not off-host**, a stated deviation from 3.9. If the write fails, nothing changes. A grant
@@ -221,6 +225,11 @@ and is recorded in `transitions` in the same transaction.
   settled row becomes a tombstone 30 days after settlement, and its key is refused for good.
 
 The runner does not use these rows yet, and automatic merging is off.
+
+**Ledger schema v3.** The ledger now carries these tables, plus `items.cause` (why an item is in its state: a
+dependency or budget name). A same-state settle keeps the cause, and a state change without one clears it. A fresh
+ledger and a v2 ledger migrated to v3 have the same tables and columns. The migration is forward-only: older ahc
+code refuses a v3 ledger, and rollback means restoring the `ledger.sqlite3.pre-v3.*.bak` copy made before the step.
 
 **The daemon's review is bound and unstamped.** It runs `peer_review.py pr ... --github-repo OWNER/NAME --pr N
 --no-main-stamp`, so the FINAL carries the PR binding that `merge_gate.pr_pass_evidence` checks. It never takes or

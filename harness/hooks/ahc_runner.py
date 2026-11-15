@@ -41,6 +41,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ahc_core as core  # noqa: E402
+import ahc_contracts  # noqa: E402
 import ahc_packet  # noqa: E402
 import redact  # noqa: E402
 
@@ -317,7 +318,7 @@ CREATE TABLE IF NOT EXISTS items (
   state TEXT NOT NULL, next_action_at REAL, submitted REAL NOT NULL,
   lease_token INTEGER NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
   attempts TEXT NOT NULL DEFAULT '{}', request TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', updated REAL,
-  entered_at REAL, esc_n INTEGER NOT NULL DEFAULT 0, esc_at REAL, disposed_at REAL);
+  entered_at REAL, esc_n INTEGER NOT NULL DEFAULT 0, esc_at REAL, disposed_at REAL, cause TEXT);
 CREATE INDEX IF NOT EXISTS items_due ON items(state, next_action_at);
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, item TEXT NOT NULL, event TEXT NOT NULL, at REAL NOT NULL, data TEXT);
@@ -334,7 +335,10 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
-SCHEMA_VERSION = 2
+# v3 (goodqa#16049 M-1): items.cause (why the item is in its state: a dependency or budget name) and the Review,
+# Grant, Operation and transition tables of ahc_contracts, in the fresh path and the v2 -> v3 step alike.
+SCHEMA += ahc_contracts.SCHEMA
+SCHEMA_VERSION = 3
 # D20 timing columns (v2): entered_at = when the item entered its current state (a same-state settle keeps it);
 # esc_n = the escalation number <n> in the critical alert key ahc:<item>:<n>, bumped once per escalation in the same
 # transaction as its notice, never by a retry; esc_at = the last D20 escalation; disposed_at = a recorded disposition.
@@ -360,7 +364,14 @@ def _migrate_v2(db):
 # statements or callables taking the connection. Version 0 is a ledger written before schema_version existed (same
 # tables). All steps run inside one transaction after a verified online backup (spec v14 NEG-37, v17 F2); a failure
 # restores that backup and moves the failed database files aside, never deleting them.
-MIGRATIONS = {1: [], 2: [_migrate_v2]}
+def _migrate_v3(db):
+    if "cause" not in {row[1] for row in db.execute("PRAGMA table_info(items)")}:
+        db.execute("ALTER TABLE items ADD COLUMN cause TEXT")
+    for statement in _statements(ahc_contracts.SCHEMA):
+        db.execute(statement)
+
+
+MIGRATIONS = {1: [], 2: [_migrate_v2], 3: [_migrate_v3]}
 
 
 SCHEMA_EXIT = 3
@@ -642,10 +653,12 @@ class Worker:
         with self.led.tx():
             row = self.led.item(iid)
             merged = dict(json.loads(row["data"]), **data)
+            cause = data.get("cause")   # v3: kept while the state stays; cleared when it changes without one
             cur = self.led.db.execute(
-                "UPDATE items SET entered_at=CASE WHEN state=? THEN COALESCE(entered_at, ?) ELSE ? END, state=?,"
+                "UPDATE items SET entered_at=CASE WHEN state=? THEN COALESCE(entered_at, ?) ELSE ? END,"
+                " cause=CASE WHEN ? IS NOT NULL THEN ? WHEN state=? THEN cause ELSE NULL END, state=?,"
                 " next_action_at=?, data=?, updated=? WHERE id=? AND lease_token=?",
-                (state, now, now, state, next_action_at if state in NON_TERMINAL else None,
+                (state, now, now, cause, cause, state, state, next_action_at if state in NON_TERMINAL else None,
                  json.dumps(merged, sort_keys=True, default=str), now, iid, token))
             if cur.rowcount != 1:
                 raise Fenced(iid)
