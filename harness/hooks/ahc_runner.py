@@ -337,10 +337,12 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 
 # v3 (goodqa#16049 M-1): items.cause (why the item is in its state: a dependency or budget name) and the Review,
 # Grant, Operation and transition tables of ahc_contracts, in the fresh path and the v2 -> v3 step alike.
-# v4 (spec ahc-m1-v2e, Codex v2d F6): the Grant and Operation layout keyed on the candidate M, epochs, CAP1 slots,
-# the proven-absent count, contract_meta and repo_flags. A v3 ledger's grants and operations (either committed v3
-# layout) are kept intact as grants_v3_legacy / operations_v3_legacy; any unsettled legacy row is reported by
-# Contracts.legacy_unsettled() and fails eligibility until main reconciles it.
+# v4 (spec ahc-m1-v2g2, folded into v4 by the spec owner's ruling since no v4 ledger was ever installed): Grants
+# scoped (repo, pr, H, B), Operations keyed (kind, repo, pr, B, H, revision, g) for the fast-forward integration,
+# Review code rows bound to B_r, epochs, CAP1 slots, the proven-absent count, contract_meta and repo_flags. A v3
+# ledger's grants, operations and reviews (either committed v3 layout) are kept intact as *_v3_legacy; an unsettled
+# legacy grant or operation is reported by Contracts.legacy_unsettled() and fails eligibility until main reconciles
+# it (legacy reviews authorize nothing and are not reconcile items).
 SCHEMA += ahc_contracts.SCHEMA
 SCHEMA_VERSION = 4
 # D20 timing columns (v2): entered_at = when the item entered its current state (a same-state settle keeps it);
@@ -375,13 +377,20 @@ def _migrate_v3(db):
         db.execute(statement)
 
 
+# A table is in the v4 layout when it has its v4 marker column; any other committed layout (either v3 layout of
+# grants/operations, the v3 reviews table without B_r) is renamed aside. merge_sha is gone in v4 (spec ahc-m1-v2g2),
+# so its absence no longer tells v3 from v4: the markers are columns only v4 has.
+V4_MARKERS = {"grants": "cap_held", "operations": "proven_absent", "reviews": "snapshot_base"}
+
+
 def _migrate_v4(db):
     def cols(table):
         return {row[1] for row in db.execute("PRAGMA table_info(%s)" % table)}
-    for table in ("grants", "operations"):
+    for table, marker in V4_MARKERS.items():
         present = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
-        if present and "merge_sha" not in cols(table):
-            db.execute("DROP INDEX IF EXISTS grants_one_live_per_scope")
+        if present and marker not in cols(table):
+            if table == "grants":
+                db.execute("DROP INDEX IF EXISTS grants_one_live_per_scope")
             db.execute("ALTER TABLE %s RENAME TO %s_v3_legacy" % (table, table))
     for statement in _statements(ahc_contracts.SCHEMA):
         db.execute(statement)

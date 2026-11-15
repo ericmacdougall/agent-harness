@@ -22,28 +22,35 @@ B37_PROBES = 20               # automatic readbacks per episode before held
 B42_INCIDENT_SECONDS = 1800   # unknown-effect age that raises an incident
 B47_GRANT_SECONDS = 86400     # grant lifetime
 B48_RETENTION_SECONDS = 30 * 86400   # operation record retention after settlement; then a tombstone, kept forever
-B54_LATE_SECONDS = 86400      # late-request horizon for "absent by quiescence"
 B55_REQUEST_SECONDS = 120     # one effect, readback or probe request
+# spec ahc-m1-v2g2: there is no B54 horizon (Codex v2e F2): elapsed time never abandons an operation.
+FENCED_ESCALATE_SECONDS = 4 * 3600   # a fenced op escalates to main 4 h after entry (then every 24 h, runner side)
+E13_FIRST_READ_SECONDS = 120         # E13's first activity read is at least 2 min after the dispatch
+E13_READ_GAP_SECONDS = 60            # and its second read at least 60 s after the first (activity lag, CHK-ACT)
 
+# Schema v4 (spec ahc-m1-v2g2, folded into v4 by the spec owner's ruling: no v4 ledger was ever installed). Code
+# review rows bind (repo, pr, H, B_r, packet, revision); spec rows store snapshot_base '' (never NULL, so the
+# unique key still de-duplicates). Grants are scoped (repo, pr, H, B); operations keyed (repo, pr, B, H, revision,
+# g). There is no candidate M: integration is a fast-forward of the default branch from B to H.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
-  packet_sha256 TEXT NOT NULL, policy_revision TEXT NOT NULL, state TEXT NOT NULL, version INTEGER NOT NULL,
-  receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER, data TEXT NOT NULL DEFAULT '{}',
-  created REAL NOT NULL, updated REAL NOT NULL,
-  UNIQUE(kind, repo, pr, head, packet_sha256, policy_revision));
+  snapshot_base TEXT NOT NULL, packet_sha256 TEXT NOT NULL, policy_revision TEXT NOT NULL, state TEXT NOT NULL,
+  version INTEGER NOT NULL, receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER,
+  data TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL, updated REAL NOT NULL,
+  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision));
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL,
-  repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL, merge_sha TEXT NOT NULL,
+  repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
   policy_revision TEXT NOT NULL, uses INTEGER NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL,
   operation TEXT, authority_epoch INTEGER NOT NULL, kill_epoch INTEGER NOT NULL, cap_day INTEGER NOT NULL,
   cap_held INTEGER NOT NULL, authority_seq INTEGER, version INTEGER NOT NULL, created REAL NOT NULL,
   updated REAL NOT NULL);
-CREATE UNIQUE INDEX IF NOT EXISTS grants_one_live_per_scope ON grants(kind, repo, pr, merge_sha)
+CREATE UNIQUE INDEX IF NOT EXISTS grants_one_live_per_scope ON grants(kind, repo, pr, base, head)
   WHERE state IN ('validated', 'active', 'reserved');
 CREATE TABLE IF NOT EXISTS operations (
   key TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, repo TEXT NOT NULL, pr INTEGER NOT NULL,
-  head TEXT NOT NULL, base TEXT NOT NULL, merge_sha TEXT NOT NULL, policy_revision TEXT NOT NULL,
+  head TEXT NOT NULL, base TEXT NOT NULL, policy_revision TEXT NOT NULL,
   generation INTEGER NOT NULL, params TEXT, params_sha256 TEXT NOT NULL, grant_id TEXT,
   state TEXT NOT NULL, dispatch_count INTEGER NOT NULL DEFAULT 0, proven_absent INTEGER NOT NULL DEFAULT 0,
   dispatched_at REAL, request_id TEXT, refusal TEXT, probe_at REAL, escalate_at REAL,
@@ -82,6 +89,10 @@ def _canon(value):
 
 def _sha(value):
     return hashlib.sha256(_canon(value).encode("utf-8")).hexdigest()
+
+
+def _is_oid(value):
+    return isinstance(value, str) and len(value) in (40, 64) and all(c in "0123456789abcdef" for c in value)
 
 
 def apply_schema(db):
@@ -214,24 +225,31 @@ class Contracts:
     }
 
     def require_review(self, kind, repo, pr, head, packet_sha256, policy_revision, item=None, event_id=None,
-                       actor="ahc-core"):
-        """none -> required, or the existing row for this exact binding (idempotent)."""
+                       actor="ahc-core", snapshot_base=""):
+        """none -> required, or the existing row for this exact binding (idempotent). R1: a code kind is bound to
+        (repo, pr, H, B_r, packet, revision), where B_r is the default-branch tip at queue time and differs from H;
+        a spec kind has no B_r and stores ''."""
         if kind not in self.REVIEW_KINDS:
             raise ContractError("unknown review kind %r" % kind)
         if actor not in self.D:
             raise ContractError("review rows are created by ahc-core")
+        if kind in self.ATTEMPT_KINDS:
+            if not isinstance(snapshot_base, str) or not _is_oid(snapshot_base) or snapshot_base == head:
+                raise ContractError("a code review is bound to its snapshot base B_r (a full sha other than H)")
+        elif snapshot_base != "":
+            raise ContractError("a spec review has no snapshot base")
         binding = {"kind": kind, "repo": str(repo).lower(), "pr": int(pr), "head": head,
-                   "packet_sha256": packet_sha256, "policy_revision": policy_revision}
+                   "snapshot_base": snapshot_base, "packet_sha256": packet_sha256, "policy_revision": policy_revision}
         rid = "rv-" + _sha(binding)[:24]
         with self.tx():
             existing = self._row("reviews", "id", rid)
             if existing:
                 return existing
             now = self.now()
-            self.db.execute("INSERT INTO reviews(id, kind, item, repo, pr, head, packet_sha256, policy_revision, "
-                            "state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (rid, kind, item, binding["repo"], binding["pr"], head, packet_sha256, policy_revision,
-                             "required", 1, now, now))
+            self.db.execute("INSERT INTO reviews(id, kind, item, repo, pr, head, snapshot_base, packet_sha256, "
+                            "policy_revision, state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (rid, kind, item, binding["repo"], binding["pr"], head, snapshot_base, packet_sha256,
+                             policy_revision, "required", 1, now, now))
             self._a0("review", rid, None, "required", event_id or "ev-" + rid + "-required", actor)
             return self._row("reviews", "id", rid)
 
@@ -282,6 +300,9 @@ class Contracts:
                 "policy_revision": row["policy_revision"]}
         got = {"repo": str(receipt.get("repo", "")).lower(), "pr": receipt.get("pr"), "head": receipt.get("head"),
                "packet_sha256": receipt.get("packet_sha256"), "policy_revision": receipt.get("policy_revision")}
+        if row["snapshot_base"]:      # R4: a code receipt names the B_r the reviewer diffed against
+            want["snapshot_base"] = row["snapshot_base"]
+            got["snapshot_base"] = receipt.get("snapshot_base")
         if got != want:
             raise ContractError("receipt is bound to another subject: %s" % sorted(k for k in want
                                                                                    if want[k] != got[k]))
@@ -305,12 +326,13 @@ class Contracts:
                 out.append((rid, to))
         return out
 
-    # -------------------------------------------------------------- Grant (spec ahc-m1-v2e G1-G9)
+    # -------------------------------------------------------------- Grant (spec ahc-m1-v2g2 G1-G9)
 
     GRANT_TERMINAL = ("consumed", "retired", "expired", "revoked")
     GRANT_LIVE = ("validated", "active", "reserved")
     POLICY_PRINCIPALS = ("ahc-policy",)
     CAP1_PER_DAY = 10              # spec A3: integrations per repo per UTC day, reserved at G1
+    SCOPE = ("repo", "pr", "head", "base")
     GRANT = {
         ("validated", "active"): ("ahc-core",),                        # G2
         ("active", "reserved"): ("ahc-core",),                         # G3
@@ -338,27 +360,30 @@ class Contracts:
     def issue_grant(self, kind, source, principal, scope, policy_revision, *, event_id, kill_epoch,
                     lifetime=B47_GRANT_SECONDS):
         """G1: none -> validated, authority log first. The caller (ahc-policy in W7) checked ELIG on fresh
-        observations. Scope (repo, pr, H, B, M); one non-terminal grant per (kind, repo, pr, M) by unique index; a
+        observations. Scope (repo, pr, H, B); one non-terminal grant per (kind, repo, pr, B, H) by unique index; a
         CAP1 slot for the UTC day of G1 is reserved in the same transaction; the grant carries the current authority
         epoch and the kill epoch the caller read."""
         if principal not in self.POLICY_PRINCIPALS:
             raise ContractError("grants are issued by a policy principal, never by a model or an owner")
         if not isinstance(source, str) or not source.startswith(("user:", "answer:", "queue:")):
             raise ContractError("a grant needs the source of the user's decision")
-        if not isinstance(scope, dict) or any(scope.get(k) in (None, "") for k in ("repo", "pr", "head", "base",
-                                                                                     "merge_sha")):
-            raise ContractError("a grant's scope names repo, pr, head, base and the candidate M")
+        if not isinstance(scope, dict) or set(scope) != set(self.SCOPE) \
+                or any(scope.get(k) in (None, "") for k in self.SCOPE):
+            raise ContractError("a grant's scope is exactly repo, pr, head H and base B")
+        if not _is_oid(scope["head"]) or not _is_oid(scope["base"]) or scope["head"] == scope["base"]:
+            raise ContractError("a grant's H and B are distinct full commit shas")
         if type(kill_epoch) is not int:
             raise ContractError("a grant records the kill epoch it was issued under")
         repo, pr = str(scope["repo"]).lower(), int(scope["pr"])
-        head, base, m = scope["head"], scope["base"], scope["merge_sha"]
-        gid = "gr-" + _sha({"kind": kind, "repo": repo, "pr": pr, "m": m, "policy": policy_revision,
+        head, base = scope["head"], scope["base"]
+        gid = "gr-" + _sha({"kind": kind, "repo": repo, "pr": pr, "b": base, "h": head, "policy": policy_revision,
                             "event": event_id})[:24]
         with self.tx():
-            live = self.db.execute("SELECT id FROM grants WHERE kind=? AND repo=? AND pr=? AND merge_sha=? AND "
-                                   "state IN ('validated', 'active', 'reserved')", (kind, repo, pr, m)).fetchone()
+            live = self.db.execute("SELECT id FROM grants WHERE kind=? AND repo=? AND pr=? AND base=? AND head=? AND "
+                                   "state IN ('validated', 'active', 'reserved')",
+                                   (kind, repo, pr, base, head)).fetchone()
             if live:
-                raise ContractError("a non-terminal grant %s already covers this candidate" % live[0])
+                raise ContractError("a non-terminal grant %s already covers this (B, H)" % live[0])
             day = self.utc_day()
             if self.cap_used(repo, day) >= self.CAP1_PER_DAY:
                 raise ContractError("CAP1 reached for %s on this UTC day" % repo)
@@ -367,13 +392,13 @@ class Contracts:
             now, epoch = self.now(), self.authority_epoch()
             seq = self.authority.append({"event_id": event_id, "grant": gid, "from": None, "to": "validated",
                                          "operation": None, "scope": {"repo": repo, "pr": pr, "head": head,
-                                                                      "base": base, "merge_sha": m},
+                                                                      "base": base},
                                          "actor": principal, "epochs": [epoch, kill_epoch]})
-            self.db.execute("INSERT INTO grants(id, kind, source, principal, repo, pr, head, base, merge_sha, "
+            self.db.execute("INSERT INTO grants(id, kind, source, principal, repo, pr, head, base, "
                             "policy_revision, uses, expires_at, state, authority_epoch, kill_epoch, cap_day, "
                             "cap_held, authority_seq, version, created, updated) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (gid, kind, source, principal, repo, pr, head, base, m, policy_revision, 1,
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (gid, kind, source, principal, repo, pr, head, base, policy_revision, 1,
                              now + lifetime, "validated", epoch, kill_epoch, day, 1, seq, 1, now, now))
             self._a0("grant", gid, None, "validated", event_id, "ahc-core", principal=principal)
             return self._row("grants", "id", gid)
@@ -387,8 +412,7 @@ class Contracts:
         self._g0("grant", row, expected_version, event_id, actor, self.GRANT, frm, to)
         op = row["operation"] if operation is None else operation
         seq = self.authority.append({"event_id": event_id, "grant": gid, "from": frm, "to": to,
-                                     "operation": op or None,
-                                     "scope": {k: row[k] for k in ("repo", "pr", "head", "base", "merge_sha")},
+                                     "operation": op or None, "scope": {k: row[k] for k in self.SCOPE},
                                      "actor": actor})
         held = 0 if to in self.CAP_RELEASED_BY else row["cap_held"]
         self.db.execute("UPDATE grants SET state=?, version=version+1, updated=?, authority_seq=?, operation=?, "
@@ -421,8 +445,7 @@ class Contracts:
                 raise ContractError("grant is past expiry: no new reservation")
             if row["operation"]:
                 raise ContractError("grant is already reserved for %s" % row["operation"])
-            if op["state"] != "intent" or any(str(op[k]).lower() != str(row[k]).lower()
-                                              for k in ("repo", "pr", "head", "base", "merge_sha")):
+            if op["state"] != "intent" or any(str(op[k]).lower() != str(row[k]).lower() for k in self.SCOPE):
                 raise ContractError("operation is outside the grant's scope")
             if op["policy_revision"] != row["policy_revision"]:
                 raise ContractError("operation is bound to another policy revision")
@@ -459,77 +482,103 @@ class Contracts:
                 out.append(gid)
         return out
 
+    # The ONLY abandonment proofs that retire a grant (G5: CAP1 released, g may rise): nothing was ever sent, or
+    # every send was proven absent by p1 or p3. Anything else (E15, main's evidence on a held op, an unknown use)
+    # consumes the grant (G4): fail closed, the slot stays charged and the (B, H) never gets a new generation.
+    RETIRE_PROOFS = ("never-sent", "all-sends-absent")
+
     def _settle_grant_for(self, op, event_id):
-        """The grant side of an operation reaching a terminal state: G4 when confirmed, or abandoned after a send
-        whose outcome stayed unknown; G5 (retired) when abandoned with nothing sent or every send proven absent."""
+        """The grant side of an operation reaching a terminal state: G5 (retired) only for an abandonment on the
+        RETIRE_PROOFS allow-list; G4 (consumed) for a confirmation and for every other abandonment."""
         gid = op["grant_id"]
         row = self._row("grants", "id", gid) if gid else None
         if row is None or row["state"] != "reserved" or row["operation"] != op["key"]:
             return row
-        if op["state"] == "confirmed" or op["proof"] == "unknown-spent":
-            return self._grant_move(gid, "consumed", row["version"], event_id + "-grant", "ahc-core")
-        return self._grant_move(gid, "retired", row["version"], event_id + "-grant", "ahc-core")
+        if op["state"] == "abandoned" and op["proof"] in self.RETIRE_PROOFS:
+            return self._grant_move(gid, "retired", row["version"], event_id + "-grant", "ahc-core")
+        return self._grant_move(gid, "consumed", row["version"], event_id + "-grant", "ahc-core")
 
-    # -------------------------------------------------------------- Effect / Operation (spec ahc-m1-v2e E1-E12)
+    # -------------------------------------------------------------- Effect / Operation (spec ahc-m1-v2g2 E1-E16)
 
     OP_TERMINAL = ("confirmed", "abandoned")
-    OP_UNSETTLED = ("intent", "dispatched", "absent-proven", "outcome-unknown", "held")
+    OP_UNSETTLED = ("intent", "dispatched", "absent-proven", "outcome-unknown", "held", "fenced")
     OPERATORS = ("main", "reconcile")
-    PROOFS = ("p1", "p2", "p3")
+    PROOFS = ("p1", "p3")         # E4: the two admissible absence proofs; p2 is not absence, it fences (E13)
     P1_KINDS = ("non-fast-forward", "ref-lock", "protected-ref")
+    P3_STAGES = ("dns", "tcp", "tls")
     OBSERVATION_SECONDS = 120     # T2: an external fact in a guard is under 2 min old
     PR_MARK_SECONDS = 600         # E12: the PR does not show merged within 10 min of the dispatch
+    METHOD = "fast-forward"       # E2: updateRefs beforeOid B, afterOid H, force false; no other send path
+    OP_KIND = "fast-forward"      # operations.kind; the only Effect kind in M-1
     OP = {
         ("intent", "dispatched"): ("ahc-merge",),                           # E2
         ("dispatched", "confirmed"): ("ahc-merge",),                        # E3, E12
         ("outcome-unknown", "confirmed"): ("ahc-merge",),                   # E3, E12
         ("dispatched", "absent-proven"): ("ahc-merge",),                    # E4
         ("outcome-unknown", "absent-proven"): ("ahc-merge",),               # E4
+        ("dispatched", "fenced"): ("ahc-core",),                            # E13
+        ("outcome-unknown", "fenced"): ("ahc-core",),                       # E13
+        ("fenced", "confirmed"): ("ahc-core",),                             # E14 (late-apply watch)
+        ("fenced", "abandoned"): ("main",),                                 # E15
         ("dispatched", "outcome-unknown"): ("ahc-core",),                   # E5
         ("outcome-unknown", "held"): ("ahc-core",),                         # E6
         ("absent-proven", "intent"): ("ahc-core",),                         # E7
-        ("absent-proven", "abandoned"): ("ahc-core",),                      # E8
+        ("absent-proven", "abandoned"): ("ahc-core",),                      # E8, E16
         ("intent", "abandoned"): ("ahc-core",),                             # E9
-        ("held", "confirmed"): OPERATORS, ("held", "abandoned"): OPERATORS,  # E10
+        ("held", "confirmed"): OPERATORS,                                   # E10 confirmed
+        ("held", "abandoned"): ("main",),                                   # E10 abandoned: main's evidence only
+        ("held", "fenced"): ("reconcile",),                                 # E10 fenced
         ("absent-proven", "held"): ("ahc-core",),                           # E11
     }
 
     @staticmethod
-    def operation_key(repo, pr, merge_sha, policy_revision, generation):
-        """E1: (repo, pr, M, policy revision, g), derived by core, never supplied by a model. M is deterministic
-        from (B, H), so a base move always gives a new key."""
-        if any(v in (None, "") for v in (repo, pr, merge_sha, policy_revision)) or type(generation) is not int \
+    def operation_key(repo, pr, base, head, policy_revision, generation):
+        """E1: (repo, pr, B, H, policy revision, g), derived by core, never supplied by a model. A base move or a
+        head move always gives a new key."""
+        if any(v in (None, "") for v in (repo, pr, base, head, policy_revision)) or type(generation) is not int \
                 or generation < 0:
-            raise ContractError("an operation key needs repo, pr, M, policy revision and generation")
-        ident = {"repo": str(repo).lower(), "pr": int(pr), "m": merge_sha, "policy": policy_revision, "g": generation}
-        return "op-merge-%s" % _sha(ident)[:32]
+            raise ContractError("an operation key needs repo, pr, B, H, policy revision and generation")
+        if not _is_oid(base) or not _is_oid(head) or base == head:
+            raise ContractError("an operation's B and H are distinct full commit shas")
+        # The kind is part of the key so a later Effect kind (v2g3 may make W21's update-branch one) gets its own
+        # keyspace with no schema change; M-1 has exactly one kind.
+        ident = {"kind": Contracts.OP_KIND, "repo": str(repo).lower(), "pr": int(pr), "b": base, "h": head,
+                 "policy": policy_revision, "g": generation}
+        return "op-ff-%s" % _sha(ident)[:32]
 
-    def next_generation(self, repo, pr, merge_sha, policy_revision):
-        """g rises only when the previous operation for the same M was abandoned with nothing sent or with every
-        send proven absent (p1-p3). An operation with any send not proven absent never yields a new g."""
-        rows = self.db.execute("SELECT generation, state, dispatch_count, proven_absent FROM operations WHERE "
-                               "repo=? AND pr=? AND merge_sha=? AND policy_revision=? ORDER BY generation DESC "
-                               "LIMIT 1", (str(repo).lower(), int(pr), merge_sha, policy_revision)).fetchall()
+    def next_generation(self, repo, pr, base, head, policy_revision):
+        """g rises only when the previous operation for the same (B, H) was abandoned on the RETIRE_PROOFS
+        allow-list (nothing sent, or every send proven absent by p1 or p3). A fenced, held or otherwise unsettled
+        op keeps its g (intend returns that row); an op abandoned any other way never yields a new g."""
+        rows = self.db.execute("SELECT generation, state, proof FROM operations WHERE repo=? AND pr=? AND base=? "
+                               "AND head=? AND policy_revision=? ORDER BY generation DESC LIMIT 1",
+                               (str(repo).lower(), int(pr), base, head, policy_revision)).fetchall()
         if not rows:
             return 0
-        g, state, sent, proven = rows[0]
-        if state == "abandoned" and proven >= sent:
+        g, state, proof = rows[0]
+        if state == "abandoned" and proof in self.RETIRE_PROOFS:
             return g + 1
         if state == "abandoned":
             raise ContractError("an operation with a send not proven absent never yields a new generation")
         return g
 
+    PARAMS = ("repo", "pr", "head", "base", "policy_revision", "method", "default_branch")
+
     def intend(self, params, *, item=None, lease_ok, event_id):
-        """E1 none -> intent. params: repo, pr, head, base, merge_sha, policy_revision, method ("merge" only),
+        """E1 none -> intent. params: repo, pr, head H, base B, policy_revision, method ("fast-forward" only),
         default_branch. Same key and same parameters returns the row; same key with other parameters raises."""
-        for k in ("repo", "pr", "head", "base", "merge_sha", "policy_revision", "method", "default_branch"):
+        for k in self.PARAMS:
             if params.get(k) in (None, ""):
                 raise ContractError("operation is missing %s" % k)
-        if params["method"] != "merge":
-            raise ContractError("only the merge-commit method is allowed")
+        if set(params) != set(self.PARAMS):
+            raise ContractError("operation parameters are exactly %s" % ", ".join(self.PARAMS))
+        if params["method"] != self.METHOD:
+            raise ContractError("only the fast-forward method is allowed")
         with self.tx():
-            g = self.next_generation(params["repo"], params["pr"], params["merge_sha"], params["policy_revision"])
-            key = self.operation_key(params["repo"], params["pr"], params["merge_sha"], params["policy_revision"], g)
+            g = self.next_generation(params["repo"], params["pr"], params["base"], params["head"],
+                                     params["policy_revision"])
+            key = self.operation_key(params["repo"], params["pr"], params["base"], params["head"],
+                                     params["policy_revision"], g)
             params_sha = _sha(params)
             row = self._row("operations", "key", key)
             if row is not None:
@@ -543,11 +592,11 @@ class Contracts:
             self._g0("operation", None, None, event_id, "ahc-core", {(None, "intent"): ("ahc-core",)}, None,
                      "intent")
             now = self.now()
-            self.db.execute("INSERT INTO operations(key, kind, item, repo, pr, head, base, merge_sha, "
-                            "policy_revision, generation, params, params_sha256, state, version, created, updated) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (key, "merge", item, str(params["repo"]).lower(), int(params["pr"]), params["head"],
-                             params["base"], params["merge_sha"], params["policy_revision"], g, _canon(params),
+            self.db.execute("INSERT INTO operations(key, kind, item, repo, pr, head, base, policy_revision, "
+                            "generation, params, params_sha256, state, version, created, updated) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (key, self.OP_KIND, item, str(params["repo"]).lower(), int(params["pr"]),
+                             params["head"], params["base"], params["policy_revision"], g, _canon(params),
                              params_sha, "intent", 1, now, now))
             self._a0("operation", key, None, "intent", event_id, "ahc-core", generation=g)
             return self._row("operations", "key", key)
@@ -570,10 +619,34 @@ class Contracts:
         return new
 
     def _fresh(self, obs):
-        if not isinstance(obs, dict) or not isinstance(obs.get("at"), (int, float)):
+        if not isinstance(obs, dict) or not isinstance(obs.get("at"), (int, float)) or isinstance(obs["at"], bool):
             raise ContractError("the guard needs an observation row with its time (T2)")
         if self.now() - float(obs["at"]) >= self.OBSERVATION_SECONDS or float(obs["at"]) > self.now():
             raise ContractError("observation is stale (over 2 min) or from the future (T2)")
+
+    @staticmethod
+    def _bh_entry(row, obs):
+        """The activity-log fact every confirm, fence and absence row reads: True when the default branch's
+        activity has an entry with before B and after H, False when a COMPLETE read has none. An activity read that
+        failed, was paginated incompletely, or is malformed raises: absence of an entry is a claim only a complete
+        read can make (fail closed)."""
+        act = obs.get("activity") if isinstance(obs, dict) else None
+        if not isinstance(act, dict) or act.get("complete") is not True or not isinstance(act.get("entries"), list):
+            raise ContractError("the activity read is missing or incomplete: no (B, H) claim can be made")
+        for entry in act["entries"]:
+            if not isinstance(entry, dict):
+                raise ContractError("the activity read is malformed")
+            if entry.get("before") == row["base"] and entry.get("after") == row["head"]:
+                return True
+        return False
+
+    def _applied(self, row, obs):
+        """E3 / E10 / E14 / E16: the update (B -> H) is shown applied when the tip equals H, or a complete activity
+        read has the (before B, after H) entry. Reachability of H is never evidence (a later integration containing
+        H would make it reachable)."""
+        if obs.get("tip") == row["head"]:
+            return True
+        return self._bh_entry(row, obs)
 
     def _row_or_raise(self, key):
         row = self._row("operations", "key", key)
@@ -583,7 +656,8 @@ class Contracts:
 
     def dispatch(self, key, obs, *, expected_version, event_id, lease_ok, mirror_read_back, request_id=None):
         """E2 intent -> dispatched. Every guard is re-read here; the count rises BEFORE the request is sent, and the
-        caller sends only after this commits (T5), holding the T9 lock shared."""
+        caller sends only after this commits (T5), holding the T9 lock shared. The request is updateRefs on the
+        default branch with beforeOid B, afterOid H (this row's head, the reviewed H) and force false."""
         with self.tx():
             row = self._row_or_raise(key)
             if row["dispatch_count"] >= B10_DISPATCHES:
@@ -601,13 +675,11 @@ class Contracts:
             if obs.get("kill_switch") is not False:
                 problems.append("kill switch on or unread")
             if obs.get("pr_state") != "OPEN" or obs.get("pr_head") != row["head"] or obs.get("draft") is not False:
-                problems.append("PR not open at H")
+                problems.append("PR not open and ready at H")
             if obs.get("tip") != row["base"]:
                 problems.append("default branch not at B")
-            if obs.get("candidate") != row["merge_sha"]:
-                problems.append("candidate ref is not M")
-            if list(obs.get("parents") or []) != [row["base"], row["head"]]:
-                problems.append("M's parents are not (B, H)")
+            if obs.get("compare") != "ahead":      # e10: compare B...H is exactly 'ahead' (B is a proper ancestor)
+                problems.append("B is not an ancestor of H")
             if obs.get("checks_green") is not True:
                 problems.append("policy checks not green on H")
             if problems:
@@ -615,14 +687,17 @@ class Contracts:
             now = self.now()
             return self._op_move(key, "dispatched", expected_version, event_id, "ahc-merge", {
                 "dispatch_count": row["dispatch_count"] + 1, "dispatched_at": now, "request_id": request_id,
-                "probe_at": now + B55_REQUEST_SECONDS}, observation=obs)
+                "probe_at": now + B55_REQUEST_SECONDS}, observation=obs,
+                request={"method": "updateRefs", "beforeOid": row["base"], "afterOid": row["head"], "force": False})
 
     def confirm(self, key, obs, *, expected_version, event_id, actor="ahc-merge"):
-        """E3: M is reachable from the current tip (compare M...tip is identical or ahead) and M's parents are
-        (B, H). E12: the same, but the PR is not shown merged 10 min after the dispatch: still confirmed, flagged
-        so ahc comments on the PR. E10 by main with evidence, or the reconcile under the E3 readback."""
+        """E3: the tip equals H, or a complete activity read shows (before B, after H). E12: the same, but the PR is
+        not shown merged 10 min after the dispatch: still confirmed, flagged so ahc comments on the PR. E10 by main
+        with evidence, or the reconcile under the E3 readback."""
         with self.tx():
             row = self._row_or_raise(key)
+            if row["state"] == "fenced":
+                raise ContractError("a fenced operation is confirmed only by the late-apply watch (E14)")
             if row["state"] == "held" and actor == "main":
                 if not isinstance(obs, dict) or not obs:
                     raise ContractError("main settles a held operation with evidence")
@@ -630,9 +705,8 @@ class Contracts:
             if row["state"] == "held" and actor != "reconcile":
                 raise ContractError("a held operation is settled only by main or the reconcile")
             self._fresh(obs)
-            if obs.get("m_reachable") is not True or obs.get("compare") not in ("identical", "ahead") \
-                    or list(obs.get("parents") or []) != [row["base"], row["head"]]:
-                raise ContractError("readback does not show M reachable from the tip with parents (B, H)")
+            if not self._applied(row, obs):
+                raise ContractError("readback does not show the update B -> H applied")
             unmarked = obs.get("pr_merged") is not True
             if unmarked and row["state"] != "held" and \
                     self.now() - float(row["dispatched_at"] or 0) < self.PR_MARK_SECONDS:
@@ -641,36 +715,82 @@ class Contracts:
                                  {"evidence": _canon(obs), "pr_unmarked": 1 if unmarked else 0})
 
     def absent(self, key, proof, evidence, *, expected_version, event_id):
-        """E4 -> absent-proven with an admissible proof. "Not there now" is never one.
+        """E4 -> absent-proven with one of exactly two admissible proofs. "Not there now" is never one.
         p1: a typed server refusal (evidence {"kind": non-fast-forward | ref-lock | protected-ref}).
-        p2: an error response to a completed request AND a fresh readback taken after the dispatch showing the tip
-            is no longer B and M is not reachable from it (evidence {"error": ..., "readback": {at, tip,
-            m_reachable}}). An error while the tip is still B is NOT absence: the op stays dispatched or
-            outcome-unknown with its grant reserved (L5).
-        p3: the connection failed before the request was sent (evidence {"stage": dns | tcp | tls}).
-        Each proof covers the one send in flight, so proven_absent rises by one."""
+        p3: the connection failed before any request byte was written (evidence {"stage": dns | tcp | tls}); a reset
+            or close after the request was written is never p3.
+        An error response or no response is not absence: see fence() (E13). Each proof covers the one send in
+        flight, so proven_absent rises by one."""
         if proof not in self.PROOFS or not isinstance(evidence, dict):
-            raise ContractError("absent-proven needs proof p1, p2 or p3 with its evidence")
+            raise ContractError("absent-proven needs proof p1 or p3 with its evidence")
         with self.tx():
             row = self._row_or_raise(key)
             if proof == "p1" and evidence.get("kind") not in self.P1_KINDS:
                 raise ContractError("p1 needs a typed server refusal")
-            if proof == "p2":
-                rb = evidence.get("readback")
-                if not evidence.get("error") or not isinstance(rb, dict):
-                    raise ContractError("p2 needs the error response and a readback")
-                self._fresh(rb)
-                if float(rb["at"]) < float(row["dispatched_at"] or 0):
-                    raise ContractError("p2's readback must follow the dispatch")
-                if not rb.get("tip") or rb.get("tip") == row["base"]:
-                    raise ContractError("an error while the tip is still B is not an absence proof")
-                if rb.get("m_reachable") is not False:
-                    raise ContractError("p2 needs M not reachable from the tip")
-            if proof == "p3" and evidence.get("stage") not in ("dns", "tcp", "tls"):
+            if proof == "p3" and evidence.get("stage") not in self.P3_STAGES:
                 raise ContractError("p3 needs a failure before the request was sent")
             return self._op_move(key, "absent-proven", expected_version, event_id, "ahc-merge",
-                                 {"refusal": evidence.get("kind") or proof, "proof": proof,
+                                 {"refusal": evidence.get("kind") or evidence.get("stage"), "proof": proof,
                                   "proven_absent": row["proven_absent"] + 1, "evidence": _canon(evidence)})
+
+    def _off_bh(self, row, read):
+        """A fresh, complete read in which the tip is neither B nor H and there is no (B, H) entry (p2, E10)."""
+        self._fresh(read)
+        if not read.get("tip") or read["tip"] in (row["base"], row["head"]):
+            raise ContractError("the tip is B or H (or unread): not a fence")
+        if self._bh_entry(row, read):
+            raise ContractError("the activity log shows (B, H): the update applied, confirm instead")
+
+    def fence(self, key, error, reads, *, expected_version, event_id):
+        """E13 dispatched | outcome-unknown -> fenced (p2): an error response or no response (error names it),
+        followed by two complete activity reads, the first at least 2 min after the dispatch and the second at
+        least 60 s after the first, each with the tip neither B nor H and no (before B, after H) entry. Not absence:
+        the request may still apply if the branch is ever rewound exactly to B (L5), so the grant stays reserved,
+        no new grant or generation is issued for this (B, H), and the op is never tombstoned."""
+        if not isinstance(error, str) or not error:
+            raise ContractError("a fence names the error response or 'no-response'")
+        if not isinstance(reads, (list, tuple)) or len(reads) != 2:
+            raise ContractError("a fence needs exactly two activity reads")
+        with self.tx():
+            row = self._row_or_raise(key)
+            sent = float(row["dispatched_at"] or 0)
+            first, second = reads
+            for read in reads:
+                self._off_bh(row, read)
+            if float(first["at"]) < sent + E13_FIRST_READ_SECONDS:
+                raise ContractError("E13's first read is at least 2 min after the dispatch (activity lag)")
+            if float(second["at"]) - float(first["at"]) < E13_READ_GAP_SECONDS:
+                raise ContractError("E13's two reads are at least 60 s apart")
+            return self._op_move(key, "fenced", expected_version, event_id, "ahc-core", {
+                "proof": "p2", "refusal": error, "evidence": _canon({"error": error, "reads": list(reads)}),
+                "escalate_at": self.now() + FENCED_ESCALATE_SECONDS, "probe_at": None}, escalate="digest")
+
+    def watch_confirm(self, key, obs, *, event_id, expected_version):
+        """E14 fenced -> confirmed: the late-apply watch found the tip equal to H or a (before B, after H) entry.
+        An incident names the op, the repo's merging turns off until main turns it on, and the grant is consumed
+        (G4)."""
+        with self.tx():
+            row = self._row_or_raise(key)
+            if row["state"] != "fenced":
+                raise ContractError("E14 applies to a fenced operation")
+            self._fresh(obs)
+            if not self._applied(row, obs):
+                raise ContractError("the watch read does not show the update B -> H applied")
+            self.set_merging(row["repo"], off=True, cause="late-apply:%s" % key, actor="ahc-core", _in_tx=True)
+            return self._op_move(key, "confirmed", expected_version, event_id, "ahc-core",
+                                 {"evidence": _canon(obs), "incident": row["incident"] + 1}, incident="late-apply")
+
+    def settle_fenced(self, key, evidence, *, expected_version, event_id, actor):
+        """E15 fenced -> abandoned, by main only, on stamped evidence that the request can never apply (the caller
+        verifies main's stamp: C6 obligation). The grant is consumed (G4), never retired: CAP1 stays charged."""
+        if actor != "main" or not isinstance(evidence, dict) or not evidence:
+            raise ContractError("a fenced operation is abandoned only by main, with evidence")
+        with self.tx():
+            row = self._row_or_raise(key)
+            if row["state"] != "fenced":
+                raise ContractError("E15 applies to a fenced operation")
+            return self._op_move(key, "abandoned", expected_version, event_id, "main",
+                                 {"proof": "never-applies", "evidence": _canon(evidence)}, incident="closed")
 
     def unknown(self, key, *, expected_version, event_id, restart=False):
         """E5 dispatched -> outcome-unknown when B55 passed or a restart found no conclusive readback."""
@@ -699,10 +819,16 @@ class Contracts:
                             (count, self.now() + B37_PROBE_SECONDS, self.now(), key))
             return self._row("operations", "key", key)
 
-    def after_absence(self, key, params, tip_obs, *, expected_version, event_id, lease_ok):
-        """From absent-proven, exactly one of: E11 held (grant revoked, or the third dispatch used); E8 abandoned
-        (p1 or p2, or the tip is no longer B; the grant retires); E7 intent (p3 only, below 3 dispatches, same
-        parameters, grant reserved, tip still B, lease valid)."""
+    def after_absence(self, key, params, read, *, expected_version, event_id, lease_ok):
+        """From absent-proven, exactly one of:
+        E11 held: the grant was revoked, or the third dispatch was used.
+        E16 abandoned: a fresh read shows the update B -> H applied (tip == H, or a complete activity read with the
+            (B, H) entry). The proof (p1 or p3) says this op's request did not apply, so something else integrated
+            H: an incident (L1 or a sibling op); the grant retires (G5); the WorkItem takes W14.
+        E8 abandoned: p1, or p3 with the tip no longer B, and a complete activity read has no (B, H) entry; the
+            grant retires (G5).
+        E7 intent: p3 only, the tip still B, below 3 dispatches, the same parameters, the grant reserved, a lease.
+        An incomplete activity read raises: neither E8 nor E16 fires on a partial read."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None or row["state"] != "absent-proven":
@@ -710,10 +836,18 @@ class Contracts:
             grant = self._row("grants", "id", row["grant_id"]) if row["grant_id"] else None
             if (grant is not None and grant["state"] == "revoked") or row["dispatch_count"] >= B10_DISPATCHES:
                 return self._op_move(key, "held", expected_version, event_id, "ahc-core", {"incident": 1})
-            self._fresh(tip_obs)
-            if row["proof"] != "p3" or tip_obs.get("tip") != row["base"]:
+            self._fresh(read)
+            tip = read.get("tip")
+            if not tip:
+                raise ContractError("the read names no tip")
+            if tip == row["head"] or (not (row["proof"] == "p3" and tip == row["base"]) and self._bh_entry(row, read)):
                 return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
-                                     {"proof": "all-sends-absent"})
+                                     {"proof": "all-sends-absent", "incident": row["incident"] + 1},
+                                     incident="integrated-elsewhere", row="E16")
+            if row["proof"] == "p1" or tip != row["base"]:
+                # E8: reached only after a complete read showed no (B, H) entry (_bh_entry raised on a partial one)
+                return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
+                                     {"proof": "all-sends-absent"}, row="E8")
             if _sha(params) != row["params_sha256"]:
                 raise OperationConflict("a retry must carry the same parameters")
             if lease_ok is not True:
@@ -725,7 +859,7 @@ class Contracts:
     def abandon_unsent(self, key, *, expected_version, event_id, reason):
         """E9 intent -> abandoned: the owning item left merge-ready while the op is in intent, never sent or with
         every send proven absent (an intent row reached by E7 always is). The grant retires (G5), and the next W7
-        for the same M uses generation g+1."""
+        for the same (B, H) uses generation g+1."""
         with self.tx():
             row = self._row_or_raise(key)
             if row["proven_absent"] < row["dispatch_count"]:
@@ -735,43 +869,54 @@ class Contracts:
                                  {"proof": proof}, reason=reason)
 
     def settle_held(self, key, evidence, *, expected_version, event_id, actor):
-        """E10 held -> abandoned: by main with evidence, or by the reconcile once the B54 horizon has passed with M
-        unreachable and the tip no longer at B (a late CAS cannot apply). The outcome stayed unknown, so the grant
-        is spent (G4). A held operation found merged goes through confirm()."""
-        if actor not in self.OPERATORS or not isinstance(evidence, dict) or not evidence:
-            raise ContractError("a held operation is settled only by main or the reconcile, with evidence")
+        """E10 held -> abandoned: by main only, with stamped evidence that the request can never apply (the caller
+        verifies main's stamp). Elapsed time is never evidence: there is no horizon. The outcome stayed unknown, so
+        the grant is consumed (G4). A held op found applied goes through confirm(); one found off (B, H) goes
+        through fence_held()."""
+        if actor != "main" or not isinstance(evidence, dict) or not evidence:
+            raise ContractError("a held operation is abandoned only by main, with evidence")
         with self.tx():
             row = self._row_or_raise(key)
-            if actor == "reconcile":
-                self._fresh(evidence)
-                if self.now() - float(row["dispatched_at"] or 0) < B54_LATE_SECONDS:
-                    raise ContractError("the B54 late-request horizon has not passed")
-                if evidence.get("m_reachable") is not False or not evidence.get("tip") \
-                        or evidence.get("tip") == row["base"]:
-                    raise ContractError("reconcile abandons only with M unreachable and the tip no longer at B")
-            return self._op_move(key, "abandoned", expected_version, event_id, actor,
+            if row["state"] != "held":
+                raise ContractError("E10 applies to a held operation")
+            return self._op_move(key, "abandoned", expected_version, event_id, "main",
                                  {"proof": "unknown-spent", "evidence": _canon(evidence)})
+
+    def fence_held(self, key, read, *, expected_version, event_id):
+        """E10 held -> fenced (the reconcile): a fresh complete read with the tip neither B nor H and no (B, H)
+        entry. The grant stays reserved; the op is watched without expiry (L5)."""
+        with self.tx():
+            row = self._row_or_raise(key)
+            if row["state"] != "held":
+                raise ContractError("E10 applies to a held operation")
+            self._off_bh(row, read)
+            return self._op_move(key, "fenced", expected_version, event_id, "reconcile", {
+                "proof": "p2", "evidence": _canon(read), "escalate_at": self.now() + FENCED_ESCALATE_SECONDS})
 
     # ---- L5 late-apply watch and the per-repo merging switch
 
     LATE_WATCH_SECONDS = 30 * 86400
 
     def watched(self, repo):
-        """Abandoned operations for the repo settled in the last 30 days whose M must not become reachable."""
-        return [dict(zip(("key", "merge_sha", "base"), r)) for r in self.db.execute(
-            "SELECT key, merge_sha, base FROM operations WHERE repo=? AND state='abandoned' AND settled_at >= ?",
+        """What the late-apply watch checks on every repo poll: every fenced op (no expiry) and every op abandoned
+        in the last 30 days, each with the (B, H) whose update must not appear."""
+        return [dict(zip(("key", "base", "head", "state"), r)) for r in self.db.execute(
+            "SELECT key, base, head, state FROM operations WHERE repo=? AND (state='fenced' OR "
+            "(state='abandoned' AND settled_at >= ?)) ORDER BY created, key",
             (str(repo).lower(), self.now() - self.LATE_WATCH_SECONDS))]
 
     def late_apply(self, key, evidence, *, event_id):
-        """L5: a readback found an abandoned operation's M reachable from the tip. Raise one incident naming the op
-        and turn the repo's merging off until main turns it back on. A detector, not a fence."""
-        if not isinstance(evidence, dict) or evidence.get("m_reachable") is not True:
-            raise ContractError("a late apply is recorded only on a readback showing M reachable")
+        """L5: a read found an abandoned operation's update applied (tip == H, or the (B, H) activity entry). Raise
+        one incident naming the op and turn the repo's merging off until main turns it back on. A detector, not a
+        fence. A fenced op's late apply is E14 (watch_confirm)."""
         with self.tx():
             row = self._row_or_raise(key)
             if row["state"] != "abandoned":
-                raise ContractError("the late-apply watch applies to abandoned operations")
+                raise ContractError("the late-apply watch records an incident on abandoned operations (E14 for "
+                                    "fenced ones)")
             self._fresh(evidence)
+            if not self._applied(row, evidence):
+                raise ContractError("a late apply is recorded only on a read showing the update B -> H")
             if self.db.execute("SELECT 1 FROM transitions WHERE event_id=?", (event_id,)).fetchone():
                 raise ContractError("event id %s was already applied" % event_id)
             self.set_merging(row["repo"], off=True, cause="late-apply:%s" % key, actor="ahc-core", _in_tx=True)
@@ -802,7 +947,8 @@ class Contracts:
 
     def legacy_unsettled(self):
         """Rows kept from a pre-v4 ledger (grants_v3_legacy / operations_v3_legacy) that were not terminal. Each one
-        is a reconcile item for main; any one makes its repo ineligible."""
+        is a reconcile item for main; any one makes its repo ineligible. (reviews_v3_legacy rows authorize nothing:
+        they carry no B_r, and a fresh bound review is required, so they are not reconcile items.)"""
         out = []
         for table, terminal in (("grants_v3_legacy", self.GRANT_TERMINAL), ("operations_v3_legacy",
                                                                           self.OP_TERMINAL)):
@@ -818,7 +964,8 @@ class Contracts:
 
     def retain(self):
         """B48: a terminal operation older than B48 after settlement becomes a tombstone (key, outcome and
-        settled_at kept, parameters dropped). A non-terminal operation never expires."""
+        settled_at kept, parameters dropped). A non-terminal operation (fenced and held included) never expires and
+        is never tombstoned."""
         cutoff = self.now() - B48_RETENTION_SECONDS
         with self.tx():
             cur = self.db.execute("UPDATE operations SET tombstone=1, params=NULL, evidence=NULL WHERE tombstone=0 "

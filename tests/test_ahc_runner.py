@@ -2726,13 +2726,26 @@ class SchemaTests(Base):
             "NOT NULL DEFAULT 0, version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL)"),
     }
 
+    # The reviews table both committed v3 layouts share (no snapshot base B_r).
+    V3_REVIEWS = (
+        "CREATE TABLE reviews (id TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, repo TEXT NOT NULL, pr INTEGER NOT "
+        "NULL, head TEXT NOT NULL, packet_sha256 TEXT NOT NULL, policy_revision TEXT NOT NULL, state TEXT NOT NULL, "
+        "version INTEGER NOT NULL, receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER, data TEXT "
+        "NOT NULL DEFAULT '{}', created REAL NOT NULL, updated REAL NOT NULL, UNIQUE(kind, repo, pr, head, "
+        "packet_sha256, policy_revision))")
+
     def make_v3(self, layout):
         import sqlite3
         self.make_v2()
         db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"), isolation_level=None)
         db.execute("ALTER TABLE items ADD COLUMN cause TEXT")
+        db.execute(self.V3_REVIEWS)
+        db.execute("INSERT INTO reviews(id, kind, repo, pr, head, packet_sha256, policy_revision, state, version, "
+                   "created, updated) VALUES ('rv-v3', 'adversarial', 'o/r', 5, ?, ?, 'p', 'running', 3, 1, 2)",
+                   ("a" * 40, "d" * 64))
         for statement in runner._statements(runner.ahc_contracts.SCHEMA):
-            if not any(statement.startswith(p) for p in ("CREATE TABLE IF NOT EXISTS grants",
+            if not any(statement.startswith(p) for p in ("CREATE TABLE IF NOT EXISTS reviews",
+                                                         "CREATE TABLE IF NOT EXISTS grants",
                                                          "CREATE UNIQUE INDEX IF NOT EXISTS grants_",
                                                          "CREATE TABLE IF NOT EXISTS operations",
                                                          "CREATE TABLE IF NOT EXISTS contract_meta",
@@ -2756,7 +2769,8 @@ class SchemaTests(Base):
             db.execute("INSERT INTO operations(key, kind, params, params_sha256, grant_id, state, version, created, "
                        "updated) VALUES ('op-live','merge','{}','s','gr-live','dispatched',2,1,1)")
         db.execute("UPDATE meta SET v='3' WHERE k='schema_version'")
-        before = {t: sorted(db.execute("SELECT * FROM %s" % t).fetchall()) for t in ("grants", "operations")}
+        before = {t: sorted(db.execute("SELECT * FROM %s" % t).fetchall()) for t in ("grants", "operations",
+                                                                                     "reviews")}
         db.close()
         return before
 
@@ -2773,13 +2787,18 @@ class SchemaTests(Base):
                 try:
                     self.assertEqual(db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()[0],
                                      str(runner.SCHEMA_VERSION))
-                    for t in ("grants", "operations"):
+                    for t in ("grants", "operations", "reviews"):
                         self.assertEqual(sorted(db.execute("SELECT * FROM %s_v3_legacy" % t).fetchall()), before[t],
                                          "%s rows are kept byte for byte" % t)
                         self.assertEqual(db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0], 0)
-                    self.assertIn("merge_sha", [r[1] for r in db.execute("PRAGMA table_info(grants)")])
-                    index = db.execute("SELECT sql FROM sqlite_master WHERE name='grants_one_live_per_scope'")
-                    self.assertIn("merge_sha", index.fetchone()[0], "the v4 index, not the renamed v3 one")
+                    grant_cols = [r[1] for r in db.execute("PRAGMA table_info(grants)")]
+                    self.assertIn("cap_held", grant_cols)
+                    self.assertNotIn("merge_sha", grant_cols, "v4 (v2g2) has no candidate M")
+                    self.assertIn("snapshot_base", [r[1] for r in db.execute("PRAGMA table_info(reviews)")])
+                    index = db.execute("SELECT tbl_name, sql FROM sqlite_master WHERE name='grants_one_live_per_scope'")
+                    table, sql = index.fetchone()
+                    self.assertEqual(table, "grants", "the v4 index is on the new table, not the renamed v3 one")
+                    self.assertIn("base, head", sql)
                     db.row_factory = sqlite3.Row
                     contracts = runner.ahc_contracts.Contracts(db, None)
                     unsettled = {(u["table"], u["id"]) for u in contracts.legacy_unsettled()}
@@ -2787,6 +2806,32 @@ class SchemaTests(Base):
                 finally:
                     db.close()
                 self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v4.*.bak"))), 1)
+
+    def schema_sql(self, path):
+        """Every non-legacy table and index, as SQLite stores it (autoindexes by table and name)."""
+        import sqlite3
+        db = sqlite3.connect(str(path))
+        try:
+            return sorted((t, n, tb, sql) for t, n, tb, sql in db.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index')")
+                if not tb.endswith("_v3_legacy") and n != "sqlite_sequence")
+        finally:
+            db.close()
+
+    def test_fresh_v2_and_v3_paths_give_the_identical_v4_schema(self):
+        """Advisor item 2: the marker-column detection and the reviews step leave no path with another layout."""
+        fresh = core.Paths(self.home / "fresh")
+        runner.Ledger(fresh).close()
+        want = self.schema_sql(fresh.root / "ledger.sqlite3")
+        self.assertTrue(any(n == "grants_one_live_per_scope" for _, n, _, _ in want))
+        paths = {"v2": lambda: self.make_v2()}
+        paths.update({"v3-%s" % layout: (lambda layout=layout: self.make_v3(layout)) for layout in self.V3_LAYOUTS})
+        for name, make in paths.items():
+            with self.subTest(path=name):
+                self.setUp()
+                make()
+                runner.Ledger(self.paths).close()
+                self.assertEqual(self.schema_sql(self.paths.root / "ledger.sqlite3"), want)
 
     def test_previous_release_still_reads_the_pre_v4_backup(self):
         """Rollback before cutover restores the pre-v4 backup and runs the previous release (21357968) on it."""
