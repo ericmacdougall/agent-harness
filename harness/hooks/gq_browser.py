@@ -68,6 +68,9 @@ machine_revoked machines_token_grant_level machines_user_token_refused no_machin
 not_delivered origin_mismatch outside_machine_grant outside_remote_consent remote_session_active renew_limit_reached
 runner_key_refused session_changed session_not_active token_grants_off token_lacks_machines_ability token_org_not_allowed
 unknown_command_kind vault_fill_refused
+user_token_expired user_token_rate_limited user_token_locked_out user_token_ability_missing user_token_non_delegable
+desktop_token_session_scope human_approval_required approval_mismatch commander_ceiling payload_too_large
+admission_store_unavailable
 """.split())
 
 
@@ -602,6 +605,7 @@ def op_keys(orphans=False, delete=None, org=None, base=None):
 # Only four command kinds exist here (screenshot, click, type, key); there is no generic kind. Commands always name the
 # lease this tool opened (never autoLease, never takeOver), and a refusal is surfaced, never retried with a wider scope.
 
+ISO_UTC = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z$")
 STRICT_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 MACHINE_TERMINAL = {"ok", "error", "refused", "expired", "cancelled", "denied"}  # bugtracker service.ts TERMINAL
 MACHINE_TTL_DEFAULT, MACHINE_TTL_MAX = 300, 7200  # the server's LEASE_MAX_SECONDS is two hours
@@ -735,7 +739,9 @@ def _lease_from(got, what):
     lid = lease.get("id")
     if not isinstance(lid, str) or not STRICT_UUID.match(lid):
         raise ApiError(what, 0, "unexpected_response")
-    return lid, lease.get("expiresAt") if isinstance(lease.get("expiresAt"), str) else None
+    # A server value kept only as a plain UTC timestamp (red-team r3 B1): anything else could echo the token into output.
+    exp = lease.get("expiresAt")
+    return lid, exp if isinstance(exp, str) and ISO_UTC.match(exp) else None
 
 
 def _mrelease(api, d, state, recover=True):

@@ -44,6 +44,7 @@ class FakeMachines:
         self.unhold = threading.Event()
         self.command_status = "ok"
         self.lease_status = 201
+        self.lease_expires = "2026-11-14T23:00:00.000Z"
         self.artifact_bytes = PNG
         self.artifact_ids = [ARTIFACT]
         self.leases = {}  # holder -> lease id
@@ -108,10 +109,10 @@ class FakeMachines:
                 return h._json(202, {"approval": {"id": "ask"}, "status": "awaiting_approval"})
             holder = (body or {}).get("holder")
             lid = self.leases.setdefault(holder, LEASE)  # service.ts:871: the same holder adopts its live lease
-            return h._json(201, {"lease": {"id": lid, "machineId": MACHINE, "mode": "control", "expiresAt": "2026-11-14T23:00:00.000Z"}})
+            return h._json(201, {"lease": {"id": lid, "machineId": MACHINE, "mode": "control", "expiresAt": self.lease_expires}})
         if method == "POST" and p in ("/machine-leases/%s/release" % LEASE, "/machine-leases/%s/renew" % LEASE):
             return h._json(200, {"lease": {"id": LEASE, "machineId": MACHINE, "releasedAt": "x" if p.endswith("release") else None,
-                                           "expiresAt": "2026-11-14T23:05:00.000Z"}})
+                                           "expiresAt": self.lease_expires}})
         if method == "POST" and p == "/machines/%s/commands" % MACHINE:
             cid = "c%07d-0000-4000-8000-000000000000" % (len(self.commands) + 1)
             self.commands[cid] = body
@@ -438,6 +439,23 @@ class Refusals(Base):
             self.assertIn("unrecognized_error", p.stderr)
             self.assertNotIn(code, p.stderr)
             self.assertNotIn(code.lower(), p.stderr.lower().replace("unrecognized_error", ""))
+
+    def test_echoed_lease_expiry_never_reaches_output_or_state(self):
+        # red-team r3 B1: expiresAt is a server value; only an ISO-8601 UTC timestamp is kept. tearDown scans for the token.
+        self.api.lease_expires = "echo " + USER_TOKEN
+        h = self.e.open()
+        self.assertIsNone(self.e.state(h)["expiresAt"])
+        self.e.run("renew", h, check=0)
+        self.e.run("list", check=0)
+        self.api.lease_expires = "2026-11-14T23:00:00.123Z"
+        h2 = self.e.open()
+        self.assertEqual(self.e.state(h2)["expiresAt"], "2026-11-14T23:00:00.123Z")
+
+    def test_auth_gate_codes_print(self):
+        # red-team r3 M1: an expired token is the likeliest real failure; its code must be readable.
+        for code in ("user_token_expired", "user_token_rate_limited", "payload_too_large"):
+            self.api.fail[("GET", r"/machines/")] = (401, code)
+            self.assertIn(code, self.e.run("open", MACHINE, check=1).stderr)
 
     def test_every_allow_listed_code_still_prints(self):
         import importlib.util
