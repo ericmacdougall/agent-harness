@@ -5,12 +5,12 @@ import * as v from './ledger-views.js';
 
 const SECTIONS = [
   // id, builder, store reasons that repaint it, view that must be showing (null: always)
-  { id: 'mission-tiles', build: (s, ui, go) => [v.tiles(s, go)], on: ['ledger', 'owners', 'asks', 'chat', 'initiatives', 'decisions'], view: 'overview' },
+  { id: 'mission-tiles', build: (s, ui, go) => [v.tiles(s, go)], on: ['ledger', 'owners', 'asks', 'chat', 'initiatives', 'decisions', 'health'], view: 'overview' },
   { id: 'goals-list', build: (s, ui) => v.goals(s, ui), on: ['ledger'], view: 'overview', slow: true },
   { id: 'deploys-list', build: (s, ui) => v.deals(s, ui), on: ['ledger', 'event'], view: 'overview', slow: true },
-  { id: 'blockers-list', build: (s, ui) => v.blockers(s, ui), on: ['ledger', 'asks', 'owners', 'initiatives'], view: 'overview' },
+  { id: 'blockers-list', build: (s, ui) => v.blockers(s, ui), on: ['ledger', 'asks', 'owners', 'initiatives', 'health'], view: 'overview' },
   { id: 'requirements-body', build: (s, ui) => v.requirements(s, ui), on: ['ledger'], view: 'requirements', slow: true },
-  { id: 'archive-body', build: (s, ui) => v.archive(s, ui), on: ['ledger', 'asks'], view: 'archive', slow: true },
+  { id: 'archive-body', build: (s, ui) => v.archive(s, ui), on: ['ledger', 'asks', 'health'], view: 'archive', slow: true },
   { id: 'inventory-body', build: (s, ui, go) => v.inventory(s, go), on: ['ledger', 'asks', 'owners', 'initiatives', 'chat', 'health', 'seed'], view: 'sources', slow: true },
 ];
 

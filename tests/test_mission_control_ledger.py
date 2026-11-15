@@ -290,6 +290,189 @@ class LedgerCollector(unittest.TestCase):
         self.assertNotIn("ah-ticket-get", [k for k, _ in runner.calls])
 
 
+EMPTY_STATUS = dict(STATUS, verified=[], live=[], failed=[], blockers=[], unread=[])
+FAILURES = {"timeout": (124, ""), "nonzero": (1, "Traceback: boom"), "invalid_json": (0, "{not json")}
+
+
+class StatusTruth(unittest.TestCase):
+    """review PR 234 v3 F1 (v2 F2): one status truth per source, computed by collectors.read_truth. An unsuccessful
+    initial read is unknown, a failure after a good read is stale with its last good time, recovery is current."""
+
+    def fail_status(self, runner, mode):
+        code, out = FAILURES[mode]
+        runner.codes["ah-status"] = code
+        runner.payload["ah-status"] = out
+
+    def heal_status(self, runner):
+        runner.codes.pop("ah-status", None)
+        runner.payload["ah-status"] = EMPTY_STATUS
+
+    def test_an_initial_failure_is_unknown_never_an_empty_current_read(self):
+        for mode in FAILURES:
+            with self.subTest(mode=mode):
+                runner = Fake(status=EMPTY_STATUS)
+                self.fail_status(runner, mode)
+                ledger, hub, health = make(runner)
+                ledger.run(1000.0)
+                part = hub.snapshots["ledger"]["status"]
+                self.assertEqual((part["truth"], part["at"], part["stale"], part["blockers"]), ("unknown", "", False, []))
+                self.assertTrue(part["error"])
+                self.assertEqual(part["failed_at"], ev.iso(1000.0))
+                self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("error", "unknown"))
+        self.assertIn("timed out", self.error_of("timeout"))
+
+    def error_of(self, mode):
+        runner = Fake(status=EMPTY_STATUS)
+        self.fail_status(runner, mode)
+        ledger, hub, _ = make(runner)
+        ledger.run(1000.0)
+        return hub.snapshots["ledger"]["status"]["error"]
+
+    def test_a_failure_after_a_good_empty_read_is_stale_with_the_last_good_time(self):
+        for mode in FAILURES:
+            with self.subTest(mode=mode):
+                runner = Fake(status=EMPTY_STATUS)
+                ledger, hub, health = make(runner)
+                ledger.run(1000.0)
+                self.assertEqual(hub.snapshots["ledger"]["status"]["truth"], "current")
+                self.fail_status(runner, mode)
+                ledger.run(1100.0)
+                ledger.run(1200.0)  # a second failure keeps the first failure time and the last good time
+                part = hub.snapshots["ledger"]["status"]
+                self.assertEqual((part["truth"], part["stale"], part["at"], part["failed_at"]), ("stale", True, ev.iso(1000.0), ev.iso(1100.0)))
+                self.assertEqual(part["blockers"], [])
+                self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("error", "stale"))
+
+    def test_recovery_after_an_initial_failure_or_a_stale_read_is_current(self):
+        for mode in FAILURES:
+            for good_first in (False, True):
+                with self.subTest(mode=mode, good_first=good_first):
+                    runner = Fake(status=EMPTY_STATUS)
+                    ledger, hub, health = make(runner)
+                    if good_first:
+                        ledger.run(900.0)
+                    self.fail_status(runner, mode)
+                    ledger.run(1000.0)
+                    self.heal_status(runner)
+                    ledger.run(1100.0)
+                    part = hub.snapshots["ledger"]["status"]
+                    self.assertEqual((part["truth"], part["stale"], part["error"], part["failed_at"], part["at"]), ("current", False, "", "", ev.iso(1100.0)))
+                    self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("ok", "current"))
+
+    def test_a_partial_read_is_partial_and_a_failure_after_it_is_stale(self):
+        runner = Fake(status=dict(EMPTY_STATUS, unread=[{"wal": "agent-x.jsonl", "agent": "x", "reason": "denied"}]))
+        ledger, hub, health = make(runner)
+        ledger.run(1000.0)
+        self.assertEqual(hub.snapshots["ledger"]["status"]["truth"], "partial")
+        self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("ok", "partial"))
+        self.fail_status(runner, "nonzero")
+        ledger.run(1100.0)
+        self.assertEqual(hub.snapshots["ledger"]["status"]["truth"], "stale")
+
+    def test_never_read_is_unknown_even_when_the_collector_is_ok(self):
+        ledger, hub, health = make(Fake(), session="")
+        ledger.run(1000.0)
+        snap = hub.snapshots["ledger"]
+        self.assertEqual((snap["goals"]["truth"], snap["requirements"]["truth"], snap["status"]["truth"]), ("current", "unknown", "unknown"))
+        self.assertEqual((health.rows["ledger"]["status"], health.rows["ledger"]["truth"]), ("ok", "unknown"))
+
+    def test_a_failed_read_for_a_new_session_is_unknown_and_drops_the_old_sessions_rows(self):
+        session = {"id": SID}
+        runner = Fake()
+        hub = ev.Hub()
+        ledger = col.Ledger(hub, col.Health(hub), runner, lambda: session["id"])
+        ledger.run(1000.0)
+        self.assertEqual(hub.snapshots["ledger"]["status"]["blockers"][0]["id"], "wb1")
+        session["id"] = "ffffffff-0000-4000-8000-000000000000"
+        runner.codes.update({"ah-status": 1, "ah-requirements": 1})
+        ledger.run(1100.0)
+        snap = hub.snapshots["ledger"]
+        for name in ("status", "requirements"):
+            self.assertEqual((snap[name]["truth"], snap[name]["at"]), ("unknown", ""), name)
+        self.assertEqual((snap["status"]["blockers"], snap["requirements"]["items"]), ([], []))
+        self.assertEqual(snap["goals"]["truth"], "current")
+
+    def test_more_goals_than_kept_and_truncated_requirements_are_partial(self):
+        goals = dict(GOALS, goals=[dict(GOALS["goals"][0], id=f"g{i}") for i in range(col.Ledger.MAX_GOALS + 5)])
+        ledger, hub, _ = make(Fake(goals=goals, reqs=dict(REQS, truncated=True)))
+        ledger.run(1000.0)
+        snap = hub.snapshots["ledger"]
+        self.assertEqual((snap["goals"]["truth"], snap["goals"]["total"], len(snap["goals"]["items"])), ("partial", col.Ledger.MAX_GOALS + 5, col.Ledger.MAX_GOALS))
+        self.assertEqual(snap["requirements"]["truth"], "partial")
+        ledger.reclassify()
+        self.assertEqual(hub.snapshots["ledger"]["requirements"]["truth"], "partial")
+
+    def test_read_truth_and_worst_truth(self):
+        self.assertEqual([col.read_truth("", ""), col.read_truth("", "x"), col.read_truth("t", "x"), col.read_truth("t", "", True), col.read_truth("t")],
+                         ["unknown", "unknown", "stale", "partial", "current"])
+        self.assertEqual(col.worst_truth("current", "partial"), "partial")
+        self.assertEqual(col.worst_truth("partial", "stale", "current"), "stale")
+        self.assertEqual(col.worst_truth("current", "bogus"), "unknown")
+        self.assertEqual(col.worst_truth(), "unknown")
+
+
+class HealthTruth(unittest.TestCase):
+    """The Health row carries the same truth for the sources outside the ledger (asks, owners, initiatives, chat)."""
+
+    def test_an_error_before_any_good_read_is_unknown_after_one_is_stale_and_recovery_is_current(self):
+        health = col.Health(ev.Hub())
+        health.error("asks", "boom")
+        self.assertEqual((health.rows["asks"]["truth"], health.rows["asks"]["ok_at"]), ("unknown", None))
+        health.ok("asks", "fine")
+        ok_at = health.rows["asks"]["ok_at"]
+        health.error("asks", "boom")
+        self.assertEqual((health.rows["asks"]["truth"], health.rows["asks"]["ok_at"]), ("stale", ok_at))
+        health.ok("asks", "fine")
+        self.assertEqual(health.rows["asks"]["truth"], "current")
+
+    def test_a_tick_that_reports_itself_off_is_not_overwritten_as_ok(self):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        asks = col.Asks(hub, health, Fake(), lambda: "")
+        asks.run(1000.0)
+        self.assertEqual((health.rows["asks"]["status"], health.rows["asks"]["truth"]), ("off", "unknown"))
+
+    def test_an_initiatives_file_that_is_not_configured_is_off_but_current(self):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        col.Initiatives(hub, health, None, None).run(1000.0)
+        self.assertEqual((health.rows["initiatives"]["status"], health.rows["initiatives"]["truth"]), ("off", "current"))
+
+    def test_an_unreadable_initiatives_file_at_start_is_unknown(self):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        col.Initiatives(hub, health, None, "/nonexistent/initiatives.json").run(1000.0)
+        self.assertEqual((health.rows["initiatives"]["status"], health.rows["initiatives"]["truth"]), ("error", "unknown"))
+
+    def test_the_health_row_is_republished_when_its_truth_changes(self):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        health.ok("ledger", "x", truth="unknown")
+        health.ok("ledger", "x", truth="current")
+        self.assertEqual([r["truth"] for r in hub.snapshots["health"] if r["name"] == "ledger"], ["current"])
+
+
+class ChatHealth(unittest.TestCase):
+    def test_a_chat_store_failure_clears_on_the_next_good_read(self):
+        sys.path.insert(0, str(REPO / "tests"))
+        from test_mission_control import ServerHarness  # noqa: PLC0415
+
+        class H(ServerHarness):
+            def runTest(self):
+                pass
+        h = H()
+        h.setUp()
+        self.addCleanup(h.tearDown)
+        app = h.app
+        real = app.refresh_chat
+        app.refresh_chat = lambda force=False: (_ for _ in ()).throw(OSError("chat store unreadable"))
+        app.chat_once()
+        self.assertEqual((app.health.rows["chat"]["status"], app.health.rows["chat"]["truth"]), ("error", "unknown"))
+        app.refresh_chat = real
+        app.chat_once()
+        self.assertEqual((app.health.rows["chat"]["status"], app.health.rows["chat"]["truth"]), ("ok", "current"))
+
+
 class ServerIntegration(unittest.TestCase):
     def setUp(self):
         sys.path.insert(0, str(REPO / "tests"))

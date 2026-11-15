@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { created, text, walk } from './dom-shim.mjs';
-import { ledger } from '../js/adapt.js';
+import { ledger, sources } from '../js/adapt.js';
 import * as v from '../js/ledger-views.js';
 
 const here = new URL('..', import.meta.url).pathname;
@@ -276,9 +276,10 @@ test('textual evidence from the producer is shown on the requirement row', () =>
 
 
 // review PR 234 v2 F2: a status read that missed WALs never reads as healthy, and never says "No blockers recorded" bare.
+const HEALTHY = sources(['asks', 'owners', 'initiatives', 'wals', 'chat'].map(name => ({ name, status: 'ok', checked: NOW / 1000, ok_at: NOW / 1000, truth: 'current' })));
 const partial = (unread, extra = {}) => ({ now: NOW, events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
-  asksStale: [], asksSweptAt: '', initiativesStale: false, initiativesError: '', sessions: [],
-  ledger: ledger({ status: { blockers: [], verified: [], incomplete: unread.count !== 0, unread, at: iso(1), ...extra } }) });
+  asksStale: [], asksSweptAt: '', initiativesStale: false, initiativesError: '', sessions: [], sources: HEALTHY,
+  ledger: ledger({ status: { blockers: [], verified: [], incomplete: unread.count !== 0, unread, at: iso(1), truth: unread.count !== 0 ? 'partial' : 'current', ...extra } }) });
 
 test('an incomplete status read is flagged beside blockers, deploys and source health', () => {
   const s = partial({ count: 3, items: [{ wal: 'agent-x.jsonl', agent: 'x', reason: 'Permission denied' }, { wal: '<img src=x>', agent: '', reason: '' }] });
@@ -294,7 +295,7 @@ test('an incomplete status read is flagged beside blockers, deploys and source h
   assert.match(text([row]), /incomplete/);
   assert.ok(walk([row]).some(n => n.className === 'warn'), 'Blockers health cell is a warning, not ok');
   const tile = v.tiles(s, () => {});
-  assert.match(text([tile]), /incomplete/i);
+  assert.match(text([tile]), /partial read/i);  // review PR 234 v3 F1: the tile says partial (was "incomplete")
 });
 
 test('an unknown unread count still warns, and a complete read says nothing extra', () => {

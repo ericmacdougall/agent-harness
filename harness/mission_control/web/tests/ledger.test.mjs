@@ -1,26 +1,28 @@
 // Ledger adapters and the archive view model (GoodQA goodqa#15920 AC-4, AC-7, AC-8, AC-9). No DOM: pure functions.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ledger, archiveRows, dealRows, blockerRows, missionTiles, GOAL_STATE } from '../js/adapt.js';
+import { ledger, archiveRows, dealRows, blockerRows, missionTiles, GOAL_STATE, sources } from '../js/adapt.js';
 
 const NOW = Date.parse('2026-11-13T12:00:00Z');
 const iso = ageS => new Date(NOW - ageS * 1000).toISOString();
 
 const snapshot = () => ({
   goals: { items: [{ id: 'g1', title: 'Ship it', state: 'LIVE_TESTED', ticket: 'goodqa#1', evidence: [{ id: 'e1', kind: 'live_test', verdict: 'PASS', at: iso(60), check: 'c', note: 'ok' }], evidence_total: 1, problems: { missing: 0, tampered: 0, unpinned: 0 }, owners: [] },
-    { id: 'g2', title: '<img src=x onerror=alert(1)>', state: 'UNKNOWN', evidence: [] }], stale: false, error: '', at: iso(1) },
+    { id: 'g2', title: '<img src=x onerror=alert(1)>', state: 'UNKNOWN', evidence: [] }], stale: false, error: '', at: iso(1), truth: 'current' },
   requirements: { items: [
     { id: 'r1', text: 'keep chat live', at: iso(100), bucket: 'live', rule: 'live', reason: 'open: nothing', evidence_ref: '', expires_in_s: 86400 },
     { id: 'r2', text: 'old', at: iso(40 * 86400), bucket: 'archived', rule: 'R4', rule_title: 'expired', reason: 'older than 30 d', evidence_ref: 'age' },
     { id: 'r3', text: 'done', at: iso(5000), bucket: 'archived', rule: 'R1', reason: 'state is done', evidence_ref: '' }],
-    total: 3, truncated: false, summary: { live: 1, archived: 2, rules: { R1: 1, R4: 1, live: 1 } }, stale: false, error: '', at: iso(1) },
+    total: 3, truncated: false, summary: { live: 1, archived: 2, rules: { R1: 1, R4: 1, live: 1 } }, stale: false, error: '', at: iso(1), truth: 'current' },
   status: { counts: { blockers: 1 }, verified: [{ id: 'v1', agent: 'a1', at: iso(300), event: 'check', note: 'REALLY_TESTED t: ok', check: 't', verdict: 'PASS' }],
     live: [{ id: 'l1', agent: 'a1', at: iso(200), event: 'deploy', note: 'DEPLOYED x', check: '', verdict: '' }],
     failed: [{ id: 'f1', agent: 'a2', at: iso(100), event: 'check', note: 'FAIL', check: 'f', verdict: 'FAIL' }],
     pending: [{ id: 'p1', agent: 'a3', at: iso(50), event: 'check', note: 'PENDING_REAL_TEST q', check: 'q', verdict: '' }],
     blockers: [{ id: 'b1', agent: 'a3', at: iso(10), event: 'blocker', note: 'blocked on X' }], owners: { counts: {}, attention: [], live: [], undisposed: [] },
-    stale: false, error: '', at: iso(1) },
+    stale: false, error: '', at: iso(1), truth: 'current' },
 });
+// the Health rows of a page whose every source read well (the server's shape: collectors.Health)
+const HEALTHY = sources(['asks', 'owners', 'initiatives', 'wals', 'chat'].map(name => ({ name, status: 'ok', checked: NOW / 1000, ok_at: NOW / 1000, truth: 'current' })));
 
 test('ledger adapter keeps every string a string and bounds hostile input', () => {
   const huge = 'A'.repeat(100000);
@@ -79,7 +81,7 @@ test('blocker rows gather ledger blockers, untraceable asks and dropped owners w
 });
 
 test('mission tiles count goals, live owners, open asks, blockers and requirements', () => {
-  const tiles = missionTiles({ ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false }, { state: 'done', severe: false }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] });
+  const tiles = missionTiles({ sources: HEALTHY, ledger: ledger(snapshot()), owners: [{ state: 'live', severe: false }, { state: 'done', severe: false }], asks: [{ id: 'a' }], messages: [], decisions: {}, initiatives: [{ state: 'At risk' }, { state: 'Done' }] });
   const by = Object.fromEntries(tiles.map(t => [t.id, t]));
   assert.equal(by.goals.value, '0 / 2');  // g1 is LIVE_TESTED: live, not done (review PR 234 v2 F1)
   assert.match(by.goals.note, /1 live, not done · 1 open/);
@@ -91,8 +93,8 @@ test('mission tiles count goals, live owners, open asks, blockers and requiremen
 
 // review PR 234 v2 F1: the producer's own vocabulary (harness/hooks/goals_view.py). Only DONE_LIVE is done.
 const PRODUCER_STATES = ['FAILING', 'UNCONFIRMED', 'UNKNOWN', 'LIVE_UNTESTED', 'IN_PROGRESS', 'VERIFIED', 'DEFERRED', 'LIVE_TESTED', 'DONE_LIVE', 'RETIRED'];
-const goalsOf = states => ledger({ goals: { items: states.map((state, i) => ({ id: `g${i}`, title: `goal ${i}`, state, evidence: [] })), at: iso(1) } });
-const goalTile = states => missionTiles({ ledger: goalsOf(states), owners: [], asks: [], messages: [], decisions: {}, initiatives: [] }).find(t => t.id === 'goals');
+const goalsOf = states => ledger({ goals: { items: states.map((state, i) => ({ id: `g${i}`, title: `goal ${i}`, state, evidence: [] })), at: iso(1), truth: 'current' } });
+const goalTile = states => missionTiles({ sources: HEALTHY, ledger: goalsOf(states), owners: [], asks: [], messages: [], decisions: {}, initiatives: [] }).find(t => t.id === 'goals');
 
 test('only DONE_LIVE counts as done; a board of finished goals is not "still open"', () => {
   const tile = goalTile(['DONE_LIVE', 'DONE_LIVE']);

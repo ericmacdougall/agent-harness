@@ -1,5 +1,6 @@
 import { getState, subscribe, select, update, highlight } from './store.js';
 import { el, button, age, freshness, stateClass } from './ui.js';
+import { ownersEmpty, ownerCount } from './adapt.js';
 
 export const OWNERS_SHOWN = 8;
 const ACTIVE = /^(live|working|finishing|waiting|blocked|error|offline|observed|stale|unknown)/;
@@ -81,14 +82,14 @@ export function mountOwners() {
       parts.time.className = `owner-age ${freshness(owner.last_item.active, state.now)}`;
       parts.row.setAttribute('aria-label', `${owner.name}, ${owner.runtime}, ${owner.state}. ${owner.task}. ${holdText ? `${holdText}. ` : ''}Last work item: ${owner.last_item.note}. Last active ${age(owner.last_item.active, state.now)}. Open details.`);
     });
-    if (!owners.length) list.append(el('p', 'empty-state', state.owners.length ? 'No owners in this state.' : 'Waiting for the owner list…'));
+    if (!owners.length) list.append(el('p', 'empty-state', ownersEmpty(state, state.owners.length > 0)));
     const count = document.getElementById('owner-count');
-    count.textContent = String(owners.length).padStart(2, '0');
+    count.textContent = ownerCount(state, owners.length);
     count.title = `${owners.length} shown of ${total} matching, ${state.owners.length} owners in all`;
   }
   render(getState());
   subscribe((state, reason) => {
-    if (['event','owners','owner-filter'].includes(reason)) render(state);
+    if (['event','owners','owner-filter','health'].includes(reason)) render(state);
     if (reason === 'tick') rows.forEach(({ time }) => { time.textContent = age(time.dateTime, state.now); time.className = `owner-age ${freshness(time.dateTime, state.now)}`; });
     if (reason === 'highlight') rows.forEach(({ row }, id) => row.classList.toggle('is-highlighted', id === state.highlight));
   });

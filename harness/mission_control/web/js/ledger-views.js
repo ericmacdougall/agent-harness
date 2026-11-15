@@ -2,7 +2,7 @@
 // the data inventory. Builders are pure: state in, nodes out, textContent only (no HTML is ever parsed from data).
 // Each long text is clamped with a disclosure, and each list is bounded with "show more", so volume never takes over.
 import { el, button, age, stateClass } from './ui.js';
-import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine } from './adapt.js';
+import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine, claim, truthLines, noneText, countText, hiddenBlockers } from './adapt.js';
 
 export const PAGE = 25;  // default rows per list; "show more" adds one page
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
@@ -75,11 +75,23 @@ export function goalCard(goal, now) {
   return card;
 }
 
+// review PR 234 v3 F1: beside every claim, what its sources could not tell (one line per source that is not current).
+export function truthNotice(c) {
+  const lines = truthLines(c);
+  if (!lines.length) return null;
+  const box = el('div', `notice warn truth-${c.truth}`);
+  box.setAttribute('role', 'status');
+  lines.forEach(line => box.append(el('p', '', line)));
+  return box;
+}
+const notices = (c, ...more) => [truthNotice(c), ...more].filter(Boolean);
+
 export function goals(state, ui) {
   const part = state.ledger.goals;
-  const out = [];
-  if (part.error) out.push(el('p', 'notice warn', `${part.stale ? 'Showing the last good read. ' : ''}Goal ledger: ${part.error}`));
-  if (!part.items.length) out.push(el('p', 'empty', part.error ? 'The goal ledger could not be read.' : 'No goals in the ledger yet.'));
+  const c = claim(state, 'goals');
+  const out = notices(c);
+  if (part.total > part.items.length) out.push(el('p', 'notice', `Showing ${part.items.length} of ${part.total} goals.`));
+  if (!part.items.length) out.push(el('p', 'empty', noneText(c, 'No goals in the ledger yet.', 'goals')));
   part.items.slice(0, ui.goalsLimit).forEach(goal => out.push(goalCard(goal, state.now)));
   if (part.items.length > ui.goalsLimit) out.push(button('more-button', `Show ${part.items.length - ui.goalsLimit} more goals`, () => ui.more('goalsLimit')));
   return out;
@@ -88,10 +100,9 @@ export function goals(state, ui) {
 export function deals(state, ui) {
   const status = state.ledger.status;
   const all = dealRows(status, state.events, 500);
-  const out = [];
-  if (status.error) out.push(el('p', 'notice warn', `${status.stale ? 'Showing the last good read. ' : ''}Status: ${status.error}`));
-  if (status.incomplete) out.push(unreadNotice(status));
-  if (!all.length) out.push(el('p', 'empty', status.incomplete ? 'No deploys or live tests in the logs that could be read.' : 'No deploys or live tests recorded in the last 12 hours.'));
+  const c = claim(state, 'deploys');
+  const out = notices(c, unreadNotice(status));
+  if (!all.length) out.push(el('p', 'empty', noneText(c, 'No deploys or live tests recorded in the last 12 hours.', 'deploys or live tests')));
   if (all.length) out.push(el('p', 'count-line', `Showing ${Math.min(all.length, ui.dealsLimit)} of ${all.length} records from the last ${Math.round(status.since_s / 3600) || 12} hours.`));
   const list = el('ul', 'deals');
   all.slice(0, ui.dealsLimit).forEach(row => {
@@ -107,6 +118,7 @@ export function deals(state, ui) {
 
 // review PR 234 v2 F2: what a partial status read missed, beside every panel that depends on it.
 function unreadNotice(status) {
+  if (!status.incomplete) return null;
   const box = el('div', 'notice warn');
   box.setAttribute('role', 'status');
   box.append(el('p', '', unreadLine(status)));
@@ -120,9 +132,11 @@ function unreadNotice(status) {
 
 export function blockers(state, ui) {
   const all = blockerRows(state.ledger.status, state.asksFlagged, state.owners, state.initiatives);
-  const out = [];
-  if (state.ledger.status.incomplete) out.push(unreadNotice(state.ledger.status));
-  if (!all.length) out.push(el('p', 'empty', state.ledger.status.incomplete ? 'No blockers in the logs that could be read.' : 'No blockers recorded.'));
+  const c = claim(state, 'blockers');
+  const out = notices(c, unreadNotice(state.ledger.status));
+  const hidden = hiddenBlockers(state.ledger.status);
+  if (hidden) out.push(el('p', 'notice', `${hidden} more ledger blockers are recorded than Mission Control holds (ah status lists them all).`));
+  if (!all.length && !hidden) out.push(el('p', 'empty', noneText(c, 'No blockers recorded.', 'blockers')));
   const list = el('ul', 'blockers');
   all.slice(0, ui.blockersLimit).forEach(row => {
     const item = el('li', `blocker src-${row.source}`);
@@ -217,13 +231,14 @@ function filterBar(id, label, options, value, onChange) {
 export function requirements(state, ui) {
   const part = state.ledger.requirements;
   const summary = part.summary;
+  const c = claim(state, 'requirements');
   const out = [];
-  out.push(filterBar('req-filter', 'Show requirements', [['live', `Live ${summary.live}`], ['archived', `Archived ${summary.archived}`], ['all', `All ${part.items.length}`]], ui.reqFilter, key => ui.set('reqFilter', key)));
-  if (part.error) out.push(el('p', 'notice warn', `${part.stale ? 'Showing the last good read. ' : ''}Requirements: ${part.error}`));
+  out.push(filterBar('req-filter', 'Show requirements', [['live', `Live ${countText(summary.live, c)}`], ['archived', `Archived ${countText(summary.archived, c)}`], ['all', `All ${countText(part.items.length, c)}`]], ui.reqFilter, key => ui.set('reqFilter', key)));
+  out.push(...notices(c));
   if (part.truncated) out.push(el('p', 'notice', `Showing the newest ${part.items.length} of ${part.total} recorded requirements.`));
   const query = ui.reqQuery.trim().toLowerCase();
   const matches = part.items.filter(r => (ui.reqFilter === 'all' || r.bucket === ui.reqFilter) && (!query || r.text.toLowerCase().includes(query) || r.id.toLowerCase().includes(query)));
-  if (!matches.length) out.push(el('p', 'empty', part.items.length ? 'No requirements match.' : part.error ? 'The requirements could not be read.' : 'No requirements recorded.'));
+  if (!matches.length) out.push(el('p', 'empty', part.items.length ? noneText(c, 'No requirements match.', 'matching requirements') : noneText(c, 'No requirements recorded.', 'requirements')));
   const list = el('ul', 'req-list');
   matches.slice(0, ui.reqLimit).forEach(row => list.append(requirementItem(row, state.now, ui)));
   out.push(list);
@@ -252,11 +267,15 @@ export function archiveItem(row, now, ui = {}) {
 export function archive(state, ui) {
   const rows = archiveRows(state.asksArchive, state.ledger.requirements.items);
   const kinds = { all: rows.length, ask: rows.filter(r => r.kind === 'ask').length, requirement: rows.filter(r => r.kind === 'requirement').length, 'manual-user': rows.filter(manualUser).length };
+  const c = claim(state, 'archive');
+  const askTruth = claim(state, 'needs'), reqTruth = claim(state, 'requirements');
   const out = [];
   if (state.asksArchiveTotal > state.asksArchive.length) out.push(el('p', 'notice', `Showing the newest ${state.asksArchive.length} of ${state.asksArchiveTotal} archived asks. The rest are in the asks ledger (provenance.py asks).`));
-  out.push(filterBar('archive-kind', 'Show archived items', [['all', `All ${kinds.all}`], ['ask', `Asks ${kinds.ask}`], ['requirement', `Requirements ${kinds.requirement}`], ['manual-user', `Dashboard-archived, your words ${kinds['manual-user']}`]], ui.archiveKind, key => ui.set('archiveKind', key)));
+  out.push(filterBar('archive-kind', 'Show archived items', [['all', `All ${countText(kinds.all, c)}`], ['ask', `Asks ${countText(kinds.ask, askTruth)}`], ['requirement', `Requirements ${countText(kinds.requirement, reqTruth)}`], ['manual-user', `Dashboard-archived, your words ${countText(kinds['manual-user'], reqTruth)}`]], ui.archiveKind, key => ui.set('archiveKind', key)));
+  out.push(...notices(c));
   const matches = rows.filter(r => ui.archiveKind === 'all' || (ui.archiveKind === 'manual-user' ? manualUser(r) : r.kind === ui.archiveKind));
-  if (!matches.length) out.push(el('p', 'empty', 'Nothing is archived.'));
+  const kindClaim = { ask: askTruth, requirement: reqTruth, 'manual-user': reqTruth }[ui.archiveKind] || c;
+  if (!matches.length) out.push(el('p', 'empty', noneText(kindClaim, 'Nothing is archived.', 'archived items')));
   const list = el('ul', 'req-list');
   matches.slice(0, ui.archiveLimit).forEach(row => list.append(archiveItem(row, state.now, ui)));
   out.push(list);
@@ -273,30 +292,42 @@ export const GAPS = Object.freeze([
   'Release-kit deploy records outside the WALs: no read path.',
 ]);
 const unreadCount = status => (status.unread.count > 0 ? `${status.unread.count} logs unread` : 'some logs unread');
+const TRUTH_WORD = { current: 'ok', partial: 'partial', stale: 'stale', unknown: 'unknown' };
 export function inventory(state, go) {
   const led = state.ledger;
-  const rowsOut = [
-    ['Goals', led.goals.at, led.goals.stale, led.goals.error, `${led.goals.items.length} goals`, 'Overview', 'overview'],
-    ['Initiatives', '', state.initiativesStale, state.initiativesError, `${state.initiatives.length} initiatives`, 'Overview', 'overview'],
-    ['Owners', '', false, '', `${state.owners.length} owners`, 'Overview', 'overview'],
-    ['Open asks', state.asksSweptAt, false, '', `${state.asks.length} open, ${state.asksStale.length} stale, ${state.asksFlagged.length} untraceable`, 'Overview', 'overview'],
-    ['Deploys and live tests', led.status.at, led.status.stale || led.status.incomplete, led.status.error, `${led.status.incomplete ? 'incomplete: ' + unreadCount(led.status) + '; ' : ''}${led.status.live.length} deploys, ${led.status.verified.length} tested, ${led.status.failed.length} failed, ${led.status.pending.length} pending`, 'Overview', 'overview'],
-    ['Blockers', led.status.at, led.status.stale || led.status.incomplete, led.status.error, `${led.status.incomplete ? 'incomplete: ' + unreadCount(led.status) + '; ' : ''}${led.status.blockers.length} recorded`, 'Overview', 'overview'],
-    ['Requirements', led.requirements.at, led.requirements.stale, led.requirements.error, `${led.requirements.summary.live} live, ${led.requirements.summary.archived} archived of ${led.requirements.total}`, 'Requirements', 'requirements'],
-    ['Archived asks', state.asksSweptAt, false, '', `${state.asksArchive.length} archived`, 'Archive', 'archive'],
-    ['Activity feed', '', false, '', `${state.events.length} events held`, 'Activity', 'activity'],
-    ['Chat', '', false, '', `${state.messages.length} messages, ${state.sessions.length} sessions`, 'Chat panel', 'chat'],
-    ['Decisions and commits', led.status.at, led.status.stale || led.status.incomplete, led.status.error, `${led.status.incomplete ? 'incomplete: ' + unreadCount(led.status) + '; ' : ''}${led.status.decisions.length} decisions, ${led.status.commits.length} commits, ${led.status.claimed.length} claimed, ${led.status.assumptions.length} assumptions`, 'Sources', 'sources'],
+  const st = led.status;
+  const n = (count, c) => countText(count, c);
+  const unread = st.incomplete ? `incomplete: ${unreadCount(st)}; ` : '';
+  // [name, claim, holds, shown in, tab]: each row's Health is its claim's truth, its counts follow the same rule
+  const spec = [
+    ['Goals', 'goals', c => `${n(led.goals.items.length, c)} goals`, 'Overview', 'overview'],
+    ['Initiatives', 'initiatives', c => `${n(state.initiatives.length, c)} initiatives`, 'Overview', 'overview'],
+    ['Owners', 'owners', c => `${n(state.owners.length, c)} owners`, 'Overview', 'overview'],
+    ['Open asks', 'needs', c => `${n(state.asks.length, c)} open, ${n(state.asksStale.length, c)} stale, ${n(state.asksFlagged.length, c)} untraceable`, 'Overview', 'overview'],
+    ['Deploys and live tests', 'deploys', c => `${unread}${n(st.live.length, c)} deploys, ${n(st.verified.length, c)} tested, ${n(st.failed.length, c)} failed, ${n(st.pending.length, c)} pending`, 'Overview', 'overview'],
+    ['Blockers', 'blockers', c => `${unread}${n(st.blockers.length + hiddenBlockers(st), c)} recorded in status`, 'Overview', 'overview'],
+    ['Requirements', 'requirements', c => `${n(led.requirements.summary.live, c)} live, ${n(led.requirements.summary.archived, c)} archived of ${n(led.requirements.total, c)}`, 'Requirements', 'requirements'],
+    ['Archived asks', 'needs', c => `${n(state.asksArchive.length, c)} archived`, 'Archive', 'archive'],
+    ['Activity feed', 'activity', c => `${n(state.events.length, c)} events held`, 'Activity', 'activity'],
+    ['Chat', 'chat', c => `${n(state.messages.length, c)} messages, ${n(state.sessions.length, c)} sessions`, 'Chat panel', 'chat'],
+    ['Decisions and commits', 'decisions', c => `${unread}${n(st.decisions.length, c)} decisions, ${n(st.commits.length, c)} commits, ${n(st.claimed.length, c)} claimed, ${n(st.assumptions.length, c)} assumptions`, 'Sources', 'sources'],
   ];
+  const rowsOut = spec.map(([name, id, holds, where, tab]) => {
+    const c = claim(state, id);
+    const at = c.facts.map(f => f.at).filter(Boolean).sort()[0] || '';
+    const errors = c.bad.map(f => f.error).filter(Boolean);
+    return [name, at, c.truth, errors.join('; '), holds(c), where, tab];
+  });
   const table = el('table', 'inventory');
   const head = el('tr');
   ['Data', 'Last read', 'Health', 'Holds', 'Shown in'].forEach(text => head.append(el('th', '', text)));
   const thead = el('thead');
   thead.append(head);
   const body = el('tbody');
-  for (const [name, at, stale, error, holds, where, tab] of rowsOut) {
+  for (const [name, at, truth, error, holds, where, tab] of rowsOut) {
     const row = el('tr');
-    row.append(el('th', '', name), el('td', '', at ? age(at, state.now) : 'live'), el('td', error ? 'bad' : stale ? 'warn' : 'ok', error ? `error: ${error}` : stale ? (/^incomplete/.test(holds) ? 'incomplete' : 'stale') : 'ok'), el('td', '', holds));
+    const tone = truth === 'current' ? 'ok' : truth === 'unknown' ? 'bad' : 'warn';
+    row.append(el('th', '', name), el('td', '', at ? age(at, state.now) : 'never'), el('td', tone, `${TRUTH_WORD[truth]}${error ? `: ${error}` : ''}`), el('td', '', holds));
     const cell = el('td');
     cell.append(button('link-button', where, () => go(tab)));
     row.append(cell);
