@@ -605,14 +605,28 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     size=$BULK_CHUNK fit=$(( $(time_left) * TPSLIMIT / 2 ))
     [ "$fit" -ge "$size" ] || size=$fit
     [ "$size" -ge 1 ] || size=1
-    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk"
-    n=$(wc -l < "$st/chunk" | tr -d ' ')
-    cut -f1 "$st/chunk" > "$st/chunk.paths"
+    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk" \
+      || { say "cannot read the $rel chunk"; ok=1; hard_fail=1; return 1; }
+    n=$(wc -l < "$st/chunk"); n=${n//[[:space:]]/}
+    printf '%s' "$n" | grep -Eq '^[0-9]+$' || { say "cannot count the $rel chunk"; ok=1; hard_fail=1; return 1; }
+    cut -f1 "$st/chunk" > "$st/chunk.paths" || { say "cannot read the $rel chunk"; ok=1; hard_fail=1; return 1; }
     # A pass listed before the exclude lists changed still holds names the remote refuses: drop them from the chunk
-    # (counted, and the cursor still moves past them) so the copy never offers them (goodqa#16123).
-    LC_ALL=C grep -Eiv -- "$REFUSED_RE" "$st/chunk.paths" > "$st/chunk.paths.tmp"
-    kept=$(wc -l < "$st/chunk.paths.tmp" 2>/dev/null | tr -d ' ')
-    if [ "$kept" != "$n" ]; then note_refused "$rel" "$(( n - ${kept:-0} ))" "left out of the chunk, refused"; fi
+    # (counted, and the cursor still moves past them) so the copy never offers them (goodqa#16123). Every status is
+    # checked: grep exits 0 (some paths kept) or 1 (all excluded); any other status, or counts that do not add up, means
+    # the list may be short, and a short list must never be sent, replace the chunk or move the cursor (PR #259 review).
+    LC_ALL=C grep -Eiv -- "$REFUSED_RE" "$st/chunk.paths" > "$st/chunk.paths.tmp"; grc=$?
+    kept=$(wc -l < "$st/chunk.paths.tmp"); wrc=$?; kept=${kept//[[:space:]]/}
+    LC_ALL=C grep -Eic -- "$REFUSED_RE" "$st/chunk.paths" > "$st/chunk.refused.tmp"; crc=$?
+    dropped=$(cat "$st/chunk.refused.tmp" 2>/dev/null)
+    rm -f "$st/chunk.refused.tmp"
+    if [ $grc -gt 1 ] || [ $crc -gt 1 ] || [ $wrc -ne 0 ] \
+       || ! printf '%s' "$kept" | grep -Eq '^[0-9]+$' || ! printf '%s' "$dropped" | grep -Eq '^[0-9]+$' \
+       || [ $(( kept + dropped )) -ne "$n" ] || { [ $grc -eq 0 ] && [ "$kept" -eq 0 ]; } || { [ $grc -eq 1 ] && [ "$kept" -ne 0 ]; }; then
+      say "cannot filter the $rel chunk (grep exit $grc/$crc, kept=${kept:-?} refused=${dropped:-?} of $n); nothing sent, the cursor stays at $cur"
+      rm -f "$st/chunk.paths.tmp"
+      ok=1; hard_fail=1; return 1
+    fi
+    if [ "$dropped" -gt 0 ]; then note_refused "$rel" "$dropped" "left out of the chunk, refused"; fi
     mv "$st/chunk.paths.tmp" "$st/chunk.paths" || { say "cannot filter the $rel chunk"; ok=1; hard_fail=1; return 1; }
     if [ -s "$st/chunk.paths" ]; then
       upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse

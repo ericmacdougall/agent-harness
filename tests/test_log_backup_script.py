@@ -738,6 +738,73 @@ class DisallowedNames(Case):
         self.assertFalse(self.last_ok().exists())
 
 
+FAULTY_GREP = """#!%(python)s
+import os, subprocess, sys, signal
+args = sys.argv[1:]
+mode = os.environ.get("GREP_FAULT", "")
+if mode and "-Eiv" in args and any(a.endswith("chunk.paths") for a in args):
+    out = subprocess.run(["/usr/bin/grep"] + args, capture_output=True).stdout.splitlines(True)
+    sys.stdout.buffer.write(b"".join(out[:1]))   # a short list on stdout, whatever the status
+    sys.stdout.flush()
+    if mode == "exit2":
+        sys.exit(2)
+    if mode == "interrupted":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if mode == "short-exit0":
+        sys.exit(0)
+os.execv("/usr/bin/grep", ["grep"] + args)
+"""
+
+
+class ChunkFilterFailure(Case):
+    """PR #259 review (High): a chunk filter that fails or is cut short must never send a short list, replace the chunk,
+    or move the cursor; the files it dropped would later count as backed up."""
+
+    def setUp(self):
+        super().setUp()
+        if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
+            self.skipTest("rclone not installed")
+        self.names = [f".agent-harness/work/w{i}/f{i}.md" for i in range(9)]
+        for i, rel in enumerate(self.names):
+            self.put(rel, b"ordinary %d\n" % i)
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        grep = fakebin / "grep"
+        grep.write_text(FAULTY_GREP % {"python": sys.executable})
+        grep.chmod(0o755)
+        self.path = f"{fakebin}:/usr/bin:/bin"
+
+    def work_remote(self):
+        return {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
+
+    def cursor(self):
+        path = self.logs / "log-backup.bulk.d" / ".agent-harness_work" / "cursor"
+        return path.read_text().strip() if path.exists() else None
+
+    def faulty_then_good(self, mode):
+        bad = self.local_run(PATH=self.path, GREP_FAULT=mode, LOG_BACKUP_BULK_CHUNK="3")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertFalse(self.bulk_ok().exists())
+        self.assertIn(self.cursor(), (None, "0"), "the cursor must not move past a chunk that was not sent")
+        self.assertEqual(self.work_remote(), set(), "nothing from the faulted chunk may have been uploaded")
+        self.assertIn("cannot filter the .agent-harness/work chunk", (self.logs / "log-backup.log").read_text())
+        good = self.local_run(PATH=self.path, LOG_BACKUP_BULK_CHUNK="3")   # same PATH, no fault
+        self.assertEqual(good.returncode, 0, good.stderr.decode())
+        self.assertTrue(set(self.names) <= self.work_remote(), set(self.names) - self.work_remote())
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_a_filter_that_prints_part_of_the_list_and_exits_2_sends_nothing_and_loses_nothing(self):
+        self.faulty_then_good("exit2")
+
+    def test_a_filter_that_is_interrupted_sends_nothing_and_loses_nothing(self):
+        self.faulty_then_good("interrupted")
+
+    def test_a_filter_that_exits_0_with_a_short_list_is_caught_by_the_counts(self):
+        self.faulty_then_good("short-exit0")
+
+
 class BulkResume(Case):
     """goodqa#15062: the bulk tier never finished on the Mac. Each pass was a fresh copy of the 620k-file work tree,
     so every pass spent its budget re-checking the same first files. A pass must resume where the last one stopped
