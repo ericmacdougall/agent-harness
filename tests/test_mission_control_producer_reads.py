@@ -717,10 +717,141 @@ class OneRecordValidator(unittest.TestCase):
         ah_src, prov_src = (HOOKS / "ah.py").read_text(), (HOOKS / "provenance.py").read_text()
         export_src = (HOOKS / "ah_export.py").read_text()
         for name, fn in (("_summarize_agent_wal", ah_src), ("owners", ah_src), ("status_report", ah_src),
-                         ("requirements_view", ah_src), ("ledger_read", prov_src), ("_read", export_src)):
+                         ("requirements_view", ah_src), ("ledger_read", prov_src), ("_read", export_src),
+                         ("ask_states", ah_src), ("ask_owners", ah_src), ("narrow_wait", ah_src), ("_wal_has", ah_src)):
             with self.subTest(reader=name):
                 body = re.search(r"\ndef %s\(.*?(?=\ndef )" % re.escape(name), fn, re.S).group(0)
                 self.assertIn("wal_record_problem(", body)
+
+
+class LedgerReaderStops(unittest.TestCase):
+    """Receipt v11 F1: when the ledger thread stops, the watchdog ages its Health row; every ledger part (goals,
+    requirements, status) ages with it, in the dataset reads, the ledger snapshot and so the page's claims, keeping
+    its last good time, and recovers on the next good read."""
+
+    def test_parts_go_stale_with_their_reader_and_recover(self):
+        home = Home(self)
+        hub = ev.Hub()
+        health = col.Health(hub)
+        ledger = col.Ledger(hub, health, InProcess(home.home), lambda: SID)
+        truth = col.Truth(hub, health, ledger, lambda: SID)
+        health.on_change = truth.publish   # as App wires it
+        hub.before = truth.publish
+        health.ok("main-session", "main is in the fixture session")   # the other source the session parts rest on
+        ledger.run(time.time())
+        parts = ("goals", "requirements", "status")
+        self.assertEqual({p: truth.reads()[p]["truth"] for p in parts}, dict.fromkeys(parts, "current"))
+        good_at = {p: hub.snapshots["ledger"][p]["at"] for p in parts}
+        aged = health.expire({"ledger": 930.0}, time.time() + 931)   # the reader stopped: no run in 931 s
+        self.assertEqual(aged, ["ledger"])
+        for p in parts:
+            with self.subTest(part=p, when="stopped"):
+                self.assertEqual(hub.snapshots["reads"][p]["truth"], "stale")         # what the page's claims gate on
+                self.assertEqual(hub.snapshots["ledger"][p]["truth"], "stale")        # the rows' own truth
+                self.assertEqual(hub.snapshots["ledger"][p]["at"], good_at[p])        # last good time kept
+                self.assertIn("reader may have stopped", hub.snapshots["ledger"][p]["error"])
+        ledger.run(time.time())
+        for p in parts:
+            with self.subTest(part=p, when="recovered"):
+                self.assertEqual((hub.snapshots["reads"][p]["truth"], hub.snapshots["ledger"][p]["truth"]), ("current", "current"))
+
+    def test_a_part_never_read_ages_to_unknown(self):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        ledger = col.Ledger(hub, health, InProcess(Home(self).home), lambda: SID)
+        health.error("ledger", "first read failed")
+        health.expire({"ledger": 10.0}, time.time() + 11)
+        self.assertEqual(ledger.view(SID)["status"]["truth"], "unknown")
+
+    def test_the_ledger_registers_its_ageing_hook(self):
+        hub = ev.Hub()
+        health = col.Health(hub)
+        ledger = col.Ledger(hub, health, InProcess(Home(self).home), lambda: SID)
+        self.assertEqual(health.on_aged["ledger"], ledger.publish)
+
+
+class IndexUpgrade(unittest.TestCase):
+    """Receipt v11 F2: every machine upgrading carries owners indexes written by an older ah. One built under another
+    record contract (or none) is rebuilt, so a record the contract now rejects stops counting as activity."""
+
+    def test_an_index_from_before_the_record_contract_is_rescanned(self):
+        for wal in ("agent", "task"):
+            with self.subTest(wal=wal):
+                home = Home(self)
+                path = home.agent if wal == "agent" else home.folder / "goodqa-6-build.jsonl"
+                ident = AGENT if wal == "agent" else "goodqa-6-build"
+                quiet = time.time() - 2 * 3600
+                path.write_text(line({"event": "intent", "note": "Build goodqa#6", "at": iso_at(quiet)})
+                                + line({"at": iso_at(time.time()), "note": "lost event field"}))   # rejected now
+                os.utime(path, (quiet, quiet))
+                os.utime(home.meta, (quiet, quiet))
+                fresh = ah.owners(home.home, SID)
+                fresh_row = {r["agent_id"]: r for r in fresh["owners"]}[ident]
+                # what an older ah left: the malformed object taken as activity, nothing skipped, no record contract
+                for cache in ah.state_dir(home.home, "ah-index").glob("wal-*.json"):
+                    index = json.loads(cache.read_text())
+                    if index.get("first") != "Build goodqa#6":
+                        continue
+                    index.update(last_at=time.time(), skipped=0, lost_trail=prov.LostTrail().state(), events=2)
+                    index.pop("record_rule", None)
+                    cache.write_text(json.dumps(index))
+                warm = ah.owners(home.home, SID)
+                warm_row = {r["agent_id"]: r for r in warm["owners"]}[ident]
+                self.assertEqual((warm_row["last_activity"], warm_row["state"]), (fresh_row["last_activity"], fresh_row["state"]))
+                self.assertEqual((warm["read"]["state"], warm["read"]["skipped"]), (fresh["read"]["state"], fresh["read"]["skipped"]))
+                self.assertEqual(fresh["read"]["skipped"], 1)
+
+    def test_an_index_under_another_contract_revision_is_rescanned(self):
+        home = Home(self)
+        ah.owners(home.home, SID)
+        with mock.patch.object(prov, "RECORD_RULE", "harness.wal-record/999"):
+            calls = []
+            real = ah.read_new_lines
+            with mock.patch.object(ah, "read_new_lines", side_effect=lambda path, meta: (calls.append(dict(meta)), real(path, meta))[1]):
+                ah.owners(home.home, SID)
+        self.assertTrue(calls and all(not meta.get("offset") for meta in calls), calls)   # read from the start
+
+
+class AskHelpersValidate(unittest.TestCase):
+    """Receipt v11 F3: the helpers that reread the main WAL for ask state, ask owners, a wait's owner and an entry's
+    existence use the shared validator: a rejected record changes nothing, and ah owners reports the loss."""
+
+    BAD_AT = "not-a-time"
+
+    def test_a_rejected_resolution_leaves_the_ask_open_and_the_read_partial(self):
+        home = Home(self)
+        home.append(home.main, line({"event": "ask", "id": "w00000000a01", "note": "May main push?", "at": stamp(), "source": "inferred: x"}))
+        home.append(home.main, line({"event": "ask_resolved", "ref": "w00000000a01", "at": self.BAD_AT, "note": "done"}))
+        self.assertEqual(ah.ask_states(home.main)["w00000000a01"], "open")
+        read = ah.owners(home.home, SID)["read"]
+        self.assertEqual((read["state"], read["skipped"]), ("partial", 1))
+
+    def test_a_rejected_owner_assignment_changes_nothing(self):
+        home = Home(self)
+        home.append(home.main, line({"event": "ask", "id": "w00000000a02", "note": "x?", "owner": AGENT, "at": stamp(), "source": "inferred: x"})
+                    + line({"event": "ask", "id": "w00000000a02", "note": "x?", "owner": "a9999999999999999", "at": self.BAD_AT}))
+        self.assertEqual(ah.ask_owners(home.main)["w00000000a02"], AGENT)
+        self.assertEqual(ah.owners(home.home, SID)["read"]["skipped"], 1)
+
+    def test_a_rejected_ask_neither_refuses_nor_grants_a_wait(self):
+        home = Home(self)
+        home.append(home.main, line({"event": "ask", "id": "w00000000a03", "note": "y?", "owner": "a9999999999999999", "at": self.BAD_AT}))
+        ah.narrow_wait(home.home, home.main, SID, AGENT, "w00000000a03")   # the rejected owner does not refuse it
+        home.append(home.main, line({"event": "ask", "id": "w00000000a04", "note": "z?", "owner": "a9999999999999999", "at": stamp()}))
+        with self.assertRaises(ah.AhError):
+            ah.narrow_wait(home.home, home.main, SID, AGENT, "w00000000a04")   # a valid owner still does
+
+    def test_a_rejected_record_is_not_an_entry_the_wal_holds(self):
+        home = Home(self)
+        home.append(home.main, line({"event": "decision", "id": "wdec00000009", "at": self.BAD_AT}))
+        self.assertFalse(ah._wal_has(home.main, "decision", "wdec00000009"))
+        home.append(home.main, line({"event": "decision", "id": "wdec00000010", "at": stamp()}))
+        self.assertTrue(ah._wal_has(home.main, "decision", "wdec00000010"))
+
+    def test_an_unreadable_main_wal_in_the_ask_pass_is_unread_not_empty(self):
+        tally = ah.ReadTally()
+        self.assertEqual(ah.ask_states(Path("/nonexistent-dir/main.jsonl"), tally), {})
+        self.assertEqual(tally.unread[0]["source"], "main WAL (ask states)")
 
 
 class NoLiteralWholeRead(unittest.TestCase):

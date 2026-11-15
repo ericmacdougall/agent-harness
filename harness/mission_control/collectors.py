@@ -238,6 +238,10 @@ class Health:
     def __init__(self, hub):
         self.hub, self.rows = hub, {}
         self.on_change = None  # called after every pushed change (Truth republishes the dataset reads)
+        # receipt v11 F1: name -> callable, run after expire() ages that row out and again when its reader reports back.
+        # A collector whose own snapshot carries truth derived from its row (the ledger's parts) republishes it, since
+        # its stopped thread never will.
+        self.on_aged = {}
         # Receipt v7 F3: collector threads, the ledger thread and the session-watch thread (expire) all change rows.
         # Every read-modify-write of a row happens under this lock, so a fresh read written while expire runs is never
         # overwritten by the aged copy. The push runs after the lock is released: on_change -> Truth.reads ->
@@ -272,13 +276,21 @@ class Health:
                 aged.append(name)
         if aged:
             self._push()
+            for name in aged:
+                hook = self.on_aged.get(name)
+                if hook:
+                    hook()
         return aged
 
     def _set(self, name, status, detail, truth=None, session=None):
         with self.lock:
+            was_aged = bool((self.rows.get(name) or {}).get("aged"))
             pushed = self._set_locked(name, status, detail, truth, session)
         if pushed:
             self._push()
+        hook = self.on_aged.get(name) if was_aged else None
+        if hook:   # the reader is back: what it republishes is no longer aged
+            hook()
 
     def _set_locked(self, name, status, detail, truth, session) -> bool:
         now = time.time()
@@ -1419,6 +1431,7 @@ class Ledger(Collector):
 
     def __init__(self, hub, health, runner, session_fn, root=None, actions=None):
         super().__init__(hub, health)
+        health.on_aged[self.name] = self.publish   # receipt v11 F1: the parts age with this row
         self.runner, self.session_fn, self.root = runner, session_fn, root
         self.actions = actions  # req_actions.ReqActions: the user's archive and restore clicks
         self.raw_requirements: list[dict] = []
@@ -1453,6 +1466,16 @@ class Ledger(Collector):
         for name in self.SESSION_PARTS:
             if not session or parts[name].get("session") != session:
                 parts[name] = self._empty(name)
+        # receipt v11 F1: the watchdog ages out the ledger's Health row when its reader stops (Health.expire). Each part
+        # is that reader's output, so it ages with it: stale after a good read (its last good time kept), unknown
+        # before one. The aggregate row is not a dataset source, so without this the parts stayed current for ever.
+        with self.health.lock:
+            row = dict(self.health.rows.get(self.name) or {})
+        if row.get("aged"):
+            for name, part in parts.items():
+                aged = "stale" if part.get("at") else "unknown"
+                parts[name] = dict(part, truth=worst_truth(part.get("truth"), aged), stale=aged == "stale",
+                                   error=part.get("error") or row.get("detail") or "the ledger reader stopped")
         return parts
 
     def _reset_session_parts(self) -> None:

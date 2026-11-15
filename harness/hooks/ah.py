@@ -278,7 +278,9 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
     summary["schema"] = SCHEMA
     meta = summary.setdefault("meta", {})
     if "outcome_at" not in summary or "skipped" not in summary or summary.get("skipped_to") != meta.get("offset") \
-            or _prov().LostTrail.from_state(summary.get("lost_trail")) is None:   # PR 234 v10: no lost-line evidence
+            or _prov().LostTrail.from_state(summary.get("lost_trail")) is None \
+            or summary.get("record_rule") != _prov().RECORD_RULE:
+        # PR 234 v10: no lost-line evidence; v11 (receipt v11 F2): built under another record contract, or before one
         # an index written before outcome_at (goodqa#15943 r5) or skipped (PR 234 v8) existed, or one an older ah
         # advanced without counting the lines it skipped (skipped_to is where the count was last brought up to): rescan
         meta.clear()
@@ -320,6 +322,7 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
                 summary["tickets"].append(match)
     summary["skipped_to"] = meta.get("offset", 0)   # the skipped count covers every line before this offset
     summary["lost_trail"] = trail.state()   # and the evidence for each lost line, for the shared window rule
+    summary["record_rule"] = _prov().RECORD_RULE   # every record in this summary passed this contract
     atomic_json(cache, summary)
     return summary
 
@@ -507,7 +510,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                      "ticket": summary["tickets"][0] if summary["tickets"] else None, "ticket_comment_age_s": None,
                      "result_at": iso(summary["outcome_at"]) if summary.get("outcome") and summary.get("outcome_at") else None,
                      "active_1h": now - summary["last_at"] <= 3600})
-    asks = ask_states(main)
+    asks = ask_states(main, tally)
     for r in rows:  # round 5 MJ-1: a wait on an ask holds only while that ask is open in this session
         target = r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else ""
         if r["owner"] and ASK_ID_RE.match(target) and asks.get(target) != "open":
@@ -577,7 +580,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     # `wait_on` is the one reading of what an owner waits on (a live waiting disposition, else a `waiting-on-<x>`
     # state from its last WAL note); idle_guard reads it instead of re-deriving it. A wait on anything but a user ask
     # (a ticket, an agent, main) is a next step main can take: `attention: wait-not-user` (never decision_required).
-    owned, holders = ask_owners(main), {}
+    owned, holders = ask_owners(main, tally), {}
     for r in rows:
         r["wait_on"] = None
         if not r["owner"]:
@@ -1813,8 +1816,9 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
     return found
 
 
-def ask_owners(main_wal: Path) -> dict:
-    """{ask id: owner agent id} for the asks of the session main WAL that name an owner (wal_note --owner)."""
+def ask_owners(main_wal: Path, tally: "ReadTally | None" = None) -> dict:
+    """{ask id: owner agent id} for the asks of the session main WAL that name an owner (wal_note --owner). A line the
+    shared validator rejects names no owner (receipt v11 F3); ah owners counts it in its main-WAL pass."""
     out = {}
     try:
         with open(main_wal, "rb") as handle:
@@ -1825,11 +1829,14 @@ def ask_owners(main_wal: Path) -> dict:
                     rec = json.loads(raw)
                 except ValueError:
                     continue
-                if isinstance(rec, dict) and rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
+                if _prov().wal_record_problem(rec):
+                    continue
+                if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
                         and isinstance(rec.get("owner"), str) and rec["owner"]:
                     out[rec["id"]] = rec["owner"]
-    except OSError:
-        pass
+    except OSError as error:
+        if tally is not None:   # the owner of each ask is unknown: never an empty "nobody owns it" read
+            tally.missed("main WAL (ask owners)", error if not isinstance(error, FileNotFoundError) else "file-missing")
     return out
 
 
@@ -1846,8 +1853,8 @@ def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) 
                     rec = json.loads(raw)
                 except ValueError:
                     continue
-                if isinstance(rec, dict) and rec.get("event") == "ask" and rec.get("id") == ref:
-                    owner = rec.get("owner")
+                if not _prov().wal_record_problem(rec) and rec.get("event") == "ask" and rec.get("id") == ref:
+                    owner = rec.get("owner")   # receipt v11 F3: a rejected record assigns no owner
                     if isinstance(owner, str) and owner and owner != agent:
                         raise AhError("bad_request", f"waiting: ask {ref} belongs to {owner}, not {agent}; "
                                                      "a wait on one ask excuses only its own owner", 3)
@@ -1860,8 +1867,9 @@ def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) 
                                          "owner. Raise a separate ask for this owner (wal_note --event ask --owner)", 3)
 
 
-def ask_states(main_wal: Path) -> dict:
-    """{ask id: "open" | "resolved"} from the session main WAL (an `ask` entry, closed by `ask_resolved --ref`)."""
+def ask_states(main_wal: Path, tally: "ReadTally | None" = None) -> dict:
+    """{ask id: "open" | "resolved"} from the session main WAL (an `ask` entry, closed by `ask_resolved --ref`). A line
+    the shared validator rejects opens and resolves nothing (receipt v11 F3); ah owners counts it in its main-WAL pass."""
     states = {}
     try:
         with open(main_wal, "rb") as handle:
@@ -1872,14 +1880,15 @@ def ask_states(main_wal: Path) -> dict:
                     rec = json.loads(raw)
                 except ValueError:
                     continue
-                if not isinstance(rec, dict):
+                if _prov().wal_record_problem(rec):
                     continue
                 if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")):
                     states.setdefault(rec["id"], "open")
                 elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
                     states[rec["ref"]] = "resolved"
-    except OSError:
-        pass
+    except OSError as error:
+        if tally is not None:   # which asks are open is unknown: never an empty "every wait is on a missing ask" read
+            tally.missed("main WAL (ask states)", error if not isinstance(error, FileNotFoundError) else "file-missing")
     return states
 
 
@@ -1892,8 +1901,8 @@ def _wal_has(path: Path, event: str, ident, agent=None) -> bool:
                     rec = json.loads(raw)
                 except ValueError:
                     continue
-                if not isinstance(rec, dict) or (event is not None and rec.get("event") != event):
-                    continue
+                if _prov().wal_record_problem(rec) or (event is not None and rec.get("event") != event):
+                    continue   # receipt v11 F3: a rejected record is not an entry the WAL holds
                 if (ident is not None and rec.get("id") == ident) or (agent is not None and rec.get("agent_id") == agent):
                     return True
     except OSError:

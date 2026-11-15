@@ -61,6 +61,13 @@ def _record_time(value) -> float:
     return parsed.timestamp()
 
 
+# The revision of the record contract below. An index built from WAL records (ah owners' agent-WAL index) stores it,
+# and one built under another revision (or none: every index written before PR 234 v11) is rebuilt from the start of
+# the WAL, so no record the current contract rejects keeps counting as activity (receipt v11 F2). Bump it whenever
+# wal_record_problem changes what it accepts.
+RECORD_RULE = "harness.wal-record/1"
+
+
 def wal_record_problem(rec) -> str:
     """Why a parsed WAL line is not a record ("" when it is). A record is a JSON object with a non-empty string
     `event`; an `at`, when present and not null, must be an ISO time. A line that fails is a lost line for every reader:
