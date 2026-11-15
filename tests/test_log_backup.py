@@ -40,6 +40,7 @@ class Base(unittest.TestCase):
         (self.logs / "log-backup.last-ok").write_text(text)
         if bulk is True:
             (self.logs / "log-backup.bulk-last-ok").write_text(stamp(time.time()) + "\n")
+            (self.logs / "log-backup.large-last-ok").write_text(stamp(time.time()) + "\n")
 
 
 class Freshness(Base):
@@ -94,6 +95,7 @@ class Freshness(Base):
 
     def test_bulk_tier_states(self):
         self.last_ok(stamp(time.time()), bulk=False)
+        (self.logs / "log-backup.large-last-ok").write_text(stamp(time.time()) + "\n")
         bulk = self.logs / "log-backup.bulk-last-ok"
         first = self.logs / "log-backup.first-run"
         # never completed, backup installed a moment ago: pending, not an alert
@@ -115,6 +117,53 @@ class Freshness(Base):
                            (stamp(time.time() - 60), 0)):
             bulk.write_text(text)
             self.assertEqual(self.run_cli("check").returncode, code, text)
+
+    def test_the_backup_is_fresh_only_when_transcripts_large_files_and_bulk_are_all_within_their_limits(self):
+        """goodqa#16123: check (what the delete guard reads) is 0 only when all three tiers are within their limits."""
+        self.last_ok(stamp(time.time()))   # transcripts, bulk and large all fresh
+        self.assertEqual(self.run_cli("check").returncode, 0)
+        large = self.logs / "log-backup.large-last-ok"
+        first = self.logs / "log-backup.first-run"
+        first.write_text(stamp(time.time() - 30 * 3600) + "\n")
+        for text, code in ((stamp(time.time() - 5 * 3600), 0), (stamp(time.time() - 7 * 3600), 3), ("garbage", 3),
+                           (stamp(time.time() + 3600), 3), (stamp(time.time() - 60), 0)):
+            large.write_text(text)
+            self.assertEqual(self.run_cli("check").returncode, code, text)
+        large.write_text(stamp(time.time() - 7 * 3600))
+        done = self.run_cli("check")
+        self.assertIn(b"large-file tier", done.stdout)
+        self.assertIn(b"large-file tier", self.run_cli("session-start").stdout)
+        large.unlink()   # never completed, installed long ago: not fresh
+        self.assertEqual(self.run_cli("check").returncode, 3)
+        # bulk stale with large fresh: still not fresh
+        large.write_text(stamp(time.time()))
+        (self.logs / "log-backup.bulk-last-ok").write_text(stamp(time.time() - 7 * 3600))
+        self.assertEqual(self.run_cli("check").returncode, 3)
+        # stale transcripts outrank both
+        self.last_ok(stamp(time.time() - 7200), bulk=False)
+        self.assertEqual(self.run_cli("check").returncode, 1)
+
+    def test_status_prints_all_three_tiers_and_the_refused_name_count(self):
+        self.last_ok(stamp(time.time() - 60))
+        (self.logs / "log-backup.refused").write_text(stamp(time.time()) + " refused=3\n")
+        (self.logs / "log-backup.lane.refused").write_text(stamp(time.time()) + " refused=4\n")
+        text = self.run_cli("status").stdout.decode()
+        self.assertIn("last success :", text)
+        self.assertIn("bulk success :", text)
+        self.assertIn("large success:", text)
+        self.assertIn("refused names: 7", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lb.main(["--home", str(self.home), "status", "--json"])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["refused"], data["large"]["state"], data["ok"]), (0, 7, "fresh", True))
+        (self.logs / "log-backup.large-last-ok").write_text(stamp(time.time() - 7 * 3600))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lb.main(["--home", str(self.home), "status", "--json"])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["large"]["state"], data["ok"]), (1, "stale", False))
+        self.assertEqual(self.run_cli("status").returncode, 1)
 
     def test_stale_transcripts_outrank_a_bulk_notice(self):
         self.last_ok(stamp(time.time() - 7200), bulk=False)
@@ -206,8 +255,10 @@ class Status(Base):
             code = lb.main(["--home", str(self.home), "status", "--json"])
         data = json.loads(out.getvalue())
         self.assertEqual(code, 0)
-        self.assertEqual(set(data), {"schema", "transcripts", "bulk", "last_run", "last_skip", "last_throttled", "lock",
-                                     "ok"})
+        self.assertEqual(set(data), {"schema", "transcripts", "bulk", "large", "refused", "last_run", "last_skip",
+                                     "last_throttled", "lock", "ok"})
+        self.assertEqual(data["large"]["marker"], "log-backup.large-last-ok")
+        self.assertEqual(data["large"]["max_age_seconds"], 21600)
         self.assertEqual(data["schema"], 1)
         self.assertEqual(data["transcripts"]["marker"], "log-backup.last-ok")
         self.assertEqual(data["transcripts"]["max_age_seconds"], 3600)

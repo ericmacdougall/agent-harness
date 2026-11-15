@@ -51,14 +51,15 @@ def verdict(home: Path, now: float | None = None) -> dict:
         return {"code": 4, "transcripts": "unavailable", "bulk": "unavailable"}
     t = lb.classify(home, now=now)
     b = lb.bulk_classify(home, now=now)
+    big = lb.large_classify(home, now=now) if hasattr(lb, "large_classify") else {"state": "fresh", "age": None}
     if t["state"] != "fresh":
         code = 1 if t["state"] == "stale" else 2
-    elif b["state"] not in ("fresh", "pending"):
+    elif b["state"] not in ("fresh", "pending") or big["state"] not in ("fresh", "pending"):
         code = 3
     else:
         code = 0
     return {"code": code, "transcripts": t["state"], "transcripts_age": t.get("age"), "bulk": b["state"],
-            "bulk_age": b.get("age")}
+            "bulk_age": b.get("age"), "large": big["state"], "large_age": big.get("age")}
 
 
 MAX_STATE_BYTES = 65536
@@ -137,7 +138,7 @@ def run(home: Path, now: float | None = None) -> int:
         _write_private(logs / ALERT_LOG, json.dumps(line) + "\n", append=True)
         _write_private(logs / STATE, json.dumps({"code": v["code"], "at": now}))
         if v["code"] != 0:
-            msg = f"BACKUP ALERT code={v['code']} transcripts={v['transcripts']} bulk={v['bulk']}"
+            msg = f"BACKUP ALERT code={v['code']} transcripts={v['transcripts']} bulk={v['bulk']} large={v.get('large', 'n/a')}"
             print(msg, file=sys.stderr)
             notify(msg)
     return v["code"]

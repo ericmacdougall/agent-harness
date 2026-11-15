@@ -36,6 +36,16 @@
 #   LOG_BACKUP_LANE_POLL_SECONDS  how often a lane copy checks for a tier-1 run (default 2, 1-60)
 #   LOG_BACKUP_LANE_BUDGET_SECONDS  wall time of one lane run (default 10800); the next scheduled run starts another
 #   LOG_BACKUP_TIER         internal: bulk marks the lane run itself; nothing else may set it
+#   LOG_BACKUP_LARGE_MB     live files of this many MiB or more (default 100) that changed since their last verified
+#                           upload are sent by the large-file tier, not by tier 1 (goodqa#16123); 1-99999
+#   LOG_BACKUP_LARGE_EVERY_SECONDS  least gap between large-tier passes (default 7200)
+#   LOG_BACKUP_LARGE_BUDGET_SECONDS wall time of one pass (default 3000; in a scheduled run without the lane, the time
+#                           that run has left). A file not sent in time stays pending, the pass is not complete, and
+#                           log-backup.large-last-ok is not written (log_backup.py allows it 6 h)
+#   LOG_BACKUP_LARGE_TPS    --tpslimit of a large upload (default 1); it never yields to tier 1: a 500 MB upload
+#                           restarted by every tier-1 run would never finish
+#   Large files keep the versions/ move: it is a server-side move (no data sent), but it keeps one full old copy per pass
+#   (about 6 GB a day for one 530 MB transcript at the default gap); see the review packet for why it is not skipped.
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
 # atomically with the run START time only after every tier-1 source copied cleanly and a primary source
 # (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
@@ -71,6 +81,16 @@ BULK_TPS=${LOG_BACKUP_BULK_TPS:-$TPSLIMIT}   # the lane's rate; it never copies 
 LANE_POLL=${LOG_BACKUP_LANE_POLL_SECONDS:-2}
 LANE_BUDGET=${LOG_BACKUP_LANE_BUDGET_SECONDS:-10800}
 TIER=${LOG_BACKUP_TIER:-all}             # all: both tiers in this run; live: tier 1 only; bulk: the lane run
+# The large-file tier (goodqa#16123): live files of LARGE_MB or more that changed since their last verified upload. One
+# active 530 MB transcript, re-sent whole every run, used up tier 1's budget on the Mac for two days, so such files go
+# to their own tier: its own pass gap, budget, rate, marker (log-backup.large-last-ok) and 6 h limit in log_backup.py.
+LARGE_MB=${LOG_BACKUP_LARGE_MB:-100}
+LARGE_EVERY=${LOG_BACKUP_LARGE_EVERY_SECONDS:-7200}     # least gap between large-tier passes
+LARGE_BUDGET=${LOG_BACKUP_LARGE_BUDGET_SECONDS:-3000}   # wall time of one pass, never past the run's own end
+LARGE_TPS=${LOG_BACKUP_LARGE_TPS:-1}                    # large uploads use few operations; they do not yield to tier 1
+printf '%s' "$LARGE_MB" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LARGE_MB must be a whole number from 1 to 99999" >&2; exit 2; }
+printf '%s' "$LARGE_TPS" | grep -Eq '^[1-9][0-9]?$' || { echo "log-backup: LOG_BACKUP_LARGE_TPS must be a whole number from 1 to 99" >&2; exit 2; }
+LARGE_BYTES=$(( LARGE_MB * 1048576 ))
 for rate in TPSLIMIT TRANSFERS BULK_TPS; do
   if ! printf '%s' "${!rate}" | grep -Eq '^[1-9][0-9]?$'; then
     echo "log-backup: $rate must be a whole number from 1 to 99" >&2; exit 2
@@ -97,7 +117,7 @@ if [ -n "$budget_share" ]; then
 fi
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
+for numeric in LARGE_EVERY LARGE_BUDGET BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
@@ -447,7 +467,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
     fi ;;
   esac
   while :; do
-    if [ "$TIER" = bulk ] && ! lane_gate; then
+    if [ "$TIER" = bulk ] && [ "${NO_YIELD:-0}" != 1 ] && ! lane_gate; then
       say "lane budget (${LANE_BUDGET}s) used up waiting for tier 1 before $rel; the next lane run continues"; ok=1; budget_hit=1; return
     fi
     # This copy's share: wall time left, less its own stop and kill grace, less what the later tier-1 sources are
@@ -480,7 +500,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
       wait "$nap" || exit 0
       kill -KILL "$copy_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
     dog_pid=$!
-    if [ "$TIER" = bulk ]; then
+    if [ "$TIER" = bulk ] && [ "${NO_YIELD:-0}" != 1 ]; then
       # A tier-1 run that starts during this copy gets the budget: stop the copy (TERM, then KILL after KILL_GRACE) and
       # send its chunk again later. The overlap is at most one poll plus the stop grace (goodqa#15147 NEG-1).
       while kill -0 "$copy_pid" 2>/dev/null; do
@@ -654,6 +674,80 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   return 0
 }
 
+# ---- the large-file tier (goodqa#16123) ---------------------------------------------------------------------------------
+# State: $LARGE_STATE/done.tsv holds "path<TAB>size<TAB>mtime" of every large file whose copy rclone reported complete
+# (exit 0 after its own checksum verification), written only after that. A file is pending when its listed size or time
+# differs from its last record, so a file whose upload failed, or that changed since, is pending and never counted as
+# backed up. log-backup.large-last-ok gets the pass START time only when no file is left pending.
+LARGE_STATE="$LOGDIR/log-backup.large.d"
+LARGE_STAGE="$(printf '%s' "$STAGE" | sed 's#//*#/#g; s#/$##')-large"
+large_ok=0
+clone_file() { # clone_file SRC DST: a snapshot that costs no space on APFS or btrfs, else a plain copy
+  mkdir -p "$(dirname "$2")" || return 1
+  if [ "$(uname)" = Darwin ]; then cp -c -p -- "$1" "$2" 2>/dev/null || cp -p -- "$1" "$2"
+  else cp --reflink=auto -p -- "$1" "$2"; fi
+}
+large_fail() { say "large tier: $1"; large_ok=1; }
+large_tier() {
+  local try="$LOGDIR/log-backup.large-last-try" age st="$LARGE_STATE" lst src rc key size mt snap sent=0 total saved_end lend before
+  if [ -e "$try" ]; then
+    age=$(raw_age "$try")
+    if [ -n "$age" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$LARGE_EVERY" ]; then
+      say "large tier skipped: last pass started ${age}s ago (every ${LARGE_EVERY}s)"; return 0
+    fi
+  fi
+  if [ "$(time_left)" -lt "$MIN_SLICE" ]; then say "large tier deferred: no run time left"; return 0; fi
+  case "$LARGE_STAGE" in "$HOME"/?*) ;; *) large_fail "the large stage is not below $HOME"; return 1 ;; esac
+  case "$LARGE_STAGE" in *..*|*[[:cntrl:]]*) large_fail "the large stage is not a plain path"; return 1 ;; esac
+  mkdir -p "$st" "$LARGE_STAGE" && chmod 700 "$st" "$LARGE_STAGE" || { large_fail "cannot create its state or stage directory"; return 1; }
+  : > "$try"
+  lst="$st/listing"
+  : > "$lst" && touch "$st/done.tsv" || { large_fail "cannot write its listing"; return 1; }
+  for src in "${LIVE[@]}"; do
+    [ -d "$HOME/$src" ] && [ ! -L "$HOME/$src" ] || continue
+    "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --min-size "${LARGE_MB}M" --exclude-from "$EXCLUDES" --ignore-case \
+      -- "$HOME/$src" </dev/null > "$st/one.tmp" 2>> "$LOG"
+    rc=$?
+    if [ $rc -ne 0 ]; then large_fail "listing $src failed (rclone exit $rc)"; return 1; fi
+    # A path with a tab or newline cannot be tracked: it fails the pass (it is never silently counted as backed up).
+    awk -F'\t' -v s="$src" 'NF == 3 {print s "/" $1 "\t" $2 "\t" $3} NF != 3 {bad++} END {exit bad > 0}' "$st/one.tmp" >> "$lst" \
+      || { large_fail "$src has a large file whose path has a tab or newline; it cannot be tracked"; return 1; }
+  done
+  awk -F'\t' 'FILENAME == ARGV[1] {have[$1] = $2 "\t" $3; next} !($1 in have) || have[$1] != $2 "\t" $3' "$st/done.tsv" "$lst" > "$st/pending.tmp" \
+    && mv "$st/pending.tmp" "$st/pending" || { large_fail "cannot work out what is pending"; return 1; }
+  total=$(wc -l < "$st/pending"); total=${total//[[:space:]]/}
+  printf '%s' "$total" | grep -Eq '^[0-9]+$' || { large_fail "cannot count what is pending"; return 1; }
+  say "large tier: $total of $(wc -l < "$lst" | tr -d ' ') large files (${LARGE_MB} MiB or more) changed since their last upload"
+  saved_end=$WALL_END
+  lend=$(( $(date +%s) + LARGE_BUDGET + DEADLINE_GRACE + KILL_GRACE ))
+  [ "$lend" -ge "$WALL_END" ] || WALL_END=$lend
+  NO_YIELD=1
+  while IFS=$'\t' read -r key size mt; do
+    if [ "$(time_left)" -lt "$MIN_SLICE" ]; then large_fail "its budget is used up; the files left stay pending"; break; fi
+    if [ ! -f "$HOME/$key" ] || [ -L "$HOME/$key" ]; then say "large tier: $key is gone; nothing to send"; continue; fi
+    snap="$LARGE_STAGE/$key"
+    rm -f -- "$snap"
+    clone_file "$HOME/$key" "$snap" || { large_fail "cannot snapshot $key"; rm -f -- "$snap"; continue; }
+    before=$REFUSED_N
+    upload "$snap" "$key" --tpslimit "$LARGE_TPS" --transfers 1
+    if [ "$copied" -eq 1 ] && [ "$REFUSED_N" -eq "$before" ]; then
+      printf '%s\t%s\t%s\n' "$key" "$size" "$mt" >> "$st/done.tsv" && sent=$((sent + 1)) || large_fail "cannot record $key as sent"
+    else
+      large_fail "$key was not backed up"
+    fi
+    rm -f -- "$snap"
+    [ "$budget_hit" -eq 0 ] || break
+  done < "$st/pending"
+  NO_YIELD=0 WALL_END=$saved_end
+  if [ $large_ok -eq 0 ]; then
+    echo "$STARTED" > "$LOGDIR/log-backup.large-last-ok.tmp.$$" && mv "$LOGDIR/log-backup.large-last-ok.tmp.$$" "$LOGDIR/log-backup.large-last-ok" \
+      || { large_fail "cannot write its marker"; return 1; }
+    say "large tier: pass complete ($sent file(s) sent)"
+  else
+    say "large tier: pass incomplete ($sent file(s) sent); log-backup.large-last-ok is not written"
+  fi
+}
+
 bulk_try="$LOGDIR/log-backup.bulk-last-try"
 bulk_due() { # the hourly gap has passed (or a pass stopped on the budget cleared it)
   local a
@@ -729,7 +823,21 @@ for src in "${LIVE[@]}"; do
     # (exit 11 or 23, source skipped, run non-fresh) instead of leaving a truncated file in place.
     # The trash directory is pruned before the catch-all directory include below (first rsync rule wins), at any depth (B7).
     mkdir -p "$STAGE/.rsync-tmp" || { say "cannot create the stage temp directory"; ok=1; continue; }
-    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    # Files of LARGE_MB or more belong to the large-file tier (goodqa#16123). Tier 1 must neither stage nor send them,
+    # and a stale smaller stage copy of a file that has since grown must go, or tier 1 would send that old copy over the
+    # remote's newer one. A failed search leaves that unknown, so the source is not backed up this run.
+    large_list="$STAGE/.rsync-tmp/large.$$" large_excl="$STAGE/.rsync-tmp/large-excl.$$"
+    if ! find "$HOME/$src" -type f -size +"$(( LARGE_BYTES - 1 ))"c -print0 > "$large_list" 2>/dev/null; then
+      say "cannot search $src for large files; skipped, the run is not fresh"; ok=1; continue
+    fi
+    : > "$large_excl" || { say "cannot write the large-file exclude list"; ok=1; continue; }
+    while IFS= read -r -d '' lf; do
+      lrel=${lf#"$HOME/$src"}
+      case "$lrel" in *[\\*?\[\]]*|*$'\n'*) ;; *) printf '%s\n' "$lrel" >> "$large_excl" ;; esac
+      rm -f -- "$snap$lrel"
+    done < "$large_list"
+    rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --exclude-from="$large_excl" --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
+    rm -f "$large_list" "$large_excl"
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
@@ -740,7 +848,7 @@ for src in "${LIVE[@]}"; do
   else
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
-  upload "$snap" "$src"
+  if [ -d "$HOME/$src" ]; then upload "$snap" "$src" --max-size "$(( LARGE_BYTES - 1 ))"; else upload "$snap" "$src"; fi
 done
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
@@ -776,6 +884,12 @@ if [ "$TIER" = all ] && [ $bulk_ran -eq 1 ] && ! acquire_lock "$LANE_LOCKD"; the
 fi
 [ $bulk_ran -eq 1 ] && : > "$bulk_try"
 RESERVE=0 budget_hit=0 hard_fail=0
+# The large-file tier runs before the bulk sources, which can take days, with its own budget, so they never starve it.
+# Its failures stay its own: they do not touch the bulk marker or the bulk tier's hourly gap.
+if [ $bulk_ran -eq 1 ]; then
+  large_tier
+  ok=0 budget_hit=0 hard_fail=0 RESERVE=0
+fi
 # The git-tree scan of the work tree is not time-bounded (26 s on the Mac, 301 trees, warm cache). It starts only when
 # the last measured scan time plus a copy slice still fits, so a short remainder is not spent scanning every run.
 scan_file="$LOGDIR/log-backup.work-scan-seconds"
@@ -839,10 +953,10 @@ fi
 echo "$STARTED refused=$REFUSED_N" > "$LOGDIR/log-backup${TAG}.refused.tmp.$$" \
   && mv "$LOGDIR/log-backup${TAG}.refused.tmp.$$" "$LOGDIR/log-backup${TAG}.refused"
 rc=0
-{ [ $transcripts_ok -eq 0 ] && [ $bulk_ok -eq 0 ]; } || rc=1
+{ [ $transcripts_ok -eq 0 ] && [ $bulk_ok -eq 0 ] && [ $large_ok -eq 0 ]; } || rc=1
 case "$TIER" in
-  bulk) echo "$STARTED exit=$rc bulk=$bulk_ok" > "$LASTRUN" ;;
+  bulk) echo "$STARTED exit=$rc bulk=$bulk_ok large=$large_ok" > "$LASTRUN" ;;
   live) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=lane" > "$LASTRUN" ;;
-  *) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok" > "$LASTRUN" ;;
+  *) echo "$STARTED exit=$rc transcripts=$transcripts_ok bulk=$bulk_ok large=$large_ok" > "$LASTRUN" ;;
 esac
 exit $rc
