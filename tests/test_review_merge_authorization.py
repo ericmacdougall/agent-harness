@@ -276,6 +276,64 @@ class AuthorizationTests(unittest.TestCase):
                           "main:fixture")
 
 
+class PrPassEvidenceTests(AuthorizationTests):
+    """merge_gate.pr_pass_evidence: the pure predicate add_review_waiver and the ahc daemon share (goodqa#16049
+    M-1). It classifies evidence only; it never writes a waiver or any other state."""
+
+    def inspected(self, **changes):
+        store, reference = self.evidence(**changes)
+        return store.inspect(reference)
+
+    def test_settled_independent_pass_returns_its_binding(self):
+        self.assertEqual(mg.pr_pass_evidence(self.inspected()), ("o/r", 5, HEAD, REPORT_SHA))
+
+    def test_each_guard_clause_refuses(self):
+        good = self.inspected()
+        mutations = {
+            "unsettled": lambda e: e.update(review_finalization="PENDING"),
+            "not completed": lambda e: e.update(execution="TIMEOUT"),
+            "not CHECK_OK": lambda e: e.update(result="CHECK_FAILED"),
+            "reason set": lambda e: e.update(reason="ADVISORY"),
+            "wrong purpose": lambda e: e["invocation"].update(purpose="peer-review-code-inspection"),
+            "stage": lambda e: e["review"].update(stage="CODE_INSPECTION"),
+            "verdict": lambda e: e["review"].update(verdict="BLOCK"),
+            "findings": lambda e: e["review"].update(findings=["F1"]),
+            "ticketed": lambda e: e["review"].update(ticketed=True),
+            "missing report sha": lambda e: e["review"].pop("report_sha256"),
+            "subject head differs": lambda e: e["subject"].update(head=OTHER),
+            "author unknown": lambda e: e["review"].update(author_harness="unknown"),
+            "reviewer unknown": lambda e: e["review"].update(reviewer_harness="kimi"),
+            "same harness": lambda e: e["review"].update(reviewer_harness="claude", reviewer="Claude fixture"),
+            "prefix mismatch": lambda e: e["review"].update(reviewer="Claude fixture"),
+            "no provider launch": lambda e: e["usage"].update(provider_launches=0),
+            "launches not int": lambda e: e["usage"].update(provider_launches="1"),
+            "no review": lambda e: e.pop("review"),
+            "invocation not a mapping": lambda e: e.update(invocation="peer-review-pr"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name):
+                evidence = json.loads(json.dumps(good))
+                mutate(evidence)
+                with self.assertRaises((ValueError, guard.GuardError)):
+                    mg.pr_pass_evidence(evidence)
+        with self.assertRaises(ValueError):
+            mg.pr_pass_evidence(None)
+
+    def test_predicate_writes_nothing(self):
+        evidence = self.inspected()
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        mg.pr_pass_evidence(evidence)
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+        self.assertFalse(self.state.exists(), "classifying evidence never creates merge_gate state")
+
+    def test_add_review_waiver_decides_through_the_predicate(self):
+        store, reference = self.evidence()
+        with mock.patch.object(mg, "pr_pass_evidence", side_effect=ValueError("refused by predicate")):
+            with self.assertRaisesRegex(ValueError, "refused by predicate"):
+                mg.add_review_waiver(self.state, reference, store=store)
+        self.assertEqual(mg._read_waivers(self.state) if self.state.exists() else [], [])
+
+
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

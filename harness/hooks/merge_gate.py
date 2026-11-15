@@ -1639,6 +1639,44 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
+def pr_pass_evidence(evidence):
+    """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
+
+    Pure: it reads only the evidence mapping a UsageStore.inspect() returned and writes nothing. It is the one
+    predicate for "this FINAL is a merge-eligible PR PASS", shared by add_review_waiver (main's merge gate) and the
+    ahc daemon (which never mints a waiver). Authority to merge is a separate fact; this only classifies evidence.
+    """
+    import usage_guard
+
+    if not isinstance(evidence, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    review = evidence.get('review')
+    if not isinstance(review, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
+    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
+    reviewer = review.get('reviewer', '')
+    reviewer_harness = review.get('reviewer_harness')
+    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
+    invocation = evidence.get('invocation') if isinstance(evidence.get('invocation'), dict) else {}
+    subject = evidence.get('subject') if isinstance(evidence.get('subject'), dict) else {}
+    if (evidence.get('review_finalization') != 'SETTLED'
+            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
+            or evidence.get('reason') != 'NONE'
+            or invocation.get('purpose') != 'peer-review-pr'
+            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
+            or review.get('findings') != [] or review.get('ticketed')
+            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
+            or subject.get('head') != review['head']
+            or review.get('author_harness') not in {'claude', 'openai'}
+            or reviewer_harness not in {'claude', 'openai'}
+            or reviewer_harness == review['author_harness']
+            or not expected_prefix or not isinstance(reviewer, str) or not reviewer.startswith(expected_prefix)
+            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
+        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
+    return review['repo'], review['pr'], review['head'], review['report_sha256']
+
+
 def add_review_waiver(state_dir, reference, *, store=None, now=None):
     """Authorize only a loaded, settled, independent pure PR PASS FINAL.
 
@@ -1649,30 +1687,9 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None):
 
     store = store or usage_guard.UsageStore()
     evidence = store.inspect(reference)
-    review = evidence.get('review')
-    if not isinstance(review, dict):
-        raise ValueError('merge authorization needs typed PR review FINAL evidence')
-    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
-    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
-    reviewer = review.get('reviewer', '')
-    reviewer_harness = review.get('reviewer_harness')
-    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
-    if (evidence.get('review_finalization') != 'SETTLED'
-            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
-            or evidence.get('reason') != 'NONE'
-            or evidence.get('invocation', {}).get('purpose') != 'peer-review-pr'
-            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
-            or review.get('findings') != [] or review.get('ticketed')
-            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
-            or evidence.get('subject', {}).get('head') != review['head']
-            or review.get('author_harness') not in {'claude', 'openai'}
-            or reviewer_harness not in {'claude', 'openai'}
-            or reviewer_harness == review['author_harness']
-            or not expected_prefix or not reviewer.startswith(expected_prefix)
-            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
-        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
-    repo, pr, head = review['repo'], review['pr'], review['head']
-    report_sha256, final_sha256 = review['report_sha256'], reference['sha256']
+    repo, pr, head, report_sha256 = pr_pass_evidence(evidence)
+    reviewer = evidence['review'].get('reviewer', '')
+    final_sha256 = reference['sha256']
     state_dir = Path(state_dir)
     wid = "mgw-review-" + hashlib.sha256(
         f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}".encode("utf-8")).hexdigest()[:24]
