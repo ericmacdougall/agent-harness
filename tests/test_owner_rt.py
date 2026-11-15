@@ -1107,6 +1107,96 @@ class BypassLapseTests(AuthorityBase):
         out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=self.runner)
         self.assertEqual([r["action"] for r in out], ["bypass-stop-unconfirmed"], out)
 
+    def test_v8_second_resolution_never_clears_held_record(self):
+        """Receipt v8 F1: a revoke landing between two grant resolutions in one tick must not erase the record of a
+        bypass session that may still run. The second and later resolutions here return None (the revoke)."""
+        self.launch_with_bypass(hours=24)
+        self.live[0].update(status="idle", state="done")
+        self.stop_code = 1  # the idle session cannot be stopped: it keeps running in bypass
+        real = ort.end_lapsed_bypass
+
+        def then_revoked(*a, **k):  # the revoke lands right after the tick's lapse check
+            got = real(*a, **k)
+            ort.revoke_bypass(self.home, "*")
+            return got
+        with mock.patch.object(ort, "end_lapsed_bypass", side_effect=then_revoked):
+            out = ort.tick(self.home, now=self.t0 + 2 * 3600, runner=self.runner)
+        self.assertEqual(out[0]["action"], "launch-failed", out)  # it reached the launch: the replace was refused
+        self.assertEqual(self.launches(), [], out)
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual(st["bypass"].get("answer"), self.answer, out)  # the record of the live session is kept
+        self.assertEqual(out[0].get("permission_mode"), "bypassPermissions", out)  # one resolution, one decision
+        out = ort.tick(self.home, now=self.t0 + 2 * 3600 + 60, runner=self.runner)  # the kept record is acted on
+        self.assertEqual(out[0]["action"], "bypass-stop-failed", out)
+
+    def _race(self, gate_grant):
+        """Run a tick in thread A, held at a gate; while it holds the goal lock, thread B revokes the grant. Returns
+        the tick and revoke results once both finish."""
+        import threading
+        results, reached, go = {}, threading.Event(), threading.Event()
+        gate = gate_grant(reached, go)
+        a = threading.Thread(target=lambda: results.__setitem__(
+            "tick", ort.tick(self.home, now=self.t0, runner=gate.get("runner", self.runner))))
+        with mock.patch.object(ort, "bypass_grant", side_effect=gate["grant"]):
+            a.start()
+            self.assertTrue(reached.wait(10))
+            b = threading.Thread(target=lambda: results.__setitem__(
+                "revoke", ort.revoke_and_stop(self.home, "*", now=self.t0 + 1, runner=self.runner)))
+            b.start()
+            deadline = time.time() + 10
+            while ort.load_authority(self.home)["bypass"] and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(ort.load_authority(self.home)["bypass"], [])  # the revoke is written
+            b.join(0.5)  # an unlocked revoke finishes here; a locked one waits for the tick
+            go.set()
+            a.join(10)
+            b.join(10)
+        self.assertFalse(a.is_alive() or b.is_alive())
+        return results
+
+    def test_v8_revoke_during_tick_resolution_cancels_bypass_launch(self):
+        """Receipt v8 F2: the tick has resolved the grant but not saved its record when the revoke lands: the revoke
+        waits for the goal lock, and the pre-launch re-check cancels the bypass launch."""
+        self.t0 = time.time()
+        self.answer = self.grant_answer(hours=24)
+        ort.grant_bypass(self.home, "*", 24, self.answer, now=self.t0)
+        real, n = ort.bypass_grant, {"c": 0}
+
+        def gate_grant(reached, go):
+            def grant(home, goal, now):
+                got = real(home, goal, now)
+                n["c"] += 1
+                if n["c"] == 1:  # the tick's first resolution: hold it here, lock held, record not yet saved
+                    reached.set()
+                    go.wait(10)
+                return got
+            return {"grant": grant}
+        results = self._race(gate_grant)
+        modes = [c[c.index("--permission-mode") + 1] for c in self.launches()]
+        self.assertNotIn("bypassPermissions", modes, results)  # nothing launched in bypass after the revoke
+        self.assertEqual(results["tick"][0]["action"], "bypass-launch-cancelled", results)
+        self.assertEqual(ort.load_state(self.home, "solve")["bypass"], {})
+
+    def test_v8_revoke_waits_for_mid_launch_tick_and_stops_its_session(self):
+        """Receipt v8 F2: a tick is inside the launch (record saved, program starting) when the revoke lands: the
+        revoke takes the listing under the goal lock, after the launch, so it sees the new session and stops it."""
+        self.t0 = time.time()
+        self.answer = self.grant_answer(hours=24)
+        ort.grant_bypass(self.home, "*", 24, self.answer, now=self.t0)
+
+        def gate_grant(reached, go):
+            def runner(argv, timeout=60, cwd=None):
+                if "--bg" in argv:
+                    reached.set()
+                    go.wait(10)
+                return self.runner(argv, timeout, cwd)
+            return {"grant": ort.bypass_grant, "runner": runner}
+        results = self._race(gate_grant)
+        self.assertEqual(results["tick"][0]["action"], "launch", results)
+        self.assertEqual([r["action"] for r in results["revoke"]["stopped"]], ["bypass-ended"], results)
+        self.assertEqual(self.stops(), [["claude", "stop", "c9f43044"]])  # the session it launched is stopped
+        self.assertEqual(ort.load_state(self.home, "solve")["bypass"], {})
+
     def test_lapse_session_already_gone_clears_without_stop(self):
         self.launch_with_bypass(hours=2)
         self.live = []

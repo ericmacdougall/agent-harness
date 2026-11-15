@@ -1104,27 +1104,38 @@ def due_reason(home: Path, goal: str, state: dict, now: float) -> str:
     return ""
 
 
-def bypass_lapse(home: Path, state: dict, now: float) -> str:
+_UNRESOLVED = object()
+
+
+def bypass_lapse(home: Path, state: dict, now: float, grant=_UNRESOLVED) -> str:
     """Why the bypass session this owner was launched with has lost its authority ('' when it has not, or when the
-    owner was not launched with bypass): its grant expired, was revoked, or its answer no longer resolves."""
+    owner was not launched with bypass): its grant expired, was revoked, or its answer no longer resolves. `grant` is
+    the caller's one resolution of bypass_grant (receipt v8 F1: one tick never decides on two different answers)."""
     held = state.get("bypass") or {}
     if not held:
         return ""
-    if bypass_grant(home, state["goal"], now) is not None:
+    if grant is _UNRESOLVED:
+        grant = bypass_grant(home, state["goal"], now)
+    if grant is not None:
         return ""
     return (f"the bypassPermissions grant for {state['goal']} (answer {clean(held.get('answer'), 120)}, until "
             f"{held.get('expires_at') or '?'}) no longer holds: expired, revoked, or its answer does not resolve")
 
 
 def end_lapsed_bypass(home: Path, goal: str, state: dict, cfg: dict, sessions, now: float, runner=_run,
-                      dry_run: bool = False):
+                      dry_run: bool = False, grant=_UNRESOLVED):
     """Receipt v7 F1: a session launched with bypassPermissions lives only while a grant covers its goal. When the
     grant lapses, every live session of the owner (busy too) is stopped and the stop is confirmed by a fresh
     listing; a failed or unconfirmed stop is reported every tick until it succeeds, never assumed. None when there is
     nothing to end; else the tick result. Called with the goal lock held."""
-    lapse = bypass_lapse(home, state, now)
+    lapse = bypass_lapse(home, state, now, grant)
     if not lapse:
         return None
+    if callable(sessions):  # receipt v8 F2: list under the goal lock the caller holds, never before waiting for it
+        try:
+            sessions = sessions()
+        except Exception:  # noqa: BLE001 - reported as unconfirmed below
+            sessions = None
     out = {"goal": goal, "reason": lapse}
     if sessions is None:
         out.update(action="bypass-stop-unconfirmed", reason=lapse + "; the session listing is unreadable, so the "
@@ -1163,7 +1174,11 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
     out = {"goal": goal, "action": "none", "reason": ""}
     with locked(home, goal):
         state = load_state(home, goal)
-        ended = end_lapsed_bypass(home, goal, state, cfg, sessions, now, runner, dry_run)
+        # receipt v8 F1: the grant is resolved once, under this goal's lock, and that one result decides both the lapse
+        # check and the launch mode; a revoke landing later is caught by the re-check right before the launch, and a
+        # held bypass record is never cleared on the strength of a second, different resolution
+        grant = bypass_grant(home, goal, now)
+        ended = end_lapsed_bypass(home, goal, state, cfg, sessions, now, runner, dry_run, grant=grant)
         if ended is not None and ended["action"] != "bypass-ended":
             return ended  # a lapsed bypass session not shown stopped: nothing else runs for this owner
         if ended is not None:
@@ -1201,7 +1216,7 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
             return out
         size = transcript_bytes(home, state)
         fresh = size < 0 or size > cfg["fresh_bytes"]
-        grant = bypass_grant(home, goal, now)  # receipt v6 F1: only a re-resolved grant, per goal, never text
+        # receipt v6 F1: only a re-resolved grant, per goal, never text; v8 F1: the one resolved above
         mode = "bypassPermissions" if grant else cfg["permission_mode"]
         out["permission_mode"] = mode
         argv = [cfg["claude"], "--bg", "--permission-mode", mode, "--name", f"owner-{goal}"]
@@ -1244,6 +1259,15 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
                 finish(-1, "replace refused: " + problem)
                 out.update(action="launch-failed", reason="replace refused: " + problem)
                 return out
+        # receipt v8 F2: the grant is checked again right before the program runs, still under this goal's lock; a
+        # revoke that landed after the resolution above cancels the bypass launch. Nothing of this owner runs here
+        # (no session, or every idle one stopped and confirmed above), so the record is cleared truthfully.
+        if grant is not None and bypass_grant(home, goal, now) is None:
+            state["bypass"] = {}
+            finish(-1, "bypass grant revoked before the launch ran; nothing launched")
+            out.update(action="bypass-launch-cancelled",
+                       reason="the bypass grant was revoked before the launch ran; nothing launched")
+            return out
         try:
             code, text = runner(argv + [prompt], 90, cwd=state["cwd"])  # the session's workspace is its cwd
         except Exception as exc:  # noqa: BLE001
@@ -1271,12 +1295,11 @@ def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, n
 
 
 def _end_lapsed(home: Path, goals, cfg: dict, now: float, runner=_run, dry_run: bool = False, sessions=False):
-    """end_lapsed_bypass for each goal outside the normal tick (runtime disabled, or the listing refused)."""
+    """end_lapsed_bypass for each goal outside the normal tick (runtime disabled, the listing refused, or a revoke).
+    Receipt v8 F2: without a given listing, each goal's sessions are listed under its lock, after any tick that held
+    it has finished, so a session launched while this call waited is seen and stopped."""
     if sessions is False:
-        try:
-            sessions = bg_sessions(cfg, runner) if cfg.get("claude") else None
-        except Exception:  # noqa: BLE001 - reported as unconfirmed below
-            sessions = None
+        sessions = (lambda: bg_sessions(cfg, runner)) if cfg.get("claude") else None
     out = []
     for g in goals:
         try:
@@ -1296,15 +1319,11 @@ def revoke_and_stop(home: Path, scope: str, now=None, runner=_run) -> dict:
     effect now, not at the next tick). The result names each stop as ended, failed or unconfirmed."""
     now = time.time() if now is None else now
     out = revoke_bypass(home, scope)
+    # receipt v8 F2: no unlocked pre-filter on state.json. Every covered goal is judged under its own lock, so a tick
+    # that resolved the grant but has not yet saved its record finishes first (and its pre-launch re-check sees the
+    # revoke), and a session it did launch is in the listing taken under that lock.
     goals = [g for g in owner_goals(home) if scope in ("*", g)]
-    held = []
-    for g in goals:
-        try:
-            if (load_state(home, g).get("bypass") or {}).get("answer"):
-                held.append(g)
-        except Exception:  # noqa: BLE001 - _end_lapsed reports it
-            held.append(g)
-    out["stopped"] = _end_lapsed(home, held, runtime(home), now, runner) if held else []
+    out["stopped"] = _end_lapsed(home, goals, runtime(home), now, runner) if goals else []
     return out
 
 
