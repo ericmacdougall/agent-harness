@@ -1390,6 +1390,17 @@ class PacketRetentionTests(Base):
         self.core_tick(self.deps.now + 7 * self.DAY + 1)
         self.assertFalse(self.staged.exists())
 
+    def test_restaging_an_old_orphan_restarts_its_clock(self):
+        import io
+        import time as _time
+        self.assertEqual(self.paths.packets, self.paths.root / "staging", "spec D14 names the staging root")
+        old = _time.time() - 30 * self.DAY
+        os.utime(str(self.staged), (old, old))
+        again, sha = runner.stage_packet(self.paths, io.BytesIO(GOOD_PACKET.encode()))
+        self.assertEqual((again, sha), (self.staged, self.sha))
+        self.core_tick(_time.time() + 60)   # between staging and admission
+        self.assertTrue(self.staged.exists(), "a just-restaged packet was pruned before its submit was admitted")
+
     def test_unreferenced_staged_file_goes_after_seven_days_others_untouched(self):
         outside = self.home / "outside.md"
         outside.write_text("not ours")

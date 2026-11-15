@@ -1806,6 +1806,7 @@ def stage_packet(paths, stream, expect_sha=None):
     except FileExistsError:
         if core.read_regular(target, core.PACKET_MAX_BYTES) != data:
             raise core.Refused("a different staged packet already has this name; refusing") from None
+        os.utime(str(target))  # restart the orphan clock so prune_packets cannot remove it before admission
         return target, sha
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)

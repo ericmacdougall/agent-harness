@@ -42,7 +42,7 @@ does three things in order:
 A file placed in the queue directory admits nothing. It is quarantined unread and raises an alert.
 
 `ahc submit --packet -` reads the packet from stdin and checks it against `--expect-sha` when that flag is given.
-It then writes the packet once to `<coordinator root>/packets/<sha256>.md` (mode 0600, in a 0700 directory).
+It then writes the packet once to `<coordinator root>/staging/<sha256>.md` (mode 0600, in a 0700 directory).
 
 The core pass removes a staged packet 7 days after the last item that names it turned terminal. It never
 removes a packet while any item that names it is non-terminal. A staged file that no item names (its submit was

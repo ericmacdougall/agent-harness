@@ -123,7 +123,7 @@ class Paths:
     def __init__(self, home=None):
         self.home = Path(home or Path.home())
         self.root = self.home / ".agent-harness" / "coordinator"
-        self.packets = self.root / "packets"   # private staging root for `ahc submit --packet -` (adv-3 F2)
+        self.packets = self.root / "staging"   # private staging root for `ahc submit --packet -` (D14, adv-3 F2)
         self.queue = self.root / "queue"
         self.items = self.root / "items"
         self.inbox = self.root / "inbox"
