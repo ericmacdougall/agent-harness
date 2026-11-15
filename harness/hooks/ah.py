@@ -3448,6 +3448,14 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] in (["drive"], ["own"]):  # goodqa#15968: the drive table and the owner runtime
+        try:
+            mod = __import__("drive" if given[0] == "drive" else "owner_rt")
+        except ImportError:
+            json.dump({"ok": False, "code": "missing", "message": f"{given[0]} is not installed beside ah.py"}, sys.stdout)
+            sys.stdout.write("\n")
+            return 4
+        return mod.main(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415
