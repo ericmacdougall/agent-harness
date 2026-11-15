@@ -539,6 +539,12 @@ def _lease(lease):
     state = load_state(d)
     if state.get("leaseId") != lease:
         raise Refused("state for %s does not match; nothing touched" % lease)
+    # Server ids kept in state reach request paths, the cleanup report and output: a uuid or nothing (a state file
+    # written by an earlier build may hold an unchecked value; PR 250 rescue, class A).
+    for field in ("sessionId", "grantId", "keyId"):
+        v = state.get(field)
+        if v is not None and (not isinstance(v, str) or not UUID_RE.match(v)):
+            raise Refused("state for %s has a malformed %s; nothing touched" % (lease, field))
     _, base, _, _ = context(state.get("org"), state.get("base"))
     return d, state, base
 
@@ -566,8 +572,10 @@ def _run_job(lease, body):
     o = "/orgs/%s/agent-browsers/sessions/%s" % (state["org"], state["sessionId"])
     queued = obj(api.call("POST", o + "/actions", key, body), "POST actions")
     job_id = queued.get("jobId")
-    if not isinstance(job_id, str) or not ARTIFACT_RE.match(job_id):
-        raise ApiError("POST actions", 0, "unexpected_response")  # it is printed and becomes a path segment
+    if not isinstance(job_id, str) or not STRICT_UUID.match(job_id):
+        # A uuid (bugtracker packages/db/src/schema/agent-browsers.ts agentBrowserJobs.id): it is printed and becomes a
+        # path segment, so no other shape is accepted.
+        raise ApiError("POST actions", 0, "unexpected_response")
     wait = float(os.environ.get("GQ_BROWSER_WAIT_SECONDS") or 30)
     deadline = time.time() + wait
     while True:
@@ -944,8 +952,8 @@ def op_machine_open(machine_id, ttl=MACHINE_TTL_DEFAULT):
         state["leaseId"], state["expiresAt"] = lid, expires
         save_state(d, state)
     except BaseException as e:
-        if (isinstance(e, ApiError) and not e.lost and isinstance(e.status, int) and 200 <= e.status < 500
-                and e.status != 408 and not state.get("leaseId")):
+        if (isinstance(e, ApiError) and not e.lost and isinstance(e.status, int)
+                and (e.status == 202 or (400 <= e.status < 500 and e.status != 408)) and not state.get("leaseId")):
             # The server answered this one create with a refusal (4xx) or a 202 approval ask: acquireLease throws or
             # returns the ask before its insert, so this request made no lease and nothing is re-asked. A lost or
             # malformed answer (status 0), a 408 or a 5xx may hide a lease, so cleanup re-asks with the same holder.

@@ -715,6 +715,13 @@ class Interrupts(Base):
             rows = json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]
             self.assertEqual(len(rows), before + listed, reason)
 
+    def test_create_redirect_is_treated_like_a_lost_answer(self):
+        # A 3xx is no refusal: the create may have run before a proxy redirected it, so cleanup re-asks with the holder.
+        self.api.fail[("POST", r"/leases$")] = (303, "bad_request")
+        self.e.run("open", MACHINE, check=1)
+        self.assertEqual(len(self.api.calls("POST", r"/leases$")), 2)
+        self.assertEqual(len(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]), 1)
+
     def test_create_5xx_is_treated_like_a_lost_answer(self):
         # A 5xx on create does not prove the server made no lease: recover with the same holder and release.
         self.api.fail[("POST", r"/leases$")] = (502, "internal_error")
@@ -1085,6 +1092,7 @@ class HostileServer(unittest.TestCase):
                 proc.stdin.flush()
                 line = proc.stdout.readline()
                 self.api.mutate = None
+                self.assertEqual(json.loads(line)["id"], i + 1, (verb, name))  # an answer, never an empty or lost line
                 found = leaks(line) + self.state_leaks()
                 if found:
                     failures.append("%s %s: %s" % (verb, name, sorted(set(found))[:3]))
