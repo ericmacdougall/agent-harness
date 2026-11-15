@@ -56,6 +56,7 @@ sys.path.insert(1, str(HOOKS))
 import collectors as col  # noqa: E402
 import demo as demo_mode  # noqa: E402
 import events as ev  # noqa: E402
+import req_actions  # noqa: E402
 import mc_chat  # noqa: E402
 from codex_responder import CodexResponder  # noqa: E402
 from safeio import Reader, Runner  # noqa: E402
@@ -466,6 +467,10 @@ class App:
             self.supervised = col.SupervisedOwners(self.hub, self.health, Reader([owner_root]), owner_root,
                                                    on_change=self.owners.publish, tailer=self.tailer)
             self.owners.supervised = self.supervised
+        else:
+            # Every source an owner claim rests on reports a row (review PR 234 v6): a missing row is unknown on the page,
+            # so an instance without OpenAI supervisors says so, as an unconfigured initiatives file does.
+            self.health.off("codex-owners", "OpenAI supervised owners are not configured on this instance", truth="current")
         self.github = col.GitHub(self.hub, self.health, self.runner)
         self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
@@ -474,8 +479,21 @@ class App:
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
                              owners_fn=lambda: self.owners.rows)
         self.tailer.on_ask = self.asks.mark_dirty
+        self.actions = req_actions.ReqActions(root, self.key)
+        self.ledger = col.Ledger(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
+                                 actions=self.actions)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote]
+        # One read per dataset, composed from the sources that feed it (collectors.FEEDS) and pushed before any rows.
+        self.truth = col.Truth(self.hub, self.health, self.ledger, lambda: self.owners.session)
+        self.health.on_change = self.truth.publish
+        self.hub.before = self.truth.publish
+        self.max_ages = {"chat": 60.0}
+        # the sources in self.collectors share one thread: each waits for every other's read before its next turn
+        loop_budget = sum(source.read_budget for source in self.collectors)
+        for source in self.collectors + [self.asks, self.ledger] + ([self.supervised] if self.supervised else []):
+            for name in (source.name,) + tuple(source.rows_written):
+                self.max_ages[name] = source.max_age(loop_budget if source in self.collectors else 0.0)
         self.codex = CodexResponder(self.hub, self.health, self.runner, codex_binary(), root,
                                     disabled="" if codex else "Codex chat is turned off for this instance")
         self.chat_sig = None
@@ -492,7 +510,7 @@ class App:
 
     def start(self) -> None:
         loops = [(self.loop, "collectors"), (self.codex.loop, "codex"), (self.chat_loop, "chat"),
-                 (self.asks_loop, "asks")]
+                 (self.asks_loop, "asks"), (self.ledger_loop, "ledger"), (self.session_loop, "session-watch")]
         if self.supervised:
             loops.append((self.supervised_loop, 'supervised-owners'))
         if self.demo:
@@ -512,8 +530,33 @@ class App:
     def wake(self) -> None:
         """A page attached: sources that were on their idle cadence refresh now."""
         now = time.time()
-        for collector in self.collectors:
+        for collector in self.collectors + [self.ledger]:
             collector.wake(now)
+
+    def follow_sessions(self) -> None:
+        """One pass of the session watch (review PR 234 v6): main's session can move while the ledger and asks threads
+        are inside slow reads, so their own ticks would notice late. Each is told now; neither waits on a read."""
+        for source in (self.ledger, self.asks):
+            try:
+                source.follow()
+            except Exception as exc:  # noqa: BLE001 - shown, never fatal; the source's next tick still follows
+                self.health.error("session-watch", f"{source.name}: {type(exc).__name__}: {str(exc)[:120]}")
+        self.watch_truth()
+
+    def watch_truth(self, now: float | None = None) -> None:
+        """A source whose reader stopped (a hung or dead thread) is aged out, so its last rows are not shown as
+        current for ever; then the dataset reads are recomposed (a session move changes them with no Health change)."""
+        try:
+            if self.threads:  # with no reader threads (a test driving ticks by hand) nothing can have stopped
+                self.health.expire(self.max_ages, now)
+            self.truth.publish()
+        except Exception as exc:  # noqa: BLE001
+            self.health.error("session-watch", f"truth: {type(exc).__name__}: {str(exc)[:120]}")
+
+    def session_loop(self) -> None:
+        while not self.stop.is_set():
+            self.follow_sessions()
+            self.stop.wait(0.5)
 
     def asks_loop(self) -> None:
         """The Needs-you sweeper, on its own thread: the ledger read takes seconds and must not delay the live
@@ -522,6 +565,14 @@ class App:
             now = time.time()
             if self.asks.due(now):
                 self.asks.run(now)
+            self.stop.wait(1.0)
+
+    def ledger_loop(self) -> None:
+        """Goals, requirements and status: three `ah` reads that take seconds, so they have their own thread."""
+        while not self.stop.is_set():
+            now = time.time()
+            if self.ledger.due(now):
+                self.ledger.run(now)
             self.stop.wait(1.0)
 
     def loop(self) -> None:
@@ -534,10 +585,25 @@ class App:
 
     def chat_loop(self) -> None:
         while not self.stop.wait(1.0):
-            try:
-                self.refresh_chat()
-            except Exception as exc:  # noqa: BLE001
-                self.health.error("chat", f"{type(exc).__name__}: {str(exc)[:160]}")
+            self.chat_once()
+
+    def chat_once(self) -> None:
+        """One chat-store read. A failure shows in Source health; the next good read clears it (review PR 234 v3 F1:
+        the row used to stay "error" for good, and the page had no way to know the chat list was current)."""
+        try:
+            # mc_chat lists return [] when a folder cannot be listed; the store's folders exist from start-up, so one
+            # that cannot be listed is a failed read, never an empty chat (v7 audit)
+            chat = mc_chat.chat_dir(self.root)
+            for sub in ("inbox", "outbox", "state", "targets"):
+                os.listdir(chat / sub)
+            self.refresh_chat()
+        except Exception as exc:  # noqa: BLE001
+            self.health.error("chat", f"{type(exc).__name__}: {str(exc)[:160]}")
+            return
+        if self.health.rows.get("chat", {}).get("status") != "ok":
+            self.health.ok("chat", "chat store read")  # once, and again after a recovery: not every second
+        else:
+            self.health.beat("chat")
 
     def refresh_chat(self, force: bool = False) -> None:
         chat = mc_chat.chat_dir(self.root)
@@ -599,10 +665,13 @@ class App:
                           "busy": self.codex.busy}}
 
     def state(self) -> dict:
+        self.follow_sessions()  # a page that loads between two passes of the session watch gets the same truth
         return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
+                "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
+                "reads": self.truth.reads(),
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 
@@ -637,6 +706,57 @@ class App:
         self.refresh_chat(force=True)
         return (201 if created else 200), {"id": record["id"], "created": created,
                                            "status": mc_chat.state(record["id"], self.root).get("status")}
+
+    def post_requirement(self, body: dict) -> tuple[int, dict]:
+        """One Archive or Restore click on a requirement. The page names the requirement, the digest of the text it
+        showed, the action and a reason; whether the requirement exists, and its current text, come from the server's
+        own ledger read, never from the request. It records a signed row and never deletes anything."""
+        if not isinstance(body, dict):
+            return 400, {"error": "bad-json"}
+        req, action, digest = body.get("req_id"), body.get("action"), body.get("digest")
+        session = self.owners.session or ""
+        if not session:
+            return 409, {"error": "no-main", "message": "Mission Control does not know main's session yet"}
+        # A retry with the same key after a lost response is answered with the row it already made, whatever state
+        # the requirement is in now (the row's own archive made the "already archived" check below true).
+        prior = self.actions.by_key(body.get("client_key"))
+        if prior:
+            # The same key must mean the same request: requirement, action, reason, digest and main session. Anything
+            # else is a conflict, never an acknowledgement of something that was not recorded.
+            same = (prior["req"], prior["action"], prior["session"]) == (req, action, session) \
+                and isinstance(body.get("reason"), str) and prior["reason"] == " ".join(mc_chat._redact(body["reason"]).split()) \
+                and isinstance(digest, str) and hmac.compare_digest(digest.encode("utf-8", "replace"), str(prior["digest"]).encode())
+            if not same:
+                return 409, {"error": "key-conflict", "message": "this request id was already used for a different request"}
+            return 200, {"id": prior["id"], "created": False, "req": req, "action": action, "at": prior["at"]}
+        item = next((r for r in self.ledger.parts["requirements"].get("items", []) if r["id"] == req), None) \
+            if isinstance(req, str) else None
+        if self.ledger.req_session != session or (item is not None and item.get("session") not in ("", session)):
+            # review PR 234 F3: the rows on hand were read for another main session (or the new one has not loaded
+            # yet): an action must never pair one session's requirement with another session's provenance
+            return 409, {"error": "session_changed", "message": "the requirement list is from another session; reload"}
+        if item is None:
+            return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
+        if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
+            return 409, {"error": "stale-digest", "message": "the requirement changed since it was shown; read it again"}
+        if action == "archive" and item.get("clipped") is True:
+            # review PR 234 v2 F3: the page could show only part of this requirement; an archive is never confirmed on
+            # words the user could not read. A restore only makes a row visible again, so it stays allowed.
+            return 409, {"error": "text-clipped", "message": "this requirement is longer than Mission Control can show; "
+                         "it cannot be archived from the dashboard"}
+        if action == "archive" and item["bucket"] == "archived":
+            return 409, {"error": "already-archived", "message": "this requirement is already archived"}
+        if action == "restore" and item["bucket"] == "live":
+            return 409, {"error": "not-archived", "message": "this requirement is not archived"}
+        try:
+            row, created = self.actions.record(session=session, req=req, action=action, reason=body.get("reason"),
+                                               digest=digest, client_key=body.get("client_key"))
+        except req_actions.ActionError as exc:
+            return exc.status, {"error": exc.code, "message": str(exc)}
+        self.ledger.reclassify()
+        self.hub.publish(ev.make("system", "dashboard", f"dashboard session {session[:8]} {action}d requirement {req}", eid=f"req:{row['id']}",
+                                 actor={"runtime": "dashboard"}, subject={"initiative": ""}))
+        return (201 if created else 200), {"id": row["id"], "created": created, "req": req, "action": action, "at": row["at"]}
 
     def post_approve(self, body: dict) -> tuple[int, dict]:
         """One Approve or Deny click on an open ask of main's session. The request names the ask, the digest of
@@ -797,7 +917,7 @@ class Handler(BaseHTTPRequestHandler):
         if not hmac.compare_digest(str(self.headers.get("X-MC-CSRF") or ""), info["csrf"]):
             return self.deny(403, "csrf")
         route = urlsplit(self.path).path
-        if route not in ("/api/chat", "/api/approve"):
+        if route not in ("/api/chat", "/api/approve", "/api/requirements/archive"):
             return self.deny(404, "not-found")
         if "application/json" not in (self.headers.get("Content-Type") or ""):
             return self.deny(415, "content-type")
@@ -811,7 +931,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self.deny(400, "bad-json")
-        status, value = self.app.post_approve(body) if route == "/api/approve" else self.app.post_chat(body)
+        handler = {"/api/approve": self.app.post_approve, "/api/requirements/archive": self.app.post_requirement}.get(route, self.app.post_chat)
+        status, value = handler(body)
         if self.app.demo and self.app.demo_drop_first and status == 201:
             self.app.demo_drop_first = False  # demo knob: the message is stored but its response is lost, once
             self.close_connection = True

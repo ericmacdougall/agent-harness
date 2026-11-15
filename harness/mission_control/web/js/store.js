@@ -19,7 +19,10 @@ try { const theme = localStorage.getItem('mc-theme'); if (['light', 'dark'].incl
 let state = {
   initiatives: [], initiativesStale: false, initiativesError: '', owners: [], ownerRows: [], events: [], messages: [], sources: [],
   host: '', chat: null, pending: [], sessions: [], mainSession: '', asks: [], asksResolved: [], asksSession: '',
-  asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '',
+  asksStale: [], asksFlagged: [], asksCleared: [], asksSweptAt: '', asksArchive: [], asksArchiveTotal: 0,
+  ledger: adapt.ledger(null), lastData: 0,
+  reads: {},  // dataset -> the server's read of it (collectors.Truth): the only thing a count or a "none" may rest on
+  loss: {},   // dataset -> rows the server sent that this page could not show (the gate reads that as partial)
   decisions: {},  // ask id -> this page's own Approve/Deny click while it is in flight or after it was refused
   connection: 'connecting', now: Date.now(), filters: Object.keys(KINDS),
   selection: null, highlight: null, tab: 'overview', responder: 'claude', session: '',
@@ -33,8 +36,20 @@ const seen = new Set();
 let transport;
 export const getState = () => state;
 export function subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); }
+// A server message (a snapshot or an event) is what "last update" counts; ticks and local clicks are not.
+const DATA_REASONS = new Set(['initiatives', 'owners', 'health', 'seed', 'event', 'chat', 'asks', 'ledger', 'availability', 'reads']);
+const lost = (dataset, sent, kept) => ({ ...state.loss, [dataset]: Array.isArray(sent) ? Math.max(0, sent.length - kept) : sent == null ? 0 : 1 });
+// The server's read of every dataset. It is applied before the rows that changed with it, and every panel that
+// states a count or a "none" repaints ('truth').
+let readsSig = '';
+export function setReads(reads) {
+  const map = reads && typeof reads === 'object' && !Array.isArray(reads) ? reads : {};
+  update({ reads: map }, 'reads');
+  const sig = JSON.stringify(map);
+  if (sig !== readsSig) { readsSig = sig; update({}, 'truth'); }
+}
 export function update(patch, reason = 'update') {
-  state = { ...state, ...patch };
+  state = DATA_REASONS.has(reason) ? { ...state, ...patch, lastData: Date.now() } : { ...state, ...patch };
   listeners.forEach(fn => { try { fn(state, reason); } catch (error) { reportError(error, reason); } });
 }
 // A broken panel must not hide silently: show a short notice and keep the rest of the page running.
@@ -50,7 +65,8 @@ window.addEventListener('unhandledrejection', event => reportError(event.reason,
 export function tick() { update({ now: Date.now() }, 'tick'); }
 export function select(kind, id) { update({ selection: kind ? { kind, id } : null }, 'selection'); }
 export function highlight(id) { if (state.highlight !== id) update({ highlight: id }, 'highlight'); }
-export function setTab(tab) { update({ tab }, 'tab'); }
+export const TABS = Object.freeze(['overview', 'requirements', 'archive', 'activity', 'topology', 'sources', 'chat']);
+export function setTab(tab) { if (TABS.includes(tab) && tab !== state.tab) update({ tab }, 'tab'); }
 export function toggleFilter(kind) {
   const all = Object.keys(KINDS);
   const filters = kind === 'all' ? all : state.filters.length === all.length ? [kind] : state.filters.includes(kind) ? state.filters.filter(k => k !== kind) : [...state.filters, kind];
@@ -76,24 +92,35 @@ media.addEventListener('change', event => update({ reducedMotion: event.matches,
 // ---- server snapshots
 export function setInitiatives(snapshot) {
   const { items, stale, error } = adapt.initiatives(snapshot);
-  update({ initiatives: items, initiativesStale: stale, initiativesError: error, owners: adapt.owners(state.ownerRows, items) }, 'initiatives');
+  update({ initiatives: items, initiativesStale: stale, initiativesError: error, owners: adapt.owners(state.ownerRows, items), loss: lost('initiatives', snapshot?.items, items.length) }, 'initiatives');
   update({}, 'owners');
 }
-export function setOwners(rows) { update({ ownerRows: Array.isArray(rows) ? rows : [], owners: adapt.owners(rows, state.initiatives) }, 'owners'); }
-export function setSources(rows) { update({ sources: adapt.sources(rows) }, 'health'); }
+export function setOwners(rows) {
+  const owners = adapt.owners(rows, state.initiatives);
+  update({ ownerRows: Array.isArray(rows) ? rows : [], owners, loss: lost('owners', rows, owners.length) }, 'owners');
+}
+// 'truth' fires only when a source's status or truth changed: the panels whose zero claims rest on it repaint then, not
+// on every health snapshot (a failing source re-reports every tick).
+let truthSig = '';
+export function setSources(rows) {
+  const list = adapt.sources(rows);
+  update({ sources: list }, 'health');
+  const sig = list.map(s => `${s.id}:${s.status}:${s.truth}`).join('|');
+  if (sig !== truthSig) { truthSig = sig; update({}, 'truth'); }
+}
 export function setHost(host) { update({ host: String(host || '') }, 'host'); }
 export function seedEvents(list) {
   const events = (Array.isArray(list) ? list : []).map(adapt.event).filter(e => e && KINDS[e.kind]);
   events.forEach(e => seen.add(e.id));
   events.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
-  update({ events: events.slice(0, 150) }, 'seed');
+  update({ events: events.slice(0, adapt.EVENTS_HELD) }, 'seed');
 }
 export function ingestEvent(raw) {
   const event = adapt.event(raw);
   if (!event || !KINDS[event.kind] || seen.has(event.id)) return;
   seen.add(event.id);
   if (seen.size > 2000) seen.delete(seen.values().next().value);
-  const events = [event, ...state.events].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, 150);
+  const events = [event, ...state.events].sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts)).slice(0, adapt.EVENTS_HELD);
   let owners = state.owners;
   // A quiet event (tool call, prompt, subagent start/stop) refreshes the owner's activity age, never its work item.
   if (!event.historic && event.actor.agent) owners = owners.map(o => o.agent_id !== event.actor.agent ? o : event.quiet
@@ -102,7 +129,14 @@ export function ingestEvent(raw) {
   const counted = state.feedPaused && !event.historic && (!event.quiet || state.showQuiet);
   update({ events, owners, lastEvent: event, buffered: counted ? state.buffered + 1 : state.buffered }, 'event');
 }
-export function setConnection(connection) { if (state.connection !== connection) update({ connection }, 'connection'); }
+export function setLedger(snapshot) { update({ ledger: adapt.ledger(snapshot) }, 'ledger'); }
+export function setConnection(connection) {
+  if (state.connection === connection) return;
+  const wasLive = state.connection === 'live';
+  update({ connection }, 'connection');
+  // every zero or "none" claim also rests on the link (adapt.claim): the panels that state them repaint when it drops or returns
+  if (wasLive !== (connection === 'live')) update({}, 'truth');
+}
 export function setChat(chat) {
   if (!chat || typeof chat !== 'object') return;
   const sessions = adapt.sessions(chat.targets, chat.main_session);
@@ -190,7 +224,13 @@ export function setAsks(snapshot) {
   const list = key => (Array.isArray(snapshot?.[key]) ? snapshot[key].filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : []);
   // the sweeper's sections: stale asks are still open and answerable; flagged ones are not valid asks; cleared rows
   // are settled asks it hid, each with its reason
-  update({ asks: items, asksResolved: resolved, asksStale: list('stale'), asksFlagged: list('flagged'), asksCleared: list('cleared'),
+  // an expired ask is archived by the archive rule, so it leaves the stale section: it is shown once, with its reason
+  const archive = adapt.archiveRows(Array.isArray(snapshot?.archive) ? snapshot.archive.filter(a => a && /^[A-Za-z0-9_-]{1,40}$/.test(String(a.id))) : [], []);
+  const archived = new Set(archive.map(a => a.id));
+  const sent = ['items', 'resolved', 'stale', 'flagged', 'cleared'].map(key => snapshot?.[key]);
+  const kept = [items, resolved, list('stale'), list('flagged'), list('cleared')];
+  const dropped = sent.reduce((sum, rows, i) => sum + (Array.isArray(rows) ? Math.max(0, rows.length - kept[i].length) : snapshot ? 1 : 0), 0);
+  update({ loss: { ...state.loss, asks: dropped }, asks: items, asksResolved: resolved, asksStale: list('stale').filter(a => !archived.has(a.id)), asksFlagged: list('flagged'), asksCleared: list('cleared'), asksArchive: archive, asksArchiveTotal: Number.isInteger(snapshot?.archive_total) ? snapshot.archive_total : archive.length,
     asksSweptAt: typeof snapshot?.swept_at === 'string' ? snapshot.swept_at : '', asksSession: String(snapshot?.session || '') }, 'asks');
 }
 export function askReplyAccess(ask, current = state) { return chatAccess(current, 'claude', ask?.session || current.asksSession); }
@@ -237,5 +277,23 @@ export function decideAsk(ask, decision, note = '') {
     () => { if (state.decisions[ask.id]?.client_key === client_key) setDecision(ask.id, { ...item, status: 'sent' }); },
     error => { if (state.decisions[ask.id]?.client_key === client_key) setDecision(ask.id, { ...item, status: 'failed', retryable: !!error?.retryable, reason: String(error?.message || 'no answer from Mission Control').slice(0, 200) }); });
   return true;
+}
+// ---- requirements: Archive and Restore are the only writes the cleanup has. One click, one explicit confirm, one
+// reason; the same exact request reuses its client key, so a lost response and a retry record once.
+let requirementTransport;
+export function setRequirementTransport(send) { requirementTransport = send; }
+const requirementKeys = new Map();
+export async function requirementAction(row, action, reason) {
+  const clean = String(reason || '').trim();
+  if (!row?.id || !row.digest || !['archive', 'restore'].includes(action) || !clean || clean.length > 300 || !requirementTransport) return { ok: false, message: 'a reason of 1 to 300 characters is required' };
+  const sig = `${row.id}|${action}|${clean}|${row.digest}`;  // the digest is part of the request: a changed requirement is a new request
+  if (!requirementKeys.has(sig)) requirementKeys.set(sig, adapt.newClientKey());
+  try {
+    await requirementTransport({ req_id: row.id, action, reason: clean, digest: row.digest, client_key: requirementKeys.get(sig) });
+    requirementKeys.delete(sig);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, retryable: !!error?.retryable, message: String(error?.message || 'not recorded').slice(0, 200) };
+  }
 }
 export const messageSession = id => state.messages.find(m => m.id === id)?.session || state.session;

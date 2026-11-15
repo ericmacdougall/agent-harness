@@ -12,6 +12,55 @@ It runs on your Mac as a launchd user agent bound to `127.0.0.1`, and it is read
 
 The event and chat formats are in [mission-control-events.md](mission-control-events.md).
 
+## The page
+
+One scrolling page with six views (Overview, Requirements, Archive, Activity, Topology, Sources) and a docked chat. The Overview reads top to bottom:
+
+1. **Mission**: five summary tiles (goals live and tested, live owners, asks waiting on you, blockers, live requirements), the goals from the ledger with their evidence one click down, and the initiatives behind a disclosure.
+2. **Live owners and streams** and **Needs you**, side by side. The age beside each owner is its heartbeat (time since it last wrote). Needs you is part of the page, not a dialog; the top-bar button jumps to it.
+3. **Recent deploys and live tests** and **Blockers**, side by side.
+
+The top bar always shows the connection (Live, Reconnecting, Offline, Signed out) and the age of the last server message. The page opens one SSE stream and never polls `/api/state` on a timer; after a drop it resyncs once on reconnect. The 3D topology loads only when its tab is first opened (`#gl=off` still forces the static view). Every long text is clamped with a disclosure, and every list shows one page with "show more", so volume does not take over the page.
+
+### Requirements, Archive and the archive rule
+
+Asks and requirements are live or archived by one deterministic rule (`archive.py`). The first match wins, each row says which rule and why, nothing is deleted, and an item returns to live on the next read if its cause reverses.
+
+| Rule | Archived when |
+| --- | --- |
+| M archived from the dashboard | someone archived it from the page (see below). The "who" is the dashboard session, never the user: any process that holds a launch link can make that click. A restore keeps it live whatever the other rules say |
+| R1 terminal state | the record says resolved, closed, done, superseded, expired, declined or withdrawn; an ask has `resolved_at`; the sweeper cleared it as resolved or because its owner was reassigned |
+| R2 done live | a deploy and a live test bound to the same ticket or commit, the newest of each by time, the test passing and not older than the deploy; or its ticket is closed (from the sweeper's cache). A local REALLY_TESTED pass, a lone deploy, an unbound pair, a FAIL or UNSTATED test, or a reopened ticket never archives |
+| R3 superseded | a newer record of the same session (same owner for asks) has exactly the same full text, and that newer record is itself live. Near-duplicates stay live |
+| R4 expired | a requirement is older than 30 days with no owner, ticket or evidence and is not sourced to you (`user:`, `uuid:`, `answer:` or `queue:`). The 30 days is an assumption, shown on the row ("moves to the archive in N d") before it applies |
+
+An ask is never archived by age or by its `until`: an unanswered ask past its deadline stays in Needs you, answerable, with a stale mark. A requirement you stated yourself is never archived by age; if it has no owner it says so and waits for your own click. The Archive view lists archived asks and requirements with who registered them, their source, the resolution or reason, the evidence id and the rule. A missing who, when or source shows "unknown".
+
+#### Archive and restore (the one write path of the cleanup)
+
+Each requirement row has an Archive button (or Restore on an archived row). It opens a reason box (required, 1 to 300 characters) and a confirm button that stays disabled until there is a reason. `POST /api/requirements/archive` takes `req_id`, `action` (archive or restore), `reason`, the `digest` of the text the page showed and a `client_key`; it needs the session cookie, the exact Origin and the CSRF header like chat and approve. The server checks the requirement against its own ledger read and the digest, then appends one signed row to `~/.agent-harness/mission-control/requirements/actions.jsonl`:
+
+| Field | Meaning |
+| --- | --- |
+| `at`, `session`, `req`, `action`, `reason` | when, whose main session, which requirement, what, why (redacted) |
+| `rule` | always `manual` |
+| `origin`, `source` | `dashboard` and `mc:<session>/<row id> "Dashboard click: ..."`. It is a dashboard click, never the user's own words (`user:`) |
+| `digest`, `client_key`, `sig` | the text it was shown, the idempotency key, the HMAC with the install secret |
+
+The manual archive's "who" is the dashboard session (`archived from dashboard session <short id>`), in the page, the activity line and the log row; Mission Control never writes "you" for it. A `user:`, `uuid:`, `answer:` or `queue:` sourced requirement archived this way keeps a distinct badge, and the Overview counts them with a one-click filter to review and restore them. The root cause (agents can obtain launch links, which also affects `/api/approve`) is goodqa#15926. The log only grows and is the audit trail. The latest verified row per requirement overrides the automatic rules, including on the next `ah requirements` read. A row with a bad signature, a wrong shape or a source that does not start with `mc:` is ignored. Nothing is written to the harness ledgers: the archive is a view you control.
+
+### Ledger source
+
+`ah goals --json`, `ah requirements --session S` and `ah status --session S --since 12h` are read through three allowlisted read-only runner shapes by the Ledger collector: once per cadence (60 s with a page attached, 300 s without, plus the attach refresh; never on a client request), at most 1 MiB each (4 MiB for requirements), 60 goals with 12 evidence records each, 1000 requirements, 30 rows per status list. A failing source keeps its last good rows marked stale and shows in Source health. The snapshot is published as the SSE event `ledger` (and in `/api/state`) only when its content changed.
+
+**Status truth.** Every ledger part (goals, requirements, status) and every Source health row carries one `truth` value, computed once on the server (`collectors.read_truth`): `unknown` when the source has not been read successfully (an initial timeout, nonzero exit or invalid JSON, no main session yet, or a failed read for a session the rows on hand do not belong to), `stale` when a read failed after a good one (`at` is the last good read, `failed_at` the first failure since), `partial` when the last read succeeded but could not see everything (unread WALs, more goals than are kept, truncated requirements), and `current` otherwise. The page accepts only those four words (anything else, or a source it has not heard from, is `unknown`) and takes the worst over the sources a claim rests on (`CLAIM_SOURCES` in `web/js/adapt.js`; Blockers rest on status, asks, owners and initiatives). A zero or "none" (No blockers recorded, a 0 tile, Nothing needs you right now, Listening for signals…) is stated only when that is `current`. Otherwise the panel says what is known: `?` for an unknown count, `N+` for a partial one, and the last good read time (UTC) for a stale one, with one line per source that is not current. An initiatives file that is not configured is `off` but `current`: it has nothing to report, and an instance without OpenAI supervised owners reports that row the same way (a source that has never reported is `unknown`, never skipped).
+
+**Truth across sessions, caps and the link.** A source is `current` only while its last attempted read succeeded, was whole, and was for the session main is in now. Requirements, status and asks are read for main's session: when it moves (to another session, or to none), the rows read for the old one are never shown, as `current` or as `stale`. They are `unknown` until a read for the new session succeeds. That is decided in one place per source (`Ledger.view()`; `Asks.health_truth()`), so what is pushed, what `/api/state` serves and the Source health row agree. The source is due at once, and a session watch (`App.follow_sessions`, twice a second and at each `/api/state`) tells the page even while that source's thread is still inside a slow read for the old session. `off` keeps no good-read time, so an error after it is `unknown`. A read that holds less than its source reports `partial`: over 100 asks or initiatives, over 60 owners, a goal, requirement, ask or owner row dropped for its shape, a WAL root or session directory that exists but cannot be listed, a WAL that exists but cannot be opened (retried until it reads, or it is removed), or the WAL file cap. A ledger payload that exits 0 but lacks one of its lists, or holds a status row that is not a row, is not read at all: it is an error, so `unknown` or `stale`, because a zero from it would be a guess. Status keeps 30 rows per list but carries each list's whole count; every count the page states from a status list uses that count, and the rows it does not hold are counted beside the list. Not marked: a non-regular `.jsonl` (a symlink or a FIFO) is refused by design and is not a WAL, and supervised-owner directories whose names break the supervisor's naming rule are not owners. The page also counts its own link: while it is not live (connecting, reconnecting, offline or signed out), every claim is at best `stale` as of the last data received (`unknown` if none came). After a drop, it is live again only once it has re-read `/api/state` from the server it reconnected to, so a restarted server's state replaces the old process's rows before anything is called current. A source whose reader stops (a hung or dead thread) is aged out: a row not checked within two of its slowest cadences plus its longest read turns `stale` (`unknown` if it never read) until its reader reports again. Bounded windows: up to 0.5 s between a session move and the watch pass that turns the session parts unknown; the previous session's asks stay listed (their truth already unknown) until the asks lock frees, which a click's read can hold up to its 60 s timeout; a `partial` asks read made by a click reaches Source health at the next asks run.
+
+### Data with no UI today
+
+Requirements of earlier sessions (only main's current session is read), the owner of a requirement (`ah requirements` leaves it empty, shown as no owner recorded), peer-review receipts, full ticket comment threads (only checkpoint comments arrive, as feed events) and release-kit deploy records outside the WALs have no read path in Mission Control. `web/coverage.json` maps every `/api/state` key, SSE event and ledger field to the page section that shows it; a test fails when a new key has no section.
+
 ## Run kit
 
 | Task | Command |
@@ -52,6 +101,7 @@ Every source has a fixed interval. A failing source is never retried faster, and
 | GoodQA tickets | Checkpoint comments on tickets that initiatives reference | One ticket read every 10 s, round robin, at most 12 tickets |
 | t2-dev | One fixed WAL probe over ssh | At most one ssh connection every 60 s |
 | Event drops | `~/.agent-harness/mission-control/sources/*.jsonl`, written by external sources such as Fabric | Every 5 s |
+| Ledger | `ah goals`, `ah requirements`, `ah status` (see Ledger source) | 60 s attached, 300 s idle |
 
 Two kinds of WAL line are not work items:
 
@@ -72,6 +122,38 @@ The two expensive sources are subprocesses: `provenance.py asks` (about 5 CPU se
 - The asks ledger is read when a WAL line registers or resolves an ask (debounced by 5 s), when you click Approve or Deny, and at every sweep (5 minutes). It is not read every minute.
 - `ah owners`, GitHub, the GoodQA ticket reader and the t2-dev probe run at their normal interval while a page is attached, and at their idle interval (5 minutes; tickets 2 minutes) while none is. Attaching a page refreshes them at once.
 - Scripts, styles and the three.js bundle are served gzipped with an ETag and `Cache-Control: no-cache, private`, so an unchanged file costs a 304. The page shell and every API response stay `no-store`.
+
+### The read envelope and the gate
+
+One rule holds from the producer to the sentence on the page: no layer turns an exception or a missing field into an
+empty success. Three layers carry it.
+
+| Layer | What carries the read | never read | failed | partial | stale |
+|---|---|---|---|---|---|
+| Producer (`ah requirements`, `ah status`, `ah owners`, `provenance asks`) | a `read` block, `harness.read/1` | no block: the collector refuses the output | `state: failed`, each unread source with its reason | `state: partial`: unread sources, skipped lines, `limited` | not its concern |
+| Source (one Health row per collector) | the row: status, truth, `ok_at`, `checked`, `session` | no `ok_at`: unknown | error; unknown before a good read | ok with truth partial | error after a good read; a row not checked within its max age; a row read for another session is unknown |
+| Dataset (`reads`, pushed before the rows) | `collectors.FEEDS` names its sources; `Truth` takes the worst | a source with no row | from its sources | from its sources | from its sources |
+| Page | `adapt.CLAIMS` names a claim's datasets; `claim()` / `gate()` | no read from the server: unknown | from the read | from the read; rows the page could not show | from the read; the link not live |
+
+To add to it:
+
+- A new source: write its Health row through `Collector.run` (or `Health.ok` / `error` / `off`) and add its name to
+  `FEEDS` for every dataset its data reaches. A source that is deliberately not configured reports `off` with
+  `truth="current"`.
+- A new producer: print a `read` block and parse the run with `collectors.producer_read`.
+- A new claim: one line in `adapt.CLAIMS`, then state every count and every "none" through
+  `gate(state, id).count(n)` and `.none(text, noun)`. A count of rows on hand ("Show 3 more") carries a
+  `// held: <why>` comment instead.
+- A new state key: one line in `adapt.STATE_DATASETS`.
+
+Two tests compare what is declared with what is observed and fail on a difference:
+`tests/test_mission_control_truth_chain.py` traces a run of the real server against `FEEDS`, and
+`web/tests/truth-gate.test.mjs` renders each panel over a recording state against `CLAIMS` and scans the browser-only
+modules for counts written outside the gate.
+
+Limits of the two tests: the page derivation is per panel, so in a panel that makes several claims (the tiles, the inventory) one claim's declaration can excuse another's read; the browser-only modules are scanned as text, not rendered. Not marked: a single chat record that cannot be read is skipped by the chat store; `ah owners` reports the places it
+could not list, not a WAL it could list but only partly parse; a status list keeps the newest 30 rows and says how many
+more the ledger holds. If every server thread stops while the stream stays open, nothing ages the rows out.
 
 ## Needs you
 

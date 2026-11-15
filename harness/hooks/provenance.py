@@ -37,6 +37,173 @@ LEDGER_MAX_HITS = 100_000         # the asks ledger reads every ask and resoluti
 MAX_TEXT = 2 * 1024 * 1024
 MAX_SCAN_BYTES = 1 << 30          # a transcript or WAL larger than this is not scanned
 SCAN_SECONDS = 3.0                # wall-clock budget for one scan
+# PR 234 v8 (receipt v7 F1/F4): the one rule every read-only producer uses for a line it cannot parse. It counts as
+# skipped (its record is missing from the result) unless it is the file's unterminated last line and the file was
+# written in the last APPEND_GRACE_S seconds: that line is a write in progress, not a lost record. An unterminated
+# last line in a file nobody is writing is a torn record and counts.
+APPEND_GRACE_S = 60.0
+
+
+def tail_in_progress(at_tail: bool, mtime: float, now: float | None = None) -> bool:
+    return bool(at_tail) and (time.time() if now is None else now) - mtime <= APPEND_GRACE_S
+
+
+# ---- one WAL record validator and one unread-entry shape (PR 234 v11; receipt v10 F1, F2), shared by every reader
+def _record_time(value) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+# The revision of the record contract below. An index built from WAL records (ah owners' agent-WAL index) stores it,
+# and one built under another revision (or none: every index written before PR 234 v11) is rebuilt from the start of
+# the WAL, so no record the current contract rejects keeps counting as activity (receipt v11 F2). Bump it whenever
+# wal_record_problem changes what it accepts.
+RECORD_RULE = "harness.wal-record/1"
+
+
+def wal_record_problem(rec) -> str:
+    """Why a parsed WAL line is not a record ("" when it is). A record is a JSON object with a non-empty string
+    `event`; an `at`, when present and not null, must be an ISO time. A line that fails is a lost line for every reader:
+    it is never activity (no liveness), never dated evidence, never a row. An undated record (no `at`, or `at: null`, as
+    some hand-written notes are) is a record that proves no time; an ask written that way is still listed (red-team F8,
+    tests/test_provenance.py)."""
+    if not isinstance(rec, dict):
+        return "not an object"
+    event = rec.get("event")
+    if not isinstance(event, str) or not event.strip():
+        return "no event" if event is None or event == "" else "event is not a string"
+    if rec.get("at") is not None and _record_time(rec.get("at")) <= 0:
+        return "bad timestamp"
+    return ""
+
+
+def unread_entry(entry) -> dict:
+    """The one shape of an unread-source entry, for every producer and renderer: source and reason always; the WAL
+    file name and agent when the source is a WAL. Producers may name the source `wal` (a WAL) or `source`."""
+    entry = entry if isinstance(entry, dict) else {}
+    wal = clip(str(entry.get("wal") or ""), 120)
+    out = {"source": clip(str(entry.get("source") or wal or "(unnamed source)"), 120),
+           "reason": clip(str(entry.get("reason") or "unread"), 200)}
+    if wal:
+        out["wal"] = wal
+    if entry.get("agent"):
+        out["agent"] = clip(str(entry["agent"]), 60)
+    return out
+
+
+def unread_text(entry) -> str:
+    """The one text rendering of an unread entry (ah --text status and any other text report)."""
+    e = unread_entry(entry)
+    return f"  {e['source']:<40} {e['reason'][:80]}"
+
+
+# ---- lost lines and the window a read covers (PR 234 v10; receipts v9 F1/F2; the user's last-round decision)
+# A read covers a window (ah status: its --since window; ah owners: the rows its default view shows). A line that
+# could not be used is inside the window unless the evidence about that line itself places it before the cutoff.
+# This is the ONLY place that decides it, for every producer: lost_outside is called by LostWindow.place alone,
+# and only LostWindow counts outside_window (tests/test_mission_control_producer_reads.py guards both).
+LOST_WINDOW_RULE = "harness.lost-window/1"
+MAX_LOST_KEPT = 2000   # per file: lost lines past this keep no evidence, so they are inside
+
+
+def lost_outside(next_date, ordered: bool, mtime, cutoff) -> bool:
+    """Whether one lost line was provably written before `cutoff` (a Unix time; None: the read has no window, so
+    every lost line is inside). Outside only if (b) its file was last written before the cutoff, or (a) the first
+    dated record after it in the same file is dated before the cutoff AND the file's dated records never go back in
+    time (receipt v9 F2: a file whose dates are out of order proves nothing about position, so (a) does not apply).
+    Everything else, including a torn tail or a lost line with no dated record after it, is inside."""
+    if cutoff is None:
+        return False
+    if isinstance(mtime, (int, float)) and mtime < cutoff:
+        return True
+    return bool(ordered) and isinstance(next_date, (int, float)) and 0 < next_date < cutoff
+
+
+class LostTrail:
+    """The evidence for the lost lines of one file, in file order: for each, the date of the first dated record after
+    it (None until one is read), and whether the file's dated records are in time order. It can be kept in an index
+    (state()/from_state) so an incremental reader places a line seen in an earlier call with the same evidence."""
+
+    def __init__(self, nexts=None, ordered=True, last=0.0, extra=0):
+        self.nexts, self.ordered, self.last, self.extra = list(nexts or []), bool(ordered), float(last or 0.0), int(extra or 0)
+
+    @classmethod
+    def from_state(cls, state):
+        if not isinstance(state, dict):
+            return None
+        nexts = state.get("nexts")
+        if not isinstance(nexts, list) or not all(n is None or isinstance(n, (int, float)) for n in nexts):
+            return None
+        return cls(nexts, state.get("ordered", False) is True, state.get("last") or 0.0, state.get("extra") or 0)
+
+    def state(self) -> dict:
+        return {"nexts": self.nexts, "ordered": self.ordered, "last": self.last, "extra": self.extra}
+
+    def copy(self):
+        return LostTrail(self.nexts, self.ordered, self.last, self.extra)
+
+    def lost(self) -> None:
+        if len(self.nexts) < MAX_LOST_KEPT:
+            self.nexts.append(None)
+        else:
+            self.extra += 1
+
+    def dated(self, at) -> None:
+        """A record in file order with date `at` (0 or None: undated, which proves nothing and is ignored)."""
+        if not isinstance(at, (int, float)) or at <= 0:
+            return
+        if at < self.last:
+            self.ordered = False
+        self.last = max(self.last, at)
+        i = len(self.nexts) - 1
+        while i >= 0 and self.nexts[i] is None:   # the lost lines just before this record
+            self.nexts[i] = float(at)
+            i -= 1
+
+    def count(self) -> int:
+        return len(self.nexts) + self.extra
+
+
+class LostWindow:
+    """One read's window: how many lost lines are inside it (they make the read partial) and outside it (disclosed as
+    outside_window, never partial). `cutoff` None: no window, every lost line is inside."""
+
+    def __init__(self, cutoff=None):
+        self.cutoff, self.inside, self.outside = cutoff, 0, 0
+
+    def place(self, trail, mtime, hidden: bool = True) -> None:
+        """Place every lost line of one file. `hidden` False (an owner row the view shows): all inside, whatever the
+        evidence, since the read claims that row."""
+        if trail is None:
+            return
+        for nxt in trail.nexts:
+            if hidden and lost_outside(nxt, trail.ordered, mtime, self.cutoff):
+                self.outside += 1
+            else:
+                self.inside += 1
+        for _ in range(trail.extra):
+            if hidden and lost_outside(None, False, mtime, self.cutoff):
+                self.outside += 1
+            else:
+                self.inside += 1
+
+    def fields(self) -> dict:
+        """The read-block fields: the outside count, and the rule that produced it (only a read with a window)."""
+        out = {"outside_window": self.outside}
+        if self.cutoff is not None:
+            try:   # `ah status --since` with a very long window puts the cutoff before the epoch, or out of range
+                cutoff = datetime.datetime.fromtimestamp(max(0.0, float(self.cutoff)), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (OverflowError, OSError, ValueError):
+                cutoff = ""
+            out["window"] = {"rule": LOST_WINDOW_RULE, "cutoff": cutoff}
+        return out
 SMALL_FILE = 1 << 20              # policy, cache and similar small files
 MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
@@ -457,12 +624,15 @@ def _line_around(fd: int, index: int, size: int):
             fwd *= 4
 
 
-def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS):
+def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS, *, tails: bool = False):
     """Yield the line (or None when oversized) for each line containing needle. bytes.find on 8 MiB chunks:
-    mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript."""
+    mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript.
+    tails=True yields (line, in_progress) instead: in_progress is tail_in_progress for the file's unterminated last
+    line (a line that fails to parse is then a write in progress, not a skipped record)."""
     fd = open_regular(path)
     try:
-        size = os.fstat(fd).st_size
+        info = os.fstat(fd)
+        size = info.st_size
         if size > MAX_SCAN_BYTES:
             raise Problem("file-too-large", f"{clip(path.name, 60)} is larger than {MAX_SCAN_BYTES >> 20} MiB; not scanned")
         deadline = time.monotonic() + SCAN_SECONDS
@@ -488,10 +658,10 @@ def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS):
                 hits += 1
                 if line is None:
                     next_line = absolute + MAX_LINE  # skip the rest of an oversized line, do not re-read it per hit
-                    yield None
+                    yield (None, False) if tails else None
                 else:
                     next_line = start + len(line) + 1
-                    yield line
+                    yield (line, tail_in_progress(start + len(line) >= size, info.st_mtime)) if tails else line
             offset += len(chunk)
             carry = data[-(len(needle) - 1):] if len(needle) > 1 else b""
     except (OSError, ValueError) as error:
@@ -1340,42 +1510,101 @@ def packet_gate(text: str, mode=None, ctx=None):
 
 # --------------------------------------------------------------------------- asks ledger
 
-def session_wals(session: str, home=None) -> list:
+READ_SCHEMA = "harness.read/1"
+
+
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, window: "LostWindow | None" = None) -> dict:
+    """What a read-only view actually read, for a consumer that must not take "nothing found" for "nothing there"
+    (goodqa#15920). state: "failed" when no source could be read, "partial" when a source was unread, a matching line
+    could not be parsed or a cap or time budget stopped the read, else "ok". `unread` names each source and why."""
+    window = window if window is not None else LostWindow()
+    skipped = int(skipped) + window.inside   # lost lines inside the window are skipped lines like any other
+    state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
+    return {"schema": READ_SCHEMA, "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
+            "unread": [unread_entry(u) for u in unread[:50]],
+            "skipped": skipped, "limited": bool(limited), **window.fields()}
+
+
+def session_wals_read(session: str, home=None) -> tuple:
+    """(paths, unread): the session's main and agent WALs, and why the folder or its main WAL could not be listed. A
+    folder that is missing or cannot be listed is an unread source, never an empty session."""
     if not SESSION_RE.match(session):
         raise Problem("user-session-invalid", "bad session id")
     folder = wals_root(home) / session
     try:
-        return sorted(p for p in folder.glob("*.jsonl") if p.name == "main.jsonl" or p.name.startswith("agent-"))
-    except OSError:
-        return []
+        with os.scandir(folder) as entries:
+            names = sorted(e.name for e in entries if e.name == "main.jsonl" or (e.name.startswith("agent-") and e.name.endswith(".jsonl")))
+    except FileNotFoundError:
+        return [], [{"source": "session WAL folder", "reason": "missing: no WAL folder for this session"}]
+    except OSError as error:
+        return [], [{"source": "session WAL folder", "reason": f"file-unreadable: cannot list it ({type(error).__name__})"}]
+    unread = [] if "main.jsonl" in names else [{"source": "main.jsonl", "reason": "missing: no main WAL for this session"}]
+    return [folder / name for name in names], unread
+
+
+def session_wals(session: str, home=None) -> list:
+    return session_wals_read(session, home)[0]
 
 
 def ledger(session: str, home=None) -> list:
     """Asks and their resolutions across the main and agent WALs of a session."""
+    return ledger_read(session, home)[0]
+
+
+def ledger_read(session: str, home=None) -> tuple:
+    """(records, read): the ledger, and what was actually read for it (read_block). One unreadable WAL does not hide
+    the other WALs' asks, but it is named in `read`, so a reader never takes the rest for the whole ledger."""
     asks, closed = {}, {}
-    for path in session_wals(session, home):
-        for needle in (b'"event":"ask"', b'"event":"ask_resolved"'):
+    paths, unread = session_wals_read(session, home)
+    read_ok, skipped, limited = 0, 0, False
+    for path in paths:
+        failed = None
+        # PR 234 v8: the needle is the JSON string value alone, so `"event": "ask"` (spaced) is read as well as the
+        # compact form; the parsed record decides. Every line that names an ask and is not used is counted.
+        for needle in (b'"ask"', b'"ask_resolved"'):
+            hits = 0
             try:
-                for line in _lines_containing(path, needle, LEDGER_MAX_HITS):
+                for line, in_progress in _lines_containing(path, needle, LEDGER_MAX_HITS, tails=True):
+                    hits += 1
                     if line is None:
+                        skipped += 1  # an oversized line that names an ask: its ask is not in the result
                         continue
                     try:
                         record = loads_line(line)
                     except ValueError:
+                        if not in_progress:   # receipt v7 F4: a last line still being written is not a lost ask
+                            skipped += 1
                         continue
-                    if not isinstance(record, dict):
+                    if wal_record_problem(record):
+                        skipped += 1  # a line that names an ask but is not a record (receipt v10 F2: one validator)
                         continue
-                    if record.get("event") == "ask" and isinstance(record.get("id"), str):
-                        record["at"] = str(record.get("at") or "")
-                        record["_wal"] = path
-                        asks[record["id"]] = record
-                    elif record.get("event") == "ask_resolved" and isinstance(record.get("ref"), str):
-                        closed[record["ref"]] = record
-            except Exception:  # one unreadable WAL must not hide every other ask
-                continue
+                    event = record.get("event")
+                    if event == "ask" and needle == b'"ask"':
+                        if isinstance(record.get("id"), str):
+                            record["at"] = str(record.get("at") or "")
+                            record["_wal"] = path
+                            asks[record["id"]] = record
+                        else:
+                            skipped += 1  # an ask with no id cannot be listed
+                    elif event == "ask_resolved" and needle == b'"ask_resolved"':
+                        if isinstance(record.get("ref"), str):
+                            closed[record["ref"]] = record
+                        else:
+                            skipped += 1  # a resolution with no ref closes nothing we can name
+            except Problem as problem:  # one unreadable WAL must not hide every other ask; it is reported as unread
+                failed = f"{problem.code}: {problem.message}"
+            except Exception as error:  # noqa: BLE001
+                failed = f"file-unreadable: {type(error).__name__}"
+            limited = limited or hits >= LEDGER_MAX_HITS
+        if failed:
+            unread.append({"source": path.name, "reason": failed})
+        else:
+            read_ok += 1
     for ident, record in asks.items():
         record["_closed"] = closed.get(ident)
-    return sorted(asks.values(), key=lambda r: r["at"])
+    if any(u["source"] in ("main.jsonl", "session WAL folder") for u in unread):
+        read_ok = 0  # without the main WAL the session's ledger was not read
+    return sorted(asks.values(), key=lambda r: r["at"]), read_block(read_ok, unread, skipped, limited)
 
 
 def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
@@ -1405,7 +1634,7 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
     """The open asks a person may be shown, as data (Mission Control's "Needs you" list).
 
     Blocked asks (no resolvable source) are left out, exactly as the text ledger says not to present them."""
-    entries = ledger(session, home)
+    entries, read = ledger_read(session, home)
     traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx, entries)
     items = []
     for kind, rows in (("traced", traced), ("unverified", unverified), ("assumption", assumptions)):
@@ -1425,7 +1654,7 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
                         "problem": f"{problem['code']}: {clip(problem['message'], 200)}"})
     return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
                        "blocked": len(blocked), "closed": closed}, "items": items, "blocked": flagged,
-            "resolved": resolved_items(session, home, entries=entries)}
+            "resolved": resolved_items(session, home, entries=entries), "read": read}
 
 
 def resolved_items(session: str, home=None, days: float = 7.0, limit: int = 100, entries=None) -> list:

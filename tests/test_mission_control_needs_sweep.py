@@ -140,6 +140,33 @@ class Settled(Base):
         self.assertEqual([r["action"] for r in self.audit()], ["cleared", "restored"])
 
 
+class RequirementTickets(Base):
+    """review PR 234 F1: requirement tickets get a bounded recheck of their own, and one failing ticket never starves."""
+    def test_a_persistently_failing_ticket_never_starves_the_others(self):
+        refs = ["goodqa#11", "goodqa#12", "goodqa#13"]
+        calls = []
+
+        def lookup(ref):
+            calls.append(ref)
+            if ref == "goodqa#11":
+                raise RuntimeError("unavailable")
+            return "open"
+        for step in range(3):
+            ns.refresh_tickets(self.root, refs, lookup, now=NOW + step * 10, budget=1)
+        self.assertEqual(sorted(calls), refs)  # each ticket got its turn, the failing one only once
+        cache = json.loads((self.root / "needs" / "tickets.json").read_text())
+        self.assertEqual((cache["goodqa#12"]["state"], cache["goodqa#13"]["state"]), ("open", "open"))
+        self.assertNotIn("state", cache["goodqa#11"])
+
+    def test_a_failed_recheck_keeps_the_last_answer_but_it_reads_as_unknown_once_expired(self):
+        (self.root / "needs").mkdir(exist_ok=True)
+        (self.root / "needs" / "tickets.json").write_text(json.dumps({"goodqa#9": {"state": "closed", "at": NOW - ns.TICKET_RECHECK_S - 1}}))
+        cache = ns.refresh_tickets(self.root, ["goodqa#9"], lambda ref: None, now=NOW)
+        self.assertEqual(cache["goodqa#9"]["state"], "closed")
+        self.assertIsNone(ns.fresh_state(cache, "goodqa#9", NOW))
+        self.assertEqual(ns.fresh_state({"goodqa#9": {"state": "closed", "at": NOW - 5}}, "goodqa#9", NOW), "closed")
+
+
 class StaleAndFlagged(Base):
     def test_past_ttl_without_activity_moves_to_stale_and_is_never_hidden(self):  # AC-12, NEG-24
         items = [ask("wold00000001", "old", age_h=80), ask("wold00000002", "old but answered", age_h=80),
@@ -216,7 +243,7 @@ class Safety(Base):
         code = ("import sys,json;sys.path[:0]=[%r,%r];import needs_sweep as ns;from pathlib import Path;"
                 "ns.sweep(Path(%r),%r,json.loads(sys.stdin.read()),now=%r)"
                 % (str(REPO / "harness" / "hooks"), str(REPO / "harness" / "mission_control"), str(self.root), SID, NOW))
-        data = json.dumps({"items": [ask(f"wproc{i:07d}", f"q{i}", age_h=100) for i in range(20)], "resolved": [], "blocked": []})
+        data = json.dumps({"read": col.whole_read(), "items": [ask(f"wproc{i:07d}", f"q{i}", age_h=100) for i in range(20)], "resolved": [], "blocked": []})
         procs = [subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, text=True, env=dict(os.environ))
                  for _ in range(4)]
         for proc in procs:
@@ -251,7 +278,7 @@ class Collector(Base):
                 self.calls.append(kind)
                 if kind == "ah-ticket-get":
                     return 0, json.dumps({"issue": {"closedAt": "2026-11-11T00:00:00Z" if "101" in args[0] else None}})
-                return 0, json.dumps(payload)
+                return 0, json.dumps({"read": col.whole_read(), "blocked": [], "resolved": [], **payload})
         hub = ev.Hub()
         asks = col.Asks(hub, col.Health(hub), Runner(), lambda: SID, root=self.root, owners_fn=lambda: list(owners))
         return asks
