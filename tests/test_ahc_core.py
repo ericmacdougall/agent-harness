@@ -823,6 +823,30 @@ class RootOwnershipTests(unittest.TestCase):
             runner.acquire_lock(self.paths, "core")
         self.assertEqual(self.snapshot(self.paths.root), before)
 
+    def test_every_subcommand_refuses_to_start_with_a_no_restart_exit(self):
+        """`ahc run`, `status`, `submit` and `ack` refuse a foreign root before reading anything in it, print the
+        conflict, and exit 3, which the units list in RestartPreventExitStatus (no restart loop)."""
+        import contextlib
+        import io
+        from unittest import mock
+        sys.path.insert(0, str(HOOKS))
+        import ahc_install
+        import ahc_runner as runner
+        self.assertIn("RestartPreventExitStatus=%d " % runner.ROOT_EXIT, ahc_install.unit_text("ahc-core") + " ")
+        self.coordd_layout()
+        before = self.snapshot(self.paths.root)
+        for argv in (["run", "--role", "core", "--once"], ["status"], ["ack", "x", "--owner", "agent-abc123"],
+                     ["submit", "--repo", REPO, "--pr", "7", "--head", HEAD, "--base", BASE, "--packet", "-",
+                      "--ticket", "GoodQA goodqa#16034", "--owner", "agent-abc123"]):
+            err = io.StringIO()
+            with mock.patch.object(Path, "home", return_value=self.home), mock.patch.object(
+                    runner, "claim_main", return_value=False), contextlib.redirect_stderr(err):
+                rc = runner.main(argv)
+            self.assertEqual(rc, runner.ROOT_EXIT, argv)
+            self.assertIn("refusing to start", err.getvalue(), argv)
+            self.assertIn("token", err.getvalue(), argv)
+        self.assertEqual(self.snapshot(self.paths.root), before)
+
     def test_the_names_ahc_writes_are_its_own(self):
         """Every top-level name ahc's code writes under the root passes the ownership check, so ahc never refuses
         its own root; the list is the one place a new top-level file must be added."""

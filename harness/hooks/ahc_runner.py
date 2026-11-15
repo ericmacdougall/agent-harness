@@ -401,6 +401,7 @@ MIGRATIONS = {1: [], 2: [_migrate_v2], 3: [_migrate_v3], 4: [_migrate_v4]}
 
 
 SCHEMA_EXIT = 3
+ROOT_EXIT = SCHEMA_EXIT   # a foreign state root (core.ForeignRoot): also a no-restart exit
 
 
 class SchemaError(RuntimeError):
@@ -1721,7 +1722,7 @@ def _core_intake(worker, ledger, paths, config, deps, summary):
     summary["email_route"] = "ready" if worker.email_route() else "unavailable"
     summary["rejected"] = ingest(ledger, paths, config, worker.now())
     for name, reason in summary["rejected"]:
-        message = "ahc rejected queue file %s: %s (moved to coordinator/rejected/)" % (name, reason)
+        message = "ahc rejected queue file %s: %s (moved to %s)" % (name, reason, paths.root / "rejected")
         try:
             rc, _out, _err = deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
                                       "ahc:rejected:" + name, "--source", "ahc", "--key", "ahc-rejected-" + name,
@@ -2313,6 +2314,14 @@ def main(argv=None):
     main_proven = claim_main(argv)
     args = build_parser().parse_args(argv)
     paths = core.Paths()
+    try:
+        paths.claim_root()        # before reading anything under the root, for every subcommand
+    except core.ForeignRoot as error:
+        # Exit 3 is in the units' RestartPreventExitStatus, so a foreign root stops the unit instead of looping.
+        # No `ah alert` here: the deps need ahc's own config, which a foreign root does not hold; the failed unit
+        # and this line are what the operator sees.
+        print("ahc: %s" % error, file=sys.stderr)
+        return ROOT_EXIT
     config = load_config(paths)
     if args.cmd == "submit":
         req = {"repo": args.repo, "pr": args.pr, "head": args.head, "base": args.base, "packet": args.packet,
