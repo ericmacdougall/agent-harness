@@ -1208,6 +1208,120 @@ for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the
     if _name.startswith("test_") and _name not in vars(LargeTierDelta):
         setattr(LargeTierDelta, _name, None)
 
+
+class LargeTierLane(LargeTier):
+    """PR #261 review v3 (and goodqa#16151): the large tier with the lane ON. F1: a large upload never exceeds the host's
+    write share. F2: a large upload says so in the lane state ("large PID"), and a tier-1 run that starts during it takes
+    the rest of the share, so the two together stay inside it (share 1: the large upload keeps a quarter, tier 1 three
+    quarters); a large file never starts while tier 1 runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.budget = self.tmp / "budget.conf"
+        self.budget.write_text("account 6\nlog-backup.testhost 1\n")   # this host's share: 1 write operation a second
+
+    def lane_env(self, **extra):
+        env = dict(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_BUDGET_FILE=str(self.budget), LOG_BACKUP_LARGE_MB="1")
+        env.update(extra)
+        return env
+
+    def lane_state(self):
+        path = self.logs / "log-backup.lane.state"
+        return path.read_text().strip() if path.exists() else ""
+
+    def lane_lock(self):
+        return self.logs / "log-backup.lane.lock.d"
+
+    def wait_for(self, predicate, seconds, what):
+        end = time.time() + seconds
+        while time.time() < end:
+            if predicate():
+                return
+            time.sleep(0.2)
+        self.fail("timed out waiting for " + what + "; lane log: " + (self.logs / "log-backup.lane.log").read_text()[-1500:]
+                  if (self.logs / "log-backup.lane.log").exists() else "timed out waiting for " + what)
+
+    def lane_over(self):
+        self.wait_for(lambda: not self.lane_lock().exists(), 150, "the lane run to end")
+
+    def rate(self, argv):
+        return float(argv[len(argv) - 1 - argv[::-1].index("--tpslimit") + 1])   # the last --tpslimit wins in rclone
+
+    def large_copies(self):
+        return [c for c in self.copies() if any("backup-stage-large" in a for a in c)]
+
+    def test_a_large_upload_never_goes_above_the_host_share_whatever_large_tps_says(self):
+        done = self.local_run(**self.lane_env(LOG_BACKUP_BULK_LANE="0", LOG_BACKUP_LARGE_TPS="99"))
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        big = self.large_copies()
+        self.assertTrue(big)
+        for argv in big:
+            self.assertLessEqual(self.rate(argv), 1.0, argv)
+
+    def test_with_the_lane_on_a_large_upload_is_announced_and_a_tier_1_run_splits_the_share_with_it(self):
+        env = self.lane_env(FAKE_HANG="45", FAKE_HANG_MATCH="backup-stage-large", LOG_BACKUP_LARGE_TPS="99")
+        self.addCleanup(self.lane_over)
+        first = self.local_run(**env)   # a scheduled run: tier 1, then it starts the lane
+        self.assertEqual(first.returncode, 0, first.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        before = len(self.copies())
+        second = self.local_run(**env)   # a scheduled run that starts while the large upload is in flight
+        self.assertEqual(second.returncode, 0, second.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        self.assertTrue(self.lane_state().startswith("large "), "the upload was still in flight: " + self.lane_state())
+        tier1 = [c for c in self.copies()[before:] if any("backup-stage/" in a for a in c) and "--files-from-raw" not in c]
+        self.assertTrue(tier1, "the second run copied")
+        large = self.large_copies()
+        self.assertEqual(len(large), 1, "the large upload was not stopped and restarted by the tier-1 start")
+        big_rate = self.rate(large[0])
+        self.assertLessEqual(big_rate, 0.25 + 1e-9)
+        for argv in tier1:
+            self.assertLessEqual(self.rate(argv) + big_rate, 1.0 + 1e-9, "together they stay inside the share of 1: " + str(argv))
+        self.assertIn("large-file upload is in flight", (self.logs / "log-backup.log").read_text())
+        self.lane_over()
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes(), "the large upload finished")
+        self.assertTrue(self.last_ok().exists() and self.large_marker().exists() and self.bulk_ok().exists())
+        self.assertNotIn("stopped: a tier-1 run started", (self.logs / "log-backup.lane.log").read_text())
+
+    def test_a_large_file_does_not_start_while_a_tier_1_run_holds_the_lock(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        lock = self.logs / "log-backup.lock.d"
+        lock.mkdir()
+        holder_dir = self.tmp / "holder"
+        holder_dir.mkdir()
+        (holder_dir / "log-backup.sh").write_text("sleep 120\n")   # looks like a live tier-1 run to holder_alive
+        holder = subprocess.Popen(["/bin/bash", str(holder_dir / "log-backup.sh")])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.terminate)
+        (lock / "pid").write_text(str(holder.pid))
+        env = self.lane_env(LOG_BACKUP_LANE_BUDGET_SECONDS="12", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                            LOG_BACKUP_KILL_GRACE_SECONDS="1", LOG_BACKUP_SLICE_RESERVE_SECONDS="2", LOG_BACKUP_TIER="bulk")
+        done = self.local_run(**env)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.large_copies(), [], "no large upload starts beside tier 1")
+        self.assertFalse(self.large_marker().exists())
+
+    def test_terminating_the_lane_stops_the_large_copy_before_the_lock_is_released_and_removes_the_snapshot(self):
+        env = self.lane_env(FAKE_HANG="60", FAKE_HANG_MATCH="backup-stage-large")
+        self.addCleanup(self.lane_over)
+        first = self.local_run(**env)
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        pid = int((self.lane_lock() / "pid").read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        self.wait_for(lambda: not self.lane_lock().exists(), 60, "the lane lock to be released")
+        alive = subprocess.run(["pgrep", "-f", str(self.fake)], capture_output=True)
+        self.assertNotEqual(alive.returncode, 0, "the copy was stopped before the lock was released: " + alive.stdout.decode())
+        stage = self.home / ".agent-harness/backup-stage-large"
+        self.assertEqual([p for p in stage.rglob("*") if p.is_file()] if stage.is_dir() else [], [])
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.remote_big().exists())
+        self.assertEqual(self.lane_state(), "", "the lane state is cleared")
+
+
+for _name in list(vars(LargeTier)):
+    if _name.startswith("test_") and _name not in vars(LargeTierLane):
+        setattr(LargeTierLane, _name, None)
+
 for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the parent's tests
     if _name.startswith("test_") and _name not in vars(LargeTierSafety):
         setattr(LargeTierSafety, _name, None)
