@@ -33,14 +33,21 @@ CREATE TABLE IF NOT EXISTS reviews (
   created REAL NOT NULL, updated REAL NOT NULL,
   UNIQUE(kind, repo, pr, head, packet_sha256, policy_revision));
 CREATE TABLE IF NOT EXISTS grants (
-  id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL, scope TEXT NOT NULL,
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL,
+  repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
   policy_revision TEXT NOT NULL, uses INTEGER NOT NULL, expires_at REAL NOT NULL, state TEXT NOT NULL,
-  operation TEXT, authority_seq INTEGER, version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
+  operation TEXT, bound_key TEXT, authority_seq INTEGER, version INTEGER NOT NULL, created REAL NOT NULL,
+  updated REAL NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS grants_one_live_per_scope ON grants(kind, repo, pr, head, base)
+  WHERE state IN ('validated', 'active', 'reserved');
 CREATE TABLE IF NOT EXISTS operations (
-  key TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, params TEXT, params_sha256 TEXT NOT NULL, grant_id TEXT,
+  key TEXT PRIMARY KEY, kind TEXT NOT NULL, item TEXT, repo TEXT NOT NULL, pr INTEGER NOT NULL,
+  head TEXT NOT NULL, base TEXT NOT NULL, policy_revision TEXT NOT NULL, generation INTEGER NOT NULL,
+  params TEXT, params_sha256 TEXT NOT NULL, grant_id TEXT,
   state TEXT NOT NULL, dispatch_count INTEGER NOT NULL DEFAULT 0, dispatched_at REAL, request_id TEXT,
-  probe_at REAL, escalate_at REAL, readbacks INTEGER NOT NULL DEFAULT 0, proof TEXT, evidence TEXT,
-  incident INTEGER NOT NULL DEFAULT 0, settled_at REAL, tombstone INTEGER NOT NULL DEFAULT 0,
+  built_sha TEXT, refusal TEXT, probe_at REAL, escalate_at REAL, readbacks INTEGER NOT NULL DEFAULT 0,
+  proof TEXT, evidence TEXT, incident INTEGER NOT NULL DEFAULT 0, pr_unmarked INTEGER NOT NULL DEFAULT 0,
+  settled_at REAL, tombstone INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS transitions (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, id TEXT NOT NULL, from_state TEXT,
@@ -293,146 +300,197 @@ class Contracts:
                 out.append((rid, to))
         return out
 
-    # -------------------------------------------------------------- Grant (3.9, 3.9a)
+    # -------------------------------------------------------------- Grant (spec ahc-m1-v2b G1-G9)
 
     GRANT_TERMINAL = ("consumed", "expired", "revoked")
+    GRANT_LIVE = ("validated", "active", "reserved")
     POLICY_PRINCIPALS = ("ahc-policy",)
-    REVOKERS = ("main", "kill-switch", "user")
     GRANT = {
-        ("proposed", "validated"): ("ahc-policy",),
-        ("validated", "active"): ("ahc-policy",),
-        ("active", "reserved"): ("ahc-merge", "ahc-core"),
-        ("reserved", "consumed"): ("ahc-core",),
-        ("reserved", "active"): ("ahc-core",),
-        ("reserved", "expired"): ("ahc-core",),
-        ("proposed", "expired"): ("ahc-core",), ("validated", "expired"): ("ahc-core",),
-        ("active", "expired"): ("ahc-core",),
-        ("proposed", "revoked"): REVOKERS, ("validated", "revoked"): REVOKERS, ("active", "revoked"): REVOKERS,
-        ("reserved", "revoked"): REVOKERS,
+        ("validated", "active"): ("ahc-core",),                       # G2
+        ("active", "reserved"): ("ahc-core",),                        # G3
+        ("reserved", "consumed"): ("ahc-core",),                      # G4
+        ("reserved", "active"): ("ahc-core",),                        # G5
+        ("reserved", "expired"): ("ahc-core",),                       # G6
+        ("validated", "expired"): ("ahc-core",), ("active", "expired"): ("ahc-core",),   # G7
+        ("validated", "revoked"): ("main", "ahc-core"),               # G8 (main) / G9 (kill switch, ahc-core)
+        ("active", "revoked"): ("main", "ahc-core"),
+        ("reserved", "revoked"): ("main", "ahc-core"),
     }
-    SCOPE_KEYS = ("repo", "pr", "head", "base")
 
-    def propose_grant(self, kind, source, principal, scope, policy_revision, *, uses=1, lifetime=B47_GRANT_SECONDS,
-                      event_id):
+    def issue_grant(self, kind, source, principal, scope, policy_revision, *, event_id, lifetime=B47_GRANT_SECONDS):
+        """G1: none -> validated, authority log first. The caller (ahc-policy in W7) has checked the W2 guard and
+        W5 inside the same transaction. One non-terminal grant per (kind, repo, pr, H, B), by unique index."""
         if principal not in self.POLICY_PRINCIPALS:
-            raise ContractError("grants are proposed by a policy principal, never by a model or an owner")
-        if not isinstance(source, str) or not source.startswith(("user:", "answer:", "queue:", "policy:")):
-            raise ContractError("a grant needs an authenticated source")
-        gid = "gr-" + _sha({"kind": kind, "scope": scope, "policy": policy_revision, "event": event_id})[:24]
+            raise ContractError("grants are issued by a policy principal, never by a model or an owner")
+        if not isinstance(source, str) or not source.startswith(("user:", "answer:", "queue:")):
+            raise ContractError("a grant needs the source of the user's decision")
+        if not isinstance(scope, dict) or any(scope.get(k) in (None, "") for k in ("repo", "pr", "head", "base")):
+            raise ContractError("a grant's scope names repo, pr, head and base")
+        repo, pr, head, base = str(scope["repo"]).lower(), int(scope["pr"]), scope["head"], scope["base"]
+        gid = "gr-" + _sha({"kind": kind, "repo": repo, "pr": pr, "head": head, "base": base,
+                            "policy": policy_revision, "event": event_id})[:24]
         with self.tx():
-            if self._row("grants", "id", gid):
-                return self._row("grants", "id", gid)
+            live = self.db.execute("SELECT id FROM grants WHERE kind=? AND repo=? AND pr=? AND head=? AND base=? AND "
+                                   "state IN ('validated', 'active', 'reserved')", (kind, repo, pr, head, base)).fetchone()
+            if live:
+                raise ContractError("a non-terminal grant %s already covers this scope" % live[0])
+            self._g0("grant", None, None, event_id, "ahc-core", {(None, "validated"): ("ahc-core",)}, None,
+                     "validated")
             now = self.now()
-            self.db.execute("INSERT INTO grants(id, kind, source, principal, scope, policy_revision, uses, expires_at, "
-                            "state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (gid, kind, source, principal, _canon(scope), policy_revision, int(uses), now + lifetime,
-                             "proposed", 1, now, now))
-            self._a0("grant", gid, None, "proposed", event_id, principal)
+            seq = self.authority.append({"event_id": event_id, "grant": gid, "from": None, "to": "validated",
+                                         "operation": None, "scope": {"repo": repo, "pr": pr, "head": head,
+                                                                      "base": base}, "actor": principal})
+            self.db.execute("INSERT INTO grants(id, kind, source, principal, repo, pr, head, base, policy_revision, "
+                            "uses, expires_at, state, authority_seq, version, created, updated) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (gid, kind, source, principal, repo, pr, head, base, policy_revision, 1, now + lifetime,
+                             "validated", seq, 1, now, now))
+            self._a0("grant", gid, None, "validated", event_id, "ahc-core", principal=principal)
             return self._row("grants", "id", gid)
 
-    def _grant_move(self, gid, to, expected_version, event_id, actor, authority_first, operation=None, **data):
+    def _grant_move(self, gid, to, expected_version, event_id, actor, operation=None, **data):
+        """Every grant move after G1 writes the authority log first (T4); a failed append aborts the transaction."""
         row = self._row("grants", "id", gid)
         if row is None:
             raise ContractError("no grant %s" % gid)
         frm = row["state"]
         self._g0("grant", row, expected_version, event_id, actor, self.GRANT, frm, to)
-        seq = row["authority_seq"]
-        if authority_first:
-            seq = self.authority.append({"event_id": event_id, "grant": gid, "from": frm, "to": to,
-                                         "operation": operation if operation is not None else row["operation"],
-                                         "scope": json.loads(row["scope"]), "actor": actor})
+        op = row["operation"] if operation is None else operation
+        seq = self.authority.append({"event_id": event_id, "grant": gid, "from": frm, "to": to,
+                                     "operation": op or None,
+                                     "scope": {k: row[k] for k in ("repo", "pr", "head", "base")}, "actor": actor})
         self.db.execute("UPDATE grants SET state=?, version=version+1, updated=?, authority_seq=?, operation=? "
-                        "WHERE id=?", (to, self.now(), seq,
-                                       operation if operation is not None else row["operation"], gid))
+                        "WHERE id=?", (to, self.now(), seq, op, gid))
         self._a0("grant", gid, frm, to, event_id, actor, **data)
         return self._row("grants", "id", gid)
 
-    def validate_grant(self, gid, *, expected_version, event_id, actor="ahc-policy"):
+    def activate_grant(self, gid, *, expected_version, event_id):
+        """G2: the G1 log line is durable (AuthorityLog.append fsyncs before returning)."""
         with self.tx():
-            row = self._row("grants", "id", gid)
-            scope = json.loads(row["scope"]) if row else {}
-            if not row or not all(scope.get(k) not in (None, "") for k in self.SCOPE_KEYS):
-                raise ContractError("a grant's scope names repo, pr, head and base")
-            if row["uses"] != 1 or row["expires_at"] <= self.now():
-                raise ContractError("a grant states one use and an expiry in the future")
-            return self._grant_move(gid, "validated", expected_version, event_id, actor, False)
+            return self._grant_move(gid, "active", expected_version, event_id, "ahc-core")
 
-    def activate_grant(self, gid, *, expected_version, event_id, actor="ahc-policy"):
-        with self.tx():
-            return self._grant_move(gid, "active", expected_version, event_id, actor, True)
-
-    def reserve_grant(self, gid, op_key, *, expected_version, event_id, actor="ahc-core"):
+    def reserve_grant(self, gid, op_key, *, expected_version, event_id, mirror_read_back):
+        """G3: the intent for exactly this scope exists and the off-host mirror comment was read back."""
         with self.tx():
             row = self._row("grants", "id", gid)
             op = self._row("operations", "key", op_key)
             if row is None or op is None:
                 raise ContractError("reserve needs an existing grant and operation")
+            if mirror_read_back is not True:
+                raise ContractError("reserve needs the mirror comment read back from the ticket")
             if row["expires_at"] <= self.now():
                 raise ContractError("grant is past expiry: no new reservation")
             if row["operation"]:
                 raise ContractError("grant is already reserved for %s" % row["operation"])
-            scope, params = json.loads(row["scope"]), json.loads(op["params"] or "{}")
-            if any(str(params.get(k, "")).lower() != str(scope.get(k, "")).lower() for k in self.SCOPE_KEYS):
+            if row["bound_key"] and row["bound_key"] != op_key:
+                raise ContractError("a released grant may be re-reserved only by the same operation key (G5)")
+            if op["state"] != "intent" or any(str(op[k]).lower() != str(row[k]).lower()
+                                              for k in ("repo", "pr", "head", "base")):
                 raise ContractError("operation is outside the grant's scope")
-            return self._grant_move(gid, "reserved", expected_version, event_id, actor, True, operation=op_key)
+            if op["policy_revision"] != row["policy_revision"]:
+                raise ContractError("operation is bound to another policy revision")
+            moved = self._grant_move(gid, "reserved", expected_version, event_id, "ahc-core", operation=op_key)
+            self.db.execute("UPDATE grants SET bound_key=? WHERE id=?", (op_key, gid))
+            self.db.execute("UPDATE operations SET grant_id=? WHERE key=?", (gid, op_key))
+            return self._row("grants", "id", gid) if moved else None
 
-    def revoke_grant(self, gid, *, expected_version, event_id, actor, source):
+    def revoke_grant(self, gid, *, expected_version, event_id, by, source):
+        """G8 (by="main", stamped) or G9 (by="kill-switch", actor ahc-core). An in-flight operation then settles
+        only by readback; its absent-proven goes to held (E11)."""
+        if by not in ("main", "kill-switch"):
+            raise ContractError("a grant is revoked by main or by the kill switch")
         if not isinstance(source, str) or not source:
             raise ContractError("a revocation records its source")
+        actor = "main" if by == "main" else "ahc-core"
         with self.tx():
-            return self._grant_move(gid, "revoked", expected_version, event_id, actor, True, source=source)
+            return self._grant_move(gid, "revoked", expected_version, event_id, actor, source=source, by=by)
 
     def expire_grants(self, event_prefix):
-        """Expiry sweep. A reserved grant past expiry has NO transition while its operation is unsettled (3.9a)."""
+        """G7 sweep. A reserved grant past expiry has NO transition while its operation is unsettled."""
         out = []
         with self.tx():
-            for gid, state, version in self.db.execute(
-                    "SELECT id, state, version FROM grants WHERE state IN ('proposed', 'validated', 'active') "
-                    "AND expires_at <= ?", (self.now(),)).fetchall():
-                self._grant_move(gid, "expired", version, "%s-%s" % (event_prefix, gid), "ahc-core",
-                                 state == "active")
+            for gid, version in self.db.execute(
+                    "SELECT id, version FROM grants WHERE state IN ('validated', 'active') AND expires_at <= ?",
+                    (self.now(),)).fetchall():
+                self._grant_move(gid, "expired", version, "%s-%s" % (event_prefix, gid), "ahc-core")
                 out.append(gid)
         return out
 
-    def _settle_grant_for(self, op, outcome, event_id):
-        """Grant side of an operation settling. outcome: confirmed | abandoned-unknown | released."""
+    def _settle_grant_for(self, op, event_id):
+        """The grant side of an operation reaching a terminal state: G4 when confirmed, or abandoned after a
+        dispatch whose outcome stayed unknown (held -> abandoned); G5 or G6 when abandoned before any dispatch or
+        after a definite refusal."""
         gid = op["grant_id"]
-        if not gid:
-            return None
-        row = self._row("grants", "id", gid)
+        row = self._row("grants", "id", gid) if gid else None
         if row is None or row["state"] != "reserved" or row["operation"] != op["key"]:
             return row
-        if outcome in ("confirmed", "abandoned-unknown"):
-            return self._grant_move(gid, "consumed", row["version"], event_id + "-grant", "ahc-core", True)
+        if op["state"] == "confirmed" or (op["state"] == "abandoned" and op["proof"] == "unknown-spent"):
+            return self._grant_move(gid, "consumed", row["version"], event_id + "-grant", "ahc-core")
         to = "expired" if row["expires_at"] <= self.now() else "active"
-        moved = self._grant_move(gid, to, row["version"], event_id + "-grant", "ahc-core", True, operation="")
-        return moved
+        return self._grant_move(gid, to, row["version"], event_id + "-grant", "ahc-core", operation="")
 
-    # -------------------------------------------------------------- Operation / Effect (2.5, 3.9a)
+    # -------------------------------------------------------------- Effect / Operation (spec ahc-m1-v2b E1-E12)
 
     OP_TERMINAL = ("confirmed", "abandoned")
     OP_UNSETTLED = ("intent", "dispatched", "absent-proven", "outcome-unknown", "held")
-    OP_KEY_FIELDS = {"merge": ("repo", "pr", "head", "base", "grant")}
-    OPERATORS = ("main", "user", "operator")
-    PROOFS_FROM_UNKNOWN = ("server-idempotency", "quiescence-ack", "fence-closed-quiet")
+    OPERATORS = ("main", "reconcile")
+    REFUSALS = ("non-fast-forward", "stale", "transient")
+    OBSERVATION_SECONDS = 120     # T2: an external fact in a guard is under 2 min old
+    PR_MARK_SECONDS = 600         # E12: the PR does not show merged within 10 min of the push
+    OP = {
+        ("intent", "dispatched"): ("ahc-merge",),                           # E2
+        ("dispatched", "confirmed"): ("ahc-merge",),                        # E3, E12
+        ("outcome-unknown", "confirmed"): ("ahc-merge",),                   # E3, E12
+        ("dispatched", "absent-proven"): ("ahc-merge",),                    # E4
+        ("outcome-unknown", "absent-proven"): ("ahc-merge",),               # E4
+        ("dispatched", "outcome-unknown"): ("ahc-core",),                   # E5
+        ("outcome-unknown", "held"): ("ahc-core",),                         # E6
+        ("absent-proven", "intent"): ("ahc-core",),                         # E7
+        ("absent-proven", "abandoned"): ("ahc-core",),                      # E8
+        ("intent", "abandoned"): ("ahc-core",),                             # E9
+        ("held", "confirmed"): OPERATORS, ("held", "abandoned"): OPERATORS,  # E10
+        ("absent-proven", "held"): ("ahc-core",),                           # E11
+    }
 
-    def operation_key(self, kind, params):
-        """Derived by core from the operation's identity fields, never supplied by a model."""
-        fields = self.OP_KEY_FIELDS.get(kind)
-        if not fields:
-            raise ContractError("unknown operation kind %r" % kind)
-        missing = [f for f in fields if params.get(f) in (None, "")]
-        if missing:
-            raise ContractError("operation is missing identity fields %s" % missing)
-        ident = {f: (str(params[f]).lower() if f == "repo" else params[f]) for f in fields}
-        return "op-%s-%s" % (kind, _sha(ident)[:32])
+    @staticmethod
+    def operation_key(repo, pr, head, base, policy_revision, generation):
+        """E1: derived by core from the operation's identity, never supplied by a model."""
+        if any(v in (None, "") for v in (repo, pr, head, base, policy_revision)) or type(generation) is not int \
+                or generation < 0:
+            raise ContractError("an operation key needs repo, pr, H, B, policy revision and generation")
+        ident = {"repo": str(repo).lower(), "pr": int(pr), "head": head, "base": base, "policy": policy_revision,
+                 "g": generation}
+        return "op-merge-%s" % _sha(ident)[:32]
 
-    def intend(self, kind, params, *, item=None, lease_ok, event_id):
-        """none -> intent. Same key and same parameters: the existing row (idempotent). Same key, other parameters:
-        OperationConflict. A tombstoned or expired key is refused."""
-        key = self.operation_key(kind, params)
-        params_sha = _sha(params)
+    def next_generation(self, repo, pr, head, base, policy_revision):
+        """g starts at 0 and rises only when the previous operation for the tuple was abandoned without ever being
+        sent. A tuple whose last operation was dispatched never gets a fresh key."""
+        rows = self.db.execute("SELECT generation, state, dispatch_count FROM operations WHERE repo=? AND pr=? AND "
+                               "head=? AND base=? AND policy_revision=? ORDER BY generation DESC LIMIT 1",
+                               (str(repo).lower(), int(pr), head, base, policy_revision)).fetchall()
+        if not rows:
+            return 0
+        g, state, sent = rows[0]
+        if state == "abandoned" and sent == 0:
+            return g + 1
+        if state == "abandoned":
+            raise ContractError("a dispatched operation never gets a fresh key at the same (H, B)")
+        return g
+
+    def intend(self, params, *, item=None, lease_ok, event_id):
+        """E1 none -> intent. params: repo, pr, head, base, policy_revision, method ("merge" only), default_branch.
+        Same key and same parameters returns the row; same key with other parameters raises OperationConflict."""
+        for k in ("repo", "pr", "head", "base", "policy_revision", "method", "default_branch"):
+            if params.get(k) in (None, ""):
+                raise ContractError("operation is missing %s" % k)
+        if params["method"] != "merge":
+            raise ContractError("only the merge-commit method is allowed")
         with self.tx():
+            g = self.next_generation(params["repo"], params["pr"], params["head"], params["base"],
+                                     params["policy_revision"])
+            key = self.operation_key(params["repo"], params["pr"], params["head"], params["base"],
+                                     params["policy_revision"], g)
+            params_sha = _sha(params)
             row = self._row("operations", "key", key)
             if row is not None:
                 if row["tombstone"]:
@@ -442,38 +500,17 @@ class Contracts:
                 return row
             if lease_ok is not True:
                 raise ContractError("intent needs a valid owning lease")
-            grant = params.get("grant")
-            if grant:
-                g = self._row("grants", "id", grant)
-                if g is None or g["state"] != "active" or g["operation"]:
-                    raise ContractError("the operation's grant cannot be reserved")
+            self._g0("operation", None, None, event_id, "ahc-core", {(None, "intent"): ("ahc-core",)}, None,
+                     "intent")
             now = self.now()
-            self.db.execute("INSERT INTO operations(key, kind, item, params, params_sha256, grant_id, state, "
-                            "version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                            (key, kind, item, _canon(params), params_sha, grant, "intent", 1, now, now))
-            self._a0("operation", key, None, "intent", event_id, "ahc-core")
-            if grant:
-                g = self._row("grants", "id", grant)
-                self.reserve_grant(grant, key, expected_version=g["version"], event_id=event_id + "-reserve")
+            self.db.execute("INSERT INTO operations(key, kind, item, repo, pr, head, base, policy_revision, "
+                            "generation, params, params_sha256, state, version, created, updated) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (key, "merge", item, str(params["repo"]).lower(), int(params["pr"]), params["head"],
+                             params["base"], params["policy_revision"], g, _canon(params), params_sha, "intent", 1,
+                             now, now))
+            self._a0("operation", key, None, "intent", event_id, "ahc-core", generation=g)
             return self._row("operations", "key", key)
-
-    OP = {
-        ("intent", "dispatched"): ("ahc-core", "ahc-merge"),
-        ("intent", "abandoned"): ("ahc-core",),
-        ("dispatched", "confirmed"): ("ahc-core", "ahc-merge"),
-        ("dispatched", "absent-proven"): ("ahc-core", "ahc-merge"),
-        ("dispatched", "outcome-unknown"): ("ahc-core", "ahc-merge"),
-        ("outcome-unknown", "confirmed"): ("ahc-core",),
-        ("outcome-unknown", "absent-proven"): ("ahc-core",),
-        ("outcome-unknown", "held"): ("ahc-core",),
-        ("outcome-unknown", "outcome-unknown"): ("ahc-core",),   # one more readback, no conclusion
-        ("absent-proven", "intent"): ("ahc-core",),
-        ("absent-proven", "held"): ("ahc-core",),
-        ("absent-proven", "abandoned"): ("ahc-core",),
-        ("held", "confirmed"): OPERATORS + ("reconcile",),
-        ("held", "absent-proven"): OPERATORS + ("reconcile",),
-        ("held", "abandoned"): OPERATORS + ("reconcile",),
-    }
 
     def _op_move(self, key, to, expected_version, event_id, actor, sets=None, **data):
         row = self._row("operations", "key", key)
@@ -487,69 +524,87 @@ class Contracts:
         assignments = ", ".join("%s=?" % k for k in sets) + ", version=version+1"
         self.db.execute("UPDATE operations SET %s WHERE key=?" % assignments, list(sets.values()) + [key])
         self._a0("operation", key, frm, to, event_id, actor, **data)
-        return row, self._row("operations", "key", key)
+        new = self._row("operations", "key", key)
+        if to in self.OP_TERMINAL:
+            self._settle_grant_for(new, event_id)
+        return new
 
-    def _grant_ok_for_dispatch(self, row):
-        if not row["grant_id"]:
-            return True
-        g = self._row("grants", "id", row["grant_id"])
-        return g is not None and g["state"] == "reserved" and g["operation"] == row["key"]
+    def _fresh(self, obs):
+        if not isinstance(obs, dict) or not isinstance(obs.get("at"), (int, float)):
+            raise ContractError("the guard needs an observation row with its time (T2)")
+        if self.now() - float(obs["at"]) >= self.OBSERVATION_SECONDS or float(obs["at"]) > self.now():
+            raise ContractError("observation is stale (over 2 min) or from the future (T2)")
 
-    def dispatch(self, key, *, expected_version, event_id, lease_ok, heartbeat_ok=True, request_id=None,
-                 actor="ahc-core"):
-        """intent -> dispatched. The count rises BEFORE the request leaves; the caller sends only after this commits."""
+    def dispatch(self, key, obs, *, expected_version, event_id, lease_ok, mirror_read_back, request_id=None):
+        """E2 intent -> dispatched. Every guard is re-read here; the count rises BEFORE the push is sent, and the
+        caller sends only after this commits (T5)."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None:
                 raise ContractError("no operation %s" % key)
             if row["dispatch_count"] >= B10_DISPATCHES:
                 raise ContractError("dispatch budget B10 is spent for %s" % key)
-            if lease_ok is not True or heartbeat_ok is not True:
-                raise ContractError("dispatch needs a re-read valid lease and a fresh core heartbeat")
-            if not self._grant_ok_for_dispatch(row):
+            if lease_ok is not True:
+                raise ContractError("dispatch needs a re-read valid lease")
+            g = self._row("grants", "id", row["grant_id"]) if row["grant_id"] else None
+            if g is None or g["state"] != "reserved" or g["operation"] != key:
                 raise ContractError("dispatch needs the grant reserved for this operation")
+            if mirror_read_back is not True:
+                raise ContractError("dispatch needs the mirror comment read back")
+            self._fresh(obs)
+            problems = []
+            if obs.get("kill_switch") is not False:
+                problems.append("kill switch on or unread")
+            if obs.get("pr_state") != "OPEN" or obs.get("pr_head") != row["head"]:
+                problems.append("PR not open at H")
+            if obs.get("branch") != row["base"]:
+                problems.append("default branch not at B")
+            if obs.get("checks_green") is not True:
+                problems.append("policy checks not green on H")
+            if not obs.get("built_sha") or list(obs.get("built_parents") or []) != [row["base"], row["head"]] \
+                    or obs.get("conflict") is not False:
+                problems.append("M is not a clean merge(B, H)")
+            if problems:
+                raise ContractError("E2 guard false: " + "; ".join(problems))
             now = self.now()
-            return self._op_move(key, "dispatched", expected_version, event_id, actor, {
+            return self._op_move(key, "dispatched", expected_version, event_id, "ahc-merge", {
                 "dispatch_count": row["dispatch_count"] + 1, "dispatched_at": now, "request_id": request_id,
-                "probe_at": now + B55_REQUEST_SECONDS})[1]
+                "built_sha": obs["built_sha"], "probe_at": now + B55_REQUEST_SECONDS}, observation=obs)
 
-    def confirm(self, key, evidence, *, expected_version, event_id, actor="ahc-core"):
-        """-> confirmed: the endpoint readback shows the effect bound to this key. The grant is consumed."""
-        if not isinstance(evidence, dict) or not evidence:
-            raise ContractError("confirmed needs the endpoint readback evidence")
-        with self.tx():
-            row = self._row("operations", "key", key)
-            if row is not None and row["state"] == "held" and actor not in self.OPERATORS + ("reconcile",):
-                raise ContractError("a held operation is settled only by an operator or the reconcile read")
-            _, new = self._op_move(key, "confirmed", expected_version, event_id, actor,
-                                   {"evidence": _canon(evidence)})
-            self._settle_grant_for(new, "confirmed", event_id)
-            return new
-
-    def absent(self, key, proof, evidence, *, expected_version, event_id, request_closed=False, actor="ahc-core"):
-        """-> absent-proven, only with the 2.5 proof: from dispatched a typed refusal; from outcome-unknown a
-        server idempotency answer, a quiescence acknowledgement, or the adapter's fence with the request known
-        closed and B54 elapsed. "Not there now" is never proof."""
+    def confirm(self, key, obs, *, expected_version, event_id, actor="ahc-merge"):
+        """E3 (branch == M, M's parents (B, H), PR merged) or E12 (the same, but the PR is not shown merged 10 min
+        after the push: still confirmed, flagged so ahc comments on the PR). E10 by an operator from held."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None:
                 raise ContractError("no operation %s" % key)
-            frm = row["state"]
-            if frm == "dispatched" and proof != "typed-refusal":
-                raise ContractError("dispatched -> absent-proven needs a typed refusal from the endpoint")
-            if frm == "outcome-unknown":
-                if proof not in self.PROOFS_FROM_UNKNOWN:
-                    raise ContractError("outcome-unknown -> absent-proven needs the 2.5 proof, got %r" % proof)
-                if proof == "fence-closed-quiet" and not (
-                        request_closed and self.now() - float(row["dispatched_at"] or 0) >= B54_LATE_SECONDS):
-                    raise ContractError("fence proof needs the request known closed and B54 elapsed since dispatch")
-            if not isinstance(evidence, dict) or not evidence:
-                raise ContractError("absent-proven records its evidence")
-            return self._op_move(key, "absent-proven", expected_version, event_id, actor,
-                                 {"proof": proof, "evidence": _canon(evidence)})[1]
+            if row["state"] == "held":
+                if actor not in self.OPERATORS or not isinstance(obs, dict) or not obs:
+                    raise ContractError("a held operation is settled only by main or the reconcile, with evidence")
+                return self._op_move(key, "confirmed", expected_version, event_id, actor,
+                                     {"evidence": _canon(obs)})
+            self._fresh(obs)
+            if obs.get("branch") != row["built_sha"] or list(obs.get("parents") or []) != [row["base"], row["head"]]:
+                raise ContractError("readback does not show M on the default branch with parents (B, H)")
+            unmarked = obs.get("pr_merged") is not True
+            if unmarked and self.now() - float(row["dispatched_at"] or 0) < self.PR_MARK_SECONDS:
+                raise ContractError("the PR is not shown merged yet; wait up to 10 min before E12")
+            return self._op_move(key, "confirmed", expected_version, event_id, actor,
+                                 {"evidence": _canon(obs), "pr_unmarked": 1 if unmarked else 0})
 
-    def unknown(self, key, *, expected_version, event_id, restart=False, actor="ahc-core"):
-        """dispatched -> outcome-unknown when B55 passed or a restart found no conclusive readback."""
+    def refused(self, key, refusal, evidence, *, expected_version, event_id, request_closed):
+        """E4 -> absent-proven: the push was rejected as non-fast-forward or stale, or a transient transport
+        refusal, and the request is known closed. "Not there now" is never proof."""
+        if refusal not in self.REFUSALS:
+            raise ContractError("unknown refusal %r" % refusal)
+        if request_closed is not True or not isinstance(evidence, dict) or not evidence:
+            raise ContractError("absent-proven needs the typed refusal evidence and the request known closed")
+        with self.tx():
+            return self._op_move(key, "absent-proven", expected_version, event_id, "ahc-merge",
+                                 {"refusal": refusal, "proof": "typed-refusal", "evidence": _canon(evidence)})
+
+    def unknown(self, key, *, expected_version, event_id, restart=False):
+        """E5 dispatched -> outcome-unknown when B55 passed or a restart found no conclusive readback."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None:
@@ -557,56 +612,72 @@ class Contracts:
             if not restart and self.now() < float(row["probe_at"] or 0):
                 raise ContractError("the request has not timed out yet (B55)")
             now = self.now()
-            return self._op_move(key, "outcome-unknown", expected_version, event_id, actor, {
-                "readbacks": 0, "probe_at": now + B37_PROBE_SECONDS, "escalate_at": now + B42_INCIDENT_SECONDS})[1]
+            return self._op_move(key, "outcome-unknown", expected_version, event_id, "ahc-core", {
+                "readbacks": 0, "probe_at": now + B37_PROBE_SECONDS, "escalate_at": now + B42_INCIDENT_SECONDS})
 
     def readback_missed(self, key, *, expected_version, event_id):
-        """One inconclusive readback of an unknown outcome. At the B37 count: held (Q), one incident, the grant
-        stays reserved and the record cannot expire."""
+        """One inconclusive readback (a counter, not a transition). At 20: E6 held, one incident, the grant stays
+        reserved and the record cannot expire."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None or row["state"] != "outcome-unknown":
                 raise ContractError("readback applies to an outcome-unknown operation")
+            if row["version"] != expected_version:
+                raise VersionConflict("operation changed since it was read")
             count = row["readbacks"] + 1
             if count >= B37_PROBES:
                 return self._op_move(key, "held", expected_version, event_id, "ahc-core",
-                                     {"readbacks": count, "incident": 1, "probe_at": None})[1]
-            return self._op_move(key, "outcome-unknown", expected_version, event_id, "ahc-core",
-                                 {"readbacks": count, "probe_at": self.now() + B37_PROBE_SECONDS})[1]
+                                     {"readbacks": count, "incident": 1, "probe_at": None})
+            self.db.execute("UPDATE operations SET readbacks=?, probe_at=?, version=version+1, updated=? WHERE key=?",
+                            (count, self.now() + B37_PROBE_SECONDS, self.now(), key))
+            return self._row("operations", "key", key)
 
-    def retry(self, key, params, *, expected_version, event_id, lease_ok):
-        """absent-proven -> intent (count below B10, same parameters, lease valid, grant not revoked), else -> held."""
+    def after_refusal(self, key, params, *, expected_version, event_id, lease_ok):
+        """From absent-proven, exactly one of: E11 held (grant revoked, or the third dispatch used); E8 abandoned
+        (non-fast-forward or stale: the base moved, the grant is released by G5/G6); E7 intent (a transient
+        transport refusal, same parameters, lease valid)."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None or row["state"] != "absent-proven":
-                raise ContractError("retry applies to an absent-proven operation")
+                raise ContractError("this step applies to an absent-proven operation")
+            grant = self._row("grants", "id", row["grant_id"]) if row["grant_id"] else None
+            if (grant is not None and grant["state"] == "revoked") or row["dispatch_count"] >= B10_DISPATCHES:
+                return self._op_move(key, "held", expected_version, event_id, "ahc-core", {"incident": 1})
+            if row["refusal"] in ("non-fast-forward", "stale"):
+                return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
+                                     {"proof": "definite-refusal"})
             if _sha(params) != row["params_sha256"]:
                 raise OperationConflict("a retry must carry the same parameters")
-            grant = self._row("grants", "id", row["grant_id"]) if row["grant_id"] else None
-            if row["dispatch_count"] >= B10_DISPATCHES or (grant is not None and grant["state"] == "revoked"):
-                return self._op_move(key, "held", expected_version, event_id, "ahc-core", {"incident": 1})[1]
             if lease_ok is not True:
                 raise ContractError("retry needs a valid lease")
-            return self._op_move(key, "intent", expected_version, event_id, "ahc-core")[1]
+            return self._op_move(key, "intent", expected_version, event_id, "ahc-core")
 
-    def abandon(self, key, *, expected_version, event_id, actor="ahc-core", evidence=None):
-        """intent or absent-proven -> abandoned (owning item cancelled or superseded): the grant goes back to
-        active, or expired past B47. held -> abandoned only by an operator with evidence; the outcome is still
-        unknown, so the grant is spent (uncertain use is spent)."""
+    def abandon_unsent(self, key, *, expected_version, event_id, reason):
+        """E9 intent -> abandoned: the owning item left merge-ready before dispatch. The grant is released (G5/G6)
+        and the next W7 for the tuple uses generation g+1."""
         with self.tx():
             row = self._row("operations", "key", key)
             if row is None:
                 raise ContractError("no operation %s" % key)
-            if row["state"] == "held" and not (isinstance(evidence, dict) and evidence):
-                raise ContractError("settling a held operation needs evidence")
-            old, new = self._op_move(key, "abandoned", expected_version, event_id, actor,
-                                     {"evidence": _canon(evidence) if evidence else None})
-            self._settle_grant_for(new, "abandoned-unknown" if old["state"] == "held" else "released", event_id)
-            return new
+            if row["dispatch_count"] != 0:
+                raise ContractError("an operation that was ever sent cannot be abandoned as unsent")
+            return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
+                                 {"proof": "never-sent"}, reason=reason)
+
+    def settle_held(self, key, outcome, evidence, *, expected_version, event_id, actor):
+        """E10 held -> abandoned by main or the reconcile, with evidence. The outcome stayed unknown, so the grant
+        is spent (G4); confirmed goes through confirm()."""
+        if outcome != "abandoned":
+            raise ContractError("use confirm() for a held operation found merged")
+        if actor not in self.OPERATORS or not isinstance(evidence, dict) or not evidence:
+            raise ContractError("a held operation is settled only by main or the reconcile, with evidence")
+        with self.tx():
+            return self._op_move(key, "abandoned", expected_version, event_id, actor,
+                                 {"proof": "unknown-spent", "evidence": _canon(evidence)})
 
     def retain(self):
-        """B48: a terminal operation older than B48 after settlement becomes a tombstone (key, outcome, settled_at
-        kept; parameters dropped). A non-terminal operation never expires."""
+        """B48: a terminal operation older than B48 after settlement becomes a tombstone (key, outcome and
+        settled_at kept, parameters dropped). A non-terminal operation never expires."""
         cutoff = self.now() - B48_RETENTION_SECONDS
         with self.tx():
             cur = self.db.execute("UPDATE operations SET tombstone=1, params=NULL, evidence=NULL WHERE tombstone=0 "

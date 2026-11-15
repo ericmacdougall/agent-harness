@@ -214,15 +214,28 @@ and is recorded in `transitions` in the same transaction.
   Anything else is `unverified-producer` and authorizes nothing. A `spec` row passes only from `required`, on its
   attach record. A new head supersedes every open row, and a running row goes through `cancelling` first so its
   unit is stopped. A receipt that arrives later for a superseded row authorizes nothing. There is no waiver path.
-- **Grant** rows (3.9a) are proposed only by the `ahc-policy` principal. Each has a scope (repo, pr, head, base), one
-  use and a 24 h expiry. Every move after validation is written first to an append-only, fsynced authority log.
-  The log is **local, not off-host**, a stated deviation from 3.9. If the write fails, nothing changes. A grant
-  reserved past its expiry has no transition until its operation settles.
-- **Operation** rows (2.5, 3.9a) carry a key derived by core from the operation's identity fields. The same key
-  with other parameters is an `OperationConflict`, never a new row. A dispatch counts before the request leaves,
-  and at most 3 are allowed (B10). Absence needs the 2.5 proof, never "not there now". Twenty inconclusive
-  readbacks give `held`, with an incident, and only an operator or the reconcile read settles a held row. A
-  settled row becomes a tombstone 30 days after settlement, and its key is refused for good.
+- **Grant** rows (spec ahc-m1 G1-G9) are issued only by the `ahc-policy` principal, straight to `validated`.
+  Each has a scope (repo, pr, head, base), one use and a 24 h expiry, and a partial unique index allows at most
+  one non-terminal grant per (kind, repo, pr, head, base). Every move is written first to an append-only, fsynced
+  authority log. The log is **local, not off-host**, a stated deviation from 3.9. If the write fails, nothing
+  changes. A grant is reserved only for an intent with exactly its scope and policy revision, and only after the
+  mirror comment was read back. It is consumed when its operation is confirmed, or abandoned after an unknown
+  dispatch. It is released (back to `active`, or `expired` past expiry) when the operation was abandoned unsent or
+  after a definite refusal, and then only the same operation key may reserve it again. Main revokes it (G8); the
+  kill switch revokes it as `ahc-core` (G9). A grant reserved past its expiry has no transition until its operation
+  settles.
+- **Operation** rows (E1-E12) are merge-commit only. The key is derived by core from (repo, pr, H, B, policy
+  revision, g). The generation g rises only after the previous operation for that tuple was abandoned without ever
+  being sent; a tuple whose operation was sent never gets a fresh key. The same key with other parameters is an
+  `OperationConflict`, never a new row. Dispatch re-reads every guard on an observation under 2 min old (PR open at
+  H, default branch at B, checks green, kill switch read off, M built with parents (B, H) and no conflict), the
+  lease and the mirror, and counts before the push leaves; at most 3 are allowed (B10). Confirmation needs the
+  branch at M with parents (B, H). If the PR is not shown merged 10 min after the push it is still confirmed and
+  flagged (E12). Absence needs a typed refusal (non-fast-forward, stale or transient) and a closed request, never
+  "not there now". After it: revoked grant or third dispatch gives `held` (E11), non-fast-forward or stale gives
+  `abandoned` (E8), and a transient refusal retries the same key (E7). Twenty inconclusive readbacks give `held`,
+  with an incident, and only main or the reconcile read settles a held row. A settled row becomes a tombstone 30
+  days after settlement, and its key is refused for good.
 
 The runner does not use these rows yet, and automatic merging is off.
 

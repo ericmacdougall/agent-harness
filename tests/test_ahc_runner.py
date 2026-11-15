@@ -2643,7 +2643,8 @@ class SchemaTests(Base):
             if statement.startswith("CREATE TABLE IF NOT EXISTS items"):
                 statement = statement.replace(", cause TEXT)", ")")
             if any(statement.startswith("CREATE TABLE IF NOT EXISTS " + n) for n in
-                   ("reviews", "grants", "operations", "transitions")):
+                   ("reviews", "grants", "operations", "transitions")) or \
+                    statement.startswith("CREATE UNIQUE INDEX IF NOT EXISTS grants_"):
                 continue
             db.execute(statement)
         db.execute("INSERT INTO meta(k, v) VALUES ('schema_version', '2')")
