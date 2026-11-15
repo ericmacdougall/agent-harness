@@ -350,7 +350,7 @@ class RetryTests(Base):
         now = 1000.0
         self.assertEqual(runner.retry_policy("quota", 1, now, retry_at=now + 7200), ("deferred", now + 7200))
         self.assertEqual(runner.retry_policy("quota", 3, now + 86400, first_at=now)[0], "review-error")  # T8
-        self.assertEqual(runner.retry_policy("auth", 1, now), ("needs-attention", None))
+        self.assertEqual(runner.retry_policy("auth", 1, now), ("deferred", now + 1800))  # T15
         self.assertEqual(runner.retry_policy("block", 1, now), ("block-delivered", None))
         self.assertEqual(runner.retry_policy("invalid-output", 1, now)[0], "deferred")
         self.assertEqual(runner.retry_policy("invalid-output", 2, now), ("review-invalid", None))  # T14
@@ -380,7 +380,7 @@ class RetryTests(Base):
     def test_auth_opens_circuit_and_never_retries_on_a_timer(self):
         iid, deps = self.submit(), ErrDeps("PROVIDER_AUTH")
         self.run_all(deps)
-        self.assertEqual(self.state(iid), "needs-attention")
+        self.assertEqual(self.state(iid), "deferred", "T15: auth defers on the circuit")
         other = self.packet.parent / "p2.md"
         other.write_text(GOOD_PACKET)
         req = {"repo": "ericmacdougall/agent-harness", "pr": 8, "head": HEAD, "base": BASE, "packet": str(other),
@@ -391,6 +391,24 @@ class RetryTests(Base):
             self.run_all(deps)
         self.assertEqual(len(deps.review_calls), 1, "a review ran while the auth circuit was open")
         self.assertEqual(self.state(second), "queued")
+
+    def test_auth_deferral_never_relaunches_and_ends_at_the_24h_deadline(self):
+        """T15 + T8: an auth block defers on the open circuit, consumes no class, never relaunches while the circuit
+        is open, and ends in review-error 24 h after the head's first deferral."""
+        iid, deps = self.submit(), ErrDeps("PROVIDER_AUTH")
+        start = deps.now
+        self.run_all(deps)
+        while deps.now < start + 25 * 3600:
+            deps.now += 1800
+            self.run_all(deps)
+        self.assertEqual(len(deps.review_calls), 1, "relaunched while the auth circuit was open")
+        self.assertEqual(self.state(iid), "review-error")
+        ledger = runner.Ledger(self.paths)
+        try:
+            budget = ledger.head_budget("%s|7" % REPO, HEAD)
+        finally:
+            ledger.close()
+        self.assertEqual((budget["transient"], budget["invalid"], budget["freshness"]), (0, 0, 0))
 
     def test_invalid_output_gets_one_declared_repeat_then_owner(self):
         iid, deps = self.submit(), ErrDeps("PROVIDER_INVALID_OUTPUT")
@@ -488,7 +506,7 @@ class AtomicNoticeTests(Base):
         self.assertEqual(len(self.rows("SELECT * FROM notices WHERE item=?", iid)), 1)
 
     def test_terminal_unsuccessful_gets_ticket_and_alert(self):
-        iid, deps = self.submit(), ErrDeps("PROVIDER_AUTH")
+        iid, deps = self.submit(), ErrDeps("EXEC_MISSING")   # an environment defect: needs-attention
         self.run_all(deps)
         self.assertEqual(self.state(iid), "needs-attention")
         alerts = [a for a in deps.ah_calls if a[:3] == ["ah", "alert", "raise"]]
@@ -1659,6 +1677,50 @@ class AckInactivityTests(Base):
                                     disposition="false positive, main accepts the risk"), 1)
         self.at(deps, t0 + 60 * 3600)
         self.assertEqual(len(self.acked_escalations(deps)), 1, "a main disposition stops the repair deadline")
+
+
+class EffectCrashTests(Base):
+    """v6f: a crash during a side effect marks only that effect row outcome-unknown; the item keeps its state, and
+    the effect is read back (for a ticket: re-sent under the same idempotency key) before any redispatch."""
+
+    class Crash(BaseException):
+        pass
+
+    def test_crash_mid_ticket_comment_leaves_the_item_state_and_reads_back(self):
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
+        real = deps.ah
+        crashed = []
+
+        def ah(argv, timeout):
+            if argv[:3] == ["ah", "ticket", "comment"] and not crashed:
+                crashed.append(argv[argv.index("--key") + 1])
+                deps.ah_calls.append(argv)
+                raise self.Crash()   # the process dies between intent and result
+            return real(argv, timeout)
+        deps.ah = ah
+        with self.assertRaises(self.Crash):
+            self.run_all(deps)
+        self.assertEqual(self.state(iid), "block-delivered")
+        ledger = runner.Ledger(self.paths)
+        try:
+            row = ledger.db.execute("SELECT status FROM effects WHERE kind='ticket' AND item=?", (iid,)).fetchone()
+        finally:
+            ledger.close()
+        self.assertEqual(row["status"], "intent")
+        deps.now += 60
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "block-delivered", "the effect's crash never moves the item")
+        ledger = runner.Ledger(self.paths)
+        try:
+            events = [r["event"] for r in ledger.db.execute("SELECT event FROM events WHERE item=?", (iid,))]
+            status = ledger.db.execute("SELECT status FROM effects WHERE kind='ticket' AND item=?",
+                                       (iid,)).fetchone()["status"]
+        finally:
+            ledger.close()
+        self.assertIn("effect-outcome-unknown", events)
+        self.assertEqual(status, "done")
+        keys = [a[a.index("--key") + 1] for a in deps.ah_calls if a[:3] == ["ah", "ticket", "comment"]]
+        self.assertEqual(keys, [crashed[0], crashed[0]], "re-sent once, under the same idempotency key")
 
 
 class PacketRetentionTests(Base):

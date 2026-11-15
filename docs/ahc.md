@@ -50,7 +50,13 @@ shares it; only a new head starts a fresh one. Per head:
 - one declared invalid-output repeat. A second invalid output goes to `review-invalid`;
 - one ticket-freshness re-run (D24). A second STALE goes to `needs-attention`.
 
-Each class is first-come and used at most once. Quota, auth and pool contention consume nothing.
+Each class is first-come and used at most once. Quota, auth and pool contention consume nothing. An auth block
+opens the provider circuit and defers the item. The item re-checks the circuit every 30 min and never launches
+while the circuit is open.
+
+A crash during a side effect (ticket comment, alert, inbox write, note) marks only that effect row
+`outcome-unknown`. The item keeps its state. The effect is read back before it is sent again: a ticket, alert
+or clear is re-sent under the same idempotency key.
 
 The head's 24 h deferred deadline starts at its first deferral. Later deferrals never restart it, so a flapping
 quota ends in `review-error` 24 h after the first one.

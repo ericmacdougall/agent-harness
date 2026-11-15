@@ -169,7 +169,9 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
                         note (T13), then needs-attention (T16)
     quota               durable retry_at from the reset time (default 1 h), no probing, no class consumed (T15);
                         review-error once 24 h have passed since the head's first deferral (T8)
-    auth                opens the provider circuit; never retried on a timer
+    auth                opens the provider circuit and defers (T15): the item re-checks the circuit every 30 min
+                        and never launches while it is open (no timed retry, no class consumed); T8 ends it in
+                        review-error 24 h after the head's first deferral
     contention          pool busy (REVIEW_NOT_STARTED on a held pool): wait; waiting is not an attempt
     unknown-outcome     launch or supervision outcome unknown: outcome-unknown until usage_guard reconciliation
     environment         local reviewer environment defect (EXEC_*, SNAPSHOT_*): needs-attention
@@ -199,7 +201,7 @@ def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, con
             return "review-error", None
         return "deferred", max(now + 60, retry_at or now + 3600)
     if failure_class == "auth":
-        return "needs-attention", None
+        return "deferred", now + 1800
     if failure_class == "contention":
         return "deferred", now + 120
     if failure_class in ("advisory", "inconsistent"):
@@ -1139,16 +1141,24 @@ class Worker:
     def dispatch_effects(self):
         now = self.now()
         rows = self.led.db.execute(
-            "SELECT * FROM effects WHERE kind != 'review' AND status IN ('pending', 'intent') AND next_action_at <= ?"
-            " ORDER BY next_action_at, key", (now,)).fetchall()
+            "SELECT * FROM effects WHERE kind != 'review' AND status IN ('pending', 'intent', 'outcome-unknown') AND "
+            "next_action_at <= ? ORDER BY next_action_at, key", (now,)).fetchall()
         for row in rows:
             payload = json.loads(row["payload"])
             if row["kind"] == "mail":
                 self.check_mail(row, payload, now)
                 continue
+            if row["status"] == "intent":
+                # v6f: a dispatcher stopped between intent and result. Only this effect row becomes
+                # outcome-unknown; its item keeps its state. It is read back before any redispatch (a ticket,
+                # alert or clear is re-sent under the same idempotency key, which ah applies once).
+                with self.led.tx():
+                    self.led.db.execute("UPDATE effects SET status='outcome-unknown', updated=? WHERE key=?",
+                                        (now, row["key"]))
+                    self.led.event(row["item"], "effect-outcome-unknown", now, effect=row["key"], kind=row["kind"])
             if row["kind"] == "alert" and payload.get("severity") == "critical":
                 self._note_raise(row["key"], now)
-            if row["status"] == "intent" and self.readback(row["kind"], payload):
+            if row["status"] in ("intent", "outcome-unknown") and self.readback(row["kind"], payload):
                 self._effect_done(row["key"], "readback")
                 continue
             with self.led.tx():
