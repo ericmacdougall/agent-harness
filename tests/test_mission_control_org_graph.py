@@ -851,6 +851,39 @@ class EscalationReadIsBounded(unittest.TestCase):
             self.assertTrue(problems, "the refused file is a failed read, so the graph read is partial")
 
 
+class PayloadShapes(unittest.TestCase):
+    """PR 260 v2 F4 shape rule applied to 243: an escalation file or a ticket payload of the wrong shape is a failed
+    read, never an exception that aborts the org-graph tick."""
+
+    def test_escalation_files_of_the_wrong_shape(self):
+        for name, value in {"dispatches a number": {"escalations": [{"to": "R1"}], "dispatches": 5},
+                            "escalations a string": {"escalations": "R1", "dispatches": [{"agent_id": "a1"}]},
+                            "escalations a number": {"escalations": 3}}.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "task.json").write_text(json.dumps(value))
+                problems = []
+                self.assertEqual(og.escalations(Path(tmp), now=time.time(), problems=problems), {})
+                self.assertTrue(problems, name)
+
+    def test_ticket_payloads_of_the_wrong_shape(self):
+        bad = {"title": "T", "status": "open", "links": {"blocks": 5, "blockedBy": "goodqa#2"}, "parent": {"number": "x"}}
+        fx = Fixture()
+        graph, hub, _ = collector(fx, [row("o1", ticket="goodqa#1")], Runner(tickets={"goodqa#1": bad}))
+        graph.run(time.time())   # must not raise
+        stored = graph.tickets.get("goodqa#1")
+        self.assertIsNotNone(stored)
+        self.assertEqual((stored["blocks"], stored["blocked_by"], stored["parent"]), ([], [], ""))
+
+    def test_a_ticket_payload_that_breaks_a_walk_is_a_failed_read(self):
+        class Odd(Runner):
+            def run(self, kind, *args, timeout=20.0, limit=0):
+                return 0, json.dumps({"issue": {"links": {"blocks": [{"number": 1, "projectSlug": ["x"]}]}}})
+        fx = Fixture()
+        graph, hub, _ = collector(fx, [row("o1", ticket="goodqa#1")], Odd())
+        graph.run(time.time())   # must not raise
+        self.assertNotIn("goodqa#1x", json.dumps(graph.tickets))
+
+
 class NodeTruthFromOwnerRows(unittest.TestCase):
     """PR 243 on main: an agent node whose ah owners row is the last good copy (a failed ah read) says so."""
 

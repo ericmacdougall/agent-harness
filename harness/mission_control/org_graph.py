@@ -307,12 +307,17 @@ def escalations(root: Path | None, *, max_files: int = 200, max_age_s: float = 8
         if not isinstance(state, dict):
             problems.append("an escalation file: not an object")
             continue
-        steps = [e for e in state.get("escalations") or [] if isinstance(e, dict)]
+        # PR 260 v2 F4 shape rule: every structure is checked before it is walked; a wrong shape is a failed read
+        steps, dispatches = state.get("escalations", []), state.get("dispatches", [])
+        if not isinstance(steps, list) or not isinstance(dispatches, list):
+            problems.append("an escalation file: escalations or dispatches is not a list")
+            continue
+        steps = [e for e in steps if isinstance(e, dict)]
         if not steps:
             continue
         last = steps[-1]
         level = len(steps)
-        for dispatch in state.get("dispatches") or []:
+        for dispatch in dispatches:
             agent = dispatch.get("agent_id") if isinstance(dispatch, dict) else None
             if isinstance(agent, str) and AGENT_RE.match(agent):
                 if level > out.get(agent, {}).get("level", 0):
@@ -603,7 +608,9 @@ class OrgGraph(col.Collector):
 
         def refs(values):
             found = []
-            for value in values or []:
+            if not isinstance(values, list):   # PR 260 v2 F4 shape rule: a wrong shape links nothing
+                return found
+            for value in values:
                 number = value.get("number") if isinstance(value, dict) else value
                 slug = (value.get("projectSlug") if isinstance(value, dict) else None) or project
                 if isinstance(number, int) and not isinstance(number, bool):
@@ -637,8 +644,8 @@ class OrgGraph(col.Collector):
         if due:
             try:
                 read = self._ticket(due[0], now)
-            except (ValueError, OSError, RecursionError, Refused):
-                read = False
+            except (ValueError, OSError, RecursionError, Refused, TypeError, AttributeError):
+                read = False   # any payload shape the checks above missed is a failed read, never a crashed tick
             if not read:
                 # Every failure path (nonzero exit, no issue, bad JSON, refusal) counts as an attempt: retry after
                 # half the TTL, so one unavailable ticket never starves the others (PR 243 review F3). The last good
