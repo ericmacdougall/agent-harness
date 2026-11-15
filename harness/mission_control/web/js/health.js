@@ -17,10 +17,10 @@ export function mountHealth() {
       const { row, name, status, time } = part;
       row.className = `health-item ${source.state}`;
       name.textContent = source.name;
-      status.textContent = `${source.state} · `;
+      status.textContent = `${source.label} · `;
       time.textContent = age(source.checked, state.now);
       time.dateTime = source.checked;
-      row.setAttribute('aria-label', `${source.name}: ${source.state}. Last checked ${age(source.checked, state.now)}. ${source.note}`);
+      row.setAttribute('aria-label', `${source.name}: ${source.label}. Last checked ${age(source.checked, state.now)}. ${source.note}`);
     });
     const ids = new Set(state.sources.map(source => source.id));
     for (const [id, part] of parts) if (!ids.has(id)) { part.row.remove(); parts.delete(id); }

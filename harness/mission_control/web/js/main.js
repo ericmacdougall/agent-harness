@@ -1,7 +1,7 @@
 import { getState, subscribe, tick, select, setTab, setResponder, toggleFilter, toggleMotion, cycleTheme, KINDS, TABS } from './store.js';
 import { el, button, progress, checklist, field, eta, age, stateClass } from './ui.js';
 import { mountInitiatives } from './initiatives.js';
-import { liveFields } from './adapt.js';
+import { liveFields, updatedText, ownerLineText, hubCounts, sceneText } from './adapt.js';
 import { mountActivity } from './activity.js';
 import { mountOwners } from './owners.js';
 import { mountChat } from './chat.js';
@@ -84,7 +84,7 @@ function shell(state, reason) {
   motion.disabled = state.reducedMotion;
   motion.title = state.reducedMotion ? 'Your system reduced motion setting takes precedence' : 'Toggle ambient motion';
   document.getElementById('motion-label').textContent = state.reducedMotion ? 'Reduced motion' : state.motion ? 'Motion on' : 'Motion off';
-  document.getElementById('scene-status').textContent = SCENE_TEXT[state.connection] || '';
+  document.getElementById('scene-status').textContent = sceneText(state, SCENE_TEXT[state.connection] || '');
 }
 shell(getState(), 'initial');
 subscribe(shell);
@@ -107,10 +107,10 @@ function renderInspector(state) {
     content.append(progress(item), checklist(item, true));
     const live = liveFields(item, state.owners, state.asks, state.events, state.now);  // same as the card (click-test a954 F2)
     fields.append(field('Ticket', item.ticket || '—'),
-      field('Owner', live.owner ? `${live.owner.name} · ${live.owner.state}` : (item.owner ? `${item.owner} · no live owner` : '—')),
+      field('Owner', ownerLineText(state, live.owner, item, { full: false, none: '—' })),
       field('Next step', item.next_step || '—'),
       field('Next step estimate', eta(item.next_eta, item.estimate_by, '')), field('Full completion estimate', eta(item.full_eta, item.estimate_by, '')),
-      field('Updated', live.updated ? `${age(live.updated, state.now)}${live.stale ? ' · no activity for over 30 min' : ''}` : 'No activity recorded'));
+      field('Updated', updatedText(state, live, at => age(at, state.now))));
     if (live.note) fields.append(field('Last note', `“${live.note.text}” · ${live.note.by} · ${age(live.note.at, state.now)}`));
     content.append(fields);
     const owner = state.owners.find(entry => entry.initiative_id === item.id);
@@ -157,7 +157,7 @@ function renderInspector(state) {
   } else if (kind === 'source') {
     const source = state.sources.find(entry => entry.id === id); if (!source) return select(null);
     title.textContent = source.name;
-    content.append(title, el('span', `state-badge ${source.state}`, source.state), el('p', 'detail-intro', source.note || 'No detail.'));
+    content.append(title, el('span', `state-badge ${source.state}`, source.label), el('p', 'detail-intro', source.note || 'No detail.'));
     fields.append(field('Last checked', `${age(source.checked, state.now)} · ${new Date(source.checked).toLocaleString()}`), field('Connection', state.connection));
     content.append(fields);
   } else if (kind === 'repo') {
@@ -167,7 +167,7 @@ function renderInspector(state) {
   } else if (kind === 'hub') {
     title.textContent = 'Main coordinator';
     content.append(title, el('p', 'detail-intro', 'Every initiative and owner reports into the coordinating session.'));
-    fields.append(field('Session', state.mainSession || '—'), field('Host', state.host || '—'), field('Owners', String(state.owners.length)), field('Initiatives', String(state.initiatives.length)));
+    fields.append(field('Session', state.mainSession || '—'), field('Host', state.host || '—'), field('Owners', hubCounts(state).owners), field('Initiatives', hubCounts(state).initiatives));
     content.append(fields);
   }
   if (!inspector.open) inspector.showModal();

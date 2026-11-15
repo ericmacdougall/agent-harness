@@ -5,7 +5,7 @@
 // `[ask:<id>]`. Main resolves the ask from either, and the next ledger read moves it to the Archive view.
 import { getState, subscribe, askReplyAccess, sendAskReply, decisionAccess, decideAsk, DECISION_NOTE_MAX } from './store.js';
 import { el, button, age } from './ui.js';
-import { trailOf, waitingOnUser, askProgress, replyStatus, decisionOf, decisionStatus } from './adapt.js';
+import { trailOf, waitingOnUser, askProgress, replyStatus, decisionOf, decisionStatus, needsSummary } from './adapt.js';
 
 const BASE_TITLE = 'Mission Control';
 const REPLY_MAX = 3900;
@@ -149,11 +149,12 @@ export function mountNeeds() {
   function paint(state) {
     const waiting = state.asks.filter(ask => waitingOnUser(state.messages, ask) && state.decisions[ask.id]?.status !== 'sending').length;
     const stale = state.asksStale.length;
-    count.textContent = String(waiting);
-    panelCount.textContent = String(waiting);
+    const summary = needsSummary(state, waiting, stale);
+    count.textContent = summary.count;
+    panelCount.textContent = summary.count;
     open.classList.toggle('has-asks', waiting > 0);
-    open.setAttribute('aria-label', (waiting ? `Needs you: ${waiting} open ask${waiting === 1 ? '' : 's'}` : 'Needs you: nothing waiting on you') + (stale ? `, ${stale} stale` : ''));
-    document.title = waiting ? `(${waiting}) ${BASE_TITLE}` : BASE_TITLE;
+    open.setAttribute('aria-label', summary.label);
+    document.title = `${summary.title}${BASE_TITLE}`;
     const shown = key => (key === 'asks' && !showAll ? state.asks.slice(0, ASKS_SHOWN) : state[key]);
     const more = document.getElementById('needs-more');
     more.hidden = state.asks.length <= ASKS_SHOWN;
@@ -162,7 +163,7 @@ export function mountNeeds() {
     const wanted = new Set(sections.flatMap(section => shown(section.key).map(a => a.id)));
     for (const [id, parts] of rows) if (!wanted.has(id)) { parts.row.remove(); rows.delete(id); drafts.delete(id); arming.delete(id); announced.delete(id); }
     list.querySelector('.empty-state')?.remove();
-    if (!state.asks.length) list.append(el('li', 'empty-state', stale ? 'Nothing new needs you. Older open asks are under Stale.' : 'Nothing needs you right now.'));
+    if (!state.asks.length) list.append(el('li', 'empty-state', summary.empty));
     for (const section of sections) {
       if (section.box) { section.box.hidden = !state[section.key].length; section.count.textContent = String(state[section.key].length); }
       shown(section.key).forEach((ask, index) => paintAsk(state, section, ask, index));
@@ -247,7 +248,7 @@ export function mountNeeds() {
       if (visible() && [...state.asks, ...state.asksStale].some(ask => decisionOf(state.messages, ask)?.status === 'queued')) paint(state);  // the expiry countdown
       return;
     }
-    if (['asks', 'chat', 'connection', 'routing', 'availability', 'update'].includes(reason)) paint(state);
+    if (['asks', 'chat', 'connection', 'routing', 'availability', 'update', 'truth'].includes(reason)) paint(state);
   });
   paint(getState());
 }

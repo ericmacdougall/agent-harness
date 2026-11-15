@@ -25,6 +25,28 @@ DEPLOY_RE = re.compile(r"\bDEPLOYED\b|\bdeployed to (?:live|prod)|\blive deploy\
                        re.I)
 TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy")
 
+# Status truth (review PR 234 v3 F1, v2 F2): how far a source's rows can be believed. The page states a zero or "none"
+# only when its source is "current". Computed here, once, for every ledger part and every Health row; the page only
+# checks the value against this vocabulary (anything else is "unknown") and takes the worst across sources.
+TRUTHS = ("current", "partial", "stale", "unknown")  # best to worst
+
+
+def read_truth(ok_at, error="", incomplete=False) -> str:
+    """unknown: no successful read yet (an initial failure, or never read). stale: a read failed after a good one, so
+    the rows are the last good read's. partial: the last read succeeded but could not see everything. current: the
+    last read succeeded and was whole."""
+    if not ok_at:
+        return "unknown"
+    if error:
+        return "stale"
+    return "partial" if incomplete else "current"
+
+
+def worst_truth(*values) -> str:
+    """The least believable of several truths; an unrecognised value counts as unknown."""
+    ranked = [TRUTHS.index(v) if v in TRUTHS else len(TRUTHS) - 1 for v in values]
+    return TRUTHS[max(ranked)] if ranked else "unknown"
+
 
 class Collector:
     name = "collector"
@@ -51,37 +73,60 @@ class Collector:
         # set first: a failing source is never retried faster
         self.next_at = now + (self.interval if self.watched() else max(self.interval, self.idle_interval))
         self.ran_at = now
+        before = self.health.rows.get(self.name)
         try:
             detail = self.tick(now)
-            self.health.ok(self.name, detail)
+            row = self.health.rows.get(self.name)
+            if row is not before and row and row.get("status") == "off":
+                return  # the tick reported itself off (not configured, no session): that is not a good read
+            self.health.ok(self.name, detail, truth=self.health_truth())
         except Refused as exc:
-            self.health.error(self.name, f"refused: {exc}")
+            self.health.error(self.name, f"refused: {exc}", truth=self.health_truth())
         except Exception as exc:  # noqa: BLE001 - a collector failure is shown, never fatal
-            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}")
+            self.health.error(self.name, f"{type(exc).__name__}: {str(exc)[:160]}", truth=self.health_truth())
+
+    def health_truth(self):
+        """A collector whose snapshot has parts (the Ledger) reports its own worst truth; None derives it from the row."""
+        return None
 
     def tick(self, now: float):
         raise NotImplementedError
 
 
 class Health:
+    """One row per source: ok, error or off, when it was checked, when it last read well (ok_at) and its status
+    truth. An error after a good read is stale (the page keeps the last good rows); before one it is unknown; off
+    (not configured, or nothing to read yet) is unknown. A collector with parts may pass its own worst truth."""
+
     def __init__(self, hub):
         self.hub, self.rows = hub, {}
 
-    def _set(self, name, status, detail):
-        row = {"name": name, "status": status, "checked": time.time(), "detail": ev.short(detail or "", 160)}
-        changed = self.rows.get(name, {}).get("status") != status
+    def _set(self, name, status, detail, truth=None):
+        now = time.time()
+        previous = self.rows.get(name, {})
+        ok_at = now if status == "ok" else previous.get("ok_at")
+        derived = read_truth(ok_at if status != "off" else None, status == "error")
+        if status == "off":
+            truth = truth if truth in TRUTHS else "unknown"  # off says why there is nothing to read
+        else:
+            truth = worst_truth(derived, truth) if truth is not None else derived
+        row = {"name": name, "status": status, "checked": now, "detail": ev.short(detail or "", 160),
+               "ok_at": ok_at, "truth": truth}
+        changed = (previous.get("status"), previous.get("truth")) != (status, truth)
         self.rows[name] = row
         if changed or status != "ok":
             self.hub.snapshot("health", list(self.rows.values()))
 
-    def ok(self, name, detail=""):
-        self._set(name, "ok", detail)
+    def ok(self, name, detail="", truth=None):
+        self._set(name, "ok", detail, truth)
 
-    def error(self, name, detail):
-        self._set(name, "error", detail)
+    def error(self, name, detail, truth=None):
+        self._set(name, "error", detail, truth)
 
-    def off(self, name, detail):
-        self._set(name, "off", detail)
+    def off(self, name, detail, truth="unknown"):
+        """`truth="current"` only for a source that is deliberately absent, so it has nothing to report (no
+        initiatives file configured); a source that cannot read yet (no main session) stays unknown."""
+        self._set(name, "off", detail, truth)
 
     def snapshot(self):
         return list(self.rows.values())
@@ -401,7 +446,7 @@ class Initiatives(Collector):
 
     def tick(self, now: float):
         if not self.path:
-            self.health.off(self.name, "no initiatives file configured")
+            self.health.off(self.name, "no initiatives file configured", truth="current")
             return "off"
         try:
             info = os.stat(self.path, follow_symlinks=False)
@@ -986,22 +1031,35 @@ class Ledger(Collector):
         self.raw_total, self.raw_truncated = 0, False
         # the session the requirement rows on hand were read for: set only by a successful read (review PR 234 F3)
         self.req_session = ""
-        self.parts = {name: {"stale": False, "error": "", "at": ""} for name in ("goals", "requirements", "status")}
-        self.parts["goals"]["items"] = []
-        self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
-        self.parts["status"].update(counts={}, since_s=0, entries=0, owners={}, unread={"count": 0, "items": []}, incomplete=False)
-        for key in self.STATUS_LISTS:
-            self.parts["status"][key] = []
+        self.parts = {name: self._empty(name) for name in ("goals", "requirements", "status")}
         self.sig = None
         self.published_at = ""
 
+    def _empty(self, name: str) -> dict:
+        """A part before any good read: no rows, and truth unknown, so the page claims nothing from it.
+        `at` is the last good read, `failed_at` the first failure since it, `session` the session the rows are for."""
+        part = {"stale": False, "error": "", "at": "", "failed_at": "", "session": "", "truth": "unknown", "incomplete": False}
+        if name == "goals":
+            part.update(items=[], total=0)
+        elif name == "requirements":
+            part.update(items=[], total=0, truncated=False, summary=archive.summary([]))
+        else:
+            part.update(counts={}, since_s=0, entries=0, owners={}, unread={"count": 0, "items": []})
+            for key in self.STATUS_LISTS:
+                part[key] = []
+        return part
+
+    def health_truth(self):
+        return worst_truth(*(part["truth"] for part in self.parts.values()))
+
     # -- one source
     def _read(self, part: str, label: str, kind: str, args: tuple, parse, now: float) -> str:
+        session = args[0] if args else ""
         try:
             cap = self.REQ_LIMIT if kind == "ah-requirements" else self.LIMIT
             code, out = self.runner.run(kind, *args, timeout=90, limit=cap + 1)
             if code != 0:
-                raise ValueError(f"{label} exited {code}")
+                raise ValueError(f"{label} timed out" if code == 124 else f"{label} exited {code}")  # 124: Runner timeout
             raw = out.encode("utf-8", "replace") if isinstance(out, str) else bytes(out or b"")
             if len(raw) > cap:
                 raise ValueError(f"{label} output is over {cap // 1024} KiB")
@@ -1015,9 +1073,18 @@ class Ledger(Collector):
         except Exception as exc:  # noqa: BLE001 - a failed source keeps its last good rows
             previous = self.parts[part]
             message = ev.short(str(exc), 160)
-            self.parts[part] = dict(previous, stale=bool(previous.get("at")), error=message)
+            if previous.get("at") and previous.get("session", "") != session:
+                # the rows on hand were read for another session: they are not this session's last good read
+                previous = self._empty(part)
+                if part == "requirements":
+                    self.raw_requirements, self.raw_total, self.raw_truncated = [], 0, False
+            truth = read_truth(previous.get("at"), message)
+            self.parts[part] = dict(previous, stale=truth == "stale", error=message, truth=truth,
+                                    failed_at=previous.get("failed_at") or ev.iso(now))
             return message
-        self.parts[part] = dict(value, stale=False, error="", at=ev.iso(now))
+        at = ev.iso(now)
+        self.parts[part] = dict(value, stale=False, error="", at=at, failed_at="", session=session,
+                                truth=read_truth(at, "", value.get("incomplete") is True))
         return ""
 
     def tick(self, now: float):
@@ -1054,7 +1121,8 @@ class Ledger(Collector):
 
     def _goals(self, data: dict, now: float) -> dict:
         items = []
-        for raw in (data.get("goals") if isinstance(data.get("goals"), list) else [])[:self.MAX_GOALS]:
+        listed = data.get("goals") if isinstance(data.get("goals"), list) else []
+        for raw in listed[:self.MAX_GOALS]:
             if not isinstance(raw, dict) or not raw.get("id"):
                 continue
             evidence = [self._evidence_row(e) for e in raw.get("evidence") or [] if isinstance(e, dict)]
@@ -1071,7 +1139,8 @@ class Ledger(Collector):
                 "deferral": ev.short(json.dumps(deferral, sort_keys=True), 300) if deferral else "",
                 "problems": {k: len(raw[k]) if isinstance(raw.get(k), list) else 0 for k in ("missing", "tampered", "unpinned")},
                 "evidence": evidence[:self.MAX_EVIDENCE], "evidence_total": len(evidence)})
-        return {"items": items}
+        # more goals than are kept: the counts the page shows would be short, so the read is partial
+        return {"items": items, "total": len(listed), "incomplete": len(listed) > self.MAX_GOALS}
 
     def overrides(self) -> dict:
         """The user's latest archive or restore click per requirement (signed rows only; see req_actions)."""
@@ -1152,7 +1221,7 @@ class Ledger(Collector):
         truncated = truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
         return {"items": classified, "total": self._int(data.get("total"), len(rows)), "truncated": truncated,
-                "summary": archive.summary(classified)}
+                "summary": archive.summary(classified), "incomplete": truncated}
 
     def _status(self, data: dict, now: float) -> dict:
         def entry(raw):
@@ -1200,8 +1269,10 @@ class Ledger(Collector):
         classified = archive.classify_all(self.raw_requirements, "requirement", time.time(), self._ticket_closed(), self.overrides())
         truncated = self.raw_truncated or len(classified) > self.MAX_REQUIREMENTS
         classified = classified[:self.MAX_REQUIREMENTS]
-        self.parts["requirements"] = dict(self.parts["requirements"], items=classified, truncated=truncated,
-                                          total=self.raw_total, summary=archive.summary(classified))
+        part = self.parts["requirements"]
+        self.parts["requirements"] = dict(part, items=classified, truncated=truncated, incomplete=truncated,
+                                          total=self.raw_total, summary=archive.summary(classified),
+                                          truth=read_truth(part.get("at"), part.get("error"), truncated))
         self.publish()
 
     # -- publication
