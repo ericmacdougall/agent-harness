@@ -88,6 +88,32 @@ class Transcripts:
         self.tail_bytes = tail_bytes
         self.cache: dict[str, tuple] = {}
         self.dirs: dict[str, tuple] = {}   # session -> (when, projects root mtime_ns, [session dirs])
+        # PR 234 v7 audit T243-2: reads that failed this tick (a missing file is no failure). OrgGraph clears it per
+        # tick and reports a non-empty list as a partial read, never as an empty graph that is current.
+        self.problems: list[str] = []
+
+    def _problem(self, what: str, exc: BaseException) -> None:
+        if len(self.problems) < 20:
+            self.problems.append(f"{what}: {type(exc).__name__}")
+
+    def _regular(self, path: Path, what: str) -> bool:
+        """A regular file (not a link) at path. Absent is False; any other failure is a problem and False."""
+        try:
+            return stat.S_ISREG(os.lstat(path).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            self._problem(what, exc)
+            return False
+
+    def _directory(self, path: Path, what: str) -> bool:
+        try:
+            return stat.S_ISDIR(os.lstat(path).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            self._problem(what, exc)
+            return False
 
     def _inside(self, path: Path) -> bool:
         real = Path(os.path.realpath(path))
@@ -119,16 +145,20 @@ class Transcripts:
         now = time.monotonic()
         try:
             root_mtime = os.stat(self.root).st_mtime_ns
-        except OSError:
+        except FileNotFoundError:
+            return []   # no Claude projects at all on this host: nothing to read, truthfully empty
+        except OSError as exc:
+            self._problem("the Claude projects root", exc)
             return []
         hit = self.dirs.get(session)
         if hit and now - hit[0] < self.DIRS_TTL_S and hit[1] == root_mtime:
             return hit[2]
         try:
             projects = [Path(e.path) for e in os.scandir(self.root) if e.is_dir(follow_symlinks=False)]
-        except OSError:
+        except OSError as exc:
+            self._problem("the Claude projects root", exc)
             return []
-        found = [p / session for p in projects if (p / session).is_dir() and not (p / session).is_symlink()]
+        found = [p / session for p in projects if self._directory(p / session, "a session directory")]
         if len(self.dirs) > 16:
             self.dirs.clear()
         self.dirs[session] = (now, root_mtime, found)
@@ -137,7 +167,7 @@ class Transcripts:
     def main_path(self, session: str) -> Path | None:
         for project in self.session_dirs(session):
             candidate = project.parent / f"{session}.jsonl"
-            if candidate.is_file() and not candidate.is_symlink():
+            if self._regular(candidate, "main's transcript"):
                 return candidate
         return None
 
@@ -146,7 +176,7 @@ class Transcripts:
             return None
         for project in self.session_dirs(session):
             candidate = project / "subagents" / f"agent-{agent}{suffix}"
-            if candidate.is_file() and not candidate.is_symlink():
+            if self._regular(candidate, f"an agent {suffix} file"):
                 return candidate
         return None
 
@@ -160,9 +190,13 @@ class Transcripts:
                 if info.st_size > META_LIMIT:
                     return {}
                 raw = json.loads(handle.read(META_LIMIT))
-        except (OSError, ValueError, RecursionError, Refused):
+        except FileNotFoundError:
+            return {}   # removed since it was listed: no meta yet is no failure
+        except (OSError, ValueError, RecursionError, Refused) as exc:
+            self._problem("an agent meta file", exc)
             return {}
         if not isinstance(raw, dict):
+            self._problem("an agent meta file", ValueError("not an object"))
             return {}
         parent = raw.get("parentAgentId")
         depth = raw.get("spawnDepth")
@@ -178,7 +212,10 @@ class Transcripts:
             return empty
         try:
             handle, info = self._open(path)
-        except (OSError, Refused):
+        except FileNotFoundError:
+            return empty
+        except (OSError, Refused) as exc:
+            self._problem("a transcript", exc)
             return empty
         key = str(path)
         sig = (info.st_ino, info.st_size, info.st_mtime_ns)
@@ -231,21 +268,29 @@ class Transcripts:
 
 
 def escalations(root: Path | None, *, max_files: int = 200, max_age_s: float = 86400.0, now: float | None = None,
-                limit: int = 262144) -> dict:
-    """agent id -> {level, to, reason} from model-ladder state files touched in the last day."""
+                limit: int = 262144, problems: list | None = None) -> dict:
+    """agent id -> {level, to, reason} from model-ladder state files touched in the last day. A read that failed
+    (other than a missing root or file) is appended to `problems` (T243-2): the levels may then be incomplete."""
     out: dict[str, dict] = {}
+    problems = [] if problems is None else problems
     if not root:
         return out
     now = time.time() if now is None else now
     try:
         entries = [e for e in os.scandir(root) if e.name.endswith(".json") and e.is_file(follow_symlinks=False)]
-    except OSError:
+    except FileNotFoundError:
+        return out   # no model-ladder state yet
+    except OSError as exc:
+        problems.append(f"the escalation directory: {type(exc).__name__}")
         return out
     fresh = []
     for entry in entries:
         try:
             info = entry.stat(follow_symlinks=False)
-        except OSError:
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            problems.append(f"an escalation file: {type(exc).__name__}")
             continue
         if now - info.st_mtime <= max_age_s and info.st_size <= limit:
             fresh.append((info.st_mtime, entry.path))
@@ -254,9 +299,13 @@ def escalations(root: Path | None, *, max_files: int = 200, max_age_s: float = 8
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
             with os.fdopen(fd, "rb") as handle:
                 state = json.loads(handle.read(limit))
-        except (OSError, ValueError, RecursionError):
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, RecursionError) as exc:
+            problems.append(f"an escalation file: {type(exc).__name__}")
             continue
         if not isinstance(state, dict):
+            problems.append("an escalation file: not an object")
             continue
         steps = [e for e in state.get("escalations") or [] if isinstance(e, dict)]
         if not steps:
@@ -535,7 +584,9 @@ class OrgGraph(col.Collector):
         self.ticket_cursor = 0
         self.messages_seen: set[str] = set()
         self.seeded_messages = False
-        self.escalation_cache: tuple[float, dict] = (0.0, {})
+        self.escalation_cache: tuple[float, dict, list] = (0.0, {}, [])
+        self.problems: list[str] = []   # this tick's failed reads (T243-2): the read is partial while any is listed
+        self.read_for = ""              # the session this tick read for (Truth: unknown once the pin has moved)
         self.seq = 0
         self.helpers = helper_types()
 
@@ -595,8 +646,15 @@ class OrgGraph(col.Collector):
                 self.ticket_stale[due[0]] = True
                 self.ticket_at[due[0]] = now - TICKET_TTL_S / 2
 
+    def health_truth(self):
+        return "partial" if self.problems else None
+
+    def health_session(self):
+        return self.read_for or None
+
     def tick(self, now: float):
         session = self.session_fn() or ""
+        self.read_for, self.transcripts.problems = session, []
         rows = [r for r in (self.owners_fn() or []) if isinstance(r, dict) and r.get("runtime", "claude") != "codex"
                 and AGENT_RE.match(str(r.get("agent_id") or ""))]
         main_path = self.transcripts.main_path(session) if session else None
@@ -639,7 +697,9 @@ class OrgGraph(col.Collector):
                 wanted.append(ref)
         self._refresh_tickets(wanted, now)
         if now - self.escalation_cache[0] > 60:
-            self.escalation_cache = (now, escalations(self.escalation_root, now=now))
+            failed: list[str] = []
+            self.escalation_cache = (now, escalations(self.escalation_root, now=now, problems=failed), failed)
+        self.problems = list(self.transcripts.problems) + list(self.escalation_cache[2])
         snapshot = build(session=session, coordinator=coordinator, agents=agents, tickets=self.tickets,
                          escalation=self.escalation_cache[1], host=self.host, now=now, helpers=self.helpers,
                          stale=self.ticket_stale)
@@ -656,10 +716,16 @@ class OrgGraph(col.Collector):
                                        "read and may be out of date.")
         if not session:
             snapshot["gaps"].insert(0, "No session is selected yet: ah owners has not reported one.")
+        elif main_path is None and self.transcripts.problems:
+            snapshot["gaps"].insert(0, f"Following session {session[:8]}, but its Claude transcript could not be read "
+                                       f"({self.transcripts.problems[0]}): models, effort and messages are unknown.")
         elif main_path is None:
             # ah owners follows the newest main WAL, Codex sessions included (goodqa#15961): say so, never a silent 0.
             snapshot["gaps"].insert(0, f"Following session {session[:8]}, which has no Claude transcript (likely a Codex "
                                        "session that wrote the newest WAL); owners and asks may read 0 (goodqa#15961).")
+        if self.problems:
+            snapshot["gaps"].insert(0, f"{len(self.problems)} transcript or escalation read(s) could not be read "
+                                       f"({'; '.join(sorted(set(self.problems))[:3])}): the graph may be incomplete.")
         changes = diff(self.snapshot_data, snapshot, now)
         # Messages from the coordinator and owners, read from their transcripts' SendMessage targets.
         senders = [("coordinator", coordinator)] + [(a["agent_id"], a) for a in agents]
@@ -683,7 +749,9 @@ class OrgGraph(col.Collector):
         if published:
             self.hub.snapshot("orggraph", snapshot)
         counts = snapshot["counts"]
-        return f"{counts['live_owners']} live owners, {counts['subagent']} subagents, {counts['reviewer']} reviewers, {counts['work']} work items"
+        failed = f"; {len(self.problems)} read(s) failed" if self.problems else ""
+        return (f"{counts['live_owners']} live owners, {counts['subagent']} subagents, {counts['reviewer']} reviewers, "
+                f"{counts['work']} work items{failed}")
 
     def snapshot(self) -> dict:
         return self.snapshot_data or {"schema": SCHEMA, "generated": "", "nodes": [], "edges": [], "counts": {},

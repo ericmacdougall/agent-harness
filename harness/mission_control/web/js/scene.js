@@ -15,7 +15,7 @@ function shortModel(model) {
   return String(model).replace(/^claude-/, '').replace(/-\d{8}$/, '');
 }
 function labelText(node) {
-  if (node.kind === 'user') return node.inbox == null ? 'You · asks loading…' : `You · ${node.inbox} open ask${node.inbox === 1 ? '' : 's'}`;
+  if (node.kind === 'user') return node.inbox == null ? 'You · asks not known' : `You · ${node.inbox} open ask${node.inbox === 1 ? '' : 's'}`;
   if (node.kind === 'coordinator') return `Main · ${shortModel(node.model)} · ${node.effort}`;
   if (node.kind === 'work') return `${node.ref}${node.done ? ' ✓' : ''}`;
   if (node.kind === 'repo') return `⌘ ${node.label}`;

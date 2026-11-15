@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -313,3 +314,30 @@ class PinTruth(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InboxTruth(unittest.TestCase):
+    """PR 234 v7 audit T243-4: the topology's "You (inbox)" counts come from a current asks read for the pin, or are
+    unknown (None); a failed, reset (pin moved) or partial asks read never shows as a plain number."""
+
+    def inbox(self, *, ran=True, status="ok", truth=None, items=2, stale=1):
+        asks = types.SimpleNamespace(name="asks", ran_at=1.0 if ran else None, items=[{}] * items, stale=[{}] * stale,
+                                     health_truth=lambda: truth)
+        health = types.SimpleNamespace(rows={"asks": {"status": status}})
+        import server as mcs  # noqa: PLC0415
+        return mcs.App._open_asks(types.SimpleNamespace(asks=asks, health=health))
+
+    def test_a_current_read_gives_its_counts(self):
+        self.assertEqual(self.inbox(), (2, 1))
+
+    def test_before_the_first_read_it_is_unknown(self):
+        self.assertIsNone(self.inbox(ran=False))
+
+    def test_a_failed_read_is_unknown(self):
+        self.assertIsNone(self.inbox(status="error"))
+
+    def test_a_read_for_another_session_is_unknown(self):
+        self.assertIsNone(self.inbox(truth="unknown", items=0, stale=0))
+
+    def test_a_partial_read_is_unknown(self):
+        self.assertIsNone(self.inbox(truth="partial"))

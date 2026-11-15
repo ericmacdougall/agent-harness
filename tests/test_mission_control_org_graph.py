@@ -746,3 +746,76 @@ class RestrictedFileRowIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadFailures(unittest.TestCase):
+    """PR 234 v7 audit T243-2: an unreadable transcript root, directory or file, or a bad escalation file, makes the
+    org-graph read partial and says so; it is never an empty graph that reads as current. A file that does not exist
+    is no failure (an agent with no meta yet)."""
+
+    def setUp(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads unreadable files")
+        self.fx = Fixture()
+        self.fx.main([assistant("claude-opus-5-5")])
+        self.fx.agent("own1", kind="task-owner", records=[assistant("claude-opus-5-5", "high")])
+        self.locked = []
+
+    def tearDown(self):
+        for path in self.locked:
+            os.chmod(path, 0o700)
+
+    def lock(self, path):
+        os.chmod(path, 0)
+        self.locked.append(path)
+
+    def run_graph(self, escalation_root=None):
+        hub = Hub()
+        health = col.Health(hub)
+        graph = og.OrgGraph(hub, health, Runner(), owners_fn=lambda: [row("own1", kind="task-owner")],
+                            session_fn=lambda: SESSION, transcripts=og.Transcripts(self.fx.root),
+                            escalation_root=escalation_root, host="h", inbox_fn=lambda: (0, 0))
+        graph.run(1_000_000.0)
+        return health.rows["org-graph"], graph.snapshot()
+
+    def test_everything_readable_is_current(self):
+        health, _snap = self.run_graph()
+        self.assertEqual((health["status"], health["truth"]), ("ok", "current"))
+
+    def test_a_missing_meta_file_is_no_failure(self):
+        (self.fx.sub / "agent-own1.meta.json").unlink()
+        health, _snap = self.run_graph()
+        self.assertEqual(health["truth"], "current")
+
+    def test_an_unreadable_projects_root_is_partial_and_named(self):
+        self.lock(self.fx.root)
+        health, snap = self.run_graph()
+        self.assertEqual(health["truth"], "partial", health)
+        self.assertFalse(any("likely a Codex" in g for g in snap["gaps"]), snap["gaps"])
+        self.assertTrue(any("could not be read" in g for g in snap["gaps"]), snap["gaps"])
+
+    def test_an_unreadable_session_directory_is_partial(self):
+        self.lock(self.fx.sub)
+        health, _snap = self.run_graph()
+        self.assertEqual(health["truth"], "partial", health)
+
+    def test_an_unreadable_meta_or_transcript_is_partial(self):
+        self.lock(self.fx.sub / "agent-own1.jsonl")
+        health, _snap = self.run_graph()
+        self.assertEqual(health["truth"], "partial", health)
+
+    def test_a_bad_json_meta_is_partial(self):
+        (self.fx.sub / "agent-own1.meta.json").write_text("{not json")
+        health, _snap = self.run_graph()
+        self.assertEqual(health["truth"], "partial", health)
+
+    def test_a_bad_or_unreadable_escalation_file_is_partial(self):
+        esc = Path(self.fx.tmp.name) / "escalation"
+        esc.mkdir()
+        (esc / "a.json").write_text("{not json")
+        health, _snap = self.run_graph(esc)
+        self.assertEqual(health["truth"], "partial", health)
+        (esc / "a.json").write_text("{}")
+        self.lock(esc / "a.json")
+        health, _snap = self.run_graph(esc)
+        self.assertEqual(health["truth"], "partial", health)

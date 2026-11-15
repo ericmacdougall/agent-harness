@@ -526,9 +526,10 @@ class DerivedFeeds(unittest.TestCase):
     row, a snapshot or a read between collectors exists that FEEDS, NOT_A_FEED or SAFE_READS does not account for:
     that is how a stacked change (an owner-policy row, a session pin, an org graph) is made to declare itself."""
 
-    DATA_SNAPSHOTS = {"owners": "owners", "asks": "asks", "initiatives": "initiatives", "chat": "chat"}
+    DATA_SNAPSHOTS = {"owners": "owners", "asks": "asks", "initiatives": "initiatives", "chat": "chat", "orggraph": "orggraph"}
     META_SNAPSHOTS = {"health", "reads", "ledger"}
-    STATE_META = {"version", "started", "host", "health", "limits", "reads", "requirement_actions", "events", "ledger"}
+    # pin: which session Mission Control follows and may write against (goodqa#15961); its row is session-pin
+    STATE_META = {"version", "started", "host", "health", "limits", "reads", "requirement_actions", "events", "ledger", "pin"}
     # a row one collector writes about something other than its own rows
     ROW_ROLES = {}
     SESSION_READS = ("session", "pin")   # reading which session the reads are for: the dataset rests on session-pin
@@ -595,8 +596,10 @@ class DerivedFeeds(unittest.TestCase):
             derived[part] = {f"ledger:{part}"} | beside | ({"session-pin"} if part in trace.session_parts else set())
         # every read of the pinned session is declared: the dataset its reader publishes rests on session-pin
         for reader, provider, attribute in trace.cross:
-            if attribute in self.SESSION_READS and reader in self.DATA_SNAPSHOTS:
-                derived[self.DATA_SNAPSHOTS[reader]].add("session-pin")
+            if attribute in self.SESSION_READS:
+                for snapshot, writers in trace.snapshots.items():
+                    if snapshot in self.DATA_SNAPSHOTS and reader in writers:
+                        derived[self.DATA_SNAPSHOTS[snapshot]].add("session-pin")
         self.assertEqual({k: sorted(v) for k, v in derived.items()}, {k: sorted(v) for k, v in col.FEEDS.items()})
         self.assertEqual(sorted(trace.unattributed), [], "a Health row, snapshot or event written by no traced source: give it a "
                                                          "Collector (or trace its writer as a named source) and a line in FEEDS")
@@ -620,6 +623,9 @@ class DerivedFeeds(unittest.TestCase):
         rows = set()
         for name in seen:
             rows |= {name} | {row for row in trace.rows.get(name, ()) if (name, row) not in self.ROW_ROLES}
+        # whatever rests on a source that read for the pin rests on the pin too (the ledger's parts declare it per part)
+        if any((name, "session-pin", "pin") in trace.cross for name in seen if name != "ledger"):
+            rows.add("session-pin")
         return rows
 
     def test_every_read_between_collectors_is_a_feed_or_a_stated_exemption(self):

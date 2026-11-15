@@ -229,8 +229,12 @@ FEEDS = {
     # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
     # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
     "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "owner-policy", "initiatives", "github",
-               "goodqa", "t2-dev", "sources"),
+               "goodqa", "t2-dev", "sources", "session-pin"),
     "chat": ("chat", "session-pin"),  # the chat snapshot names the pinned session as main's
+    # the Topology tab's org graph (goodqa#15950): its own transcript, escalation and ticket reads (partial when one
+    # fails, T243-2), the owner rows it draws and everything they rest on, for the pinned session (T243-6)
+    "orggraph": ("org-graph", "owners", "codex-owners", "wals", "native-projects", "native-streams", "owner-policy",
+                 "session-pin"),
 }
 # Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
 NOT_A_FEED = {
@@ -261,6 +265,17 @@ SAFE_READS = {
     ("ledger", "owners", "unrestricted"): "a redaction filter: unknown shows main's notes only; no row is dropped",
     ("wals", "owners", "unrestricted"): "a redaction filter: hides sub-agent notes not shown unrestricted",
     ("goodqa", "owners", "restricted_tickets"): "a privacy filter: restricted tickets are never polled or shown",
+    # the org graph (Topology tab, goodqa#15950): owners and their transcripts for the pin, and the user's inbox (T243-2/4)
+    ("org-graph", "session-pin", "pin"): "covered: session-pin is a feed of orggraph",
+    ("org-graph", "owners", "rows"): "covered: owners is a feed of orggraph",
+    # the inbox fails closed (T243-4, server.App._open_asks): counts only from a current asks read for the pin, else none
+    ("org-graph", "asks", "items"): "fail closed: inbox counts only from a current asks read for the pin, else none",
+    ("org-graph", "asks", "stale"): "fail closed: inbox counts only from a current asks read for the pin, else none",
+    ("org-graph", "asks", "ran_at"): "fail closed: no inbox counts before the first asks read",
+    ("org-graph", "asks", "health_truth"): "fail closed: no inbox counts unless the asks read is current",
+    ("org-graph", "owners", "restricted_known"): "a change signal only: decides when initiatives republish, not what",
+    ("org-graph", "owners", "restricted_tickets"): "a change signal only: decides when initiatives republish, not what",
+    ("org-graph", "initiatives", "publish"): "a change signal only: asks initiatives to republish, reads nothing",
 }
 
 

@@ -141,9 +141,9 @@ test('the scene is a guarded module: no innerHTML, reduced motion respected, lis
   assert.ok(!/\.initiatives\b/.test(src), 'the topology no longer reads the hand-written initiatives file');
 });
 
-test('user node says loading before the asks source reports, never a false 0', () => {
+test('user node says not known unless the asks read is current, never a false 0 (T243-4)', () => {
   const loading = Object.fromEntries(org.describe({ id: 'user', kind: 'user', inbox: null }, new Map()));
-  assert.equal(loading['Open asks (Needs you)'], 'loading…');
+  assert.equal(loading['Open asks (Needs you)'], 'not known (no current asks read for this session)');
   assert.equal('Stale asks, still open' in loading, false);
   const ready = Object.fromEntries(org.describe({ id: 'user', kind: 'user', inbox: 0, inbox_stale: 2 }, new Map()));
   assert.equal(ready['Open asks (Needs you)'], '0');

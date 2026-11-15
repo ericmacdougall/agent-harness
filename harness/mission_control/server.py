@@ -387,7 +387,8 @@ class App:
         # The Topology tab's org graph: live owners, their transcripts' model/effort fields and their tickets.
         # Demo mode reads only its fixture transcripts and no escalation state (never the real ~/.claude).
         self.org = org_graph.OrgGraph(
-            self.hub, self.health, self.runner, owners_fn=lambda: self.owners.rows, session_fn=lambda: self.owners.session,
+            # T243-6: the graph follows the pin itself, as the asks and the ledger do (review A-1)
+            self.hub, self.health, self.runner, owners_fn=lambda: self.owners.rows, session_fn=lambda: self.pin()["display"],
             transcripts=org_graph.Transcripts(projects_root or home / ".claude" / "projects"),
             escalation_root=None if demo else (escalation_root or home / ".agent-harness" / "escalation"),
             host="demo-host" if demo else ev.HOST, inbox_fn=self._open_asks)
@@ -452,11 +453,15 @@ class App:
         return ids if session and session == self.pin()["display"] else None
 
     def _open_asks(self) -> tuple:
-        """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them;
-        None until the asks source has run once, so the page never shows a false 0 at startup."""
-        if getattr(self.asks, "ran_at", None) is None:
+        """The user node's inbox: open asks (the "Needs you" count) and the stale ones listed below them. None
+        (unknown) unless the asks read is current for the pinned session (PR 234 v7 audit T243-4): before the first
+        read, after a failed one, after the pin moved (its rows were reset) or when the read was partial, the page
+        shows no number at all rather than a false or short one."""
+        asks = self.asks
+        row = self.health.rows.get(getattr(asks, "name", "asks")) or {}
+        if getattr(asks, "ran_at", None) is None or row.get("status") != "ok" or asks.health_truth() is not None:
             return None
-        return len(getattr(self.asks, "items", None) or []), len(getattr(self.asks, "stale", None) or [])
+        return len(getattr(asks, "items", None) or []), len(getattr(asks, "stale", None) or [])
 
     def tracked_tickets(self):
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]
