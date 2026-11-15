@@ -20,6 +20,7 @@ export function initiative(row) {
     milestone_items: Array.isArray(row.milestone_items) ? row.milestone_items.map(m => ({ done: !!m.done, text: str(m.text, 200).replace(/^(Done:|Not yet:)\s*/i, '') })) : [],
     next_step: str(row.next_step, 600), next_eta: str(row.next_eta, 80) || null, full_eta: str(row.full_eta, 80) || null,
     estimate_by: str(row.estimate_by, 80) || 'main', note: str(row.note, 600), updated: str(row.updated, 60), error: str(row.error, 300),
+    source: row.source === 'live' ? 'live' : 'file',
   };
   if (item.pct === null) item.milestones_done = item.milestones_total = null;
   return item;
@@ -27,7 +28,12 @@ export function initiative(row) {
 
 export function initiatives(snapshot) {
   const items = Array.isArray(snapshot?.items) ? snapshot.items.filter(x => x && typeof x === 'object').map(initiative) : [];
-  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300) };
+  // mtime: when the hand-written file was last edited (seconds), so the page can say how old it is (goodqa#15950).
+  const mtime = Number.isFinite(snapshot?.mtime) && snapshot.mtime > 0 ? snapshot.mtime * 1000 : null;
+  // derived: rows built from live owners + GoodQA; hiddenFileRows: file rows dropped because the file is over a day old
+  // T243-7: a count the server did not send, or sent malformed, is unknown (null), never 0 (initiativesLoss)
+  const count = v => (Number.isInteger(v) && v >= 0 ? v : null);
+  return { items, stale: !!snapshot?.stale, error: str(snapshot?.error, 300), mtime, derived: count(snapshot?.derived), untracked: count(snapshot?.untracked), hiddenFileRows: count(snapshot?.hidden_file_rows) };
 }
 
 // An initiative's free-text owner ("a095f32d (waiting)", "none live", "main") links to an owner row by id prefix.
@@ -138,6 +144,9 @@ export const CLAIMS = Object.freeze({
   progress: ['owners', 'events'],
   decisions: ['status'],
   chat: ['chat'],
+  // the Topology tab (goodqa#15950, T243-3): its counts rest on the org graph read (FEEDS.orggraph: the org-graph
+  // source's transcript, escalation and ticket reads, the owner rows and their feeds, and the pin)
+  topology: ['orggraph'],
 });
 // Which dataset each key of the store's state belongs to. null: page-local (a click, a filter, the clock), or the
 // truth data itself. A key that is missing here fails the gate test, so new server data cannot be shown ungated.
@@ -146,6 +155,8 @@ export const STATE_DATASETS = Object.freeze({
   asks: 'asks', asksResolved: 'asks', asksStale: 'asks', asksFlagged: 'asks', asksCleared: 'asks', asksArchive: 'asks',
   asksArchiveTotal: 'asks', asksSession: 'asks', asksSweptAt: 'asks',
   initiatives: 'initiatives', initiativesStale: 'initiatives', initiativesError: 'initiatives',
+  orggraph: 'orggraph',
+  initiativesDerived: 'initiatives', initiativesUntracked: 'initiatives', initiativesHidden: 'initiatives', initiativesMtime: 'initiatives',
   events: 'events', lastEvent: 'events', feedSnapshot: 'events',
   messages: 'chat', chat: 'chat', sessions: 'chat', mainSession: 'chat', chatAvailability: 'chat', pending: 'chat',
   'ledger.goals': 'goals', 'ledger.requirements': 'requirements', 'ledger.status': 'status', 'ledger.generated': null,
@@ -159,7 +170,7 @@ export const SAFE_READS = Object.freeze({
   needs: { chat: 'a reply or decision on its way takes an ask off the waiting count only when its record is on hand; a missing chat read leaves every ask waiting' },
   initiatives: { asks: 'an initiative card adds "N open asks" only when it holds some' },
 });
-const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat' };
+const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat', orggraph: 'Topology' };
 const FACT_NAMES = { 'ledger:goals': 'Goal ledger (ah goals)', 'ledger:requirements': 'Requirements (ah requirements)', 'ledger:status': 'Status (ah status)',
   'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', sources: 'Event drops' };
 const LEDGER_DATASETS = ['goals', 'requirements', 'status'];
@@ -239,6 +250,7 @@ export function noneText(c, current, noun) {
 // A count: a bare 0 is itself a claim, so an unknown zero is "?" and a partial count says there may be more. A stale
 // count is the last good read's; `bare` marks a count with no note beside it, which then says so itself.
 export function countText(n, c, bare = false) {
+  if (n == null) return '?';   // a count that is not known (T243-7) is never stated, whatever the claim's truth
   const truth = typeof c === 'string' ? truthOf(c) : c.truth;
   if (truth === 'unknown') return n ? `${n}+` : '?';
   if (truth === 'stale' && bare) return `${n} (stale)`;
@@ -623,6 +635,28 @@ export const ownerCount = (state, n) => padded(countText(n, claim(state, 'owners
 export function initiativesEmpty(state) {
   if ((state.sources || []).find(s => s.id === 'initiatives')?.status === 'off') return 'No initiatives file is configured.';
   return noneText(claim(state, 'initiatives'), 'No initiatives in the file.', 'initiatives');
+}
+// T243-7: one per derived count the server did not send (or sent malformed), so the initiatives read is partial
+export function initiativesLoss(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return 0;
+  const ok = v => Number.isInteger(v) && v >= 0;
+  return ['derived', 'untracked', 'hidden_file_rows'].filter(key => !ok(snapshot[key])).length;
+}
+// T243-1: the panel's source line. Its rows are derived from live owners, the org graph's GoodQA ticket reads and the
+// file, all of which the initiatives read rests on (collectors.FEEDS), so every count goes through that gate.
+export function initiativesLine(state, fileText = '') {
+  const g = gate(state, 'initiatives');
+  const untracked = state.initiativesUntracked, hidden = state.initiativesHidden;
+  return `${g.count(state.initiativesDerived)} from live owners and GoodQA${untracked ? ` (${g.count(untracked)} with no ticket)` : ''}`
+    + (fileText ? `; ${fileText}` : '')
+    + (hidden ? `, so its other ${g.count(hidden)} row${hidden === 1 ? ' is' : 's are'} hidden as out of date` : '') + '.';
+}
+// T243-3: the Topology meta line; every count goes through the topology gate ("?" when the server sent none)
+export function topologyMeta(state, changed) {
+  const g = state.orggraph || {}, c = g.counts || {}, t = gate(state, 'topology');
+  return `${t.count(c.live_owners)} live of ${t.count(c.owner)} owners · ${t.count(c.subagent)} sub-agents · ${t.count(c.reviewer)} reviewers · ${t.count(c.work)} work items`
+    + `${c.hidden_agents ? ` · ${t.count(c.hidden_agents)} older agents not drawn` : ''} · graph last changed ${changed}`
+    + ` · session ${g.session ? String(g.session).slice(0, 8) : 'unknown'} · from ah owners, transcripts and GoodQA`;
 }
 export const initiativeCount = (state, n) => padded(countText(n, claim(state, 'initiatives'), true));
 export const atRiskEmpty = state => noneText(claim(state, 'initiatives'), 'Nothing open to rank.', 'open initiatives to rank');

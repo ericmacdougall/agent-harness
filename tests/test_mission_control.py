@@ -337,7 +337,7 @@ class OwnersPoll(Tmp):
 
     def test_rows_keep_state_and_disposition_and_drop_old_terminal_helpers(self):
         data = self.rows()
-        runner = FakeRunner({"ah-owners": lambda: (0, json.dumps(data))})
+        runner = FakeRunner({"ah-owners": lambda *_a: (0, json.dumps(data))})
         wals = self.base / "w"
         (wals / "sess1").mkdir(parents=True)
         (wals / "sess1" / "agent-aaef3bc7aaaa.jsonl").write_text(json.dumps({"at": "t", "event": "intent", "note": "polling CI"}) + "\n")
@@ -345,6 +345,11 @@ class OwnersPoll(Tmp):
         tailer.run(time.time())
         owners = col.Owners(self.hub, self.health, runner, tailer)
         owners.run(time.time())
+        self.assertEqual(owners.rows, [], "unwired: the real argv refuses a session-less ah owners (goodqa#15961)")
+        data["session"] = "11111111-2222-4333-8444-555555555555"
+        owners.pin_fn = lambda: data["session"]
+        owners.run(time.time())
+        self.assertEqual(self.health.rows["owners"]["status"], "ok", self.health.rows["owners"])
         ids = [r["agent_id"] for r in owners.rows]
         self.assertEqual(ids, ["acccccc", "aaef3bc7aaaa"], "old terminal rows and malformed ids are dropped")
         row = owners.rows[1]
@@ -416,7 +421,10 @@ class ReadOnly(unittest.TestCase):
                                     fabric_bin="/srv/fabric/bin/fab-live")
 
     def test_only_read_shapes_are_allowed(self):
-        self.assertEqual(self.runner.argv("ah-owners"), ["/usr/bin/python3", "-I", "/h/ah.py", "owners"])
+        sid = "baab765b-d85c-46b4-b7b9-588eb912c770"
+        self.assertEqual(self.runner.argv("ah-owners", sid), ["/usr/bin/python3", "-I", "/h/ah.py", "owners", "--session", sid])
+        with self.assertRaises(safeio.Refused):   # goodqa#15961: never session-less (ah would follow the newest WAL)
+            self.runner.argv("ah-owners")
         self.assertEqual(self.runner.argv("gh-events", "eric")[-1], "/users/eric/events?per_page=30")
         self.assertIn("GET", self.runner.argv("gh-user"))
         self.assertIn("control export --since abc", self.runner.argv("fabric-export", "abc")[-1])
@@ -428,7 +436,7 @@ class ReadOnly(unittest.TestCase):
                     self.runner.argv(kind, *args)
 
     def test_no_write_verbs_in_any_allowlisted_argv(self):
-        shapes = [("ah-owners", ()), ("ah-sessions", ()), ("ah-ticket-comments", ("goodqa#1",)), ("gh-user", ()),
+        shapes = [("ah-owners", ("baab765b-d85c-46b4-b7b9-588eb912c770",)), ("ah-sessions", ()), ("ah-ticket-comments", ("goodqa#1",)), ("gh-user", ()),
                   ("gh-events", ("eric",)), ("remote-wal-probe", ()), ("fabric-export", ("c",)),
                   ("codex-login-status", ()), ("codex-pool-status", ())]
         for kind, args in shapes:
@@ -623,6 +631,18 @@ class CodexResponderTests(Tmp):
                 self.assertEqual(mc_chat.state(record["id"])["status"], "unavailable")
                 self.assertIn(words, mc_chat.state(record["id"])["reason"])
         self.assertFalse((self.bindir / "argv.json").exists(), "codex exec never ran")
+
+
+def pin_app(app, session):
+    """Test helper (goodqa#15961): pin an App to `session` as a config pin backed by a disposable Claude WAL root;
+    None leaves it unpinned (session-scoped writes are refused)."""
+    root = Path(tempfile.mkdtemp(prefix="mc-pin-"))
+    if session:
+        (root / session).mkdir()
+        (root / session / "main.jsonl").write_text("")
+    app.claude_wals, app.config_pin, app.pin_last_good = root, session, ""
+    app.owners.session = session or ""
+    app.asks.session = session or ""
 
 
 class ServerHarness(Tmp):
