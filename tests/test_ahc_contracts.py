@@ -393,9 +393,9 @@ class GrantTests(Base):
     def test_g05_retires_only_on_the_allow_list(self):
         """Fail closed: every abandonment proof outside never-sent / all-sends-absent consumes the grant."""
         self.assertEqual(C.Contracts.RETIRE_PROOFS, ("never-sent", "all-sends-absent"))
-        for proof in ("unknown-spent", "never-applies", "p2", None, "anything-new"):
+        for n, proof in enumerate(("unknown-spent", "never-applies", "p2", None, "anything-new")):
             with self.subTest(proof=proof):
-                g, op = self.reserved(pr=hash(str(proof)) % 900 + 50)
+                g, op = self.reserved(pr=50 + n)
                 self.db.execute("UPDATE operations SET state='abandoned', proof=? WHERE key=?", (proof, op["key"]))
                 self.c._settle_grant_for(self.c._row("operations", "key", op["key"]), self.ev())
                 self.assertEqual((self.gstate(g), self.grow(g)["cap_held"]), ("consumed", 1))
@@ -621,6 +621,23 @@ class OperationTests(Base):
         with self.assertRaises(C.ContractError):
             self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
 
+    def test_e13_also_fences_from_outcome_unknown(self):
+        g, op = self.dispatched()
+        self.clock.t += C.B55_REQUEST_SECONDS
+        op = self.c.unknown(op["key"], expected_version=op["version"], event_id=self.ev())
+        first = self.read()
+        self.clock.t += C.E13_READ_GAP_SECONDS
+        op = self.c.fence(op["key"], "no-response", [first, self.read()], expected_version=op["version"],
+                          event_id=self.ev())
+        self.assertEqual((op["state"], self.gstate(g)), ("fenced", "reserved"))
+
+    def test_e14_the_watch_also_confirms_on_tip_h(self):
+        g, op = self.fenced()
+        op = self.c.watch_confirm(op["key"], self.read(tip=H1, activity=None), expected_version=op["version"],
+                                  event_id=self.ev())
+        self.assertEqual((op["state"], self.gstate(g)), ("confirmed", "consumed"))
+        self.assertTrue(self.c.merging_off("o/r"))
+
     def test_e14_the_watch_confirms_a_fenced_op_with_an_incident_and_merging_off(self):
         g, op = self.fenced()
         for r in (self.read(), self.read(entries=[self.entry()], complete=False), self.read(tip=BASE)):
@@ -690,33 +707,33 @@ class OperationTests(Base):
         self.assertEqual((op2["state"], self.gstate(g2)), ("fenced", "reserved"))
 
     def test_e07_retry_is_p3_only_with_the_tip_still_b(self):
-        for proof, read, want in (("p3", self.read(tip=BASE), "intent"),
+        for n, (proof, read, want) in enumerate((("p3", self.read(tip=BASE), "intent"),
                                   ("p3", self.read(tip=B2), "abandoned"),
                                   ("p1", self.read(tip=BASE), "abandoned"),
-                                  ("p1", self.read(tip=B2), "abandoned")):
+                                  ("p1", self.read(tip=B2), "abandoned"))):
             with self.subTest(proof=proof, tip=read["tip"]):
-                g, op = self.absent_p(proof, pr=hash((proof, read["tip"])) % 1000 + 10)
+                g, op = self.absent_p(proof, pr=100 + n)
                 op = self.after(op, read)
                 self.assertEqual(op["state"], want)
                 self.assertEqual(self.gstate(g), "reserved" if want == "intent" else "retired")
 
     def test_e08_needs_a_complete_activity_read(self):
-        for proof, tip in (("p1", BASE), ("p1", B2), ("p3", B2)):
+        for n, (proof, tip) in enumerate((("p1", BASE), ("p1", B2), ("p3", B2))):
             with self.subTest(proof=proof, tip=tip):
-                g, op = self.absent_p(proof, pr=hash((proof, tip, "e08")) % 1000 + 10)
+                g, op = self.absent_p(proof, pr=200 + n)
                 for r in (self.read(tip=tip, complete=False), self.read(tip=tip, activity=None)):
                     with self.assertRaisesRegex(C.ContractError, "activity"):
                         self.after(op, r)
                 self.assertEqual(self.c._row("operations", "key", op["key"])["state"], "absent-proven")
 
     def test_e16_absence_contradicted_by_a_readback_abandons_with_an_incident_and_retires(self):
-        for proof, read in (("p1", self.read(tip=H1, activity=None)),
+        for n, (proof, read) in enumerate((("p1", self.read(tip=H1, activity=None)),
                             ("p1", self.read(tip=OTHER, entries=[self.entry()])),
                             ("p3", self.read(tip=H1)),
                             ("p3", self.read(tip=OTHER, entries=[self.entry()])),
-                            ("p1", self.read(tip=BASE, entries=[self.entry()]))):
+                            ("p1", self.read(tip=BASE, entries=[self.entry()])))):
             with self.subTest(proof=proof, tip=read["tip"]):
-                g, op = self.absent_p(proof, pr=hash((proof, json.dumps(read, sort_keys=True))) % 1000 + 10)
+                g, op = self.absent_p(proof, pr=300 + n)
                 op = self.after(op, read)
                 self.assertEqual((op["state"], op["incident"]), ("abandoned", 1), "never credited as confirmed")
                 self.assertEqual((self.gstate(g), self.grow(g)["cap_held"]), ("retired", 0))
