@@ -414,7 +414,7 @@ export async function mountScene() {
     lastTime = time; lastFrame = time;
     if (moving) elapsed += dt;
     yaw += (targetYaw - yaw) * .1; tilt += (targetTilt - tilt) * .1;
-    world.rotation.y = yaw + (moving ? Math.sin(elapsed * .05) * .06 : 0);
+    world.rotation.y = yaw + (moving && animates(claimTruth) ? Math.sin(elapsed * .05) * .06 : 0);   // no idle sway on a page that is not current
     world.rotation.x = tilt;
     const state = getState();
     for (const [id, entry] of nodes) {
@@ -433,7 +433,7 @@ export async function mountScene() {
       else pulse.mesh.position.copy(pulse.curve.getPoint(t));
     }
     renderOnce();
-    if (moving || pulses.length || Math.abs(targetYaw - yaw) > .001 || Math.abs(targetTilt - tilt) > .001) frame = requestAnimationFrame(draw);
+    if ((moving && animates(claimTruth)) || pulses.length || Math.abs(targetYaw - yaw) > .001 || Math.abs(targetTilt - tilt) > .001) frame = requestAnimationFrame(draw);
   }
 
   // ---- cues: every org change and every relevant feed event animates (or flashes, under reduced motion)

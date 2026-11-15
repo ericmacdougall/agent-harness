@@ -69,5 +69,7 @@ test('the scene draws through the claim: rebuild, meshes, labels, cues and the s
   assert.match(src, /\['truth', 'health', 'reads', 'connection'\]\.includes\(reason\)/, 'a truth change redraws the graph');
   assert.match(src, /queue = \[\]; pulses\.forEach\(disposePulse\); pulses = \[\];/, 'leaving current stops what is in flight');
   assert.match(src, /label\.classList\.toggle\('not-current'/);
+  assert.match(src, /moving && animates\(claimTruth\) \? Math\.sin/, 'no idle sway while not current');
+  assert.match(src, /if \(\(moving && animates\(claimTruth\)\) \|\| pulses\.length/, 'the frame loop stops when nothing may move');
   assert.match(src, /n\.truth\}:\$\{n\.live\}/, 'the scene signature includes truth, so a change rebuilds the meshes');
 });
