@@ -1186,5 +1186,54 @@ class AuthorTrailerHarness(unittest.TestCase):
                         self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
                         self.assertEqual(out.returncode, 2 if refused else 0, out.stderr[-400:])
 
+class ClaudeSessionTrailerTests(unittest.TestCase):
+    """goodqa#16106: the Claude Code attribution paragraph is Co-Authored-By plus Claude-Session."""
+
+    BODY = ("fix(hooks): accept the claude session trailer\n\nWhy: the attribution paragraph was refused.\n"
+            "What: recognise the trailer.\nTesting: `python3 -m pytest tests/test_commit_policy.py -q` -> 3 passed\n"
+            "Refs: GoodQA #16106\n\n")
+    COAUTH = "Co-Authored-By: Claude Sonnet <noreply@anthropic.com>"
+    SESSION = "Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv"
+
+    def problems(self, trailers, harness="claude"):
+        old = cp.HARNESS_OVERRIDE
+        cp.HARNESS_OVERRIDE = harness
+        try:
+            return cp.validate(self.BODY + trailers + "\n", policy=cp.load_policy())
+        finally:
+            cp.HARNESS_OVERRIDE = old
+
+    def test_ac1_both_trailer_lines_pass(self):
+        self.assertEqual(self.problems(self.COAUTH + "\n" + self.SESSION), [])
+        self.assertEqual(self.problems(self.SESSION + "\n" + self.COAUTH), [])
+
+    def test_neg1_claude_session_needs_the_exact_claude_ai_url(self):
+        for value in ("https://example.com/code/session_abc123", "http://claude.ai/code/session_abc123",
+                      "https://claude.ai/code/abc123", "https://claude.ai/code/session_",
+                      "https://claude.ai.evil.test/code/session_abc123", "https://claude.ai/code/session_abc 123", ""):
+            with self.subTest(value=value):
+                found = self.problems(self.COAUTH + "\nClaude-Session: " + value)
+                self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+
+    def test_ac2_error_names_the_unrecognised_line(self):
+        found = self.problems(self.COAUTH + "\nClaude-Session: https://example.com/code/session_abc123")
+        text = "\n".join(found)
+        self.assertIn("Claude-Session: https://example.com/code/session_abc123", text)
+        self.assertIn("not recognised", text)
+
+    def test_neg2_unknown_key_in_the_final_paragraph_is_still_refused(self):
+        found = self.problems(self.COAUTH + "\nX-Foo: bar")
+        self.assertTrue(any("X-Foo: bar" in p for p in found), found)
+
+    def test_neg3_attribution_still_reads_only_co_authored_by(self):
+        # a valid Claude-Session never stands in for, or changes, the Co-Authored-By check
+        wrong = self.problems("Co-Authored-By: Codex <noreply@openai.com>\n" + self.SESSION)
+        self.assertTrue(any("Co-Authored-By names" in p for p in wrong), wrong)
+        self.assertEqual(self.problems(self.SESSION), [])  # no named harness: nothing to compare
+        _, _, _, _, _, trailers, _, _ = cp.parse_message(cp.normalize(self.BODY + self.COAUTH + "\n" + self.SESSION))
+        self.assertEqual(trailers, [self.COAUTH, self.SESSION])
+        self.assertEqual({cp.trailer_harness(t) for t in trailers if t.lower().startswith("co-authored-by")}, {"claude"})
+
+
 if __name__ == "__main__":
     unittest.main()

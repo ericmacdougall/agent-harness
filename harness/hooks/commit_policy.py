@@ -44,7 +44,8 @@ LOCAL_PROFILE_NAME = "commit_policy.local.json"
 LEDGER = Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl"
 SECTION_NAMES = ("Why", "What", "Testing", "Refs", "Risk", "Reason", "Authorized-by")
 SECTION_LINE = re.compile(r"^(Why|What|Testing|Refs|Risk|Reason|Authorized-by)\s*:\s?(.*)$", re.I)
-TRAILER_LINE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-)+[Bb]y:\s+\S|^(?:Change-Id|Reviewed-on|Cc|Fixes|Closes|Co-authored-by):\s+\S", re.I)
+TRAILER_LINE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-)+[Bb]y:\s+\S|^(?:Change-Id|Reviewed-on|Cc|Fixes|Closes|Co-authored-by):\s+\S"
+                          r"|^(?-i:Claude-Session):[ \t]+https://claude\.ai/code/session_[A-Za-z0-9_-]+[ \t]*$", re.I)
 SUBJECT = re.compile(r"^(?P<type>[A-Za-z]+)(?:\((?P<scope>[^()]*)\))?(?P<bang>!)?: (?P<summary>.*)$")
 PR_REF = re.compile(r"\bPR\s*#[1-9]\d*\b|\b[\w.-]+/[\w.-]+#[1-9]\d*\b|https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 NONE_REF = re.compile(r"^none\s*\((?P<reason>.+)\)\s*\.?$", re.I | re.S)
@@ -209,9 +210,12 @@ def parse_message(message: str):
             current = []
     if current:
         paragraphs.append(current)
-    trailers = []
+    trailers, unrecognised = [], []
     if paragraphs and all(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
         trailers = paragraphs.pop()
+    elif paragraphs and any(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
+        # a mixed final paragraph is not a trailer block: name the lines that are not trailers (goodqa#16106)
+        unrecognised = [line for line in paragraphs[-1] if not TRAILER_LINE.match(line) or SECTION_LINE.match(line)]
     sections, order, stray = {}, [], []
     name = None
     for paragraph in paragraphs:
@@ -229,7 +233,7 @@ def parse_message(message: str):
     joined = {key: "\n".join(value).strip() for key, value in sections.items()}
     misplaced = [line for paragraph in paragraphs for line in paragraph
                  if TRAILER_LINE.match(line) and not SECTION_LINE.match(line)]
-    return subject, (lines[1] if len(lines) > 1 else None), joined, order, stray, trailers, misplaced
+    return subject, (lines[1] if len(lines) > 1 else None), joined, order, stray, trailers, misplaced, unrecognised
 
 
 def tickets_required_for(origin: str | None, policy: dict) -> bool:
@@ -463,7 +467,7 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
             "squash them (git rebase -i --autosquash) before publication"]
     rules, body_rules, ref_rules = policy["subject"], policy["body"], policy["refs"]
     problems = []
-    subject, separator, sections, order, stray, trailers, misplaced = parse_message(text)
+    subject, separator, sections, order, stray, trailers, misplaced, unrecognised = parse_message(text)
     match = SUBJECT.match(subject)
     kind = None
     if not match:
@@ -582,7 +586,12 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                 problems.append("revert: Authorized-by must cite the ticket where the authorization is recorded, "
                                 "e.g. 'Authorized-by: Eric, GoodQA #14151'")
     if misplaced:
-        problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line")
+        detail = ""
+        if unrecognised:
+            shown = "; ".join(repr(line if len(line) <= 80 else line[:77] + "...") for line in unrecognised[:3])
+            detail = (f" (the final paragraph also holds line(s) not recognised as trailers: {shown}; "
+                      "Claude-Session must be https://claude.ai/code/session_<id>)")
+        problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line" + detail)
     named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
     if named and attribution is not None and attribution.blocked:
         problems.append("trailers: cannot establish the current committing harness (" + attribution.reason +
