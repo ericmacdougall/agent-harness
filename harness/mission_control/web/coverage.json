@@ -5,6 +5,7 @@
   "host": "sources-panel",
   "initiatives": "initiatives-panel",
   "owners": "owners-panel",
+  "orggraph": "topology-panel", "pin": "sources-panel",
   "health": "health-panel",
   "events": "activity-panel",
   "chat": "chat-panel",
@@ -24,6 +25,7 @@
   "codex": "chat-panel",
   "asks": "needs-panel",
   "ledger": "mission-panel",
+  "orggraph": "topology-panel",
   "reads": "internal"
  },
  "asks": {
@@ -41,6 +43,7 @@
   "goals": "goals-list",
   "requirements": "requirements-body",
   "status": "deploys-panel",
+  "session": "internal",
   "generated": "sources-panel"
  },
  "routes": {
@@ -59,6 +62,7 @@
   "tool activity": "activity-quiet",
   "theme": "theme-toggle",
   "motion": "motion-toggle",
+  "org graph list view": "org-view-toggle",
   "requirement search": "req-search",
   "show more owners": "owners-more",
   "show more asks": "needs-more",

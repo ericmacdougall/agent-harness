@@ -55,8 +55,9 @@ class Runner:
 
     # Each shape returns the argv or raises Refused. Arguments are validated before they are placed.
     def argv(self, kind: str, *args) -> list[str]:
-        if kind == "ah-owners" and not args:
-            return [self.python, "-I", self.ah, "owners"]
+        if kind == "ah-owners" and len(args) == 1 and SESSION_RE.match(str(args[0])):
+            # always pinned (goodqa#15961): without --session ah follows the newest WAL, Codex sessions included
+            return [self.python, "-I", self.ah, "owners", "--session", str(args[0])]
         if kind == "ah-sessions" and not args:
             return [self.python, "-I", self.ah, "sessions"]
         if kind == "ah-ticket-comments" and len(args) == 1 and TICKET_RE.match(str(args[0])):
