@@ -592,6 +592,50 @@ class EndToEndTests(unittest.TestCase):
         head, binding = self.reviewed_two_commit_pr()
         self.assertEqual(binding[4], self.head, "no flag: the head^1 snapshot base, never an inferred merge-base")
 
+    def reviewed_evidence(self, repo, head, *extra):
+        """Run the bound daemon-style PR review of `head` in `repo`; return its settled FINAL evidence."""
+        self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
+                               "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
+        value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
+        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        output = self.root / ("review-%s.md" % head[:12])
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", head,
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", *extra],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
+        return guard.UsageStore(self.root / "usage").inspect(json.loads(line[len("Usage receipt: "):]))
+
+    def assert_no_base_and_refused(self, evidence, head):
+        self.assertNotIn("snapshot_base", evidence["review"], "no base: the key is absent, never defaulted")
+        self.assertEqual(mg.pr_pass_evidence(evidence)[2], head, "the legacy 4-tuple path still accepts it")
+        with self.assertRaisesRegex(ValueError, "LEGACY_NO_SNAPSHOT_BASE"):
+            mg.pr_pass_evidence(evidence, with_base=True)
+
+    def test_root_commit_pr_without_a_flag_has_no_base_and_is_refused_with_base(self):
+        root = self.root / "rootrepo"
+        root.mkdir()
+        for args in (["init", "-q", "-b", "main"], ["config", "user.name", "Fixture"],
+                     ["config", "user.email", "fixture@example.invalid"]):
+            subprocess.run(["git", "-C", str(root)] + args, check=True)
+        (root / "app.txt").write_text("only\n")
+        subprocess.run(["git", "-C", str(root), "add", "app.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "feat: root\n\nRefs: none (fixture)\n\n"
+                        "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
+        head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", head + "^1"],
+                                        capture_output=True).returncode, 1, "fixture: a parentless commit")
+        self.assert_no_base_and_refused(self.reviewed_evidence(root, head), head)
+
+    def test_explicit_base_equal_to_head_is_omitted_and_refused_with_base(self):
+        evidence = self.reviewed_evidence(self.repo, self.head, "--snapshot-base", self.head)
+        self.assert_no_base_and_refused(evidence, self.head)
+
     def test_unstamped_review_mints_nothing(self):
         # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp
         output = self.root / "unstamped.md"
