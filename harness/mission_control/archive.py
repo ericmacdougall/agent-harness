@@ -170,6 +170,9 @@ def _normalise(row: dict, kind: str) -> dict:
         "evidence_in": _text(row.get("evidence"), 200) if isinstance(row.get("evidence"), str) else "",
         "evidence": _evidence(row.get("evidence")),
         "full_len": len(full),
+        # review PR 234 v2 F3: the shown text is only part of the requirement; an archive cannot be confirmed on it
+        "clipped": row.get("clipped") is True,
+        "text_len": row["text_len"] if isinstance(row.get("text_len"), int) and not isinstance(row.get("text_len"), bool) else len(full),
         # the words the duplicate rule compares: the whole text, so two long texts that only differ late never merge
         "words": row["words"] if isinstance(row.get("words"), str) else
         hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest(),  # "" means completeness is unknown
