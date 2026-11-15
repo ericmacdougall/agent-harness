@@ -1688,33 +1688,40 @@ def pr_pass_evidence(evidence, *, with_base=False):
 _SHA40 = re.compile(r'[0-9a-f]{40}')
 
 
-def ahc_candidate_pass(evidence, candidate):
-    """Candidate binding for an ahc item (goodqa#16049 spec ahc-m1-v2e AC-3): the PR PASS must be for the candidate
-    merge commit M itself, not for H. Returns (repo, pr, M, report_sha256) or raises ValueError.
+AHC_BASE_COMPARE = ('identical', 'ahead')
 
-    `candidate` is core's record plus a fresh GitHub readback, supplied by the caller (freshness is the caller's
-    guard, T2): repo, pr, head (H), base (B), merge_sha (M), ref (the immutable candidate ref, ending /{pr}/{M}),
-    tree (M's tree), parents (M's parents as read back) and pr_head (the PR head as read back). It requires
-    pr_pass_evidence to hold, the FINAL's repo and PR to be the candidate's, its Reviewed HEAD to equal M, its
-    reviewed tree to equal M's tree, M's parents to be exactly (B, H) and the PR head to be H. A FINAL for H alone,
-    or for another M with the same H, is refused. Pure: it reads its arguments and writes nothing.
+
+def ahc_bound_pass(evidence, binding):
+    """H/B_r binding for an ahc item (goodqa#16049 spec ahc-m1-v2g2 R4, E2): the PR PASS must be for the reviewed
+    head H, carry the snapshot base B_r the reviewer diffed against, and B_r must be the current default-branch tip
+    B or an ancestor of it. Returns (repo, pr, H, B_r, report_sha256) or raises ValueError. Replaces the withdrawn
+    candidate-M binding (v2e): integration is now a fast-forward of the default branch from B to H.
+
+    `binding` is core's record plus fresh GitHub readbacks, supplied by the caller (freshness is the caller's guard,
+    T2): repo, pr, head (H), base (B, the default-branch tip now), pr_head (the PR head as read back) and
+    base_compare (the status of GitHub's compare B_r...B: 'identical' when B_r == B, 'ahead' when B is a proper
+    descendant of B_r). It requires pr_pass_evidence(with_base=True) to hold (a legacy receipt without B_r is
+    refused), the FINAL's repo and PR to be the binding's, its Reviewed HEAD to equal H, the PR head to be H by
+    readback, and the compare status to be in {identical, ahead} and consistent with B_r == B. Pure: it reads its
+    arguments and writes nothing. The author-harness derivation that excludes ahc's own update-branch commits is
+    NOT here (parked with the held W21 work).
     """
-    repo, pr, reviewed, report = pr_pass_evidence(evidence)
-    if not isinstance(candidate, dict):
-        raise ValueError('candidate binding needs the candidate record')
-    head, base, m = candidate.get('head'), candidate.get('base'), candidate.get('merge_sha')
-    tree, ref = candidate.get('tree'), candidate.get('ref')
-    if not all(isinstance(v, str) and _SHA40.fullmatch(v) for v in (head, base, m, tree)) or len({head, base, m}) != 3:
-        raise ValueError('candidate record is malformed')
-    subject = evidence.get('subject') if isinstance(evidence.get('subject'), dict) else {}
-    if (repo_key(candidate.get('repo')) is None or repo_key(candidate['repo']) != repo_key(repo)
-            or candidate.get('pr') != pr or type(pr) is not int
-            or reviewed != m or subject.get('tree') != tree
-            or not isinstance(ref, str) or not ref.endswith('/ahc/candidate/%d/%s' % (pr, m))
-            or not ref.startswith(('refs/ahc/candidate/', 'refs/heads/ahc/candidate/'))
-            or candidate.get('parents') != [base, head] or candidate.get('pr_head') != head):
-        raise ValueError('PR PASS is not bound to this candidate M = merge(B, H)')
-    return repo, pr, m, report
+    repo, pr, reviewed, report, snapshot_base = pr_pass_evidence(evidence, with_base=True)
+    if not isinstance(binding, dict):
+        raise ValueError('ahc binding needs the item record and its readbacks')
+    head, base, compare = binding.get('head'), binding.get('base'), binding.get('base_compare')
+    if not all(isinstance(v, str) and _SHA40.fullmatch(v) for v in (head, base)) or head == base:
+        raise ValueError('ahc binding record is malformed')
+    if (repo_key(binding.get('repo')) is None or repo_key(binding['repo']) != repo_key(repo)
+            or type(pr) is not int or type(binding.get('pr')) is not int or binding['pr'] != pr):
+        raise ValueError('PR PASS is for another repo or PR')
+    if reviewed != head:
+        raise ValueError('PR PASS Reviewed HEAD is not H')
+    if binding.get('pr_head') != head:
+        raise ValueError('the PR head read back is not H')
+    if compare not in AHC_BASE_COMPARE or (compare == 'identical') != (snapshot_base == base):
+        raise ValueError('the snapshot base B_r is not B or an ancestor of B')
+    return repo, pr, head, snapshot_base, report
 
 
 def add_review_waiver(state_dir, reference, *, store=None, now=None):
