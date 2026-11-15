@@ -156,6 +156,23 @@ class InitiativesRecoverWithoutAChange(unittest.TestCase):
         self.assertEqual(self.health.rows["initiatives"]["status"], "ok")
         self.assertFalse(source.stale)
 
+    def test_an_unchanged_invalid_file_is_not_read_again(self):  # only a read that raised is retried
+        self.path.write_text("not json")
+        real = safeio.Reader([self.dir])
+        attempts = []
+
+        class Counting:
+            def read(self, path, limit):
+                attempts.append(path)
+                return real.read(path, limit)
+
+        source = col.Initiatives(self.hub, self.health, Counting(), self.path)
+        source.run(time.time())
+        source.run(time.time() + 3)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(self.health.rows["initiatives"]["status"], "error")
+        self.assertTrue(source.stale)
+
     def test_an_unchanged_good_file_is_not_read_again(self):  # control: a good read still caches
         real = safeio.Reader([self.dir])
         attempts = []

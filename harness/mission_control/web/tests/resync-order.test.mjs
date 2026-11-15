@@ -86,5 +86,23 @@ test('a failed resync replays the held stream updates and is not live', async ()
   await wait(20);
   assert.equal(store.getState().ledger.goals.items[0].id, 'held');
   assert.notEqual(store.getState().connection, 'live');
+});
+
+test('a state load that never answers is timed out: the held updates apply and a late answer is dropped', async () => {
+  live.setStateTimeout(80);
+  const es = sources[0];
+  es.emit('error');
+  es.emit('open');
+  const late = await nextFetch();   // this fake fetch ignores the abort signal and never answers on its own
+  es.emit('ledger', ledger('while-stalled', 'BLOCKED'));
+  assert.notEqual(store.getState().ledger.goals.items[0].id, 'while-stalled');
+  await wait(120);
+  assert.equal(store.getState().ledger.goals.items[0].id, 'while-stalled', 'released by the timeout');
+  es.emit('ledger', ledger('after-release', 'BLOCKED'));
+  assert.equal(store.getState().ledger.goals.items[0].id, 'after-release', 'the stream applies directly again');
+  late(snapshot('too-late'));
+  await wait(20);
+  assert.equal(store.getState().ledger.goals.items[0].id, 'after-release', 'an answer after the timeout installs nothing');
+  assert.notEqual(store.getState().connection, 'live');
   live.stop();
 });

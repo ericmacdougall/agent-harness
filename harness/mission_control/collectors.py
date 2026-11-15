@@ -751,6 +751,7 @@ class Initiatives(Collector):
         self.items: list[dict] = []
         self.stale = False
         self.error = ""
+        self.read_failed = False  # the last read of this signature raised (refused, unreadable): read it again
         self.partial = False  # the file holds more initiatives than the MAX_ROWS kept
 
     MAX_ROWS = 100
@@ -768,15 +769,18 @@ class Initiatives(Collector):
             return self._fail("initiatives file missing")
         sig = (info.st_ino, info.st_size, info.st_mtime_ns)
         previous = self.sig
-        if sig == self.sig and not self.error:
+        if sig == self.sig and not self.read_failed:
+            if self.error:
+                raise ValueError(self.error)  # the same bad bytes (not JSON, too large): no change, no new read
             return f"{len(self.items)} initiatives"
-        # goodqa#16117 F3: an unchanged file is read again while its last read failed. A refused or unreadable read
+        # goodqa#16117 F3: an unchanged file is read again while its last read raised. A refused or unreadable read
         # often recovers with no change to inode, size or mtime (permissions restored, a reader that was busy), so the
-        # signature is a cache of good reads only, never of failures.
-        self.sig = sig
+        # signature never caches a read that did not happen.
+        self.sig, self.read_failed = sig, False
         try:
             raw = self.reader.read(self.path, 1024 * 1024 + 1)
         except (OSError, Refused) as exc:
+            self.read_failed = True
             # the signature is already taken: without this the next tick would see no change and report ok (v7 audit)
             return self._fail(f"initiatives file could not be read ({type(exc).__name__}); showing the last good copy")
         if len(raw) > 1024 * 1024:

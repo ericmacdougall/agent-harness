@@ -12,6 +12,10 @@ let failures = 0;
 // later one superseded is dropped (it neither installs nor marks the page live).
 let loadGen = 0;
 let held = null;
+// A load that never answers would hold the stream for ever: it is aborted, which replays what it held, and the
+// caller's retry and backoff take over. Tests shorten it.
+let stateTimeoutMs = 15000;
+export function setStateTimeout(ms) { stateTimeoutMs = ms; }
 
 class SendError extends Error {
   constructor(message, retryable) { super(message); this.retryable = retryable; }
@@ -28,17 +32,25 @@ async function loadState() {
   const gen = ++loadGen;
   held = held || [];
   let state;
+  const abort = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = setTimeout(() => {
+    abort?.abort();
+    if (gen === loadGen) replayHeld(gen);  // even when the fetch ignores the abort, the stream is released
+  }, stateTimeoutMs);
   try {
-    const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
+    const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' }, signal: abort?.signal });
     if (gen !== loadGen) return false;  // superseded while in flight
     if (response.status === 401 || response.status === 403) { replayHeld(gen); setConnection('expired'); return false; }
     if (!response.ok) throw new Error(`state ${response.status}`);
     state = await response.json();
     if (gen !== loadGen) return false;
+    if (!held) throw new Error('state load timed out');  // released by the timeout: this answer is older than what was shown
     installState(state);
   } catch (error) {
     replayHeld(gen);  // the held stream updates are still the newest data; the stream is never left held
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
   replayHeld(gen);  // then everything the stream sent while the response was on its way, in order
   return true;
