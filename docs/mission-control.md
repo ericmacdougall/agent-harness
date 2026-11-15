@@ -207,7 +207,31 @@ owner, ticket, next_step, next_eta, full_eta, estimate_by, note, updated
 
 ### Owners panel
 
-The panel shows what `ah owners` reports and never rewrites a state. By default it lists live, working, finishing and waiting owners, plus any that are DROPPED or SILENT; "All owners" shows the rest.
+The panel shows what `ah owners` reports and never rewrites a state.
+
+**Default view: live owners by initiative.** Owners are grouped under the initiative whose ticket they name. Owners with no matching initiative go under "Not linked to an initiative".
+
+Each group shows its live owners, with their working helpers nested under them. A parked owner that needs a decision also stays in view. Everything else folds under the group's fold button, which says how many rows it holds and how many of them need attention:
+- parked owners (handoff, returned, done, DROPPED, finishing, waiting);
+- finished helpers;
+- helpers whose owner could not be found.
+
+**Roles: live, parked and helper.** These are decided the way the owner cap counts them. The owner and helper type lists come from `caps.owner_types` and `caps.helper_types` in the policy tier_gate reads (`AGENT_HARNESS_TIER_POLICY`, else the hooks' `model_tiers.json`).
+- That file is read only as a regular file of at most 1 MiB, never followed through a link. A FIFO, a directory, an oversized file or bad JSON falls back to the default lists.
+- On a fallback the `owner-policy` Source health row errors. The owners claim is then not current, because the counts may differ from the cap's.
+
+**Counts.**
+- The headline and the summary line count live owners: holders of an 8-slot owner-cap slot, any runtime, as tier_gate counts them.
+- Live Codex owners, parked or history rows, and helpers are separate figures beside it.
+- Helpers never count toward any figure.
+- Group headings sum to the headline.
+- Every count goes through the owners claim: `?` while unknown, `N+` while partial, and "N (stale)" while stale.
+
+**What a row may claim.** A row says "• live" only while the owners claim is current or partial. When the owners read is stale, or the row's own source is stale, the row shows its last known state, marked "(last known)". When the read is unknown, the row is marked "(not known now)".
+
+**History window.** Owners finished over 6 h ago are not listed, and the summary line says so.
+
+**Other views.** "All rows (flat)" lists every row in one list, sorted by severity and then recency, with no grouping and no folds. The Live, Dropped, Silent, Finishing, Codex, Returned and Done filters are flat lists of that state.
 
 A DROPPED or SILENT owner is shown as *held* (amber, not red) when either:
 

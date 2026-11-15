@@ -35,6 +35,30 @@ OWNER_TYPES_DEFAULT = ("task-owner", "general-purpose", "claude", "fork", "")
 HELPER_TYPES_DEFAULT = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide",
                         "statusline-setup")
 _owner_policy_cache: dict = {}
+POLICY_MAX_BYTES = 1 << 20   # model_tiers.json is a few KiB; anything over 1 MiB is not a policy file
+
+
+def read_regular(path, limit: int) -> bytes:
+    """The bytes of a regular file of at most `limit` bytes, or OSError/ValueError (PR 260 review F2). lstat first: a
+    FIFO, device, directory or link is refused without opening it (a FIFO would block the shared collector thread for
+    ever); O_NONBLOCK and O_NOFOLLOW guard the open itself, and the fstat refuses anything but the file the lstat saw.
+    An oversized file is refused, never read whole."""
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{Path(path).name} is not a regular file")
+    if info.st_size > limit:
+        raise ValueError(f"{Path(path).name} is over {limit} bytes")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError(f"{Path(path).name} changed while it was opened")
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise ValueError(f"{Path(path).name} is over {limit} bytes")
+    return data
 
 
 def owner_policy(hooks_dir=None) -> dict:
@@ -44,22 +68,24 @@ def owner_policy(hooks_dir=None) -> dict:
     path = Path(os.environ.get("AGENT_HARNESS_TIER_POLICY") or hooks / "model_tiers.json") if not hooks_dir \
         else hooks / "model_tiers.json"
     try:
-        stamp = path.stat().st_mtime_ns
+        info = os.lstat(path)
+        stamp = (info.st_mtime_ns, info.st_size, info.st_mode)
     except OSError:
         stamp = None
     key = (str(path), stamp)
     if key not in _owner_policy_cache:
-        caps, fallback = {}, False
+        caps, fallback, error = {}, False, ""
         try:
-            caps = json.loads(path.read_text()).get("caps") or {}
-        except (OSError, ValueError, AttributeError):
+            caps = json.loads(read_regular(path, POLICY_MAX_BYTES)).get("caps") or {}
+        except (OSError, ValueError, AttributeError, RecursionError) as exc:
             caps, fallback = {}, True
+            error = ev.short(str(exc), 120) if type(exc) is ValueError else type(exc).__name__
         owner = caps.get("owner_types") if isinstance(caps.get("owner_types"), list) else None
         helper = caps.get("helper_types") if isinstance(caps.get("helper_types"), list) else None
         _owner_policy_cache.clear()
         _owner_policy_cache[key] = {"owner_types": frozenset(map(str, owner or OWNER_TYPES_DEFAULT)),
                                     "helper_types": frozenset(map(str, helper or HELPER_TYPES_DEFAULT)),
-                                    "fallback": fallback or owner is None or helper is None}
+                                    "fallback": fallback or owner is None or helper is None, "error": error}
     return _owner_policy_cache[key]
 
 
@@ -1209,9 +1235,11 @@ class Owners(Collector):
         self.claude_rows = rows[:self.MAX_ROWS]
         self.partial = dropped > 0 or len(rows) > self.MAX_ROWS  # the owner counts would be short: never shown as whole
         self.publish()
-        if owner_policy().get("fallback"):
+        policy = owner_policy()
+        if policy.get("fallback"):
             # the panel still counts, but by default owner/helper types: say so instead of drifting silently
-            self.health.error("owner-policy", "model_tiers caps unreadable: owner/helper types are defaults; count may differ from the cap")
+            why = f" ({policy['error']})" if policy.get("error") else ""
+            self.health.error("owner-policy", f"model_tiers caps unreadable{why}: owner/helper types are defaults; count may differ from the cap")
         else:
             self.health.ok("owner-policy", "owner/helper types from model_tiers caps")
         return "; ".join(filter(None, [f"{len(rows)} owners", outside_window(data)]))
