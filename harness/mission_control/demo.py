@@ -316,7 +316,8 @@ class DemoRunner:
 
 
 def goals_payload(now: float) -> dict:
-    """Mission goals for the demo: one live-tested, one in progress, one with a failing test, one hostile title."""
+    """Mission goals for the demo, in goals_view's vocabulary: one done live (deploy plus a later live PASS), one live
+    and tested with no deploy record (live, not done), one in progress, one failing, one hostile title."""
     def proof(ident, kind, verdict, age, check, note):
         return {"id": ident, "kind": kind, "verdict": verdict, "at": _iso(now - age), "check": check, "by": "main", "note": note}
     return {"generated": _iso(now), "session": DEMO_SESSION, "state": "OK", "warnings": [], "goals": [
@@ -325,14 +326,18 @@ def goals_payload(now: float) -> dict:
          "deferral": None, "missing": [], "tampered": [], "unpinned": [],
          "evidence": [proof("wev0001", "live_test", "PASS", 5400, "checkout-staging", "REALLY_TESTED checkout-staging: PASS on staging")]},
         {"id": "reports", "title": "Reports table migrated without downtime", "ticket": "demo#104", "ledger_status": "active",
-         "state": "BLOCKED", "priority": 2, "target": "reports migration live", "owners": ["a4held0demo"], "deferral": None,
+         "state": "FAILING", "priority": 2, "target": "reports migration live", "owners": ["a4held0demo"], "deferral": None,
          "missing": ["backup"], "tampered": [], "unpinned": [],
          "evidence": [proof("wev0002", "live_test", "FAIL", 7200, "reports-canary", "REALLY_TESTED reports-canary: FAIL, 3 rows differ")]},
         {"id": "release", "title": "Release 0.4 deployed and tested live", "ticket": "demo#103", "ledger_status": "active",
-         "state": "LIVE_TESTED", "priority": 2, "target": "0.4 live", "owners": [], "deferral": None, "missing": [],
+         "state": "DONE_LIVE", "priority": 2, "target": "0.4 live", "owners": [], "deferral": None, "missing": [],
          "tampered": [], "unpinned": [],
          "evidence": [proof("wev0003", "deploy", "PASS", 9000, "release-0.4", "DEPLOYED demo/shop 0.4.0 to live"),
                       proof("wev0004", "live_test", "PASS", 8400, "release-0.4-live", "REALLY_TESTED release-0.4-live: PASS")]},
+        {"id": "search", "title": "Search suggestions answer in under 200 ms", "ticket": "demo#105", "ledger_status": "active",
+         "state": "LIVE_TESTED", "priority": 3, "target": "p95 under 200 ms live", "owners": [], "deferral": None,
+         "missing": [], "tampered": [], "unpinned": [],
+         "evidence": [proof("wev0005", "live_test", "PASS", 3000, "search-live", "REALLY_TESTED search-live: PASS, no deploy record attached")]},
         {"id": "xss", "title": "<img src=x onerror=alert(1)> goal title", "ticket": "", "ledger_status": "imported",
          "state": "UNKNOWN", "priority": 3, "target": "<script>alert(2)</script>", "owners": [], "deferral": None,
          "missing": [], "tampered": [], "unpinned": [], "evidence": []}]}

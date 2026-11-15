@@ -88,6 +88,43 @@ class RunnerShapes(unittest.TestCase):
                 self.runner.argv(kind, *args)
 
 
+class StatusUnread(unittest.TestCase):
+    """review PR 234 v2 F2: a status read that could not open every WAL is marked incomplete, never shown as healthy."""
+
+    def producer_shape(self, unread):
+        import ah  # noqa: PLC0415 - the real producer, fed rows so it opens no file
+        rows = [("a1", {"event": "check", "at": iso(60), "id": "wv1", "note": "REALLY_TESTED t: ok"})]
+        report = ah.status_report(Path("/nonexistent"), SID, 43200, now=NOW, rows=rows, unread=unread)
+        return json.loads(json.dumps(report, default=str))
+
+    def test_unread_wals_mark_the_status_incomplete_with_a_bounded_redacted_list(self):
+        token = "ghp_" + "A1b2" * 9
+        unread = [{"wal": f"agent-x{i}.jsonl", "agent": f"x{i}", "reason": f"[Errno 13] Permission denied {token}"} for i in range(25)]
+        ledger, hub, _ = make(Fake(status=self.producer_shape(unread)))
+        ledger.run(1000.0)
+        part = hub.snapshots["ledger"]["status"]
+        self.assertIs(part["incomplete"], True)
+        self.assertEqual(part["unread"]["count"], 25)
+        self.assertLessEqual(len(part["unread"]["items"]), 10)
+        blob = json.dumps(part)
+        self.assertNotIn(token, blob)
+        self.assertIn("agent-x0.jsonl", blob)
+        self.assertFalse(part["error"])  # a partial read is not a failed read: the rows it did read still show
+
+    def test_a_complete_read_is_not_incomplete(self):
+        ledger, hub, _ = make(Fake(status=self.producer_shape([])))
+        ledger.run(1000.0)
+        part = hub.snapshots["ledger"]["status"]
+        self.assertEqual((part["incomplete"], part["unread"]["count"], part["unread"]["items"]), (False, 0, []))
+
+    def test_a_malformed_unread_field_fails_closed_as_incomplete(self):
+        for value in ("lots", {"wal": "x"}, [1, None, "agent-y.jsonl"], 3):
+            with self.subTest(value=value):
+                ledger, hub, _ = make(Fake(status=dict(STATUS, unread=value)))
+                ledger.run(1000.0)
+                self.assertIs(hub.snapshots["ledger"]["status"]["incomplete"], True, value)
+
+
 class LedgerCollector(unittest.TestCase):
     def test_one_tick_reads_each_source_once_and_publishes_one_snapshot(self):
         runner = Fake()

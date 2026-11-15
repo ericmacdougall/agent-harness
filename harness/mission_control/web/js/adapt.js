@@ -323,10 +323,16 @@ export function atRisk(initiatives = [], owners = [], events = [], now = Date.no
 
 // ---- ledger (goodqa#15920): goals, requirements and evidence-only status, as the server's Ledger source reports them.
 // Everything is clamped again here: the page never trusts a field's type or length, and renders with textContent only.
+// The producer's vocabulary (harness/hooks/goals_view.py; review PR 234 v2 F1). Only DONE_LIVE is done; LIVE_TESTED and
+// LIVE_UNTESTED are live but not done; everything else is open. A state this page does not know is shown as written, open.
 export const GOAL_STATE = Object.freeze({
-  LIVE_TESTED: 'Live and tested', LIVE: 'Live, not tested', MERGED: 'Merged, not live', IN_PROGRESS: 'In progress', BLOCKED: 'Blocked',
-  DEFERRED: 'Deferred', DONE: 'Done', FAILED: 'Failed', UNKNOWN: 'No evidence yet',
+  DONE_LIVE: 'Done: deployed and tested live', LIVE_TESTED: 'Live and tested, no deploy record (not done)',
+  LIVE_UNTESTED: 'Deployed, not tested live', VERIFIED: 'Tested, not live yet', FAILING: 'Failing: newest test failed',
+  UNCONFIRMED: 'Unconfirmed: evidence changed since attach (not done)', IN_PROGRESS: 'In progress', DEFERRED: 'Deferred',
+  RETIRED: 'Retired', UNKNOWN: 'No record either way',
 });
+export const GOAL_DONE = Object.freeze(new Set(['DONE_LIVE']));
+export const GOAL_LIVE_NOT_DONE = Object.freeze(new Set(['LIVE_TESTED', 'LIVE_UNTESTED']));
 const LIST_CAP = 2000;
 const rows = value => (Array.isArray(value) ? value.filter(x => x && typeof x === 'object' && !Array.isArray(x)) : []);
 const int = value => (Number.isInteger(value) ? value : 0);
@@ -346,7 +352,7 @@ export function ledger(snapshot) {
   const reqs = root.requirements && typeof root.requirements === 'object' ? root.requirements : {};
   const status = root.status && typeof root.status === 'object' ? root.status : {};
   const requirementItems = rows(reqs.items).slice(0, LIST_CAP).map(r => ({
-    id: str(r.id, 64), kind: 'requirement', text: str(r.text, 700), at: validIso(r.at) || '', session: str(r.session, 64), owner: str(r.owner, 60), ticket: str(r.ticket, 60),
+    id: str(r.id, 64), kind: 'requirement', text: str(r.text, 700), clipped: r.clipped === true, text_len: Number.isInteger(r.text_len) ? r.text_len : 0, at: validIso(r.at) || '', session: str(r.session, 64), owner: str(r.owner, 60), ticket: str(r.ticket, 60),
     source: str(r.source, 300), state: str(r.state, 40), bucket: r.bucket === 'archived' ? 'archived' : 'live', rule: str(r.rule, 8) || 'live', rule_title: str(r.rule_title, 40),
     reason: str(r.reason, 300), evidence_ref: str(r.evidence_ref, 120), has_evidence: r.has_evidence === true,
     expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null, digest: str(r.digest, 40), unowned_note: str(r.unowned_note, 200), user_sourced: r.user_sourced === true, evidence_text: str(r.evidence_text, 300),
@@ -370,12 +376,26 @@ export function ledger(snapshot) {
     requirements: part(reqs, { items: requirementItems, total: Number.isInteger(reqs.total) ? reqs.total : requirementItems.length, truncated: reqs.truncated === true, summary }),
     status: part(status, { counts: status.counts && typeof status.counts === 'object' ? Object.fromEntries(Object.entries(status.counts).slice(0, 20).map(([k, v]) => [str(k, 30), int(v)])) : {},
       owners: { counts: {}, attention: [], live: [], undisposed: [], ...(status.owners && typeof status.owners === 'object' ? { attention: arr(status.owners.attention), live: arr(status.owners.live), undisposed: arr(status.owners.undisposed) } : {}) },
-      since_s: int(status.since_s), entries: int(status.entries), ...Object.fromEntries(STATUS_LISTS.map(k => [k, rows(status[k]).slice(0, 60).map(statusRow)])) }),
+      since_s: int(status.since_s), entries: int(status.entries), ...unreadPart(status),
+      ...Object.fromEntries(STATUS_LISTS.map(k => [k, rows(status[k]).slice(0, 60).map(statusRow)])) }),
     generated: validIso(root.generated) || '',
   };
   return out;
 }
 function arr(value) { return Array.isArray(value) ? value.slice(0, 20).map(v => str(v, 40)) : []; }
+// review PR 234 v2 F2: the WALs `ah status` could not read. The server fails closed (count -1 when unknown); here the
+// flag is believed only when it is exactly true, and the list is clamped again.
+function unreadPart(status) {
+  const raw = status.unread && typeof status.unread === 'object' && !Array.isArray(status.unread) ? status.unread : {};
+  const count = Number.isInteger(raw.count) && raw.count >= -1 ? raw.count : 0;
+  const items = rows(raw.items).slice(0, 10).map(r => ({ wal: str(r.wal, 80), agent: str(r.agent, 40), reason: str(r.reason, 200) }));
+  return { incomplete: status.incomplete === true, unread: { count, items } };
+}
+export function unreadLine(status) {
+  if (!status?.incomplete) return '';
+  const n = status.unread?.count;
+  return `Incomplete: ${n > 0 ? `${n} session log${n === 1 ? '' : 's'}` : 'some session logs'} could not be read, so blockers, deploys and tests recorded there are missing here.`;
+}
 
 // Archived asks (server) and archived requirements (ledger) as one list, newest first. Each row keeps the rule and reason
 // that put it there. The page removes nothing: a row that stops matching comes back on the next snapshot.
@@ -418,7 +438,9 @@ export function blockerRows(status, flagged = [], owners = [], initiatives = [])
 export function missionTiles(state) {
   const led = state.ledger || ledger(null);
   const goals = led.goals.items;
-  const tested = goals.filter(g => g.state === 'LIVE_TESTED').length;
+  const done = goals.filter(g => GOAL_DONE.has(g.state)).length;
+  const liveNotDone = goals.filter(g => GOAL_LIVE_NOT_DONE.has(g.state)).length;
+  const open = goals.length - done - liveNotDone;
   const counts = ownerCounts(state.owners || []);
   const live = counts.live, attention = counts.attention;
   const waiting = (state.asks || []).filter(ask => waitingOnUser(state.messages, ask) && state.decisions?.[ask.id]?.status !== 'sending').length;
@@ -426,10 +448,10 @@ export function missionTiles(state) {
   const reqs = led.requirements.summary;
   const risky = (state.initiatives || []).filter(i => /at risk|blocked/i.test(i.state)).length;
   const tiles = [
-    { id: 'goals', label: 'Goals live and tested', value: `${tested} / ${goals.length}`, note: led.goals.error ? 'ledger error' : `${goals.length - tested} still open`, target: 'mission-panel' },
+    { id: 'goals', label: 'Goals done live', value: `${done} / ${goals.length}`, note: led.goals.error ? 'ledger error' : `${liveNotDone} live, not done · ${open} open`, target: 'mission-panel' },
     { id: 'owners', label: 'Owners live', value: String(live), note: [counts.codexLive ? `${counts.codexLive} live Codex` : '', attention ? `${attention} need attention` : 'none need attention'].filter(Boolean).join(' · '), target: 'owners-panel' },
     { id: 'asks', label: 'Needs you', value: String(waiting), note: waiting ? 'waiting on your answer' : 'nothing waiting', target: 'needs-panel' },
-    { id: 'blockers', label: 'Blockers', value: String(blockers), note: risky ? `${risky} initiatives at risk` : 'across status, asks, owners', target: 'blockers-panel' },
+    { id: 'blockers', label: 'Blockers', value: String(blockers), note: led.status.incomplete ? 'incomplete: some logs unread' : risky ? `${risky} initiatives at risk` : 'across status, asks, owners', target: 'blockers-panel', alert: led.status.incomplete === true },
     { id: 'requirements', label: 'Requirements live', value: String(reqs.live), note: `${reqs.archived} archived`, target: 'requirements' },
   ];
   // Your own requirements archived from the dashboard: any process holding a launch link can make that click, so they are counted here until looked at.

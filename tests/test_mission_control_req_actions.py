@@ -332,6 +332,29 @@ class Route(ServerHarness):
         self.assertEqual(status, 201, value)
         self.assertEqual(self.app.actions.all()[-1]["session"], other)
 
+    def test_review_v2_f3_requirements_that_differ_after_600_characters_cannot_be_archived_unseen(self):
+        import hashlib  # noqa: PLC0415
+        head = "Keep the checkout flow exactly as specified here. " * 12   # 600 characters
+        self.assertEqual(len(head), 600)
+        fulls = {"wr8": head + "Then ship it on Monday.", "wr9": head + "Never ship it without a rollback."}
+        rows = [dict(REQS["requirements"][0], id=k, text=v[:600], text_len=len(v),
+                     text_sha=hashlib.sha256(v.encode()).hexdigest()) for k, v in fulls.items()]
+        self.app.runner.outputs["ah-requirements"] = lambda *_a: (0, json.dumps(dict(REQS, requirements=rows)))
+        self.app.ledger.run(time.time() + 61)
+        a, b = self.req("wr8"), self.req("wr9")
+        self.assertEqual(a["text"], b["text"])                    # the page can only show the same 600 characters
+        self.assertNotEqual(a["digest"], b["digest"])             # but the whole texts are told apart
+        self.assertEqual((a["clipped"], a["text_len"]), (True, len(fulls["wr8"])))
+        before = len(self.app.actions.all())
+        for rid, key in (("wr8", "click-key-0500"), ("wr9", "click-key-0501")):
+            status, value = self.click(rid=rid, key=key)
+            self.assertEqual((status, value.get("error")), (409, "text-clipped"), value)
+        self.assertEqual(len(self.app.actions.all()), before)   # nothing recorded for text the user could not read
+
+    def test_review_v2_f3_a_short_or_whole_requirement_is_not_clipped(self):
+        self.assertIs(self.req("wr1")["clipped"], False)
+        self.assertEqual(self.click(key="click-key-0502")[0], 201)
+
     def test_the_write_routes_in_the_server_match_the_coverage_map(self):
         import re
         server = (REPO / "harness" / "mission_control" / "server.py").read_text()

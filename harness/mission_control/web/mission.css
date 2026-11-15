@@ -148,14 +148,15 @@ body[data-tab="topology"] #scene-layer { display: block; }
 .tile-note { font-size: 12px; color: var(--muted); }
 .goals { gap: 10px; }
 .goal { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; display: grid; gap: 4px; background: var(--panel-2); border-left: 4px solid var(--line-strong); }
-.goal.state-live-tested { border-left-color: var(--ok); }
+.goal.state-done-live { border-left-color: var(--ok); }
+.goal.state-live-tested, .goal.state-live-untested { border-left-color: var(--warn); }
 .goal.state-blocked, .goal.state-failed { border-left-color: var(--bad); }
 .goal.state-in-progress, .goal.state-merged, .goal.state-live { border-left-color: var(--warn); }
 .goal-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px; }
 .goal-title { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
-.goal-state.live-tested { color: var(--ok); border-color: var(--ok); }
-.goal-state.blocked, .goal-state.failed { color: var(--bad); border-color: var(--bad); }
-.goal-state.in-progress, .goal-state.merged, .goal-state.live { color: var(--warn); border-color: var(--warn); }
+.goal-state.done-live { color: var(--ok); border-color: var(--ok); }
+.goal-state.failing, .goal-state.unconfirmed { color: var(--bad); border-color: var(--bad); }
+.goal-state.in-progress, .goal-state.live-tested, .goal-state.live-untested, .goal-state.verified { color: var(--warn); border-color: var(--warn); }
 .goal-meta, .goal-target { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
 .goal-problem { font-size: 13px; color: var(--bad); }
 .goal-evidence > summary { cursor: pointer; font-size: 13px; color: var(--accent); padding: 4px 0; }

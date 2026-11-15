@@ -1286,7 +1286,7 @@ class Ledger(Collector):
         self.mission: dict = {}
         self.parts["goals"]["items"] = []
         self.parts["requirements"].update(items=[], total=0, truncated=False, summary=archive.summary([]))
-        self.parts["status"].update(counts={}, since_s=0, entries=0, owners={})
+        self.parts["status"].update(counts={}, since_s=0, entries=0, owners={}, unread={"count": 0, "items": []}, incomplete=False)
         for key in self.STATUS_LISTS:
             self.parts["status"][key] = []
         self.sig = None
@@ -1441,6 +1441,10 @@ class Ledger(Collector):
             full = raw.get("text") if isinstance(raw.get("text"), str) else ""
             sha = raw.get("text_sha") if isinstance(raw.get("text_sha"), str) and re.fullmatch(r"[0-9a-f]{64}", raw["text_sha"]) else ""
             complete = bool(sha) or len(full) < 600  # the producer clips at 600: a clipped text without its hash is not whole
+            # review PR 234 v2 F3: the page holds only `full`; when the producer says the whole text is longer (text_len),
+            # or cannot say and the text sits at the clip, the user cannot read it all, so it is marked clipped
+            text_len = raw.get("text_len") if isinstance(raw.get("text_len"), int) and not isinstance(raw.get("text_len"), bool) else None
+            clipped = text_len > len(full) if text_len is not None else len(full) >= 600
             rid = str(raw["id"])
             if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", rid):  # never merge two ids by rewriting them
                 rid = "x-" + hashlib.sha256(rid.encode("utf-8", "replace")).hexdigest()[:16]
@@ -1450,6 +1454,7 @@ class Ledger(Collector):
                          # it was not clipped; empty (the rule refuses) when completeness is unknown
                          "words": (sha or hashlib.sha256(" ".join(full.split()).lower().encode("utf-8", "replace")).hexdigest()) if complete else "",
                          "text": ev.short(raw.get("text"), 600), "source": ev.short(raw.get("source"), 300),
+                         "text_len": text_len if text_len is not None else len(full), "clipped": clipped,
                          "at": ev.short(raw.get("at"), 40),
                          "state": ev.short(raw.get("state"), 40) if isinstance(raw.get("state"), str) else "",
                          "ticket": ticket if TICKET_RE.match(ticket) else "",
@@ -1494,7 +1499,24 @@ class Ledger(Collector):
         out["owners"] = {"counts": {ev.short(k, 40): v for k, v in list(counts.items())[:30] if isinstance(v, int) and not isinstance(v, bool)},
                          "attention": names("attention"), "live": names("live"), "undisposed": names("undisposed")}
         out["since_s"], out["entries"] = self._int(data.get("since_s")), self._int(data.get("entries"))
+        out["unread"] = self._unread(data.get("unread"))
+        out["incomplete"] = out["unread"]["count"] != 0
         return out
+
+    MAX_UNREAD = 10
+
+    def _unread(self, value) -> dict:
+        """The WALs `ah status` could not read (review PR 234 v2 F2): a count and at most MAX_UNREAD redacted rows. A
+        missing or malformed field fails closed: the count is unknown (-1) and the read is marked incomplete."""
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return {"count": value, "items": []}
+        if not isinstance(value, list):
+            return {"count": -1, "items": []}
+        items = [{"wal": ev.short(r.get("wal"), 80), "agent": ev.short(r.get("agent"), 40), "reason": ev.short(r.get("reason"), 120)}
+                 for r in value[:self.MAX_UNREAD] if isinstance(r, dict)]
+        if any(not isinstance(r, dict) for r in value):
+            items.append({"wal": "(unnamed)", "agent": "", "reason": "the status report named an unread source it could not describe"})
+        return {"count": len(value), "items": items[:self.MAX_UNREAD]}
 
     def reclassify(self) -> None:
         """Apply the user's latest archive and restore clicks to the rows already read: no `ah` run, one publish."""
