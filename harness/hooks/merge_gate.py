@@ -1698,20 +1698,31 @@ def ahc_bound_pass(evidence, binding):
     candidate-M binding (v2e): integration is now a fast-forward of the default branch from B to H.
 
     `binding` is core's record plus fresh GitHub readbacks, supplied by the caller (freshness is the caller's guard,
-    T2): repo, pr, head (H), base (B, the default-branch tip now), pr_head (the PR head as read back) and
-    base_compare (the status of GitHub's compare B_r...B: 'identical' when B_r == B, 'ahead' when B is a proper
-    descendant of B_r). It requires pr_pass_evidence(with_base=True) to hold (a legacy receipt without B_r is
-    refused), the FINAL's repo and PR to be the binding's, its Reviewed HEAD to equal H, the PR head to be H by
-    readback, and the compare status to be in {identical, ahead} and consistent with B_r == B. Pure: it reads its
-    arguments and writes nothing. The author-harness derivation that excludes ahc's own update-branch commits is
-    NOT here (parked with the held W21 work).
+    T2): repo, pr, head (H), base (B, the default-branch tip now), pr_head (the PR head as read back), and two
+    compare readback records {base, head, status}, each naming the two commits GitHub compared:
+    - base_compare, the compare B_r...B: base must be B_r (the receipt's snapshot base) and head must be B; status
+      'identical' exactly when B_r == B, otherwise 'ahead' (B is a proper descendant of B_r);
+    - head_compare, the compare B...H: base must be B and head must be H; status 'ahead' (H is a proper descendant
+      of B, so updating the default branch from B to H is a fast-forward).
+    It also requires pr_pass_evidence(with_base=True) to hold (a legacy receipt without B_r is refused, and so are
+    a same-vendor or unknown-author receipt), the FINAL's repo and PR to be the binding's, its Reviewed HEAD to
+    equal H, and the PR head to be H by readback. Every sha is full 40-hex.
+
+    Established when it returns: the PASS was for H reviewed against B_r; B_r is B or an ancestor of B; H
+    fast-forwards B; and the PR head is H, per readbacks the caller supplied. NOT established: that those readbacks
+    are fresh or genuine (the caller's T2 guard); that the default branch is still at B when the update is sent
+    (the update's beforeOid compare-and-swap, E2); that the commits B_r..B were reviewed (they were already on the
+    default branch, outside the PR's diff); and the author-harness derivation that excludes ahc's own update-branch
+    commits (parked with the held W21 work). Pure: it reads its arguments and writes nothing.
     """
     repo, pr, reviewed, report, snapshot_base = pr_pass_evidence(evidence, with_base=True)
     if not isinstance(binding, dict):
         raise ValueError('ahc binding needs the item record and its readbacks')
-    head, base, compare = binding.get('head'), binding.get('base'), binding.get('base_compare')
+    head, base = binding.get('head'), binding.get('base')
     if not all(isinstance(v, str) and _SHA40.fullmatch(v) for v in (head, base)) or head == base:
         raise ValueError('ahc binding record is malformed')
+    base_cmp = _compare_readback(binding.get('base_compare'), snapshot_base, base, 'B_r...B')
+    head_cmp = _compare_readback(binding.get('head_compare'), base, head, 'B...H')
     if (repo_key(binding.get('repo')) is None or repo_key(binding['repo']) != repo_key(repo)
             or type(pr) is not int or type(binding.get('pr')) is not int or binding['pr'] != pr):
         raise ValueError('PR PASS is for another repo or PR')
@@ -1719,9 +1730,23 @@ def ahc_bound_pass(evidence, binding):
         raise ValueError('PR PASS Reviewed HEAD is not H')
     if binding.get('pr_head') != head:
         raise ValueError('the PR head read back is not H')
-    if compare not in AHC_BASE_COMPARE or (compare == 'identical') != (snapshot_base == base):
+    if base_cmp not in AHC_BASE_COMPARE or (base_cmp == 'identical') != (snapshot_base == base):
         raise ValueError('the snapshot base B_r is not B or an ancestor of B')
+    if head_cmp != 'ahead':
+        raise ValueError('H does not fast-forward B (compare B...H is not ahead)')
     return repo, pr, head, snapshot_base, report
+
+
+def _compare_readback(record, want_base, want_head, name):
+    """A compare readback {base, head, status} is trusted only for the exact pair it names: base and head full
+    40-hex and equal to the expected commits. Returns its status."""
+    if (not isinstance(record, dict) or not isinstance(record.get('base'), str)
+            or not isinstance(record.get('head'), str) or not _SHA40.fullmatch(record['base'])
+            or not _SHA40.fullmatch(record['head']) or not isinstance(record.get('status'), str)):
+        raise ValueError('the %s compare readback is missing or malformed' % name)
+    if record['base'] != want_base or record['head'] != want_head:
+        raise ValueError('the %s compare readback is for another pair of commits' % name)
+    return record['status']
 
 
 def add_review_waiver(state_dir, reference, *, store=None, now=None):

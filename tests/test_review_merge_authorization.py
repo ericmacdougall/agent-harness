@@ -349,15 +349,21 @@ class BoundPassTests(AuthorizationTests):
         store, reference = self.evidence(review, subject_head=review["head"])
         return store.inspect(reference)
 
-    def binding(self, **changes):
-        b = {"repo": "o/r", "pr": 5, "head": self.H, "base": self.B, "pr_head": self.H, "base_compare": "ahead"}
+    @staticmethod
+    def cmp(base, head, status="ahead"):
+        return {"base": base, "head": head, "status": status}
+
+    def binding(self, br=None, base_status="ahead", head_status="ahead", **changes):
+        b = {"repo": "o/r", "pr": 5, "head": self.H, "base": self.B, "pr_head": self.H,
+             "base_compare": self.cmp(br or self.BR, self.B, base_status),
+             "head_compare": self.cmp(self.B, self.H, head_status)}
         b.update(changes)
         return b
 
     def test_pass_for_h_with_b_r_an_ancestor_of_b_or_equal_binds(self):
         self.assertEqual(mg.ahc_bound_pass(self.final(), self.binding()), ("o/r", 5, self.H, self.BR, REPORT_SHA))
         same = self.final(snapshot_base=self.B)
-        self.assertEqual(mg.ahc_bound_pass(same, self.binding(base_compare="identical"))[3], self.B)
+        self.assertEqual(mg.ahc_bound_pass(same, self.binding(br=self.B, base_status="identical"))[3], self.B)
         self.assertEqual(mg.ahc_bound_pass(self.final(), self.binding(repo="O/R"))[0], "o/r")
 
     def test_each_binding_condition_refuses(self):
@@ -371,14 +377,28 @@ class BoundPassTests(AuthorizationTests):
             "Reviewed HEAD is not H": (self.final(head=self.H2), self.binding()),
             "PR head read back moved": (final, self.binding(pr_head=self.H2)),
             "PR head unread": (final, self.binding(pr_head=None)),
-            "B_r diverged from B": (final, self.binding(base_compare="diverged")),
-            "B_r ahead of B": (final, self.binding(base_compare="behind")),
+            "B_r diverged from B": (final, self.binding(base_status="diverged")),
+            "B_r ahead of B": (final, self.binding(base_status="behind")),
             "compare unread": (final, self.binding(base_compare=None)),
-            "identical but B_r is not B": (final, self.binding(base_compare="identical")),
-            "ahead but B_r is B": (self.final(snapshot_base=self.B), self.binding()),
+            "compare a bare status": (final, self.binding(base_compare="ahead")),
+            "identical but B_r is not B": (final, self.binding(base_status="identical")),
+            "ahead but B_r is B": (self.final(snapshot_base=self.B), self.binding(br=self.B)),
+            "compare base is not B_r": (final, self.binding(br=self.B2)),
+            "compare head is not B": (final, self.binding(base_compare=self.cmp(self.BR, self.B2))),
+            "compare pair swapped": (final, self.binding(base_compare=self.cmp(self.B, self.BR))),
+            "compare sha short": (final, self.binding(base_compare=self.cmp(self.BR[:12], self.B))),
+            "compare status missing": (final, self.binding(base_compare={"base": self.BR, "head": self.B})),
+            "H not ahead of B": (final, self.binding(head_status="diverged")),
+            "H behind B": (final, self.binding(head_status="behind")),
+            "H identical to B by compare": (final, self.binding(head_status="identical")),
+            "B...H unread": (final, self.binding(head_compare=None)),
+            "B...H base is not B": (final, self.binding(head_compare=self.cmp(self.B2, self.H))),
+            "B...H head is not H": (final, self.binding(head_compare=self.cmp(self.B, self.H2))),
+            "B...H pair swapped": (final, self.binding(head_compare=self.cmp(self.H, self.B))),
             "malformed H": (final, self.binding(head="xyz")),
             "malformed B": (final, self.binding(base="B" * 40)),
-            "H equals B": (final, self.binding(base=self.H)),
+            "H equals B": (final, self.binding(base=self.H, head_compare=self.cmp(self.H, self.H),
+                                               base_compare=self.cmp(self.BR, self.H))),
             "not a mapping": (final, None),
         }
         for name, (evidence, binding) in bad.items():
