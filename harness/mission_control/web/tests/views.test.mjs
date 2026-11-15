@@ -273,3 +273,67 @@ test('textual evidence from the producer is shown on the requirement row', () =>
   const row = ledger({ requirements: { items: [{ id: 'r', text: 'x', bucket: 'live', reason: 'open', evidence_text: 'REALLY_TESTED a: PASS on the live host', has_evidence: true }] } }).requirements.items[0];
   assert.match(text(v.requirementItem(row, NOW, {})), /Evidence recorded: REALLY_TESTED a: PASS on the live host/);
 });
+
+
+// review PR 234 v2 F2: a status read that missed WALs never reads as healthy, and never says "No blockers recorded" bare.
+const partial = (unread, extra = {}) => ({ now: NOW, events: [], owners: [], initiatives: [], asks: [], messages: [], decisions: {}, asksFlagged: [], asksArchive: [], asksArchiveTotal: 0,
+  asksStale: [], asksSweptAt: '', initiativesStale: false, initiativesError: '', sessions: [],
+  ledger: ledger({ status: { blockers: [], verified: [], incomplete: unread.count !== 0, unread, at: iso(1), ...extra } }) });
+
+test('an incomplete status read is flagged beside blockers, deploys and source health', () => {
+  const s = partial({ count: 3, items: [{ wal: 'agent-x.jsonl', agent: 'x', reason: 'Permission denied' }, { wal: '<img src=x>', agent: '', reason: '' }] });
+  assert.equal(s.ledger.status.incomplete, true);
+  assert.equal(s.ledger.status.unread.count, 3);
+  const blockers = text(v.blockers(s, ui));
+  assert.doesNotMatch(blockers, /^No blockers recorded\.?$/m);
+  assert.match(blockers, /3 session logs could not be read/);
+  assert.match(blockers, /agent-x\.jsonl/);
+  assert.match(text(v.deals(s, ui)), /3 session logs could not be read/);
+  const health = v.inventory(s, () => {});
+  const row = walk(health).find(n => n.tagName === 'TR' && /Blockers/.test(text([n])));
+  assert.match(text([row]), /incomplete/);
+  assert.ok(walk([row]).some(n => n.className === 'warn'), 'Blockers health cell is a warning, not ok');
+  const tile = v.tiles(s, () => {});
+  assert.match(text([tile]), /incomplete/i);
+});
+
+test('an unknown unread count still warns, and a complete read says nothing extra', () => {
+  assert.match(text(v.blockers(partial({ count: -1, items: [] }), ui)), /some session logs could not be read/);
+  const clean = partial({ count: 0, items: [] });
+  assert.equal(clean.ledger.status.incomplete, false);
+  assert.match(text(v.blockers(clean, ui)), /No blockers recorded/);
+  assert.doesNotMatch(text(v.deals(clean, ui)), /could not be read/);
+});
+
+test('the unread list is bounded and stays text', () => {
+  const items = Array.from({ length: 500 }, (_, i) => ({ wal: `agent-${i}.jsonl`, agent: 'a', reason: 'r'.repeat(5000) }));
+  const s = partial({ count: 500, items });
+  assert.ok(s.ledger.status.unread.items.length <= 10);
+  assert.ok(s.ledger.status.unread.items.every(r => r.reason.length <= 200));
+});
+
+
+// review PR 234 v2 F3: a requirement longer than what Mission Control can read says so, and archive cannot be confirmed.
+test('a clipped requirement discloses its length and offers no archive confirmation', () => {
+  const head = 'Keep the checkout flow exactly as specified here. '.repeat(12);
+  const led = ledger({ requirements: { items: [{ id: 'r8', text: head, text_len: 623, clipped: true, bucket: 'live', rule: 'live', reason: 'open', at: iso(5) }] } });
+  const row = led.requirements.items[0];
+  assert.equal(row.clipped, true);
+  assert.equal(row.text_len, 623);
+  const idle = v.requirementItem(row, NOW, {});
+  assert.match(text([idle]), /first 600 of 623 characters/);
+  assert.match(text([idle]), /cannot be archived here/i);
+  const archiveButton = walk([idle]).find(n => n.tagName === 'BUTTON' && /Archive/.test(text([n])));
+  assert.ok(!archiveButton || archiveButton.disabled === true, 'no live Archive button for a clipped requirement');
+  const armed = v.requirementItem(row, NOW, { armed: { id: 'r8', action: 'archive' }, draft: 'done with it' });
+  const confirm = walk([armed]).find(n => n.tagName === 'BUTTON' && /Confirm archive/.test(text([n])));
+  assert.ok(!confirm || confirm.disabled === true, 'confirm archive stays disabled');
+});
+
+test('a whole requirement keeps its normal archive flow', () => {
+  const led = ledger({ requirements: { items: [{ id: 'r1', text: 'short', text_len: 5, clipped: false, bucket: 'live', rule: 'live', reason: 'open', at: iso(5) }] } });
+  const armed = v.requirementItem(led.requirements.items[0], NOW, { armed: { id: 'r1', action: 'archive' }, draft: 'done with it' });
+  const confirm = walk([armed]).find(n => n.tagName === 'BUTTON' && /Confirm archive/.test(text([n])));
+  assert.equal(confirm.disabled, false);
+  assert.doesNotMatch(text([armed]), /cannot be archived here/i);
+});

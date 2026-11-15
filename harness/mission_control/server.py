@@ -559,6 +559,11 @@ class App:
             return 409, {"error": "unknown-requirement", "message": "this requirement is not in the current ledger read"}
         if not isinstance(digest, str) or not hmac.compare_digest(digest.encode("utf-8", "replace"), item["digest"].encode()):
             return 409, {"error": "stale-digest", "message": "the requirement changed since it was shown; read it again"}
+        if action == "archive" and item.get("clipped") is True:
+            # review PR 234 v2 F3: the page could show only part of this requirement; an archive is never confirmed on
+            # words the user could not read. A restore only makes a row visible again, so it stays allowed.
+            return 409, {"error": "text-clipped", "message": "this requirement is longer than Mission Control can show; "
+                         "it cannot be archived from the dashboard"}
         if action == "archive" and item["bucket"] == "archived":
             return 409, {"error": "already-archived", "message": "this requirement is already archived"}
         if action == "restore" and item["bucket"] == "live":

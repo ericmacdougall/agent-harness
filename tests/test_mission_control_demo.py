@@ -453,3 +453,18 @@ class LaunchCode(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoalVocabulary(unittest.TestCase):
+    """review PR 234 v2 F1: the demo speaks the producer's goal vocabulary (goals_view.ORDER), so the page is exercised
+    with the states it really receives: DONE_LIVE for a deploy plus a later live PASS, never an invented state."""
+
+    def test_every_demo_goal_state_is_a_producer_state(self):
+        import goals_view  # noqa: PLC0415
+        goals = demo.goals_payload(time.time())["goals"]
+        for goal in goals:
+            self.assertIn(goal["state"], goals_view.ORDER, goal["id"])
+        by = {g["id"]: g for g in goals}
+        self.assertEqual(by["release"]["state"], "DONE_LIVE")  # deploy wev0003 then live PASS wev0004
+        self.assertEqual(by["reports"]["state"], "FAILING")    # its newest test is a FAIL
+        self.assertIn("LIVE_TESTED", {g["state"] for g in goals})  # a live PASS with no deploy record: live, not done
