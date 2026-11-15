@@ -7,6 +7,7 @@ import base64
 import binascii
 import json
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -373,10 +374,27 @@ class RedactParityTests(unittest.TestCase):
         for kind, instances in sorted(self.samples.items()):
             for i, (label, value) in enumerate(instances):
                 text = (label + " " + value).encode()
-                for name, blob in (("base64", base64.b64encode(text)), ("hex", binascii.hexlify(text)),
+                for name, blob in (("base64", base64.b64encode(text)), ("base64url", base64.urlsafe_b64encode(text)),
+                                   ("hex", binascii.hexlify(text)), ("hex-upper", binascii.hexlify(text).upper()),
                                    ("url", urllib.parse.quote_from_bytes(text, safe="").encode())):
                     with self.subTest(kind=kind, instance=i, encoding=name):
                         self.assertNotEqual(S.verdict(S.scan_report(b"x " + blob + b"\n"))["action"], S.CLEAN)
+
+    def test_low_entropy_samples_get_no_help_from_the_entropy_rule(self):
+        """Round 4 F4: segmented values whose every segment is below the entropy threshold (SendGrid's three
+        segments among them) must still never be clean, so the floor, not entropy, is what catches them."""
+        low = _redact_samples(Secrets(SEED + 3), low=True)
+        for kind, instances in sorted(low.items()):
+            if kind == "jwt":
+                continue                                   # the JWT sample is random by construction
+            for label, value in instances:
+                with self.subTest(kind=kind):
+                    for seg in re.split(r"[^A-Za-z0-9+/]", value):
+                        self.assertLess(S._entropy(seg.encode()) if seg else 0, S.SEGMENT_BITS, seg[:4])
+                    findings = S.scan_report(("x " + label + " " + value + "\n").encode())
+                    self.assertNotIn("high-entropy", [f["rule"] for f in findings])
+                    self.assertNotEqual(S.verdict(S.scan_report(("x " + label + " " + value + "\n").encode()))
+                                        ["action"], S.CLEAN)
 
     def test_restrict_only_kinds_stay_restrict(self):
         for kind in ("url-userinfo", "named-credential"):
