@@ -28,6 +28,8 @@ if argv and argv[0] == "listremotes":
     print(os.environ.get("FAKE_REMOTES", "lessons-dropbox: dropbox"))
     sys.exit(0)
 if argv and argv[0] == "lsf":  # the bulk checkpoint lists a local source once per pass
+    if os.environ.get("FAKE_LSF_HANG") and "--min-size" in argv:  # a stalled large-file listing
+        time.sleep(float(os.environ["FAKE_LSF_HANG"]))
     if os.environ.get("FAKE_DELEGATE"):
         os.execv(os.environ["FAKE_DELEGATE"], [os.environ["FAKE_DELEGATE"]] + argv)
     root = argv[-1]
@@ -938,6 +940,156 @@ class LargeTier(Case):
                             ("LOG_BACKUP_LARGE_EVERY_SECONDS", "-1")):
             done = self.go(**{name: value})
             self.assertEqual(done.returncode, 2, (name, value))
+
+
+SLOW_CP = """#!%(python)s
+import os, sys
+args = sys.argv[1:]
+if os.environ.get("SLOW_CP_SECONDS") and any("backup-stage-large" in a for a in args):
+    import time
+    time.sleep(float(os.environ["SLOW_CP_SECONDS"]))
+os.execv("/bin/cp", ["cp"] + args)
+"""
+STAND_IN = b"stand-in for a live transcript\n"
+
+
+class LargeTierSafety(LargeTier):
+    """PR #261 review (F1 High, F2, F3): the snapshot directory must never reach a live file through a link, the
+    pass budget must bound the listing and the snapshot, and standalone live files must use the tier too."""
+
+    def setUp(self):
+        super().setUp()
+        self.parent = self.home / ".agent-harness"
+        self.parent.mkdir(parents=True, exist_ok=True)
+        self.stage = self.parent / "backup-stage-large"
+        self.live = self.home / self.BIG
+        self.live_bytes = self.live.read_bytes()
+        fakebin = self.tmp / "fakebin2"
+        fakebin.mkdir()
+        cp = fakebin / "cp"
+        cp.write_text(SLOW_CP % {"python": sys.executable})
+        cp.chmod(0o755)
+        self.slow_path = f"{fakebin}:/usr/bin:/bin"
+
+    def live_files(self):
+        return {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob("*")
+                if p.is_file() and not p.is_symlink() and ".agent-harness" not in p.parts}
+
+    def assert_live_untouched(self, before):
+        self.assertEqual(self.live_files(), before)
+        self.assertEqual(self.live.read_bytes(), self.live_bytes)
+
+    def leftovers(self):
+        return [p for p in self.stage.rglob("*") if not p.is_dir()] if self.stage.is_dir() else []
+
+    def test_a_symlinked_stage_root_pointing_at_home_fails_closed_and_touches_nothing(self):
+        before = self.live_files()
+        mode = os.stat(self.home).st_mode
+        os.symlink(self.home, self.stage)
+        done = self.go()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assert_live_untouched(before)
+        self.assertEqual(os.stat(self.home).st_mode, mode)
+        self.assertIn("large tier:", (self.logs / "log-backup.log").read_text())
+
+    def test_a_stage_directory_that_is_not_private_fails_closed(self):
+        before = self.live_files()
+        self.stage.mkdir()
+        os.chmod(self.stage, 0o755)
+        done = self.go()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assertEqual(os.stat(self.stage).st_mode & 0o777, 0o755, "a refused directory is not chmodded")
+        self.assert_live_untouched(before)
+
+    def test_a_link_to_a_live_directory_inside_the_stage_cannot_delete_the_live_file(self):
+        before = self.live_files()
+        self.stage.mkdir(mode=0o700)
+        os.symlink(self.home / ".claude", self.stage / ".claude")
+        done = self.go()
+        self.assert_live_untouched(before)
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual(self.remote_big().read_bytes(), self.live_bytes)
+
+    def test_a_link_at_the_snapshot_file_itself_cannot_delete_or_overwrite_the_live_file(self):
+        before = self.live_files()
+        self.stage.mkdir(mode=0o700)
+        (self.stage / ".claude/projects/p1").mkdir(parents=True)
+        os.symlink(self.live, self.stage / ".claude/projects/p1/big.jsonl")
+        done = self.go()
+        self.assert_live_untouched(before)
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual(self.remote_big().read_bytes(), self.live_bytes)
+
+    def test_a_link_in_the_tier_1_stage_cannot_delete_a_file_outside_it_and_the_run_fails_closed(self):
+        decoy = self.tmp / "decoy"
+        decoy.mkdir()
+        (decoy / "big.jsonl").write_bytes(STAND_IN)
+        stage1 = self.parent / "backup-stage/.claude/projects"
+        stage1.mkdir(parents=True)
+        os.symlink(decoy, stage1 / "p1")
+        done = self.go()
+        self.assertEqual((decoy / "big.jsonl").read_bytes(), STAND_IN)
+        self.assertEqual(sorted(p.name for p in decoy.iterdir()), ["big.jsonl"], "nothing was written through the link")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+
+    def test_a_run_leaves_no_snapshot_files_behind(self):
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_hung_large_listing_is_stopped_inside_the_pass_budget(self):
+        started = time.time()
+        done = self.go(FAKE_LSF_HANG="300", LOG_BACKUP_LARGE_BUDGET_SECONDS="4", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                       LOG_BACKUP_KILL_GRACE_SECONDS="1", LOG_BACKUP_SLICE_RESERVE_SECONDS="2")
+        self.assertLess(time.time() - started, 90)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.last_ok().exists())
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+        self.assertIn("listing", (self.logs / "log-backup.log").read_text())
+
+    def test_a_hung_snapshot_copy_is_stopped_inside_the_pass_budget_and_the_file_stays_pending(self):
+        started = time.time()
+        done = self.go(PATH=self.slow_path, SLOW_CP_SECONDS="300", LOG_BACKUP_LARGE_BUDGET_SECONDS="4",
+                       LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                       LOG_BACKUP_SLICE_RESERVE_SECONDS="2")
+        self.assertLess(time.time() - started, 90)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+        self.assertEqual(self.leftovers(), [], "a partial snapshot is removed by name")
+        self.assertFalse(self.remote_big().exists())
+
+    def test_a_large_standalone_live_file_goes_through_the_large_tier(self):
+        history = self.home / ".claude/history.jsonl"
+        self.put(".claude/history.jsonl", (b"h\n" * 800000)[: self.BIG_BYTES])
+        done = self.go()
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual((self.remote / "testhost/.claude/history.jsonl").read_bytes(), history.read_bytes())
+        self.assertTrue(self.large_marker().exists())
+        self.assertFalse((self.home / ".agent-harness/backup-stage/.claude/history.jsonl").exists())
+        for argv in self.copies():
+            self.assertFalse(argv[-2].endswith("backup-stage/.claude/history.jsonl"), "tier 1 must not send it")
+
+    def test_a_failing_large_standalone_file_is_not_reported_as_backed_up(self):
+        self.put(".claude/history.jsonl", (b"h\n" * 800000)[: self.BIG_BYTES])
+        done = self.go(FAKE_FAIL_MATCH="backup-stage-large", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse((self.remote / "testhost/.claude/history.jsonl").exists())
+        self.assertFalse(self.state().exists() and "history.jsonl" in self.state().read_text())
+        self.assertTrue(self.last_ok().exists(), "tier 1 still finishes")
+
+    def test_a_small_standalone_file_stays_in_tier_1(self):
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual((self.remote / "testhost/.claude/history.jsonl").read_bytes(), ORDINARY[".claude/history.jsonl"])
+
+
+for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the parent's tests
+    if _name.startswith("test_") and _name not in vars(LargeTierSafety):
+        setattr(LargeTierSafety, _name, None)
 
 
 class BulkResume(Case):
