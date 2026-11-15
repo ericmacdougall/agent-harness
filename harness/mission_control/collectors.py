@@ -275,6 +275,7 @@ class WalTailer(Collector):
         except (OSError, Refused):
             self.unopened.add(path)  # its newest line is not known: partial until a read of it succeeds
             return
+        self.unopened.discard(path)
         newest = None
         found_item = found_progress = False
         for raw in reversed(lines):
@@ -338,6 +339,8 @@ class WalTailer(Collector):
                 tail.ino, tail.offset, tail.partial = info.st_ino, 0, b""
                 tail.generation += 1
             if info.st_size == tail.offset:
+                if path in self.unopened:
+                    self._seed_last(path, tail, info)  # its newest line was never seen: retried until it reads
                 continue
             try:
                 with self.reader.open(path) as handle:
@@ -1311,7 +1314,9 @@ class Ledger(Collector):
 
     def _goals(self, data: dict, now: float) -> dict:
         items, dropped = [], 0
-        listed = data.get("goals") if isinstance(data.get("goals"), list) else []
+        listed = data.get("goals")
+        if not isinstance(listed, list):  # `ah goals --json` always sends the list: without it nothing was read
+            raise ValueError("ah goals returned no goals list")
         for raw in listed[:self.MAX_GOALS]:
             if not isinstance(raw, dict) or not raw.get("id"):
                 dropped += 1
@@ -1372,7 +1377,9 @@ class Ledger(Collector):
 
     def _requirements(self, data: dict, now: float) -> dict:
         rows, dropped = [], 0
-        for raw in (data.get("requirements") if isinstance(data.get("requirements"), list) else []):
+        if not isinstance(data.get("requirements"), list):  # the producer always sends it: without it nothing was read
+            raise ValueError("ah requirements returned no requirements list")
+        for raw in data["requirements"]:
             if not isinstance(raw, dict) or not raw.get("id"):
                 dropped += 1  # a row the page cannot show: the counts would be short (review PR 234 v6)
                 continue
@@ -1424,7 +1431,14 @@ class Ledger(Collector):
                     "check": ev.short(raw.get("check"), 80), "verdict": ev.short(raw.get("verdict"), 12)}
         out: dict = {"counts": {}}
         for key in self.STATUS_LISTS:
-            rows = [r for r in (data.get(key) if isinstance(data.get(key), list) else []) if isinstance(r, dict)]
+            # `ah status` always sends every list, as rows: a list missing or holding a row that is not one means the
+            # counts would be short, so the read fails closed, never a "none recorded" (review PR 234 v6)
+            listed = data.get(key)
+            if not isinstance(listed, list):
+                raise ValueError(f"ah status returned no {key} list")
+            rows = [r for r in listed if isinstance(r, dict)]
+            if len(rows) != len(listed):
+                raise ValueError(f"ah status returned a {key} list with rows it could not read")
             out["counts"][key] = len(rows)
             rows.sort(key=lambda r: str(r.get("at", "")), reverse=True)
             out[key] = [entry(r) for r in rows[:self.MAX_STATUS]]

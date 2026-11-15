@@ -715,6 +715,20 @@ def partial(w):
     w.runner.payload["ah-status"] = dict(STATUS, unread=[{"wal": "agent-x.jsonl", "agent": "x", "reason": "denied"}])
 
 
+def without(kind, key, bad_row=False):
+    """An exit-0 payload whose list is missing, or holds a row that is not one: a zero from it would be a guess."""
+    base = {"ah-goals": GOALS, "ah-requirements": REQS, "ah-status": STATUS}[kind]
+
+    def step(w):
+        payload = dict(base)
+        if bad_row:
+            payload[key] = list(base[key]) + ["not a row"]
+        else:
+            payload.pop(key)
+        w.runner.payload[kind] = payload
+    return step
+
+
 def misshapen(kind):
     """One more row the parser cannot show (no id): the counts the page states from that part would be short."""
     key, base = {"ah-goals": ("goals", GOALS), "ah-requirements": ("requirements", REQS)}[kind]
@@ -797,6 +811,11 @@ LEDGER_TABLE = [
     _ledger_row("G18", "guard", "requirements invalid JSON after a good read", _scenario(tick, fail("ah-requirements", mode="invalid_json"), tick), _parts(CUR, STA, CUR), health=("error", STA)),
     _ledger_row("D08", "defect", "goals: a row dropped for its shape is partial", _scenario(misshapen("ah-goals"), tick), _parts(PAR, CUR, CUR), health=("ok", PAR)),
     _ledger_row("D09", "defect", "requirements: a row dropped for its shape is partial", _scenario(misshapen("ah-requirements"), tick), _parts(CUR, PAR, CUR), health=("ok", PAR)),
+    _ledger_row("D10", "defect", "goals: an exit-0 payload with no goals list is not read (never 0 goals)", _scenario(without("ah-goals", "goals"), tick), _parts(UNK, CUR, CUR), health=("error", UNK)),
+    _ledger_row("D11", "defect", "requirements: an exit-0 payload with no requirements list is not read", _scenario(without("ah-requirements", "requirements"), tick), _parts(CUR, UNK, CUR), health=("error", UNK)),
+    _ledger_row("D12", "defect", "status: an exit-0 payload with no blockers list is not read (never \"No blockers recorded.\")", _scenario(without("ah-status", "blockers"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
+    _ledger_row("D13", "defect", "status: a list holding a row that is not one is not read (its count would be short)", _scenario(without("ah-status", "live", bad_row=True), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
+    _ledger_row("D14", "defect", "status: a list missing after a good read is stale, not a current zero", _scenario(tick, without("ah-status", "verified"), tick), _parts(CUR, CUR, STA), health=("error", STA)),
     _ledger_row("C01", "change", "session A -> empty -> A, then A's status read fails (no good read since the gap)", _scenario(tick, to(""), tick, to(SID), fail("ah-status"), tick), _parts(CUR, CUR, UNK), health=("error", UNK)),
 ]
 # D04 serves the finished tick's result (current for B) and checks only what was pushed while its first read ran.
@@ -957,6 +976,25 @@ def unreadable_session_dir(root):
     (root / SID_B).chmod(0)
 
 
+def _wal_unseeded(case):
+    """At start the tailer reads each WAL's newest line; one it cannot open is unseen until a later read succeeds."""
+    root = case.tmp / "wals"
+    two_wals(root)
+    path = root / SID / "agent-a1.jsonl"
+    path.write_text(json.dumps({"event": "check", "note": "the newest line"}) + "\n")
+    path.chmod(0)
+    hub = ev.Hub()
+    health = col.Health(hub)
+    tailer = col.WalTailer(hub, health, Reader([case.tmp]), [(root, "claude")])
+    tailer.run(time.time())
+    first = health.rows["wals"]
+    first = (first["status"], first["truth"])
+    path.chmod(0o600)
+    tailer.run(time.time() + 5)
+    row = health.rows["wals"]
+    return {"health": first, "after": (row["status"], row["truth"])}
+
+
 def _wal_unopenable(case):
     """A WAL that grows after the first scan but can no longer be opened: its new lines are not seen."""
     root = case.tmp / "wals"
@@ -995,6 +1033,7 @@ OTHER_TABLE = [
     ("D34", "defect", "WALs: the file cap reached is partial", _wals(two_wals, cap=1), {"health": ("ok", PAR)}),
     ("D36", "defect", "WALs: a session directory that exists but cannot be listed is partial", _wals(unreadable_session_dir), {"health": ("ok", PAR)}),
     ("D37", "defect", "WALs: a WAL that exists but cannot be opened is partial", _wal_unopenable, {"health": ("ok", PAR)}),
+    ("D38", "defect", "WALs: a WAL whose newest line could not be read at start is partial, and current once it reads", _wal_unseeded, {"health": ("ok", PAR), "after": ("ok", CUR)}),
     ("D35", "defect", "Health: an error after off (nothing was read in between) is unknown, not stale", _off_then_error, {"health": ("error", UNK)}),
 ]
 
