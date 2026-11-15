@@ -324,15 +324,24 @@ def _resolve_answer(answer: str) -> dict:
     except Exception:  # noqa: BLE001 - the resolver below reports why
         key = None
     if key is not None and key in _ANSWER_CACHE:
-        return _ANSWER_CACHE[key]
+        got = _ANSWER_CACHE[key]
+        if isinstance(got, ValueError):
+            raise ValueError(str(got))
+        return dict(got)
     # now=inf: neither the age nor the future-date check applies here; answer_at applies both to its own clock, so a
-    # cached result never carries a stale age decision
-    got = command_guard.resolve_user_source(answer, now=float("inf"))
+    # cached result never carries a stale age decision. A refusal (ValueError) depends only on the transcript bytes and
+    # is cached too, so a bad row does not re-read a large transcript every tick; any other error is not cached.
+    try:
+        got = command_guard.resolve_user_source(answer, now=float("inf"))
+    except ValueError as exc:
+        got = exc
     if key is not None:
         if len(_ANSWER_CACHE) > 256:
             _ANSWER_CACHE.clear()
         _ANSWER_CACHE[key] = got
-    return got
+    if isinstance(got, ValueError):
+        raise ValueError(str(got))
+    return dict(got)
 
 
 def answer_at(home: Path, answer: str, question: str, options: list, now: float, max_age=None) -> float:

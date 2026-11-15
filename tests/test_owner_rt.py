@@ -1115,6 +1115,22 @@ class AnswerBindingTests(AuthorityBase):
             ort.answer_at(self.home, src, ort.bypass_question("*", 24), ort.bypass_options("*", 24), time.time())
             self.assertEqual(spy.call_count, 2)
 
+    def test_refusal_cached_too_until_transcript_changes(self):
+        import command_guard
+        src = self.grant_answer(question="Some other question?")
+        real = command_guard.resolve_user_source
+        q, opts = ort.bypass_question("*", 24), ort.bypass_options("*", 24)
+        with mock.patch.object(command_guard, "resolve_user_source", side_effect=real) as spy:
+            ort._ANSWER_CACHE.clear()
+            for _ in range(3):
+                with self.assertRaises(ort.OwnerError):
+                    ort.answer_at(self.home, src, q, opts, time.time())
+            self.assertEqual(spy.call_count, 1)
+        bad = "answer:%s/%s" % (fx.MISSION, "0" * 32)  # no such record: a refusal, cached, never a grant
+        for _ in range(2):
+            with self.assertRaises(ort.OwnerError):
+                ort.answer_at(self.home, bad, q, opts, time.time())
+
     def test_cached_answer_still_ages_out(self):
         src = self.grant_answer()
         q, opts = ort.bypass_question("*", 24), ort.bypass_options("*", 24)
