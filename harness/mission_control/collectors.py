@@ -766,6 +766,10 @@ class Initiatives(Collector):
         try:
             info = os.stat(self.path, follow_symlinks=False)
         except OSError:
+            # goodqa#16117 (PR 257 v1 F2): a metadata failure is retried like a read failure. The parent directory can
+            # come back with the file's inode, size and mtime unchanged, and the cached signature must not then repeat
+            # this error for ever. The signature is kept, so a file that did change meanwhile still counts as an update.
+            self.read_failed = True
             return self._fail("initiatives file missing")
         sig = (info.st_ino, info.st_size, info.st_mtime_ns)
         previous = self.sig
