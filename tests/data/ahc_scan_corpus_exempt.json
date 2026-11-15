@@ -1,0 +1,252 @@
+{
+ "docs/FINDINGS.md": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "github-classic:prefix": 1
+  },
+  "reason": "documentation names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/ah_export.py": {
+  "counts": {
+   "github-classic:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/deliver.py": {
+  "counts": {
+   "github-fine-grained:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/integrate_local.py": {
+  "counts": {
+   "github-fine-grained:prefix": 1,
+   "openai:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/kimi_review.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "github-fine-grained:prefix": 1,
+   "openai:prefix": 3
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/publish_feature.py": {
+  "counts": {
+   "github-fine-grained:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/redact.py": {
+  "counts": {
+   "github-fine-grained:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/review_diagnostics.py": {
+  "counts": {
+   "anthropic:prefix": 2,
+   "github-classic:prefix": 2,
+   "github-fine-grained:prefix": 2,
+   "openai:prefix": 2
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "harness/hooks/usage_guard.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "github-classic:prefix": 1,
+   "github-fine-grained:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "internal/redact/testdata/gen_corpus.py": {
+  "counts": {
+   "github-classic": 1,
+   "github-fine-grained:prefix": 1,
+   "openai-project": 1
+  },
+  "reason": "generator of the redaction test corpus; builds fake secret-shaped values"
+ },
+ "scripts/leak_scan.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "github-fine-grained:prefix": 1,
+   "openai:prefix": 1
+  },
+  "reason": "a redactor or scanner pattern names the public token prefixes; prefix-only"
+ },
+ "tests/test_ah.py": {
+  "counts": {
+   "github-classic": 6
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ah_ahd_writes.py": {
+  "counts": {
+   "github-classic:prefix": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ah_export.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "github-classic:prefix": 3,
+   "high-entropy": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ah_proc.py": {
+  "counts": {
+   "openai": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ah_ticket_create.py": {
+  "counts": {
+   "openai": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ah_views.py": {
+  "counts": {
+   "anthropic:prefix": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ah_worktree_remove.py": {
+  "counts": {
+   "github-classic:prefix": 3
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ahd.py": {
+  "counts": {
+   "anthropic": 2,
+   "anthropic:prefix": 1,
+   "jwt": 1,
+   "openai:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ahd_peek.py": {
+  "counts": {
+   "anthropic:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_approve_top_one_command.py": {
+  "counts": {
+   "github-classic:prefix": 2,
+   "high-entropy": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_command_guard.py": {
+  "counts": {
+   "anthropic:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_delivery_checks.py": {
+  "counts": {
+   "github-classic:prefix": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_delivery_hardening.py": {
+  "counts": {
+   "github-classic:prefix": 3
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_heavy_job_guard.py": {
+  "counts": {
+   "openai": 1,
+   "openai:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_install_codex.py": {
+  "counts": {
+   "openai:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_kill_guard.py": {
+  "counts": {
+   "github-classic:prefix": 1,
+   "openai": 2,
+   "openai:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_kimi_review.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "github-classic:prefix": 2,
+   "high-entropy": 3,
+   "openai:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_leak_scan.py": {
+  "counts": {
+   "high-entropy": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ops_watch.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "openai": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_ops_watch_proxmox.py": {
+  "counts": {
+   "openai": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_review_diagnostics.py": {
+  "counts": {
+   "anthropic": 1,
+   "github-classic": 3,
+   "github-classic:prefix": 1,
+   "high-entropy": 2,
+   "openai:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_review_map.py": {
+  "counts": {
+   "github-classic:prefix": 1,
+   "high-entropy": 2,
+   "jwt": 1,
+   "openai": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_successor.py": {
+  "counts": {
+   "github-classic:prefix": 2,
+   "high-entropy": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_tui_plugin.py": {
+  "counts": {
+   "openai": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_worktree_config_extension.py": {
+  "counts": {
+   "github-classic": 2
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ }
+}
