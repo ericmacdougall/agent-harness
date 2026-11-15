@@ -1745,7 +1745,9 @@ class Ledger(Collector):
             return {"count": value, "items": []}
         if not isinstance(value, list):
             return {"count": -1, "items": []}
-        items = [{"wal": ev.short(r.get("wal"), 80), "agent": ev.short(r.get("agent"), 40), "reason": ev.short(r.get("reason"), 120)}
+        # receipt v10 F1: ah status names each unread source in `source` (a WAL also in `wal`); the page shows the source
+        items = [{"wal": ev.short(r.get("source") or r.get("wal") or "(unnamed source)", 80), "agent": ev.short(r.get("agent"), 40),
+                  "reason": ev.short(r.get("reason"), 120)}
                  for r in value[:self.MAX_UNREAD] if isinstance(r, dict)]
         if any(not isinstance(r, dict) for r in value):
             items.append({"wal": "(unnamed)", "agent": "", "reason": "the status report named an unread source it could not describe"})

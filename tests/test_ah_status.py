@@ -125,7 +125,7 @@ class StatusReport(unittest.TestCase):
             r = self.report()
         self.assertEqual([u['wal'] for u in r['unread']], ['agent-big.jsonl'])
         self.assertIn('too_large', r['unread'][0]['reason'])
-        self.assertIn('UNREAD WALs (1)', ah.status_text(r))
+        self.assertIn('UNREAD SOURCES (1)', ah.status_text(r))  # PR 234 v11: an unread source need not be a WAL
         self.assertEqual(self.report()['unread'], [])
 
     def test_cli_dispatch_needs_a_session(self):

@@ -48,6 +48,54 @@ def tail_in_progress(at_tail: bool, mtime: float, now: float | None = None) -> b
     return bool(at_tail) and (time.time() if now is None else now) - mtime <= APPEND_GRACE_S
 
 
+# ---- one WAL record validator and one unread-entry shape (PR 234 v11; receipt v10 F1, F2), shared by every reader
+def _record_time(value) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+def wal_record_problem(rec) -> str:
+    """Why a parsed WAL line is not a record ("" when it is). A record is a JSON object with a non-empty string
+    `event`; an `at`, when present, must be an ISO time. A line that fails is a lost line for every reader: it is never
+    activity (no liveness), never dated evidence, never a row. An undated record (no `at`, as some hand-written notes
+    are) is a record that proves no time."""
+    if not isinstance(rec, dict):
+        return "not an object"
+    event = rec.get("event")
+    if not isinstance(event, str) or not event.strip():
+        return "no event" if event is None or event == "" else "event is not a string"
+    if "at" in rec and _record_time(rec.get("at")) <= 0:
+        return "bad timestamp"
+    return ""
+
+
+def unread_entry(entry) -> dict:
+    """The one shape of an unread-source entry, for every producer and renderer: source and reason always; the WAL
+    file name and agent when the source is a WAL. Producers may name the source `wal` (a WAL) or `source`."""
+    entry = entry if isinstance(entry, dict) else {}
+    wal = clip(str(entry.get("wal") or ""), 120)
+    out = {"source": clip(str(entry.get("source") or wal or "(unnamed source)"), 120),
+           "reason": clip(str(entry.get("reason") or "unread"), 200)}
+    if wal:
+        out["wal"] = wal
+    if entry.get("agent"):
+        out["agent"] = clip(str(entry["agent"]), 60)
+    return out
+
+
+def unread_text(entry) -> str:
+    """The one text rendering of an unread entry (ah --text status and any other text report)."""
+    e = unread_entry(entry)
+    return f"  {e['source']:<40} {e['reason'][:80]}"
+
+
 # ---- lost lines and the window a read covers (PR 234 v10; receipts v9 F1/F2; the user's last-round decision)
 # A read covers a window (ah status: its --since window; ah owners: the rows its default view shows). A line that
 # could not be used is inside the window unless the evidence about that line itself places it before the cutoff.
@@ -1465,8 +1513,7 @@ def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = Fal
     skipped = int(skipped) + window.inside   # lost lines inside the window are skipped lines like any other
     state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
     return {"schema": READ_SCHEMA, "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
-            "unread": [{"source": clip(str(u.get("source", "")), 120), "reason": clip(str(u.get("reason", "")), 200)}
-                       for u in unread[:50]],
+            "unread": [unread_entry(u) for u in unread[:50]],
             "skipped": skipped, "limited": bool(limited), **window.fields()}
 
 
@@ -1520,8 +1567,8 @@ def ledger_read(session: str, home=None) -> tuple:
                         if not in_progress:   # receipt v7 F4: a last line still being written is not a lost ask
                             skipped += 1
                         continue
-                    if not isinstance(record, dict):
-                        skipped += 1  # a line that names an ask but is not a record
+                    if wal_record_problem(record):
+                        skipped += 1  # a line that names an ask but is not a record (receipt v10 F2: one validator)
                         continue
                     event = record.get("event")
                     if event == "ask" and needle == b'"ask"':

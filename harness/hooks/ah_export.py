@@ -213,8 +213,8 @@ def _read(ah, sd: Path):
             except (ValueError, RecursionError):  # RecursionError: hostile nesting depth
                 skipped += 1
                 continue
-            if not isinstance(rec, dict) or not isinstance(rec.get("event"), str) or not rec.get("event"):
-                skipped += 1  # code inspection 3: a non-string event is malformed, never a crash
+            if ah._prov().wal_record_problem(rec):
+                skipped += 1  # the shared validator (receipt v10 F2): no event, a non-string event, a bad timestamp
                 continue
             if any(isinstance(rec.get(key), (dict, list)) for key in ("id", "ref")):
                 skipped += 1  # PR 223 receipt F2: ids and refs are dict keys in status_report; a container is malformed
@@ -434,9 +434,9 @@ def _render(session, generated, report, tree, counts, timeline, omitted, unread,
         parts.append("</tbody></table></details>")
     if not by_agent:
         parts.append('<p class="muted">no rows in this window</p>')
-    parts.append("</section><section><h2>Unread WALs (%d)</h2>" % len(unread))
-    if unread:
-        parts.append("<ul>" + "".join("<li><code>%s</code>: %s</li>" % (_e(u.get("wal")), _e(u.get("reason")))
+    parts.append("</section><section><h2>Unread sources (%d)</h2>" % len(unread))
+    if unread:   # receipt v10 F1: entries arrive in the one shape (provenance.unread_entry, applied in export)
+        parts.append("<ul>" + "".join("<li><code>%s</code>: %s</li>" % (_e(u["source"]), _e(u["reason"]))
                                       for u in unread) + "</ul>")
     else:
         parts.append('<p class="muted">none</p>')
@@ -546,6 +546,7 @@ def export(ah, home, args) -> dict:
     unread = [{k: scrub.text(v) for k, v in u.items()} for u in unread_raw]
     agents_read = {scrub.text(a) for a in _read_agents}
 
+    unread = [ah._prov().unread_entry(u) for u in unread]   # receipt v10 F1: one shape for every renderer
     page = _render(session, _iso(now), report, tree, counts, candidates, omitted, unread, skipped,
                    sorted(scrub.text(a) for a in wanted), "every row" if not args.since else "last " + str(args.since))
     data = page.encode("utf-8", "replace")  # a lone surrogate from a JSON \ud800 escape must not raise

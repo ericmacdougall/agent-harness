@@ -79,8 +79,7 @@ def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = Fal
     """What a read-only view actually read (goodqa#15920): provenance.read_block, the one builder of the block, with
     ah's unread entries (which may name a `wal`). `window` is a provenance.LostWindow: the only source of
     outside_window (lost lines the shared rule places before the view's cutoff: disclosed, never partial)."""
-    return _prov().read_block(read_ok, [{"source": u.get("source") or u.get("wal") or "", "reason": u.get("reason") or ""}
-                                        for u in unread], skipped, limited, window)
+    return _prov().read_block(read_ok, unread, skipped, limited, window)   # entries: provenance.unread_entry
 
 
 class ReadTally:
@@ -296,7 +295,7 @@ def _summarize_agent_wal(path: Path, index_dir: Path) -> dict:
             summary["skipped"] += 1  # a complete line that is not a record: kept with the summary, counted every call
             trail.lost()
             continue
-        if not isinstance(rec, dict):
+        if _prov().wal_record_problem(rec):   # receipt v10 F2: never activity, never dated evidence
             summary["skipped"] += 1
             trail.lost()
             continue
@@ -422,7 +421,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
                 if raw.strip():   # e.g. a torn subagent_stop: a stopped agent could show as running
                     tally.line_lost(not raw.endswith(b"\n"), main_mtime)
                 continue
-            if not isinstance(rec, dict):
+            if _prov().wal_record_problem(rec):   # receipt v10 F2: e.g. a subagent_stop with no event or a bad time
                 tally.skipped += 1
                 continue
             if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
@@ -2545,6 +2544,11 @@ def render_text(cmd: str, data: dict) -> str:
         lines = [f"session {data['session']}  " + " ".join(f"{k}={v}" for k, v in sorted(data["counts"].items()))
                  + (f"  hidden={data['hidden']} (terminal rows idle over {OWNERS_RECENT_S // 3600} h; --all shows them)"
                     if data.get("hidden") else "")]
+        read = data.get("read") or {}
+        if read.get("state") != "ok" or read.get("outside_window"):   # receipt v10 sweep: the text view says it too
+            lines.append(f"read {read.get('state', 'unknown')}: skipped={read.get('skipped', '?')} "
+                         f"outside_window={read.get('outside_window', 0)} unread={read.get('unread_total', '?')}")
+            lines += [_prov().unread_text(u) for u in (read.get("unread") or [])[:10]]
         for r in data["owners"]:
             lines.append(f"{r['state']:<14} idle {fmt_age(r['idle_s']):>7}  {r['agent_id'][:12]:<12} {r['type'] or '-':<12} "
                          f"{(r['ticket'] or '-'):<18} c-age {fmt_age(r['ticket_comment_age_s']):>6}  {(r['task'] or '')[:70]}")
@@ -2678,8 +2682,8 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
                     if not (open_tail and index == len(lines) - 1):
                         trail.lost()  # a complete line that is not a record: what it held is missing from this report
                     continue
-                if not isinstance(rec, dict) or not rec.get("event"):
-                    trail.lost()  # parsed, but not a WAL record (PR 234 v8): nothing in it can be reported
+                if _prov().wal_record_problem(rec):
+                    trail.lost()  # parsed, but not a WAL record (the shared validator): nothing in it can be reported
                     continue
                 trail.dated(parse_ts(rec.get("at")))
                 consider(agent, rec)
@@ -2788,7 +2792,8 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
             "failed": sorted(failed.values(), key=lambda e: e["at"]),
             "claimed": claimed, "blockers": blockers, "commits": commits,
             "asks_open": [a for k, a in asks.items() if k not in resolved],
-            "assumptions": assumptions, "decisions": decisions, "owners": owners_summary, "unread": unread,
+            "assumptions": assumptions, "decisions": decisions, "owners": owners_summary,
+            "unread": [_prov().unread_entry(u) for u in unread],   # receipt v10 F1: one shape for every renderer
             "read": read_block(read_ok, unread, skipped, window=window),
             "rule": "edit this report; never write a status list from memory (nov-7-issues-2 B2.5)"}
 
@@ -2811,7 +2816,7 @@ def status_text(data: dict) -> str:
     lines += block("ASKS open", data["asks_open"], lambda r: f"  [ask:{r['id']}] {r['note'][:100]}")
     lines += block("ASSUMPTIONS and TARGET_MISMATCH (no user source)", data["assumptions"], lambda r: f"  {r['label']:<16} {r['agent'][:12]:<12} {r['note'][:100]}")
     lines += block("COMMITS", data["commits"], lambda r: f"  {r['agent'][:12]:<12} {r['note'][:120]}")
-    lines += block("UNREAD WALs", data.get("unread") or [], lambda r: f"  {r['wal']:<40} {r['reason'][:80]}")
+    lines += block("UNREAD SOURCES", data.get("unread") or [], _prov().unread_text)   # receipt v10 F1: one shape
     o = data.get("owners") or {}
     if "counts" in o:
         lines.append(f"## OWNERS live {len(o.get('live') or [])}: {', '.join(a[:12] for a in o.get('live') or [])}; "
@@ -3234,7 +3239,12 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 skipped += 1  # a line that names a requirement but is not a record
                 continue
             if rec.get("event") != "requirement":
+                if _prov().wal_record_problem(rec):
+                    skipped += 1  # names a requirement, but is no record at all (no event): what it held is lost
                 continue  # another record with a "requirement" field
+            if _prov().wal_record_problem(rec):
+                skipped += 1  # a requirement with a bad timestamp (receipt v10 F2: the shared validator)
+                continue
             if not isinstance(rec.get("id"), str) or not rec["id"]:
                 skipped += 1  # a requirement record with no id cannot be listed
                 continue

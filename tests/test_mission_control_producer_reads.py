@@ -592,6 +592,136 @@ class OneSharedRule(unittest.TestCase):
         self.assertNotIn("window", ah.status_report(Home(self).home, SID, WINDOW, rows=[], sources_read=1)["read"])
 
 
+class OneUnreadShape(unittest.TestCase):
+    """Receipt v10 F1: every unread entry the producers emit renders in every text report. The entries are collected
+    from the producers themselves (ah status on damaged homes, ah export's reader, the read blocks), never by hand."""
+
+    def damaged_reports(self):
+        out = []
+        home = Home(self)
+        home.not_regular(home.agent)   # a WAL status cannot read (named by `wal`) and an owners view that is partial
+        out.append(("WAL not a regular file + owners view partial", ah.status_report(home.home, SID, WINDOW)))
+        home = Home(self)
+        with mock.patch.object(ah, "owners", side_effect=RuntimeError("boom")):   # the owners view fails outright
+            out.append(("owners view failed", ah.status_report(home.home, SID, WINDOW)))
+        home = Home(self)
+        home.append(home.agent, TORN)   # a torn line in a shown owner's WAL: the owners view is partial
+        out.append(("owners view partial (torn line)", ah.status_report(home.home, SID, WINDOW)))
+        return out
+
+    @unittest.skipIf(ROOT, "root reads any file")
+    def test_the_text_status_report_renders_every_unread_kind(self):
+        kinds = set()
+        for name, report in self.damaged_reports():
+            with self.subTest(case=name):
+                self.assertTrue(report["unread"], report["read"])
+                text = ah.status_text(report)   # raised KeyError: 'wal' at 0ca0731e for a source-named entry
+                for entry in report["unread"]:
+                    self.assertIn(entry["source"], text)
+                    self.assertEqual(set(entry) - {"source", "reason", "wal", "agent"}, set())
+                    kinds.add("wal" if "wal" in entry else "source")
+                rendered = ah.render_text("status", report)
+                self.assertIn("UNREAD SOURCES", rendered)
+        self.assertEqual(kinds, {"wal", "source"})   # both ways a producer names a source were exercised
+
+    def test_every_read_block_entry_and_export_entry_renders(self):
+        import ah_export
+        home = Home(self)
+        home.not_regular(home.agent)
+        entries = list(ah.status_report(home.home, SID, WINDOW)["read"]["unread"])
+        entries += ah.requirements_view(home.home, SID)["read"]["unread"] + prov.ask_items(SID, home.home / ".claude")["read"]["unread"]
+        entries += ah_export._read(ah, home.folder)[1]
+        entries += ah.owners(home.home, SID)["read"]["unread"]
+        self.assertTrue(entries)
+        for entry in entries:
+            with self.subTest(entry=entry):
+                line_text = prov.unread_text(entry)
+                self.assertIn(prov.unread_entry(entry)["source"], line_text)
+        self.assertIn("read partial", ah.render_text("owners", ah.owners(home.home, SID)))
+
+    def test_the_collector_shows_a_source_named_entry(self):
+        hub = ev.Hub()
+        ledger = col.Ledger(hub, col.Health(hub), None, lambda: SID)
+        items = ledger._unread([{"source": "owners view", "reason": "ah owners read partial"}, {"wal": "agent-x.jsonl", "reason": "r"}])["items"]
+        self.assertEqual([i["wal"] for i in items], ["owners view", "agent-x.jsonl"])
+
+
+BAD_RECORDS = {   # receipt v10 F2: parsed objects that are not WAL records, each dated now so it would look like activity
+    "no event": lambda at: {"at": at, "note": "lost event field"},
+    "non-string event": lambda at: {"event": 7, "at": at, "note": "x"},
+    "empty event": lambda at: {"event": "", "at": at},
+    "bad timestamp": lambda at: {"event": "status", "at": "yesterday-ish", "note": "x"},
+    "non-string timestamp": lambda at: {"event": "status", "at": 1763200000, "note": "x"},
+}
+
+
+class OneRecordValidator(unittest.TestCase):
+    """Receipt v10 F2: one validator (provenance.wal_record_problem) for every WAL reader. A record that fails it is a
+    lost line, never activity: no liveness change, never dated evidence, never a row."""
+
+    def owner_home(self, task):
+        home = Home(self)
+        quiet = iso_at(time.time() - 2 * 3600)
+        path = home.folder / "goodqa-5-build.jsonl" if task else home.agent
+        path.write_text(line({"event": "intent", "note": "Build goodqa#5", "at": quiet}))
+        if not task:
+            os.utime(home.meta, (time.time() - 2 * 3600, time.time() - 2 * 3600))
+        return home, path, ("goodqa-5-build" if task else AGENT)
+
+    def test_owners_bad_record_is_lost_and_never_activity(self):
+        for task in (False, True):
+            for kind, make in BAD_RECORDS.items():
+                with self.subTest(wal="task" if task else "agent", record=kind):
+                    home, path, ident = self.owner_home(task)
+                    before = {r["agent_id"]: r for r in ah.owners(home.home, SID)["owners"]}[ident]
+                    home.append(path, line(make(iso_at(time.time()))))
+                    os.utime(path, (time.time() - 2 * 3600, time.time() - 2 * 3600))   # liveness from records only
+                    for call in ("cold", "warm"):
+                        if call == "cold":
+                            for cache in ah.state_dir(home.home, "ah-index").glob("wal-*.json"):
+                                cache.write_text("{}")   # an empty index: the next read rescans the WAL
+                        data = ah.owners(home.home, SID)
+                        row = {r["agent_id"]: r for r in data["owners"]}[ident]
+                        self.assertEqual((row["last_activity"], row["state"]), (before["last_activity"], before["state"]), call)
+                        self.assertEqual((data["read"]["state"], data["read"]["skipped"]), ("partial", 1), call)
+
+    def test_status_bad_record_is_lost(self):
+        for kind, make in BAD_RECORDS.items():
+            with self.subTest(record=kind):
+                home = Home(self)
+                home.append(home.main, line(make(iso_at(time.time()))))
+                report = ah.status_report(home.home, SID, WINDOW)
+                self.assertEqual((report["read"]["state"], report["read"]["skipped"]), ("partial", 1), report["read"])
+
+    def test_requirements_and_asks_with_a_bad_timestamp_are_lost(self):
+        home = Home(self)
+        home.append(home.main, line({"event": "requirement", "id": "wreq00000009", "note": "x", "at": "soon", "source": "inferred: x"})
+                    + line({"event": "ask", "id": "wask00000009", "note": "x?", "at": "soon", "source": "inferred: x"}))
+        req = ah.requirements_view(home.home, SID)
+        self.assertEqual((req["read"]["state"], req["total"]), ("partial", 1))
+        asks = prov.ask_items(SID, home.home / ".claude")
+        self.assertEqual(asks["read"]["state"], "partial")
+        self.assertNotIn("wask00000009", [i["id"] for i in asks["items"]])
+
+    def test_the_validator(self):
+        self.assertEqual(prov.wal_record_problem({"event": "status", "at": "2026-11-15T00:00:00Z"}), "")
+        self.assertEqual(prov.wal_record_problem({"event": "status", "ts": "x"}), "")   # undated: a record that proves no time
+        for kind, make in BAD_RECORDS.items():
+            with self.subTest(record=kind):
+                self.assertTrue(prov.wal_record_problem(make("2026-11-15T00:00:00Z")))
+        self.assertTrue(prov.wal_record_problem([1]))
+
+    def test_every_wal_reader_uses_the_one_validator(self):
+        import re
+        ah_src, prov_src = (HOOKS / "ah.py").read_text(), (HOOKS / "provenance.py").read_text()
+        export_src = (HOOKS / "ah_export.py").read_text()
+        for name, fn in (("_summarize_agent_wal", ah_src), ("owners", ah_src), ("status_report", ah_src),
+                         ("requirements_view", ah_src), ("ledger_read", prov_src), ("_read", export_src)):
+            with self.subTest(reader=name):
+                body = re.search(r"\ndef %s\(.*?(?=\ndef )" % re.escape(name), fn, re.S).group(0)
+                self.assertIn("wal_record_problem(", body)
+
+
 class NoLiteralWholeRead(unittest.TestCase):
     def test_no_producer_builds_a_read_block_from_a_literal_count(self):
         import re
