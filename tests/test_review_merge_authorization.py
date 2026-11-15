@@ -398,6 +398,49 @@ class CandidateBindingTests(AuthorizationTests):
         self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
 
 
+class SnapshotBaseTests(AuthorizationTests):
+    """B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling option a): the PR FINAL may carry the reviewer's snapshot
+    base; usage_guard validates it and pr_pass_evidence exposes it. BOUNDARY: main merges this."""
+
+    BR = "9" * 40
+
+    def meta(self, **changes):
+        m = {"stage": "PR", "verdict": "ACCEPT", "findings": [], "repo": "o/r", "pr": 5, "head": HEAD,
+             "report_sha256": REPORT_SHA, "reviewer": "Codex fixture", "reviewer_harness": "openai",
+             "author_harness": "claude", "snapshot_base": self.BR}
+        m.update(changes)
+        return m
+
+    def test_metadata_accepts_a_full_snapshot_base_and_legacy_receipts_without_one(self):
+        guard.validate_review_metadata(self.meta(), result="CHECK_OK")
+        legacy = self.meta()
+        legacy.pop("snapshot_base")
+        guard.validate_review_metadata(legacy, result="CHECK_OK")
+
+    def test_metadata_refuses_a_malformed_snapshot_base(self):
+        for name, changes in {"short": {"snapshot_base": "9" * 12}, "upper": {"snapshot_base": "A" * 40},
+                              "not a string": {"snapshot_base": 9}, "equals head": {"snapshot_base": HEAD},
+                              "length differs from head": {"snapshot_base": "9" * 64},
+                              "no head": {"head": None}, "plan stage": {"stage": "PLAN"}}.items():
+            with self.subTest(name):
+                m = self.meta(**changes)
+                if m.get("head") is None:
+                    m.pop("head")
+                if m["stage"] != "PR":
+                    for k in ("repo", "pr", "reviewer", "reviewer_harness", "author_harness"):
+                        m.pop(k)
+                with self.assertRaises(guard.GuardError):
+                    guard.validate_review_metadata(m, result="CHECK_OK")
+
+    def test_pr_pass_evidence_exposes_the_base_only_when_asked(self):
+        store, reference = self.evidence({"snapshot_base": self.BR})
+        evidence = store.inspect(reference)
+        self.assertEqual(mg.pr_pass_evidence(evidence), ("o/r", 5, HEAD, REPORT_SHA), "default shape unchanged")
+        self.assertEqual(mg.pr_pass_evidence(evidence, with_base=True), ("o/r", 5, HEAD, REPORT_SHA, self.BR))
+        store, reference = self.evidence()
+        self.assertIsNone(mg.pr_pass_evidence(store.inspect(reference), with_base=True)[4])
+
+
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -412,6 +455,7 @@ class EndToEndTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "app.txt"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "baseline"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        self.baseline = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         (self.repo / "app.txt").write_text("change\n")
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qam", "feat: change\n\nRefs: none (fixture)\n\n"
                         "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
@@ -487,7 +531,7 @@ class EndToEndTests(unittest.TestCase):
         result = subprocess.run([
             sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
             "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
-            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp"],
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", "--snapshot-base", self.baseline],
             text=True, capture_output=True, env=env, timeout=45)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("Merge authorization:", result.stdout)
@@ -503,6 +547,8 @@ class EndToEndTests(unittest.TestCase):
         evidence = guard.UsageStore(self.root / "usage").inspect(reference)
         self.assertEqual(mg.pr_pass_evidence(evidence)[:3], ("o/r", 5, self.head))
         self.assertEqual(evidence["review"]["author_harness"], "claude", "derived from the trailers")
+        self.assertEqual(mg.pr_pass_evidence(evidence, with_base=True)[4], self.baseline,
+                         "the FINAL records the snapshot base B_r the reviewer diffed against (v2g)")
 
     def test_unstamped_review_mints_nothing(self):
         # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp

@@ -1185,7 +1185,7 @@ class UsageStore:
 
 TICKETED_CATEGORIES = {'correctness', 'reliability', 'performance', 'maintainability', 'testing', 'documentation', 'ux'}
 REVIEW_METADATA_KEYS = {'stage', 'verdict', 'findings', 'report_sha256', 'head', 'repo', 'pr', 'ticketed',
-                        'reviewer', 'reviewer_harness', 'author_harness'}
+                        'reviewer', 'reviewer_harness', 'author_harness', 'snapshot_base'}
 REVIEWER_IDENTITY_KEYS = {'reviewer', 'reviewer_harness', 'author_harness'}
 TICKETED_RECORD_KEYS = {'state', 'finding', 'category', 'ticket', 'head', 'report_sha256'}
 
@@ -1205,6 +1205,14 @@ def validate_review_metadata(review, *, result):
                               or not re.fullmatch(r'[0-9a-f]{64}' if key == 'report_sha256'
                                                   else r'[0-9a-f]{40}|[0-9a-f]{64}', review[key])):
             raise GuardError('INVALID_OUTPUT', 'Review report or head binding is malformed')
+    if 'snapshot_base' in review:
+        # goodqa#16049 v2g: the base the PR reviewer diffed against; only with a bound head, never the head itself
+        if (review['stage'] != 'PR' or not isinstance(review['snapshot_base'], str)
+                or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', review['snapshot_base'])
+                or not isinstance(review.get('head'), str)
+                or len(review['snapshot_base']) != len(review['head'])
+                or review['snapshot_base'] == review['head']):
+            raise GuardError('INVALID_OUTPUT', 'Review snapshot base binding is malformed')
     if ('repo' in review) != ('pr' in review):
         raise GuardError('INVALID_OUTPUT', 'Review repository and PR must be bound together')
     if 'repo' in review:

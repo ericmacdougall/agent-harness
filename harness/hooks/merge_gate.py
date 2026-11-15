@@ -1639,8 +1639,10 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
-def pr_pass_evidence(evidence):
+def pr_pass_evidence(evidence, *, with_base=False):
     """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
+    With with_base=True it is (repo, pr, head, report_sha256, snapshot_base), where snapshot_base is the reviewer's
+    validated snapshot base B_r or None when the run named none (goodqa#16049 spec ahc-m1-v2g).
 
     Pure: it reads only the evidence mapping a UsageStore.inspect() returned and writes nothing. It is the one
     predicate for "this FINAL is a merge-eligible PR PASS", shared by add_review_waiver (main's merge gate) and the
@@ -1674,6 +1676,8 @@ def pr_pass_evidence(evidence):
             or not expected_prefix or not isinstance(reviewer, str) or not reviewer.startswith(expected_prefix)
             or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
         raise ValueError('FINAL is not settled independent pure PR PASS evidence')
+    if with_base:
+        return review['repo'], review['pr'], review['head'], review['report_sha256'], review.get('snapshot_base')
     return review['repo'], review['pr'], review['head'], review['report_sha256']
 
 
