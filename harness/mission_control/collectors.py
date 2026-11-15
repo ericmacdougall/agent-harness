@@ -361,6 +361,13 @@ SAFE_READS = {
     ("initiatives", "owners", "rows"): "covered: owners is a feed of initiatives (one row per live owner's ticket)",
     ("initiatives", "owners", "restricted_known"): "covered: owners is a feed of initiatives (before its read, ticketed rows wait)",
     ("initiatives", "owners", "restricted_tickets"): "covered: owners is a feed of initiatives (restricted rows are dropped)",
+    # PR 262 v3 receipt F1: every ticket consumer reads the restriction for the pinned session (server.App.restriction);
+    # a read for another session is unknown, so each of them fails closed until the pinned session's read lands
+    ("goodqa", "owners", "restriction_for"): "a privacy filter: only the pinned session's read; else none polled",
+    ("goodqa", "session-pin", "pin"): "a privacy filter's key: which session's restriction read applies (fail closed)",
+    ("org-graph", "owners", "restriction_for"): "covered: owners is a feed of orggraph (another session's read: no ticket)",
+    ("initiatives", "owners", "restriction_for"): "covered: owners is a feed of initiatives (another session's read waits)",
+    ("initiatives", "session-pin", "pin"): "a privacy filter's key: which session's restriction read applies (fail closed)",
 }
 
 
@@ -1197,11 +1204,21 @@ class Owners(Collector):
         # scrubs on restricted text; and whether any owner read has landed (before one, ticketed file rows are hidden)
         self.read_restricted_tickets: frozenset = frozenset()
         self.restricted_known = False
+        self.restricted_session = ""   # PR 262 v3 receipt F1: the session the restriction read above was for
         self.partial = False  # the last good read held more owners than MAX_ROWS, or rows it could not show
 
     MAX_ROWS = 60
     rows_written = ("native-projects", "native-streams", "owner-policy")
     read_budget = 30.0
+
+    def restriction_for(self, session) -> tuple:
+        """(known, restricted tickets) for `session` (PR 262 v3 receipt F1). Known only when the last owner read was
+        for that very session: after the pin moves, the previous session's read says nothing about the new one, so
+        it is unknown (fail closed: no ticket polled, shown or fetched) until the new session's read lands, however
+        long that read is delayed or keeps failing."""
+        if not self.restricted_known or not session or self.restricted_session != str(session):
+            return False, frozenset()
+        return True, self.restricted_tickets
 
     def health_truth(self):
         return "partial" if self.partial else None
@@ -1298,6 +1315,7 @@ class Owners(Collector):
             # goodqa#15961: never guess a session; an explicit "unpinned" state, never a silent 0 from another one
             self.session, self.claude_rows = "", []
             self.unrestricted = ("", frozenset())
+            self.restricted_known, self.restricted_session = False, ""
             self.next_at = min(self.next_at, now + 5)   # the ledger read pins it seconds after start
             # T243-5: off, not an error. No rows are shown and none of them is a last good read of this pin, so the
             # owners read is unknown, never "stale" with an empty list.
@@ -1329,7 +1347,7 @@ class Owners(Collector):
         self.read_restricted_tickets = self.restricted_tickets = frozenset(
             str(r.get("ticket")).lower() for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is True and r.get("ticket"))
-        self.restricted_known = True
+        self.restricted_known, self.restricted_session = True, str(data.get("session") or "")
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 dropped += 1

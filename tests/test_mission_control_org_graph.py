@@ -765,6 +765,45 @@ class RestrictedFileRowIntegration(unittest.TestCase):
         self.assertIn("goodqa#15950", asked, "an unrestricted ticket is still polled (not vacuous)")
         self.assertFalse(any("777" in json.dumps(e) for e in events), events)
 
+    def test_a_pin_move_makes_restriction_unknown_until_the_new_sessions_read(self):  # PR 262 v3 receipt F1
+        app, frames = self.app([self.owner()])
+        from test_mission_control_session_pin import OTHER   # on the path once app() has set it up
+        now = time.time()
+        app.owners.run(now)            # session A (MAIN): goodqa#777 restricted there, goodqa#15950 visible
+        app.initiatives.run(now)
+        app.org.run(now)
+        self.assertIn("goodqa#15950", app.tracked_tickets(), "A's read is known for A (the control: not vacuous)")
+        self.assertNotIn("goodqa#777", " ".join(app.tracked_tickets()))
+        # the pin moves to B; B's owner read is delayed and then keeps failing. In B, goodqa#777's work is
+        # unrestricted in A's read but B's restrictions are unknown, so nothing may be polled, shown or fetched.
+        app.config_pin = OTHER
+        self.assertEqual(app.pin()["display"], OTHER)
+        self.assertEqual(app.tracked_tickets(), [], "a read for A authorizes nothing in B (fail closed)")
+        self.assertFalse(app.org.visible()("goodqa#15950"))
+        self.assertEqual(app.restriction(), (False, frozenset()))
+        app.runner.outputs["ah-owners"] = (1, "")   # B's owner read fails
+        for i in range(3):
+            try:
+                app.owners.run(now + 10 + i)
+            except Exception:  # noqa: BLE001 - the failed read is the collector's own business
+                pass
+            self.assertEqual(app.tracked_tickets(), [], f"still unknown after failed B read {i}")
+        asked, events = self.polled(app)
+        self.assertEqual((asked, events), ([], []), "nothing is polled across the pin change")
+        app.initiatives.run(now + 20)
+        app.org.run(now + 20)
+        latest = [d for n, d in frames if n == "initiatives"][-1]
+        self.assertNotIn("Visible plan row", json.dumps(latest), "ticketed rows wait for B's read")
+        self.assertNotIn("SECRET-TITLE", json.dumps(latest))
+        # B's read lands: B restricts goodqa#15950, so the set comes from B, never from A
+        app.runner.outputs["ah-owners"] = lambda *a: (0, json.dumps({"read": col.whole_read(), "session": a[0],
+                                                                      "owners": [self.owner(ticket="goodqa#15950")]}))
+        app.owners.run(now + 30)
+        self.assertEqual(app.restriction(), (True, frozenset({"goodqa#15950"})))
+        self.assertNotIn("goodqa#15950", app.tracked_tickets())
+        self.assertFalse(app.org.visible()("goodqa#15950"))
+        self.assertTrue(app.org.visible()("goodqa#777"), "B's read, not A's, decides now")
+
     def test_a_restricted_owner_appearing_later_republishes_without_the_row(self):  # not live: the org sig is unchanged
         owners = []
         app, frames = self.app(owners)

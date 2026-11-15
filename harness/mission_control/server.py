@@ -519,14 +519,14 @@ class App:
         # The Initiatives panel comes from live owners and GoodQA, not the hand-written file alone (goodqa#15950).
         # PR 243 review F1: file rows on restricted tickets are dropped; before the first owner read (the loop runs
         # initiatives first) the restricted set is unknown (None) and every ticketed file row is withheld.
-        self.initiatives.derive = lambda snap: org_graph.derive_initiatives(
+        self.initiatives.derive = lambda snap: (lambda known, hidden: org_graph.derive_initiatives(
             snap, self.owners.rows, self.org.visible_tickets(), time.time(),
-            restricted_tickets=self.owners.restricted_tickets if self.owners.restricted_known else None)
+            restricted_tickets=hidden if known else None))(*self.restriction())
         self.org.on_initiatives = lambda: self.initiatives.publish(None)
-        # a change in the restricted set republishes the panel, even when no live owner row changed
-        self.org.restricted_fn = lambda: [self.owners.restricted_known, sorted(self.owners.restricted_tickets)]
+        # a change in the restricted set (or in whose read it is) republishes the panel, even when no owner row changed
+        self.org.restricted_fn = lambda: (lambda known, hidden: [known, sorted(hidden)])(*self.restriction())
         # PR 262 review F1: the one ticket visibility rule the graph applies to every ticket, by every route
-        self.org.visibility_fn = lambda: (self.owners.restricted_known, self.owners.restricted_tickets)
+        self.org.visibility_fn = self.restriction
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote, self.org]
         # One read per dataset, composed from the sources that feed it (collectors.FEEDS) and pushed before any rows.
@@ -589,12 +589,18 @@ class App:
             return None
         return len(getattr(asks, "items", None) or []), len(getattr(asks, "stale", None) or [])
 
+    def restriction(self) -> tuple:
+        """(known, restricted tickets) for the pinned session: what every ticket consumer (comment polling, the org
+        graph, initiatives) judges by. PR 262 v3 receipt F1: a read for another session (the pin moved since) is
+        unknown, never the old session's set, so nothing is polled or shown until the pinned session's read lands."""
+        return self.owners.restriction_for(self.pin()["display"])
+
     def tracked_tickets(self):
         """The tickets whose comments are polled. PR 262 v2 receipt F2: through the org graph's one visibility rule,
-        fail closed: before an owner read has said which tickets are restricted, no ticket is polled at all."""
+        fail closed: before an owner read of the pinned session has said which tickets are restricted (v3 F1), no
+        ticket is polled at all."""
         refs = [i.get("ticket") for i in self.initiatives.items if i.get("ticket")]
-        visible = org_graph.ticket_visibility(getattr(self.owners, "restricted_known", False),
-                                              getattr(self.owners, "restricted_tickets", frozenset()))
+        visible = org_graph.ticket_visibility(*self.restriction())
         return [r for r in refs + self.owners.tickets() if visible(str(r))]
 
     def start(self) -> None:
