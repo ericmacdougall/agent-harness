@@ -837,12 +837,14 @@ try { Stop-Process -Id %d -Force -ErrorAction Stop; 'AHK1 {"status":"stopped"}' 
 
 
 _WIN_ABS = re.compile(r"[A-Za-z]:\\[^/\x00-\x1f]*")
+_ASCII_LOWER = {c: c + 32 for c in range(ord("A"), ord("Z") + 1)}
 
 
 def _win_under(path, roots, localappdata):
     """True when the Windows PATH lies strictly inside one of ROOTS. Both strings come from the host: a missing, empty,
-    relative, UNC, forward-slash or non-normalized ('..', doubled separators) value fails closed, and the comparison is
-    case-insensitive with a separator-terminated prefix so a look-alike directory (bin2\\) does not match."""
+    relative, UNC, forward-slash or non-normalized ('..', doubled separators) value fails closed, and the prefix ends in
+    a separator so a look-alike directory (bin2\\) does not match. Only ASCII letters compare case-insensitively:
+    str.casefold would equate a different NTFS name (a U+FB01 ligature in place of 'fi' in 'Program Files')."""
     import ntpath  # noqa: PLC0415
     if not isinstance(path, str) or not _WIN_ABS.fullmatch(path) or ntpath.normpath(path) != path:
         return False
@@ -853,7 +855,7 @@ def _win_under(path, roots, localappdata):
             if not lad_ok:
                 continue
             root = root.replace("{localappdata}", lad.rstrip("\\"))
-        if path.casefold().startswith(root.casefold()) and len(path) > len(root):
+        if path.translate(_ASCII_LOWER).startswith(root.translate(_ASCII_LOWER)) and len(path) > len(root):
             return True
     return False
 
@@ -912,9 +914,11 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
                    orphan=ident["orphan"])
         exe = ident.get("exe")
         rec["exe"] = _clip(exe, MAX_CMD) if isinstance(exe, str) else ""
+        lad = ident.get("lad")
         audit.row({"event": "identity", "run": run_id, "host": host, "pid": pid, "ppid": rec["ppid"],
                    "name": rec["name"], "created": rec["created"], "cmd": rec["cmd"], "owner": rec["owner"],
-                   "orphan": rec["orphan"], "exe": rec["exe"]})
+                   "orphan": rec["orphan"], "exe": rec["exe"],
+                   "localappdata": _clip(lad, MAX_CMD) if isinstance(lad, str) else ""})
         base = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
         agent_names, agent_roots = WINDOWS_AGENT_ALLOWED.get(host, (set(), ()))
         agent = base in agent_names

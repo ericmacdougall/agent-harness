@@ -877,6 +877,7 @@ class WindowsMsiAgent(unittest.TestCase):
                 self.assertEqual(len(self.notices), 1)
                 ident = [r for r in self.read_audit() if r.get("event") == "identity" and r["exe"] == proc["exe"]]
                 self.assertTrue(ident)
+                self.assertEqual(ident[0]["localappdata"], self.LAD)  # an empty answer is visible in the audit
 
     def read_audit(self):
         rows = []
@@ -896,7 +897,13 @@ class WindowsMsiAgent(unittest.TestCase):
         for name in ("goodqa.exe", "GoodQA.exe", "claude.exe", "codex.exe", "node.exe", "sshd.exe", "svchost.exe",
                      "goodqa-agentd2.exe", "goodqa-agent.exe", ""):
             with self.subTest(name=name):
-                self.refused(dict(self.AGENTD, name=name), detail="not ")
+                self.refused(dict(self.AGENTD, name=name), detail="only an orphaned")
+        # the app at the exact place it is installed: only the name rule refuses it
+        app = "C:\\Program Files\\goodqa\\goodqa.exe"
+        for exe in (app, "C:\\Program Files\\goodqa\\resources\\agent\\goodqa.exe",
+                    self.LAD + "\\GoodQA\\agent\\bin\\0.2.52\\goodqa.exe"):
+            with self.subTest(exe=exe):
+                self.refused(dict(self.AGENTD, name="goodqa.exe", exe=exe), detail="only an orphaned")
 
     def test_an_agent_outside_the_install_directories_is_refused(self):
         lad = self.LAD
@@ -912,6 +919,8 @@ class WindowsMsiAgent(unittest.TestCase):
                     "\\\\server\\share\\GoodQA\\agent\\bin\\goodqa-agentd.exe",
                     "\\GoodQA\\agent\\bin\\0.2.52\\goodqa-agentd.exe",
                     lad + "\\GoodQA\\agent\\bin\\0.2.52\\evil.exe",
+                    "C:\\Program \ufb01les\\goodqa\\resources\\agent\\goodqa-agentd.exe",  # fi ligature: other dir
+                    lad + "\\GoodQA\\agent\\b\u0130n\\0.2.52\\goodqa-agentd.exe",  # dotted capital I
                     "", None, 42):
             with self.subTest(exe=exe):
                 self.refused(dict(self.AGENTD, exe=exe), detail="install directory")
