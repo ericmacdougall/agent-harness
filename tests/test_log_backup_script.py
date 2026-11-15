@@ -23,18 +23,26 @@ FAKE = """#!%(python)s
 import json, os, sys, time
 argv = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as h:
-    h.write(json.dumps({"argv": argv, "rclone_env": sorted(k for k in os.environ if k.startswith("RCLONE_"))}) + "\\n")
+    h.write(json.dumps({"argv": argv, "t": time.time(), "rclone_env": sorted(k for k in os.environ if k.startswith("RCLONE_"))}) + "\\n")
 if argv and argv[0] == "listremotes":
     print(os.environ.get("FAKE_REMOTES", "lessons-dropbox: dropbox"))
     sys.exit(0)
 if argv and argv[0] == "lsf":  # the bulk checkpoint lists a local source once per pass
+    if os.environ.get("FAKE_LSF_HANG") and "--min-size" in argv:  # a stalled large-file listing
+        time.sleep(float(os.environ["FAKE_LSF_HANG"]))
     if os.environ.get("FAKE_DELEGATE"):
         os.execv(os.environ["FAKE_DELEGATE"], [os.environ["FAKE_DELEGATE"]] + argv)
     root = argv[-1]
+    minsize = 0
+    if "--min-size" in argv:
+        raw = argv[argv.index("--min-size") + 1]
+        minsize = int(raw[:-1]) * 1048576 if raw.endswith("M") else int(raw)
     for d, _, fs in sorted(os.walk(root)):
         for f in sorted(fs):
             full = os.path.join(d, f)
             st = os.stat(full)
+            if st.st_size < minsize:
+                continue
             print("%%s\t%%d\t%%d" %% (os.path.relpath(full, root), st.st_size, int(st.st_mtime)))
     sys.exit(0)
 if argv and argv[0] == "copy":
@@ -197,6 +205,7 @@ class Case(unittest.TestCase):
 
     def run_script(self, script=SCRIPT, **extra):
         extra.setdefault("LOG_BACKUP_RETRY_SLEEP", "0")
+        extra.setdefault("LOG_BACKUP_LARGE_EVERY_SECONDS", "0")
         extra.setdefault("LOG_BACKUP_BULK_EVERY_SECONDS", "0")  # tests run the bulk tier every time unless they test the gap
         done = subprocess.run(["/bin/bash", str(script)], env=self.env(**extra), cwd=str(self.tmp),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
@@ -805,6 +814,572 @@ class ChunkFilterFailure(Case):
         self.faulty_then_good("short-exit0")
 
 
+CHECK = ROOT / "harness" / "hooks" / "log_backup.py"
+
+
+class LargeTier(Case):
+    """goodqa#16123 item 5: one 530 MB active transcript, re-sent whole every run, used up tier 1's budget for two days.
+    Files over a size threshold go to their own tier with its own budget and marker; the backup counts as fresh only
+    when transcripts, large files and bulk are all within their limits."""
+    BIG = ".claude/projects/p1/big.jsonl"
+    BIG_BYTES = 2 * 1048576   # the threshold is 1 MiB here (LOG_BACKUP_LARGE_MB=1)
+
+    def setUp(self):
+        super().setUp()
+        if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
+            self.skipTest("rclone not installed")
+        for i in range(25):
+            self.put(f".claude/projects/p1/small{i:02d}.jsonl", b"small %d\n" % i)
+        self.put(self.BIG, (b"big line\n" * 300000)[: self.BIG_BYTES])
+
+    def go(self, **extra):
+        settings = dict(LOG_BACKUP_LARGE_MB="1", LOG_BACKUP_BULK_LANE="0")
+        settings.update(extra)
+        return self.local_run(**settings)
+
+    def remote_big(self):
+        return self.remote / "testhost" / self.BIG
+
+    def state(self):
+        return self.logs / "log-backup.large.d" / "done.tsv"
+
+    def large_marker(self):
+        return self.logs / "log-backup.large-last-ok"
+
+    def check(self):
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
+        return subprocess.run([sys.executable, str(CHECK), "check"], env=env, capture_output=True, timeout=60)
+
+    def test_a_large_file_goes_to_its_own_tier_and_everything_is_fresh_when_all_tiers_finish(self):
+        done = self.go()
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-3000:])
+        self.assertTrue(self.last_ok().exists() and self.bulk_ok().exists() and self.large_marker().exists())
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes())
+        self.assertFalse((self.tmp / "home/.agent-harness/backup-stage/.claude/projects/p1/big.jsonl").exists(),
+                         "tier 1 must not stage a large file")
+        tier1 = [c for c in self.copies() if "--files-from-raw" not in c and os.path.isdir(c[c.index("--") + 1])
+                 and "backup-stage/" in c[c.index("--") + 1]]
+        self.assertTrue(tier1)
+        for argv in tier1:
+            self.assertIn("--max-size", argv, "tier 1 never sends a large file, whatever is in its stage")
+        self.assertEqual(self.check().returncode, 0, self.check().stdout)
+
+    def test_tier_1_goes_fresh_while_a_failing_large_upload_lags_is_reported_and_keeps_the_guard_closed(self):
+        done = self.go(FAKE_FAIL_MATCH="backup-stage-large", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0, "a large file that is not backed up fails the run")
+        self.assertTrue(self.last_ok().exists(), "tier 1 finishes on its own")
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.remote_big().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text(),
+                         "a file whose upload failed is never recorded as backed up")
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertIn("large tier:", log)
+        self.assertIn("was not backed up", log)
+        self.assertIn("log-backup.large-last-ok is not written", log)
+        (self.logs / "log-backup.first-run").write_text("2026-01-01T00:00:00Z\n")   # installed long ago: not "pending"
+        check = self.check()
+        self.assertEqual(check.returncode, 3, check.stdout)
+        self.assertIn(b"large-file tier", check.stdout)
+
+    def test_the_guard_opens_only_when_all_three_tiers_are_within_their_limits(self):
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual(self.check().returncode, 0)
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7 * 3600))
+        self.large_marker().write_text(old + "\n")
+        self.assertEqual(self.check().returncode, 3)
+        self.large_marker().write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
+        self.assertEqual(self.check().returncode, 0)
+        self.bulk_ok().write_text(old + "\n")
+        self.assertEqual(self.check().returncode, 3)
+
+    def test_an_unchanged_large_file_is_not_sent_again_and_a_changed_one_is(self):
+        self.assertEqual(self.go().returncode, 0)
+        open(self.calls, "w").close()
+        self.assertEqual(self.go().returncode, 0)
+        self.assertFalse([c for c in self.copies() if any("backup-stage-large" in a for a in c)])
+        self.put(self.BIG, (b"changed!\n" * 300000)[: self.BIG_BYTES + 10])
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes())
+
+    def test_a_stale_small_stage_copy_of_a_file_that_grew_cannot_overwrite_the_newer_remote_copy(self):
+        stale = self.home / ".agent-harness/backup-stage/.claude/projects/p1/big.jsonl"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"old and small\n")
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes())
+        self.assertFalse(stale.exists())
+
+    def test_a_large_upload_that_cannot_finish_inside_its_budget_is_stopped_and_stays_pending(self):
+        started = time.time()
+        done = self.go(FAKE_HANG="300", FAKE_HANG_MATCH="backup-stage-large", LOG_BACKUP_LARGE_BUDGET_SECONDS="4",
+                       LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1", LOG_BACKUP_SLICE_RESERVE_SECONDS="2")
+        self.assertLess(time.time() - started, 90)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.last_ok().exists(), "tier 1 was inside its budget")
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+
+    def test_a_large_file_named_like_a_credential_is_never_listed_or_sent(self):
+        self.put(".claude/projects/p1/auth.json", b"x" * self.BIG_BYTES)
+        self.assertEqual(self.go().returncode, 0)
+        self.assertNotIn("p1/auth.json", self.remote_files())
+        self.assertFalse(self.state().exists() and "auth.json" in self.state().read_text())
+
+    def test_the_gap_between_large_passes_is_kept(self):
+        self.assertEqual(self.go(LOG_BACKUP_LARGE_EVERY_SECONDS="7200").returncode, 0)
+        open(self.calls, "w").close()
+        self.put(self.BIG, (b"again\n" * 400000)[: self.BIG_BYTES + 5])
+        self.assertEqual(self.go(LOG_BACKUP_LARGE_EVERY_SECONDS="7200").returncode, 0)
+        self.assertIn("large tier skipped", (self.logs / "log-backup.log").read_text())
+        self.assertFalse([c for c in self.copies() if any("backup-stage-large" in a for a in c)])
+
+    def test_large_settings_are_validated(self):
+        for name, value in (("LOG_BACKUP_LARGE_MB", "0"), ("LOG_BACKUP_LARGE_MB", "x"), ("LOG_BACKUP_LARGE_TPS", "100"),
+                            ("LOG_BACKUP_LARGE_EVERY_SECONDS", "-1")):
+            done = self.go(**{name: value})
+            self.assertEqual(done.returncode, 2, (name, value))
+
+
+SLOW_CP = """#!%(python)s
+import os, sys
+args = sys.argv[1:]
+if os.environ.get("SLOW_CP_SECONDS") and any("backup-stage-large" in a for a in args):
+    import time
+    time.sleep(float(os.environ["SLOW_CP_SECONDS"]))
+os.execv("/bin/cp", ["cp"] + args)
+"""
+STAND_IN = b"stand-in for a live transcript\n"
+
+
+class LargeTierSafety(LargeTier):
+    """PR #261 review (F1 High, F2, F3): the snapshot directory must never reach a live file through a link, the
+    pass budget must bound the listing and the snapshot, and standalone live files must use the tier too."""
+
+    def setUp(self):
+        super().setUp()
+        self.parent = self.home / ".agent-harness"
+        self.parent.mkdir(parents=True, exist_ok=True)
+        self.stage = self.parent / "backup-stage-large"
+        self.live = self.home / self.BIG
+        self.live_bytes = self.live.read_bytes()
+        fakebin = self.tmp / "fakebin2"
+        fakebin.mkdir()
+        cp = fakebin / "cp"
+        cp.write_text(SLOW_CP % {"python": sys.executable})
+        cp.chmod(0o755)
+        self.slow_path = f"{fakebin}:/usr/bin:/bin"
+
+    def live_files(self):
+        return {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob("*")
+                if p.is_file() and not p.is_symlink() and p.relative_to(self.home).parts[0] in (".claude", ".codex")}
+
+    def assert_live_untouched(self, before):
+        self.assertEqual(self.live_files(), before)
+        self.assertEqual(self.live.read_bytes(), self.live_bytes)
+
+    def leftovers(self):
+        return [p for p in self.stage.rglob("*") if not p.is_dir()] if self.stage.is_dir() else []
+
+    def test_a_symlinked_stage_root_pointing_at_home_fails_closed_and_touches_nothing(self):
+        before = self.live_files()
+        mode = os.stat(self.home).st_mode
+        os.symlink(self.home, self.stage)
+        done = self.go()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assert_live_untouched(before)
+        self.assertEqual(os.stat(self.home).st_mode, mode)
+        self.assertIn("large tier:", (self.logs / "log-backup.log").read_text())
+
+    def test_a_stage_directory_that_is_not_private_fails_closed(self):
+        before = self.live_files()
+        self.stage.mkdir()
+        os.chmod(self.stage, 0o755)
+        done = self.go()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assertEqual(os.stat(self.stage).st_mode & 0o777, 0o755, "a refused directory is not chmodded")
+        self.assert_live_untouched(before)
+
+    def test_a_link_to_a_live_directory_inside_the_stage_cannot_delete_the_live_file(self):
+        before = self.live_files()
+        self.stage.mkdir(mode=0o700)
+        os.symlink(self.home / ".claude", self.stage / ".claude")
+        done = self.go()
+        self.assert_live_untouched(before)
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual(self.remote_big().read_bytes(), self.live_bytes)
+
+    def test_a_link_at_the_snapshot_file_itself_cannot_delete_or_overwrite_the_live_file(self):
+        before = self.live_files()
+        self.stage.mkdir(mode=0o700)
+        (self.stage / ".claude/projects/p1").mkdir(parents=True)
+        os.symlink(self.live, self.stage / ".claude/projects/p1/big.jsonl")
+        done = self.go()
+        self.assert_live_untouched(before)
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual(self.remote_big().read_bytes(), self.live_bytes)
+
+    def test_a_link_in_the_tier_1_stage_cannot_delete_a_file_outside_it_and_the_run_fails_closed(self):
+        decoy = self.tmp / "decoy"
+        decoy.mkdir()
+        (decoy / "big.jsonl").write_bytes(STAND_IN)
+        stage1 = self.parent / "backup-stage/.claude/projects"
+        stage1.mkdir(parents=True)
+        os.symlink(decoy, stage1 / "p1")
+        done = self.go()
+        self.assertEqual((decoy / "big.jsonl").read_bytes(), STAND_IN)
+        self.assertEqual(sorted(p.name for p in decoy.iterdir()), ["big.jsonl"], "nothing was written through the link")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+
+    def test_a_link_at_the_bulk_checkpoint_directory_cannot_reach_files_outside_it(self):
+        decoy = self.tmp / "decoy2"
+        decoy.mkdir()
+        names = ("pending", "cursor", "done", "listing", "chunk", "chunk.paths")
+        for name in names:
+            (decoy / name).write_bytes(STAND_IN)
+        self.logs.mkdir(parents=True, exist_ok=True)
+        os.symlink(decoy, self.logs / "log-backup.bulk.d")
+        done = self.go()
+        for name in names:
+            self.assertEqual((decoy / name).read_bytes(), STAND_IN, name)
+        self.assertEqual(sorted(p.name for p in decoy.iterdir()), sorted(names), "nothing was written through the link")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.bulk_ok().exists())
+
+    def test_a_run_leaves_no_snapshot_files_behind(self):
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_hung_large_listing_is_stopped_inside_the_pass_budget(self):
+        started = time.time()
+        done = self.go(FAKE_LSF_HANG="300", LOG_BACKUP_LARGE_BUDGET_SECONDS="4", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                       LOG_BACKUP_KILL_GRACE_SECONDS="1", LOG_BACKUP_SLICE_RESERVE_SECONDS="2")
+        self.assertLess(time.time() - started, 90)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.last_ok().exists())
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+        self.assertIn("listing", (self.logs / "log-backup.log").read_text())
+
+    def test_a_hung_snapshot_copy_is_stopped_inside_the_pass_budget_and_the_file_stays_pending(self):
+        started = time.time()
+        done = self.go(PATH=self.slow_path, SLOW_CP_SECONDS="300", LOG_BACKUP_LARGE_BUDGET_SECONDS="4",
+                       LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                       LOG_BACKUP_SLICE_RESERVE_SECONDS="2")
+        self.assertLess(time.time() - started, 90)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+        self.assertEqual(self.leftovers(), [], "a partial snapshot is removed by name")
+        self.assertFalse(self.remote_big().exists())
+
+    def test_a_large_standalone_live_file_goes_through_the_large_tier(self):
+        history = self.home / ".claude/history.jsonl"
+        self.put(".claude/history.jsonl", (b"h\n" * 800000)[: self.BIG_BYTES])
+        done = self.go()
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual((self.remote / "testhost/.claude/history.jsonl").read_bytes(), history.read_bytes())
+        self.assertTrue(self.large_marker().exists())
+        self.assertFalse((self.home / ".agent-harness/backup-stage/.claude/history.jsonl").exists())
+        for argv in self.copies():
+            self.assertFalse(argv[-2].endswith("backup-stage/.claude/history.jsonl"), "tier 1 must not send it")
+
+    def test_a_failing_large_standalone_file_is_not_reported_as_backed_up(self):
+        self.put(".claude/history.jsonl", (b"h\n" * 800000)[: self.BIG_BYTES])
+        done = self.go(FAKE_FAIL_MATCH="backup-stage-large", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse((self.remote / "testhost/.claude/history.jsonl").exists())
+        self.assertFalse(self.state().exists() and "history.jsonl" in self.state().read_text())
+        self.assertTrue(self.last_ok().exists(), "tier 1 still finishes")
+
+    def test_a_small_standalone_file_stays_in_tier_1(self):
+        self.assertEqual(self.go().returncode, 0)
+        self.assertEqual((self.remote / "testhost/.claude/history.jsonl").read_bytes(), ORDINARY[".claude/history.jsonl"])
+
+
+FAULTY_CP = """#!%(python)s
+import os, sys
+args = sys.argv[1:]
+mode = os.environ.get("CP_FAULT", "")
+dest = args[-1] if args else ""
+if mode and "backup-stage-large" in dest:
+    counter = os.environ["CP_COUNTER"]
+    seen = int(open(counter).read()) if os.path.exists(counter) else 0
+    open(counter, "w").write(str(seen + 1))
+    src = args[-2]
+    partial = lambda: open(dest, "wb").write(open(src, "rb").read(1000))
+    if mode == "fail-first-with-partial" and seen == 0:
+        partial()
+        sys.exit(1)
+    if mode == "fail-always-with-partial":
+        partial()
+        sys.exit(1)
+    if mode == "truncate-and-succeed":
+        partial()
+        sys.exit(0)
+os.execv("/bin/cp", ["cp"] + args)
+"""
+
+
+class LargeTierDelta(LargeTier):
+    """PR #261 review v2: F1 the completion state is bound to the destination; F2 a failed snapshot attempt cannot
+    leave a partial file that a retry accepts."""
+
+    def setUp(self):
+        super().setUp()
+        (self.home / ".agent-harness").mkdir(parents=True, exist_ok=True)
+        fakebin = self.tmp / "fakebin3"
+        fakebin.mkdir()
+        cp = fakebin / "cp"
+        cp.write_text(FAULTY_CP % {"python": sys.executable})
+        cp.chmod(0o755)
+        self.cp_path = f"{fakebin}:/usr/bin:/bin"
+        self.cp_counter = self.tmp / "cp-counter"
+
+    def to(self, remote=None, host=None, **extra):
+        """A run to one destination with the pass gap on, so a gap that outlives a destination change would show."""
+        settings = dict(LOG_BACKUP_ALLOW_LOCAL="1", FAKE_DELEGATE=REAL_RCLONE, LOG_BACKUP_LARGE_MB="1",
+                        LOG_BACKUP_BULK_LANE="0", LOG_BACKUP_LARGE_EVERY_SECONDS="7200",
+                        LOG_BACKUP_REMOTE=str(remote or self.remote))
+        if host:
+            settings["LOG_BACKUP_HOST"] = host
+        settings.update(extra)
+        return self.run_script(**settings)
+
+    def test_changing_the_host_sends_the_unchanged_large_file_to_the_new_destination(self):
+        self.assertEqual(self.to().returncode, 0)
+        self.assertTrue(self.large_marker().exists())
+        done = self.to(host="otherhost")
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual((self.remote / "otherhost" / self.BIG).read_bytes(), (self.home / self.BIG).read_bytes())
+        self.assertTrue(self.large_marker().exists())
+
+    def test_changing_the_remote_path_sends_the_unchanged_large_file_to_the_new_destination(self):
+        self.assertEqual(self.to().returncode, 0)
+        other = self.tmp / "remote-b"
+        other.mkdir()
+        done = self.to(remote=other)
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual((other / "testhost" / self.BIG).read_bytes(), (self.home / self.BIG).read_bytes())
+        self.assertTrue(self.large_marker().exists())
+
+    def test_a_failed_upload_to_the_new_destination_leaves_no_fresh_marker_from_the_old_one(self):
+        self.assertEqual(self.to().returncode, 0)
+        self.assertTrue(self.large_marker().exists())
+        done = self.to(host="otherhost", FAKE_FAIL_MATCH="backup-stage-large", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists(), "the old destination's marker must not vouch for the new one")
+        self.assertFalse((self.remote / "otherhost" / self.BIG).exists())
+
+    def test_the_same_destination_still_skips_an_unchanged_large_file(self):
+        self.assertEqual(self.to().returncode, 0)
+        open(self.calls, "w").close()
+        self.assertEqual(self.to().returncode, 0)
+        self.assertFalse([c for c in self.copies() if any("backup-stage-large" in a for a in c)])
+
+    def test_a_failed_clone_attempt_that_leaves_a_partial_file_is_removed_before_the_retry(self):
+        done = self.to(PATH=self.cp_path, CP_FAULT="fail-first-with-partial", CP_COUNTER=str(self.cp_counter))
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes(), "the whole file, not the partial")
+        self.assertTrue(self.large_marker().exists())
+        self.assertGreaterEqual(int(self.cp_counter.read_text()), 2, "a second attempt was made")
+
+    def test_when_every_attempt_leaves_a_partial_nothing_is_uploaded_or_recorded(self):
+        done = self.to(PATH=self.cp_path, CP_FAULT="fail-always-with-partial", CP_COUNTER=str(self.cp_counter))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.remote_big().exists())
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+
+    def test_a_snapshot_shorter_than_the_listed_size_is_never_uploaded_or_recorded(self):
+        done = self.to(PATH=self.cp_path, CP_FAULT="truncate-and-succeed", CP_COUNTER=str(self.cp_counter))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.remote_big().exists())
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+
+
+for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the parent's tests
+    if _name.startswith("test_") and _name not in vars(LargeTierDelta):
+        setattr(LargeTierDelta, _name, None)
+
+
+class LargeTierLane(LargeTier):
+    """PR #261 review v3 (and goodqa#16151): the large tier with the lane ON. F1: a large upload never exceeds the host's
+    write share. F2: a large upload says so in the lane state ("large PID"), and a tier-1 run that starts during it takes
+    the rest of the share, so the two together stay inside it (share 1: the large upload keeps a quarter, tier 1 three
+    quarters); a large file never starts while tier 1 runs."""
+
+    def setUp(self):
+        super().setUp()
+        self.budget = self.tmp / "budget.conf"
+        self.budget.write_text("account 6\nlog-backup.testhost 1\n")   # this host's share: 1 write operation a second
+
+    def lane_env(self, **extra):
+        env = dict(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_BUDGET_FILE=str(self.budget), LOG_BACKUP_LARGE_MB="1")
+        env.update(extra)
+        return env
+
+    def lane_state(self):
+        path = self.logs / "log-backup.lane.state"
+        return path.read_text().strip() if path.exists() else ""
+
+    def lane_lock(self):
+        return self.logs / "log-backup.lane.lock.d"
+
+    def wait_for(self, predicate, seconds, what):
+        end = time.time() + seconds
+        while time.time() < end:
+            if predicate():
+                return
+            time.sleep(0.2)
+        self.fail("timed out waiting for " + what + "; lane log: " + (self.logs / "log-backup.lane.log").read_text()[-1500:]
+                  if (self.logs / "log-backup.lane.log").exists() else "timed out waiting for " + what)
+
+    def lane_over(self):
+        self.wait_for(lambda: not self.lane_lock().exists(), 150, "the lane run to end")
+
+    def rate(self, argv):
+        return float(argv[len(argv) - 1 - argv[::-1].index("--tpslimit") + 1])   # the last --tpslimit wins in rclone
+
+    def large_copies(self):
+        return [c for c in self.copies() if any("backup-stage-large" in a for a in c)]
+
+    def test_a_large_upload_never_goes_above_the_host_share_whatever_large_tps_says(self):
+        done = self.local_run(**self.lane_env(LOG_BACKUP_BULK_LANE="0", LOG_BACKUP_LARGE_TPS="99"))
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        big = self.large_copies()
+        self.assertTrue(big)
+        for argv in big:
+            self.assertLessEqual(self.rate(argv), 1.0, argv)
+
+    def test_with_the_lane_on_a_large_upload_is_announced_and_a_tier_1_run_splits_the_share_with_it(self):
+        env = self.lane_env(FAKE_HANG="45", FAKE_HANG_MATCH="backup-stage-large", LOG_BACKUP_LARGE_TPS="99")
+        self.addCleanup(self.lane_over)
+        first = self.local_run(**env)   # a scheduled run: tier 1, then it starts the lane
+        self.assertEqual(first.returncode, 0, first.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        before = len(self.copies())
+        second = self.local_run(**env)   # a scheduled run that starts while the large upload is in flight
+        self.assertEqual(second.returncode, 0, second.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        self.assertTrue(self.lane_state().startswith("large "), "the upload was still in flight: " + self.lane_state())
+        tier1 = [c for c in self.copies()[before:] if any("backup-stage/" in a for a in c) and "--files-from-raw" not in c]
+        self.assertTrue(tier1, "the second run copied")
+        large = self.large_copies()
+        self.assertEqual(len(large), 1, "the large upload was not stopped and restarted by the tier-1 start")
+        big_rate = self.rate(large[0])
+        self.assertLessEqual(big_rate, 0.25 + 1e-9)
+        for argv in tier1:
+            self.assertLessEqual(self.rate(argv) + big_rate, 1.0 + 1e-9, "together they stay inside the share of 1: " + str(argv))
+        self.assertIn("is in flight in the bulk lane at 0.25/s", (self.logs / "log-backup.log").read_text())
+        self.lane_over()
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes(), "the large upload finished")
+        self.assertTrue(self.last_ok().exists() and self.large_marker().exists() and self.bulk_ok().exists())
+        self.assertNotIn("stopped: a tier-1 run started", (self.logs / "log-backup.lane.log").read_text())
+
+    def share(self, n):
+        self.budget.write_text("account 8\nlog-backup.testhost %d\n" % n)
+
+    def large_calls(self):
+        return [c for c in self.recorded() if c["argv"][0] == "copy" and any("backup-stage-large" in a for a in c["argv"])]
+
+    def test_a_tier_1_run_reserves_the_rate_the_running_upload_published_not_its_own_setting(self):
+        """PR #261 review v4 F1: the lane started with LARGE_TPS=99 on a share of 8 uploads at 2/s; a later run with the
+        default LARGE_TPS must reserve that 2, not its own 1, or the two together are 9/s."""
+        self.share(8)
+        self.addCleanup(self.lane_over)
+        hang = dict(FAKE_HANG="45", FAKE_HANG_MATCH="backup-stage-large")
+        first = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="99", **hang))
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        fields = self.lane_state().split()
+        self.assertEqual(len(fields), 3, "the state publishes the rate: 'large PID RATE', got " + repr(self.lane_state()))
+        self.assertEqual(float(fields[2]), 2.0)
+        before = len(self.copies())
+        second = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="1", **hang))   # a different setting from the lane's
+        self.assertEqual(second.returncode, 0, second.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        tier1 = [c for c in self.copies()[before:] if any("backup-stage/" in a for a in c) and "--files-from-raw" not in c]
+        self.assertTrue(tier1)
+        large = self.large_copies()
+        self.assertEqual(len(large), 1)
+        self.assertEqual(self.rate(large[0]), 2.0)
+        for argv in tier1:
+            self.assertLessEqual(self.rate(argv) + 2.0, 8.0 + 1e-9, "the aggregate stays inside the share of 8: " + str(argv))
+        self.lane_over()
+
+    def test_when_the_budget_is_lowered_during_an_upload_tier_1_defers_instead_of_going_over(self):
+        """Same lane (share 8, upload at 2/s); the budget file then drops this host's share to 2, so nothing is left under
+        the new ceiling beside the running upload: tier 1 must wait for it, not copy at 2/s on top of it."""
+        self.share(8)
+        self.addCleanup(self.lane_over)
+        hang = dict(FAKE_HANG="40", FAKE_HANG_MATCH="backup-stage-large")
+        first = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="99", **hang))
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        self.share(2)
+        before = len(self.recorded())
+        second = self.local_run(**self.lane_env(LOG_BACKUP_LARGE_TPS="1", **hang))
+        self.assertEqual(second.returncode, 0, second.stderr.decode() + (self.logs / "log-backup.log").read_text()[-1500:])
+        self.assertIn("defers its copies", (self.logs / "log-backup.log").read_text())
+        started = self.large_calls()[0]["t"]
+        tier1 = [c for c in self.recorded()[before:] if c["argv"][0] == "copy" and any("backup-stage/" in a for a in c["argv"])
+                 and "--files-from-raw" not in c["argv"]]
+        self.assertTrue(tier1, "tier 1 copied once the upload was over")
+        for call in tier1:
+            self.assertGreaterEqual(call["t"], started + 40 - 3, "no tier-1 copy while the upload was running")
+            self.assertLessEqual(self.rate(call["argv"]), 2.0)
+        self.lane_over()
+
+    def test_a_large_file_does_not_start_while_a_tier_1_run_holds_the_lock(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        lock = self.logs / "log-backup.lock.d"
+        lock.mkdir()
+        holder_dir = self.tmp / "holder"
+        holder_dir.mkdir()
+        (holder_dir / "log-backup.sh").write_text("sleep 120\n")   # looks like a live tier-1 run to holder_alive
+        holder = subprocess.Popen(["/bin/bash", str(holder_dir / "log-backup.sh")])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.terminate)
+        (lock / "pid").write_text(str(holder.pid))
+        env = self.lane_env(LOG_BACKUP_LANE_BUDGET_SECONDS="12", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1",
+                            LOG_BACKUP_KILL_GRACE_SECONDS="1", LOG_BACKUP_SLICE_RESERVE_SECONDS="2", LOG_BACKUP_TIER="bulk")
+        done = self.local_run(**env)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.large_copies(), [], "no large upload starts beside tier 1")
+        self.assertFalse(self.large_marker().exists())
+
+    def test_terminating_the_lane_stops_the_large_copy_before_the_lock_is_released_and_removes_the_snapshot(self):
+        env = self.lane_env(FAKE_HANG="60", FAKE_HANG_MATCH="backup-stage-large")
+        self.addCleanup(self.lane_over)
+        first = self.local_run(**env)
+        self.assertEqual(first.returncode, 0, first.stderr.decode())
+        self.wait_for(lambda: self.lane_state().startswith("large "), 90, "the lane to announce a large upload")
+        pid = int((self.lane_lock() / "pid").read_text().strip())
+        os.kill(pid, signal.SIGTERM)
+        self.wait_for(lambda: not self.lane_lock().exists(), 60, "the lane lock to be released")
+        alive = subprocess.run(["pgrep", "-f", str(self.fake)], capture_output=True)
+        self.assertNotEqual(alive.returncode, 0, "the copy was stopped before the lock was released: " + alive.stdout.decode())
+        stage = self.home / ".agent-harness/backup-stage-large"
+        self.assertEqual([p for p in stage.rglob("*") if p.is_file()] if stage.is_dir() else [], [])
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.remote_big().exists())
+        self.assertEqual(self.lane_state(), "", "the lane state is cleared")
+
+
+for _name in list(vars(LargeTier)):
+    if _name.startswith("test_") and _name not in vars(LargeTierLane):
+        setattr(LargeTierLane, _name, None)
+
+for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the parent's tests
+    if _name.startswith("test_") and _name not in vars(LargeTierSafety):
+        setattr(LargeTierSafety, _name, None)
+
+
 class BulkResume(Case):
     """goodqa#15062: the bulk tier never finished on the Mac. Each pass was a fresh copy of the 620k-file work tree,
     so every pass spent its budget re-checking the same first files. A pass must resume where the last one stopped
@@ -938,10 +1513,12 @@ class Failure(Case):
             live = argv[-2].startswith(str(stage))
             self.assertNotIn("--min-age", argv)  # live sources are snapshots; a bulk chunk carries no filter flags
             self.assertEqual("--files-from-raw" in argv, not live, argv)
-        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
+        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf" and "--min-size" not in c["argv"]]
         self.assertTrue(lists)
         for argv in lists:
             self.assertIn("--min-age", argv)  # static sources skip young files when their pass is listed
+        # the large-file tier lists live sources (--min-size) and sends a clone of the file, so it needs no --min-age
+        self.assertTrue([c for c in self.recorded() if c["argv"][0] == "lsf" and "--min-size" in c["argv"]])
 
     def test_snapshot_temp_files_live_outside_every_uploaded_tree(self):
         stage = self.home / ".agent-harness/backup-stage"
