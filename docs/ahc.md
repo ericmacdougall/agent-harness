@@ -4,6 +4,24 @@ GoodQA goodqa#16034. Gate 1 is receipt-only: `ahc` lints the queued packet, runs
 `peer_review.py pr` receipt, and writes the result back to the ticket, the owner inbox and the digest. It never
 merges. Code: `harness/hooks/ahc_core.py`, `ahc_packet.py`, `ahc_clone.py`, `ahc_runner.py`.
 
+## State root
+
+The coordinator root is `~/.agent-harness/ahc` (`ahc_core.Paths.root`). It was `~/.agent-harness/coordinator`
+until goodqa#16049 slice 1. That directory belongs to another program, coordd, which keeps its own ledger, clones
+and token there. No ahc install existed when the root moved.
+
+ahc owns its root only by the marker file `.ahc-root`. The marker is written to a temp file, fsynced, then
+hard-linked into place, so it is never torn. On every start, before reading anything, ahc claims the root:
+- If the root is absent or empty, ahc creates the marker.
+- It refuses, naming the conflict and changing nothing, when:
+  - the root has no marker and is not empty;
+  - a marked root holds a top-level entry ahc does not write (`ROOT_NAMES` and `ROOT_PATTERNS` in `ahc_core`);
+  - the root or the marker is a symlink.
+- Every subcommand turns a refusal into exit 3, which is in the units' `RestartPreventExitStatus`, so a foreign
+  root stops the unit instead of looping.
+
+A change that adds a top-level file under the root must add its name to `ROOT_NAMES` in the same commit.
+
 ## Ledger and migrations
 
 State lives in one SQLite database, `<coordinator root>/ledger.sqlite3`, in WAL mode. `meta.schema_version`
