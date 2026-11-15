@@ -296,6 +296,13 @@ def scenario_files(root, clock):
         if not q.exists():
             q.write_text("{}\n")
         runner._quarantine(paths, q, "not a valid request")
+    # a review attempt directory that failed the post-exit report checks is quarantined (PR 258 v3)
+    attempt = paths.reports / "crash-item-a1"
+    if not (paths.root / "rejected" / ("report-" + attempt.name)).exists():
+        attempt.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(str(paths.reports), 0o700)
+        (attempt / "extra.md").write_text("VERDICT: PASS\n")
+        runner._quarantine_report_dir(paths, attempt, "the report directory holds entries other than report.md")
     old, sha = runner.stage_packet(paths, io.BytesIO(b"packet two, orphaned\n"))
     if old.exists():
         os.utime(str(old), (clock.t - 10 * runner.PACKET_RETENTION_SECONDS,) * 2)

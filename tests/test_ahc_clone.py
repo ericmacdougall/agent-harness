@@ -265,9 +265,15 @@ class CloneReuseHardeningTests(CloneTests):
             calls.append((list(argv), dict(env or {}), os.umask(0o077)))
             os.umask(calls[-1][2])
             return real(argv, timeout, cwd=cwd, env=env)
+        # The caller's environment is hostile: a global config that sets a hook path, and system config allowed.
+        # ahc's own GIT_ENV must override both (the shared ENV fixture already isolates git, so it is not used).
+        hostile_global = Path(self.tmp.name) / "hostile.gitconfig"
+        hostile_global.write_text("[core]\n\thooksPath = %s\n" % (Path(self.tmp.name) / "hostile-hooks"))
+        hostile = {**ENV, "GIT_CONFIG_GLOBAL": str(hostile_global), "GIT_CONFIG_NOSYSTEM": "0"}
         ahc_clone.ahc_core.run_argv = recording
         try:
-            path = self.fresh()
+            path = ahc_clone.prepare(self.clones, "o/n", str(self.remote), self.head, self.base, env=hostile,
+                                     **CLONE_KW)
         finally:
             ahc_clone.ahc_core.run_argv = real
         self.assertTrue(calls)

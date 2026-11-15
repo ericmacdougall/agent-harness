@@ -18,7 +18,7 @@ FS = "harness/hooks/ahc_fs.py"
 CLONE = "harness/hooks/ahc_clone.py"
 T = ["tests.test_ahc_core.RootOwnershipTests", "tests.test_ahc_clone", "tests.test_ahc_fs",
      "tests.test_ahc_runner.IngestValidationTests",
-     "tests.test_ahc_runner.UntrustedReadTests"]
+     "tests.test_ahc_runner.UntrustedReadTests", "tests.test_ahc_runner.FileTransportOptInTests"]
 V = [
     ("the root ownership check dropped (ensure only makes directories)", [
         ("    def ensure(self):\n        self.claim_root()\n", "    def ensure(self):\n        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)\n")]),
@@ -30,8 +30,12 @@ V = [
         ("        foreign = [name for name in os.listdir(str(root)) if not _ahc_root_name(name)]\n",
          "        foreign = []\n")]),
     ("marker content not verified", [("        self._verify_marker()\n", "")]),
-    ("symlinked root followed", [
-        ("        info = os.lstat(str(root))\n", "        info = os.stat(str(root))\n")]),
+    # A symlinked root is caught by two layers since PR 258 v3 (the lstat type check and the O_NOFOLLOW descriptor
+    # check of fs.open_root in claim_root), so this variant drops both.
+    ("symlinked root followed (lstat and the descriptor check both dropped)", [
+        ("        info = os.lstat(str(root))\n", "        info = os.stat(str(root))\n"),
+        ("            os.close(fs.open_root(root))              # owned by this uid, mode exactly 0700, existing or new\n",
+         "            pass\n")]),
     # A symlinked marker is caught by two layers (the O_NOFOLLOW open in _verify_marker and the lstat type check of
     # every top-level entry), so this variant drops both.
     ("symlinked marker accepted (marker opened following links and exempt from the type check)", [
@@ -108,8 +112,11 @@ V = [
     # PR 258 v3: the reused clone (D4 ruling): allowlist walk, bounds, quarantine, rewrite, hardened git
     ("v3 clone: the .git allowlist is not applied", [
         ("            if not _allowed(rel, is_dir):\n", "            if False:\n")], CLONE),
-    ("v3 clone: a link inside .git is accepted", [
-        ('            if stat.S_ISLNK(info.st_mode):\n                return "%s is a symlink" % where\n', "")], CLONE),
+    # A link is refused by name (S_ISLNK) and again as "not a directory or regular file", so this drops both.
+    ("v3 clone: a link inside .git is accepted (both the link and the special-file checks dropped)", [
+        ('            if stat.S_ISLNK(info.st_mode):\n                return "%s is a symlink" % where\n', ""),
+        ("            if not is_dir and not stat.S_ISREG(info.st_mode):\n",
+         "            if not is_dir and not stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):\n")], CLONE),
     ("v3 clone: a foreign-owned entry inside .git is accepted", [
         ('            if info.st_uid != uid:\n                return "%s is owned by uid %d" % (where, info.st_uid)\n',
          "")], CLONE),
@@ -133,6 +140,20 @@ V = [
     # PR 258 v3: the review report is read only through the attempt directory ahc created
     ("v3 report: the attempt directory's inode is not compared", [
         ("                if [info.st_dev, info.st_ino] != list(want):\n", "                if False:\n")], RUNNER),
+    # Spec owner's conditions on the report-directory deviation
+    ("v3 report: entries beside the report are allowed", [
+        ("                if names != [report.name]:\n", "                if report.name not in names:\n")], RUNNER),
+    ("v3 report: a hard-linked report is accepted", [
+        ("                if entry.st_nlink != 1:\n", "                if False:\n")], RUNNER),
+    ("v3 report: the size cap is not checked before the read", [
+        ("                if entry.st_size > core.REPORT_MAX_BYTES:\n", "                if False:\n"),
+        ("                    return core.read_regular(report.name, core.REPORT_MAX_BYTES, dir_fd=dfd), None\n",
+         "                    return core.read_regular(report.name, 1 << 40, dir_fd=dfd), None\n")], RUNNER),
+    ("v3 report: a failed attempt directory is not quarantined", [
+        ("            moved = _quarantine_report_dir(self.paths, Path(str(data.get(\"report\"))).parent, problem)\n",
+         "            moved = None\n")], RUNNER),
+    ("v3 clone: the file transport opt-in is honoured for the production root", [
+        ("        if allow_file and file_transport_refused(self.paths):\n", "        if False:\n")], RUNNER),
 ]
 out, survivors = [], []
 for entry in V:

@@ -1016,7 +1016,9 @@ class Worker:
     def _read_report(self, data):
         """(bytes or None, problem or None). The report is read only through a descriptor for the attempt
         directory ahc created for it, and that directory must have the (dev, ino) recorded at creation. The report
-        must be a regular file owned by this uid. None bytes with no problem means no report was written."""
+        must be the directory's only entry (peer_review unlinks its own temp file before exiting) and a regular
+        file owned by this uid with one link, within REPORT_MAX_BYTES. None bytes with no problem means no report
+        was written. Any problem is INVALID, and conclude() quarantines the attempt directory."""
         want = data.get("report_dir_id")
         report = Path(str(data.get("report")))
         if not want:
@@ -1026,12 +1028,19 @@ class Worker:
                 info = os.fstat(dfd)
                 if [info.st_dev, info.st_ino] != list(want):
                     return None, "the report directory was replaced after the review was launched"
-                try:
-                    entry = os.stat(report.name, dir_fd=dfd, follow_symlinks=False)
-                except FileNotFoundError:
+                names = sorted(os.listdir(dfd))
+                if not names:
                     return None, None
+                if names != [report.name]:
+                    return None, "the report directory holds entries other than %s (%d entries)" % (
+                        report.name, len(names))
+                entry = os.stat(report.name, dir_fd=dfd, follow_symlinks=False)
                 if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.geteuid():
                     return None, "the report is not a regular file owned by ahc"
+                if entry.st_nlink != 1:
+                    return None, "the report has %d hard links; only one is allowed" % entry.st_nlink
+                if entry.st_size > core.REPORT_MAX_BYTES:
+                    return None, "the report is larger than %d bytes" % core.REPORT_MAX_BYTES
                 try:
                     return core.read_regular(report.name, core.REPORT_MAX_BYTES, dir_fd=dfd), None
                 except core.Unreadable as error:
@@ -1059,6 +1068,9 @@ class Worker:
         report_bytes, problem = self._read_report(data)
         if problem:
             verdict = {"verdict": "INVALID", "reason": problem}
+            moved = _quarantine_report_dir(self.paths, Path(str(data.get("report"))).parent, problem)
+            if moved:
+                verdict["reason"] += "; attempt directory quarantined as rejected/%s" % moved
         else:
             verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"],
                                           report_bytes=report_bytes)
@@ -1749,6 +1761,37 @@ def _quarantine(paths, qfile, reason):
         return None
 
 
+def file_transport_refused(paths):
+    """True when `paths` is the production root, under the real home directory of this uid. Tests always build
+    Paths on a temporary home, so only they can turn the local file transport on."""
+    try:
+        return Path(paths.home).resolve() == Path(os.path.expanduser("~")).resolve()
+    except (OSError, RuntimeError):
+        return True
+
+
+def _quarantine_report_dir(paths, report_dir, reason):
+    """Move a review attempt's directory that failed _read_report into rejected/ as a name (a link or a swapped
+    directory is moved, never followed), with a reason file beside it. Its contents are never read again, and the
+    next attempt gets a fresh directory. Returns the quarantined name, or None if nothing could be moved."""
+    report_dir = Path(report_dir)
+    if report_dir.parent != paths.reports or not os.path.lexists(str(report_dir)):
+        return None
+    target = paths.root / "rejected" / ("report-%s" % report_dir.name)
+    try:
+        fs.make_dirs(paths.root, target.parent)
+        if os.path.lexists(str(target)):
+            target = target.with_name("%s.%d" % (target.name, time.time_ns()))
+        _write_private(paths.root, target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
+        crash_before("runner.quarantine_report")
+        fs.rename(paths.root, report_dir, target)
+        crash_after("runner.quarantine_report")
+        return target.name
+    except OSError as error:
+        log.warning("could not quarantine report dir %s: %s", report_dir.name, type(error).__name__)
+        return None
+
+
 def supersede(worker):
     """NEG-15: for one PR only the newest submission proceeds; older queued or deferred items are superseded."""
     led = worker.led
@@ -2184,13 +2227,16 @@ class LiveDeps:
 
     def clone(self, repo, head, base):
         import ahc_clone
+        # https only. config.json can opt into local file remotes for tests, and that opt-in is refused for the
+        # production root (under the real home), so a stray key can never widen the transports of the live daemon.
+        allow_file = self.config.get("clone_file_transport") is True
+        if allow_file and file_transport_refused(self.paths):
+            raise ahc_clone.CloneError("clone_file_transport is for test roots only; refused for %s" % self.paths.root)
         floor = int(self.config.get("disk_floor_bytes", 20 * 1024 ** 3))
         if shutil.disk_usage(str(self.paths.clones)).free < floor:
             raise RuntimeError("disk floor: less than %d GiB free for clones" % (floor // 1024 ** 3))
         url = self.config.get("clone_urls", {}).get(repo, "https://github.com/%s.git" % repo)
-        # https only, unless the operator's config.json (inside the 0700 root) opts into local file remotes
-        return ahc_clone.prepare(self.paths.clones, repo, url, head, base,
-                                 allow_file=self.config.get("clone_file_transport") is True)
+        return ahc_clone.prepare(self.paths.clones, repo, url, head, base, allow_file=allow_file)
 
     def merge_base(self, clone, head, base):
         import ahc_clone

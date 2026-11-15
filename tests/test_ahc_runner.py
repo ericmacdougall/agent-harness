@@ -713,22 +713,53 @@ class IngestValidationTests(Base):
     def test_a_report_not_written_into_the_attempt_directory_ahc_created_is_never_a_pass(self):
         """PR 258 v3 (main's ruling on the review child). ahc creates the attempt's private report directory
         exclusively and records its inode. After the child exits, ahc reads the report only through that same
-        directory. A replaced directory, a linked report or a foreign directory gives INVALID, never PASS. A
-        normal report in the created directory still passes."""
+        directory. The report must be that directory's only entry: a regular file owned by this uid with one link
+        and within the size cap. A replaced directory (before or after the child exits), a linked or hard-linked
+        report, an extra entry or an oversized report gives INVALID, never PASS. The attempt directory is
+        quarantined into rejected/, and a file outside the root is never touched. A normal report in the created
+        directory still passes. (Spec owner's conditions on the report-directory deviation.)"""
         cases = {}
 
-        def swap_dir(out):          # the attempt directory is replaced by another with a forged PASS report
+        def swap_dir(out):          # before the child: the directory is replaced, and the child writes there
             aside = out.parent.with_name(out.parent.name + ".moved")
             os.rename(str(out.parent), str(aside))
             out.parent.mkdir(mode=0o700)
-            return out
+            return out, None
 
         def link_report(out):       # the report name is a link to a PASS report kept elsewhere
             elsewhere = self.home / "forged.md"
             os.symlink(str(elsewhere), str(out))
-            return elsewhere
+            return elsewhere, None
+
+        def hard_link(out):         # after the child: a second name for the report, outside ahc's directory
+            def after():
+                os.link(str(out), str(self.home / ("hard-%s.md" % out.parent.name)))
+            return out, after
+
+        def extra_entry(out):       # after the child: another file beside the report
+            def after():
+                (out.parent / "extra.md").write_text("VERDICT: PASS\n")
+            return out, after
+
+        def swap_after_exit(out):   # after the child: the whole directory is replaced by a copy
+            def after():
+                body = out.read_bytes()
+                os.rename(str(out.parent), str(out.parent.with_name(out.parent.name + ".moved")))
+                out.parent.mkdir(mode=0o700)
+                out.write_bytes(body)
+            return out, after
+
+        def oversized(out):         # after the child: the report grows past the cap
+            def after():
+                with open(str(out), "ab") as handle:
+                    handle.write(b"x" * (core.REPORT_MAX_BYTES + 1))
+            return out, after
         cases["replaced directory"] = swap_dir
         cases["linked report"] = link_report
+        cases["hard-linked report"] = hard_link
+        cases["extra entry"] = extra_entry
+        cases["directory swapped after exit"] = swap_after_exit
+        cases["oversized report"] = oversized
         for label, tamper in cases.items():
             with self.subTest(case=label):
                 self.tearDown()
@@ -739,13 +770,24 @@ class IngestValidationTests(Base):
 
                 def review(argv, timeout, tamper=tamper, plain=plain):
                     out = Path(argv[argv.index("--output") + 1])
-                    target = tamper(out)
+                    target, after = tamper(out)
                     rc = plain(argv[:argv.index("--output") + 1] + [str(target)] + argv[argv.index("--output") + 2:],
                                timeout)
+                    if after:
+                        after()
                     return rc
                 deps.review = review
+                forged = self.home / "forged.md"
                 self.run_all(deps)
                 self.assertNotEqual(self.state(iid), "routed-to-main", "%s became a PASS" % label)
+                rejected = sorted(p.name for p in (self.paths.root / "rejected").glob("report-%s-a1*" % iid))
+                self.assertTrue(any(n.endswith(".reason") for n in rejected), "%s: no quarantine reason" % label)
+                self.assertTrue(any(not n.endswith(".reason") for n in rejected), "%s: not quarantined" % label)
+                if label == "hard-linked report":
+                    outside = self.home / ("hard-%s-a1.md" % iid)
+                    self.assertEqual(os.stat(str(outside)).st_nlink, 2, "the outside name must be left alone")
+                if label == "linked report":
+                    self.assertTrue(forged.exists(), "the link target outside the root must be left alone")
         self.tearDown()
         self.setUp()
         iid, deps = self.submit(), Deps(verdict="PASS")
@@ -3195,6 +3237,40 @@ class OwnerCopyTests(Base):
             self.assertTrue(str(Path(cwd).resolve()).startswith(root), "git ran outside the clone root: %s" % cwd)
         review_repo = deps.review_calls[0][deps.review_calls[0].index("--repo") + 1]
         self.assertTrue(str(Path(review_repo).resolve()).startswith(root))
+
+
+class FileTransportOptInTests(unittest.TestCase):
+    """Spec owner's condition on PR 258 v3: the local file transport is off by default and refused outside tests.
+    The production root lives under the real home, so the opt-in is refused there before git runs. On a test
+    root it is honoured, and without the key it stays off."""
+
+    def run_clone(self, home, config):
+        import ahc_clone
+        seen = []
+        real = ahc_clone.prepare
+
+        def prepare(*args, **kw):
+            seen.append(kw.get("allow_file"))
+            return "/nonexistent/clone"
+        ahc_clone.prepare = prepare
+        try:
+            with mock.patch.object(runner.shutil, "disk_usage", return_value=mock.Mock(free=1 << 50)):
+                runner.LiveDeps(core.Paths(home), config).clone(REPO, HEAD, BASE)
+        finally:
+            ahc_clone.prepare = real
+        return seen
+
+    def test_production_root_refuses_the_file_transport(self):
+        import ahc_clone
+        real_home = os.path.expanduser("~")
+        with self.assertRaises(ahc_clone.CloneError):
+            self.run_clone(real_home, {"clone_file_transport": True})
+        self.assertFalse(self.run_clone(real_home, {})[0], "without the key the file transport is off")
+
+    def test_a_test_root_may_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.run_clone(tmp, {"clone_file_transport": True}), [True])
+            self.assertEqual(self.run_clone(tmp, {"clone_file_transport": "yes"}), [False], "only literal true")
 
 
 class LiveIsolationTests(unittest.TestCase):

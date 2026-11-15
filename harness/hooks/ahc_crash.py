@@ -43,6 +43,7 @@ SEAMS = (
     "runner.inbox",            # _write_inbox: the owner notice rename into place
     "runner.stage_packet",     # stage_packet: the staged packet file
     "runner.quarantine",       # _quarantine: the queue entry rename into rejected/
+    "runner.quarantine_report",  # _quarantine_report_dir: a failed attempt directory moved into rejected/
     "runner.prune",            # Worker.prune_packets: a staged packet removal
     "runner.backup",           # Ledger.backup: the verified pre-migration copy
     "runner.restore_intent",   # Ledger.restore: the durable interrupted-restore record written first
@@ -316,6 +317,8 @@ INVENTORY = {
     ("ahc_runner", "acquire_lock", "fs.open_file"): (1, "exempt:the lock file; empty, flocked, not state"),
     ("ahc_runner", "_quarantine", "fs.rename"): (1, "seam:runner.quarantine"),
     ("ahc_runner", "_quarantine", "fs.make_dirs"): (1, _DIR),
+    ("ahc_runner", "_quarantine_report_dir", "fs.rename"): (1, "seam:runner.quarantine_report"),
+    ("ahc_runner", "_quarantine_report_dir", "fs.make_dirs"): (1, _DIR),
     ("ahc_runner", "_setup_logging", "path.mkdir"): (1, "exempt:the log directory; logs are not ledger state"),
 }
 
