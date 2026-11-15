@@ -522,9 +522,12 @@ class ServerIntegration(unittest.TestCase):
     def test_v6_D40_the_session_watch_unshows_the_old_sessions_rows_while_the_ledger_read_still_runs(self):
         """D40 [defect] review PR 234 v6: main moves while the ledger thread is inside a slow read; the page is told."""
         app = self.h.app
+        # main's session as the sources see it, whichever server wiring supplies it (owners here, a pin in PR 243)
+        main = {"id": SID}
+        app.ledger.session_fn = app.asks.session_fn = lambda: main["id"]
         app.ledger.run(time.time())
         self.assertEqual(app.hub.snapshots["ledger"]["status"]["truth"], "current")
-        app.owners.session = SID_B  # the ledger thread has not ticked since (it may be inside a read for SID)
+        main["id"] = SID_B  # the ledger thread has not ticked since (it may be inside a read for SID)
         getattr(app, "follow_sessions", lambda: None)()  # one pass of the session watch (none at ec6d0edd)
         snap = app.hub.snapshots["ledger"]
         self.assertEqual((snap["requirements"]["truth"], snap["status"]["truth"], snap["status"]["blockers"]), ("unknown", "unknown", []))
