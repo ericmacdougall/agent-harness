@@ -131,6 +131,26 @@ test('a held update with no parsable stamp is dropped (fail closed)', async () =
   assert.equal(store.getState().connection, 'live');
 });
 
+test('a load begun before a later reopen is superseded at once: its answer installs nothing and is not live', async () => {
+  const es = sources[0];
+  assert.equal(store.getState().connection, 'live');
+  es.emit('error');
+  es.emit('open');
+  const first = await nextFetch();                    // load A, on the old process
+  es.emit('error');                                   // the old process stops while A is in flight
+  restart('ee55');
+  es.emit('open');                                    // reopened on the new process: a new resync is scheduled
+  first.answer(snapshot('old-process-answer', first.at));  // A answers before the new resync's load has started
+  await wait(20);
+  assert.ok(!goals().includes('old-process-answer'), 'an answer from before the reopen was installed');
+  assert.notEqual(store.getState().connection, 'live', 'live on an answer from before the reopen');
+  const second = await nextFetch();
+  second.answer(snapshot('after-reopen', second.at));
+  await wait(20);
+  assert.deepEqual(goals(), ['after-reopen']);
+  assert.equal(store.getState().connection, 'live');
+});
+
 test('a live stream message from another server process marks the page not live and re-reads the state', async () => {
   const es = sources[0];
   assert.equal(store.getState().connection, 'live');

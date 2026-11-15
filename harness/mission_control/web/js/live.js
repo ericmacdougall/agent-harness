@@ -158,6 +158,10 @@ function connect() {
 // read leaves the page not live (every claim at best stale) and tries again, backing off, while the stream stays open.
 function resync(delay = 300) {
   clearTimeout(resyncTimer);
+  // A load begun before this (re)open may be answered by a process that has since stopped. It is superseded now, not
+  // when the next load starts: its answer installs nothing and never marks the page live. What it held stays held
+  // until the next load starts, whose snapshot is taken after all of it arrived (goodqa#16117 sweep).
+  loadGen += 1;
   resyncTimer = setTimeout(async () => {
     try {
       if (await loadState() && failures === 0) setConnection('live');
