@@ -46,7 +46,10 @@
 #                           yields to tier 1 (a 500 MB upload restarted by every tier-1 run would never finish), so the
 #                           share is split: the lane says "large PID" in log-backup.lane.state, never starts a large file
 #                           while a tier-1 run holds the lock, and keeps at most a quarter of the share (share 1: 0.25/s)
-#                           for the upload; a tier-1 run that starts during it copies with the rest (0.75/s).
+#                           for the upload. The state is "large PID RATE": the rate the upload really uses. A tier-1 run
+#                           that starts during it reserves that published RATE under its own ceiling and copies with the
+#                           rest (share 1: 0.75/s), whatever its own LARGE_TPS or budget now say; when nothing is left
+#                           (a lowered budget), it waits for the upload to end and copies nothing if that takes the run.
 #   Large files keep the versions/ move: it is a server-side move (no data sent), but it keeps one full old copy per pass
 #   (about 6 GB a day for one 530 MB transcript at the default gap); see the review packet for why it is not skipped.
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
@@ -403,14 +406,14 @@ tier1_active() {
   if [ -z "$holder" ]; then [ "$(file_age "$LOCKD")" -lt $STALE_LOCK_SECONDS ]; return; fi
   holder_alive "$holder"
 }
-lane_set_state() { echo "$1 $$" > "$LANE_STATE.tmp.$$" && mv "$LANE_STATE.tmp.$$" "$LANE_STATE"; }
+lane_set_state() { echo "$1 $$${2:+ $2}" > "$LANE_STATE.tmp.$$" && mv "$LANE_STATE.tmp.$$" "$LANE_STATE"; }   # "STATE PID [RATE]"
 large_gate() { # 0: clear to start a large upload (state is "large"); 1: the time ran out while tier 1 held the lock.
   # A large upload does not stop for tier 1 (it would never finish), so it says so in the lane state ("large PID") and
   # never starts beside a tier-1 run: same protocol as lane_gate, whichever side acts second sees the other. A tier-1
   # run that starts during the upload reads that state and takes the rest of the host share (see large_share).
   local said=0
   while :; do
-    lane_set_state large
+    lane_set_state large "$(large_rate)"   # "large PID RATE": the rate this upload really uses, for tier 1 to reserve
     tier1_active || return 0
     lane_set_state idle
     [ $said -eq 1 ] || { say "a tier-1 run holds the lock; the large upload waits for it (one uploader at a time until it ends)"; said=1; }
@@ -914,7 +917,7 @@ bulk_due() { # the hourly gap has passed (or a pass stopped on the budget cleare
   [ -z "$a" ] || [ "$a" -lt 0 ] || [ "$a" -ge "$BULK_EVERY" ]
 }
 lane_yields() { # the live lane run $1 is one that yields to tier 1 (it keeps a state file under its pid)
-  case "$(cat "$LANE_STATE" 2>/dev/null)" in "copying $1"|"idle $1"|"large $1") return 0 ;; esac
+  case "$(cat "$LANE_STATE" 2>/dev/null)" in "copying $1"|"idle $1"|"large $1"|"large $1 "*) return 0 ;; esac
   return 1
 }
 lane_quiet() { # wait, bounded, until the lane run $1 has no copy in flight; it stops one when it sees this run's lock
@@ -937,13 +940,42 @@ if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
     lane_pid=
   fi
 fi
+tier1_deferred=0
 if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
-  if [ "$(cat "$LANE_STATE" 2>/dev/null)" = "large $lane_pid" ]; then
-    # A large upload is in flight and does not pause for tier 1. This host's write share is split, not doubled: the
-    # upload keeps its part (large_share), tier 1 copies with the rest (PR #261 review v3 F2).
-    large_part=$(large_share "$TPSLIMIT")
-    TPSLIMIT=$(awk -v t="$TPSLIMIT" -v c="$large_part" 'BEGIN {printf "%g", t - c}')
-    say "a large-file upload is in flight in the bulk lane (pid $lane_pid) and does not pause; the host share is split: tier 1 copies at ${TPSLIMIT}/s, the upload keeps at most ${large_part}/s"
+  lane_state_now=$(cat "$LANE_STATE" 2>/dev/null)
+  case "$lane_state_now" in "large $lane_pid"|"large $lane_pid "*) large_running=1 ;; *) large_running=0 ;; esac
+  if [ "$large_running" = 1 ]; then
+    # A large upload is in flight and does not pause for tier 1. The lane publishes the rate it really uses ("large PID
+    # RATE", written before it looked at the lock); this run reserves that rate under its own ceiling and copies with
+    # what is left. It never recomputes the upload's rate from its own settings, which can differ from the ones the
+    # lane started with (another LOG_BACKUP_LARGE_TPS, a lowered budget): PR #261 review v4 F1.
+    published=${lane_state_now#"large $lane_pid"}; published=${published# }
+    if printf '%s' "$published" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+      avail=$(awk -v t="$TPSLIMIT" -v r="$published" 'BEGIN {a = t - r; if (a < 0) a = 0; printf "%g", a}')
+    else
+      avail=0
+      say "the lane's large-upload state has no valid rate (\"$published\"); tier 1 reserves the whole share until it ends"
+    fi
+    if awk -v a="$avail" 'BEGIN {exit !(a >= 0.1)}'; then
+      say "a large-file upload (pid $lane_pid) is in flight in the bulk lane at ${published}/s and does not pause; tier 1 copies at ${avail}/s of its ${TPSLIMIT}/s ceiling so the two stay inside this host's share"
+      TPSLIMIT=$avail
+    else
+      say "a large-file upload (pid $lane_pid) runs at ${published:-?}/s and leaves nothing under this run's ceiling of ${TPSLIMIT}/s; tier 1 defers its copies until it ends"
+      while [ "$(time_left)" -ge $(( MIN_SLICE * 2 )) ] && holder_alive "$lane_pid"; do
+        lane_state_now=$(cat "$LANE_STATE" 2>/dev/null)
+        case "$lane_state_now" in "large $lane_pid"|"large $lane_pid "*) ;; *) break ;; esac
+        nap "$LANE_POLL"
+      done
+      lane_state_now=$(cat "$LANE_STATE" 2>/dev/null)
+      case "$lane_state_now" in
+        "large $lane_pid"|"large $lane_pid "*)
+          if holder_alive "$lane_pid"; then
+            tier1_deferred=1 ok=1
+            say "the large-file upload is still running and this run's time is nearly used up; tier 1 copied nothing this run (not fresh)"
+          fi ;;
+        *) say "the large-file upload ended; tier 1 continues at ${TPSLIMIT}/s" ;;
+      esac
+    fi
   elif lane_yields "$lane_pid"; then
     lane_quiet "$lane_pid" && say "bulk lane running (pid $lane_pid); it pauses while tier 1 copies at ${TPSLIMIT}/s"
   elif [ "$TPSLIMIT" -gt 1 ]; then
@@ -973,6 +1005,7 @@ if [ "$TIER" != bulk ]; then
 later=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
 for src in "${LIVE[@]}"; do
+  [ "$tier1_deferred" = 0 ] || continue   # a large upload leaves no rate under this run's ceiling (v4 F1)
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   later=$((later - 1)); [ $later -ge 0 ] || later=0
   # A later copy that hangs costs its slice, both graces and about 3 s to snapshot the source first.
