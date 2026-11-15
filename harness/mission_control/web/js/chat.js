@@ -1,13 +1,40 @@
-import { getState, subscribe, sendMessage, retryMessage, setResponder, setSession, messageSession, chatAccess } from './store.js';
+import { getState, subscribe, sendMessage, retryMessage, setResponder, setSession, setTab, messageSession, chatAccess } from './store.js';
 import { el, button } from './ui.js';
+import { chatAttention } from './chat-attention.js';
 
 export function mountChat() {
   const log = document.getElementById('chat-log'), form = document.getElementById('chat-form');
   const input = document.getElementById('chat-input'), send = document.getElementById('chat-send');
   const counter = document.getElementById('chat-counter'), notice = document.getElementById('chat-notice');
   const announcer = document.getElementById('chat-announcer');
+  const newReplies = document.getElementById('chat-new'), unreadBadge = document.getElementById('chat-unread');
+  const chatTab = document.getElementById('tab-chat'), panel = document.getElementById('chat-panel');
+  const attention = chatAttention();
+  const desktop = window.matchMedia('(min-width: 1100px)');
   const parts = new Map(), previousStatuses = new Map();
   let forceScroll = true, initial = true;
+  const visible = () => !document.hidden && (desktop.matches || getState().tab === 'chat');
+  const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  function showUnread(count) {
+    newReplies.hidden = unreadBadge.hidden = !count;
+    newReplies.textContent = `${count} new ${count === 1 ? 'reply' : 'replies'} · jump to latest ↓`;
+    unreadBadge.textContent = count ? String(count) : '';
+    chatTab.setAttribute('aria-label', count ? `Chat, ${count} new ${count === 1 ? 'reply' : 'replies'}` : 'Chat');
+  }
+  function readLatest() {
+    log.scrollTop = log.scrollHeight;
+    forceScroll = false;
+    attention.clear();
+    showUnread(0);
+  }
+  newReplies.addEventListener('click', () => { readLatest(); log.focus({ preventScroll: true }); });
+  log.addEventListener('scroll', () => { if (visible() && atBottom()) { attention.clear(); showUnread(0); } });
+  document.getElementById('skip-chat').addEventListener('click', event => {
+    event.preventDefault();
+    setTab('chat');
+    // View subscribers reveal the mobile panel before the browser moves focus.
+    (input.disabled ? panel : input).focus();
+  });
   const announce = text => { announcer.textContent = text; };
   function composer(state) {
     const access = chatAccess(state);
@@ -27,7 +54,7 @@ export function mountChat() {
     if (message.status === 'queued') {
       if (message.to === 'codex') return `Queued for Codex · ${elapsed} s`;
       const session = messageSession(message.id);
-      return `${state.chatAvailability.claude[session]?.waiting ? 'Waiting for main to pick this up' : 'Main will see it at its next stop'} · ${elapsed} s · ${session.slice(0, 8)}`;
+      return `Queued · ${state.chatAvailability.claude[session]?.waiting ? 'Waiting for main to pick this up' : 'Main will see it at its next stop'} · ${elapsed} s · ${session.slice(0, 8)}`;
     }
     if (message.status === 'sending') return 'Sending…';
     if (message.status === 'expired') return 'Expired before main read it · it does not count · decide again in Needs you';
@@ -49,7 +76,7 @@ export function mountChat() {
     sessionSelect.disabled = state.sessions.length < 2;
   }
   function render(state) {
-    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+    const reading = visible() && atBottom();
     const wanted = new Set(state.messages.map(message => message.id));
     for (const [id, part] of parts) if (!wanted.has(id)) { part.row.remove(); parts.delete(id); previousStatuses.delete(id); }
     state.messages.forEach(message => {
@@ -95,13 +122,17 @@ export function mountChat() {
       previousStatuses.set(message.id, message.status);
     });
     initial = false;
-    if (nearBottom || forceScroll) { log.scrollTop = log.scrollHeight; forceScroll = false; }
+    // Wait for the first real chat snapshot; the empty store at mount is not history.
+    if (state.chat) showUnread(attention.observe(state.messages, reading));
+    if (visible() && (reading || forceScroll)) { readLatest(); forceScroll = false; }
     document.getElementById('responder-claude').setAttribute('aria-pressed', String(state.responder === 'claude'));
     document.getElementById('responder-codex').setAttribute('aria-pressed', String(state.responder === 'codex'));
     document.getElementById('session-label').hidden = state.responder !== 'claude';
     const waiting = state.messages.some(message => ['sending','queued','answering'].includes(message.status));
     const access = chatAccess(state);
-    document.getElementById('chat-presence').textContent = access.presence === 'READY' && waiting ? 'IN PROGRESS' : access.presence;
+    const presence = document.getElementById('chat-presence');
+    presence.textContent = access.presence === 'READY' && waiting ? 'IN PROGRESS' : access.presence;
+    presence.dataset.state = access.disabled ? 'unavailable' : waiting || access.presence === 'BUSY' ? 'busy' : 'ready';
     syncSessions(state);
     empty.hidden = state.messages.length > 0;
     composer(state);
@@ -112,7 +143,7 @@ export function mountChat() {
   });
   form.addEventListener('submit', event => {
     event.preventDefault();
-    forceScroll = true;
+    forceScroll = !send.disabled;
     if (sendMessage(input.value)) { input.value = ''; composer(getState()); input.focus(); }
   });
   document.getElementById('responder-claude').addEventListener('click', () => setResponder('claude'));
@@ -124,6 +155,8 @@ export function mountChat() {
     if (reason === 'tick') state.messages.forEach(message => {
       if (message.status === 'queued' && parts.has(message.id)) parts.get(message.id).statusLabel.textContent = statusText(message, state);
     });
-    if (reason === 'tab' && state.tab === 'chat') log.scrollTop = log.scrollHeight;
+    if (reason === 'tab' && state.tab === 'chat') queueMicrotask(readLatest);
   });
+  document.addEventListener('visibilitychange', () => { if (visible() && atBottom()) readLatest(); });
+  desktop.addEventListener('change', () => { if (visible() && atBottom()) readLatest(); });
 }
