@@ -505,7 +505,8 @@ def export(ah, home, args) -> dict:
         return cache[index]
 
     # Classes on the raw rows (same verdicts as `ah status`); display from the redacted copies, matched by index.
-    report = _display(ah, ah.status_report(home, session, since_s, now=now, rows=raw_rows, unread=unread_raw),
+    report = _display(ah, ah.status_report(home, session, since_s, now=now, rows=raw_rows, unread=unread_raw,
+                                         sources_read=len(_read_agents), skipped_rows=skipped),
                       len(raw_rows), redacted)
 
     tree, counts, picked = {a: "" for a in _read_agents}, {}, []

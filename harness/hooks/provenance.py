@@ -37,6 +37,15 @@ LEDGER_MAX_HITS = 100_000         # the asks ledger reads every ask and resoluti
 MAX_TEXT = 2 * 1024 * 1024
 MAX_SCAN_BYTES = 1 << 30          # a transcript or WAL larger than this is not scanned
 SCAN_SECONDS = 3.0                # wall-clock budget for one scan
+# PR 234 v8 (receipt v7 F1/F4): the one rule every read-only producer uses for a line it cannot parse. It counts as
+# skipped (its record is missing from the result) unless it is the file's unterminated last line and the file was
+# written in the last APPEND_GRACE_S seconds: that line is a write in progress, not a lost record. An unterminated
+# last line in a file nobody is writing is a torn record and counts.
+APPEND_GRACE_S = 60.0
+
+
+def tail_in_progress(at_tail: bool, mtime: float, now: float | None = None) -> bool:
+    return bool(at_tail) and (time.time() if now is None else now) - mtime <= APPEND_GRACE_S
 SMALL_FILE = 1 << 20              # policy, cache and similar small files
 MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
@@ -457,12 +466,15 @@ def _line_around(fd: int, index: int, size: int):
             fwd *= 4
 
 
-def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS):
+def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS, *, tails: bool = False):
     """Yield the line (or None when oversized) for each line containing needle. bytes.find on 8 MiB chunks:
-    mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript."""
+    mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript.
+    tails=True yields (line, in_progress) instead: in_progress is tail_in_progress for the file's unterminated last
+    line (a line that fails to parse is then a write in progress, not a skipped record)."""
     fd = open_regular(path)
     try:
-        size = os.fstat(fd).st_size
+        info = os.fstat(fd)
+        size = info.st_size
         if size > MAX_SCAN_BYTES:
             raise Problem("file-too-large", f"{clip(path.name, 60)} is larger than {MAX_SCAN_BYTES >> 20} MiB; not scanned")
         deadline = time.monotonic() + SCAN_SECONDS
@@ -488,10 +500,10 @@ def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS):
                 hits += 1
                 if line is None:
                     next_line = absolute + MAX_LINE  # skip the rest of an oversized line, do not re-read it per hit
-                    yield None
+                    yield (None, False) if tails else None
                 else:
                     next_line = start + len(line) + 1
-                    yield line
+                    yield (line, tail_in_progress(start + len(line) >= size, info.st_mtime)) if tails else line
             offset += len(chunk)
             carry = data[-(len(needle) - 1):] if len(needle) > 1 else b""
     except (OSError, ValueError) as error:
@@ -1388,10 +1400,12 @@ def ledger_read(session: str, home=None) -> tuple:
     read_ok, skipped, limited = 0, 0, False
     for path in paths:
         failed = None
-        for needle in (b'"event":"ask"', b'"event":"ask_resolved"'):
+        # PR 234 v8: the needle is the JSON string value alone, so `"event": "ask"` (spaced) is read as well as the
+        # compact form; the parsed record decides. Every line that names an ask and is not used is counted.
+        for needle in (b'"ask"', b'"ask_resolved"'):
             hits = 0
             try:
-                for line in _lines_containing(path, needle, LEDGER_MAX_HITS):
+                for line, in_progress in _lines_containing(path, needle, LEDGER_MAX_HITS, tails=True):
                     hits += 1
                     if line is None:
                         skipped += 1  # an oversized line that names an ask: its ask is not in the result
@@ -1399,16 +1413,25 @@ def ledger_read(session: str, home=None) -> tuple:
                     try:
                         record = loads_line(line)
                     except ValueError:
-                        skipped += 1
+                        if not in_progress:   # receipt v7 F4: a last line still being written is not a lost ask
+                            skipped += 1
                         continue
                     if not isinstance(record, dict):
+                        skipped += 1  # a line that names an ask but is not a record
                         continue
-                    if record.get("event") == "ask" and isinstance(record.get("id"), str):
-                        record["at"] = str(record.get("at") or "")
-                        record["_wal"] = path
-                        asks[record["id"]] = record
-                    elif record.get("event") == "ask_resolved" and isinstance(record.get("ref"), str):
-                        closed[record["ref"]] = record
+                    event = record.get("event")
+                    if event == "ask" and needle == b'"ask"':
+                        if isinstance(record.get("id"), str):
+                            record["at"] = str(record.get("at") or "")
+                            record["_wal"] = path
+                            asks[record["id"]] = record
+                        else:
+                            skipped += 1  # an ask with no id cannot be listed
+                    elif event == "ask_resolved" and needle == b'"ask_resolved"':
+                        if isinstance(record.get("ref"), str):
+                            closed[record["ref"]] = record
+                        else:
+                            skipped += 1  # a resolution with no ref closes nothing we can name
             except Problem as problem:  # one unreadable WAL must not hide every other ask; it is reported as unread
                 failed = f"{problem.code}: {problem.message}"
             except Exception as error:  # noqa: BLE001
