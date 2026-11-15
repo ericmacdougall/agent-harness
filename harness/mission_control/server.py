@@ -3,6 +3,7 @@
 
     server.py serve [--port P] [--initiatives PATH] [--no-remote]   run the server (launchd runs this)
     server.py url                                                   print a single-use launch URL (60 s)
+    server.py approve CODE                                          sign in the browser showing CODE (5 min)
     server.py open                                                  open a launch URL in the default browser
     server.py status                                                health and launchd state
     server.py install-launchd [--apply] | uninstall-launchd [--apply]
@@ -63,6 +64,10 @@ VERSION = "1"
 DEFAULT_PORT = 47615
 LABEL = "com.agent-harness.mission-control"
 LAUNCH_TTL_S = 60
+SIGNIN_TTL_S = 300  # a sign-in code, approved or not, lives at most five minutes (GoodQA #16047)
+MAX_PENDING = 8
+# No 0/O, 1/I/L: a code read off a screenshot cannot be mistaken for another, and a look-alike is refused, never mapped.
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 SESSION_TTL_S = 12 * 3600
 MAX_SESSIONS = 16
 MAX_CONNECTIONS = 32  # AC-9
@@ -86,11 +91,25 @@ def _unb64(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
 
 
-def mint_code(key: bytes, now: float | None = None) -> str:
+PROOF_DOMAINS = {"launch": b"mc-launch|", "approve": b"mc-approve|"}
+
+
+def mint_code(key: bytes, now: float | None = None, purpose: str = "launch") -> str:
+    """A single-use token signed with the install secret. `launch` is a launch link; `approve` is the proof that
+    `server.py approve` sends with a sign-in code. The domains differ, so neither works as the other."""
     now = time.time() if now is None else now
     payload = int(now).to_bytes(8, "big") + secrets.token_bytes(16)
-    mac = hmac.new(key, b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
+    mac = hmac.new(key, PROOF_DOMAINS[purpose] + payload, hashlib.sha256).digest()[:16]
     return _b64(payload) + "." + _b64(mac)
+
+
+def normal_code(code) -> str | None:
+    """The canonical XXXX-XXXX form of a sign-in code, or None. Only case is folded; nothing else is coerced."""
+    if not isinstance(code, str) or len(code) != 9 or code[4] != "-" or not code.isascii():
+        return None
+    code = code.upper()
+    body = code[:4] + code[5:]
+    return code if all(ch in CODE_ALPHABET for ch in body) else None
 
 
 SESSION_STORE_MAX = 64 * 1024
@@ -111,7 +130,13 @@ class Auth:
         self.lock = threading.Lock()
         self.used: dict[bytes, float] = {}
         self.sessions: dict[str, dict] = {}
+        # Sign-in codes (GoodQA #16047), keyed by sha256(pending id); the id itself lives only in the browser cookie.
+        self.pending: dict[str, dict] = {}
+        # code -> created time of entries already claimed, kept until their window ends, so a retried approval after
+        # a lost response reports already-approved, not unknown-code. Bounded at 2 * MAX_PENDING.
+        self.claimed: dict[str, float] = {}
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        self.loopback_hosts = frozenset(self.hosts)  # sign-in codes are offered and approved on these hosts only
         self.origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
         self.key = self._current_key()
         self._load()
@@ -134,6 +159,8 @@ class Auth:
             return True
         if current != self.key:
             self.sessions.clear()
+            self.pending.clear()
+            self.claimed.clear()
             self.key = current
             self._save_locked()
         return True
@@ -216,7 +243,7 @@ class Auth:
                 return None
             return self._redeem_locked(payload, now, generation)
 
-    def _signed_payload(self, code, key):
+    def _signed_payload(self, code, key, purpose="launch"):
         try:
             left, right = str(code).split(".", 1)
             payload, mac = _unb64(left), _unb64(right)
@@ -224,8 +251,19 @@ class Auth:
             return None
         if len(payload) != 24 or len(mac) != 16:
             return None
-        expected = hmac.new(key, b"mc-launch|" + payload, hashlib.sha256).digest()[:16]
+        expected = hmac.new(key, PROOF_DOMAINS[purpose] + payload, hashlib.sha256).digest()[:16]
         return payload if hmac.compare_digest(expected, mac) else None
+
+    def _consume_locked(self, payload, now) -> bool:
+        """True once for a fresh payload: inside the launch window and never seen before."""
+        minted = int.from_bytes(payload[:8], "big")
+        if not -5 <= now - minted <= LAUNCH_TTL_S:
+            return False
+        self.used = {k: t for k, t in self.used.items() if now - t < 2 * LAUNCH_TTL_S}
+        if payload in self.used:
+            return False
+        self.used[payload] = now
+        return True
 
     def _redeem_locked(self, payload, now, generation):
         minted = int.from_bytes(payload[:8], "big")
@@ -237,6 +275,9 @@ class Auth:
         if not self._key_check_locked() or self.key != generation:
             return None
         self.used[payload] = now
+        return self._new_session_locked(now)
+
+    def _new_session_locked(self, now):
         if len(self.sessions) >= MAX_SESSIONS:
             oldest = min(self.sessions, key=lambda s: self.sessions[s]["last"])
             self.sessions.pop(oldest, None)
@@ -276,7 +317,90 @@ class Auth:
     def revoke_all(self) -> None:
         with self.lock:
             self.sessions.clear()
+            self.pending.clear()
+            self.claimed.clear()
             self._save_locked()
+
+    # -- sign-in codes (GoodQA #16047): the browser shows a code; the host approves it; only that browser signs in
+
+    def _prune_pending_locked(self, now: float) -> None:
+        for key in [k for k, v in self.pending.items() if now - v["created"] > SIGNIN_TTL_S or v["gen"] != self.key]:
+            self.pending.pop(key, None)
+        for code in [c for c, created in self.claimed.items() if now - created > SIGNIN_TTL_S]:
+            self.claimed.pop(code, None)
+
+    def signin_start(self, pid: str | None, now: float | None = None) -> tuple[str | None, str | None]:
+        """(pending id, code) for this browser: its live entry when the cookie names one, else a new entry.
+        (None, None) when no secret is readable."""
+        now = time.time() if now is None else now
+        with self.lock:
+            if not self._key_check_locked():
+                return None, None
+            self._prune_pending_locked(now)
+            if isinstance(pid, str) and 0 < len(pid) <= 128:
+                row = self.pending.get(self._hash(pid))
+                if row is not None:
+                    return pid, row["code"]
+            live = {row["code"] for row in self.pending.values()} | set(self.claimed)
+            while True:
+                raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+                code = raw[:4] + "-" + raw[4:]
+                if code not in live:
+                    break
+            while len(self.pending) >= MAX_PENDING:
+                self.pending.pop(min(self.pending, key=lambda k: self.pending[k]["created"]))
+            new = secrets.token_urlsafe(32)
+            self.pending[self._hash(new)] = {"code": code, "created": now, "approved": False, "gen": self.key}
+            return new, code
+
+    def signin_approve(self, proof, code, now: float | None = None) -> str:
+        """approved | already-approved | unknown-code | bad-code | bad-proof. `proof` is a fresh single-use
+        mint_code(secret, purpose="approve"): only someone who can read the install secret approves."""
+        now = time.time() if now is None else now
+        wanted = normal_code(code)
+        if wanted is None:
+            return "bad-code"
+        with self.lock:
+            if not self._key_check_locked():
+                return "bad-proof"
+            try:
+                key = self.key_loader()
+            except Exception:  # noqa: BLE001 - unavailable key approves nothing
+                return "bad-proof"
+            if self._key_generation(key) != self.key:
+                return "bad-proof"
+            payload = self._signed_payload(proof, key, "approve")
+            if payload is None or not self._consume_locked(payload, now):
+                return "bad-proof"
+            self._prune_pending_locked(now)
+            for row in self.pending.values():
+                if hmac.compare_digest(row["code"], wanted):
+                    if row["approved"]:
+                        return "already-approved"
+                    row["approved"] = True
+                    return "approved"
+            if wanted in self.claimed:
+                return "already-approved"
+            return "unknown-code"
+
+    def signin_claim(self, pid: str | None, now: float | None = None) -> str | None:
+        """A new session id, once, for the browser whose pending entry was approved; else None."""
+        now = time.time() if now is None else now
+        if not isinstance(pid, str) or not 0 < len(pid) <= 128:
+            return None
+        with self.lock:
+            if not self._key_check_locked():
+                return None
+            self._prune_pending_locked(now)
+            key = self._hash(pid)
+            row = self.pending.get(key)
+            if row is None or not row["approved"]:
+                return None
+            self.pending.pop(key)
+            self.claimed[row["code"]] = row["created"]
+            while len(self.claimed) > 2 * MAX_PENDING:
+                self.claimed.pop(min(self.claimed, key=self.claimed.get))
+            return self._new_session_locked(now)
 
 
 # ---------------------------------------------------------------- the application (state + collectors)
@@ -599,7 +723,8 @@ class Handler(BaseHTTPRequestHandler):
                    "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Resource-Policy": "same-origin"}
         headers.update(extra or {})
         for key, value in headers.items():
-            self.send_header(key, value)
+            for one in (value if isinstance(value, list) else [value]):
+                self.send_header(key, one)
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
@@ -649,11 +774,7 @@ class Handler(BaseHTTPRequestHandler):
         sid, info = self.authed()
         if not sid:
             if document:
-                page = (b"<!doctype html><meta charset=utf-8><title>Mission Control</title>"
-                        b"<p>Open Mission Control: run <code>mc</code> in a terminal"
-                        b" (or <code>python3 ~/.agent-harness/mission-control/app/server.py open</code>)."
-                        b" Launch links work once and expire after 60 seconds.</p>")
-                return self.send_secure(401, page, "text/html; charset=utf-8")
+                return self.signin_page()
             return self.deny(401, "session")
         if url.path == "/api/state":
             state = self.app.state()
@@ -666,6 +787,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.host_ok():
             return self.deny(403, "host")
+        if urlsplit(self.path).path == "/signin/approve":
+            return self.signin_approve()
         if self.headers.get("Origin") not in self.app.auth.origins:
             return self.deny(403, "origin")
         sid, info = self.authed()
@@ -709,6 +832,78 @@ class Handler(BaseHTTPRequestHandler):
         if not (self.headers.get("Host") or "").startswith(("127.0.0.1:", "localhost:")):
             cookie += "; Secure"  # the demo Funnel host is served over https
         return self.send_secure(303, b"", "text/plain", {"Location": "/", "Set-Cookie": cookie})
+
+    def cookie(self, name: str) -> str | None:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            key, _, value = part.strip().partition("=")
+            if key == name:
+                return value
+        return None
+
+    def signin_page(self):
+        """The signed-out page. On a loopback host it also carries a sign-in code bound to this browser's pending
+        cookie (GoodQA #16047): the host runs `server.py approve CODE`, and the next reload of this page, and only
+        this browser's, gets the session. The page carries no script; it reloads itself every few seconds."""
+        auth = self.app.auth
+        code = None
+        extra = {}
+        proxied = any(k.lower() in ("x-forwarded-for", "x-forwarded-host", "forwarded") or k.lower().startswith("tailscale-")
+                      for k in self.headers.keys())
+        if (self.headers.get("Host") or "") in auth.loopback_hosts and not proxied:
+            pid = self.cookie("mc_pending")
+            sid = auth.signin_claim(pid)
+            if sid:
+                self.server.log.info("signin claimed")  # no code, id or address: a lost race shows up as two lines
+                return self.send_secure(303, b"", "text/plain", {"Location": "/", "Set-Cookie": [
+                    f"mc_sid={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_S}",
+                    "mc_pending=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"]})
+            new, code = auth.signin_start(pid)
+            if new and new != pid:
+                extra["Set-Cookie"] = f"mc_pending={new}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SIGNIN_TTL_S}"
+        page = (b"<!doctype html><meta charset=utf-8><title>Mission Control</title>"
+                b"<p>Open Mission Control: run <code>mc</code> in a terminal"
+                b" (or <code>python3 ~/.agent-harness/mission-control/app/server.py open</code>)."
+                b" Launch links work once and expire after 60 seconds.</p>")
+        if code:
+            page = (b'<!doctype html><meta charset=utf-8><meta http-equiv="refresh" content="3">'
+                    b"<title>Mission Control sign-in</title>"
+                    b"<h1>Sign in to Mission Control</h1>"
+                    b'<p>Sign-in code: <strong id="code">' + code.encode() + b"</strong></p>"
+                    b"<p>On the host, run <code>server.py approve " + code.encode() + b"</code>."
+                    b" This page signs in by itself within a few seconds. The code works for this browser only,"
+                    b" once, and expires after 5 minutes.</p>"
+                    b"<p>Or run <code>mc</code> in a terminal"
+                    b" (or <code>python3 ~/.agent-harness/mission-control/app/server.py open</code>)."
+                    b" Launch links work once and expire after 60 seconds.</p>")
+        return self.send_secure(401, page, "text/html; charset=utf-8", extra)
+
+    def signin_approve(self):
+        """POST /signin/approve from `server.py approve` on the host: {"proof": <approve token>, "code": "XXXX-XXXX"}.
+        A browser can never call it: any Origin or Sec-Fetch header is refused."""
+        if (self.headers.get("Host") or "") not in self.app.auth.loopback_hosts:
+            return self.deny(403, "host")
+        if any(self.headers.get(h) is not None for h in ("Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Cookie")):
+            return self.deny(403, "browser")
+        if "application/json" not in (self.headers.get("Content-Type") or ""):
+            return self.deny(415, "content-type")
+        try:
+            length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            return self.deny(400, "length")
+        if length <= 0 or length > 4096:
+            return self.deny(413, "body-size")
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return self.deny(400, "bad-json")
+        if not isinstance(body, dict):
+            return self.deny(400, "bad-json")
+        result = self.app.auth.signin_approve(body.get("proof"), body.get("code"))
+        status = {"approved": 200, "already-approved": 409, "unknown-code": 404, "bad-code": 400}.get(result, 401)
+        if status == 200:
+            self.server.log.info("signin approved")
+            return self.send_json(200, {"approved": True})
+        return self.deny(status, result)
 
     def static(self, path: str):
         files = self.server.static_files  # type: ignore[attr-defined]
@@ -878,6 +1073,37 @@ def launch_url(port: int, demo_host: str | None = None) -> str:
     return f"http://127.0.0.1:{port}/launch?c={code}"
 
 
+def cmd_approve(args) -> int:
+    """Approve the sign-in code a Mission Control page on this host shows. The code is not a secret; the proof sent
+    with it is a fresh single-use token from the install secret, and it travels in the request body only."""
+    import http.client
+    try:
+        key = mc_chat.secret(create=False)
+    except mc_chat.ChatError as exc:
+        print(f"mission-control: {exc}", file=sys.stderr)
+        return 2
+    body = json.dumps({"proof": mint_code(key, purpose="approve"), "code": args.code}).encode()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", args.port, timeout=IO_TIMEOUT_S)
+        conn.request("POST", "/signin/approve", body=body,
+                     headers={"Host": f"127.0.0.1:{args.port}", "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read(4096)
+        conn.close()
+    except OSError as exc:
+        print(f"mission-control: cannot reach 127.0.0.1:{args.port}: {exc}", file=sys.stderr)
+        return 2
+    if resp.status == 200:
+        print("approved: the browser showing that code signs in on its next reload (within a few seconds)")
+        return 0
+    try:
+        reason = json.loads(data).get("error", "")
+    except (ValueError, AttributeError):
+        reason = ""
+    print(f"mission-control: not approved ({resp.status} {reason})", file=sys.stderr)
+    return 1
+
+
 def plist_text(port: int, python: str) -> str:
     """The LaunchAgent, built with plistlib so a path with XML characters cannot change its structure."""
     import plistlib
@@ -1033,6 +1259,9 @@ def main(argv=None) -> int:
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
         if name == "url":
             q.add_argument("--demo-host", help="print the https Funnel form of the link for a demo instance")
+    q = sub.add_parser("approve", help="sign in the browser that shows this code (GoodQA #16047)")
+    q.add_argument("code")
+    q.add_argument("--port", type=int, default=DEFAULT_PORT)
     for name in ("install-launchd", "uninstall-launchd"):
         q = sub.add_parser(name)
         q.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -1062,6 +1291,8 @@ def main(argv=None) -> int:
         return 0
     if args.cmd == "status":
         return cmd_status(args)
+    if args.cmd == "approve":
+        return cmd_approve(args)
     if args.cmd == "install-launchd":
         return cmd_install(args)
     if args.cmd == "uninstall-launchd":
