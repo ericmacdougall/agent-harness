@@ -277,7 +277,7 @@ elif legacy_run_active || ! acquire_lock; then
   exit 0
 fi
 lane_clear_state() { [ "$TIER" = bulk ] && [ "$(cut -d' ' -f2 "$LANE_STATE" 2>/dev/null)" = "$$" ] && rm -f "$LANE_STATE"; return 0; }
-trap 'release_locks "$LOCKD" "$LANE_LOCKD"; lane_clear_state' EXIT
+trap 'release_locks "$LOCKD" "$LANE_LOCKD"; lane_clear_state; type large_cleanup >/dev/null 2>&1 && large_cleanup all' EXIT
 copy_pid= dog_pid= nap_pid=
 nap() { sleep "$1" & nap_pid=$!; wait "$nap_pid"; nap_pid=; }   # a pause a signal can interrupt (and stop)
 on_term() {
@@ -580,7 +580,9 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   [ $# -gt 0 ] && shift
   copy_args=("$@")
   st="$BULK_STATE/$(bulk_key "$rel")"
-  mkdir -p "$st" && chmod 700 "$BULK_STATE" "$st" || { say "cannot create bulk state for $rel"; ok=1; hard_fail=1; return 1; }
+  # The checkpoint directories are ours: real directories (never a link, so the fixed-name rm and mv below cannot reach
+  # another tree), owned by us, made private (PR #261 F1 audit).
+  bulk_dir "$BULK_STATE" && bulk_dir "$st" || { say "cannot create bulk state for $rel (it must be a real directory of ours, not a link)"; ok=1; hard_fail=1; return 1; }
   # A checkpoint belongs to one destination: another remote or host starts over.
   if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then
     rm -f "$st/pending" "$st/cursor" "$st/done" "$st/listing" && printf '%s\n' "$R" > "$st/remote"
@@ -679,66 +681,156 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
 # (exit 0 after its own checksum verification), written only after that. A file is pending when its listed size or time
 # differs from its last record, so a file whose upload failed, or that changed since, is pending and never counted as
 # backed up. log-backup.large-last-ok gets the pass START time only when no file is left pending.
+#
+# Safety (PR #261 review F1): the snapshot area is a private directory this script creates or verifies (a real directory,
+# ours, mode 0700, no link on the way from $HOME), each run works in a fresh mktemp directory below it, a snapshot is a
+# flat file in a fresh directory of its own (cp -n; nothing can exist there to follow), and cleanup removes only the
+# files and directories this run created, by name (rm -f of one file, rmdir), never a recursive delete.
 LARGE_STATE="$LOGDIR/log-backup.large.d"
 LARGE_STAGE="$(printf '%s' "$STAGE" | sed 's#//*#/#g; s#/$##')-large"
 large_ok=0
-clone_file() { # clone_file SRC DST: a snapshot that costs no space on APFS or btrfs, else a plain copy
-  mkdir -p "$(dirname "$2")" || return 1
-  if [ "$(uname)" = Darwin ]; then cp -c -p -- "$1" "$2" 2>/dev/null || cp -p -- "$1" "$2"
-  else cp --reflink=auto -p -- "$1" "$2"; fi
+LARGE_RUN= LARGE_CUR= LARGE_FILE=
+owner_of() { if [ "$(uname)" = Darwin ]; then stat -f %u "$1" 2>/dev/null; else stat -c %u "$1" 2>/dev/null; fi; }
+mode_of() { if [ "$(uname)" = Darwin ]; then stat -f %Lp "$1" 2>/dev/null; else stat -c %a "$1" 2>/dev/null; fi; }
+size_of() { if [ "$(uname)" = Darwin ]; then stat -f %z "$1" 2>/dev/null; else stat -c %s "$1" 2>/dev/null; fi; }
+mtime_of() { if [ "$(uname)" = Darwin ]; then stat -f %m "$1" 2>/dev/null; else stat -c %Y "$1" 2>/dev/null; fi; }
+no_link_below() { # no_link_below ROOT PATH: 0 when no component of PATH below ROOT is a symlink (stops at the first
+  # component that does not exist); 1 when one is, or PATH is not below ROOT. ROOT itself is not examined.
+  local root=$1 path=$2 rest cur part
+  case "$path" in "$root") return 0 ;; "$root"/*) ;; *) return 1 ;; esac
+  rest=${path#"$root"/} cur=$root
+  while [ -n "$rest" ]; do
+    part=${rest%%/*}
+    if [ "$part" = "$rest" ]; then rest=; else rest=${rest#*/}; fi
+    [ -n "$part" ] || continue
+    cur="$cur/$part"
+    [ ! -L "$cur" ] || return 1
+    [ -e "$cur" ] || return 0
+  done
+  return 0
+}
+bulk_dir() { # bulk_dir DIR: a real directory of ours below $HOME with no link on the way, created if missing, made 0700
+  case "$1" in "$HOME"/?*) ;; *) return 1 ;; esac
+  no_link_below "$HOME" "$1" || return 1
+  [ -d "$1" ] || mkdir -- "$1" 2>/dev/null || return 1
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(owner_of "$1")" = "$(id -u)" ] && chmod 700 "$1"
+}
+private_dir() { # private_dir DIR: DIR exists as a real directory of ours with mode 0700 (created without -p when it
+  # is missing), below $HOME with no link on the way and an existing parent; nothing is chmodded or followed
+  local d=$1 parent
+  case "$d" in "$HOME"/?*) ;; *) return 1 ;; esac
+  case "$d" in *..*|*[[:cntrl:]]*) return 1 ;; esac
+  parent=$(dirname "$d")
+  no_link_below "$HOME" "$parent" && [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+  [ ! -L "$d" ] || return 1
+  if [ ! -e "$d" ]; then (umask 077; mkdir -- "$d") 2>/dev/null || return 1; fi
+  [ -d "$d" ] && [ ! -L "$d" ] && [ "$(owner_of "$d")" = "$(id -u)" ] && [ "$(mode_of "$d")" = 700 ]
+}
+bounded() { # bounded SECONDS CMD [ARGS...]: CMD runs with stdin closed and is stopped (TERM, then KILL after KILL_GRACE)
+  # when SECONDS pass. Status: CMD's own, or 124 when it ran out of time. CMD must be a program, not a shell function
+  # (a stopped function would leave its child running).
+  local secs=$1 flag="$LOGDIR/.log-backup${TAG}.bounded.$$" rc
+  shift
+  [ "$secs" -ge 1 ] 2>/dev/null || secs=1
+  rm -f "$flag"
+  "$@" </dev/null &
+  copy_pid=$!
+  ( nap=
+    trap 'kill ${nap:+"$nap"} 2>/dev/null; exit 0' TERM
+    sleep "$secs" & nap=$!
+    wait "$nap" || exit 0
+    touch "$flag"
+    kill -TERM "$copy_pid" 2>/dev/null || exit 0
+    sleep "$KILL_GRACE" & nap=$!
+    wait "$nap" || exit 0
+    kill -KILL "$copy_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  dog_pid=$!
+  wait "$copy_pid"; rc=$?
+  kill "$dog_pid" 2>/dev/null; wait "$dog_pid" 2>/dev/null
+  dog_pid= copy_pid=
+  if [ -e "$flag" ]; then rm -f "$flag"; return 124; fi
+  return $rc
+}
+large_cleanup() { # large_cleanup [all]: removes only what this run created, by name: the current snapshot file and its
+  # directory, and with "all" the run directory too (rmdir: it only goes when empty)
+  if [ -n "$LARGE_FILE" ] && no_link_below "$LARGE_STAGE" "$LARGE_FILE"; then rm -f -- "$LARGE_FILE"; fi
+  if [ -n "$LARGE_CUR" ] && no_link_below "$LARGE_STAGE" "$LARGE_CUR"; then rmdir -- "$LARGE_CUR" 2>/dev/null; fi
+  LARGE_CUR= LARGE_FILE=
+  if [ "${1:-}" = all ] && [ -n "$LARGE_RUN" ] && no_link_below "$LARGE_STAGE" "$LARGE_RUN"; then rmdir -- "$LARGE_RUN" 2>/dev/null; LARGE_RUN=; fi
+  return 0
 }
 large_fail() { say "large tier: $1"; large_ok=1; }
-large_tier() {
-  local try="$LOGDIR/log-backup.large-last-try" age st="$LARGE_STATE" lst src rc key size mt snap sent=0 total saved_end lend before
-  if [ -e "$try" ]; then
-    age=$(raw_age "$try")
-    if [ -n "$age" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$LARGE_EVERY" ]; then
-      say "large tier skipped: last pass started ${age}s ago (every ${LARGE_EVERY}s)"; return 0
-    fi
-  fi
-  if [ "$(time_left)" -lt "$MIN_SLICE" ]; then say "large tier deferred: no run time left"; return 0; fi
-  case "$LARGE_STAGE" in "$HOME"/?*) ;; *) large_fail "the large stage is not below $HOME"; return 1 ;; esac
-  case "$LARGE_STAGE" in *..*|*[[:cntrl:]]*) large_fail "the large stage is not a plain path"; return 1 ;; esac
-  mkdir -p "$st" "$LARGE_STAGE" && chmod 700 "$st" "$LARGE_STAGE" || { large_fail "cannot create its state or stage directory"; return 1; }
-  : > "$try"
+large_pass() {
+  local st="$LARGE_STATE" lst src rc key size mt snap base idx=0 sent=0 total left n
+  : > "$LOGDIR/log-backup.large-last-try"
+  private_dir "$st" || { large_fail "its state directory is not a private directory of ours; nothing was sent"; return 1; }
+  for n in "$HOME/.claude" "$HOME/.codex" "$HOME/.agent-harness/work"; do
+    case "$LARGE_STAGE/" in "$n/"*) large_fail "the large stage is inside $n"; return 1 ;; esac
+    case "$n/" in "$LARGE_STAGE/"*) large_fail "the large stage contains $n"; return 1 ;; esac
+  done
+  private_dir "$LARGE_STAGE" || { large_fail "the large stage is not a private directory of ours (not a link, mode 0700); nothing was sent"; return 1; }
+  n=$(find "$LARGE_STAGE" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
+  [ "${n:-0}" = 0 ] || say "large tier: $n leftover entries in the large stage from an interrupted run or an older version; they are not removed"
   lst="$st/listing"
+  [ ! -L "$lst" ] && [ ! -L "$st/done.tsv" ] && [ ! -L "$st/one.tmp" ] && [ ! -L "$st/pending" ] && [ ! -L "$st/pending.tmp" ] \
+    || { large_fail "its state directory holds a link"; return 1; }
   : > "$lst" && touch "$st/done.tsv" || { large_fail "cannot write its listing"; return 1; }
   for src in "${LIVE[@]}"; do
-    [ -d "$HOME/$src" ] && [ ! -L "$HOME/$src" ] || continue
-    "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --min-size "${LARGE_MB}M" --exclude-from "$EXCLUDES" --ignore-case \
-      -- "$HOME/$src" </dev/null > "$st/one.tmp" 2>> "$LOG"
-    rc=$?
-    if [ $rc -ne 0 ]; then large_fail "listing $src failed (rclone exit $rc)"; return 1; fi
-    # A path with a tab or newline cannot be tracked: it fails the pass (it is never silently counted as backed up).
-    awk -F'\t' -v s="$src" 'NF == 3 {print s "/" $1 "\t" $2 "\t" $3} NF != 3 {bad++} END {exit bad > 0}' "$st/one.tmp" >> "$lst" \
-      || { large_fail "$src has a large file whose path has a tab or newline; it cannot be tracked"; return 1; }
+    if [ -L "$HOME/$src" ]; then continue; fi
+    left=$(time_left)
+    if [ "$left" -lt "$MIN_SLICE" ]; then large_fail "its budget is used up before listing $src; nothing is marked"; return 1; fi
+    if [ -d "$HOME/$src" ]; then
+      bounded "$left" "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --min-size "${LARGE_MB}M" --exclude-from "$EXCLUDES" --ignore-case \
+        -- "$HOME/$src" > "$st/one.tmp" 2>> "$LOG"
+      rc=$?
+      if [ $rc -eq 124 ]; then large_fail "listing $src ran out of time; nothing is marked"; return 1; fi
+      if [ $rc -ne 0 ]; then large_fail "listing $src failed (rclone exit $rc)"; return 1; fi
+      # A path with a tab or newline cannot be tracked: it fails the pass (never silently counted as backed up).
+      awk -F'\t' -v s="$src" 'NF == 3 {print s "/" $1 "\t" $2 "\t" $3} NF != 3 {bad++} END {exit bad > 0}' "$st/one.tmp" >> "$lst" \
+        || { large_fail "$src has a large file whose path has a tab or newline; it cannot be tracked"; return 1; }
+    elif [ -f "$HOME/$src" ]; then   # a standalone live file (history, ledgers): the same threshold
+      size=$(size_of "$HOME/$src"); mt=$(mtime_of "$HOME/$src")
+      printf '%s' "$size" | grep -Eq '^[0-9]+$' && printf '%s' "$mt" | grep -Eq '^[0-9]+$' \
+        || { large_fail "cannot read the size of $src"; return 1; }
+      if [ "$size" -ge "$LARGE_BYTES" ]; then printf '%s\t%s\t%s\n' "$src" "$size" "$mt" >> "$lst" || { large_fail "cannot write its listing"; return 1; }; fi
+    fi
   done
   awk -F'\t' 'FILENAME == ARGV[1] {have[$1] = $2 "\t" $3; next} !($1 in have) || have[$1] != $2 "\t" $3' "$st/done.tsv" "$lst" > "$st/pending.tmp" \
     && mv "$st/pending.tmp" "$st/pending" || { large_fail "cannot work out what is pending"; return 1; }
   total=$(wc -l < "$st/pending"); total=${total//[[:space:]]/}
   printf '%s' "$total" | grep -Eq '^[0-9]+$' || { large_fail "cannot count what is pending"; return 1; }
   say "large tier: $total of $(wc -l < "$lst" | tr -d ' ') large files (${LARGE_MB} MiB or more) changed since their last upload"
-  saved_end=$WALL_END
-  lend=$(( $(date +%s) + LARGE_BUDGET + DEADLINE_GRACE + KILL_GRACE ))
-  [ "$lend" -ge "$WALL_END" ] || WALL_END=$lend
-  NO_YIELD=1
+  if [ "$total" -gt 0 ]; then
+    LARGE_RUN=$(mktemp -d "$LARGE_STAGE/run.XXXXXX" 2>/dev/null) && [ -d "$LARGE_RUN" ] && [ ! -L "$LARGE_RUN" ] \
+      || { LARGE_RUN=; large_fail "cannot create this run's snapshot directory"; return 1; }
+  fi
   while IFS=$'\t' read -r key size mt; do
-    if [ "$(time_left)" -lt "$MIN_SLICE" ]; then large_fail "its budget is used up; the files left stay pending"; break; fi
+    left=$(time_left)
+    if [ "$left" -lt "$MIN_SLICE" ]; then large_fail "its budget is used up; the files left stay pending"; break; fi
     if [ ! -f "$HOME/$key" ] || [ -L "$HOME/$key" ]; then say "large tier: $key is gone; nothing to send"; continue; fi
-    snap="$LARGE_STAGE/$key"
-    rm -f -- "$snap"
-    clone_file "$HOME/$key" "$snap" || { large_fail "cannot snapshot $key"; rm -f -- "$snap"; continue; }
+    idx=$((idx + 1)); base=${key##*/}
+    LARGE_CUR="$LARGE_RUN/$idx" LARGE_FILE="$LARGE_RUN/$idx/$base"
+    if ! mkdir -- "$LARGE_CUR" 2>/dev/null; then large_fail "cannot create the snapshot directory for $key"; LARGE_CUR= LARGE_FILE=; continue; fi
+    # cp -n never replaces anything (the directory is new, so nothing is there); -c clones on APFS and costs no space.
+    if [ "$(uname)" = Darwin ]; then
+      bounded "$left" cp -n -c -p -- "$HOME/$key" "$LARGE_FILE" 2>/dev/null; rc=$?
+      if [ $rc -ne 0 ] && [ $rc -ne 124 ]; then bounded "$(time_left)" cp -n -p -- "$HOME/$key" "$LARGE_FILE"; rc=$?; fi
+    else
+      bounded "$left" cp -n --reflink=auto -p -- "$HOME/$key" "$LARGE_FILE"; rc=$?
+    fi
+    if [ $rc -eq 124 ]; then large_fail "the snapshot of $key ran out of time; it stays pending"; large_cleanup; break; fi
+    if [ $rc -ne 0 ] || [ ! -f "$LARGE_FILE" ] || [ -L "$LARGE_FILE" ]; then large_fail "cannot snapshot $key"; large_cleanup; continue; fi
     before=$REFUSED_N
-    upload "$snap" "$key" --tpslimit "$LARGE_TPS" --transfers 1
+    upload "$LARGE_FILE" "$key" --tpslimit "$LARGE_TPS" --transfers 1
     if [ "$copied" -eq 1 ] && [ "$REFUSED_N" -eq "$before" ]; then
       printf '%s\t%s\t%s\n' "$key" "$size" "$mt" >> "$st/done.tsv" && sent=$((sent + 1)) || large_fail "cannot record $key as sent"
     else
       large_fail "$key was not backed up"
     fi
-    rm -f -- "$snap"
+    large_cleanup
     [ "$budget_hit" -eq 0 ] || break
   done < "$st/pending"
-  NO_YIELD=0 WALL_END=$saved_end
+  large_cleanup all
   if [ $large_ok -eq 0 ]; then
     echo "$STARTED" > "$LOGDIR/log-backup.large-last-ok.tmp.$$" && mv "$LOGDIR/log-backup.large-last-ok.tmp.$$" "$LOGDIR/log-backup.large-last-ok" \
       || { large_fail "cannot write its marker"; return 1; }
@@ -746,6 +838,24 @@ large_tier() {
   else
     say "large tier: pass incomplete ($sent file(s) sent); log-backup.large-last-ok is not written"
   fi
+}
+large_tier() {
+  local try="$LOGDIR/log-backup.large-last-try" age saved_end=$WALL_END lend rc
+  if [ -e "$try" ]; then
+    age=$(raw_age "$try")
+    if [ -n "$age" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$LARGE_EVERY" ]; then
+      say "large tier skipped: last pass started ${age}s ago (every ${LARGE_EVERY}s)"; return 0
+    fi
+  fi
+  if [ "$(time_left)" -lt "$MIN_SLICE" ]; then say "large tier deferred: no run time left"; return 0; fi
+  # The pass deadline starts here, before the first listing: listing, snapshot and upload all run inside it.
+  lend=$(( $(date +%s) + LARGE_BUDGET + DEADLINE_GRACE + KILL_GRACE ))
+  [ "$lend" -ge "$WALL_END" ] || WALL_END=$lend
+  NO_YIELD=1
+  large_pass; rc=$?
+  NO_YIELD=0 WALL_END=$saved_end
+  large_cleanup all
+  return $rc
 }
 
 bulk_try="$LOGDIR/log-backup.bulk-last-try"
@@ -815,6 +925,9 @@ for src in "${LIVE[@]}"; do
   RESERVE=$(( later * (MIN_SLICE + DEADLINE_GRACE + KILL_GRACE + 3) ))
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
   snap="$STAGE/$src"
+  # A link anywhere below the stage root would let mkdir, rsync, cp or rm reach a file outside the stage (PR #261 F1):
+  # refuse the source, never follow it. The stage is ours; a link in it is a fault to fix by hand, not to guess about.
+  no_link_below "$STAGE" "$snap" || { say "the stage path for $src holds a symlink; nothing was staged or sent for it (remove the link by hand)"; ok=1; continue; }
   mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
   if [ -d "$HOME/$src" ]; then
     # rsync -a keeps symlinks as links; rclone never follows them. Exit 24 = a file vanished mid-copy (not an error).
@@ -831,11 +944,18 @@ for src in "${LIVE[@]}"; do
       say "cannot search $src for large files; skipped, the run is not fresh"; ok=1; continue
     fi
     : > "$large_excl" || { say "cannot write the large-file exclude list"; ok=1; continue; }
+    stage_link=0
     while IFS= read -r -d '' lf; do
       lrel=${lf#"$HOME/$src"}
       case "$lrel" in *[\\*?\[\]]*|*$'\n'*) ;; *) printf '%s\n' "$lrel" >> "$large_excl" ;; esac
+      # One file, by name, and only when no component of its stage path is a link (PR #261 F1).
+      if ! no_link_below "$STAGE" "$snap$lrel"; then stage_link=1; break; fi
       rm -f -- "$snap$lrel"
     done < "$large_list"
+    if [ $stage_link -eq 1 ]; then
+      rm -f "$large_list" "$large_excl"
+      say "the stage path for $src holds a symlink below it; nothing was staged or sent for it (remove the link by hand)"; ok=1; continue
+    fi
     rsync -a --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --exclude-from="$large_excl" --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" </dev/null; rc=$?
     rm -f "$large_list" "$large_excl"
     if [ $rc -eq 23 ]; then
@@ -846,6 +966,12 @@ for src in "${LIVE[@]}"; do
       say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
     fi
   else
+    # A standalone file of LARGE_MB or more (history, ledgers) belongs to the large tier like a large file in a tree.
+    fsz=$(size_of "$HOME/$src")
+    if [ -f "$HOME/$src" ] && printf '%s' "$fsz" | grep -Eq '^[0-9]+$' && [ "$fsz" -ge "$LARGE_BYTES" ]; then
+      [ ! -e "$snap" ] || rm -f -- "$snap"   # a stale smaller stage copy (no link on its path: checked above)
+      continue
+    fi
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
   if [ -d "$HOME/$src" ]; then upload "$snap" "$src" --max-size "$(( LARGE_BYTES - 1 ))"; else upload "$snap" "$src"; fi

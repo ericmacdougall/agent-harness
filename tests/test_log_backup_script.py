@@ -973,7 +973,7 @@ class LargeTierSafety(LargeTier):
 
     def live_files(self):
         return {str(p.relative_to(self.home)): p.read_bytes() for p in self.home.rglob("*")
-                if p.is_file() and not p.is_symlink() and ".agent-harness" not in p.parts}
+                if p.is_file() and not p.is_symlink() and p.relative_to(self.home).parts[0] in (".claude", ".codex")}
 
     def assert_live_untouched(self, before):
         self.assertEqual(self.live_files(), before)
@@ -1034,6 +1034,21 @@ class LargeTierSafety(LargeTier):
         self.assertEqual(sorted(p.name for p in decoy.iterdir()), ["big.jsonl"], "nothing was written through the link")
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.last_ok().exists())
+
+    def test_a_link_at_the_bulk_checkpoint_directory_cannot_reach_files_outside_it(self):
+        decoy = self.tmp / "decoy2"
+        decoy.mkdir()
+        names = ("pending", "cursor", "done", "listing", "chunk", "chunk.paths")
+        for name in names:
+            (decoy / name).write_bytes(STAND_IN)
+        self.logs.mkdir(parents=True, exist_ok=True)
+        os.symlink(decoy, self.logs / "log-backup.bulk.d")
+        done = self.go()
+        for name in names:
+            self.assertEqual((decoy / name).read_bytes(), STAND_IN, name)
+        self.assertEqual(sorted(p.name for p in decoy.iterdir()), sorted(names), "nothing was written through the link")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.bulk_ok().exists())
 
     def test_a_run_leaves_no_snapshot_files_behind(self):
         self.assertEqual(self.go().returncode, 0)
