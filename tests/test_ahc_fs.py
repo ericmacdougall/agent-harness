@@ -352,9 +352,11 @@ class RootFsTests(unittest.TestCase):
         src, dst = self.root / "src.bak", self.root / "live.db"
         src.write_bytes(b"x" * 10)
         real_read = os.read
+        calls = []
 
-        def growing(fd, n):
-            return real_read(fd, n) or (b"y" * n)        # the file keeps producing bytes after its fstat size
+        def growing(fd, n):                              # the file keeps producing bytes after its fstat size,
+            calls.append(n)                              # for a bounded number of reads (no hang if unchecked)
+            return real_read(fd, n) or (b"y" * n if len(calls) < 64 else b"")
         with mock.patch.object(self.fs.os, "read", growing):
             with self.assertRaises(self.fs.TooLarge):
                 self.fs.copy_to_temp(self.root, src, dst, max_bytes=64, chunk=16)

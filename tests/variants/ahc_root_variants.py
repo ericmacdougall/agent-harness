@@ -192,8 +192,12 @@ for entry in V:
                 sys.exit("anchor not unique for %s (%d): %r" % (name, text.count(old), old[:70]))
             text = text.replace(old, new)
         open(src, "w").write(text)
-        proc = subprocess.run([sys.executable, "-B", "-m", "unittest"] + T, cwd=ROOT, capture_output=True, text=True,
-                              timeout=900)
+        try:
+            proc = subprocess.run([sys.executable, "-B", "-m", "unittest"] + T, cwd=ROOT, capture_output=True,
+                                  text=True, timeout=900)
+        except subprocess.TimeoutExpired:   # a hang is recorded and the run goes on; it is not a survivor
+            out.append("== variant %s rc=timeout (tests did not finish in 900 s)" % name)
+            continue
         lines = [l for l in proc.stderr.splitlines() if l.startswith(("FAIL:", "ERROR:", "Ran ", "FAILED", "OK"))]
         out.append("== variant %s rc=%d\n%s" % (name, proc.returncode, "\n".join(lines)))
         if proc.returncode == 0:
