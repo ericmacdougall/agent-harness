@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS operations (
   readbacks INTEGER NOT NULL DEFAULT 0, proof TEXT, evidence TEXT, incident INTEGER NOT NULL DEFAULT 0,
   pr_unmarked INTEGER NOT NULL DEFAULT 0, settled_at REAL, tombstone INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS attributions (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, entry_id TEXT UNIQUE, op_key TEXT NOT NULL, repo TEXT NOT NULL,
+  how TEXT NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS contract_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 INSERT OR IGNORE INTO contract_meta(k, v) VALUES ('authority_epoch', '1');
 CREATE TABLE IF NOT EXISTS repo_flags (
@@ -640,6 +643,56 @@ class Contracts:
                 return True
         return False
 
+    @staticmethod
+    def _bh_entries(row, obs):
+        """Every (before B, after H) entry of a complete activity read, in read order (raises like _bh_entry)."""
+        if not Contracts._bh_entry(row, obs):
+            return []
+        return [e for e in obs["activity"]["entries"]
+                if e.get("before") == row["base"] and e.get("after") == row["head"]]
+
+    # ---- watch attribution (spec v2g4, Late-apply watch): each activity entry id explains at most one op
+
+    @staticmethod
+    def _entry_id(entry):
+        eid = entry.get("id")
+        return eid if isinstance(eid, str) and eid else None
+
+    def _attributed(self, entry_id):
+        return self.db.execute("SELECT 1 FROM attributions WHERE entry_id=?", (entry_id,)).fetchone() is not None
+
+    def _attribute(self, row, entry_id, how):
+        self.db.execute("INSERT INTO attributions(entry_id, op_key, repo, how, at) VALUES (?,?,?,?,?)",
+                        (entry_id, row["key"], row["repo"], how, self.now()))
+
+    def _holds_entry(self, key):
+        return self.db.execute("SELECT 1 FROM attributions WHERE op_key=? AND entry_id IS NOT NULL",
+                               (key,)).fetchone() is not None
+
+    def _claim(self, row, obs, how):
+        """After an op confirmed (E3/E12/E10/E14) or was abandoned under E16: attribute to it the first (B, H) entry
+        of the read that has an id and is not yet attributed, if the op holds none. A read without a complete
+        activity log claims nothing (the watch may claim the entry later, see _explainers)."""
+        act = obs.get("activity") if isinstance(obs, dict) else None
+        if self._holds_entry(row["key"]) or not isinstance(act, dict) or act.get("complete") is not True:
+            return
+        for entry in self._bh_entries(row, obs):
+            eid = self._entry_id(entry)
+            if eid and not self._attributed(eid):
+                self._attribute(row, eid, how)
+                return
+
+    def _explainers(self, row):
+        """The ops whose integration explains an update B -> H at this op's (repo, pr, B, H, revision): every
+        confirmed op, and every op abandoned under E16 (its incident already named the integration)."""
+        cur = self.db.execute(
+            "SELECT o.* FROM operations o WHERE o.repo=? AND o.pr=? AND o.base=? AND o.head=? AND "
+            "o.policy_revision=? AND (o.state='confirmed' OR EXISTS (SELECT 1 FROM attributions a WHERE "
+            "a.op_key=o.key AND a.how='E16')) ORDER BY o.created, o.key",
+            (row["repo"], row["pr"], row["base"], row["head"], row["policy_revision"]))
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
     def _applied(self, row, obs):
         """E3 / E10 / E14 / E16: the update (B -> H) is shown applied when the tip equals H, or a complete activity
         read has the (before B, after H) entry. Reachability of H is never evidence (a later integration containing
@@ -701,7 +754,9 @@ class Contracts:
             if row["state"] == "held" and actor == "main":
                 if not isinstance(obs, dict) or not obs:
                     raise ContractError("main settles a held operation with evidence")
-                return self._op_move(key, "confirmed", expected_version, event_id, "main", {"evidence": _canon(obs)})
+                new = self._op_move(key, "confirmed", expected_version, event_id, "main", {"evidence": _canon(obs)})
+                self._claim(new, obs, "confirm")
+                return new
             if row["state"] == "held" and actor != "reconcile":
                 raise ContractError("a held operation is settled only by main or the reconcile")
             self._fresh(obs)
@@ -711,8 +766,10 @@ class Contracts:
             if unmarked and row["state"] != "held" and \
                     self.now() - float(row["dispatched_at"] or 0) < self.PR_MARK_SECONDS:
                 raise ContractError("the PR is not shown merged yet; wait up to 10 min before E12")
-            return self._op_move(key, "confirmed", expected_version, event_id, actor,
-                                 {"evidence": _canon(obs), "pr_unmarked": 1 if unmarked else 0})
+            new = self._op_move(key, "confirmed", expected_version, event_id, actor,
+                                {"evidence": _canon(obs), "pr_unmarked": 1 if unmarked else 0})
+            self._claim(new, obs, "confirm")
+            return new
 
     def absent(self, key, proof, evidence, *, expected_version, event_id):
         """E4 -> absent-proven with one of exactly two admissible proofs. "Not there now" is never one.
@@ -777,8 +834,10 @@ class Contracts:
             if not self._applied(row, obs):
                 raise ContractError("the watch read does not show the update B -> H applied")
             self.set_merging(row["repo"], off=True, cause="late-apply:%s" % key, actor="ahc-core", _in_tx=True)
-            return self._op_move(key, "confirmed", expected_version, event_id, "ahc-core",
-                                 {"evidence": _canon(obs), "incident": row["incident"] + 1}, incident="late-apply")
+            new = self._op_move(key, "confirmed", expected_version, event_id, "ahc-core",
+                                {"evidence": _canon(obs), "incident": row["incident"] + 1}, incident="late-apply")
+            self._claim(new, obs, "confirm")
+            return new
 
     def settle_fenced(self, key, evidence, *, expected_version, event_id, actor):
         """E15 fenced -> abandoned, by main only, on stamped evidence that the request can never apply (the caller
@@ -841,9 +900,13 @@ class Contracts:
             if not tip:
                 raise ContractError("the read names no tip")
             if tip == row["head"] or (not (row["proof"] == "p3" and tip == row["base"]) and self._bh_entry(row, read)):
-                return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
-                                     {"proof": "all-sends-absent", "incident": row["incident"] + 1},
-                                     incident="integrated-elsewhere", row="E16")
+                new = self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
+                                    {"proof": "all-sends-absent", "incident": row["incident"] + 1},
+                                    incident="integrated-elsewhere", row="E16")
+                self._claim(new, read, "E16")
+                if not self._holds_entry(key):
+                    self._attribute(new, None, "E16")     # E16 by the tip alone: the marker, no entry yet
+                return new
             if row["proof"] == "p1" or tip != row["base"]:
                 # E8: reached only after a complete read showed no (B, H) entry (_bh_entry raised on a partial one)
                 return self._op_move(key, "abandoned", expected_version, event_id, "ahc-core",
@@ -906,9 +969,17 @@ class Contracts:
             (str(repo).lower(), self.now() - self.LATE_WATCH_SECONDS))]
 
     def late_apply(self, key, evidence, *, event_id):
-        """L5: a read found an abandoned operation's update applied (tip == H, or the (B, H) activity entry). Raise
-        one incident naming the op and turn the repo's merging off until main turns it back on. A detector, not a
-        fence. A fenced op's late apply is E14 (watch_confirm)."""
+        """L5: a read found an abandoned operation's update applied (tip == H, or the (B, H) activity entry). The
+        watch fires only when that application is unexplained (spec v2g4 attribution):
+        - a (B, H) entry is explained when its id is already attributed (it confirmed an op under E3/E12/E14/E10,
+          was named by an E16 incident, or already raised a late-apply incident), or when a confirmed or E16 op at
+          the same (repo, pr, B, H, revision) holds no entry yet: that op claims it here;
+        - tip == H is explained when such a confirmed or E16 op exists.
+        An entry without an id cannot be attributed, so it is never explained (fail closed). On an unexplained
+        application: one incident naming the op, its fresh entries attributed to it (so the same entry never raises
+        twice), and the repo's merging off until main turns it back on; returns the repo flag. When everything is
+        explained, returns None and records only the claims. A detector, not a fence. A fenced op's late apply is
+        E14 (watch_confirm)."""
         with self.tx():
             row = self._row_or_raise(key)
             if row["state"] != "abandoned":
@@ -919,6 +990,30 @@ class Contracts:
                 raise ContractError("a late apply is recorded only on a read showing the update B -> H")
             if self.db.execute("SELECT 1 FROM transitions WHERE event_id=?", (event_id,)).fetchone():
                 raise ContractError("event id %s was already applied" % event_id)
+            tip_h = evidence.get("tip") == row["head"]
+            entries = [] if tip_h and not isinstance(evidence.get("activity"), dict) else \
+                self._bh_entries(row, evidence)
+            explainers = self._explainers(row)
+            free = [e for e in explainers if not self._holds_entry(e["key"])]
+            fresh = []
+            for entry in entries:
+                eid = self._entry_id(entry)
+                if eid and self._attributed(eid):
+                    continue
+                if eid and free:
+                    claimer = free.pop(0)
+                    self._attribute(claimer, eid, "E16" if claimer["state"] == "abandoned" else "confirm")
+                    continue
+                fresh.append(eid)
+            tip_unexplained = tip_h and not explainers and not self.db.execute(
+                "SELECT 1 FROM attributions WHERE op_key=? AND how LIKE 'late-apply%'", (key,)).fetchone()
+            if not fresh and not tip_unexplained:
+                return None
+            for eid in fresh:
+                if eid:
+                    self._attribute(row, eid, "late-apply")
+            if tip_unexplained and not any(fresh):
+                self._attribute(row, None, "late-apply-tip")
             self.set_merging(row["repo"], off=True, cause="late-apply:%s" % key, actor="ahc-core", _in_tx=True)
             self.db.execute("UPDATE operations SET incident=incident+1 WHERE key=?", (key,))
             self._a0("operation", key, "abandoned", "abandoned", event_id, "ahc-core", late_apply=evidence,
