@@ -291,5 +291,23 @@ class Policy(unittest.TestCase):
         self.assertEqual(set(col.HELPER_TYPES_DEFAULT), tier_gate.helper_types({}))
 
 
+
+class PolicyIsAFeed(Base):
+    """T242-1 (PR 234 v7 audit): roles come from the owner/helper type policy, so a fallback policy (model_tiers caps
+    unreadable) makes the live, parked and helper counts a guess: the owners read must not be current."""
+
+    def test_owners_read_is_not_current_while_the_type_policy_is_a_fallback(self):
+        hub = ev.Hub(max_rate=10_000)
+        health = col.Health(hub)
+        for name in col.FEEDS["owners"]:
+            health.ok(name, "read")
+        truth = col.Truth(hub, health)
+        self.assertEqual(truth.reads()["owners"]["truth"], "current")
+        health.error("owner-policy", "model_tiers caps unreadable: owner/helper types are defaults")
+        self.assertNotEqual(truth.reads()["owners"]["truth"], "current")
+
+    def test_owners_collector_writes_and_ages_its_policy_row(self):
+        self.assertIn("owner-policy", col.Owners.rows_written)
+
 if __name__ == "__main__":
     unittest.main()

@@ -221,12 +221,13 @@ FEEDS = {
     "requirements": ("ledger:requirements", "main-session"),
     "status": ("ledger:status", "main-session"),
     "asks": ("asks", "main-session"),
-    "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams"),
+    # owner-policy: the owner/helper type table the roles (live, parked, helper) are decided by (T242-1)
+    "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams", "owner-policy"),
     "initiatives": ("initiatives",),
     # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
     # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
-    "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "initiatives", "github", "goodqa",
-               "t2-dev", "sources"),
+    "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "owner-policy", "initiatives", "github",
+               "goodqa", "t2-dev", "sources"),
     "chat": ("chat", "main-session"),  # the chat snapshot names which session is main's
 }
 # Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
@@ -1017,7 +1018,7 @@ class Owners(Collector):
         self.partial = False  # the last good read held more owners than MAX_ROWS, or rows it could not show
 
     MAX_ROWS = 60
-    rows_written = ("native-projects", "native-streams", "main-session")
+    rows_written = ("native-projects", "native-streams", "main-session", "owner-policy")
     read_budget = 30.0
 
     def health_truth(self):

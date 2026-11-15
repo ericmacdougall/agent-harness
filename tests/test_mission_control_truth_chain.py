@@ -632,7 +632,7 @@ class DerivedFeeds(unittest.TestCase):
     def test_a_seeded_undeclared_source_fails_the_derivation(self):
         """The shape of T242-1 and T243-2: a collector writes a row, or pushes a snapshot, that FEEDS does not name."""
         app, trace, _state = self.run_app()
-        trace.rows["owners"].add("owner-policy")
+        trace.rows["owners"].add("seeded-undeclared-row")  # owner-policy itself is declared since T242-1
         derived = self.sources_of("owners", trace)
         self.assertNotEqual(sorted(derived), sorted(col.FEEDS["owners"]))
         trace.snapshots["org"].add("orggraph")
