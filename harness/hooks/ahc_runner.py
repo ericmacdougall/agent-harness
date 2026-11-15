@@ -156,6 +156,19 @@ def bounds(config):
     return limits
 
 
+def unstamped_argv_problem(argv):
+    """Why a daemon review argv may not launch, or None (M-1 NEG-7). The daemon's review is bound to one PR and
+    carries --no-main-stamp, so it can never take main's review-auth stamp; it never asserts --author-harness and
+    never passes a main approval."""
+    if "--no-main-stamp" not in argv:
+        return "daemon review argv lacks --no-main-stamp"
+    if "--author-harness" in argv or "--approved-by" in argv:
+        return "daemon review argv asserts an author harness or an approval"
+    if not ("--github-repo" in argv and "--pr" in argv):
+        return "daemon review argv is not bound to a PR"
+    return None
+
+
 def retry_policy(failure_class, attempts, now, retry_at=None, first_at=None, config=None):
     """(state, next_action_at) for a failure. `attempts` counts this class's failures so far, this one included;
     For provider-transient, invalid-output and freshness, `attempts` is 1 when the head's one retry of that class
@@ -808,9 +821,17 @@ class Worker:
         argv = [sys.executable, str(self.config.get("peer_review", Path.home() / ".claude/hooks/peer_review.py")),
                 "pr", "--repo", clone, "--packet", str(fixed_path), "--output", str(report),
                 "--expected-head", facts["head"], "--snapshot-base", merge_base, "--base", merge_base,
-                "--timeout", str(REVIEW_TIMEOUT), "--owner", "ahc"]
+                "--timeout", str(REVIEW_TIMEOUT), "--owner", "ahc",
+                # M-1 (goodqa#16049, superseding P0 AC-5 "unbound"): bound to the exact PR so the FINAL carries the
+                # typed repo/pr binding pr_pass_evidence needs, and unstamped so it can never take or burn main's
+                # review-auth stamp. No --author-harness: peer_review derives it from the commit trailers.
+                "--github-repo", req["repo"], "--pr", str(req["pr"]), "--no-main-stamp"]
         if attempt > 1 and prior:
             argv += ["--repeat-reason", prior]
+        refusal = unstamped_argv_problem(argv)
+        if refusal:  # NEG-7: refused before launch, never sent
+            return self.settle(iid, token, "needs-attention", event="review-argv-refused", reason=refusal,
+                               notice=_owner_notice("needs-attention", refusal))
         key = "review:%s:%d" % (iid, attempt)
         now = self.now()
         with self.led.tx():  # I4: intent before dispatch

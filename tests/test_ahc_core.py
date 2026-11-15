@@ -595,7 +595,8 @@ class P0SurfaceTests(unittest.TestCase):
                 finally:
                     sys.stderr = stderr
 
-    AHC_SOURCES = ("ahc_core.py", "ahc_runner.py", "ahc_clone.py", "ahc_packet.py", "ahc_install.py")
+    AHC_SOURCES = ("ahc_core.py", "ahc_runner.py", "ahc_clone.py", "ahc_packet.py", "ahc_install.py",
+                   "ahc_contracts.py")
 
     def stamp_violations(self, sources):
         """Narrowed AC-31 rule (spec owner ruling): ahc_* never puts a stamp, never adds a review waiver, never imports
@@ -662,6 +663,15 @@ class P0SurfaceTests(unittest.TestCase):
         argv = ["ack", iid, "--owner", "main", "--disposition", "x"]
         self.assertFalse(self.runner.claim_main(argv), "no ahc-dispose stamp was put, so not main")
         self.assertEqual(sorted(p.name for p in folder.glob("*.json")), before, "main's stamps were consumed")
+        # M-1 (goodqa#16049): the daemon's review is bound and unstamped, and the flow wrote no merge_gate waiver state
+        reviews = [a for a in rec.argvs if "pr" in a and "--packet" in a]
+        self.assertTrue(reviews, "the flow must have launched a review for this to mean anything")
+        for argv in reviews:
+            self.assertIn("--no-main-stamp", argv)
+            self.assertEqual(argv[argv.index("--github-repo") + 1], REPO)
+            self.assertNotIn("--author-harness", argv)
+        state = self.home / ".agent-harness" / "state"
+        self.assertFalse((state / "merge-gate-waivers.jsonl").exists(), "ahc never writes merge_gate waiver state")
 
     def test_detector_is_not_vacuous(self):
         self.assertTrue(_lands_a_pr(["gh", "pr", "merge", "7", "-R", REPO, "--merge"]))

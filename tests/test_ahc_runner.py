@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
@@ -120,8 +121,28 @@ class FlowTests(Base):
         argv = deps.review_calls[0]
         self.assertEqual(argv[argv.index("--expected-head") + 1], HEAD)
         self.assertEqual(argv[argv.index("--snapshot-base") + 1], BASE)
-        self.assertNotIn("--github-repo", argv)  # Gate 1: unbound, cannot mint merge authority
+        # P0 AC-5 "unbound" superseded by goodqa#16049 M-1 (user: queue 2026-11-15T03:15:28Z#6165f60532c0): bound to
+        # the exact PR, unstamped, never asserting the author harness, so the run still cannot mint merge authority
+        self.assertEqual(argv[argv.index("--github-repo") + 1], REPO)
+        self.assertEqual(argv[argv.index("--pr") + 1], "7")
+        self.assertIn("--no-main-stamp", argv)
+        self.assertNotIn("--author-harness", argv)
+        self.assertNotIn("--approved-by", argv)
         self.assertLessEqual(int(argv[argv.index("--timeout") + 1]), 720)
+
+    def test_review_argv_without_no_main_stamp_is_refused_before_launch(self):
+        # M-1 NEG-7: the check that guards the launch, and the launch path using it
+        good = ["peer_review.py", "pr", "--github-repo", REPO, "--pr", "7", "--no-main-stamp"]
+        self.assertIsNone(runner.unstamped_argv_problem(good))
+        for bad in ([a for a in good if a != "--no-main-stamp"], good + ["--author-harness", "claude"],
+                    good + ["--approved-by", "main:x"], ["peer_review.py", "pr", "--no-main-stamp"]):
+            with self.subTest(bad=bad):
+                self.assertIsNotNone(runner.unstamped_argv_problem(bad))
+        iid, deps = self.submit(), Deps()
+        with mock.patch.object(runner, "unstamped_argv_problem", return_value="fixture refusal"):
+            self.run_all(deps)
+        self.assertEqual(deps.review_calls, [], "a refused argv is never launched")
+        self.assertEqual(self.state(iid), "needs-attention")
 
     def test_block_writes_back_once_with_key_and_inbox(self):
         iid, deps = self.submit(), Deps(verdict="BLOCK")

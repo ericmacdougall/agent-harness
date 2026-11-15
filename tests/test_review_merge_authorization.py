@@ -433,6 +433,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("Reviewed PR: 5", output.read_text(), "the run still binds to the PR")
         self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=self.root),
                              "main can still use its stamp afterwards")
+        # the daemon's own settled FINAL is still merge-eligible evidence for the shared predicate (M-1 C6 needs it)
+        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
+        reference = json.loads(line[len("Usage receipt: "):])
+        evidence = guard.UsageStore(self.root / "usage").inspect(reference)
+        self.assertEqual(mg.pr_pass_evidence(evidence)[:3], ("o/r", 5, self.head))
+        self.assertEqual(evidence["review"]["author_harness"], "claude", "derived from the trailers")
 
     def test_unstamped_review_mints_nothing(self):
         # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp

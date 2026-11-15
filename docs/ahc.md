@@ -221,3 +221,9 @@ and is recorded in `transitions` in the same transaction.
   settled row becomes a tombstone 30 days after settlement, and its key is refused for good.
 
 The runner does not use these rows yet, and automatic merging is off.
+
+**The daemon's review is bound and unstamped.** It runs `peer_review.py pr ... --github-repo OWNER/NAME --pr N
+--no-main-stamp`, so the FINAL carries the PR binding that `merge_gate.pr_pass_evidence` checks. It never takes or
+burns main's `review-auth` stamp, and it never passes `--author-harness`, because peer_review derives that from the
+commit trailers. An argv without `--no-main-stamp`, or one that asserts an author or an approval, is refused before
+launch. The configured `peer_review.py` must therefore support `--no-main-stamp`, which it does from commit e50c3619.

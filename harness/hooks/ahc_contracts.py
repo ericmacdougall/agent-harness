@@ -224,7 +224,7 @@ class Contracts:
                 raise ContractError("superseded needs the successor row id")
             if to == "waived" and not (isinstance(waiver_source, str) and waiver_source.startswith(("user:",
                                                                                                     "answer:"))):
-                raise ContractError("a waiver needs an authenticated user: or answer: source")
+                raise ContractError("waived needs an authenticated user: or answer: source")
             self.db.execute("UPDATE reviews SET state=?, version=version+1, updated=?, receipt=COALESCE(?, receipt), "
                             "successor=COALESCE(?, successor) WHERE id=?",
                             (to, self.now(), _canon(receipt) if receipt is not None else None, successor, rid))
