@@ -706,6 +706,7 @@ class OneRecordValidator(unittest.TestCase):
     def test_the_validator(self):
         self.assertEqual(prov.wal_record_problem({"event": "status", "at": "2026-11-15T00:00:00Z"}), "")
         self.assertEqual(prov.wal_record_problem({"event": "status", "ts": "x"}), "")   # undated: a record that proves no time
+        self.assertEqual(prov.wal_record_problem({"event": "ask", "at": None}), "")     # null at: undated (red-team F8)
         for kind, make in BAD_RECORDS.items():
             with self.subTest(record=kind):
                 self.assertTrue(prov.wal_record_problem(make("2026-11-15T00:00:00Z")))

@@ -63,15 +63,16 @@ def _record_time(value) -> float:
 
 def wal_record_problem(rec) -> str:
     """Why a parsed WAL line is not a record ("" when it is). A record is a JSON object with a non-empty string
-    `event`; an `at`, when present, must be an ISO time. A line that fails is a lost line for every reader: it is never
-    activity (no liveness), never dated evidence, never a row. An undated record (no `at`, as some hand-written notes
-    are) is a record that proves no time."""
+    `event`; an `at`, when present and not null, must be an ISO time. A line that fails is a lost line for every reader:
+    it is never activity (no liveness), never dated evidence, never a row. An undated record (no `at`, or `at: null`, as
+    some hand-written notes are) is a record that proves no time; an ask written that way is still listed (red-team F8,
+    tests/test_provenance.py)."""
     if not isinstance(rec, dict):
         return "not an object"
     event = rec.get("event")
     if not isinstance(event, str) or not event.strip():
         return "no event" if event is None or event == "" else "event is not a string"
-    if "at" in rec and _record_time(rec.get("at")) <= 0:
+    if rec.get("at") is not None and _record_time(rec.get("at")) <= 0:
         return "bad timestamp"
     return ""
 
