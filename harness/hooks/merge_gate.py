@@ -1642,7 +1642,9 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
 def pr_pass_evidence(evidence, *, with_base=False):
     """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
     With with_base=True it is (repo, pr, head, report_sha256, snapshot_base), where snapshot_base is the reviewer's
-    validated snapshot base B_r or None when the run named none (goodqa#16049 spec ahc-m1-v2g).
+    validated snapshot base B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling). A receipt without snapshot_base is
+    legacy and is refused there (ValueError naming LEGACY_NO_SNAPSHOT_BASE): absence never means "same as the
+    merge-base", and B_r is never inferred. The default 4-tuple path is unchanged and still accepts legacy receipts.
 
     Pure: it reads only the evidence mapping a UsageStore.inspect() returned and writes nothing. It is the one
     predicate for "this FINAL is a merge-eligible PR PASS", shared by add_review_waiver (main's merge gate) and the
@@ -1677,7 +1679,9 @@ def pr_pass_evidence(evidence, *, with_base=False):
             or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
         raise ValueError('FINAL is not settled independent pure PR PASS evidence')
     if with_base:
-        return review['repo'], review['pr'], review['head'], review['report_sha256'], review.get('snapshot_base')
+        if 'snapshot_base' not in review:
+            raise ValueError('LEGACY_NO_SNAPSHOT_BASE: PR PASS evidence has no snapshot base B_r')
+        return review['repo'], review['pr'], review['head'], review['report_sha256'], review['snapshot_base']
     return review['repo'], review['pr'], review['head'], review['report_sha256']
 
 

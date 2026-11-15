@@ -1848,6 +1848,8 @@ def main() -> int:
             if base and base != before[0]:
                 # goodqa#16049 spec ahc-m1-v2g: the snapshot base B_r the reviewer diffed against, so the ahc
                 # binding can require B_r to be an ancestor of (or equal to) the current default-branch tip.
+                # Recorded on every PR review that has a base, explicit or the head^1 default, whatever its
+                # relation to the merge-base. Only a root commit (no base) omits it; ahc treats absence as legacy.
                 review_metadata['snapshot_base'] = base
         if ticketed_success:
             review_metadata['ticketed'] = [dict(record, report_sha256=report_sha256) for record in ticketed]

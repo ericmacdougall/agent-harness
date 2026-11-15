@@ -437,8 +437,14 @@ class SnapshotBaseTests(AuthorizationTests):
         evidence = store.inspect(reference)
         self.assertEqual(mg.pr_pass_evidence(evidence), ("o/r", 5, HEAD, REPORT_SHA), "default shape unchanged")
         self.assertEqual(mg.pr_pass_evidence(evidence, with_base=True), ("o/r", 5, HEAD, REPORT_SHA, self.BR))
+
+    def test_with_base_refuses_a_legacy_receipt_without_a_snapshot_base(self):
+        # main's ruling: absence is legacy, never "same as the merge-base"; the 4-tuple path still accepts it
         store, reference = self.evidence()
-        self.assertIsNone(mg.pr_pass_evidence(store.inspect(reference), with_base=True)[4])
+        legacy = store.inspect(reference)
+        self.assertEqual(mg.pr_pass_evidence(legacy), ("o/r", 5, HEAD, REPORT_SHA))
+        with self.assertRaisesRegex(ValueError, "LEGACY_NO_SNAPSHOT_BASE"):
+            mg.pr_pass_evidence(legacy, with_base=True)
 
 
 class EndToEndTests(unittest.TestCase):
@@ -547,8 +553,44 @@ class EndToEndTests(unittest.TestCase):
         evidence = guard.UsageStore(self.root / "usage").inspect(reference)
         self.assertEqual(mg.pr_pass_evidence(evidence)[:3], ("o/r", 5, self.head))
         self.assertEqual(evidence["review"]["author_harness"], "claude", "derived from the trailers")
+        merge_base = subprocess.check_output(["git", "-C", str(self.repo), "merge-base", self.head,
+                                              "refs/remotes/origin/main"], text=True).strip()
+        self.assertEqual(merge_base, self.baseline, "fixture: the explicit base IS the merge-base")
         self.assertEqual(mg.pr_pass_evidence(evidence, with_base=True)[4], self.baseline,
-                         "the FINAL records the snapshot base B_r the reviewer diffed against (v2g)")
+                         "explicit base == merge-base still records the key (v2g, main's ruling)")
+
+    def reviewed_two_commit_pr(self, *extra):
+        # a second PR commit, so the merge-base (baseline) differs from head^1 (self.head)
+        (self.repo / "app.txt").write_text("second\n")
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qam", "feat: second\n\nRefs: none (fixture)\n\n"
+                        "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
+        head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
+                               "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
+        value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
+        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        output = self.root / "two.md"
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", head,
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", *extra],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
+        evidence = guard.UsageStore(self.root / "usage").inspect(json.loads(line[len("Usage receipt: "):]))
+        return head, mg.pr_pass_evidence(evidence, with_base=True)
+
+    def test_explicit_base_off_the_merge_base_is_recorded_not_inferred(self):
+        head, binding = self.reviewed_two_commit_pr("--snapshot-base", self.head)
+        self.assertEqual(binding[2], head)
+        self.assertEqual(binding[4], self.head, "B_r is the base the reviewer diffed against, not the merge-base")
+
+    def test_default_base_is_recorded_as_reviewed_not_the_merge_base(self):
+        head, binding = self.reviewed_two_commit_pr()
+        self.assertEqual(binding[4], self.head, "no flag: the head^1 snapshot base, never an inferred merge-base")
 
     def test_unstamped_review_mints_nothing(self):
         # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp
