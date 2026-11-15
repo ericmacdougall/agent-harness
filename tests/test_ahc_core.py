@@ -226,7 +226,7 @@ class StdinPacketTests(Base):
         argv = ["submit", "--repo", REPO, "--pr", "7", "--head", HEAD, "--base", BASE, "--packet", "-",
                 "--ticket", "GoodQA goodqa#16034", "--owner", "agent-abc123",
                 "--expect-sha", hashlib.sha256(data).hexdigest()]
-        (self.paths.root).mkdir(parents=True, exist_ok=True)
+        self.paths.ensure()   # ahc claims its own root (marker) before anything is placed in it
         (self.paths.root / "config.json").write_text(json.dumps(self.config))
         with mock.patch.object(Path, "home", return_value=self.home), mock.patch.object(sys, "stdin", stdin), \
                 contextlib.redirect_stdout(out):
@@ -679,6 +679,160 @@ class P0SurfaceTests(unittest.TestCase):
         self.assertTrue(_lands_a_pr(["git", "push", "origin", "HEAD:main"]))
         self.assertFalse(_lands_a_pr(["git", "merge-base", HEAD, BASE]))
         self.assertFalse(_lands_a_pr(["ah", "ticket", "comment", "t", "--body", "gh pr merge 7 --match-head-commit x"]))
+
+
+class RootOwnershipTests(unittest.TestCase):
+    """goodqa#16049 slice 1 (the spec owner's ruling after the Q7 read): ahc's root is ~/.agent-harness/ahc, never the
+    ~/.agent-harness/coordinator that another live coordinator (coordd) uses, and ahc refuses to start, naming the
+    conflict, when its root holds anything it did not create. A refusal writes nothing and deletes nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.paths = core.Paths(self.home)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def snapshot(root):
+        out = {}
+        for path in sorted(root.rglob("*")):
+            info = os.lstat(path)
+            out[str(path.relative_to(root))] = (info.st_mode, info.st_size, info.st_mtime_ns)
+        return out
+
+    def coordd_layout(self, marker=False):
+        """The layout another program keeps at a root: its own ledger, clones/, runs/ and a credential file. The
+        token here is a placeholder word, never a credential shape."""
+        root = self.paths.root
+        root.mkdir(parents=True)
+        (root / "ledger.sqlite").write_bytes(b"not ahc")
+        (root / "ledger.sqlite-wal").write_bytes(b"")
+        (root / "clones" / "x").mkdir(parents=True)
+        (root / "runs").mkdir()
+        (root / "token").write_text("placeholder\n")
+        if marker:
+            (root / core.ROOT_MARKER).write_text(core.ROOT_MARKER_TEXT)
+        return root
+
+    def refused(self, *names):
+        root = self.paths.root
+        before = self.snapshot(root)
+        with self.assertRaises(core.ForeignRoot) as caught:
+            self.paths.ensure()
+        for name in names:
+            self.assertIn(name, str(caught.exception))
+        self.assertEqual(self.snapshot(root), before, "a refusal must change nothing in the root")
+        return str(caught.exception)
+
+    def test_default_root_is_ahc_and_never_the_coordinator_directory(self):
+        self.assertEqual(self.paths.root, self.home / ".agent-harness" / "ahc")
+        self.assertNotIn("coordinator", str(self.paths.root.relative_to(self.home)))
+
+    def test_absent_root_is_created_with_the_marker(self):
+        self.paths.ensure()
+        self.assertEqual((self.paths.root / core.ROOT_MARKER).read_text(), core.ROOT_MARKER_TEXT)
+        self.assertEqual(os.stat(self.paths.root).st_mode & 0o777, 0o700)
+        self.paths.ensure()                       # idempotent on its own root
+
+    def test_an_empty_unmarked_root_is_claimed(self):
+        self.paths.root.mkdir(parents=True)       # a claim that stopped between the mkdir and the marker
+        self.paths.ensure()
+        self.assertTrue((self.paths.root / core.ROOT_MARKER).is_file())
+
+    def test_a_claim_interrupted_before_the_marker_link_is_finished(self):
+        """A crash after the temp marker was written and before the link leaves only that temp file; the next
+        start finishes the claim instead of refusing ahc's own root."""
+        self.paths.root.mkdir(parents=True)
+        (self.paths.root / ".ahc-root.4242.1.tmp").write_text(core.ROOT_MARKER_TEXT[:5])   # torn temp
+        self.paths.ensure()
+        self.assertEqual((self.paths.root / core.ROOT_MARKER).read_text(), core.ROOT_MARKER_TEXT)
+
+    def test_a_crash_between_the_link_and_the_temp_removal_restarts_cleanly(self):
+        self.paths.ensure()
+        (self.paths.root / ".ahc-root.4242.2.tmp").write_text(core.ROOT_MARKER_TEXT)
+        self.paths.ensure()
+
+    def test_the_marker_is_never_written_in_place(self):
+        """Every marker write goes to a temp name first, so a torn write can never become the marker."""
+        from unittest import mock
+        opened = []
+        real_open = os.open
+
+        def spy(path, flags, *args):
+            opened.append((os.path.basename(str(path)), flags))
+            return real_open(path, flags, *args)
+        with mock.patch.object(core.os, "open", spy):
+            self.paths.ensure()
+        writes = [name for name, flags in opened if flags & (os.O_WRONLY | os.O_RDWR)]
+        self.assertTrue(writes, "the claim wrote nothing")
+        self.assertNotIn(core.ROOT_MARKER, writes)
+
+    def test_a_foreign_ledger_is_refused(self):
+        self.paths.root.mkdir(parents=True)
+        (self.paths.root / "ledger.sqlite").write_bytes(b"not ahc")
+        self.refused("ledger.sqlite", "no .ahc-root marker")
+
+    def test_a_foreign_token_file_is_refused(self):
+        self.paths.root.mkdir(parents=True)
+        (self.paths.root / "token").write_text("placeholder\n")
+        self.refused("token")
+
+    def test_a_foreign_clones_directory_is_refused(self):
+        (self.paths.root / "clones" / "x").mkdir(parents=True)
+        self.refused("clones")
+
+    def test_the_whole_coordd_layout_is_refused(self):
+        self.coordd_layout()
+        message = self.refused("ledger.sqlite", "token", "clones", "runs")
+        self.assertIn("refusing to start", message)
+
+    def test_foreign_files_inside_a_marked_root_are_refused(self):
+        self.coordd_layout(marker=True)           # a marker does not make another program's files ahc's
+        self.refused("ledger.sqlite", "token", "runs")
+
+    def test_a_symlinked_root_is_refused(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        self.paths.root.parent.mkdir(parents=True)
+        os.symlink(str(elsewhere), str(self.paths.root))
+        with self.assertRaises(core.ForeignRoot):
+            self.paths.ensure()
+        self.assertEqual(os.listdir(str(elsewhere)), [], "nothing was written through the link")
+
+    def test_a_wrong_or_symlinked_marker_is_refused(self):
+        self.paths.root.mkdir(parents=True)
+        (self.paths.root / core.ROOT_MARKER).write_text('{"owner": "coordd"}\n')
+        self.refused("does not name ahc")
+        (self.paths.root / core.ROOT_MARKER).unlink()
+        target = self.home / "marker-elsewhere"
+        target.write_text(core.ROOT_MARKER_TEXT)
+        os.symlink(str(target), str(self.paths.root / core.ROOT_MARKER))
+        self.refused("symlink")
+
+    def test_every_entry_point_refuses_a_foreign_root(self):
+        """Paths.ensure is the gate: submit, the ledger and the lock all go through it."""
+        sys.path.insert(0, str(HOOKS))
+        import ahc_runner as runner
+        self.coordd_layout()
+        before = self.snapshot(self.paths.root)
+        with self.assertRaises(core.ForeignRoot):
+            runner.Ledger(self.paths)
+        with self.assertRaises(core.ForeignRoot):
+            runner.acquire_lock(self.paths, "core")
+        self.assertEqual(self.snapshot(self.paths.root), before)
+
+    def test_the_names_ahc_writes_are_its_own(self):
+        """Every top-level name ahc's code writes under the root passes the ownership check, so ahc never refuses
+        its own root; the list is the one place a new top-level file must be added."""
+        for name in ("ledger.sqlite3", "ledger.sqlite3-wal", "ledger.sqlite3-shm", "ledger.sqlite3.pre-v4.1.bak",
+                     "ledger.sqlite3.restore-intent", "ledger.sqlite3.failed-1", "ahc-core.lock", "ahc-review.lock",
+                     "config.json", ".config.json.tmp", "install.json", ".install.json.123.tmp", "digest.md",
+                     ".digest.md.tmp", "staging", "queue", "items", "inbox", "clones", "reports", "rejected"):
+            self.assertTrue(core._ahc_root_name(name), name)
+        for name in ("ledger.sqlite", "ledger.sqlite-wal", "token", "runs", "ledger.db", ".token.tmp"):
+            self.assertFalse(core._ahc_root_name(name), name)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ GitHub and must match. Stdlib only.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import hashlib
 import json
 import math
@@ -119,10 +120,45 @@ class Retry(RuntimeError):
     """A transient failure (gh, network); retry later with backoff. Never treated as PASS."""
 
 
+class ForeignRoot(Refused):
+    """ahc's state root holds something ahc did not create; ahc refuses to start rather than share it."""
+
+
+# ahc's state root (goodqa#16049 slice 1, the spec owner's ruling after the Q7 read). It was
+# ~/.agent-harness/coordinator, which another live program (coordd, a different coordinator) also uses on t2-dev for
+# its own ledger.sqlite, clones/, runs/ and token. No ahc ledger was installed on any host, so the root moved with
+# no migration. ahc owns a root only by its marker, written with O_EXCL after an exclusive mkdir:
+#   - absent: ahc creates it and writes the marker;
+#   - present, empty, unmarked: an earlier claim stopped between the mkdir and the marker; ahc claims it;
+#   - present, unmarked, not empty: refused, naming what is there (somebody else's directory);
+#   - marked: every top-level entry must be a name ahc writes (ROOT_NAMES, ROOT_PATTERNS), or it is refused.
+# A new top-level file in a later slice joins ROOT_NAMES in the same commit, or ahc refuses its own root.
+ROOT_DIRNAME = "ahc"
+ROOT_MARKER = ".ahc-root"
+ROOT_MARKER_TEXT = '{"owner": "ahc", "v": 1}\n'
+ROOT_MARKER_MAX = 4096
+ROOT_FILES = ("digest.md", "config.json", "install.json")
+ROOT_NAMES = frozenset((ROOT_MARKER, "staging", "queue", "items", "inbox", "clones", "reports", "rejected",
+                        "ahc-core.lock", "ahc-review.lock", "ledger.sqlite3") + ROOT_FILES)
+ROOT_MARKER_TEMP = ".ahc-root.*.tmp"   # a claim interrupted before its marker link (see Paths._write_marker)
+ROOT_PATTERNS = ("ledger.sqlite3-*", "ledger.sqlite3.*", ROOT_MARKER_TEMP) + tuple(
+    pattern for name in ROOT_FILES for pattern in (".%s.tmp" % name, ".%s.*.tmp" % name))
+
+
+def _ahc_root_name(name):
+    return name in ROOT_NAMES or any(fnmatch.fnmatchcase(name, p) for p in ROOT_PATTERNS)
+
+
+def _named(entries, limit=8):
+    shown = sorted(entries)[:limit]
+    more = len(entries) - len(shown)
+    return ", ".join(shown) + (" and %d more" % more if more > 0 else "")
+
+
 class Paths:
     def __init__(self, home=None):
         self.home = Path(home or Path.home())
-        self.root = self.home / ".agent-harness" / "coordinator"
+        self.root = self.home / ".agent-harness" / ROOT_DIRNAME
         self.packets = self.root / "staging"   # private staging root for `ahc submit --packet -` (D14, adv-3 F2)
         self.queue = self.root / "queue"
         self.items = self.root / "items"
@@ -132,8 +168,72 @@ class Paths:
         self.digest = self.root / "digest.md"
 
     def ensure(self):
-        for path in (self.root, self.queue, self.items, self.inbox, self.clones, self.reports):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.claim_root()
+        for path in (self.queue, self.items, self.inbox, self.clones, self.reports):
+            path.mkdir(exist_ok=True, mode=0o700)
+
+    def claim_root(self):
+        """Create or verify ahc's own root; raise ForeignRoot naming the conflict. Never writes into a root that is
+        not ahc's, and never deletes anything."""
+        root = self.root
+        root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.mkdir(str(root), 0o700)
+        except FileExistsError:
+            pass
+        info = os.lstat(str(root))
+        if not stat.S_ISDIR(info.st_mode):
+            raise ForeignRoot("ahc root %s is not a directory (a symlink or a file); refusing to start" % root)
+        entries = os.listdir(str(root))
+        if ROOT_MARKER not in entries:
+            others = [name for name in entries if not fnmatch.fnmatchcase(name, ROOT_MARKER_TEMP)]
+            if others:
+                raise ForeignRoot("ahc root %s is not ahc's (no %s marker) and holds: %s; refusing to start"
+                                  % (root, ROOT_MARKER, _named(others)))
+            self._write_marker()
+        self._verify_marker()
+        foreign = [name for name in os.listdir(str(root)) if not _ahc_root_name(name)]
+        if foreign:
+            raise ForeignRoot("ahc root %s holds entries ahc did not create: %s; refusing to start"
+                              % (root, _named(foreign)))
+
+    def _write_marker(self):
+        """The marker appears whole or not at all: written and fsynced under a private temp name, then hard-linked
+        into place (link never replaces, so a concurrent claim that won keeps its marker). A crash before the link
+        leaves only a temp file, which the next claim tolerates (ROOT_MARKER_TEMP) and finishes."""
+        root = self.root
+        temp = root / (".ahc-root.%d.%d.tmp" % (os.getpid(), time.time_ns()))
+        fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(ROOT_MARKER_TEXT)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(str(temp), str(root / ROOT_MARKER))
+            except FileExistsError:
+                pass                                   # a concurrent claim won; its marker is verified next
+        finally:
+            os.unlink(str(temp))
+        dir_fd = os.open(str(root), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    def _verify_marker(self):
+        path = self.root / ROOT_MARKER
+        try:
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError as error:
+            raise ForeignRoot("ahc root marker %s is unreadable or a symlink (%s); refusing to start"
+                              % (path, type(error).__name__))
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ForeignRoot("ahc root marker %s is not a regular file; refusing to start" % path)
+            text = handle.read(ROOT_MARKER_MAX + 1)
+        if text.decode("utf-8", "replace") != ROOT_MARKER_TEXT:
+            raise ForeignRoot("ahc root marker %s does not name ahc; refusing to start" % path)
 
 
 REPORT_MAX_BYTES = 2_000_000

@@ -2220,7 +2220,8 @@ def stage_packet(paths, stream, expect_sha=None):
     if expect_sha is not None and expect_sha.strip().lower() != sha:
         raise core.Refused("the packet received has SHA-256 %s, not the expected %s; nothing was queued"
                            % (sha, expect_sha.strip()))
-    paths.packets.mkdir(parents=True, exist_ok=True, mode=0o700)
+    paths.ensure()                       # ahc's own root first (marker); a foreign root refuses before any write
+    paths.packets.mkdir(exist_ok=True, mode=0o700)
     os.chmod(str(paths.packets), 0o700)
     target = paths.packets / (sha + ".md")
     crash_before("runner.stage_packet")

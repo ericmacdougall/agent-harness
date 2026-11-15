@@ -2859,9 +2859,15 @@ class SchemaTests(Base):
                               capture_output=True, text=True, env=dict(os.environ, AH_HOME=str(self.home)))
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertEqual(proc.stdout.split(), ["3", "outcome-unknown"])
-        # and the previous release refuses the migrated v4 ledger rather than misreading it
+        # and the previous release refuses the migrated v4 ledger rather than misreading it. The previous release's
+        # root is ~/.agent-harness/coordinator (ahc's root moved to ~/.agent-harness/ahc in slice 1), so the v4 file is
+        # placed where that release looks for it.
+        migrated = self.home / "migrated"
+        (migrated / ".agent-harness" / "coordinator").mkdir(parents=True)
+        _shutil.copyfile(self.paths.root / "ledger.sqlite3",
+                         migrated / ".agent-harness" / "coordinator" / "ledger.sqlite3")
         proc = subprocess.run([sys.executable, "-B", "-c", script, str(old / "harness" / "hooks"),
-                               str(self.paths.home)], capture_output=True, text=True,
+                               str(migrated)], capture_output=True, text=True,
                               env=dict(os.environ, AH_HOME=str(self.home)))
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("not supported", proc.stderr)
@@ -3104,9 +3110,11 @@ class LiveIsolationTests(unittest.TestCase):
     def test_full_tick_leaves_live_state_untouched(self):
         import os
         real_home = Path(os.path.expanduser("~"))
-        coordinator = real_home / ".agent-harness" / "coordinator"
+        coordinator = real_home / ".agent-harness" / "coordinator"   # another program's root (coordd)
+        ahc_root = real_home / ".agent-harness" / "ahc"
         state = real_home / ".agent-harness" / "state"
         before_coord = self.snapshot(coordinator)
+        before_ahc = self.snapshot(ahc_root)
         before_state = {k: v for k, v in (self.snapshot(state) or {}).items() if "ahc" in k or "coordinator" in k}
         with tempfile.TemporaryDirectory() as tmp:
             saved = os.environ.get("HOME")
@@ -3130,6 +3138,7 @@ class LiveIsolationTests(unittest.TestCase):
                     os.environ["HOME"] = saved
         self.assertTrue(deps.ah_calls, "the fake ah was not used")
         self.assertEqual(self.snapshot(coordinator), before_coord)
+        self.assertEqual(self.snapshot(ahc_root), before_ahc)
         after_state = {k: v for k, v in (self.snapshot(state) or {}).items() if "ahc" in k or "coordinator" in k}
         self.assertEqual(after_state, before_state)
 
