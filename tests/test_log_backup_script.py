@@ -1102,6 +1102,112 @@ class LargeTierSafety(LargeTier):
         self.assertEqual((self.remote / "testhost/.claude/history.jsonl").read_bytes(), ORDINARY[".claude/history.jsonl"])
 
 
+FAULTY_CP = """#!%(python)s
+import os, sys
+args = sys.argv[1:]
+mode = os.environ.get("CP_FAULT", "")
+dest = args[-1] if args else ""
+if mode and "backup-stage-large" in dest:
+    counter = os.environ["CP_COUNTER"]
+    seen = int(open(counter).read()) if os.path.exists(counter) else 0
+    open(counter, "w").write(str(seen + 1))
+    src = args[-2]
+    partial = lambda: open(dest, "wb").write(open(src, "rb").read(1000))
+    if mode == "fail-first-with-partial" and seen == 0:
+        partial()
+        sys.exit(1)
+    if mode == "fail-always-with-partial":
+        partial()
+        sys.exit(1)
+    if mode == "truncate-and-succeed":
+        partial()
+        sys.exit(0)
+os.execv("/bin/cp", ["cp"] + args)
+"""
+
+
+class LargeTierDelta(LargeTier):
+    """PR #261 review v2: F1 the completion state is bound to the destination; F2 a failed snapshot attempt cannot
+    leave a partial file that a retry accepts."""
+
+    def setUp(self):
+        super().setUp()
+        (self.home / ".agent-harness").mkdir(parents=True, exist_ok=True)
+        fakebin = self.tmp / "fakebin3"
+        fakebin.mkdir()
+        cp = fakebin / "cp"
+        cp.write_text(FAULTY_CP % {"python": sys.executable})
+        cp.chmod(0o755)
+        self.cp_path = f"{fakebin}:/usr/bin:/bin"
+        self.cp_counter = self.tmp / "cp-counter"
+
+    def to(self, remote=None, host=None, **extra):
+        """A run to one destination with the pass gap on, so a gap that outlives a destination change would show."""
+        settings = dict(LOG_BACKUP_ALLOW_LOCAL="1", FAKE_DELEGATE=REAL_RCLONE, LOG_BACKUP_LARGE_MB="1",
+                        LOG_BACKUP_BULK_LANE="0", LOG_BACKUP_LARGE_EVERY_SECONDS="7200",
+                        LOG_BACKUP_REMOTE=str(remote or self.remote))
+        if host:
+            settings["LOG_BACKUP_HOST"] = host
+        settings.update(extra)
+        return self.run_script(**settings)
+
+    def test_changing_the_host_sends_the_unchanged_large_file_to_the_new_destination(self):
+        self.assertEqual(self.to().returncode, 0)
+        self.assertTrue(self.large_marker().exists())
+        done = self.to(host="otherhost")
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual((self.remote / "otherhost" / self.BIG).read_bytes(), (self.home / self.BIG).read_bytes())
+        self.assertTrue(self.large_marker().exists())
+
+    def test_changing_the_remote_path_sends_the_unchanged_large_file_to_the_new_destination(self):
+        self.assertEqual(self.to().returncode, 0)
+        other = self.tmp / "remote-b"
+        other.mkdir()
+        done = self.to(remote=other)
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual((other / "testhost" / self.BIG).read_bytes(), (self.home / self.BIG).read_bytes())
+        self.assertTrue(self.large_marker().exists())
+
+    def test_a_failed_upload_to_the_new_destination_leaves_no_fresh_marker_from_the_old_one(self):
+        self.assertEqual(self.to().returncode, 0)
+        self.assertTrue(self.large_marker().exists())
+        done = self.to(host="otherhost", FAKE_FAIL_MATCH="backup-stage-large", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.large_marker().exists(), "the old destination's marker must not vouch for the new one")
+        self.assertFalse((self.remote / "otherhost" / self.BIG).exists())
+
+    def test_the_same_destination_still_skips_an_unchanged_large_file(self):
+        self.assertEqual(self.to().returncode, 0)
+        open(self.calls, "w").close()
+        self.assertEqual(self.to().returncode, 0)
+        self.assertFalse([c for c in self.copies() if any("backup-stage-large" in a for a in c)])
+
+    def test_a_failed_clone_attempt_that_leaves_a_partial_file_is_removed_before_the_retry(self):
+        done = self.to(PATH=self.cp_path, CP_FAULT="fail-first-with-partial", CP_COUNTER=str(self.cp_counter))
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + (self.logs / "log-backup.log").read_text()[-2000:])
+        self.assertEqual(self.remote_big().read_bytes(), (self.home / self.BIG).read_bytes(), "the whole file, not the partial")
+        self.assertTrue(self.large_marker().exists())
+        self.assertGreaterEqual(int(self.cp_counter.read_text()), 2, "a second attempt was made")
+
+    def test_when_every_attempt_leaves_a_partial_nothing_is_uploaded_or_recorded(self):
+        done = self.to(PATH=self.cp_path, CP_FAULT="fail-always-with-partial", CP_COUNTER=str(self.cp_counter))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.remote_big().exists())
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+
+    def test_a_snapshot_shorter_than_the_listed_size_is_never_uploaded_or_recorded(self):
+        done = self.to(PATH=self.cp_path, CP_FAULT="truncate-and-succeed", CP_COUNTER=str(self.cp_counter))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.remote_big().exists())
+        self.assertFalse(self.large_marker().exists())
+        self.assertFalse(self.state().exists() and self.BIG in self.state().read_text())
+
+
+for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the parent's tests
+    if _name.startswith("test_") and _name not in vars(LargeTierDelta):
+        setattr(LargeTierDelta, _name, None)
+
 for _name in list(vars(LargeTier)):   # the subclass shares the helpers, not the parent's tests
     if _name.startswith("test_") and _name not in vars(LargeTierSafety):
         setattr(LargeTierSafety, _name, None)
