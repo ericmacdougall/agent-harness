@@ -1034,7 +1034,8 @@ class Initiatives(Collector):
     def publish(self, mtime) -> None:
         if mtime is not None:
             self.mtime = mtime
-        self.hub.snapshot("initiatives", self.snapshot(mtime))
+        with AUTH_LOCK:   # PR 262 v4 F4: derived under this moment's authorization and enqueued before it can change
+            self.hub.snapshot("initiatives", self.snapshot(mtime))
 
     def snapshot(self, mtime=None) -> dict:
         # The file's edit time rides in every snapshot, /api/state too, so the page can say how old the file is.
@@ -1315,7 +1316,8 @@ class Owners(Collector):
             # goodqa#15961: never guess a session; an explicit "unpinned" state, never a silent 0 from another one
             self.session, self.claude_rows = "", []
             self.unrestricted = ("", frozenset())
-            self.restricted_known, self.restricted_session = False, ""
+            with AUTH_LOCK:
+                self.restricted_known, self.restricted_session = False, ""
             self.next_at = min(self.next_at, now + 5)   # the ledger read pins it seconds after start
             # T243-5: off, not an error. No rows are shown and none of them is a last good read of this pin, so the
             # owners read is unknown, never "stale" with an empty list.
@@ -1344,10 +1346,12 @@ class Owners(Collector):
             str(r.get("agent_id")) for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is True and isinstance(r.get("agent_id"), str)))
         # tickets restricted work is on: never fetched or shown, even when the initiatives file also names them
-        self.read_restricted_tickets = self.restricted_tickets = frozenset(
+        hidden = frozenset(
             str(r.get("ticket")).lower() for r in data.get("owners") or []
             if isinstance(r, dict) and r.get("restricted") is True and r.get("ticket"))
-        self.restricted_known, self.restricted_session = True, str(data.get("session") or "")
+        with AUTH_LOCK:   # PR 262 v4 F4: the set and whose read it is change together, between publish checks
+            self.read_restricted_tickets = self.restricted_tickets = hidden
+            self.restricted_known, self.restricted_session = True, str(data.get("session") or "")
         for row in data.get("owners") or []:
             if not isinstance(row, dict):
                 dropped += 1
@@ -1506,6 +1510,12 @@ class Owners(Collector):
 
 
 ASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+# PR 262 v4 receipt F4: the authorization lock. The writers of what decides who may see a ticket (the mission ledger's
+# session, from which the pin is resolved, and the owner read's restriction set) take it for each change, and every
+# publication of ticket data takes it across "is this still authorized?" and the enqueue, so a pin or restriction
+# change cannot land between the check and the publish. Held only for those short steps, never across a read.
+AUTH_LOCK = threading.RLock()
+
 RESTRICTED_TEXT = re.compile(r"\b(solve|interview)", re.I)  # as ah.py RESTRICTED: fail closed, liveness only
 HIDDEN_NOTE = "note hidden (restricted or not in the current owner read)"
 
@@ -1972,7 +1982,8 @@ class Ledger(Collector):
         self._follow_session()  # a moved session is shown unread now, not after the reads below
         errors = [self._read("goals", "ah goals", "ah-goals", (), self._goals, now)]
         if errors[0]:
-            self.mission = {"state": "error", "mission_session": ""}   # a failed read never keeps a writable pin (D1)
+            with AUTH_LOCK:   # PR 262 v4 F4: the pin's input changes only between, never inside, a publish check
+                self.mission = {"state": "error", "mission_session": ""}   # a failed read never keeps a writable pin (D1)
         session = self._follow_session()  # again: the session can move during the goals read
         if session:
             failed = self._read("requirements", "ah requirements", "ah-requirements", (session,), self._requirements, now)
@@ -2007,8 +2018,9 @@ class Ledger(Collector):
 
     def _goals(self, data: dict, now: float) -> dict:
         # goodqa#15961: the session pin reads the ledger's own session here, never the ledger file itself
-        self.mission = {"state": str(data.get("state") or "")[:20],
-                        "mission_session": str(data.get("mission_session") or "")[:64]}
+        with AUTH_LOCK:   # PR 262 v4 F4: as above
+            self.mission = {"state": str(data.get("state") or "")[:20],
+                            "mission_session": str(data.get("mission_session") or "")[:64]}
         items, dropped = [], 0
         listed = data.get("goals")
         if not isinstance(listed, list):  # `ah goals --json` always sends the list: without it nothing was read
@@ -2329,9 +2341,14 @@ class Tickets(Collector):
     MAX_TICKETS = 12
     read_budget = 20.0
 
-    def __init__(self, hub, health, runner, sources):
+    def __init__(self, hub, health, runner, sources, auth=None):
         super().__init__(hub, health)
         self.runner, self.sources = runner, sources  # callable -> iterable of ticket refs
+        # PR 262 v4 receipt F4: auth() -> (token, visible). The token names the authorization a read was made under
+        # (the pin and its restriction read); a result is published only if the token is unchanged and the ticket
+        # still visible at the publish boundary, checked and enqueued under AUTH_LOCK. None: unchecked (unit tests).
+        self.auth = auth
+        self.discarded = 0   # results dropped because the authorization changed while their read was in flight
         self.seen: dict[str, set] = {}
         self.cursor = 0
         self.failed: dict[str, str] = {}  # tracked tickets whose last read failed, until a read of them succeeds
@@ -2362,6 +2379,7 @@ class Tickets(Collector):
             return "no tickets"
         ref = tickets[self.cursor % len(tickets)]
         self.cursor += 1
+        token = self.auth()[0] if self.auth else None
         try:
             code, out = self.runner.run("ah-ticket-comments", ref, timeout=20)
             if code != 0:
@@ -2374,23 +2392,31 @@ class Tickets(Collector):
             self.failed[ref] = str(exc)[:80]
             raise
         self.failed.pop(ref, None)
-        seen = self.seen.get(ref)
-        first = seen is None
-        seen = seen if seen is not None else set()
-        for comment in comments[-50:]:
-            if not isinstance(comment, dict):
-                continue
-            cid = re.sub(r"[^0-9A-Za-z-]", "", str(comment.get("id") or ""))[:40]
-            if not cid or cid in seen:
-                continue
-            seen.add(cid)
-            ts = ev.parse_ts(comment.get("createdAt"), now)
-            body = str(comment.get('body') or '')
-            if RESTRICTED_TEXT.search(body):
-                body = HIDDEN_NOTE   # review P recheck: a tracked ticket's comment can carry restricted work
-            self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {body}", eid=f"goodqa:{cid}",
-                                     ts=ts, subject={"ticket": ref}, historic=first))
-        self.seen[ref] = seen
+        with AUTH_LOCK:
+            if self.auth:
+                current, visible = self.auth()
+                if current != token or not visible(ref):
+                    # PR 262 v4 F4: the pin or the restriction changed during the read: the result was authorized for
+                    # another context and is dropped unseen (nothing marked seen, so a later authorized read shows it)
+                    self.discarded += 1
+                    return f"{ref}: discarded (authorization changed during the read)"
+            seen = self.seen.get(ref)
+            first = seen is None
+            seen = seen if seen is not None else set()
+            for comment in comments[-50:]:
+                if not isinstance(comment, dict):
+                    continue
+                cid = re.sub(r"[^0-9A-Za-z-]", "", str(comment.get("id") or ""))[:40]
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                ts = ev.parse_ts(comment.get("createdAt"), now)
+                body = str(comment.get('body') or '')
+                if RESTRICTED_TEXT.search(body):
+                    body = HIDDEN_NOTE   # review P recheck: a tracked ticket's comment can carry restricted work
+                self.hub.publish(ev.make("ticket", "goodqa", f"{ref}: {body}", eid=f"goodqa:{cid}",
+                                         ts=ts, subject={"ticket": ref}, historic=first))
+            self.seen[ref] = seen
         return f"{ref} ({len(tickets)} tracked)"
 
 

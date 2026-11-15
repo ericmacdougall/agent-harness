@@ -659,6 +659,8 @@ class OrgGraph(col.Collector):
         self.restricted_fn = None   # -> the owners' restricted-ticket state; part of the initiatives signature
         # -> (known, restricted tickets) from the last owner read; None is fail closed (no ticket is shown or fetched)
         self.visibility_fn = None
+        self.auth_token_fn = None   # PR 262 v4 F4: () -> the authorization token (pin + its restriction read)
+        self.discarded = 0
         self.snapshot_data: dict | None = None
         self.metas: dict[str, tuple] = {}   # agent id -> (meta file fingerprint, fields)
         self.tickets: dict[str, dict] = {}
@@ -812,6 +814,7 @@ class OrgGraph(col.Collector):
                            "row_stale": r_stale(row), **facts})
         seen = {a["agent_id"] for a in agents}
         self.metas = {k: v for k, v in self.metas.items() if k in seen}
+        token = self.auth_token_fn() if self.auth_token_fn else None   # PR 262 v4 F4: what this tick is authorized by
         visible = self.visible()
         self._forget_hidden(visible)
         wanted = []
@@ -878,10 +881,16 @@ class OrgGraph(col.Collector):
         self.seq += 1
         snapshot["seq"] = self.seq
         snapshot["changes"] = changes[:MAX_CHANGES]
-        published = self.snapshot_data is None or changes or _shape(self.snapshot_data) != _shape(snapshot)
-        self.snapshot_data = snapshot
-        if published:
-            self.hub.snapshot("orggraph", snapshot)
+        with col.AUTH_LOCK:
+            if self.auth_token_fn and self.auth_token_fn() != token:
+                # PR 262 v4 receipt F4: the pin or the restriction changed during this tick's reads: the snapshot was
+                # built under another authorization, so it is neither kept nor broadcast; the next tick rebuilds it
+                self.discarded += 1
+                return "discarded: the authorization changed during the read"
+            published = self.snapshot_data is None or changes or _shape(self.snapshot_data) != _shape(snapshot)
+            self.snapshot_data = snapshot
+            if published:
+                self.hub.snapshot("orggraph", snapshot)
         counts = snapshot["counts"]
         failed = f"; {len(self.problems)} read(s) failed" if self.problems else ""
         return (f"{counts['live_owners']} live owners, {counts['subagent']} subagents, {counts['reviewer']} reviewers, "
@@ -919,6 +928,11 @@ def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now
     snap = file_snapshot or {}
     mtime = snap.get("mtime")
     unknown = restricted_tickets is None
+    if unknown:
+        # PR 262 v4 receipt F1: unknown restriction (no owner read yet, or the last one was for another session)
+        # derives nothing from owner rows either: a cached row from the previous session's read never shows a
+        # ticket, title or task here until the pinned session's own read lands
+        owner_rows = []
     hidden_keys = {_ticket_key(t) for t in restricted_tickets or ()} - {None}
     file_items = [i for i in (snap.get("items") or []) if isinstance(i, dict)
                   and not (unknown and _ticket_key(i.get("ticket")))

@@ -804,6 +804,93 @@ class RestrictedFileRowIntegration(unittest.TestCase):
         self.assertFalse(app.org.visible()("goodqa#15950"))
         self.assertTrue(app.org.visible()("goodqa#777"), "B's read, not A's, decides now")
 
+    def pinned_away_unrestricted(self):
+        """An app whose session A has a live, unrestricted owner on goodqa#15950 with its task text populated, read and
+        shown in A (the control), then pinned to B whose owner reads fail: the PR 262 v4 F1 fixture."""
+        owner = self.owner(restricted=False, ticket="goodqa#15950", task="A-ONLY-TASK ship the plain row")
+        app, frames = self.app([owner])
+        from test_mission_control_session_pin import MAIN, OTHER  # on the path once app() set it up
+        now = time.time()
+        app.owners.run(now)
+        app.initiatives.run(now)
+        app.org.run(now)
+        shown = json.dumps([d for n, d in frames if n == "initiatives"][-1])
+        self.assertIn("goodqa#15950", shown, "the live row is shown in A (control)")
+        self.assertIn("SECRET-TICKET", shown, "with its GoodQA title (control)")
+        app.config_pin = OTHER
+        app.runner.outputs["ah-owners"] = (1, "")
+        return app, frames, now
+
+    def test_live_owner_initiatives_wait_for_the_new_sessions_read(self):  # PR 262 v4 receipt F1
+        app, frames, now = self.pinned_away_unrestricted()
+        mark = len(frames)
+        for i in range(3):   # B's owner read keeps failing; A's live row stays cached in owners.rows
+            try:
+                app.owners.run(now + 10 + i)
+            except Exception:  # noqa: BLE001 - the failed read is the collector's own business
+                pass
+            app.initiatives.publish(None)
+            app.org.run(now + 10 + i)
+            state = app.state()
+            for part in ("initiatives", "orggraph"):
+                text = json.dumps(state[part], default=str)
+                for secret in ("A-ONLY-TASK", "goodqa#15950", "SECRET-TICKET"):
+                    self.assertNotIn(secret, text, f"{part} after failed B read {i}")
+        published = [json.dumps(d) for n, d in frames[mark:] if n in ("initiatives", "orggraph")]
+        self.assertTrue(published, "frames were published during the failed reads (not vacuous)")
+        for text in published:
+            for secret in ("A-ONLY-TASK", "goodqa#15950", "SECRET-TICKET"):
+                self.assertNotIn(secret, text)
+
+    def test_a_comment_read_in_flight_across_a_pin_move_is_discarded(self):  # PR 262 v4 receipt F4
+        app, _frames = self.app([self.owner()])
+        from test_mission_control_session_pin import MAIN, OTHER  # on the path once app() set it up
+        now = time.time()
+        app.owners.run(now)
+        app.initiatives.run(now)
+        self.assertIn("goodqa#15950", app.tracked_tickets())
+        events = []
+        real = app.hub.publish
+        app.hub.publish = lambda event, *a, **k: (events.append(json.loads(json.dumps(event, default=str))),
+                                                  real(event, *a, **k))[1]
+
+        def moving(ref):   # the ledger thread moves the pin while this 20 s read is in flight
+            app.config_pin = OTHER
+            return 0, json.dumps({"comments": [{"id": "c-inflight", "createdAt": "2026-11-14T04:00:00Z",
+                                                "body": f"INFLIGHT-COMMENT on {ref}"}]})
+        app.runner.outputs["ah-ticket-comments"] = moving
+        app.tickets.run(now + 1)
+        self.assertFalse([e for e in events if e.get("kind") == "ticket"], "nothing authorized under A is published")
+        self.assertNotIn("INFLIGHT-COMMENT", json.dumps(app.hub.recent(limit=500), default=str), "nor replayed")
+        self.assertNotIn("goodqa#15950", app.tickets.seen, "a dropped result is not marked seen")
+        # control: back on A, the same read publishes (the check is not a blanket refusal)
+        app.config_pin = MAIN
+        app.runner.outputs["ah-ticket-comments"] = lambda ref: (0, json.dumps({"comments": [
+            {"id": "c-ok", "createdAt": "2026-11-14T04:00:00Z", "body": f"OK-COMMENT on {ref}"}]}))
+        for i in range(2):
+            app.tickets.run(now + 2 + i)
+        self.assertTrue(any("OK-COMMENT" in json.dumps(e) for e in events), "an authorized read still publishes")
+
+    def test_a_graph_ticket_read_in_flight_across_a_pin_move_is_not_broadcast(self):  # PR 262 v4 receipt F4
+        owner = self.owner(restricted=False, ticket="goodqa#15950", task="plain work")
+        app, frames = self.app([owner])
+        from test_mission_control_session_pin import MAIN, OTHER  # on the path once app() set it up
+        now = time.time()
+        app.owners.run(now)
+
+        def moving(*args):   # the pin moves while the graph's GoodQA read is in flight
+            app.config_pin = OTHER
+            return 0, json.dumps({"issue": {"title": "INFLIGHT-TITLE", "status": "todo"}})
+        app.runner.outputs["ah-ticket-get"] = moving
+        mark = len(frames)
+        app.org.run(now + 1)
+        self.assertTrue(any(k == "ah-ticket-get" for k, _a, _t in app.runner.calls), "the read happened (not vacuous)")
+        for name, data in frames[mark:]:
+            if name == "orggraph":
+                self.assertNotIn("INFLIGHT-TITLE", json.dumps(data))
+                self.assertNotIn("goodqa#15950", json.dumps(data))
+        self.assertNotIn("INFLIGHT-TITLE", json.dumps(app.state()["orggraph"], default=str))
+
     def test_a_restricted_owner_appearing_later_republishes_without_the_row(self):  # not live: the org sig is unchanged
         owners = []
         app, frames = self.app(owners)

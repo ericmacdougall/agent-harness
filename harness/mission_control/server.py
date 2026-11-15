@@ -491,7 +491,7 @@ class App:
             # so an instance without OpenAI supervisors says so, as an unconfigured initiatives file does.
             self.health.off("codex-owners", "OpenAI supervised owners are not configured on this instance", truth="current")
         self.github = col.GitHub(self.hub, self.health, self.runner)
-        self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
+        self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets, auth=self.ticket_auth)
         self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
@@ -527,6 +527,7 @@ class App:
         self.org.restricted_fn = lambda: (lambda known, hidden: [known, sorted(hidden)])(*self.restriction())
         # PR 262 review F1: the one ticket visibility rule the graph applies to every ticket, by every route
         self.org.visibility_fn = self.restriction
+        self.org.auth_token_fn = self.auth_token   # PR 262 v4 F4: a tick built under another authorization is dropped
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote, self.org]
         # One read per dataset, composed from the sources that feed it (collectors.FEEDS) and pushed before any rows.
@@ -594,6 +595,18 @@ class App:
         graph, initiatives) judges by. PR 262 v3 receipt F1: a read for another session (the pin moved since) is
         unknown, never the old session's set, so nothing is polled or shown until the pinned session's read lands."""
         return self.owners.restriction_for(self.pin()["display"])
+
+    def auth_token(self) -> tuple:
+        """What a ticket read is authorized by (PR 262 v4 receipt F4): the pinned session and that session's restriction
+        read. A result is published only while this is unchanged (compared under collectors.AUTH_LOCK)."""
+        pinned = self.pin()["display"]   # resolved once: the token and its restriction are for the same session
+        known, hidden = self.owners.restriction_for(pinned)
+        return pinned, known, frozenset(hidden)
+
+    def ticket_auth(self) -> tuple:
+        """(token, visible) for the comment poller's publish boundary (PR 262 v4 receipt F4)."""
+        token = self.auth_token()
+        return token, org_graph.ticket_visibility(token[1], token[2])
 
     def tracked_tickets(self):
         """The tickets whose comments are polled. PR 262 v2 receipt F2: through the org graph's one visibility rule,
