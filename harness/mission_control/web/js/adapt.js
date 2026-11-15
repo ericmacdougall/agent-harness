@@ -49,6 +49,9 @@ export function ownerHold(r, last) {
   return { severe: SEVERE(r?.state) && !held, held, disposition, waitNote };
 }
 
+// Rows the server sent that the page could not show or place: dropped by shape, or with a role it does not know.
+export const ownersLoss = (rows, owners) => (Array.isArray(rows) ? Math.max(0, rows.length - owners.length) : rows == null ? 0 : 1)
+  + owners.filter(o => o.role_unknown).length;
 export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
   const out = rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
@@ -70,7 +73,9 @@ export function owners(rows, items = []) {
       progress: validIso(last?.progress_at) ? { at: last.progress_at, event: str(last.progress_event, 40), note: str(last.progress_note, 160) } : null,
       initiative_id: linked ? linked.id : null,
       // goodqa#15920: the server's cap role; anything unknown is parked (shown, never counted)
-      role: ['live', 'parked', 'helper'].includes(r.role) ? r.role : 'parked', source: r.source === 'ah' ? 'ah' : str(r.source, 20),
+      // T242-2: an unknown role is still shown (parked, never counted), and the store counts it as a row the page
+      // could not place, so the owners claim is partial rather than a short count shown as current
+      role: ['live', 'parked', 'helper'].includes(r.role) ? r.role : 'parked', role_unknown: !['live', 'parked', 'helper'].includes(r.role), source: r.source === 'ah' ? 'ah' : str(r.source, 20),
       serves: r.serves ? str(r.serves, 80) : null,
       decision_required: r.decision_required === true,
       session: str(r.session, 64),
@@ -147,7 +152,7 @@ export const STATE_DATASETS = Object.freeze({
   reads: null, loss: null, sources: null, connection: null, lastData: null, host: null, now: null,
   decisions: null, filters: null, selection: null, highlight: null, tab: null, responder: null, session: null,
   motion: null, motionPreference: null, reducedMotion: null, feedPaused: null, buffered: null, ownerFilter: null,
-  ownersAll: null, fallback: null, showQuiet: null, theme: null, coverage: null,
+  ownersAll: null, ownerFolds: null, fallback: null, showQuiet: null, theme: null, coverage: null,
 });
 // Reads that are not dependencies, each with the reason: the data can only reveal more, never hide.
 export const SAFE_READS = Object.freeze({

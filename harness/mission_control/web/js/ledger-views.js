@@ -3,7 +3,7 @@
 // Each long text is clamped with a disclosure, and each list is bounded with "show more", so volume never takes over.
 import { el, button, age, stateClass } from './ui.js';
 import { GOAL_STATE, missionTiles, dealRows, blockerRows, archiveRows, unreadLine, claim, truthLines, noneText, countText, hiddenBlockers, hiddenDeals, statusCount } from './adapt.js';
-import { ownerCounts } from './owner-groups.js';
+import { ownerCounts, HISTORY_WINDOW } from './owner-groups.js';
 
 export const PAGE = 25;  // default rows per list; "show more" adds one page
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
@@ -313,7 +313,7 @@ export function inventory(state, go) {
   const spec = [
     ['Goals', 'goals', c => `${countText(led.goals.items.length, c)} goals`, 'Overview', 'overview'],
     ['Initiatives', 'initiatives', c => `${countText(state.initiatives.length, c)} initiatives`, 'Overview', 'overview'],
-    ['Owners', 'owners', c => (k => `${countText(k.live, c)} live owners, ${countText(k.codexLive, c)} live Codex, ${countText(k.parked, c)} parked or history, ${countText(k.helpers, c)} helpers`)(ownerCounts(state.owners)), 'Overview', 'overview'],
+    ['Owners', 'owners', c => (k => `${countText(k.live, c)} live owners, ${countText(k.codexLive, c)} live Codex, ${countText(k.parked, c)} parked or history, ${countText(k.helpers, c)} helpers (${HISTORY_WINDOW})`)(ownerCounts(state.owners)), 'Overview', 'overview'],
     ['Open asks', 'needs', c => `${countText(state.asks.length, c)} open, ${countText(state.asksStale.length, c)} stale, ${countText(state.asksFlagged.length, c)} untraceable`, 'Overview', 'overview'],
     ['Deploys and live tests', 'deploys', c => `${unread}${countText(sc('live'), c)} deploys, ${countText(sc('verified'), c)} tested, ${countText(sc('failed'), c)} failed, ${countText(sc('pending'), c)} pending`, 'Overview', 'overview'],
     ['Blockers', 'blockers', c => `${unread}${countText(sc('blockers'), c)} recorded in status`, 'Overview', 'overview'],

@@ -62,20 +62,25 @@ export function ownerGroups(owners = [], initiatives = []) {
     || (a.id === UNLINKED) - (b.id === UNLINKED) || (order.get(a.id) ?? 1e9) - (order.get(b.id) ?? 1e9));
 }
 
-export function foldLabel(group) {
-  return `Parked / history (${group.foldCount})${group.attention ? ` · ${group.attention} need attention` : ''}`;
+// Every count below is stated through the owners gate `g` (adapt.gate(state, 'owners')), so a read that is unknown,
+// partial or stale never shows a plain number (PR 234 v7 audit T242-3, T242-4).
+export function foldLabel(group, g) {
+  return `Parked / history (${g.count(group.foldCount)})${group.attention ? ` · ${g.count(group.attention)} need attention` : ''}`;
 }
 
-export function summaryLine(counts, { session = '', stale = false } = {}) {
-  return [`${counts.live} live ${counts.live === 1 ? 'owner' : 'owners'} per ah owners${session ? ` (session ${session.slice(0, 8)})` : ''}${stale ? ', STALE: last read failed' : ''}`,
-    `${counts.codexLive} live Codex`, `${counts.parked} parked or history`, `${counts.helpers} helpers`,
-    counts.attention ? `${counts.attention} need attention` : ''].filter(Boolean).join(' · ');
+export function groupHeading(group, g) {
+  return `${group.label} · ${g.count(group.liveCount)} live${group.codexLive ? ` · ${g.count(group.codexLive)} live Codex` : ''}`
+    + `${group.decide.length ? ` · ${g.count(group.decide.length)} need a decision` : ''}`;
 }
 
-// The ah read is stale when the rows say so, or when the owners source itself failed (a first read that failed leaves
-// no rows to carry the flag, and "0 live" must not look current).
-export function ownersStale(state = {}) {
-  const rows = (state.owners || []).some(owner => owner.source === 'ah' && (owner.ah_stale || owner.source_stale));
-  const source = (state.sources || []).find(s => s.id === 'owners');
-  return rows || Boolean(source && ['error', 'stale'].includes(source.state));
+export const groupEmpty = g => g.none('No live owner in this initiative.', 'live owners in this initiative');
+
+// T242-5, a declared window: the server lists a finished owner (done, handoff, returned...) only while it was active in
+// the last 6 h (collectors.Owners). Older ones are left out on purpose, and every count of parked or history says so.
+export const HISTORY_WINDOW = 'owners finished over 6 h ago are not listed';
+
+export function summaryLine(counts, g, { session = '' } = {}) {
+  return [`${g.count(counts.live)} live ${counts.live === 1 ? 'owner' : 'owners'} per ah owners${session ? ` (session ${session.slice(0, 8)})` : ''}`,
+    `${g.count(counts.codexLive)} live Codex`, `${g.count(counts.parked)} parked or history`, `${g.count(counts.helpers)} helpers`,
+    counts.attention ? `${g.count(counts.attention)} need attention` : '', g.current ? '' : g.note(''), HISTORY_WINDOW].filter(Boolean).join(' · ');
 }
