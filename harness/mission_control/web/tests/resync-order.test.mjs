@@ -8,13 +8,17 @@ globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {}
 globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
 globalThis.document.getElementById = () => null;
 globalThis.setInterval = () => { throw new Error('no polling'); };
+// The fake server stamps as the real one does (goodqa#16117 PR 257 v1 F1): every stream message has
+// `id: <generation>.<revision>`, and a state answer carries the revision current when its request was made.
+const GENERATION = '0123456789abcdef';
+let revision = 0;
 const sources = [];
 class FakeES {
   static CLOSED = 2;
   constructor(url) { this.url = url; this.readyState = 1; this.l = {}; sources.push(this); }
   addEventListener(t, f) { this.l[t] = f; }
   close() { this.readyState = 2; }
-  emit(t, data) { this.l[t]?.(data === undefined ? {} : { data: JSON.stringify(data) }); }
+  emit(t, data) { this.l[t]?.(data === undefined ? {} : { data: JSON.stringify(data), lastEventId: `${GENERATION}.${++revision}` }); }
 }
 globalThis.EventSource = FakeES;
 
@@ -25,7 +29,10 @@ const snapshot = tag => ({ version: '1', host: 'h', csrf: 'c', initiatives: { it
 
 // fetch answers only when the test releases it, so a response can arrive after newer stream messages
 const pending = [];
-globalThis.fetch = async () => new Promise(resolve => pending.push(body => resolve({ ok: true, status: 200, json: async () => body })));
+globalThis.fetch = async () => {
+  const stream = { generation: GENERATION, revision };
+  return new Promise(resolve => pending.push(body => resolve({ ok: true, status: 200, json: async () => body && { ...body, stream } })));
+};
 const wait = ms => new Promise(r => setTimeout(r, ms));
 async function nextFetch() { for (let i = 0; i < 100 && !pending.length; i++) await wait(10); assert.ok(pending.length, 'a state load started'); return pending.shift(); }
 

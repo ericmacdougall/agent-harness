@@ -12,6 +12,14 @@ let failures = 0;
 // later one superseded is dropped (it neither installs nor marks the page live).
 let loadGen = 0;
 let held = null;
+// goodqa#16117, PR 257 review v1 F1: what a load held is replayed only when it is newer than the snapshot just installed.
+// The server stamps /api/state with `stream: {generation, revision}` taken before it reads anything, and every stream
+// message with `id: <generation>.<revision>` from the same counter. A held message is replayed when it has the
+// snapshot's generation and a higher revision; one from another server process, at or below the snapshot, or with no
+// readable stamp is dropped. A new load starts with an empty buffer: anything an earlier load held arrived before this
+// request was sent, so this snapshot already supersedes it.
+let installed = null;   // the stamp of the installed snapshot
+let otherProcess = false;  // a re-read is pending because a live message came from another server process
 // A load that never answers would hold the stream for ever: it is aborted, which replays what it held, and the
 // caller's retry and backoff take over. Tests shorten it.
 let stateTimeoutMs = 15000;
@@ -21,16 +29,34 @@ class SendError extends Error {
   constructor(message, retryable) { super(message); this.retryable = retryable; }
 }
 
-function replayHeld(gen) {
+const STAMP = /^([0-9a-f]{1,64})\.([0-9]{1,15})$/;
+function messageStamp(message) {
+  const found = STAMP.exec(typeof message?.lastEventId === 'string' ? message.lastEventId : '');
+  return found ? { generation: found[1], revision: Number(found[2]) } : null;
+}
+function snapshotStamp(stream) {
+  const generation = stream?.generation, revision = stream?.revision;
+  return typeof generation === 'string' && generation && Number.isSafeInteger(revision) && revision >= 0 ? { generation, revision } : null;
+}
+// Newer than the installed snapshot: same server process, later revision. Without both stamps nothing is newer.
+function supersedes(stamp, snapshot) {
+  return !!stamp && !!snapshot && stamp.generation === snapshot.generation && stamp.revision > snapshot.revision;
+}
+
+// `snapshot` is the stamp of the snapshot just installed: only what supersedes it replays. Without one (the load
+// failed, timed out or was refused, so nothing was installed) everything held is still the newest data and replays.
+function replayHeld(gen, snapshot) {
   if (gen !== loadGen) return;  // a newer load holds the stream now; it replays what it holds
   const queue = held || [];
   held = null;
-  for (const [apply, data] of queue) apply(data);
+  for (const [apply, data, stamp] of queue) {
+    if (snapshot === undefined || supersedes(stamp, snapshot)) apply(data);
+  }
 }
 
 async function loadState() {
   const gen = ++loadGen;
-  held = held || [];
+  held = [];  // a superseded load's buffer is dropped: this snapshot is taken after all of it arrived
   let state;
   const abort = typeof AbortController === 'function' ? new AbortController() : null;
   const timer = setTimeout(() => {
@@ -52,11 +78,13 @@ async function loadState() {
   } finally {
     clearTimeout(timer);
   }
-  replayHeld(gen);  // then everything the stream sent while the response was on its way, in order
+  replayHeld(gen, installed);  // then what the stream sent after the snapshot was taken, in order
   return true;
 }
 
 function installState(state) {
+  installed = snapshotStamp(state.stream);  // null (unstamped) replays nothing held
+  otherProcess = false;
   csrf = typeof state.csrf === 'string' ? state.csrf : '';
   setHost(state.host);
   setReads(state.reads);  // first: the rows below are never shown ahead of the server's read of them
@@ -74,8 +102,16 @@ function deliver(apply) {
   return message => {
     const data = parse(message);
     if (!data) return;
-    if (held) held.push([apply, data]);
-    else apply(data);
+    const stamp = messageStamp(message);
+    if (held) { held.push([apply, data, stamp]); return; }
+    apply(data);
+    // The server restarted between the state read and this stream (or the stream reopened on a new process without a
+    // drop the page saw): the rest of the page is the old process's. Not live until this process's state is read.
+    if (stamp && installed && stamp.generation !== installed.generation && !otherProcess) {
+      otherProcess = true;
+      setConnection('reconnecting');
+      resync();
+    }
   };
 }
 
@@ -230,4 +266,4 @@ export async function start() {
   }
 }
 
-export function stop() { source?.close(); source = null; clearTimeout(resyncTimer); loadGen += 1; held = null; }
+export function stop() { source?.close(); source = null; clearTimeout(resyncTimer); loadGen += 1; held = null; installed = null; otherProcess = false; }

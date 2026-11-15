@@ -7,6 +7,7 @@ import calendar
 import collections
 import json
 import re
+import secrets
 import socket
 import threading
 import time
@@ -136,12 +137,29 @@ class Client:
             return items
 
 
+_EVENT_ID = re.compile(r"([0-9a-f]{16})\.([0-9]{1,15})")
+
+
+def resume_after(last_event_id, generation: str) -> int:
+    """The revision a reconnecting stream resumes after: the Last-Event-ID's revision when it names this process's
+    generation, else 0 (nothing replayed). A revision from another process, or a bare number from an older server, is
+    meaningless here."""
+    found = _EVENT_ID.fullmatch(last_event_id or "") if isinstance(last_event_id, str) else None
+    return int(found.group(2)) if found and found.group(1) == generation else 0
+
+
 class Hub:
-    """Ring of recent events plus SSE fan-out. publish() never blocks on a client."""
+    """Ring of recent events plus SSE fan-out. publish() never blocks on a client.
+
+    goodqa#16117 (PR 257 review v1 F1): every frame is stamped `id: <generation>.<revision>`, and /api/state carries the
+    same pair from position(). The generation is random per process, so a restarted server never matches the old one;
+    the revision is `seq`, which grows by one for every frame under the lock. The page replays an update it held during
+    a state load only when it has the snapshot's generation and a higher revision."""
 
     def __init__(self, ring: int = 500, max_clients: int = 8, max_rate: float = 20.0):
         self.lock = threading.Lock()
         self.ring = collections.deque(maxlen=ring)
+        self.generation = secrets.token_hex(8)
         self.seq = 0
         self.clients: list[Client] = []
         self.max_clients = max_clients
@@ -153,7 +171,12 @@ class Hub:
 
     def frame(self, seq: int, name: str, data) -> bytes:
         body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        return f"id: {seq}\nevent: {name}\ndata: {body}\n\n".encode("utf-8")
+        return f"id: {self.generation}.{seq}\nevent: {name}\ndata: {body}\n\n".encode("utf-8")
+
+    def position(self) -> dict:
+        """The stamp of a snapshot taken from now on: every frame at or below this revision was broadcast before it."""
+        with self.lock:
+            return {"generation": self.generation, "revision": self.seq}
 
     def _broadcast(self, frame: bytes) -> None:
         for client in list(self.clients):

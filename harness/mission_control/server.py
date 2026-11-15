@@ -620,8 +620,13 @@ class App:
             force = True
         if sig == self.chat_sig and not force:
             return
+        try:
+            snapshot = self.chat_snapshot()
+        except Exception:
+            self.chat_sig = None  # goodqa#16117 sweep: a snapshot that failed is built again, even over an unchanged store
+            raise
         self.chat_sig = sig
-        self.hub.snapshot("chat", self.chat_snapshot())
+        self.hub.snapshot("chat", snapshot)
 
     def chat_snapshot(self) -> dict:
         messages = []
@@ -665,8 +670,12 @@ class App:
                           "busy": self.codex.busy}}
 
     def state(self) -> dict:
+        # goodqa#16117 (PR 257 v1 F1): stamped before anything is read, so the stamp is a lower bound. An update
+        # broadcast at or below it was already in the collectors when they were read; one above it may be newer than
+        # the snapshot, and the page replays it (every named snapshot is a full replacement, so replaying is safe).
+        stream = self.hub.position()
         self.follow_sessions()  # a page that loads between two passes of the session watch gets the same truth
-        return {"version": VERSION, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
+        return {"version": VERSION, "stream": stream, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
                 "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
                 "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
                 "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
@@ -1067,10 +1076,8 @@ class Handler(BaseHTTPRequestHandler):
         wake = getattr(self.app, "wake", None)
         if wake:
             wake()  # sources on their idle cadence refresh for the page that just attached
-        try:
-            last = int(self.headers.get("Last-Event-ID") or "0")
-        except ValueError:
-            last = 0
+        # a reconnect resumes only from an id this process framed (goodqa#16117): another process's revision is unrelated
+        last = ev.resume_after(self.headers.get("Last-Event-ID"), getattr(self.app.hub, "generation", None))
         self.connection.settimeout(None)
         self.send_response(200)
         for key, value in {"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store",
