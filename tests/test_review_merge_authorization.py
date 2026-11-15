@@ -410,6 +410,30 @@ class EndToEndTests(unittest.TestCase):
         finally:
             fixture.HEAD = original_head
 
+    def test_no_main_stamp_leaves_mains_stamp_and_mints_nothing(self):
+        # goodqa#16049: the ahc daemon's bound run on a host where main has a stamp for this exact repo and PR
+        import caller_identity
+        caller_identity.put_stamp("review-auth", ["o/r", 5], home=self.root)
+        folder = caller_identity.stamp_dir(self.root)
+        before = sorted(p.name for p in folder.iterdir())
+        output = self.root / "daemon.md"
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp"],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Merge authorization:", result.stdout)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), before, "main's stamp is neither taken nor burnt")
+        state = self.root / ".agent-harness" / "state"
+        self.assertEqual([r for r in mg._read_waivers(state) if r.get("event") == "waive"], [])
+        self.assertIn("Reviewed PR: 5", output.read_text(), "the run still binds to the PR")
+        self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=self.root),
+                             "main can still use its stamp afterwards")
+
     def test_unstamped_review_mints_nothing(self):
         # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp
         output = self.root / "unstamped.md"

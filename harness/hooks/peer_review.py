@@ -1454,6 +1454,9 @@ def main() -> int:
                         help='Harness that wrote the change; the other harness reviews when available')
     parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
     parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
+    parser.add_argument('--no-main-stamp', action='store_true',
+                        help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
+                             'but can never mint a merge authorization (the ahc daemon always passes this)')
     args = parser.parse_args()
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
@@ -1532,7 +1535,10 @@ def main() -> int:
             parser.error(str(error))
         # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization
         import caller_identity
-        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
+        # goodqa#16049: a caller that is never the authority (the ahc daemon) opts out, so a run on a host where
+        # main has stamps can neither take main's authority nor burn main's stamp
+        if not args.no_main_stamp:
+            args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
         if args.main_stamp is None:
             print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
                   'review cannot authorize a merge.', file=sys.stderr)
