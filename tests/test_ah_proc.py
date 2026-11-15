@@ -831,6 +831,182 @@ class WindowsHost(unittest.TestCase):
         self.assertTrue(out["ok"])
 
 
+class WindowsMsiAgent(unittest.TestCase):
+    """goodqa#16147: on ah-msi (only) main may stop an installed GoodQA agent binary owned by the login user, from its
+    install directory, without the orphan rule. Every negative varies exactly one field of a fixture that is stopped."""
+    LAD = "C:\\Users\\eric\\AppData\\Local"
+    AGENTD = {"ppid": 121316, "name": "goodqa-agentd.exe", "created": "2026-11-07T10:02:11.5000000Z",
+              "cmd": "goodqa-agentd.exe run", "owner": "MSI\\eric", "mine": True, "self": False, "orphan": False,
+              "exe": LAD + "\\GoodQA\\agent\\bin\\0.2.52\\goodqa-agentd.exe", "lad": LAD}
+    MACHINE = dict(AGENTD, ppid=1, name="goodqa-machine.exe", cmd="goodqa-machine.exe",
+                   exe="C:\\Program Files\\goodqa\\resources\\agent\\goodqa-machine.exe")
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.notices = []
+
+    def run_kill(self, remote, host="ah-msi"):
+        return ak.kill_remote(host, [8476], "stale agent holds the per-user lock", False, 5, "sess-1", "",
+                              home=self.home, runner=remote, foreign=True,
+                              notify=lambda h, e: self.notices.append(e))
+
+    def refused(self, proc, host="ah-msi", detail=None):
+        self.notices = []  # per call, so one wrongly admitted subcase does not fail the ones after it
+        remote = FakeWindowsRemote({8476: proc})
+        out = self.run_kill(remote, host)
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+        if detail:
+            self.assertIn(detail, out["results"][0]["detail"])
+        self.assertEqual(len(remote.calls), 1)  # read only, no stop script sent
+        self.assertEqual(remote.stopped, [])
+        self.assertEqual(self.notices, [])
+
+    def test_main_may_stop_an_owned_installed_agent_on_msi(self):
+        for name, proc in (("agentd under LOCALAPPDATA", self.AGENTD),
+                           ("agentd case-folded", dict(self.AGENTD, name="GoodQA-AgentD.EXE",
+                                                       exe=self.AGENTD["exe"].upper())),
+                           ("machine under Program Files", self.MACHINE)):
+            with self.subTest(name=name):
+                self.notices = []
+                remote = FakeWindowsRemote({8476: proc})
+                out = self.run_kill(remote)
+                self.assertTrue(out["ok"], out)
+                self.assertEqual(remote.stopped, [8476])
+                self.assertEqual(remote.calls[0][6], "ah-msi")
+                self.assertEqual(len(self.notices), 1)
+                ident = [r for r in self.read_audit() if r.get("event") == "identity" and r["exe"] == proc["exe"]]
+                self.assertTrue(ident)
+                self.assertEqual(ident[0]["localappdata"], self.LAD)  # an empty answer is visible in the audit
+
+    def read_audit(self):
+        rows = []
+        for f in self.home.rglob("*.jsonl"):
+            for line in f.read_text().splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    pass
+        return rows
+
+    def test_read_script_reports_the_image_path_and_the_login_users_localappdata(self):
+        self.assertIn("exe=[string]$p.ExecutablePath", ak._WIN_READ)
+        self.assertIn("[Environment]::GetFolderPath('LocalApplicationData')", ak._WIN_READ)
+
+    def test_the_app_and_other_names_are_refused_on_msi(self):
+        for name in ("goodqa.exe", "GoodQA.exe", "claude.exe", "codex.exe", "node.exe", "sshd.exe", "svchost.exe",
+                     "goodqa-agentd2.exe", "goodqa-agent.exe", ""):
+            with self.subTest(name=name):
+                self.refused(dict(self.AGENTD, name=name), detail="only an orphaned")
+        # the app at the exact place it is installed: only the name rule refuses it
+        app = "C:\\Program Files\\goodqa\\goodqa.exe"
+        for exe in (app, "C:\\Program Files\\goodqa\\resources\\agent\\goodqa.exe",
+                    self.LAD + "\\GoodQA\\agent\\bin\\0.2.52\\goodqa.exe"):
+            with self.subTest(exe=exe):
+                self.refused(dict(self.AGENTD, name="goodqa.exe", exe=exe), detail="only an orphaned")
+
+    def test_an_agent_outside_the_install_directories_is_refused(self):
+        lad = self.LAD
+        for exe in (lad + "\\GoodQA\\agent\\bin2\\goodqa-agentd.exe",
+                    lad + "\\GoodQA\\agent\\goodqa-agentd.exe",
+                    lad + "\\GoodQA\\agent\\bin\\..\\..\\..\\Temp\\goodqa-agentd.exe",
+                    lad + "\\GoodQA\\agent\\bin\\\\goodqa-agentd.exe",
+                    lad.replace("\\", "/") + "/GoodQA/agent/bin/0.2.52/goodqa-agentd.exe",
+                    "C:\\Users\\other\\AppData\\Local\\GoodQA\\agent\\bin\\0.2.52\\goodqa-agentd.exe",
+                    "C:\\Temp\\goodqa-agentd.exe",
+                    "C:\\Program Files\\goodqa\\resources\\agent2\\goodqa-agentd.exe",
+                    "C:\\Program Files\\goodqa\\resources\\agent\\",
+                    "\\\\server\\share\\GoodQA\\agent\\bin\\goodqa-agentd.exe",
+                    "\\GoodQA\\agent\\bin\\0.2.52\\goodqa-agentd.exe",
+                    lad + "\\GoodQA\\agent\\bin\\0.2.52\\evil.exe",
+                    "C:\\Program \ufb01les\\goodqa\\resources\\agent\\goodqa-agentd.exe",  # fi ligature: other dir
+                    lad + "\\GoodQA\\agent\\b\u0130n\\0.2.52\\goodqa-agentd.exe",  # dotted capital I
+                    "", None, 42):
+            with self.subTest(exe=exe):
+                self.refused(dict(self.AGENTD, exe=exe), detail="install directory")
+        for lad_value in ("", None, "C:\\", "relative\\dir", "C:\\Users\\eric\\..\\other\\AppData\\Local"):
+            with self.subTest(lad=lad_value):  # a missing or odd LOCALAPPDATA never yields a usable prefix
+                # the image sits exactly where that LOCALAPPDATA would put it (C:\GoodQA\agent\bin\... for "C:\")
+                exe = (lad_value or "").rstrip("\\") + "\\GoodQA\\agent\\bin\\0.2.52\\goodqa-agentd.exe"
+                self.refused(dict(self.AGENTD, lad=lad_value, exe=exe), detail="install directory")
+
+    def test_an_agent_owned_by_another_user_or_in_the_session_is_refused(self):
+        self.refused(dict(self.AGENTD, mine=False, owner="NT AUTHORITY\\SYSTEM"), detail="another user")
+        self.refused(dict(self.MACHINE, mine=False, owner="MSI\\other"), detail="another user")
+        self.refused(dict(self.AGENTD, self=True), detail="ssh session")
+
+    def test_a_look_alike_host_is_refused(self):
+        remote = FakeWindowsRemote({8476: self.AGENTD})
+        with self.assertRaises(ak.KillError) as caught:
+            self.run_kill(remote, host="ah-msi2")
+        self.assertEqual(caught.exception.code, "bad_request")
+        self.assertEqual(remote.calls, [])
+
+    def test_spectre_keeps_the_shell_only_allowlist(self):
+        self.refused(dict(self.AGENTD, owner="SPECTRE\\lab"), host="ah-spectre", detail="not goodqa-agentd")
+        self.refused(self.MACHINE, host="ah-spectre", detail="not goodqa-machine")
+
+    def test_the_notice_and_audit_keep_the_callers_agent_id_on_both_hosts(self):
+        # PR 264 v1 review F1: the allowlist flag must not overwrite the caller's agent argument
+        for host, proc in (("ah-msi", self.AGENTD), ("ah-spectre", WindowsHost.PS)):
+            for session in ("", "sess-1"):
+                with self.subTest(host=host, session=session):
+                    self.notices = []
+                    shutil.rmtree(self.home, True)
+                    remote = FakeWindowsRemote({8476: proc})
+                    out = ak.kill_remote(host, [8476], "stale", False, 5, session, "agent-a1", home=self.home,
+                                         runner=remote, foreign=True, notify=lambda h, e: self.notices.append(e))
+                    self.assertTrue(out["ok"], out)
+                    self.assertEqual(len(self.notices), 1)
+                    notice = self.notices[0]
+                    self.assertEqual(notice["detail"]["caller"], {"session": session or None, "agent": "agent-a1"})
+                    self.assertTrue(notice["key"].endswith("-" + (session[:12] or "agent-a1")), notice["key"])
+                    rows = self.read_audit()
+                    self.assertTrue(rows)
+                    for row in rows:
+                        if "caller" in row:
+                            self.assertEqual(row["caller"]["agent"], "agent-a1", row)
+
+    def test_the_answer_shape_observed_live_on_ah_msi(self):
+        # REALLY_TESTED ah-kill-msi-ps-read (2026-11-15): _WIN_READ as ah_kill builds it, read only, on ah-msi. The
+        # answers below are those, with the user folder and account replaced by "user" and cmd shortened.
+        lad = "C:\\Users\\user\\AppData\\Local"
+        app = {"found": True, "pid": 8476, "ppid": 25340, "name": "goodqa.exe",
+               "created": "2026-11-15T22:30:27.9682160Z", "cmd": "goodqa.exe", "owner": "MSI-Desktop\\user",
+               "mine": True, "self": False, "orphan": False,
+               "exe": lad + "\\Programs\\goodqa\\goodqa.exe", "lad": lad}
+        agentd = dict(app, ppid=121316, name="goodqa-agentd.exe", created="2026-11-08T04:23:55.3215470Z",
+                      cmd="goodqa-agentd.exe", exe=lad + "\\GoodQA\\agent\\bin\\0.2.52\\goodqa-agentd.exe")
+        for proc in (app, agentd):
+            self.assertEqual({k: type(v).__name__ for k, v in proc.items()},
+                             {"found": "bool", "pid": "int", "ppid": "int", "name": "str", "created": "str",
+                              "cmd": "str", "owner": "str", "mine": "bool", "self": "bool", "orphan": "bool",
+                              "exe": "str", "lad": "str"})
+        # the per-user app install (LOCALAPPDATA\Programs\goodqa) is refused by name, wherever it runs from
+        self.refused(app, detail="only an orphaned")
+        self.notices = []
+        remote = FakeWindowsRemote({8476: agentd})
+        out = self.run_kill(remote)
+        self.assertEqual(out["results"][0]["status"], "stopped", out)  # the stale agentd, parent alive, is admitted
+        self.assertEqual(remote.stopped, [8476])
+
+    def test_shells_on_msi_still_need_the_orphan_rule(self):
+        shell = dict(WindowsHost.PS, owner="MSI\\eric")
+        self.refused(dict(shell, orphan=False), detail="still running")
+        remote = FakeWindowsRemote({8476: shell})
+        self.assertEqual(self.run_kill(remote)["results"][0]["status"], "stopped")
+
+    def test_guard_admits_msi_for_main_only(self):
+        cmd = "python3 -I ~/.claude/hooks/ah.py kill --pid 8476 --reason stale-agent --host ah-msi --foreign"
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True)[0], "allow")
+            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=False)[0], "block")
+            for look in ("ah-msi2", "ah-ms", "AH-MSI", "ah-msi.local"):
+                with self.subTest(host=look):
+                    self.assertEqual(kg.decide(cmd.replace("ah-msi", look), cwd=tmp, policy=kg.load_policy(),
+                                               home=tmp, main=True)[0], "block")
+
+
 class GuardRule(unittest.TestCase):
     A = "python3 -I ~/.claude/hooks/ah.py kill "
 
