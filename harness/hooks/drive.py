@@ -818,7 +818,7 @@ def ops_alerts(home: Path, now=None) -> list:
     with contextlib.suppress(Exception):
         for r in owner_results:
             if r.get("action") in ("stuck", "launch-failed", "error", "bypass-stop-failed",
-                                   "bypass-stop-unconfirmed"):
+                                   "bypass-stop-unconfirmed", "tick-stuck"):
                 out.append({"check": "drive", "key": f"owner:{r['goal']}:{r['action']}", "severity": "high",
                             "message": f"owner {r['goal']}: {r['action']} ({ort.clean(r.get('reason'), 160)})",
                             "detail": {"stop_block": False}})

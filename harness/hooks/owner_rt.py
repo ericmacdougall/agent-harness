@@ -1169,20 +1169,34 @@ def end_lapsed_bypass(home: Path, goal: str, state: dict, cfg: dict, sessions, n
     return out
 
 
-def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, sessions: list, now: float, runner=_run,
+def _list_or_error(cfg: dict, runner=_run):
+    """(sessions, '') or (None, why): the session listing, or the reason it was refused (receipt v6 F2)."""
+    try:
+        return bg_sessions(cfg, runner), ""
+    except Exception as exc:  # noqa: BLE001 - no listing, no launch; the caller logs why
+        return None, "session listing refused, nothing launched: " + clean(str(exc), 200)
+
+
+def tick_one(home: Path, goal: str, goal_row: dict, cfg: dict, now: float, runner=_run,
              dry_run: bool = False) -> dict:
     out = {"goal": goal, "action": "none", "reason": ""}
+    # receipt v9: every read that decides anything here is taken after this goal's lock is held, in this order: the
+    # owner state, the grant (v8 F1: resolved once; that one result decides the lapse check and the launch mode, and
+    # the launch re-checks it), and the session listing. None of them is carried in from before the lock.
     with locked(home, goal):
         state = load_state(home, goal)
-        # receipt v8 F1: the grant is resolved once, under this goal's lock, and that one result decides both the lapse
-        # check and the launch mode; a revoke landing later is caught by the re-check right before the launch, and a
-        # held bypass record is never cleared on the strength of a second, different resolution
         grant = bypass_grant(home, goal, now)
+        sessions, listing_error = _list_or_error(cfg, runner)
         ended = end_lapsed_bypass(home, goal, state, cfg, sessions, now, runner, dry_run, grant=grant)
         if ended is not None and ended["action"] != "bypass-ended":
             return ended  # a lapsed bypass session not shown stopped: nothing else runs for this owner
         if ended is not None:
             return ended  # stopped this tick; the next tick relaunches in the configured mode when work is due
+        if listing_error:  # no listing, no launch: this owner's log says why
+            _append(goal_dir(home, goal) / "launch.log", {"ts": now, "at": now_iso(now), "code": None,
+                                                         "launched": False, "out": listing_error})
+            out.update(action="error", reason=listing_error)
+            return out
         if goal_done(goal_row):
             out["reason"] = "goal done"
             return out
@@ -1304,6 +1318,8 @@ def _end_lapsed(home: Path, goals, cfg: dict, now: float, runner=_run, dry_run: 
     for g in goals:
         try:
             with locked(home, g):
+                if not (goal_dir(home, g) / "state.json").exists():
+                    continue  # no owner state: nothing was launched for it
                 st = load_state(home, g)
                 r = end_lapsed_bypass(home, g, st, cfg, sessions, now, runner, dry_run)
             if r is not None:
@@ -1335,48 +1351,67 @@ def owner_goals(home: Path) -> list:
                   and (p / "state.json").exists())
 
 
+TICK_STUCK_S = 900  # a tick lock held longer than this is reported as stuck (high alert), not just busy
+
+
 def tick(home: Path, now=None, runner=_run, dry_run: bool = False, only: str = "") -> list:
+    """Receipt v9: one tick at a time. Every entry point (the `tick` command, `task add --wake`, drive.ops_alerts for
+    ops-watch) comes through here and takes the process-wide tick lock without waiting; a second tick returns at once
+    with `tick-busy` (or `tick-stuck` when the holder has run for over TICK_STUCK_S) and writes owners/tick.log."""
     now = time.time() if now is None else now
-    cfg = runtime(home)
-    goals = mission_goals(home)
     names = [g for g in owner_goals(home) if not only or g == only]
     if not names:
         return []
-    lapsed = []
-    for g in names:
+    root = owners_root(home)
+    fd = os.open(str(root / ".tick.lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
         try:
-            if bypass_lapse(home, load_state(home, g), now):
-                lapsed.append(g)
-        except Exception:  # noqa: BLE001 - unknown is reported by _end_lapsed, never read as "no bypass session"
-            if (goal_dir(home, g) / "state.json").exists():
-                lapsed.append(g)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return _tick_refused(home, now)
+        _atomic(root / "tick.holder.json", {"pid": os.getpid(), "since": time.time()})
+        return _tick_locked(home, names, now, runner, dry_run)
+    finally:
+        os.close(fd)
+
+
+def _tick_refused(home: Path, now: float) -> list:
+    root = owners_root(home)
+    holder = {}
+    with contextlib.suppress(Exception):
+        holder = json.loads(_read(root / "tick.holder.json", 4096).decode("utf-8"))
+    since = holder.get("since") if isinstance(holder, dict) else None
+    age = time.time() - since if isinstance(since, (int, float)) else None
+    action = "tick-stuck" if age is not None and age > TICK_STUCK_S else "tick-busy"
+    reason = ("another owner tick is running" + (f" (pid {holder.get('pid')}, for {int(age)} s)" if age is not None
+                                                 else "") + "; this tick did nothing")
+    with contextlib.suppress(Exception):
+        _append(root / "tick.log", {"ts": now, "at": now_iso(now), "event": action, "pid": os.getpid(),
+                                    "holder": holder if isinstance(holder, dict) else {}})
+    return [{"goal": "*", "action": action, "reason": reason}]
+
+
+def _tick_locked(home: Path, names: list, now: float, runner=_run, dry_run: bool = False) -> list:
+    cfg = runtime(home)
+    goals = mission_goals(home)
     if not cfg.get("enabled") or not cfg.get("claude"):  # nothing runs a program while disabled (r1 M1) ...
         why = "runtime disabled" if not cfg.get("enabled") else "claude binary not found in " + ", ".join(CLAUDE_DIRS)
-        out = []
-        if lapsed:  # ... except stopping a bypass session whose grant lapsed (receipt v7 F1): it only lowers authority
-            out += _end_lapsed(home, lapsed, cfg, now, runner, dry_run)
-        for g in [g for g in names if g not in lapsed]:
-            with contextlib.suppress(Exception):
+        # ... except stopping a bypass session whose grant lapsed (receipt v7 F1): it only lowers authority. Every
+        # owner is judged under its own lock (receipt v9: no unlocked pre-scan picks which ones).
+        out = _end_lapsed(home, names, cfg, now, runner, dry_run)
+        judged = {r.get("goal") for r in out}
+        for g in [g for g in names if g not in judged]:
+            with contextlib.suppress(Exception), locked(home, g):
                 st = load_state(home, g)
                 reason = due_reason(home, g, st, now)
                 out.append({"goal": g, "action": "would-launch" if reason and cfg.get("enabled") is False else
                             ("error" if reason else "none"), "reason": (reason + f" ({why})") if reason else
                             "nothing due"})
         return out
-    try:
-        sessions = bg_sessions(cfg, runner)
-    except Exception as exc:  # noqa: BLE001 - receipt v6 F2: no listing, no launch; each owner's log says why
-        reason = "session listing refused, nothing launched: " + clean(str(exc), 200)
-        for g in names:
-            with contextlib.suppress(Exception), locked(home, g) as d:
-                _append(d / "launch.log", {"ts": now, "at": now_iso(now), "code": None, "launched": False,
-                                           "out": reason})
-        out = _end_lapsed(home, lapsed, cfg, now, runner, dry_run, sessions=None)
-        return out + [{"goal": g, "action": "error", "reason": reason} for g in names if g not in lapsed]
     out = []
     for g in names:
         try:
-            out.append(tick_one(home, g, goals.get(g, {}), cfg, sessions, now, runner, dry_run))
+            out.append(tick_one(home, g, goals.get(g, {}), cfg, now, runner, dry_run))
         except Exception as exc:  # noqa: BLE001 - one bad owner never stops the others
             out.append({"goal": g, "action": "error", "reason": clean(str(exc), 200)})
     return out

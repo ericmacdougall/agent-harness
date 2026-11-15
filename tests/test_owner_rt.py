@@ -1195,7 +1195,91 @@ class BypassLapseTests(AuthorityBase):
         self.assertEqual(results["tick"][0]["action"], "launch", results)
         self.assertEqual([r["action"] for r in results["revoke"]["stopped"]], ["bypass-ended"], results)
         self.assertEqual(self.stops(), [["claude", "stop", "c9f43044"]])  # the session it launched is stopped
-        self.assertEqual(ort.load_state(self.home, "solve")["bypass"], {})
+        st = ort.load_state(self.home, "solve")
+        self.assertEqual(st["bypass"], {})
+        # the revoke judged the state it read under the lock, after the launch: the tick's own record survives
+        self.assertEqual((st["launches"][-1]["code"], st["bg_id"]), (0, "c9f43044"))
+
+    def test_v9_second_tick_refuses_while_one_runs_and_is_audited(self):
+        """Receipt v9: one tick at a time. A second tick (any entry point) returns at once, does nothing, and is
+        written to owners/tick.log."""
+        import threading
+        self.t0 = time.time()
+        reached, go, results = threading.Event(), threading.Event(), {}
+
+        def runner(argv, timeout=60, cwd=None):
+            if "--bg" in argv:
+                reached.set()
+                go.wait(10)
+            return self.runner(argv, timeout, cwd)
+        a = threading.Thread(target=lambda: results.__setitem__("a", ort.tick(self.home, now=self.t0, runner=runner)))
+        a.start()
+        try:
+            self.assertTrue(reached.wait(10))
+            calls_before = len(self.calls)
+            b = threading.Thread(target=lambda: results.__setitem__(
+                "b", ort.tick(self.home, now=self.t0 + 1, runner=self.runner)))
+            b.start()
+            b.join(3)
+            self.assertFalse(b.is_alive(), "the second tick waited instead of refusing")
+            self.assertEqual([r["action"] for r in results["b"]], ["tick-busy"], results)
+            self.assertEqual(len(self.calls), calls_before)  # the second tick ran no program at all
+        finally:
+            go.set()
+            a.join(10)
+        self.assertEqual(results["a"][0]["action"], "launch", results)
+        log = [json.loads(x) for x in (self.home / ".agent-harness/owners/tick.log").read_text().splitlines()]
+        self.assertEqual([r["event"] for r in log], ["tick-busy"])
+        self.assertEqual(log[0]["holder"]["pid"], os.getpid())
+        out = ort.tick(self.home, now=self.t0 + 7200, runner=self.runner)  # control: the lock is released
+        self.assertNotEqual(out[0]["action"], "tick-busy")
+
+    def test_v9_tick_lock_held_too_long_is_stuck_and_alerts(self):
+        import fcntl
+        root = self.home / ".agent-harness/owners"
+        fd = os.open(str(root / ".tick.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            (root / "tick.holder.json").write_text(json.dumps({"pid": 1, "since": time.time() - 2 * ort.TICK_STUCK_S}))
+            out = ort.tick(self.home, now=time.time(), runner=self.runner)
+            self.assertEqual([r["action"] for r in out], ["tick-stuck"], out)
+            import drive
+            with mock.patch.object(drive.ort, "mission_goals", return_value={}):
+                keys = [a["key"] for a in drive.ops_alerts(self.home, now=time.time())]
+            self.assertIn("owner:*:tick-stuck", keys)
+        finally:
+            os.close(fd)
+
+    def test_v9_revoke_first_then_tick_decides_on_fresh_reads(self):
+        """Receipt v9 (the other order): the revoke holds the goal lock, mid-stop, when a tick starts. The tick
+        must read the listing, state and grant only after it gets the lock, so it sees the session stopped, the
+        record cleared and the grant gone, and launches in the configured mode."""
+        import threading
+        self.launch_with_bypass(hours=24)
+        reached, go, results = threading.Event(), threading.Event(), {}
+
+        def stopping(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["stop"]:
+                reached.set()
+                go.wait(10)
+            return self.runner(argv, timeout, cwd)
+        b = threading.Thread(target=lambda: results.__setitem__(
+            "revoke", ort.revoke_and_stop(self.home, "*", now=self.t0 + 60, runner=stopping)))
+        b.start()
+        try:
+            self.assertTrue(reached.wait(10))  # the revoke holds the goal lock, inside `claude stop`
+            a = threading.Thread(target=lambda: results.__setitem__(
+                "tick", ort.tick(self.home, now=self.t0 + 2 * 3600, runner=self.runner)))
+            a.start()
+            a.join(0.5)  # it must be waiting for the goal lock, not deciding
+            self.assertNotIn("tick", results)
+        finally:
+            go.set()
+            b.join(10)
+            a.join(10)
+        self.assertEqual([r["action"] for r in results["revoke"]["stopped"]], ["bypass-ended"], results)
+        self.assertEqual(results["tick"][0]["action"], "launch", results)
+        self.assertEqual(results["tick"][0]["permission_mode"], "auto", results)
 
     def test_lapse_session_already_gone_clears_without_stop(self):
         self.launch_with_bypass(hours=2)
