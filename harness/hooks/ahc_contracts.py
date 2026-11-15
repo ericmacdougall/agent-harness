@@ -15,6 +15,8 @@ import json
 import os
 import time
 
+from ahc_crash import crash_after, crash_before
+
 # Bounds from design v3 1.1 (the only numbers here)
 B10_DISPATCHES = 3            # physical dispatches per operation key, in total, the first included
 B37_PROBE_SECONDS = 60        # readback rate per unknown outcome
@@ -134,12 +136,14 @@ class AuthorityLog:
         entry = dict(record, seq=len(rows) + 1, label=self.label)
         try:
             os.makedirs(os.path.dirname(self.path) or ".", mode=0o700, exist_ok=True)
+            crash_before("contracts.authority")
             fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
             try:
                 os.write(fd, (_canon(entry) + "\n").encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            crash_after("contracts.authority")
         except OSError as error:
             raise AuthorityError("authority record not written: %s" % type(error).__name__) from None
         return entry["seq"]
@@ -169,7 +173,9 @@ class Contracts:
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
+        crash_before("contracts.commit")
         self.db.execute("COMMIT")
+        crash_after("contracts.commit")
 
     def _row(self, table, column, value):
         cur = self.db.execute("SELECT * FROM %s WHERE %s=?" % (table, column), (value,))

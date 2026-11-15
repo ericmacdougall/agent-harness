@@ -43,6 +43,7 @@ sys.path.insert(0, str(HERE))
 import ahc_core as core  # noqa: E402
 import ahc_contracts  # noqa: E402
 import ahc_packet  # noqa: E402
+from ahc_crash import crash_after, crash_before  # noqa: E402
 import redact  # noqa: E402
 
 STOP_AFTER = None   # test hook: raise after this state is persisted (simulates a kill)
@@ -416,6 +417,11 @@ class Ledger:
         self.migrate = migrate
         self.paths = paths
         self.path = paths.root / "ledger.sqlite3"
+        if migrate:
+            self._resume_restore()
+        elif self._intent_path().exists():
+            raise SchemaError("the ledger has an interrupted restore; ahc-core completes it at start, this process "
+                              "does not")
         fresh = not self.path.exists()
         self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
@@ -486,6 +492,7 @@ class Ledger:
         file), then prove the copy: integrity_check is ok and every table has the same row count as the source.
         Returns the copy path; raises SchemaError (and the migration does not start) if the copy is not proven."""
         target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, time.time_ns()))
+        crash_before("runner.backup")
         copy = sqlite3.connect(str(target))
         try:
             self.db.backup(copy)
@@ -494,6 +501,7 @@ class Ledger:
         finally:
             copy.close()
         os.chmod(target, 0o600)
+        crash_after("runner.backup")
         if [tuple(row) for row in check] != [("ok",)] or source != copied:
             raise SchemaError("ledger backup %s failed verification (integrity %r, rows %r vs %r); not migrating"
                               % (target.name, [tuple(r) for r in check][:3], source, copied))
@@ -505,18 +513,70 @@ class Ledger:
         names. The connection is reopened on the restored file."""
         self.db.close()
         suffix = ".failed-%d" % time.time_ns()
+        # A durable intent first: a crash between the move-aside and the copy-back leaves no live file, and the next
+        # open would otherwise create an empty ledger over it (AC-18 found this). Ledger.__init__ finishes it.
+        intent = self._intent_path()
+        temp = Path(str(intent) + ".tmp")
+        crash_before("runner.restore_intent")
+        with open(str(temp), "w") as handle:
+            handle.write(json.dumps({"backup": copy.name, "suffix": suffix}, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(intent))
+        crash_after("runner.restore_intent")
+        moved = self._finish_restore(copy, suffix)
+        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        return moved
+
+    def _intent_path(self):
+        return Path(str(self.path) + ".restore-intent")
+
+    def _finish_restore(self, copy, suffix):
+        """Move whatever live database files exist aside under `suffix`, copy the verified backup into place and
+        drop the intent. Idempotent, so a restart after a crash at any step completes the same restore."""
         moved = []
+        crash_before("runner.restore_move")
         for extra in ("", "-wal", "-shm"):
             source = Path(str(self.path) + extra)
             if os.path.lexists(str(source)):
                 target = Path(str(self.path) + suffix + extra)
                 os.rename(str(source), str(target))
                 moved.append(target.name)
-        shutil.copyfile(str(copy), str(self.path))
-        os.chmod(self.path, 0o600)
-        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
+        crash_after("runner.restore_move")
+        crash_before("runner.restore_copy")
+        temp = Path(str(self.path) + ".restoring")
+        shutil.copyfile(str(copy), str(temp))
+        os.chmod(temp, 0o600)
+        with open(str(temp), "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(str(temp), str(self.path))
+        os.unlink(str(self._intent_path()))
+        crash_after("runner.restore_copy")
         return moved
+
+    def _resume_restore(self):
+        """At open: an intent left by a crash inside restore is completed before anything else touches the file.
+        An intent naming a backup that is not beside the ledger is refused (fail closed, nothing created)."""
+        intent = self._intent_path()
+        if not intent.exists():
+            return
+        try:
+            record = json.loads(intent.read_text())
+            name, suffix = record["backup"], record["suffix"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise SchemaError("unreadable interrupted-restore record %s (%s); refusing to open the ledger"
+                              % (intent.name, type(error).__name__))
+        plain = isinstance(name, str) and isinstance(suffix, str) and name not in ("", ".", "..") and \
+            "/" not in name and "\\" not in name and re.match(r"^\.failed-\d+$", suffix)
+        copy = self.path.with_name(name) if plain else None
+        if copy is None or not copy.is_file():
+            raise SchemaError("interrupted-restore record %s names no backup beside the ledger; refusing to open"
+                              % intent.name)
+        logging.getLogger("ahc").warning("completing an interrupted ledger restore from %s", name)
+        # the live file may already be the restored copy (crash after the replace, before the unlink): moving it
+        # aside again and copying the same backup in is harmless and keeps the step idempotent
+        self._finish_restore(copy, suffix)
 
     def close(self):
         self.db.close()
@@ -575,7 +635,12 @@ class _Tx:
         return self.db
 
     def __exit__(self, kind, value, tb):
-        self.db.execute("COMMIT" if kind is None else "ROLLBACK")
+        if kind is None:
+            crash_before("runner.commit")
+            self.db.execute("COMMIT")
+            crash_after("runner.commit")
+        else:
+            self.db.execute("ROLLBACK")
         return False
 
 
@@ -1132,7 +1197,9 @@ class Worker:
                 until = keep_until.get(entry.name, info.st_mtime + PACKET_RETENTION_SECONDS)
                 if now < until:
                     continue
+                crash_before("runner.prune")
                 os.unlink(str(entry))
+                crash_after("runner.prune")
                 removed.append(entry.name)
             except OSError:
                 continue  # retried next pass
@@ -1586,8 +1653,12 @@ def _quarantine(paths, qfile, reason):
         target = target_dir / qfile.name
         if os.path.lexists(str(target)):
             target = target_dir / ("%s.%d.json" % (qfile.stem, time.time_ns()))
-        os.rename(str(qfile), str(target))  # same filesystem: atomic; renames the link, not its referent
+        # the reason first (AC-18): a crash after the rename must still leave the reason beside the quarantined
+        # file, because the alert below is best effort and the queue entry is gone after the rename
         _write_private(target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
+        crash_before("runner.quarantine")
+        os.rename(str(qfile), str(target))  # same filesystem: atomic; renames the link, not its referent
+        crash_after("runner.quarantine")
         return target.name
     except OSError as error:
         log.warning("could not quarantine %s: %s", qfile.name, type(error).__name__)
@@ -1912,7 +1983,9 @@ def _write_inbox(inbox, owner, name, text):
                 handle.write(text)
                 handle.flush()
                 os.fsync(handle.fileno())
+            crash_before("runner.inbox")
             os.rename(tmp, name, src_dir_fd=owner_fd, dst_dir_fd=owner_fd)
+            crash_after("runner.inbox")
         finally:
             os.close(owner_fd)
     finally:
@@ -1991,22 +2064,26 @@ def _write_private(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name("." + path.name + ".tmp")
+    crash_before("runner.write_private")
     fd = _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(tmp, path)
+    crash_after("runner.write_private")
 
 
 def _append_private(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    crash_before("runner.append_private")
     fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     with os.fdopen(fd, "a", encoding="utf-8") as handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
+    crash_after("runner.append_private")
 
 
 # ---------------------------------------------------------------- live dependencies
@@ -2146,6 +2223,7 @@ def stage_packet(paths, stream, expect_sha=None):
     paths.packets.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(str(paths.packets), 0o700)
     target = paths.packets / (sha + ".md")
+    crash_before("runner.stage_packet")
     try:
         fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except FileExistsError:
@@ -2157,6 +2235,7 @@ def stage_packet(paths, stream, expect_sha=None):
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
+    crash_after("runner.stage_packet")
     return target, sha
 
 
