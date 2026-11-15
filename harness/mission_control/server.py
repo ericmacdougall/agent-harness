@@ -496,10 +496,18 @@ class App:
 
     def chat_loop(self) -> None:
         while not self.stop.wait(1.0):
-            try:
-                self.refresh_chat()
-            except Exception as exc:  # noqa: BLE001
-                self.health.error("chat", f"{type(exc).__name__}: {str(exc)[:160]}")
+            self.chat_once()
+
+    def chat_once(self) -> None:
+        """One chat-store read. A failure shows in Source health; the next good read clears it (review PR 234 v3 F1:
+        the row used to stay "error" for good, and the page had no way to know the chat list was current)."""
+        try:
+            self.refresh_chat()
+        except Exception as exc:  # noqa: BLE001
+            self.health.error("chat", f"{type(exc).__name__}: {str(exc)[:160]}")
+            return
+        if self.health.rows.get("chat", {}).get("status") != "ok":
+            self.health.ok("chat", "chat store read")  # once, and again after a recovery: not every second
 
     def refresh_chat(self, force: bool = False) -> None:
         chat = mc_chat.chat_dir(self.root)

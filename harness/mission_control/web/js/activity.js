@@ -1,5 +1,6 @@
 import { getState, subscribe, select, KINDS, pauseFeed, toggleQuiet } from './store.js';
 import { el, button, age, relativeTime } from './ui.js';
+import { feedEmpty, feedCount } from './adapt.js';
 
 export function mountActivity() {
   const list = document.getElementById('activity-list');
@@ -49,18 +50,18 @@ export function mountActivity() {
       }
     });
     if (previousScroll > 16) list.scrollTop = previousScroll + list.scrollHeight - previousHeight;
-    if (!events.length) list.append(el('p', 'empty-state', source.length ? 'No work items match. Choose an event kind above, or show tool activity.' : 'Listening for signals…'));
+    if (!events.length) list.append(el('p', 'empty-state', source.length ? 'No work items match. Choose an event kind above, or show tool activity.' : feedEmpty(state)));
     quiet.setAttribute('aria-pressed', String(state.showQuiet));
     quiet.textContent = state.showQuiet ? 'Hide tool activity' : 'Show tool activity';
     pause.textContent = state.feedPaused ? '▷ Resume feed' : 'Ⅱ Pause feed';
     pause.setAttribute('aria-pressed', String(state.feedPaused));
     buffer.hidden = !state.feedPaused;
     resume.textContent = state.buffered ? `${state.buffered} new signals · resume feed ↓` : 'Feed paused · resume ↓';
-    document.getElementById('activity-summary').textContent = `${events.length} work items${hidden ? ` · ${hidden} tool and lifecycle events hidden` : ''}${state.feedPaused ? ' · paused' : ''}`;
+    document.getElementById('activity-summary').textContent = `${feedCount(state, events.length)} work items${hidden ? ` · ${hidden} tool and lifecycle events hidden` : ''}${state.feedPaused ? ' · paused' : ''}`;
   }
   render(getState(), 'initial');
   subscribe((state, reason) => {
-    if (['event', 'filters', 'feed', 'seed'].includes(reason)) render(state, reason);
+    if (['event', 'filters', 'feed', 'seed', 'truth'].includes(reason)) render(state, reason);
     if (reason === 'tick') list.querySelectorAll('time').forEach(time => { time.textContent = age(time.dateTime, state.now); });
     if (reason === 'event' && state.lastEvent && !state.lastEvent.historic && !state.lastEvent.quiet && !state.feedPaused && state.filters.includes(state.lastEvent.kind)) {
       pending.push(state.lastEvent);

@@ -189,7 +189,9 @@ class Route(ServerHarness):
             return resp.status, {}
 
     def click(self, action="archive", rid="wr1", key="click-key-0001", reason="not wanted any more", **kw):
-        return self.post({"req_id": rid, "action": action, "reason": reason, "client_key": key, "digest": kw.pop("digest", self.req(rid)["digest"]), **kw})
+        # the row is looked up only when no digest is given: after a failed read for another session it is gone (PR 234 v3 F1)
+        digest = kw.pop("digest") if "digest" in kw else self.req(rid)["digest"]
+        return self.post({"req_id": rid, "action": action, "reason": reason, "client_key": key, "digest": digest, **kw})
 
     def test_archive_then_restore_moves_the_row_and_keeps_both_records(self):
         status, value = self.click()

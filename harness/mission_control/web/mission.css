@@ -268,7 +268,7 @@ body[data-tab="topology"] #scene-layer { display: block; }
 .at-risk-item { display: grid; gap: 2px; font-size: 13px; }
 .at-risk-top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .at-risk-badge { font-size: 12px; font-weight: 700; }
-.at-risk-badge.uncovered, .at-risk-badge.stalled { color: var(--bad); }
+.at-risk-badge.uncovered, .at-risk-badge.stalled { color: var(--bad); } .at-risk-badge.unknown { color: var(--warn); }
 .at-risk-title { text-align: left; font-weight: 600; font-size: 14px; }
 .at-risk-reason, .at-risk-since { color: var(--muted); }
 .at-risk-action.none { color: var(--warn); }
