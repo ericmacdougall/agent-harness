@@ -1041,14 +1041,20 @@ def stop_idle_sessions(cfg: dict, state: dict, runner=_run, busy_too: bool = Fal
         live = owner_sessions(state, bg_sessions(cfg, runner))
     except Exception as exc:  # noqa: BLE001
         return "could not list sessions before stopping: " + clean(str(exc), 120)
+    failed = []  # busy_too (a lapsed grant): every session is attempted before anything is reported
     for a in live:
         if not busy_too and not (a.get("status") == "idle" and a.get("state") == "done"):
             return f"session {clean(a.get('id') or a.get('sessionId'), 40)} is working again"
         if not a.get("id"):
-            return f"live session {clean(a.get('sessionId'), 40)} has no id to stop"
-        code, text = runner([cfg["claude"], "stop", str(a["id"])], 30)
-        if code != 0:
-            return f"claude stop {clean(a['id'], 20)} failed ({code}): " + clean(text, 120)
+            failed.append(f"live session {clean(a.get('sessionId'), 40)} has no id to stop")
+        else:
+            code, text = runner([cfg["claude"], "stop", str(a["id"])], 30)
+            if code != 0:
+                failed.append(f"claude stop {clean(a['id'], 20)} failed ({code}): " + clean(text, 120))
+        if failed and not busy_too:
+            return failed[0]
+    if failed:
+        return "; ".join(failed)
     try:
         left = owner_sessions(state, bg_sessions(cfg, runner))
     except Exception as exc:  # noqa: BLE001
@@ -1280,7 +1286,25 @@ def _end_lapsed(home: Path, goals, cfg: dict, now: float, runner=_run, dry_run: 
             if r is not None:
                 out.append(r)
         except Exception as exc:  # noqa: BLE001
-            out.append({"goal": g, "action": "bypass-stop-failed", "reason": clean(str(exc), 200)})
+            out.append({"goal": g, "action": "bypass-stop-unconfirmed",
+                        "reason": "cannot tell whether a lapsed bypass session runs: " + clean(str(exc), 200)})
+    return out
+
+
+def revoke_and_stop(home: Path, scope: str, now=None, runner=_run) -> dict:
+    """revoke-bypass, then at once stop every owner session that grant was covering (receipt v7 F1: a revoke takes
+    effect now, not at the next tick). The result names each stop as ended, failed or unconfirmed."""
+    now = time.time() if now is None else now
+    out = revoke_bypass(home, scope)
+    goals = [g for g in owner_goals(home) if scope in ("*", g)]
+    held = []
+    for g in goals:
+        try:
+            if (load_state(home, g).get("bypass") or {}).get("answer"):
+                held.append(g)
+        except Exception:  # noqa: BLE001 - _end_lapsed reports it
+            held.append(g)
+    out["stopped"] = _end_lapsed(home, held, runtime(home), now, runner) if held else []
     return out
 
 
@@ -1301,8 +1325,11 @@ def tick(home: Path, now=None, runner=_run, dry_run: bool = False, only: str = "
         return []
     lapsed = []
     for g in names:
-        with contextlib.suppress(Exception):
+        try:
             if bypass_lapse(home, load_state(home, g), now):
+                lapsed.append(g)
+        except Exception:  # noqa: BLE001 - unknown is reported by _end_lapsed, never read as "no bypass session"
+            if (goal_dir(home, g) / "state.json").exists():
                 lapsed.append(g)
     if not cfg.get("enabled") or not cfg.get("claude"):  # nothing runs a program while disabled (r1 M1) ...
         why = "runtime disabled" if not cfg.get("enabled") else "claude binary not found in " + ", ".join(CLAUDE_DIRS)
@@ -1745,7 +1772,7 @@ def main(argv=None) -> int:
         elif args.cmd == "grant-bypass":
             out = grant_bypass(home, args.scope, args.hours, args.answer)
         elif args.cmd == "revoke-bypass":
-            out = revoke_bypass(home, args.scope)
+            out = revoke_and_stop(home, args.scope)
         elif args.cmd == "park":
             out = park_goal(home, args.goal, args.until, args.answer)
         elif args.cmd == "unpark":

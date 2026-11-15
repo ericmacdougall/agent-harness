@@ -1053,6 +1053,60 @@ class BypassLapseTests(AuthorityBase):
         out = ort.tick(self.home, now=self.t0 + 4 * 3600, runner=self.runner)  # disabled: nothing else runs
         self.assertEqual(self.calls, [], out)
 
+    def test_lapse_revoke_command_stops_at_once(self):
+        """Receipt v7 F1: revoke-bypass stops the session it covered now, not at the next tick."""
+        self.launch_with_bypass(hours=24)
+        out = ort.revoke_and_stop(self.home, "*", now=self.t0 + 60, runner=self.runner)
+        self.assertEqual(out["removed"], 1)
+        self.assertEqual([r["action"] for r in out["stopped"]], ["bypass-ended"], out)
+        self.assertEqual(self.stops(), [["claude", "stop", "c9f43044"]])
+        self.assertEqual(ort.load_state(self.home, "solve")["bypass"], {})
+        self.calls = []
+        self.stop_code = 1  # nothing left to stop: a second revoke reports nothing and stops nothing
+        self.assertEqual(ort.revoke_and_stop(self.home, "*", now=self.t0 + 90, runner=self.runner)["stopped"], [])
+        self.assertEqual(self.stops(), [])
+
+    def test_lapse_revoke_command_reports_failed_stop(self):
+        self.launch_with_bypass(hours=24)
+        self.stop_code = 1
+        out = ort.revoke_and_stop(self.home, "*", now=self.t0 + 60, runner=self.runner)
+        self.assertEqual([r["action"] for r in out["stopped"]], ["bypass-stop-failed"], out)
+
+    def test_lapse_revoke_of_another_scope_stops_nothing(self):
+        self.launch_with_bypass(hours=24)
+        out = ort.revoke_and_stop(self.home, "leads", now=self.t0 + 60, runner=self.runner)
+        self.assertEqual((out["removed"], out["stopped"], self.stops()), (0, [], []))
+
+    def test_lapse_mission_session_change_stops(self):
+        self.launch_with_bypass(hours=24)
+        import mission_coverage
+        with mock.patch.object(mission_coverage, "mission_session_of",
+                               return_value="bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"):
+            out = ort.tick(self.home, now=self.t0 + 60, runner=self.runner)
+        self.assertEqual(out[0]["action"], "bypass-ended", out)
+
+    def test_lapse_every_session_attempted_before_report(self):
+        self.launch_with_bypass(hours=2)
+        self.live.append({"id": "d0d0d0d0", "sessionId": SID, "pid": 9, "status": "busy", "state": "working",
+                          "name": "owner-solve"})
+        real = self.runner
+
+        def runner(argv, timeout=60, cwd=None):
+            if argv[1:2] == ["stop"] and argv[2] == "c9f43044":
+                self.calls.append(argv)
+                return 1, "stop failed"
+            return real(argv, timeout, cwd)
+        out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=runner)
+        self.assertEqual(out[0]["action"], "bypass-stop-failed", out)
+        self.assertEqual(sorted(c[2] for c in self.stops()), ["c9f43044", "d0d0d0d0"])  # the second one still tried
+
+    def test_lapse_unreadable_state_reported_while_disabled(self):
+        self.launch_with_bypass(hours=2)
+        self.write_runtime({"enabled": False})
+        (self.home / ".agent-harness/owners/solve/state.json").write_text("{not json")
+        out = ort.tick(self.home, now=self.t0 + 3 * 3600, runner=self.runner)
+        self.assertEqual([r["action"] for r in out], ["bypass-stop-unconfirmed"], out)
+
     def test_lapse_session_already_gone_clears_without_stop(self):
         self.launch_with_bypass(hours=2)
         self.live = []

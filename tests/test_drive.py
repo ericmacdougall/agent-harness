@@ -30,6 +30,9 @@ class Base(unittest.TestCase):
         p = mock.patch.dict(os.environ, {"AH_HOME": str(self.home)})
         p.start()
         self.addCleanup(p.stop)
+        p = mock.patch.object(drive, "ticket_facts", return_value={"state": None})  # never the network in tests
+        p.start()
+        self.addCleanup(p.stop)
         (self.home / ".agent-harness" / "mission").mkdir(parents=True)
         self.goals = [
             {"id": "solve", "title": "Solve", "status": "active", "ticket": "goodqa#11", "priority": 1},
@@ -702,6 +705,39 @@ class OpsWatchTests(Base):
         self.assertIn("drive:solve:UNOWNED", keys)
         self.assertIn("drive:leads:IMPORTED", keys)
         self.assertTrue(all(a["severity"] == "high" for a in alerts))
+
+    def test_ops_watch_alerts_on_lapse_actions_and_a_raising_tick(self):
+        """Receipt v7 F1: a lapsed grant not shown stopped, or a tick that never ran, is a high alert."""
+        rows = [{"goal": "solve", "action": "bypass-stop-failed", "reason": "x"},
+                {"goal": "leads", "action": "bypass-stop-unconfirmed", "reason": "y"},
+                {"goal": "pp", "action": "bypass-ended", "reason": "z"}]
+        with mock.patch.object(ort, "tick", return_value=rows):
+            keys = [a["key"] for a in drive.ops_alerts(self.home, now=NOW)]
+        self.assertIn("owner:solve:bypass-stop-failed", keys)
+        self.assertIn("owner:leads:bypass-stop-unconfirmed", keys)
+        self.assertNotIn("owner:pp:bypass-ended", keys)  # a confirmed stop is not an alert
+        with mock.patch.object(ort, "tick", side_effect=RuntimeError("authority.json unreadable")):
+            alerts = drive.ops_alerts(self.home, now=NOW)
+        hit = [a for a in alerts if a["key"] == "owner:tick:error"]
+        self.assertEqual(len(hit), 1, alerts)
+        self.assertEqual(hit[0]["severity"], "high")
+        self.assertIn("no lapsed bypass grant was enforced", hit[0]["message"])
+
+    def test_lapse_check_budget_counts_slow_lookups_as_lapsed(self):
+        snap = {"rows": [{"goal": "solve", "actions": [{"key": f"solve:REVIEW_LOOP:t{i}"} for i in range(3)]}]}
+        now = time.time()
+        rows = [{"key": f"solve:REVIEW_LOOP:t{i}", "kind": "ticket", "ref": f"goodqa#{40 + i}", "ts": now}
+                for i in range(3)]
+        seen = []
+
+        def slow(ref):
+            seen.append(ref)
+            return {"state": "open", "title": "[drive:solve:t%d]" % (int(ref[-2:]) - 40)}
+        with mock.patch.object(drive, "LAPSE_BUDGET_S", -1.0):  # budget already spent: no lookup at all
+            void = drive.lapsed_responses(self.home, snap, rows, now, MISSION, ticket_check=slow)
+        self.assertEqual((seen, len(void)), ([], 3))
+        void = drive.lapsed_responses(self.home, snap, rows, now, MISSION, ticket_check=slow)  # control
+        self.assertEqual((len(seen), void), (3, []))
 
 
 class McTests(Base):

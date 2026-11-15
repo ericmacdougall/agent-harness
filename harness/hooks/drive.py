@@ -60,6 +60,7 @@ sys.path.insert(0, str(HERE))
 import owner_rt as ort  # noqa: E402
 
 RESPONSE_TTL_S = 4 * 3600
+LAPSE_BUDGET_S = 20.0  # total GoodQA time one full tick spends re-checking ticket responses (10 s per lookup at most)
 SNAPSHOT_MAX_S = 30 * 60
 MAX_STOP_BLOCKS = 3
 CONDITIONS = ("IMPORTED", "UNOWNED", "STALLED", "STUCK", "HELP_OPEN", "BLOCKED_USER", "REVIEW_LOOP",
@@ -475,6 +476,7 @@ def lapsed_responses(home: Path, snapshot: dict, responses: list, now: float, se
     condition."""
     current = {a.get("key") for r in snapshot.get("rows") or [] for a in r.get("actions") or []}
     facts_of, asks, out = {}, None, []
+    deadline = time.monotonic() + LAPSE_BUDGET_S  # GoodQA lookups past the budget count as unknown: lapsed
     for x in responses:
         key, kind, ts = x.get("key"), x.get("kind"), x.get("ts")
         if key not in current or kind not in ("ticket", "ask") or not isinstance(ts, (int, float)) \
@@ -485,6 +487,8 @@ def lapsed_responses(home: Path, snapshot: dict, responses: list, now: float, se
             if kind == "ticket":
                 ref = str(x.get("ref") or "")
                 if ref not in facts_of:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("lapse check budget spent")
                     got = (ticket_check or ticket_facts)(ref)
                     facts_of[ref] = got if isinstance(got, dict) else {"state": None}
                 parts = str(key).split(":", 2)
@@ -803,8 +807,16 @@ def ops_alerts(home: Path, now=None) -> list:
     """ops_watch.check_drive: owner_rt tick, then the drive tick, then one high alert per unanswered action."""
     now = time.time() if now is None else now
     out = []
+    try:
+        owner_results = ort.tick(home, now=now)
+    except Exception as exc:  # noqa: BLE001 - receipt v7 F1: no tick means no lapse enforcement: say so
+        owner_results = []
+        out.append({"check": "drive", "key": "owner:tick:error", "severity": "high",
+                    "message": "owner_rt tick raised; no owner was launched or stopped and no lapsed bypass grant "
+                               "was enforced: " + ort.clean(f"{type(exc).__name__}: {exc}", 160),
+                    "detail": {"stop_block": False}})
     with contextlib.suppress(Exception):
-        for r in ort.tick(home, now=now):
+        for r in owner_results:
             if r.get("action") in ("stuck", "launch-failed", "error", "bypass-stop-failed",
                                    "bypass-stop-unconfirmed"):
                 out.append({"check": "drive", "key": f"owner:{r['goal']}:{r['action']}", "severity": "high",
