@@ -55,8 +55,9 @@ class Runner:
 
     # Each shape returns the argv or raises Refused. Arguments are validated before they are placed.
     def argv(self, kind: str, *args) -> list[str]:
-        if kind == "ah-owners" and not args:
-            return [self.python, "-I", self.ah, "owners"]
+        if kind == "ah-owners" and len(args) == 1 and SESSION_RE.match(str(args[0])):
+            # always pinned (goodqa#15961): without --session ah follows the newest WAL, Codex sessions included
+            return [self.python, "-I", self.ah, "owners", "--session", str(args[0])]
         if kind == "ah-sessions" and not args:
             return [self.python, "-I", self.ah, "sessions"]
         if kind == "ah-ticket-comments" and len(args) == 1 and TICKET_RE.match(str(args[0])):
@@ -206,7 +207,9 @@ class Reader:
         Never opens turns, inboxes, outboxes or arbitrary paths from the status payload.
         A failed scan is distinct from a healthy empty directory.
         """
-        root = Path(os.path.abspath(root))
+        # realpath, as the roots themselves are (Reader.__init__): a home under a symlinked folder (macOS /var ->
+        # /private/var) is the same root, and the walk below must start from the real path to pass O_NOFOLLOW
+        root = Path(os.path.realpath(root))
         if credential_path(root) or root not in self.roots:
             raise Refused('owner root is outside the readable roots')
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW

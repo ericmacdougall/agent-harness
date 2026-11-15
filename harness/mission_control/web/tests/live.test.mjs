@@ -60,6 +60,20 @@ test('a refused stream goes offline and reconnects with a new stream, not a poll
   live.stop();
 });
 
+test('a ledger read for another session reloads the state once (goodqa#15961 review A-7)', async () => {
+  state.pin = { display: 'sess-1' };
+  await live.start();
+  const es = sources[sources.length - 1];
+  fetches.length = 0;
+  es.emit('ledger', { session: 'sess-1', goals: { items: [] }, requirements: { items: [] }, status: {} });
+  assert.deepEqual(fetches, [], 'same session: no reload');
+  es.emit('ledger', { session: 'sess-2', goals: { items: [] }, requirements: { items: [] }, status: {} });
+  await new Promise(resolve => realSet(resolve, 0));
+  assert.deepEqual(fetches, ['/api/state'], 'the pin moved: one state reload');
+  delete state.pin;
+  live.stop();
+});
+
 test('a 401 on state shows signed out', async () => {
   globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({}) });
   await live.start();

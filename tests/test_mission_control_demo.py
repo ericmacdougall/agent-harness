@@ -106,7 +106,11 @@ class Guards(Base):
         self.assertEqual(len(app.asks.items), len(demo.ASKS))  # canned "Needs you" fixture, no process
         with self.assertRaises(PermissionError):
             app.runner.run("remote-wal-probe")
-        self.assertEqual(len(app.owners.rows), len(demo.OWNERS) + len(demo.HELPERS))
+        # The fixture `ah owners` also lists sub-agents and reviewers (goodqa#15950), as the real one does.
+        helpers = len(demo.SUBAGENTS) + (1 if demo.cycling_live(now) else 0)
+        self.assertEqual(len(app.owners.rows), len(demo.OWNERS) + len(demo.HELPERS) + helpers)
+        self.assertEqual(app.health.rows["org-graph"]["status"], "ok")
+        self.assertTrue(app.org.snapshot()["nodes"], "the org graph is built from the fixture transcripts")
         states = {r["agent_id"]: r for r in app.owners.rows}
         self.assertTrue(states["a4held0demo"]["disposition"]["live"], "a held owner is in the fixture")
         self.assertEqual(app.health.rows["github"]["status"], "error", "the failing source is in the fixture")
@@ -230,10 +234,16 @@ class Http(Base):
     def test_fixture_initiatives_have_milestones_and_computed_percentages(self):
         # AC-17: each listed milestone renders, and the shown percentage is computed from the counts.
         self.app.initiatives.run(time.time())
+        # PR 243 review F1: before the first owner read the restricted set is unknown, so ticketed rows are withheld
+        self.assertEqual([r for r in self.app.hub.snapshots["initiatives"]["items"] if r.get("ticket")], [])
+        self.app.owners.run(time.time())
+        self.app.initiatives.publish(None)
         snapshot = self.app.hub.snapshots["initiatives"]
         self.assertNotIn(str(Path.home()), json.dumps(snapshot))  # no file paths reach a demo session
         rows = {row["ticket"]: row for row in snapshot["items"]}
-        self.assertEqual(len(rows), 5)
+        fixture = ("demo#101", "demo#104", "demo#103", "demo#109", "demo#108")   # live owners' rows join these
+        self.assertTrue(set(fixture) <= set(rows), sorted(rows))
+        rows = {k: rows[k] for k in fixture}
         self.assertEqual([i["done"] for i in rows["demo#101"]["milestone_items"]], [True] * 5 + [False] * 3)
         self.assertEqual(len(rows["demo#104"]["milestone_items"]), 4)
         self.assertEqual({k: rows[k]["pct"] for k in rows},

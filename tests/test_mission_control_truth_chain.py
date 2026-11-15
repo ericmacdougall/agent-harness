@@ -361,7 +361,7 @@ class Outputs:
             return 0, json.dumps({"read": read, "items": [{"id": "wask00000001", "note": "Q? (goodqa#1)", "owner": "agent-" + HEX, "at": stamp()}],
                                   "blocked": [], "resolved": []})
         if kind == "ah-goals":
-            return 0, json.dumps({"state": "ok", "warnings": [], "goals": [{"id": "g1", "title": "G", "state": "UNKNOWN"}]})
+            return 0, json.dumps({"state": "ok", "mission_session": SID, "warnings": [], "goals": [{"id": "g1", "title": "G", "state": "UNKNOWN"}]})
         if kind == "ah-requirements":
             return 0, json.dumps({"read": read, "total": 1, "truncated": False,
                                   "requirements": [{"id": "r1", "text": "R", "at": stamp(), "ticket": "goodqa#1"}]})
@@ -482,6 +482,20 @@ class Trace:
                     trace.stack.pop()
             return wrapped
         self.patches += [mock.patch.object(col.Truth, "publish", outside(real_publish_truth)), mock.patch.object(col.Truth, "reads", outside(real_reads))]
+        # the session pin (PR 243, goodqa#15961) is resolved by the App itself: traced as the source "session-pin", and
+        # every collector that resolves it is recorded as reading it
+        real_pin = mcs.App.pin
+
+        def pin(app_, *args, **kwargs):
+            reader = trace.active()
+            if reader is not None and reader.name not in ("truth", "session-pin"):
+                trace.cross.add((reader.name, "session-pin", "pin"))
+            trace.stack.append(Named("session-pin"))
+            try:
+                return real_pin(app_, *args, **kwargs)
+            finally:
+                trace.stack.pop()
+        self.patches.append(mock.patch.object(mcs.App, "pin", pin))
         # the chat store is read by the App itself, not by a Collector: its methods are traced as the source "chat"
         for method in ("chat_once", "refresh_chat", "chat_snapshot"):
             def as_chat(real=getattr(mcs.App, method)):
@@ -512,11 +526,13 @@ class DerivedFeeds(unittest.TestCase):
     row, a snapshot or a read between collectors exists that FEEDS, NOT_A_FEED or SAFE_READS does not account for:
     that is how a stacked change (an owner-policy row, a session pin, an org graph) is made to declare itself."""
 
-    DATA_SNAPSHOTS = {"owners": "owners", "asks": "asks", "initiatives": "initiatives", "chat": "chat"}
+    DATA_SNAPSHOTS = {"owners": "owners", "asks": "asks", "initiatives": "initiatives", "chat": "chat", "orggraph": "orggraph"}
     META_SNAPSHOTS = {"health", "reads", "ledger"}
-    STATE_META = {"version", "started", "host", "health", "limits", "reads", "requirement_actions", "events", "ledger"}
+    # pin: which session Mission Control follows and may write against (goodqa#15961); its row is session-pin
+    STATE_META = {"version", "started", "host", "health", "limits", "reads", "requirement_actions", "events", "ledger", "pin"}
     # a row one collector writes about something other than its own rows
-    ROW_ROLES = {("owners", "main-session"): "what the owners read knows of main's session: it feeds the session-scoped datasets"}
+    ROW_ROLES = {}
+    SESSION_READS = ("session", "pin")   # reading which session the reads are for: the dataset rests on session-pin
 
     def run_app(self):
         tmp = tempfile.TemporaryDirectory(prefix="mc-chain-")
@@ -527,6 +543,7 @@ class DerivedFeeds(unittest.TestCase):
         (claude / SID).mkdir(parents=True)
         (codex / "thread-00000001").mkdir(parents=True)
         (claude / SID / f"agent-{HEX}.jsonl").write_text(json.dumps({"event": "intent", "note": "start", "at": stamp()}) + "\n")
+        (claude / SID / "main.jsonl").write_text(json.dumps({"event": "intent", "note": "main", "at": stamp()}) + "\n")  # a pinnable session
         (codex / "thread-00000001" / "main.jsonl").write_text(json.dumps({"event": "result", "note": "done", "at": stamp()}) + "\n")
         supervised = home / ".agent-harness" / "codex-owners" / "worker-a"
         supervised.mkdir(parents=True)
@@ -576,11 +593,13 @@ class DerivedFeeds(unittest.TestCase):
         # when its read took one
         beside = self.sources_of("ledger", trace) - {"ledger"}
         for part in ("goals", "requirements", "status"):
-            derived[part] = {f"ledger:{part}"} | beside | ({"main-session"} if part in trace.session_parts else set())
-        # every read of main's session is declared: the dataset its reader publishes rests on main-session
+            derived[part] = {f"ledger:{part}"} | beside | ({"session-pin"} if part in trace.session_parts else set())
+        # every read of the pinned session is declared: the dataset its reader publishes rests on session-pin
         for reader, provider, attribute in trace.cross:
-            if attribute == "session" and reader in self.DATA_SNAPSHOTS:
-                derived[self.DATA_SNAPSHOTS[reader]].add("main-session")
+            if attribute in self.SESSION_READS:
+                for snapshot, writers in trace.snapshots.items():
+                    if snapshot in self.DATA_SNAPSHOTS and reader in writers:
+                        derived[self.DATA_SNAPSHOTS[snapshot]].add("session-pin")
         self.assertEqual({k: sorted(v) for k, v in derived.items()}, {k: sorted(v) for k, v in col.FEEDS.items()})
         self.assertEqual(sorted(trace.unattributed), [], "a Health row, snapshot or event written by no traced source: give it a "
                                                          "Collector (or trace its writer as a named source) and a line in FEEDS")
@@ -599,11 +618,14 @@ class DerivedFeeds(unittest.TestCase):
                     continue
                 reason = col.SAFE_READS.get((reader, provider, attribute))
                 if reason is None or reason.startswith("covered"):
-                    if attribute != "session":
+                    if attribute not in self.SESSION_READS:
                         todo.append(provider)
         rows = set()
         for name in seen:
             rows |= {name} | {row for row in trace.rows.get(name, ()) if (name, row) not in self.ROW_ROLES}
+        # whatever rests on a source that read for the pin rests on the pin too (the ledger's parts declare it per part)
+        if any((name, "session-pin", "pin") in trace.cross for name in seen if name != "ledger"):
+            rows.add("session-pin")
         return rows
 
     def test_every_read_between_collectors_is_a_feed_or_a_stated_exemption(self):
@@ -612,7 +634,7 @@ class DerivedFeeds(unittest.TestCase):
         self.assertEqual(unknown, [], "a collector reads another's data: add the provider to FEEDS, or the edge to SAFE_READS with its reason")
         for (reader, provider, attribute), reason in col.SAFE_READS.items():
             self.assertTrue(reason.strip())
-            if reason.startswith("covered") and attribute != "session":
+            if reason.startswith("covered") and attribute not in self.SESSION_READS:
                 into = [self.DATA_SNAPSHOTS[s] for s, writers in trace.snapshots.items() if reader in writers and s in self.DATA_SNAPSHOTS]
                 into += ["events"] if reader in trace.events else []
                 for dataset in into:

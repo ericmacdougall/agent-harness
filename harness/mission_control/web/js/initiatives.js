@@ -1,6 +1,6 @@
 import { getState, subscribe, select, highlight } from './store.js';
 import { el, button, progress, checklist, eta, stateClass, age } from './ui.js';
-import { liveFields, atRisk, atRiskEmpty, noProgress, noAction, updatedText, initiativesEmpty, initiativeCount, ownerLineText, claim } from './adapt.js';
+import { liveFields, atRisk, atRiskEmpty, noProgress, noAction, updatedText, initiativesEmpty, initiativeCount, initiativesLine, ownerLineText, claim, noneText } from './adapt.js';
 
 const LABEL = { uncovered: 'UNCOVERED', unknown: 'UNKNOWN', stalled: 'STALLED', moving: 'moving' };
 function sinceText(row, now, state) {
@@ -45,7 +45,8 @@ export function mountInitiatives() {
       const card = el('article', 'initiative-card');
       card.dataset.id = item.id;
       const top = el('div', 'initiative-topline');
-      top.append(el('span', 'ticket-id', item.ticket || 'no ticket'), el('span', `state-badge ${stateClass(item.state)}`, item.state));
+      top.append(el('span', 'ticket-id', item.ticket || 'no ticket'), el('span', `state-badge ${stateClass(item.state)}`, item.state),
+        el('span', 'initiative-source', item.source === 'live' ? 'live' : 'from file'));
       const title = button('initiative-title', '', () => select('initiative', item.id));
       title.setAttribute('aria-label', `Open ${item.initiative} details`);
       title.append(el('span', '', item.initiative), el('span', '', '↗'));
@@ -77,7 +78,18 @@ export function mountInitiatives() {
       else if (/at risk|blocked/i.test(item.state) && item.note) card.append(el('p', 'initiative-note', `↳ ${item.note.slice(0, 160)}`));
       fragment.append(card);
     });
-    if (!state.initiatives.length) fragment.append(el('p', 'empty-state', initiativesEmpty(state)));
+    // Rows come from live owners' GoodQA tickets; the hand-written file only adds plan fields, and its other rows are
+    // hidden once it is over a day old (goodqa#15950). Say both, with the file's age.
+    const ageMs = state.initiativesMtime ? state.now - state.initiativesMtime : null;
+    const old = ageMs !== null && ageMs > 24 * 3600 * 1000;
+    const fileText = state.initiativesMtime ? `the hand-written file was last edited ${age(new Date(state.initiativesMtime).toISOString(), state.now)}` : 'the hand-written file has no known edit time';
+    const fileAge = el('p', `initiatives-file-age${old ? ' stale' : ''}`, initiativesLine(state, fileText));
+    fileAge.id = 'initiatives-file-age';
+    fragment.prepend(fileAge);
+    // PR 234 status truth: "none" only while both sources of these rows (the file and the owner read) are current
+    if (!state.initiatives.length) fragment.append(el('p', 'empty-state', state.initiativesError ? `Initiatives file: ${state.initiativesError}`
+      : claim(state, 'initiatives').truth !== 'current' ? initiativesEmpty(state)
+        : noneText(claim(state, 'initiatives'), 'No live owner holds a ticket yet, and the hand-written file has no current rows.', 'initiatives from live owners')));
     list.replaceChildren(fragment);
     document.getElementById('initiatives-panel').classList.toggle('stale', state.initiativesStale);
     document.getElementById('initiative-count').textContent = initiativeCount(state, state.initiatives.length);

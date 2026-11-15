@@ -134,7 +134,7 @@ const ROWS_ONLY = {
   'chat.js': 'shows the messages on hand; its empty text is instructions, not a claim that there are none',
 };
 const MODULE_EXEMPT = {
-  'main.js': { asks: 'the inspector shows the selected row', chat: 'the session picker lists the sessions on hand', initiatives: 'the inspector shows the selected row' },
+  'main.js': { asks: 'the inspector shows the selected row', chat: 'the session picker lists the sessions on hand', initiatives: 'the inspector shows the selected row', orggraph: 'the inspector shows the selected node\'s fields (its inbox counts fail closed on the server, T243-4)' },
   'needs.js': { chat: 'a reply on hand takes an ask off the waiting count; a missing chat read leaves every ask waiting (adapt.SAFE_READS.needs)' },
   'scene.js': { asks: 'draws a node per row on hand', chat: 'draws the chat node', initiatives: 'draws a node per row on hand', owners: 'draws a node per row on hand; its status line is written by main.js under the progress claim', events: 'animates the events on hand' },
   'initiatives.js': { asks: 'a card adds "N open asks" only when it holds some (adapt.SAFE_READS.initiatives)' },
@@ -182,7 +182,7 @@ test('seeded T243-1: a panel that reads owners under a claim that declares only 
   assert.deepEqual(scan("el('p', '', gate(state, 'initiatives').count(state.initiatives.length + state.owners.length))").ungated, ['owners']);
 });
 test('seeded: a claim id that is not declared is unknown, and so is a dataset the server sent no read for', () => {
-  assert.equal(adapt.claim(world(false), 'topology').truth, 'unknown');
+  assert.equal(adapt.claim(world(false), 'nonesuch').truth, 'unknown');   // ('topology' is declared since T243-3)
   const s = world(false);
   delete s.reads.owners;
   assert.equal(adapt.claim(s, 'owners').truth, 'unknown');
