@@ -173,6 +173,27 @@ test('review v3 F5: after the install, a stream message the snapshot already cov
   server.revision = ahead.revision + 1;
 });
 
+test('review v4 F8: a held message from another process during a load keeps the page not live until that process\'s state installs', async () => {
+  const es = sources[0];
+  assert.equal(store.getState().connection, 'live');
+  es.emit('error');
+  es.emit('open');
+  const load = await nextFetch();                     // load A, answered by process A
+  const fromA = load.at;
+  restart('ff66');                                    // process B is now on the stream
+  es.send('ledger', ledger('process-b-row', 'BLOCKED'));  // held while A's answer is on its way
+  load.answer(snapshot('process-a-snapshot', fromA));
+  await wait(20);
+  assert.notEqual(store.getState().connection, 'live', 'live with process A\'s snapshot and process B\'s stream');
+  const second = await nextFetch();                   // the re-read the B message started
+  await wait(50);
+  assert.notEqual(store.getState().connection, 'live', 'live before process B\'s state installed');
+  second.answer(snapshot('process-b-snapshot', second.at));
+  await wait(20);
+  assert.deepEqual(goals(), ['process-b-snapshot']);
+  assert.equal(store.getState().connection, 'live');
+});
+
 test('a live stream message from another server process marks the page not live and re-reads the state', async () => {
   const es = sources[0];
   assert.equal(store.getState().connection, 'live');

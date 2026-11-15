@@ -669,18 +669,29 @@ class App:
                 "codex": {"available": self.codex.available[0], "reason": self.codex.available[1],
                           "busy": self.codex.busy}}
 
+    # The datasets /api/state serves and the hub publishes under the same names (the stream's event names).
+    STATE_DATASETS = ("initiatives", "owners", "health", "chat", "asks", "ledger", "reads")
+
     def state(self) -> dict:
-        # goodqa#16117 (PR 257 v1 F1): stamped before anything is read, so the stamp is a lower bound. An update
-        # broadcast at or below it was already in the collectors when they were read; one above it may be newer than
-        # the snapshot, and the page replays it (every named snapshot is a full replacement, so replaying is safe).
-        stream = self.hub.position()
+        """goodqa#16117, PR 257 review v4 F7: the datasets are what the hub last broadcast, taken with the stamp in one
+        step under the hub lock (Hub.published), so the snapshot holds exactly the frames at or below its revision. A
+        dataset read from its collector could be newer than the stamp (then an older frame above the stamp
+        overwrites it) or computed before a frame it then misses. A dataset the hub has never published is read from
+        its collector before the lock; no frame of it exists at or below the stamp."""
         self.follow_sessions()  # a page that loads between two passes of the session watch gets the same truth
-        return {"version": VERSION, "stream": stream, "started": ev.iso(self.started), "host": "demo" if self.demo else ev.HOST,
-                "initiatives": self.initiatives.snapshot(), "owners": self.owners.rows,
-                "health": self.health.snapshot(), "events": self.hub.recent(limit=200),
-                "chat": self.chat_snapshot(), "asks": self.asks.snapshot(),
-                "ledger": self.ledger.snapshot(), "requirement_actions": len(self.actions.latest()),
-                "reads": self.truth.reads(),
+        readers = {"initiatives": self.initiatives.snapshot, "owners": lambda: self.owners.rows,
+                   "health": self.health.snapshot, "chat": self.chat_snapshot, "asks": self.asks.snapshot,
+                   "ledger": self.ledger.snapshot, "reads": self.truth.reads}
+        unpublished = {name: readers[name]() for name in self.STATE_DATASETS if name not in self.hub.bodies}
+        bodies, stream, events = self.hub.published(self.STATE_DATASETS)
+        data = {name: json.loads(bodies[name]) if name in bodies else unpublished[name] for name in self.STATE_DATASETS}
+        return {"version": VERSION, "stream": stream, "started": ev.iso(self.started),
+                "host": "demo" if self.demo else ev.HOST,
+                "initiatives": data["initiatives"], "owners": data["owners"],
+                "health": data["health"], "events": events,
+                "chat": data["chat"], "asks": data["asks"],
+                "ledger": data["ledger"], "requirement_actions": len(self.actions.latest()),
+                "reads": data["reads"],
                 "limits": {"chat_max": mc_chat.MAX_TEXT, "approval_note_max": mc_chat.APPROVAL_NOTE_MAX,
                            "approval_ttl_s": mc_chat.APPROVAL_TTL_S}}
 

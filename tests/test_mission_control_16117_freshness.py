@@ -57,25 +57,66 @@ class StreamStamp(unittest.TestCase):
 
 
 class StateCarriesTheStamp(ServerHarness):
-    def test_state_is_stamped_before_it_is_collected(self):
-        hub = self.app.hub
-        hub.snapshot("owners", [])
-        before = hub.seq
-        published = []
+    # review v4 F7: the snapshot must hold exactly what was broadcast up to its stamp. A dataset newer than the stamp
+    # is overwritten by an older frame above the stamp; one older than it is never corrected by a frame at or below it.
+    def frames(self, client):
+        out = []
+        for raw in client.take(0) or []:
+            head, _, rest = raw.decode().partition("\nevent: ")
+            name, _, body = rest.partition("\ndata: ")
+            out.append((int(head.split(".")[-1]), name, json.loads(body)))
+        return out
+
+    def assert_matches_broadcast(self, state, frames, names=("owners", "reads", "health", "initiatives", "asks", "ledger", "chat")):
+        revision = state["stream"]["revision"]
+        for name in names:
+            sent = [data for seq, frame_name, data in frames if frame_name == name and seq <= revision]
+            if sent:
+                self.assertEqual(state[name], sent[-1], f"{name}: the snapshot is not the last {name} frame at or below its stamp {revision}")
+
+    def publish_owners(self, n):
+        rows = [{"id": f"row-{n}"}]
+        self.app.owners.rows = rows
+        self.app.hub.snapshot("owners", rows)
+
+    def test_updates_published_while_the_state_is_collected_match_its_stamp(self):
+        client = self.app.hub.attach()
+        client.maxlen = 10 ** 6
+        self.publish_owners(1)
         real = self.app.initiatives.snapshot
 
-        def snapshot_while_publishing(*args, **kwargs):  # an update published while the state is being collected
-            hub.snapshot("owners", [{"id": "during"}])
-            published.append(hub.seq)
+        def collect_while_publishing(*args, **kwargs):  # two owners updates land while the state is being collected
+            self.publish_owners(2)
+            self.publish_owners(3)
             return real(*args, **kwargs)
 
-        with mock.patch.object(self.app.initiatives, "snapshot", snapshot_while_publishing):
+        with mock.patch.object(self.app.initiatives, "snapshot", collect_while_publishing):
             state = self.app.state()
         self.assertIn("stream", state)
-        self.assertEqual(state["stream"]["generation"], hub.generation)
-        self.assertEqual(state["stream"]["revision"], before, "the stamp is taken before any part is read")
-        self.assertGreater(published[0], state["stream"]["revision"],
-                           "an update published during collection is newer than the stamp, so the page replays it")
+        self.assert_matches_broadcast(state, self.frames(client))
+
+    def test_concurrent_publishes_never_give_a_snapshot_newer_or_older_than_its_stamp(self):
+        client = self.app.hub.attach()
+        client.maxlen = 10 ** 6
+        self.publish_owners(0)
+        stop = threading.Event()
+
+        def publisher():
+            n = 1
+            while not stop.is_set() and n < 20000:
+                self.publish_owners(n)
+                n += 1
+
+        thread = threading.Thread(target=publisher, daemon=True)
+        thread.start()
+        try:
+            states = [self.app.state() for _ in range(60)]
+        finally:
+            stop.set()
+            thread.join(10)
+        frames = self.frames(client)
+        for state in states:
+            self.assert_matches_broadcast(state, frames, names=("owners",))
 
     def test_the_served_state_has_the_stamp(self):
         cookie, _ = self.login()

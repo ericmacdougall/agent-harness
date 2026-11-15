@@ -167,11 +167,25 @@ class Hub:
         self.window = [time.monotonic(), 0]
         self.suppressed = self.suppressed_quiet = 0
         self.snapshots: dict[str, object] = {}
+        self.bodies: dict[str, str] = {}  # each snapshot exactly as it was framed: what /api/state serves (published())
         self.before = None  # called before any data snapshot is pushed (Truth pushes the dataset reads first)
 
     def frame(self, seq: int, name: str, data) -> bytes:
-        body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        return self._frame_body(seq, name, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+    def _frame_body(self, seq: int, name: str, body: str) -> bytes:
         return f"id: {self.generation}.{seq}\nevent: {name}\ndata: {body}\n\n".encode("utf-8")
+
+    def published(self, names, events: int = 200) -> tuple:
+        """(bodies, stamp, events), all taken under the lock in one step (PR 257 review v4 F7): for each name in names
+        that was ever published, the JSON body of its last frame; the stamp {generation, revision} of that instant; and
+        the newest events. Every frame at or below the revision is in what is returned, and every frame above it was
+        framed later, so a page that installs these and applies only frames above the revision never goes back."""
+        with self.lock:
+            bodies = {name: self.bodies[name] for name in names if name in self.bodies}
+            stamp = {"generation": self.generation, "revision": self.seq}
+            recent = [e for _s, e in self.ring][-events:]
+        return bodies, stamp, recent
 
     def position(self) -> dict:
         """The stamp of a snapshot taken from now on: every frame at or below this revision was broadcast before it."""
@@ -218,7 +232,9 @@ class Hub:
         with self.lock:
             self.snapshots[name] = data
             self.seq += 1
-            self._broadcast(self.frame(self.seq, name, data))
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))  # serialized under the lock, as framed
+            self.bodies[name] = body
+            self._broadcast(self._frame_body(self.seq, name, body))
 
     def recent(self, after: int = 0, limit: int = 500) -> list[dict]:
         with self.lock:

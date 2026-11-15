@@ -107,7 +107,9 @@ async function loadState() {
     throw error;
   }
   replayHeld(gen);  // then what the stream sent after the snapshot was taken, in order
-  return true;
+  // review PR 257 v4 F8: the replay can show the snapshot is not this stream's (a held message from another process
+  // starts a re-read and moves loadGen on). Success only while this load is still the authoritative one.
+  return gen === loadGen && !otherProcess;
 }
 
 function installState(state) {
@@ -179,18 +181,20 @@ function connect() {
 
 // Re-read the state after a reopened stream, then show live, unless the stream dropped again meanwhile. A failed
 // read leaves the page not live (every claim at best stale) and tries again, backing off, while the stream stays open.
+let resyncs = 0;
 function resync(delay = 300) {
   clearTimeout(resyncTimer);
+  const mine = ++resyncs;  // only the newest scheduled resync may mark the page live (review PR 257 v4 F8)
   // A load begun before this (re)open may be answered by a process that has since stopped. It is superseded now, not
   // when the next load starts: its answer installs nothing and never marks the page live. What it held stays held
   // until the next load starts, whose snapshot is taken after all of it arrived (goodqa#16117 sweep).
   loadGen += 1;
   resyncTimer = setTimeout(async () => {
     try {
-      if (await loadState() && failures === 0) setConnection('live');
+      if (await loadState() && failures === 0 && mine === resyncs && !otherProcess) setConnection('live');
     } catch {
       // a failed or timed-out read: the page is not live, and it tries again, backing off, while the stream stays open
-      if (failures === 0 && source) { setConnection('reconnecting'); resync(Math.min(30000, delay * 4)); }
+      if (failures === 0 && source && mine === resyncs) { setConnection('reconnecting'); resync(Math.min(30000, delay * 4)); }
     }
   }, delay);
 }
