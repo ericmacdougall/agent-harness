@@ -7,8 +7,12 @@ import { fileURLToPath } from 'node:url';
 const SCRIPT = fileURLToPath(new URL('./truth_scenarios.py', import.meta.url));
 const run = spawnSync(process.env.PYTHON || 'python3', ['-I', SCRIPT, '--feeds'], { encoding: 'utf8', timeout: 60000 });
 if (run.status !== 0) throw new Error(`truth_scenarios.py --feeds failed: ${run.stderr || run.error}`);
-export const FEEDS = JSON.parse(run.stdout);
-export const SOURCES = [...new Set(Object.values(FEEDS).flat().filter(id => !id.startsWith('ledger:')))].sort();
+const declared = JSON.parse(run.stdout);
+// A tree from before the server declared its feeds prints its scenarios instead (the failing-first runs copy this
+// file there): then there are no reads to compose, and the page under test reads the Source health rows itself.
+export const FEEDS = Array.isArray(declared.owners) ? declared : null;
+export const SOURCES = FEEDS ? [...new Set(Object.values(FEEDS).flat().filter(id => !id.startsWith('ledger:')))].sort()
+  : ['asks', 'chat', 'codex-owners', 'initiatives', 'owners', 'wals'];
 const ORDER = ['current', 'partial', 'stale', 'unknown'];
 const rank = truth => (ORDER.includes(truth) ? ORDER.indexOf(truth) : 3);
 
@@ -22,6 +26,7 @@ function fact(state, id) {
   return { id, truth: ORDER[rank(row.truth)], at: row.truth === 'unknown' ? '' : row.okAt || '', error: row.status === 'ok' ? '' : row.detail || row.status };
 }
 export function readsFor(state) {
+  if (!FEEDS) return undefined;
   return Object.fromEntries(Object.entries(FEEDS).map(([dataset, ids]) => {
     const facts = ids.map(id => fact(state, id));
     return [dataset, { truth: ORDER[Math.max(...facts.map(f => rank(f.truth)))], facts }];

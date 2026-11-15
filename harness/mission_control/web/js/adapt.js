@@ -140,9 +140,7 @@ export const STATE_DATASETS = Object.freeze({
 // Reads that are not dependencies, each with the reason: the data can only reveal more, never hide.
 export const SAFE_READS = Object.freeze({
   needs: { chat: 'a reply or decision on its way takes an ask off the waiting count only when its record is on hand; a missing chat read leaves every ask waiting' },
-  initiatives: { asks: 'an initiative card adds "N open asks" only when it holds some', owners: 'covered by the owners and progress claims on the same card', events: 'covered by the progress claim on the same card' },
-  blockers: { chat: 'the Needs-you tile beside it reads replies under its own claim' },
-  goals: { owners: 'the tiles row holds the owners tile under its own claim' },
+  initiatives: { asks: 'an initiative card adds "N open asks" only when it holds some' },
 });
 const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat' };
 const FACT_NAMES = { 'ledger:goals': 'Goal ledger (ah goals)', 'ledger:requirements': 'Requirements (ah requirements)', 'ledger:status': 'Status (ah status)',
@@ -181,7 +179,10 @@ function linkFact(state) {
   return { id: 'connection', name: 'Connection to Mission Control', truth: at ? 'stale' : 'unknown', at,
     error: `not connected (${LINK_WORDS[state.connection] || 'no live stream'})` };
 }
+// A test seam: observe.claim(id) is called for every claim made (tests/truth-gate.test.mjs derives which claims a panel uses).
+export const observe = { claim: null };
 export function claim(state, id) {
+  observe.claim?.(id);
   const s = state || {};
   const datasets = CLAIMS[id] || [];
   const seen = new Set();
@@ -651,7 +652,7 @@ export const hiddenBlockers = status => hiddenRows(status, 'blockers');
 export const hiddenDeals = status => ['pending', 'failed', 'live', 'verified'].reduce((sum, key) => sum + hiddenRows(status, key), 0);
 export function missionTiles(state) {
   const led = state.ledger || ledger(null);
-  const view = { ...state, ledger: led };
+  const view = state.ledger ? state : { ...state, ledger: led };
   const goals = led.goals.items;
   const done = goals.filter(g => GOAL_DONE.has(g.state)).length;
   const liveNotDone = goals.filter(g => GOAL_LIVE_NOT_DONE.has(g.state)).length;

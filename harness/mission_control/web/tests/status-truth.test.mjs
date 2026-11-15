@@ -248,7 +248,7 @@ test('audit: more goals than the server keeps make the goals tile partial, and t
   const s = world();
   s.ledger = ledger({ goals: { items: [{ id: 'g', title: 'one', state: 'DONE_LIVE', evidence: [] }], total: 80, at, truth: 'partial' } });
   assert.equal(tile(s, 'goals').value, '1+ / 80+');
-  assert.match(text(v.goals(s, ui)), /Showing 1 of 80 goals/);
+  assert.match(text(v.goals(s, ui)), /Showing 1 of 80\+ goals/);  // the total is itself a partial read's count
 });
 
 test('audit: ledger blockers beyond the 30 the server holds are counted, not dropped', () => {

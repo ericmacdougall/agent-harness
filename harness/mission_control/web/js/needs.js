@@ -5,7 +5,7 @@
 // `[ask:<id>]`. Main resolves the ask from either, and the next ledger read moves it to the Archive view.
 import { getState, subscribe, askReplyAccess, sendAskReply, decisionAccess, decideAsk, DECISION_NOTE_MAX } from './store.js';
 import { el, button, age } from './ui.js';
-import { trailOf, waitingOnUser, askProgress, replyStatus, decisionOf, decisionStatus, needsSummary } from './adapt.js';
+import { trailOf, waitingOnUser, askProgress, replyStatus, decisionOf, decisionStatus, needsSummary, countText } from './adapt.js';
 
 const BASE_TITLE = 'Mission Control';
 const REPLY_MAX = 3900;
@@ -158,6 +158,7 @@ export function mountNeeds() {
     const shown = key => (key === 'asks' && !showAll ? state.asks.slice(0, ASKS_SHOWN) : state[key]);
     const more = document.getElementById('needs-more');
     more.hidden = state.asks.length <= ASKS_SHOWN;
+    // held: rows on hand that are folded away
     more.textContent = showAll ? 'Show fewer asks' : `Show ${state.asks.length - ASKS_SHOWN} more asks`;
     more.setAttribute('aria-expanded', String(showAll));
     const wanted = new Set(sections.flatMap(section => shown(section.key).map(a => a.id)));
@@ -165,7 +166,7 @@ export function mountNeeds() {
     list.querySelector('.empty-state')?.remove();
     if (!state.asks.length) list.append(el('li', 'empty-state', summary.empty));
     for (const section of sections) {
-      if (section.box) { section.box.hidden = !state[section.key].length; section.count.textContent = String(state[section.key].length); }
+      if (section.box) { section.box.hidden = !state[section.key].length; section.count.textContent = countText(state[section.key].length, summary.claim); }
       shown(section.key).forEach((ask, index) => paintAsk(state, section, ask, index));
     }
   }
@@ -220,6 +221,7 @@ export function mountNeeds() {
       parts.badge.className = `needs-badge ${decision?.decision || ''}`;
       parts.send.hidden = !!armed;
       parts.send.disabled = reply.disabled || sending || !words;
+      // held: whether this page holds a reply of the user's, for the button's wording
       parts.send.textContent = trail.length || decision?.live ? 'Send more' : 'Send reply';
       parts.label.textContent = decision?.live ? 'Add to your answer' : ask.approvable ? 'Your words (optional with a decision)' : 'Your answer';
       parts.input.placeholder = decision?.live ? 'Anything main should know…' : ask.approvable ? 'Add a note, or answer in your own words…' : 'Your answer to main…';
@@ -234,6 +236,7 @@ export function mountNeeds() {
       if (parts.status.textContent !== line) parts.status.textContent = line;
       parts.status.className = `needs-status ${tone}`;
       parts.status.hidden = !line;
+      // held: the characters the user typed
       const hint = noteTooLong && decidable ? `A note on a decision can be ${DECISION_NOTE_MAX} characters; yours is ${words.length}. Send it as a reply instead.` : '';
       parts.hint.textContent = hint;
       parts.hint.hidden = !hint;

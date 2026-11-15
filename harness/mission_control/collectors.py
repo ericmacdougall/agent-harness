@@ -119,7 +119,10 @@ FEEDS = {
     "asks": ("asks", "main-session"),
     "owners": ("owners", "codex-owners", "wals", "native-projects", "native-streams"),
     "initiatives": ("initiatives",),
-    "events": ("wals", "owners", "initiatives", "github", "goodqa", "t2-dev", "sources"),
+    # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
+    # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
+    "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "initiatives", "github", "goodqa",
+               "t2-dev", "sources"),
     "chat": ("chat",),
 }
 # Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
@@ -136,6 +139,8 @@ SAFE_READS = {
     ("owners", "wals", "last_items"): "covered: wals is a feed of owners",
     ("owners", "codex-owners", "rows"): "covered: codex-owners is a feed of owners",
     ("codex-owners", "wals", "last_items"): "a change signal only: decides when to republish, not what",
+    ("goodqa", "initiatives", "items"): "covered: names the tickets to poll; initiatives is a feed of events",
+    ("goodqa", "owners", "tickets"): "covered: names the tickets to poll; owners and its feeds are feeds of events",
     ("ledger", "owners", "session"): "covered: main-session is a feed of the session-scoped datasets",
     ("asks", "owners", "session"): "covered: main-session is a feed of asks",
 }
