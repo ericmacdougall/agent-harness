@@ -84,6 +84,7 @@ def collector(fx, rows, runner=None):
     health = col.Health(hub)
     graph = og.OrgGraph(hub, health, runner or Runner(), owners_fn=lambda: rows, session_fn=lambda: SESSION,
                         transcripts=og.Transcripts(fx.root), escalation_root=None, host="testhost")
+    graph.visibility_fn = lambda: (True, ())   # an owner read landed and restricted nothing
     return graph, hub, health
 
 
@@ -315,16 +316,16 @@ class Changes(unittest.TestCase):
 
     def test_dag_link_change(self):  # AC-4
         prev = og.build(session=SESSION, coordinator={}, agents=[dict(row("o1"), read=True)],
-                        tickets={}, escalation={}, host="h", now=1.0)
+                        tickets={}, escalation={}, host="h", now=1.0, visible=og.ticket_visibility(True, ()))
         cur = og.build(session=SESSION, coordinator={}, agents=[dict(row("o1", ticket="goodqa#1"), read=True)],
-                       tickets={"goodqa#1": {"blocks": ["goodqa#2"]}}, escalation={}, host="h", now=2.0)
+                       tickets={"goodqa#1": {"blocks": ["goodqa#2"]}}, escalation={}, host="h", now=2.0, visible=og.ticket_visibility(True, ()))
         kinds = {c["type"] for c in og.diff(prev, cur, 2.0)}
         self.assertTrue({"added", "dag", "assigned"} <= kinds)
 
     def test_cap_keeps_live_agents(self):  # NEG-6
         agents = [dict(row(f"d{i}", state="done", idle=10), read=False) for i in range(og.MAX_AGENTS + 5)]
         agents.append(dict(row("live1"), read=False))
-        snap = og.build(session=SESSION, coordinator={}, agents=agents, tickets={}, escalation={}, host="h", now=1.0)
+        snap = og.build(session=SESSION, coordinator={}, agents=agents, tickets={}, escalation={}, host="h", now=1.0, visible=og.ticket_visibility(True, ()))
         self.assertIn("live1", nodes(snap))
         self.assertEqual(snap["counts"]["hidden_agents"], 6)
 
@@ -352,6 +353,7 @@ class Demo(unittest.TestCase):
             graph = og.OrgGraph(hub, col.Health(hub), demo.DemoRunner(), owners_fn=lambda: rows,
                                 session_fn=lambda: demo.DEMO_SESSION, transcripts=og.Transcripts(projects),
                                 escalation_root=None, host="demo-host")
+            graph.visibility_fn = lambda: (True, ())   # as the server wires it once the demo owner read lands
             for i in range(10):
                 graph.tick(1000.0 + i)
             snap = graph.snapshot()
@@ -540,7 +542,7 @@ class RestrictedProducerShape(unittest.TestCase):
         agent = {"agent_id": row["agent_id"], "type": row["type"], "state": row["state"], "task": row["task"],
                  "ticket": row["ticket"], "restricted": row["restricted"], "owner_flag": True,
                  "cap_role": row.get("role"), "description": ""}
-        snap = og.build(session="s", coordinator={}, agents=[agent], tickets=tickets, escalation={}, host="h", now=2.0)
+        snap = og.build(session="s", coordinator={}, agents=[agent], tickets=tickets, escalation={}, host="h", now=2.0, visible=og.ticket_visibility(True, ()))
         self.assertNotIn("SECRET", json.dumps(snap))
         self.assertNotIn("goodqa#777", json.dumps(snap))
 
@@ -866,13 +868,18 @@ class PayloadShapes(unittest.TestCase):
                 self.assertTrue(problems, name)
 
     def test_ticket_payloads_of_the_wrong_shape(self):
-        bad = {"title": "T", "status": "open", "links": {"blocks": 5, "blockedBy": "goodqa#2"}, "parent": {"number": "x"}}
-        fx = Fixture()
-        graph, hub, _ = collector(fx, [row("o1", ticket="goodqa#1")], Runner(tickets={"goodqa#1": bad}))
-        graph.run(time.time())   # must not raise
-        stored = graph.tickets.get("goodqa#1")
-        self.assertIsNotNone(stored)
-        self.assertEqual((stored["blocks"], stored["blocked_by"], stored["parent"]), ([], [], ""))
+        """PR 262 review F3: a wrong shape is a failed read (stale, retried, partial), never "no links"."""
+        for name, bad in {"blocks a number": {"title": "T", "status": "open", "links": {"blocks": 5}},
+                          "blockedBy a string": {"title": "T", "status": "open", "links": {"blockedBy": "goodqa#2"}},
+                          "links a list": {"title": "T", "status": "open", "links": []},
+                          "parent a number": {"title": "T", "status": "open", "parent": 7}}.items():
+            with self.subTest(case=name):
+                fx = Fixture()
+                graph, hub, health = collector(fx, [row("o1", ticket="goodqa#1")], Runner(tickets={"goodqa#1": bad}))
+                graph.run(time.time())   # must not raise
+                self.assertNotIn("goodqa#1", graph.tickets, name)
+                self.assertTrue(graph.ticket_stale.get("goodqa#1"), name)
+                self.assertEqual(health.rows["org-graph"]["truth"], "partial", name)
 
     def test_a_ticket_payload_that_breaks_a_walk_is_a_failed_read(self):
         class Odd(Runner):
@@ -882,6 +889,142 @@ class PayloadShapes(unittest.TestCase):
         graph, hub, _ = collector(fx, [row("o1", ticket="goodqa#1")], Odd())
         graph.run(time.time())   # must not raise
         self.assertNotIn("goodqa#1x", json.dumps(graph.tickets))
+
+
+SECRET_REF, SECRET_TITLE = "goodqa#9001", "SECRET hiring loop"
+
+
+def shown_tickets(graph):
+    """What the initiatives are given (visible_tickets); before PR 262's fix, the raw cache was handed over."""
+    return graph.visible_tickets() if hasattr(graph, "visible_tickets") else dict(graph.tickets)
+
+
+class RestrictedTicketRoutes(unittest.TestCase):
+    """PR 262 review F1: a restricted ticket reaches the graph payload by no route. Each case names a different way a
+    ticket id can arrive; the payload must carry no trace of it (id, number, title), and it is never fetched."""
+
+    ROUTES = {
+        "held by an unrestricted agent": dict(rows=[row("o1", ticket=SECRET_REF)], tickets={}),
+        "named in an agent's task": dict(rows=[row("o1", task=f"work on GoodQA {SECRET_REF}")], tickets={}),
+        "blocks link": dict(rows=[row("o1", ticket="goodqa#1")], tickets={"goodqa#1": {"links": {"blocks": [{"number": 9001}]}}}),
+        "blockedBy link": dict(rows=[row("o1", ticket="goodqa#1")], tickets={"goodqa#1": {"links": {"blockedBy": [9001]}}}),
+        "parent link": dict(rows=[row("o1", ticket="goodqa#1")], tickets={"goodqa#1": {"parent": {"number": 9001}}}),
+        "a two-step link": dict(rows=[row("o1", ticket="goodqa#1")], tickets={"goodqa#1": {"links": {"blocks": [2]}},
+                                                                             "goodqa#2": {"links": {"blocks": [9001]}}}),
+    }
+
+    def run_route(self, case, restricted=(SECRET_REF,), known=True, ticks=8):
+        fx = Fixture()
+        tickets = {ref: dict({"title": f"T{ref}", "status": "in_progress"}, **issue) for ref, issue in case["tickets"].items()}
+        tickets[SECRET_REF] = {"title": SECRET_TITLE, "status": "in_progress"}
+        runner = Runner(tickets=tickets)
+        graph, hub, _ = collector(fx, case["rows"], runner)
+        graph.visibility_fn = lambda: (known, restricted)
+        t = 1_000_000.0
+        for i in range(ticks):
+            graph.run(t + i * og.TICKET_TTL_S)
+        return graph, hub, runner
+
+    def assert_no_trace(self, graph, hub, runner, name):
+        blob = json.dumps([graph.snapshot(), [d for _n, d in hub.snaps], shown_tickets(graph)])
+        self.assertNotIn("9001", blob, name)
+        self.assertNotIn("SECRET", blob, name)
+        self.assertNotIn(SECRET_REF, [args[0] for _k, args in runner.calls], f"{name}: fetched")
+
+    def test_no_route_brings_a_restricted_ticket_into_the_payload(self):
+        for name, case in self.ROUTES.items():
+            with self.subTest(route=name):
+                self.assert_no_trace(*self.run_route(case), name)
+
+    def test_control_the_same_routes_show_an_unrestricted_ticket(self):  # the matrix is not vacuous
+        for name, case in self.ROUTES.items():
+            if name == "named in an agent's task":
+                continue   # a ticket named only in task text is drawn when it is the agent's ticket ref (covered above)
+            with self.subTest(route=name):
+                graph, hub, runner = self.run_route(case, restricted=())
+                self.assertIn(SECRET_REF, json.dumps(graph.snapshot()), name)
+
+    def test_before_the_restriction_set_is_known_no_ticket_is_shown_or_fetched(self):
+        graph, hub, runner = self.run_route(self.ROUTES["held by an unrestricted agent"], restricted=(), known=False)
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(nodes(graph.snapshot(), "work"), {})
+        self.assertEqual(shown_tickets(graph), {})
+
+    def test_a_ticket_restricted_after_it_was_cached_is_dropped(self):
+        case = self.ROUTES["blocks link"]
+        state = {"restricted": ()}
+        fx = Fixture()
+        tickets = {"goodqa#1": {"title": "T1", "status": "in_progress", "links": {"blocks": [{"number": 9001}]}},
+                   SECRET_REF: {"title": SECRET_TITLE, "status": "in_progress"}}
+        runner = Runner(tickets=tickets)
+        graph, hub, _ = collector(fx, case["rows"], runner)
+        graph.visibility_fn = lambda: (True, state["restricted"])
+        t = 1_000_000.0
+        for i in range(4):
+            graph.run(t + i * og.TICKET_TTL_S)
+        self.assertIn(SECRET_TITLE, json.dumps(graph.snapshot()))   # cached and shown while it was not restricted
+        state["restricted"] = (SECRET_REF,)
+        hub.snaps.clear()
+        runner.calls.clear()
+        graph.run(t + 10 * og.TICKET_TTL_S)
+        self.assertNotIn(SECRET_REF, graph.tickets)
+        self.assert_no_trace(graph, hub, runner, "restricted after caching")
+
+    def test_the_served_snapshot_follows_a_restriction_made_between_ticks(self):
+        state = {"restricted": ()}
+        fx = Fixture()
+        runner = Runner(tickets={SECRET_REF: {"title": SECRET_TITLE, "status": "in_progress"}})
+        graph, hub, _ = collector(fx, [row("o1", ticket=SECRET_REF, task=f"build {SECRET_REF}")], runner)
+        graph.visibility_fn = lambda: (True, state["restricted"])
+        graph.run(1_000_000.0)
+        graph.run(1_000_000.0 + og.TICKET_TTL_S)
+        self.assertIn(SECRET_TITLE, json.dumps(graph.snapshot()))
+        state["restricted"] = (SECRET_REF,)   # the owner read lands between two org-graph ticks
+        blob = json.dumps(graph.snapshot())
+        self.assertNotIn("9001", blob)
+        self.assertNotIn("SECRET", blob)
+        self.assertEqual(nodes(graph.snapshot())["o1"]["task"], "restricted")
+
+    def test_initiatives_get_only_visible_tickets(self):
+        graph, _hub, _runner = self.run_route(self.ROUTES["blocks link"], restricted=())
+        graph.visibility_fn = lambda: (True, (SECRET_REF,))
+        rows = [dict(row("o1", ticket=SECRET_REF), role="live", source="ah")]
+        out = og.derive_initiatives({"items": [], "mtime": None}, rows, shown_tickets(graph), now=1.0)
+        self.assertNotIn("SECRET", json.dumps(out))
+
+
+class TicketReadsInTheEnvelope(unittest.TestCase):
+    """PR 262 review F3: a failed or malformed ticket read makes the graph read partial and the initiative built on
+    that ticket last known; recovery clears both."""
+
+    def test_good_then_failed_then_malformed_then_good(self):
+        fx = Fixture()
+        good = {"title": "Build it", "status": "in_progress"}
+        runner = Runner(tickets={"goodqa#5": good})
+        graph, hub, health = collector(fx, [row("o1", ticket="goodqa#5")], runner)
+        published = []
+        graph.on_initiatives = lambda: published.append(1)
+        live_rows = [dict(row("o1", ticket="goodqa#5"), role="live", source="ah")]
+
+        def step(at):
+            graph.run(at)
+            item = og.derive_initiatives({"items": [], "mtime": None}, live_rows, shown_tickets(graph), now=at)["items"][0]
+            return health.rows["org-graph"]["truth"], nodes(graph.snapshot(), "work")["work:goodqa#5"]["stale"], item
+        t = 1_000_000.0
+        truth, stale, item = step(t)
+        self.assertEqual((truth, stale, item["state"], item["stale"]), ("current", False, "In progress", False))
+        runner.fail = {"goodqa#5"}
+        before = len(published)
+        truth, stale, item = step(t + og.TICKET_TTL_S + 1)
+        self.assertEqual((truth, stale, item["state"], item["stale"]), ("partial", True, "In progress (last known)", True))
+        self.assertGreater(len(published), before, "the initiatives republish on a failed read")
+        runner.fail = set()
+        runner.tickets["goodqa#5"] = dict(good, links={"blocks": "goodqa#6"})
+        truth, stale, item = step(t + 2 * og.TICKET_TTL_S + 1)
+        self.assertEqual((truth, stale, item["stale"]), ("partial", True, True), "malformed is failed, not current")
+        runner.tickets["goodqa#5"] = dict(good, status="in_review")
+        truth, stale, item = step(t + 3 * og.TICKET_TTL_S + 1)
+        self.assertEqual((truth, stale, item["state"], item["stale"]), ("current", False, "In review", False))
 
 
 class NodeTruthFromOwnerRows(unittest.TestCase):

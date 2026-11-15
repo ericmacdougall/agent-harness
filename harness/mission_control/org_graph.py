@@ -358,10 +358,27 @@ def _owner_of(agent_id: str, agents: dict) -> str | None:
     return None
 
 
+def ticket_visibility(known: bool, restricted) -> "callable":
+    """The one ticket visibility rule (PR 262 review F1): ref -> whether that ticket may reach the graph at all.
+    Before an owner read has said which tickets restricted work is on (`known` False) no ticket may (fail closed).
+    A restricted ticket contributes nothing: no node, title, status, count, edge or fetch."""
+    if not known:
+        return lambda ref: False
+    hidden = {_ticket_key(t) for t in restricted or ()} - {None}
+    return lambda ref: bool(ref) and _ticket_key(ref) is not None and _ticket_key(ref) not in hidden
+
+
+def _names_hidden_ticket(text: str, visible) -> bool:
+    """True when free text (a task or a description) names any ticket that is not visible."""
+    return any(not visible(m.group(0)) for m in re.finditer(r"[A-Za-z0-9-]*#\d+", str(text or "")))
+
+
 def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escalation: dict, host: str,
-          now: float, helpers: tuple = DEFAULT_HELPERS, stale: dict | None = None) -> dict:
+          now: float, visible, helpers: tuple = DEFAULT_HELPERS, stale: dict | None = None) -> dict:
     """agents: dicts with agent_id, type, parent, depth, state, severity, last_activity, task, ticket, restricted,
-    owner_flag and the transcript facts. tickets: ref -> {title, status, parent, blocks, blocked_by, children}."""
+    owner_flag and the transcript facts. tickets: ref -> {title, status, parent, blocks, blocked_by, children}.
+    `visible` (ticket_visibility) is required: it is applied here, the only place a ticket id enters the payload, for
+    every route (an agent's ticket or task text, a held ticket, blocks, blocked_by and parent links)."""
     by_id: dict[str, dict] = {}
     ordered = sorted(agents, key=lambda a: (str(a.get("state") or "") not in LIVE_STATES, a.get("idle_s") or 0))
     hidden = max(0, len(ordered) - MAX_AGENTS)
@@ -397,6 +414,10 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
         owner = agent_id if role == "owner" else _owner_of(agent_id, by_id)
         restricted = bool(agent.get("restricted")) or bool(RESTRICTED.search(str(agent.get("task") or "") + " " +
                                                                             str(agent.get("description") or "")))
+        # an agent on, or whose task names, a ticket that may not be shown is drawn as restricted work (no task, no
+        # ticket), so the hidden ticket's id never reaches the page through it
+        restricted = restricted or not _ticket_ok(agent.get("ticket"), visible) \
+            or _names_hidden_ticket(agent.get("task"), visible)
         ticket = "" if restricted else (ticket_ref(agent.get("ticket")) or ticket_ref(agent.get("task")))
         state = str(agent.get("state") or UNKNOWN)
         # The task text only: `ah owners` blanks it for a restricted row, and the meta description is never a fallback.
@@ -453,6 +474,8 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
     work: dict[str, dict] = {}
 
     def add_work(ref: str, layer: int, via: str) -> dict | None:
+        if not visible(ref):
+            return None                                  # F1: no node, so no edge, title or count either
         if ref in work:
             work[ref]["layer"] = min(work[ref]["layer"], layer)
             return work[ref]
@@ -503,8 +526,8 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
     counts = {kind: sum(1 for n in nodes if n["kind"] == kind) for kind in ("owner", "subagent", "reviewer", "work")}
     counts["live_owners"] = sum(1 for n in nodes if n["kind"] == "owner" and n.get("live"))
     counts["hidden_agents"] = hidden
-    links = sum(len((tickets.get(r) or {}).get("blocks") or []) + len((tickets.get(r) or {}).get("blocked_by") or [])
-                for r in work)
+    links = sum(1 for r in work for ref in ((tickets.get(r) or {}).get("blocks") or []) +
+                ((tickets.get(r) or {}).get("blocked_by") or []) if visible(ref))
     gaps = []
     if not links:
         gaps.append("No GoodQA dependency links on the held tickets: the planned DAG has no recorded edges yet.")
@@ -512,6 +535,40 @@ def build(*, session: str, coordinator: dict, agents: list, tickets: dict, escal
         gaps.append("Some tickets have child tickets, but there is no API to list them, so they are counted and not shown.")
     return {"schema": SCHEMA, "generated": ev.iso(now), "session": session, "host_label": host,
             "nodes": nodes, "edges": edges, "counts": counts, "gaps": gaps}
+
+
+def _without_hidden(snapshot: dict | None, visible) -> dict | None:
+    """A snapshot built before a ticket became hidden, with every trace of it left out: its work node, the edges and
+    change cues that name that node, and an agent's ticket, task and mission (the agent is then drawn restricted)."""
+    if not snapshot:
+        return snapshot
+    gone = {n["id"] for n in snapshot.get("nodes") or [] if n.get("kind") == "work" and not visible(n.get("ref") or "")}
+    exposed = [n for n in snapshot.get("nodes") or [] if n.get("kind") in ("owner", "subagent", "reviewer")
+               and (not _ticket_ok(n.get("ticket"), visible) or _names_hidden_ticket(n.get("task"), visible)
+                    or _names_hidden_ticket(n.get("mission"), visible))]
+    if not gone and not exposed:
+        return snapshot
+    hidden_agents = {n["id"] for n in exposed}
+
+    def clean(node):
+        if node["id"] not in hidden_agents:
+            return node
+        return dict(node, ticket="", task="restricted", restricted=True,
+                    mission=("idle" if node.get("mission") == "idle" else UNKNOWN) if node.get("kind") == "owner" else "")
+
+    def cue_ok(change):
+        edge = change.get("edge") or {}
+        return change.get("node") not in gone and edge.get("from") not in gone and edge.get("to") not in gone \
+            and not (change.get("type") == "assigned" and not visible(change.get("ticket") or ""))
+    return dict(snapshot, nodes=[clean(n) for n in snapshot["nodes"] if n["id"] not in gone],
+                edges=[e for e in snapshot.get("edges") or [] if e.get("from") not in gone and e.get("to") not in gone],
+                changes=[c for c in snapshot.get("changes") or [] if cue_ok(c)])
+
+
+def _ticket_ok(value, visible) -> bool:
+    """An agent's ticket field: empty is fine; a ticket that is set must be visible."""
+    ref = ticket_ref(value) if value else ""
+    return not value or (bool(ref) and visible(ref)) or (not ref and not _names_hidden_ticket(value, visible))
 
 
 def _index(snapshot: dict | None) -> dict:
@@ -581,6 +638,8 @@ class OrgGraph(col.Collector):
         self.inbox_fn = inbox_fn or (lambda: (0, 0))
         self.on_initiatives, self.initiatives_sig = None, None
         self.restricted_fn = None   # -> the owners' restricted-ticket state; part of the initiatives signature
+        # -> (known, restricted tickets) from the last owner read; None is fail closed (no ticket is shown or fetched)
+        self.visibility_fn = None
         self.snapshot_data: dict | None = None
         self.metas: dict[str, tuple] = {}   # agent id -> (meta file fingerprint, fields)
         self.tickets: dict[str, dict] = {}
@@ -608,8 +667,10 @@ class OrgGraph(col.Collector):
 
         def refs(values):
             found = []
-            if not isinstance(values, list):   # PR 260 v2 F4 shape rule: a wrong shape links nothing
+            if values is None:
                 return found
+            if not isinstance(values, list):   # PR 262 review F3: a wrong shape is a failed read, never "no links"
+                raise ValueError("ticket links are not a list")
             for value in values:
                 number = value.get("number") if isinstance(value, dict) else value
                 slug = (value.get("projectSlug") if isinstance(value, dict) else None) or project
@@ -619,8 +680,14 @@ class OrgGraph(col.Collector):
                         found.append(candidate)
             return found[:12]
 
-        links = issue.get("links") if isinstance(issue.get("links"), dict) else {}
+        links = issue.get("links")
+        if links is None:
+            links = {}
+        if not isinstance(links, dict):
+            raise ValueError("ticket links are not an object")
         parent = issue.get("parent")
+        if parent is not None and not isinstance(parent, dict):
+            raise ValueError("ticket parent is not an object")
         parent_ref = refs([parent])[0] if isinstance(parent, dict) and refs([parent]) else ""
         self.tickets[ref] = {"title": ev.short(issue.get("title"), 120), "status": ev.short(issue.get("status"), 24),
                              "priority": ev.short(issue.get("priority"), 12), "is_blocked": bool(issue.get("isBlocked")),
@@ -631,14 +698,39 @@ class OrgGraph(col.Collector):
         self.ticket_stale[ref] = False
         return True
 
-    def _refresh_tickets(self, wanted: list, now: float) -> None:
-        """One ticket read per tick, oldest first: about 40 tickets refresh in 3 minutes at the 5 s cadence."""
+    def visible(self):
+        """The ticket visibility rule for this moment (ticket_visibility over the last owner read)."""
+        known, restricted = self.visibility_fn() if self.visibility_fn else (False, ())
+        return ticket_visibility(known, restricted)
+
+    def visible_tickets(self) -> dict:
+        """The cached ticket payloads that may be shown now, with their read state: what the initiatives use."""
+        visible = self.visible()
+        def keep(refs):
+            return [r for r in refs or [] if visible(r)]
+        return {ref: dict(info, stale=bool(self.ticket_stale.get(ref)), blocks=keep(info.get("blocks")),
+                          blocked_by=keep(info.get("blocked_by")),
+                          parent=info.get("parent") if visible(info.get("parent") or "") else "")
+                for ref, info in self.tickets.items() if visible(ref)}
+
+    def _forget_hidden(self, visible) -> None:
+        """A ticket that became restricted (or before restriction is known) is dropped from the cache entirely."""
+        for ref in [r for r in self.tickets if not visible(r)] + [r for r in self.ticket_at if not visible(r)]:
+            self.tickets.pop(ref, None)
+            self.ticket_at.pop(ref, None)
+            self.ticket_stale.pop(ref, None)
+
+    def _refresh_tickets(self, wanted: list, now: float, visible=None) -> None:
+        """One ticket read per tick, oldest first: about 40 tickets refresh in 3 minutes at the 5 s cadence. Only
+        visible tickets are fetched, whatever route named them (held, blocks, blocked_by, parent)."""
+        visible = visible or self.visible()
         known = set(wanted)
         for ref in list(self.tickets):
             known.update(self.tickets[ref].get("blocks") or [])
             known.update(self.tickets[ref].get("blocked_by") or [])
             if self.tickets[ref].get("parent"):
                 known.add(self.tickets[ref]["parent"])
+        known = {ref for ref in known if visible(ref)}
         candidates = sorted(known, key=lambda r: self.ticket_at.get(r, 0.0))[:MAX_TICKETS]
         due = [r for r in candidates if now - self.ticket_at.get(r, 0.0) >= TICKET_TTL_S]
         if due:
@@ -701,22 +793,33 @@ class OrgGraph(col.Collector):
                            "row_stale": r_stale(row), **facts})
         seen = {a["agent_id"] for a in agents}
         self.metas = {k: v for k, v in self.metas.items() if k in seen}
+        visible = self.visible()
+        self._forget_hidden(visible)
         wanted = []
         for agent in agents:
+            if agent.get("restricted") or not _ticket_ok(agent["ticket"], visible) \
+                    or _names_hidden_ticket(agent["task"], visible):
+                continue
             ref = ticket_ref(agent["ticket"]) or ticket_ref(agent["task"])
             if ref and str(agent.get("state")) in LIVE_STATES and ref not in wanted:
                 wanted.append(ref)
-        self._refresh_tickets(wanted, now)
+        self._refresh_tickets(wanted, now, visible)
         if now - self.escalation_cache[0] > 60:
             failed: list[str] = []
             self.escalation_cache = (now, escalations(self.escalation_root, now=now, problems=failed), failed)
         self.problems = list(self.transcripts.problems) + list(self.escalation_cache[2])
         snapshot = build(session=session, coordinator=coordinator, agents=agents, tickets=self.tickets,
                          escalation=self.escalation_cache[1], host=self.host, now=now, helpers=self.helpers,
-                         stale=self.ticket_stale)
+                         stale=self.ticket_stale, visible=visible)
+        # PR 262 review F3: a failed or malformed ticket read the graph shows is a failed read of this dataset (partial),
+        # in the same envelope as the transcript and escalation reads; its node and initiative are the last good copy
+        failed_tickets = sorted(n["ref"] for n in snapshot["nodes"] if n["kind"] == "work" and n.get("stale"))
+        self.problems += [f"a GoodQA ticket read: failed ({len(failed_tickets)} ticket(s) shown from the last good copy)"] \
+            if failed_tickets else []
         live_rows = [[r.get("agent_id"), r.get("ticket"), r.get("task")] for r in (self.owners_fn() or [])
                      if isinstance(r, dict) and r.get("role") == "live"]
-        sig = json.dumps([live_rows, sorted((k, v.get("title"), v.get("status")) for k, v in self.tickets.items()),
+        sig = json.dumps([live_rows, sorted((k, v.get("title"), v.get("status"), v.get("stale"))
+                                            for k, v in self.visible_tickets().items()),
                           self.restricted_fn() if self.restricted_fn else None], default=str)
         if sig != self.initiatives_sig and self.on_initiatives:
             self.initiatives_sig = sig
@@ -735,9 +838,10 @@ class OrgGraph(col.Collector):
             snapshot["gaps"].insert(0, f"Following session {session[:8]}, which has no Claude transcript (likely a Codex "
                                        "session that wrote the newest WAL); owners and asks may read 0 (goodqa#15961).")
         if self.problems:
-            snapshot["gaps"].insert(0, f"{len(self.problems)} transcript or escalation read(s) could not be read "
+            snapshot["gaps"].insert(0, f"{len(self.problems)} transcript, escalation or ticket read(s) could not be read "
                                        f"({'; '.join(sorted(set(self.problems))[:3])}): the graph may be incomplete.")
-        changes = diff(self.snapshot_data, snapshot, now)
+        # a ticket that became hidden since the last snapshot leaves no "removed" cue naming it (PR 262 review F1)
+        changes = diff(_without_hidden(self.snapshot_data, visible), snapshot, now)
         # Messages from the coordinator and owners, read from their transcripts' SendMessage targets.
         senders = [("coordinator", coordinator)] + [(a["agent_id"], a) for a in agents]
         node_ids = {n["id"] for n in snapshot["nodes"]}
@@ -765,6 +869,9 @@ class OrgGraph(col.Collector):
                 f"{counts['work']} work items{failed}")
 
     def snapshot(self) -> dict:
+        # served between ticks too (the state endpoint): filtered by the restriction set of this moment, not the tick's
+        if self.snapshot_data:
+            return _without_hidden(self.snapshot_data, self.visible())
         return self.snapshot_data or {"schema": SCHEMA, "generated": "", "nodes": [], "edges": [], "counts": {},
                                       "gaps": [], "changes": [], "seq": 0}
 
@@ -821,11 +928,15 @@ def derive_initiatives(file_snapshot: dict, owner_rows: list, tickets: dict, now
         info = tickets.get(ref) or {}
         status = str(info.get("status") or "")
         base = dict(by_ticket.get(ref) or {})
+        stale = info.get("stale") is True   # PR 262 review F3: the last GoodQA read of this ticket failed
         title = ev.short(info.get("title") or base.get("initiative") or task or ref, 200)
         base.update({"id": "live-" + re.sub(r"[^A-Za-z0-9._-]", "_", ref)[:58], "initiative": title,
                      "state": STATUS_LABELS.get(status, status.replace("_", " ").capitalize() or "unknown"),
                      "ticket": ref, "owner": str(row.get("agent_id") or "")[:40], "source": "live",
-                     "updated": str(row.get("last_activity") or "")[:40]})
+                     "updated": str(row.get("last_activity") or "")[:40], "stale": stale})
+        if stale:
+            base["state"] = f"{base['state']} (last known)"
+            base["note"] = "The last GoodQA read of this ticket failed: its title and status are the previous copy."
         if base.get("pct") is None:
             base.setdefault("milestones_done", None)
             base.setdefault("milestones_total", None)

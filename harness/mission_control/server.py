@@ -520,11 +520,13 @@ class App:
         # PR 243 review F1: file rows on restricted tickets are dropped; before the first owner read (the loop runs
         # initiatives first) the restricted set is unknown (None) and every ticketed file row is withheld.
         self.initiatives.derive = lambda snap: org_graph.derive_initiatives(
-            snap, self.owners.rows, self.org.tickets, time.time(),
+            snap, self.owners.rows, self.org.visible_tickets(), time.time(),
             restricted_tickets=self.owners.restricted_tickets if self.owners.restricted_known else None)
         self.org.on_initiatives = lambda: self.initiatives.publish(None)
         # a change in the restricted set republishes the panel, even when no live owner row changed
         self.org.restricted_fn = lambda: [self.owners.restricted_known, sorted(self.owners.restricted_tickets)]
+        # PR 262 review F1: the one ticket visibility rule the graph applies to every ticket, by every route
+        self.org.visibility_fn = lambda: (self.owners.restricted_known, self.owners.restricted_tickets)
         self.collectors = [self.tailer, self.initiatives, self.drop, self.owners, self.github, self.tickets,
                            self.remote, self.org]
         # One read per dataset, composed from the sources that feed it (collectors.FEEDS) and pushed before any rows.

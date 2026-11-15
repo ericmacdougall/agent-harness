@@ -35,6 +35,20 @@ export function stateText(node) {
     : node?.truth === 'unknown' ? `${state} (not known now: the topology read is not current)` : state;
 }
 export const animates = claimTruth => claimTruth === 'current' || claimTruth === 'partial';
+// PR 262 review F2: the inspector shows a node through the same claim as the scene, never a raw snapshot node. null
+// when the node is gone (the inspector then closes). It is refreshed on every reason that can change what it shows.
+export function inspectorView(graph, claimTruth, id) {
+  const shown = truthGraph(graph, claimTruth);
+  const node = (shown?.nodes || []).find(entry => entry.id === id);
+  return node ? { node, byId: new Map(shown.nodes.map(entry => [entry.id, entry])) } : null;
+}
+export const INSPECTOR_REASONS = Object.freeze(['orggraph', 'truth', 'health', 'reads', 'connection']);
+export const inspectorRefreshes = (reason, selection) => selection?.kind === 'org' && INSPECTOR_REASONS.includes(reason);
+// A node that is not current says so first in its detail list, for every kind (work items included).
+export function truthField(node) {
+  return node?.truth === 'stale' ? [['Read', 'last known: the read behind this node failed or is out of date']]
+    : node?.truth === 'unknown' ? [['Read', 'not known now: the topology read is not current']] : [];
+}
 
 // One color per node type. Severity and escalation use a separate warm ramp drawn as a halo and rings, never as the
 // node's own fill, so type and alarm are read independently.
@@ -174,6 +188,9 @@ export function nodeColor(node) {
 
 // The fields the user asked to see, per node type, as [label, value] pairs (also the list view and the inspector).
 export function describe(node, byId = new Map()) {
+  return [...truthField(node), ...describeFields(node, byId)];
+}
+function describeFields(node, byId) {
   const name = id => (id && byId.get(id) ? `${byId.get(id).label} (${byId.get(id).kind})` : id || UNKNOWN);
   const agent = [['Model', node.model], ['Effort', node.effort], ['Advisor', node.advisor_model],
     ['Machine', node.machine === UNKNOWN ? UNKNOWN : `${node.machine}${node.machine_source ? ` (${node.machine_source})` : ''}`],

@@ -10,7 +10,8 @@ import { mountNeeds } from './needs.js';
 import { mountHealth } from './health.js';
 import { mountViews } from './views.js';
 import * as live from './live.js';
-import { describe as describeOrg, TYPE_COLORS as ORG_TYPES } from './org.js';
+import { describe as describeOrg, TYPE_COLORS as ORG_TYPES, inspectorView, inspectorRefreshes } from './org.js';
+import { gate } from './adapt.js';
 
 mountInitiatives(); mountActivity(); mountOwners(); mountChat(); mountHealth(); mountNeeds();
 const { go } = mountViews();  // the 3D topology loads only when its tab is first opened
@@ -82,7 +83,7 @@ shell(getState(), 'initial');
 subscribe(shell);
 
 const inspector = document.getElementById('inspector'), content = document.getElementById('inspector-content');
-function renderInspector(state) {
+function renderInspector(state, refresh = false) {
   const selection = state.selection;
   if (!selection) { if (inspector.open) inspector.close(); return; }
   const { kind, id } = selection;
@@ -159,9 +160,9 @@ function renderInspector(state) {
     state.events.filter(event => event.subject.repo === id).slice(0, 8).forEach(event => content.append(button('lab-button', `${KINDS[event.kind].icon} ${event.summary}`, () => select('event', event.id))));
   } else if (kind === 'org') {
     // A node of the live org graph (goodqa#15950): the fields the snapshot carries, "unknown" where none exists.
-    const graph = state.orggraph;
-    const node = graph?.nodes.find(entry => entry.id === id); if (!node) return select(null);
-    const byId = new Map(graph.nodes.map(entry => [entry.id, entry]));
+    // PR 262 review F2: through the Topology claim, as the scene; a node that is gone closes the inspector
+    const view = inspectorView(state.orggraph, gate(state, 'topology').truth, id); if (!view) return select(null);
+    const { node, byId } = view;
     document.getElementById('inspector-type').textContent = `${(ORG_TYPES[node.kind]?.label || node.kind).toUpperCase()} DETAIL`;
     title.textContent = node.kind === 'work' ? `${node.ref} · ${node.title}` : node.kind === 'coordinator' ? 'Main coordinator' : node.kind === 'user' ? 'You' : `${node.label} · ${node.type}`;
     content.append(title);
@@ -176,9 +177,12 @@ function renderInspector(state) {
     content.append(fields);
   }
   if (!inspector.open) inspector.showModal();
-  else document.getElementById('inspector-close').focus();
+  else if (!refresh) document.getElementById('inspector-close').focus();   // a data refresh leaves focus where it is
 }
-subscribe((state, reason) => { if (reason === 'selection') renderInspector(state); });
+subscribe((state, reason) => {
+  if (reason === 'selection') renderInspector(state);
+  else if (inspector.open && inspectorRefreshes(reason, state.selection)) renderInspector(state, true);
+});
 document.getElementById('inspector-close').addEventListener('click', () => select(null));
 inspector.addEventListener('close', () => { if (getState().selection) select(null); });
 inspector.addEventListener('click', event => {
