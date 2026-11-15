@@ -3225,6 +3225,8 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
                 raise prov.Problem("missing", "no main WAL for this session")
             # PR 234 v8: the JSON string value alone, so a spaced `"event": "requirement"` is read too
             lines = list(prov._lines_containing(path, b'"requirement"', tails=True))
+            # goodqa#16117 F1: a line torn before the needle, or one that is not JSON, may have been a requirement
+            skipped += prov.lost_lines_without(path, (b'"requirement"',))
         except prov.Problem as problem:
             # review PR 234 v6 F1: an unreadable WAL is an unread source, named with its reason, never zero requirements
             unread.append({"source": f"{s[:64]}/main.jsonl", "reason": f"{problem.code}: {problem.message}"})

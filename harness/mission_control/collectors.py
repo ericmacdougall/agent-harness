@@ -768,10 +768,11 @@ class Initiatives(Collector):
             return self._fail("initiatives file missing")
         sig = (info.st_ino, info.st_size, info.st_mtime_ns)
         previous = self.sig
-        if sig == self.sig:
-            if self.error:
-                raise ValueError(self.error)
+        if sig == self.sig and not self.error:
             return f"{len(self.items)} initiatives"
+        # goodqa#16117 F3: an unchanged file is read again while its last read failed. A refused or unreadable read
+        # often recovers with no change to inode, size or mtime (permissions restored, a reader that was busy), so the
+        # signature is a cache of good reads only, never of failures.
         self.sig = sig
         try:
             raw = self.reader.read(self.path, 1024 * 1024 + 1)
@@ -790,7 +791,7 @@ class Initiatives(Collector):
         self.items = [clean_initiative(r, n) for n, r in enumerate(rows[:self.MAX_ROWS])]
         self.stale, self.error, self.partial = False, "", len(rows) > self.MAX_ROWS
         self.publish(info.st_mtime)
-        if previous is not None:
+        if previous is not None and previous != sig:   # a recovered read of an unchanged file is not an update
             self.hub.publish(ev.make("initiative", "initiatives", f"{len(self.items)} initiatives updated",
                                      eid=f"initiatives:{info.st_mtime_ns}"))
         return f"{len(self.items)} initiatives"

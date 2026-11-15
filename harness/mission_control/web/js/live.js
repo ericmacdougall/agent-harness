@@ -6,16 +6,45 @@ let csrf = '';
 let source = null;
 let resyncTimer = 0;
 let failures = 0;
+// goodqa#16117 F2: a state response is a snapshot taken when the server answered, and stream messages can be newer
+// than it. While a load is in flight, stream updates are held in `held` and applied after the response is installed,
+// so a slow response never overwrites newer stream data. Each load has a generation; a response from a load that a
+// later one superseded is dropped (it neither installs nor marks the page live).
+let loadGen = 0;
+let held = null;
 
 class SendError extends Error {
   constructor(message, retryable) { super(message); this.retryable = retryable; }
 }
 
+function replayHeld(gen) {
+  if (gen !== loadGen) return;  // a newer load holds the stream now; it replays what it holds
+  const queue = held || [];
+  held = null;
+  for (const [apply, data] of queue) apply(data);
+}
+
 async function loadState() {
-  const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
-  if (response.status === 401 || response.status === 403) { setConnection('expired'); return false; }
-  if (!response.ok) throw new Error(`state ${response.status}`);
-  const state = await response.json();
+  const gen = ++loadGen;
+  held = held || [];
+  let state;
+  try {
+    const response = await fetch('/api/state', { credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } });
+    if (gen !== loadGen) return false;  // superseded while in flight
+    if (response.status === 401 || response.status === 403) { replayHeld(gen); setConnection('expired'); return false; }
+    if (!response.ok) throw new Error(`state ${response.status}`);
+    state = await response.json();
+    if (gen !== loadGen) return false;
+    installState(state);
+  } catch (error) {
+    replayHeld(gen);  // the held stream updates are still the newest data; the stream is never left held
+    throw error;
+  }
+  replayHeld(gen);  // then everything the stream sent while the response was on its way, in order
+  return true;
+}
+
+function installState(state) {
   csrf = typeof state.csrf === 'string' ? state.csrf : '';
   setHost(state.host);
   setReads(state.reads);  // first: the rows below are never shown ahead of the server's read of them
@@ -26,7 +55,16 @@ async function loadState() {
   setChat(state.chat);
   setAsks(state.asks);
   setLedger(state.ledger);
-  return true;
+}
+
+// A stream message: applied now, or held while a state load is in flight (see `held`).
+function deliver(apply) {
+  return message => {
+    const data = parse(message);
+    if (!data) return;
+    if (held) held.push([apply, data]);
+    else apply(data);
+  };
 }
 
 function parse(message) {
@@ -57,15 +95,15 @@ function connect() {
       setConnection('reconnecting');
     }
   });
-  source.addEventListener('event', message => { const data = parse(message); if (data) ingestEvent(data); });
-  source.addEventListener('initiatives', message => { const data = parse(message); if (data) setInitiatives(data); });
-  source.addEventListener('owners', message => { const data = parse(message); if (data) setOwners(data); });
-  source.addEventListener('health', message => { const data = parse(message); if (data) setSources(data); });
-  source.addEventListener('chat', message => { const data = parse(message); if (data) setChat(data); });
-  source.addEventListener('codex', message => { const data = parse(message); if (data) setCodex(data); });
-  source.addEventListener('asks', message => { const data = parse(message); if (data) setAsks(data); });
-  source.addEventListener('ledger', message => { const data = parse(message); if (data) setLedger(data); });
-  source.addEventListener('reads', message => { const data = parse(message); if (data) setReads(data); });
+  source.addEventListener('event', deliver(ingestEvent));
+  source.addEventListener('initiatives', deliver(setInitiatives));
+  source.addEventListener('owners', deliver(setOwners));
+  source.addEventListener('health', deliver(setSources));
+  source.addEventListener('chat', deliver(setChat));
+  source.addEventListener('codex', deliver(setCodex));
+  source.addEventListener('asks', deliver(setAsks));
+  source.addEventListener('ledger', deliver(setLedger));
+  source.addEventListener('reads', deliver(setReads));
 }
 
 // Re-read the state after a reopened stream, then show live, unless the stream dropped again meanwhile. A failed
@@ -180,4 +218,4 @@ export async function start() {
   }
 }
 
-export function stop() { source?.close(); source = null; clearTimeout(resyncTimer); }
+export function stop() { source?.close(); source = null; clearTimeout(resyncTimer); loadGen += 1; held = null; }

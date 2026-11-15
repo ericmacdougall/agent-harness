@@ -670,6 +670,76 @@ def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS, *, ta
         os.close(fd)
 
 
+def lost_lines_without(path: Path, needles) -> int:
+    """goodqa#16117 F1: lines of path that hold no needle and are not a JSON object (torn, not JSON, or oversized).
+    A search for an event's needle never sees a line torn before the needle (`{"event":"a`), so a needle scan alone
+    reads such a file as whole. Each of these lines may have held the searched record, so the caller counts every
+    one as skipped. Only the file's unterminated last line inside the append grace (tail_in_progress) is a write in
+    progress, not lost. Lines holding a needle are left to the caller's own scan, which counts them already."""
+    needles = tuple(needles)
+    fd = open_regular(path)
+    lost = 0
+    try:
+        info = os.fstat(fd)
+        size = info.st_size
+        if size > MAX_SCAN_BYTES:
+            raise Problem("file-too-large", f"{clip(path.name, 60)} is larger than {MAX_SCAN_BYTES >> 20} MiB; not scanned")
+        deadline = time.monotonic() + SCAN_SECONDS
+        offset, carry, oversized = 0, b"", False
+        while offset < size:
+            if time.monotonic() > deadline:
+                raise Problem("scan-timeout", f"integrity scan of {clip(path.name, 60)} exceeded {SCAN_SECONDS:.0f}s")
+            chunk = os.pread(fd, min(CHUNK, size - offset), offset)
+            if not chunk:
+                break
+            offset += len(chunk)
+            parts = (carry + chunk).split(b"\n")
+            carry = parts.pop()
+            for line in parts:
+                if oversized:
+                    oversized = False  # the end of a line already counted as oversized
+                    continue
+                lost += _lost_line(line, needles)
+            if len(carry) > MAX_LINE:
+                if not oversized and not any(n in carry for n in needles):
+                    lost += 1
+                carry, oversized = b"", True
+        if carry and not oversized and not tail_in_progress(True, info.st_mtime):
+            lost += _lost_line(carry, needles)
+    except (OSError, ValueError) as error:
+        raise Problem("file-unreadable", f"cannot read {clip(path.name, 60)} ({type(error).__name__})")
+    finally:
+        os.close(fd)
+    return lost
+
+
+_LEADING_EVENT = re.compile(rb'\A\{\s*"event"\s*:\s*"([A-Za-z0-9_.:-]*)(")?')
+
+
+def _lost_line(line: bytes, needles) -> int:
+    line = line.strip()
+    if not line or any(n in line for n in needles):
+        return 0
+    if len(line) > MAX_LINE:
+        return 1
+    try:
+        return 0 if isinstance(loads_line(line), dict) else 1
+    except ValueError:
+        pass
+    # A broken line whose first field names its event can be classified: a whole other event name (`"event":"result"`)
+    # or a torn name no searched event starts with (`"event":"res`) was never a searched record. Anything else, a
+    # torn name that could still become one (`"event":"a` for "ask"), or no leading event at all, is counted.
+    lead = _LEADING_EVENT.match(line)
+    if lead:
+        name = lead.group(1).decode("ascii")
+        events = [n.strip(b'"').decode("ascii", "replace") for n in needles]
+        if lead.group(2) and name not in events:
+            return 0
+        if not lead.group(2) and not any(e.startswith(name) for e in events):
+            return 0
+    return 1
+
+
 def load_record(path: Path, key: str, value: str):
     """The JSON object on a line of path whose top-level `key` equals value, or a Problem-worthy reason."""
     # Compact `"key":"value"` first: it matches only the record's own field, not parentUuid references or
@@ -1596,6 +1666,13 @@ def ledger_read(session: str, home=None) -> tuple:
             except Exception as error:  # noqa: BLE001
                 failed = f"file-unreadable: {type(error).__name__}"
             limited = limited or hits >= LEDGER_MAX_HITS
+        if not failed:
+            try:
+                skipped += lost_lines_without(path, (b'"ask"', b'"ask_resolved"'))  # goodqa#16117 F1
+            except Problem as problem:
+                failed = f"{problem.code}: {problem.message}"
+            except Exception as error:  # noqa: BLE001
+                failed = f"file-unreadable: {type(error).__name__}"
         if failed:
             unread.append({"source": path.name, "reason": failed})
         else:
