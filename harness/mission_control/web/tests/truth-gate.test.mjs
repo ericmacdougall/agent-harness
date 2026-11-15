@@ -139,6 +139,7 @@ const MODULE_EXEMPT = {
   'scene.js': { asks: 'draws a node per row on hand', chat: 'draws the chat node', initiatives: 'draws a node per row on hand', owners: 'draws a node per row on hand; its status line is written by main.js under the progress claim', events: 'animates the events on hand' },
   'initiatives.js': { asks: 'a card adds "N open asks" only when it holds some (adapt.SAFE_READS.initiatives)' },
   'views.js': { events: 'reads the last event only to decide which section repaints' },
+  'owners.js': { initiatives: 'groups the owner rows under the initiatives on hand and labels each group; it counts nothing from them' },
 };
 for (const file of readdirSync(`${here}js`).filter(f => f.endsWith('.js')).sort()) {
   test(`scan: ${file} reads only datasets covered by the claims it uses`, () => {
