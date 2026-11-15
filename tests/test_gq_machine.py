@@ -429,6 +429,30 @@ class Refusals(Base):
         self.e.run("shot", h, check=1)
         self.assertEqual(self.api.calls("GET", r"/machine-artifacts/"), [self.api.calls("GET", r"/machine-artifacts/")[0]])
 
+    def test_unlisted_error_codes_print_as_unrecognized(self):
+        # PR 250 receipt F2: only allow-listed server codes are printed; a lowercase token or any fragment is not.
+        low = USER_TOKEN.lower()
+        for code in (low, low[5:17], low[5:13], low[5:9], "GqU_MiXeD", "q1w2e3r4t5y6", "not_found_" + low[5:12]):
+            self.api.fail[("GET", r"/machines/")] = (403, code)
+            p = self.e.run("open", MACHINE, check=1)
+            self.assertIn("unrecognized_error", p.stderr)
+            self.assertNotIn(code, p.stderr)
+            self.assertNotIn(code.lower(), p.stderr.lower().replace("unrecognized_error", ""))
+
+    def test_every_allow_listed_code_still_prints(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("gqb_under_test", str(CLIENT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertGreater(len(mod.KNOWN_CODES), 20)
+        api = mod.Api(self.api.base, USER_TOKEN)
+        for code in sorted(mod.KNOWN_CODES):
+            self.api.fail[("GET", r"/machines/")] = (403, code)
+            with self.assertRaises(mod.ApiError) as cm:
+                api.call("GET", "/machines/" + MACHINE, USER_TOKEN)
+            self.assertEqual(cm.exception.code, code)
+            self.assertIn(code, str(cm.exception))
+
     def test_hostile_error_body_is_never_echoed(self):
         self.api.fail[("GET", r"/machines/")] = (403, "machines_user_token_refused")
         p = self.e.run("open", MACHINE, check=1)
@@ -574,6 +598,32 @@ class Interrupts(Base):
         p = self.e.run("close", rows[0]["handle"], check=0)
         self.assertEqual(json.loads(p.stdout)["result"], "released")
         self.assertEqual(len(self.api.calls("POST", r"/release$")), 1)
+
+    def test_recovery_refusal_other_than_absent_keeps_the_lease_listed(self):
+        # PR 250 receipt F1: after a lost create, only not-found or not-yours proves there is no lease.
+        for status, code in ((500, "internal_error"), (429, "rate_limited"), (403, "forbidden"), (409, "lease_held")):
+            before = len(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"])
+            self.api.drop_once.add(("POST", r"/leases$"))
+            self.api.fail[("POST", r"/leases$")] = (status, code)
+            self.e.run("open", MACHINE, check=1)
+            del self.api.fail[("POST", r"/leases$")]
+            rows = json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]
+            self.assertEqual(len(rows), before + 1, (status, code))
+        for status, code in ((404, "not_found"), (409, "lease_not_yours")):
+            before = len(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"])
+            self.api.drop_once.add(("POST", r"/leases$"))
+            self.api.fail[("POST", r"/leases$")] = (status, code)
+            self.e.run("open", MACHINE, check=1)
+            del self.api.fail[("POST", r"/leases$")]
+            rows = json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]
+            self.assertEqual(len(rows), before, (status, code))
+
+    def test_create_5xx_is_treated_like_a_lost_answer(self):
+        # A 5xx on create does not prove the server made no lease: recover with the same holder and release.
+        self.api.fail[("POST", r"/leases$")] = (502, "internal_error")
+        self.e.run("open", MACHINE, check=1)
+        self.assertEqual(len(self.api.calls("POST", r"/leases$")), 2)
+        self.assertEqual(len(json.loads(self.e.run("list", "--orphans", check=0).stdout)["leases"]), 1)
 
     def test_sigkill_leaves_an_orphan_that_close_releases(self):
         h = self.e.open()

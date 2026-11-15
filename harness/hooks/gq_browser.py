@@ -53,6 +53,31 @@ OPTIONAL = {"get_text": ("selector",), "tabs_new": ("url",)}
 MAX_BODY = 32 * 1024 * 1024
 
 
+# Server error codes this client prints (PR 250 receipt F2). Any other code, however code-like, may be a token or a piece
+# of one echoed back, so it is reported as "unrecognized_error". Taken from bugtracker lib/errors.ts and the AppError codes
+# of the machines, agent-browsers and api-keys modules.
+KNOWN_CODES = frozenset("""
+bad_request unauthorized forbidden not_found conflict rate_limited validation_error validation_failed internal_error
+database_busy approval_required policy_denied revision_conflict duplicate_operation no_session org_suspended invalid_json
+agent_browsers_disabled agent_unavailable approval_expired approval_request_missing artifact_limit artifact_mismatch
+artifact_too_large artifact_type_refused capability_not_available command_delivered command_finished command_not_finished
+command_not_running control_blocked delegated_key_browser_only enrollment_invalid grant_ended idempotency_conflict
+lease_ended lease_held lease_holder_mismatch lease_not_yours lease_required machine_approval_required machine_is_browser
+machine_not_browser machine_org_queue_full machine_org_rate_limited machine_paused machine_queue_full machine_rate_limited
+machine_revoked machines_token_grant_level machines_user_token_refused no_machine_grant not_awaiting_approval
+not_delivered origin_mismatch outside_machine_grant outside_remote_consent remote_session_active renew_limit_reached
+runner_key_refused session_changed session_not_active token_grants_off token_lacks_machines_ability token_org_not_allowed
+unknown_command_kind vault_fill_refused
+""".split())
+
+
+def known_code(code):
+    """A server code as printable text: itself when allow-listed, else "unrecognized_error" (never the raw value)."""
+    if code is None:
+        return None
+    return code if isinstance(code, str) and code in KNOWN_CODES else "unrecognized_error"
+
+
 class Refused(Exception):
     """Bad input or local precondition: exit 2, nothing sent."""
 
@@ -230,7 +255,7 @@ class Api:
                 code = (json.loads(e.read(65536) or b"{}").get("error") or {}).get("code")
             except Exception:
                 pass
-            raise ApiError(what, e.code, code if isinstance(code, str) and re.match(r"^[a-z0-9_.-]{1,79}$", code) else None)
+            raise ApiError(what, e.code, known_code(code))
         except (urllib.error.URLError, OSError, TimeoutError):
             raise ApiError(what, lost=True)
         if len(payload) > MAX_BODY:
@@ -726,10 +751,13 @@ def _mrelease(api, d, state, recover=True):
                 state["leaseId"] = lid
                 report.append("lease_recovered")
             except ApiError as e:
-                report.append("no_lease_to_recover (%s)" % (_code(e) or ("no response" if e.lost else e.status)))
-                # Only a definite HTTP answer proves there is no lease (red-team r1 F1). A lost or malformed answer may
-                # hide one, so the state stays open: list --orphans shows it and close retries.
-                unknown = not e.status
+                # Only not-found, not-yours or an approval ask proves there is no lease of ours (PR 250 receipt F1).
+                # Anything else (lost, malformed, 5xx, 429, 403, lease_held) may hide one, so the state stays open as an
+                # orphan: list --orphans shows it and close retries.
+                absent = e.status == 404 or _code(e) == "lease_not_yours" or e.code == "approval_pending"
+                unknown = not absent
+                report.append("%s (%s)" % ("no_lease_to_recover" if absent else "lease_state_unknown",
+                                           _code(e) or ("no response" if e.lost else e.status)))
         failed = False
         if not lid and unknown:
             failed = True
@@ -773,9 +801,9 @@ def op_machine_open(machine_id, ttl=MACHINE_TTL_DEFAULT):
         state["leaseId"], state["expiresAt"] = lid, expires
         save_state(d, state)
     except BaseException as e:
-        if isinstance(e, ApiError) and not e.lost and e.status and not state.get("leaseId"):
+        if isinstance(e, ApiError) and not e.lost and e.status and e.status < 500 and not state.get("leaseId"):
             # The server answered with an HTTP refusal (or a 202 approval ask): it made no lease, so nothing is re-asked.
-            # A lost or malformed answer (status 0) may hide a lease, so cleanup re-asks with the same holder.
+            # A lost or malformed answer (status 0) or a 5xx may hide a lease, so cleanup re-asks with the same holder.
             state["leaseRequested"] = False
         cleanup = _mrelease(api, d, state)
         if isinstance(e, ApiError):
@@ -838,7 +866,7 @@ def _command(handle, kind, args, d, state, base, token):
                         "retry": "never re-sent; the command may still run"}
             cmd = obj(obj(api.call("GET", "/machine-commands/%s?wait=%d" % (cid, int(min(left, 10) * 1000)), token), "GET command").get("command"), "GET command")
         err = cmd.get("error")
-        code = err.get("code") if isinstance(err, dict) and isinstance(err.get("code"), str) and CODE_RE.match(err["code"]) else None
+        code = known_code(err.get("code")) if isinstance(err, dict) else None
         if status != "ok":
             if code in ("lease_ended", "lease_not_yours"):
                 state["closed"], state["endReason"] = True, code

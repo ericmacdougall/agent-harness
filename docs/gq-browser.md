@@ -82,7 +82,8 @@ MCP tools: `gq_machine_open`, `gq_machine_screenshot`, `gq_machine_click`, `gq_m
 - **Approvals.** A lease that needs approval (202) or a command `awaiting_approval` is reported. The command is cancelled and the lease released; the tool never waits on it or approves it.
 - **State files are checked.** The lease id, holder and ttl in `state.json` are validated before they reach a request.
 - **Lost answers.** A command whose answer was lost is never re-sent (each send carries a fresh `clientRequestId`). Look at the screen before acting again.
-  - If the lease answer is lost, open asks once more with the same holder; the server returns that holder's lease, never a new scope. It then releases that lease and fails. If that answer is lost too, the lease stays open locally (`list --orphans`), and `close` retries.
+  - If the lease answer is lost, open asks once more with the same holder; the server returns that holder's lease, never a new scope. It then releases that lease and fails. A 5xx on create is handled the same way. Only a not-found or not-yours answer to that second ask proves there is no lease. Any other answer (lost, 5xx, 429, 403, `lease_held`) leaves the lease listed in `list --orphans`, and `close` retries.
+- **Error codes.** A server error code is printed only if it is on the client's allow-list (`KNOWN_CODES`). Any other value prints as `unrecognized_error`, so a token echoed back as a code never reaches the output.
 
 ### Release (AC-5)
 
