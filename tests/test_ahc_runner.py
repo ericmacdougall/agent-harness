@@ -710,6 +710,64 @@ class IngestValidationTests(Base):
         moved = self.paths.root / "rejected" / link.name
         self.assertTrue(moved.is_symlink(), "the link itself is quarantined")
 
+    def test_links_in_every_shared_dir_are_refused_at_their_operation_while_ahc_keeps_serving(self):
+        """PR 258 v2 (spec owner's condition 1). Shared dirs are checked per operation, not walked at start, so
+        links in all five must neither stop ahc nor be followed. Item A is refused where the links touch it: its
+        report name is taken by a link and its owner notice name is a link. Item B, untouched, still completes,
+        and every external target stays byte-identical."""
+        self.paths.ensure()
+        b = self.submit()
+        a = core.submit(self.paths, self.config, {   # a different PR, so B never supersedes it
+            "repo": REPO, "pr": 8, "head": HEAD, "base": BASE, "packet": str(self.packet),
+            "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"})["id"]
+        externals = {}
+
+        def plant(link, name):
+            target = self.home / ("external-" + name)
+            target.write_text("external " + name)
+            externals[target] = target.read_text()
+            link.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(str(target), str(link))
+            return link
+
+        _, rec = self.valid_record()
+        queued = plant(self.paths.queue / (rec["id"] + ".json"), "queue")
+        report = plant(self.paths.reports / ("%s-a1.md" % a), "report")
+        plant(self.paths.inbox / "agent-abc123" / ("%s-needs-attention.md" % a), "inbox")
+        staged = plant(self.paths.packets / ("e" * 64 + ".md"), "staging")
+        rejected = plant(self.paths.root / "rejected" / "old.json", "rejected")
+        deps = Deps(verdict="BLOCK")
+        plain_gh = deps.gh
+
+        def gh(argv, timeout):          # the fixture serves PR 7; answer for whichever PR is asked
+            rc, out, err = plain_gh(argv, timeout)
+            if argv[1:3] == ["pr", "view"]:
+                pr = json.loads(out)
+                pr["number"] = int(argv[3])
+                out = json.dumps(pr)
+            return rc, out, err
+        deps.gh = gh
+        for _ in range(4):
+            self.run_all(deps)           # never ForeignRoot: shared-dir links do not stop the daemon
+            deps.now += 7200
+        self.assertEqual(self.state(b), "block-delivered", "an unrelated item stopped being served")
+        self.assertEqual(self.state(a), "needs-attention", "a linked report path must refuse the review")
+        self.assertTrue(report.is_symlink())
+        self.assertFalse(queued.exists() or os.path.lexists(str(queued)), "the queue link was not quarantined")
+        self.assertTrue((self.paths.root / "rejected" / queued.name).is_symlink())
+        self.assertTrue(staged.is_symlink() and rejected.is_symlink())
+        ledger = runner.Ledger(self.paths)
+        try:
+            notices = ledger.db.execute("SELECT status, result FROM effects WHERE item=? AND kind='inbox'",
+                                        (a,)).fetchall()
+        finally:
+            ledger.close()
+        self.assertTrue(notices, "item A's owner notice was never attempted")
+        self.assertTrue(all(row["status"] != "done" and "refused" in (row["result"] or "") for row in notices),
+                        "a notice written to a linked name looked delivered")
+        for target, text in externals.items():
+            self.assertEqual(target.read_text(), text, "%s was written through a link" % target.name)
+
     def test_inbox_path_rejects_escape_after_resolving(self):
         with self.assertRaises(core.Refused):
             core.inbox_path(self.paths, "..", "x.md")

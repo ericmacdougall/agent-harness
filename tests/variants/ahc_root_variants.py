@@ -14,7 +14,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".ahc-local", "variants_root.out")
 SRC = "harness/hooks/ahc_core.py"
 RUNNER = "harness/hooks/ahc_runner.py"
-T = ["tests.test_ahc_core.RootOwnershipTests", "tests.test_ahc_clone.CloneLinkTests"]
+T = ["tests.test_ahc_core.RootOwnershipTests", "tests.test_ahc_clone.CloneLinkTests",
+     "tests.test_ahc_runner.IngestValidationTests.test_links_in_every_shared_dir_are_refused_at_their_operation_while_ahc_keeps_serving"]
 V = [
     ("the root ownership check dropped (ensure only makes directories)", [
         ("    def ensure(self):\n        self.claim_root()\n", "    def ensure(self):\n        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)\n")]),
@@ -62,6 +63,8 @@ V = [
         ('STRICT_TREES = frozenset(("items", "clones"))\n', "STRICT_TREES = frozenset()\n")]),
     ("v1 BLOCK: shared directories walked strictly (a submitter's link halts ahc)", [
         ('STRICT_TREES = frozenset(("items", "clones"))\n', "STRICT_TREES = ROOT_DIRS\n")]),
+    ("v2: a linked report name in a shared dir is not refused at its operation", [
+        ("        if os.path.lexists(str(report)):\n", "        if False:\n")], RUNNER),
     ("v1 BLOCK: a clone's .git not checked", [
         ("            for path, want_dir in ((directory / name, True), (directory / name / \".git\", True)):\n",
          "            for path, want_dir in ((directory / name, True),):\n")]),

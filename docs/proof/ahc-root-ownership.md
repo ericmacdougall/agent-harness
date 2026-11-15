@@ -18,12 +18,14 @@ Run each from the repo root.
   Result: `Ran 31 tests`, `FAILED (failures=62, errors=13)`, exit 1.
   Log `ff258.log`, sha256 ff50de48d929a208b660639a482391d6a1366dcd661176b398f62d793e71e156.
 - Variants: `python3 -B tests/variants/ahc_root_variants.py <out>`
-  Result: `SUMMARY: 19 variants, 0 did not fail: []`, exit 0.
-  Log `variants_root3.out`, sha256 c262021ed6872889960854d29a2471e3b90fa4abd1fa37b8979ce65e39d9dd7f.
+  Result: `SUMMARY: 20 variants, 0 did not fail: []`, exit 0.
+  Log `variants_root4.out`, sha256 9d99e0ae8eee733e7b8e6885cc7d0c767a3dc6e1a2f999a19a4a7969501a9b57.
+  (The 19-variant run before the shared-dir test was added: `variants_root3.out`, sha256
+  c262021ed6872889960854d29a2471e3b90fa4abd1fa37b8979ce65e39d9dd7f.)
 - Focused suites:
   `python3 -B -m unittest tests.test_ahc_contracts tests.test_ahc_runner tests.test_ahc_core tests.test_ahc_scan tests.test_redaction tests.test_redact_shapes tests.test_ahc_crash tests.test_ahc_clone tests.test_ahc_packet`
-  Result: `Ran 416 tests`, `OK (skipped=1)`, exit 0.
-  Log `ev19.log`, sha256 f828413030bb1d97dd4624756067dabe9b3081487b2ca5793b9c2e9e1a613355.
+  Result: `Ran 417 tests`, `OK (skipped=1)`, exit 0.
+  Log `ev20.log`, sha256 6a3e78b8f281d9d7bdebd70ae87fa68ad91a3535195609e04f6c3b13f4c364c5.
 
 ## What the variants break
 
@@ -52,6 +54,14 @@ v1 BLOCK repair:
 - the ledger is opened by plain `sqlite3.connect`;
 - there is no device and inode comparison after the open;
 - clone `prepare` follows a linked clone directory.
+
+Shared directories (spec owner's condition 1 on PR 258 v2):
+- a linked report name is not refused at its operation.
+
+`IngestValidationTests.test_links_in_every_shared_dir_are_refused_at_their_operation_while_ahc_keeps_serving`
+plants a link in each shared directory at once. It fails under this variant and under "shared directories walked
+strictly". At cbe43e6d it is a regression guard, not a failing-first test, because the per-operation checks
+already existed there.
 
 ## One variant changed meaning during the repair
 
