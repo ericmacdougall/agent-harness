@@ -53,6 +53,7 @@ SEAMS = (
     "runner.restore_publish",  # Ledger._publish_restored: the digest-checked copy renamed into place
     "runner.restore_done",     # Ledger._drop_intent: the intent removed after the publish (or a found publish)
     "runner.restore_abandon",  # Ledger._abandon_restore: the intent removed, the never-moved live db kept
+    "runner.v5_fence",         # Ledger._migrate_to_v5: the v5-migrating-from-n fence committed (AC-11 step 3)
 )
 
 
@@ -295,13 +296,20 @@ INVENTORY = {
            "runner.backup seam; restore reopen: after the runner.restore_copy seam)"),
     ("ahc_runner", "Ledger.__init__", "sql:PRAGMA"): (
         2, "exempt:connection settings (journal_mode=WAL, synchronous=FULL), re-applied at every open"),
-    ("ahc_runner", "Ledger._schema", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
+    ("ahc_runner", "Ledger._migrate_to_v5", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
+    ("ahc_runner", "Ledger._v5_gate", "sql:PRAGMA"): (
+        2, "exempt:connection settings (journal_mode=WAL, synchronous=FULL) on the migrator's connection"),
+    ("ahc_runner", "Ledger.rollback_v5", "sqlite3.connect"): (
+        1, "exempt:a read-only (mode=ro) integrity and version check of the kept pre-v5 backup; writes nothing"),
+    ("ahc_runner", "_migrate_v5", "sql:DYNAMIC"): (1, _MIG),
     ("ahc_runner", "Ledger.backup", "sqlite.backup"): (1, "seam:runner.backup"),
     ("ahc_runner", "Ledger.restore", "fs.write_file"): (1, "seam:runner.restore_intent"),
     # PR 258 v5: one method per durable restore step, so each step has its own seam and inventory row
     ("ahc_runner", "Ledger._finish_restore", "fs.copy_to_temp"): (1, "seam:runner.restore_copy"),
     ("ahc_runner", "Ledger._move_aside", "fs.rename"): (1, "seam:runner.restore_move"),
-    ("ahc_runner", "Ledger._publish_restored", "fs.rename"): (1, "seam:runner.restore_publish"),
+    ("ahc_runner", "Ledger._publish_restored", "fs.link_exclusive"): (1, "seam:runner.restore_publish"),
+    ("ahc_runner", "Ledger._publish_restored", "fs.unlink"): (
+        1, "exempt:removes the staged temp name after link_exclusive published the same inode at the ledger path"),
     ("ahc_runner", "Ledger._drop_intent", "fs.unlink"): (1, "seam:runner.restore_done"),
     ("ahc_runner", "Ledger._abandon_restore", "fs.unlink"): (1, "seam:runner.restore_abandon"),
     ("ahc_runner", "Ledger._finish_restore", "fs.remove_temps"): (

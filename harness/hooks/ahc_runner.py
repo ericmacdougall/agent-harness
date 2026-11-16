@@ -43,6 +43,7 @@ sys.path.insert(0, str(HERE))
 import ahc_core as core  # noqa: E402
 import ahc_fs as fs  # noqa: E402
 import ahc_contracts  # noqa: E402
+import ahc_migrate  # noqa: E402
 import ahc_packet  # noqa: E402
 from ahc_crash import crash_after, crash_before  # noqa: E402
 import redact  # noqa: E402
@@ -346,7 +347,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 # legacy grant or operation is reported by Contracts.legacy_unsettled() and fails eligibility until main reconciles
 # it (legacy reviews authorize nothing and are not reconcile items).
 SCHEMA += ahc_contracts.SCHEMA
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = ahc_migrate.SCHEMA_VERSION   # 5 (goodqa#16049 slice 1 (b), AC-11)
 # D20 timing columns (v2): entered_at = when the item entered its current state (a same-state settle keeps it);
 # esc_n = the escalation number <n> in the critical alert key ahc:<item>:<n>, bumped once per escalation in the same
 # transaction as its notice, never by a retry; esc_at = the last D20 escalation; disposed_at = a recorded disposition.
@@ -398,15 +399,28 @@ def _migrate_v4(db):
         db.execute(statement)
 
 
-MIGRATIONS = {1: [], 2: [_migrate_v2], 3: [_migrate_v3], 4: [_migrate_v4]}
+def _migrate_v5(db):
+    """v5 (AC-11, AC-16): every ahc_contracts table whose v5 definition differs is rebuilt (renamed aside as
+    {table}_v4_legacy, recreated from SCHEMA, rows copied as round 1); new tables are created from SCHEMA. The layout
+    is detected on the reviews table's marker columns; the earlier v4 layout and any unknown one refuse."""
+    layout = ahc_migrate.detect_layout(db)
+    if layout not in ("pr258", "4d45fe40", "v5"):
+        raise ahc_migrate.MigrationRefused("ledger reviews layout %s is not migratable to v5" % layout)
+    ahc_migrate.rebuild_changed_tables(db, ahc_contracts.SCHEMA, layout)
+    for statement in _statements(ahc_contracts.SCHEMA):
+        db.execute(statement)
+
+
+MIGRATIONS = {1: [], 2: [_migrate_v2], 3: [_migrate_v3], 4: [_migrate_v4], 5: [_migrate_v5]}
 
 
 SCHEMA_EXIT = 3
 ROOT_EXIT = SCHEMA_EXIT   # a foreign state root (core.ForeignRoot): also a no-restart exit
 
 
-class SchemaError(RuntimeError):
-    """The ledger's schema is unknown or newer than this code; the daemon must not start."""
+SchemaError = ahc_migrate.SchemaError   # the ledger's schema is unknown, newer, fenced or refused; do not start
+MigrationPending = ahc_migrate.MigrationPending
+MigrationRefused = ahc_migrate.MigrationRefused
 
 
 _NO_DIGEST = object()   # an interrupted-restore record with no "sha256" key: written by an ahc before PR 258 v5
@@ -481,44 +495,53 @@ class Ledger:
     of migrating it: only ahc-core, holding its lock, migrates, so a failed migration can never move the database
     aside under another process (advisor review of the unit split)."""
 
+    # Injectable for tests only (AC-11): the open-file probe's runner, the hooks directory whose entry points the
+    # preflight verifies, and the bound on waiting for a role lock or the exclusive maint lock.
+    PROBE_RUN = staticmethod(ahc_migrate.default_run)
+    HOOKS_DIR = Path(__file__).resolve().parent
+    LOCK_WAIT = ahc_migrate.ROLE_WAIT_SECONDS
+
     def __init__(self, paths, migrate=True):
         paths.ensure()
         self.migrate = migrate
         self.paths = paths
         self.path = paths.root / "ledger.sqlite3"
         self.verified = {}          # backup name -> sha256 of the bytes Ledger.backup proved (PR 258 v5)
+        self._maint = None
+        self.db = None
         if migrate:
             self._resume_restore()
         elif self._intent_path().exists():
             raise SchemaError("the ledger has an interrupted restore; ahc-core completes it at start, this process "
                               "does not")
-        fresh = not os.path.lexists(str(self.path))
-        self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
+        if migrate and os.path.lexists(str(self.path)):
+            self._v5_gate()             # AC-11: migration holds the role locks and the exclusive maint lock
+        # every connection holds the maint flock shared for as long as it is open (AC-11)
+        self._maint = ahc_migrate.maint_lock(self.paths.root, shared=True)
         try:
+            fresh = not os.path.lexists(str(self.path))
+            self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
+            self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             _check_sidecars(self.path)
             self._schema(fresh)
         except Exception:
-            self.db.close()
+            if self.db is not None:
+                self.db.close()
+            self._maint.close()
             raise
 
     def _version(self):
-        has_meta = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
-        if not has_meta:
-            has_items = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'").fetchone()
-            return 0 if has_items else None
-        row = self.db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
-        if row is None:
-            return 0
+        """The schema version; a `v5-migrating-from-n` fence is reported by _schema, never read as a version."""
         try:
-            return int(row["v"])
-        except (TypeError, ValueError):
-            raise SchemaError("unreadable schema_version %r in %s" % (row["v"], self.path)) from None
+            version, _fenced = ahc_migrate.read_version(self.db)
+        except SchemaError as error:
+            raise SchemaError("%s in %s" % (error, self.path)) from None
+        return version
 
     def _schema(self, fresh):
-        version = None if fresh else self._version()
+        version, fenced = (None, False) if fresh else ahc_migrate.read_version(self.db)
         if version is None:
             with self.tx():
                 for statement in _statements(SCHEMA):
@@ -526,23 +549,195 @@ class Ledger:
                 self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?)",
                                 (str(SCHEMA_VERSION),))
             return
+        if fenced:
+            raise MigrationPending("ledger %s is fenced (%s%d): a v5 migration was interrupted or refused; v5 "
+                                   "ahc-core reruns it at start (migration pending), this process does not open it"
+                                   % (self.path.name, ahc_migrate.FENCE_PREFIX, version))
         if version > SCHEMA_VERSION or version < 0:
             raise SchemaError("ledger schema_version %d is not supported by this ahc (knows %d); refusing to start"
                               % (version, SCHEMA_VERSION))
         if version == SCHEMA_VERSION:
             return
-        if not self.migrate:
-            raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
-                              "this process does not" % (version, SCHEMA_VERSION))
+        raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
+                          "this process does not" % (version, SCHEMA_VERSION))
+
+    # ------------------------------------------------------------ schema version 5 (AC-11)
+
+    def _v5_gate(self):
+        """Migration runs only in v5 ahc-core, holding (1) the core role lock, then the review role lock, then the
+        exclusive maint lock, each until the reopen. 4d45fe40's roles take their role locks but not the maint lock,
+        so the role locks are what prove an old-version role has stopped. A lock not taken within LOCK_WAIT refuses
+        (nothing written). With the locks held, a v5 ledger is left as it is; anything older, or fenced, migrates."""
+        root = self.paths.root
+        held = []
+        try:
+            for role in ("core", "review"):
+                mine = _HELD_ROLES.get((str(root), role))
+                if mine is not None and not mine.closed:
+                    continue
+                handle = ahc_migrate.wait_role_lock(root, role, self.LOCK_WAIT)
+                if handle is None:
+                    raise MigrationRefused("migration-locks: the %s role lock is held by another process; stop the "
+                                           "ahc units and CLI users first (nothing was written)" % role)
+                held.append(handle)
+            exclusive = ahc_migrate.maint_lock(root, shared=False, timeout=self.LOCK_WAIT)
+            if exclusive is None:
+                raise MigrationRefused("migration-locks: a ledger connection holds %s; migration waits for it and "
+                                       "refuses after %.0f s (nothing was written)" % (ahc_migrate.MAINT_NAME,
+                                                                                      self.LOCK_WAIT))
+            held.append(exclusive)
+            self.db = connect_nofollow(root, self.path, timeout=30, isolation_level=None)
+            self.db.row_factory = sqlite3.Row
+            try:
+                self.db.execute("PRAGMA journal_mode=WAL")
+                self.db.execute("PRAGMA synchronous=FULL")
+                _check_sidecars(self.path)
+                version, fenced = ahc_migrate.read_version(self.db)
+                if version is None or (version == SCHEMA_VERSION and not fenced):
+                    return
+                if version > SCHEMA_VERSION or version < 0:
+                    raise SchemaError("ledger schema_version %d is not supported by this ahc (knows %d); refusing "
+                                      "to start" % (version, SCHEMA_VERSION))
+                self._migrate_to_v5(version)
+            finally:
+                if self.db is not None:
+                    self.db.close()
+                self.db = None
+        finally:
+            for handle in reversed(held):
+                handle.close()
+
+    @classmethod
+    def rollback_v5(cls, paths, backup_name):
+        """AC-11 code rollback, the run kit's v5 step with every unit stopped: under the same locks, restore the
+        kept pre-v5 backup through the same restore, clear its fence back to the prior version n in one
+        transaction, and check that the old `_version()` reads n. Returns n. Only then is the old code installed
+        (e0e4ac46 for a PR 258 layout, 4d45fe40 for its own layout and for a ledger below version 4)."""
+        self = cls.__new__(cls)
+        self.migrate, self.paths, self.path, self.verified = True, paths, paths.root / "ledger.sqlite3", {}
+        self._maint, self.db = None, None
+        root = paths.root
+        name = Path(backup_name).name
+        if not re.fullmatch(r"ledger\.sqlite3\.pre-v5\.[0-9]+\.bak", name):
+            raise SchemaError("rollback names a kept pre-v5 backup beside the ledger, not %r" % backup_name)
+        copy = self.path.with_name(name)
+        held = []
+        try:
+            for role in ("core", "review"):
+                handle = ahc_migrate.wait_role_lock(root, role, cls.LOCK_WAIT)
+                if handle is None:
+                    raise MigrationRefused("rollback: the %s role lock is held; stop the units first" % role)
+                held.append(handle)
+            exclusive = ahc_migrate.maint_lock(root, shared=False, timeout=cls.LOCK_WAIT)
+            if exclusive is None:
+                raise MigrationRefused("rollback: a ledger connection is open; stop the CLI users first")
+            held.append(exclusive)
+            check = sqlite3.connect("file:%s?mode=ro" % copy, uri=True)
+            try:
+                if [tuple(r) for r in check.execute("PRAGMA integrity_check").fetchall()] != [("ok",)]:
+                    raise SchemaError("rollback: backup %s fails integrity_check" % name)
+                n, fenced = ahc_migrate.read_version(check)
+            finally:
+                check.close()
+            if not fenced:
+                raise SchemaError("rollback: backup %s is not a fenced pre-v5 backup" % name)
+            self.verified[name] = fs.digest_file(root, copy, RESTORE_MAX_BYTES)
+            self.db = connect_nofollow(root, self.path, timeout=30, isolation_level=None)
+            self.restore(copy)
+            ahc_migrate.clear_fence(self.db, n)
+            got, still = ahc_migrate.read_version(self.db)
+            if (got, still) != (n, False) or not self._old_version_reads(n):
+                raise SchemaError("rollback: the restored ledger does not read as version %d" % n)
+            return n
+        finally:
+            if self.db is not None:
+                self.db.close()
+            for handle in reversed(held):
+                handle.close()
+
+    def _old_version_reads(self, n):
+        """The old `_version()` rule (4d45fe40 and e0e4ac46): no meta table and no items -> fresh; no row -> 0;
+        otherwise int(v), which must be n."""
+        row = self.db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+        try:
+            return (0 if row is None else int(row[0])) == n
+        except (TypeError, ValueError):
+            return False
+
+    def _installed_extras(self):
+        """(path, expected sha256) of the installed wrapper and unit files, when an install record says so. The
+        expected text is derived from the v5 code (ahc_install), never read from what is installed."""
+        import ahc_install  # noqa: PLC0415
+        record = ahc_install.read_record(self.paths)
+        if not record:
+            return []
+        out = []
+        for path in record.get("files", []) or []:
+            name = Path(path).name
+            text = None
+            if name in getattr(ahc_install, "UNITS", ()):
+                text = ahc_install.unit_text(name)
+            elif name == "ahc":
+                text = ahc_install.wrapper_text()
+            if text is not None and os.path.exists(path):
+                out.append((path, hashlib.sha256(text.encode("utf-8")).hexdigest()))
+        return out
+
+    def _probe(self, files):
+        return ahc_migrate.open_file_holders(files, self.PROBE_RUN)
+
+    def _migrate_to_v5(self, n):
+        """Steps 2-8 of AC-11 on the open connection, every lock held. n is the ledger's version (or the prior
+        version a fence names). A refusal before the backup leaves every row and schema_version as they were."""
+        # (2) read-only preflight: entry points, layout, size and a probe that must list this migrator's own pid
+        ahc_migrate.verify_entry_points(self.HOOKS_DIR, self._installed_extras())
+        if n == 4:
+            layout = ahc_migrate.detect_layout(self.db)
+            if layout not in ("pr258", "4d45fe40", "v5"):
+                raise MigrationRefused("migration-layout: the reviews table is in the %s layout, which is not "
+                                       "migratable (the earlier version 4 layout was never installed); nothing was "
+                                       "written" % layout)
         size = sum(os.lstat(str(self.path) + extra).st_size for extra in ("", "-wal")
                    if os.path.lexists(str(self.path) + extra))
         if size > RESTORE_MAX_BYTES:
             raise SchemaError("ledger %s is %d bytes, over the %d-byte migration cap; refusing to migrate from "
-                              "v%d (nothing was changed)" % (self.path.name, size, RESTORE_MAX_BYTES, version))
+                              "v%d (nothing was changed)" % (self.path.name, size, RESTORE_MAX_BYTES, n))
+        try:
+            probe = self._probe([self.path])
+        except ahc_migrate.ProbeError as error:
+            raise MigrationRefused("migration-preflight: the open-file probe failed (%s); nothing was written"
+                                   % error) from None
+        if os.getpid() not in probe:
+            raise MigrationRefused("migration-preflight: the open-file probe did not list this migrator's own pid; "
+                                   "it cannot see who holds the ledger, so nothing was written")
+        # (3) the fence, so old code that opens from now on refuses before any write
+        crash_before("runner.v5_fence")
+        ahc_migrate.set_fence(self.db, n)
+        crash_after("runner.v5_fence")
+        # (4) the open-file check and (5) the TRUNCATE checkpoint; a held file or any probe error clears the fence
+        try:
+            files = [Path(str(self.path) + extra) for extra in ("", "-wal", "-shm")
+                     if os.path.lexists(str(self.path) + extra)]
+            try:
+                others = self._probe(files) - {os.getpid()}
+            except ahc_migrate.ProbeError as error:
+                raise MigrationRefused("migration-held: the open-file check failed (%s), which counts as held"
+                                       % error) from None
+            if others:
+                raise MigrationRefused("migration-held: the ledger is open in pid(s) %s; stop them first"
+                                       % ", ".join(str(p) for p in sorted(others)))
+            busy = self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            if busy:
+                raise MigrationRefused("migration-held: the TRUNCATE checkpoint did not complete")
+        except MigrationRefused as refused:
+            ahc_migrate.clear_fence(self.db, n)
+            raise MigrationRefused("%s; the fence was cleared back to schema_version %d" % (refused, n)) from None
+        # (6) the verified online backup, which carries the fence
         copy = self.backup("pre-v%d" % SCHEMA_VERSION)
+        # (7) the migration in one transaction, writing schema_version 5 at its end
         try:
             with self.tx():
-                for step in range(version + 1, SCHEMA_VERSION + 1):
+                for step in range(n + 1, SCHEMA_VERSION + 1):
                     if step == 1:
                         for statement in _statements(SCHEMA):
                             self.db.execute(statement)
@@ -551,10 +746,12 @@ class Ledger:
                 self.db.execute("INSERT OR REPLACE INTO meta(k, v) VALUES ('schema_version', ?)",
                                 (str(SCHEMA_VERSION),))
         except Exception as error:
+            # (8) the restore, then the reopen; the restored copy carries the fence, so the ledger stays fenced
             aside = self.restore(copy)
-            raise SchemaError("ledger migration v%d->v%d failed (%s); restored the verified backup %s and moved the "
-                              "failed database files aside as %s" % (version, SCHEMA_VERSION, type(error).__name__,
-                                                                      copy.name, ", ".join(aside))) from error
+            raise SchemaError("ledger migration v%d->v%d failed (%s); restored the verified backup %s (still fenced "
+                              "%s%d) and moved the failed database files aside as %s"
+                              % (n, SCHEMA_VERSION, type(error).__name__, copy.name, ahc_migrate.FENCE_PREFIX, n,
+                                 ", ".join(aside))) from error
 
     def _counts(self, db):
         tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE "
@@ -697,8 +894,18 @@ class Ledger:
         return moved
 
     def _publish_restored(self, staged):
+        """AC-11: published by link then unlink, never by a replacing rename. An old process that connected while
+        the ledger path was absent created a stray file there; it is never replaced: the intent, the stray file,
+        the staged copy and the moved-aside files are kept, and the refusal names the stray file for main."""
         crash_before("runner.restore_publish")
-        fs.rename(self.paths.root, staged, self.path)               # the complete, fsynced, digest-checked copy
+        try:
+            fs.link_exclusive(self.paths.root, staged, self.path)   # the complete, fsynced, digest-checked copy
+        except FileExistsError:
+            raise ahc_migrate.StrayLedger(
+                "incident: a stray ledger file %s appeared while the path was absent during the restore (an old "
+                "process created it); it was not replaced. The restore intent, the staged copy %s and the moved-"
+                "aside files are kept for main" % (self.path, Path(staged).name)) from None
+        fs.unlink(self.paths.root, staged)
         crash_after("runner.restore_publish")
 
     def _drop_intent(self):
@@ -774,7 +981,12 @@ class Ledger:
                           "(the restore intent is kept for an operator)" % (self._intent_path().name, name))
 
     def close(self):
-        self.db.close()
+        try:
+            self.db.close()
+        finally:
+            if self._maint is not None:
+                self._maint.close()
+                self._maint = None
 
     def tx(self):
         return _Tx(self.db)
@@ -883,6 +1095,7 @@ def _mirror(paths, iid, event, at, data):
 
 
 ROLES = ("core", "review", "all")
+_HELD_ROLES = {}      # (root, role) -> the open lock handle this process holds (the v5 migrator skips those)
 LOCKED_OUT_EXIT = 75   # another instance holds this role's lock; the unit does not restart on it
 
 
@@ -907,6 +1120,7 @@ def acquire_lock(paths, role="all"):
     except OSError:
         handle.close()
         return None
+    _HELD_ROLES[(str(paths.root), role)] = handle
     return handle
 
 

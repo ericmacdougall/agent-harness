@@ -21,7 +21,7 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 MODULES = ("ahc_core", "ahc_runner", "ahc_contracts", "ahc_clone", "ahc_install", "ahc_packet", "ahc_scan",
-           "ahc_crash")
+           "ahc_crash", "ahc_migrate", "ahc_clock")
 OS_WRITES = {"chmod", "lchmod", "chown", "lchown", "replace", "rename", "renames", "link", "symlink", "unlink",
              "remove", "rmdir", "removedirs", "mkdir", "makedirs", "mkfifo", "mknod", "truncate", "utime"}
 SHUTIL_WRITES = {"copy", "copy2", "copyfile", "copytree", "move", "rmtree", "copymode", "copystat", "chown"}
@@ -44,6 +44,11 @@ ALLOWED = {
     ("ahc_runner", "connect_nofollow", "sqlite3.connect"): (
         "sqlite takes only a path. The file was opened or created first through ahc_fs.open_file, and the path's "
         "dev and inode are compared with that descriptor right after the connect, before any statement"),
+    ("ahc_runner", "Ledger.rollback_v5", "sqlite3.connect"): (
+        "a read-only (mode=ro URI) integrity and version check of the kept pre-v5 backup; it writes nothing, and the "
+        "restore itself goes through Ledger.restore and ahc_fs"),
+    ("ahc_migrate", "schema_objects", "sqlite3.connect"): (
+        "an in-memory database (':memory:') that normalizes the schema text; no file is touched"),
     ("ahc_runner", "_setup_logging", "path.mkdir"): "~/.agent-harness/logs: outside the root",
     ("ahc_runner", "_setup_logging", "logging.RotatingFileHandler"): "~/.agent-harness/logs/ahc.log: outside the root",
     ("ahc_contracts", "AuthorityLog.append", "os.makedirs"): (

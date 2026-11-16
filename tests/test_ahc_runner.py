@@ -15,6 +15,24 @@ sys.path.insert(0, str(HOOKS))
 import ahc_core as core  # noqa: E402
 import ahc_runner as runner  # noqa: E402
 
+
+def _release_hooks():
+    """AC-11's preflight verifies the installed entry points against the release list. Tests migrate against a copy
+    of the modules as they are now, with a list computed from that copy, so a variant run (which mutates a module)
+    still exercises the migration; the shipped list is checked by test_v5_release_list_is_current."""
+    import shutil as _shutil
+    target = Path(tempfile.mkdtemp(prefix="ahc-release-"))
+    files = {}
+    for name in json.loads((HOOKS / runner.ahc_migrate.RELEASE_LIST).read_text())["files"]:
+        path = HOOKS / name
+        _shutil.copyfile(path, target / path.name)
+        files[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (target / runner.ahc_migrate.RELEASE_LIST).write_text(json.dumps({"files": files}))
+    return target
+
+
+runner.Ledger.HOOKS_DIR = _release_hooks()
+
 HEAD, BASE, REPO = "a" * 40, "b" * 40, "ericmacdougall/agent-harness"
 GOOD_PACKET = f"head {HEAD}\n```\n$ python3 -m unittest\nRan 12 tests\nOK\nexit 0\n```\n"
 
@@ -2624,6 +2642,11 @@ class UninstallTests(_HostBase):
         self.assertTrue(wrapper.exists(), "uninstall removes only the wrapper it wrote")
 
 
+# AC-11 (slice 1 (b)): the v5 migration fences the ledger at its prior version before the backup, so the backup
+# and any restored copy carry the fence; a rollback clears it back to the prior version.
+FENCED_V1 = "v5-migrating-from-1"
+
+
 class SchemaTests(Base):
     """v14 item 1 / NEG-37: schema_version; refuse newer or unknown; forward-only migration after a copy."""
 
@@ -2683,7 +2706,7 @@ class SchemaTests(Base):
         finally:
             db.close()
         self.assertNotIn("extra", tables, "a failed migration left a partial change")
-        self.assertIsNone(version)
+        self.assertEqual(version, ("v5-migrating-from-0",), "AC-11: the restored copy stays fenced at its prior 0")
         self.assertTrue(list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak")))
 
     # --- v17 F2: the v1 -> v2 migration, its verified backup and the restore path
@@ -2741,7 +2764,7 @@ class SchemaTests(Base):
         backups = list(self.paths.root.glob("ledger.sqlite3.pre-v%d.*.bak" % runner.SCHEMA_VERSION))
         self.assertEqual(len(backups), 1)
         cols, version, count = self.columns(backups[0])
-        self.assertEqual((version, count), ("1", 3), "the backup is the v1 ledger with the -wal rows included")
+        self.assertEqual((version, count), (FENCED_V1, 3), "the backup is the v1 ledger with the -wal rows included")
         self.assertNotIn("esc_n", cols)
 
     def test_failed_v2_migration_restores_the_backup_and_moves_files_aside(self):
@@ -2760,7 +2783,7 @@ class SchemaTests(Base):
             held.close()
         self.assertIn("restored", str(caught.exception))
         cols, version, count = self.columns(self.paths.root / "ledger.sqlite3")
-        self.assertEqual((version, count), ("1", 3), "the restored ledger is the v1 copy with every row")
+        self.assertEqual((version, count), (FENCED_V1, 3), "the restored ledger is the v1 copy with every row")
         self.assertNotIn("esc_n", cols, "no partial v2 change survives")
         aside = sorted(p.name for p in self.paths.root.glob("ledger.sqlite3.failed-*"))
         self.assertTrue(aside and aside[0].endswith(tuple("0123456789")), aside)
@@ -2819,7 +2842,7 @@ class SchemaTests(Base):
         self.assertLess(peaks["restore"], budget, "the restore held %d bytes for an %d-byte backup"
                         % (peaks["restore"], size))
         cols, version, count = self.columns(self.paths.root / "ledger.sqlite3")
-        self.assertEqual((version, count), ("1", 3), "the restored ledger is the v1 copy")
+        self.assertEqual((version, count), (FENCED_V1, 3), "the restored ledger is the v1 copy")
         import sqlite3
         db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"))
         try:
@@ -2849,7 +2872,7 @@ class SchemaTests(Base):
         self.assertIn("left in place", str(caught.exception))
         live = self.paths.root / "ledger.sqlite3"
         self.assertTrue(live.is_file(), "the live database was moved aside before the copy succeeded")
-        self.assertEqual(self.columns(live)[1:], ("1", 3), "the live database is the unchanged v1 ledger")
+        self.assertEqual(self.columns(live)[1:], (FENCED_V1, 3), "the live database is the unchanged v1 ledger")
         self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "nothing was moved aside")
         self.assertFalse(Path(str(live) + ".restore-intent").exists(), "a stale intent would repeat the restore")
         self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "the partial copy is removed")
@@ -2931,7 +2954,7 @@ class SchemaTests(Base):
             held.close()
         live = self.paths.root / "ledger.sqlite3"
         self.assertTrue(Path(str(live) + ".restore-intent").exists(), "setup: the crash left the intent")
-        self.assertEqual(self.columns(live)[1:], ("1", 3), "setup: the live ledger is the intact v1 ledger")
+        self.assertEqual(self.columns(live)[1:], (FENCED_V1, 3), "setup: the live ledger is the intact v1 ledger")
         return live
 
     def assert_abandoned_then_migrated(self, live):
@@ -3238,7 +3261,7 @@ class SchemaTests(Base):
                     self.assertEqual(unsettled, {("grants_v3_legacy", "gr-live"), ("operations_v3_legacy", "op-live")})
                 finally:
                     db.close()
-                self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v4.*.bak"))), 1)
+                self.assertEqual(len(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak"))), 1)
 
     def schema_sql(self, path):
         """Every non-legacy table and index, as SQLite stores it (autoindexes by table and name)."""
@@ -3280,10 +3303,19 @@ class SchemaTests(Base):
         subprocess.run(["tar", "-x", "-C", str(old)], input=archive.stdout, check=True)
         self.make_v3("21357968")
         runner.Ledger(self.paths).close()
-        backup = next(self.paths.root.glob("ledger.sqlite3.pre-v4.*.bak"))
+        backup = next(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak"))
         restored = self.home / "restored"
         (restored / ".agent-harness" / "coordinator").mkdir(parents=True)
         _shutil.copyfile(backup, restored / ".agent-harness" / "coordinator" / "ledger.sqlite3")
+        # AC-11 rollback: the backup carries the fence; the run kit's v5 step clears it back to the prior version
+        import sqlite3 as _sqlite3
+        fenced = _sqlite3.connect(str(restored / ".agent-harness" / "coordinator" / "ledger.sqlite3"),
+                                  isolation_level=None)
+        try:
+            self.assertEqual(runner.ahc_migrate.read_version(fenced), (3, True))
+            runner.ahc_migrate.clear_fence(fenced, 3)
+        finally:
+            fenced.close()
         script = ("import sys; sys.path.insert(0, sys.argv[1]); import ahc_core, ahc_runner; "
                   "l = ahc_runner.Ledger(ahc_core.Paths(sys.argv[2])); "
                   "print(l.db.execute(\"SELECT v FROM meta WHERE k='schema_version'\").fetchone()[0], "
@@ -3322,7 +3354,7 @@ class SchemaTests(Base):
             runner.Ledger._counts = real
             held.close()
         self.assertIn("failed verification", str(caught.exception))
-        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], ("1", 3), "the ledger is untouched")
+        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], (FENCED_V1, 3), "the ledger is untouched")
         self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")))
 
 
@@ -4353,6 +4385,447 @@ class StateMachineTests(TC.Base):
     # slice (b) obligations with no test yet (goodqa#16204 items 2 and 3; the W3 finding_ids assumption)
     PENDING_B = ("test_b_scheduler_skips_rows_of_a_finished_item", "test_b_status_and_digest_show_inert_rows",
                  "test_b_findings_producer_writes_finding_ids")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Slice 1 (b) AC-11 / AC-16: schema version 5 (goodqa#16049). The PR 258 and 4d45fe40 fixtures are built by the
+# old code itself, from `git archive` of e0e4ac46 and 4d45fe40, each pinned by its ahc_contracts.py sha256.
+
+PIN_E0E4 = "586cda00d1930645eb3bed97ddfe5d007a31ff542d4526036ac39efa2d7c1bdd"
+PIN_4D45 = "b10962cc9bdaa50cab5bd71fee7c57448048744ec7045b94f76a33104235068a"
+OLD_TREES = {}
+
+
+def old_tree(commit, pin):
+    """harness/hooks at `commit`, extracted once per run and checked against its pinned ahc_contracts.py hash."""
+    import hashlib
+    import subprocess
+    if commit in OLD_TREES:
+        return OLD_TREES[commit]
+    repo = Path(__file__).resolve().parent.parent
+    target = Path(tempfile.mkdtemp(prefix="ahc-old-%s-" % commit))
+    archive = subprocess.run(["git", "-C", str(repo), "archive", commit, "harness/hooks"], capture_output=True)
+    if archive.returncode != 0:
+        raise AssertionError("commit %s is not in this checkout; fetch it (the fixture is pinned)" % commit)
+    subprocess.run(["tar", "-x", "-C", str(target)], input=archive.stdout, check=True)
+    hooks = target / "harness" / "hooks"
+    got = hashlib.sha256((hooks / "ahc_contracts.py").read_bytes()).hexdigest()
+    if got != pin:
+        raise AssertionError("fixture %s ahc_contracts.py sha256 %s is not the pin %s" % (commit, got, pin))
+    OLD_TREES[commit] = hooks
+    return hooks
+
+
+def run_old(hooks, home, code):
+    """Run `code` in a child process on the old tree (its own ahc_core and ahc_runner) against `home`."""
+    import subprocess
+    script = ("import sys; sys.path.insert(0, sys.argv[1]); import ahc_core, ahc_runner; "
+              "paths = ahc_core.Paths(sys.argv[2]); " + code)
+    return subprocess.run([sys.executable, "-I", "-B", "-c", script, str(hooks), str(home)], capture_output=True,
+                          text=True, timeout=120)
+
+
+class _ProbeRun:
+    """A fake lsof: lists this process's pid for every probe, plus `others` (pids) on the checks after the fence."""
+
+    def __init__(self, others=(), fail=None):
+        self.others, self.fail, self.calls = list(others), fail, []
+
+    def __call__(self, argv, timeout):
+        import types
+        self.calls.append(argv)
+        if self.fail:
+            raise self.fail
+        pids = [os.getpid()] + (self.others if len(self.calls) > 1 else [])
+        return types.SimpleNamespace(returncode=0 if pids else 1, stdout="".join("p%d\nf4\n" % p for p in pids),
+                                     stderr="")
+
+
+class MigrationV5Tests(Base):
+    SHA = {"h": "a" * 40, "b": "c" * 40, "pkt": "d" * 64, "core": "e" * 64}
+
+    def setUp(self):
+        super().setUp()
+        self._saved = (runner.Ledger.PROBE_RUN, runner.Ledger.HOOKS_DIR, runner.Ledger.LOCK_WAIT)
+        runner.Ledger.LOCK_WAIT = 2.0
+        self.live = self.paths.root / "ledger.sqlite3"
+
+    def tearDown(self):
+        runner.Ledger.PROBE_RUN, runner.Ledger.HOOKS_DIR, runner.Ledger.LOCK_WAIT = self._saved
+        super().tearDown()
+
+    def db(self, path=None, ro=False):
+        import sqlite3
+        conn = sqlite3.connect(str(path or self.live), isolation_level=None)   # ro cannot open a WAL ledger w/o -shm
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def make_old(self, commit, pin, populate=True):
+        """A version 4 ledger written by the old code itself, then populated with code passes, a findings row,
+        spec passes and an operation, all as raw rows in that layout."""
+        hooks = old_tree(commit, pin)
+        proc = run_old(hooks, self.home, "ahc_runner.Ledger(paths).close()")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        if not populate:
+            return
+        db = self.db()
+        try:
+            s = self.SHA
+            cols = [r[1] for r in db.execute("PRAGMA table_info(reviews)")]
+            spec_core = "spec_core" in cols
+            rows = [("rv-code-pass", "adversarial", "passed", s["b"], ""), ("rv-code-find", "red-team", "findings",
+                                                                             s["b"], ""),
+                    ("rv-spec-pass", "spec", "passed", "", s["core"])]
+            for rid, kind, state, br, core in rows:
+                names = "id, kind, item, repo, pr, head, snapshot_base, packet_sha256, policy_revision, state, " \
+                        "version, receipt, created, updated" + (", spec_core" if spec_core else "")
+                values = [rid, kind, "it-p0" if not spec_core else "wi-old", "o/r", 5, s["h"], br, s["pkt"], "rev1",
+                          state, 3, '{"verdict": "%s"}' % ("PASS" if state == "passed" else "BLOCK"), 1.0, 2.0]
+                if spec_core:
+                    values.append(core)
+                db.execute("INSERT INTO reviews(%s) VALUES (%s)" % (names, ",".join("?" * len(values))), values)
+            db.execute("INSERT INTO operations(key, kind, repo, pr, head, base, policy_revision, generation, "
+                       "params_sha256, state, version, created, updated) VALUES ('op-1', 'ff', 'o/r', 5, ?, ?, "
+                       "'rev1', 1, ?, 'confirmed', 2, 1, 2)", (s["h"], s["b"], s["pkt"]))
+        finally:
+            db.close()
+
+    def fresh_v5_sql(self):
+        other = Path(tempfile.mkdtemp(prefix="ahc-fresh-"))
+        runner.Ledger(core.Paths(other)).close()
+        return self.schema(core.Paths(other).root / "ledger.sqlite3")
+
+    def schema(self, path):
+        db = self.db(path, ro=True)
+        try:
+            return {(t, n, sql) for t, n, sql in db.execute(
+                "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE "
+                "'%\\_v3\\_legacy' ESCAPE '\\' AND name NOT LIKE '%\\_v4\\_legacy' ESCAPE '\\'")}
+        finally:
+            db.close()
+
+    def rows(self, path, table):
+        db = self.db(path, ro=True)
+        try:
+            return sorted(tuple(r) for r in db.execute("SELECT * FROM %s" % table))
+        finally:
+            db.close()
+
+    def version(self, path=None):
+        db = self.db(path, ro=True)
+        try:
+            row = db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()
+            return row[0] if row else None
+        finally:
+            db.close()
+
+    def open_v5(self, probe=None):
+        runner.Ledger.PROBE_RUN = probe or _ProbeRun()
+        return runner.Ledger(self.paths)
+
+    def must_open(self, probe=None):
+        """A migration that must succeed: a refusal is an assertion failure (so a variant counts as killed)."""
+        try:
+            return self.open_v5(probe)
+        except runner.SchemaError as error:
+            self.fail("the migration was refused: %s" % error)
+
+    def expect_refusal(self, cls, pattern, probe=None):
+        try:
+            self.open_v5(probe).close()
+        except runner.SchemaError as error:
+            self.assertIsInstance(error, cls, str(error))
+            self.assertRegex(str(error), pattern)
+            return error
+        self.fail("the migration was not refused")
+
+    # ---- the two layouts
+
+    def test_v5_pr258_layout_migrates_code_rows_keeps_spec_rows_legacy(self):
+        self.make_old("e0e4ac46", PIN_E0E4)
+        before = self.rows(self.live, "reviews")
+        self.must_open().close()
+        self.assertEqual(self.version(), "5")
+        self.assertEqual(self.rows(self.live, "reviews_v4_legacy"), before, "every PR 258 row is kept aside")
+        db = self.db(ro=True)
+        try:
+            kept = {r["id"]: (r["state"], r["round"], r["receipt"], r["item"]) for r in db.execute("SELECT * FROM reviews")}
+            ops = [tuple(r) for r in db.execute("SELECT key, state, wait_mono, wait_boot FROM operations")]
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally:
+            db.close()
+        self.assertEqual(set(kept), {"rv-code-pass", "rv-code-find"}, "spec rows stay only in reviews_v4_legacy")
+        self.assertEqual(kept["rv-code-pass"][:2], ("passed", 1))
+        self.assertEqual(kept["rv-code-find"][:2], ("findings", 1))
+        self.assertEqual(ops, [("op-1", "confirmed", None, None)], "operations rebuilt: an unknown AC-10 anchor")
+        self.assertIn("operations_v4_legacy", tables)
+        self.assertTrue({"work_items", "wi_notices", "observations", "w21_sends"} <= tables)
+        self.assertEqual(self.schema(self.live), self.fresh_v5_sql(), "fresh and migrated v5 SQL are identical")
+
+    def test_v5_4d45fe40_layout_migrates_every_row_as_round_1(self):
+        self.make_old("4d45fe40", PIN_4D45)
+        before = {r[0]: r for r in self.rows(self.live, "reviews")}
+        self.must_open().close()
+        db = self.db(ro=True)
+        try:
+            after = {r["id"]: r for r in db.execute("SELECT * FROM reviews")}
+        finally:
+            db.close()
+        self.assertEqual(set(after), set(before), "every row is copied in place")
+        for rid, row in after.items():
+            self.assertEqual((row["round"], row["state"], row["receipt"], row["item"]),
+                             (1, before[rid][9], before[rid][11], before[rid][2]))
+        self.assertEqual(self.schema(self.live), self.fresh_v5_sql())
+
+    def test_v5_readmitted_workitem_never_gets_a_copied_row(self):
+        """NEG-28 / AC-16: a WorkItem whose round 1 binding equals a copied PR 258 row's gets its own row."""
+        self.make_old("e0e4ac46", PIN_E0E4)
+        ledger = self.must_open()
+        try:
+            c = runner.ahc_contracts.Contracts(ledger.db, runner.ahc_contracts.AuthorityLog(self.home / "auth.log"))
+            s = self.SHA
+            row = c.require_review("adversarial", "o/r", 5, s["h"], s["pkt"], "rev1", item="wi-new",
+                                   snapshot_base=s["b"])
+            self.assertNotEqual(row["id"], "rv-code-pass")
+            self.assertEqual((row["item"], row["state"], row["round"]), ("wi-new", "required", 1))
+            again = c.require_review("adversarial", "o/r", 5, s["h"], s["pkt"], "rev1", item="wi-new",
+                                     snapshot_base=s["b"])
+            self.assertEqual(again["id"], row["id"], "looked up by the key, idempotent")
+        finally:
+            ledger.close()
+
+    def test_v5_refuses_the_earlier_v4_layout_and_unknown_markers(self):
+        for label, ddl in (("early-v4", "CREATE TABLE reviews (id TEXT PRIMARY KEY, kind TEXT, merge_sha TEXT)"),
+                           ("unknown", "CREATE TABLE reviews (id TEXT PRIMARY KEY, kind TEXT, spec_core TEXT)")):
+            with self.subTest(layout=label):
+                self.setUp()
+                self.make_old("4d45fe40", PIN_4D45, populate=False)
+                db = self.db()
+                db.execute("DROP TABLE reviews")
+                db.execute(ddl)
+                db.close()
+                before = self.rows(self.live, "reviews"), self.version()
+                self.expect_refusal(runner.MigrationRefused, "migration-layout")
+                self.assertEqual((self.rows(self.live, "reviews"), self.version()), before)
+                self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak")), "no backup taken")
+
+    # ---- the fence, the preflight and the open-file check
+
+    def test_v5_failure_restores_fenced_then_the_retry_migrates(self):
+        self.make_old("4d45fe40", PIN_4D45)
+        before = {t: self.rows(self.live, t) for t in ("reviews", "operations", "grants")}
+        saved = list(runner.MIGRATIONS[5])
+        runner.MIGRATIONS[5] = saved + ["THIS IS NOT SQL"]
+        try:
+            self.expect_refusal(runner.SchemaError, "restored the verified backup")
+        finally:
+            runner.MIGRATIONS[5] = saved
+        self.assertEqual(self.version(), "v5-migrating-from-4", "the restored copy carries the fence")
+        self.assertEqual({t: self.rows(self.live, t) for t in before}, before, "row-for-row equal to the backup")
+        self.assertTrue(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "failed files moved aside, kept")
+        with self.assertRaises(runner.MigrationPending):
+            runner.Ledger(self.paths, migrate=False)
+        self.must_open().close()
+        self.assertEqual(self.version(), "5")
+        self.assertEqual(len(self.rows(self.live, "reviews")), len(before["reviews"]))
+
+    def test_v5_fence_over_v3_is_cleared_when_the_file_is_held(self):
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        db = self.db()
+        db.execute("UPDATE meta SET v='3' WHERE k='schema_version'")
+        db.close()
+        before = self.rows(self.live, "items"), self.version()
+        self.expect_refusal(runner.MigrationRefused, "migration-held.*cleared back to schema_version 3",
+                            _ProbeRun(others=[999999]))
+        self.assertEqual((self.rows(self.live, "items"), self.version()), before)
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak")))
+
+    def test_v5_a_failed_open_file_check_counts_as_held(self):
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+
+        class Fails(_ProbeRun):
+            def __call__(self, argv, timeout):
+                import types
+                self.calls.append(argv)
+                if len(self.calls) == 1:
+                    return types.SimpleNamespace(returncode=0, stdout="p%d\n" % os.getpid(), stderr="")
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="lsof: WARNING: permission denied\n")
+        self.expect_refusal(runner.MigrationRefused, "migration-held.*cleared back to schema_version 4",
+                            Fails())
+        self.assertEqual(self.version(), "4")
+
+    def test_v5_the_fence_is_committed_before_the_open_file_check(self):
+        """NEG-43 at the check: an old reader that connects after the preflight and before the open-file check
+        finds the fence and refuses; the fence is in place when the check runs, and the backup carries it."""
+        self.make_old("4d45fe40", PIN_4D45)
+        seen = []
+        hooks = old_tree("4d45fe40", PIN_4D45)
+
+        class Watch(_ProbeRun):
+            def __call__(inner, argv, timeout):
+                if len(inner.calls) == 1:          # the open-file check after the preflight probe
+                    seen.append(self.version())
+                    proc = run_old(hooks, self.home, "ahc_runner.Ledger(paths, migrate=False)")
+                    seen.append(proc.returncode != 0 and "unreadable schema_version" in proc.stderr)
+                return _ProbeRun.__call__(inner, argv, timeout)
+        self.must_open(Watch()).close()
+        self.assertEqual(seen, ["v5-migrating-from-4", True])
+        backup = next(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak"))
+        self.assertEqual(self.version(backup), "v5-migrating-from-4", "the backup carries the fence")
+
+    def test_v5_preflight_refuses_without_a_probe_or_its_own_pid(self):
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        import types
+        for label, run in (("missing", _ProbeRun(fail=FileNotFoundError("lsof"))),
+                           ("denied", lambda argv, t: types.SimpleNamespace(returncode=1, stdout="", stderr=""))):
+            with self.subTest(case=label):
+                self.expect_refusal(runner.MigrationRefused, "migration-preflight", run)
+                self.assertEqual(self.version(), "4", "refused before the fence: nothing written")
+        self.assertIsNone(runner.ahc_migrate.open_file_holders.__defaults__[0] if False else None)
+        with self.assertRaises(runner.ahc_migrate.ProbeError):
+            runner.ahc_migrate.open_file_holders([self.live], lambda a, t: None, tools={"lsof": None, "fuser": None})
+
+    def test_v5_entry_point_mismatch_refuses_before_any_backup(self):
+        import shutil as _shutil
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        hooks = Path(tempfile.mkdtemp(prefix="ahc-hooks-"))
+        source = runner.Ledger.HOOKS_DIR
+        for name in runner.ahc_migrate.release_list(source):
+            _shutil.copyfile(source / name, hooks / name)
+        _shutil.copyfile(source / runner.ahc_migrate.RELEASE_LIST, hooks / runner.ahc_migrate.RELEASE_LIST)
+        _shutil.copyfile(old_tree("4d45fe40", PIN_4D45) / "ahc_runner.py", hooks / "ahc_runner.py")
+        runner.Ledger.HOOKS_DIR = hooks
+        self.expect_refusal(runner.MigrationRefused, "preflight: installed entry points.*ahc_runner.py")
+        self.assertEqual(self.version(), "4")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak")))
+
+    def test_v5_release_list_is_current(self):
+        import subprocess
+        proc = subprocess.run([sys.executable, "-B", str(HOOKS.parents[1] / "scripts" / "ahc_release_hashes.py"),
+                               "--check"], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+    def test_v5_probe_output_is_parsed_never_the_exit_status(self):
+        import types
+        m = runner.ahc_migrate
+        f = Path("/x/ledger.sqlite3")
+        ok = lambda out, err="", rc=0: (lambda a, t: types.SimpleNamespace(returncode=rc, stdout=out, stderr=err))
+        self.assertEqual(m.open_file_holders([f], ok("", rc=1), tools={"lsof": "/usr/sbin/lsof"}), set(),
+                         "lsof exits 1 when nothing holds the file: clear")
+        self.assertEqual(m.open_file_holders([f], ok("p12\nf3\np34\n"), tools={"lsof": "/usr/sbin/lsof"}), {12, 34})
+        self.assertEqual(m.open_file_holders([f], ok("", "%s:\n" % f), tools={"fuser": "/usr/bin/fuser"}), set(),
+                         "macOS fuser exits 0 with only its file-name echo: clear")
+        self.assertEqual(m.open_file_holders([f], ok(" 77", "%s:\n" % f), tools={"fuser": "/usr/bin/fuser"}), {77})
+        for tools, run in (({"lsof": "/usr/sbin/lsof"}, ok("", "lsof: WARNING: can't stat()\n", 1)),
+                           ({"fuser": "/usr/bin/fuser"}, ok("", "fuser: permission denied\n")),
+                           ({"lsof": "/usr/sbin/lsof"}, ok("", rc=-9))):
+            with self.assertRaises(m.ProbeError):
+                m.open_file_holders([f], run, tools=tools)
+
+    def test_v5_real_probe_lists_this_process_on_the_mac_and_t2(self):
+        f = self.home / "held.sqlite3"
+        with open(str(f), "w") as handle:
+            handle.write("x")
+            holders = runner.ahc_migrate.open_file_holders([f], runner.ahc_migrate.default_run)
+        self.assertIn(os.getpid(), holders)
+
+    # ---- locks: a live connection, a role, and the restore publish
+
+    def test_v5_waits_for_an_open_connection_and_refuses_without_writing(self):
+        """NEG-27: a review-role connection is open in another process; migration waits on the maint flock and
+        refuses after its bound. Its commit survives and nothing is written."""
+        import subprocess
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        db = self.db()
+        db.execute("UPDATE meta SET v='4' WHERE k='schema_version'")
+        db.close()
+        holder = subprocess.Popen([sys.executable, "-I", "-B", "-c",
+                                   "import sys, fcntl, time; sys.path.insert(0, sys.argv[1]); import ahc_migrate, ahc_core;"
+                                   " h = ahc_migrate.maint_lock(ahc_core.Paths(sys.argv[2]).root, shared=True);"
+                                   " print('held', flush=True); time.sleep(30)", str(HOOKS), str(self.home)],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            self.expect_refusal(runner.MigrationRefused, "migration-locks.*ledger.sqlite3.maint")
+            self.assertEqual(self.version(), "4")
+        finally:
+            holder.terminate()
+            holder.wait()
+        self.must_open().close()
+        self.assertEqual(self.version(), "5")
+
+    def test_v5_a_stray_file_at_the_absent_path_is_never_replaced(self):
+        """NEG-43's path-absent window: an old process creates a file at the ledger path between the move-aside
+        and the publish. The publish refuses, keeps the stray file, the intent and the moved-aside files."""
+        self.make_old("4d45fe40", PIN_4D45)
+        saved = list(runner.MIGRATIONS[5])
+        runner.MIGRATIONS[5] = saved + ["THIS IS NOT SQL"]
+        hooks = old_tree("4d45fe40", PIN_4D45)
+        made = []
+
+        def stray(name):
+            if name == "runner.restore_publish" and not made:
+                # a 4d45fe40 reader refuses here already: the restore intent exists while the path is absent
+                proc = run_old(hooks, self.home, "l = ahc_runner.Ledger(paths, migrate=False); l.close()")
+                made.append(proc.returncode != 0 and "interrupted restore" in proc.stderr)
+                # an old process that connects anyway creates and stamps its own file at the absent path
+                import sqlite3
+                conn = sqlite3.connect(str(self.live), isolation_level=None)
+                conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+                conn.execute("INSERT INTO meta VALUES ('schema_version', '4')")
+                conn.close()
+        import ahc_crash
+        old_before = ahc_crash.crash_before
+        runner.crash_before = lambda name: (stray(name), old_before(name))
+        try:
+            with self.assertRaises(runner.SchemaError) as caught:
+                self.open_v5()
+            self.assertIsInstance(caught.exception, runner.ahc_migrate.StrayLedger, str(caught.exception))
+        finally:
+            runner.crash_before = old_before
+            runner.MIGRATIONS[5] = saved
+        self.assertEqual(made, [True], "a 4d45fe40 reader refuses on the restore intent")
+        self.assertEqual(self.version(), "4", "the stray file at the ledger path is kept, never replaced")
+        self.assertTrue((self.paths.root / "ledger.sqlite3.restore-intent").exists(), "the intent is kept")
+        self.assertTrue(list(self.paths.root.glob("ledger.sqlite3.failed-*")))
+
+    def test_v5_old_code_refuses_a_fenced_and_a_v5_ledger(self):
+        """NEG-28 / NEG-43: 4d45fe40 and e0e4ac46 code read schema_version at every open and refuse a fence or 5
+        before any write."""
+        self.make_old("4d45fe40", PIN_4D45)
+        self.must_open().close()
+        for commit, pin in (("4d45fe40", PIN_4D45), ("e0e4ac46", PIN_E0E4)):
+            before = self.rows(self.live, "items")
+            proc = run_old(old_tree(commit, pin), self.home, "ahc_runner.Ledger(paths, migrate=False)")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("SchemaError", proc.stderr)
+            self.assertEqual(self.rows(self.live, "items"), before)
+        db = self.db()
+        runner.ahc_migrate.set_fence(db, 4)
+        db.close()
+        proc = run_old(old_tree("4d45fe40", PIN_4D45), self.home,
+                       "ahc_runner.Ledger(paths, migrate=False)")
+        self.assertIn("unreadable schema_version", proc.stderr)
+
+    def test_v5_rollback_restores_the_backup_clears_the_fence_and_old_code_opens_it(self):
+        for commit, pin in (("4d45fe40", PIN_4D45), ("e0e4ac46", PIN_E0E4)):
+            with self.subTest(layout=commit):
+                self.setUp()
+                self.make_old(commit, pin)
+                before = self.rows(self.live, "reviews")
+                self.must_open().close()
+                backup = next(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak"))
+                try:
+                    n = runner.Ledger.rollback_v5(self.paths, backup.name)
+                except runner.SchemaError as error:
+                    self.fail("rollback refused: %s" % error)
+                self.assertEqual(n, 4)
+                self.assertEqual(self.version(), "4")
+                self.assertEqual(self.rows(self.live, "reviews"), before)
+                proc = run_old(old_tree(commit, pin), self.home,
+                               "l = ahc_runner.Ledger(paths, migrate=False); print(l.db.execute(\"SELECT COUNT(*) "
+                               "FROM reviews\").fetchone()[0]); l.close()")
+                self.assertEqual((proc.returncode, proc.stdout.strip()), (0, str(len(before))), proc.stderr[-400:])
 
 
 if __name__ == "__main__":

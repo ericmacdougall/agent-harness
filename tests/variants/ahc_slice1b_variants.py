@@ -39,6 +39,95 @@ ENTRIES = {
                          ('    if any(v in ("error", "skip") for v in values):\n        return "inconclusive"\n', "")],
                          HARNESS)]},
 }
+MV = "tests.test_ahc_runner.MigrationV5Tests."
+ENTRIES.update({
+    "AC-11/NEG-39 manifest check": {
+        "tests": [MV + "test_v5_entry_point_mismatch_refuses_before_any_backup"],
+        "mutations": [("the preflight skips the entry-point manifest check", [
+            ("        ahc_migrate.verify_entry_points(self.HOOKS_DIR, self._installed_extras())\n", "")],
+            RUNNER_PY)]},
+    "AC-11/NEG-39 failed check is held": {
+        "tests": [MV + "test_v5_a_failed_open_file_check_counts_as_held"],
+        "mutations": [("a failed open-file check counts as clear", [
+            ('                raise MigrationRefused("migration-held: the open-file check failed (%s), which counts '
+             'as held"\n                                       % error) from None\n',
+             "                others = set()\n")], RUNNER_PY)]},
+    "AC-11/NEG-39 held file clears the fence": {
+        "tests": [MV + "test_v5_fence_over_v3_is_cleared_when_the_file_is_held"],
+        "mutations": [("a held file refuses without clearing the fence", [
+            ("            ahc_migrate.clear_fence(self.db, n)\n            raise MigrationRefused(\"%s; the fence",
+             "            raise MigrationRefused(\"%s; the fence")], RUNNER_PY)]},
+    "AC-11/NEG-43 fence before the check": {
+        "tests": [MV + "test_v5_the_fence_is_committed_before_the_open_file_check"],
+        "mutations": [("the fence is written after the open-file check", [
+            ("        ahc_migrate.set_fence(self.db, n)\n", ""),
+            ('        # (6) the verified online backup, which carries the fence\n',
+             "        ahc_migrate.set_fence(self.db, n)\n")], RUNNER_PY)]},
+    "AC-11 backup after the fence": {
+        "tests": [MV + "test_v5_failure_restores_fenced_then_the_retry_migrates",
+                  MV + "test_v5_the_fence_is_committed_before_the_open_file_check"],
+        "mutations": [("the backup is taken before the fence", [
+            ('        crash_before("runner.v5_fence")\n',
+             '        copy = self.backup("pre-v%d" % SCHEMA_VERSION)\n        crash_before("runner.v5_fence")\n'),
+            ('        copy = self.backup("pre-v%d" % SCHEMA_VERSION)\n        # (7)', "        # (7)")], RUNNER_PY)]},
+    "AC-11/NEG-43 publish never replaces": {
+        "tests": [MV + "test_v5_a_stray_file_at_the_absent_path_is_never_replaced"],
+        "mutations": [("the restored copy is published by a replacing rename", [
+            ("            fs.link_exclusive(self.paths.root, staged, self.path)   # the complete, fsynced, "
+             "digest-checked copy\n", "            fs.rename(self.paths.root, staged, self.path)\n"),
+            ("        fs.unlink(self.paths.root, staged)\n        crash_after(\"runner.restore_publish\")",
+             "        crash_after(\"runner.restore_publish\")")], RUNNER_PY)]},
+    "AC-11 layout refusal": {
+        "tests": [MV + "test_v5_refuses_the_earlier_v4_layout_and_unknown_markers"],
+        "mutations": [("the preflight does not check the layout", [
+            ('            if layout not in ("pr258", "4d45fe40", "v5"):\n                raise MigrationRefused('
+             '"migration-layout',
+             '            if False:\n                raise MigrationRefused("migration-layout')], RUNNER_PY)]},
+    "AC-11 PR 258 spec rows stay legacy": {
+        "tests": [MV + "test_v5_pr258_layout_migrates_code_rows_keeps_spec_rows_legacy"],
+        "mutations": [("PR 258 spec rows are copied into the v5 table", [
+            ('where = "WHERE kind != \'spec\'" if (name == "reviews" and layout == "pr258") else ""',
+             'where = ""')], "harness/hooks/ahc_migrate.py")]},
+    "AC-11 rollback clears the fence": {
+        "tests": [MV + "test_v5_rollback_restores_the_backup_clears_the_fence_and_old_code_opens_it"],
+        "mutations": [("rollback restores without clearing the fence", [
+            ("            self.restore(copy)\n            ahc_migrate.clear_fence(self.db, n)\n",
+             "            self.restore(copy)\n")], RUNNER_PY)]},
+    "AC-16/NEG-28 item in the review identity": {
+        "tests": [MV + "test_v5_readmitted_workitem_never_gets_a_copied_row"],
+        "mutations": [("require_review looks rows up without the item", [
+            ('"SELECT id FROM reviews WHERE item=? AND kind=? AND',
+             '"SELECT id FROM reviews WHERE ? IS NOT NULL AND kind=? AND')], CONTRACTS)]},
+})
+CK = "tests.test_ahc_clock.ClockTests."
+CLOCK = "harness/hooks/ahc_clock.py"
+ENTRIES.update({
+    "AC-10 wall never backwards": {
+        "tests": [CK + "test_effective_wall_never_goes_backwards_across_restarts"],
+        "mutations": [("the high-water mark is never persisted", [
+            ('            self.db.execute("INSERT OR REPLACE INTO contract_meta(k, v) VALUES (?, ?)", (self.HWM_KEY, '
+             'repr(now)))\n', "")], CLOCK)]},
+    "AC-10 escalation on either clock": {
+        "tests": [CK + "test_escalation_fires_on_either_clock_and_on_a_new_boot"],
+        "mutations": [("an escalation waits for both clocks", [
+            ("return elapsed is None or wall_passed or elapsed >= float(duration)",
+             "return elapsed is None or (wall_passed and elapsed >= float(duration))")], CLOCK)]},
+    "AC-10 wait needs both clocks": {
+        "tests": [CK + "test_wait_needs_both_clocks_and_restarts_on_a_new_boot"],
+        "mutations": [("a wait ends on the wall clock alone", [
+            ("        return wall_passed and elapsed >= float(duration)\n",
+             "        return wall_passed or elapsed >= float(duration)\n")], CLOCK)]},
+    "AC-10 new boot is unknown elapsed": {
+        "tests": [CK + "test_escalation_fires_on_either_clock_and_on_a_new_boot",
+                  CK + "test_wait_needs_both_clocks_and_restarts_on_a_new_boot"],
+        "mutations": [("a new boot keeps the old anchor", [
+            (" or boot != self.boot_id:", ":")], CLOCK)]},
+    "AC-10 elapsed from the boot clock": {
+        "tests": [CK + "test_elapsed_comes_from_the_boot_clock_not_the_wall"],
+        "mutations": [("elapsed is derived from wall timestamps", [
+            ("        return max(0.0, float(self._boot()) - float(anchor))\n",
+             "        return max(0.0, self.effective_wall() - (float(_deadline) - float(_duration)))\n")], CLOCK)]},
+})
 
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
