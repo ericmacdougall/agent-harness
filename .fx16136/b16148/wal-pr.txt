@@ -1,0 +1,17 @@
+goodqa#16148 step 2: draft PR ericmacdougall/bugtracker#1373 is open from fix/16148-job-envfile, HEAD 158ec0db4b6b0a9dbb56fdce63a05df97fc1548c, base fix/16185 3b7cde1a (#1372). Nothing is merged or deployed.
+
+New commit 158ec0db adds infra/release-harness/test_selfhost_ctl_job_secrets.py, the Sonnet v4 condition from the lead. It runs the real selfhost-ctl pin and its rollback on a fake VM, and the mount and group_add stay. The rollback of a release pinned before the apply is refused by the fence (exit 3). Broken variant C1 (the pin rewrite drops the marked block) fails 1 test; C2 (no fence) fails 1.
+
+Evidence at HEAD (t2-dev), all exit 0:
+- vitest 359 passed, 14 skipped;
+- tsc;
+- derive and host 61 and 61 OK;
+- wrapper and sampler 18 OK;
+- node 23 of 23;
+- pytest ctl 1584 passed.
+
+Packet: harness worktree .fx16136/packets/pr-16148.md, sha256 bcc0d0976431e7fd64a3d3dd4c283041cd08905ae62dda87c150bb6dc7b39f8c, 153361 bytes, lint clean. It is pushed on fx/16148-pem-spec at dec04106.
+
+The ship order lists steps 1 to 6, each with a stated check. The drift gate is red from merge until the host apply; it fails closed and has a node selfhost-plan.mjs no-drift check after the apply.
+
+The packet lists 5 deviations: empty env, R2 on compose (w02dccb8d90d), R3 dropping the installed derive, marked-line restore, and the rh lock check deferred.
