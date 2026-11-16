@@ -19,6 +19,10 @@ from pathlib import Path
 import ahc_fs as fs
 from ahc_crash import crash_after, crash_before
 
+# The attached spec these tables implement: M-1 v2g16 (goodqa#16049, attach comment 1a9b9eaf). The vendored copy of
+# its State machine section, docs/spec/ahc-m1-state-machine.md, names this core in its header (AC-1).
+SPEC_CORE_SHA256 = "0130008d4280234e1320b0d433a5dcfabe210dda228b2e9893745ae40a2b006f"
+
 # Bounds from design v3 1.1 (the only numbers here)
 B10_DISPATCHES = 3            # physical dispatches per operation key, in total, the first included
 B37_PROBE_SECONDS = 60        # readback rate per unknown outcome
@@ -201,6 +205,59 @@ class Contracts:
                         "VALUES (?,?,?,?,?,?,?,?)", (entity, ident, frm, to, event_id, actor, self.now(),
                                                      _canon(data) if data else None))
 
+    # -------------------------------------------------------------- WorkItem (spec M-1 v2g16, W1-W27)
+
+    # Shadow only in slice 1 (a): the P0 item machine in ahc_runner stays authoritative until the cutover, and no
+    # WorkItem row sends anything. These tables equal the vendored spec section one to one (AC-1,
+    # tests.test_ahc_core.TransitionTableTests). States: name -> (class, outcome, next actor).
+    WI_STATES = {
+        "pr-gate": ("active", "-", "ahc-review"),
+        "merge-ready": ("active", "-", "ahc-core"),
+        "waiting-dep": ("waiting", "-", "ahc-core"),
+        "waiting-ask": ("waiting", "-", "main"),
+        "exhausted": ("waiting", "-", "main"),
+        "merged": ("waiting", "-", "ahc-core"),
+        "headed-verified": ("terminal", "success", "none"),
+        "handed-to-staging": ("terminal", "neutral", "none"),
+        "superseded": ("terminal", "neutral", "none"),
+        "closed-unmerged": ("terminal", "failure", "none"),
+        "cancelled": ("terminal", "neutral", "none"),
+    }
+    _WI_LIVE = ("pr-gate", "merge-ready", "waiting-dep", "waiting-ask", "exhausted")
+    _WI_INFLIGHT = ("merge-ready", "pr-gate", "waiting-ask")      # where an unsettled Effect can be (T7, W24)
+    # Rows: id -> (from states, to states, actor). W24 keeps the item where it is, so its To is its From.
+    WI_TRANSITIONS = {
+        "W1": (("(entry)",), ("pr-gate",), "ahc-core"),
+        "W2": (("pr-gate",), ("merge-ready",), "ahc-core"),
+        "W3": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W4": (_WI_LIVE, ("superseded",), "ahc-core"),
+        "W5": (("merge-ready",), ("waiting-dep",), "ahc-core"),
+        "W6": (("waiting-dep",), ("merge-ready",), "ahc-core"),
+        "W7": (("merge-ready",), ("merge-ready",), "ahc-core"),
+        "W8": (("merge-ready",), ("merged",), "ahc-core"),
+        "W9": (("merge-ready",), ("pr-gate",), "ahc-core"),
+        "W10": (("merge-ready",), ("waiting-ask",), "ahc-core"),
+        "W11": (("merged",), ("handed-to-staging",), "ahc-core"),
+        "W12": (("merged",), ("headed-verified",), "ahc-core"),
+        "W13": (_WI_LIVE, ("closed-unmerged",), "ahc-core"),
+        "W14": (_WI_LIVE, ("merged",), "ahc-core"),
+        "W15": (("pr-gate",), ("exhausted",), "ahc-core"),
+        "W16": (("waiting-ask", "exhausted", "waiting-dep"), ("pr-gate", "cancelled"), "main"),
+        "W17": (("pr-gate", "merge-ready", "waiting-dep"), ("waiting-ask",), "ahc-core"),
+        "W18": (("pr-gate", "merge-ready", "waiting-dep"), ("pr-gate",), "ahc-core"),
+        "W19": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W20": (("pr-gate",), ("cancelled",), "owner"),
+        "W21": (("pr-gate",), ("pr-gate",), "ahc-core"),
+        "W22": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W23": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W24": (_WI_INFLIGHT, _WI_INFLIGHT, "ahc-core"),
+        "W25": (_WI_INFLIGHT, ("superseded", "closed-unmerged"), "ahc-core"),
+        # W26 from waiting-dep and exhausted is defensive (spec owner ruling Q-A5.2): T7 keeps an unsettled Effect
+        # out of those states, but a confirmed merge found there is still recorded, never lost.
+        "W26": (("pr-gate", "waiting-dep", "waiting-ask", "exhausted"), ("merged",), "ahc-core"),
+        "W27": (("merge-ready",), ("pr-gate",), "ahc-core"),
+    }
+
     # -------------------------------------------------------------- Review (3.3)
 
     # M-1 spec (ahc-m1-v1, Review table R1-R13): kinds adversarial and spec, plus red-team where the class requires
@@ -222,12 +279,12 @@ class Contracts:
         ("running", "findings"): P,           # R5
         ("running", "infra-wait"): P,         # R6
         ("running", "outcome-unknown"): D,    # R7
-        ("running", "cancelling"): D,         # R12 via cancelling (ruling 2)
-        ("cancelling", "superseded"): D,
+        ("running", "cancelling"): D,         # R14: the subject changed (W4, W9, W18) or the owner cancelled (W20)
+        ("cancelling", "superseded"): D,      # R15: the unit is gone; a later result is stored as late only
         ("outcome-unknown", "passed"): D,     # R8
         ("outcome-unknown", "findings"): D,   # R8
         ("outcome-unknown", "queued"): D,     # R9
-        ("outcome-unknown", "superseded"): D,  # R12: a receipt arriving later authorizes nothing
+        ("outcome-unknown", "cancelling"): D,  # R14 (v2g16): its unit may still be running, so it is stopped first
         ("infra-wait", "queued"): D,          # R10
         ("infra-wait", "superseded"): D,      # R12
     }
@@ -319,16 +376,17 @@ class Contracts:
             raise ContractError("receipt verdict %r does not match %s" % (verdict, to))
 
     def supersede_reviews(self, repo, pr, head, successor_of, event_prefix, actor="ahc-core"):
-        """R12, a changed head: every non-terminal row for (repo, pr) at another head is superseded; a running row
-        goes to cancelling first and settles to superseded once its unit is stopped. A receipt that arrives for a
-        superseded row authorizes nothing. successor_of(row id) names the new row."""
+        """R12 and R14, a changed head: every required, queued or infra-wait row for (repo, pr) at another head is
+        superseded (R12); a running or outcome-unknown row goes to cancelling first (R14) and settles to superseded
+        once its unit is stopped (R15). A receipt that arrives for either authorizes nothing. successor_of(row id)
+        names the new row."""
         out = []
         with self.tx():
             rows = self.db.execute("SELECT id, state, version FROM reviews WHERE repo=? AND pr=? AND head != ? "
                                    "AND state NOT IN ('passed', 'findings', 'superseded', 'cancelling')",
                                    (str(repo).lower(), int(pr), head)).fetchall()
             for rid, state, version in rows:
-                to = "cancelling" if state == "running" else "superseded"
+                to = "cancelling" if state in ("running", "outcome-unknown") else "superseded"
                 self.review(rid, to, expected_version=version, event_id="%s-%s" % (event_prefix, rid), actor=actor,
                             successor=successor_of(rid) if to == "superseded" else None, cause="head-changed")
                 out.append((rid, to))

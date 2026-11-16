@@ -241,15 +241,26 @@ class ReviewTests(Base):
         passed = self.result(self.walk(self.row(kind="red-team", packet_sha256="8" * 64), "queued", "running"),
                              receipt=self.receipt(packet_sha256="8" * 64))
         moved = dict(self.c.supersede_reviews("o/r", 5, H2, lambda rid: "rv-new", "sup"))
+        # v2g16 R14: an outcome-unknown row's unit may still be running, so it is cancelled first, like a running
+        # row; it never jumps straight to superseded (the pre-R14 shortcut, flipped in slice 1a).
         self.assertEqual(moved, {queued["id"]: "superseded", running["id"]: "cancelling",
-                                 unknown["id"]: "superseded", spec["id"]: "superseded"})
+                                 unknown["id"]: "cancelling", spec["id"]: "superseded"})
         self.assertEqual(self.state("reviews", "id", passed["id"]), "passed", "history never changes")
-        r = self.db.execute("SELECT version FROM reviews WHERE id=?", (running["id"],)).fetchone()[0]
-        self.c.review(running["id"], "superseded", expected_version=r, event_id=self.ev())
+        for rid in (running["id"], unknown["id"]):
+            r = self.c._row("reviews", "id", rid)
+            with self.assertRaises(C.ContractError):   # R15: a result arriving while cancelling authorizes nothing
+                self.c.review(rid, "passed", expected_version=r["version"], event_id=self.ev(),
+                              receipt=self.receipt(packet_sha256=r["packet_sha256"]), peer_uid=self.UID)
+            self.c.review(rid, "superseded", expected_version=r["version"], event_id=self.ev())
         r = self.c._row("reviews", "id", unknown["id"])
         with self.assertRaises(C.ContractError):   # a late receipt for a superseded row authorizes nothing
             self.c.review(unknown["id"], "passed", expected_version=r["version"], event_id=self.ev(),
                           receipt=self.receipt(packet_sha256="9" * 64), peer_uid=self.UID)
+        with self.assertRaises(C.ContractError):   # and the shortcut is gone from the table
+            other = self.walk(self.row(kind="adversarial", packet_sha256="7" * 64), "queued", "running",
+                              "outcome-unknown")
+            self.c.review(other["id"], "superseded", expected_version=other["version"], event_id=self.ev(),
+                          successor="rv-new")
 
     def test_r01_code_rows_bind_the_snapshot_base_and_spec_rows_store_empty(self):
         row = self.row()
