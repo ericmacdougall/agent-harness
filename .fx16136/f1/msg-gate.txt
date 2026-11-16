@@ -1,0 +1,25 @@
+fix(release-harness): measure docker's own containerd store
+
+Why: receipt bth-pr73-v5 F1 (High). The VM disk gate read DockerRootDir and then ran a bare `containerd config dump`. With docker's containerd using another config or root, that measured an unrelated filesystem while docker's real image store could be full, and rw-ship.sh would load seven images. The same bytes are in this gate branch (store_roots). Lead and main ruling: fix it here first, then port it to the rh line.
+
+What:
+- selfhost-ctl.py containerd_root() finds docker's endpoint in this order:
+  1. docker info .Containerd.Address (Docker 27+);
+  2. otherwise the one dockerd holding docker's API socket and its --containerd flag;
+  3. otherwise its daemon.json "containerd" key (--config-file, else /etc/docker/daemon.json);
+  4. otherwise the two default sockets (system and dockerd-managed). Exactly one may be live, or both with the same root.
+- It then needs exactly one listening socket at that path (/proc/net/unix) and exactly one process holding it (the socket owner's processes, same pid namespace). That process's --root, else the top-level root of its --config file, is the store. Section keys are ignored, an empty imports is allowed, and the root is realpath'd and must exist.
+- Each failure refuses with its own message: no dockerd; several dockerd; unparseable daemon.json; nothing listens; several listening sockets; several holders; both default sockets live with different roots; neither live; non-empty imports; root set twice; unreadable or missing root; relative paths; unreadable process (as root).
+- No `containerd config dump` is run any more, and there is no new dependency or privilege: the ctl already runs as `sudo python3 -` on the VM.
+- rw-ship.sh prints the ctl's refusal reason after "VM image store: unresolved", so NO DISK (exit 11) names its cause.
+- test_rw_ship_selfhost.py: the fixture runs real stand-in dockerd and containerd processes that listen on unix sockets, so the real /proc lookup is exercised. 25 F1 cases test the discovery through store_roots. A release-level regression covers docker's containerd root being full while a default config dump names a root with room: exit 11, no LOAD, nothing changed.
+- Retargeted, not removed: test_vm_disk_unresolved_containerd_root_refuses was parametrized on containerd-fail and containerd-noroot, two failures of the removed config dump. Its cases are now no-listener and old-docker-no-dockerd, with the same exit-11 assertions plus the reason.
+
+Testing:
+- `pytest -q test_rw_ship_selfhost.py -k "f1_ or unresolved_containerd or measures_dockers"` with only the new tests, on the 5eafc9a0 ctl (t2-dev) -> 27 failed (DID NOT RAISE, alt-root measured, rc 0 not 11).
+- The same with the fix plus the vm_disk tests -> 45 passed, exit 0.
+- `pytest -q test_rw_ship_selfhost.py test_rw_release_authority_d2.py` -> RESULT_SELFHOST_D2.
+
+Refs: GoodQA #16148, GoodQA #16136
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
