@@ -112,9 +112,11 @@ Checkpoint: each green step committed and pushed on the feature branch; tests ar
 
 ## Reviews
 
-Spec core sha256: `e002c59f11652005a7f0d24e4b832a1ef372f09638476d4de0cb7de3a729a1df`
+Spec core sha256: `5d317b219289998925ef12f4d7b3fc2da16f94f0ae9fa8ff705cab883a0e9a22`
 
 | Role | Verdict | Reviewer | Kind | Source | Bound to |
 |---|---|---|---|---|---|
+| acceptance | ACCEPT | a9c212c3b8fbe5530 (red-team) | agent | WAL-verified red-team agent | stale |
+| adversarial | ACCEPT | a5a2642f07434bbc9 (red-team) | agent | WAL-verified red-team agent | stale |
 | acceptance | ACCEPT | a9c212c3b8fbe5530 (red-team) | agent | WAL-verified red-team agent | current |
 | adversarial | ACCEPT | a5a2642f07434bbc9 (red-team) | agent | WAL-verified red-team agent | current |

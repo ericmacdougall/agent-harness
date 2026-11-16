@@ -1,0 +1,13 @@
+docs(fx16136): record the goodqa#16148 spec v4 attach
+
+Why: both reviewers accepted spec v4 (core 5d317b21), so the spec is attached and its record must be reproducible.
+
+What: spec-16148-pem.md with the regenerated Reviews section, the reviews.json sidecar, and the Opus v4 report (sha 37d7aec3) at its recorded path. Attached as ticket comment ef963731.
+
+Testing: `python3 ~/.claude/hooks/spec_flow.py attach --actor agent:a9dc66afb96703739 .fx16136/spec-16148-pem.md` -> exit 0, status RECORDED.
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
