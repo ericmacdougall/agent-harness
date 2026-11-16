@@ -93,6 +93,14 @@ V = [
         ("            if row[\"wait_boot\"] == self.boot_id and isinstance(row[\"wait_mono\"], (int, float)):\n",
          "            if isinstance(row[\"wait_mono\"], (int, float)):\n")],
      CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
+    ("T-1: a pending id dropped from the pinned list while it has no test", [
+        ('            "test_e_held", "test_e_confirmed", "test_e_abandoned", "test_e06", "test_e11"),\n',
+         '            "test_e_held", "test_e_confirmed", "test_e_abandoned", "test_e06"),\n')],
+     "tests/test_ahc_runner.py", ["tests.test_ahc_runner.StateMachineTests.test_every_spec_test_id_resolves_to_a_test"]),
+    ("T-1: a retired row id (R17) reappears in the spec", [
+        ("| R18 |", "| R17 | x | x | x | x | x | x | SMTests.test_r17 |\n| R18 |")],
+     "docs/spec/ahc-m1-state-machine.md",
+     ["tests.test_ahc_runner.StateMachineTests.test_every_spec_test_id_resolves_to_a_test"]),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
          '                if prior[0] == "work_item":\n')], CONTRACTS, SM),

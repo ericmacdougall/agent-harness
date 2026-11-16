@@ -3910,22 +3910,59 @@ class StateMachineTests(TC.Base):
         with self.assertRaises(C.ContractError):
             S(["G1"], False)
 
-    def test_every_workitem_test_id_resolves_to_a_test(self):
+    def test_every_spec_test_id_resolves_to_a_test(self):
+        """Spec owner ruling T-1: a spec test id (`SMTests.<id>`) resolves by exact name, or name plus a `_suffix`,
+        in any tests/test_ahc*.py class. The ids with no such test yet are pinned exactly per entity in PENDING,
+        so the list can only shrink: a new gap fails, and so does a pending id that now resolves until it is
+        removed from the list. R17 and G6 are retired ids and must not reappear."""
         import re
         text = (HOOKS.parents[1] / "docs" / "spec" / "ahc-m1-state-machine.md").read_text(encoding="utf-8")
-        part = text.split("### Entity: WorkItem", 1)[1].split("### Entity:", 1)[0]
-        ids = sorted(set(re.findall(r"SMTests\.(test_\w+)", part)))
-        self.assertEqual(len(ids), 38, "11 states and 27 rows")
-        missing = [i for i in ids if not any(n == i or n.startswith(i + "_") for n in dir(self))]
-        self.assertLessEqual(set(missing), set(self.PENDING_IDS), "a test id the spec names has no test")
+        names = set()
+        for path in sorted((HOOKS.parents[1] / "tests").glob("test_ahc*.py")):
+            names |= set(re.findall(r"^    def (test_\w+)", path.read_text(encoding="utf-8"), re.M))
+        counts = {"WorkItem": 38, "Review": 28, "Grant": 15, "Effect": 24}
+        for entity, n in counts.items():
+            part = text.split("### Entity: %s" % entity, 1)[1].split("### Entity:", 1)[0]
+            rows = {line.strip("|").split("|")[0].strip() for line in part.splitlines() if line.startswith("| ")}
+            self.assertFalse(rows & self.RETIRED_ROWS, "%s: a retired row id reappeared" % entity)
+            ids = sorted(set(re.findall(r"SMTests\.(test_\w+)", part)))
+            with self.subTest(entity=entity):
+                self.assertEqual(len(ids), n)
+                missing = sorted(i for i in ids if not any(m == i or m.startswith(i + "_") for m in names))
+                self.assertEqual(missing, sorted(self.PENDING[entity]),
+                                 "%s: PENDING must equal the ids with no test of that name" % entity)
+        self.assertLessEqual(set(self.PENDING_RUNTIME), {i for p in self.PENDING.values() for i in p} | names)
 
-    # Spec test ids not yet covered by a test of that name; each step of slice 1 (a) shrinks this list.
-    PENDING_IDS = (
-        "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask", "test_wi_exhausted",
-        "test_wi_merged", "test_wi_headed_verified", "test_wi_handed", "test_wi_superseded", "test_wi_closed_unmerged",
-        "test_wi_cancelled", "test_w06", "test_w07", "test_w11", "test_w12",
-        "test_w15", "test_w16", "test_w19", "test_w22",
-        "test_w23", "test_w25", "test_w26")
+    # Retired by the spec (v2g16 lines 395 and 424): R17 moved to a follow-up ticket, G6 is covered by G5.
+    RETIRED_ROWS = {"R17", "G6"}
+
+    # Spec test ids with no test of that name yet, pinned per entity; each step of slice 1 (a) shrinks these.
+    # Every id here is closed in slice 1 (a) unless PENDING_RUNTIME names it.
+    PENDING = {
+        "WorkItem": (
+            "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask",
+            "test_wi_exhausted", "test_wi_merged", "test_wi_headed_verified", "test_wi_handed",
+            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w06", "test_w07",
+            "test_w11", "test_w12", "test_w15", "test_w16", "test_w19", "test_w22", "test_w23", "test_w25",
+            "test_w26"),
+        "Review": (
+            "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
+            "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",
+            "test_r03", "test_r04_rc_refuses_usage_store", "test_r05", "test_r06", "test_r07", "test_r08",
+            "test_r09", "test_r10", "test_r11", "test_r12", "test_r13", "test_r14", "test_r15", "test_r16",
+            "test_r18", "test_r19"),
+        "Grant": (
+            "test_g_validated", "test_g_active", "test_g_reserved", "test_g_consumed", "test_g_retired",
+            "test_g_expired", "test_g_revoked"),
+        "Effect": (
+            "test_e_intent", "test_e_dispatched", "test_e_absent_proven", "test_e_fenced", "test_e_outcome_unknown",
+            "test_e_held", "test_e_confirmed", "test_e_abandoned", "test_e06", "test_e11"),
+    }
+
+    # Ids whose runtime half belongs to slice 1 (b), with the ruling (T-1): the ledger part is tested in 1 (a);
+    # (b) adds the packet build (R2), the DynamicUser unit and its launch (R3), the socket FINAL and the R-c
+    # usage-store refusal (R4), and the unit's findings result (R5).
+    PENDING_RUNTIME = ("test_r02", "test_r03", "test_r04_rc_refuses_usage_store", "test_r05")
 
 
 if __name__ == "__main__":
