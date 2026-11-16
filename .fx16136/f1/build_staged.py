@@ -43,5 +43,18 @@ keep = keep.replace(old_p, "@pytest.mark.parametrize('how', ['driverstatus-fail'
 keep = keep.replace(old_b, "before = R.get('live')\n    if how == 'containerd-not-listening': R.put('ctd-address', os.path.join(R.sk, 'gone.sock'))\n"
                            "    else: R.put(how, '')\n    sha = R.release('release/wave-90')")
 out = up.rstrip('\n') + keep.rstrip('\n') + '\n'
+
+# 4. tests that read the bugtracker tree itself (its compose.yaml, the b3604eae ctl in its history) find it through the
+#    same bugtracker checkout this suite already needs for tools/lane-harness (config/tools links into it)
+h = "HERE = os.path.dirname(os.path.abspath(__file__))\n"
+assert out.count(h) == 1
+out = out.replace(h, h + "# the bugtracker checkout whose tools/ the lane links at config/tools (bugtracker-harness staged layout)\n"
+                          "BT = os.path.realpath(os.path.join(HERE, '..', '..', 'tools', '..'))\n")
+c = "os.path.join(HERE, '..', 'selfhost', 'app', 'compose.yaml')"
+assert out.count(c) == 3, out.count(c)
+out = out.replace(c, "os.path.join(BT, 'infra', 'selfhost', 'app', 'compose.yaml')")
+g = "'b3604eaec1c6eac8a0f2558ca7f8ebd24cdc7254:infra/release-harness/selfhost-ctl.py'], cwd=HERE,"
+assert out.count(g) == 1
+out = out.replace(g, "'b3604eaec1c6eac8a0f2558ca7f8ebd24cdc7254:infra/release-harness/selfhost-ctl.py'], cwd=BT,")
 open(sys.argv[3], 'w').write(out)
 print('built', sys.argv[3], len(out.split('\n')), 'lines')
