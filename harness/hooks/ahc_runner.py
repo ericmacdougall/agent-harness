@@ -41,6 +41,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ahc_core as core  # noqa: E402
+import ahc_fs as fs  # noqa: E402
 import ahc_contracts  # noqa: E402
 import ahc_packet  # noqa: E402
 from ahc_crash import crash_after, crash_before  # noqa: E402
@@ -401,10 +402,78 @@ MIGRATIONS = {1: [], 2: [_migrate_v2], 3: [_migrate_v3], 4: [_migrate_v4]}
 
 
 SCHEMA_EXIT = 3
+ROOT_EXIT = SCHEMA_EXIT   # a foreign state root (core.ForeignRoot): also a no-restart exit
 
 
 class SchemaError(RuntimeError):
     """The ledger's schema is unknown or newer than this code; the daemon must not start."""
+
+
+_NO_DIGEST = object()   # an interrupted-restore record with no "sha256" key: written by an ahc before PR 258 v5
+
+
+class RestoreAbandoned(SchemaError):
+    """A restore could not copy its verified backup (gone, partial, changed or unreadable) while the live database
+    had never been moved: the intent is dropped and the live database is left in place, unchanged (PR 258 v5 F1)."""
+
+
+def _restore_progress(stage, copied):
+    """The mid-copy crash point: called by ahc_fs.copy_to_temp around each chunk it writes into the staged copy."""
+    if stage == "before":
+        crash_before("runner.restore_chunk")
+    else:
+        crash_after("runner.restore_chunk")
+
+
+SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+REPORT_NAME = "report.md"
+# The largest ledger ahc migrates, and so the largest backup it may have to restore. Checked before a migration
+# starts (nothing changes if it is over) and again on the backup's descriptor before the restore copies anything.
+# The copy streams in ahc_fs.COPY_CHUNK pieces, so memory use does not grow with this cap (MemoryMax=512M).
+RESTORE_MAX_BYTES = 2 * 1024 ** 3
+
+
+def _check_sidecars(path):
+    for extra in SQLITE_SIDECARS:
+        problem = core._entry_problem(Path(str(path) + extra), False)
+        if problem:
+            raise core.ForeignRoot("ledger file %s%s is %s; refusing to open" % (Path(path).name, extra, problem))
+
+
+def connect_nofollow(root, path, exclusive=False, **kwargs):
+    """Open a ledger database without following a link (PR 258 v1 BLOCK). Python's sqlite3 cannot take
+    SQLITE_OPEN_NOFOLLOW, so: the sidecar files must not be links; the database file is opened (or created) first
+    by an O_NOFOLLOW descriptor, which must be a regular file and gets its mode by fchmod; sqlite then opens the
+    path, and the path's device and inode are compared with the descriptor's right after. A mismatch or a link
+    closes the connection and raises ForeignRoot before any statement runs (sqlite reads nothing until the first
+    statement). Remaining window, stated: a process with write access to the 0700 root (the same uid, L10) could
+    swap the path to a link and back between sqlite's open and the comparison; the sidecars that sqlite creates at
+    the first WAL statement are re-checked after it (_check_sidecars), not before their creation."""
+    path = Path(path)
+    _check_sidecars(path)
+    flags = os.O_RDWR | os.O_CREAT
+    if exclusive:
+        flags |= os.O_EXCL
+    try:
+        fd = fs.open_file(root, path, flags)          # checked directories, O_NOFOLLOW, regular, our uid, fchmod
+    except OSError as error:
+        raise core.ForeignRoot("ledger file %s cannot be opened without following a link (%s); refusing to open"
+                               % (path.name, error if isinstance(error, fs.UnsafePath) else type(error).__name__))
+    try:
+        info = os.fstat(fd)
+        os.fchmod(fd, 0o600)
+        db = sqlite3.connect(str(path), **kwargs)     # sqlite takes only a path: the inode compare below binds it
+        try:
+            after = os.lstat(str(path))
+        except OSError:
+            after = None
+        if after is None or stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+            db.close()
+            raise core.ForeignRoot("ledger file %s was replaced while it was being opened; refusing to open"
+                                   % path.name)
+        return db
+    finally:
+        os.close(fd)
 
 
 class Ledger:
@@ -417,22 +486,23 @@ class Ledger:
         self.migrate = migrate
         self.paths = paths
         self.path = paths.root / "ledger.sqlite3"
+        self.verified = {}          # backup name -> sha256 of the bytes Ledger.backup proved (PR 258 v5)
         if migrate:
             self._resume_restore()
         elif self._intent_path().exists():
             raise SchemaError("the ledger has an interrupted restore; ahc-core completes it at start, this process "
                               "does not")
-        fresh = not self.path.exists()
-        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        fresh = not os.path.lexists(str(self.path))
+        self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         try:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
+            _check_sidecars(self.path)
             self._schema(fresh)
         except Exception:
             self.db.close()
             raise
-        os.chmod(self.path, 0o600)
 
     def _version(self):
         has_meta = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").fetchone()
@@ -464,6 +534,11 @@ class Ledger:
         if not self.migrate:
             raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
                               "this process does not" % (version, SCHEMA_VERSION))
+        size = sum(os.lstat(str(self.path) + extra).st_size for extra in ("", "-wal")
+                   if os.path.lexists(str(self.path) + extra))
+        if size > RESTORE_MAX_BYTES:
+            raise SchemaError("ledger %s is %d bytes, over the %d-byte migration cap; refusing to migrate from "
+                              "v%d (nothing was changed)" % (self.path.name, size, RESTORE_MAX_BYTES, version))
         copy = self.backup("pre-v%d" % SCHEMA_VERSION)
         try:
             with self.tx():
@@ -493,90 +568,210 @@ class Ledger:
         Returns the copy path; raises SchemaError (and the migration does not start) if the copy is not proven."""
         target = self.path.with_name("%s.%s.%d.bak" % (self.path.name, label, time.time_ns()))
         crash_before("runner.backup")
-        copy = sqlite3.connect(str(target))
+        copy = connect_nofollow(self.paths.root, target, exclusive=True)   # a new name, never a link
         try:
             self.db.backup(copy)
             check = copy.execute("PRAGMA integrity_check").fetchall()
             source, copied = self._counts(self.db), self._counts(copy)
         finally:
             copy.close()
-        os.chmod(target, 0o600)
         crash_after("runner.backup")
         if [tuple(row) for row in check] != [("ok",)] or source != copied:
             raise SchemaError("ledger backup %s failed verification (integrity %r, rows %r vs %r); not migrating"
                               % (target.name, [tuple(r) for r in check][:3], source, copied))
+        # the proven bytes' digest (PR 258 v5): a restore publishes a copy only if it has exactly these bytes
+        try:
+            self.verified[target.name] = fs.digest_file(self.paths.root, target, RESTORE_MAX_BYTES)
+        except OSError as error:
+            raise SchemaError("ledger backup %s could not be read back for its digest (%s: %s); not migrating"
+                              % (target.name, type(error).__name__, error)) from None
         return target
 
     def restore(self, copy):
-        """Put the verified backup back after a failed migration. The live database, -wal and -shm files are moved
-        aside together under one suffix (never deleted), then the backup is copied into place. Returns the moved
-        names. The connection is reopened on the restored file."""
+        """Put the verified backup back after a failed migration: the live database and its sidecars are moved
+        aside together under one suffix (never deleted), and a copy holding exactly the backup's proven bytes is
+        published. Returns the moved names. The connection is reopened on the restored file. RestoreAbandoned (a
+        SchemaError) when the copy failed before anything moved: the live database is left in place."""
         self.db.close()
+        sha256 = self.verified.get(Path(copy).name)
+        if sha256 is None:
+            raise SchemaError("backup %s was not proven by this process; not restoring (the live database is left "
+                              "in place)" % Path(copy).name)
         suffix = ".failed-%d" % time.time_ns()
-        # A durable intent first: a crash between the move-aside and the copy-back leaves no live file, and the next
-        # open would otherwise create an empty ledger over it (AC-18 found this). Ledger.__init__ finishes it.
-        intent = self._intent_path()
-        temp = Path(str(intent) + ".tmp")
+        # A durable intent first: a crash between the move-aside and the publish leaves no live file, and the next
+        # open would otherwise create an empty ledger over it (AC-18 found this). Ledger.__init__ finishes it. The
+        # record carries the backup's digest, so a resume needs nothing but the files and this record.
         crash_before("runner.restore_intent")
-        with open(str(temp), "w") as handle:
-            handle.write(json.dumps({"backup": copy.name, "suffix": suffix}, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(intent))
+        fs.write_file(self.paths.root, self._intent_path(),
+                      json.dumps({"backup": Path(copy).name, "sha256": sha256, "suffix": suffix},
+                                 sort_keys=True) + "\n")
         crash_after("runner.restore_intent")
-        moved = self._finish_restore(copy, suffix)
-        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+        moved = self._finish_restore(copy, suffix, sha256)
+        self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         return moved
 
     def _intent_path(self):
         return Path(str(self.path) + ".restore-intent")
 
-    def _finish_restore(self, copy, suffix):
-        """Move whatever live database files exist aside under `suffix`, copy the verified backup into place and
-        drop the intent. Idempotent, so a restart after a crash at any step completes the same restore."""
-        moved = []
-        crash_before("runner.restore_move")
-        for extra in ("", "-wal", "-shm"):
-            source = Path(str(self.path) + extra)
-            if os.path.lexists(str(source)):
-                target = Path(str(self.path) + suffix + extra)
-                os.rename(str(source), str(target))
-                moved.append(target.name)
-        crash_after("runner.restore_move")
+    def _finish_restore(self, copy, suffix, sha256):
+        """Finish the restore named by (copy, suffix, sha256) from whatever state the files are in. Restore and
+        resume both run it, and every step reads the files first, so a crash at any point followed by any number of
+        restarts converges (PR 258 v4 F1, v5 F1). L below is "the live file exists"; the suffix is unique to this
+        restore, so only this restore's own move (or a foreign file) can take a name <ledger><suffix>*.
+          1. Unpublished temps of an earlier attempt are removed (names only).
+          2. L, and the live file is byte-identical to the verified backup: an earlier attempt published it and
+             died before dropping the intent. The intent is dropped and nothing is moved again (moving it aside
+             would replace the moved-aside failed database, PR 258 v4 residual).
+          3. Any move target is taken while its source is in place (_aside_pairs). With L that means the ledger was
+             already moved aside and the file now at its name is neither the original nor the restored copy.
+             Refuse, keeping the intent; nothing changes and nothing is copied. So past this step, L means the
+             live file was never moved.
+          4. Stream the backup into a temp; its bytes must hash to sha256 (ahc_fs.Mismatch otherwise). On failure:
+             - L (never moved, by step 3): abandon. Drop the intent, leave the live database untouched, raise
+               RestoreAbandoned. The next open uses that database, and a retried migration takes a fresh
+               verified backup first.
+             - not L: refuse, keeping the intent. No ledger is created, and every start refuses until the
+               backup is back or an operator decides.
+          5. Move the live file and every SQLite sidecar still in place aside under the suffix (every target is
+             checked again before the first rename, so nothing is half-moved). Publish the fsynced, digest-checked
+             copy. Drop the intent.
+        Memory does not grow with the ledger: the copy and both digests stream in ahc_fs.COPY_CHUNK pieces."""
+        fs.remove_temps(self.paths.root, self.path)                 # an earlier attempt's unpublished copy
+        if os.path.lexists(str(self.path)) and self._is_backup_copy(self.path, sha256):
+            self._drop_intent()
+            return []
+        self._aside_pairs(suffix)           # a taken target refuses now, before a copy that could not be published
         crash_before("runner.restore_copy")
-        temp = Path(str(self.path) + ".restoring")
-        shutil.copyfile(str(copy), str(temp))
-        os.chmod(temp, 0o600)
-        with open(str(temp), "rb") as handle:
-            os.fsync(handle.fileno())
-        os.replace(str(temp), str(self.path))
-        os.unlink(str(self._intent_path()))
+        try:
+            staged = fs.copy_to_temp(self.paths.root, copy, self.path, RESTORE_MAX_BYTES, expect_sha256=sha256,
+                                     progress=_restore_progress)
+        except OSError as error:
+            reason = "%s: %s" % (type(error).__name__, error)
+            if os.path.lexists(str(self.path)):                     # never moved (step 3 passed)
+                self._abandon_restore()
+                raise RestoreAbandoned("could not copy the backup %s back (%s); the live database is left in "
+                                       "place, unchanged" % (Path(copy).name, reason)) from None
+            raise SchemaError("could not copy the backup %s back (%s); the live database is absent; the restore "
+                              "intent is kept, so every start refuses until the backup can be copied"
+                              % (Path(copy).name, reason)) from None
         crash_after("runner.restore_copy")
+        moved = self._move_aside(suffix)
+        self._publish_restored(staged)
+        self._drop_intent()
         return moved
 
+    def _is_backup_copy(self, path, sha256):
+        """Whether the regular file `path` holds exactly the verified backup's bytes."""
+        try:
+            return fs.digest_file(self.paths.root, path, RESTORE_MAX_BYTES) == sha256
+        except OSError:
+            return False
+
+    def _aside_pairs(self, suffix):
+        """(source, target) for the live database and each SQLite sidecar still in place, target being
+        <name><suffix><sidecar>. SchemaError (intent kept, nothing changed) if any target name is already taken
+        while its source is still in place: renaming would replace that file."""
+        pairs = []
+        for extra in ("",) + SQLITE_SIDECARS:
+            source = Path(str(self.path) + extra)
+            if not os.path.lexists(str(source)):
+                continue
+            target = Path(str(self.path) + suffix + extra)
+            if os.path.lexists(str(target)):
+                raise SchemaError("interrupted restore: %s and %s both exist; refusing to replace either (the "
+                                  "restore intent is kept)" % (source.name, target.name))
+            pairs.append((source, target))
+        return pairs
+
+    def _move_aside(self, suffix):
+        """Rename the live database and each of its SQLite sidecars still in place to <name><suffix><sidecar>, as
+        names (never followed, never deleted). A sidecar is never left beside the restored copy, where SQLite would
+        apply a stale -wal or -journal to it. Every target is checked before the first rename (_aside_pairs)."""
+        moved = []
+        crash_before("runner.restore_move")
+        for source, target in self._aside_pairs(suffix):
+            fs.rename(self.paths.root, source, target)              # moves a name; never follows it
+            moved.append(target.name)
+        crash_after("runner.restore_move")
+        return moved
+
+    def _publish_restored(self, staged):
+        crash_before("runner.restore_publish")
+        fs.rename(self.paths.root, staged, self.path)               # the complete, fsynced, digest-checked copy
+        crash_after("runner.restore_publish")
+
+    def _drop_intent(self):
+        crash_before("runner.restore_done")
+        fs.unlink(self.paths.root, self._intent_path())
+        crash_after("runner.restore_done")
+
+    def _abandon_restore(self):
+        crash_before("runner.restore_abandon")
+        fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)
+        crash_after("runner.restore_abandon")
+
     def _resume_restore(self):
-        """At open: an intent left by a crash inside restore is completed before anything else touches the file.
-        An intent naming a backup that is not beside the ledger is refused (fail closed, nothing created)."""
+        """At open (ahc-core only): an intent left by a crash inside restore is finished before anything else
+        touches the file. Only the RECORD is validated here: a plain backup name beside the ledger, a .failed-<n>
+        suffix and a 64-hex sha256. An invalid record refuses (fail closed, nothing created). Whether the backup is
+        still there is not checked here (PR 258 v5 F1: checking it first stranded an intact live ledger). The files
+        decide in _finish_restore. An abandoned restore (the backup cannot be copied and the live database was
+        never moved) is logged, and the open goes on with that database."""
         intent = self._intent_path()
         if not intent.exists():
             return
         try:
             record = json.loads(intent.read_text())
             name, suffix = record["backup"], record["suffix"]
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            sha256 = record.get("sha256", _NO_DIGEST)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise SchemaError("unreadable interrupted-restore record %s (%s); refusing to open the ledger"
                               % (intent.name, type(error).__name__))
-        plain = isinstance(name, str) and isinstance(suffix, str) and name not in ("", ".", "..") and \
-            "/" not in name and "\\" not in name and re.match(r"^\.failed-\d+$", suffix)
-        copy = self.path.with_name(name) if plain else None
-        if copy is None or not copy.is_file():
-            raise SchemaError("interrupted-restore record %s names no backup beside the ledger; refusing to open"
-                              % intent.name)
-        logging.getLogger("ahc").warning("completing an interrupted ledger restore from %s", name)
-        # the live file may already be the restored copy (crash after the replace, before the unlink): moving it
-        # aside again and copying the same backup in is harmless and keeps the step idempotent
-        self._finish_restore(copy, suffix)
+        plain = isinstance(name, str) and isinstance(suffix, str) and \
+            name not in (".", "..") and re.fullmatch(r"[A-Za-z0-9._-]+", name) and \
+            re.fullmatch(r"\.failed-[0-9]+", suffix) and \
+            (sha256 is _NO_DIGEST or isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256))
+        if not plain:
+            raise SchemaError("interrupted-restore record %s does not name a backup beside the ledger, a .failed-<n> "
+                              "suffix and a sha256; refusing to open" % intent.name)
+        log = logging.getLogger("ahc")
+        if sha256 is _NO_DIGEST:
+            self._resume_undigested(name, suffix, log)
+            return
+        log.warning("completing an interrupted ledger restore from %s", name)
+        try:
+            self._finish_restore(self.path.with_name(name), suffix, sha256)
+        except RestoreAbandoned as abandoned:
+            log.warning("abandoned the interrupted ledger restore: %s; opening that database", abandoned)
+
+    def _resume_undigested(self, name, suffix, log):
+        """An intent with no sha256, as an ahc before PR 258 v5 wrote it (that ahc moved the live files aside
+        before copying). The backup's bytes cannot be checked, so they are never published here:
+          * the live ledger is in place and was never moved aside under the suffix: it is kept. The intent is
+            dropped and the start goes on; a failed migration is retried with a fresh, digested backup;
+          * the live file is byte-identical to the backup (that ahc published it and died before dropping the
+            intent): the intent is dropped, nothing is moved again;
+          * otherwise (moved and not published, or absent): refuse with the intent kept, for an operator."""
+        fs.remove_temps(self.paths.root, self.path)
+        backup = self.path.with_name(name)
+        if os.path.lexists(str(self.path)) and not os.path.lexists(str(self.path) + suffix):
+            self._abandon_restore()
+            log.warning("abandoned the interrupted ledger restore: its record (from an earlier ahc) has no sha256 "
+                        "for %s, and the live database was never moved; opening that database", name)
+            return
+        if os.path.lexists(str(self.path)):
+            try:
+                published = fs.digest_file(self.paths.root, backup, RESTORE_MAX_BYTES)
+            except OSError:
+                published = None
+            if published is not None and self._is_backup_copy(self.path, published):
+                self._drop_intent()
+                log.warning("completed the interrupted ledger restore from %s: it had been published", name)
+                return
+        raise SchemaError("interrupted-restore record %s (from an earlier ahc) has no sha256, so %s cannot be "
+                          "verified, and the live database was already moved aside or is absent; refusing to open "
+                          "(the restore intent is kept for an operator)" % (self._intent_path().name, name))
 
     def close(self):
         self.db.close()
@@ -681,7 +876,7 @@ class Journal:
 
 def _mirror(paths, iid, event, at, data):
     try:
-        _append_private(paths.items / (iid + ".jsonl"),
+        _append_private(paths.root, paths.items / (iid + ".jsonl"),
                         json.dumps({"event": event, "at": at, **data}, sort_keys=True, default=str) + "\n")
     except OSError:
         log.warning("journal mirror write failed for %s", iid)
@@ -705,8 +900,8 @@ def acquire_lock(paths, role="all"):
                 return None
             held.append(handle)
         return held
-    handle = os.fdopen(_open_private(paths.root / ("ahc-%s.lock" % role), os.O_WRONLY | os.O_CREAT | os.O_APPEND),
-                       "a")
+    lock_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    handle = os.fdopen(fs.open_file(paths.root, paths.root / ("ahc-%s.lock" % role), lock_flags), "a")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -886,7 +1081,7 @@ class Worker:
         except Exception as error:  # noqa: BLE001 - fail closed: unknown diff counts as protected
             protected_note = "protected-path: unknown (diff failed: %s); main merge only" % _short(error)
         fixed_path = self.paths.reports / (iid + ".packet.md")
-        _write_private(fixed_path, fix["text"])
+        _write_private(self.paths.root, fixed_path, fix["text"])
         return self.review(iid, token, req, facts, clone, merge_base, fixed_path, fix, protected_note)
 
     def review(self, iid, token, req, facts, clone, merge_base, fixed_path, fix, protected_note):
@@ -916,9 +1111,19 @@ class Worker:
                 reason = "review budget exhausted for this head: push a new head or ask main"
                 return self.settle(iid, token, "needs-attention", event="needs-attention:head-budget", reason=reason,
                                    notice=_owner_notice("needs-attention", reason))
-        report = self.paths.reports / ("%s-a%d.md" % (iid, attempt))
-        if os.path.lexists(str(report)):
-            reason = "report path already exists; refusing to overwrite a receipt"
+        # PR 258 v3: the review child (peer_review) writes its report itself, so ahc cannot hand it an open file.
+        # peer_review refuses an existing report path, and it writes with an O_EXCL temp file plus link through
+        # its own directory descriptor. ahc therefore creates a private directory for this one attempt,
+        # exclusively, at 0700, and records the directory's (dev, ino). After the child exits, ahc reads the report
+        # only through a descriptor for that same directory, checked by inode (Worker._read_report). A name planted
+        # in reports/ cannot become the report.
+        report_dir = self.paths.reports / ("%s-a%d" % (iid, attempt))
+        report = report_dir / REPORT_NAME
+        try:
+            report_dir_id = list(fs.make_fresh_dir(self.paths.root, report_dir, reuse_empty=True))
+        except (FileExistsError, fs.UnsafePath) as error:
+            reason = "report path already exists or is not private; refusing to overwrite a receipt (%s)" % (
+                type(error).__name__)
             return self.settle(iid, token, "needs-attention", event="report-path-taken", reason=reason,
                                notice=_owner_notice("needs-attention", reason))
         argv = [sys.executable, str(self.config.get("peer_review", Path.home() / ".claude/hooks/peer_review.py")),
@@ -941,7 +1146,8 @@ class Worker:
             self.led.db.execute("INSERT INTO effects(key, item, kind, status, attempts, next_action_at, payload,"
                                 " updated) VALUES (?,?,?,?,?,?,?,?)",
                                 (key, iid, "review", "intent", 1, None, json.dumps({"argv": argv}), now))
-        self.settle(iid, token, "reviewing", now + REVIEW_WALL, report=str(report), packet=str(fixed_path),
+        self.settle(iid, token, "reviewing", now + REVIEW_WALL, report=str(report), report_dir_id=report_dir_id,
+                    packet=str(fixed_path),
                     review_key=key, clone=clone, merge_base=merge_base, base_note=facts.get("base_repaired_from", ""),
                     fix_actions=fix["actions"], protected=protected_note, attempt=attempt,
                     repeat_reason=None, relaunch_ok=None)  # a declared repeat is spent by this launch
@@ -962,6 +1168,43 @@ class Worker:
             return "the repo is no longer on the coordinator allowlist"
         return None
 
+    def _read_report(self, data):
+        """(bytes or None, problem or None). The report is read only through a descriptor for the attempt
+        directory ahc created for it, and that directory must have the (dev, ino) recorded at creation. The report
+        must be the directory's only entry (peer_review unlinks its own temp file before exiting) and a regular
+        file owned by this uid with one link, within REPORT_MAX_BYTES. None bytes with no problem means no report
+        was written. Any problem is INVALID, and conclude() quarantines the attempt directory."""
+        want = data.get("report_dir_id")
+        report = Path(str(data.get("report")))
+        if not want:
+            return None, "no report directory identity was recorded for this attempt"
+        try:
+            with fs.directory(self.paths.root, report.parent) as dfd:
+                info = os.fstat(dfd)
+                if [info.st_dev, info.st_ino] != list(want):
+                    return None, "the report directory was replaced after the review was launched"
+                names = sorted(os.listdir(dfd))
+                if not names:
+                    return None, None
+                if names != [report.name]:
+                    return None, "the report directory holds entries other than %s (%d entries)" % (
+                        report.name, len(names))
+                entry = os.stat(report.name, dir_fd=dfd, follow_symlinks=False)
+                if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.geteuid():
+                    return None, "the report is not a regular file owned by ahc"
+                if entry.st_nlink != 1:
+                    return None, "the report has %d hard links; only one is allowed" % entry.st_nlink
+                if entry.st_size > core.REPORT_MAX_BYTES:
+                    return None, "the report is larger than %d bytes" % core.REPORT_MAX_BYTES
+                try:
+                    return core.read_regular(report.name, core.REPORT_MAX_BYTES, dir_fd=dfd), None
+                except core.Unreadable as error:
+                    return None, None if error.kind == "absent" else "report unreadable: %s" % error
+        except FileNotFoundError:
+            return None, None
+        except fs.UnsafePath as error:
+            return None, "the report directory is not private: %s" % error
+
     def conclude(self, iid, token, req, key):
         row = self.led.item(iid)
         data = json.loads(row["data"])
@@ -977,7 +1220,15 @@ class Worker:
         stale = stale_tickets(result.get("stderr", ""), result["rc"])
         if stale:
             return self.freshness(iid, token, req, data, stale)
-        verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"])
+        report_bytes, problem = self._read_report(data)
+        if problem:
+            verdict = {"verdict": "INVALID", "reason": problem}
+            moved = _quarantine_report_dir(self.paths, Path(str(data.get("report"))).parent, problem)
+            if moved:
+                verdict["reason"] += "; attempt directory quarantined as rejected/%s" % moved
+        else:
+            verdict = core.verify_receipt(result["rc"], data["report"], req["head"], data["packet"],
+                                          report_bytes=report_bytes)
         name = verdict["verdict"]
         if name == "PASS" or name == "PASS-WITH-TICKETS":
             reason = "pass-gate1" + ("; " + data["protected"] if data.get("protected") else "")
@@ -991,7 +1242,7 @@ class Worker:
                 self.led.db.execute("UPDATE lineage SET block_rounds=block_rounds+1 WHERE lineage=?",
                                     (row["lineage"],))
             self.settle(iid, token, "block-delivered", event="block-delivered", verdict="BLOCK",
-                        notice=_owner_notice("block-delivered", _report_body(data["report"])))
+                        notice=_owner_notice("block-delivered", _report_body(data["report"], report_bytes)))
             return "block-delivered"
         if name == "ADVISORY":
             return self.fail(iid, token, "advisory", "peer_review returned an advisory opinion, not a signoff")
@@ -1198,7 +1449,7 @@ class Worker:
                 if now < until:
                     continue
                 crash_before("runner.prune")
-                os.unlink(str(entry))
+                fs.unlink(self.paths.root, entry)
                 crash_after("runner.prune")
                 removed.append(entry.name)
             except OSError:
@@ -1583,7 +1834,7 @@ class Worker:
                 return True, "written"
             if kind == "digest":
                 if not self.readback("digest", payload):
-                    _append_private(self.paths.digest, payload["line"])
+                    _append_private(self.paths.root, self.paths.digest, payload["line"])
                 return True, "appended"
             if kind == "alert":
                 rc, _out, err = self.deps.ah(["ah", "alert", "raise", "--severity", payload.get("severity", "high"),
@@ -1649,19 +1900,50 @@ def _quarantine(paths, qfile, reason):
     file. Returns the quarantined name, which keys the one alert for it, or None if it could not be moved."""
     target_dir = paths.root / "rejected"
     try:
-        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fs.make_dirs(paths.root, target_dir)
         target = target_dir / qfile.name
         if os.path.lexists(str(target)):
             target = target_dir / ("%s.%d.json" % (qfile.stem, time.time_ns()))
         # the reason first (AC-18): a crash after the rename must still leave the reason beside the quarantined
         # file, because the alert below is best effort and the queue entry is gone after the rename
-        _write_private(target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
+        _write_private(paths.root, target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
         crash_before("runner.quarantine")
-        os.rename(str(qfile), str(target))  # same filesystem: atomic; renames the link, not its referent
+        fs.rename(paths.root, qfile, target)  # atomic; renames the link, never its referent
         crash_after("runner.quarantine")
         return target.name
     except OSError as error:
         log.warning("could not quarantine %s: %s", qfile.name, type(error).__name__)
+        return None
+
+
+def file_transport_refused(paths):
+    """True when `paths` is the production root, under the real home directory of this uid. Tests always build
+    Paths on a temporary home, so only they can turn the local file transport on."""
+    try:
+        return Path(paths.home).resolve() == Path(os.path.expanduser("~")).resolve()
+    except (OSError, RuntimeError):
+        return True
+
+
+def _quarantine_report_dir(paths, report_dir, reason):
+    """Move a review attempt's directory that failed _read_report into rejected/ as a name (a link or a swapped
+    directory is moved, never followed), with a reason file beside it. Its contents are never read again, and the
+    next attempt gets a fresh directory. Returns the quarantined name, or None if nothing could be moved."""
+    report_dir = Path(report_dir)
+    if report_dir.parent != paths.reports or not os.path.lexists(str(report_dir)):
+        return None
+    target = paths.root / "rejected" / ("report-%s" % report_dir.name)
+    try:
+        fs.make_dirs(paths.root, target.parent)
+        if os.path.lexists(str(target)):
+            target = target.with_name("%s.%d" % (target.name, time.time_ns()))
+        _write_private(paths.root, target.with_name(target.name + ".reason"), redact.redact(reason) + "\n")
+        crash_before("runner.quarantine_report")
+        fs.rename(paths.root, report_dir, target)
+        crash_after("runner.quarantine_report")
+        return target.name
+    except OSError as error:
+        log.warning("could not quarantine report dir %s: %s", report_dir.name, type(error).__name__)
         return None
 
 
@@ -1721,7 +2003,7 @@ def _core_intake(worker, ledger, paths, config, deps, summary):
     summary["email_route"] = "ready" if worker.email_route() else "unavailable"
     summary["rejected"] = ingest(ledger, paths, config, worker.now())
     for name, reason in summary["rejected"]:
-        message = "ahc rejected queue file %s: %s (moved to coordinator/rejected/)" % (name, reason)
+        message = "ahc rejected queue file %s: %s (moved to %s)" % (name, reason, paths.root / "rejected")
         try:
             rc, _out, _err = deps.ah(["ah", "alert", "raise", "--severity", "high", "--alert-key",
                                       "ahc:rejected:" + name, "--source", "ahc", "--key", "ahc-rejected-" + name,
@@ -1852,9 +2134,11 @@ def _is_protected(path):
     return any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED) or path.startswith(".claude/")
 
 
-def _report_body(report_path):
+def _report_body(report_path, raw=None):
     try:
-        text = core.read_regular(report_path, core.REPORT_MAX_BYTES).decode("utf-8", errors="replace")
+        if raw is None:
+            raw = core.read_regular(report_path, core.REPORT_MAX_BYTES)
+        text = raw.decode("utf-8", errors="replace")
     except core.Unreadable:
         return "(the report could not be read)"
     head, _sep, body = text.partition("\n\n")
@@ -1953,43 +2237,25 @@ def _write_inbox(inbox, owner, name, text):
     opened with O_NOFOLLOW|O_DIRECTORY and the file is created relative to the owner directory's fd with
     O_EXCL|O_NOFOLLOW, then renamed within that directory. A symlink swapped in after inbox_path's check makes the open
     fail; nothing is ever written through it. An existing notice is left as is (idempotent)."""
+    root = Path(inbox).parent                # paths.inbox is always <ahc root>/inbox
+    notice = Path(inbox) / owner / name
     try:
-        root_fd = os.open(str(inbox), _DIR_FLAGS)
-    except OSError as error:
-        raise _InboxRefused("inbox directory is not a real directory: %s" % type(error).__name__) from None
-    try:
-        try:
-            os.mkdir(owner, 0o700, dir_fd=root_fd)
-        except FileExistsError:
-            pass
-        try:
-            owner_fd = os.open(owner, _DIR_FLAGS, dir_fd=root_fd)
-        except OSError as error:
-            raise _InboxRefused("owner inbox is not a real directory: %s" % type(error).__name__) from None
-        try:
+        with fs.directory(root, notice.parent, create=True) as owner_fd:
             present = _notice_state(owner_fd, name, text)
-            if present == "match":
-                return  # already delivered with exactly this content
-            if present != "absent":
-                raise _InboxRefused("notice name is occupied by a %s entry" % present)
-            tmp = "." + name + ".tmp"
-            try:
-                os.unlink(tmp, dir_fd=owner_fd)
-            except FileNotFoundError:
-                pass
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600,
-                         dir_fd=owner_fd)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            crash_before("runner.inbox")
-            os.rename(tmp, name, src_dir_fd=owner_fd, dst_dir_fd=owner_fd)
-            crash_after("runner.inbox")
-        finally:
-            os.close(owner_fd)
-    finally:
-        os.close(root_fd)
+    except fs.UnsafePath as error:
+        raise _InboxRefused("owner inbox is not a private directory: %s" % error) from None
+    if present == "match":
+        return  # already delivered with exactly this content
+    if present != "absent":
+        raise _InboxRefused("notice name is occupied by a %s entry" % present)
+    crash_before("runner.inbox")
+    try:
+        fs.write_file(root, notice, text, exclusive=True)   # first writer wins; a name planted since is kept
+    except FileExistsError:
+        raise _InboxRefused("notice name was taken while it was being written") from None
+    except fs.UnsafePath as error:
+        raise _InboxRefused("owner inbox is not a private directory: %s" % error) from None
+    crash_after("runner.inbox")
 
 
 def _notice_state(owner_fd, name, text):
@@ -2060,29 +2326,17 @@ def _digest_has(path, key):
     return ("[k:%s]" % key).encode("utf-8") in tail
 
 
-def _write_private(path, text):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tmp = path.with_name("." + path.name + ".tmp")
+def _write_private(root, path, text):
+    """Replace `path` under the ahc root whole: an unpredictable O_EXCL temp file, then rename by descriptor."""
     crash_before("runner.write_private")
-    fd = _open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+    fs.write_file(root, Path(path), text, create_dirs=True)
     crash_after("runner.write_private")
 
 
-def _append_private(path, text):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+def _append_private(root, path, text):
+    """Append to `path` under the ahc root through checked directory descriptors (O_NOFOLLOW, regular, our uid)."""
     crash_before("runner.append_private")
-    fd = _open_private(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-    with os.fdopen(fd, "a", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
+    fs.append_file(root, Path(path), text, create_dirs=True)
     crash_after("runner.append_private")
 
 
@@ -2128,11 +2382,16 @@ class LiveDeps:
 
     def clone(self, repo, head, base):
         import ahc_clone
+        # https only. config.json can opt into local file remotes for tests, and that opt-in is refused for the
+        # production root (under the real home), so a stray key can never widen the transports of the live daemon.
+        allow_file = self.config.get("clone_file_transport") is True
+        if allow_file and file_transport_refused(self.paths):
+            raise ahc_clone.CloneError("clone_file_transport is for test roots only; refused for %s" % self.paths.root)
         floor = int(self.config.get("disk_floor_bytes", 20 * 1024 ** 3))
         if shutil.disk_usage(str(self.paths.clones)).free < floor:
             raise RuntimeError("disk floor: less than %d GiB free for clones" % (floor // 1024 ** 3))
         url = self.config.get("clone_urls", {}).get(repo, "https://github.com/%s.git" % repo)
-        return ahc_clone.prepare(self.paths.clones, repo, url, head, base)
+        return ahc_clone.prepare(self.paths.clones, repo, url, head, base, allow_file=allow_file)
 
     def merge_base(self, clone, head, base):
         import ahc_clone
@@ -2220,21 +2479,16 @@ def stage_packet(paths, stream, expect_sha=None):
     if expect_sha is not None and expect_sha.strip().lower() != sha:
         raise core.Refused("the packet received has SHA-256 %s, not the expected %s; nothing was queued"
                            % (sha, expect_sha.strip()))
-    paths.packets.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(str(paths.packets), 0o700)
+    paths.ensure()                       # ahc's own root first (marker); a foreign root refuses before any write
     target = paths.packets / (sha + ".md")
     crash_before("runner.stage_packet")
     try:
-        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fs.write_file(paths.root, target, data, exclusive=True, create_dirs=True)
     except FileExistsError:
         if core.read_regular(target, core.PACKET_MAX_BYTES) != data:
             raise core.Refused("a different staged packet already has this name; refusing") from None
-        os.utime(str(target))  # restart the orphan clock so prune_packets cannot remove it before admission
+        fs.touch(paths.root, target)  # restart the orphan clock so prune_packets cannot remove it before admission
         return target, sha
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(data)
-        handle.flush()
-        os.fsync(handle.fileno())
     crash_after("runner.stage_packet")
     return target, sha
 
@@ -2312,6 +2566,14 @@ def main(argv=None):
     main_proven = claim_main(argv)
     args = build_parser().parse_args(argv)
     paths = core.Paths()
+    try:
+        paths.claim_root()        # before reading anything under the root, for every subcommand
+    except core.ForeignRoot as error:
+        # Exit 3 is in the units' RestartPreventExitStatus, so a foreign root stops the unit instead of looping.
+        # No `ah alert` here: the deps need ahc's own config, which a foreign root does not hold; the failed unit
+        # and this line are what the operator sees.
+        print("ahc: %s" % error, file=sys.stderr)
+        return ROOT_EXIT
     config = load_config(paths)
     if args.cmd == "submit":
         req = {"repo": args.repo, "pr": args.pr, "head": args.head, "base": args.base, "packet": args.packet,

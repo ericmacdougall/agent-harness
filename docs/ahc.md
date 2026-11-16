@@ -2,7 +2,104 @@
 
 GoodQA goodqa#16034. Gate 1 is receipt-only: `ahc` lints the queued packet, runs one exact-head
 `peer_review.py pr` receipt, and writes the result back to the ticket, the owner inbox and the digest. It never
-merges. Code: `harness/hooks/ahc_core.py`, `ahc_packet.py`, `ahc_clone.py`, `ahc_runner.py`.
+merges. Code: `harness/hooks/ahc_core.py`, `ahc_fs.py`, `ahc_packet.py`, `ahc_clone.py`, `ahc_runner.py`.
+
+## State root
+
+The coordinator root is `~/.agent-harness/ahc` (`ahc_core.Paths.root`). It was `~/.agent-harness/coordinator`
+until goodqa#16049 slice 1. That directory belongs to another program, coordd, which keeps its own ledger, clones
+and token there. No ahc install existed when the root moved.
+
+ahc owns its root only by the marker file `.ahc-root`. The marker is written to a temp file, fsynced, then
+hard-linked into place, so it is never torn. On every start, before reading anything, ahc claims the root:
+- If the root is absent or empty, ahc creates the marker.
+- It refuses, naming the conflict and changing nothing, when:
+  - the root has no marker and is not empty;
+  - a marked root holds a top-level entry ahc does not write (`ROOT_NAMES` and `ROOT_PATTERNS` in `ahc_core`);
+  - the root or the marker is a symlink;
+  - the root, existing or new, or any ahc directory below it is not a real directory owned by this uid at mode
+    exactly 0700, or a file at an ahc name is owned by another uid (PR 258 v3 F2);
+  - an ancestor of the root is owned by a uid other than this one or root, or is group- or other-writable without
+    the sticky bit (`ahc_fs.ancestor_problems`). ahc never chmods an ancestor or an existing root; it refuses.
+- Every subcommand turns a refusal into exit 3, which is in the units' `RestartPreventExitStatus`, so a foreign
+  root stops the unit instead of looping.
+
+A name alone proves nothing (PR 258 v1 BLOCK). The checks run in two tiers:
+- Top level: every entry is checked with lstat for the type ahc gives it. A symlink, or a file where ahc keeps a
+  directory, refuses the start.
+- `items/` and `clones/` (`STRICT_TREES`): only ahc writes these. They are walked without following links, and a
+  link or special file anywhere in them refuses the start. Under `clones/`, only each clone directory and its `.git`
+  must be real, because a clone's work tree may hold symlinks committed in the repository.
+- `queue/`, `inbox/`, `staging/`, `reports/` and `rejected/` (`SHARED_DIRS`): other processes write into these by
+  design. A link inside them never stops ahc, since anyone who can submit could then halt it. Instead, every open
+  of an entry there uses `O_NOFOLLOW` and requires a regular file.
+
+The ledger, its pre-migration backups and the reopen after a restore all go through
+`ahc_runner.connect_nofollow`:
+- the sidecars must not be links;
+- the file is opened or created by an `O_NOFOLLOW` descriptor and gets its mode by `fchmod`;
+- the path's device and inode are compared with that descriptor right after sqlite opens it, before any statement
+  runs.
+
+### One writer under the root (PR 258 v3 F1)
+
+Every write under the root goes through `harness/hooks/ahc_fs.py`:
+- the root is opened `O_DIRECTORY|O_NOFOLLOW`, and each directory below it is opened relative to its parent's
+  descriptor and must be owned by this uid at 0700;
+- a file is written to a temp name that cannot be predicted (`.<name>.<16 hex>.tmp`), created
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, written, `fchmod`ed and fsynced by descriptor, then renamed or hard-linked into
+  place by directory descriptor, and the directory is fsynced;
+- appends, opens, renames, unlinks, `make_dirs` and `make_fresh_dir` use the same descriptor walk.
+
+`tests/test_ahc_fs.py` parses every ahc module and fails on any path-based write (`open` for writing,
+`write_text`, `chmod`, `os.replace`, `os.link`, `mkdir` and similar) outside `ahc_fs`. Its allowlist names each
+remaining site and why it is outside the root or pre-checked, and the test fails if an allowlisted site
+disappears. A new writer must use `ahc_fs`, or justify an allowlist entry in review.
+
+### Daemon clones (D4)
+
+The clone in `clones/<repo>` is reused across reviews (D4 kept on PR 258 v3). Before every use, `ahc_clone`
+walks its `.git` without following links, bounded at 200,000 entries and depth 12 (past either bound it fails
+closed), against an allowlist: `HEAD`, `config`, `packed-refs`, `index`, `FETCH_HEAD`, `ORIG_HEAD`, and `objects/`
+and `refs/` with their usual names. A link, special file, foreign owner, writable directory or any other name
+(hooks, `info/`, `worktrees/`, `modules/`, `logs/`, alternates, `shallow`, `config.ahc-tmp`) moves the clone to
+`rejected/clone-<name>.<ns>.<pid>` with a `.reason` file. It is never repaired in place, and a fresh clone is made
+into a new directory that ahc creates exclusively. The local config is rewritten from scratch each time. git runs
+with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+https only (`protocol.allow=never`, `protocol.https.allow=always`), `--template=` and umask 077. The local file
+transport is off by default. The config key `clone_file_transport: true` turns it on for local test remotes, and
+it is refused, before git runs, for the production root under the real home directory.
+
+### Review report directory
+
+peer_review refuses an existing report path and writes the report itself (an `O_EXCL` temp plus a link through
+its own directory descriptor), so ahc cannot pre-create the file. Instead it creates a fresh private directory
+`reports/<item>-a<attempt>/` per attempt with `ahc_fs.make_fresh_dir` and records its device and inode. The child
+writes `report.md` there. After the child exits, ahc opens that directory, compares its device and inode with the
+recorded ones, and reads `report.md` through the directory descriptor with `O_NOFOLLOW`. It must be:
+- the directory's only entry (peer_review unlinks its own temp file before it exits);
+- a regular file owned by this uid;
+- a file with exactly one link;
+- within `REPORT_MAX_BYTES`.
+
+Anything else concludes as INVALID, never PASS. The attempt directory is then moved, as a name, to
+`rejected/report-<item>-a<attempt>` with a `.reason` file, and the next attempt gets a fresh directory. A crash
+right after the directory is made leaves it empty, and the retry reuses it only if it is still empty, 0700, owned
+by this uid and not a link.
+
+### What remains (L10)
+
+Every check above defends against other users. A process running as this same uid can still write inside the
+0700 root. For example, it could:
+- swap the ledger path to a link and back between sqlite's open and the inode comparison, because Python's sqlite3
+  cannot pass `SQLITE_OPEN_NOFOLLOW`;
+- plant into a clone while git runs;
+- replace a report between the child's exit and ahc's read.
+
+The defense is that no other uid can reach the root: `claim_root` enforces the 0700, uid-owned chain at every
+start.
+
+A change that adds a top-level file under the root must add its name to `ROOT_NAMES` in the same commit.
 
 ## Ledger and migrations
 
@@ -20,14 +117,45 @@ Version 2 adds the D20 timing columns on `items`:
 
 A migration runs only after a proven backup:
 
+0. A ledger larger than `RESTORE_MAX_BYTES` (2 GiB, counting its `-wal` file) is never migrated: ahc refuses
+   with a `SchemaError` before anything is copied or changed.
 1. The SQLite online backup API copies the database to `ledger.sqlite3.pre-v<N>.<ns>.bak`. The copy includes
    committed rows that are still only in the `-wal` file.
 2. The copy must pass `PRAGMA integrity_check` and have the same row count as the source in every table.
-   Otherwise the migration does not start.
+   Otherwise the migration does not start. The proven copy's SHA-256 is then recorded (streamed, PR 258 v5).
 3. All steps run in one transaction.
-4. If any step fails, the daemon restores the backup. The live `.db`, `-wal` and `-shm` files are moved aside
-   together as `ledger.sqlite3.failed-<ns>[-wal|-shm]`; they are never deleted. The daemon then refuses to start
-   with a `SchemaError` that names both files.
+4. If any step fails, the daemon restores the backup (PR 258 v4 F1, v5 F1). The steps, in order:
+   - A durable restore intent, `ledger.sqlite3.restore-intent`, is written first. It is one JSON object:
+     `{"backup": "<backup file name>", "sha256": "<64 hex>", "suffix": ".failed-<ns>"}`.
+   - The backup is streamed through a directory descriptor, in 1 MiB chunks (`ahc_fs.copy_to_temp`), into a
+     new temp file beside the ledger. Its bytes must hash to the recorded SHA-256, or nothing is published
+     (`ahc_fs.Mismatch`). The temp is fsynced. Memory use does not grow with the ledger under the unit's
+     `MemoryMax`.
+   - Only after the copy succeeds are the live `.db` and its `-wal`, `-shm` and `-journal` files moved aside
+     together as `ledger.sqlite3.failed-<ns>[-wal|-shm|-journal]`. They are never deleted. Every target name is
+     checked first; one that is already taken refuses the restore and nothing moves.
+   - The copy is renamed into place and the intent is dropped.
+   - The daemon then refuses to start with a `SchemaError` that names both files.
+
+   If the copy fails while the live database is still in place, nothing has been moved. The intent is dropped,
+   so the next start opens that unchanged database instead of repeating the restore.
+
+   A start that finds an intent (ahc-core only; other processes refuse while one exists) checks only that the
+   record is well formed: a plain file name, a `.failed-<digits>` suffix and a 64-hex SHA-256. A malformed record
+   refuses, and nothing is created. The files then decide, from whatever state a crash left:
+
+   | What the start finds | What it does |
+   |---|---|
+   | The live file holds exactly the backup's bytes (a crash after the publish) | Drops the intent. Nothing is moved again. |
+   | A move target is already taken while its source is still in place | Refuses with the intent kept; nothing changes. |
+   | The backup copies with its recorded digest | Removes any partial temp, finishes the restore (moving the live file aside once if it is still there) and starts. |
+   | The backup is gone, partial or changed, and the live ledger was never moved | Drops the intent, logs `abandoned the interrupted ledger restore`, and starts on that ledger. Its migration is retried with a fresh verified backup. |
+   | The backup is gone, partial or changed, and there is no live ledger | Refuses at every start with the intent kept. No empty ledger is created. An operator puts the backup back or decides. |
+
+   An intent written by an ahc before PR 258 v5 has no `sha256` key, so its backup cannot be verified and is never
+   published. If the live ledger is in place and was never moved aside, it is kept and the intent is dropped. If
+   the live file is byte-identical to the backup (that ahc had already published it), the intent is dropped.
+   Otherwise the start refuses with the intent kept. An explicit `"sha256": null` is malformed and refuses.
 
 ## Admission and staged packets
 

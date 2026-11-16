@@ -7,6 +7,7 @@ GitHub and must match. Stdlib only.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import hashlib
 import json
 import math
@@ -15,9 +16,12 @@ import re
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 from pathlib import Path
+
+import sys  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ahc_fs as fs  # noqa: E402
 
 HEAD_RE = re.compile(r"[0-9a-f]{40}")
 REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
@@ -119,10 +123,102 @@ class Retry(RuntimeError):
     """A transient failure (gh, network); retry later with backoff. Never treated as PASS."""
 
 
+class ForeignRoot(Refused):
+    """ahc's state root holds something ahc did not create; ahc refuses to start rather than share it."""
+
+
+# ahc's state root (goodqa#16049 slice 1, the spec owner's ruling after the Q7 read). It was
+# ~/.agent-harness/coordinator, which another live program (coordd, a different coordinator) also uses on t2-dev for
+# its own ledger.sqlite, clones/, runs/ and token. No ahc ledger was installed on any host, so the root moved with
+# no migration. ahc owns a root only by its marker, written with O_EXCL after an exclusive mkdir:
+#   - absent: ahc creates it and writes the marker;
+#   - present, empty, unmarked: an earlier claim stopped between the mkdir and the marker; ahc claims it;
+#   - present, unmarked, not empty: refused, naming what is there (somebody else's directory);
+#   - marked: every top-level entry must be a name ahc writes (ROOT_NAMES, ROOT_PATTERNS), or it is refused.
+# A new top-level file in a later slice joins ROOT_NAMES in the same commit, or ahc refuses its own root.
+ROOT_DIRNAME = "ahc"
+ROOT_MARKER = ".ahc-root"
+ROOT_MARKER_TEXT = '{"owner": "ahc", "v": 1}\n'
+ROOT_MARKER_MAX = 4096
+ROOT_FILES = ("digest.md", "config.json", "install.json")
+ROOT_NAMES = frozenset((ROOT_MARKER, "staging", "queue", "items", "inbox", "clones", "reports", "rejected",
+                        "ahc-core.lock", "ahc-review.lock", "ledger.sqlite3") + ROOT_FILES)
+ROOT_MARKER_TEMP = ".ahc-root.*.tmp"   # a claim interrupted before its marker link (see Paths._write_marker)
+ROOT_PATTERNS = ("ledger.sqlite3-*", "ledger.sqlite3.*", ".ledger.sqlite3.*.tmp", ROOT_MARKER_TEMP) + tuple(
+    pattern for name in ROOT_FILES for pattern in (".%s.tmp" % name, ".%s.*.tmp" % name))
+
+
+ROOT_DIRS = frozenset(("staging", "queue", "items", "inbox", "clones", "reports", "rejected"))
+# Two tiers below the top level (every top-level entry is always lstat-checked for its type):
+#   STRICT_TREES: written only by ahc's own code, so a link or special file anywhere in them refuses the start.
+#   SHARED_DIRS: other processes write into them by design (submitters drop queue entries, owners read and may
+#     plant entries in their inbox, quarantine moves links from queue/ into rejected/, the review child writes its
+#     report, `ahc submit --packet -` stages packets). A link there must never stop ahc (anyone who can submit
+#     could then halt it); instead every open of an entry in them is O_NOFOLLOW and regular-file checked at the
+#     operation, each with its own test (IngestValidationTests, UntrustedReadTests, PacketRetentionTests).
+STRICT_TREES = frozenset(("items", "clones"))
+SHARED_DIRS = ROOT_DIRS - STRICT_TREES
+TREE_PROBLEM_LIMIT = 50
+
+
+def _entry_problem(path, want_dir):
+    """Why `path` is not an ahc entry of the expected type, or None. It uses lstat, because a symlink is never ahc's.
+    PR 258 v3 F2: a directory must also be owned by this uid with mode exactly 0700, and a file owned by this uid.
+    Otherwise another user could have put or changed it."""
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return "a symlink"
+    if want_dir:
+        return fs.dir_problem(info)
+    if not stat.S_ISREG(info.st_mode):
+        return "not a regular file"
+    if info.st_uid != os.geteuid():
+        return "owned by uid %d" % info.st_uid
+    return None
+
+
+def _tree_problems(directory, clones=False):
+    """Symlinks and special files inside a state directory, found without following any link. A clone's work tree
+    is repository content (it may hold symlinks committed in the repo), so under clones/ only each clone directory
+    and its .git must be real directories; git itself never follows a symlinked .git there once this holds."""
+    out = []
+    if clones:
+        for name in sorted(os.listdir(str(directory))):
+            for path, want_dir in ((directory / name, True), (directory / name / ".git", True)):
+                problem = _entry_problem(path, want_dir)
+                if problem:
+                    out.append("%s (%s)" % (path.relative_to(directory.parent), problem))
+                    break
+        return out
+    for dirpath, dirnames, filenames in os.walk(str(directory), followlinks=False):
+        for name in sorted(dirnames) + sorted(filenames):
+            path = Path(dirpath) / name
+            problem = _entry_problem(path, name in dirnames)
+            if problem:
+                out.append("%s (%s)" % (path.relative_to(directory.parent), problem))
+                if len(out) >= TREE_PROBLEM_LIMIT:
+                    return out
+        dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+    return out
+
+
+def _ahc_root_name(name):
+    return name in ROOT_NAMES or any(fnmatch.fnmatchcase(name, p) for p in ROOT_PATTERNS)
+
+
+def _named(entries, limit=8):
+    shown = sorted(entries)[:limit]
+    more = len(entries) - len(shown)
+    return ", ".join(shown) + (" and %d more" % more if more > 0 else "")
+
+
 class Paths:
     def __init__(self, home=None):
         self.home = Path(home or Path.home())
-        self.root = self.home / ".agent-harness" / "coordinator"
+        self.root = self.home / ".agent-harness" / ROOT_DIRNAME
         self.packets = self.root / "staging"   # private staging root for `ahc submit --packet -` (D14, adv-3 F2)
         self.queue = self.root / "queue"
         self.items = self.root / "items"
@@ -132,8 +228,83 @@ class Paths:
         self.digest = self.root / "digest.md"
 
     def ensure(self):
-        for path in (self.root, self.queue, self.items, self.inbox, self.clones, self.reports):
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.claim_root()
+        for path in (self.queue, self.items, self.inbox, self.clones, self.reports):
+            try:
+                fs.make_dirs(self.root, path)        # checked by descriptor: a link placed after the claim fails
+            except fs.UnsafePath as error:
+                raise ForeignRoot("ahc state directory %s: %s; refusing to start" % (path, error)) from None
+
+    def claim_root(self):
+        """Create or verify ahc's own root; raise ForeignRoot naming the conflict. Never writes into a root that is
+        not ahc's, and never deletes anything."""
+        root = self.root
+        root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)   # outside the root: the home's .agent-harness
+        # PR 258 v3 F2: an ancestor another user can write lets that user swap the root itself. Refuse, never chmod.
+        loose = fs.ancestor_problems(root)
+        if loose:
+            raise ForeignRoot("ahc root %s has ancestors other users can change: %s; refusing to start"
+                              % (root, _named(loose)))
+        try:
+            os.mkdir(str(root), 0o700)                # the root itself, exclusively; checked by descriptor next
+        except FileExistsError:
+            pass
+        info = os.lstat(str(root))
+        if not stat.S_ISDIR(info.st_mode):
+            raise ForeignRoot("ahc root %s is not a directory (a symlink or a file); refusing to start" % root)
+        entries = os.listdir(str(root))
+        if ROOT_MARKER not in entries:
+            others = [name for name in entries if not fnmatch.fnmatchcase(name, ROOT_MARKER_TEMP)]
+            if others:
+                raise ForeignRoot("ahc root %s is not ahc's (no %s marker) and holds: %s; refusing to start"
+                                  % (root, ROOT_MARKER, _named(others)))
+        try:
+            os.close(fs.open_root(root))              # owned by this uid, mode exactly 0700, existing or new
+        except fs.UnsafePath as error:
+            raise ForeignRoot("%s; refusing to start" % error) from None
+        if ROOT_MARKER not in entries:
+            self._write_marker()
+        self._verify_marker()
+        foreign = [name for name in os.listdir(str(root)) if not _ahc_root_name(name)]
+        if foreign:
+            raise ForeignRoot("ahc root %s holds entries ahc did not create: %s; refusing to start"
+                              % (root, _named(foreign)))
+        # PR 258 v1 BLOCK: a name alone proves nothing. Every entry is lstat-checked for its type (a symlink is
+        # never ahc's), and the state directories are walked without following links, so no write can be steered
+        # into another program's file through a link placed under a valid marker.
+        bad = []
+        for name in sorted(os.listdir(str(root))):
+            problem = _entry_problem(root / name, name in ROOT_DIRS)
+            if problem:
+                bad.append("%s (%s)" % (name, problem))
+            elif name in STRICT_TREES:
+                bad.extend(_tree_problems(root / name, clones=(name == "clones")))
+        if bad:
+            raise ForeignRoot("ahc root %s holds entries ahc did not create: %s; refusing to start"
+                              % (root, _named(bad)))
+
+    def _write_marker(self):
+        """The marker appears whole or not at all: written and fsynced under a private temp name, then hard-linked
+        into place (link never replaces, so a concurrent claim that won keeps its marker). A crash before the link
+        leaves only a temp file, which the next claim tolerates (ROOT_MARKER_TEMP) and finishes."""
+        try:
+            fs.write_file(self.root, self.root / ROOT_MARKER, ROOT_MARKER_TEXT, exclusive=True)
+        except FileExistsError:
+            pass                                       # a concurrent claim won; its marker is verified next
+
+    def _verify_marker(self):
+        path = self.root / ROOT_MARKER
+        try:
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError as error:
+            raise ForeignRoot("ahc root marker %s is unreadable or a symlink (%s); refusing to start"
+                              % (path, type(error).__name__))
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ForeignRoot("ahc root marker %s is not a regular file; refusing to start" % path)
+            text = handle.read(ROOT_MARKER_MAX + 1)
+        if text.decode("utf-8", "replace") != ROOT_MARKER_TEXT:
+            raise ForeignRoot("ahc root marker %s does not name ahc; refusing to start" % path)
 
 
 REPORT_MAX_BYTES = 2_000_000
@@ -324,19 +495,6 @@ def item_id(req, packet_sha):
     return "ahc-" + hashlib.sha256(key.encode()).hexdigest()[:20]
 
 
-def _atomic_write(path, data):
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.link(tmp, path)  # fails if the item already exists: first writer wins, no overwrite
-    finally:
-        os.unlink(tmp)
-
-
 def submit(paths, config, req, now=None, data=None):
     """Validate and enqueue. Returns {"id", "duplicate"}. Raises Refused; writes nothing on refusal. `data` is the
     packet bytes the caller already read (and linted); when given they are the bytes hashed."""
@@ -412,7 +570,7 @@ def _parse_report(text):
 EXIT_PASS, EXIT_ERROR, EXIT_BLOCK, EXIT_ADVISORY = 0, 2, 3, 4   # peer_review.py main()
 
 
-def verify_receipt(rc, report_path, head, packet_path):
+def verify_receipt(rc, report_path, head, packet_path, report_bytes=None):
     """{"verdict": PASS|PASS-WITH-TICKETS|BLOCK|ADVISORY|INVALID|ERROR, "reason"} (spec AC-5, NEG-5).
 
     PASS needs exit 0, stage pr, the exact head, the raw-byte SHA-256 of the packet that was passed and an exact
@@ -424,7 +582,8 @@ def verify_receipt(rc, report_path, head, packet_path):
     if rc not in (EXIT_PASS, EXIT_BLOCK):
         return {"verdict": "ERROR", "reason": f"peer_review exited {rc}"}
     try:
-        text = read_regular(report_path, REPORT_MAX_BYTES).decode("utf-8", errors="replace")
+        raw = read_regular(report_path, REPORT_MAX_BYTES) if report_bytes is None else report_bytes
+        text = raw.decode("utf-8", errors="replace")
     except Unreadable as error:
         if error.kind == "absent":
             return {"verdict": "ERROR", "reason": "no report was written"}

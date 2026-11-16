@@ -43,11 +43,16 @@ SEAMS = (
     "runner.inbox",            # _write_inbox: the owner notice rename into place
     "runner.stage_packet",     # stage_packet: the staged packet file
     "runner.quarantine",       # _quarantine: the queue entry rename into rejected/
+    "runner.quarantine_report",  # _quarantine_report_dir: a failed attempt directory moved into rejected/
     "runner.prune",            # Worker.prune_packets: a staged packet removal
     "runner.backup",           # Ledger.backup: the verified pre-migration copy
     "runner.restore_intent",   # Ledger.restore: the durable interrupted-restore record written first
-    "runner.restore_move",     # Ledger.restore: the failed database files renamed aside
-    "runner.restore_copy",     # Ledger.restore: the verified backup copied back into place
+    "runner.restore_copy",     # Ledger._finish_restore: the verified backup streamed into a temp file, fsynced
+    "runner.restore_chunk",    # _restore_progress: around each chunk written into that temp (mid-copy)
+    "runner.restore_move",     # Ledger._move_aside: the live database and its sidecars renamed aside
+    "runner.restore_publish",  # Ledger._publish_restored: the digest-checked copy renamed into place
+    "runner.restore_done",     # Ledger._drop_intent: the intent removed after the publish (or a found publish)
+    "runner.restore_abandon",  # Ledger._abandon_restore: the intent removed, the never-moved live db kept
 )
 
 
@@ -99,6 +104,9 @@ def crash_after(name):
 # ---------------------------------------------------------------- inventory
 
 SQL_READS = ("SELECT", "BEGIN", "ROLLBACK", "SAVEPOINT", "RELEASE", "EXPLAIN", "WITH")
+FS_WRITE_OPS = frozenset(("write_file", "append_file", "rename", "unlink", "link_exclusive", "make_dirs",
+                          "copy_to_temp", "remove_temps",
+                          "make_fresh_dir", "touch", "open_file"))
 FILE_OPS = {
     ("os", "write"), ("os", "rename"), ("os", "replace"), ("os", "remove"), ("os", "unlink"), ("os", "rmdir"),
     ("os", "makedirs"), ("os", "mkdir"), ("os", "chmod"), ("os", "fsync"), ("os", "truncate"), ("os", "link"),
@@ -157,6 +165,8 @@ def _op(call):
             return "sql:commit()"
         if f.attr == "backup":
             return "sqlite.backup"
+        if isinstance(f.value, ast.Name) and f.value.id == "fs" and f.attr in FS_WRITE_OPS:
+            return "fs." + f.attr                   # PR 258 v3: every write under the root goes through ahc_fs
         if isinstance(f.value, ast.Name) and (f.value.id, f.attr) in FILE_OPS:
             return "%s.%s" % (f.value.id, f.attr)
         if isinstance(f.value, ast.Name) and f.value.id == "os" and f.attr == "open":
@@ -269,37 +279,35 @@ TX_SEAM = {"ahc_contracts": "contracts.commit", "ahc_runner": "runner.commit"}
 _DIR = "exempt:directory creation, idempotent, before the seam; no state"
 _MIG = "exempt:a MIGRATIONS step, run only inside Ledger._schema's transaction; durable at runner.commit"
 INVENTORY = {
-    ("ahc_contracts", "AuthorityLog.append", "os.open(write)"): (1, "seam:contracts.authority"),
-    ("ahc_contracts", "AuthorityLog.append", "os.write"): (1, "seam:contracts.authority"),
-    ("ahc_contracts", "AuthorityLog.append", "os.fsync"): (1, "seam:contracts.authority"),
+    # PR 258 v3: every write under the root goes through ahc_fs (dir-fd, O_NOFOLLOW, O_EXCL temp, rename by fd),
+    # so a site is one fs.<op> call; its temp write, fsync and rename happen inside that call, before it returns.
+    ("ahc_contracts", "AuthorityLog.append", "fs.append_file"): (1, "seam:contracts.authority"),
     ("ahc_contracts", "AuthorityLog.append", "os.makedirs"): (1, _DIR),
     ("ahc_contracts", "Contracts.tx", "sql:COMMIT"): (1, "seam:contracts.commit"),
-    ("ahc_contracts", "Contracts.set_merging.write", "sql:INSERT"): (
-        1, "exempt:runs only inside a transaction: set_merging's own `with self.tx()`, or a caller's when "
-           "_in_tx=True (late_apply and watch_confirm, both inside tx bodies); durable at contracts.commit"),
     ("ahc_contracts", "apply_schema", "sql:DYNAMIC"): (
         1, "exempt:idempotent DDL (CREATE ... IF NOT EXISTS, INSERT OR IGNORE), re-run at every open; no data"),
-    ("ahc_runner", "Ledger.__init__", "sqlite3.connect"): (
-        1, "exempt:opens or creates the database file; its first rows commit at runner.commit"),
+    # connect_nofollow (PR 258 v1 BLOCK, v3) is the one sqlite open for the ledger, its pre-migration backup and the
+    # reopen after a restore: the file is opened or created through ahc_fs and fchmod'ed first.
+    ("ahc_runner", "connect_nofollow", "fs.open_file"): (
+        1, "exempt:opens or creates the database file before sqlite opens it (same disposition as the connect)"),
+    ("ahc_runner", "connect_nofollow", "sqlite3.connect"): (
+        1, "exempt:opens or creates a database file (ledger: first rows commit at runner.commit; backup: inside the "
+           "runner.backup seam; restore reopen: after the runner.restore_copy seam)"),
     ("ahc_runner", "Ledger.__init__", "sql:PRAGMA"): (
         2, "exempt:connection settings (journal_mode=WAL, synchronous=FULL), re-applied at every open"),
-    ("ahc_runner", "Ledger.__init__", "os.chmod"): (1, "exempt:permission metadata, re-applied at every open"),
     ("ahc_runner", "Ledger._schema", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
-    ("ahc_runner", "Ledger.backup", "sqlite3.connect"): (1, "seam:runner.backup"),
     ("ahc_runner", "Ledger.backup", "sqlite.backup"): (1, "seam:runner.backup"),
-    ("ahc_runner", "Ledger.backup", "os.chmod"): (1, "seam:runner.backup"),
-    ("ahc_runner", "Ledger.restore", "open(write)"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger.restore", "handle.write"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger.restore", "os.fsync"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger.restore", "os.replace"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger.restore", "sqlite3.connect"): (
-        1, "exempt:reopens the restored file after the runner.restore_copy seam; no write"),
-    ("ahc_runner", "Ledger._finish_restore", "os.rename"): (1, "seam:runner.restore_move"),
-    ("ahc_runner", "Ledger._finish_restore", "shutil.copyfile"): (1, "seam:runner.restore_copy"),
-    ("ahc_runner", "Ledger._finish_restore", "os.chmod"): (1, "seam:runner.restore_copy"),
-    ("ahc_runner", "Ledger._finish_restore", "os.fsync"): (1, "seam:runner.restore_copy"),
-    ("ahc_runner", "Ledger._finish_restore", "os.replace"): (1, "seam:runner.restore_copy"),
-    ("ahc_runner", "Ledger._finish_restore", "os.unlink"): (1, "seam:runner.restore_copy"),
+    ("ahc_runner", "Ledger.restore", "fs.write_file"): (1, "seam:runner.restore_intent"),
+    # PR 258 v5: one method per durable restore step, so each step has its own seam and inventory row
+    ("ahc_runner", "Ledger._finish_restore", "fs.copy_to_temp"): (1, "seam:runner.restore_copy"),
+    ("ahc_runner", "Ledger._move_aside", "fs.rename"): (1, "seam:runner.restore_move"),
+    ("ahc_runner", "Ledger._publish_restored", "fs.rename"): (1, "seam:runner.restore_publish"),
+    ("ahc_runner", "Ledger._drop_intent", "fs.unlink"): (1, "seam:runner.restore_done"),
+    ("ahc_runner", "Ledger._abandon_restore", "fs.unlink"): (1, "seam:runner.restore_abandon"),
+    ("ahc_runner", "Ledger._finish_restore", "fs.remove_temps"): (
+        1, "exempt:removes only an unpublished temp copy of the ledger left by an interrupted restore"),
+    ("ahc_runner", "Ledger._resume_undigested", "fs.remove_temps"): (
+        1, "exempt:removes only an unpublished temp copy of the ledger left by an interrupted restore"),
     ("ahc_runner", "_Tx.__exit__", "sql:COMMIT"): (1, "seam:runner.commit"),
     ("ahc_runner", "_migrate_v2", "sql:ALTER"): (1, _MIG),
     ("ahc_runner", "_migrate_v2", "sql:UPDATE"): (1, _MIG),
@@ -308,28 +316,21 @@ INVENTORY = {
     ("ahc_runner", "_migrate_v4", "sql:ALTER"): (1, _MIG),
     ("ahc_runner", "_migrate_v4", "sql:DROP"): (1, _MIG),
     ("ahc_runner", "_migrate_v4", "sql:DYNAMIC"): (1, _MIG),
-    ("ahc_runner", "Worker.prune_packets", "os.unlink"): (1, "seam:runner.prune"),
-    ("ahc_runner", "_append_private", "handle.write"): (1, "seam:runner.append_private"),
-    ("ahc_runner", "_append_private", "os.fsync"): (1, "seam:runner.append_private"),
-    ("ahc_runner", "_append_private", "path.mkdir"): (1, _DIR),
-    ("ahc_runner", "_write_private", "handle.write"): (1, "seam:runner.write_private"),
-    ("ahc_runner", "_write_private", "os.fsync"): (1, "seam:runner.write_private"),
-    ("ahc_runner", "_write_private", "os.replace"): (1, "seam:runner.write_private"),
-    ("ahc_runner", "_write_private", "path.mkdir"): (1, _DIR),
-    ("ahc_runner", "_write_inbox", "os.open(write)"): (1, "seam:runner.inbox"),
-    ("ahc_runner", "_write_inbox", "handle.write"): (1, "seam:runner.inbox"),
-    ("ahc_runner", "_write_inbox", "os.fsync"): (1, "seam:runner.inbox"),
-    ("ahc_runner", "_write_inbox", "os.rename"): (1, "seam:runner.inbox"),
-    ("ahc_runner", "_write_inbox", "os.unlink"): (
-        1, "exempt:removes a stale temp file before the write; never the notice itself"),
-    ("ahc_runner", "_write_inbox", "os.mkdir"): (1, _DIR),
-    ("ahc_runner", "stage_packet", "os.open(write)"): (1, "seam:runner.stage_packet"),
-    ("ahc_runner", "stage_packet", "handle.write"): (1, "seam:runner.stage_packet"),
-    ("ahc_runner", "stage_packet", "os.fsync"): (1, "seam:runner.stage_packet"),
-    ("ahc_runner", "stage_packet", "path.mkdir"): (1, _DIR),
-    ("ahc_runner", "stage_packet", "os.chmod"): (1, "exempt:permission metadata on the staging directory"),
-    ("ahc_runner", "_quarantine", "os.rename"): (1, "seam:runner.quarantine"),
-    ("ahc_runner", "_quarantine", "path.mkdir"): (1, _DIR),
+    ("ahc_runner", "Worker.prune_packets", "fs.unlink"): (1, "seam:runner.prune"),
+    ("ahc_runner", "Worker.review", "fs.make_fresh_dir"): (
+        1, "exempt:the attempt's empty private report directory, before the review intent; a crash after it leaves "
+           "an empty private directory that the retry reuses (make_fresh_dir reuse_empty); no state"),
+    ("ahc_runner", "_append_private", "fs.append_file"): (1, "seam:runner.append_private"),
+    ("ahc_runner", "_write_private", "fs.write_file"): (1, "seam:runner.write_private"),
+    ("ahc_runner", "_write_inbox", "fs.write_file"): (1, "seam:runner.inbox"),
+    ("ahc_runner", "stage_packet", "fs.write_file"): (1, "seam:runner.stage_packet"),
+    ("ahc_runner", "stage_packet", "fs.touch"): (
+        1, "exempt:mtime only (restarts the orphan clock of an already staged packet); no content"),
+    ("ahc_runner", "acquire_lock", "fs.open_file"): (1, "exempt:the lock file; empty, flocked, not state"),
+    ("ahc_runner", "_quarantine", "fs.rename"): (1, "seam:runner.quarantine"),
+    ("ahc_runner", "_quarantine", "fs.make_dirs"): (1, _DIR),
+    ("ahc_runner", "_quarantine_report_dir", "fs.rename"): (1, "seam:runner.quarantine_report"),
+    ("ahc_runner", "_quarantine_report_dir", "fs.make_dirs"): (1, _DIR),
     ("ahc_runner", "_setup_logging", "path.mkdir"): (1, "exempt:the log directory; logs are not ledger state"),
 }
 

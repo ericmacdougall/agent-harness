@@ -14,7 +14,9 @@ import hashlib
 import json
 import os
 import time
+from pathlib import Path
 
+import ahc_fs as fs
 from ahc_crash import crash_after, crash_before
 
 # Bounds from design v3 1.1 (the only numbers here)
@@ -135,14 +137,11 @@ class AuthorityLog:
                 return row["seq"]
         entry = dict(record, seq=len(rows) + 1, label=self.label)
         try:
-            os.makedirs(os.path.dirname(self.path) or ".", mode=0o700, exist_ok=True)
+            directory = Path(os.path.abspath(os.path.dirname(self.path) or "."))
+            os.makedirs(str(directory), mode=0o700, exist_ok=True)   # the log's own directory; fs checks it next
             crash_before("contracts.authority")
-            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            try:
-                os.write(fd, (_canon(entry) + "\n").encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            # the log's directory is its root: it must be ours at 0700, and the append never follows a link
+            fs.append_file(directory, directory / os.path.basename(self.path), _canon(entry) + "\n")
             crash_after("contracts.authority")
         except OSError as error:
             raise AuthorityError("authority record not written: %s" % type(error).__name__) from None

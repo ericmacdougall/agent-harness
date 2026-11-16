@@ -710,6 +710,148 @@ class IngestValidationTests(Base):
         moved = self.paths.root / "rejected" / link.name
         self.assertTrue(moved.is_symlink(), "the link itself is quarantined")
 
+    def test_a_report_not_written_into_the_attempt_directory_ahc_created_is_never_a_pass(self):
+        """PR 258 v3 (main's ruling on the review child). ahc creates the attempt's private report directory
+        exclusively and records its inode. After the child exits, ahc reads the report only through that same
+        directory. The report must be that directory's only entry: a regular file owned by this uid with one link
+        and within the size cap. A replaced directory (before or after the child exits), a linked or hard-linked
+        report, an extra entry or an oversized report gives INVALID, never PASS. The attempt directory is
+        quarantined into rejected/, and a file outside the root is never touched. A normal report in the created
+        directory still passes. (Spec owner's conditions on the report-directory deviation.)"""
+        cases = {}
+
+        def swap_dir(out):          # before the child: the directory is replaced, and the child writes there
+            aside = out.parent.with_name(out.parent.name + ".moved")
+            os.rename(str(out.parent), str(aside))
+            out.parent.mkdir(mode=0o700)
+            return out, None
+
+        def link_report(out):       # the report name is a link to a PASS report kept elsewhere
+            elsewhere = self.home / "forged.md"
+            os.symlink(str(elsewhere), str(out))
+            return elsewhere, None
+
+        def hard_link(out):         # after the child: a second name for the report, outside ahc's directory
+            def after():
+                os.link(str(out), str(self.home / ("hard-%s.md" % out.parent.name)))
+            return out, after
+
+        def extra_entry(out):       # after the child: another file beside the report
+            def after():
+                (out.parent / "extra.md").write_text("VERDICT: PASS\n")
+            return out, after
+
+        def swap_after_exit(out):   # after the child: the whole directory is replaced by a copy
+            def after():
+                body = out.read_bytes()
+                os.rename(str(out.parent), str(out.parent.with_name(out.parent.name + ".moved")))
+                out.parent.mkdir(mode=0o700)
+                out.write_bytes(body)
+            return out, after
+
+        def oversized(out):         # after the child: the report grows past the cap
+            def after():
+                with open(str(out), "ab") as handle:
+                    handle.write(b"x" * (core.REPORT_MAX_BYTES + 1))
+            return out, after
+        cases["replaced directory"] = swap_dir
+        cases["linked report"] = link_report
+        cases["hard-linked report"] = hard_link
+        cases["extra entry"] = extra_entry
+        cases["directory swapped after exit"] = swap_after_exit
+        cases["oversized report"] = oversized
+        for label, tamper in cases.items():
+            with self.subTest(case=label):
+                self.tearDown()
+                self.setUp()
+                iid = self.submit()
+                deps = Deps(verdict="PASS")
+                plain = deps.review
+
+                def review(argv, timeout, tamper=tamper, plain=plain):
+                    out = Path(argv[argv.index("--output") + 1])
+                    target, after = tamper(out)
+                    rc = plain(argv[:argv.index("--output") + 1] + [str(target)] + argv[argv.index("--output") + 2:],
+                               timeout)
+                    if after:
+                        after()
+                    return rc
+                deps.review = review
+                forged = self.home / "forged.md"
+                self.run_all(deps)
+                self.assertNotEqual(self.state(iid), "routed-to-main", "%s became a PASS" % label)
+                rejected = sorted(p.name for p in (self.paths.root / "rejected").glob("report-%s-a1*" % iid))
+                self.assertTrue(any(n.endswith(".reason") for n in rejected), "%s: no quarantine reason" % label)
+                self.assertTrue(any(not n.endswith(".reason") for n in rejected), "%s: not quarantined" % label)
+                if label == "hard-linked report":
+                    outside = self.home / ("hard-%s-a1.md" % iid)
+                    self.assertEqual(os.stat(str(outside)).st_nlink, 2, "the outside name must be left alone")
+                if label == "linked report":
+                    self.assertTrue(forged.exists(), "the link target outside the root must be left alone")
+        self.tearDown()
+        self.setUp()
+        iid, deps = self.submit(), Deps(verdict="PASS")
+        self.run_all(deps)
+        self.assertEqual(self.state(iid), "routed-to-main", "an honest report in the created directory must pass")
+
+    def test_links_in_every_shared_dir_are_refused_at_their_operation_while_ahc_keeps_serving(self):
+        """PR 258 v2 (spec owner's condition 1). Shared dirs are checked per operation, not walked at start, so
+        links in all five must neither stop ahc nor be followed. Item A is refused where the links touch it: its
+        report name is taken by a link and its owner notice name is a link. Item B, untouched, still completes,
+        and every external target stays byte-identical."""
+        self.paths.ensure()
+        b = self.submit()
+        a = core.submit(self.paths, self.config, {   # a different PR, so B never supersedes it
+            "repo": REPO, "pr": 8, "head": HEAD, "base": BASE, "packet": str(self.packet),
+            "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"})["id"]
+        externals = {}
+
+        def plant(link, name):
+            target = self.home / ("external-" + name)
+            target.write_text("external " + name)
+            externals[target] = target.read_text()
+            link.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.symlink(str(target), str(link))
+            return link
+
+        _, rec = self.valid_record()
+        queued = plant(self.paths.queue / (rec["id"] + ".json"), "queue")
+        report = plant(self.paths.reports / ("%s-a1" % a), "report")
+        plant(self.paths.inbox / "agent-abc123" / ("%s-needs-attention.md" % a), "inbox")
+        staged = plant(self.paths.packets / ("e" * 64 + ".md"), "staging")
+        rejected = plant(self.paths.root / "rejected" / "old.json", "rejected")
+        deps = Deps(verdict="BLOCK")
+        plain_gh = deps.gh
+
+        def gh(argv, timeout):          # the fixture serves PR 7; answer for whichever PR is asked
+            rc, out, err = plain_gh(argv, timeout)
+            if argv[1:3] == ["pr", "view"]:
+                pr = json.loads(out)
+                pr["number"] = int(argv[3])
+                out = json.dumps(pr)
+            return rc, out, err
+        deps.gh = gh
+        for _ in range(4):
+            self.run_all(deps)           # never ForeignRoot: shared-dir links do not stop the daemon
+            deps.now += 7200
+        self.assertEqual(self.state(b), "block-delivered", "an unrelated item stopped being served")
+        self.assertEqual(self.state(a), "needs-attention", "a linked report path must refuse the review")
+        self.assertTrue(report.is_symlink())
+        self.assertFalse(queued.exists() or os.path.lexists(str(queued)), "the queue link was not quarantined")
+        self.assertTrue((self.paths.root / "rejected" / queued.name).is_symlink())
+        self.assertTrue(staged.is_symlink() and rejected.is_symlink())
+        ledger = runner.Ledger(self.paths)
+        try:
+            notices = ledger.db.execute("SELECT status, result FROM effects WHERE item=? AND kind='inbox'",
+                                        (a,)).fetchall()
+        finally:
+            ledger.close()
+        self.assertTrue(notices, "item A's owner notice was never attempted")
+        self.assertTrue(all(row["status"] != "done" and "refused" in (row["result"] or "") for row in notices),
+                        "a notice written to a linked name looked delivered")
+        for target, text in externals.items():
+            self.assertEqual(target.read_text(), text, "%s was written through a link" % target.name)
+
     def test_inbox_path_rejects_escape_after_resolving(self):
         with self.assertRaises(core.Refused):
             core.inbox_path(self.paths, "..", "x.md")
@@ -941,17 +1083,24 @@ class UntrustedReadTests(Base):
     def test_fifo_digest_and_lock_never_block(self):
         import os
         self.paths.ensure()
+        iid, deps = self.submit(), Deps(verdict="BLOCK")
         os.mkfifo(self.paths.digest)
         self.assertFalse(runner._digest_has(self.paths.digest, "x"))
         with self.assertRaises(OSError):
-            runner._append_private(self.paths.digest, "line\n")
-        iid, deps = self.submit(), Deps(verdict="BLOCK")
+            runner._append_private(self.paths.root, self.paths.digest, "line\n")
+        # PR 258 v1 BLOCK: a FIFO at a top-level ahc name is not ahc's file, so the start is refused (exit 3 from
+        # the CLI) instead of running around it; nothing blocks either way.
+        with self.assertRaises(core.ForeignRoot):
+            self.run_all(deps)
+        os.unlink(self.paths.digest)
         self.run_all(deps)
         self.assertEqual(self.state(iid), "block-delivered")
         self.assertTrue([a for a in deps.ah_calls if a[:3] == ["ah", "heartbeat", "beat"]])
         lock = self.paths.root / "ahc-core.lock"
+        if os.path.lexists(str(lock)):
+            os.unlink(str(lock))
         os.mkfifo(lock)
-        with self.assertRaises(OSError):
+        with self.assertRaises((OSError, core.ForeignRoot)):
             runner.acquire_lock(self.paths, "core")
 
     def test_digest_readback_reads_only_a_bounded_tail(self):
@@ -2623,6 +2772,290 @@ class SchemaTests(Base):
         runner.Ledger(self.paths).close()
         self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], (str(runner.SCHEMA_VERSION), 3))
 
+    # --- PR 258 v4 F1: the restore streams the backup and never moves the live database aside before the copy
+    def failing_migration(self, step):
+        saved = dict(runner.MIGRATIONS)
+        runner.MIGRATIONS[2] = [step] + list(saved[2])
+
+        def undo():
+            runner.MIGRATIONS.clear()
+            runner.MIGRATIONS.update(saved)
+        return undo
+
+    def test_restore_memory_does_not_grow_with_the_backup(self):
+        """A backup far larger than a small memory budget restores within it. The old restore read the whole backup
+        into memory (read_regular joins its chunks, about twice the size) after moving the live database aside, so
+        under the unit's MemoryMax a large ledger could not be restored. tracemalloc measures Python allocations
+        while the restore runs; the copy must hold no more than a few chunks."""
+        import tracemalloc
+        held = self.make_v1()
+        size = 8 * 1024 * 1024
+        held.execute("CREATE TABLE ballast(b BLOB)")
+        held.execute("INSERT INTO ballast(b) VALUES (randomblob(?))", (size,))
+        held.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        peaks = {}
+
+        def boom(db):
+            raise RuntimeError("injected migration failure")
+        real_restore = runner.Ledger.restore
+
+        def measured(ledger, copy):
+            tracemalloc.start()
+            try:
+                return real_restore(ledger, copy)
+            finally:
+                peaks["restore"] = tracemalloc.get_traced_memory()[1]
+                tracemalloc.stop()
+        undo = self.failing_migration(boom)
+        try:
+            with mock.patch.object(runner.Ledger, "restore", measured):
+                with self.assertRaises(runner.SchemaError) as caught:
+                    runner.Ledger(self.paths)
+        finally:
+            undo()
+            held.close()
+        self.assertIn("restored", str(caught.exception))
+        budget = 4 * 1024 * 1024
+        self.assertLess(peaks["restore"], budget, "the restore held %d bytes for an %d-byte backup"
+                        % (peaks["restore"], size))
+        cols, version, count = self.columns(self.paths.root / "ledger.sqlite3")
+        self.assertEqual((version, count), ("1", 3), "the restored ledger is the v1 copy")
+        import sqlite3
+        db = sqlite3.connect(str(self.paths.root / "ledger.sqlite3"))
+        try:
+            self.assertEqual(db.execute("SELECT length(b) FROM ballast").fetchone()[0], size)
+            self.assertEqual(db.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            db.close()
+
+    def test_a_restore_whose_copy_fails_leaves_the_live_database_in_place(self):
+        """The backup vanishes during the failed migration, so the restore cannot copy it. The old restore had
+        already moved the live database aside, which left no ledger and a pending intent, so every restart failed
+        the same way. Now the live database is never moved before the copy succeeds. It stays in place, unchanged,
+        the intent is dropped, and the next start migrates it."""
+        held = self.make_v1()
+
+        def lose_backup(db):
+            for backup in self.paths.root.glob("ledger.sqlite3.pre-v*.bak"):
+                backup.unlink()
+            raise RuntimeError("injected migration failure")
+        undo = self.failing_migration(lose_backup)
+        try:
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+        finally:
+            undo()
+            held.close()
+        self.assertIn("left in place", str(caught.exception))
+        live = self.paths.root / "ledger.sqlite3"
+        self.assertTrue(live.is_file(), "the live database was moved aside before the copy succeeded")
+        self.assertEqual(self.columns(live)[1:], ("1", 3), "the live database is the unchanged v1 ledger")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "nothing was moved aside")
+        self.assertFalse(Path(str(live) + ".restore-intent").exists(), "a stale intent would repeat the restore")
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "the partial copy is removed")
+        runner.Ledger(self.paths).close()                    # the next start migrates the intact ledger
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3))
+
+    def test_a_ledger_over_the_cap_is_never_migrated(self):
+        """The size cap is enforced before the migration starts: no backup, no intent, nothing moved."""
+        held = self.make_v1()
+        held.close()
+        with mock.patch.object(runner, "RESTORE_MAX_BYTES", 1024):
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+        self.assertIn("migration cap", str(caught.exception))
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v*.bak")), "a backup was made")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")))
+        self.assertEqual(self.columns(self.paths.root / "ledger.sqlite3")[1:], ("1", 3))
+
+    def test_an_interrupted_streaming_copy_is_discarded_and_the_restore_completes(self):
+        """A crash in the middle of the copy leaves a partial temp file. With the live file already gone (the
+        crash came between move and publish on an earlier attempt), the intent stays. The next start removes the
+        partial copy, streams a full one and publishes it."""
+        held = self.make_v1()
+        held.close()
+        live = self.paths.root / "ledger.sqlite3"
+        backup = live.with_name("ledger.sqlite3.pre-v9.1.bak")
+        import sqlite3
+        src = sqlite3.connect(str(live))
+        dst = sqlite3.connect(str(backup))
+        src.backup(dst)
+        src.close()
+        dst.close()
+        os.chmod(str(backup), 0o600)
+        os.rename(str(live), str(live) + ".failed-1")
+        for extra in ("-wal", "-shm"):
+            if os.path.lexists(str(live) + extra):
+                os.rename(str(live) + extra, str(live) + ".failed-1" + extra)
+        partial = self.paths.root / ".ledger.sqlite3.0123456789abcdef.tmp"
+        with open(str(backup), "rb") as handle:
+            partial.write_bytes(handle.read(4096))
+        os.chmod(str(partial), 0o600)
+        sha = hashlib.sha256(backup.read_bytes()).hexdigest()
+        Path(str(live) + ".restore-intent").write_text(json.dumps({"backup": backup.name, "suffix": ".failed-1",
+                                                                   "sha256": sha}))
+        os.chmod(str(live) + ".restore-intent", 0o600)
+        runner.Ledger(self.paths).close()
+        self.assertFalse(partial.exists(), "the partial copy was left behind")
+        self.assertFalse(Path(str(live) + ".restore-intent").exists())
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3), "restored, then migrated")
+
+    # --- PR 258 v5 F1: an interrupted restore is finished from what the files say, never stranding an intact ledger
+    def crash_after_the_intent(self, damage):
+        """The receipt's sequence, in process: the migration fails, the backup is damaged during it, and the
+        process dies right after the restore intent is durable (a BaseException at that seam, so no handler runs).
+        Returns the live path."""
+        held = self.make_v1()
+
+        class Died(BaseException):
+            pass
+
+        def die_after(name):
+            if name == "runner.restore_intent":
+                raise Died()
+
+        def damage_backup(db):
+            for backup in self.paths.root.glob("ledger.sqlite3.pre-v*.bak"):
+                if damage == "missing":
+                    backup.unlink()
+                else:
+                    os.truncate(str(backup), 4096)
+            raise RuntimeError("injected migration failure")
+        undo = self.failing_migration(damage_backup)
+        try:
+            with mock.patch.object(runner, "crash_after", die_after):
+                with self.assertRaises(Died):
+                    runner.Ledger(self.paths)
+        finally:
+            undo()
+            held.close()
+        live = self.paths.root / "ledger.sqlite3"
+        self.assertTrue(Path(str(live) + ".restore-intent").exists(), "setup: the crash left the intent")
+        self.assertEqual(self.columns(live)[1:], ("1", 3), "setup: the live ledger is the intact v1 ledger")
+        return live
+
+    def assert_abandoned_then_migrated(self, live):
+        with self.assertLogs("ahc", "WARNING") as logs:
+            runner.Ledger(self.paths).close()                # the next ahc-core start
+        self.assertTrue(any("abandoned the interrupted ledger restore" in line for line in logs.output), logs.output)
+        self.assertFalse(Path(str(live) + ".restore-intent").exists(), "the stale intent is dropped")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "the intact ledger was moved aside")
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")))
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3), "kept, then migrated")
+        runner.Ledger(self.paths).close()                    # and every later start is an ordinary one
+
+    def test_a_crash_after_the_intent_with_the_backup_gone_keeps_and_migrates_the_intact_ledger(self):
+        """Receipt harness-pr258-v5 F1, the exact sequence: the old resume refused at every start (its
+        copy.is_file() check ran before the abandon handling) while the live ledger was intact."""
+        self.assert_abandoned_then_migrated(self.crash_after_the_intent("missing"))
+
+    def test_a_crash_after_the_intent_with_a_partial_backup_never_publishes_it(self):
+        """A truncated backup fails its recorded digest, so it is never published over the intact ledger (the old
+        resume published it, and the ledger no longer opened)."""
+        self.assert_abandoned_then_migrated(self.crash_after_the_intent("partial"))
+
+    def interrupted(self):
+        """A v1 ledger moved aside as .failed-1 (with its sidecars) beside a backup of it and a valid intent:
+        the files a restore leaves right after its move. Returns (live, backup, aside, sha256 of the backup)."""
+        held = self.make_v1()
+        held.close()
+        live = self.paths.root / "ledger.sqlite3"
+        backup = live.with_name("ledger.sqlite3.pre-v9.1.bak")
+        import sqlite3
+        src, dst = sqlite3.connect(str(live)), sqlite3.connect(str(backup))
+        src.backup(dst)
+        src.close()
+        dst.close()
+        for extra in ("-wal", "-shm"):
+            for path in (str(backup) + extra, str(live) + extra):
+                if os.path.lexists(path):
+                    os.unlink(path)
+        os.chmod(str(backup), 0o600)
+        aside = Path(str(live) + ".failed-1")
+        os.rename(str(live), str(aside))
+        sha = hashlib.sha256(backup.read_bytes()).hexdigest()
+        intent = Path(str(live) + ".restore-intent")
+        intent.write_text(json.dumps({"backup": backup.name, "suffix": ".failed-1", "sha256": sha}))
+        os.chmod(str(intent), 0o600)
+        return live, backup, aside, sha
+
+    def test_a_found_publish_is_not_moved_aside_again(self):
+        """The PR 258 v4 residual: a crash after the publish and before the intent was dropped. The old resume moved
+        the restored copy aside under the same suffix, replacing the moved-aside failed ledger. Now the live file is
+        recognised by the backup's digest, the intent is dropped, and the moved-aside file stays byte for byte."""
+        live, backup, aside, _sha = self.interrupted()
+        live.write_bytes(backup.read_bytes())                # what the publish left
+        os.chmod(str(live), 0o600)
+        kept = aside.read_bytes()
+        runner.Ledger(self.paths).close()
+        self.assertEqual(aside.read_bytes(), kept, "the moved-aside failed ledger was replaced")
+        self.assertEqual(sorted(p.name for p in self.paths.root.glob("ledger.sqlite3.failed-*")), [aside.name])
+        self.assertFalse(Path(str(live) + ".restore-intent").exists())
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3))
+
+    def test_a_foreign_file_where_the_ledger_was_moved_from_is_refused_and_replaces_nothing(self):
+        live, _backup, aside, _sha = self.interrupted()
+        import sqlite3
+        db = sqlite3.connect(str(live))
+        db.execute("CREATE TABLE stray(x)")
+        db.commit()
+        db.close()
+        os.chmod(str(live), 0o600)
+        kept, foreign = aside.read_bytes(), live.read_bytes()
+        for _ in range(2):
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+            self.assertIn("refusing to replace either", str(caught.exception))
+        self.assertEqual((aside.read_bytes(), live.read_bytes()), (kept, foreign))
+        self.assertTrue(Path(str(live) + ".restore-intent").exists(), "the intent is kept for the operator")
+
+    def test_a_sidecar_whose_aside_name_is_taken_refuses_and_replaces_nothing(self):
+        """Renaming would replace the taken file; leaving it would put a stale -wal beside the restored copy."""
+        live, _backup, aside, _sha = self.interrupted()
+        stale, taken = Path(str(live) + "-wal"), Path(str(aside) + "-wal")
+        stale.write_bytes(b"a stale -wal of the moved ledger")
+        taken.write_bytes(b"the moved ledger's -wal")
+        os.chmod(str(stale), 0o600)
+        os.chmod(str(taken), 0o600)
+        with self.assertRaises(runner.SchemaError) as caught:
+            runner.Ledger(self.paths)
+        self.assertIn("refusing to replace either", str(caught.exception))
+        self.assertEqual((stale.read_bytes(), taken.read_bytes()),
+                         (b"a stale -wal of the moved ledger", b"the moved ledger's -wal"))
+        self.assertFalse(live.exists(), "no ledger is published beside a stale -wal")
+        self.assertTrue(Path(str(live) + ".restore-intent").exists())
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "a copy was made for nothing")
+
+    def test_a_taken_sidecar_target_refuses_before_anything_moves(self):
+        """Every move target is checked before the first rename: the live ledger is not moved, then left stranded
+        beside a -wal that could not follow it."""
+        live, _backup, aside, _sha = self.interrupted()
+        os.rename(str(aside), str(live))                     # nothing moved yet
+        stale, taken = Path(str(live) + "-wal"), Path(str(aside) + "-wal")
+        stale.write_bytes(b"")                               # an empty -wal: SQLite would open beside it
+        taken.write_bytes(b"a foreign file under the aside name")
+        kept = live.read_bytes()
+        with self.assertRaises(runner.SchemaError) as caught:
+            runner.Ledger(self.paths)
+        self.assertIn("refusing to replace either", str(caught.exception))
+        self.assertEqual(live.read_bytes(), kept, "the live ledger was moved or changed")
+        self.assertFalse(aside.exists())
+        self.assertEqual(taken.read_bytes(), b"a foreign file under the aside name")
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "a copy was made for nothing")
+
+    def test_a_stray_journal_moves_aside_with_the_ledger(self):
+        """SQLITE_SIDECARS, -journal included, move with the database: a hot journal left beside the restored copy
+        would be rolled back into it."""
+        live, backup, aside, sha = self.interrupted()
+        os.rename(str(aside), str(live))                     # back to "nothing moved yet"
+        journal = Path(str(live) + "-journal")
+        journal.write_bytes(b"a journal of the failed ledger")
+        os.chmod(str(journal), 0o600)
+        runner.Ledger(self.paths).close()
+        self.assertEqual(Path(str(aside) + "-journal").read_bytes(), b"a journal of the failed ledger")
+        self.assertTrue(aside.exists(), "the failed ledger moved aside with its journal")
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3))
+
     # --- v3 (goodqa#16049 M-1): the v2 -> v3 step adds items.cause and the contract tables, keeping every row and
     # its D20 clock; a migrated ledger has exactly the fresh ledger's tables and columns
     def shape(self, path):
@@ -2859,9 +3292,15 @@ class SchemaTests(Base):
                               capture_output=True, text=True, env=dict(os.environ, AH_HOME=str(self.home)))
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertEqual(proc.stdout.split(), ["3", "outcome-unknown"])
-        # and the previous release refuses the migrated v4 ledger rather than misreading it
+        # and the previous release refuses the migrated v4 ledger rather than misreading it. The previous release's
+        # root is ~/.agent-harness/coordinator (ahc's root moved to ~/.agent-harness/ahc in slice 1), so the v4 file is
+        # placed where that release looks for it.
+        migrated = self.home / "migrated"
+        (migrated / ".agent-harness" / "coordinator").mkdir(parents=True)
+        _shutil.copyfile(self.paths.root / "ledger.sqlite3",
+                         migrated / ".agent-harness" / "coordinator" / "ledger.sqlite3")
         proc = subprocess.run([sys.executable, "-B", "-c", script, str(old / "harness" / "hooks"),
-                               str(self.paths.home)], capture_output=True, text=True,
+                               str(migrated)], capture_output=True, text=True,
                               env=dict(os.environ, AH_HOME=str(self.home)))
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("not supported", proc.stderr)
@@ -3063,7 +3502,8 @@ class OwnerCopyTests(Base):
                 self.review_calls.append(argv)
                 return 0
 
-        config = dict(self.config, clone_urls={REPO: str(remote)}, bounds={}, disk_floor_bytes=0)
+        config = dict(self.config, clone_urls={REPO: str(remote)}, bounds={}, disk_floor_bytes=0,
+                      clone_file_transport=True)
         req = {"repo": REPO, "pr": 7, "head": head, "base": base, "packet": str(self.packet),
                "ticket": "GoodQA goodqa#16034", "owner": "agent-abc123"}
         iid = core.submit(self.paths, config, req)["id"]
@@ -3081,6 +3521,40 @@ class OwnerCopyTests(Base):
             self.assertTrue(str(Path(cwd).resolve()).startswith(root), "git ran outside the clone root: %s" % cwd)
         review_repo = deps.review_calls[0][deps.review_calls[0].index("--repo") + 1]
         self.assertTrue(str(Path(review_repo).resolve()).startswith(root))
+
+
+class FileTransportOptInTests(unittest.TestCase):
+    """Spec owner's condition on PR 258 v3: the local file transport is off by default and refused outside tests.
+    The production root lives under the real home, so the opt-in is refused there before git runs. On a test
+    root it is honoured, and without the key it stays off."""
+
+    def run_clone(self, home, config):
+        import ahc_clone
+        seen = []
+        real = ahc_clone.prepare
+
+        def prepare(*args, **kw):
+            seen.append(kw.get("allow_file"))
+            return "/nonexistent/clone"
+        ahc_clone.prepare = prepare
+        try:
+            with mock.patch.object(runner.shutil, "disk_usage", return_value=mock.Mock(free=1 << 50)):
+                runner.LiveDeps(core.Paths(home), config).clone(REPO, HEAD, BASE)
+        finally:
+            ahc_clone.prepare = real
+        return seen
+
+    def test_production_root_refuses_the_file_transport(self):
+        import ahc_clone
+        real_home = os.path.expanduser("~")
+        with self.assertRaises(ahc_clone.CloneError):
+            self.run_clone(real_home, {"clone_file_transport": True})
+        self.assertFalse(self.run_clone(real_home, {})[0], "without the key the file transport is off")
+
+    def test_a_test_root_may_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.run_clone(tmp, {"clone_file_transport": True}), [True])
+            self.assertEqual(self.run_clone(tmp, {"clone_file_transport": "yes"}), [False], "only literal true")
 
 
 class LiveIsolationTests(unittest.TestCase):
@@ -3104,9 +3578,11 @@ class LiveIsolationTests(unittest.TestCase):
     def test_full_tick_leaves_live_state_untouched(self):
         import os
         real_home = Path(os.path.expanduser("~"))
-        coordinator = real_home / ".agent-harness" / "coordinator"
+        coordinator = real_home / ".agent-harness" / "coordinator"   # another program's root (coordd)
+        ahc_root = real_home / ".agent-harness" / "ahc"
         state = real_home / ".agent-harness" / "state"
         before_coord = self.snapshot(coordinator)
+        before_ahc = self.snapshot(ahc_root)
         before_state = {k: v for k, v in (self.snapshot(state) or {}).items() if "ahc" in k or "coordinator" in k}
         with tempfile.TemporaryDirectory() as tmp:
             saved = os.environ.get("HOME")
@@ -3130,6 +3606,7 @@ class LiveIsolationTests(unittest.TestCase):
                     os.environ["HOME"] = saved
         self.assertTrue(deps.ah_calls, "the fake ah was not used")
         self.assertEqual(self.snapshot(coordinator), before_coord)
+        self.assertEqual(self.snapshot(ahc_root), before_ahc)
         after_state = {k: v for k, v in (self.snapshot(state) or {}).items() if "ahc" in k or "coordinator" in k}
         self.assertEqual(after_state, before_state)
 
