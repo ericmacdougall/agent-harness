@@ -125,60 +125,6 @@ INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-
 # goodqa#16124: an operand that is only a file name (test/qac-kill-switch-ceiling.test.ts) is not signalling.
 PATH_OPERAND_EXTS = ('.ts', '.tsx', '.js', '.mjs', '.py', '.go', '.rs')
 PATH_OPERAND_CHARS = re.compile(r'[A-Za-z0-9_.@+/-]+')
-# The value of these options is the program itself (code or a module), so the words after it are its arguments.
-PROGRAM_OPTS = frozenset(('-c', '-m', '-e', '-E', '-p', '--eval', '--print'))
-PYTHON_NOVALUE_OPT = re.compile(r'-[IuBsSOqbPdER]+')  # python3 -I, -u, -IB ...: no value follows
-# PR 265 review F1: the only wrappers whose words before the command path_operand_indexes can count exactly, as
-# (options that take no value, options that take one value, operands before the command, NAME=VALUE allowed).
-# Anything else after a wrapper (another option, a short-option cluster such as `-Eu`, a glued value, or any wrapper
-# not listed here) is ambiguous, and an ambiguous parse means no word of the command is exempt.
-WRAPPER_GRAMMAR = {
-    'env': (frozenset(('-', '-i', '--ignore-environment', '-0', '--null', '-v', '--debug')),
-            frozenset(('-u', '--unset', '-C', '--chdir', '-P')), 0, True),
-    'sudo': (frozenset(('-E', '-H', '-n', '-S', '-b', '-P', '-A', '-B', '-k', '--preserve-env', '--set-home',
-                        '--non-interactive', '--stdin', '--background', '--askpass', '--bell', '--reset-timestamp')),
-             frozenset(('-u', '--user', '-g', '--group', '-D', '--chdir', '-C', '--close-from', '-p', '--prompt',
-                        '-R', '--chroot', '-r', '--role', '-t', '--type', '-T', '--command-timeout', '-U',
-                        '--other-user')), 0, True),
-    'timeout': (frozenset(('--foreground', '--preserve-status', '-v', '--verbose')),
-                frozenset(('-s', '--signal', '-k', '--kill-after')), 1, False),
-    'nice': (frozenset(), frozenset(('-n', '--adjustment')), 0, False),
-    'nohup': (frozenset(), frozenset(), 0, False),
-    'time': (frozenset(('-p',)), frozenset(), 0, False),
-    'exec': (frozenset(('-c', '-l')), frozenset(('-a',)), 0, False),
-    'npx': (frozenset(('-y', '--yes')), frozenset(('-p', '--package')), 0, False),
-}
-
-
-def wrapper_command_index(name, texts, j):
-    """PR 265 review F1: `texts[j:]` follow the wrapper `name`. Return the index of the word the wrapper runs, or
-    None when the wrapper's words cannot be counted exactly (an unlisted wrapper, an option not in its grammar, a
-    cluster, a glued short value, or a line that ends before the command). Options are read only before the first
-    operand, as these wrappers do (`env`, `sudo`, `timeout` and `nice` stop at the first non-option)."""
-    grammar = WRAPPER_GRAMMAR.get(name)
-    if grammar is None:
-        return None
-    novalue, value, operands, assignments = grammar
-    n = len(texts)
-    while j < n:
-        t = texts[j]
-        if t == '--':
-            j += 1
-            break
-        if t in novalue:
-            j += 1
-        elif t in value:
-            j += 2
-        elif t.startswith('--') and '=' in t and t.split('=', 1)[0] in value:
-            j += 1
-        elif t.startswith('-'):
-            return None
-        else:
-            break
-    while assignments and j < n and ASSIGNMENT_WORD.fullmatch(texts[j]):
-        j += 1
-    j += operands
-    return j if j < n else None
 
 
 def path_operand(word, kill_re):
@@ -187,7 +133,7 @@ def path_operand(word, kill_re):
     in a listed test or source extension, or which has a '/' and whose last component holds no kill word. So
     `test/qac-kill-switch.test.ts` and `kill-notes/README` pass; `pkill`, `/usr/bin/pkill`, `bin/kill`,
     `scripts/kill-all.sh`, `'kill 4242'` and `--script=x/kill.py` do not. Where the word sits is decided by the
-    caller (path_operand_indexes); this only judges its shape."""
+    caller (test_runner_exemptions); this only judges its shape."""
     text = word.text
     if word.dynamic or word.subs or word.glob or word.quoted or word.raw != text:
         return False
@@ -199,6 +145,96 @@ def path_operand(word, kill_re):
     if base.lower().endswith(PATH_OPERAND_EXTS):
         return True
     return '/' in text and not kill_re.search(base)
+
+
+# PR 265 rescue (receipts v1 and v2): the exemption is an allowlist. A test path is exempt only when the WHOLE
+# interpreter command is one of the exact test-runner lines below; any other word, option, wrapper, runner or
+# subcommand anywhere in the command means no exemption, and the full script-kill scan applies. There is no generic
+# wrapper or runner parsing: unknown means scan.
+PYTHON_TEST_FLAGS = frozenset(('-I', '-u', '-B'))  # python3 -I lanes/pgpool.py ...: flags that take no value
+PGPOOL_SCRIPT = re.compile(r'(?:.*/)?lanes/pgpool\.py')
+PGPOOL_RUN_OPTS = frozenset(('--job', '--lane', '--ttl', '--mode', '--template', '--database'))  # each takes a value
+DBTEST_SCRIPT = re.compile(r'dbtest-any\.sh|(?:/|~/)[A-Za-z0-9_.@+/-]*/dbtest-any\.sh')
+TEST_DIRS = frozenset(('test', 'tests', '__tests__'))
+
+
+def plain_word(word):
+    """A literal word: no expansion, substitution or glob, so the shell passes exactly this one word."""
+    return not (word.dynamic or word.subs or word.glob) and bool(word.text)
+
+
+def is_test_path(word, kill_re):
+    """A test-file operand: a path_operand that is also test-shaped (a `.test.`/`.spec.` or `test_`/`test-` file
+    name, or a file inside a test/, tests/ or __tests__/ directory). `tools/kill-all.ts` and `scripts/kill-all.sh`
+    are not test paths, so a runner given them keeps the full scan."""
+    if not path_operand(word, kill_re):
+        return False
+    parts = word.text.split('/')
+    base = parts[-1].lower()
+    return ('.test.' in base or '.spec.' in base or base.startswith(('test_', 'test-'))
+            or any(p in TEST_DIRS for p in parts[:-1]))
+
+
+def _test_paths(args, i, kill_re):
+    """Indexes of args[i:] when every one of them (at least one) is a test path, else None."""
+    if i >= len(args) or not all(is_test_path(a, kill_re) for a in args[i:]):
+        return None
+    return set(range(i, len(args)))
+
+
+def _pgpool_inner(args, i, kill_re):
+    """The command after pgpool's `--`, which must be exactly one of:
+    `[~/|/...]dbtest-any.sh WT LOG TEST [-t NAME]`, `npx [-y] vitest run TEST...` or
+    `pnpm --filter PKG exec vitest run TEST...`. Only TEST words are exempt; WT, LOG, PKG and NAME stay scanned."""
+    texts = [a.text for a in args]
+    rest = texts[i:]
+    if rest and DBTEST_SCRIPT.fullmatch(rest[0]):
+        if len(rest) not in (4, 6) or rest[1].startswith('-') or rest[2].startswith('-'):
+            return None
+        if len(rest) == 6 and rest[4] != '-t':
+            return None
+        test = i + 3
+        return {test} if is_test_path(args[test], kill_re) else None
+    if rest[:2] == ['npx', 'vitest'] and rest[2:3] == ['run']:
+        return _test_paths(args, i + 3, kill_re)
+    if rest[:3] == ['npx', '-y', 'vitest'] and rest[3:4] == ['run']:
+        return _test_paths(args, i + 4, kill_re)
+    if len(rest) > 6 and rest[0] == 'pnpm' and rest[1] == '--filter' and not rest[2].startswith('-') \
+            and rest[3:6] == ['exec', 'vitest', 'run']:
+        return _test_paths(args, i + 6, kill_re)
+    return None
+
+
+def test_runner_exemptions(name, args, kill_re):
+    """goodqa#16124: the indexes of `args` (the words after interpreter `name`) that are test paths of one of these
+    exact lines, and so are file names rather than signalling code:
+      G1 python3 [-I|-u|-B]... lanes/pgpool.py run [--job|--lane|--ttl|--mode|--template|--database V]... -- INNER
+         (INNER as _pgpool_inner says)
+      G2 python3 [-I|-u|-B]... -m pytest TEST...
+      G3 node --test TEST...
+    Every word must be literal (plain_word). Anything else returns the empty set, which keeps the full scan."""
+    if kill_re is None or not args or not all(plain_word(a) for a in args):
+        return set()
+    texts = [a.text for a in args]
+    if name.startswith('python'):
+        i = 0
+        while i < len(texts) and texts[i] in PYTHON_TEST_FLAGS:
+            i += 1
+        if texts[i:i + 2] == ['-m', 'pytest']:
+            return _test_paths(args, i + 2, kill_re) or set()  # G2
+        if i + 1 < len(texts) and PGPOOL_SCRIPT.fullmatch(texts[i]) and texts[i + 1] == 'run':  # G1
+            i, seen = i + 2, set()
+            while i < len(texts) and texts[i] in PGPOOL_RUN_OPTS and texts[i] not in seen:
+                if i + 1 >= len(texts) or texts[i + 1].startswith('-'):
+                    return set()
+                seen.add(texts[i])
+                i += 2
+            if i < len(texts) and texts[i] == '--':
+                return _pgpool_inner(args, i + 1, kill_re) or set()
+        return set()
+    if name == 'node' and texts[:1] == ['--test']:
+        return _test_paths(args, 1, kill_re) or set()  # G3
+    return set()
 RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
@@ -1595,72 +1631,9 @@ def make_analyzer_class(cg):
                 return False  # delta red-team D-F2: main may not use another session's spawns or asks
             return '--pid' in seen and '--reason' in seen
 
-        def path_operand_indexes(self, name, args):
-            """goodqa#16124: indexes of the arguments of an interpreter's program that are only file names, so a kill
-            word inside them (test/qac-kill-switch-ceiling.test.ts) is not read as signalling. The program operand
-            (the script, or the value of -c/-m/-e ...) is never one of them. A word right after an option is not one
-            either (it may be that option's value, as in `node --require ./x.js`), nor the word after `--` or after a
-            shell or interpreter name (a runner executes it), and the option scan gives up on `--` or a cluster it
-            cannot read (`perl -le CODE`), which leaves every word scanned."""
-            if self.script_kill is None or not args:
-                return set()
-            texts = [a.text for a in args]
-            python = name.startswith(('python', 'pypy'))
-            program, i = None, 0
-            while i < len(texts):
-                t = texts[i]
-                if python and PYTHON_NOVALUE_OPT.fullmatch(t):
-                    i += 1
-                elif t in PROGRAM_OPTS:
-                    program = i + 1
-                    break
-                elif t.startswith('-'):
-                    return set()  # `--`, an option that may take a value, or a glued cluster: ambiguous
-                else:
-                    program = i
-                    break
-            if program is None or program >= len(texts):
-                return set()
-            from_opt = program > 0 and texts[program - 1] in PROGRAM_OPTS  # -c CODE, -m MODULE: the value is the program
-            if not from_opt and '/' not in texts[program] and '.' not in texts[program]:
-                return set()  # a subcommand (`deno run X`, `bun run X`, `node inspect X`), not a script: scan all
-            # A `--`, a wrapper, a shell or an interpreter name starts a command line; the word that runs is never
-            # exempt. PR 265 review F1: a wrapper's words are counted only by its exact grammar
-            # (wrapper_command_index), and an option or assignment where the command should be is ambiguous. Any
-            # ambiguity returns nothing, which keeps the full scan (fail closed). When the word that runs is bare (no
-            # '/' or '.'), it may be a tool or subcommand whose next word is what really runs (`npx tsx X`,
-            # `deno run X`, `docker exec web X`), so that next word is not exempt either (`hold`).
-            out, command_pos, hold, j = set(), False, False, program + 1
-            while j < len(texts):
-                t, prev = texts[j], texts[j - 1]
-                name_j = cg.norm_name(t)
-                if name_j.startswith('g') and name_j[1:] in GNU_PREFIXED:
-                    name_j = name_j[1:]  # gtimeout, genv, gnice ...
-                if name_j in WRAPPER_NAMES:
-                    j = wrapper_command_index(name_j, texts, j + 1)
-                    if j is None:
-                        return set()
-                    command_pos = True
-                    continue
-                if t == '--' or name_j in cg.SHELLS or name_j in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name_j):
-                    command_pos, j = True, j + 1
-                    continue
-                if command_pos:
-                    if t.startswith('-') or ASSIGNMENT_WORD.fullmatch(t):
-                        return set()  # a shell's, interpreter's or runner's option whose value is unknown
-                    command_pos, hold, j = False, '/' not in t and '.' not in t, j + 1  # the word that runs
-                    continue
-                if hold:
-                    hold, j = False, j + 1  # the word after a bare tool or subcommand (`vitest run`, `tsx X`)
-                    continue
-                if not prev.startswith('-') and path_operand(args[j], self.script_kill):
-                    out.add(j)  # a word right after an option may be its value (`--require ./x.js`)
-                j += 1
-            return out
-
         def check_interpreter(self, name, texts, cmd, args=None):
             if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
-                skip = self.path_operand_indexes(name, args)
+                skip = test_runner_exemptions(name, args, self.script_kill)
                 if skip:
                     keep = [k for k in range(len(args)) if k not in skip]
                     texts, args = [texts[k] for k in keep], [args[k] for k in keep]
