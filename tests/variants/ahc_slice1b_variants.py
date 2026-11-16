@@ -416,8 +416,10 @@ ENTRIES.update({
         "mutations": [("the body is not checked for a closing keyword", [
             ("any(foreign_closing_keyword(t, repo) for t in messages + [body])",
              "any(foreign_closing_keyword(t, repo) for t in messages)")], OBSERVE),
-                      ("a missing body passes", [
-            ('        if "body" not in p:\n', "        if False:\n")], OBSERVE)]},
+                      ("a missing body passes as empty", [
+            ('        if "body" not in p:\n', "        if False:\n"),
+            ('        body = p["body"] if p["body"] is not None else ""\n', '        body = p.get("body") or ""\n')],
+                       OBSERVE)]},
     "AC-1 persisted by id": {
         "tests": [OP + "test_ac1_each_read_gets_its_own_id_and_guards_load_it_by_id"],
         "mutations": [("the loaded observation is not checked against its digest", [

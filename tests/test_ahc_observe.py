@@ -156,6 +156,14 @@ class Base(unittest.TestCase):
         kw.setdefault("clone", self.repo.root)
         return (producer or self.producer()).observe(REPO, 5, **kw)
 
+    def observe_ok(self, **kw):
+        """An observation the test expects to succeed: a refusal is an assertion failure, not an error, so a
+        variant that makes the producer refuse is killed rather than inconclusive (AC-15)."""
+        try:
+            return self.observe(**kw)
+        except O.ObservationRefused as error:
+            self.fail("the observation was refused: %s" % error)
+
     def rows(self):
         return self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
 
@@ -169,7 +177,7 @@ class ProducerTests(Base):
     def test_ac1_fields_come_from_their_named_sources(self):
         tip = self.repo.commit({"src/other.py": "o\n"}, "moved main", parent=self.base)
         self.wire(self.head, tip)
-        o = self.observe(snapshot_bases=[self.base], base=self.base)
+        o = self.observe_ok(snapshot_bases=[self.base], base=self.base)
         self.assertEqual((o["pr_head"], o["pr_state"], o["draft"], o["mergeable"]), (self.head, "OPEN", False, True))
         self.assertEqual(o["tip"], tip, "tip from the default-branch ref")
         self.assertEqual(o["paths"], ["src/b.py"], "M..H from local git, not B..H")
@@ -293,7 +301,7 @@ class ProducerTests(Base):
     def test_neg33_divergent_history_counts_only_the_prs_own_changes(self):
         tip = self.repo.commit({"src/a.py": "changed on main\n"}, "main edits A", parent=self.base)
         self.wire(self.head, tip, changed=1)
-        o = self.observe()
+        o = self.observe_ok()     # NEG-33: the counts agree over M..H; a B..H list would refuse
         self.assertEqual(o["paths"], ["src/b.py"])
         self.assertEqual(o["changed_files"], 1)
 
@@ -314,8 +322,15 @@ class ProducerTests(Base):
         for answer, why in ((missing, "no body"), (pull_json(self.head, body="x" * (O.BODY_MAX_BYTES + 1)),
                                                    "byte cap"), ('{"number": 5, "body": "trunc', "not JSON")):
             self.gh.set("repos/o/r/pulls/5", answer)
-            with self.subTest(why=why), self.assertRaisesRegex(O.ObservationRefused, why):
-                self.observe()
+            with self.subTest(why=why):
+                try:
+                    self.observe()
+                except O.ObservationRefused as error:
+                    self.assertRegex(str(error), why)
+                except Exception as error:  # noqa: BLE001 - a crash is not the named refusal (fail closed by name)
+                    self.fail("a bad body read (%s) raised %r instead of ObservationRefused" % (why, error))
+                else:
+                    self.fail("a bad body read (%s) was accepted" % why)
 
 
 class ChecksEvidenceTests(Base):
