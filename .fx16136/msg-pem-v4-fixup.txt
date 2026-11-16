@@ -1,0 +1,13 @@
+docs(fx16136): keep the final goodqa#16148 v4 commit message
+
+Why: the v4 commit staged the first draft of its message file before the Testing line was corrected, so the worktree still held the corrected text uncommitted.
+
+What: commits the corrected msg-pem-v4.txt (Testing states the lint result) so the record matches commit 74ce9845's actual message.
+
+Testing: `python3 /Users/eric/.claude/hooks/commit_policy.py check-message --file .fx16136/msg-pem-v4.txt` -> PASS.
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

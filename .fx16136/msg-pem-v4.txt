@@ -4,7 +4,7 @@ Why: the lead's rulings after the v3 attach (WAL w3f9d85d1129, w0e0906c66fa) mak
 
 What: spec v4 (core 5d317b21), frozen copy, v3 attached copy, the v3-to-v4 diff and the edit script. Adds AC-11 (host apply with check, backup, restore and idempotent apply; env-keys.json and drift gate) and NEG-14 to NEG-19. AC-6 names the sampler contract, AC-7 limits redaction to secret sources with a short-value token rule, and AC-8 adds the isolated trial boot and the HOLD NOT RE-APPLIED exit. The ship order now puts the host apply between the merge and the release.
 
-Testing: `python3 ~/.claude/hooks/spec_flow.py lint .fx16136/spec-16148-pem.md` no problems.
+Testing: `python3 ~/.claude/hooks/spec_flow.py lint .fx16136/spec-16148-pem.md` -> problems: [] (lint pass).
 
 Refs: GoodQA #16148
 
