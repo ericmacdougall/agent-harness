@@ -1,0 +1,26 @@
+goodqa#16148 steps 2d and 2e are committed and pushed on fix/16148-job-envfile (ericmacdougall/bugtracker), HEAD 3330aa2e65a2825e9a4e72a1dac21d935dde170f. The branch is stacked on fix/16185 (PR 1372). Nothing is merged or deployed.
+
+Commits:
+- a9dffadc: apply-job-secrets-host.py (AC-11, R1, R2).
+- d80d0429: compose.yaml and env-keys.json changes, the apply-job-secrets.sh wrapper (R3 streamed, R4 lock, in-flight check, epoch bump) and the drift test (AC-3, NEG-16, R4 cross-check against main's rw-ship.sh LOCKF).
+- 3330aa2e: cmdline-sampler.py (AC-6 (3), NEG-18, P2, R6).
+
+Results at HEAD (t2-dev, 32G free):
+- vitest: 359 passed, 14 skipped.
+- tsc: exit 0.
+- run_derive_tests.sh: host 61 OK (41 skipped), container as root 61 OK (2 skipped).
+- wrapper and sampler unittest: 18 OK.
+- node --test for drift, selfhost-plan and qa-closure: 23 of 23 pass.
+
+Failing-first and broken variants:
+- The drift test failed 5 times before the repo change.
+- Host apply variants H1 to H6 all FAILED.
+- Wrapper variants W1 to W4 all FAILED.
+- Sampler variants S1 to S4 all FAILED.
+
+Open:
+- No explicit fake-VM test yet that the mount survives a selfhost-ctl pin or rollback. Only indirect coverage exists: the drift test pins the new compose.
+- The step-2 PR and its packet are not yet created.
+- The rw-ship gate (AC-8, P3, P4, NEG-12, NEG-19), AC-10 live checks and the prod operator remain.
+
+PENDING_REAL_TEST p16148-sampler-live: on the deployed dispatcher, the sampler reports PASS with runs_seen >= expect_runs and runs_with_env_flag 0.

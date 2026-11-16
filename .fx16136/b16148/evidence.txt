@@ -1,0 +1,23 @@
+HEAD 3330aa2e65a2825e9a4e72a1dac21d935dde170f status-lines=0
+/dev/sda1       643G  611G   32G  96% /
+$ cd apps/job-dispatcher && timeout 900 npx vitest run
+ Test Files  15 passed | 1 skipped (16)
+      Tests  359 passed | 14 skipped (373)
+exit 0
+$ cd apps/job-dispatcher && timeout 600 npx tsc --noEmit
+exit 0
+$ bash infra/selfhost/app/run_derive_tests.sh
+Ran 61 tests in 1.221s
+OK (skipped=41)
+Ran 61 tests in 2.902s
+OK (skipped=2)
+exit 0
+$ cd infra/selfhost/app && DERIVE_TEST_TMP=$PWD/../../../.scratch timeout 300 python3 -m unittest test_apply_job_secrets_wrapper test_cmdline_sampler
+Ran 18 tests in 3.849s
+OK
+exit 0
+$ timeout 300 node --test infra/selfhost-job-secrets-drift.test.mjs infra/selfhost-plan.test.mjs infra/selfhost/app/qa-closure-topology.test.mjs
+# tests 23
+# pass 23
+# fail 0
+exit 0

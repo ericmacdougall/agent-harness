@@ -1,0 +1,16 @@
+chore(fx16136): keep the goodqa#16148 step 2d and 2e build scratch
+
+Why: the host-apply, wrapper and sampler sources, the variant scripts and the evidence for goodqa#16148 steps 2d and 2e must be recoverable, not only on this disk.
+
+What:
+- The .fx16136/b16148/ copies of the files committed to bugtracker fix/16148-job-envfile at 3330aa2e.
+- The broken-variant scripts and the focused-suite evidence script and its output.
+- WAL note text, fake values only.
+
+Testing: not run: scratch copies; the suites ran on t2-dev at 3330aa2e (see .fx16136/b16148/evidence.txt, all exit 0).
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
