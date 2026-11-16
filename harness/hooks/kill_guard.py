@@ -159,20 +159,30 @@ TEST_DIRS = frozenset(('test', 'tests', '__tests__'))
 
 
 def plain_word(word):
-    """A literal word: no expansion, substitution or glob, so the shell passes exactly this one word."""
-    return not (word.dynamic or word.subs or word.glob) and bool(word.text)
+    """A literal word: no expansion, substitution, glob or brace alternatives, so the shell passes exactly this one
+    word and the grammar's slot count is the real argv count."""
+    return (not (word.dynamic or word.subs or word.glob) and bool(word.text) and len(word.alts) == 1
+            and word.overflow is None)
 
 
 def is_test_path(word, kill_re):
-    """A test-file operand: a path_operand that is also test-shaped (a `.test.`/`.spec.` or `test_`/`test-` file
-    name, or a file inside a test/, tests/ or __tests__/ directory). `tools/kill-all.ts` and `scripts/kill-all.sh`
-    are not test paths, so a runner given them keeps the full scan."""
+    """A test-file operand: a path_operand that is a relative path written only with plain names (no leading `/`,
+    no empty, `.` or `..` component; path_operand already refuses `~`, quotes and expansions), that has a test/,
+    tests/ or __tests__/ directory component, and whose file name is test-shaped (`.test.`, `.spec.`, `test_` or
+    `test-`). PR 265 review v3: `tests/../tools/kill-all.js` names a file outside the test directory, so it is not
+    a test path. `tools/kill-all.ts`, `tools/kill-all.test.ts` and `tests/kill-all.py` are not test paths either,
+    so a runner given them keeps the full scan. A symlink inside a test directory cannot be seen statically."""
     if not path_operand(word, kill_re):
         return False
-    parts = word.text.split('/')
+    text = word.text
+    if text.startswith('/'):
+        return False
+    parts = text.split('/')
+    if any(p in ('', '.', '..') for p in parts):
+        return False
     base = parts[-1].lower()
-    return ('.test.' in base or '.spec.' in base or base.startswith(('test_', 'test-'))
-            or any(p in TEST_DIRS for p in parts[:-1]))
+    return (any(p in TEST_DIRS for p in parts[:-1])
+            and ('.test.' in base or '.spec.' in base or base.startswith(('test_', 'test-'))))
 
 
 def _test_paths(args, i, kill_re):

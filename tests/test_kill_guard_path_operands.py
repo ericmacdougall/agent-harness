@@ -37,7 +37,7 @@ ALLOW = [
     REPORTED,
     PGPOOL + "dbtest-any.sh /srv/wt /srv/wt.log " + TEST_TS,
     PGPOOL + "dbtest-any.sh /srv/wt /srv/wt.log tests/test-kill-switch-ceiling.py",  # the same in a .py path
-    "ssh t2-dev 'cd ~/repos/harness && " + PGPOOL + "dbtest-any.sh /srv/wt /srv/wt.log tests/qac-kill-switch.py'",
+    "ssh t2-dev 'cd ~/repos/harness && " + PGPOOL + "dbtest-any.sh /srv/wt /srv/wt.log tests/test-kill-switch.py'",
     PGPOOL + "npx vitest run " + TEST_TS + " test/oauth.test.ts",
     PGPOOL + "npx -y vitest run " + TEST_TS,
     PGPOOL + "pnpm --filter @bugtracker/api exec vitest run " + TEST_TS,
@@ -56,6 +56,8 @@ LOST_EXEMPTION = [
     PGPOOL + "env CI=1 npx vitest run " + TEST_TS,  # a wrapper inside the pgpool line
     PGPOOL + "timeout 600 dbtest-any.sh /srv/wt /srv/wt.log " + TEST_TS,
     PGPOOL + "env -u NODE_OPTIONS sudo -u ci -- npx -y vitest run " + TEST_TS,
+    # review v3: a test path needs a test-shaped file name, not only a tests/ directory (main approved losing it)
+    "ssh t2-dev 'cd ~/repos/harness && " + PGPOOL + "dbtest-any.sh /srv/wt /srv/wt.log tests/qac-kill-switch.py'",
 ]
 
 BLOCK = [
@@ -241,12 +243,42 @@ GRAMMAR_EDGES = [
 # cannot see, so it is scanned, as it was at a0eaf357. Disclosed in the packet.
 SCANNED_TEST_NAME = [QAC_LINE + ' -t "kill switch ceiling"']
 
+# PR 265 review v3 (receipts/harness-pr265-v3.md): a TEST operand that resolves outside a test directory, or that
+# only looks like a test, is not exempt. `..`, `.`, empty components, absolute paths and `~` fail closed.
+PGPOOL_DB = "python3 lanes/pgpool.py run -- dbtest-any.sh /srv/wt qac.log "
+TRAVERSAL_ESCAPES = [
+    "node --test tests/../tools/kill-all.js",  # v3 F1 as reported (G3)
+    "python3 -m pytest tests/../tools/kill-all.py",  # v3 F1 as reported (G2)
+    PGPOOL_DB + "tests/../tools/kill-all.ts",  # v3 F1 as reported (G1)
+    QAC_DBTEST + "test/../tools/kill-all.ts",
+    QAC_DBTEST + "test/../tools/kill-all.test.ts",  # a test-shaped name reached through `..`
+    QAC_DBTEST + "test/x/../../tools/kill-all.test.ts",
+    QAC_DBTEST + "./test/../tools/kill-all.test.ts",
+    QAC_DBTEST + "test/./kill-all.ts",
+    QAC_DBTEST + "test//kill-all.ts",
+    QAC_DBTEST + "/srv/test/kill-all.test.ts",  # an absolute path
+    QAC_DBTEST + "~/test/kill-all.test.ts",  # a tilde path
+    PGPOOL + "npx vitest run test/../tools/kill-all.ts",
+    PGPOOL + "npx vitest run " + TEST_TS + " test/../tools/kill-all.test.ts",
+    PGPOOL + "pnpm --filter api exec vitest run tests/../tools/kill-all.ts",
+    "python3 -m pytest tests/kill-all.py",  # inside tests/, but not a test-shaped name
+    "python3 -m pytest tools/kill-all.test.py",  # a test-shaped name outside a test directory
+    "node --test tests/kill-all.js",
+    "node --test tools/kill-all.test.js",
+    "node --test /srv/test/kill-all.test.js",
+    QAC_PGPOOL + "~/qacp-work/fable-b1/dbtest-any.sh /srv/wt{,2} qac.log " + TEST_TS,  # brace alternatives
+    "ssh t2-dev '" + QAC_DBTEST + "test/../tools/kill-all.ts'",  # the ssh forms of the same escapes
+    "ssh t2-dev 'cd ~/repos/harness && " + PGPOOL_DB + "tests/../tools/kill-all.ts'",
+    "ssh t2-dev 'python3 -m pytest tests/../tools/kill-all.py'",
+    "ssh t2-dev 'node --test tests/../tools/kill-all.js'",
+]
+
 # Refusals that match a grammar and fail only in path_operand (a test-shaped word that is quoted or holds non-path
 # characters). Widening path_operand to "any token" must flip each one, so the mutation check is not vacuous.
 PREDICATE_REFUSALS = [
     QAC_DBTEST + "'test/kill-switch.test.ts; pkill -f vite'",
     PGPOOL + "npx vitest run 'test/kill 4242.test.ts'",
-    "python3 -m pytest 'tests/kill 4242'",
+    "python3 -m pytest 'tests/test_kill 4242.py'",
     "node --test 'test/kill-all.test.js'",
 ]
 
@@ -260,11 +292,12 @@ TEST_SHAPE_REFUSALS = [
 ]
 
 BLOCK += (WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED + WRAPPER_SUBCOMMANDS + RUNNER_SCRIPT_ESCAPES
-          + GRAMMAR_EDGES + LOST_EXEMPTION + SCANNED_TEST_NAME + PREDICATE_REFUSALS)
+          + GRAMMAR_EDGES + LOST_EXEMPTION + SCANNED_TEST_NAME + PREDICATE_REFUSALS + TRAVERSAL_ESCAPES)
 
 # Rows that must be refused by the script-kill rule itself (not by some other rule).
 SCRIPT_KILL_ROWS = (WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED + WRAPPER_SUBCOMMANDS + RUNNER_SCRIPT_ESCAPES
-                    + GRAMMAR_EDGES + LOST_EXEMPTION + SCANNED_TEST_NAME + PREDICATE_REFUSALS)
+                    + GRAMMAR_EDGES + LOST_EXEMPTION + SCANNED_TEST_NAME + PREDICATE_REFUSALS
+                    + TRAVERSAL_ESCAPES)
 
 
 def verdict(cmd):
@@ -363,12 +396,15 @@ class PathOperands(unittest.TestCase):
     def test_test_path_shape(self):
         kill_re = kg.re.compile(kg.load_policy()['script_kill_pattern'])
         cg = kg._import_base()
-        for text in (TEST_TS, "apps/api/" + TEST_TS, "tests/test_kill_switch.py", "tests/qac-kill-switch.py",
-                     "src/__tests__/kill.spec.tsx", "test_kill.py"):
+        for text in (TEST_TS, "apps/api/" + TEST_TS, "tests/test_kill_switch.py", "tests/test-kill-switch.py",
+                     "src/__tests__/kill.spec.tsx", "test/unit/kill-switch.test.ts"):
             with self.subTest(text=text):
                 self.assertTrue(kg.is_test_path(word(text, cg), kill_re))
         for text in (KILL_TS, KILL_PY, "scripts/kill-all.sh", "kill-all.ts", "testing/kill-all.ts",
-                     "src/kill-switch.go", "kill-switch-notes/README"):
+                     "src/kill-switch.go", "kill-switch-notes/README", "test_kill.py", "tests/qac-kill-switch.py",
+                     "tools/kill-all.test.ts", "tests/../tools/kill-all.js", "test/../tools/kill-all.test.ts",
+                     "./test/kill.test.ts", "test/./kill.test.ts", "test//kill.test.ts", "/srv/test/kill.test.ts",
+                     "~/test/kill.test.ts", "test/kill.test.ts/"):
             with self.subTest(text=text):
                 self.assertFalse(kg.is_test_path(word(text, cg), kill_re))
 
