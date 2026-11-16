@@ -48,9 +48,11 @@ CREATE TABLE IF NOT EXISTS reviews (
   version INTEGER NOT NULL, receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER,
   data TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL, updated REAL NOT NULL,
   spec_core TEXT NOT NULL DEFAULT '',
+  round INTEGER NOT NULL DEFAULT 1, base_move INTEGER NOT NULL DEFAULT 0,
   CHECK ((kind = 'spec' AND length(spec_core) = 64 AND spec_core NOT GLOB '*[^0-9a-f]*')
          OR (kind != 'spec' AND spec_core = '')),
-  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, spec_core));
+  CHECK (round >= 1 AND base_move IN (0, 1)),
+  UNIQUE(item, kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, spec_core, round));
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL,
   repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
@@ -94,6 +96,39 @@ CREATE TABLE IF NOT EXISTS wi_notices (
 CREATE TABLE IF NOT EXISTS transitions (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, id TEXT NOT NULL, from_state TEXT,
   to_state TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL, at REAL NOT NULL, data TEXT);
+CREATE TABLE IF NOT EXISTS observations (
+  id TEXT PRIMARY KEY, boot TEXT NOT NULL, mono REAL NOT NULL, seq INTEGER NOT NULL, at REAL NOT NULL,
+  repo TEXT NOT NULL, pr INTEGER NOT NULL, item TEXT, source TEXT NOT NULL, refs TEXT NOT NULL,
+  digest TEXT NOT NULL, fields TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS w21_sends (
+  request_id TEXT PRIMARY KEY, item TEXT NOT NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL, base TEXT NOT NULL,
+  head TEXT NOT NULL, seq INTEGER NOT NULL, event_id TEXT NOT NULL UNIQUE, state TEXT NOT NULL, reason TEXT,
+  attempted_at REAL, gh_request_id TEXT, new_head TEXT, successor TEXT, version INTEGER NOT NULL,
+  created REAL NOT NULL, updated REAL NOT NULL,
+  CHECK (state IN ('intent', 'attempted', 'readback-pending', 'lost', 'resolved', 'cancelled')),
+  UNIQUE(item, base, seq));
+CREATE UNIQUE INDEX IF NOT EXISTS w21_one_unresolved_per_repo ON w21_sends(repo)
+  WHERE state IN ('intent', 'attempted', 'readback-pending');
+CREATE TABLE IF NOT EXISTS launch_intents (
+  id TEXT PRIMARY KEY, row TEXT NOT NULL, row_version INTEGER NOT NULL, unit TEXT NOT NULL UNIQUE,
+  cmd_sha256 TEXT NOT NULL, lineage TEXT NOT NULL, charge INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT,
+  created REAL NOT NULL, updated REAL NOT NULL,
+  CHECK (state IN ('open', 'started', 'closed', 'orphaned')));
+CREATE TABLE IF NOT EXISTS review_blocks (
+  row TEXT PRIMARY KEY, unit TEXT NOT NULL, reason TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS lineage_budget (
+  lineage TEXT PRIMARY KEY, b33_used INTEGER NOT NULL DEFAULT 0 CHECK (b33_used >= 0));
+CREATE TABLE IF NOT EXISTS timers (
+  owner TEXT NOT NULL, name TEXT NOT NULL, deadline_wall REAL NOT NULL, duration REAL NOT NULL, boot TEXT,
+  anchor REAL, PRIMARY KEY (owner, name));
+CREATE TABLE IF NOT EXISTS w16_proofs (
+  proof_id TEXT PRIMARY KEY, item TEXT NOT NULL, target TEXT NOT NULL, expected_version INTEGER NOT NULL,
+  argv_sha256 TEXT NOT NULL, accepted TEXT NOT NULL DEFAULT '[]', ticket TEXT, extension INTEGER NOT NULL DEFAULT 0,
+  used INTEGER NOT NULL DEFAULT 0, created REAL NOT NULL,
+  CHECK (target IN ('pr-gate', 'cancelled')), CHECK (extension >= 0));
+CREATE TABLE IF NOT EXISTS wi_quarantine (
+  event_id TEXT NOT NULL, item TEXT NOT NULL, row_id TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL,
+  created REAL NOT NULL, PRIMARY KEY (event_id, kind));
 """
 
 
@@ -830,7 +865,7 @@ class Contracts:
     }
 
     def require_review(self, kind, repo, pr, head, packet_sha256, policy_revision, item=None, event_id=None,
-                       actor="ahc-core", snapshot_base="", spec_core=""):
+                       actor="ahc-core", snapshot_base="", spec_core="", round=1, base_move=False):
         """none -> required, or the existing row for this exact binding (idempotent). R1: a code kind is bound to
         (repo, pr, H, B_r, packet, revision), where B_r is the default-branch tip at queue time and differs from H;
         a spec kind has no B_r and stores '', and is bound to the spec core it reviews (Q-A6), so a new attached
@@ -849,21 +884,32 @@ class Contracts:
                 raise ContractError("a spec review has no snapshot base")
             if not (isinstance(spec_core, str) and len(spec_core) == 64 and _is_oid(spec_core)):
                 raise ContractError("a spec review is bound to the full sha256 spec core it reviews")
-        binding = {"kind": kind, "repo": str(repo).lower(), "pr": int(pr), "head": head,
-                   "snapshot_base": snapshot_base, "packet_sha256": packet_sha256, "policy_revision": policy_revision}
-        if kind == "spec":       # code rows keep their pre-Q-A6 ids
-            binding["spec_core"] = spec_core
-        rid = "rv-" + _sha(binding)[:24]
+        # AC-16 (v5): a Review row's identity includes its WorkItem and its round. Rows are looked up by that key,
+        # never by recomputing an id, so a migrated row keeps its id and is still found for its own item; a row made
+        # in v5 takes an id derived from the whole key. R9-3: a v5 row always names its item (only migrated legacy
+        # rows may have none, and SQLite would let NULL items escape the unique key).
+        if not isinstance(item, str) or not item:
+            raise ContractError("a review row is created for a work item (AC-16)")
+        if type(round) is not int or round < 1:
+            raise ContractError("a review round is an integer from 1")
+        binding = {"item": item, "kind": kind, "repo": str(repo).lower(), "pr": int(pr), "head": head,
+                   "snapshot_base": snapshot_base, "packet_sha256": packet_sha256, "policy_revision": policy_revision,
+                   "spec_core": spec_core, "round": round}
         with self.tx():
-            existing = self._row("reviews", "id", rid)
-            if existing:
-                return existing
+            found = self.db.execute(
+                "SELECT id FROM reviews WHERE item=? AND kind=? AND repo=? AND pr=? AND head=? AND snapshot_base=? "
+                "AND packet_sha256=? AND policy_revision=? AND spec_core=? AND round=?",
+                (item, kind, binding["repo"], binding["pr"], head, snapshot_base, packet_sha256, policy_revision,
+                 spec_core, round)).fetchone()
+            if found:
+                return self._row("reviews", "id", found[0])
+            rid = "rv-" + _sha(binding)[:24]
             now = self.now()
             self.db.execute("INSERT INTO reviews(id, kind, item, repo, pr, head, snapshot_base, packet_sha256, "
-                            "policy_revision, state, version, created, updated, spec_core) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "policy_revision, state, version, created, updated, spec_core, round, base_move) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (rid, kind, item, binding["repo"], binding["pr"], head, snapshot_base, packet_sha256,
-                             policy_revision, "required", 1, now, now, spec_core))
+                             policy_revision, "required", 1, now, now, spec_core, round, 1 if base_move else 0))
             self._a0("review", rid, None, "required", event_id or "ev-" + rid + "-required", actor)
             return self._row("reviews", "id", rid)
 

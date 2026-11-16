@@ -164,6 +164,7 @@ class ReviewTests(Base):
         args.update(kw)
         args.setdefault("snapshot_base", "" if args["kind"] == "spec" else BASE)
         args.setdefault("spec_core", CORE1 if args["kind"] == "spec" else "")
+        args.setdefault("item", "wi-review-tests")
         return self.c.require_review(**args)
 
     # ---- Q-A6 (spec owner ruling on slice 1a): a spec row is bound to the spec core it reviewed

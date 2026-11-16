@@ -523,13 +523,14 @@ def final_problems(root, expect, crashed=False):
         return ["no live ledger"]
     db = sqlite3.connect("file:%s?mode=ro" % live, uri=True)
     try:
-        version = int(db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()[0])
+        # AC-11: a restored original carries the v5 fence at its prior version 3; a migrated ledger is 5, unfenced
+        version = runner.ahc_migrate.read_version(db)
         rows = [r[0] for r in db.execute("SELECT data FROM events WHERE event='before-migration'")]
     finally:
         db.close()
-    want = (3, ("first", "resume") if crashed else ("first",)) if expect == "original" else \
-        (runner.SCHEMA_VERSION, ("prep",))
-    out = [] if version == want[0] else ["schema_version %d, not %d" % (version, want[0])]
+    want = ((3, True), ("first", "resume") if crashed else ("first",)) if expect == "original" else \
+        ((runner.SCHEMA_VERSION, False), ("prep",))
+    out = [] if version == want[0] else ["schema_version %r, not %r" % (version, want[0])]
     if len(rows) != 1 or not any('"phase": "%s"' % phase in rows[0] for phase in want[1]):
         out.append("the original before-migration row (phase %s) is not the one in the ledger: %r" % (want[1], rows))
     return out
