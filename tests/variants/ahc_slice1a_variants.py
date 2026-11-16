@@ -103,6 +103,74 @@ V = [
     ("W24: the mark is not checked against the observation", [
         ("            if not fact:\n                raise ContractError(\"W24's observation",
          "            if False:\n                raise ContractError(\"W24's observation")], CONTRACTS, SM),
+    # ELIG (step 5): each clause, the fail-closed paths, the queue and the rows that read it
+    ("ELIG e1: B_r ancestry not checked", [
+        ("or any(s != \"passed\" or anc.get(br) is not True for s, br, _p, _r in code)):",
+         "or any(s != \"passed\" for s, br, _p, _r in code)):")], CONTRACTS, SM),
+    ("ELIG e1: the PR head is not compared with H", [
+        ("        if (not code or o[\"pr_head\"] != head or pol.get(\"revision\")",
+         "        if (not code or pol.get(\"revision\")")], CONTRACTS, SM),
+    ("ELIG e1: the policy revision read now is not compared (Q-A5.1)", [
+        (" or pol.get(\"revision\") != item[\"policy_revision\"]\n", "\n")], CONTRACTS, SM),
+    ("ELIG e2: the spec row is not bound to the core attached now", [
+        ("        if o[\"attached_core\"] != item[\"spec_core\"] or [s for (s,) in spec] != [\"passed\"]:\n",
+         "        if [s for (s,) in spec] != [\"passed\"]:\n")], CONTRACTS, SM),
+    ("ELIG e2: a missing spec row counts as passed (NEG-18)", [
+        ("        if o[\"attached_core\"] != item[\"spec_core\"] or [s for (s,) in spec] != [\"passed\"]:\n",
+         "        if o[\"attached_core\"] != item[\"spec_core\"] or any(s != \"passed\" for (s,) in spec):\n")],
+     CONTRACTS, SM),
+    ("ELIG e3: a truthy findings count passes", [
+        ("        if o[\"open_findings\"] != 0 or isinstance(o[\"open_findings\"], bool):\n",
+         "        if o[\"open_findings\"]:\n")], CONTRACTS, SM),
+    ("ELIG e4: an empty path list passes", [
+        ("(not isinstance(paths, list) or not paths or o[\"foreign_closing_keyword\"]",
+         "(not isinstance(paths, list) or o[\"foreign_closing_keyword\"]")], CONTRACTS, SM),
+    ("NEG-6: .github/** not protected", [('"settings*.json", "hooks_manifest.json", ".github/**", ',
+                                          '"settings*.json", "hooks_manifest.json", ')], CONTRACTS, SM),
+    ("NEG-6: names matched only at the root", [
+        ("            elif fnmatch.fnmatchcase(name, pat):\n", "            elif fnmatch.fnmatchcase(path, pat):\n")],
+     CONTRACTS, SM),
+    ("ELIG e5: the repo's merging-off flag is ignored", [
+        ("or pol.get(\"checks_green\") is not True or (flags and flags[0])):",
+         "or pol.get(\"checks_green\") is not True):")], CONTRACTS, SM),
+    ("ELIG e6: a frozen authority epoch is ignored", [
+        ("        if o[\"kill_switch\"] is not False or (frozen and frozen[0] == \"1\"):\n",
+         "        if o[\"kill_switch\"] is not False:\n")], CONTRACTS, SM),
+    ("ELIG e7: CAP1 not checked", [("        if self.cap_used(item[\"repo\"]) >= self.CAP1_PER_DAY:\n",
+                                     "        if False:\n")], CONTRACTS, SM),
+    ("ELIG e8: a draft passes", [("        if o[\"pr_state\"] != \"OPEN\" or o[\"draft\"] is not False:\n",
+                                   "        if o[\"pr_state\"] != \"OPEN\":\n")], CONTRACTS, SM),
+    ("ELIG e9: canary age unbounded", [(" or not 0 <= age < 86400:", " or not 0 <= age:")], CONTRACTS, SM),
+    ("ELIG e10: not checked", [("        if o[\"compare\"] != \"ahead\" or tip == head:\n", "        if False:\n")],
+     CONTRACTS, SM),
+    ("ELIG: a bad observation fails nothing (fail open)", [
+        ("            return [\"e1\", \"e2\", \"e3\", \"e4\", \"e5\", \"e6\", \"e7\", \"e8\", \"e9\", \"e10\"]\n",
+         "            return []\n")], CONTRACTS, SM),
+    ("W5: any ELIG failure counts as a dependency", [
+        ("            if not (set(failed) & {\"e5\", \"e6\", \"e7\", \"e8\", \"e10\"}) and not mirror_down:\n",
+         "            if not failed and not mirror_down:\n")], CONTRACTS, SM),
+    ("W2/W6: the values ELIG passed on are not recorded (W27 never fires)", [
+        ("                extra = {\"elig_core\": item[\"spec_core\"], \"elig_policy\": item[\"policy_revision\"]}\n",
+         "                extra = {}\n")], CONTRACTS, SM),
+    ("W27: no replacement Review rows", [
+        ("                if kind != \"spec\" and new[\"policy_revision\"] == item[\"policy_revision\"]:\n",
+         "                if True:\n")], CONTRACTS, SM),
+    ("W27: the item keeps the old core and policy", [
+        ("                extra = {\"spec_core\": obs[\"attached_core\"], \"policy_revision\": obs[\"policy\"][\"revision\"]}\n",
+         "                extra = {}\n")], CONTRACTS, SM),
+    ("queue: newest lineage first", [("ORDER BY admitted, w.created, \"\n", "ORDER BY admitted DESC, w.created, \"\n")],
+     CONTRACTS, SM),
+    ("queue: e10 required of the head", [
+        ("            if iid in observations and not self.elig(item, observations[iid], skip=(\"e10\",)):\n",
+         "            if iid in observations and not self.elig(item, observations[iid]):\n")], CONTRACTS, SM),
+    ("W21: taken by an item that is not the queue head", [
+        ("            if self.queue_head(item[\"repo\"], queue) != item[\"id\"]:\n", "            if False:\n")],
+     CONTRACTS, SM),
+    ("W21: a second update at the same B", [
+        ("            if item[\"w21_base\"] == o[\"tip\"]:\n", "            if False:\n")], CONTRACTS, SM),
+    ("W21: no authority log line first", [
+        ("                self.authority.append({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",",
+         "                (lambda r: None)({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",")], CONTRACTS, SM),
     ("T7 precedence: G8 and G9 outrank the WorkItem rows", [
         ('    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")\n',
          '    T7_ORDER = ("G8", "G9", "W4", "W13", "W14", "W18", "W19", "W17")\n')], CONTRACTS, SM),
