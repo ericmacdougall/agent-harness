@@ -104,6 +104,69 @@ v4 variants:
 - copy_to_temp enforces no cap;
 - remove_temps matches any name.
 
+## PR 258 v5 BLOCK repair: F1, a restore resumed from its files; F2, honest variant counts
+
+The receipt `harness-pr258-v5` (reviewed head e4fc5ce4) blocked on two findings:
+- F1 (High): `_resume_restore` refused when the intent's backup was not a file, before the safe abandon could
+  run. A crash right after the intent was written, with the backup then gone, stranded an intact live ledger:
+  every later start refused.
+- F2 (Medium): the variants runner skipped a timed-out variant without counting it, and always exited 0.
+
+The counts, logs and their SHA-256 values for this repair are in the PR 258 v5 delta packet and the ticket, not
+here, so this file does not move the validated head. Commands, from the repo root:
+
+- The recovery table: `python3 -B -m unittest tests.test_ahc_crash.RestoreRecoveryTableTests`. Seven real crash
+  points of a restore (before the intent, after it, mid-copy, after the fsync, after the move, after the publish,
+  after the intent is dropped) x the backup present, missing or partial x the live ledger present or absent: 42
+  rows. Each crash state comes from a real crash child and is checked for its expected file shape first, so a
+  code version without that crash point fails as "another state", never as a wrong outcome.
+- The whole crash matrix, which also crashes inside the resume itself (six `resume-*` scenarios):
+  `python3 -B -m unittest tests.test_ahc_crash`.
+- Failing first: the tests against the hooks at e4fc5ce4, in a scratch tree:
+  ```
+  git archive e4fc5ce4 harness/hooks | tar -x -C <scratch>
+  mkdir <scratch>/tests && cp tests/*.py <scratch>/tests/
+  cd <scratch>
+  python3 -B -m unittest tests.test_ahc_crash tests.test_ahc_runner.SchemaTests tests.test_ahc_fs.RootFsTests
+  ```
+  Most table rows fail there on their shape check (e4fc5ce4 has no mid-copy, publish or intent-removal seam). The
+  rows that fail on behavior are the receipt's exact sequence (it refuses "names no backup beside the ledger"), a
+  partial backup published over the intact ledger (it no longer opens), and a staged copy left behind. The v4
+  residual (a found publish moved aside over the failed database) and the foreign-file refusal fail first in
+  `SchemaTests`, not in the table.
+- The variants runner's own tests: `python3 -B -m unittest tests.test_ahc_root_variants`. Failing first: seven
+  controlled broken runners, e4fc5ce4's exit-0 and skipped-timeout behavior among them, each run against these
+  tests.
+- Variants: `python3 -B tests/variants/ahc_root_variants.py <out>`. It exits 0 only when every variant was caught.
+
+Decisions in this repair:
+- The intent records the proven backup's SHA-256 (`Ledger.backup` streams it after the integrity and row-count
+  proof). A copy is published only if its bytes hash to it, so a partial or changed backup is never published.
+- A failed copy with the live ledger never moved abandons the restore: the intent is dropped, a warning is logged,
+  and the start goes on with that ledger; its migration is retried with a fresh verified backup. `restore()`
+  itself still raises (`RestoreAbandoned`, a `SchemaError`).
+- An intent from an ahc before v5 has no `sha256`; its backup is never published (see docs/ahc.md).
+- Every move-aside target is checked before the copy and before the first rename. That replaces v4's separate
+  "the file at the ledger's name is not the verified backup" refusal, which the same check covers.
+- A backup name in the intent must be `[A-Za-z0-9._-]+` and the suffix `.failed-` plus ASCII digits.
+- The runner reports four outcomes: caught, survived, timed out and broken (no tests ran, an import failed, or
+  another exit status). Only "caught" passes. A timeout kills the test command's process group, and a `.vs.bak`
+  left by an interrupted run stops the run instead of being overwritten.
+- Two crash-matrix checks changed. `committed_events` skips a copy SQLite cannot read (a backup cut short holds
+  no committed rows). The restart may write the before-migration row itself (phase "resume") only when no such row
+  had committed at the crash.
+
+v5 variants:
+- the backup's availability checked before the files decide (the receipt's defect);
+- a failed copy abandons even with no live ledger;
+- no digest asked for, or `copy_to_temp` ignoring it, or the backup's digest not recorded;
+- a found publish not recognised, and the whole v4 residual (also renaming over a taken target);
+- a taken move target renamed over, or targets checked only as each is renamed;
+- a `-journal` left beside the restored copy;
+- an abandoned resume that stops the start;
+- a control character in the backup name, or non-ASCII suffix digits, accepted;
+- an undigested record that trusts the backup's current bytes, or strands a never-moved live ledger.
+
 ## What the variants break
 
 Each variant is a unique text swap applied to one source file, and the source is restored after the run.

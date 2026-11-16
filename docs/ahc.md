@@ -122,21 +122,40 @@ A migration runs only after a proven backup:
 1. The SQLite online backup API copies the database to `ledger.sqlite3.pre-v<N>.<ns>.bak`. The copy includes
    committed rows that are still only in the `-wal` file.
 2. The copy must pass `PRAGMA integrity_check` and have the same row count as the source in every table.
-   Otherwise the migration does not start.
+   Otherwise the migration does not start. The proven copy's SHA-256 is then recorded (streamed, PR 258 v5).
 3. All steps run in one transaction.
-4. If any step fails, the daemon restores the backup (PR 258 v4 F1). The steps, in order:
-   - A durable restore intent is written first.
+4. If any step fails, the daemon restores the backup (PR 258 v4 F1, v5 F1). The steps, in order:
+   - A durable restore intent, `ledger.sqlite3.restore-intent`, is written first. It is one JSON object:
+     `{"backup": "<backup file name>", "sha256": "<64 hex>", "suffix": ".failed-<ns>"}`.
    - The backup is streamed through a directory descriptor, in 1 MiB chunks (`ahc_fs.copy_to_temp`), into a
-     new temp file beside the ledger, and fsynced. Memory use does not grow with the ledger under the unit's
+     new temp file beside the ledger. Its bytes must hash to the recorded SHA-256, or nothing is published
+     (`ahc_fs.Mismatch`). The temp is fsynced. Memory use does not grow with the ledger under the unit's
      `MemoryMax`.
-   - Only after the copy succeeds are the live `.db`, `-wal` and `-shm` files moved aside together as
-     `ledger.sqlite3.failed-<ns>[-wal|-shm]`. They are never deleted.
+   - Only after the copy succeeds are the live `.db` and its `-wal`, `-shm` and `-journal` files moved aside
+     together as `ledger.sqlite3.failed-<ns>[-wal|-shm|-journal]`. They are never deleted. Every target name is
+     checked first; one that is already taken refuses the restore and nothing moves.
    - The copy is renamed into place and the intent is dropped.
    - The daemon then refuses to start with a `SchemaError` that names both files.
 
    If the copy fails while the live database is still in place, nothing has been moved. The intent is dropped,
-   so the next start opens that unchanged database instead of repeating the restore. A restart after a crash
-   removes any partial temp copy and completes the same restore.
+   so the next start opens that unchanged database instead of repeating the restore.
+
+   A start that finds an intent (ahc-core only; other processes refuse while one exists) checks only that the
+   record is well formed: a plain file name, a `.failed-<digits>` suffix and a 64-hex SHA-256. A malformed record
+   refuses, and nothing is created. The files then decide, from whatever state a crash left:
+
+   | What the start finds | What it does |
+   |---|---|
+   | The live file holds exactly the backup's bytes (a crash after the publish) | Drops the intent. Nothing is moved again. |
+   | A move target is already taken while its source is still in place | Refuses with the intent kept; nothing changes. |
+   | The backup copies with its recorded digest | Removes any partial temp, finishes the restore (moving the live file aside once if it is still there) and starts. |
+   | The backup is gone, partial or changed, and the live ledger was never moved | Drops the intent, logs `abandoned the interrupted ledger restore`, and starts on that ledger. Its migration is retried with a fresh verified backup. |
+   | The backup is gone, partial or changed, and there is no live ledger | Refuses at every start with the intent kept. No empty ledger is created. An operator puts the backup back or decides. |
+
+   An intent written by an ahc before PR 258 v5 has no `sha256` key, so its backup cannot be verified and is never
+   published. If the live ledger is in place and was never moved aside, it is kept and the intent is dropped. If
+   the live file is byte-identical to the backup (that ahc had already published it), the intent is dropped.
+   Otherwise the start refuses with the intent kept. An explicit `"sha256": null` is malformed and refuses.
 
 ## Admission and staged packets
 
