@@ -1988,3 +1988,149 @@ class ProviderOutputBoundDeltaTests(unittest.TestCase):
             result = self.normalize(stdout)
         self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
         self.assertLessEqual(len([size for size in calls if size < 100]), 0, 'records after the bound were parsed')
+
+
+class ProviderOutputBoundDelta2Tests(unittest.TestCase):
+    """Review harness-pr266-v2 (goodqa#16170): F1 the node count must use constant auxiliary memory and reject an
+    oversized line before decoding it; F2/F3 any cleanup that cannot prove the process group is gone is UNKNOWN, so
+    the provider pool stays reserved."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta2_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    FINAL = 'VERDICT: PASS\n\nok'
+
+    def stream(self, command):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'id': 'c', 'type': 'command_execution', 'command': 'probe',
+                                                       'aggregated_output': command}},
+                   {'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': self.FINAL}},
+                   {'type': 'turn.completed'}]
+        return '\n'.join(json.dumps(record) for record in records)
+
+    def test_f1_escape_heavy_output_parses_with_bounded_memory(self):
+        import tracemalloc
+        stdout = self.stream('\\' * 500_000)  # 1 MB of escaped backslashes in one command output
+        self.assertGreater(len(stdout), 1_000_000)
+        tracemalloc.start()
+        try:
+            result = self.module.normalize_provider('codex', 0, stdout, '', self.FINAL, 'pr')
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result['result'], 'CHECK_OK')
+        self.assertLess(peak, 8 * 2 ** 20, 'node counting allocated %d bytes for 1 MB of escapes' % peak)
+
+    def test_f1_line_over_the_record_cap_is_rejected_before_decoding(self):
+        stdout = self.stream('h' * (9 * 2 ** 20))
+        sizes = []
+        real = json.loads
+
+        def counting(text, *args, **kwargs):
+            sizes.append(len(text))
+            return real(text, *args, **kwargs)
+        with patch.object(self.module.json, 'loads', side_effect=counting):
+            result = self.module.normalize_provider('codex', 0, stdout, '', self.FINAL, 'pr')
+        self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
+        self.assertFalse([size for size in sizes if size > 8 * 2 ** 20], 'an oversized line was decoded')
+
+    def test_f2_failed_child_record_with_unreapable_child_keeps_the_pool(self):
+        import types
+        spawned = []
+
+        def note_child(child):
+            spawned.append(child)
+            raise self.module.GuardError('INVALID_OUTPUT', 'Too many recorded children')
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=note_child)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        options = {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                   'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                   'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture), \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(store.release_pool.called, 'a child that may be alive must keep its pool reservation')
+            self.assertEqual(options['attempts'][-1]['code'], 'REVIEW_LAUNCH_UNCONFIRMED')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    FLOOD = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n'
+             '    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+
+    def run_with_survivor(self, temp, **patches):
+        """A leader that floods stdout and leaves a same-group descendant with its pipes closed."""
+        pid_file = Path(temp) / 'descendant'
+        child = ('import subprocess, sys\n'
+                 'd = subprocess.Popen([sys.executable, "-c", "import os, time\\nos.close(0); os.close(1); os.close(2)'
+                 '\\ntime.sleep(30)"])\n'
+                 'open(sys.argv[1], "w").write(str(d.pid))\n' + self.FLOOD)
+
+        def reap():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(reap)
+        with patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3), \
+                patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True):
+            with contextlib_exit_stack(patches) as _:
+                started = time.monotonic()
+                outcome = self.module.run([sys.executable, '-c', child, str(pid_file)], '', Path(temp), timeout=20)
+        return outcome, time.monotonic() - started
+
+    def test_f3_reaped_leader_with_surviving_group_member_is_unknown(self):
+        def leader_only(pid, signum):  # group signalling cannot reach the descendant
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+        with tempfile.TemporaryDirectory() as temp:
+            (code, _stdout, stderr), elapsed = self.run_with_survivor(
+                temp, **{'signal_group': (self.process, leader_only)})
+        self.assertEqual((code, stderr), (125, 'HARNESS_PROVIDER_IO_UNKNOWN'))
+        self.assertEqual(self.module.normalize_provider('codex', code, '', stderr, '', 'pr')['reason'], 'UNKNOWN')
+        self.assertLess(elapsed, 10)
+
+    def test_f3_denied_liveness_signal_is_unknown(self):
+        real = os.killpg
+
+        def denied_probe(pgid, signum):
+            if signum == 0:
+                raise PermissionError('denied')
+            return real(pgid, signum)
+        with tempfile.TemporaryDirectory() as temp:
+            (code, _stdout, stderr), _ = self.run_with_survivor(
+                temp, **{'killpg': (self.process.os, denied_probe)})
+        self.assertEqual((code, stderr), (125, 'HARNESS_PROVIDER_IO_UNKNOWN'))
+
+
+def contextlib_exit_stack(patches):
+    import contextlib
+    stack = contextlib.ExitStack()
+    for name, (target, value) in patches.items():
+        stack.enter_context(patch.object(target, name, value))
+    return stack

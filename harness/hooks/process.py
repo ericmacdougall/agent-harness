@@ -84,8 +84,27 @@ class OutputLimitExceeded(Exception):
 
 
 class CleanupIncomplete(OSError):
-    """The child could not be confirmed stopped and reaped. Ownership is unknown: callers must not treat this as a
-    known end (for example, must not release a provider reservation)."""
+    """The child's process group could not be proven gone (leader not reaped, a member still alive, or liveness
+    could not be checked). Ownership is unknown: callers must not treat this as a known end (for example, must not
+    release a provider reservation). `original` is the error that started the cleanup, when there was one.
+    `cleanup_incomplete` follows the existing convention that usage_guard records on interrupted runs. Raised by the
+    bounded-capture stop; the on_spawn failure path instead marks the callback error cleanup_incomplete."""
+    cleanup_incomplete = True
+
+    def __init__(self, message, original=None):
+        super().__init__(message)
+        self.original = original
+
+
+def _confirm_gone(process, original=None):
+    """After SIGKILL: reap the leader, then require that no member of its group remains, within a bounded deadline.
+    A PermissionError on the liveness probe means liveness cannot be established, which also fails."""
+    try:
+        process.wait(timeout=DISCARD_CLEANUP_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise CleanupIncomplete('child %d could not be reaped' % process.pid, original) from original
+    if not _wait_group(process, time.monotonic() + DISCARD_CLEANUP_SECONDS):
+        raise CleanupIncomplete('process group %d could not be proven gone' % process.pid, original) from original
 
 
 def _wait_group(process, deadline):
@@ -104,8 +123,8 @@ def _wait_group(process, deadline):
 
 def _stop_bounded(process):
     """Stop the group without retaining more output: TERM, drain-discard, wait out the grace period for the whole
-    group (a child may close its pipes and still be running its TERM handler), KILL, drain-discard, reap.
-    Raises CleanupIncomplete when the leader cannot be reaped.
+    group (a child may close its pipes and still be running its TERM handler), KILL, drain-discard, then prove the
+    whole group is gone (_confirm_gone); otherwise CleanupIncomplete.
 
     stdin belongs to the feeder thread (it closes it); closing it here could block on the writer's lock."""
     pipes = [pipe for pipe in (process.stdout, process.stderr) if pipe is not None and not pipe.closed]
@@ -128,10 +147,7 @@ def _stop_bounded(process):
             pipe.close()
         except OSError:
             pass
-    try:
-        process.wait(timeout=DISCARD_CLEANUP_SECONDS)
-    except subprocess.TimeoutExpired:
-        raise CleanupIncomplete('child %d could not be confirmed stopped' % process.pid) from None
+    _confirm_gone(process)
 
 
 def _bounded_capture(command, process, data, timeout, limit, decode):
@@ -238,19 +254,28 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
                                start_new_session=True, **decoding)
     if on_spawn is not None:
         # Lets a supervisor record the child it is responsible for (usage guard liveness).
-        # If recording fails the child must not outlive the record: kill its group and re-raise.
+        # If recording fails the child must not outlive the record: kill its group and re-raise the callback error.
+        # When the group cannot be proven gone the error is marked cleanup_incomplete (the convention of the discard
+        # path below), so a caller never treats it as a known end. The original type is kept: usage_guard relies on
+        # a failed registration propagating as its own GuardError, which writes no final record.
         try:
             on_spawn(process)
-        except BaseException:
+        except BaseException as failure:
             try:
                 signal_group(process.pid, signal.SIGKILL)
-                process.wait(timeout=TERMINATION_GRACE_SECONDS)
-            except (OSError, subprocess.TimeoutExpired):
+            except OSError:
                 pass
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     try: stream.close()
                     except OSError: pass
+            try:
+                _confirm_gone(process, failure)
+            except CleanupIncomplete:
+                try:
+                    failure.cleanup_incomplete = True
+                except AttributeError:
+                    pass
             raise
     if discard_output:
         deadline = None if timeout is None else time.monotonic() + timeout
