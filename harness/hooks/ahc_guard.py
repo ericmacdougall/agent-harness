@@ -40,7 +40,11 @@ import stat
 import sys
 from pathlib import Path
 
-TRUSTED_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/local/bin", "/opt/homebrew/bin")
+TRUSTED_DIRS = ("/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin")
+# The user unit's PATH (ahc_install) puts these per-user directories first, so the daemon resolves the same gh
+# and git it ran before AC-13 (ASSUMPTION: a file there must still be owned by the daemon uid and not group- or
+# other-writable).
+HOME_DIRS = (".local/bin", "bin", ".npm-global/bin")
 EXECUTABLES = ("git", "gh", "systemd-run", "systemctl", "lsof", "fuser", "sysctl")
 PROVIDER_MODULES = ("anthropic", "openai", "google.genai", "google.generativeai", "mistralai", "cohere")
 HTTP_MODULES = ("urllib.request", "http.client", "requests", "httpx", "aiohttp", "urllib3")
@@ -71,7 +75,7 @@ GH_HEADERS = ("Accept: application/vnd.github+json", "X-GitHub-Api-Version: 2022
 # gh pr view --json fields: the legacy fields at 4d45fe40 plus AC-1's
 PR_FIELDS = frozenset(("number", "state", "headRefOid", "mergeCommit", "baseRefName", "baseRefOid", "isDraft",
                        "mergeable", "mergeStateStatus", "body", "updatedAt", "changedFiles", "headRepository",
-                       "headRepositoryOwner", "title", "url"))
+                       "headRepositoryOwner", "title", "url", "isCrossRepository"))
 # Legacy helpers: the installed scripts only (never a path from config), and the keys of their environment, whose
 # values are fixed when the policy is made (ASSUMPTION: the helpers run model CLIs and ah, which need the daemon's
 # own PATH and HOME; every other inherited key, such as GIT_* or a provider key, is dropped).
@@ -111,6 +115,32 @@ def _under(path, root):
     return real == root or real.startswith(root + os.sep)
 
 
+def trusted_dirs(home):
+    """The fixed trusted directory list for a daemon whose HOME is `home`."""
+    return tuple(os.path.join(str(home), d) for d in HOME_DIRS) + TRUSTED_DIRS
+
+
+def resolve(name, dirs):
+    """The first trusted, executable `name` in `dirs`, as an absolute path, or None. Never PATH."""
+    for d in dirs:
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK) and trusted_file_problem(p) is None:
+            return p
+    return None
+
+
+def form_env(name, dirs, home, gh_auth=None):
+    """The minimal environment of one executable's form: fixed keys and values only."""
+    base = {"PATH": ":".join(dirs), "HOME": str(home), "LC_ALL": "C"}
+    if name == "git":
+        base.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"})
+    elif name == "gh":
+        base.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"})
+        if gh_auth:
+            base["GH_TOKEN"] = gh_auth
+    return base
+
+
 def trusted_file_problem(path):
     """Why an executable or helper file is not trusted, or None: it must be a regular file, not group- or
     other-writable, and owned by root or the daemon uid."""
@@ -132,13 +162,13 @@ class Policy:
     the test constructor `Policy.for_test` maps executables to stub files and may enable the file transport. Fakes
     are never injectable through config or env."""
 
-    def __init__(self, root, *, repos=(), home=None, trusted_dirs=TRUSTED_DIRS, helpers=None, unit_scope="--user",
+    def __init__(self, root, *, repos=(), home=None, trusted_dirs=None, helpers=None, unit_scope="--user",
                  gh_auth=None, _stubs=None, _allow_file=False, _python=None):
         self.root = os.path.realpath(str(root))
         self.clones = os.path.join(self.root, "clones")
         self.repos = {str(r).lower() for r in repos}
         self.home = str(home or Path.home())
-        self.trusted = tuple(trusted_dirs)
+        self.trusted = tuple(trusted_dirs) if trusted_dirs is not None else globals()["trusted_dirs"](self.home)
         self.path_env = ":".join(self.trusted)
         self.allow_file = bool(_allow_file)
         self.unit_scope = unit_scope if unit_scope in ("--user", "") else "--user"
@@ -171,23 +201,12 @@ class Policy:
         return cls(root, _stubs=dict(stubs), **kw)
 
     def _resolve(self, name):
-        for d in self.trusted:
-            p = os.path.join(d, name)
-            if os.path.isfile(p) and os.access(p, os.X_OK):
-                return p
-        return None
+        return resolve(name, self.trusted)
 
     # ------------------------------------------------------------ the forms' environments and argv
 
     def env(self, name):
-        base = {"PATH": self.path_env, "HOME": self.home, "LC_ALL": "C"}
-        if name == "git":
-            base.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"})
-        elif name == "gh":
-            base.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"})
-            if self.gh_auth:
-                base["GH_TOKEN"] = self.gh_auth
-        return base
+        return form_env(name, self.trusted, self.home, self.gh_auth)
 
     def argv(self, name, args):
         if name not in self.exe:
@@ -510,7 +529,10 @@ def run(policy, name, args, timeout, cwd=None):
     return ahc_core.run_argv(policy.argv(name, args), timeout, cwd=str(cwd or policy.root), env=policy.env(name))
 
 
-def run_helper(policy, name, args, timeout):
-    """The production launcher for a legacy Python helper (installed script, fixed env, cwd the root)."""
+def run_helper(policy, name, args, timeout, script=None):
+    """The production launcher for a legacy Python helper: the interpreter, the script, the helper form's fixed
+    env and the root as cwd. `script` (a configured path) is launched as given; under an active policy the hook
+    refuses it unless it is the installed, unchanged script (NEG-47)."""
     import ahc_core  # noqa: PLC0415
-    return ahc_core.run_argv(policy.helper_argv(name, args), timeout, cwd=policy.root, env=dict(policy.helper_env))
+    argv = [policy.python, str(script)] + [str(a) for a in args] if script else policy.helper_argv(name, args)
+    return ahc_core.run_argv(argv, timeout, cwd=policy.root, env=dict(policy.helper_env))

@@ -28,7 +28,7 @@ A, B = "a" * 40, "b" * 40
 RANGE = "%s..%s" % (B, A)
 
 
-class NoModelInDaemonTests(unittest.TestCase):
+class _GuardFixture(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -101,6 +101,9 @@ class NoModelInDaemonTests(unittest.TestCase):
 
     def ctl(self, *args):
         return [self.policy.exe["systemctl"], "--user"] + list(args)
+
+
+class NoModelInDaemonTests(_GuardFixture):
 
     # ------------------------------------------------------------------ positive controls
 
@@ -354,6 +357,50 @@ class NoModelInDaemonTests(unittest.TestCase):
                     self.assertFalse(any(mod == b or mod.startswith(b + ".") for b in banned), (name, mod))
             for host in hosts:
                 self.assertNotIn(host, text, name)
+
+
+class LegacyProductionPathTests(_GuardFixture):
+    """NEG-44 and NEG-47 through the production dependency path (LiveDeps), under the enforcing policy."""
+
+    def deps(self, **config):
+        import ahc_runner  # noqa: PLC0415
+        from types import SimpleNamespace  # noqa: PLC0415
+        paths = SimpleNamespace(root=self.root, home=Path(self.policy.home))
+        return ahc_runner.LiveDeps(paths, {"repos": ["o/r"], **config}, policy=self.policy)
+
+    def test_legacy_commits_runs_in_the_git_form(self):
+        self.clear()
+        clone = str(self.root / "clones" / "o__r")
+        rc, _o, err = 0, "", ""
+        try:
+            self.deps().commits(clone, B, A)
+        except RuntimeError as error:            # the stub prints nothing; an empty log is fine, a refusal is not
+            self.assertNotIsInstance(error, guard.LaunchRefused)
+            err = str(error)
+        self.assertTrue(self.mark("git"), err)
+        line = (self.marks / "git").read_text()
+        self.assertTrue(line.startswith(" ".join(ahc_clone.SAFE)), line)
+        self.assertIn("-C %s log --format=%%H%%x09%%s %s" % (clone, RANGE), line)
+
+    def test_legacy_helper_from_config_must_be_the_installed_one(self):
+        other = self.helper.parent / "other.py"
+        other.write_text(self.helper.read_text())
+        self.clear()
+        rc, _o, err = self.deps(ah=str(other)).ah(["ah", "ticket", "comment", "1", "--body", "x"], 20)
+        self.assertEqual(rc, 126, err)
+        self.assertIn("LaunchRefused", err)
+        self.assertFalse(self.mark("helper"))
+        rc, _o, err = self.deps(ah=str(self.helper)).ah(["ah", "ticket", "comment", "1", "--body", "x"], 20)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.mark("helper"))
+
+    def test_legacy_gh_readback_runs_in_the_gh_form(self):
+        self.clear()
+        rc, _o, err = self.deps().gh(["gh", "pr", "view", "5", "-R", "o/r", "--json", "state"], 20)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.mark("gh"))
+        rc, _o, err = self.deps().gh(["gh", "api", "--method", "POST", "repos/o/r/pulls/5"], 20)
+        self.assertEqual(rc, 126, err)
 
 
 class GuardPolicyUnitTests(unittest.TestCase):

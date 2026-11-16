@@ -2592,30 +2592,54 @@ def _append_private(root, path, text):
 class LiveDeps:
     """The production children. Every call is an argv list with a timeout; nothing goes through a shell."""
 
-    def __init__(self, paths, config):
+    def __init__(self, paths, config, policy=None):
+        import ahc_guard  # noqa: PLC0415
         self.paths, self.config = paths, config
+        # AC-13: every child is launched in its form (resolved absolute path, minimal env, cwd the root). The
+        # daemon entry installs an enforcing policy; elsewhere (CLI, tests) the same forms run unenforced.
+        self.policy = policy or ahc_guard.active() or ahc_guard.Policy(
+            paths.root, repos=config.get("repos", []), home=getattr(paths, "home", None))
 
     def clock(self):
         return time.time()
 
-    def _run(self, argv, timeout):
-        return core.run_argv(argv, timeout)
+    def _refused(self, error):
+        log.error("launch refused: %s", error)
+        return 126, "", "LaunchRefused: %s" % error
 
     def gh(self, argv, timeout):
-        return self._run(argv, min(timeout, core.TIMEOUTS["gh"]))
+        import ahc_guard  # noqa: PLC0415
+        try:
+            return ahc_guard.run(self.policy, "gh", list(argv[1:]), min(timeout, core.TIMEOUTS["gh"]))
+        except ahc_guard.LaunchRefused as error:
+            return self._refused(error)
+
+    def _helper(self, name, default, args, timeout):
+        import ahc_guard  # noqa: PLC0415
+        script = str(self.config.get(name, default))
+        try:
+            return ahc_guard.run_helper(self.policy, name, list(args), timeout, script=script)
+        except ahc_guard.LaunchRefused as error:
+            return self._refused(error)
 
     def ah(self, argv, timeout):
-        script = str(self.config.get("ah", Path.home() / ".claude/hooks/ah.py"))
-        return self._run([sys.executable, script] + list(argv[1:]), min(timeout, core.TIMEOUTS["ah"]))
+        return self._helper("ah", Path.home() / ".claude/hooks/ah.py", argv[1:], min(timeout, core.TIMEOUTS["ah"]))
 
     def review(self, argv, timeout):
-        rc, _out, err = self._run(argv, timeout)
+        """The legacy review helper: argv is [python, peer_review script, ...] as the runner built it."""
+        import ahc_guard  # noqa: PLC0415
+        try:
+            rc, _out, err = ahc_guard.run_helper(self.policy, "peer_review", list(argv[2:]), timeout,
+                                                 script=argv[1])
+        except ahc_guard.LaunchRefused as error:
+            rc, _out, err = self._refused(error)
         return rc, err
 
     def commits(self, clone, merge_base, head):
         """[(full sha, subject)] of merge_base..head in the daemon clone (D24 note)."""
-        rc, out, err = self._run(["git", "-C", str(clone), "log", "--format=%H%x09%s", "%s..%s" % (merge_base, head)],
-                                 60)
+        # AC-13: the legacy call (no SAFE, inherited env) moves onto the git form
+        rc, out, err = ahc_clone_git(["-C", str(clone), "log", "--format=%H%x09%s", "%s..%s" % (merge_base, head)],
+                                     60, cwd=str(clone))
         if rc != 0:
             raise RuntimeError("git log failed: %s" % _short(err))
         return [tuple(line.split("\t", 1)) for line in out.splitlines() if "\t" in line]
@@ -2624,8 +2648,8 @@ class LiveDeps:
         """Read-only ops-watch queries only: capabilities, config (emptiness of sinks.deadman), delivered."""
         if not argv or argv[0] not in ("capabilities", "config", "delivered"):
             raise ValueError("ops_watch: only read-only queries")
-        script = str(self.config.get("ops_watch", Path.home() / ".claude/hooks/ops_watch.py"))
-        return self._run([sys.executable, script] + list(argv), min(timeout, OPS_WATCH_TIMEOUT))
+        return self._helper("ops_watch", Path.home() / ".claude/hooks/ops_watch.py", argv,
+                            min(timeout, OPS_WATCH_TIMEOUT))
 
     def clone(self, repo, head, base):
         import ahc_clone
@@ -2648,6 +2672,13 @@ class LiveDeps:
         import ahc_clone
         out = ahc_clone._git(["diff", "--name-only", "--no-renames", "-z", merge_base, head], cwd=clone).stdout
         return [p for p in out.split("\0") if p]
+
+
+def ahc_clone_git(args, timeout, cwd=None):
+    """(rc, stdout, stderr) of one git child in the AC-13 git form, never raising on a nonzero exit."""
+    import ahc_clone  # noqa: PLC0415
+    r = ahc_clone._git(list(args), cwd=cwd, timeout=timeout, check=False)
+    return r.returncode, r.stdout, r.stderr
 
 
 # ---------------------------------------------------------------- CLI
@@ -2900,6 +2931,11 @@ def main(argv=None):
         print("ahc: another instance holds the %s lock; exiting" % args.role, file=sys.stderr)
         return LOCKED_OUT_EXIT
     _setup_logging(paths)
+    import ahc_guard  # noqa: PLC0415
+    # AC-13: the daemon process enforces its launch, socket and import policy from here on
+    # gh authenticates from its own config under HOME; the unit sets no gh credential variable, so the gh
+    # form carries none (ASSUMPTION)
+    ahc_guard.install(ahc_guard.Policy(paths.root, repos=config.get("repos", []), home=paths.home))
     deps = LiveDeps(paths, config)
     while True:
         try:
