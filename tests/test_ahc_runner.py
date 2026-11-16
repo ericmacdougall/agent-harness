@@ -3594,6 +3594,63 @@ class StateMachineTests(TC.Base):
             self.move("W9")
         self.assertEqual(self.move("W25", to="superseded")["state"], "superseded")
 
+    def notices(self, row):
+        return sorted(self.db.execute("SELECT kind, event_id, text FROM wi_notices WHERE item=? AND row_id=?",
+                                      (self.item["id"], row)).fetchall())
+
+    def test_w25_closed_in_flight_ends_closed_unmerged_with_a_notice_naming_the_op(self):
+        self.at("waiting-ask")
+        _g, op = self.dispatched()
+        self.move("W24", mark="closed-in-flight", obs=self.pr(pr_state="CLOSED"))
+        with self.assertRaisesRegex(C.ContractError, "abandoned"):
+            self.move("W25", to="closed-unmerged")                     # T7: the Effect is still unsettled
+        self.db.execute("UPDATE operations SET state='abandoned' WHERE key=?", (op["key"],))
+        with self.assertRaisesRegex(C.ContractError, "closed-in-flight item to closed-unmerged"):
+            self.move("W25", to="superseded")
+        with self.assertRaisesRegex(C.ContractError, "goes to"):
+            self.move("W25", to="merged")
+        ev = self.ev()
+        self.assertEqual(self.move("W25", to="closed-unmerged", event_id=ev)["state"], "closed-unmerged")
+        self.assertEqual(self.notices("W25"), [("ticket", ev, "%s ended abandoned; item closed-unmerged" % op["key"])])
+
+    def test_w26_a_confirmed_effect_merges_from_every_listed_state_and_announces_once(self):
+        for n, frm in enumerate(("pr-gate", "waiting-dep", "waiting-ask", "exhausted")):
+            with self.subTest(frm=frm):
+                self.item = self.admit(pr=20 + n)
+                self.at(frm)
+                with self.assertRaisesRegex(C.ContractError, "confirmed"):
+                    self.move("W26")
+                g, op = self.dispatched(pr=20 + n)
+                op = self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
+                self.assertEqual(self.gstate(g), "consumed", "G4 already consumed the grant at the confirm")
+                self.assertEqual(self.move("W26")["state"], "merged")
+                text = "integrated at %s by %s" % (TC.H1, op["key"])
+                self.assertEqual(self.notices("W26"), [("digest", "op:" + op["key"], text),
+                                                       ("ticket", "op:" + op["key"], text)],
+                                 "keyed by the op key: one ticket comment and one digest line")
+        self.item = self.admit(pr=40)                      # a closed-in-flight item also tells the owner (L7)
+        self.at("waiting-ask")
+        _g, op = self.dispatched(pr=40)
+        self.move("W24", mark="closed-in-flight", obs=self.pr(pr=40, pr_state="CLOSED"))
+        self.db.execute("UPDATE operations SET state='confirmed' WHERE key=?", (op["key"],))
+        self.move("W26")
+        self.assertIn("owner", [k for k, _e, _t in self.notices("W26")])
+        with self.assertRaisesRegex(C.ContractError, "W26"):               # merged is terminal: no second W26
+            self.move("W26")
+
+    def test_w06_back_to_merge_ready_only_from_waiting_dep_under_elig_rereading_core_and_policy(self):
+        self.pass_reviews()
+        with self.assertRaisesRegex(C.ContractError, "W6"):
+            self.move("W6", obs=self.eligible())                      # pr-gate is not W6's source
+        self.at("waiting-dep")
+        for bad in (dict(attached_core=TC.CORE2), dict(policy=dict(self.eligible()["policy"], revision="policy-r2")),
+                    dict(at=self.clock.t - C.Contracts.OBSERVATION_SECONDS), dict(boot="another-boot")):
+            with self.subTest(bad=bad), self.assertRaises(C.ContractError):
+                self.move("W6", obs=self.eligible(**bad))
+        self.assertEqual(self.wstate(), "waiting-dep")
+        item = self.move("W6", obs=self.eligible(), cause=None)
+        self.assertEqual((item["state"], item["elig_core"], item["elig_policy"]), ("merge-ready", TC.CORE1, TC.POLICY))
+
     # ---- observation rows (T2)
 
     def test_w04_head_moved_supersedes_with_a_successor_and_abandons_an_unsent_intent(self):
@@ -3936,15 +3993,15 @@ class StateMachineTests(TC.Base):
     # Retired by the spec (v2g16 lines 395 and 424): R17 moved to a follow-up ticket, G6 is covered by G5.
     RETIRED_ROWS = {"R17", "G6"}
 
-    # Spec test ids with no test of that name yet, pinned per entity; each step of slice 1 (a) shrinks these.
-    # Every id here is closed in slice 1 (a) unless PENDING_RUNTIME names it.
+    # Spec test ids with no test of that name yet, pinned per entity. Slice 1 (a) is capped here (main): the state
+    # ids, R2 to R19, E6 and E11 are closed by goodqa#16197, and each unwired W row by the commit that wires it.
+    # PENDING_RUNTIME names the ids whose runtime half slice 1 (b) also closes.
     PENDING = {
         "WorkItem": (
             "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask",
             "test_wi_exhausted", "test_wi_merged", "test_wi_headed_verified", "test_wi_handed",
-            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w06", "test_w07",
-            "test_w11", "test_w12", "test_w15", "test_w16", "test_w19", "test_w22", "test_w23", "test_w25",
-            "test_w26"),
+            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w07",
+            "test_w11", "test_w12", "test_w15", "test_w16", "test_w19", "test_w22", "test_w23"),
         "Review": (
             "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
             "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",

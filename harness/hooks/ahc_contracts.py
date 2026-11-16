@@ -620,6 +620,20 @@ class Contracts:
                             % (self._row("work_items", "id", item["id"])["cause"]))
         elif row_id == "W17":
             self._wi_notice(event_id, item, row_id, "ticket", "protected path; main integrates by hand")
+        elif row_id in ("W8", "W26"):
+            # keyed by the op key, not the event, so the integration is announced exactly once (W26: a restart
+            # cannot repeat it); recorded as integrated at H only, never at a successor's H'
+            key = [k for k, state, _v in self._item_effects(item) if state == "confirmed"][0]
+            text = "integrated at %s by %s" % (item["head"], key)
+            self._wi_notice("op:%s" % key, item, row_id, "ticket", text)
+            self._wi_notice("op:%s" % key, item, row_id, "digest", text)
+            if item["marks"] == "closed-in-flight":                                    # L7
+                self._wi_notice("op:%s" % key, item, row_id, "owner", "the closed PR's H %s was integrated; revert "
+                                "by a normal PR if unwanted" % item["head"])
+        elif row_id == "W25":
+            key, state, _v = [e for e in self._item_effects(item) if e[1] == "abandoned"][0]
+            self._wi_notice(event_id, item, row_id, "ticket", "%s ended %s; item %s" % (
+                key, state, self._row("work_items", "id", item["id"])["state"]))
         elif row_id == "W13":
             self._wi_notice(event_id, item, row_id, "ticket", "closed without integration at %s" % item["head"])
         elif row_id == "W14":
