@@ -82,6 +82,27 @@ V = [
         ("            if row_id not in self.WI_WIRED:\n", "            if False:\n")], CONTRACTS, SM),
     ("T7 precedence by table order instead of row number", [
         ("        return min(rows, key=lambda r: int(r[1:]))\n", "        return rows[0]\n")], CONTRACTS, SM),
+    ("T2: a WorkItem observation is not checked for age", [
+        ("        self._fresh(obs)\n        if str(obs.get(\"repo\", \"\")).lower() != item[\"repo\"]",
+         "        if str(obs.get(\"repo\", \"\")).lower() != item[\"repo\"]")], CONTRACTS, SM),
+    ("T2: an observation for another PR is accepted", [
+        ("        if str(obs.get(\"repo\", \"\")).lower() != item[\"repo\"] or obs.get(\"pr\") != item[\"pr\"]:\n",
+         "        if False:\n")], CONTRACTS, SM),
+    ("W18: the caller's 'explained' flag is trusted", [
+        ("        elif row_id == \"W18\" and not self.db.execute(\n",
+         "        elif row_id == \"W18\" and not obs.get(\"explained\") and not self.db.execute(\n")], CONTRACTS, SM),
+    ("W4: the old Review rows are left open", [
+        ("            self.supersede_reviews(item[\"repo\"], item[\"pr\"], new[\"head\"],\n",
+         "            (lambda *a: None)(item[\"repo\"], item[\"pr\"], new[\"head\"],\n")], CONTRACTS, SM),
+    ("W4: an unsent intent is not abandoned (E9)", [
+        ("                if state == \"intent\":                                # E9",
+         "                if False:                                # E9")], CONTRACTS, SM),
+    ("W14: taken even when this item's own Effect made the merge", [
+        ("            if row_id == \"W14\" and \"confirmed\" in effects:\n", "            if False:\n")],
+     CONTRACTS, SM),
+    ("W24: the mark is not checked against the observation", [
+        ("            if not fact:\n                raise ContractError(\"W24's observation",
+         "            if False:\n                raise ContractError(\"W24's observation")], CONTRACTS, SM),
     ("T7 precedence: G8 and G9 outrank the WorkItem rows", [
         ('    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")\n',
          '    T7_ORDER = ("G8", "G9", "W4", "W13", "W14", "W18", "W19", "W17")\n')], CONTRACTS, SM),

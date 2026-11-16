@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS work_items (
   CHECK (marks IN ('', 'head-moved', 'closed-in-flight')));
 CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_live_per_head ON work_items(repo, pr, head)
   WHERE state NOT IN ('headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled');
+CREATE TABLE IF NOT EXISTS wi_notices (
+  event_id TEXT NOT NULL, item TEXT NOT NULL, row_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+  created REAL NOT NULL, delivered REAL,
+  CHECK (kind IN ('incident', 'ticket', 'owner', 'digest')), PRIMARY KEY (event_id, kind));
 CREATE TABLE IF NOT EXISTS transitions (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, id TEXT NOT NULL, from_state TEXT,
   to_state TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL, at REAL NOT NULL, data TEXT);
@@ -283,7 +287,8 @@ class Contracts:
     GRANT_ROWS = ("G8", "G9")
     # Rows whose guard reads only ledger facts are applied here. Rows whose guard needs ELIG, an observation, a
     # budget or main's stamp are wired in later steps of slice 1 (a); until then they are refused (fail closed).
-    WI_WIRED = ("W3", "W8", "W9", "W10", "W20", "W24", "W25", "W26")
+    WI_WIRED = ("W3", "W4", "W8", "W9", "W10", "W13", "W14", "W18", "W20", "W24", "W25", "W26")
+    PR_STATES = ("OPEN", "CLOSED", "MERGED")
 
     @classmethod
     def select_row(cls, holding, unsettled):
@@ -351,7 +356,29 @@ class Contracts:
         """T7: the item has an Effect for its H in an unsettled state."""
         return any(state in self.T7_UNSETTLED for _k, state, _v in self._item_effects(item))
 
-    def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None):
+    def _wi_obs(self, item, obs, *fields):
+        """T2: a GitHub fact in a guard is a fresh observation row (under 2 min, never from the future) for this
+        item's repo and PR, carrying the named fields. A missing, stale, foreign or malformed one fails closed."""
+        self._fresh(obs)
+        if str(obs.get("repo", "")).lower() != item["repo"] or obs.get("pr") != item["pr"]:
+            raise ContractError("the observation is for another repo or PR")
+        for f in fields:
+            if f not in obs:
+                raise ContractError("the observation has no %s" % f)
+        if "pr_state" in fields and obs["pr_state"] not in self.PR_STATES:
+            raise ContractError("unknown PR state %r" % obs["pr_state"])
+        for f in ("pr_head", "tip"):
+            if f in fields and not _is_oid(obs[f]):
+                raise ContractError("the observation's %s is not a full sha" % f)
+        return obs
+
+    def _wi_notice(self, event_id, item, row_id, kind, text):
+        """An escalation written in the row's own transaction (T3); delivery is the outbox's job (H5, later)."""
+        self.db.execute("INSERT INTO wi_notices(event_id, item, row_id, kind, text, created) VALUES (?,?,?,?,?,?)",
+                        (event_id, item["id"], row_id, kind, text, self.now()))
+
+    def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None, obs=None,
+                successor_packet=None):
         """The one WorkItem transition function (T1 to T7). One BEGIN IMMEDIATE; the guard re-reads its ledger
         facts; the state change and one audit row commit together (T3). A replay of the same event for the same
         item and row is a no-op that returns the current row (T6), checked before the version so a post-crash replay
@@ -399,17 +426,78 @@ class Contracts:
                 raise ContractError("incident: %s would put an item with an unsettled Effect in %s" % (row_id, to))
             if row_id not in self.WI_WIRED:
                 raise ContractError("%s is not wired in this build of slice 1 (a); refused, fail closed" % row_id)
-            mark = self._wi_guard(item, row_id, to, mark, unsettled)
-            self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), version=version+1, "
-                            "updated=? WHERE id=?", (to, mark, cause, self.now(), iid))
-            self._a0("work_item", iid, frm, to, event_id, actor, row=row_id, cause=cause)
+            mark = self._wi_guard(item, row_id, to, mark, unsettled, obs)
+            base = obs["tip"] if row_id == "W18" else item["base"]
+            successor = None
+            if row_id == "W4" or (row_id == "W24" and mark == "head-moved" and not item["successor"]):
+                successor = self._wi_successor(item, obs["pr_head"], successor_packet, event_id)
+            self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), base=?, "
+                            "successor=COALESCE(?, successor), version=version+1, updated=? WHERE id=?",
+                            (to, mark, cause, base, successor, self.now(), iid))
+            self._wi_effects(item, row_id, event_id, obs)
+            self._a0("work_item", iid, frm, to, event_id, actor, row=row_id, cause=cause,
+                     obs=obs.get("id") if isinstance(obs, dict) else None)
             return self._row("work_items", "id", iid)
 
-    def _wi_guard(self, item, row_id, to, mark, unsettled):
-        """Ledger-fact guards of the wired rows, read inside the transaction (T1). Returns the item's marks after
-        the row."""
+    def _wi_successor(self, item, new_head, packet_sha256, event_id):
+        """W4 and W24: the successor item at H' (W1). It never inherits this item's grant, Effect or Review rows;
+        under W4 this item's open Review rows for H go to superseded or, while an attempt may run, cancelling."""
+        if not (isinstance(packet_sha256, str) and len(packet_sha256) == 64 and _is_oid(packet_sha256)):
+            raise ContractError("the successor at H' needs its own packet sha256")
+        succ = self.admit_item(item["repo"], item["pr"], new_head, item["base"], item["policy_revision"],
+                               item["spec_core"], packet_sha256, event_id=event_id + "-successor")
+        return succ["id"]
+
+    def _wi_effects(self, item, row_id, event_id, obs):
+        """The Effects column of the applied row, in the same transaction (T3)."""
+        if row_id == "W4":
+            new = self._row("work_items", "id", self._row("work_items", "id", item["id"])["successor"])
+            by_kind = {k: rid for k, rid in self.db.execute("SELECT kind, id FROM reviews WHERE item=?", (new["id"],))}
+            kinds = dict(self.db.execute("SELECT id, kind FROM reviews WHERE item=?", (item["id"],)).fetchall())
+            self.supersede_reviews(item["repo"], item["pr"], new["head"],
+                                   lambda rid: by_kind.get(kinds.get(rid)) or new["id"], event_id + "-r12")
+        if row_id in ("W4", "W13", "W14", "W18"):
+            for key, state, version in self._item_effects(item):
+                if state == "intent":                                # E9: an intent never sent is abandoned
+                    self.abandon_unsent(key, expected_version=version, event_id="%s-e9-%s" % (event_id, key),
+                                        reason="item left by %s" % row_id)
+        if row_id == "W13":
+            self._wi_notice(event_id, item, row_id, "ticket", "closed without integration at %s" % item["head"])
+        elif row_id == "W14":
+            self._wi_notice(event_id, item, row_id, "incident", "PR shows merged; no confirmed ahc Effect made it")
+        elif row_id == "W18" and not self.db.execute(
+                "SELECT 1 FROM operations WHERE repo=? AND state='confirmed' AND head=? AND base=?",
+                (item["repo"], obs["tip"], item["base"])).fetchone():
+            # L1, L2: a move no confirmed ahc Effect explains (read from the ledger, never from the caller)
+            kind = "digest" if obs.get("fast_forward") is True else "incident"
+            self._wi_notice(event_id, item, row_id, kind, "default branch moved %s -> %s" % (item["base"],
+                                                                                            obs["tip"]))
+
+    def _wi_guard(self, item, row_id, to, mark, unsettled, obs=None):
+        """Guards of the wired rows: ledger facts read inside the transaction (T1) and fresh observations (T2).
+        Returns the item's marks after the row."""
         effects = {state for _k, state, _v in self._item_effects(item)}
         marks = item["marks"]
+        if row_id in ("W4", "W13", "W14"):
+            o = self._wi_obs(item, obs, "pr_state", "pr_head")
+            want = {"W4": "OPEN", "W13": "CLOSED", "W14": "MERGED"}[row_id]
+            if o["pr_state"] != want:
+                raise ContractError("%s needs the PR %s, the readback says %s" % (row_id, want, o["pr_state"]))
+            if row_id == "W4" and o["pr_head"] == item["head"]:
+                raise ContractError("W4 needs the PR head moved away from H")
+            if row_id == "W14" and "confirmed" in effects:
+                raise ContractError("W14 is for a merge no confirmed ahc Effect made; this item's Effect did (W8)")
+        elif row_id == "W18":
+            o = self._wi_obs(item, obs, "tip", "fast_forward")
+            if o["tip"] == item["base"]:
+                raise ContractError("W18 needs the default branch moved from B")
+        elif row_id == "W24":
+            o = self._wi_obs(item, obs, "pr_state", "pr_head", "tip")
+            moved = o["pr_head"] != item["head"]
+            fact = {"head-moved": moved, "closed-in-flight": o["pr_state"] == "CLOSED",
+                    "": o["pr_state"] == "MERGED" or o["tip"] != item["base"]}.get(mark or "")
+            if not fact:
+                raise ContractError("W24's observation does not show what its mark %r claims" % (mark or ""))
         if row_id == "W3":
             findings = self.db.execute("SELECT 1 FROM reviews WHERE item=? AND head=? AND state='findings'",
                                        (item["id"], item["head"])).fetchone()
