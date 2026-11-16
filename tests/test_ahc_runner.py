@@ -3836,7 +3836,16 @@ class StateMachineTests(TC.Base):
         with self.assertRaisesRegex(C.ContractError, "e6"):
             self.move("W6", obs=self.eligible(kill_switch=True))
         self.assertEqual(self.move("W6", obs=self.eligible())["state"], "merge-ready")
-        self.assertEqual(self.move("W5", obs=self.eligible(mirror_ok=False))["state"], "waiting-dep")
+        ev = self.ev()
+        item = self.move("W5", obs=self.eligible(mirror_ok=False), event_id=ev)
+        self.assertEqual((item["state"], item["cause"]), ("waiting-dep", "mirror undeliverable"))
+        self.assertEqual(self.db.execute("SELECT text FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                         [("waiting on a dependency: mirror undeliverable",)])
+        # W6 needs the recorded cause cleared: ELIG alone does not show the mirror is deliverable again
+        for obs in (self.eligible(mirror_ok=False), self.eligible()):
+            with self.subTest(obs=obs.get("mirror_ok")), self.assertRaisesRegex(C.ContractError, "mirror"):
+                self.move("W6", obs=obs)
+        self.assertEqual(self.move("W6", obs=self.eligible(mirror_ok=True))["state"], "merge-ready")
 
     def test_w17_protected_path_goes_to_main(self):
         self.pass_reviews()
@@ -3865,6 +3874,8 @@ class StateMachineTests(TC.Base):
         new_spec = [r for r in rows if r != old_spec]
         self.assertEqual([rows[r] for r in new_spec], ["required"])
         self.assertEqual(self.c.elig(item, self.eligible(item)), ["e2"], "e2 fails until the new spec row passes")
+        with self.assertRaisesRegex(C.ContractError, "W27"):          # pr-gate is not W27's source: no re-fire
+            self.move("W27", obs=changed)
         self.db.execute("UPDATE reviews SET state='passed' WHERE id=?", (new_spec[0],))
         self.assertEqual(self.c.elig(item, self.eligible(item)), [])
         # the core attached now must be the item's own core: an older core's pass, still terminal, never counts

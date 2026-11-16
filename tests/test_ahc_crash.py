@@ -282,7 +282,7 @@ def scenario_contracts(root, clock):
             o = op()
             c.confirm(o["key"], c.stamp({"tip": head, "pr_merged": True}), expected_version=o["version"],
                       event_id="pr%d-e3" % pr)
-    # Slice 1 (a): one WorkItem through W1, W2, W5 and W6. Each move is retried with the expected version it had
+    # Slice 1 (a): one WorkItem through W1, W21, W2, W5 and W6. Each move is retried with the expected version it had
     # BEFORE it first ran, so after a crash past its COMMIT the retry carries a stale version and must land as the
     # T6 no-op; before the COMMIT it applies. admit_item is itself idempotent (NEG-11).
     item = c.admit_item("o/r", 7, H1, BASE, POLICY, "1" * 64, "d" * 64, event_id="wi-w1")
@@ -293,7 +293,11 @@ def scenario_contracts(root, clock):
            "policy": {"revision": POLICY, "readable": True, "allowlisted": True, "enabled": True,
                       "checks_green": True},
            "kill_switch": False, "chk_cas": True, "canary_age": 60}
-    for version, row, extra in ((1, "W2", {}), (2, "W5", {"kill_switch": True}), (3, "W6", {})):
+    # W21 first: the one WorkItem row that writes the authority log (seam contracts.authority) before its COMMIT.
+    # A crash between the two must leave one log line and, on the retry, one recorded update.
+    behind = dict(obs, compare="behind")
+    w21 = dict(obs, queue={item["id"]: behind}, mergeable=True)
+    for version, row, extra in ((1, "W21", w21), (2, "W2", {}), (3, "W5", {"kill_switch": True}), (4, "W6", {})):
         c.wi_move(item["id"], row, expected_version=version, event_id="wi-%s" % row.lower(), actor="ahc-core",
                   obs=dict(obs, **extra))
     led.close()
