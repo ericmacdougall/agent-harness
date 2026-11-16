@@ -134,8 +134,8 @@ ENTRIES.update({
     "AC-10 restart keeps the anchor": {
         "tests": [CC + "test_crash_loop_every_5_min_for_1_h_keeps_elapsed"],
         "mutations": [("a restart resets every anchor", [
-            ("        self.boot_id = boot_id if boot_id is not None else (read_boot_id() or process_boot_id())\n",
-             "        self.boot_id = boot_id if boot_id is not None else (read_boot_id() or process_boot_id())\n"
+            ("                process_boot_id()\n        self.boot_id = boot_id\n",
+             "                process_boot_id()\n        self.boot_id = boot_id\n"
              "        db.execute('UPDATE timers SET anchor=?', (float(self._boot()),))\n")], CLOCK)]},
     "AC-10 re-anchor commits on a refusal": {
         "tests": [CC + "test_new_boot_mid_wait_restarts_the_full_wait"],
@@ -372,6 +372,85 @@ ENTRIES.update({
 })
 
 
+OBSERVE = "harness/hooks/ahc_observe.py"
+OP = "tests.test_ahc_observe.ProducerTests."
+OC = "tests.test_ahc_observe.ChecksEvidenceTests."
+ENTRIES.update({
+    "AC-1/NEG-2 PR identity": {
+        "tests": [OP + "test_neg2_another_repo_number_or_short_head_is_refused"],
+        "mutations": [("another repo's PR is accepted", [
+            ('        if str(base_repo or "").lower() != repo or p.get("number") != pr:\n',
+             '        if p.get("number") != pr:\n')], OBSERVE),
+                      ("a short head is accepted", [
+            ('        if not (isinstance(head, str) and SHA.fullmatch(head)):\n            raise ObservationRefused("the PR head',
+             '        if not isinstance(head, str):\n            raise ObservationRefused("the PR head')], OBSERVE)]},
+    "AC-1/NEG-3 count check": {
+        "tests": [OP + "test_neg3_a_changed_files_count_that_disagrees_fails_closed"],
+        "mutations": [("the changed_files count check is dropped", [
+            ("        if type(changed) is not int or changed != count:\n", "        if False:\n")], OBSERVE)]},
+    "AC-1/NEG-3 local paths and messages": {
+        "tests": [OP + "test_neg3_local_git_sees_the_3001st_file_and_the_251st_commit"],
+        "mutations": [("commit messages are not read", [
+            ("any(foreign_closing_keyword(t, repo) for t in messages + [body])",
+             "any(foreign_closing_keyword(t, repo) for t in [body])")], OBSERVE)]},
+    "AC-1/NEG-33 M..H not B..H": {
+        "tests": [OP + "test_neg33_divergent_history_counts_only_the_prs_own_changes",
+                  OP + "test_ac1_fields_come_from_their_named_sources"],
+        "mutations": [("paths are read over B..H", [
+            ('"--find-renames", "-z", merge_base, head]', '"--find-renames", "-z", tip, head]')], OBSERVE)]},
+    "AC-1/NEG-4 head re-read": {
+        "tests": [OP + "test_neg4_head_moves_timeout_byte_cap_and_rate_limit_refuse"],
+        "mutations": [("the end-of-session head re-read is not compared", [
+            ("        if head2 != head:\n", "        if False:\n")], OBSERVE),
+                      ("the byte cap is not checked", [
+            ('        if len(out.encode("utf-8", "replace")) > ahc_guard.READ_TEMPLATES[name]["max_bytes"]:\n',
+             "        if False:\n")], OBSERVE),
+                      ("a rate limit does not back off", [
+            ("        if self._backing_off(repo):\n", "        if False:\n")], OBSERVE)]},
+    "AC-1 budget and deadline": {
+        "tests": [OP + "test_ac1_the_call_budget_and_deadline_fail_closed"],
+        "mutations": [("the call budget is not enforced", [
+            ("        if s[\"calls\"] >= CALL_BUDGET or self.tick_left <= 0:\n", "        if False:\n")], OBSERVE)]},
+    "AC-1/NEG-34 body on every read": {
+        "tests": [OP + "test_neg34_body_keyword_body_edit_and_bad_body_read"],
+        "mutations": [("the body is not checked for a closing keyword", [
+            ("any(foreign_closing_keyword(t, repo) for t in messages + [body])",
+             "any(foreign_closing_keyword(t, repo) for t in messages)")], OBSERVE),
+                      ("a missing body passes", [
+            ('        if "body" not in p:\n', "        if False:\n")], OBSERVE)]},
+    "AC-1 persisted by id": {
+        "tests": [OP + "test_ac1_each_read_gets_its_own_id_and_guards_load_it_by_id"],
+        "mutations": [("the loaded observation is not checked against its digest", [
+            ('        if _sha(fields) != row["digest"]:\n            raise ContractError("observation %s does not match',
+             '        if False:\n            raise ContractError("observation %s does not match')], CONTRACTS)]},
+    "AC-2/NEG-6 reruns": {
+        "tests": [OC + "test_neg6_failed_then_passed_rerun_is_false"],
+        "mutations": [("only the latest attempt counts", [("        for r in mine:\n", "        for r in mine[-1:]:\n")],
+                       OBSERVE)]},
+    "AC-2/NEG-6 duplicate and app": {
+        "tests": [OC + "test_neg6_duplicate_context_and_spoofed_app_are_false"],
+        "mutations": [("a context also posted as a status is accepted", [
+            ("        if ctx in status_contexts:\n", "        if False:\n")], OBSERVE),
+                      ("another app's run is accepted", [("            if slug != app:\n", "            if False:\n")],
+                       OBSERVE)]},
+    "AC-2/NEG-6 missing page": {
+        "tests": [OC + "test_neg6_a_missing_page_is_false_or_refused"],
+        "mutations": [("the total_count check is dropped", [
+            ("    if type(total) is not int or total != len(runs):\n", "    if False:\n")], OBSERVE),
+                      ("a gap in the Link chain is accepted", [
+            ("        if not last and nxt != idx + 2:\n", "        if False:\n")], OBSERVE)]},
+    "AC-2/NEG-6 binding": {
+        "tests": [OC + "test_neg6_stale_b_another_head_or_revision_is_false",
+                  OC + "test_neg6_injected_true_without_bound_evidence_is_false"],
+        "mutations": [("the binding is not compared", [
+            ('    return evidence.get("binding") == want\n', "    return True\n")], OBSERVE)]},
+    "AC-2/NEG-6 ahc-local": {
+        "tests": [OC + "test_neg6_ahc_local_checks_are_false_in_this_slice"],
+        "mutations": [("ahc-local requirements are ignored", [
+            ('    if req.get("ahc_local"):\n', "    if False:\n")], OBSERVE)]},
+})
+
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:
@@ -509,14 +588,20 @@ def main(argv):
         problems = self_test()
         print("SELF-TEST %s%s" % ("OK" if not problems else "FAILED: ", "; ".join(problems)))
         return 1 if problems else 0
-    only = None
-    if "--only" in argv:
-        only = argv[argv.index("--only") + 1]
-        argv = [a for a in argv if a not in ("--only", only)]
+    only, rest = [], []                 # --only KEY may repeat; a KEY ending in * selects by prefix
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--only" and i + 1 < len(argv):
+            only.append(argv[i + 1])
+            i += 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    argv = rest
     out_path = argv[0] if argv else os.path.join(ROOT, ".ahc-local", "variants_slice1b.out")
     reports = []
     for key, entry in ENTRIES.items():
-        if only and key != only:
+        if only and not any(key == o or (o.endswith("*") and key.startswith(o[:-1])) for o in only):
             continue
         reports.append(evaluate(ROOT, key, entry))
     lines = []

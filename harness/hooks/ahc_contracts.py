@@ -2097,3 +2097,42 @@ class Contracts:
             for k in keys:
                 self.db.execute("UPDATE operations SET tombstone=1, params=NULL, evidence=NULL WHERE key=?", (k,))
             return len(keys)
+
+    # -------------------------------------------------------------- observations (slice 1 (b) AC-1)
+
+    OBSERVATION_ROW_CAP = 200_000      # AC-1: past this many rows a size incident is raised (ASSUMPTION: the cap)
+
+    def first_read_stamp(self):
+        """AC-1: the stamp an observation takes at its first read: (boot id, boot-clock reading, sequence). The
+        sequence is a committed counter, so the triple is unique per read, across restarts and processes."""
+        with self.tx():
+            self.db.execute("INSERT INTO contract_meta(k, v) VALUES ('obs_seq', '1') ON CONFLICT(k) DO UPDATE SET "
+                            "v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)")
+            seq = int(self.db.execute("SELECT v FROM contract_meta WHERE k='obs_seq'").fetchone()[0])
+        stamped = self.stamp({})
+        return {"boot": stamped["boot"], "mono": stamped["mono"], "seq": seq, "at": stamped["at"],
+                "id": "obs:%s:%r:%d" % (stamped["boot"], stamped["mono"], seq)}
+
+    def record_observation(self, stamp, repo, pr, item, source, refs, fields):
+        """AC-1: append one observation row (never updated). `fields` are the facts the guards read; the row keeps
+        the sources, the shas or ETags read and a digest of the fields. Returns the row count, which the caller
+        compares with OBSERVATION_ROW_CAP."""
+        with self.tx():
+            self.db.execute("INSERT INTO observations(id, boot, mono, seq, at, repo, pr, item, source, refs, digest, "
+                            "fields) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (stamp["id"], stamp["boot"], stamp["mono"], stamp["seq"], stamp["at"],
+                             str(repo).lower(), int(pr), item, _canon(source), _canon(refs), _sha(fields),
+                             _canon(fields)))
+            return self.db.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+
+    def load_observation(self, oid):
+        """AC-1: a guard loads its observation by id: the stored fields plus the first-read stamp. A row whose
+        fields no longer match its digest fails closed."""
+        row = self._row("observations", "id", oid)
+        if row is None:
+            raise ContractError("no observation %s" % oid)
+        fields = json.loads(row["fields"])
+        if _sha(fields) != row["digest"]:
+            raise ContractError("observation %s does not match its digest" % oid)
+        return dict(fields, id=row["id"], at=row["at"], mono=row["mono"], boot=row["boot"],
+                    repo=row["repo"], pr=row["pr"])
