@@ -1,0 +1,13 @@
+docs(fx16136): keep the goodqa#16184 ticket body
+
+Why: the docker run -e exposure follow-up (filed as goodqa#16184 from the #16148 spec risk) should have its filed text next to the spec it came from.
+
+What: .fx16136/ticket-docker-env-exposure.md and this message file.
+
+Testing: not run: ticket text only.
+
+Refs: GoodQA #16184
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
