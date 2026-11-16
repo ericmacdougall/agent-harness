@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -53,6 +54,9 @@ _EPOCH = re.compile(r"\b1[0-9]{9}(?:\.[0-9]+)?\b|\b1[0-9]{18}\b")
 
 
 _PHASE = re.compile(r'"phase": "[a-z]+"')
+# a restore's staged copy of the ledger, named by ahc_fs.temp_name: `.ledger.sqlite3.<16 random hex>.tmp`
+STAGED_TEMP = re.compile(r"^\.ledger\.sqlite3\.[0-9a-f]{16}\.tmp$")
+STAGED_KEY = ".ledger.sqlite3.H.tmp"
 
 
 def live_db(root):
@@ -135,12 +139,15 @@ def state(root, *, normalize_times=False, skip_backups=False):
             continue
         if skip_backups and (".bak" in rel or ".failed-" in rel):
             continue
-        name = re.sub(r"\d{9,}", "N", rel)
-        staged = re.search(r"\.ledger\.sqlite3\.[0-9a-f]{16}\.tmp$", path.name)
+        staged = STAGED_TEMP.match(path.name)
         if staged:
             # a restore's staged copy (PR 258 v4): its name is random by design, and opening it with SQLite here
-            # would create -wal/-shm files beside it that outlive its rename, so it is compared by bytes only
-            name = re.sub(r"\.[0-9a-f]{16}\.tmp$", ".H.tmp", name)
+            # would create -wal/-shm files beside it that outlive its rename, so it is compared by bytes only. The
+            # random part is replaced BEFORE the digit normalization below: a hex name holding a run of 9 or more
+            # decimal characters (about 5% of names) was otherwise cut by it first and kept a random key (the PR
+            # 258 v5 load flake at restore_copy:after@1 and restore_move:before@1).
+            rel = str(path.parent.relative_to(root) / STAGED_KEY)
+        name = re.sub(r"\d{9,}", "N", rel)
         if not staged and _is_sqlite(path):
             content = _db_dump(path)
         else:
@@ -546,6 +553,57 @@ class RestoreIntentTests(unittest.TestCase):
         finally:
             led.close()
         self.assertFalse(self.intent.exists())
+
+
+class StateDigestTests(unittest.TestCase):
+    """state() names a restore's staged copy by a fixed key whatever its random name (PR 258 v5 load flake: 64 of
+    640 checks failed at restore_copy:after@1 and restore_move:before@1 on t2-dev, every one a temp name holding a
+    run of 9 or more decimal characters)."""
+
+    def scenario_dir(self, temp_name):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ahc = core.Paths(root).root
+        ahc.mkdir(parents=True, mode=0o700)
+        (ahc / temp_name).write_bytes(b"the staged copy's bytes")
+        (ahc / "ledger.sqlite3.pre-v4.1800000000123000000.bak").write_bytes(b"not sqlite")
+        return root
+
+    def test_a_staged_copy_has_one_key_whatever_its_random_name(self):
+        plain = self.scenario_dir(".ledger.sqlite3.0123abcdef456789.tmp")
+        for name in ("ab123456789cdef0", "6722194634013886", "fedcba9876543210", "3957310579c5d1bc"):
+            with self.subTest(name=name):
+                other = self.scenario_dir(".ledger.sqlite3.%s.tmp" % name)
+                self.assertEqual(state(other), state(plain))
+                self.assertIn(str(Path(".agent-harness") / "ahc" / STAGED_KEY), state(other))
+
+    def test_random_names_never_change_the_digest(self):
+        """Seeded (16049): 2,000 names from the same alphabet as secrets.token_hex(8). About 5% hold a 9-digit
+        run, so the old normalization fails this within the first few dozen."""
+        rng = random.Random(16049)
+        want = digest(self.scenario_dir(".ledger.sqlite3.0123abcdef456789.tmp"))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        ahc = core.Paths(root).root
+        ahc.mkdir(parents=True, mode=0o700)
+        (ahc / "ledger.sqlite3.pre-v4.1800000000123000000.bak").write_bytes(b"not sqlite")
+        current = None
+        for _ in range(2000):
+            name = ".ledger.sqlite3.%s.tmp" % "".join(rng.choice("0123456789abcdef") for _ in range(16))
+            if current is not None:
+                current.unlink()
+            current = ahc / name
+            current.write_bytes(b"the staged copy's bytes")
+            self.assertEqual(digest(root), want, name)
+
+    def test_other_names_still_fold_their_time_digits(self):
+        a = self.scenario_dir(".ledger.sqlite3.0123abcdef456789.tmp")
+        b = self.scenario_dir(".ledger.sqlite3.0123abcdef456789.tmp")
+        os.rename(str(core.Paths(b).root / "ledger.sqlite3.pre-v4.1800000000123000000.bak"),
+                  str(core.Paths(b).root / "ledger.sqlite3.pre-v4.1800000000999000000.bak"))
+        self.assertEqual(state(a), state(b))
 
 
 class InventoryTests(unittest.TestCase):
