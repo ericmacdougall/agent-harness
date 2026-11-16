@@ -477,10 +477,15 @@ for _backup in ("present", "missing", "partial"):
         FINAL[_name] = "migrated" if _backup == "present" or _live == "present" else "refused"
 
 
+def unset(kept):
+    """Whether the crash came inside the scenario's own setup, before its before-migration row committed (in the
+    rows committed at the crash, `kept`). Only then may the restart's own row (phase "resume") stand in for it."""
+    return not any(row[0] == "events" and row[2] == "before-migration" for row in kept)
+
+
 def final_problems(root, expect, crashed=False):
-    """Why a run's final files are not what FINAL says, or []. After a crash inside the scenario's own setup,
-    before its before-migration row committed, the restart writes that row itself (phase "resume"); losing a row
-    that HAD committed is caught separately (committed_events)."""
+    """Why a run's final files are not what FINAL says, or []. crashed=True only when unset() says the original
+    before-migration row never committed: then the restart writes that row itself (phase "resume")."""
     live, intent = live_db(root), Path(str(live_db(root)) + ".restore-intent")
     if expect == "refused":
         out = [] if intent.exists() else ["the restore intent was dropped"]
@@ -610,9 +615,9 @@ class CrashPointTests(unittest.TestCase):
                             len(kept - committed_events(root)), len(kept))
                     elif state(root, normalize_times=True, skip_backups=True) != final:
                         outcome = "restart diverged from the uncrashed run"
-                    elif scenario in FINAL and final_problems(root, FINAL[scenario], crashed=True):
+                    elif scenario in FINAL and final_problems(root, FINAL[scenario], crashed=unset(kept)):
                         outcome = "restart did not reach %s: %s" % (
-                            FINAL[scenario], final_problems(root, FINAL[scenario], crashed=True))
+                            FINAL[scenario], final_problems(root, FINAL[scenario], crashed=unset(kept)))
                     elif invariants(root):
                         outcome = "invariants after restart: %s" % invariants(root)
                     elif cap_used(root) < cap_at_crash:
@@ -934,17 +939,71 @@ class RestoreIntentTests(unittest.TestCase):
         self.assert_refused(because="the live database is absent")
         self.assert_refused(because="the live database is absent")
 
-    def test_a_record_without_a_sha256_or_with_a_bad_one_refuses(self):
-        self.record(sha256=None)
-        self.assert_refused(because="unreadable")
-        for bad in ("A" * 64, "0" * 63, "0" * 64 + "\n", 7):
-            self.record(sha256=bad)
+    def test_a_record_with_a_bad_sha256_refuses(self):
+        for bad in ("A" * 64, "0" * 63, "0" * 64 + "\n", 7, None, ""):        # None is an explicit JSON null
+            self.intent.write_text(json.dumps({"backup": "ledger.sqlite3.pre-v4.1.bak", "suffix": ".failed-1",
+                                               "sha256": bad}))
             self.assert_refused(because="does not name a backup beside the ledger")
 
     def test_a_suffix_that_is_not_exactly_failed_digits_refuses(self):
-        for bad in (".failed-1\n", ".failed-", "failed-1", ".failed-1/x", ".failed-1-wal"):
+        for bad in (".failed-1\n", ".failed-", "failed-1", ".failed-1/x", ".failed-1-wal", ".failed-١"):
             self.record(suffix=bad)
             self.assert_refused(because="does not name a backup beside the ledger")
+
+    # --- an intent written before PR 258 v5 has no sha256 (the base branch writes {"backup", "suffix"} only)
+    def undigested(self):
+        """A v1-era ledger with a proven backup and an intent from an earlier ahc. Returns (live, backup)."""
+        led = runner.Ledger(self.paths)
+        with led.tx():
+            led.event("i1", "kept", T0)
+        copy = led.backup("pre-v4")
+        led.close()
+        self.record(backup=copy.name, sha256=None)                  # record() drops a None field: no "sha256" key
+        self.assertNotIn("sha256", json.loads(self.intent.read_text()))
+        return self.paths.root / "ledger.sqlite3", copy
+
+    def test_an_undigested_record_keeps_a_live_ledger_that_was_never_moved(self):
+        live, copy = self.undigested()
+        os.truncate(str(copy), 4096)                                # even a partial backup is never published
+        with self.assertLogs("ahc", "WARNING") as logs:
+            runner.Ledger(self.paths).close()
+        self.assertTrue(any("has no sha256" in line for line in logs.output), logs.output)
+        self.assertFalse(self.intent.exists())
+        led = runner.Ledger(self.paths)
+        try:
+            self.assertEqual(led.db.execute("SELECT event FROM events").fetchall()[0][0], "kept")
+        finally:
+            led.close()
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "the live ledger was moved")
+
+    def test_an_undigested_record_whose_backup_was_published_drops_the_intent(self):
+        live, copy = self.undigested()
+        os.rename(str(live), str(live) + ".failed-1")               # the earlier ahc moved it aside, then published
+        for extra in ("-wal", "-shm"):
+            if os.path.lexists(str(live) + extra):
+                os.rename(str(live) + extra, str(live) + ".failed-1" + extra)
+        live.write_bytes(copy.read_bytes())
+        os.chmod(str(live), 0o600)
+        kept = Path(str(live) + ".failed-1").read_bytes()
+        runner.Ledger(self.paths).close()
+        self.assertFalse(self.intent.exists())
+        self.assertEqual(Path(str(live) + ".failed-1").read_bytes(), kept, "moved aside again")
+
+    def test_an_undigested_record_with_the_ledger_moved_or_absent_refuses(self):
+        live, copy = self.undigested()
+        for extra in ("", "-wal", "-shm"):
+            if os.path.lexists(str(live) + extra):
+                os.rename(str(live) + extra, str(live) + ".failed-1" + extra)
+        for _ in range(2):
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+            self.assertIn("has no sha256", str(caught.exception))
+        self.assertFalse(live.exists(), "the unverifiable backup was published or an empty ledger created")
+        self.assertTrue(self.intent.exists())
+        live.write_bytes(b"SQLite format 3\x00 but not the backup")    # a foreign file, the original moved aside
+        with self.assertRaises(runner.SchemaError):
+            runner.Ledger(self.paths)
+        self.assertTrue(self.intent.exists())
 
     def test_a_non_migrating_process_never_completes_a_restore(self):
         self.record(backup="x.bak")

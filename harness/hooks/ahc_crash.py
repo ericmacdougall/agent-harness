@@ -306,6 +306,8 @@ INVENTORY = {
     ("ahc_runner", "Ledger._abandon_restore", "fs.unlink"): (1, "seam:runner.restore_abandon"),
     ("ahc_runner", "Ledger._finish_restore", "fs.remove_temps"): (
         1, "exempt:removes only an unpublished temp copy of the ledger left by an interrupted restore"),
+    ("ahc_runner", "Ledger._resume_undigested", "fs.remove_temps"): (
+        1, "exempt:removes only an unpublished temp copy of the ledger left by an interrupted restore"),
     ("ahc_runner", "_Tx.__exit__", "sql:COMMIT"): (1, "seam:runner.commit"),
     ("ahc_runner", "_migrate_v2", "sql:ALTER"): (1, _MIG),
     ("ahc_runner", "_migrate_v2", "sql:UPDATE"): (1, _MIG),

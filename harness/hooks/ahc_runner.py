@@ -409,6 +409,9 @@ class SchemaError(RuntimeError):
     """The ledger's schema is unknown or newer than this code; the daemon must not start."""
 
 
+_NO_DIGEST = object()   # an interrupted-restore record with no "sha256" key: written by an ahc before PR 258 v5
+
+
 class RestoreAbandoned(SchemaError):
     """A restore could not copy its verified backup (gone, partial, changed or unreadable) while the live database
     had never been moved: the intent is dropped and the live database is left in place, unchanged (PR 258 v5 F1)."""
@@ -720,22 +723,55 @@ class Ledger:
             return
         try:
             record = json.loads(intent.read_text())
-            name, suffix, sha256 = record["backup"], record["suffix"], record["sha256"]
-        except (OSError, ValueError, KeyError, TypeError) as error:
+            name, suffix = record["backup"], record["suffix"]
+            sha256 = record.get("sha256", _NO_DIGEST)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
             raise SchemaError("unreadable interrupted-restore record %s (%s); refusing to open the ledger"
                               % (intent.name, type(error).__name__))
-        plain = isinstance(name, str) and isinstance(suffix, str) and isinstance(sha256, str) and \
+        plain = isinstance(name, str) and isinstance(suffix, str) and \
             name not in (".", "..") and re.fullmatch(r"[A-Za-z0-9._-]+", name) and \
-            re.fullmatch(r"\.failed-\d+", suffix) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+            re.fullmatch(r"\.failed-[0-9]+", suffix) and \
+            (sha256 is _NO_DIGEST or isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256))
         if not plain:
             raise SchemaError("interrupted-restore record %s does not name a backup beside the ledger, a .failed-<n> "
                               "suffix and a sha256; refusing to open" % intent.name)
         log = logging.getLogger("ahc")
+        if sha256 is _NO_DIGEST:
+            self._resume_undigested(name, suffix, log)
+            return
         log.warning("completing an interrupted ledger restore from %s", name)
         try:
             self._finish_restore(self.path.with_name(name), suffix, sha256)
         except RestoreAbandoned as abandoned:
             log.warning("abandoned the interrupted ledger restore: %s; opening that database", abandoned)
+
+    def _resume_undigested(self, name, suffix, log):
+        """An intent with no sha256, as an ahc before PR 258 v5 wrote it (that ahc moved the live files aside
+        before copying). The backup's bytes cannot be checked, so they are never published here:
+          * the live ledger is in place and was never moved aside under the suffix: it is kept. The intent is
+            dropped and the start goes on; a failed migration is retried with a fresh, digested backup;
+          * the live file is byte-identical to the backup (that ahc published it and died before dropping the
+            intent): the intent is dropped, nothing is moved again;
+          * otherwise (moved and not published, or absent): refuse with the intent kept, for an operator."""
+        fs.remove_temps(self.paths.root, self.path)
+        backup = self.path.with_name(name)
+        if os.path.lexists(str(self.path)) and not os.path.lexists(str(self.path) + suffix):
+            self._abandon_restore()
+            log.warning("abandoned the interrupted ledger restore: its record (from an earlier ahc) has no sha256 "
+                        "for %s, and the live database was never moved; opening that database", name)
+            return
+        if os.path.lexists(str(self.path)):
+            try:
+                published = fs.digest_file(self.paths.root, backup, RESTORE_MAX_BYTES)
+            except OSError:
+                published = None
+            if published is not None and self._is_backup_copy(self.path, published):
+                self._drop_intent()
+                log.warning("completed the interrupted ledger restore from %s: it had been published", name)
+                return
+        raise SchemaError("interrupted-restore record %s (from an earlier ahc) has no sha256, so %s cannot be "
+                          "verified, and the live database was already moved aside or is absent; refusing to open "
+                          "(the restore intent is kept for an operator)" % (self._intent_path().name, name))
 
     def close(self):
         self.db.close()

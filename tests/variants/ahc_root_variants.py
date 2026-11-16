@@ -230,6 +230,15 @@ V = [
          "            raise\n")], RUNNER),
     ("v5 resume: a record with a control character in the backup name is accepted", [
         ("re.fullmatch(r\"[A-Za-z0-9._-]+\", name)", "\"/\" not in name")], RUNNER),
+    ("v5 resume: a suffix of non-ASCII digits is accepted", [
+        ("re.fullmatch(r\"\\.failed-[0-9]+\", suffix)", "re.fullmatch(r\"\\.failed-\\d+\", suffix)")], RUNNER),
+    ("v5 resume: an undigested record (an earlier ahc's) trusts the backup's current bytes", [
+        ("            self._resume_undigested(name, suffix, log)\n            return\n",
+         "            sha256 = fs.digest_file(self.paths.root, self.path.with_name(name), RESTORE_MAX_BYTES)\n")],
+     RUNNER),
+    ("v5 resume: an undigested record strands a live ledger that was never moved", [
+        ("        if os.path.lexists(str(self.path)) and not os.path.lexists(str(self.path) + suffix):\n",
+         "        if False:\n")], RUNNER),
 ]
 
 CAUGHT, SURVIVED, TIMED_OUT, BROKEN = "caught", "survived", "timed out", "broken"
