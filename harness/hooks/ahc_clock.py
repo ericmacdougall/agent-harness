@@ -36,6 +36,7 @@ TIMERS = {
     "E13": WAIT,                  # E13's first read gap and second read gap
     "B55": WAIT,                  # dispatch to unknown
     "B37": WAIT,                  # the next readback probe
+    "GH_BACKOFF": WAIT,           # AC-1: a gh 403/429 backs the producer off before it reads again
     "B48": RETENTION,             # tombstoning after settlement
 }
 
