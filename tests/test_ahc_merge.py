@@ -85,7 +85,7 @@ class FakeGitHub(M.Transport):
     None (normal), "lose" (applied, response lost), "drop" (not applied, no response), "untyped" (not applied, an
     untyped error), "typed" (not applied, a typed non-fast-forward refusal), "p3" (connection failed before any byte),
     "hang" (blocks until `release` is set, then applies), "delay" (not applied now, no response; `deliver()` applies
-    it later as GitHub would, only if the ref is still at beforeOid). `w21_script` does the same for update-branch.
+    it later as GitHub would, only if the ref is still at beforeOid).
     `on_send()` is called at every write request; its value is stored on the request (the ledger state at send)."""
 
     def __init__(self, path=None):
@@ -96,7 +96,6 @@ class FakeGitHub(M.Transport):
         self.activity = []
         self.requests = []
         self.script = []
-        self.w21_script = []
         self.pending = []
         self.runs = 0
         self.runs_on_canary = False
@@ -201,23 +200,18 @@ class FakeGitHub(M.Transport):
         return out
 
     def update_branch(self, repo, pr, expected_head_sha, timeout):
-        req = {"kind": "update-branch", "repo": repo, "pr": pr, "expected_head_sha": expected_head_sha,
-               "ledger": self.on_send() if self.on_send else None}
-        self.requests.append(req)
-        fault = self.w21_script.pop(0) if self.w21_script else None
-        if fault == "drop":
-            return M.SendResult(M.NO_RESPONSE, "timeout")
-        p = self.prs[pr]
-        if expected_head_sha is None or p["head"] != expected_head_sha:
-            return M.SendResult(M.P1, "expected head sha didn't match current head ref", kind="expected-head")
-        if p.get("conflict"):
-            return M.SendResult(M.UNTYPED, "merge conflict")
-        self._n += 1
-        new = self.commit("w21-%d" % self._n, p["head"], self.refs[MAIN])
-        p["head"] = new
-        if fault == "lose":
-            return M.SendResult(M.NO_RESPONSE, "timeout")
+        """A tripwire: ahc_merge never writes a PR branch (W21 is the daemon's, owner ruling). Recorded, not applied."""
+        self.requests.append({"kind": "update-branch", "repo": repo, "pr": pr})
         return M.SendResult(M.OK, "accepted")
+
+    def push_git(self, *a, **kw):
+        """A tripwire for a plain `git push` fallback (NEG-19): recorded, never applied."""
+        self.requests.append({"kind": "git-push"})
+        return M.SendResult(M.OK, "pushed")
+
+    def writes(self):
+        """Every write request of any kind (for NEG-17 / NEG-19: only updateRefs ever appears)."""
+        return [r for r in self.requests if r["kind"] != "updateRefs"]
 
     # ---- reads
     def read_ref(self, repo, ref):
@@ -259,7 +253,7 @@ class FakeGitHub(M.Transport):
         return [r for r in self.requests if r["kind"] == kind]
 
     # ---- persistence (child-process tests)
-    STATE = ("commits", "refs", "prs", "activity", "requests", "script", "w21_script", "pending", "runs", "_n",
+    STATE = ("commits", "refs", "prs", "activity", "requests", "script", "pending", "runs", "_n",
              "mark_merged", "act_complete")
 
     def save(self):
@@ -301,8 +295,6 @@ class Persisted(M.Transport):
     def update_refs(self, *a, **kw):
         return self.__getattr__("update_refs")(*a, **kw)
 
-    def update_branch(self, *a, **kw):
-        return self.__getattr__("update_branch")(*a, **kw)
 
 
 # ---------------------------------------------------------------- the scenario
@@ -343,7 +335,7 @@ class World:
     def sender(self, **kw):
         kw.setdefault("send_deadline", 2.0)
         return M.Sender(self.port, self.gh, self.lock(), self.kill, self.identity, self.canary, allowlist={REPO},
-                        checks=lambda row: self.green, branches={REPO: "main"}, **kw)
+                        checks=lambda row: self.green, **kw)
 
     def obs(self, item=None, **changes):
         """A fresh ELIG observation for the WorkItem rows (what core's producer would record)."""
@@ -451,7 +443,7 @@ def run_child(root, phase, key, seam=None, count=None, extra=(), timeout=60):
 
 def _child_main(argv):
     """A child `ahc-merge` process over a file-backed world. Phases: dispatch (E2 once), resume (a restart: E2 is
-    tried again and must not send, then readbacks until the op settles or is held), canary, kill, w21."""
+    tried again and must not send, then readbacks until the op settles or is held), canary, kill."""
     root, phase, key = Path(argv[0]), argv[1], argv[2]
     w = World(root, files=True)
     w.identity.check(w.gh, {REPO})
@@ -469,8 +461,6 @@ def _child_main(argv):
         out = M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill).run(REPO, "main")
     elif phase == "kill":
         out = M.Fence(w.port, w.lock(), w.kill, None, bound=1.0).kill_switch()
-    elif phase == "w21":
-        out = w.sender().update_branch(key)
     else:
         raise SystemExit("unknown phase")
     sys.stdout.write(json.dumps(out, default=str) + "\n")
@@ -682,6 +672,149 @@ class EffectTests(Base):
                     self.assertEqual(row["state"], "held", "no request went out: held after 20 readbacks, a "
                                      "person decides (never retried)")
                     self.assertEqual(w.grant(key)["state"], "reserved")
+
+
+    def test_03_head_moved_before_dispatch_sends_nothing_then_w4(self):
+        w = self.w
+        key = self.ready()
+        w.gh.prs[PR]["head"] = oid("H2")                         # the author pushed H' after the last observation
+        out = w.sender().dispatch(key)
+        self.assertEqual((out["state"], out["sent"]), ("refused", False), "the E2 guard re-reads the PR head")
+        self.assertEqual(w.gh.requests, [], "nothing is sent")
+        self.assertEqual(w.op(key)["state"], "intent")
+        item = w.move("W4", obs=w.obs(pr_head=oid("H2")), successor_packet="e" * 64)
+        self.assertEqual(item["state"], "superseded", "W4")
+        self.assertEqual(w.op(key)["state"], "abandoned", "E9: an intent never sent is abandoned")
+        self.assertEqual(w.grant(key)["state"], "retired")
+
+    def test_04_red_check_sends_nothing_then_w5(self):
+        w = self.w
+        key = self.ready()
+        w.green = False
+        out = w.sender().dispatch(key)
+        self.assertEqual((out["state"], out["sent"]), ("refused", False), "checks_green is false at E2")
+        self.assertEqual(w.gh.requests, [])
+        obs = w.obs()
+        obs["policy"] = dict(obs["policy"], checks_green=False)
+        self.assertEqual(w.move("W5", obs=obs)["state"], "waiting-dep", "W5")
+        self.assertEqual(w.op(key)["state"], "abandoned", "E9")
+
+    def test_09_same_key_with_other_parameters_is_an_error_and_nothing_is_sent(self):
+        w = self.w
+        key = self.ready()
+        row = w.op(key)
+        params = dict(w.port.params(row), default_branch="other")
+        ok, err = attempt(w.c.intend, params, item=row["item"], lease_ok=True, event_id=w.ev())
+        self.assertFalse(ok, "E1: the same key with other parameters is raised")
+        self.assertIsInstance(err, C.ContractError)
+        # the request is built only from the committed row and the reviewed H: any other (B, H) is refused
+        s = w.sender()
+        for req in ({"method": "updateRefs", "beforeOid": oid("B"), "afterOid": oid("H2"), "force": False},
+                    {"method": "updateRefs", "beforeOid": oid("A"), "afterOid": oid("H"), "force": False},
+                    {"method": "updateRefs", "beforeOid": oid("B"), "afterOid": oid("H"), "force": True},
+                    {"method": "push", "beforeOid": oid("B"), "afterOid": oid("H"), "force": False}, None):
+            ok, err = attempt(s.payload, row, req, oid("H"))
+            self.assertFalse(ok, "payload refuses %s" % req)
+        # a Review row that names another H: refused before E2, nothing sent
+        w.db.execute("UPDATE reviews SET head=? WHERE item=? AND kind='adversarial'", (oid("H2"), row["item"]))
+        out = s.dispatch(key)
+        self.assertEqual((out["state"], out["sent"], w.op(key)["state"]), ("refused", False, "intent"))
+        self.assertEqual(w.gh.requests, [])
+
+    def test_10_later_integration_containing_h_confirms_only_by_the_activity_entry(self):
+        w = self.w
+        key = self.ready()
+        w.gh.script = ["lose"]
+        w.gh.after_send.append(lambda: w.gh.push(MAIN, oid("H2")))   # H2 contains H: H is reachable from the tip
+        w.gh.act_complete = False
+        s = w.sender()
+        s.dispatch(key)
+        self.assertTrue(w.gh.ancestor(oid("H"), w.gh.refs[MAIN]), "H is reachable")
+        for _ in range(3):
+            w.tick(s, key, seconds=30)
+            self.assertNotEqual(w.op(key)["state"], "confirmed", "reachability alone never confirms (E3)")
+        w.gh.act_complete = True
+        w.tick(s, key, seconds=30)
+        row = w.op(key)
+        self.assertEqual((row["state"], json.loads(row["evidence"])["attribution"]), ("confirmed", "observed"))
+
+    def delayed_cas_trace(self, days):
+        w = self.world()
+        key = w.build()
+        w.gh.on_send = self.ledger_state(w, key)
+        w.gh.script = ["delay"]                                   # the request is delayed; its response is lost
+        s = w.sender()
+        s.dispatch(key)
+        w.gh.push(MAIN, oid("S"))                                 # the tip leaves B without (B, H)
+        w.tick(s, key, seconds=C.E13_FIRST_READ_SECONDS)
+        w.tick(s, key, seconds=C.E13_READ_GAP_SECONDS)
+        self.assertEqual(w.op(key)["state"], "fenced", "E13")
+        generation, grants = w.op(key)["generation"], w.db.execute("SELECT COUNT(*) FROM grants").fetchone()[0]
+        # a cancel (ASSUMPTION A-cancel: the owner's cancel of the item): refused while the Effect is unsettled (T7)
+        item = w.item()
+        ok, _ = attempt(w.c.wi_move, item["id"], "W20", expected_version=item["version"], event_id=w.ev(),
+                        actor="owner")
+        self.assertFalse(ok, "the item is not cancelled under a fenced Effect")
+        ok, again = attempt(w.c.intend, w.port.params(w.op(key)), item=item["id"], lease_ok=True, event_id=w.ev())
+        self.assertTrue(not ok or (again["key"], again["generation"]) == (key, generation),
+                        "no new generation for a fenced (B, H): %r" % (again,))
+        w.clock.t += days * 86400
+        w.c.retain()
+        w.gh.push(MAIN, oid("B"))                                 # the branch is rewound exactly to B
+        self.assertEqual(s.settle(key)["state"], "fenced", "still fenced: nothing applied yet")
+        applied = w.gh.deliver()                                  # the delayed CAS reaches the server now
+        self.assertEqual([r["outcome"] for r in applied], [M.OK])
+        s.settle(key)                                             # the watch (E14)
+        row = w.op(key)
+        self.assertEqual((row["state"], row["incident"], row["tombstone"]), ("confirmed", 1, 0))
+        self.assertTrue(w.c.merging_off(REPO), "E14 turns the repo's merging off")
+        self.assertEqual(w.db.execute("SELECT COUNT(*) FROM grants").fetchone()[0], grants, "no new grant")
+        self.assertEqual(w.db.execute("SELECT MAX(generation) FROM operations").fetchone()[0], generation)
+        self.assertEqual(len(w.gh.updates()), 1, "ahc-merge sent exactly one request")
+
+    def test_delayed_cas_trace(self):
+        for days in (1, 31):
+            with self.subTest(days=days):
+                self.delayed_cas_trace(days)
+
+    def test_14_no_passing_chk_cas_is_ineligible_and_sends_nothing(self):
+        w = self.w
+        key = self.ready()
+        for record in (None, {"repo": REPO, "identity": {"login": LOGIN, "id": UID_GH}, "passed": False,
+                              "cases": {}, "boot": BOOT, "mono": w.clock.t},
+                       {"repo": REPO, "identity": {"login": "someone-else", "id": 1}, "passed": True, "cases": {},
+                        "boot": BOOT, "mono": w.clock.t}):
+            with self.subTest(record=record and (record["passed"], record["identity"]["login"])):
+                path = w.canary._path(REPO)
+                if record is None:
+                    os.unlink(str(path))
+                else:
+                    w.canary.write(record)
+                out = w.sender().dispatch(key)
+                self.assertEqual((out["state"], out["sent"]), ("refused", False))
+                self.assertEqual(w.gh.requests, [], "no updateRefs, no plain push, no other path (NEG-19)")
+                self.assertEqual(w.op(key)["state"], "intent")
+                facts = w.canary.local_facts(REPO, w.identity)
+                age = w.c.clock.canary_age(facts["canary"])
+                failed = w.c.elig(w.item(), w.obs(chk_cas=facts["chk_cas"], canary_age=age))
+                self.assertIn("e9", failed, "ELIG e9 fails without a passing CHK-CAS")
+
+    def test_16_absent_proven_while_h_is_on_the_branch_abandons_with_an_incident(self):
+        for answer in ("typed", "p3"):
+            with self.subTest(answer=answer):
+                w = self.world()
+                key = w.build()
+                w.gh.on_send = self.ledger_state(w, key)
+                w.gh.script = [answer]
+                s = w.sender(hooks={"committed": lambda: w.gh.push(MAIN, oid("H"))})   # another writer integrates H
+                s.dispatch(key)
+                row = w.op(key)
+                self.assertEqual((row["state"], row["incident"]), ("abandoned", 1), "E16, never confirmed")
+                self.assertEqual(json.loads(w.db.execute(
+                    "SELECT data FROM transitions WHERE id=? AND to_state='abandoned'", (key,)).fetchone()[0])["row"],
+                    "E16")
+                self.assertEqual(w.grant(key)["state"], "retired", "G5")
+                self.assertEqual(w.c.cap_used(REPO), 0, "the CAP1 slot is released")
 
 
 if __name__ == "__main__":
