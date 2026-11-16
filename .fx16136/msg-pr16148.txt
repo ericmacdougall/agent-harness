@@ -1,0 +1,15 @@
+chore(fx16136): keep the goodqa#16148 step-2 PR packet and pin test
+
+Why: the step-2 PR review packet and the fake-VM pin-survival test sources for goodqa#16148 must be recoverable for the receipt run, not only on this disk.
+
+What:
+- packets/pr-16148{,-head,-tail}.md: the bugtracker PR #1373 packet at HEAD 158ec0db, sha256 bcc0d0976431.
+- b16148/test_selfhost_ctl_job_secrets.py and ctl_variants.sh, the updated evidence.sh and evidence.txt, and the PR diff.
+
+Testing: `python3 .fx16136/build_packet.py ... 158ec0db4b6b0a9dbb56fdce63a05df97fc1548c` -> lint [] (no problems). The suites ran on t2-dev, all exit 0 (b16148/evidence.txt).
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
