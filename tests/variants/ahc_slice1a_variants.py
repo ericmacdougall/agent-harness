@@ -15,6 +15,8 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".ahc-local", "va
 CONTRACTS = "harness/hooks/ahc_contracts.py"
 TABLES = ["tests.test_ahc_core.TransitionTableTests"]
 REVIEW = ["tests.test_ahc_contracts.ReviewTests"]
+SM = ["tests.test_ahc_runner.StateMachineTests"]
+TIMEOUT = float(os.environ.get("AHC_VARIANT_TIMEOUT", "900"))   # seconds per variant; a timeout is inconclusive
 V = [
     ("Q-A6: spec_core dropped from the row id and the unique key", [
         ('        if kind == "spec":       # code rows keep their pre-Q-A6 ids\n            binding["spec_core"] = '
@@ -42,8 +44,49 @@ V = [
          '        "W20": (("pr-gate",), ("cancelled",), "ahc-core"),\n')], CONTRACTS, TABLES),
     ("AC-1: the pinned core constant moved off the attached spec", [
         ('SPEC_CORE_SHA256 = "0130008d', 'SPEC_CORE_SHA256 = "a320dda4')], CONTRACTS, TABLES),
+    # WorkItem transition function (StateMachineTests)
+    ("T7 dropped: an unsettled Effect does not stop any row", [
+        ("            if unsettled and row_id not in self.T7_ALLOWED:\n", "            if False:\n")],
+     CONTRACTS, SM),
+    ("T7 as a block-list of the rows it names as waiting (lets W15 and W20 through)", [
+        ("            if unsettled and row_id not in self.T7_ALLOWED:\n",
+         '            if unsettled and row_id in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):\n')],
+     CONTRACTS, SM),
+    ("note 8: absent-proven treated as settled", [
+        ('    T7_UNSETTLED = ("dispatched", "outcome-unknown", "held", "fenced", "absent-proven")\n',
+         '    T7_UNSETTLED = ("dispatched", "outcome-unknown", "held", "fenced")\n')], CONTRACTS, SM),
+    ("T6: the version is checked before the replay", [
+        ("            prior = self.db.execute(\"SELECT entity, id, data FROM transitions WHERE event_id=?\",\n",
+         "            if item[\"version\"] != expected_version:\n                raise VersionConflict(\"stale\")\n"
+         "            prior = self.db.execute(\"SELECT entity, id, data FROM transitions WHERE event_id=?\",\n")],
+     CONTRACTS, SM),
+    ("T6: a replay on another item is accepted as a no-op", [
+        ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
+         '                if prior[0] == "work_item":\n')], CONTRACTS, SM),
+    ("NEG-11: the actor check dropped", [
+        ("            if actor != row_actor:\n", "            if False:\n")], CONTRACTS, SM),
+    ("W8: merged without a confirmed Effect", [
+        ('            if "confirmed" not in effects:\n', "            if False:\n")], CONTRACTS, SM),
+    ("W9: a marked item returns to pr-gate", [
+        ("            if marks:\n                raise ContractError(\"W9 is for an unmarked item",
+         "            if False:\n                raise ContractError(\"W9 is for an unmarked item")], CONTRACTS, SM),
+    ("W25: the mark does not pick the terminal", [
+        ("            if want != to:\n", "            if False:\n")], CONTRACTS, SM),
+    ("W24: applies without an unsettled Effect", [
+        ("            if not unsettled:\n                raise ContractError(\"W24 applies only",
+         "            if False:\n                raise ContractError(\"W24 applies only")], CONTRACTS, SM),
+    ("NEG-11: a resubmit at the same head makes a second item", [
+        ("            if live:\n                return self._row(\"work_items\", \"id\", live[0])\n",
+         "            pass\n")], CONTRACTS, SM),
+    ("unwired rows applied without their guards", [
+        ("            if row_id not in self.WI_WIRED:\n", "            if False:\n")], CONTRACTS, SM),
+    ("T7 precedence by table order instead of row number", [
+        ("        return min(rows, key=lambda r: int(r[1:]))\n", "        return rows[0]\n")], CONTRACTS, SM),
+    ("T7 precedence: G8 and G9 outrank the WorkItem rows", [
+        ('    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")\n',
+         '    T7_ORDER = ("G8", "G9", "W4", "W13", "W14", "W18", "W19", "W17")\n')], CONTRACTS, SM),
 ]
-out, survivors = [], []
+out, survivors, inconclusive = [], [], []
 for name, swaps, rel, tests in V:
     src = os.path.join(ROOT, rel)
     bak = src + ".vs.bak"
@@ -57,9 +100,10 @@ for name, swaps, rel, tests in V:
         open(src, "w").write(text)
         try:
             proc = subprocess.run([sys.executable, "-B", "-m", "unittest"] + tests, cwd=ROOT, capture_output=True,
-                                  text=True, timeout=900)
-        except subprocess.TimeoutExpired:   # a hang is recorded and the run goes on; it is not a survivor
-            out.append("== variant %s rc=timeout (tests did not finish in 900 s)" % name)
+                                  text=True, timeout=TIMEOUT)
+        except subprocess.TimeoutExpired:   # a hang is not a failing test: inconclusive, and the run exits nonzero
+            out.append("== variant %s rc=timeout INCONCLUSIVE (tests did not finish in %s s)" % (name, TIMEOUT))
+            inconclusive.append(name)
             continue
         lines = [l for l in proc.stderr.splitlines() if l.startswith(("FAIL:", "ERROR:", "Ran ", "FAILED", "OK"))]
         out.append("== variant %s rc=%d\n%s" % (name, proc.returncode, "\n".join(lines)))
@@ -68,6 +112,8 @@ for name, swaps, rel, tests in V:
     finally:
         shutil.copyfile(bak, src)
         os.remove(bak)
-out.append("SUMMARY: %d variants, %d did not fail: %s" % (len(V), len(survivors), survivors))
+out.append("SUMMARY: %d variants, %d did not fail: %s; %d inconclusive (timeout): %s"
+           % (len(V), len(survivors), survivors, len(inconclusive), inconclusive))
 open(OUT, "w").write("\n".join(out) + "\n")
 print("\n".join(out))
+sys.exit(1 if survivors or inconclusive else 0)
