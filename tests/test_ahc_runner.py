@@ -4298,6 +4298,87 @@ class StateMachineTests(TC.Base):
                 self.move(row, to=to)
         self.assertEqual(self.c._row("work_items", "id", self.item["id"])["version"], self.item["version"])
 
+    # ---- slice (b) obligations (goodqa#16204, AC-9, NEG-25)
+
+    def _queued(self, item, kind="adversarial"):
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind=?", (item["id"], kind)).fetchone()[0]
+        return self.c.review(rid, "queued", expected_version=1, event_id=self.ev())
+
+    def test_b_scheduler_skips_rows_of_a_finished_item(self):
+        """NEG-25 double-submit: across N ticks the scheduler never offers a queued row of a cancelled, merged,
+        closed or superseded item (zero attempts), while in the same test a live item's queued row is offered and
+        started (the positive control)."""
+        import ahc_shadow  # noqa: PLC0415
+        launched = []
+
+        def launch(row):
+            launched.append(row["id"])
+            return "ahc-review-%s-i1" % row["id"], self.UID
+
+        dead = []
+        cancelled = self.admit(pr=70)
+        dead.append(self._queued(cancelled)["id"])
+        self.c.wi_move(cancelled["id"], "W20", expected_version=cancelled["version"], event_id=self.ev(),
+                       actor="owner")
+        for n, state in enumerate(("merged", "closed-unmerged", "superseded")):
+            item = self.admit(pr=71 + n)
+            dead.append(self._queued(item)["id"])
+            self.db.execute("UPDATE work_items SET state=? WHERE id=?", (state, item["id"]))
+        live = self.admit(pr=80)
+        live_row = self._queued(live)["id"]
+        sched = ahc_shadow.ReviewScheduler(self.c, launch, slots=8)
+        offered = []
+        for n in range(6):
+            result = sched.tick("t%d" % n)
+            offered += result["offered"]
+            self.assertEqual(result["refused"], [], "a finished item's row reached start_attempt")
+        self.assertEqual(offered, [live_row], "only the live item's row is offered, once")
+        self.assertEqual(launched, [live_row])
+        self.assertEqual(self.c._row("reviews", "id", live_row)["state"], "running")
+        for rid in dead:
+            self.assertEqual(self.c._row("reviews", "id", rid)["state"], "queued", rid)
+
+    def test_b_status_and_digest_show_inert_rows(self):
+        """AC-9: after the owner cancels (W20), the item's queued code row and required spec row show as
+        "inert: item cancelled" in status and in the shadow digest, never as queued or required."""
+        import ahc_shadow  # noqa: PLC0415
+        rid = self._queued(self.item)["id"]
+        spec = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='spec'", (self.item["id"],)).fetchone()[0]
+        self.move("W20", actor="owner")
+        lines = ahc_shadow.status_lines(self.c)
+        for row in (rid, spec):
+            line = [x for x in lines if row in x]
+            self.assertEqual(len(line), 1, lines)
+            self.assertTrue(line[0].endswith(": inert: item cancelled"), line[0])
+        self.assertFalse([x for x in lines if x.endswith(": queued") or x.endswith(": required")], lines)
+        out = []
+        self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (1, 0))
+        self.assertEqual(len(out), 1)
+        self.assertIn("review adversarial %s: inert: item cancelled" % rid, out[0])
+        self.assertIn("review spec %s: inert: item cancelled" % spec, out[0])
+        self.assertNotIn("queued", out[0])
+        self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (0, 0), "delivered once")
+
+    def test_b_findings_producer_writes_finding_ids(self):
+        """AC-9 / NEG-25: the producer writes finding_ids that match ^[A-Za-z][A-Za-z0-9_.-]{0,31}$, at most 64;
+        an id over 32 characters, one holding a space, or any beyond the 64th is dropped and flagged. W3's
+        escalation names the kept ids."""
+        import ahc_shadow  # noqa: PLC0415
+        row = self.running_review(self.item, "adversarial")
+        raw = ["F1", "x" * 33, "has space", "9lead", "", 7] + ["G%d" % n for n in range(70)]
+        receipt = ahc_shadow.findings_receipt(row, "BLOCK", raw)
+        self.assertEqual(receipt["finding_ids"], ["F1"] + ["G%d" % n for n in range(63)])
+        self.assertEqual(receipt["finding_ids_dropped"], 5 + 7)
+        self.assertEqual(ahc_shadow.findings_receipt(row, "BLOCK", ["A" * 32])["finding_ids"], ["A" * 32])
+        self.assertNotIn("finding_ids_dropped", ahc_shadow.findings_receipt(row, "BLOCK", ["F1"]))
+        self.c.review(row["id"], "findings", expected_version=row["version"], event_id=self.ev(), receipt=receipt,
+                      peer_uid=self.UID)
+        self.assertEqual(self.move("W3")["state"], "waiting-ask")
+        text = dict(self.notices_of("W3"))["ticket"]
+        self.assertIn("F1, G0, G1", text)
+        self.assertNotIn("x" * 33, text)
+        self.assertNotIn("G63, G64", text)
+
     # ---- precedence (T7)
 
     def test_t7_precedence(self):
@@ -4383,8 +4464,7 @@ class StateMachineTests(TC.Base):
         self.assertEqual(missing, sorted(self.PENDING_B), "PENDING_B must equal the unresolved obligations")
 
     # slice (b) obligations with no test yet (goodqa#16204 items 2 and 3; the W3 finding_ids assumption)
-    PENDING_B = ("test_b_scheduler_skips_rows_of_a_finished_item", "test_b_status_and_digest_show_inert_rows",
-                 "test_b_findings_producer_writes_finding_ids")
+    PENDING_B = ()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -4827,6 +4907,144 @@ class MigrationV5Tests(Base):
                                "FROM reviews\").fetchone()[0]); l.close()")
                 self.assertEqual((proc.returncode, proc.stdout.strip()), (0, str(len(before))), proc.stderr[-400:])
 
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Slice 1 (b) shared fixture: the WorkItem helpers of StateMachineTests without re-running its tests.
+
+class _WorkItemFixture(TC.Base):
+    UID = StateMachineTests.UID
+
+    def setUp(self):
+        TC.Base.setUp(self)
+        self.item = self.admit()
+
+    admit = StateMachineTests.admit
+    move = StateMachineTests.move
+    at = StateMachineTests.at
+    reserved = StateMachineTests.reserved
+    confirmed = StateMachineTests.confirmed
+    abandoned = StateMachineTests.abandoned
+    wstate = StateMachineTests.wstate
+    notices_of = StateMachineTests.notices_of
+    running_review = StateMachineTests.running_review
+    _queued = StateMachineTests._queued
+
+
+TOKEN_PREFIX = "".join(("g", "h", "p", "_"))
+
+
+def runtime_token():
+    """A token-shaped value built at run time, so no source file holds one (the R5 clean corpus)."""
+    import random  # noqa: PLC0415
+    import string  # noqa: PLC0415
+    rng = random.SystemRandom()
+    return TOKEN_PREFIX + "".join(rng.choice(string.ascii_letters + string.digits) for _ in range(28))
+
+
+def encodings(token):
+    """The token raw and in each encoding R5 decodes: hex, base64 at all three alignments, URL-safe base64 and
+    URL (percent) encoding."""
+    import base64  # noqa: PLC0415
+    raw = token.encode()
+    out = {"raw": token, "hex": raw.hex()}
+    for pad in range(3):
+        out["b64-%d" % pad] = base64.b64encode(b"x" * pad + raw).decode()
+    out["b64url"] = base64.urlsafe_b64encode(b"\xfb\xff" + raw).decode()
+    out["url"] = "".join("%%%02X" % b for b in raw)
+    return out
+
+
+class EgressTests(_WorkItemFixture):
+    """AC-14 / NEG-31: the outbox (Contracts._wi_notice) is the one egress chokepoint. Every outward text is
+    scanned by R5 before it is stored; an exposure is never stored or delivered, and delivery goes only to the
+    shadow digest."""
+
+    def all_text(self):
+        return "\n".join(t for (t,) in self.db.execute("SELECT text FROM wi_notices")) + "\n".join(
+            r for (r,) in self.db.execute("SELECT reason FROM wi_quarantine"))
+
+    def test_w03_notice_with_a_runtime_token_is_quarantined(self):
+        secret_shape = runtime_token()
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='adversarial'",
+                              (self.item["id"],)).fetchone()[0]
+        self.db.execute("UPDATE reviews SET state='findings', receipt=? WHERE id=?",
+                        (json.dumps({"verdict": "BLOCK", "finding_ids": ["F1", secret_shape]}), rid))
+        self.assertEqual(self.move("W3")["state"], "waiting-ask", "the row still applies")
+        self.assertNotIn(secret_shape, self.all_text())
+        quarantined = sorted(k for (k,) in self.db.execute("SELECT kind FROM wi_quarantine WHERE row_id='W3'"))
+        self.assertEqual(quarantined, ["owner", "ticket"])
+        kinds = [k for k, _t in self.notices_of("W3")]
+        self.assertEqual(kinds, ["incident", "incident"], "each quarantined notice is replaced by an incident")
+        import ahc_shadow  # noqa: PLC0415
+        out = []
+        ahc_shadow.deliver_digest(self.c, out.append)
+        self.assertNotIn(secret_shape, "".join(out))
+        self.assertTrue(out and all("text withheld" in line for line in out), out)
+
+    def test_every_notice_kind_with_an_embedded_token_is_quarantined(self):
+        """W3, W19, W22 and W23 notices, E12's comment and the digest, each with the token raw and in every
+        encoding R5 decodes."""
+        cases = [("W3", "ticket"), ("W3", "owner"), ("W19", "incident"), ("W19", "ticket"), ("W22", "ticket"),
+                 ("W23", "incident"), ("W23", "ticket"), ("E12", "ticket"), ("E12", "digest"), ("W8", "digest")]
+        secret_shape = runtime_token()
+        for row, kind in cases:
+            for enc, value in encodings(secret_shape).items():
+                with self.subTest(row=row, kind=kind, enc=enc):
+                    ev = self.ev()
+                    with self.c.tx():
+                        stored = self.c._wi_notice(ev, self.item, row, kind, "note for %s: %s end" % (row, value))
+                    self.assertIsNone(stored)
+                    texts = [t for (t,) in self.db.execute("SELECT text FROM wi_notices WHERE event_id LIKE ?",
+                                                           ("%" + ev + "%",))]
+                    self.assertEqual(len(texts), 1)
+                    self.assertNotIn(value, texts[0])
+                    self.assertIn("text withheld", texts[0])
+                    self.assertEqual(self.db.execute("SELECT kind FROM wi_quarantine WHERE event_id=?",
+                                                     (ev,)).fetchone()[0], kind)
+
+    def test_a_bare_prefix_restricts_to_structured_fields(self):
+        with self.c.tx():
+            text = self.c._wi_notice(self.ev(), self.item, "W19", "ticket", "refused near %sab here" % TOKEN_PREFIX)
+        self.assertIn("restricted to structured fields", text)
+        self.assertNotIn("ab here", text)
+
+    def test_clean_text_is_stored_unchanged_and_delivered_once_to_the_shadow_digest(self):
+        import ahc_shadow  # noqa: PLC0415
+        with self.c.tx():
+            self.c._wi_notice("e-clean", self.item, "W19", "ticket", "fetch failed: repository not found")
+        out = []
+        self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (1, 0))
+        self.assertEqual(out, ["shadow ticket %s W19 [e-clean]: fetch failed: repository not found\n"
+                               % self.item["id"]])
+        self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (0, 0))
+
+    def test_delivery_rescans_a_row_written_around_the_chokepoint(self):
+        """A text that reached the outbox without the chokepoint (a direct INSERT) is quarantined at delivery and
+        never written to the digest."""
+        import ahc_shadow  # noqa: PLC0415
+        secret_shape = runtime_token()
+        self.db.execute("INSERT INTO wi_notices(event_id, item, row_id, kind, text, created) VALUES (?,?,?,?,?,?)",
+                        ("e-direct", self.item["id"], "W22", "ticket", "direct " + secret_shape, 1.0))
+        out = []
+        self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (0, 1))
+        self.assertEqual(out, [])
+        self.assertNotIn(secret_shape, self.all_text())
+
+    def test_e12_comment_is_written_to_the_outbox_and_delivered_only_to_the_digest(self):
+        import ahc_shadow  # noqa: PLC0415
+        _g, op = self.reserved()
+        op = self.send(op)
+        self.clock.t += C.Contracts.PR_MARK_SECONDS
+        op = self.c.confirm(op["key"], self.readback(pr_merged=False), expected_version=op["version"],
+                            event_id=self.ev())
+        self.assertEqual(op["pr_unmarked"], 1)
+        notes = self.notices_of("E12")
+        self.assertEqual([k for k, _t in notes], ["digest", "ticket"])
+        self.assertTrue(notes[1][1].startswith("ahc PR comment: integrated at %s" % TC.H1), notes)
+        out = []
+        self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (2, 0))
+        self.assertTrue(all(line.startswith("shadow ") for line in out))
 
 if __name__ == "__main__":
     unittest.main()
