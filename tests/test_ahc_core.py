@@ -1187,10 +1187,20 @@ class TransitionTableTests(unittest.TestCase):
 
     SPEC = HOOKS.parents[1] / "docs" / "spec" / "ahc-m1-state-machine.md"
     CHECKER = HOOKS.parents[1] / "scripts" / "ahc_check_state_tables.py"
-    # One documented actor drift, pinned so it cannot widen silently. E10's spec actor column says `main`, but its
-    # guard text says "the reconcile finds ... (fenced)"; the code lets only the reconcile fence a held op.
-    # Amendment note 7 (slice 1a packet) asks the spec owner to name both actors.
-    KNOWN_ACTOR_DRIFT = {("Effect", "held", "fenced"): ("main", ("reconcile",))}
+    # Actor sets are compared for equality. The differences below are pinned exactly, so none can widen or appear
+    # silently; each is in the slice 1a amendment notes for the spec owner to rule (note 7):
+    # - R3 to R6: the spec's actor column says ahc-review, but the merged code also lets ahc-core record the
+    #   attempt's start and result (the result arrives over core's socket).
+    # - E10: the spec's actor column says main, but its guard text says "the reconcile finds ..."; the code lets
+    #   the reconcile confirm, and only the reconcile fence, a held op.
+    KNOWN_ACTOR_DRIFT = {
+        ("Review", "queued", "running"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Review", "running", "passed"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Review", "running", "findings"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Review", "running", "infra-wait"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Effect", "held", "confirmed"): ("main", ("main", "reconcile")),
+        ("Effect", "held", "fenced"): ("main", ("reconcile",)),
+    }
 
     @classmethod
     def setUpClass(cls):
@@ -1226,13 +1236,13 @@ class TransitionTableTests(unittest.TestCase):
         out = [("spec-only", k, sorted(spec[k])) for k in sorted(set(spec) - set(table))]
         out += [("code-only", k, table[k]) for k in sorted(set(table) - set(spec))]
         for k in sorted(set(spec) & set(table)):
-            for _tid, actor in spec[k]:
-                drift = self.KNOWN_ACTOR_DRIFT.get((entity,) + k)
-                if drift is not None:
-                    if (actor, tuple(table[k])) != drift:
-                        out.append(("drift-changed", k, actor, table[k]))
-                elif actor not in table[k]:
-                    out.append(("actor", k, actor, table[k]))
+            actors = {a for _tid, a in spec[k]}
+            drift = self.KNOWN_ACTOR_DRIFT.get((entity,) + k)
+            if drift is not None:
+                if ({drift[0]}, set(drift[1])) != (actors, set(table[k])):
+                    out.append(("drift-changed", k, sorted(actors), table[k]))
+            elif actors != set(table[k]):
+                out.append(("actor", k, sorted(actors), table[k]))
         return out
 
     def test_vendored_section_is_pinned_to_the_attached_core(self):
@@ -1279,6 +1289,13 @@ class TransitionTableTests(unittest.TestCase):
         op = dict(self.C.OP)
         op[("held", "fenced")] = ("ahc-core",)
         self.assertIn("drift-changed", [d[0] for d in self.edge_diff("Effect", op)])
+        grant = dict(self.C.GRANT)
+        grant[("active", "reserved")] = ("ahc-core", "main")         # a wider actor set, not only a missing one
+        self.assertIn("actor", [d[0] for d in self.edge_diff("Grant", grant)])
+        # every pinned drift still exists: a fixed one must be removed from the pin, not left to hide a new one
+        for (entity, frm, to) in self.KNOWN_ACTOR_DRIFT:
+            table = {"Review": self.C.REVIEW, "Effect": self.C.OP}[entity]
+            self.assertIn((frm, to), table)
 
     def test_vendored_section_and_checker_are_protected_paths(self):
         import ahc_runner
