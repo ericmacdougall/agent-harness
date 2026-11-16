@@ -1873,3 +1873,118 @@ class ProviderOutputBoundTests(unittest.TestCase):
         diag = review_diagnostics.provider_attempt('codex', {'path': '/x/codex'}, 0, 'out', '',
                                                    {'reason': 'OUTPUT_TOO_LARGE'})
         self.assertEqual(diag['code'], 'PROVIDER_OUTPUT_TOO_LARGE')
+
+
+class ProviderOutputBoundDeltaTests(unittest.TestCase):
+    """Review harness-pr266-v1 (goodqa#16170): F1 a stop that cannot be confirmed is UNKNOWN and keeps the pool,
+    F2 the TERM grace period is kept after the child closes its pipes, F3 parse memory is bounded by record count,
+    record size and JSON node count, not only by raw bytes."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    FLOOD = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n'
+             '    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+
+    def test_f1_unconfirmed_stop_is_unknown_and_keeps_the_pool(self):
+        import types
+        spawned = []
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=spawned.append)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        options = {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                   'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                   'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+        # Survives its pipes closing (EPIPE), like a child stuck in uninterruptible cleanup.
+        flood = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n    try:\n'
+                 '        sys.stdout.buffer.write(chunk)\n        time.sleep(0.002)\n'
+                 '    except (OSError, ValueError):\n        time.sleep(0.05)\n')
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', flood], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture), \
+                    patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True), \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(store.release_pool.called, 'a child that may be alive must keep its pool reservation')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    def test_f2_term_grace_is_kept_after_the_child_closes_its_pipes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / 'cleaned-up'
+            child = ('import os, signal, sys, time\n'
+                     'def on_term(signum, frame):\n'
+                     '    os.close(1)\n    os.close(2)\n    time.sleep(0.4)\n'
+                     '    open(sys.argv[1], "w").write("done")\n    os._exit(0)\n'
+                     'signal.signal(signal.SIGTERM, on_term)\n' + self.FLOOD)
+            with self.assertRaises(self.process.OutputLimitExceeded):
+                self.process.run([sys.executable, '-c', child, str(marker)], input='', timeout=20,
+                                 output_limit=2 ** 20)
+            self.assertTrue(marker.exists(), 'the TERM handler was killed before it finished its cleanup')
+
+    def normalize(self, stdout):
+        return self.module.normalize_provider('codex', 0, stdout, '', 'VERDICT: PASS\n\nok', 'pr')
+
+    def test_f3_many_tiny_records_fail_fast_with_bounded_memory(self):
+        import tracemalloc
+        stdout = '{}\n' * 2_000_000  # 6 MB, far below the raw ceiling
+        tracemalloc.start()
+        try:
+            result = self.normalize(stdout)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertLess(peak, 64 * 2 ** 20, 'parsing retained %d bytes for 6 MB of tiny records' % peak)
+
+    def test_f3_many_tiny_objects_in_one_document_fail(self):
+        for stdout in ('[' + ','.join(['{}'] * 1_000_000) + ']',
+                       json.dumps({'type': 'item.completed',
+                                   'item': {'type': 'command_execution', 'aggregated_output': 'x',
+                                            'junk': [{}] * 200_000}}) + '\n'):
+            with self.subTest(size=len(stdout)):
+                self.assertEqual(self.normalize(stdout)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_f3_one_huge_record_above_the_record_cap_fails(self):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'id': 'c', 'type': 'command_execution', 'command': 'probe',
+                                                       'aggregated_output': 'h' * (9 * 2 ** 20)}},
+                   {'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': 'VERDICT: PASS\n\nok'}},
+                   {'type': 'turn.completed'}]
+        stdout = '\n'.join(json.dumps(record) for record in records)  # one 9 MiB line, under the 16 MiB ceiling
+        self.assertEqual(self.normalize(stdout)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_f3_verdict_bound_stops_parsing_early(self):
+        """Once the verdict-bearing bound is passed, later records are not parsed."""
+        bulk = json.dumps({'type': 'item.completed', 'item': {'id': 'r', 'type': 'reasoning', 'text': 'r' * 600_000}})
+        stdout = bulk + '\n' + bulk + '\n' + '{"type": "turn.completed"}\n' * 3
+        calls = []
+        real = json.loads
+
+        def counting(text, *args, **kwargs):
+            calls.append(len(text))
+            return real(text, *args, **kwargs)
+        with patch.object(self.module.json, 'loads', side_effect=counting):
+            result = self.normalize(stdout)
+        self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
+        self.assertLessEqual(len([size for size in calls if size < 100]), 0, 'records after the bound were parsed')

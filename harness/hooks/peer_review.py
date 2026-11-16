@@ -27,7 +27,7 @@ if sys.version_info < (3, 9):
              'native evidence only, not a helper receipt.')
 
 import review_diagnostics as diagnostics
-from process import OutputLimitExceeded, run as run_process, signal_group
+from process import CleanupIncomplete, OutputLimitExceeded, run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
 import escalation as ladder
@@ -43,9 +43,19 @@ PROVIDER_LIMIT = 1_000_000
 # goodqa#16170: Codex `exec --json` repeats each probe's full aggregated_output on stdout, so a valid review that runs
 # probes measured 1.08-2.68 MB on real receipts. That output never carries a verdict and is exempt from the bound
 # above; the raw ceiling bounds it instead. 16 MiB is about 6x the largest review observed, so a stream past it is a
-# runaway (OUTPUT_TOO_LARGE, fails closed). Capture stops there, so peak memory is the ceiling plus its decoded copy
-# and parsed records (roughly 5-6x, under 100 MB).
+# runaway (OUTPUT_TOO_LARGE, fails closed). Capture stops there.
 PROVIDER_RAW_LIMIT = 16 * 2 ** 20
+# Raw bytes alone do not bound parse memory: millions of tiny records or objects fit under 16 MiB (review
+# harness-pr266-v1 F3). Before anything is deserialized the stream's JSON node count (containers, separators and lines
+# outside string literals) is capped, and while parsing so are the record count and each record's size. Real reviews
+# measured at most 60 records, about 600 nodes and a 1.2 MB longest line, so the caps leave more than 100x headroom
+# on count and about 7x on record size. Measured with tracemalloc (goodqa#16170 PR packet): normalize_provider peaks
+# at 24 MiB on a full 16 MiB stream and 14-16 MiB on rejected shapes (5M tiny records, deep nesting), on top of the
+# input; bounded capture adds its 16 MiB buffer and the decoded copy, so a provider call stays under about 60 MiB.
+PROVIDER_RECORDS = 10_000
+PROVIDER_JSON_NODES = 100_000
+PROVIDER_RECORD_LIMIT = 8 * 2 ** 20
+JSON_STRING = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
 _POLICY = []
 
 
@@ -277,6 +287,65 @@ def codex_bounded_size(record):
     return utf8_size(json.dumps(record, ensure_ascii=False))
 
 
+def json_node_count(text):
+    """Containers, separators and lines outside JSON string literals: proportional to the objects json.loads
+    would allocate, counted without allocating them (review harness-pr266-v1 F3)."""
+    skeleton = JSON_STRING.sub('', text)
+    return skeleton.count('{') + skeleton.count('[') + skeleton.count(',') + skeleton.count('\n') + 1
+
+
+def provider_lines(text):
+    """Non-blank lines one at a time, so a stream is never split into a list of millions of strings."""
+    start = 0
+    while start <= len(text):
+        end = text.find('\n', start)
+        end = len(text) if end < 0 else end
+        line = text[start:end]
+        if line.strip():
+            yield line
+        start = end + 1
+
+
+def parse_provider_records(provider, stripped, side):
+    """Parse a structured provider stream incrementally under every bound: JSON node count for the whole stream
+    before anything is deserialized, then per line the record size, the record count and, for Codex, the cumulative
+    verdict-bearing size, stopping at the first bound passed. Returns the records, 'INVALID' or 'TOO_LARGE'."""
+    if json_node_count(stripped) > PROVIDER_JSON_NODES:
+        return 'TOO_LARGE'
+    try:
+        records = [json.loads(stripped)]
+    except (ValueError, TypeError, RecursionError):
+        records, bounded = [], side
+        for line in provider_lines(stripped):
+            if len(records) >= PROVIDER_RECORDS or utf8_size(line) > PROVIDER_RECORD_LIMIT:
+                return 'TOO_LARGE'
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError, RecursionError):
+                return 'INVALID'
+            if not isinstance(record, dict):
+                return 'INVALID'
+            if provider == 'codex':
+                try:
+                    bounded += codex_bounded_size(record)
+                except (ValueError, TypeError, RecursionError):
+                    return 'INVALID'
+                if bounded > PROVIDER_LIMIT:
+                    return 'TOO_LARGE'
+            records.append(record)
+        return records or 'INVALID'
+    if not isinstance(records[0], dict):
+        return 'INVALID'
+    if utf8_size(stripped) > PROVIDER_RECORD_LIMIT:
+        return 'TOO_LARGE'
+    try:
+        if provider == 'codex' and side + codex_bounded_size(records[0]) > PROVIDER_LIMIT:
+            return 'TOO_LARGE'
+    except (ValueError, TypeError, RecursionError):
+        return 'INVALID'
+    return records
+
+
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
     """Validate supported terminal envelopes before extracting model verdict text."""
     invalid = provider_failure({})
@@ -300,22 +369,10 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
     stripped = stdout.strip()
     structured = stripped.startswith(('{', '['))
     if structured:
-        try:
-            records = [json.loads(stripped)]
-        except (ValueError, TypeError, RecursionError):
-            try:
-                records = [json.loads(line) for line in stripped.splitlines() if line.strip()]
-            except (ValueError, TypeError, RecursionError):
-                return invalid
-        if not records or any(not isinstance(record, dict) for record in records):
-            return invalid
+        records = parse_provider_records(provider, stripped, side)
+        if records in ('INVALID', 'TOO_LARGE'):
+            return too_large if records == 'TOO_LARGE' else invalid
         if provider == 'codex':
-            try:
-                bounded = side + sum(codex_bounded_size(record) for record in records)
-            except (ValueError, TypeError, RecursionError):
-                return invalid
-            if bounded > PROVIDER_LIMIT:
-                return too_large
             completed = []
             messages = []
             for record in records:
@@ -664,8 +721,11 @@ def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> t
         result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
                              timeout=timeout, output_limit=PROVIDER_RAW_LIMIT, **extra)
         return result.returncode, result.stdout, result.stderr
+    except CleanupIncomplete:
+        # The child may still be alive: ownership is unknown, so the pool stays reserved until reconciliation.
+        return 125, '', 'HARNESS_PROVIDER_IO_UNKNOWN'
     except OutputLimitExceeded as error:
-        # The group is already stopped; keep a bounded prefix so the raw answer can still be saved for diagnosis.
+        # The group is stopped and reaped; keep a bounded prefix so the raw answer can still be saved for diagnosis.
         return 126, error.stdout[:RAW_KEEP], 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'

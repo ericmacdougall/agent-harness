@@ -83,8 +83,29 @@ class OutputLimitExceeded(Exception):
         self.command, self.limit, self.stdout, self.stderr = command, limit, stdout, stderr
 
 
+class CleanupIncomplete(OSError):
+    """The child could not be confirmed stopped and reaped. Ownership is unknown: callers must not treat this as a
+    known end (for example, must not release a provider reservation)."""
+
+
+def _wait_group(process, deadline):
+    """Wait until the leader is reaped and no member of its group remains, or until the deadline."""
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    return False
+
+
 def _stop_bounded(process):
-    """Stop the group without retaining more output: TERM, drain-discard, KILL, drain-discard, reap.
+    """Stop the group without retaining more output: TERM, drain-discard, wait out the grace period for the whole
+    group (a child may close its pipes and still be running its TERM handler), KILL, drain-discard, reap.
+    Raises CleanupIncomplete when the leader cannot be reaped.
 
     stdin belongs to the feeder thread (it closes it); closing it here could block on the writer's lock."""
     pipes = [pipe for pipe in (process.stdout, process.stderr) if pipe is not None and not pipe.closed]
@@ -95,6 +116,7 @@ def _stop_bounded(process):
             drain_discarded(pipe, grace)
         except (OSError, ValueError):
             pass
+    _wait_group(process, grace)
     signal_group(process.pid, signal.SIGKILL)
     for pipe in pipes:
         try:
@@ -109,7 +131,7 @@ def _stop_bounded(process):
     try:
         process.wait(timeout=DISCARD_CLEANUP_SECONDS)
     except subprocess.TimeoutExpired:
-        pass
+        raise CleanupIncomplete('child %d could not be confirmed stopped' % process.pid) from None
 
 
 def _bounded_capture(command, process, data, timeout, limit, decode):
@@ -179,8 +201,10 @@ def _bounded_capture(command, process, data, timeout, limit, decode):
             raise subprocess.TimeoutExpired(command, timeout) from None
     except BaseException:
         stop.set()
-        _stop_bounded(process)
-        finish_feeder()
+        try:
+            _stop_bounded(process)  # CleanupIncomplete replaces the original error: the end is not known
+        finally:
+            finish_feeder()
         raise
     finish_feeder()
     for pipe in captured:
