@@ -1,0 +1,3142 @@
+diff --git a/apps/job-dispatcher/src/config.ts b/apps/job-dispatcher/src/config.ts
+index e5e0da9948f..dbe98b0b0af 100644
+--- a/apps/job-dispatcher/src/config.ts
++++ b/apps/job-dispatcher/src/config.ts
+@@ -1,3 +1,4 @@
++import { JOB_ENVFILE_DIR, parseJobEnvFiles, type JobEnvFiles } from './job-env-file';
+ import { z } from 'zod';
+ import { JOB_KINDS, type JobKind } from './jobs';
+ 
+@@ -61,6 +62,10 @@ const envSchema = z.object({
+ export type Config = z.infer<typeof envSchema> & {
+   jobImages: Record<JobKind, string>;
+   jobBaseEnv: Record<JobKind, Record<string, string>>;
++  /** goodqa#16148 AC-4: allow-listed JOB_ENVFILE_KIND__VAR keys (paths only; files are read per launch). */
++  jobEnvFiles: JobEnvFiles;
++  /** The only directory a JOB_ENVFILE path may live in. Compiled, never read from the env. */
++  jobEnvFileDir: string;
+ };
+ 
+ type JobImageEnvKey =
+@@ -132,5 +137,5 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+       );
+     }
+   }
+-  return { ...parsed, jobImages, jobBaseEnv };
++  return { ...parsed, jobImages, jobBaseEnv, jobEnvFiles: parseJobEnvFiles(env), jobEnvFileDir: JOB_ENVFILE_DIR };
+ }
+diff --git a/apps/job-dispatcher/src/docker.ts b/apps/job-dispatcher/src/docker.ts
+index 5a1feab52ab..23d41d6a51b 100644
+--- a/apps/job-dispatcher/src/docker.ts
++++ b/apps/job-dispatcher/src/docker.ts
+@@ -12,6 +12,9 @@
+  * a shell unless `shell: true` is passed — it is not passed here).
+  */
+ import { execFile, type ExecFileException } from 'node:child_process';
++import { chmodSync, closeSync, constants as fsConstants, fchmodSync, lstatSync, mkdtempSync, openSync, readdirSync, rmSync, unlinkSync, writeSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
+ 
+ interface ExecFileResult {
+   stdout: string;
+@@ -301,6 +304,80 @@ export function describeDockerFailure(stderr: string, secretValues: readonly str
+   return `${head}: ${cut}`;
+ }
+ 
++/**
++ * goodqa#16148 spec v4 AC-6: job env goes to docker through `--env-file`, never `-e KEY=VALUE`.
++ * A docker CLI process's argv is world-readable in the host PID namespace (/proc/PID/cmdline).
++ *
++ * Each launch gets a fresh mkdtemp directory (0700) under the dispatcher's tmpfs /tmp, holding
++ * one file (O_CREAT|O_EXCL|O_NOFOLLOW, 0600) with one `KEY=VALUE` line per variable. A line
++ * without `=` is never written (docker would fill it from the CLI's own environment). The
++ * directory is removed in a finally on every path. docker reads the value verbatim after the
++ * first `=` (probed on t2-dev: spaces, quotes, `#`, `=` and an empty value round-trip), but a
++ * line cannot carry CR, LF or NUL, so those are refused, with a named error that never holds the
++ * value. Boot removes any leftover directory (sweepStaleEnvFileDirs).
++ */
++export const ENVFILE_DIR_PREFIX = 'goodqa-envfile-';
++export const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
++
++/** A job env that cannot be written to an env-file. Never carries a value. */
++export class JobEnvError extends Error {
++  constructor(message: string) {
++    super(message);
++    this.name = 'JobEnvError';
++  }
++}
++
++function describeKey(key: string): string {
++  return /^[\x21-\x7e]{1,128}$/.test(key) && !key.includes('=') ? key : `(a key of ${key.length} chars)`;
++}
++
++/** Why this env entry cannot be written, naming the key only; null when it can. */
++export function envEntryProblem(key: string, value: string): string | null {
++  if (!ENV_KEY_PATTERN.test(key)) return `env key ${describeKey(key)} is not a valid name`;
++  if (/[\r\n\0]/.test(value)) return `env ${key}: value holds CR, LF or NUL`;
++  if (Buffer.from(value, 'utf8').toString('utf8') !== value) return `env ${key}: value is not valid UTF-8`;
++  return null;
++}
++
++function writeLaunchEnvFile(env: Record<string, string>): { dir: string; file: string } | null {
++  const entries = Object.entries(env);
++  for (const [key, value] of entries) {
++    const problem = envEntryProblem(key, value);
++    if (problem) throw new JobEnvError(`job ${problem}`);
++  }
++  if (entries.length === 0) return null;
++  const dir = mkdtempSync(join(tmpdir(), ENVFILE_DIR_PREFIX));
++  try {
++    chmodSync(dir, 0o700);
++    const file = join(dir, 'env');
++    const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
++    try {
++      fchmodSync(fd, 0o600);
++      writeSync(fd, Buffer.from(entries.map(([k, v]) => `${k}=${v}\n`).join(''), 'utf8'));
++    } finally {
++      closeSync(fd);
++    }
++    return { dir, file };
++  } catch (error) {
++    rmSync(dir, { recursive: true, force: true });
++    throw error;
++  }
++}
++
++/** Boot: remove leftover per-launch env-file directories (and unlink, never follow, a symlink). */
++export function sweepStaleEnvFileDirs(root: string = tmpdir()): number {
++  let removed = 0;
++  for (const name of readdirSync(root)) {
++    if (!name.startsWith(ENVFILE_DIR_PREFIX)) continue;
++    const path = join(root, name);
++    const st = lstatSync(path);
++    if (st.isSymbolicLink() || !st.isDirectory()) unlinkSync(path);
++    else rmSync(path, { recursive: true, force: true });
++    removed += 1;
++  }
++  return removed;
++}
++
+ /**
+  * `secretValues`: the values from a secret source (the dispatcher's base env for the kind) that a
+  * failure message must never carry (goodqa#16185). Omitted, every env value is treated as secret.
+@@ -332,12 +409,13 @@ export async function dockerRunDetached(
+   if (security.pidsLimit) {
+     execArgs.push(`--pids-limit=${security.pidsLimit}`);
+   }
+-  for (const [key, value] of Object.entries(env)) {
+-    execArgs.push('-e', `${key}=${value}`);
+-  }
++  // goodqa#16148 AC-6: validated and written before docker is touched; removed in the finally.
++  const envFile = writeLaunchEnvFile(env);
++  if (envFile) execArgs.push('--env-file', envFile.file);
+   execArgs.push(image, ...args);
+ 
+   let stdout: string;
++  try {
+   try {
+     const result = await execFileAsync(dockerBin, execArgs, { timeout: timeoutMs, maxBuffer: 1024 * 1024 });
+     stdout = result.stdout;
+@@ -359,6 +437,9 @@ export async function dockerRunDetached(
+     const stderr = typeof err.stderr === 'string' ? err.stderr : '';
+     throw new DockerLaunchError('synchronous_failure', describeDockerFailure(stderr, secretValues));
+   }
++  } finally {
++    if (envFile) rmSync(envFile.dir, { recursive: true, force: true });
++  }
+ 
+   const containerId = stdout.trim();
+   if (!containerId) {
+diff --git a/apps/job-dispatcher/src/index.ts b/apps/job-dispatcher/src/index.ts
+index 34a28a5ce0f..262038cc3c4 100644
+--- a/apps/job-dispatcher/src/index.ts
++++ b/apps/job-dispatcher/src/index.ts
+@@ -1,11 +1,19 @@
+ import { loadConfig } from './config';
+ import { configureExecutionStore, reconcileExecutions } from './executions';
++import { sweepStaleEnvFileDirs } from './docker';
++import { bootEnvFileStatusLines } from './job-env-file';
+ import { buildServer, realDockerDeps } from './server';
+ 
+ const config = loadConfig();
+ const app = buildServer(config);
+ 
+ async function main(): Promise<void> {
++  // goodqa#16148 AC-6: a crash between writing a launch env-file and its finally leaves a
++  // directory on the tmpfs; remove any before serving.
++  app.log.info({ removed: sweepStaleEnvFileDirs() }, 'job-dispatcher: swept stale env-file dirs');
++  // goodqa#16148 AC-5: one status line per JOB_ENVFILE key (names and status only); rw-ship's
++  // unhold gate reads `job env file KIND__VAR: ok` from this container's log. Never fails boot.
++  for (const line of bootEnvFileStatusLines(config)) app.log.info(line);
+   // D3: reload the persisted registry and reconcile it against the daemon
+   // BEFORE accepting requests, so admission control starts from the real
+   // number of live job containers, not 0.
+diff --git a/apps/job-dispatcher/src/job-env-file.ts b/apps/job-dispatcher/src/job-env-file.ts
+new file mode 100644
+index 00000000000..e1a94dcfbbc
+--- /dev/null
++++ b/apps/job-dispatcher/src/job-env-file.ts
+@@ -0,0 +1,144 @@
++/**
++ * goodqa#16148 spec v4 AC-4, AC-5, AC-9: file-backed job env.
++ *
++ * `JOB_ENVFILE_<KIND>__<VAR>=<PATH>` in the dispatcher's own env makes <VAR> part of that kind's
++ * job env, read from <PATH> at every launch (so a rotated file is picked up without a restart).
++ * Only keys in the compiled allow-list are honoured; any other JOB_ENVFILE_ key is ignored and
++ * named at boot. The prefix differs from `JOB_ENV_I...` at its eighth character, so an older
++ * dispatcher (which matches only `JOB_ENV_<KIND>__`) ignores these keys entirely.
++ *
++ * The read never resolves the path twice and never follows a link: PATH must be absolute, hold no
++ * `..` segment, and have exactly the secrets directory as its parent; it is opened
++ * O_RDONLY|O_NOFOLLOW|O_NONBLOCK (a FIFO cannot block the launch), fstat on the same fd must show
++ * a regular file, and at most 64 KiB + 1 byte is read from that fd. One trailing LF is removed.
++ * Every failure is a fixed phrase that names the key and never holds the value.
++ */
++import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'node:fs';
++import { dirname, isAbsolute } from 'node:path';
++import type { JobKind } from './jobs';
++import { JOB_KINDS } from './jobs';
++
++export const JOB_ENVFILE_PREFIX = 'JOB_ENVFILE_';
++export const JOB_ENVFILE_ALLOWLIST: ReadonlySet<string> = new Set(['INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY']);
++/** The only directory a JOB_ENVFILE path may live in: the job-dispatcher's read-only secrets mount. */
++export const JOB_ENVFILE_DIR = '/run/goodqa-secrets';
++export const JOB_ENVFILE_MAX_BYTES = 64 * 1024;
++
++export interface JobEnvFileEntry {
++  /** `INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY` */
++  id: string;
++  kind: JobKind;
++  varName: string;
++  path: string;
++}
++
++export interface JobEnvFiles {
++  entries: JobEnvFileEntry[];
++  ignored: string[];
++}
++
++function envPrefixForKind(kind: JobKind): string {
++  return kind.toUpperCase().replace(/-/g, '_');
++}
++
++export function parseJobEnvFiles(env: NodeJS.ProcessEnv): JobEnvFiles {
++  const entries: JobEnvFileEntry[] = [];
++  const ignored: string[] = [];
++  for (const [key, value] of Object.entries(env)) {
++    if (value === undefined || !key.startsWith(JOB_ENVFILE_PREFIX)) continue;
++    const id = key.slice(JOB_ENVFILE_PREFIX.length);
++    const kind = JOB_KINDS.find((k) => id.startsWith(`${envPrefixForKind(k)}__`));
++    if (!kind || !JOB_ENVFILE_ALLOWLIST.has(id)) {
++      ignored.push(key);
++      continue;
++    }
++    entries.push({ id, kind, varName: id.slice(envPrefixForKind(kind).length + 2), path: value });
++  }
++  ignored.sort();
++  return { entries, ignored };
++}
++
++export type JobEnvFileRead = { ok: true; value: string } | { ok: false; reason: string };
++
++export function readJobEnvFile(path: string, allowedDir: string): JobEnvFileRead {
++  if (!isAbsolute(path) || path.split('/').includes('..') || dirname(path) !== allowedDir) {
++    return { ok: false, reason: 'path outside the secrets directory' };
++  }
++  let fd: number;
++  try {
++    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code;
++    if (code === 'ENOENT') return { ok: false, reason: 'missing' };
++    if (code === 'ELOOP') return { ok: false, reason: 'is a symlink' };
++    if (code === 'EACCES' || code === 'EPERM') return { ok: false, reason: 'unreadable' };
++    return { ok: false, reason: `cannot open (${code ?? 'error'})` };
++  }
++  try {
++    if (!fstatSync(fd).isFile()) return { ok: false, reason: 'not a regular file' };
++    const buf = Buffer.alloc(JOB_ENVFILE_MAX_BYTES + 1);
++    let total = 0;
++    for (;;) {
++      let n: number;
++      try {
++        n = readSync(fd, buf, total, buf.length - total, null);
++      } catch (error) {
++        const code = (error as NodeJS.ErrnoException).code;
++        if (code === 'EACCES' || code === 'EPERM') return { ok: false, reason: 'unreadable' };
++        return { ok: false, reason: `cannot read (${code ?? 'error'})` };
++      }
++      if (n === 0) break;
++      total += n;
++      if (total > JOB_ENVFILE_MAX_BYTES) return { ok: false, reason: 'over 64 KiB' };
++    }
++    let bytes = buf.subarray(0, total);
++    if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0a) bytes = bytes.subarray(0, bytes.length - 1);
++    if (bytes.length === 0) return { ok: false, reason: 'empty' };
++    if (bytes.includes(0x0d) || bytes.includes(0x0a) || bytes.includes(0x00)) return { ok: false, reason: 'value holds CR, LF or NUL' };
++    const value = bytes.toString('utf8');
++    if (!Buffer.from(value, 'utf8').equals(bytes)) return { ok: false, reason: 'value is not valid UTF-8' };
++    return { ok: true, value };
++  } finally {
++    closeSync(fd);
++  }
++}
++
++export function envFileError(entry: Pick<JobEnvFileEntry, 'id'>, reason: string): string {
++  return `job env file for ${entry.id}: ${reason}`;
++}
++
++/** Resolve a kind's file-backed env for one launch, or the first named error. */
++export function resolveJobEnvFiles(
++  files: JobEnvFiles,
++  allowedDir: string,
++  kind: JobKind,
++  baseEnv: Record<string, string>,
++): { ok: true; env: Record<string, string> } | { ok: false; error: string } {
++  const env: Record<string, string> = {};
++  for (const entry of files.entries) {
++    if (entry.kind !== kind) continue;
++    if (Object.prototype.hasOwnProperty.call(baseEnv, entry.varName)) {
++      return { ok: false, error: envFileError(entry, 'both JOB_ENV_ and JOB_ENVFILE_ are set') };
++    }
++    const read = readJobEnvFile(entry.path, allowedDir);
++    if (!read.ok) return { ok: false, error: envFileError(entry, read.reason) };
++    env[entry.varName] = read.value;
++  }
++  return { ok: true, env };
++}
++
++/** Boot: one status line per JOB_ENVFILE key (rw-ship's unhold gate reads `: ok`). Never throws. */
++export function bootEnvFileStatusLines(config: { jobEnvFiles: JobEnvFiles; jobEnvFileDir: string }): string[] {
++  const lines: string[] = [];
++  for (const entry of config.jobEnvFiles.entries) {
++    let read: JobEnvFileRead;
++    try {
++      read = readJobEnvFile(entry.path, config.jobEnvFileDir);
++    } catch {
++      read = { ok: false, reason: 'cannot read (error)' };
++    }
++    lines.push(read.ok ? `job env file ${entry.id}: ok` : envFileError(entry, read.reason));
++  }
++  for (const key of config.jobEnvFiles.ignored) lines.push(`job env file key ignored (not allow-listed): ${key}`);
++  return lines;
++}
+diff --git a/apps/job-dispatcher/src/server.ts b/apps/job-dispatcher/src/server.ts
+index 01c48106344..9b97563af0b 100644
+--- a/apps/job-dispatcher/src/server.ts
++++ b/apps/job-dispatcher/src/server.ts
+@@ -30,6 +30,7 @@
+  * is a new service free to use the more standard form; same "one shared
+  * secret in an env var, checked at the door" convention either way.
+  */
++import { resolveJobEnvFiles } from './job-env-file';
+ import { timingSafeEqual } from 'node:crypto';
+ import Fastify, { type FastifyInstance } from 'fastify';
+ import type { Config } from './config';
+@@ -37,6 +38,8 @@ import {
+   dockerRunDetached,
+   inspectContainer,
+   DockerLaunchError,
++  JobEnvError,
++  envEntryProblem,
+   type ContainerInspection,
+   type ContainerSecurityProfile,
+   type DockerRunResult,
+@@ -152,7 +155,28 @@ export function buildServer(config: Config, deps: DockerDeps = realDockerDeps, o
+     if (refused.length > 0) {
+       return reply.code(400).send({ error: `env not settable by a caller for ${kind}: ${refused.join(', ')}` });
+     }
+-    const mergedEnv = { ...config.jobBaseEnv[kind], ...validation.env };
++    // goodqa#16148 AC-6 / NEG-8: an env-file line cannot carry CR, LF or NUL. A request value is
++    // the caller's fault (400); a base value is a dispatcher misconfiguration (501). Key names only.
++    for (const [key, value] of Object.entries(validation.env)) {
++      const problem = envEntryProblem(key, value);
++      if (problem) return reply.code(400).send({ error: `request ${problem}` });
++    }
++    // goodqa#16148 AC-4/AC-5: file-backed env, read now (per launch); a failure is per kind and
++    // definitive (501, docker never called), logged with the key name and reason only.
++    const fileEnv = resolveJobEnvFiles(config.jobEnvFiles, config.jobEnvFileDir, kind, config.jobBaseEnv[kind]);
++    if (!fileEnv.ok) {
++      req.log.error({ jobKind: kind }, fileEnv.error);
++      return reply.code(501).send({ error: fileEnv.error });
++    }
++    const baseEnv = { ...config.jobBaseEnv[kind], ...fileEnv.env };
++    for (const [key, value] of Object.entries(baseEnv)) {
++      const problem = envEntryProblem(key, value);
++      if (problem) {
++        req.log.error({ jobKind: kind }, `job-dispatcher: base ${problem}`);
++        return reply.code(501).send({ error: `job base ${problem}` });
++      }
++    }
++    const mergedEnv = { ...baseEnv, ...validation.env };
+ 
+     try {
+       const result = await deps.run(
+@@ -166,7 +190,7 @@ export function buildServer(config: Config, deps: DockerDeps = realDockerDeps, o
+         JOB_SECURITY_PROFILE[kind],
+         // goodqa#16185 / #16148 P1: only the base env is a secret source; the caller's allow-listed
+         // request env is not redacted from a failure message.
+-        Object.values(config.jobBaseEnv[kind]),
++        Object.values(baseEnv),
+       );
+       const execution = recordExecution(kind, result.containerId, result.startedAt);
+       return reply.code(200).send({
+@@ -175,6 +199,9 @@ export function buildServer(config: Config, deps: DockerDeps = realDockerDeps, o
+         startedAt: result.startedAt,
+       });
+     } catch (error) {
++      if (error instanceof JobEnvError) {
++        return reply.code(501).send({ error: error.message });
++      }
+       if (error instanceof DockerLaunchError) {
+         if (error.reason === 'synchronous_failure') {
+           return reply.code(422).send({ error: error.message, started: false });
+diff --git a/apps/job-dispatcher/test/docker.test.ts b/apps/job-dispatcher/test/docker.test.ts
+index c183fec0b7b..5494163c9f3 100644
+--- a/apps/job-dispatcher/test/docker.test.ts
++++ b/apps/job-dispatcher/test/docker.test.ts
+@@ -49,15 +49,17 @@ describe('dockerRunDetached', () => {
+     expect(file).toBe('docker');
+     // Every element is its own argv entry -- confirms no shell-string
+     // concatenation is possible for injection regardless of value content.
++    // goodqa#16148 AC-6: the env goes through a private --env-file, never `-e KEY=VALUE`.
+     expect(args).toEqual([
+       'run',
+       '--rm',
+       '-d',
+-      '-e',
+-      'SCAN_CLONE_TOKEN=ghs_fake',
++      '--env-file',
++      expect.stringMatching(/goodqa-envfile-[^/]+\/env$/),
+       'registry.example/bugtracker/scan:tag',
+       'scan-id-1',
+     ]);
++    expect(args.join(' ')).not.toContain('ghs_fake');
+     expect((options as { timeout: number }).timeout).toBe(5000);
+   });
+ 
+@@ -72,11 +74,10 @@ describe('dockerRunDetached', () => {
+       NO_HARDENING,
+     );
+     const [, args] = execFileMock.mock.calls[0]!;
+-    expect(args).toContain('-e');
+-    // The dangerous value is the ENTIRE next argv element, not split by the
+-    // shell metacharacters it contains -- there is no shell to split it.
+-    expect(args).toContain('PAYLOAD=$(rm -rf /); echo pwned `whoami`');
+-    expect(args).toHaveLength(6); // run, --rm, -d, -e, KEY=VALUE, image -- one element each
++    // goodqa#16148 AC-6: the value never reaches argv at all; it rides in the env-file.
++    expect(args).not.toContain('-e');
++    expect((args as string[]).join(' ')).not.toContain('whoami');
++    expect(args).toHaveLength(6); // run, --rm, -d, --env-file, PATH, image -- one element each
+   });
+ 
+   it('classifies a synchronous docker failure (bad image) as synchronous_failure — proven not started', async () => {
+@@ -137,8 +138,8 @@ describe('AUD-032: dockerRunDetached security profile flags', () => {
+       '--read-only',
+       '--tmpfs',
+       '/tmp:rw,noexec,nosuid,size=1024m',
+-      '-e',
+-      'K=V',
++      '--env-file',
++      expect.stringMatching(/goodqa-envfile-[^/]+\/env$/),
+       'image:tag',
+       'arg1',
+     ]);
+diff --git a/apps/job-dispatcher/test/env-file.test.ts b/apps/job-dispatcher/test/env-file.test.ts
+new file mode 100644
+index 00000000000..eed31c7487a
+--- /dev/null
++++ b/apps/job-dispatcher/test/env-file.test.ts
+@@ -0,0 +1,211 @@
++/**
++ * goodqa#16148 spec v4 AC-6 (1), NEG-8, NEG-9, NEG-10: every job env reaches docker through a
++ * private --env-file, never `-e KEY=VALUE` on the command line (/proc/PID/cmdline is
++ * world-readable in the host PID namespace).
++ *
++ * The stub docker records its argv and inspects the env-file at call time: mode 0600 in a fresh
++ * 0700 directory under TMPDIR, exactly one `KEY=VALUE` line per variable. Both are gone after the
++ * call on every path (success, docker failure, timeout, a synchronous throw).
++ */
++import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
++import { join } from 'node:path';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++
++const execFileMock = vi.fn();
++vi.mock('node:child_process', () => ({
++  execFile: (...args: unknown[]) => execFileMock(...args),
++}));
++
++const { dockerRunDetached, sweepStaleEnvFileDirs, envEntryProblem, JobEnvError, NO_HARDENING, ENVFILE_DIR_PREFIX } = await import('../src/docker');
++const { buildServer } = await import('../src/server');
++const { loadConfig } = await import('../src/config');
++const { clearExecutionsForTesting } = await import('../src/executions');
++
++type Callback = (error: Error | null, stdout?: string, stderr?: string) => void;
++
++interface Seen {
++  args: string[];
++  fileMode: number;
++  dirMode: number;
++  content: Buffer;
++  path: string;
++  dir: string;
++}
++
++let root = '';
++const savedTmp = process.env.TMPDIR;
++
++beforeEach(() => {
++  const base = join(process.cwd(), '.scratch');
++  mkdirSync(base, { recursive: true });
++  root = mkdtempSync(join(base, 'envfile-test-'));
++  process.env.TMPDIR = root;
++  clearExecutionsForTesting();
++});
++
++afterEach(() => {
++  execFileMock.mockReset();
++  if (savedTmp === undefined) delete process.env.TMPDIR;
++  else process.env.TMPDIR = savedTmp;
++});
++
++/** Stub docker: snapshot the env-file at call time, then behave as `mode` says. */
++function stubDocker(mode: 'ok' | 'fail' | 'timeout' | 'throw', seen: Seen[]) {
++  execFileMock.mockImplementationOnce((_file: string, args: string[], _opts: unknown, cb: Callback) => {
++    const i = args.indexOf('--env-file');
++    const path = i >= 0 ? args[i + 1]! : '';
++    const dir = path ? path.slice(0, path.lastIndexOf('/')) : '';
++    seen.push({
++      args: [...args],
++      fileMode: path ? statSync(path).mode & 0o777 : -1,
++      dirMode: dir ? statSync(dir).mode & 0o777 : -1,
++      content: path ? readFileSync(path) : Buffer.alloc(0),
++      path,
++      dir,
++    });
++    if (mode === 'throw') throw new Error('spawn EACCES');
++    if (mode === 'ok') return cb(null, 'cid123\n', '');
++    if (mode === 'timeout') return cb(Object.assign(new Error('timed out'), { killed: true, signal: 'SIGTERM' }), '', '');
++    return cb(Object.assign(new Error('Command failed'), { code: 125, stderr: 'docker: boom' }), '', 'docker: boom');
++  });
++}
++
++const ENV = {
++  A_PLAIN: 'value',
++  B_SPACES: '  lead inner  trail  ',
++  C_EQ: 'x=y==z',
++  D_HASH: '#not-a-comment # inner',
++  E_EMPTY: '',
++  F_QUOTES: `"double" 'single'`,
++  G_BACKSLASH: 'a\\b\\\\c\\n',
++  H_UTF8: 'café 日本 \u{1F600}',
++};
++
++function expectedFile(env: Record<string, string>): Buffer {
++  return Buffer.from(Object.entries(env).map(([k, v]) => `${k}=${v}\n`).join(''), 'utf8');
++}
++
++describe('AC-6 (1): env reaches docker only through --env-file', () => {
++  it('argv holds --env-file and no value; the file is 0600 in a fresh 0700 dir with one KEY=VALUE line each, and both are gone afterwards', async () => {
++    const seen: Seen[] = [];
++    stubDocker('ok', seen);
++    const res = await dockerRunDetached('docker', 'img:tag', ['arg1'], ENV, 5000, NO_HARDENING);
++    expect(res.containerId).toBe('cid123');
++    const s = seen[0]!;
++    expect(s.args).toEqual(['run', '--rm', '-d', '--env-file', s.path, 'img:tag', 'arg1']);
++    expect(s.args).not.toContain('-e');
++    for (const v of Object.values(ENV).filter((x) => x.length > 0)) {
++      for (const a of s.args) expect(a.includes(v), `argv element carries a value: ${a}`).toBe(false);
++    }
++    expect(s.fileMode).toBe(0o600);
++    expect(s.dirMode).toBe(0o700);
++    expect(s.dir.startsWith(join(root, ENVFILE_DIR_PREFIX))).toBe(true);
++    expect(s.content.equals(expectedFile(ENV))).toBe(true);
++    expect(existsSync(s.dir)).toBe(false);
++    expect(readdirSync(root)).toEqual([]);
++  });
++
++  it.each(['fail', 'timeout', 'throw'] as const)('NEG-9: the env-file and its dir are removed when docker %s', async (mode) => {
++    const seen: Seen[] = [];
++    stubDocker(mode, seen);
++    await expect(dockerRunDetached('docker', 'img:tag', [], { K: 'secret-value-123' }, 5000, NO_HARDENING)).rejects.toBeTruthy();
++    expect(seen).toHaveLength(1);
++    expect(existsSync(seen[0]!.path)).toBe(false);
++    expect(readdirSync(root)).toEqual([]);
++  });
++
++  it('two launches never share a directory', async () => {
++    const seen: Seen[] = [];
++    stubDocker('ok', seen);
++    stubDocker('ok', seen);
++    await dockerRunDetached('docker', 'i', [], { K: 'a' }, 5000, NO_HARDENING);
++    await dockerRunDetached('docker', 'i', [], { K: 'b' }, 5000, NO_HARDENING);
++    expect(seen[0]!.dir).not.toBe(seen[1]!.dir);
++  });
++});
++
++describe('NEG-10: invalid keys or values are refused before anything is written', () => {
++  it.each([
++    ['empty key', { '': 'v' }],
++    ['key with =', { 'A=B': 'v' }],
++    ['key with space', { 'A B': 'v' }],
++    ['non-ASCII key', { 'CAFÉ': 'v' }],
++    ['key starting with a digit', { '1A': 'v' }],
++    ['value with LF', { K: 'a\nb' }],
++    ['value with CR', { K: 'a\rb' }],
++    ['value with NUL', { K: 'a\u0000b' }],
++    ['value that is not valid UTF-8 (lone surrogate)', { K: 'a\ud800b' }],
++  ])('%s', async (_name, env) => {
++    await expect(dockerRunDetached('docker', 'i', [], env as Record<string, string>, 5000, NO_HARDENING)).rejects.toBeInstanceOf(JobEnvError);
++    expect(execFileMock).not.toHaveBeenCalled();
++    expect(readdirSync(root)).toEqual([]);
++  });
++
++  it('the refusal names the key, never the value', () => {
++    const problem = envEntryProblem('API_KEY', 'super-secret-value\nx');
++    expect(problem).toContain('API_KEY');
++    expect(problem).not.toContain('super-secret-value');
++  });
++});
++
++describe('boot sweep of stale env-file dirs', () => {
++  it('removes leftover goodqa-envfile-* dirs, leaves other entries, and never follows a symlink', () => {
++    const stale = join(root, `${ENVFILE_DIR_PREFIX}stale1`);
++    mkdirSync(stale, { mode: 0o700 });
++    writeFileSync(join(stale, 'env'), 'K=old-secret\n', { mode: 0o600 });
++    const other = join(root, 'unrelated');
++    mkdirSync(other);
++    const outside = mkdtempSync(join(process.cwd(), '.scratch', 'outside-'));
++    writeFileSync(join(outside, 'keep'), 'keep');
++    symlinkSync(outside, join(root, `${ENVFILE_DIR_PREFIX}link`));
++    const removed = sweepStaleEnvFileDirs(root);
++    expect(removed).toBe(2);
++    expect(existsSync(stale)).toBe(false);
++    expect(existsSync(other)).toBe(true);
++    expect(() => lstatSync(join(root, `${ENVFILE_DIR_PREFIX}link`))).toThrow();
++    expect(readFileSync(join(outside, 'keep'), 'utf8')).toBe('keep');
++  });
++});
++
++describe('server: request env 400, base env 501, never docker', () => {
++  const TOKEN = 'shim-token-not-real';
++  const auth = { authorization: `Bearer ${TOKEN}` };
++  function config(base: Record<string, string> = {}) {
++    return {
++      ...loadConfig({
++        JOB_DISPATCH_TOKEN: TOKEN,
++        JOB_IMAGE_SCAN: 'ar/scan:tag',
++        JOB_IMAGE_TRANSCODE: 'ar/transcode:tag',
++        JOB_IMAGE_INTELLIGENCE_WORKER: 'ar/iw:tag',
++        JOB_IMAGE_SUGGEST_FIX_WORKER: 'ar/sf:tag',
++      }),
++      jobBaseEnv: { scan: base, transcode: {}, 'intelligence-worker': {}, 'suggest-fix-worker': {} },
++    };
++  }
++
++  it.each([['LF', 'ghs_a\nb'], ['CR', 'ghs_a\rb'], ['NUL', 'ghs_a\u0000b']])('NEG-8: a request env value with %s answers 400', async (_n, value) => {
++    const run = vi.fn();
++    const app = buildServer(config(), { run, inspect: vi.fn() } as never);
++    const res = await app.inject({ method: 'POST', url: '/jobs/scan/run', headers: auth, payload: { env: { SCAN_CLONE_TOKEN: value } } });
++    expect(res.statusCode).toBe(400);
++    expect(run).not.toHaveBeenCalled();
++    expect(res.body).not.toContain('ghs_a');
++  });
++
++  it('a base env value with LF answers 501 with a named error and no value', async () => {
++    const run = vi.fn();
++    const app = buildServer(config({ DATABASE_URL: 'postgres://secret\nx' }), { run, inspect: vi.fn() } as never);
++    const res = await app.inject({ method: 'POST', url: '/jobs/scan/run', headers: auth, payload: {} });
++    expect(res.statusCode).toBe(501);
++    expect(res.json().error).toContain('DATABASE_URL');
++    expect(res.body).not.toContain('postgres://secret');
++    expect(run).not.toHaveBeenCalled();
++  });
++
++  it('a JobEnvError from the launcher answers 501', async () => {
++    const run = vi.fn().mockRejectedValue(new JobEnvError('job env K: value holds CR, LF or NUL'));
++    const app = buildServer(config(), { run, inspect: vi.fn() } as never);
++    const res = await app.inject({ method: 'POST', url: '/jobs/scan/run', headers: auth, payload: {} });
++    expect(res.statusCode).toBe(501);
++  });
++});
+diff --git a/apps/job-dispatcher/test/job-env-file.test.ts b/apps/job-dispatcher/test/job-env-file.test.ts
+new file mode 100644
+index 00000000000..adb26697d65
+--- /dev/null
++++ b/apps/job-dispatcher/test/job-env-file.test.ts
+@@ -0,0 +1,204 @@
++/**
++ * goodqa#16148 spec v4 AC-4, AC-5, AC-9, NEG-4, NEG-6: an allow-listed `JOB_ENVFILE_KIND__VAR=PATH`
++ * supplies VAR to that kind's job env, read from a file under the secrets dir at every launch.
++ * Failures are per kind: 501 `job env file for KIND__VAR: REASON`, docker never called, the same
++ * line logged with key name and path only. Boot logs one status line per key and never fails.
++ * All values are fake.
++ */
++import { chmodSync, mkdirSync, mkdtempSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
++import { execFileSync } from 'node:child_process';
++import { join } from 'node:path';
++import { Worker } from 'node:worker_threads';
++import { beforeEach, describe, expect, it, vi } from 'vitest';
++import { loadConfig } from '../src/config';
++import { clearExecutionsForTesting } from '../src/executions';
++import { buildServer } from '../src/server';
++import { bootEnvFileStatusLines, readJobEnvFile, JOB_ENVFILE_ALLOWLIST } from '../src/job-env-file';
++
++const TOKEN = 'shim-token-not-real';
++const auth = { authorization: `Bearer ${TOKEN}` };
++const KEY = 'JOB_ENVFILE_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY';
++const FAKE_PEM = '-----BEGIN FAKE KEY-----MIIFAKEfakeFAKEfake0123456789-----END FAKE KEY-----';
++
++let dir = '';
++beforeEach(() => {
++  const base = join(process.cwd(), '.scratch');
++  mkdirSync(base, { recursive: true });
++  dir = mkdtempSync(join(base, 'secrets-'));
++  clearExecutionsForTesting();
++});
++
++function config(env: Record<string, string> = {}) {
++  return {
++    ...loadConfig({
++      JOB_DISPATCH_TOKEN: TOKEN,
++      JOB_IMAGE_SCAN: 'ar/scan:tag',
++      JOB_IMAGE_TRANSCODE: 'ar/transcode:tag',
++      JOB_IMAGE_INTELLIGENCE_WORKER: 'ar/iw:tag',
++      JOB_IMAGE_SUGGEST_FIX_WORKER: 'ar/sf:tag',
++      ...env,
++    }),
++    jobEnvFileDir: dir,
++  };
++}
++
++function okRun() {
++  return vi.fn().mockResolvedValue({ containerId: 'c1', startedAt: '2026-11-16T00:00:00.000Z' });
++}
++
++async function launch(cfg: ReturnType<typeof config>, run = okRun(), kind = 'intelligence-worker', lines: string[] = []) {
++  const app = buildServer(cfg, { run, inspect: vi.fn() } as never, { logStream: { write: (l: string) => lines.push(l) } });
++  const res = await app.inject({ method: 'POST', url: `/jobs/${kind}/run`, headers: auth, payload: {} });
++  return { res, run, lines };
++}
++
++describe('AC-4: injection', () => {
++  it('the allow-listed key supplies VAR to intelligence-worker only, read at launch, one trailing LF removed', async () => {
++    writeFileSync(join(dir, 'github-app-private-key'), `${FAKE_PEM}\n`);
++    const cfg = config({ [KEY]: join(dir, 'github-app-private-key'), JOB_ENV_INTELLIGENCE_WORKER__OTHER: 'o' });
++    const { res, run } = await launch(cfg);
++    expect(res.statusCode).toBe(200);
++    const env = run.mock.calls[0]![3] as Record<string, string>;
++    expect(env.GITHUB_APP_PRIVATE_KEY).toBe(FAKE_PEM);
++    expect(env.OTHER).toBe('o');
++    // The value is a secret source: it is in the redaction list (goodqa#16185).
++    expect(run.mock.calls[0]![6]).toContain(FAKE_PEM);
++    for (const kind of ['scan', 'transcode', 'suggest-fix-worker']) {
++      const other = await launch(cfg, okRun(), kind);
++      expect(other.res.statusCode).toBe(200);
++      expect((other.run.mock.calls[0]![3] as Record<string, string>).GITHUB_APP_PRIVATE_KEY).toBeUndefined();
++    }
++  });
++
++  it('only INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY is allow-listed', () => {
++    expect([...JOB_ENVFILE_ALLOWLIST]).toEqual(['INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY']);
++  });
++
++  it('a non-allow-listed JOB_ENVFILE key is ignored and logged by name at boot', async () => {
++    writeFileSync(join(dir, 'x'), 'secret-x');
++    const cfg = config({ JOB_ENVFILE_SCAN__DATABASE_URL: join(dir, 'x') });
++    const { res, run } = await launch(cfg, okRun(), 'scan');
++    expect(res.statusCode).toBe(200);
++    expect((run.mock.calls[0]![3] as Record<string, string>).DATABASE_URL).toBeUndefined();
++    expect(bootEnvFileStatusLines(cfg)).toContain('job env file key ignored (not allow-listed): JOB_ENVFILE_SCAN__DATABASE_URL');
++  });
++
++  it('JOB_ENV_KIND__VAR ending in _FILE keeps its literal meaning', async () => {
++    const cfg = config({ JOB_ENV_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY_FILE: '/some/path' });
++    const { run } = await launch(cfg);
++    expect((run.mock.calls[0]![3] as Record<string, string>).GITHUB_APP_PRIVATE_KEY_FILE).toBe('/some/path');
++    expect((run.mock.calls[0]![3] as Record<string, string>).GITHUB_APP_PRIVATE_KEY).toBeUndefined();
++  });
++});
++
++describe('AC-5 / NEG-4: fail closed per kind', () => {
++  const name = 'github-app-private-key';
++  const cases: Array<[string, () => string, RegExp]> = [
++    ['missing file', () => join(dir, name), /: missing$/],
++    ['unreadable (mode 000)', () => { writeFileSync(join(dir, name), FAKE_PEM); chmodSync(join(dir, name), 0o000); return join(dir, name); }, /: unreadable$/],
++    ['empty', () => { writeFileSync(join(dir, name), ''); return join(dir, name); }, /: empty$/],
++    ['only a newline', () => { writeFileSync(join(dir, name), '\n'); return join(dir, name); }, /: empty$/],
++    ['a symlink to a readable file', () => { writeFileSync(join(dir, 'real'), FAKE_PEM); symlinkSync(join(dir, 'real'), join(dir, name)); return join(dir, name); }, /: is a symlink$/],
++    ['a FIFO', () => { execFileSync('mkfifo', [join(dir, name)]); return join(dir, name); }, /: not a regular file$/],
++    ['a directory', () => { mkdirSync(join(dir, name)); return join(dir, name); }, /: not a regular file$/],
++    ['a 65 KiB file', () => { writeFileSync(join(dir, name), 'A'.repeat(65 * 1024)); return join(dir, name); }, /: over 64 KiB$/],
++    ['a path outside the secrets dir', () => { writeFileSync(join(dir, '..', 'outside-key'), FAKE_PEM); return join(dir, '..', 'outside-key'); }, /: path outside the secrets directory$/],
++    ['.. traversal', () => `${dir}/../${dir.split('/').pop()}/${name}`, /: path outside the secrets directory$/],
++    ['a relative path', () => 'github-app-private-key', /: path outside the secrets directory$/],
++    ['a CR inside the value', () => { writeFileSync(join(dir, name), 'abc\rdef\n'); return join(dir, name); }, /: value holds CR, LF or NUL$/],
++    ['an inner LF', () => { writeFileSync(join(dir, name), 'abc\ndef\n'); return join(dir, name); }, /: value holds CR, LF or NUL$/],
++    ['a NUL', () => { writeFileSync(join(dir, name), 'abc\u0000def'); return join(dir, name); }, /: value holds CR, LF or NUL$/],
++    ['invalid UTF-8', () => { writeFileSync(join(dir, name), Buffer.from([0x41, 0xff, 0x42])); return join(dir, name); }, /: value is not valid UTF-8$/],
++  ];
++
++  it.each(cases)('%s: 501, docker not called, the named line logged without the value', async (_n, setup, reason) => {
++    const path = setup();
++    const { res, run, lines } = await launch(config({ [KEY]: path }));
++    expect(res.statusCode).toBe(501);
++    const error = (res.json() as { error: string }).error;
++    expect(error.startsWith('job env file for INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY: ')).toBe(true);
++    expect(error).toMatch(reason);
++    expect(run).not.toHaveBeenCalled();
++    expect(lines.some((l) => l.includes(error))).toBe(true);
++    for (const l of [...lines, res.body]) expect(l).not.toContain('MIIFAKEfake');
++    // Other kinds are unaffected.
++    const other = await launch(config({ [KEY]: path }), okRun(), 'scan');
++    expect(other.res.statusCode).toBe(200);
++  });
++
++  it('both JOB_ENV_ and JOB_ENVFILE_ for the same VAR: 501', async () => {
++    writeFileSync(join(dir, name), FAKE_PEM);
++    const { res, run } = await launch(config({ [KEY]: join(dir, name), JOB_ENV_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY: 'inline' }));
++    expect(res.statusCode).toBe(501);
++    expect(res.json().error).toBe('job env file for INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY: both JOB_ENV_ and JOB_ENVFILE_ are set');
++    expect(run).not.toHaveBeenCalled();
++  });
++
++  it('boot status lines: ok, or the named error; never the content; boot never throws', () => {
++    writeFileSync(join(dir, name), FAKE_PEM);
++    expect(bootEnvFileStatusLines(config({ [KEY]: join(dir, name) }))).toEqual(['job env file INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY: ok']);
++    expect(bootEnvFileStatusLines(config({ [KEY]: join(dir, 'nope') }))).toEqual([
++      'job env file for INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY: missing',
++    ]);
++    expect(bootEnvFileStatusLines(config())).toEqual([]);
++  });
++});
++
++describe('AC-9 / NEG-6: rotation', () => {
++  it('a changed file is used by the next launch without a restart, never the old value', async () => {
++    const path = join(dir, 'github-app-private-key');
++    writeFileSync(path, 'OLDfakeVALUE-0001');
++    const cfg = config({ [KEY]: path });
++    const app = buildServer(cfg, { run: okRun(), inspect: vi.fn() } as never);
++    const run = okRun();
++    const app2 = buildServer(cfg, { run, inspect: vi.fn() } as never);
++    void app;
++    await app2.inject({ method: 'POST', url: '/jobs/intelligence-worker/run', headers: auth, payload: {} });
++    writeFileSync(join(dir, '.tmp'), 'NEWfakeVALUE-0002');
++    renameSync(join(dir, '.tmp'), path);
++    await app2.inject({ method: 'POST', url: '/jobs/intelligence-worker/run', headers: auth, payload: {} });
++    expect((run.mock.calls[0]![3] as Record<string, string>).GITHUB_APP_PRIVATE_KEY).toBe('OLDfakeVALUE-0001');
++    expect((run.mock.calls[1]![3] as Record<string, string>).GITHUB_APP_PRIVATE_KEY).toBe('NEWfakeVALUE-0002');
++  });
++
++  it('NEG-6: 200 reads while another thread renames in a loop each see exactly the old or the new value', async () => {
++    const path = join(dir, 'github-app-private-key');
++    const A = `A${'a'.repeat(4000)}`;
++    const B = `B${'b'.repeat(6000)}`;
++    writeFileSync(path, A);
++    const worker = new Worker(
++      `const { writeFileSync, renameSync } = require('node:fs');
++       const { workerData, parentPort } = require('node:worker_threads');
++       let i = 0, stop = false;
++       parentPort.on('message', () => { stop = true; });
++       (function loop() {
++         for (let k = 0; k < 50 && !stop; k += 1) {
++           const t = workerData.dir + '/.t' + (i % 2);
++           writeFileSync(t, i % 2 ? workerData.A : workerData.B);
++           renameSync(t, workerData.path);
++           i += 1;
++           if (i === 1) parentPort.postMessage('started');
++         }
++         if (!stop) setImmediate(loop); else parentPort.postMessage(i);
++       })();`,
++      { eval: true, workerData: { dir, path, A, B } },
++    );
++    await new Promise((res) => worker.once('message', res));
++    const seen = new Set<string>();
++    for (let n = 0; n < 200; n += 1) {
++      const r = readJobEnvFile(path, dir);
++      expect(r.ok).toBe(true);
++      const v = (r as { value: string }).value;
++      expect(v === A || v === B).toBe(true);
++      seen.add(v[0]!);
++      await new Promise((res) => setTimeout(res, 1));
++    }
++    const renames = await new Promise<number>((res) => {
++      worker.once('message', res);
++      worker.postMessage('stop');
++    });
++    await worker.terminate();
++    expect(renames).toBeGreaterThan(0);
++    expect(seen.size).toBe(2);
++  });
++});
+diff --git a/infra/release-harness/test_selfhost_ctl_job_secrets.py b/infra/release-harness/test_selfhost_ctl_job_secrets.py
+new file mode 100644
+index 00000000000..f14d55b5217
+--- /dev/null
++++ b/infra/release-harness/test_selfhost_ctl_job_secrets.py
+@@ -0,0 +1,106 @@
++"""goodqa#16148 spec v4 AC-11 (Sonnet v4 condition): on a fake VM, the job-dispatcher secrets mount and group_add that
++the host apply put in compose.yaml survive the real selfhost-ctl.py `pin` (the next release) and its `restore`
++(that release's rollback). The fence refuses the rollback of a release pinned before the apply, so it can never remove them.
++Fake docker on PATH; fake files only; no network, secrets or containers.
++Run: python3 -m pytest -q infra/release-harness/test_selfhost_ctl_job_secrets.py
++"""
++import importlib.util
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++HERE = Path(__file__).resolve().parent
++ROOT = HERE.parent.parent
++CTL = HERE / 'selfhost-ctl.py'
++APP = ROOT / 'infra/selfhost/app'
++
++spec = importlib.util.spec_from_file_location('apply_host', APP / 'apply-job-secrets-host.py')
++ah = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(ah)
++
++FAKE_DOCKER = '''#!/bin/sh
++echo "$*" >> "$FAKE_VM/docker.log"
++if [ "$1" = image ] && [ "$2" = inspect ]; then printf 'sha256:%s\\n' "$(printf %s "$5" | sha256sum | cut -c1-64)"; exit 0; fi
++exit 0
++'''
++SHA_A, SHA_B = 'a' * 40, 'b' * 40
++
++
++def env_text(sha, dep):
++    return 'KEEP=x\nRELEASE_SOURCE_SHA=%s\nRELEASE_DEPLOYMENT_ID=%s\n' % (sha, dep)
++
++
++@pytest.fixture
++def vm(tmp_path, monkeypatch):
++    d, e, b = tmp_path / 'app', tmp_path / 'etc', tmp_path / 'bin'
++    for p in (d, e, b):
++        p.mkdir()
++    (b / 'docker').write_text(FAKE_DOCKER)
++    (b / 'docker').chmod(0o755)
++    for s in ('api', 'web'):
++        (e / (s + '.env')).write_text(env_text('0' * 40, 'dep-0'))
++    monkeypatch.setenv('PATH', '%s:%s' % (b, os.environ['PATH']))
++    monkeypatch.setenv('FAKE_VM', str(tmp_path))
++    return d, e
++
++
++def ctl(vm, *argv):
++    d, e = vm
++    r = subprocess.run([sys.executable, '-B', str(CTL), '--dir', str(d), '--env-dir', str(e), *argv],
++                       capture_output=True, text=True, timeout=60)
++    return r.returncode, r.stdout
++
++
++def pin(vm, stamp, sha, tag):
++    return ctl(vm, 'pin', '--stamp', stamp, '--sha', sha, '--deploy-id', 'dep-' + stamp,
++               '--api', 'goodqa-api:' + tag, '--web', 'goodqa-web:' + tag, '--disp', 'goodqa-job-dispatcher:' + tag)
++
++
++def marked(text):
++    """The marked AC-11 lines, each checked to sit in the job-dispatcher block and nowhere else."""
++    lines = text.split('\n')
++    start = lines.index('  job-dispatcher:')
++    end = next(i for i in range(start + 1, len(lines)) if lines[i] and not lines[i].startswith('    '))
++    block = lines[start:end]
++    return [l for l in (ah.GROUP_LINE, ah.VOL_LINE) if l in block and lines.count(l) == 1]
++
++
++def compose(vm):
++    return (vm[0] / 'compose.yaml').read_text()
++
++
++def test_mount_survives_the_next_release_pin_and_its_rollback(vm):
++    applied = (APP / 'compose.yaml').read_text()          # the checked-in file is what the host apply leaves
++    assert marked(applied) == [ah.GROUP_LINE, ah.VOL_LINE]
++    (vm[0] / 'compose.yaml').write_text(applied)
++    rc, out = pin(vm, 'S1', SHA_A, 'aaaa-1')
++    assert rc == 0, out
++    after_pin = compose(vm)
++    assert 'goodqa-job-dispatcher:aaaa-1 # rw-ship' in after_pin
++    assert marked(after_pin) == [ah.GROUP_LINE, ah.VOL_LINE], 'pin dropped the AC-11 lines'
++    assert ah.compose_restore(after_pin) != after_pin
++    rc, out = pin(vm, 'S2', SHA_B, 'bbbb-2')
++    assert rc == 0, out
++    assert marked(compose(vm)) == [ah.GROUP_LINE, ah.VOL_LINE]
++    rc, out = ctl(vm, 'restore', '--stamp', 'S2')       # release S2 rolled back to S1
++    assert rc == 0, out
++    assert compose(vm) == after_pin
++    assert marked(compose(vm)) == [ah.GROUP_LINE, ah.VOL_LINE], 'rollback dropped the AC-11 lines'
++
++
++def test_rollback_of_a_release_pinned_before_the_apply_is_refused_and_keeps_the_mount(vm):
++    before = ah.compose_restore((APP / 'compose.yaml').read_text())
++    assert marked(before) == []
++    (vm[0] / 'compose.yaml').write_text(before)
++    rc, out = pin(vm, 'S1', SHA_A, 'aaaa-1')
++    assert rc == 0, out
++    applied = ah.compose_apply(compose(vm))                # the host apply runs after release S1
++    (vm[0] / 'compose.yaml').write_text(applied)
++    rc, out = ctl(vm, 'restore', '--stamp', 'S1')
++    assert rc == 3, out
++    assert out.startswith('REFUSED') and 'a stale rollback is refused' in out, out
++    assert compose(vm) == applied
++    assert marked(compose(vm)) == [ah.GROUP_LINE, ah.VOL_LINE]
+diff --git a/infra/selfhost-job-secrets-drift.test.mjs b/infra/selfhost-job-secrets-drift.test.mjs
+new file mode 100644
+index 00000000000..0d65542d75b
+--- /dev/null
++++ b/infra/selfhost-job-secrets-drift.test.mjs
+@@ -0,0 +1,95 @@
++// goodqa#16148 spec v4 AC-3, AC-11 and NEG-16: the checked-in self-host files match what the AC-11 host apply leaves
++// on the VM, so the CC8.1 selfhost-topology-drift gate (infra/selfhost-plan.mjs) is green after the apply and red
++// without the checked-in change. Also the R4 cross-check: the host-apply wrapper takes the same deploy lock as rw-ship.
++import { test } from 'node:test'
++import assert from 'node:assert/strict'
++import { spawnSync } from 'node:child_process'
++import { readFileSync } from 'node:fs'
++import { join, resolve, dirname } from 'node:path'
++import { fileURLToPath } from 'node:url'
++import { planSelfhostDrift, loadDesired } from './selfhost-plan.mjs'
++
++const HERE = dirname(fileURLToPath(import.meta.url))
++const ROOT = resolve(HERE, '..')
++const APP = join(ROOT, 'infra/selfhost/app')
++const desired = loadDesired(ROOT)
++const KEY = 'JOB_ENVFILE_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY'
++
++/** Run a function of apply-job-secrets-host.py on text, through python (the code the VM runs). */
++function hostApply(fn, text) {
++  const code = [
++    'import importlib.util, sys',
++    `s = importlib.util.spec_from_file_location("a", ${JSON.stringify(join(APP, 'apply-job-secrets-host.py'))})`,
++    'm = importlib.util.module_from_spec(s); s.loader.exec_module(m)',
++    `sys.stdout.write(getattr(m, ${JSON.stringify(fn)})(sys.stdin.read()) if ${JSON.stringify(fn)} != "consts" else "\\n".join([m.GROUP_LINE, m.VOL_LINE, m.ENV_LINE]))`,
++  ].join('\n')
++  const r = spawnSync('python3', ['-I', '-c', code], { input: text, encoding: 'utf8' })
++  assert.equal(r.status, 0, r.stderr)
++  return r.stdout
++}
++
++function block(compose, service) {
++  const lines = compose.split('\n')
++  const start = lines.indexOf(`  ${service}:`)
++  assert.ok(start >= 0, service)
++  let end = start + 1
++  while (end < lines.length && (lines[end] === '' || lines[end].startsWith('    '))) end += 1
++  return lines.slice(start, end)
++}
++
++test('AC-3: only job-dispatcher has the read-only secrets mount and group_add 64910', () => {
++  const [groupLine, volLine] = hostApply('consts', '').split('\n')
++  const disp = block(desired.compose, 'job-dispatcher')
++  assert.ok(disp.includes(groupLine), 'job-dispatcher group_add')
++  assert.ok(disp.includes(volLine), 'job-dispatcher mount')
++  assert.match(volLine, /"\/etc\/goodqa\/job-secrets:\/run\/goodqa-secrets:ro"/)
++  const elsewhere = desired.compose.split('\n').filter((l) => (l.includes('job-secrets') || l.includes('64910')) && !disp.includes(l))
++  assert.deepEqual(elsewhere, [], 'no other service mounts the secrets or gets the group')
++  assert.ok(disp.includes('    read_only: true') && disp.includes('    tmpfs: ["/tmp"]'))
++})
++
++test('AC-11: the host apply on the pre-change compose yields exactly the checked-in compose, and restore undoes it', () => {
++  const before = hostApply('compose_restore', desired.compose)
++  assert.notEqual(before, desired.compose)
++  assert.equal(hostApply('compose_apply', before), desired.compose)
++  assert.equal(hostApply('compose_apply', desired.compose), desired.compose, 'idempotent')
++})
++
++test('AC-11: env-keys.json names the dispatcher JOB_ENVFILE key, and only for the dispatcher', () => {
++  assert.ok(desired.env.dispatcher.includes(KEY))
++  assert.ok(!desired.env.api.includes(KEY) && !desired.env.web.includes(KEY))
++  const envLine = hostApply('consts', '').split('\n')[2]
++  assert.equal(envLine.split('=')[0], KEY)
++})
++
++test('NEG-16: an applied VM is no drift against the checked-in files', () => {
++  assert.deepEqual(planSelfhostDrift(desired, { compose: desired.compose, env: desired.env }), [])
++})
++
++test('NEG-16: the gate goes red if env-keys.json lacks the key (against an applied VM)', () => {
++  const stale = { ...desired, env: { ...desired.env, dispatcher: desired.env.dispatcher.filter((k) => k !== KEY) } }
++  const p = planSelfhostDrift(stale, { compose: desired.compose, env: desired.env })
++  assert.equal(p.length, 1, p.join('\n'))
++  assert.match(p[0], new RegExp(`dispatcher\\.env has key\\(s\\) not checked in: ${KEY}`))
++})
++
++test('NEG-16: the gate goes red if the checked-in compose lacks the mount (against an applied VM)', () => {
++  const stale = { ...desired, compose: hostApply('compose_restore', desired.compose) }
++  const p = planSelfhostDrift(stale, { compose: desired.compose, env: desired.env })
++  assert.equal(p.length, 1, p.join('\n'))
++  // The gate compares line by line, so the two inserted lines also shift every later line.
++  assert.match(p[0], /compose\.yaml differs on \d+ line/)
++  assert.ok(p[0].includes('group_add: [\\"64910\\"] # goodqa#16148 AC-11'), p[0])
++})
++
++test('R4: the host-apply wrapper takes the deploy lock rw-ship takes (main copy of rw-ship.sh)', () => {
++  const ship = readFileSync(join(ROOT, 'infra/release-harness/rw-ship.sh'), 'utf8')
++  const m = /^LOCKF=\$S\/(\S+?);/m.exec(ship)
++  assert.ok(m, 'rw-ship.sh LOCKF line')
++  const wrapper = readFileSync(join(APP, 'apply-job-secrets.sh'), 'utf8')
++  const w = /^LOCK_REL=(\S+)$/m.exec(wrapper)
++  assert.ok(w, 'wrapper LOCK_REL line')
++  assert.equal(w[1], m[1])
++  assert.match(ship, /INFL=\$\{LOCKF%\.lock\}\.inflight\.json/)
++  assert.match(wrapper, /inflight\.json/)
++})
+diff --git a/infra/selfhost/app/apply-job-secrets-host.py b/infra/selfhost/app/apply-job-secrets-host.py
+new file mode 100755
+index 00000000000..30596fa52d3
+--- /dev/null
++++ b/infra/selfhost/app/apply-job-secrets-host.py
+@@ -0,0 +1,350 @@
++#!/usr/bin/env python3
++"""apply-job-secrets-host.py -- goodqa#16148 spec v4 AC-11 (build conditions R1 to R4).
++
++Applies, on the self-host app VM, the parts of the job-secret wiring that no release applies:
++  * in the live compose.yaml, the job-dispatcher service gets two marked lines:
++        group_add: ["64910"] # goodqa#16148 AC-11
++        volumes: ["/etc/goodqa/job-secrets:/run/goodqa-secrets:ro"] # goodqa#16148 AC-11
++  * /etc/goodqa/dispatcher.env gets the key line
++        JOB_ENVFILE_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY=/run/goodqa-secrets/github-app-private-key
++    (a path, not a secret; raw env_file lines cannot carry a comment, so this line is matched exactly).
++The goodqa-jobsecret group and the /etc/goodqa/job-secrets directory are created by
++derive-job-secrets.py, which apply-job-secrets.sh streams first under the same deploy lock; this
++script only checks them. It never reads or prints a secret value and never recreates a container.
++
++Not run directly: apply-job-secrets.sh (on the release runner) takes the deploy lock and streams
++it as root:  ssh <app> sudo python3 -I - --dir D --env-dir E (--check | apply --stamp S | restore)
++
++  --check   read-only; one line per item: `<item>: present|absent|conflict`.
++  apply     refuses unless every item is present or absent (no conflict); validates the new
++            compose with `docker compose config -q` before any file changes; writes a backup of
++            each file it will change (<file>.pre-16148-<S>, O_EXCL|O_NOFOLLOW, root 0600, kept for the
++            newest 3 stamps); then dispatcher.env, then compose.yaml, each through a directory fd,
++            a temp file and a rename, keeping the file's owner and mode. Idempotent.
++  restore   removes exactly the lines apply inserted (R1): a later release pin or set-secret-env
++            key is kept. Refuses if a marked line was changed.
++Exit 0 ok, 2 refused.
++"""
++import argparse
++import os
++import re
++import secrets
++import stat
++import subprocess
++import sys
++
++MARK = '# goodqa#16148 AC-11'
++GROUP_LINE = '    group_add: ["64910"] ' + MARK
++VOL_LINE = '    volumes: ["/etc/goodqa/job-secrets:/run/goodqa-secrets:ro"] ' + MARK
++ENV_KEY = 'JOB_ENVFILE_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY'
++ENV_LINE = ENV_KEY + '=/run/goodqa-secrets/github-app-private-key'
++SECRETS_DIR = 'job-secrets'
++GID = 64910
++GROUP = 'goodqa-jobsecret'
++BACKUP_INFIX = '.pre-16148-'
++KEEP_BACKUPS = 3
++STAMP_RE = re.compile(r'^\d{8}T\d{6}Z$')
++
++
++class Refused(Exception):
++    pass
++
++
++# ---- safe file io (directory fd, no links, temp + rename) --------------------------------------
++def open_dir(path):
++    try:
++        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    except OSError:
++        raise Refused('%s is missing, a symlink or not a directory' % path)
++
++
++def read_file(dfd, name):
++    try:
++        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
++    except FileNotFoundError:
++        raise Refused('%s is missing' % name)
++    except OSError:
++        raise Refused('%s is a symlink or unreadable' % name)
++    try:
++        st = os.fstat(fd)
++        if not stat.S_ISREG(st.st_mode):
++            raise Refused('%s is not a regular file' % name)
++        chunks = []
++        while True:
++            b = os.read(fd, 65536)
++            if not b:
++                break
++            chunks.append(b)
++        return b''.join(chunks), st
++    finally:
++        os.close(fd)
++
++
++def write_new(dfd, name, data, uid, gid, mode):
++    """Create `name` (must not exist) with O_EXCL|O_NOFOLLOW, owner and mode set on the fd."""
++    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
++    try:
++        os.fchown(fd, uid, gid)
++        os.fchmod(fd, mode)
++        view = memoryview(data)
++        while view:
++            view = view[os.write(fd, view):]
++        os.fsync(fd)
++    finally:
++        os.close(fd)
++
++
++def replace_file(dfd, name, data, st, hooks=None, validate=None):
++    tmp = '.%s.tmp-%s' % (name, secrets.token_hex(6))
++    write_new(dfd, tmp, data, st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode))
++    try:
++        if validate:
++            validate(tmp)
++        if hooks and hooks.get('before_rename_' + name):
++            hooks['before_rename_' + name]()
++        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
++        os.fsync(dfd)
++    except BaseException:
++        try:
++            os.unlink(tmp, dir_fd=dfd)
++        except OSError:
++            pass
++        raise
++
++
++# ---- compose edits ---------------------------------------------------------------------------
++def _service_block(lines, service):
++    """(start, end) line indexes of `  service:` up to the next top-level or service key."""
++    try:
++        start = lines.index('  %s:' % service)
++    except ValueError:
++        raise Refused('compose.yaml has no %s service' % service)
++    end = start + 1
++    while end < len(lines) and (lines[end] == '' or lines[end].startswith('    ') or lines[end].lstrip().startswith('#')):
++        end += 1
++    while end > start + 1 and lines[end - 1].strip() == '':
++        end -= 1
++    return start, end
++
++
++def compose_status(text):
++    lines = text.split('\n')
++    start, end = _service_block(lines, 'job-dispatcher')
++    block = lines[start:end]
++    out = {}
++    for item, want, key in (('group_add', GROUP_LINE, '    group_add:'), ('mount', VOL_LINE, '    volumes:')):
++        have = [l for l in block if l.startswith(key)]
++        if have == [want]:
++            out[item] = 'present'
++        elif not have and not any(MARK in l and l.startswith(key) for l in lines):
++            out[item] = 'absent'
++        else:
++            out[item] = 'conflict'
++    if sum(1 for l in lines if '/etc/goodqa/job-secrets' in l or '64910' in l) != sum(1 for l in block if l in (GROUP_LINE, VOL_LINE)):
++        out['mount'] = 'conflict'
++    return out
++
++
++def compose_apply(text):
++    lines = text.split('\n')
++    st = compose_status(text)
++    _start, end = _service_block(lines, 'job-dispatcher')
++    add = [l for item, l in (('group_add', GROUP_LINE), ('mount', VOL_LINE)) if st[item] == 'absent']
++    return '\n'.join(lines[:end] + add + lines[end:])
++
++
++def compose_restore(text):
++    lines = text.split('\n')
++    marked = [l for l in lines if MARK in l]
++    if any(l not in (GROUP_LINE, VOL_LINE) for l in marked):
++        raise Refused('a goodqa#16148 marked line in compose.yaml was changed; restore by hand')
++    return '\n'.join(l for l in lines if l not in (GROUP_LINE, VOL_LINE))
++
++
++# ---- dispatcher.env edits --------------------------------------------------------------------
++def env_status(data):
++    lines = data.split(b'\n')
++    have = [l for l in lines if l.lstrip().startswith(ENV_KEY.encode() + b'=') or l.strip() == ENV_KEY.encode()]
++    if have == [ENV_LINE.encode()]:
++        return 'present'
++    if not have:
++        return 'absent'
++    return 'conflict'
++
++
++def env_apply(data):
++    if env_status(data) == 'present':
++        return data
++    if data and not data.endswith(b'\n'):
++        raise Refused('dispatcher.env does not end with a newline')
++    return data + ENV_LINE.encode() + b'\n'
++
++
++def env_restore(data):
++    st = env_status(data)
++    if st == 'conflict':
++        raise Refused('dispatcher.env holds another %s line; restore by hand' % ENV_KEY)
++    if st == 'absent':
++        return data
++    lines = data.split(b'\n')
++    i = lines.index(ENV_LINE.encode())
++    return b'\n'.join(lines[:i] + lines[i + 1:])
++
++
++# ---- group and directory (made by derive; checked here) -------------------------------------
++def _getent(*args):
++    try:
++        r = subprocess.run(['getent', *args], capture_output=True, text=True, timeout=10)
++    except (OSError, subprocess.TimeoutExpired):
++        raise Refused('getent failed')
++    return r.stdout if r.returncode == 0 else ''
++
++
++def group_status():
++    rows = [l.split(':') for l in (_getent('group', GROUP) + _getent('group', str(GID))).splitlines() if l.count(':') >= 3]
++    if not rows:
++        return 'absent'
++    if all(r[0] == GROUP and r[2] == str(GID) and r[3] == '' for r in rows):
++        return 'present'
++    return 'conflict'
++
++
++def dir_status(env_dfd):
++    try:
++        st = os.stat(SECRETS_DIR, dir_fd=env_dfd, follow_symlinks=False)
++    except FileNotFoundError:
++        return 'absent'
++    if stat.S_ISDIR(st.st_mode) and st.st_uid == 0 and st.st_gid == 0 and stat.S_IMODE(st.st_mode) == 0o711:
++        return 'present'
++    return 'conflict'
++
++
++# ---- commands --------------------------------------------------------------------------------
++def status_lines(a):
++    ddfd, edfd = open_dir(a.dir), open_dir(a.env_dir)
++    try:
++        comp, _ = read_file(ddfd, 'compose.yaml')
++        env, _ = read_file(edfd, 'dispatcher.env')
++        cs = compose_status(comp.decode('utf-8'))
++        return [
++            ('compose job-dispatcher group_add', cs['group_add']),
++            ('compose job-dispatcher mount', cs['mount']),
++            ('dispatcher.env ' + ENV_KEY, env_status(env)),
++            ('group ' + GROUP, group_status()),
++            ('dir /etc/goodqa/' + SECRETS_DIR, dir_status(edfd)),
++        ]
++    finally:
++        os.close(ddfd)
++        os.close(edfd)
++
++
++def backup(dfd, name, data, stamp):
++    write_new(dfd, name + BACKUP_INFIX + stamp, data, 0, 0, 0o600)
++
++
++def prune_backups(dfd, name):
++    pat = re.compile(re.escape(name + BACKUP_INFIX) + r'(\d{8}T\d{6}Z)$')
++    found = sorted((m.group(1), e) for e in os.listdir(dfd) for m in [pat.match(e)] if m)
++    for _s, entry in found[:-KEEP_BACKUPS]:
++        if stat.S_ISREG(os.stat(entry, dir_fd=dfd, follow_symlinks=False).st_mode):
++            os.unlink(entry, dir_fd=dfd)
++
++
++def validate_compose(dir_path, tmp_name):
++    r = subprocess.run(['docker', 'compose', '-f', os.path.join(dir_path, tmp_name), '--project-directory', dir_path, 'config', '-q'],
++                       capture_output=True, timeout=120)
++    if r.returncode != 0:
++        raise Refused('the new compose.yaml does not validate (docker compose config -q exit %d)' % r.returncode)
++
++
++def cmd_apply(a, hooks=None):
++    if not STAMP_RE.match(a.stamp or ''):
++        raise Refused('--stamp must be YYYYMMDDTHHMMSSZ')
++    items = status_lines(a)
++    bad = [i for i, s in items if s == 'conflict']
++    if bad:
++        raise Refused('conflict: ' + ', '.join(bad))
++    if dict(items)['group ' + GROUP] != 'present' or dict(items)['dir /etc/goodqa/' + SECRETS_DIR] != 'present':
++        raise Refused('the group or the secrets directory is absent: derive-job-secrets.py must run first')
++    ddfd, edfd = open_dir(a.dir), open_dir(a.env_dir)
++    try:
++        comp, cst = read_file(ddfd, 'compose.yaml')
++        env, est = read_file(edfd, 'dispatcher.env')
++        new_comp = compose_apply(comp.decode('utf-8')).encode('utf-8')
++        new_env = env_apply(env)
++        if new_comp == comp and new_env == env:
++            return 'unchanged'
++        # Validate before any file changes: a temp copy of the new compose, then removed.
++        if new_comp != comp:
++            probe = '.compose.yaml.validate-%s' % secrets.token_hex(6)
++            write_new(ddfd, probe, new_comp, cst.st_uid, cst.st_gid, stat.S_IMODE(cst.st_mode))
++            try:
++                validate_compose(a.dir, probe)
++            finally:
++                os.unlink(probe, dir_fd=ddfd)
++        if new_env != env:
++            backup(edfd, 'dispatcher.env', env, a.stamp)
++        if new_comp != comp:
++            backup(ddfd, 'compose.yaml', comp, a.stamp)
++        if new_env != env:
++            replace_file(edfd, 'dispatcher.env', new_env, est, hooks)
++        if hooks and hooks.get('between_files'):
++            hooks['between_files']()
++        if new_comp != comp:
++            replace_file(ddfd, 'compose.yaml', new_comp, cst, hooks)
++        prune_backups(edfd, 'dispatcher.env')
++        prune_backups(ddfd, 'compose.yaml')
++        return 'applied'
++    finally:
++        os.close(ddfd)
++        os.close(edfd)
++
++
++def cmd_restore(a):
++    ddfd, edfd = open_dir(a.dir), open_dir(a.env_dir)
++    try:
++        comp, cst = read_file(ddfd, 'compose.yaml')
++        env, est = read_file(edfd, 'dispatcher.env')
++        new_comp = compose_restore(comp.decode('utf-8')).encode('utf-8')
++        new_env = env_restore(env)
++        if new_comp != comp:
++            replace_file(ddfd, 'compose.yaml', new_comp, cst)
++        if new_env != env:
++            replace_file(edfd, 'dispatcher.env', new_env, est)
++        return 'restored' if (new_comp != comp or new_env != env) else 'nothing to restore'
++    finally:
++        os.close(ddfd)
++        os.close(edfd)
++
++
++def run(argv, hooks=None):
++    p = argparse.ArgumentParser(prog='apply-job-secrets-host.py')
++    p.add_argument('--dir', required=True)
++    p.add_argument('--env-dir', required=True)
++    p.add_argument('--check', action='store_true')
++    p.add_argument('cmd', nargs='?', choices=['apply', 'restore'])
++    p.add_argument('--stamp')
++    a = p.parse_args(argv)
++    try:
++        if a.check == bool(a.cmd):
++            raise Refused('give exactly one of --check, apply, restore')
++        if a.check:
++            return ['%s: %s' % (i, s) for i, s in status_lines(a)], 0
++        if a.cmd == 'apply':
++            return ['job secrets host apply: ' + cmd_apply(a, hooks)], 0
++        return ['job secrets host restore: ' + cmd_restore(a)], 0
++    except Refused as e:
++        return ['job secrets host %s: REFUSED %s' % (a.cmd or 'check', e)], 2
++    except OSError as e:
++        return ['job secrets host %s: REFUSED os error (%s)' % (a.cmd or 'check', type(e).__name__)], 2
++
++
++def main():
++    argv = sys.argv[1:]
++    lines, code = run(argv)
++    sys.stdout.write(''.join(l + '\n' for l in lines))
++    return code
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/infra/selfhost/app/apply-job-secrets.sh b/infra/selfhost/app/apply-job-secrets.sh
+new file mode 100755
+index 00000000000..544050f6ac9
+--- /dev/null
++++ b/infra/selfhost/app/apply-job-secrets.sh
+@@ -0,0 +1,59 @@
++#!/bin/bash
++# apply-job-secrets.sh -- goodqa#16148 spec v4 AC-11 (lead rulings R3, R4). Runs on the release runner.
++#
++#   RW_LANE_ROOT=<lane root> infra/selfhost/app/apply-job-secrets.sh --check | apply | restore
++#
++# Under the one deploy lock rw-ship.sh takes (<lane root>/locks/gq-promote.lock; flock -n, exit 75 when held) and
++# never while a release is in flight (gq-promote.inflight.json present, exit 75), it streams two scripts to the app
++# VM as root, exactly as rw-ship streams selfhost-ctl.py (nothing is installed on the VM):
++#   1. derive-job-secrets.py: creates the goodqa-jobsecret group, the 0711 secrets dir and the 0440 file from
++#      api.env. Anything but `written` or `unchanged` stops here with nothing else applied (exit 2).
++#   2. apply-job-secrets-host.py: the job-dispatcher mount and group_add in the live compose.yaml and the
++#      JOB_ENVFILE key line in dispatcher.env (backups, validation, marked-line restore).
++# A mutating run bumps the deploy epoch, so an rw-ship run that started earlier loses its authority (fencing).
++# Containers are not recreated: the next release's dispatcher recreate picks the mount up.
++# Output: the VM's status lines (names and status only; no value is ever read here). APPLY_SSH overrides ssh (tests).
++set -uo pipefail
++LOCK_REL=locks/gq-promote.lock
++HERE="$(cd "$(dirname "$0")" && pwd)"
++say(){ printf 'apply-job-secrets: %s\n' "$*"; }
++MODE="${1:-}"
++case "$MODE" in --check|apply|restore) ;; *) say "REFUSED usage: apply-job-secrets.sh --check|apply|restore"; exit 2;; esac
++S="${RW_LANE_ROOT:-}"
++[ -n "$S" ] && [ -d "$S" ] || { say "REFUSED: RW_LANE_ROOT is not set to the lane root"; exit 2; }
++case "$(realpath -m "$S")/" in */.scratch/*|/tmp/*) [ "${APPLY_TEST_MODE:-}" = 1 ] || { say "REFUSED: runner root must be permanent"; exit 2; };; esac
++shconf(){ sed -n "s/^$1=//p" "$S/biz/release-waves/ship.conf" 2>/dev/null | head -1; }
++APP="$(shconf SELFHOST_APP)"; DIR="$(shconf SELFHOST_DIR)"; ENVD="$(shconf SELFHOST_ENV_DIR)"
++DIR="${DIR:-/opt/goodqa/infra/selfhost/app}"; ENVD="${ENVD:-/etc/goodqa}"
++[ -n "$APP" ] || { say "REFUSED: SELFHOST_APP is not set in biz/release-waves/ship.conf"; exit 2; }
++SSH="${APPLY_SSH:-ssh}"
++LOCKF="$S/$LOCK_REL"; EPOCHF="${LOCKF%.lock}.epoch"; INFL="${LOCKF%.lock}.inflight.json"; HOLDER="${LOCKF%.lock}.holder"
++mkdir -p "$(dirname "$LOCKF")"
++exec 8>>"$LOCKF" || { say "REFUSED: cannot open the deploy lock $LOCKF"; exit 2; }
++flock -n 8 || { say "REFUSED: the deploy lock is held ($(head -c 200 "$HOLDER" 2>/dev/null | tr '\n' ' ')): nothing done"; exit 75; }
++[ -e "$INFL" ] && { say "REFUSED: a release is in flight ($INFL): nothing done"; exit 75; }
++if [ "$MODE" != --check ]; then
++  E0=$(tr -dc 0-9 < "$EPOCHF" 2>/dev/null); EPOCH=$(( ${E0:-0} + 1 ))
++  printf '%s\n' "$EPOCH" > "$EPOCHF.$$" && mv -f "$EPOCHF.$$" "$EPOCHF"
++  printf 'apply-job-secrets pid=%s host=%s started=%s epoch=%s what=%s\n' "$$" "$(hostname)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$EPOCH" "$MODE" > "$HOLDER"
++  trap 'grep -q "^apply-job-secrets pid=$$ " "$HOLDER" 2>/dev/null && rm -f "$HOLDER"' EXIT
++fi
++vm(){ "$SSH" -o ConnectTimeout=15 -o BatchMode=yes -o ServerAliveInterval=30 "$APP" "$1" < "$2"; }
++case "$MODE" in
++  --check)
++    vm "sudo python3 -I - --check" "$HERE/derive-job-secrets.py"
++    printf -v CMD 'sudo python3 -I - --dir %q --env-dir %q --check' "$DIR" "$ENVD"
++    vm "$CMD" "$HERE/apply-job-secrets-host.py"; exit $?;;
++  apply)
++    OUT=$(vm "sudo python3 -I -" "$HERE/derive-job-secrets.py" 2>/dev/null); RC=$?
++    printf '%s\n' "$OUT" | head -3
++    case "$RC:$OUT" in
++      "0:job secret github-app-private-key: written"|"0:job secret github-app-private-key: unchanged") ;;
++      *) say "REFUSED: derive did not report written or unchanged (rc $RC): nothing else applied"; exit 2;;
++    esac
++    printf -v CMD 'sudo python3 -I - --dir %q --env-dir %q apply --stamp %q' "$DIR" "$ENVD" "$(date -u +%Y%m%dT%H%M%SZ)"
++    vm "$CMD" "$HERE/apply-job-secrets-host.py"; exit $?;;
++  restore)
++    printf -v CMD 'sudo python3 -I - --dir %q --env-dir %q restore' "$DIR" "$ENVD"
++    vm "$CMD" "$HERE/apply-job-secrets-host.py"; exit $?;;
++esac
+diff --git a/infra/selfhost/app/cmdline-sampler.py b/infra/selfhost/app/cmdline-sampler.py
+new file mode 100755
+index 00000000000..a667806f3a0
+--- /dev/null
++++ b/infra/selfhost/app/cmdline-sampler.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++"""cmdline-sampler.py -- goodqa#16148 spec v4 AC-6 (3), NEG-18 (build conditions P2, R6).
++
++A read-only, unprivileged, post-deploy check that no docker CLI started by the job-dispatcher carries a job env value
++on its command line (/proc/PID/cmdline is world-readable in the host PID namespace). It looks only at processes
++whose /proc/PID/cgroup names the job-dispatcher container (`--container ID`, resolved by the caller at sample time),
++polls about every 50 ms for `--seconds`, and keeps only flag NAMES and the argv length of each `docker run`:
++  * a long flag is cut at its first `=`, and kept only if it is on the allow-list, else recorded as `--(other)`;
++  * a short flag with an attached value (`-eK=V`) is recorded as `-e(attached)`; others as `-x` if allow-listed;
++    a cluster is read as pflag reads it, so `-de` and `-ieK=V` record `-e(cluster)`;
++  * a non-flag token is only counted. Raw argv is never stored, printed or written.
++Result (one JSON line): verdict PASS | FAIL | NO_SAMPLE, label "sampled" (not exhaustive). FAIL: any observed run has
++-e, -e(attached), -e(cluster), --env or --env(attached). NO_SAMPLE (also a failure): fewer than `--expect-runs` runs seen, so a
++silent sampler can never pass. Exit 0 only on PASS.
++  python3 -I cmdline-sampler.py --container <64-hex id> --seconds 120 --expect-runs 3
++"""
++import argparse
++import json
++import os
++import re
++import sys
++import time
++
++ALLOWED_LONG = {'--rm', '--env-file', '--env', '--cap-drop', '--security-opt', '--read-only', '--tmpfs', '--memory',
++                '--memory-swap', '--cpus', '--pids-limit', '--detach', '--name', '--label', '--network', '--user'}
++ALLOWED_SHORT = {'-d', '-e', '-i', '-t', '-u'}
++# docker run's boolean shorthands: pflag lets these cluster (-dit), and any other shorthand takes the rest as its value.
++BOOL_SHORT = set('ditP')
++BAD = {'-e', '-e(attached)', '-e(cluster)', '--env', '--env(attached)'}
++ID_RE = re.compile(r'^[0-9a-f]{12,64}$')
++
++
++def sanitize(argv):
++    """Flag names only. argv[0] is the docker binary; argv[1] must be `run`."""
++    flags = []
++    for tok in argv[2:]:
++        if tok.startswith('--'):
++            name, eq, _ = tok.partition('=')
++            if name not in ALLOWED_LONG:
++                name = '--(other)'
++            flags.append(name + ('(attached)' if eq and name in ('--env',) else ''))
++        elif tok.startswith('-') and len(tok) >= 2:
++            flags.append(short_flag(tok))
++    return {'argc': len(argv), 'flags': flags}
++
++
++def short_flag(tok):
++    """A single-dash token, read the way pflag reads a shorthand cluster (code review F3): booleans chain, `e` anywhere
++    in the chain is an env flag (-de, -ieK=V), and the first value-taking shorthand ends the chain."""
++    short = tok[:2]
++    if len(tok) == 2:
++        return short if short in ALLOWED_SHORT else '-(other)'
++    for i, c in enumerate(tok[1:]):
++        if c == 'e':
++            return '-e(attached)' if i == 0 else '-e(cluster)'
++        if c not in BOOL_SHORT:
++            break
++    return (short if short in ALLOWED_SHORT else '-(other)') + '(attached)'
++
++
++def in_container(cgroup_text, container):
++    return any(('docker-%s.scope' % container) in l or ('/docker/%s' % container) in l for l in cgroup_text.splitlines())
++
++
++def scan(proc, container, seen, runs):
++    try:
++        pids = [p for p in os.listdir(proc) if p.isdigit()]
++    except OSError:
++        return
++    for pid in pids:
++        base = os.path.join(proc, pid)
++        try:
++            with open(os.path.join(base, 'cgroup')) as f:
++                if not in_container(f.read(), container):
++                    continue
++            with open(os.path.join(base, 'cmdline'), 'rb') as f:
++                raw = f.read()
++            try:
++                with open(os.path.join(base, 'stat')) as f:
++                    start = f.read().rsplit(')', 1)[-1].split()[19]
++            except (OSError, IndexError):
++                start = ''
++        except OSError:
++            continue
++        key = (pid, start)
++        if key in seen:
++            continue
++        argv = [a.decode('utf-8', 'replace') for a in raw.split(b'\0') if a]
++        if len(argv) >= 2 and os.path.basename(argv[0]) == 'docker' and argv[1] == 'run':
++            seen.add(key)
++            runs.append(sanitize(argv))
++        del argv, raw
++
++
++def run(argv):
++    p = argparse.ArgumentParser(prog='cmdline-sampler.py')
++    p.add_argument('--container', required=True)
++    p.add_argument('--seconds', type=float, default=60.0)
++    p.add_argument('--expect-runs', type=int, default=1)
++    p.add_argument('--interval', type=float, default=0.05)
++    p.add_argument('--proc', default='/proc')
++    a = p.parse_args(argv)
++    if not ID_RE.match(a.container):
++        return {'verdict': 'FAIL', 'label': 'sampled', 'error': 'container id must be 12-64 lowercase hex'}, 1
++    seen, runs = set(), []
++    end = time.monotonic() + a.seconds
++    polls = 0
++    while time.monotonic() < end and len(runs) < max(a.expect_runs, 1) * 10:
++        scan(a.proc, a.container, seen, runs)
++        polls += 1
++        time.sleep(a.interval)
++    bad = [r for r in runs if BAD.intersection(r['flags'])]
++    if len(runs) < a.expect_runs:
++        verdict = 'NO_SAMPLE'
++    elif bad:
++        verdict = 'FAIL'
++    else:
++        verdict = 'PASS'
++    out = {'verdict': verdict, 'label': 'sampled', 'runs_seen': len(runs), 'expect_runs': a.expect_runs, 'polls': polls,
++           'runs_with_env_file': sum(1 for r in runs if '--env-file' in r['flags']), 'runs_with_env_flag': len(bad),
++           'runs': runs}
++    return out, 0 if verdict == 'PASS' else 1
++
++
++def main():
++    out, code = run(sys.argv[1:])
++    sys.stdout.write(json.dumps(out, sort_keys=True) + '\n')
++    return code
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/infra/selfhost/app/compose.yaml b/infra/selfhost/app/compose.yaml
+index 2bf2999c2fd..1858d5cad2d 100644
+--- a/infra/selfhost/app/compose.yaml
++++ b/infra/selfhost/app/compose.yaml
+@@ -120,6 +120,8 @@ services:
+     # dispatch-app reaches the guard only; edge lets the api call it. No route to the proxy.
+     networks: [dispatch-app, edge]
+     mem_limit: 384m
++    group_add: ["64910"] # goodqa#16148 AC-11
++    volumes: ["/etc/goodqa/job-secrets:/run/goodqa-secrets:ro"] # goodqa#16148 AC-11
+ 
+ networks:
+   edge: {}
+diff --git a/infra/selfhost/app/derive-job-secrets.py b/infra/selfhost/app/derive-job-secrets.py
+new file mode 100755
+index 00000000000..d2c3cde6090
+--- /dev/null
++++ b/infra/selfhost/app/derive-job-secrets.py
+@@ -0,0 +1,336 @@
++#!/usr/bin/env python3
++"""derive-job-secrets.py -- goodqa#16148 spec v4 AC-1, AC-2, AC-9.
++
++Run as root on the self-host app VM, as `python3 -I derive-job-secrets.py [--check]`. It derives
++/etc/goodqa/job-secrets/github-app-private-key (root:goodqa-jobsecret 0440, in a root:root 0711
++directory) from the GITHUB_APP_PRIVATE_KEY line of /etc/goodqa/api.env. Only the job-dispatcher
++mounts that directory (read-only, group_add 64910), and the dispatcher reads the file per launch
++(JOB_ENVFILE_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY).
++
++Output is exactly one line, never the value:
++    job secret github-app-private-key: written | unchanged | REFUSED <reason>
++    job secret github-app-private-key: same | different | REFUSED <reason>        (--check)
++Exit 0 on written/unchanged/same/different, 2 on REFUSED.
++
++Parsing matches Docker Compose 5.6.0 `env_file: format: raw` (probed with fake values):
++  - `#` lines are comments; leading whitespace before the key is dropped;
++  - a line splits on its first `=`; the value is verbatim (quotes, trailing spaces, inner `#` kept);
++  - a final CR is stripped; a key holding whitespace (an `export KEY=` line) makes compose refuse.
++derive is stricter: it refuses no line, more than one line, an `export` form, an empty value, a
++value byte outside printable ASCII 0x20-0x7E, and any line compose itself would refuse.
++
++The value is written byte for byte (no decoding). Every write is relative to a directory fd that
++was opened O_DIRECTORY|O_NOFOLLOW and checked with fstat; the file is created under a random
++temp name with O_CREAT|O_EXCL|O_NOFOLLOW, fchown/fchmod on the fd, written, fsynced, renamed
++within the directory fd, and the directory is fsynced. An unchanged value leaves the file alone.
++The value never appears in argv, output, a log or a hash.
++"""
++import os
++import secrets
++import subprocess
++import sys
++
++NAME = 'github-app-private-key'
++SOURCE_KEY = 'GITHUB_APP_PRIVATE_KEY'
++GROUP = 'goodqa-jobsecret'
++GID = 64910
++DIR_MODE = 0o711
++FILE_MODE = 0o440
++MAX_SOURCE = 1024 * 1024
++
++
++class Refused(Exception):
++    pass
++
++
++def _p(root, path):
++    return os.path.join(root, path.lstrip('/')) if root != '/' else path
++
++
++# ---- AC-1: parse ----------------------------------------------------------------------------
++def parse_api_env(data):
++    """Return the GITHUB_APP_PRIVATE_KEY value (bytes) exactly as compose would deliver it, or raise Refused."""
++    found = []
++    for raw in data.split(b'\n'):
++        line = raw[:-1] if raw.endswith(b'\r') else raw
++        stripped = line.lstrip(b' \t')
++        if stripped == b'' or stripped.startswith(b'#'):
++            continue
++        key, eq, value = stripped.partition(b'=')
++        if not eq:
++            if any(c in key for c in b' \t'):
++                raise Refused('api.env has a line compose would refuse')
++            continue
++        if key.split()[:2] == [b'export', SOURCE_KEY.encode()] or key.startswith(b'export ' + SOURCE_KEY.encode()):
++            raise Refused('export form')
++        if any(c in key for c in b' \t\x0b\x0c'):
++            raise Refused('api.env has a line compose would refuse')
++        if key == SOURCE_KEY.encode():
++            found.append(value)
++    if not found:
++        raise Refused('no GITHUB_APP_PRIVATE_KEY line')
++    if len(found) > 1:
++        raise Refused('more than one GITHUB_APP_PRIVATE_KEY line')
++    value = found[0]
++    if value == b'':
++        raise Refused('empty value')
++    if any(b < 0x20 or b > 0x7e for b in value):
++        raise Refused('value holds a byte outside printable ASCII')
++    return value
++
++
++def read_source(root):
++    path = _p(root, '/etc/goodqa/api.env')
++    try:
++        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
++    except OSError:
++        raise Refused('api.env unreadable')
++    try:
++        st = os.fstat(fd)
++        if not _is_reg(st.st_mode):
++            raise Refused('api.env is not a regular file')
++        chunks, total = [], 0
++        while True:
++            b = os.read(fd, 65536)
++            if not b:
++                break
++            total += len(b)
++            if total > MAX_SOURCE:
++                raise Refused('api.env too large')
++            chunks.append(b)
++        return b''.join(chunks)
++    finally:
++        os.close(fd)
++
++
++def _is_reg(mode):
++    import stat
++    return stat.S_ISREG(mode)
++
++
++def _is_dir(mode):
++    import stat
++    return stat.S_ISDIR(mode)
++
++
++# ---- AC-2: the group (files and NSS) --------------------------------------------------------
++def _group_rows(text):
++    rows = []
++    for line in text.splitlines():
++        parts = line.split(':')
++        if len(parts) >= 4 and parts[0] and parts[2].isdigit():
++            rows.append((parts[0], int(parts[2]), [m for m in parts[3].split(',') if m]))
++    return rows
++
++
++def _passwd_primary_gids(text):
++    out = []
++    for line in text.splitlines():
++        parts = line.split(':')
++        if len(parts) >= 4 and parts[3].isdigit():
++            out.append((parts[0], int(parts[3])))
++    return out
++
++
++def _read_text(path):
++    try:
++        with open(path, 'r', encoding='utf-8', errors='replace') as f:
++            return f.read()
++    except FileNotFoundError:
++        return ''
++
++
++def _getent(*args):
++    try:
++        r = subprocess.run(['getent', *args], capture_output=True, text=True, timeout=10)
++    except (OSError, subprocess.TimeoutExpired):
++        raise Refused('getent failed')
++    if r.returncode == 2:
++        return ''
++    if r.returncode != 0:
++        raise Refused('getent failed')
++    return r.stdout
++
++
++def check_group(root):
++    """Return True if the group exists correctly, False if absent; raise Refused on any collision."""
++    sources = [_read_text(_p(root, '/etc/group')), _getent('group', GROUP) + _getent('group', str(GID))]
++    present = False
++    for text in sources:
++        for name, gid, members in _group_rows(text):
++            if name == GROUP and gid != GID:
++                raise Refused('group name goodqa-jobsecret has another gid')
++            if gid == GID and name != GROUP:
++                raise Refused('gid 64910 has another name')
++            if name == GROUP and gid == GID:
++                if members:
++                    raise Refused('group goodqa-jobsecret has members')
++                present = True
++    for text in (_read_text(_p(root, '/etc/passwd')), _getent('passwd')):
++        for _user, gid in _passwd_primary_gids(text):
++            if gid == GID:
++                raise Refused('an account has gid 64910 as its primary group')
++    return present
++
++
++def ensure_group(root):
++    if check_group(root):
++        return
++    cmd = ['groupadd', '-r', '-g', str(GID), GROUP]
++    if root != '/':
++        cmd[1:1] = ['-R', root]
++    try:
++        r = subprocess.run(cmd, capture_output=True, timeout=30)
++    except (OSError, subprocess.TimeoutExpired):
++        raise Refused('groupadd failed')
++    if r.returncode != 0:
++        raise Refused('groupadd failed')
++    if not check_group(root):
++        raise Refused('group not present after groupadd')
++
++
++# ---- AC-2: directory and file ---------------------------------------------------------------
++def _check_parent(root):
++    parent = _p(root, '/etc/goodqa')
++    try:
++        pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    except OSError:
++        raise Refused('/etc/goodqa is missing, a symlink or not a directory')
++    st = os.fstat(pfd)
++    if st.st_uid != 0 or st.st_mode & 0o022:
++        os.close(pfd)
++        raise Refused('/etc/goodqa is not root-owned or is group or world writable')
++    return pfd
++
++
++def open_secrets_dir(root, create):
++    pfd = _check_parent(root)
++    try:
++        try:
++            dfd = os.open('job-secrets', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd)
++        except FileNotFoundError:
++            if not create:
++                return None
++            os.mkdir('job-secrets', 0o700, dir_fd=pfd)
++            dfd = os.open('job-secrets', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd)
++            os.fchown(dfd, 0, 0)
++            os.fchmod(dfd, DIR_MODE)
++            os.fsync(pfd)
++        except OSError:
++            raise Refused('job-secrets is a symlink or not a directory')
++        st = os.fstat(dfd)
++        if not _is_dir(st.st_mode) or st.st_uid != 0 or st.st_gid != 0 or (st.st_mode & 0o7777) != DIR_MODE:
++            os.close(dfd)
++            raise Refused('job-secrets has another owner, mode or type')
++        return dfd
++    finally:
++        os.close(pfd)
++
++
++def read_existing(dfd):
++    """The current file's bytes, None if absent; refuse a link, a non-regular file or wrong owner/mode."""
++    try:
++        fd = os.open(NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
++    except FileNotFoundError:
++        return None
++    except OSError:
++        raise Refused('the secret file is a symlink or unreadable')
++    try:
++        st = os.fstat(fd)
++        if not _is_reg(st.st_mode) or st.st_uid != 0 or st.st_gid != GID or (st.st_mode & 0o7777) != FILE_MODE:
++            raise Refused('the secret file has another owner, mode or type')
++        chunks = []
++        while True:
++            b = os.read(fd, 65536)
++            if not b:
++                break
++            chunks.append(b)
++        return b''.join(chunks)
++    finally:
++        os.close(fd)
++
++
++def sweep_temps(dfd):
++    for entry in os.listdir(dfd):
++        if entry.startswith('.tmp-'):
++            os.unlink(entry, dir_fd=dfd)
++
++
++def write_secret(dfd, value, hooks):
++    tmp = '.tmp-' + secrets.token_hex(8)
++    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
++    try:
++        # The fd stays open until the check after the rename, so its inode cannot be freed and
++        # its number reused by a swapped-in link.
++        own = os.fstat(fd)
++        os.fchown(fd, 0, GID)
++        os.fchmod(fd, FILE_MODE)
++        view = memoryview(value)
++        while view:
++            n = os.write(fd, view)
++            view = view[n:]
++        os.fsync(fd)
++        if hooks and hooks.get('before_rename'):
++            hooks['before_rename'](tmp)
++        os.rename(tmp, NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
++        os.fsync(dfd)
++        # The name must now be the very inode this run wrote through its fd (never a swapped-in link).
++        now = os.stat(NAME, dir_fd=dfd, follow_symlinks=False)
++        if not _is_reg(now.st_mode) or (now.st_dev, now.st_ino) != (own.st_dev, own.st_ino):
++            # The rename already put the foreign file or link at NAME: remove that name (never what it points
++            # to), so the dispatcher sees the key as missing instead of using it (code review F2).
++            try:
++                os.unlink(NAME, dir_fd=dfd)
++            except FileNotFoundError:
++                pass
++            raise Refused('the secret file changed during the write')
++    except BaseException:
++        try:
++            os.unlink(tmp, dir_fd=dfd)
++        except OSError:
++            pass
++        raise
++    finally:
++        os.close(fd)
++
++
++def run(argv, root='/', hooks=None):
++    check = argv == ['--check']
++    if argv not in ([], ['--check']):
++        return 'REFUSED usage: derive-job-secrets.py [--check]', 2
++    try:
++        value = parse_api_env(read_source(root))
++        if check:
++            check_group(root)
++            dfd = open_secrets_dir(root, create=False)
++            if dfd is None:
++                return 'different', 0
++            try:
++                return ('same' if read_existing(dfd) == value else 'different'), 0
++            finally:
++                os.close(dfd)
++        ensure_group(root)
++        dfd = open_secrets_dir(root, create=True)
++        try:
++            sweep_temps(dfd)
++            if read_existing(dfd) == value:
++                return 'unchanged', 0
++            write_secret(dfd, value, hooks)
++            return 'written', 0
++        finally:
++            os.close(dfd)
++    except Refused as e:
++        return 'REFUSED ' + str(e), 2
++    except OSError as e:
++        return 'REFUSED os error (%s)' % (type(e).__name__,), 2
++
++
++def main(root='/'):
++    # The CLI always works on the real root; tests import this module and pass a fake root.
++    word, code = run(sys.argv[1:], root=root)
++    sys.stdout.write('job secret %s: %s\n' % (NAME, word))
++    return code
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+diff --git a/infra/selfhost/app/env-keys.json b/infra/selfhost/app/env-keys.json
+index d6ec9a98301..4072b0c4ee6 100644
+--- a/infra/selfhost/app/env-keys.json
++++ b/infra/selfhost/app/env-keys.json
+@@ -137,6 +137,7 @@
+     "AI_SPEND_SDK_PRICES_JSON",
+     "GOOGLE_APPLICATION_CREDENTIALS_JSON",
+     "JOB_DISPATCH_TOKEN",
++    "JOB_ENVFILE_INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY",
+     "JOB_ENV_INTELLIGENCE_WORKER__DATABASE_URL",
+     "JOB_ENV_INTELLIGENCE_WORKER__NODE_ENV",
+     "JOB_ENV_INTELLIGENCE_WORKER__OPENROUTER_API_KEY",
+diff --git a/infra/selfhost/app/run_derive_tests.sh b/infra/selfhost/app/run_derive_tests.sh
+new file mode 100755
+index 00000000000..bae9d99e023
+--- /dev/null
++++ b/infra/selfhost/app/run_derive_tests.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++# goodqa#16148: run the derive-job-secrets.py and apply-job-secrets-host.py tests. Parse and compose-parity tests run on this
++# host (needs the docker compose CLI); the ownership tests need root and run in a throwaway
++# container (--rm, --network none, this directory read-only, a scratch dir for fake roots).
++# Fake values only. Usage: infra/selfhost/app/run_derive_tests.sh [SCRATCH_DIR]
++set -euo pipefail
++HERE="$(cd "$(dirname "$0")" && pwd)"
++SCRATCH="${1:-$HERE/../../../.scratch/derive-tests}"
++IMAGE="${DERIVE_TEST_IMAGE:-python:3.12-slim}"
++mkdir -p "$SCRATCH"
++SCRATCH="$(cd "$SCRATCH" && pwd)"
++echo "== host: parse + compose parity"
++( cd "$HERE" && DERIVE_TEST_TMP="$SCRATCH" timeout 600 python3 -m unittest -v test_derive_job_secrets test_apply_job_secrets_host 2>&1 | tail -n 30 )
++echo "== container (root): ownership, races, NEG-1/2/3/13, no value in output or argv"
++docker run --rm --network none -v "$HERE:/t:ro" -v "$SCRATCH:/scratch" -e DERIVE_TEST_TMP=/scratch -w /t \
++  "$IMAGE" timeout 600 python3 -m unittest -v test_derive_job_secrets test_apply_job_secrets_host 2>&1 | tail -n 30
+diff --git a/infra/selfhost/app/test_apply_job_secrets_host.py b/infra/selfhost/app/test_apply_job_secrets_host.py
+new file mode 100644
+index 00000000000..0336fbcde18
+--- /dev/null
++++ b/infra/selfhost/app/test_apply_job_secrets_host.py
+@@ -0,0 +1,296 @@
++"""goodqa#16148 spec v4 AC-11, NEG-14, NEG-15 and build conditions R1, R2: apply-job-secrets-host.py.
++
++Root-only (backups are root 0600 via fchown): run_derive_tests.sh runs this in the throwaway
++container next to the derive tests. Fake host trees only; stub getent and docker on PATH.
++"""
++import importlib.util
++import os
++import shutil
++import stat
++import tempfile
++import time
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++spec = importlib.util.spec_from_file_location('apply_host', os.path.join(HERE, 'apply-job-secrets-host.py'))
++ah = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(ah)
++IS_ROOT = os.geteuid() == 0
++
++COMPOSE = '''services:
++  api:
++    image: goodqa-api:abc # rw-ship abc
++    env_file:
++      - path: /etc/goodqa/api.env
++        format: raw
++  job-dispatcher:
++    <<: *hardening
++    image: goodqa-job-dispatcher:abc-1 # rw-ship abc 1
++    read_only: true
++    tmpfs: ["/tmp"]
++    env_file:
++      - path: /etc/goodqa/dispatcher.env
++        format: raw
++    networks: [dispatch-app, edge]
++    mem_limit: 384m
++
++  job-dispatcher-create-guard:
++    image: goodqa-job-dispatcher:abc-1
++    group_add: ["999"]
++
++networks:
++  edge: {}
++'''
++ENV = b'JOB_DISPATCH_TOKEN=fake-token\nJOB_ENV_SCAN__NODE_ENV=production\n'
++
++STUB_GETENT = '''#!/bin/sh
++f="$FAKE_ROOT/nss-group"; [ -f "$f" ] || exit 2
++grep -E "^($2):|^[^:]*:[^:]*:($2):" "$f" || exit 2
++'''
++STUB_DOCKER = '''#!/bin/sh
++echo "$*" >> "$FAKE_ROOT/docker.log"
++[ -f "$FAKE_ROOT/compose-invalid" ] && exit 1
++exit 0
++'''
++
++
++@unittest.skipUnless(IS_ROOT, 'needs root (backups are root 0600): runs in the throwaway container')
++class HostApplyTests(unittest.TestCase):
++    def setUp(self):
++        self.root = tempfile.mkdtemp(prefix='apply-root-', dir=os.environ.get('DERIVE_TEST_TMP'))
++        self.dir = os.path.join(self.root, 'opt/goodqa/infra/selfhost/app')
++        self.env_dir = os.path.join(self.root, 'etc/goodqa')
++        os.makedirs(self.dir)
++        os.makedirs(self.env_dir, mode=0o700)
++        with open(self.p('compose'), 'w') as f:
++            f.write(COMPOSE)
++        os.chown(self.p('compose'), 1000, 1000)
++        os.chmod(self.p('compose'), 0o664)
++        with open(self.p('env'), 'wb') as f:
++            f.write(ENV)
++        os.chmod(self.p('env'), 0o600)
++        bin_dir = os.path.join(self.root, 'bin')
++        os.makedirs(bin_dir)
++        for n, body in (('getent', STUB_GETENT), ('docker', STUB_DOCKER)):
++            with open(os.path.join(bin_dir, n), 'w') as f:
++                f.write(body)
++            os.chmod(os.path.join(bin_dir, n), 0o755)
++        self.saved = dict(os.environ)
++        os.environ['PATH'] = bin_dir + ':' + os.environ['PATH']
++        os.environ['FAKE_ROOT'] = self.root
++
++    def tearDown(self):
++        os.environ.clear()
++        os.environ.update(self.saved)
++        shutil.rmtree(self.root, ignore_errors=True)
++
++    def p(self, which):
++        return {'compose': os.path.join(self.dir, 'compose.yaml'), 'env': os.path.join(self.env_dir, 'dispatcher.env')}[which]
++
++    def read(self, which):
++        with open(self.p(which), 'rb') as f:
++            return f.read()
++
++    def derive_done(self):
++        """What derive-job-secrets.py leaves: the group (seen through NSS) and the 0711 directory."""
++        with open(os.path.join(self.root, 'nss-group'), 'w') as f:
++            f.write('goodqa-jobsecret:x:64910:\n')
++        d = os.path.join(self.env_dir, 'job-secrets')
++        os.mkdir(d)
++        os.chown(d, 0, 0)
++        os.chmod(d, 0o711)
++
++    def run_cmd(self, *argv, hooks=None):
++        return ah.run(['--dir', self.dir, '--env-dir', self.env_dir, *argv], hooks=hooks)
++
++    def check(self):
++        lines, code = self.run_cmd('--check')
++        self.assertEqual(code, 0)
++        return dict(l.rsplit(': ', 1) for l in lines)
++
++    # ---- AC-11 ----
++    def test_check_on_a_fresh_host(self):
++        self.assertEqual(set(self.check().values()), {'absent'})
++
++    def test_apply_refuses_before_derive(self):
++        lines, code = self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        self.assertEqual(code, 2)
++        self.assertIn('derive-job-secrets.py must run first', lines[0])
++        self.assertEqual(self.read('compose'), COMPOSE.encode())
++        self.assertEqual(self.read('env'), ENV)
++
++    def test_apply_then_apply_again_then_restore(self):
++        self.derive_done()
++        cst0 = os.stat(self.p('compose'))
++        self.assertEqual(self.run_cmd('apply', '--stamp', '20261116T030000Z'), (['job secrets host apply: applied'], 0))
++        self.assertEqual(set(self.check().values()), {'present'})
++        comp = self.read('compose').decode()
++        block = comp[comp.index('  job-dispatcher:\n'):comp.index('  job-dispatcher-create-guard:')]
++        self.assertIn(ah.GROUP_LINE + '\n', block)
++        self.assertIn(ah.VOL_LINE + '\n', block)
++        self.assertTrue(self.read('env').endswith(ah.ENV_LINE.encode() + b'\n'))
++        cst = os.stat(self.p('compose'))
++        self.assertEqual((cst.st_uid, cst.st_gid, stat.S_IMODE(cst.st_mode)), (cst0.st_uid, cst0.st_gid, 0o664))
++        for which, orig in (('compose', COMPOSE.encode()), ('env', ENV)):
++            b = self.p(which) + '.pre-16148-20261116T030000Z'
++            bst = os.lstat(b)
++            self.assertEqual((bst.st_uid, bst.st_gid, stat.S_IMODE(bst.st_mode)), (0, 0, 0o600))
++            with open(b, 'rb') as f:
++                self.assertEqual(f.read(), orig)
++        m = (os.stat(self.p('compose')).st_mtime_ns, os.stat(self.p('env')).st_mtime_ns)
++        time.sleep(0.02)
++        self.assertEqual(self.run_cmd('apply', '--stamp', '20261116T030100Z'), (['job secrets host apply: unchanged'], 0))
++        self.assertEqual((os.stat(self.p('compose')).st_mtime_ns, os.stat(self.p('env')).st_mtime_ns), m)
++        self.assertFalse(os.path.exists(self.p('env') + '.pre-16148-20261116T030100Z'))
++        self.assertEqual(self.run_cmd('restore'), (['job secrets host restore: restored'], 0))
++        self.assertEqual(self.read('compose'), COMPOSE.encode())
++        self.assertEqual(self.read('env'), ENV)
++
++    def test_apply_validates_compose_with_docker(self):
++        self.derive_done()
++        self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        log = open(os.path.join(self.root, 'docker.log')).read()
++        self.assertIn('compose -f %s/.compose.yaml.validate-' % self.dir, log)
++        self.assertIn('config -q', log)
++        self.assertEqual([e for e in os.listdir(self.dir) if 'validate' in e or '.tmp-' in e], [])
++
++    # ---- R1: restore keeps later changes ----
++    def test_restore_keeps_a_later_release_pin_and_a_later_env_key(self):
++        self.derive_done()
++        self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        comp = self.read('compose').decode().replace('goodqa-job-dispatcher:abc-1 # rw-ship abc 1', 'goodqa-job-dispatcher:def-2 # rw-ship def 2')
++        with open(self.p('compose'), 'w') as f:
++            f.write(comp)
++        with open(self.p('env'), 'ab') as f:
++            f.write(b'LATER_KEY=added-after\n')
++        self.assertEqual(self.run_cmd('restore')[1], 0)
++        self.assertEqual(self.read('compose'), COMPOSE.replace('abc-1 # rw-ship abc 1', 'def-2 # rw-ship def 2').encode())
++        self.assertEqual(self.read('env'), ENV + b'LATER_KEY=added-after\n')
++
++    def test_restore_refuses_a_changed_marked_line(self):
++        self.derive_done()
++        self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        comp = self.read('compose').decode().replace('/run/goodqa-secrets:ro"]', '/run/goodqa-secrets:rw"]')
++        with open(self.p('compose'), 'w') as f:
++            f.write(comp)
++        lines, code = self.run_cmd('restore')
++        self.assertEqual(code, 2)
++        self.assertIn('marked line in compose.yaml was changed', lines[0])
++
++    # ---- NEG-14: partial apply ----
++    def test_neg14_stopped_between_files(self):
++        self.derive_done()
++
++        def stop():
++            raise KeyboardInterrupt('stopped between the two writes')
++
++        with self.assertRaises(KeyboardInterrupt):
++            self.run_cmd('apply', '--stamp', '20261116T030000Z', hooks={'between_files': stop})
++        st = self.check()
++        self.assertEqual(st['dispatcher.env ' + ah.ENV_KEY], 'present')
++        self.assertEqual(st['compose job-dispatcher mount'], 'absent')
++        self.assertEqual(st['compose job-dispatcher group_add'], 'absent')
++        self.assertEqual(self.read('compose'), COMPOSE.encode())
++        self.assertEqual(self.run_cmd('apply', '--stamp', '20261116T030500Z'), (['job secrets host apply: applied'], 0))
++        self.assertEqual(set(self.check().values()), {'present'})
++        self.assertEqual(self.run_cmd('restore')[1], 0)
++        self.assertEqual(self.read('compose'), COMPOSE.encode())
++        self.assertEqual(self.read('env'), ENV)
++
++    # ---- NEG-15: failed apply leaves everything ----
++    def test_neg15_invalid_compose_changes_nothing(self):
++        self.derive_done()
++        open(os.path.join(self.root, 'compose-invalid'), 'w').close()
++        lines, code = self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        self.assertEqual(code, 2)
++        self.assertIn('does not validate', lines[0])
++        self.assertEqual(self.read('compose'), COMPOSE.encode())
++        self.assertEqual(self.read('env'), ENV)
++        self.assertEqual(sorted(os.listdir(self.dir)), ['compose.yaml'])
++        self.assertEqual(sorted(e for e in os.listdir(self.env_dir) if e != 'job-secrets'), ['dispatcher.env'])
++
++    def test_neg15_existing_backup_is_never_overwritten(self):
++        self.derive_done()
++        b = self.p('env') + '.pre-16148-20261116T030000Z'
++        with open(b, 'wb') as f:
++            f.write(b'earlier backup')
++        lines, code = self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        self.assertEqual(code, 2)
++        with open(b, 'rb') as f:
++            self.assertEqual(f.read(), b'earlier backup')
++        self.assertEqual(self.read('compose'), COMPOSE.encode())
++        self.assertEqual(self.read('env'), ENV)
++
++    # ---- conflicts and unsafe paths ----
++    def _conflict(self, compose=None, env=None, expect=None):
++        self.derive_done()
++        if compose is not None:
++            with open(self.p('compose'), 'w') as f:
++                f.write(compose)
++        if env is not None:
++            with open(self.p('env'), 'wb') as f:
++                f.write(env)
++        before = (self.read('compose'), self.read('env'))
++        self.assertEqual(self.check()[expect], 'conflict')
++        lines, code = self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        self.assertEqual(code, 2)
++        self.assertIn('conflict', lines[0])
++        self.assertEqual((self.read('compose'), self.read('env')), before)
++
++    def test_conflict_dispatcher_has_other_volumes(self):
++        self._conflict(compose=COMPOSE.replace('    mem_limit: 384m\n', '    mem_limit: 384m\n    volumes: ["/x:/y"]\n'), expect='compose job-dispatcher mount')
++
++    def test_conflict_other_service_mounts_the_secrets(self):
++        self._conflict(compose=COMPOSE.replace('    group_add: ["999"]\n', '    volumes: ["/etc/goodqa/job-secrets:/s:ro"]\n'), expect='compose job-dispatcher mount')
++
++    def test_conflict_env_key_with_another_value(self):
++        self._conflict(env=ENV + ah.ENV_KEY.encode() + b'=/elsewhere\n', expect='dispatcher.env ' + ah.ENV_KEY)
++
++    def test_conflict_dir_with_wrong_mode(self):
++        self.derive_done()
++        os.chmod(os.path.join(self.env_dir, 'job-secrets'), 0o755)
++        self.assertEqual(self.check()['dir /etc/goodqa/job-secrets'], 'conflict')
++        self.assertEqual(self.run_cmd('apply', '--stamp', '20261116T030000Z')[1], 2)
++
++    def test_symlinked_compose_is_refused(self):
++        self.derive_done()
++        real = os.path.join(self.root, 'real-compose.yaml')
++        os.rename(self.p('compose'), real)
++        os.symlink(real, self.p('compose'))
++        lines, code = self.run_cmd('apply', '--stamp', '20261116T030000Z')
++        self.assertEqual(code, 2)
++        self.assertIn('symlink', lines[0])
++        with open(real) as f:
++            self.assertEqual(f.read(), COMPOSE)
++
++    def test_symlinked_env_dir_is_refused(self):
++        lines, code = ah.run(['--dir', self.dir, '--env-dir', os.path.join(self.root, 'envlink'), '--check'])
++        self.assertEqual(code, 2)
++        os.symlink(self.env_dir, os.path.join(self.root, 'envlink'))
++        lines, code = ah.run(['--dir', self.dir, '--env-dir', os.path.join(self.root, 'envlink'), '--check'])
++        self.assertEqual(code, 2)
++        self.assertIn('symlink', lines[0])
++
++    # ---- R2: retention ----
++    def test_prune_keeps_the_newest_three_backups(self):
++        names = ['dispatcher.env.pre-16148-2026111%dT000000Z' % i for i in range(1, 6)]
++        for n in names:
++            with open(os.path.join(self.env_dir, n), 'w') as f:
++                f.write('b')
++        with open(os.path.join(self.env_dir, 'dispatcher.env.pre-16148-notastamp'), 'w') as f:
++            f.write('keep')
++        dfd = ah.open_dir(self.env_dir)
++        try:
++            ah.prune_backups(dfd, 'dispatcher.env')
++        finally:
++            os.close(dfd)
++        left = sorted(e for e in os.listdir(self.env_dir) if '.pre-16148-' in e)
++        self.assertEqual(left, sorted(names[2:] + ['dispatcher.env.pre-16148-notastamp']))
++
++    def test_usage(self):
++        self.assertEqual(self.run_cmd()[1], 2)
++        self.assertEqual(self.run_cmd('apply', '--stamp', 'bad')[1], 2)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/infra/selfhost/app/test_apply_job_secrets_wrapper.py b/infra/selfhost/app/test_apply_job_secrets_wrapper.py
+new file mode 100644
+index 00000000000..fdf56d15bbf
+--- /dev/null
++++ b/infra/selfhost/app/test_apply_job_secrets_wrapper.py
+@@ -0,0 +1,147 @@
++"""goodqa#16148 spec v4 AC-11 with R3 and R4: apply-job-secrets.sh (runner side). A stub ssh records each call (its
++command and a sha256 of what was streamed on stdin) and answers from a script. No VM, no secrets.
++Run: python3 -m unittest -v test_apply_job_secrets_wrapper
++"""
++import fcntl
++import hashlib
++import os
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++WRAPPER = os.path.join(HERE, 'apply-job-secrets.sh')
++
++
++def sha(path):
++    with open(path, 'rb') as f:
++        return hashlib.sha256(f.read()).hexdigest()
++
++
++STUB_SSH = r'''#!/usr/bin/env python3
++import hashlib, json, os, sys
++root = os.environ['STUB_ROOT']
++data = sys.stdin.buffer.read()
++cmd = sys.argv[-1]
++with open(os.path.join(root, 'calls.jsonl'), 'a') as f:
++    f.write(json.dumps({'argv': sys.argv[1:], 'cmd': cmd, 'stdin': hashlib.sha256(data).hexdigest()}) + '\n')
++derive = 'derive' if data.split(b'\n')[1].startswith(b'"""derive-job-secrets.py') else 'host'
++answer = open(os.path.join(root, 'answer-' + derive)).read() if os.path.exists(os.path.join(root, 'answer-' + derive)) else '0|ok'
++rc, out = answer.split('|', 1)
++sys.stdout.write(out + '\n')
++sys.exit(int(rc))
++'''
++
++
++class WrapperTests(unittest.TestCase):
++    def setUp(self):
++        self.root = tempfile.mkdtemp(prefix='apply-wrap-', dir=os.environ.get('DERIVE_TEST_TMP'))
++        self.lane = os.path.join(self.root, 'lane')
++        os.makedirs(os.path.join(self.lane, 'biz/release-waves'))
++        with open(os.path.join(self.lane, 'biz/release-waves/ship.conf'), 'w') as f:
++            f.write('SELFHOST_APP=ubuntu@app.invalid\nSELFHOST_DIR=/opt/goodqa/infra/selfhost/app\nSELFHOST_ENV_DIR=/etc/goodqa\n')
++        self.ssh = os.path.join(self.root, 'ssh')
++        with open(self.ssh, 'w') as f:
++            f.write(STUB_SSH)
++        os.chmod(self.ssh, 0o755)
++        self.answer('derive', '0|job secret github-app-private-key: written')
++        self.answer('host', '0|job secrets host apply: applied')
++
++    def tearDown(self):
++        shutil.rmtree(self.root, ignore_errors=True)
++
++    def answer(self, which, text):
++        with open(os.path.join(self.root, 'answer-' + which), 'w') as f:
++            f.write(text)
++
++    def run_wrapper(self, *args, env_extra=None):
++        env = dict(os.environ, RW_LANE_ROOT=self.lane, APPLY_SSH=self.ssh, STUB_ROOT=self.root, APPLY_TEST_MODE='1')
++        env.update(env_extra or {})
++        return subprocess.run(['bash', WRAPPER, *args], env=env, capture_output=True, text=True, timeout=60)
++
++    def calls(self):
++        p = os.path.join(self.root, 'calls.jsonl')
++        if not os.path.exists(p):
++            return []
++        import json
++        return [json.loads(l) for l in open(p)]
++
++    def lockf(self, suffix='.lock'):
++        return os.path.join(self.lane, 'locks', 'gq-promote' + suffix)
++
++    def test_apply_streams_derive_then_host_apply_under_the_lock(self):
++        r = self.run_wrapper('apply')
++        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
++        c = self.calls()
++        self.assertEqual(len(c), 2)
++        self.assertEqual(c[0]['stdin'], sha(os.path.join(HERE, 'derive-job-secrets.py')))
++        self.assertEqual(c[0]['cmd'], 'sudo python3 -I -')
++        self.assertEqual(c[1]['stdin'], sha(os.path.join(HERE, 'apply-job-secrets-host.py')))
++        self.assertRegex(c[1]['cmd'], r'^sudo python3 -I - --dir /opt/goodqa/infra/selfhost/app --env-dir /etc/goodqa apply --stamp \d{8}T\d{6}Z$')
++        self.assertIn('ubuntu@app.invalid', c[0]['argv'])
++        self.assertEqual(open(self.lockf('.epoch')).read().strip(), '1')
++        self.assertFalse(os.path.exists(self.lockf('.holder')), 'holder removed after the run')
++
++    def test_lock_held_refuses_with_75_and_calls_nothing(self):
++        os.makedirs(os.path.dirname(self.lockf()), exist_ok=True)
++        with open(self.lockf(), 'a') as f:
++            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
++            r = self.run_wrapper('apply')
++        self.assertEqual(r.returncode, 75, r.stdout)
++        self.assertIn('deploy lock is held', r.stdout)
++        self.assertEqual(self.calls(), [])
++
++    def test_release_in_flight_refuses_with_75(self):
++        os.makedirs(os.path.dirname(self.lockf()), exist_ok=True)
++        with open(self.lockf('.inflight.json'), 'w') as f:
++            f.write('{}')
++        for mode in ('apply', 'restore', '--check'):
++            r = self.run_wrapper(mode)
++            self.assertEqual(r.returncode, 75, mode + r.stdout)
++        self.assertEqual(self.calls(), [])
++
++    def test_derive_refused_stops_before_the_host_apply(self):
++        for answer in ('2|job secret github-app-private-key: REFUSED no GITHUB_APP_PRIVATE_KEY line',
++                       '0|job secret github-app-private-key: written\nextra line',
++                       '0|',
++                       '255|ssh: connect to host app.invalid: Connection refused'):
++            open(os.path.join(self.root, 'calls.jsonl'), 'w').close()
++            self.answer('derive', answer)
++            r = self.run_wrapper('apply')
++            self.assertEqual(r.returncode, 2, answer + r.stdout)
++            self.assertIn('nothing else applied', r.stdout)
++            self.assertEqual(len(self.calls()), 1, answer)
++
++    def test_check_is_read_only_and_does_not_bump_the_epoch(self):
++        r = self.run_wrapper('--check')
++        self.assertEqual(r.returncode, 0, r.stdout)
++        c = self.calls()
++        self.assertEqual(c[0]['cmd'], 'sudo python3 -I - --check')
++        self.assertTrue(c[1]['cmd'].endswith(' --check'))
++        self.assertFalse(os.path.exists(self.lockf('.epoch')))
++
++    def test_restore_streams_only_the_host_apply(self):
++        r = self.run_wrapper('restore')
++        self.assertEqual(r.returncode, 0, r.stdout)
++        c = self.calls()
++        self.assertEqual(len(c), 1)
++        self.assertTrue(c[0]['cmd'].endswith(' restore'))
++
++    def test_host_apply_failure_is_the_exit_code(self):
++        self.answer('host', '2|job secrets host apply: REFUSED conflict: dispatcher.env X')
++        r = self.run_wrapper('apply')
++        self.assertEqual(r.returncode, 2)
++
++    def test_refusals_without_config(self):
++        self.assertEqual(self.run_wrapper('bogus').returncode, 2)
++        self.assertEqual(self.run_wrapper('apply', env_extra={'RW_LANE_ROOT': ''}).returncode, 2)
++        os.unlink(os.path.join(self.lane, 'biz/release-waves/ship.conf'))
++        r = self.run_wrapper('apply')
++        self.assertEqual(r.returncode, 2)
++        self.assertIn('SELFHOST_APP is not set', r.stdout)
++        self.assertEqual(self.calls(), [])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/infra/selfhost/app/test_cmdline_sampler.py b/infra/selfhost/app/test_cmdline_sampler.py
+new file mode 100644
+index 00000000000..bd3e97c035e
+--- /dev/null
++++ b/infra/selfhost/app/test_cmdline_sampler.py
+@@ -0,0 +1,168 @@
++"""goodqa#16148 spec v4 AC-6 (3), NEG-18 (P2, R6): cmdline-sampler.py against a fake /proc tree. Unprivileged.
++Run: python3 -m unittest -v test_cmdline_sampler
++"""
++import importlib.util
++import io
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++SCRIPT = os.path.join(HERE, 'cmdline-sampler.py')
++spec = importlib.util.spec_from_file_location('sampler', SCRIPT)
++sampler = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(sampler)
++
++CID = 'ab' * 32
++OTHER = 'cd' * 32
++MARKER = 'FAKEsamplerMARKER0123456789abcdefXYZ'
++
++
++class SamplerTests(unittest.TestCase):
++    def setUp(self):
++        self.proc = tempfile.mkdtemp(prefix='fakeproc-', dir=os.environ.get('DERIVE_TEST_TMP'))
++        self.next_pid = 100
++
++    def tearDown(self):
++        shutil.rmtree(self.proc, ignore_errors=True)
++
++    def add(self, argv, container=CID, style='systemd'):
++        pid = str(self.next_pid)
++        self.next_pid += 1
++        d = os.path.join(self.proc, pid)
++        os.makedirs(d)
++        cg = '0::/system.slice/docker-%s.scope\n' % container if style == 'systemd' else '12:pids:/docker/%s\n' % container
++        with open(os.path.join(d, 'cgroup'), 'w') as f:
++            f.write(cg)
++        with open(os.path.join(d, 'cmdline'), 'wb') as f:
++            f.write(b'\0'.join(a.encode() for a in argv) + b'\0')
++        with open(os.path.join(d, 'stat'), 'w') as f:
++            f.write('%s (docker) S ' % pid + ' '.join(['1'] * 18) + ' %s 0 0\n' % (1000 + int(pid)))
++        return pid
++
++    def sample(self, *extra, seconds='0.3'):
++        return sampler.run(['--container', CID, '--proc', self.proc, '--seconds', seconds, '--interval', '0.01', *extra])
++
++    def test_env_file_launch_passes_and_records_names_only(self):
++        self.add(['/usr/bin/docker', 'run', '--rm', '-d', '--cap-drop=ALL', '--env-file', '/tmp/goodqa-envfile-x/env', 'img@sha256:' + 'a' * 64, 'arg'])
++        out, code = self.sample('--expect-runs', '1')
++        self.assertEqual((out['verdict'], code), ('PASS', 0))
++        self.assertEqual(out['label'], 'sampled')
++        self.assertEqual(out['runs'][0]['flags'], ['--rm', '-d', '--cap-drop', '--env-file'])
++        self.assertNotIn('goodqa-envfile', json.dumps(out))
++
++    def test_neg18_planted_marker_in_every_form_never_reaches_output(self):
++        for argv in (['docker', 'run', '-e', 'K=' + MARKER, 'img'],
++                     ['docker', 'run', '-eK=' + MARKER, 'img'],
++                     ['docker', 'run', '--env=K=' + MARKER, 'img'],
++                     ['docker', 'run', '--env-file=' + MARKER, 'img'],
++                     ['docker', 'run', '--' + MARKER + '=x', 'img'],
++                     ['docker', 'run', '-' + MARKER, 'img']):
++            self.add(argv)
++        buf = io.StringIO()
++        saved = sys.stdout
++        sys.stdout = buf
++        try:
++            argv0 = sys.argv
++            sys.argv = ['cmdline-sampler.py', '--container', CID, '--proc', self.proc, '--seconds', '0.2', '--interval', '0.01', '--expect-runs', '6']
++            code = sampler.main()
++        finally:
++            sys.stdout = saved
++            sys.argv = argv0
++        text = buf.getvalue()
++        self.assertEqual(code, 1)
++        out = json.loads(text)
++        self.assertEqual(out['verdict'], 'FAIL')
++        for i in range(0, len(MARKER) - 7):
++            self.assertNotIn(MARKER[i:i + 8], text)
++        flags = [r['flags'] for r in out['runs']]
++        self.assertIn(['-e'], flags)
++        self.assertIn(['-e(attached)'], flags)
++        self.assertIn(['--env(attached)'], flags)
++        self.assertIn(['--env-file'], flags)
++        self.assertIn(['--(other)'], flags)
++        self.assertIn(['-(other)(attached)'], flags)
++        self.assertEqual(os.listdir(os.path.dirname(self.proc)).count(os.path.basename(self.proc)), 1)
++
++    def test_neg18_clustered_short_flags_with_e_fail(self):
++        # F3: pflag accepts clustered shorthands, so -de K=V and -ieK=V carry an env value too.
++        for argv in (['docker', 'run', '-de', 'K=' + MARKER, 'img'],
++                     ['docker', 'run', '-ieK=' + MARKER, 'img'],
++                     ['docker', 'run', '-dite', 'K=' + MARKER, 'img']):
++            shutil.rmtree(self.proc)
++            os.makedirs(self.proc)
++            self.add(argv)
++            out, code = self.sample('--expect-runs', '1')
++            self.assertEqual((out['verdict'], code), ('FAIL', 1), argv[2])
++            self.assertEqual(out['runs_with_env_flag'], 1)
++            text = json.dumps(out)
++            for i in range(0, len(MARKER) - 7):
++                self.assertNotIn(MARKER[i:i + 8], text)
++
++    def test_clusters_without_an_env_flag_still_pass(self):
++        # Booleans only, and an e that is part of a value-taking flag's value (-w example), are not env flags.
++        self.add(['docker', 'run', '-dit', '-wexample', '--env-file', '/x', 'img'])
++        out, code = self.sample('--expect-runs', '1')
++        self.assertEqual((out['verdict'], code), ('PASS', 0))
++        self.assertEqual(out['runs'][0]['flags'], ['-d(attached)', '-(other)(attached)', '--env-file'])
++
++    def test_neg18_other_cgroup_is_not_sampled(self):
++        self.add(['docker', 'run', '-e', 'K=' + MARKER, 'img'], container=OTHER)
++        self.add(['docker', 'run', '--env-file', '/x', 'img'])
++        out, code = self.sample('--expect-runs', '1')
++        self.assertEqual((out['verdict'], out['runs_seen']), ('PASS', 1))
++
++    def test_cgroup_v1_docker_path_is_matched(self):
++        self.add(['docker', 'run', '-e', 'K=v', 'img'], style='v1')
++        out, _ = self.sample('--expect-runs', '1')
++        self.assertEqual(out['verdict'], 'FAIL')
++
++    def test_positive_control_no_sample_fails(self):
++        out, code = self.sample('--expect-runs', '2')
++        self.assertEqual((out['verdict'], code), ('NO_SAMPLE', 1))
++        self.add(['docker', 'run', '--env-file', '/x', 'img'])
++        out, code = self.sample('--expect-runs', '2')
++        self.assertEqual((out['verdict'], code), ('NO_SAMPLE', 1))
++
++    def test_non_run_docker_commands_and_other_binaries_are_ignored(self):
++        self.add(['docker', 'inspect', 'abc'])
++        self.add(['node', 'run', '-e', 'K=v'])
++        out, _ = self.sample('--expect-runs', '1')
++        self.assertEqual(out['verdict'], 'NO_SAMPLE')
++
++    def test_a_short_lived_process_is_seen_by_polling(self):
++        def later():
++            time.sleep(0.1)
++            pid = self.add(['docker', 'run', '--env-file', '/x', 'img'])
++            time.sleep(0.15)
++            shutil.rmtree(os.path.join(self.proc, pid))
++        t = threading.Thread(target=later)
++        t.start()
++        out, code = self.sample('--expect-runs', '1', seconds='0.5')
++        t.join()
++        self.assertEqual((out['verdict'], code), ('PASS', 0))
++
++    def test_same_process_counted_once(self):
++        self.add(['docker', 'run', '--env-file', '/x', 'img'])
++        out, _ = self.sample('--expect-runs', '1')
++        self.assertEqual(out['runs_seen'], 1)
++
++    def test_bad_container_id_refused(self):
++        out, code = sampler.run(['--container', 'not-hex', '--proc', self.proc, '--seconds', '0'])
++        self.assertEqual((out['verdict'], code), ('FAIL', 1))
++
++    def test_runs_unprivileged_on_the_real_proc(self):
++        r = subprocess.run([sys.executable, '-I', SCRIPT, '--container', CID, '--seconds', '0.2', '--expect-runs', '0'],
++                           capture_output=True, text=True, timeout=30)
++        self.assertEqual(r.returncode, 0, r.stderr)
++        self.assertEqual(json.loads(r.stdout)['verdict'], 'PASS')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/infra/selfhost/app/test_derive_job_secrets.py b/infra/selfhost/app/test_derive_job_secrets.py
+new file mode 100644
+index 00000000000..fdb30b3656d
+--- /dev/null
++++ b/infra/selfhost/app/test_derive_job_secrets.py
+@@ -0,0 +1,475 @@
++"""goodqa#16148 spec v4 AC-1, AC-2, AC-9, NEG-1, NEG-2, NEG-3, NEG-13: derive-job-secrets.py.
++
++Fake values only. The ownership tests need root (fchown to 0:64910), so they run in a throwaway
++container: run_derive_tests.sh starts one with this directory mounted and --network none. The
++compose parity test needs the docker compose CLI and runs on the host (it skips elsewhere).
++Run:  python3 -m unittest -v test_derive_job_secrets
++"""
++import importlib.util
++import json
++import os
++import shutil
++import signal
++import stat
++import subprocess
++import sys
++import tempfile
++import textwrap
++import time
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++SCRIPT = os.path.join(HERE, 'derive-job-secrets.py')
++spec = importlib.util.spec_from_file_location('derive_job_secrets', SCRIPT)
++derive = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(derive)
++
++MARKER = 'FAKEpemMARKER0123456789abcdefghijKLMNOPqrst'
++IS_ROOT = os.geteuid() == 0
++LINE = 'job secret github-app-private-key: '
++
++STUB_GETENT = r'''#!/usr/bin/env python3
++import os, sys
++root = os.environ['FAKE_NSS_ROOT']
++with open(os.path.join(root, 'argv.log'), 'a') as f:
++    f.write(repr(sys.argv) + '\n')
++db = sys.argv[1]
++files = {'group': ['etc/group', 'nss-group'], 'passwd': ['etc/passwd', 'nss-passwd']}[db]
++rows = []
++for rel in files:
++    p = os.path.join(root, rel)
++    if os.path.exists(p):
++        rows += [l for l in open(p).read().splitlines() if l]
++if len(sys.argv) > 2:
++    want = sys.argv[2]
++    rows = [r for r in rows if r.split(':')[0] == want or r.split(':')[2] == want]
++    if not rows:
++        sys.exit(2)
++print('\n'.join(rows))
++'''
++
++STUB_GROUPADD = r'''#!/usr/bin/env python3
++import os, sys
++root = os.environ['FAKE_NSS_ROOT']
++with open(os.path.join(root, 'argv.log'), 'a') as f:
++    f.write(repr(sys.argv) + '\n')
++args = sys.argv[1:]
++assert args[:2] == ['-R', root], args
++with open(os.path.join(root, 'etc/group'), 'a') as f:
++    f.write('%s:x:%s:\n' % (args[-1], args[args.index('-g') + 1]))
++'''
++
++
++class FakeHost:
++    def __init__(self, api_env=None):
++        self.root = tempfile.mkdtemp(prefix='derive-root-', dir=os.environ.get('DERIVE_TEST_TMP'))
++        os.chmod(self.root, 0o755)
++        os.makedirs(self.p('etc/goodqa'), mode=0o755)
++        os.chmod(self.p('etc/goodqa'), 0o755)
++        with open(self.p('etc/group'), 'w') as f:
++            f.write('root:x:0:\nadm:x:4:syslog\n')
++        with open(self.p('etc/passwd'), 'w') as f:
++            f.write('root:x:0:0:root:/root:/bin/bash\n')
++        self.bin = self.p('stub-bin')
++        os.makedirs(self.bin)
++        for name, body in (('getent', STUB_GETENT), ('groupadd', STUB_GROUPADD)):
++            with open(os.path.join(self.bin, name), 'w') as f:
++                f.write(body)
++            os.chmod(os.path.join(self.bin, name), 0o755)
++        self.sentinel = self.p('sentinel')
++        with open(self.sentinel, 'w') as f:
++            f.write('sentinel')
++        if api_env is not None:
++            self.write_api_env(api_env)
++
++    def p(self, rel):
++        return os.path.join(self.root, rel)
++
++    def write_api_env(self, data):
++        if isinstance(data, str):
++            data = data.encode()
++        with open(self.p('etc/goodqa/api.env'), 'wb') as f:
++            f.write(data)
++
++    def env(self):
++        return {'PATH': self.bin + ':' + os.environ['PATH'], 'FAKE_NSS_ROOT': self.root}
++
++    def run(self, argv=(), hooks=None):
++        saved = dict(os.environ)
++        os.environ.update(self.env())
++        try:
++            return derive.run(list(argv), root=self.root, hooks=hooks)
++        finally:
++            os.environ.clear()
++            os.environ.update(saved)
++
++    def secret(self):
++        return self.p('etc/goodqa/job-secrets/github-app-private-key')
++
++    def sentinel_state(self):
++        st = os.lstat(self.sentinel)
++        return (st.st_uid, st.st_gid, st.st_mode, open(self.sentinel, 'rb').read())
++
++    def close(self):
++        shutil.rmtree(self.root, ignore_errors=True)
++
++
++def api(value, extra=''):
++    return 'DATABASE_URL=postgres://fake\n%sGITHUB_APP_PRIVATE_KEY=%s\nOTHER=1\n' % (extra, value)
++
++
++class ParseTests(unittest.TestCase):
++    """AC-1: the value exactly as compose `format: raw` would deliver it."""
++
++    def ok(self, text, expected):
++        self.assertEqual(derive.parse_api_env(text.encode()), expected.encode())
++
++    def refused(self, text, reason):
++        with self.assertRaises(derive.Refused) as cm:
++            derive.parse_api_env(text if isinstance(text, bytes) else text.encode())
++        self.assertEqual(str(cm.exception), reason)
++
++    def test_derive_parse_plain(self):
++        self.ok(api(MARKER), MARKER)
++
++    def test_derive_parse_base64_with_equals(self):
++        self.ok(api('TUlJRkFLRQ=='), 'TUlJRkFLRQ==')
++
++    def test_derive_parse_double_quoted(self):
++        self.ok(api('"%s"' % MARKER), '"%s"' % MARKER)
++
++    def test_derive_parse_single_quoted(self):
++        self.ok(api("'%s'" % MARKER), "'%s'" % MARKER)
++
++    def test_derive_parse_trailing_spaces(self):
++        self.ok(api(MARKER + '   '), MARKER + '   ')
++
++    def test_derive_parse_inner_hash_kept(self):
++        self.ok(api('abc # def'), 'abc # def')
++
++    def test_derive_parse_leading_key_whitespace(self):
++        self.ok('  GITHUB_APP_PRIVATE_KEY=%s\n' % MARKER, MARKER)
++
++    def test_derive_parse_crlf(self):
++        self.ok('A=1\r\nGITHUB_APP_PRIVATE_KEY=%s\r\nB=2\r\n' % MARKER, MARKER)
++
++    def test_derive_parse_comment_line_ignored(self):
++        self.ok('#GITHUB_APP_PRIVATE_KEY=commented\n' + api(MARKER), MARKER)
++
++    def test_derive_parse_export(self):
++        self.refused('export GITHUB_APP_PRIVATE_KEY=%s\n' % MARKER, 'export form')
++
++    def test_derive_parse_duplicate(self):
++        self.refused(api(MARKER) + 'GITHUB_APP_PRIVATE_KEY=second\n', 'more than one GITHUB_APP_PRIVATE_KEY line')
++
++    def test_derive_parse_missing(self):
++        self.refused('DATABASE_URL=x\n', 'no GITHUB_APP_PRIVATE_KEY line')
++
++    def test_derive_parse_empty(self):
++        self.refused(api(''), 'empty value')
++
++    def test_derive_parse_tab(self):
++        self.refused(api('abc\tdef'), 'value holds a byte outside printable ASCII')
++
++    def test_derive_parse_cr_inside(self):
++        self.refused(b'GITHUB_APP_PRIVATE_KEY=ab\rcd\n', 'value holds a byte outside printable ASCII')
++
++    def test_derive_parse_non_ascii(self):
++        self.refused('GITHUB_APP_PRIVATE_KEY=caf\u00e9\n', 'value holds a byte outside printable ASCII')
++
++    def test_derive_parse_invalid_utf8(self):
++        self.refused(b'GITHUB_APP_PRIVATE_KEY=ab\xffcd\n', 'value holds a byte outside printable ASCII')
++
++    def test_derive_parse_line_compose_refuses(self):
++        self.refused('BAD KEY=1\n' + api(MARKER), 'api.env has a line compose would refuse')
++
++
++@unittest.skipUnless(shutil.which('docker') and not IS_ROOT, 'compose parity runs on the host with the docker CLI')
++class ComposeParityTests(unittest.TestCase):
++    """AC-1 parity: derive's value equals what the real `docker compose config` gives the api service."""
++
++    COMPOSE = os.path.join(HERE, 'compose.yaml')
++
++    def test_api_env_file_is_format_raw(self):
++        text = open(self.COMPOSE).read()
++        block = text[text.index('\n  api:\n'):]
++        block = block[:block.index('\n  web:\n')]
++        self.assertIn('      - path: /etc/goodqa/api.env\n        format: raw\n', block)
++
++    def test_derive_value_equals_compose_value(self):
++        accepted = [MARKER, 'TUlJRkFLRQ==', '"%s"' % MARKER, "'%s'" % MARKER, MARKER + '   ', 'abc # def', 'x=y=z']
++        tmp = tempfile.mkdtemp(prefix='parity-', dir=os.environ.get('DERIVE_TEST_TMP'))
++        try:
++            for i, value in enumerate(accepted):
++                for eol in ('\n', '\r\n'):
++                    envp = os.path.join(tmp, 'api-%d.env' % i)
++                    with open(envp, 'w', newline='') as f:
++                        f.write('A=1%sGITHUB_APP_PRIVATE_KEY=%s%sB=2%s' % (eol, value, eol, eol))
++                    comp = os.path.join(tmp, 'compose.yaml')
++                    with open(comp, 'w') as f:
++                        f.write(textwrap.dedent('''\
++                            services:
++                              api:
++                                image: busybox:1.36
++                                env_file:
++                                  - path: %s
++                                    format: raw
++                            ''' % envp))
++                    out = subprocess.run(['docker', 'compose', '-f', comp, 'config', '--format', 'json'],
++                                         capture_output=True, text=True, timeout=60, check=True).stdout
++                    composed = json.loads(out)['services']['api']['environment']['GITHUB_APP_PRIVATE_KEY']
++                    derived = derive.parse_api_env(open(envp, 'rb').read()).decode()
++                    self.assertEqual(derived, composed, 'value %d eol %r' % (i, eol))
++        finally:
++            shutil.rmtree(tmp, ignore_errors=True)
++
++
++@unittest.skipUnless(IS_ROOT, 'ownership tests need root: run_derive_tests.sh runs them in a throwaway container')
++class DeriveTests(unittest.TestCase):
++    def setUp(self):
++        self.h = FakeHost(api(MARKER))
++
++    def tearDown(self):
++        self.h.close()
++
++    def assert_file_ok(self, value=MARKER):
++        st = os.lstat(self.h.secret())
++        self.assertTrue(stat.S_ISREG(st.st_mode))
++        self.assertEqual((st.st_uid, st.st_gid, st.st_mode & 0o7777), (0, 64910, 0o440))
++        d = os.lstat(os.path.dirname(self.h.secret()))
++        self.assertEqual((d.st_uid, d.st_gid, d.st_mode & 0o7777), (0, 0, 0o711))
++        self.assertEqual(open(self.h.secret(), 'rb').read(), value.encode())
++
++    # ---- AC-2 ----
++    def test_written_then_unchanged(self):
++        self.assertEqual(self.h.run(), ('written', 0))
++        self.assert_file_ok()
++        self.assertIn('goodqa-jobsecret:x:64910:', open(self.h.p('etc/group')).read())
++        m1 = os.lstat(self.h.secret()).st_mtime_ns
++        time.sleep(0.02)
++        self.assertEqual(self.h.run(), ('unchanged', 0))
++        self.assertEqual(os.lstat(self.h.secret()).st_mtime_ns, m1)
++
++    def test_no_temp_left_after_abrupt_stop_between_write_and_rename(self):
++        pid = os.fork()
++        if pid == 0:
++            try:
++                self.h.run(hooks={'before_rename': lambda _t: os.kill(os.getpid(), signal.SIGKILL)})
++            finally:
++                os._exit(3)
++        _, status = os.waitpid(pid, 0)
++        self.assertTrue(os.WIFSIGNALED(status))
++        d = os.path.dirname(self.h.secret())
++        self.assertTrue(any(n.startswith('.tmp-') for n in os.listdir(d)))
++        self.assertFalse(os.path.exists(self.h.secret()))
++        self.assertEqual(self.h.run(), ('written', 0))
++        self.assertEqual(sorted(os.listdir(d)), ['github-app-private-key'])
++        self.assert_file_ok()
++
++    def test_symlink_planted_at_target_before_rename_never_touches_outside(self):
++        before = self.h.sentinel_state()
++        self.h.run()  # create dir and file
++        os.unlink(self.h.secret())
++        self.h.write_api_env(api(MARKER + 'X'))
++
++        def plant(_tmp):
++            os.symlink(self.h.sentinel, self.h.secret())
++
++        self.assertEqual(self.h.run(hooks={'before_rename': plant}), ('written', 0))
++        self.assert_file_ok(MARKER + 'X')
++        self.assertEqual(self.h.sentinel_state(), before)
++
++    def test_temp_swapped_for_a_link_before_rename_is_refused(self):
++        before = self.h.sentinel_state()
++
++        def swap(tmp):
++            d = os.path.dirname(self.h.secret())
++            os.unlink(os.path.join(d, tmp))
++            os.symlink(self.h.sentinel, os.path.join(d, tmp))
++
++        word, code = self.h.run(hooks={'before_rename': swap})
++        self.assertEqual((word, code), ('REFUSED the secret file changed during the write', 2))
++        self.assertEqual(self.h.sentinel_state(), before)
++        # F2: the swapped-in link is not left as the live secret; the dispatcher fails closed as missing.
++        self.assertFalse(os.path.lexists(self.h.secret()))
++        self.assertEqual(self.h.run(), ('written', 0))  # the next run writes the real file
++        self.assert_file_ok(MARKER)
++
++    def test_temp_swapped_for_a_hardlink_before_rename_is_refused(self):
++        # A regular file that is not the one this run wrote: only the inode check can tell.
++        other = self.h.p('etc/other-key')
++        with open(other, 'wb') as f:
++            f.write(b'other-bytes')
++        os.chown(other, 0, 64910)
++        os.chmod(other, 0o440)
++
++        def swap(tmp):
++            d = os.path.dirname(self.h.secret())
++            os.unlink(os.path.join(d, tmp))
++            os.link(other, os.path.join(d, tmp))
++
++        self.assertEqual(self.h.run(hooks={'before_rename': swap}), ('REFUSED the secret file changed during the write', 2))
++        self.assertEqual(open(other, 'rb').read(), b'other-bytes')
++        # F2: the foreign inode is not left at the target name.
++        self.assertFalse(os.path.lexists(self.h.secret()))
++
++    # ---- AC-9 ----
++    def test_check_same_different(self):
++        self.assertEqual(self.h.run(['--check']), ('different', 0))
++        self.h.run()
++        self.assertEqual(self.h.run(['--check']), ('same', 0))
++        self.h.write_api_env(api(MARKER + 'NEW'))
++        self.assertEqual(self.h.run(['--check']), ('different', 0))
++        self.assertEqual(self.h.run(), ('written', 0))
++        self.assert_file_ok(MARKER + 'NEW')
++        self.assertEqual(self.h.run(['--check']), ('same', 0))
++
++    def test_check_writes_nothing(self):
++        self.h.run(['--check'])
++        self.assertFalse(os.path.exists(os.path.dirname(self.h.secret())))
++        self.assertNotIn('goodqa-jobsecret', open(self.h.p('etc/group')).read())
++
++    # ---- NEG-1 ----
++    def test_refusals_leave_the_old_file(self):
++        self.h.run()
++        m = os.lstat(self.h.secret()).st_mtime_ns
++        for text, reason in [
++            ('DATABASE_URL=x\n', 'no GITHUB_APP_PRIVATE_KEY line'),
++            (api(MARKER) + 'GITHUB_APP_PRIVATE_KEY=x\n', 'more than one GITHUB_APP_PRIVATE_KEY line'),
++            ('export GITHUB_APP_PRIVATE_KEY=x\n', 'export form'),
++            (api(''), 'empty value'),
++            (b'GITHUB_APP_PRIVATE_KEY=a\rb\n', 'value holds a byte outside printable ASCII'),
++            (api('a\tb'), 'value holds a byte outside printable ASCII'),
++            (b'GITHUB_APP_PRIVATE_KEY=a\x01b\n', 'value holds a byte outside printable ASCII'),
++        ]:
++            self.h.write_api_env(text)
++            self.assertEqual(self.h.run(), ('REFUSED ' + reason, 2))
++            self.assert_file_ok()
++            self.assertEqual(os.lstat(self.h.secret()).st_mtime_ns, m)
++        os.chmod(self.h.p('etc/goodqa/api.env'), 0o000)
++        os.rename(self.h.p('etc/goodqa/api.env'), self.h.p('etc/goodqa/api.env.gone'))
++        self.assertEqual(self.h.run(), ('REFUSED api.env unreadable', 2))
++        self.assert_file_ok()
++
++    # ---- NEG-2 ----
++    def _refused_and_sentinel(self, setup):
++        before = self.h.sentinel_state()
++        setup()
++        word, code = self.h.run()
++        self.assertEqual(code, 2, word)
++        self.assertTrue(word.startswith('REFUSED '))
++        self.assertEqual(self.h.sentinel_state(), before)
++        return word
++
++    def test_neg2_dir_is_symlink(self):
++        os.makedirs(self.h.p('elsewhere'))
++        self._refused_and_sentinel(lambda: os.symlink(self.h.p('elsewhere'), self.h.p('etc/goodqa/job-secrets')))
++        self.assertEqual(os.listdir(self.h.p('elsewhere')), [])
++
++    def test_neg2_dir_symlink_to_a_conforming_dir(self):
++        # The link target has the right owner and mode, so only O_NOFOLLOW refuses it.
++        os.makedirs(self.h.p('elsewhere'))
++        os.chown(self.h.p('elsewhere'), 0, 0)
++        os.chmod(self.h.p('elsewhere'), 0o711)
++        self._refused_and_sentinel(lambda: os.symlink(self.h.p('elsewhere'), self.h.p('etc/goodqa/job-secrets')))
++        self.assertEqual(os.listdir(self.h.p('elsewhere')), [])
++
++    def test_neg2_target_symlink_to_a_conforming_file_with_the_same_value(self):
++        # Without O_NOFOLLOW this would read as `unchanged`.
++        def s():
++            self.h.run()
++            os.unlink(self.h.secret())
++            twin = self.h.p('etc/twin')
++            with open(twin, 'wb') as f:
++                f.write(MARKER.encode())
++            os.chown(twin, 0, 64910)
++            os.chmod(twin, 0o440)
++            os.symlink(twin, self.h.secret())
++        self.assertEqual(self._refused_and_sentinel(s), 'REFUSED the secret file is a symlink or unreadable')
++
++    def test_neg2_dir_owned_by_non_root(self):
++        def s():
++            os.mkdir(self.h.p('etc/goodqa/job-secrets'), 0o711)
++            os.chown(self.h.p('etc/goodqa/job-secrets'), 1000, 1000)
++        self.assertEqual(self._refused_and_sentinel(s), 'REFUSED job-secrets has another owner, mode or type')
++
++    def test_neg2_dir_group_writable(self):
++        def s():
++            os.mkdir(self.h.p('etc/goodqa/job-secrets'))
++            os.chmod(self.h.p('etc/goodqa/job-secrets'), 0o731)
++        self._refused_and_sentinel(s)
++
++    def test_neg2_parent_world_writable(self):
++        self._refused_and_sentinel(lambda: os.chmod(self.h.p('etc/goodqa'), 0o757))
++
++    def test_neg2_target_is_symlink(self):
++        def s():
++            self.h.run()
++            os.unlink(self.h.secret())
++            os.symlink(self.h.sentinel, self.h.secret())
++        self._refused_and_sentinel(s)
++
++    def test_neg2_target_is_directory(self):
++        def s():
++            self.h.run()
++            os.unlink(self.h.secret())
++            os.mkdir(self.h.secret())
++        self._refused_and_sentinel(s)
++
++    # ---- NEG-3 ----
++    def _group_refused(self, group_lines, reason, passwd_lines=''):
++        with open(self.h.p('etc/group'), 'a') as f:
++            f.write(group_lines)
++        with open(self.h.p('etc/passwd'), 'a') as f:
++            f.write(passwd_lines)
++        self.assertEqual(self.h.run(), ('REFUSED ' + reason, 2))
++        self.assertFalse(os.path.exists(self.h.secret()))
++
++    def test_neg3_gid_taken_by_another_name(self):
++        self._group_refused('other:x:64910:\n', 'gid 64910 has another name')
++
++    def test_neg3_group_has_member(self):
++        self._group_refused('goodqa-jobsecret:x:64910:alice\n', 'group goodqa-jobsecret has members')
++
++    def test_neg3_name_has_another_gid(self):
++        self._group_refused('goodqa-jobsecret:x:64911:\n', 'group name goodqa-jobsecret has another gid')
++
++    def test_neg3_primary_gid(self):
++        self._group_refused('', 'an account has gid 64910 as its primary group', 'svc:x:999:64910::/:/bin/false\n')
++
++    # ---- NEG-13 (NSS only) ----
++    def _nss_refused(self, rel, line, reason):
++        with open(self.h.p(rel), 'w') as f:
++            f.write(line)
++        self.assertEqual(self.h.run(), ('REFUSED ' + reason, 2))
++        self.assertFalse(os.path.exists(self.h.secret()))
++
++    def test_neg13_nss_gid_other_name(self):
++        self._nss_refused('nss-group', 'ldapgrp:x:64910:\n', 'gid 64910 has another name')
++
++    def test_neg13_nss_member(self):
++        self._nss_refused('nss-group', 'goodqa-jobsecret:x:64910:bob\n', 'group goodqa-jobsecret has members')
++
++    def test_neg13_nss_primary_gid(self):
++        self._nss_refused('nss-passwd', 'ldapuser:x:5000:64910::/:/bin/false\n', 'an account has gid 64910 as its primary group')
++
++    # ---- AC-7: the value never in output or any spawned argv ----
++    def test_value_never_in_stdout_stderr_or_argv(self):
++        env = dict(os.environ, **self.h.env())
++        code = 'import importlib.util,sys; s=importlib.util.spec_from_file_location("d", %r); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(m.main(root=%r))' % (SCRIPT, self.h.root)
++        for argv in ([], [], ['--check']):
++            r = subprocess.run([sys.executable, '-I', '-c', code, *argv], env=env, capture_output=True, timeout=60)
++            out = r.stdout.decode() + r.stderr.decode()
++            self.assertEqual(r.stderr, b'')
++            self.assertEqual(len(r.stdout.decode().splitlines()), 1)
++            self.assertTrue(r.stdout.decode().startswith(LINE))
++            for i in range(0, len(MARKER) - 15):
++                self.assertNotIn(MARKER[i:i + 16], out)
++        log = open(self.h.p('argv.log')).read()
++        self.assertTrue(log)
++        for i in range(0, len(MARKER) - 15):
++            self.assertNotIn(MARKER[i:i + 16], log)
++
++
++if __name__ == '__main__':
++    unittest.main()

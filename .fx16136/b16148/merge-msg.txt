@@ -1,0 +1,12 @@
+chore(job-dispatcher): merge the F4 stderr scan cut from the 1372 branch
+
+Why: PR #1373 is stacked on #1372. The goodqa#16148 code review fix F4 landed on #1372 as c9d61ac1, and #1373 must carry it so that its packet and tests run the same docker.ts. This is a merge, not a rebase: both branches are published and are never force-pushed.
+
+What: merges fix/16185-docker-failure-category at c9d61ac1 (SCAN_LIMIT 4096 before the residue scan, plus four tests) into fix/16148-job-envfile.
+
+Testing: not run: merge only; the focused suites run on the merged HEAD before push (see the PR packet).
+
+Refs: GoodQA #16148, GoodQA #16185
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv

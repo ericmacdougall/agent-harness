@@ -1,0 +1,16 @@
+chore(fx16136): keep the goodqa#16148 code-review delta packets
+
+Why: the code-review delta for goodqa#16148 (F2, F3, F4 on bugtracker PRs 1372 and 1373) must be recoverable for the delta review and the receipts, not only on this disk.
+
+What:
+- packets: delta-16148.md (sha 34872d41), pr-16185-v2.md (sha d5e70567, HEAD c9d61ac1) and pr-16148-v2.md (sha e4f28fe1, HEAD 97bfac51), with their heads and tails.
+- b16148 and b16185: the fix and test patch scripts, the diffs, the evidence, the F1 and F5 ticket bodies (goodqa#16195, goodqa#16196), and the updated sampler variants with S5.
+- The review report and its probes are kept outside the worktree, per the lead.
+
+Testing: `python3 .fx16136/build_packet.py ...` -> lint [] for all three packets. The suites ran on t2-dev at 97bfac51, all exit 0 (b16148/evidence-delta.txt).
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

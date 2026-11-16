@@ -19,5 +19,8 @@ echo "as committed: $(t)"
 variant "S1 keeps raw argv" "    return {'argc': len(argv), 'flags': flags}" "    return {'argc': len(argv), 'flags': flags, 'raw': argv}"
 variant "S2 no cgroup filter" "                if not in_container(f.read(), container):" "                if False:"
 variant "S3 no positive control" "    if len(runs) < a.expect_runs:" "    if False:"
-variant "S4 attached short flag kept whole" "                flags.append((short if short in ALLOWED_SHORT else '-(other)') + '(attached)')" "                flags.append(tok)"
+variant "S4 attached short flag kept whole" "    return (short if short in ALLOWED_SHORT else '-(other)') + '(attached)'" "    return tok"
+variant "S5 e inside a cluster ignored (F3)" "        if c == 'e':
+            return '-e(attached)' if i == 0 else '-e(cluster)'" "        if c == 'e' and i == 0:
+            return '-e(attached)'"
 echo "restored: $(git status --short "$F" | wc -l) changed"

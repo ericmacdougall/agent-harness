@@ -1,0 +1,68 @@
+diff --git a/apps/job-dispatcher/src/docker.ts b/apps/job-dispatcher/src/docker.ts
+index d1104b83fbe..5a1feab52ab 100644
+--- a/apps/job-dispatcher/src/docker.ts
++++ b/apps/job-dispatcher/src/docker.ts
+@@ -190,6 +190,11 @@ const ALLOWED_LINE_PREFIXES: readonly string[] = [
+   'invalid reference format',
+ ];
+ const MAX_LINE = 200;
++/**
++ * Only this much of the (already redacted) first line is scanned for residue, so a 1 MiB stderr line
++ * cannot stall the event loop (code review F4). Anything past it can never reach the 200-char output.
++ */
++const SCAN_LIMIT = 4096;
+ const MIN_WINDOW = 8;
+ 
+ /**
+@@ -288,7 +293,7 @@ export function describeDockerFailure(stderr: string, secretValues: readonly str
+   for (const value of [...values].filter((v) => v.length >= MIN_WINDOW).sort((a, b) => b.length - a.length)) {
+     redacted = redacted.split(value).join('[redacted]');
+   }
+-  const line = (redacted.split('\n', 1)[0] ?? '').replace(/\r$/, '').trimEnd();
++  const line = (redacted.split('\n', 1)[0] ?? '').replace(/\r$/, '').trimEnd().slice(0, SCAN_LIMIT);
+   if (!ALLOWED_LINE_PREFIXES.some((p) => line.startsWith(p))) return head;
+   if (!isPrintableAscii(line) || hasResidue(line, values)) return head;
+   const cut = line.slice(0, MAX_LINE);
+diff --git a/apps/job-dispatcher/test/docker-failure-message.test.ts b/apps/job-dispatcher/test/docker-failure-message.test.ts
+index c395ef56ea8..d7794682b50 100644
+--- a/apps/job-dispatcher/test/docker-failure-message.test.ts
++++ b/apps/job-dispatcher/test/docker-failure-message.test.ts
+@@ -284,3 +284,38 @@ describe('server: the 422 body and log carry the category only (end to end with
+     for (const l of lines) assertNoValue(l, MARKER, 8);
+   });
+ });
++
++describe('F4 (code review goodqa#16148): a huge first line is cut before the residue scan', () => {
++  // A PEM-sized fake value, as in the review probe: the scan is per character times the value forms.
++  const PEM = 'FAKEpem' + 'Q'.repeat(1700) + 'END';
++  const GUARD = 'docker: Error response from daemon: job-dispatcher-create-guard: refused (';
++
++  it('a 1 MiB allow-listed first line returns well inside the event-loop budget', () => {
++    const line = GUARD + 'x'.repeat(1024 * 1024) + ')';
++    const started = performance.now();
++    const msg = describeDockerFailure(line + '\nmore', [MARKER, PEM, 'sk-base-fake-value']);
++    const ms = performance.now() - started;
++    expect(ms).toBeLessThan(1000);
++    expect(msg.startsWith('docker run failed: guard_refused (stderr ')).toBe(true);
++    expect(msg.length).toBeLessThanOrEqual(80 + 200);
++  }, 30_000);
++
++  it('deterministic: only the first SCAN_LIMIT characters are scanned (a fragment far past it no longer drops the line)', () => {
++    const line = GUARD + 'x'.repeat(10_000) + MARKER.slice(0, 20) + ')';
++    const msg = describeDockerFailure(line, [MARKER]);
++    expect(msg).toBe(`docker run failed: guard_refused (stderr ${Buffer.byteLength(line, 'utf8')} bytes): ${line.slice(0, 200)}`);
++  });
++
++  it('a value inside the scanned part of a long line still drops the line', () => {
++    const line = GUARD + 'x'.repeat(3000) + MARKER.slice(0, 20) + 'y'.repeat(1024 * 1024) + ')';
++    const msg = describeDockerFailure(line, [MARKER]);
++    expect(msg).toBe(`docker run failed: guard_refused (stderr ${Buffer.byteLength(line, 'utf8')} bytes)`);
++  }, 30_000);
++
++  it('a full value anywhere in the line is still redacted from the whole stderr first', () => {
++    const line = GUARD + 'x'.repeat(100) + ' ' + MARKER + ' ' + 'y'.repeat(1024 * 1024) + ')';
++    const msg = describeDockerFailure(line, [MARKER]);
++    expect(msg).not.toContain(MARKER.slice(0, 8));
++    expect(msg).toContain('[redacted]');
++  }, 30_000);
++});

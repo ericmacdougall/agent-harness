@@ -1,0 +1,33 @@
+as committed: OK
+S1 keeps raw argv: FAILED (failures=3)
+S2 no cgroup filter: FAILED (failures=1)
+S3 no positive control: FAILED (failures=2)
+S4 attached short flag kept whole: FAILED (failures=2)
+S5 e inside a cluster ignored (F3): FAILED (failures=1)
+restored: 0 changed
+HEAD 97bfac5172322d3eddc3cf7d43e951421624dd67 status-lines=0
+/dev/sda1       643G  612G   31G  96% /
+$ cd apps/job-dispatcher && timeout 900 npx vitest run
+ Test Files  15 passed | 1 skipped (16)
+      Tests  363 passed | 14 skipped (377)
+exit 0
+$ cd apps/job-dispatcher && timeout 600 npx tsc --noEmit
+exit 0
+$ bash infra/selfhost/app/run_derive_tests.sh
+Ran 61 tests in 1.281s
+OK (skipped=41)
+Ran 61 tests in 3.134s
+OK (skipped=2)
+exit 0
+$ cd infra/selfhost/app && DERIVE_TEST_TMP=$PWD/../../../.scratch timeout 300 python3 -m unittest test_apply_job_secrets_wrapper test_cmdline_sampler
+Ran 20 tests in 5.107s
+OK
+exit 0
+$ timeout 300 node --test infra/selfhost-job-secrets-drift.test.mjs infra/selfhost-plan.test.mjs infra/selfhost/app/qa-closure-topology.test.mjs
+# tests 23
+# pass 23
+# fail 0
+exit 0
+$ timeout 600 $HOME/repos/fx-16136/venv/bin/python -m pytest -q -p no:cacheprovider infra/release-harness/test_selfhost_ctl_job_secrets.py infra/release-harness/test_selfhost_ctl.py
+1584 passed in 110.08s (0:01:50)
+exit 0

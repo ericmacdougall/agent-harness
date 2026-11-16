@@ -1,0 +1,200 @@
+diff --git a/apps/job-dispatcher/src/docker.ts b/apps/job-dispatcher/src/docker.ts
+index 59acc35ccd8..23d41d6a51b 100644
+--- a/apps/job-dispatcher/src/docker.ts
++++ b/apps/job-dispatcher/src/docker.ts
+@@ -193,6 +193,11 @@ const ALLOWED_LINE_PREFIXES: readonly string[] = [
+   'invalid reference format',
+ ];
+ const MAX_LINE = 200;
++/**
++ * Only this much of the (already redacted) first line is scanned for residue, so a 1 MiB stderr line
++ * cannot stall the event loop (code review F4). Anything past it can never reach the 200-char output.
++ */
++const SCAN_LIMIT = 4096;
+ const MIN_WINDOW = 8;
+ 
+ /**
+@@ -291,7 +296,7 @@ export function describeDockerFailure(stderr: string, secretValues: readonly str
+   for (const value of [...values].filter((v) => v.length >= MIN_WINDOW).sort((a, b) => b.length - a.length)) {
+     redacted = redacted.split(value).join('[redacted]');
+   }
+-  const line = (redacted.split('\n', 1)[0] ?? '').replace(/\r$/, '').trimEnd();
++  const line = (redacted.split('\n', 1)[0] ?? '').replace(/\r$/, '').trimEnd().slice(0, SCAN_LIMIT);
+   if (!ALLOWED_LINE_PREFIXES.some((p) => line.startsWith(p))) return head;
+   if (!isPrintableAscii(line) || hasResidue(line, values)) return head;
+   const cut = line.slice(0, MAX_LINE);
+diff --git a/apps/job-dispatcher/test/docker-failure-message.test.ts b/apps/job-dispatcher/test/docker-failure-message.test.ts
+index c395ef56ea8..d7794682b50 100644
+--- a/apps/job-dispatcher/test/docker-failure-message.test.ts
++++ b/apps/job-dispatcher/test/docker-failure-message.test.ts
+@@ -284,3 +284,38 @@ describe('server: the 422 body and log carry the category only (end to end with
+     for (const l of lines) assertNoValue(l, MARKER, 8);
+   });
+ });
++
++describe('F4 (code review goodqa#16148): a huge first line is cut before the residue scan', () => {
++  // A PEM-sized fake value, as in the review probe: the scan is per character times the value forms.
++  const PEM = 'FAKEpem' + 'Q'.repeat(1700) + 'END';
++  const GUARD = 'docker: Error response from daemon: job-dispatcher-create-guard: refused (';
++
++  it('a 1 MiB allow-listed first line returns well inside the event-loop budget', () => {
++    const line = GUARD + 'x'.repeat(1024 * 1024) + ')';
++    const started = performance.now();
++    const msg = describeDockerFailure(line + '\nmore', [MARKER, PEM, 'sk-base-fake-value']);
++    const ms = performance.now() - started;
++    expect(ms).toBeLessThan(1000);
++    expect(msg.startsWith('docker run failed: guard_refused (stderr ')).toBe(true);
++    expect(msg.length).toBeLessThanOrEqual(80 + 200);
++  }, 30_000);
++
++  it('deterministic: only the first SCAN_LIMIT characters are scanned (a fragment far past it no longer drops the line)', () => {
++    const line = GUARD + 'x'.repeat(10_000) + MARKER.slice(0, 20) + ')';
++    const msg = describeDockerFailure(line, [MARKER]);
++    expect(msg).toBe(`docker run failed: guard_refused (stderr ${Buffer.byteLength(line, 'utf8')} bytes): ${line.slice(0, 200)}`);
++  });
++
++  it('a value inside the scanned part of a long line still drops the line', () => {
++    const line = GUARD + 'x'.repeat(3000) + MARKER.slice(0, 20) + 'y'.repeat(1024 * 1024) + ')';
++    const msg = describeDockerFailure(line, [MARKER]);
++    expect(msg).toBe(`docker run failed: guard_refused (stderr ${Buffer.byteLength(line, 'utf8')} bytes)`);
++  }, 30_000);
++
++  it('a full value anywhere in the line is still redacted from the whole stderr first', () => {
++    const line = GUARD + 'x'.repeat(100) + ' ' + MARKER + ' ' + 'y'.repeat(1024 * 1024) + ')';
++    const msg = describeDockerFailure(line, [MARKER]);
++    expect(msg).not.toContain(MARKER.slice(0, 8));
++    expect(msg).toContain('[redacted]');
++  }, 30_000);
++});
+diff --git a/infra/selfhost/app/cmdline-sampler.py b/infra/selfhost/app/cmdline-sampler.py
+index 0101e6b7fd2..a667806f3a0 100755
+--- a/infra/selfhost/app/cmdline-sampler.py
++++ b/infra/selfhost/app/cmdline-sampler.py
+@@ -7,9 +7,10 @@ whose /proc/PID/cgroup names the job-dispatcher container (`--container ID`, res
+ polls about every 50 ms for `--seconds`, and keeps only flag NAMES and the argv length of each `docker run`:
+   * a long flag is cut at its first `=`, and kept only if it is on the allow-list, else recorded as `--(other)`;
+   * a short flag with an attached value (`-eK=V`) is recorded as `-e(attached)`; others as `-x` if allow-listed;
++    a cluster is read as pflag reads it, so `-de` and `-ieK=V` record `-e(cluster)`;
+   * a non-flag token is only counted. Raw argv is never stored, printed or written.
+ Result (one JSON line): verdict PASS | FAIL | NO_SAMPLE, label "sampled" (not exhaustive). FAIL: any observed run has
+--e, -e(attached), --env or --env(attached). NO_SAMPLE (also a failure): fewer than `--expect-runs` runs seen, so a
++-e, -e(attached), -e(cluster), --env or --env(attached). NO_SAMPLE (also a failure): fewer than `--expect-runs` runs seen, so a
+ silent sampler can never pass. Exit 0 only on PASS.
+   python3 -I cmdline-sampler.py --container <64-hex id> --seconds 120 --expect-runs 3
+ """
+@@ -23,7 +24,9 @@ import time
+ ALLOWED_LONG = {'--rm', '--env-file', '--env', '--cap-drop', '--security-opt', '--read-only', '--tmpfs', '--memory',
+                 '--memory-swap', '--cpus', '--pids-limit', '--detach', '--name', '--label', '--network', '--user'}
+ ALLOWED_SHORT = {'-d', '-e', '-i', '-t', '-u'}
+-BAD = {'-e', '-e(attached)', '--env', '--env(attached)'}
++# docker run's boolean shorthands: pflag lets these cluster (-dit), and any other shorthand takes the rest as its value.
++BOOL_SHORT = set('ditP')
++BAD = {'-e', '-e(attached)', '-e(cluster)', '--env', '--env(attached)'}
+ ID_RE = re.compile(r'^[0-9a-f]{12,64}$')
+ 
+ 
+@@ -37,14 +40,24 @@ def sanitize(argv):
+                 name = '--(other)'
+             flags.append(name + ('(attached)' if eq and name in ('--env',) else ''))
+         elif tok.startswith('-') and len(tok) >= 2:
+-            short = tok[:2]
+-            if len(tok) > 2:
+-                flags.append((short if short in ALLOWED_SHORT else '-(other)') + '(attached)')
+-            else:
+-                flags.append(short if short in ALLOWED_SHORT else '-(other)')
++            flags.append(short_flag(tok))
+     return {'argc': len(argv), 'flags': flags}
+ 
+ 
++def short_flag(tok):
++    """A single-dash token, read the way pflag reads a shorthand cluster (code review F3): booleans chain, `e` anywhere
++    in the chain is an env flag (-de, -ieK=V), and the first value-taking shorthand ends the chain."""
++    short = tok[:2]
++    if len(tok) == 2:
++        return short if short in ALLOWED_SHORT else '-(other)'
++    for i, c in enumerate(tok[1:]):
++        if c == 'e':
++            return '-e(attached)' if i == 0 else '-e(cluster)'
++        if c not in BOOL_SHORT:
++            break
++    return (short if short in ALLOWED_SHORT else '-(other)') + '(attached)'
++
++
+ def in_container(cgroup_text, container):
+     return any(('docker-%s.scope' % container) in l or ('/docker/%s' % container) in l for l in cgroup_text.splitlines())
+ 
+diff --git a/infra/selfhost/app/derive-job-secrets.py b/infra/selfhost/app/derive-job-secrets.py
+index be2ebf85d56..d2c3cde6090 100755
+--- a/infra/selfhost/app/derive-job-secrets.py
++++ b/infra/selfhost/app/derive-job-secrets.py
+@@ -277,6 +277,12 @@ def write_secret(dfd, value, hooks):
+         # The name must now be the very inode this run wrote through its fd (never a swapped-in link).
+         now = os.stat(NAME, dir_fd=dfd, follow_symlinks=False)
+         if not _is_reg(now.st_mode) or (now.st_dev, now.st_ino) != (own.st_dev, own.st_ino):
++            # The rename already put the foreign file or link at NAME: remove that name (never what it points
++            # to), so the dispatcher sees the key as missing instead of using it (code review F2).
++            try:
++                os.unlink(NAME, dir_fd=dfd)
++            except FileNotFoundError:
++                pass
+             raise Refused('the secret file changed during the write')
+     except BaseException:
+         try:
+diff --git a/infra/selfhost/app/test_cmdline_sampler.py b/infra/selfhost/app/test_cmdline_sampler.py
+index 2a22f61ffc5..bd3e97c035e 100644
+--- a/infra/selfhost/app/test_cmdline_sampler.py
++++ b/infra/selfhost/app/test_cmdline_sampler.py
+@@ -90,6 +90,28 @@ class SamplerTests(unittest.TestCase):
+         self.assertIn(['-(other)(attached)'], flags)
+         self.assertEqual(os.listdir(os.path.dirname(self.proc)).count(os.path.basename(self.proc)), 1)
+ 
++    def test_neg18_clustered_short_flags_with_e_fail(self):
++        # F3: pflag accepts clustered shorthands, so -de K=V and -ieK=V carry an env value too.
++        for argv in (['docker', 'run', '-de', 'K=' + MARKER, 'img'],
++                     ['docker', 'run', '-ieK=' + MARKER, 'img'],
++                     ['docker', 'run', '-dite', 'K=' + MARKER, 'img']):
++            shutil.rmtree(self.proc)
++            os.makedirs(self.proc)
++            self.add(argv)
++            out, code = self.sample('--expect-runs', '1')
++            self.assertEqual((out['verdict'], code), ('FAIL', 1), argv[2])
++            self.assertEqual(out['runs_with_env_flag'], 1)
++            text = json.dumps(out)
++            for i in range(0, len(MARKER) - 7):
++                self.assertNotIn(MARKER[i:i + 8], text)
++
++    def test_clusters_without_an_env_flag_still_pass(self):
++        # Booleans only, and an e that is part of a value-taking flag's value (-w example), are not env flags.
++        self.add(['docker', 'run', '-dit', '-wexample', '--env-file', '/x', 'img'])
++        out, code = self.sample('--expect-runs', '1')
++        self.assertEqual((out['verdict'], code), ('PASS', 0))
++        self.assertEqual(out['runs'][0]['flags'], ['-d(attached)', '-(other)(attached)', '--env-file'])
++
+     def test_neg18_other_cgroup_is_not_sampled(self):
+         self.add(['docker', 'run', '-e', 'K=' + MARKER, 'img'], container=OTHER)
+         self.add(['docker', 'run', '--env-file', '/x', 'img'])
+diff --git a/infra/selfhost/app/test_derive_job_secrets.py b/infra/selfhost/app/test_derive_job_secrets.py
+index 777ff98d7c2..fdb30b3656d 100644
+--- a/infra/selfhost/app/test_derive_job_secrets.py
++++ b/infra/selfhost/app/test_derive_job_secrets.py
+@@ -290,7 +290,10 @@ class DeriveTests(unittest.TestCase):
+         word, code = self.h.run(hooks={'before_rename': swap})
+         self.assertEqual((word, code), ('REFUSED the secret file changed during the write', 2))
+         self.assertEqual(self.h.sentinel_state(), before)
+-        self.assertEqual(self.h.run()[1], 2)  # the link at the target is refused next time too
++        # F2: the swapped-in link is not left as the live secret; the dispatcher fails closed as missing.
++        self.assertFalse(os.path.lexists(self.h.secret()))
++        self.assertEqual(self.h.run(), ('written', 0))  # the next run writes the real file
++        self.assert_file_ok(MARKER)
+ 
+     def test_temp_swapped_for_a_hardlink_before_rename_is_refused(self):
+         # A regular file that is not the one this run wrote: only the inode check can tell.
+@@ -307,6 +310,8 @@ class DeriveTests(unittest.TestCase):
+ 
+         self.assertEqual(self.h.run(hooks={'before_rename': swap}), ('REFUSED the secret file changed during the write', 2))
+         self.assertEqual(open(other, 'rb').read(), b'other-bytes')
++        # F2: the foreign inode is not left at the target name.
++        self.assertFalse(os.path.lexists(self.h.secret()))
+ 
+     # ---- AC-9 ----
+     def test_check_same_different(self):
