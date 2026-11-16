@@ -584,7 +584,8 @@ class P0SurfaceTests(unittest.TestCase):
         actions = [a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction"]
         self.assertEqual(len(actions), 1)
         commands = set(actions[0].choices)
-        self.assertEqual(commands, {"submit", "ack", "status", "run", "install", "uninstall"})
+        # w16 (slice 1 (b) AC-6) is main's stamped WorkItem disposition; it merges nothing and enables nothing
+        self.assertEqual(commands, {"submit", "ack", "status", "run", "install", "uninstall", "w16"})
         for word in ("enable", "authority", "merge"):
             self.assertNotIn(word, commands)
         with self.assertRaises(SystemExit):
