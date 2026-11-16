@@ -60,6 +60,15 @@ V = [
          "            if item[\"version\"] != expected_version:\n                raise VersionConflict(\"stale\")\n"
          "            prior = self.db.execute(\"SELECT entity, id, data FROM transitions WHERE event_id=?\",\n")],
      CONTRACTS, SM),
+    ("AC-18: T6 replay checked after the version (the WorkItem crash scenario's stale retry fails)", [
+        ("            prior = self.db.execute(\"SELECT entity, id, data FROM transitions WHERE event_id=?\",\n",
+         "            if item[\"version\"] != expected_version:\n                raise VersionConflict(\"stale\")\n"
+         "            prior = self.db.execute(\"SELECT entity, id, data FROM transitions WHERE event_id=?\",\n")],
+     CONTRACTS, ["tests.test_ahc_crash.CrashPointTests"]),
+    ("AC-18: a WorkItem move without its audit row", [
+        ("            self._a0(\"work_item\", iid, frm, to, event_id, actor, row=row_id, cause=cause,\n",
+         "            (lambda *a, **k: None)(\"work_item\", iid, frm, to, event_id, actor, row=row_id, cause=cause,\n")],
+     CONTRACTS, ["tests.test_ahc_crash.CrashPointTests"]),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
          '                if prior[0] == "work_item":\n')], CONTRACTS, SM),
