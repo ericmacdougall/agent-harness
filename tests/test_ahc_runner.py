@@ -2891,12 +2891,170 @@ class SchemaTests(Base):
         with open(str(backup), "rb") as handle:
             partial.write_bytes(handle.read(4096))
         os.chmod(str(partial), 0o600)
-        Path(str(live) + ".restore-intent").write_text(json.dumps({"backup": backup.name, "suffix": ".failed-1"}))
+        sha = hashlib.sha256(backup.read_bytes()).hexdigest()
+        Path(str(live) + ".restore-intent").write_text(json.dumps({"backup": backup.name, "suffix": ".failed-1",
+                                                                   "sha256": sha}))
         os.chmod(str(live) + ".restore-intent", 0o600)
         runner.Ledger(self.paths).close()
         self.assertFalse(partial.exists(), "the partial copy was left behind")
         self.assertFalse(Path(str(live) + ".restore-intent").exists())
         self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3), "restored, then migrated")
+
+    # --- PR 258 v5 F1: an interrupted restore is finished from what the files say, never stranding an intact ledger
+    def crash_after_the_intent(self, damage):
+        """The receipt's sequence, in process: the migration fails, the backup is damaged during it, and the
+        process dies right after the restore intent is durable (a BaseException at that seam, so no handler runs).
+        Returns the live path."""
+        held = self.make_v1()
+
+        class Died(BaseException):
+            pass
+
+        def die_after(name):
+            if name == "runner.restore_intent":
+                raise Died()
+
+        def damage_backup(db):
+            for backup in self.paths.root.glob("ledger.sqlite3.pre-v*.bak"):
+                if damage == "missing":
+                    backup.unlink()
+                else:
+                    os.truncate(str(backup), 4096)
+            raise RuntimeError("injected migration failure")
+        undo = self.failing_migration(damage_backup)
+        try:
+            with mock.patch.object(runner, "crash_after", die_after):
+                with self.assertRaises(Died):
+                    runner.Ledger(self.paths)
+        finally:
+            undo()
+            held.close()
+        live = self.paths.root / "ledger.sqlite3"
+        self.assertTrue(Path(str(live) + ".restore-intent").exists(), "setup: the crash left the intent")
+        self.assertEqual(self.columns(live)[1:], ("1", 3), "setup: the live ledger is the intact v1 ledger")
+        return live
+
+    def assert_abandoned_then_migrated(self, live):
+        with self.assertLogs("ahc", "WARNING") as logs:
+            runner.Ledger(self.paths).close()                # the next ahc-core start
+        self.assertTrue(any("abandoned the interrupted ledger restore" in line for line in logs.output), logs.output)
+        self.assertFalse(Path(str(live) + ".restore-intent").exists(), "the stale intent is dropped")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.failed-*")), "the intact ledger was moved aside")
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")))
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3), "kept, then migrated")
+        runner.Ledger(self.paths).close()                    # and every later start is an ordinary one
+
+    def test_a_crash_after_the_intent_with_the_backup_gone_keeps_and_migrates_the_intact_ledger(self):
+        """Receipt harness-pr258-v5 F1, the exact sequence: the old resume refused at every start (its
+        copy.is_file() check ran before the abandon handling) while the live ledger was intact."""
+        self.assert_abandoned_then_migrated(self.crash_after_the_intent("missing"))
+
+    def test_a_crash_after_the_intent_with_a_partial_backup_never_publishes_it(self):
+        """A truncated backup fails its recorded digest, so it is never published over the intact ledger (the old
+        resume published it, and the ledger no longer opened)."""
+        self.assert_abandoned_then_migrated(self.crash_after_the_intent("partial"))
+
+    def interrupted(self):
+        """A v1 ledger moved aside as .failed-1 (with its sidecars) beside a backup of it and a valid intent:
+        the files a restore leaves right after its move. Returns (live, backup, aside, sha256 of the backup)."""
+        held = self.make_v1()
+        held.close()
+        live = self.paths.root / "ledger.sqlite3"
+        backup = live.with_name("ledger.sqlite3.pre-v9.1.bak")
+        import sqlite3
+        src, dst = sqlite3.connect(str(live)), sqlite3.connect(str(backup))
+        src.backup(dst)
+        src.close()
+        dst.close()
+        for extra in ("-wal", "-shm"):
+            for path in (str(backup) + extra, str(live) + extra):
+                if os.path.lexists(path):
+                    os.unlink(path)
+        os.chmod(str(backup), 0o600)
+        aside = Path(str(live) + ".failed-1")
+        os.rename(str(live), str(aside))
+        sha = hashlib.sha256(backup.read_bytes()).hexdigest()
+        intent = Path(str(live) + ".restore-intent")
+        intent.write_text(json.dumps({"backup": backup.name, "suffix": ".failed-1", "sha256": sha}))
+        os.chmod(str(intent), 0o600)
+        return live, backup, aside, sha
+
+    def test_a_found_publish_is_not_moved_aside_again(self):
+        """The PR 258 v4 residual: a crash after the publish and before the intent was dropped. The old resume moved
+        the restored copy aside under the same suffix, replacing the moved-aside failed ledger. Now the live file is
+        recognised by the backup's digest, the intent is dropped, and the moved-aside file stays byte for byte."""
+        live, backup, aside, _sha = self.interrupted()
+        live.write_bytes(backup.read_bytes())                # what the publish left
+        os.chmod(str(live), 0o600)
+        kept = aside.read_bytes()
+        runner.Ledger(self.paths).close()
+        self.assertEqual(aside.read_bytes(), kept, "the moved-aside failed ledger was replaced")
+        self.assertEqual(sorted(p.name for p in self.paths.root.glob("ledger.sqlite3.failed-*")), [aside.name])
+        self.assertFalse(Path(str(live) + ".restore-intent").exists())
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3))
+
+    def test_a_foreign_file_where_the_ledger_was_moved_from_is_refused_and_replaces_nothing(self):
+        live, _backup, aside, _sha = self.interrupted()
+        import sqlite3
+        db = sqlite3.connect(str(live))
+        db.execute("CREATE TABLE stray(x)")
+        db.commit()
+        db.close()
+        os.chmod(str(live), 0o600)
+        kept, foreign = aside.read_bytes(), live.read_bytes()
+        for _ in range(2):
+            with self.assertRaises(runner.SchemaError) as caught:
+                runner.Ledger(self.paths)
+            self.assertIn("refusing to replace either", str(caught.exception))
+        self.assertEqual((aside.read_bytes(), live.read_bytes()), (kept, foreign))
+        self.assertTrue(Path(str(live) + ".restore-intent").exists(), "the intent is kept for the operator")
+
+    def test_a_sidecar_whose_aside_name_is_taken_refuses_and_replaces_nothing(self):
+        """Renaming would replace the taken file; leaving it would put a stale -wal beside the restored copy."""
+        live, _backup, aside, _sha = self.interrupted()
+        stale, taken = Path(str(live) + "-wal"), Path(str(aside) + "-wal")
+        stale.write_bytes(b"a stale -wal of the moved ledger")
+        taken.write_bytes(b"the moved ledger's -wal")
+        os.chmod(str(stale), 0o600)
+        os.chmod(str(taken), 0o600)
+        with self.assertRaises(runner.SchemaError) as caught:
+            runner.Ledger(self.paths)
+        self.assertIn("refusing to replace either", str(caught.exception))
+        self.assertEqual((stale.read_bytes(), taken.read_bytes()),
+                         (b"a stale -wal of the moved ledger", b"the moved ledger's -wal"))
+        self.assertFalse(live.exists(), "no ledger is published beside a stale -wal")
+        self.assertTrue(Path(str(live) + ".restore-intent").exists())
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "a copy was made for nothing")
+
+    def test_a_taken_sidecar_target_refuses_before_anything_moves(self):
+        """Every move target is checked before the first rename: the live ledger is not moved, then left stranded
+        beside a -wal that could not follow it."""
+        live, _backup, aside, _sha = self.interrupted()
+        os.rename(str(aside), str(live))                     # nothing moved yet
+        stale, taken = Path(str(live) + "-wal"), Path(str(aside) + "-wal")
+        stale.write_bytes(b"")                               # an empty -wal: SQLite would open beside it
+        taken.write_bytes(b"a foreign file under the aside name")
+        kept = live.read_bytes()
+        with self.assertRaises(runner.SchemaError) as caught:
+            runner.Ledger(self.paths)
+        self.assertIn("refusing to replace either", str(caught.exception))
+        self.assertEqual(live.read_bytes(), kept, "the live ledger was moved or changed")
+        self.assertFalse(aside.exists())
+        self.assertEqual(taken.read_bytes(), b"a foreign file under the aside name")
+        self.assertFalse(list(self.paths.root.glob(".ledger.sqlite3.*.tmp")), "a copy was made for nothing")
+
+    def test_a_stray_journal_moves_aside_with_the_ledger(self):
+        """SQLITE_SIDECARS, -journal included, move with the database: a hot journal left beside the restored copy
+        would be rolled back into it."""
+        live, backup, aside, sha = self.interrupted()
+        os.rename(str(aside), str(live))                     # back to "nothing moved yet"
+        journal = Path(str(live) + "-journal")
+        journal.write_bytes(b"a journal of the failed ledger")
+        os.chmod(str(journal), 0o600)
+        runner.Ledger(self.paths).close()
+        self.assertEqual(Path(str(aside) + "-journal").read_bytes(), b"a journal of the failed ledger")
+        self.assertTrue(aside.exists(), "the failed ledger moved aside with its journal")
+        self.assertEqual(self.columns(live)[1:], (str(runner.SCHEMA_VERSION), 3))
 
     # --- v3 (goodqa#16049 M-1): the v2 -> v3 step adds items.cause and the contract tables, keeping every row and
     # its D20 clock; a migrated ledger has exactly the fresh ledger's tables and columns

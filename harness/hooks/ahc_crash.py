@@ -47,8 +47,12 @@ SEAMS = (
     "runner.prune",            # Worker.prune_packets: a staged packet removal
     "runner.backup",           # Ledger.backup: the verified pre-migration copy
     "runner.restore_intent",   # Ledger.restore: the durable interrupted-restore record written first
-    "runner.restore_move",     # Ledger.restore: the failed database files renamed aside, the copy published
-    "runner.restore_copy",     # Ledger.restore: the verified backup streamed into a temp file beside the ledger
+    "runner.restore_copy",     # Ledger._finish_restore: the verified backup streamed into a temp file, fsynced
+    "runner.restore_chunk",    # _restore_progress: around each chunk written into that temp (mid-copy)
+    "runner.restore_move",     # Ledger._move_aside: the live database and its sidecars renamed aside
+    "runner.restore_publish",  # Ledger._publish_restored: the digest-checked copy renamed into place
+    "runner.restore_done",     # Ledger._drop_intent: the intent removed after the publish (or a found publish)
+    "runner.restore_abandon",  # Ledger._abandon_restore: the intent removed, the never-moved live db kept
 )
 
 
@@ -294,10 +298,12 @@ INVENTORY = {
     ("ahc_runner", "Ledger._schema", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
     ("ahc_runner", "Ledger.backup", "sqlite.backup"): (1, "seam:runner.backup"),
     ("ahc_runner", "Ledger.restore", "fs.write_file"): (1, "seam:runner.restore_intent"),
-    ("ahc_runner", "Ledger._finish_restore", "fs.rename"): (2, "seam:runner.restore_move"),
+    # PR 258 v5: one method per durable restore step, so each step has its own seam and inventory row
     ("ahc_runner", "Ledger._finish_restore", "fs.copy_to_temp"): (1, "seam:runner.restore_copy"),
-    # two unlinks of the intent: after the publish, and after a copy failure with the live file still in place
-    ("ahc_runner", "Ledger._finish_restore", "fs.unlink"): (2, "seam:runner.restore_move"),
+    ("ahc_runner", "Ledger._move_aside", "fs.rename"): (1, "seam:runner.restore_move"),
+    ("ahc_runner", "Ledger._publish_restored", "fs.rename"): (1, "seam:runner.restore_publish"),
+    ("ahc_runner", "Ledger._drop_intent", "fs.unlink"): (1, "seam:runner.restore_done"),
+    ("ahc_runner", "Ledger._abandon_restore", "fs.unlink"): (1, "seam:runner.restore_abandon"),
     ("ahc_runner", "Ledger._finish_restore", "fs.remove_temps"): (
         1, "exempt:removes only an unpublished temp copy of the ledger left by an interrupted restore"),
     ("ahc_runner", "_Tx.__exit__", "sql:COMMIT"): (1, "seam:runner.commit"),

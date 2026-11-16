@@ -16,8 +16,10 @@ import hashlib
 import io
 import json
 import os
+import logging
 import random
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -34,13 +36,19 @@ sys.path.insert(0, str(HOOKS))
 import ahc_contracts as C  # noqa: E402
 import ahc_core as core  # noqa: E402
 import ahc_crash  # noqa: E402
+import ahc_fs  # noqa: E402
 import ahc_runner as runner  # noqa: E402
 
 CHILD = "tests.test_ahc_crash.ChildScenario.test_run"
 ENV_SCENARIO, ENV_DIR, ENV_PHASE = "AHC_CRASH_SCENARIO", "AHC_CRASH_DIR", "AHC_CRASH_PHASE"
+ENV_CHUNK = "AHC_CRASH_CHUNK"      # test-only: the child's restore copy chunk (ahc_fs.COPY_CHUNK)
 STRICT = os.environ.get("AHC_CRASH_STRICT") == "1"
 T0 = 1_800_000_000.0
 RESUME_ADVANCE = 300.0
+# The child's clock per phase. Names minted from time_ns (backups, .failed- suffixes) must not repeat across the
+# processes that share one directory: "prep" builds a resume scenario's starting files, "first" runs the scenario,
+# "resume" restarts it after the crash.
+PHASE_OFFSETS = {"prep": -600.0, "first": 0.0, "resume": RESUME_ADVANCE}
 H1, H2, BASE, POLICY, KILL = "a" * 40, "b" * 40, "c" * 40, "policy-r1", 7
 CHILD_TIMEOUT = 120
 
@@ -69,10 +77,11 @@ def committed_events(root):
     crash in the middle of a restore), from the newest SQLite copy beside it (the verified backup or the moved-aside
     file), since that is where the committed rows then are."""
     live = live_db(root)
+    # newest first; a copy SQLite cannot read (a backup cut short, PR 258 v5) holds no committed rows to keep
     candidates = [live] if live.exists() else sorted(
-        (p for p in live.parent.glob("ledger.sqlite3*") if _is_sqlite(p)), key=lambda p: p.stat().st_mtime)[-1:]
-    out = set()
+        (p for p in live.parent.glob("ledger.sqlite3*") if _is_sqlite(p)), key=lambda p: p.stat().st_mtime)[::-1]
     for path in candidates:
+        out = set()
         db = sqlite3.connect("file:%s?mode=rw" % path, uri=True)
         try:
             names = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -83,9 +92,14 @@ def committed_events(root):
             if "transitions" in names:
                 out |= {("transitions",) + tuple(r) for r in db.execute(
                     "SELECT entity, id, from_state, to_state, event_id, actor, at, data FROM transitions")}
+        except sqlite3.DatabaseError:
+            if path == live:
+                raise
+            continue
         finally:
             db.close()
-    return out
+        return out
+    return set()
 
 
 def _db_dump(path):
@@ -353,11 +367,48 @@ def scenario_migrate(root, clock):
     runner.Ledger(core.Paths(root)).close()
 
 
-def scenario_restore(root, clock):
-    """A migration that fails: the verified backup is restored and the failed files moved aside."""
+PARTIAL_BYTES = 65536      # what a "partial" backup keeps: whole pages, less than the scenario ledger's ~136 KiB
+TABLE_CHUNK = 65536        # restore copy chunk where the mid-copy point matters: the ~136 KiB copy takes 3 chunks
+
+
+def _damage_backups(root, how):
+    """Damage the backups beside the ledger as a failure or an operator might. "missing" removes them with their
+    sidecars. "partial" cuts them to their first PARTIAL_BYTES; the size is fixed, so repeating it changes nothing.
+    "present" leaves them."""
+    ahc = core.Paths(root).root
+    for backup in sorted(ahc.glob("ledger.sqlite3.pre-v*.bak")):
+        if how == "missing":
+            for extra in ("", "-wal", "-shm"):
+                if os.path.lexists(str(backup) + extra):
+                    os.unlink(str(backup) + extra)
+        elif how == "partial" and backup.stat().st_size > PARTIAL_BYTES:
+            os.truncate(str(backup), PARTIAL_BYTES)
+
+
+def _remove_live(root):
+    for extra in ("",) + runner.SQLITE_SIDECARS:
+        path = str(live_db(root)) + extra
+        if os.path.lexists(path):
+            os.unlink(path)
+
+
+def _plant_foreign(path):
+    """A SQLite file at the live name that is neither the original nor the restored copy (what a stray open would
+    leave): mode 0600, owned by this uid, like any ahc file."""
+    tmp = Path(str(path) + ".plant")
+    db = sqlite3.connect(str(tmp))
+    db.execute("CREATE TABLE stray(x)")
+    db.commit()
+    db.close()
+    os.chmod(str(tmp), 0o600)
+    os.rename(str(tmp), str(path))
+
+
+def _failing_restore(root, damage="present"):
     _downgraded_ledger(root)
 
     def boom(db):
+        _damage_backups(root, damage)
         raise RuntimeError("injected migration failure")
     runner.MIGRATIONS[4] = list(runner.MIGRATIONS[4]) + [boom]
     try:
@@ -366,8 +417,90 @@ def scenario_restore(root, clock):
         pass
 
 
+def scenario_restore(root, clock):
+    """A migration that fails: the verified backup is restored and the failed files moved aside."""
+    _failing_restore(root)
+
+
+def scenario_restore_lost_backup(root, clock):
+    """PR 258 v5 F1: the backup vanishes during the failed migration, so the restore cannot copy it. It abandons,
+    leaving the never-moved live ledger in place. The crash point runner.restore_intent:after@1 of this scenario is
+    the receipt's exact sequence, and its restart must keep the original ledger."""
+    _failing_restore(root, "missing")
+
+
+def scenario_restore_partial_backup(root, clock):
+    """The backup is cut short during the failed migration. Its copy fails the digest check, and the restore
+    abandons the same way, so a partial copy is never published."""
+    _failing_restore(root, "partial")
+
+
+def scenario_reopen(root, clock):
+    """ahc-core's start over a prepared interrupted restore (PREPARED): the resume, then the normal migration."""
+    try:
+        runner.Ledger(core.Paths(root)).close()
+    except runner.SchemaError:
+        pass
+
+
+def _prepare_interrupted(backup, live):
+    """The starting files of a resume scenario: a real crash right after the restore intent was written (scenario
+    restore at runner.restore_intent:after@1, on the "prep" clock so no later name collides), then the backup and
+    the live ledger set as named. The parent builds it once and copies it for the counting pass and every crash."""
+    def prepare(root):
+        died = run_child(root, "restore", seam="runner.restore_intent:after@1", phase="prep")
+        if died.returncode != ahc_crash.CRASH_EXIT:
+            raise AssertionError("prepare: the restore did not stop after its intent:\n%s" % died.stderr[-2000:])
+        _damage_backups(root, backup)
+        if live == "absent":
+            _remove_live(root)
+    return prepare
+
+
 SCENARIOS = {"contracts": scenario_contracts, "files": scenario_files, "migrate": scenario_migrate,
-             "restore": scenario_restore}
+             "restore": scenario_restore, "restore_lost_backup": scenario_restore_lost_backup,
+             "restore_partial_backup": scenario_restore_partial_backup}
+PREPARED = {}           # scenario -> prepare(root): its starting files, built by the parent
+CHUNKS = {}             # scenario -> the restore copy chunk the child uses (ahc_fs.COPY_CHUNK otherwise)
+# What every crash point of a restore scenario must converge to, checked on the uncrashed run (each restart must
+# equal it): the original ledger kept or restored ("original"), or a refusal that keeps the intent ("refused").
+FINAL = {"restore": "original", "restore_lost_backup": "original", "restore_partial_backup": "original"}
+# PR 258 v5: crash anywhere in the RESUME. Each starts from an interrupted restore with the backup present, missing
+# or partial and the live ledger present or absent; scenario_reopen resumes it, so its counting pass enumerates the
+# resume's own crash points (copy, chunks, move, publish, done, abandon) and those of the migration after it.
+for _backup in ("present", "missing", "partial"):
+    for _live in ("present", "absent"):
+        _name = "resume-%s-%s" % (_backup, "live" if _live == "present" else "nolive")
+        SCENARIOS[_name] = scenario_reopen
+        PREPARED[_name] = _prepare_interrupted(_backup, _live)
+        CHUNKS[_name] = TABLE_CHUNK
+        FINAL[_name] = "migrated" if _backup == "present" or _live == "present" else "refused"
+
+
+def final_problems(root, expect, crashed=False):
+    """Why a run's final files are not what FINAL says, or []. After a crash inside the scenario's own setup,
+    before its before-migration row committed, the restart writes that row itself (phase "resume"); losing a row
+    that HAD committed is caught separately (committed_events)."""
+    live, intent = live_db(root), Path(str(live_db(root)) + ".restore-intent")
+    if expect == "refused":
+        out = [] if intent.exists() else ["the restore intent was dropped"]
+        return out + (["a live ledger was created"] if os.path.lexists(str(live)) else [])
+    if intent.exists():
+        return ["the restore intent is still there"]
+    if not live.exists():
+        return ["no live ledger"]
+    db = sqlite3.connect("file:%s?mode=ro" % live, uri=True)
+    try:
+        version = int(db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()[0])
+        rows = [r[0] for r in db.execute("SELECT data FROM events WHERE event='before-migration'")]
+    finally:
+        db.close()
+    want = (3, ("first", "resume") if crashed else ("first",)) if expect == "original" else \
+        (runner.SCHEMA_VERSION, ("prep",))
+    out = [] if version == want[0] else ["schema_version %d, not %d" % (version, want[0])]
+    if len(rows) != 1 or not any('"phase": "%s"' % phase in rows[0] for phase in want[1]):
+        out.append("the original before-migration row (phase %s) is not the one in the ledger: %r" % (want[1], rows))
+    return out
 
 
 class ChildScenario(unittest.TestCase):
@@ -378,7 +511,10 @@ class ChildScenario(unittest.TestCase):
         if not name:
             self.skipTest("child entry point; run by CrashPointTests")
         root = Path(os.environ[ENV_DIR])
-        clock = _Clock(T0 + (RESUME_ADVANCE if os.environ.get(ENV_PHASE) == "resume" else 0.0))
+        clock = _Clock(T0 + PHASE_OFFSETS[os.environ.get(ENV_PHASE, "first")])
+        chunk = os.environ.get(ENV_CHUNK) or CHUNKS.get(name)
+        if chunk:
+            ahc_fs.COPY_CHUNK = int(chunk)
         counter = iter(range(10 ** 9))
         time.time = lambda: clock.t + next(counter) * 1e-3       # deterministic wall clock for the runner
         time.time_ns = lambda: int(time.time() * 1e9)
@@ -421,12 +557,27 @@ class CrashPointTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
+        self.templates = {}
+
+    def seed(self, scenario, root):
+        """An empty scenario directory, or a byte copy of the scenario's prepared starting files (built once)."""
+        if scenario not in PREPARED:
+            root.mkdir(mode=0o700)
+            return
+        if scenario not in self.templates:
+            template = self.base / ("template-" + scenario)
+            template.mkdir(mode=0o700)
+            PREPARED[scenario](template)
+            self.templates[scenario] = template
+        shutil.copytree(str(self.templates[scenario]), str(root), symlinks=True)
 
     def reference(self, scenario):
         root = self.base / ("ref-" + scenario)
-        root.mkdir(mode=0o700)
+        self.seed(scenario, root)
         points = counting_pass(root, scenario)
         final = state(root, normalize_times=True, skip_backups=True)
+        if scenario in FINAL:
+            self.assertEqual(final_problems(root, FINAL[scenario]), [], "the uncrashed %s run" % scenario)
         return points, final, root
 
     def test_every_seam_is_reached_and_every_crash_point_restarts_cleanly(self):
@@ -439,7 +590,7 @@ class CrashPointTests(unittest.TestCase):
                 name_when, _, k = point.rpartition("@")
                 reached.add(name_when)
                 root = self.base / ("%s-%d" % (scenario, crash_points))
-                root.mkdir(mode=0o700)
+                self.seed(scenario, root)
                 with self.subTest(scenario=scenario, point=point):
                     died = run_child(root, scenario, seam=point)
                     self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT,
@@ -459,6 +610,9 @@ class CrashPointTests(unittest.TestCase):
                             len(kept - committed_events(root)), len(kept))
                     elif state(root, normalize_times=True, skip_backups=True) != final:
                         outcome = "restart diverged from the uncrashed run"
+                    elif scenario in FINAL and final_problems(root, FINAL[scenario], crashed=True):
+                        outcome = "restart did not reach %s: %s" % (
+                            FINAL[scenario], final_problems(root, FINAL[scenario], crashed=True))
                     elif invariants(root):
                         outcome = "invariants after restart: %s" % invariants(root)
                     elif cap_used(root) < cap_at_crash:
@@ -503,6 +657,238 @@ class CrashPointTests(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), "False", done.stderr)
 
 
+# ---------------------------------------------------------------- PR 258 v5 F1: the restore recovery table
+
+# Each crash point of a restore, as the real code reaches it (scenario "restore", copy chunk TABLE_CHUNK), and the
+# shape of the files it leaves. The shape is checked before a row is used, so a code version without the point
+# (or with a different one under the same name) fails as "another state", never as a wrong outcome.
+TABLE_POINTS = OrderedDict([
+    ("before-intent", "runner.restore_intent:before@1"),
+    ("after-intent", "runner.restore_intent:after@1"),
+    ("mid-copy", "runner.restore_chunk:after@1"),
+    ("after-fsync", "runner.restore_copy:after@1"),
+    ("after-move", "runner.restore_move:after@1"),
+    ("after-publish", "runner.restore_publish:after@1"),
+    ("after-intent-removal", "runner.restore_done:after@1"),
+])
+SHAPES = {
+    "before-intent": {"intent": False, "live": "original", "aside": 0, "temp": "none"},
+    "after-intent": {"intent": True, "live": "original", "aside": 0, "temp": "none"},
+    "mid-copy": {"intent": True, "live": "original", "aside": 0, "temp": "partial"},
+    "after-fsync": {"intent": True, "live": "original", "aside": 0, "temp": "complete"},
+    "after-move": {"intent": True, "live": "absent", "aside": 1, "temp": "complete"},
+    "after-publish": {"intent": True, "live": "backup", "aside": 1, "temp": "none"},
+    "after-intent-removal": {"intent": False, "live": "backup", "aside": 1, "temp": "none"},
+}
+# (crash point, backup, live) -> what the next ahc-core start must do. The backup is the crash's verified backup,
+# then removed ("missing") or cut to PARTIAL_BYTES ("partial"). "present" keeps the live file the crash left;
+# where it left none (after-move), a foreign SQLite file is planted there. "absent" removes the live file and its
+# sidecars. Outcomes:
+#   untouched  no restore was pending: an ordinary start, the ledger the crash left is migrated;
+#   restored   the verified backup is published (a live original is first moved aside, once) and migrated;
+#   complete   an earlier attempt had published it: the intent is dropped, nothing is moved again;
+#   abandoned  the backup cannot be copied and the live ledger was never moved: the intent is dropped, that
+#              ledger is kept and migrated, and the abandonment is logged;
+#   refused    nothing can be restored and no intact live ledger exists: SchemaError at every start, the intent
+#              and every file kept byte for byte, no ledger created;
+#   fresh      no restore pending and no live ledger: the ordinary first start creates an empty ledger. This is
+#              outside the restore protocol (someone removed a ledger no restore was touching); the backup and
+#              moved-aside files stay untouched, so an operator can still recover them.
+RECOVERY_TABLE = {
+    ("before-intent", "present", "present"): "untouched",
+    ("before-intent", "missing", "present"): "untouched",
+    ("before-intent", "partial", "present"): "untouched",
+    ("before-intent", "present", "absent"): "fresh",
+    ("before-intent", "missing", "absent"): "fresh",
+    ("before-intent", "partial", "absent"): "fresh",
+    ("after-intent", "present", "present"): "restored",
+    ("after-intent", "missing", "present"): "abandoned",       # receipt harness-pr258-v5 F1, the exact sequence
+    ("after-intent", "partial", "present"): "abandoned",
+    ("after-intent", "present", "absent"): "restored",
+    ("after-intent", "missing", "absent"): "refused",
+    ("after-intent", "partial", "absent"): "refused",
+    ("mid-copy", "present", "present"): "restored",
+    ("mid-copy", "missing", "present"): "abandoned",
+    ("mid-copy", "partial", "present"): "abandoned",
+    ("mid-copy", "present", "absent"): "restored",
+    ("mid-copy", "missing", "absent"): "refused",
+    ("mid-copy", "partial", "absent"): "refused",
+    ("after-fsync", "present", "present"): "restored",
+    ("after-fsync", "missing", "present"): "abandoned",
+    ("after-fsync", "partial", "present"): "abandoned",
+    ("after-fsync", "present", "absent"): "restored",
+    ("after-fsync", "missing", "absent"): "refused",
+    ("after-fsync", "partial", "absent"): "refused",
+    ("after-move", "present", "present"): "refused",          # a foreign file where the original was moved from
+    ("after-move", "missing", "present"): "refused",
+    ("after-move", "partial", "present"): "refused",
+    ("after-move", "present", "absent"): "restored",
+    ("after-move", "missing", "absent"): "refused",
+    ("after-move", "partial", "absent"): "refused",
+    ("after-publish", "present", "present"): "complete",      # the v4 residual: never re-moved over .failed-
+    ("after-publish", "missing", "present"): "complete",
+    ("after-publish", "partial", "present"): "complete",
+    ("after-publish", "present", "absent"): "restored",
+    ("after-publish", "missing", "absent"): "refused",
+    ("after-publish", "partial", "absent"): "refused",
+    ("after-intent-removal", "present", "present"): "untouched",
+    ("after-intent-removal", "missing", "present"): "untouched",
+    ("after-intent-removal", "partial", "present"): "untouched",
+    ("after-intent-removal", "present", "absent"): "fresh",
+    ("after-intent-removal", "missing", "absent"): "fresh",
+    ("after-intent-removal", "partial", "absent"): "fresh",
+}
+_ASIDE = re.compile(r"ledger\.sqlite3\.failed-\d+")
+
+
+def _files(ahc):
+    """{name: sha256 of its bytes} for every file directly in the ahc root. Bytes only: nothing is opened with
+    SQLite, which on some platforms leaves -wal/-shm files behind."""
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(ahc.iterdir()) if p.is_file()}
+
+
+def _shape(root):
+    ahc = core.Paths(root).root
+    live = ahc / "ledger.sqlite3"
+    backups = sorted(ahc.glob("ledger.sqlite3.pre-v*.bak"))
+    bak = backups[-1].read_bytes() if backups else None
+    temps = [p.read_bytes() for p in ahc.iterdir() if STAGED_TEMP.match(p.name)]
+    return {"intent": Path(str(live) + ".restore-intent").exists(),
+            "live": "absent" if not live.exists() else "backup" if live.read_bytes() == bak else "original",
+            "aside": sum(1 for p in ahc.iterdir() if _ASIDE.fullmatch(p.name)),
+            "temp": "none" if not temps else "complete" if temps == [bak] else "partial"}
+
+
+def _events_of(data):
+    """The events rows of a SQLite file given as bytes (read from a scratch copy, so no sidecar lands anywhere)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "copy.sqlite3"
+        path.write_bytes(data)
+        db = sqlite3.connect(str(path))
+        try:
+            return [tuple(r) for r in db.execute("SELECT item, event, at, data FROM events ORDER BY rowid")]
+        finally:
+            db.close()
+
+
+class _Records(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+class RestoreRecoveryTableTests(unittest.TestCase):
+    """PR 258 v5 F1, table-driven: every crash point of a restore x backup present, missing or partial x live
+    present or absent, then the next ahc-core start (an in-process Ledger with the normal migrations). Each crash
+    state comes from a real crash child (os._exit at the seam). Crashes inside the resume itself are
+    CrashPointTests' resume-* scenarios. Invariants on every row: a backup or moved-aside file that existed is
+    byte-identical afterwards; no staged temp is left; the outcome is exactly the table's."""
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.base = Path(cls.tmp.name)
+        cls.crashes = {}
+        for label, seam in TABLE_POINTS.items():
+            root = cls.base / ("crash-" + label)
+            root.mkdir(mode=0o700)
+            died = run_child(root, "restore", seam=seam, extra_env={ENV_CHUNK: str(TABLE_CHUNK)})
+            original = None
+            backups = sorted(core.Paths(root).root.glob("ledger.sqlite3.pre-v*.bak"))
+            if backups:
+                original = _events_of(backups[-1].read_bytes())
+            cls.crashes[label] = (root, died, original)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_the_table_covers_every_point_backup_and_live_condition(self):
+        want = {(p, b, l) for p in TABLE_POINTS for b in ("present", "missing", "partial")
+                for l in ("present", "absent")}
+        self.assertEqual(set(RECOVERY_TABLE), want)
+
+    def test_every_row(self):
+        for (label, backup, live), outcome in RECOVERY_TABLE.items():
+            with self.subTest(point=label, backup=backup, live=live, outcome=outcome):
+                self.run_row(label, backup, live, outcome)
+
+    def run_row(self, label, backup, live, outcome):
+        src, died, original = self.crashes[label]
+        self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT, "the child did not die at %s, so this code has no "
+                         "such crash point:\n%s" % (TABLE_POINTS[label], died.stderr[-1500:]))
+        self.assertEqual(_shape(src), SHAPES[label], "the crash at %s left another state" % TABLE_POINTS[label])
+        self.assertTrue(original and any(r[1] == "before-migration" for r in original), original)
+        root = self.base / ("row-%s-%s-%s" % (label, backup, live))
+        shutil.copytree(str(src), str(root), symlinks=True)
+        paths = core.Paths(root)
+        ahc, led_path = paths.root, live_db(root)
+        intent = Path(str(led_path) + ".restore-intent")
+        _damage_backups(root, backup)
+        if live == "absent":
+            _remove_live(root)
+        elif not led_path.exists():
+            _plant_foreign(led_path)
+        before = _files(ahc)
+        live_before = led_path.read_bytes() if led_path.exists() else None
+        record = json.loads(intent.read_text()) if intent.exists() else None
+        asides_before = {n for n in before if _ASIDE.fullmatch(n)}
+
+        records, log = _Records(), logging.getLogger("ahc")
+        log.addHandler(records)
+        self.addCleanup(log.removeHandler, records)
+        refused, rows = None, None
+        try:
+            led = runner.Ledger(paths)
+        except runner.SchemaError as error:
+            refused = error
+        else:
+            try:
+                version = int(led.db.execute("SELECT v FROM meta WHERE k='schema_version'").fetchone()[0])
+                check = led.db.execute("PRAGMA integrity_check").fetchone()[0]
+                rows = [tuple(r) for r in led.db.execute("SELECT item, event, at, data FROM events ORDER BY rowid")]
+            finally:
+                led.close()
+        after = _files(ahc)
+
+        for name, sha in before.items():
+            if ".bak" in name or _ASIDE.match(name):
+                self.assertEqual(after.get(name), sha, "%s was changed or removed" % name)
+        self.assertEqual([n for n in after if STAGED_TEMP.match(n)], [], "a staged copy was left behind")
+        new_asides = {n for n in after if _ASIDE.fullmatch(n)} - asides_before
+
+        if outcome == "refused":
+            self.assertIsNotNone(refused, "the start opened a ledger (%s)" % records.messages)
+            self.assertEqual(after, {n: s for n, s in before.items() if not STAGED_TEMP.match(n)},
+                             "a refused start changed files other than removing its own staged copy")
+            with self.assertRaises(runner.SchemaError):
+                runner.Ledger(paths)                        # and every later start refuses the same way
+            self.assertEqual(_files(ahc), after)
+            return
+        self.assertIsNone(refused, "the start refused: %s" % refused)
+        self.assertFalse(intent.exists(), "the restore intent is still there")
+        self.assertEqual((version, check), (runner.SCHEMA_VERSION, "ok"))
+        if outcome == "fresh":
+            self.assertEqual((rows, new_asides), ([], set()))
+            return
+        self.assertEqual(rows, original, "the ledger does not hold the original rows")
+        if outcome == "restored" and live_before is not None and SHAPES[label]["live"] == "original":
+            moved = "ledger.sqlite3" + record["suffix"]
+            self.assertEqual(new_asides, {moved}, "the live original is moved aside once, under the suffix")
+            self.assertEqual(after[moved], hashlib.sha256(live_before).hexdigest(), "moved aside unchanged")
+        else:
+            self.assertEqual(new_asides, set(), "nothing is moved aside")
+        abandoned = any("abandoned the interrupted ledger restore" in m for m in records.messages)
+        self.assertEqual(abandoned, outcome == "abandoned", records.messages)
+        if outcome == "untouched":
+            self.assertFalse(any("interrupted ledger restore" in m for m in records.messages), records.messages)
+        runner.Ledger(paths).close()                        # the next start is an ordinary one
+
+
 class RestoreIntentTests(unittest.TestCase):
     """The interrupted-restore record (found by the crash matrix) fails closed when it cannot be trusted."""
 
@@ -513,28 +899,56 @@ class RestoreIntentTests(unittest.TestCase):
         self.paths.ensure()
         self.intent = self.paths.root / "ledger.sqlite3.restore-intent"
 
-    def assert_refused(self, migrate=True):
-        with self.assertRaises(runner.SchemaError):
+    SHA = "0" * 64      # a well-formed digest, so a refusal below is for the reason each test names
+
+    def assert_refused(self, migrate=True, because=None):
+        with self.assertRaises(runner.SchemaError) as caught:
             runner.Ledger(self.paths, migrate=migrate)
         self.assertFalse((self.paths.root / "ledger.sqlite3").exists(), "no empty ledger is created")
+        if because:
+            self.assertIn(because, str(caught.exception))
+        self.assertTrue(self.intent.exists(), "a refused record is kept for the operator")
+
+    def record(self, **fields):
+        data = {"backup": "ledger.sqlite3.pre-v4.1.bak", "suffix": ".failed-1", "sha256": self.SHA}
+        data.update(fields)
+        self.intent.write_text(json.dumps({k: v for k, v in data.items() if v is not None}))
 
     def test_an_unreadable_record_refuses_to_open(self):
         self.intent.write_text("not json\n")
-        self.assert_refused()
+        self.assert_refused(because="unreadable")
 
     def test_a_record_naming_a_path_outside_the_ledger_directory_refuses(self):
         outside = self.paths.home / "elsewhere.bak"
         outside.write_bytes(b"SQLite format 3\x00")
-        self.intent.write_text(json.dumps({"backup": "../../elsewhere.bak", "suffix": ".failed-1"}))
-        self.assert_refused()
+        self.record(backup="../../elsewhere.bak")
+        self.assert_refused(because="does not name a backup beside the ledger")
+        for bad in ("", ".", "..", "a\x00b.bak", "x.bak\n", "sub\\x.bak", 7):   # a NUL would be a ValueError
+            self.record(backup=bad)
+            self.assert_refused(because="does not name a backup beside the ledger")
 
-    def test_a_record_naming_a_missing_backup_refuses(self):
-        self.intent.write_text(json.dumps({"backup": "ledger.sqlite3.pre-v4.1.bak", "suffix": ".failed-1"}))
-        self.assert_refused()
+    def test_a_record_naming_a_missing_backup_refuses_while_the_live_ledger_is_absent(self):
+        """The refusal PR 258 v5 keeps: a valid record, no backup and no live ledger, so nothing can be restored
+        and nothing may be created. It refuses at every start."""
+        self.record()
+        self.assert_refused(because="the live database is absent")
+        self.assert_refused(because="the live database is absent")
+
+    def test_a_record_without_a_sha256_or_with_a_bad_one_refuses(self):
+        self.record(sha256=None)
+        self.assert_refused(because="unreadable")
+        for bad in ("A" * 64, "0" * 63, "0" * 64 + "\n", 7):
+            self.record(sha256=bad)
+            self.assert_refused(because="does not name a backup beside the ledger")
+
+    def test_a_suffix_that_is_not_exactly_failed_digits_refuses(self):
+        for bad in (".failed-1\n", ".failed-", "failed-1", ".failed-1/x", ".failed-1-wal"):
+            self.record(suffix=bad)
+            self.assert_refused(because="does not name a backup beside the ledger")
 
     def test_a_non_migrating_process_never_completes_a_restore(self):
-        self.intent.write_text(json.dumps({"backup": "x.bak", "suffix": ".failed-1"}))
-        self.assert_refused(migrate=False)
+        self.record(backup="x.bak")
+        self.assert_refused(migrate=False, because="ahc-core completes it")
 
     def test_a_valid_record_completes_the_restore_and_keeps_the_rows(self):
         led = runner.Ledger(self.paths)
@@ -546,7 +960,7 @@ class RestoreIntentTests(unittest.TestCase):
         for extra in ("", "-wal", "-shm"):
             if os.path.lexists(str(live) + extra):
                 os.rename(str(live) + extra, str(live) + ".failed-5" + extra)
-        self.intent.write_text(json.dumps({"backup": copy.name, "suffix": ".failed-6"}))
+        self.record(backup=copy.name, suffix=".failed-6", sha256=hashlib.sha256(copy.read_bytes()).hexdigest())
         led = runner.Ledger(self.paths)
         try:
             self.assertEqual(led.db.execute("SELECT event FROM events").fetchall()[0][0], "kept")

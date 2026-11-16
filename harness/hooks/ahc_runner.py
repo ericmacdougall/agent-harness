@@ -409,6 +409,19 @@ class SchemaError(RuntimeError):
     """The ledger's schema is unknown or newer than this code; the daemon must not start."""
 
 
+class RestoreAbandoned(SchemaError):
+    """A restore could not copy its verified backup (gone, partial, changed or unreadable) while the live database
+    had never been moved: the intent is dropped and the live database is left in place, unchanged (PR 258 v5 F1)."""
+
+
+def _restore_progress(stage, copied):
+    """The mid-copy crash point: called by ahc_fs.copy_to_temp around each chunk it writes into the staged copy."""
+    if stage == "before":
+        crash_before("runner.restore_chunk")
+    else:
+        crash_after("runner.restore_chunk")
+
+
 SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 REPORT_NAME = "report.md"
 # The largest ledger ahc migrates, and so the largest backup it may have to restore. Checked before a migration
@@ -470,6 +483,7 @@ class Ledger:
         self.migrate = migrate
         self.paths = paths
         self.path = paths.root / "ledger.sqlite3"
+        self.verified = {}          # backup name -> sha256 of the bytes Ledger.backup proved (PR 258 v5)
         if migrate:
             self._resume_restore()
         elif self._intent_path().exists():
@@ -562,21 +576,34 @@ class Ledger:
         if [tuple(row) for row in check] != [("ok",)] or source != copied:
             raise SchemaError("ledger backup %s failed verification (integrity %r, rows %r vs %r); not migrating"
                               % (target.name, [tuple(r) for r in check][:3], source, copied))
+        # the proven bytes' digest (PR 258 v5): a restore publishes a copy only if it has exactly these bytes
+        try:
+            self.verified[target.name] = fs.digest_file(self.paths.root, target, RESTORE_MAX_BYTES)
+        except OSError as error:
+            raise SchemaError("ledger backup %s could not be read back for its digest (%s: %s); not migrating"
+                              % (target.name, type(error).__name__, error)) from None
         return target
 
     def restore(self, copy):
-        """Put the verified backup back after a failed migration. The live database, -wal and -shm files are moved
-        aside together under one suffix (never deleted), then the backup is copied into place. Returns the moved
-        names. The connection is reopened on the restored file."""
+        """Put the verified backup back after a failed migration: the live database and its sidecars are moved
+        aside together under one suffix (never deleted), and a copy holding exactly the backup's proven bytes is
+        published. Returns the moved names. The connection is reopened on the restored file. RestoreAbandoned (a
+        SchemaError) when the copy failed before anything moved: the live database is left in place."""
         self.db.close()
+        sha256 = self.verified.get(Path(copy).name)
+        if sha256 is None:
+            raise SchemaError("backup %s was not proven by this process; not restoring (the live database is left "
+                              "in place)" % Path(copy).name)
         suffix = ".failed-%d" % time.time_ns()
-        # A durable intent first: a crash between the move-aside and the copy-back leaves no live file, and the next
-        # open would otherwise create an empty ledger over it (AC-18 found this). Ledger.__init__ finishes it.
+        # A durable intent first: a crash between the move-aside and the publish leaves no live file, and the next
+        # open would otherwise create an empty ledger over it (AC-18 found this). Ledger.__init__ finishes it. The
+        # record carries the backup's digest, so a resume needs nothing but the files and this record.
         crash_before("runner.restore_intent")
         fs.write_file(self.paths.root, self._intent_path(),
-                      json.dumps({"backup": copy.name, "suffix": suffix}, sort_keys=True) + "\n")
+                      json.dumps({"backup": Path(copy).name, "sha256": sha256, "suffix": suffix},
+                                 sort_keys=True) + "\n")
         crash_after("runner.restore_intent")
-        moved = self._finish_restore(copy, suffix)
+        moved = self._finish_restore(copy, suffix, sha256)
         self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         return moved
@@ -584,63 +611,131 @@ class Ledger:
     def _intent_path(self):
         return Path(str(self.path) + ".restore-intent")
 
-    def _finish_restore(self, copy, suffix):
-        """Copy the verified backup into a fresh temp file beside the ledger, and only then move the live database
-        files aside under `suffix`, publish the copy and drop the intent (PR 258 v4 F1). Idempotent, so a restart
-        after a crash at any step completes the same restore.
-          * The copy streams in fixed chunks (ahc_fs.copy_to_temp), so memory does not grow with the ledger.
-          * If the copy fails while the live database is still in place, nothing was moved. The intent is dropped,
-            so the next start opens that database instead of repeating the restore, and the error is raised. If the
-            live file is already gone (a crash between move and publish), the intent stays and the next start
-            retries."""
+    def _finish_restore(self, copy, suffix, sha256):
+        """Finish the restore named by (copy, suffix, sha256) from whatever state the files are in. Restore and
+        resume both run it, and every step reads the files first, so a crash at any point followed by any number of
+        restarts converges (PR 258 v4 F1, v5 F1). L below is "the live file exists"; the suffix is unique to this
+        restore, so only this restore's own move (or a foreign file) can take a name <ledger><suffix>*.
+          1. Unpublished temps of an earlier attempt are removed (names only).
+          2. L, and the live file is byte-identical to the verified backup: an earlier attempt published it and
+             died before dropping the intent. The intent is dropped and nothing is moved again (moving it aside
+             would replace the moved-aside failed database, PR 258 v4 residual).
+          3. Any move target is taken while its source is in place (_aside_pairs). With L that means the ledger was
+             already moved aside and the file now at its name is neither the original nor the restored copy.
+             Refuse, keeping the intent; nothing changes and nothing is copied. So past this step, L means the
+             live file was never moved.
+          4. Stream the backup into a temp; its bytes must hash to sha256 (ahc_fs.Mismatch otherwise). On failure:
+             - L (never moved, by step 3): abandon. Drop the intent, leave the live database untouched, raise
+               RestoreAbandoned. The next open uses that database, and a retried migration takes a fresh
+               verified backup first.
+             - not L: refuse, keeping the intent. No ledger is created, and every start refuses until the
+               backup is back or an operator decides.
+          5. Move the live file and every SQLite sidecar still in place aside under the suffix (every target is
+             checked again before the first rename, so nothing is half-moved). Publish the fsynced, digest-checked
+             copy. Drop the intent.
+        Memory does not grow with the ledger: the copy and both digests stream in ahc_fs.COPY_CHUNK pieces."""
         fs.remove_temps(self.paths.root, self.path)                 # an earlier attempt's unpublished copy
+        if os.path.lexists(str(self.path)) and self._is_backup_copy(self.path, sha256):
+            self._drop_intent()
+            return []
+        self._aside_pairs(suffix)           # a taken target refuses now, before a copy that could not be published
         crash_before("runner.restore_copy")
         try:
-            staged = fs.copy_to_temp(self.paths.root, copy, self.path, RESTORE_MAX_BYTES)
+            staged = fs.copy_to_temp(self.paths.root, copy, self.path, RESTORE_MAX_BYTES, expect_sha256=sha256,
+                                     progress=_restore_progress)
         except OSError as error:
-            if os.path.lexists(str(self.path)):
-                fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)
-                state = "left in place, unchanged"
-            else:
-                state = "absent; the restore intent is kept so the next start retries"
-            raise SchemaError("could not copy the backup %s back (%s: %s); the live database is %s"
-                              % (Path(copy).name, type(error).__name__, error, state)) from None
+            reason = "%s: %s" % (type(error).__name__, error)
+            if os.path.lexists(str(self.path)):                     # never moved (step 3 passed)
+                self._abandon_restore()
+                raise RestoreAbandoned("could not copy the backup %s back (%s); the live database is left in "
+                                       "place, unchanged" % (Path(copy).name, reason)) from None
+            raise SchemaError("could not copy the backup %s back (%s); the live database is absent; the restore "
+                              "intent is kept, so every start refuses until the backup can be copied"
+                              % (Path(copy).name, reason)) from None
         crash_after("runner.restore_copy")
+        moved = self._move_aside(suffix)
+        self._publish_restored(staged)
+        self._drop_intent()
+        return moved
+
+    def _is_backup_copy(self, path, sha256):
+        """Whether the regular file `path` holds exactly the verified backup's bytes."""
+        try:
+            return fs.digest_file(self.paths.root, path, RESTORE_MAX_BYTES) == sha256
+        except OSError:
+            return False
+
+    def _aside_pairs(self, suffix):
+        """(source, target) for the live database and each SQLite sidecar still in place, target being
+        <name><suffix><sidecar>. SchemaError (intent kept, nothing changed) if any target name is already taken
+        while its source is still in place: renaming would replace that file."""
+        pairs = []
+        for extra in ("",) + SQLITE_SIDECARS:
+            source = Path(str(self.path) + extra)
+            if not os.path.lexists(str(source)):
+                continue
+            target = Path(str(self.path) + suffix + extra)
+            if os.path.lexists(str(target)):
+                raise SchemaError("interrupted restore: %s and %s both exist; refusing to replace either (the "
+                                  "restore intent is kept)" % (source.name, target.name))
+            pairs.append((source, target))
+        return pairs
+
+    def _move_aside(self, suffix):
+        """Rename the live database and each of its SQLite sidecars still in place to <name><suffix><sidecar>, as
+        names (never followed, never deleted). A sidecar is never left beside the restored copy, where SQLite would
+        apply a stale -wal or -journal to it. Every target is checked before the first rename (_aside_pairs)."""
         moved = []
         crash_before("runner.restore_move")
-        for extra in ("", "-wal", "-shm"):
-            source = Path(str(self.path) + extra)
-            if os.path.lexists(str(source)):
-                target = Path(str(self.path) + suffix + extra)
-                fs.rename(self.paths.root, source, target)          # moves a name; never follows it
-                moved.append(target.name)
-        fs.rename(self.paths.root, staged, self.path)               # publish the complete, fsynced copy
-        fs.unlink(self.paths.root, self._intent_path())
+        for source, target in self._aside_pairs(suffix):
+            fs.rename(self.paths.root, source, target)              # moves a name; never follows it
+            moved.append(target.name)
         crash_after("runner.restore_move")
         return moved
 
+    def _publish_restored(self, staged):
+        crash_before("runner.restore_publish")
+        fs.rename(self.paths.root, staged, self.path)               # the complete, fsynced, digest-checked copy
+        crash_after("runner.restore_publish")
+
+    def _drop_intent(self):
+        crash_before("runner.restore_done")
+        fs.unlink(self.paths.root, self._intent_path())
+        crash_after("runner.restore_done")
+
+    def _abandon_restore(self):
+        crash_before("runner.restore_abandon")
+        fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)
+        crash_after("runner.restore_abandon")
+
     def _resume_restore(self):
-        """At open: an intent left by a crash inside restore is completed before anything else touches the file.
-        An intent naming a backup that is not beside the ledger is refused (fail closed, nothing created)."""
+        """At open (ahc-core only): an intent left by a crash inside restore is finished before anything else
+        touches the file. Only the RECORD is validated here: a plain backup name beside the ledger, a .failed-<n>
+        suffix and a 64-hex sha256. An invalid record refuses (fail closed, nothing created). Whether the backup is
+        still there is not checked here (PR 258 v5 F1: checking it first stranded an intact live ledger). The files
+        decide in _finish_restore. An abandoned restore (the backup cannot be copied and the live database was
+        never moved) is logged, and the open goes on with that database."""
         intent = self._intent_path()
         if not intent.exists():
             return
         try:
             record = json.loads(intent.read_text())
-            name, suffix = record["backup"], record["suffix"]
+            name, suffix, sha256 = record["backup"], record["suffix"], record["sha256"]
         except (OSError, ValueError, KeyError, TypeError) as error:
             raise SchemaError("unreadable interrupted-restore record %s (%s); refusing to open the ledger"
                               % (intent.name, type(error).__name__))
-        plain = isinstance(name, str) and isinstance(suffix, str) and name not in ("", ".", "..") and \
-            "/" not in name and "\\" not in name and re.match(r"^\.failed-\d+$", suffix)
-        copy = self.path.with_name(name) if plain else None
-        if copy is None or not copy.is_file():
-            raise SchemaError("interrupted-restore record %s names no backup beside the ledger; refusing to open"
-                              % intent.name)
-        logging.getLogger("ahc").warning("completing an interrupted ledger restore from %s", name)
-        # the live file may already be the restored copy (crash after the replace, before the unlink): moving it
-        # aside again and copying the same backup in is harmless and keeps the step idempotent
-        self._finish_restore(copy, suffix)
+        plain = isinstance(name, str) and isinstance(suffix, str) and isinstance(sha256, str) and \
+            name not in (".", "..") and re.fullmatch(r"[A-Za-z0-9._-]+", name) and \
+            re.fullmatch(r"\.failed-\d+", suffix) and re.fullmatch(r"[0-9a-f]{64}", sha256)
+        if not plain:
+            raise SchemaError("interrupted-restore record %s does not name a backup beside the ledger, a .failed-<n> "
+                              "suffix and a sha256; refusing to open" % intent.name)
+        log = logging.getLogger("ahc")
+        log.warning("completing an interrupted ledger restore from %s", name)
+        try:
+            self._finish_restore(self.path.with_name(name), suffix, sha256)
+        except RestoreAbandoned as abandoned:
+            log.warning("abandoned the interrupted ledger restore: %s; opening that database", abandoned)
 
     def close(self):
         self.db.close()

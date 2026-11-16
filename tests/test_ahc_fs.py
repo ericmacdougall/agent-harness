@@ -10,6 +10,7 @@ RootFsTests pins ahc_fs itself (imported lazily). It checks link refusal at ever
 checks, unpredictable O_EXCL temp names and descriptor-relative rename.
 """
 import ast
+import hashlib
 import os
 import stat
 import sys
@@ -361,6 +362,67 @@ class RootFsTests(unittest.TestCase):
             with self.assertRaises(self.fs.TooLarge):
                 self.fs.copy_to_temp(self.root, src, dst, max_bytes=64, chunk=16)
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["src.bak"])
+
+    def test_copy_to_temp_refuses_bytes_that_do_not_hash_to_the_expected_digest(self):
+        """PR 258 v5 F1: a partial or changed backup is never handed back to be published."""
+        src, dst = self.root / "src.bak", self.root / "live.db"
+        body = os.urandom(3 * 4096 + 17)
+        src.write_bytes(body)
+        dst.write_bytes(b"live\n")
+        good = hashlib.sha256(body).hexdigest()
+        staged = self.fs.copy_to_temp(self.root, src, dst, max_bytes=1 << 20, chunk=4096, expect_sha256=good)
+        self.assertEqual(staged.read_bytes(), body)
+        staged.unlink()
+        os.truncate(str(src), 4096)                         # a partial backup: a prefix of the verified bytes
+        with self.assertRaises(self.fs.Mismatch) as caught:
+            self.fs.copy_to_temp(self.root, src, dst, max_bytes=1 << 20, chunk=4096, expect_sha256=good)
+        self.assertIsInstance(caught.exception, OSError, "the restore's OSError handler must see it")
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["live.db", "src.bak"], "temp left")
+        self.assertEqual(dst.read_bytes(), b"live\n")
+
+    def test_copy_to_temp_reports_progress_around_each_chunk(self):
+        src, dst = self.root / "src.bak", self.root / "live.db"
+        src.write_bytes(b"z" * (2 * 4096 + 1))
+        calls = []
+        self.fs.copy_to_temp(self.root, src, dst, max_bytes=1 << 20, chunk=4096,
+                             progress=lambda stage, n: calls.append((stage, n)))
+        self.assertEqual(calls, [("before", 0), ("after", 4096), ("before", 4096), ("after", 8192),
+                                 ("before", 8192), ("after", 8193)])
+
+    def test_copy_to_temp_uses_the_module_chunk_when_none_is_given(self):
+        src, dst = self.root / "src.bak", self.root / "live.db"
+        src.write_bytes(b"q" * 100)
+        reads, real_read = [], os.read
+
+        def counted(fd, n):
+            reads.append(n)
+            return real_read(fd, n)
+        with mock.patch.object(self.fs, "COPY_CHUNK", 32), mock.patch.object(self.fs.os, "read", counted):
+            self.fs.copy_to_temp(self.root, src, dst, max_bytes=1 << 20)
+        self.assertEqual(set(reads), {32})
+
+    def test_digest_file_streams_and_refuses_a_link_an_oversized_or_a_missing_file(self):
+        src = self.root / "src.bak"
+        body = os.urandom(5 * 4096 + 3)
+        src.write_bytes(body)
+        reads, real_read = [], os.read
+
+        def counted(fd, n):
+            reads.append(n)
+            return real_read(fd, n)
+        with mock.patch.object(self.fs.os, "read", counted):
+            self.assertEqual(self.fs.digest_file(self.root, src, 1 << 20, chunk=4096),
+                             hashlib.sha256(body).hexdigest())
+        self.assertEqual(max(reads), 4096)
+        with self.assertRaises(self.fs.TooLarge):
+            self.fs.digest_file(self.root, src, 100)
+        linked = self.root / "linked.bak"
+        os.symlink(str(self.outside), str(linked))
+        with self.assertRaises(self.fs.UnsafePath):
+            self.fs.digest_file(self.root, linked, 1 << 20)
+        with self.assertRaises(self.fs.UnsafePath):
+            self.fs.digest_file(self.root, self.root / "gone.bak", 1 << 20)
+        self.external_unchanged()
 
     def test_remove_temps_removes_only_unpublished_temps_of_that_name(self):
         dst = self.root / "live.db"

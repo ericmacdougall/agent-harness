@@ -27,6 +27,7 @@ run git itself. Within this model that is not a separate attack.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
@@ -219,34 +220,77 @@ class TooLarge(UnsafePath):
     """copy_to_temp refused a source over its byte cap. Nothing was published."""
 
 
-def copy_to_temp(root, src, dst, max_bytes, mode=FILE_MODE, chunk=COPY_CHUNK):
-    """Stream the regular file `src` into a new exclusive temp file beside `dst`, in `chunk`-sized pieces, and
-    fsync it. It returns the temp's path, and the caller publishes it with rename(). Nothing at `dst` changes
-    here. So a failure here (TooLarge, a link, a vanished or foreign source, ENOSPC) leaves every published name
-    as it was. The temp is removed on failure.
+class Mismatch(UnsafePath):
+    """copy_to_temp copied bytes whose sha256 is not the expected one (a partial or changed source). Nothing was
+    published and the temp is removed."""
+
+
+def _open_source(sfd, sname):
+    """A read descriptor for the regular file `sname` in the checked directory `sfd`, opened with
+    O_NOFOLLOW|O_NONBLOCK. The OPENED descriptor must be a regular file owned by this uid. Returns (fd, fstat)."""
+    try:
+        ifd = os.open(sname, os.O_RDONLY | NOFOLLOW | NONBLOCK, dir_fd=sfd)
+    except OSError as error:
+        raise UnsafePath("%s cannot be opened as a regular file (%s)" % (sname, type(error).__name__)) from None
+    try:
+        info = os.fstat(ifd)
+        if not stat.S_ISREG(info.st_mode):
+            raise UnsafePath("%s is not a regular file" % sname)
+        if info.st_uid != _uid():
+            raise UnsafePath("%s is owned by uid %d" % (sname, info.st_uid))
+    except BaseException:
+        os.close(ifd)
+        raise
+    return ifd, info
+
+
+def digest_file(root, path, max_bytes, chunk=None):
+    """The sha256 hex digest of the regular file `path`, read in `chunk`-sized pieces (memory does not grow with
+    the file), opened as _open_source does. TooLarge if it is, or grows, over max_bytes. Read only."""
+    chunk = chunk or COPY_CHUNK
+    with directory(root, Path(path).parent) as sfd:
+        ifd, info = _open_source(sfd, Path(path).name)
+        try:
+            if info.st_size > max_bytes:
+                raise TooLarge("%s is %d bytes, over the %d-byte cap" % (Path(path).name, info.st_size, max_bytes))
+            digest, total = hashlib.sha256(), 0
+            while True:
+                block = os.read(ifd, chunk)
+                if not block:
+                    return digest.hexdigest()
+                total += len(block)
+                if total > max_bytes:
+                    raise TooLarge("%s grew past the %d-byte cap while it was read" % (Path(path).name, max_bytes))
+                digest.update(block)
+        finally:
+            os.close(ifd)
+
+
+def copy_to_temp(root, src, dst, max_bytes, mode=FILE_MODE, chunk=None, expect_sha256=None, progress=None):
+    """Stream the regular file `src` into a new exclusive temp file beside `dst`, in `chunk`-sized pieces
+    (COPY_CHUNK when None), and fsync it. It returns the temp's path, and the caller publishes it with rename().
+    Nothing at `dst` changes here. So a failure here (TooLarge, Mismatch, a link, a vanished or foreign source,
+    ENOSPC) leaves every published name as it was. The temp is removed on failure.
       * src is opened relative to its checked directory with O_NOFOLLOW|O_NONBLOCK. The OPENED descriptor must
         be a regular file owned by this uid.
       * max_bytes is enforced on the descriptor's size before any byte is copied, and again while copying, in case
-        the file grows."""
+        the file grows.
+      * expect_sha256: the copied bytes are hashed as they stream. A different digest raises Mismatch before the
+        temp is fsynced, so a partial or changed source is never handed back to be published.
+      * progress(stage, copied), when given, is called with "before" and "after" around each chunk's write (the
+        runner's mid-copy crash seam)."""
+    chunk = chunk or COPY_CHUNK
     sparent, sname = Path(src).parent, Path(src).name
     dparent, dname = Path(dst).parent, Path(dst).name
     with directory(root, sparent) as sfd, directory(root, dparent) as dfd:
+        ifd, info = _open_source(sfd, sname)
         try:
-            ifd = os.open(sname, os.O_RDONLY | NOFOLLOW | NONBLOCK, dir_fd=sfd)
-        except OSError as error:
-            raise UnsafePath("%s cannot be opened as a regular file (%s)" % (sname, type(error).__name__)) from None
-        try:
-            info = os.fstat(ifd)
-            if not stat.S_ISREG(info.st_mode):
-                raise UnsafePath("%s is not a regular file" % sname)
-            if info.st_uid != _uid():
-                raise UnsafePath("%s is owned by uid %d" % (sname, info.st_uid))
             if info.st_size > max_bytes:
                 raise TooLarge("%s is %d bytes, over the %d-byte cap" % (sname, info.st_size, max_bytes))
             tmp, ofd = _create_temp(dfd, dname, mode)
             done = False
             try:
-                total = 0
+                total, digest = 0, hashlib.sha256()
                 while True:
                     block = os.read(ifd, chunk)
                     if not block:
@@ -254,10 +298,18 @@ def copy_to_temp(root, src, dst, max_bytes, mode=FILE_MODE, chunk=COPY_CHUNK):
                     total += len(block)
                     if total > max_bytes:
                         raise TooLarge("%s grew past the %d-byte cap while it was copied" % (sname, max_bytes))
+                    digest.update(block)
+                    if progress:
+                        progress("before", total - len(block))
                     view = memoryview(block)
                     while view:
                         view = view[os.write(ofd, view):]
                     del view, block
+                    if progress:
+                        progress("after", total)
+                if expect_sha256 is not None and digest.hexdigest() != expect_sha256:
+                    raise Mismatch("%s does not match its recorded sha256 (%d bytes copied); not published"
+                                   % (sname, total))
                 os.fchmod(ofd, mode)
                 os.fsync(ofd)
                 done = True
