@@ -554,8 +554,11 @@ class Contracts:
             if row_id in ("W2", "W6"):                      # the values ELIG passed on, for W27
                 extra = {"elig_core": item["spec_core"], "elig_policy": item["policy_revision"]}
             elif row_id == "W5":
+                # every cause that holds is recorded (note 12 ruling); W6 needs each one cleared
                 failed = self.elig(item, obs)
-                cause = cause or ("ELIG failed: %s" % ", ".join(failed) if failed else self.MIRROR_CAUSE)
+                causes = (["ELIG failed: %s" % ", ".join(failed)] if failed else []) + \
+                    ([self.MIRROR_CAUSE] if obs.get("mirror_ok") is False else [])
+                cause = "; ".join(causes)                     # derived, never taken from the caller
             elif row_id == "W27":
                 extra = {"spec_core": obs["attached_core"], "policy_revision": obs["policy"]["revision"]}
             elif row_id == "W21":
@@ -658,9 +661,11 @@ class Contracts:
             failed = self.elig(item, obs)
             if failed:
                 raise ContractError("%s needs ELIG; failed: %s" % (row_id, ", ".join(failed)))
-            # W6: the recorded cause has cleared. An ELIG cause is covered by ELIG holding; a mirror cause is not
-            # an ELIG clause, so the observation must show the mirror deliverable again.
-            if row_id == "W6" and item["cause"] == self.MIRROR_CAUSE and obs.get("mirror_ok") is not True:
+            # W6: every recorded cause has cleared (spec owner ruling on note 12). An ELIG cause is covered by ELIG
+            # holding, on this fresh observation; a mirror cause is not an ELIG clause, so the same fresh
+            # observation must show mirror_ok True. A stale or other-boot observation already failed ELIG above.
+            if row_id == "W6" and self.MIRROR_CAUSE in (item["cause"] or "").split("; ") \
+                    and obs.get("mirror_ok") is not True:
                 raise ContractError("W6 needs the mirror deliverable again (the recorded cause)")
         elif row_id == "W5":
             failed = self.elig(item, obs)
