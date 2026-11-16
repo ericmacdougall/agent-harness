@@ -3821,6 +3821,36 @@ class StateMachineTests(TC.Base):
                 self.assertFalse(P(path))
         self.assertTrue(P("config/policy.json", extra=("config/policy.json",)))
 
+    def test_w06_mirror_cause_clears_only_on_a_fresh_mirror_ok_and_every_cause_must_clear(self):
+        """Spec owner ruling on note 12: the mirror is a W5 cause of its own. W6 clears it only on a fresh
+        mirror_ok True (a stale True counts as missing). With both causes recorded, W6 needs both cleared. The
+        item escalates once on entry and does not loop W5/W6 while the mirror is down."""
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        ev = self.ev()
+        item = self.move("W5", obs=self.eligible(mirror_ok=False, kill_switch=True), event_id=ev,
+                         cause="ELIG failed: e6")                  # a caller's cause never replaces the derived one
+        self.assertEqual(item["cause"], "ELIG failed: e6; mirror undeliverable", "both causes are recorded")
+        refused = {"ELIG cleared, mirror still down": self.eligible(mirror_ok=False),
+                   "ELIG cleared, mirror unread": self.eligible(),
+                   "mirror up, ELIG still failing": self.eligible(mirror_ok=True, kill_switch=True),
+                   "stale mirror_ok True": self.eligible(mirror_ok=True,
+                                                         at=self.clock.t - C.Contracts.OBSERVATION_SECONDS),
+                   "mirror_ok True from another boot": self.eligible(mirror_ok=True, boot="another-boot"),
+                   "mirror_ok as text": self.eligible(mirror_ok="true")}
+        for name, obs in refused.items():
+            with self.subTest(name), self.assertRaises(C.ContractError):
+                self.move("W6", obs=obs)
+        for _poll in range(5):                                   # N polls with the mirror down: no loop
+            with self.assertRaises(C.ContractError):
+                self.move("W6", obs=self.eligible(mirror_ok=False))
+            with self.assertRaisesRegex(C.ContractError, "W5"):       # W5's source is merge-ready only
+                self.move("W5", obs=self.eligible(mirror_ok=False))
+        self.assertEqual(self.wstate(), "waiting-dep")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM wi_notices WHERE item=? AND row_id='W5'",
+                                         (self.item["id"],)).fetchone()[0], 1, "one escalation, not one per poll")
+        self.assertEqual(self.move("W6", obs=self.eligible(mirror_ok=True))["state"], "merge-ready")
+
     def test_w05_and_w06_waiting_dep_and_back(self):
         self.pass_reviews()
         self.move("W2", obs=self.eligible())

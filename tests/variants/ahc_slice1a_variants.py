@@ -111,12 +111,21 @@ V = [
          "            (lambda *a: None)(event_id, item, row_id, \"ticket\", \"%s ended %s; item %s\" % (\n")],
      CONTRACTS, SM),
     ("W5: the merged cause expression (a mirror cause recorded as 'ELIG failed: ')", [
-        ("                cause = cause or (\"ELIG failed: %s\" % \", \".join(failed) if failed else self.MIRROR_CAUSE)\n",
-         "                cause = cause or \"ELIG failed: %s\" % \", \".join(failed) or self.MIRROR_CAUSE\n")],
+        ("                cause = \"; \".join(causes)                     # derived, never taken from the caller\n",
+         "                cause = \"ELIG failed: %s\" % \", \".join(failed) or self.MIRROR_CAUSE\n")],
      CONTRACTS, SM),
-    ("W6: a mirror cause not required to clear", [
-        ("            if row_id == \"W6\" and item[\"cause\"] == self.MIRROR_CAUSE and obs.get(\"mirror_ok\") is not True:\n",
-         "            if False:\n")], CONTRACTS, SM),
+    ("W5: only the first cause recorded when both hold (note 12)", [
+        ("                cause = \"; \".join(causes)                     # derived, never taken from the caller\n",
+         "                cause = causes[0]\n")], CONTRACTS, SM),
+    ("W5: the caller's cause overrides the derived one", [
+        ("                cause = \"; \".join(causes)                     # derived, never taken from the caller\n",
+         "                cause = cause or \"ELIG failed: x\"\n")], CONTRACTS, SM),
+    ("W6: ELIG alone treated as cleared (note 12's failing-first variant)", [
+        ("            if row_id == \"W6\" and self.MIRROR_CAUSE in (item[\"cause\"] or \"\").split(\"; \") \\\n",
+         "            if False and self.MIRROR_CAUSE in (item[\"cause\"] or \"\").split(\"; \") \\\n")], CONTRACTS, SM),
+    ("W6: the mirror cause matched only when it is the sole cause", [
+        ("            if row_id == \"W6\" and self.MIRROR_CAUSE in (item[\"cause\"] or \"\").split(\"; \") \\\n",
+         "            if row_id == \"W6\" and self.MIRROR_CAUSE == (item[\"cause\"] or \"\") \\\n")], CONTRACTS, SM),
     ("AC-18: W21's authority line keyed per call, so a crash retry writes a second line", [
         ("                self.authority.append({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",",
          "                self.authority.append({\"event_id\": event_id + os.urandom(4).hex(), \"item\": iid, \"row\": \"W21\",")],
