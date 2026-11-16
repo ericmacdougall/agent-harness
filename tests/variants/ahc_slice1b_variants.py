@@ -363,6 +363,14 @@ ENTRIES.update({
              '    elif False:\n')], GUARD)]},
 })
 
+ENTRIES.update({
+    "ruling 4 macOS boot id": {
+        "tests": ["tests.test_ahc_clock.BootIdTests.test_default_boot_id_is_the_host_s_and_stable_across_processes"],
+        "mutations": [("macOS keeps the per-process boot id", [
+            ('read_boot_id(run=ahc_guard.sysctl_run if sys.platform == "darwin" else None)', "read_boot_id(run=None)")],
+            "harness/hooks/ahc_clock.py")]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")

@@ -529,6 +529,26 @@ def run(policy, name, args, timeout, cwd=None):
     return ahc_core.run_argv(policy.argv(name, args), timeout, cwd=str(cwd or policy.root), env=policy.env(name))
 
 
+def sysctl_run(argv, timeout):
+    """`read_boot_id`'s launcher on macOS: AC-13's sysctl form (resolved path, minimal env), through the active
+    policy when one is installed (cwd its root) and unenforced otherwise (cwd /). Returns an object with returncode
+    and stdout."""
+    import ahc_core  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+    policy = _ACTIVE
+    if policy is not None:
+        rc, out, _err = ahc_core.run_argv(policy.argv("sysctl", argv[1:]), timeout, cwd=policy.root,
+                                          env=policy.env("sysctl"))
+    else:
+        home = str(Path.home())
+        dirs = trusted_dirs(home)
+        exe = resolve("sysctl", dirs)
+        if exe is None:
+            return SimpleNamespace(returncode=127, stdout="")
+        rc, out, _err = ahc_core.run_argv([exe] + list(argv[1:]), timeout, cwd="/", env=form_env("sysctl", dirs, home))
+    return SimpleNamespace(returncode=rc, stdout=out)
+
+
 def run_helper(policy, name, args, timeout, script=None):
     """The production launcher for a legacy Python helper: the interpreter, the script, the helper form's fixed
     env and the root as cwd. `script` (a configured path) is launched as given; under an active policy the hook
