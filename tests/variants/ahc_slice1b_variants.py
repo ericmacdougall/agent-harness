@@ -280,6 +280,89 @@ ENTRIES.update({
              CONTRACTS)]},
 })
 
+GUARD = "harness/hooks/ahc_guard.py"
+NM = "tests.test_ahc_guard.NoModelInDaemonTests."
+ENTRIES.update({
+    "AC-13 unlisted executable": {
+        "tests": [NM + "test_neg47_unlisted_executable_is_refused"],
+        "mutations": [("an unlisted executable is added to the allowed set", [
+            ('EXECUTABLES = ("git", "gh", "systemd-run", "systemctl", "lsof", "fuser", "sysctl")',
+             'EXECUTABLES = ("git", "gh", "systemd-run", "systemctl", "lsof", "fuser", "sysctl", "curl")'),
+            ("    def _check_sysctl(self, args, cwd):\n",
+             "    def _check_curl(self, args, cwd):\n        return None\n\n    def _check_sysctl(self, args, cwd):\n")],
+            GUARD)]},
+    "AC-13 python -c and helper hash": {
+        "tests": [NM + "test_neg47_python_only_as_a_bound_unchanged_helper"],
+        "mutations": [("python -c is allowed", [
+            ('        if len(args) < 2 or args[1].startswith("-"):\n', "        if len(args) < 2:\n"),
+            ('        self.refuse("python: %s is not an installed helper script" % args[1][:120])',
+             '        return "python"')], GUARD),
+                      ("a listed helper with a changed hash runs", [
+            (' or hashlib.sha256(Path(script).read_bytes()).hexdigest() != sha:', ':')], GUARD),
+                      ("the helper env is not compared", [
+            ("        if env != self.helper_env:\n", "        if False:\n")], GUARD)]},
+    "AC-13 inherited environment": {
+        "tests": [NM + "test_neg47_resolution_env_and_shell_are_refused",
+                  NM + "test_neg44_git_with_added_env_keys_is_refused"],
+        "mutations": [("an inherited environment (env None) is accepted", [
+            ("        if env is None:\n            self.refuse(", "        if env is None and False:\n            self.refuse("),
+            ("        if dict(env) != self.env(name):\n", "        if env is not None and dict(env) != self.env(name):\n")],
+            GUARD),
+                      ("git env keys are not compared", [
+            ("        if dict(env) != self.env(name):\n", "        if False:\n")], GUARD)]},
+    "AC-13 trusted file at launch": {
+        "tests": [NM + "test_neg47_group_writable_after_start_is_refused"],
+        "mutations": [("the launch-time trust check is dropped", [
+            ("        problem = trusted_file_problem(args[0])\n        if problem:\n",
+             "        problem = trusted_file_problem(args[0])\n        if False:\n")], GUARD)]},
+    "AC-13/NEG-44 git table": {
+        "tests": [NM + "test_neg44_git_forms_outside_the_table_are_refused"],
+        "mutations": [("git options and positionals are not checked", [
+            ('            if tok.startswith("-") or not self._git_positional(tok, kinds):\n', "            if False:\n")],
+            GUARD),
+                      ("the SAFE prefix is not required", [
+            ("        if args[:len(prefix)] != prefix:\n", "        if False:\n"),
+            ("        rest = args[len(prefix):]\n", "        rest = args[len(prefix):] if args[:len(prefix)] == prefix else args\n")],
+            GUARD)]},
+    "AC-13/NEG-45 gh table": {
+        "tests": [NM + "test_neg45_gh_forms_outside_the_table_are_refused"],
+        "mutations": [("any endpoint fills a template", [
+            ('        if name is None or m.group("repo").lower() not in self.repos:\n', "        if False:\n"),
+            ('        if "--paginate" in rest and not READ_TEMPLATES[name]["paginate"]:\n', "        if False:\n")],
+            GUARD)]},
+    "AC-13/NEG-45 W21 PUT": {
+        "tests": [NM + "test_neg45_w21_put_needs_the_flag_and_the_armed_expectation"],
+        "mutations": [("the W21 PUT needs no armed expectation", [
+            ('        if armed is None or [self.exe.get("gh")] + list(args) != armed:\n', "        if False:\n")], GUARD),
+                      ("AHC_W21_SEND is not checked", [
+            ('        if os.environ.get("AHC_W21_SEND") != "1":\n', "        if False:\n")], GUARD)]},
+    "AC-13/NEG-46 units": {
+        "tests": [NM + "test_neg46_systemd_run_only_the_armed_committed_command_line",
+                  NM + "test_neg46_systemctl_verbs_outside_the_table_are_refused",
+                  NM + "test_recovery_stop_needs_reconciliation_and_the_review_slice"],
+        "mutations": [("systemd-run is not byte-compared with the armed line", [
+            ("        if full != armed[0] or argv_digest(full) != armed[1]:\n", "        if False:\n")], GUARD),
+                      ("an armed expectation is not consumed", [
+            ('        armed = self.armed.pop("systemd-run", None)\n', '        armed = self.armed.get("systemd-run")\n')],
+             GUARD),
+                      ("recovery stop outside startup reconciliation", [
+            ("            if self.reconciling and UNIT.fullmatch(unit) and unit in self.slice_ok:\n",
+             "            if UNIT.fullmatch(unit) and unit in self.slice_ok:\n")], GUARD),
+                      ("recovery stop without the Slice check", [
+            ("            if self.reconciling and UNIT.fullmatch(unit) and unit in self.slice_ok:\n",
+             "            if self.reconciling and UNIT.fullmatch(unit):\n")], GUARD)]},
+    "AC-13/NEG-48 sockets": {
+        "tests": [NM + "test_neg48_sockets_only_unix_paths_under_the_root"],
+        "mutations": [("the socket check is dropped", [
+            ("        policy.check_connect(args[0], args[1] if len(args) > 1 else None)\n", "        pass\n")], GUARD)]},
+    "AC-13/NEG-30 import hook": {
+        "tests": [NM + "test_neg30_runtime_provider_import_is_refused_in_a_child"],
+        "mutations": [("the import hook is dropped", [
+            ("        sys.meta_path.insert(0, _ProviderFinder())\n", ""),
+            ('    elif event == "import" and args and isinstance(args[0], str) and _is_provider(args[0]):\n',
+             '    elif False:\n')], GUARD)]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
