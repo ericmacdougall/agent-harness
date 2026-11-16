@@ -2201,6 +2201,7 @@ def tick(paths, config, deps, role="all"):
             _review_pass(worker, ledger, summary)
         if core_role:
             _core_outbound(worker, ledger, summary)
+            _shadow_pass(ledger, paths, config, deps, summary)
     except _Stop:
         summary["stopped"] = True
     finally:
@@ -2260,6 +2261,37 @@ def _core_outbound(worker, ledger, summary):
     missing = ledger.db.execute("SELECT id FROM items WHERE state IN (%s) AND next_action_at IS NULL"
                                 % ",".join("?" * len(NON_TERMINAL)), sorted(NON_TERMINAL)).fetchall()
     summary["defects"] = ["I2: %s has no next_action_at" % row["id"] for row in missing]
+
+
+def _shadow_pass(ledger, paths, config, deps, summary):
+    """AC-3/AC-4: the shadow WorkItem pass (AHC_SHADOW=1 only, for the repos on the shadow list), after the legacy
+    pass; then AC-13's refusals, collected by the active launch policy, are raised as incidents in the outbox."""
+    import ahc_guard  # noqa: PLC0415
+    import ahc_shadow  # noqa: PLC0415
+    c = open_contracts(ledger, paths)
+    parts = getattr(deps, "shadow_parts", None)
+    if ahc_shadow.shadow_on() and parts is not None and config.get("shadow_repos"):
+        producer, clone, w21 = parts(c)
+        t = ahc_shadow.ShadowTick(c, producer, clone, config, w21=w21,
+                                  digest_append=lambda text: _append_private(paths.root, paths.root / SHADOW_DIGEST,
+                                                                             text))
+        summary["shadow"] = t.tick()
+        for subject, why in summary["shadow"]["incidents"] + [("observations", w) for w in producer.incidents]:
+            raise_incident(c, subject, why)
+    policy = ahc_guard.active()
+    if policy is not None:
+        while policy.incidents:
+            raise_incident(c, "launch-guard", "AC-13 refused: %s" % policy.incidents.pop(0))
+
+
+def raise_incident(contracts, subject, text):
+    """An incident in the outbox (wi_notices, kind incident) for the daemon itself, through the AC-14 chokepoint."""
+    stamp = contracts.stamp({})
+    ev = "incident:" + hashlib.sha256(("%s|%s|%s|%r" % (subject, text, stamp["boot"], stamp["mono"])).encode()
+                                      ).hexdigest()[:32]
+    with contracts.tx():
+        contracts._wi_notice(ev, {"id": SYSTEM_ITEM}, str(subject)[:80], "incident", str(text)[:1000])
+    log.warning("incident (%s): %s", subject, _short(text))
 
 
 MAIN_ACTOR = "main"
@@ -2664,6 +2696,27 @@ class LiveDeps:
         url = self.config.get("clone_urls", {}).get(repo, "https://github.com/%s.git" % repo)
         return ahc_clone.prepare(self.paths.clones, repo, url, head, base, allow_file=allow_file)
 
+    def shadow_parts(self, contracts):
+        """AC-3: the shadow tick's parts: the production observation producer (AC-1, gh and git through the AC-13
+        forms), the daemon clone, and the W21 sender (None until AC-7 is armed by its flag).
+
+        ASSUMPTION (goodqa#16049, open for main): no production GoodQA reader exists at this slice, so the reader
+        returns nothing and every shadow observation is refused (fail closed: nothing is admitted or moved live).
+        The local reader takes the repo's policy record from config `shadow_policy[repo]`; the kill switch, CAS and
+        canary are unknown (None), so ELIG's e6 and e9 fail closed."""
+        import ahc_observe  # noqa: PLC0415
+        shadow_policy = self.config.get("shadow_policy") if isinstance(self.config.get("shadow_policy"), dict) else {}
+
+        def local(repo):
+            record = shadow_policy.get(repo)
+            return {"policy": dict(record) if isinstance(record, dict) else {}, "kill_switch": None,
+                    "kill_epoch": contracts.authority_epoch(), "chk_cas": None, "canary": None}
+
+        def goodqa(repo, pr, item):
+            return None
+        producer = ahc_observe.Producer.for_live(contracts, self.policy, goodqa, local)
+        return producer, (lambda repo, head, base: self.clone(repo, head, base)), None
+
     def merge_base(self, clone, head, base):
         import ahc_clone
         return ahc_clone._git(["merge-base", head, base], cwd=clone).stdout.strip()
@@ -2713,6 +2766,11 @@ def admit(paths, config, norm, now=None):
     capacity = int(bounds(config)["queue_capacity"])
     ledger = Ledger(paths, migrate=False)
     try:
+        import ahc_shadow  # noqa: PLC0415
+        if ahc_shadow.pipeline_of(ledger.db, norm["repo"], config) == "shadow":
+            # AC-3: a shadow repo is wholly in the WorkItem pipeline; its request never enters the legacy items
+            key = ahc_shadow.queue_request(open_contracts(ledger, paths), norm)
+            return {"id": key, "duplicate": False, "pipeline": "shadow"}
         with ledger.tx():
             if ledger.item(norm["id"]) is not None:
                 return {"id": norm["id"], "duplicate": True}
