@@ -340,11 +340,8 @@ class ShadowTick:
             kw["successor_packet"] = packet
         ev = event_id(obs["id"], iid, row)
         try:
-            if row == "W21":
-                moved = self.w21.apply(item, obs)
-            else:
-                moved = self.c.wi_move(iid, row, expected_version=item["version"], event_id=ev, actor="ahc-core",
-                                       obs=obs, **kw)
+            moved = self.c.wi_move(iid, row, expected_version=item["version"], event_id=ev, actor="ahc-core",
+                                   obs=obs, **kw)
         except C.VersionConflict as error:
             summary["conflicts"].append((iid, row, str(error)))       # NEG-10: another tick applied first
             return None
