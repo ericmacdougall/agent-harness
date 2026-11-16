@@ -38,7 +38,8 @@ E13_READ_GAP_SECONDS = 60            # and its second read at least 60 s after t
 
 # Schema v4 (spec ahc-m1-v2g2, folded into v4 by the spec owner's ruling: no v4 ledger was ever installed). Code
 # review rows bind (repo, pr, H, B_r, packet, revision); spec rows store snapshot_base '' (never NULL, so the
-# unique key still de-duplicates). Grants are scoped (repo, pr, H, B); operations keyed (repo, pr, B, H, revision,
+# unique key still de-duplicates). Spec rows also bind the spec core they review (`spec_core`, folded into v4 by the
+# spec owner's slice 1a ruling Q-A6); code rows store ''. Grants are scoped (repo, pr, H, B); operations keyed (repo, pr, B, H, revision,
 # g). There is no candidate M: integration is a fast-forward of the default branch from B to H.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -46,7 +47,10 @@ CREATE TABLE IF NOT EXISTS reviews (
   snapshot_base TEXT NOT NULL, packet_sha256 TEXT NOT NULL, policy_revision TEXT NOT NULL, state TEXT NOT NULL,
   version INTEGER NOT NULL, receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER,
   data TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL, updated REAL NOT NULL,
-  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision));
+  spec_core TEXT NOT NULL DEFAULT '',
+  CHECK ((kind = 'spec' AND length(spec_core) = 64 AND spec_core NOT GLOB '*[^0-9a-f]*')
+         OR (kind != 'spec' AND spec_core = '')),
+  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, spec_core));
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL,
   repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
@@ -290,10 +294,11 @@ class Contracts:
     }
 
     def require_review(self, kind, repo, pr, head, packet_sha256, policy_revision, item=None, event_id=None,
-                       actor="ahc-core", snapshot_base=""):
+                       actor="ahc-core", snapshot_base="", spec_core=""):
         """none -> required, or the existing row for this exact binding (idempotent). R1: a code kind is bound to
         (repo, pr, H, B_r, packet, revision), where B_r is the default-branch tip at queue time and differs from H;
-        a spec kind has no B_r and stores ''."""
+        a spec kind has no B_r and stores '', and is bound to the spec core it reviews (Q-A6), so a new attached
+        core at the same head, packet and policy is a new row (W27) and the old pass cannot satisfy e2."""
         if kind not in self.REVIEW_KINDS:
             raise ContractError("unknown review kind %r" % kind)
         if actor not in self.D:
@@ -301,10 +306,17 @@ class Contracts:
         if kind in self.ATTEMPT_KINDS:
             if not isinstance(snapshot_base, str) or not _is_oid(snapshot_base) or snapshot_base == head:
                 raise ContractError("a code review is bound to its snapshot base B_r (a full sha other than H)")
-        elif snapshot_base != "":
-            raise ContractError("a spec review has no snapshot base")
+            if spec_core != "":
+                raise ContractError("a code review carries no spec core")
+        else:
+            if snapshot_base != "":
+                raise ContractError("a spec review has no snapshot base")
+            if not (isinstance(spec_core, str) and len(spec_core) == 64 and _is_oid(spec_core)):
+                raise ContractError("a spec review is bound to the full sha256 spec core it reviews")
         binding = {"kind": kind, "repo": str(repo).lower(), "pr": int(pr), "head": head,
                    "snapshot_base": snapshot_base, "packet_sha256": packet_sha256, "policy_revision": policy_revision}
+        if kind == "spec":       # code rows keep their pre-Q-A6 ids
+            binding["spec_core"] = spec_core
         rid = "rv-" + _sha(binding)[:24]
         with self.tx():
             existing = self._row("reviews", "id", rid)
@@ -312,9 +324,10 @@ class Contracts:
                 return existing
             now = self.now()
             self.db.execute("INSERT INTO reviews(id, kind, item, repo, pr, head, snapshot_base, packet_sha256, "
-                            "policy_revision, state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "policy_revision, state, version, created, updated, spec_core) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (rid, kind, item, binding["repo"], binding["pr"], head, snapshot_base, packet_sha256,
-                             policy_revision, "required", 1, now, now))
+                             policy_revision, "required", 1, now, now, spec_core))
             self._a0("review", rid, None, "required", event_id or "ev-" + rid + "-required", actor)
             return self._row("reviews", "id", rid)
 
@@ -368,6 +381,9 @@ class Contracts:
         if row["snapshot_base"]:      # R4: a code receipt names the B_r the reviewer diffed against
             want["snapshot_base"] = row["snapshot_base"]
             got["snapshot_base"] = receipt.get("snapshot_base")
+        if row["kind"] == "spec":     # R11 (Q-A6): the attach record is for the core this row reviews
+            want["spec_core"] = row["spec_core"]
+            got["spec_core"] = receipt.get("spec_core")
         if got != want:
             raise ContractError("receipt is bound to another subject: %s" % sorted(k for k in want
                                                                                    if want[k] != got[k]))

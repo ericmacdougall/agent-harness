@@ -16,6 +16,7 @@ B2 = "9" * 40         # a moved default-branch tip
 OTHER = "8" * 40      # some other tip, neither B nor H
 PKT = "d" * 64
 POLICY = "policy-r1"
+CORE1, CORE2 = "1" * 64, "2" * 64     # two attached spec cores (Q-A6)
 
 
 class Clock:
@@ -153,7 +154,47 @@ class ReviewTests(Base):
         args = dict(kind="adversarial", repo="O/R", pr=5, head=H1, packet_sha256=PKT, policy_revision=POLICY)
         args.update(kw)
         args.setdefault("snapshot_base", "" if args["kind"] == "spec" else BASE)
+        args.setdefault("spec_core", CORE1 if args["kind"] == "spec" else "")
         return self.c.require_review(**args)
+
+    # ---- Q-A6 (spec owner ruling on slice 1a): a spec row is bound to the spec core it reviewed
+
+    def spec_pass(self, row, core):
+        return self.c.review(row["id"], "passed", expected_version=row["version"], event_id=self.ev(),
+                             receipt=self.receipt(packet_sha256=row["packet_sha256"], snapshot_base=None,
+                                                  spec_core=core))
+
+    def test_qa6_a_new_spec_core_at_the_same_subject_is_a_new_row(self):
+        old = self.row(kind="spec")
+        new = self.row(kind="spec", spec_core=CORE2)
+        self.assertNotEqual(new["id"], old["id"], "same head, packet and policy, new core: a replacement row")
+        self.assertEqual((old["spec_core"], new["spec_core"]), (CORE1, CORE2))
+        self.assertEqual(self.spec_pass(old, CORE1)["state"], "passed")
+        self.assertEqual(self.state("reviews", "id", new["id"]), "required", "the old pass does not carry over")
+
+    def test_qa6_a_spec_row_needs_a_full_core_and_a_code_row_has_none(self):
+        for bad in ("", None, "A" * 64, "a" * 40, CORE1 + "0"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(C.ContractError, "spec core"):
+                self.row(kind="spec", spec_core=bad)
+        with self.assertRaisesRegex(C.ContractError, "spec core"):
+            self.row(kind="adversarial", spec_core=CORE1)
+        with self.assertRaises(sqlite3.IntegrityError):     # the CHECK holds even for a direct write
+            self.db.execute("INSERT INTO reviews(id, kind, repo, pr, head, snapshot_base, packet_sha256, "
+                            "policy_revision, state, version, created, updated, spec_core) VALUES "
+                            "('rv-x', 'spec', 'o/r', 5, ?, '', ?, ?, 'required', 1, 0, 0, '')", (H1, PKT, POLICY))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO reviews(id, kind, repo, pr, head, snapshot_base, packet_sha256, "
+                            "policy_revision, state, version, created, updated, spec_core) VALUES "
+                            "('rv-y', 'adversarial', 'o/r', 5, ?, ?, ?, ?, 'required', 1, 0, 0, ?)",
+                            (H1, BASE, PKT, POLICY, CORE1))
+
+    def test_qa6_r11_passes_a_spec_row_only_on_an_attach_record_for_its_core(self):
+        row = self.row(kind="spec")
+        for core in (CORE2, None, ""):
+            with self.subTest(core=core), self.assertRaisesRegex(C.ContractError, "spec_core"):
+                self.spec_pass(row, core)
+        self.assertEqual(self.state("reviews", "id", row["id"]), "required")
+        self.assertEqual(self.spec_pass(row, CORE1)["state"], "passed")
 
     def walk(self, row, *states, **kw):
         for to in states:
@@ -200,7 +241,7 @@ class ReviewTests(Base):
     def test_spec_row_passes_from_required_on_its_attach_record_only(self):
         spec = self.row(kind="spec", packet_sha256="5" * 64)
         self.c.review(spec["id"], "passed", expected_version=spec["version"], event_id=self.ev(),
-                      receipt=self.receipt(packet_sha256="5" * 64))
+                      receipt=self.receipt(packet_sha256="5" * 64, spec_core=CORE1))
         adversarial = self.row()
         with self.assertRaises(C.ContractError):   # an attempt kind never passes without running
             self.result(adversarial)
