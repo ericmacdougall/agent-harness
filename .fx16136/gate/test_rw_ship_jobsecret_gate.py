@@ -91,18 +91,19 @@ def test_unheld_derive_outcomes(R, body, code, word, ok):
         assert 'TRIAL' not in R.dlog() and R.state_of('release/js-2')[0] == 'deploy-failed'
 
 
-@pytest.mark.parametrize('case', ['refused', 'ssh-fail', 'unbound'])
+@pytest.mark.parametrize('case', ['refused', 'ssh-fail', 'unbound', 'no-blob'])
 def test_held_release_is_not_gated(R, case):
     _conf(R, 'SELFHOST_JOB_HOLD', 'intelligence-worker')
     if case == 'refused': R.put('derive-out', LINE + 'REFUSED no source line\n'); R.put('derive-rc', '2')
     if case == 'ssh-fail': R.put('derive-ssh-fail', '')
     if case == 'unbound': R.autobind = False
+    if case == 'no-blob': bind_release(R, derive=None)
     sha = R.release('release/js-3'); rc, out = R.run('release/js-3', sha)
     assert rc == 0, out
     assert R.jobs()[INTEL] == HELD and 'TRIAL' not in R.dlog() and 'gate (c)' not in out
-    word = {'refused': 'REFUSED-derive', 'ssh-fail': 'unreachable', 'unbound': 'skipped-unbound'}[case]
+    word = {'refused': 'REFUSED-derive', 'ssh-fail': 'unreachable', 'unbound': 'skipped-unbound', 'no-blob': 'REFUSED-no-derive-blob'}[case]
     assert ('derive ' + word) in out and audit(R, sha)['jobSecretGate'] == 'held derive=' + word, out
-    assert ('derive-runs' in os.listdir(R.st)) == (case != 'unbound')
+    assert ('derive-runs' in os.listdir(R.st)) == (case in ('refused', 'ssh-fail'))
 
 
 # ---------------------------------------------------------------- where derive comes from (lead ruling Q1)
