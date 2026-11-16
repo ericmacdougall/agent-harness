@@ -4289,8 +4289,168 @@ class StateMachineTests(TC.Base):
         with self.assertRaisesRegex(C.ContractError, "already recorded"):
             self.move("W21", obs=w21_obs())
 
+    # ---- AC-5: W7, W11, W12, W15, W19, W22 and W23 (slice 1 (b))
+
+    def w7_obs(self, item=None, **changes):
+        o = self.eligible(item, kill_epoch=TC.Base.KILL, **changes)
+        o["policy"] = dict(o["policy"], grant_source="queue:fixture#6165f60532c0", default_branch="main")
+        return o
+
+    def test_w07_writes_the_grant_and_intent_only(self):
+        """W7: ELIG holds and nothing non-terminal exists for (repo, pr, B, H, revision): G1 issues the grant and
+        E1 writes the Effect intent, in the row's transaction. Nothing dispatches. NEG-14: a second W7 is refused
+        and creates no second grant or Effect."""
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        with self.assertRaisesRegex(C.ContractError, "W7 needs ELIG"):
+            self.move("W7", obs=self.w7_obs(kill_switch=True))
+        item = self.move("W7", obs=self.w7_obs())
+        self.assertEqual(item["state"], "merge-ready")
+        grants = self.db.execute("SELECT state, kill_epoch FROM grants WHERE repo='o/r' AND pr=5").fetchall()
+        ops = self.db.execute("SELECT state, item, dispatch_count FROM operations").fetchall()
+        self.assertEqual([tuple(g) for g in grants], [("validated", TC.Base.KILL)])
+        self.assertEqual([tuple(o) for o in ops], [("intent", self.item["id"], 0)])
+        with self.assertRaisesRegex(C.ContractError, "non-terminal grant"):
+            self.move("W7", obs=self.w7_obs())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM grants").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM operations").fetchone()[0], 1)
+        self.db.execute("UPDATE grants SET state='expired'")
+        with self.assertRaisesRegex(C.ContractError, "non-terminal Effect"):
+            self.move("W7", obs=self.w7_obs())
+
+    def test_w11_hands_to_staging_and_beats_w12(self):
+        """NEG-11: W11 is refused when the policy names no staging target, and W11 beats W12 when both hold."""
+        self.at("merged")
+        pol = {"revision": TC.POLICY}
+        for bad in (pol, dict(pol, staging_target=""), dict(pol, staging_target=None)):
+            self.at("merged")
+            with self.assertRaisesRegex(C.ContractError, "staging target"):
+                self.move("W11", obs=self.pr(policy=bad))
+        self.at("merged")
+        self.db.execute("DELETE FROM wi_notices")
+        self.assertEqual(C.Contracts.select_row(["W12", "W11"], False), "W11")
+        self.assertEqual(self.move("W11", obs=self.pr(policy=dict(pol, staging_target="stage-1")))["state"],
+                         "handed-to-staging")
+        self.assertEqual(self.notices_of("W11"), [("ticket", "handed to staging target stage-1; the M-2 item is "
+                                                             "recorded only (goodqa#16070)")])
+
+    def w12_obs(self, **changes):
+        o = {"check_record": {"head": TC.H1, "passed": True, "headed": True, "recorder": "agent:clicker"},
+             "author": "agent:author", "owner": "agent:owner", "spec_reviewers": ["agent:spec"],
+             "evidence_posters": ["agent:evidence"]}
+        o.update(changes)
+        return o
+
+    def test_w12_needs_an_independent_headed_check_bound_to_h(self):
+        """NEG-12: refused when the author, owner, a spec reviewer or an evidence poster recorded it, when it is
+        bound to another sha, not headed or failed, or when the lists that prove independence are missing."""
+        self.at("merged")
+        rec = self.w12_obs()["check_record"]
+        bad = [dict(check_record=dict(rec, recorder=who)) for who in
+               ("agent:author", "agent:owner", "agent:spec", "agent:evidence")]
+        bad += [dict(check_record=dict(rec, head=TC.H2)), dict(check_record=dict(rec, headed=False)),
+                dict(check_record=dict(rec, passed=False)), dict(spec_reviewers=None), dict(author=None)]
+        for changes in bad:
+            self.at("merged")                    # a variant that lets one through must not strand the rest
+            with self.subTest(changes=changes), self.assertRaisesRegex(C.ContractError, "W12"):
+                self.move("W12", obs=self.w12_obs(**changes))
+        self.at("merged")
+        self.db.execute("DELETE FROM wi_notices")
+        self.assertEqual(self.move("W12", obs=self.w12_obs())["state"], "headed-verified")
+        self.assertEqual(self.notices_of("W12"), [("ticket", "headed check by agent:clicker passed at %s" % TC.H1)])
+
+    def findings_round(self, rnd, base_move=False):
+        row = self.c.require_review("adversarial", "o/r", 5, TC.H1, TC.PKT, TC.POLICY, item=self.item["id"],
+                                    event_id=self.ev(), snapshot_base=TC.BASE, round=rnd, base_move=base_move)
+        self.db.execute("UPDATE reviews SET state='findings' WHERE id=?", (row["id"],))
+
+    def test_w15_fires_only_on_b7_or_b33_exhaustion(self):
+        """NEG-13: a base-move re-review block does not count toward B7; W15 fires on B7 (two rounds blocked on the
+        PR's own content) or on the lineage's B33 budget, and on nothing else."""
+        with self.assertRaisesRegex(C.ContractError, "B7 or B33"):
+            self.move("W15")
+        self.findings_round(1)
+        self.findings_round(2, base_move=True)
+        with self.assertRaisesRegex(C.ContractError, "B7 or B33"):
+            self.move("W15")
+        self.findings_round(3)
+        self.assertEqual(self.c.b7_used(self.item), 2)
+        self.assertEqual(self.move("W15")["state"], "exhausted")
+        self.assertIn("B7 2 of 2 rounds", dict(self.notices_of("W15"))["ticket"])
+        other = self.admit(pr=9)
+        with self.assertRaisesRegex(C.ContractError, "B7 or B33"):
+            self.move("W15", item=other)
+        with self.c.tx():
+            self.c.charge_b33(other["lineage"], C.Contracts.B33_RUNS - 1)
+        with self.assertRaisesRegex(C.ContractError, "B7 or B33"):
+            self.move("W15", item=other)
+        with self.c.tx():
+            self.c.charge_b33(other["lineage"])
+        self.assertEqual(self.move("W15", item=other)["state"], "exhausted")
+
+    def test_w19_incident_for_an_integrity_fault_and_a_ticket_otherwise(self):
+        """NEG-14: W19 writes an incident for an integrity fault and a ticket comment for any other refusal."""
+        for bad in (None, {"kind": "other", "detail": "x"}, {"kind": "argv", "detail": ""}):
+            with self.assertRaisesRegex(C.ContractError, "typed"):
+                self.move("W19", obs={"refusal": bad})
+        self.move("W19", obs={"refusal": {"kind": "integrity", "detail": "receipt store digest mismatch"}})
+        self.assertEqual(self.notices_of("W19"), [("incident", "refused (integrity): receipt store digest mismatch")])
+        self.item = self.admit(pr=11)
+        self.move("W19", obs={"refusal": {"kind": "allowlist", "detail": "repo is off the allowlist"}})
+        self.assertEqual(self.notices_of("W19"), [("ticket", "refused (allowlist): repo is off the allowlist")])
+
+    def test_w22_conflict_tells_the_owner_and_the_next_item_heads_the_queue(self):
+        """NEG-14 and NEG-5: a conflict at the queue head takes W22 with an owner notice and nothing written to
+        the PR; the next item becomes the queue head. A null mergeable or an unknown mergeable_state is neither
+        W21 nor W22."""
+        self.pass_reviews()
+        self.clock.t += 1
+        newer = self.admit(pr=6)
+        self.pass_reviews(newer)
+
+        def obs(**kw):
+            return self.pr(queue=self.queue_of(self.item, newer), **kw)
+        for mergeable, state in ((None, "unknown"), (None, "dirty"), (False, "unknown"), (True, "clean")):
+            with self.subTest(mergeable=mergeable, state=state), self.assertRaisesRegex(C.ContractError, "conflict"):
+                self.move("W22", obs=obs(mergeable=mergeable, mergeable_state=state))
+        behind = {self.item["id"]: {"compare": "behind"}}
+        with self.assertRaisesRegex(C.ContractError, "NEG-5"):
+            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=True,
+                                         mergeable_state="unknown"))
+        with self.assertRaisesRegex(C.ContractError, "head"):
+            self.move("W22", item=newer, obs=dict(obs(mergeable=False, mergeable_state="dirty"), pr=6))
+        self.assertEqual(self.move("W22", obs=obs(mergeable=False, mergeable_state="dirty"))["state"], "waiting-ask")
+        self.assertEqual(self.notices_of("W22"), [("owner", "merge conflict with the default branch; the owner "
+                                                            "resolves (nothing was written to the PR branch)")])
+        self.assertEqual(self.c.queue_head("o/r", self.queue_of(newer)), newer["id"])
+
+    def sent(self, item, state="attempted"):
+        rid = "w21-%s-1" % item["id"]
+        with self.c.tx():
+            self.db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, "
+                            "attempted_at, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (rid, item["id"], item["repo"], item["pr"], TC.BASE, item["head"], 1, "ev-" + rid,
+                             state, self.clock.t, 1, self.clock.t, self.clock.t))
+            self.c.clock.start(rid, "W23", C.Contracts.W23_SECONDS)
+        return rid
+
+    def test_w23_escalates_a_lost_update_after_ten_minutes(self):
+        """W23: a sent update with no H' read back within 10 min escalates to the owner and the ticket, the send
+        row becomes lost, and the item leaves the queue. With no send (the flag off) W23 never fires (NEG-16)."""
+        with self.assertRaisesRegex(C.ContractError, "W23 needs"):
+            self.move("W23")
+        rid = self.sent(self.item)
+        self.clock.t += C.Contracts.W23_SECONDS - 1
+        with self.assertRaisesRegex(C.ContractError, "W23 needs"):
+            self.move("W23")
+        self.clock.t += 1
+        self.assertEqual(self.move("W23")["state"], "waiting-ask")
+        self.assertEqual(self.c._row("w21_sends", "request_id", rid)["state"], "lost")
+        text = "update-branch %s at B %s was lost; no second update until main's W16" % (rid, TC.BASE)
+        self.assertEqual(self.notices_of("W23"), [("owner", text), ("ticket", text)])
+
     def test_unwired_rows_fail_closed(self):
-        for row in ("W7", "W11", "W12", "W15", "W16", "W19", "W22", "W23"):
+        for row in ("W16",):
             src = C.Contracts.WI_TRANSITIONS[row][0][0]
             self.at(src)
             to = C.Contracts.WI_TRANSITIONS[row][1][0]
@@ -4426,8 +4586,7 @@ class StateMachineTests(TC.Base):
         "WorkItem": (
             "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask",
             "test_wi_exhausted", "test_wi_merged", "test_wi_headed_verified", "test_wi_handed",
-            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w07",
-            "test_w11", "test_w12", "test_w15", "test_w16", "test_w19", "test_w22", "test_w23"),
+            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w16"),
         "Review": (
             "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
             "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",

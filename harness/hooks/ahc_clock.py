@@ -209,6 +209,8 @@ NOW_INVENTORY = {
         "stamp:the grant row's updated time"),
     ('ahc_contracts', 'Contracts._op_move', 'self.now'): (2,
         'stamp:updated and settled_at (the B48/LATE_WATCH wall record; their clock rows start in TIMERS_ON_ENTRY)'),
+    ('ahc_contracts', 'Contracts._wi_effects', 'self.now'): (1,
+        "stamp:the W23 lost send row's updated time"),
     ('ahc_contracts', 'Contracts._wi_notice', 'self.now'): (1,
         "stamp:the notice row's time"),
     ('ahc_contracts', 'Contracts.admit_item', 'self.now'): (1,

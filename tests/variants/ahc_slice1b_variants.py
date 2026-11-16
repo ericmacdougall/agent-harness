@@ -211,6 +211,41 @@ ENTRIES.update({
              "            if isinstance(i, str) and i:\n")], CONTRACTS)]},
 })
 
+ENTRIES.update({
+    "AC-5/NEG-14 W7 one grant and intent": {
+        "tests": [SM + "test_w07_writes_the_grant_and_intent_only"],
+        "mutations": [("W7 skips the non-terminal grant or Effect check", [
+            ("            live = self._live_authority(item)\n            if live:\n",
+             "            live = self._live_authority(item)\n            if False:\n")], CONTRACTS)]},
+    "AC-5/NEG-11 W11 staging target": {
+        "tests": [SM + "test_w11_hands_to_staging_and_beats_w12"],
+        "mutations": [("W11 without a staging target", [
+            ("            if not (isinstance(target, str) and target):\n", "            if False:\n")], CONTRACTS)]},
+    "AC-5/NEG-12 W12 independent recorder": {
+        "tests": [SM + "test_w12_needs_an_independent_headed_check_bound_to_h"],
+        "mutations": [("W12 accepts a check by the author, owner, spec reviewer or evidence poster", [
+            ('        if rec["recorder"] in excluded:\n', "        if False:\n")], CONTRACTS)]},
+    "AC-5/NEG-13 W15 counts own-content blocks": {
+        "tests": [SM + "test_w15_fires_only_on_b7_or_b33_exhaustion"],
+        "mutations": [("a base-move re-review block counts toward B7", [
+            ("\"('adversarial', 'red-team') AND state='findings' AND base_move=0\",",
+             "\"('adversarial', 'red-team') AND state='findings'\",")], CONTRACTS)]},
+    "AC-5/NEG-14 W19 incident or ticket": {
+        "tests": [SM + "test_w19_incident_for_an_integrity_fault_and_a_ticket_otherwise"],
+        "mutations": [("W19 writes a ticket comment for an integrity fault", [
+            ('"incident" if refusal["kind"] == "integrity" else "ticket"', '"ticket"')], CONTRACTS)]},
+    "AC-5/NEG-5 W22 needs a reported conflict": {
+        "tests": [SM + "test_w22_conflict_tells_the_owner_and_the_next_item_heads_the_queue"],
+        "mutations": [("W22 on an unknown mergeable_state", [
+            ('            if not (o["mergeable"] is False and o["mergeable_state"] == "dirty"):\n',
+             '            if o["mergeable"] is not False:\n')], CONTRACTS)]},
+    "AC-5 W23 after ten minutes": {
+        "tests": [SM + "test_w23_escalates_a_lost_update_after_ten_minutes"],
+        "mutations": [("W23 fires before its 10 min", [
+            ('            if state == "lost" or self.clock.due(rid, "W23", self.W23_SECONDS):\n',
+             "            if True:\n")], CONTRACTS)]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")

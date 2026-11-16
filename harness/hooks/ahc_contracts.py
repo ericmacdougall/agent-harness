@@ -351,8 +351,12 @@ class Contracts:
     GRANT_ROWS = ("G8", "G9")
     # Rows whose guard reads only ledger facts are applied here. Rows whose guard needs ELIG, an observation, a
     # budget or main's stamp are wired in later steps of slice 1 (a); until then they are refused (fail closed).
-    WI_WIRED = ("W2", "W3", "W4", "W5", "W6", "W8", "W9", "W10", "W13", "W14", "W17", "W18", "W20", "W21", "W24",
-                "W25", "W26", "W27")
+    WI_WIRED = ("W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9", "W10", "W11", "W12", "W13", "W14", "W15", "W17",
+                "W18", "W19", "W20", "W21", "W22", "W23", "W24", "W25", "W26", "W27")
+    B7_ROUNDS = 2                 # bound B7: review rounds blocked on the PR's own content
+    B33_RUNS = 8                  # bound B33: model runs per root lineage (ASSUMPTION: the policy's `b33` overrides)
+    W19_KINDS = ("allowlist", "argv", "integrity")
+    W23_SECONDS = 600             # W23: no H' read back within 10 min of the send
     PR_STATES = ("OPEN", "CLOSED", "MERGED")
 
     @classmethod
@@ -747,6 +751,15 @@ class Contracts:
                 if state == "intent":                                # E9: an intent never sent is abandoned
                     self.abandon_unsent(key, expected_version=version, event_id="%s-e9-%s" % (event_id, key),
                                         reason="item left by %s" % row_id)
+        if row_id == "W7":
+            # G1 and E1 only: the grant and the Effect intent are written; in shadow nothing dispatches them
+            pol = obs["policy"]
+            scope = {"repo": item["repo"], "pr": item["pr"], "head": item["head"], "base": item["base"]}
+            self.issue_grant("merge", pol["grant_source"], "ahc-policy", scope, item["policy_revision"],
+                             event_id=event_id + "-g1", kill_epoch=obs["kill_epoch"])
+            self.intend(dict(scope, policy_revision=item["policy_revision"], method=self.METHOD,
+                             default_branch=pol["default_branch"]), item=item["id"], lease_ok=True,
+                        event_id=event_id + "-e1")
         if row_id == "W5":
             self._wi_notice(event_id, item, row_id, "ticket", "waiting on a dependency: %s"
                             % (self._row("work_items", "id", item["id"])["cause"]))
@@ -783,6 +796,33 @@ class Contracts:
                 key, state, self._row("work_items", "id", item["id"])["state"]))
         elif row_id == "W13":
             self._wi_notice(event_id, item, row_id, "ticket", "closed without integration at %s" % item["head"])
+        elif row_id == "W11":
+            self._wi_notice(event_id, item, row_id, "ticket", "handed to staging target %s; the M-2 item is "
+                            "recorded only (goodqa#16070)" % obs["policy"].get("staging_target"))
+        elif row_id == "W12":
+            self._wi_notice(event_id, item, row_id, "ticket", "headed check by %s passed at %s" % (
+                obs["check_record"]["recorder"], item["head"]))
+        elif row_id == "W15":
+            text = "review budget spent: %s" % self._w15_spent(item, obs)
+            self._wi_notice(event_id, item, row_id, "ticket", text)
+            self._wi_notice(event_id, item, row_id, "owner", text)
+        elif row_id == "W19":
+            refusal = obs["refusal"]
+            self._wi_notice(event_id, item, row_id, "incident" if refusal["kind"] == "integrity" else "ticket",
+                            "refused (%s): %s" % (refusal["kind"], refusal["detail"]))
+        elif row_id == "W22":
+            self._wi_notice(event_id, item, row_id, "owner", "merge conflict with the default branch; the owner "
+                            "resolves (nothing was written to the PR branch)")
+        elif row_id == "W23":
+            send = self._w23_lost(item)
+            if send["state"] != "lost":
+                self.db.execute("UPDATE w21_sends SET state='lost', reason=?, version=version+1, updated=? WHERE "
+                                "request_id=?", ("no H' read back within 10 min (W23)", self.now(),
+                                                 send["request_id"]))
+            text = "update-branch %s at B %s was lost; no second update until main's W16" % (send["request_id"],
+                                                                                            send["base"])
+            self._wi_notice(event_id, item, row_id, "owner", text)
+            self._wi_notice(event_id, item, row_id, "ticket", text)
         elif row_id == "W14":
             self._wi_notice(event_id, item, row_id, "incident", "PR shows merged; no confirmed ahc Effect made it")
         if row_id in self.WI_TRANSITIONS and self._row("work_items", "id", item["id"])["state"] in self.FINISHED:
@@ -800,6 +840,98 @@ class Contracts:
             kind = "digest" if obs.get("fast_forward") is True else "incident"
             self._wi_notice(event_id, item, row_id, kind, "default branch moved %s -> %s" % (item["base"],
                                                                                             obs["tip"]))
+
+    def _queue_head_check(self, item, o, row_id):
+        """W21 and W22: the item heads its repo's merge queue, over an ELIG observation for every queued item;
+        for W22 every ELIG clause but e10 also holds (W21 checks e10 itself)."""
+        queue = o["queue"] if isinstance(o["queue"], dict) else {}
+        listed = {r[0] for r in self.db.execute("SELECT id FROM work_items WHERE repo=? AND state IN "
+                                                "('pr-gate', 'merge-ready')", (item["repo"],))}
+        if set(queue) != listed:
+            raise ContractError("%s needs an ELIG observation for every item in the repo's queue" % row_id)
+        if self.queue_head(item["repo"], queue) != item["id"]:
+            raise ContractError("%s is taken only by the head of the repo's merge queue" % row_id)
+        if row_id == "W22" and [c for c in self.elig(item, queue[item["id"]]) if c != "e10"]:
+            raise ContractError("W22 needs every ELIG clause but e10 to hold")
+
+    def _live_authority(self, item):
+        """W7 / NEG-14: a non-terminal grant or Effect for (repo, pr, B, H, policy revision), or None."""
+        key = (item["repo"], item["pr"], item["base"], item["head"], item["policy_revision"])
+        g = self.db.execute("SELECT id FROM grants WHERE repo=? AND pr=? AND base=? AND head=? AND policy_revision=? "
+                            "AND state NOT IN (%s)" % ",".join("?" * len(self.GRANT_TERMINAL)),
+                            key + self.GRANT_TERMINAL).fetchone()
+        if g:
+            return "grant %s" % g[0]
+        e = self.db.execute("SELECT key FROM operations WHERE repo=? AND pr=? AND base=? AND head=? AND "
+                            "policy_revision=? AND state NOT IN (%s)" % ",".join("?" * len(self.OP_TERMINAL)),
+                            key + self.OP_TERMINAL).fetchone()
+        return "Effect %s" % e[0] if e else None
+
+    def b7_allowance(self, item):
+        """B7 plus every budget extension a used W16 proof recorded for this item (AC-6)."""
+        ext = self.db.execute("SELECT COALESCE(SUM(extension), 0) FROM w16_proofs WHERE item=? AND used=1 AND "
+                              "target='pr-gate'", (item["id"],)).fetchone()[0]
+        return self.B7_ROUNDS + int(ext)
+
+    def b7_used(self, item):
+        """AC-5: rounds in which a code reviewer blocked on the PR's own content (findings on a row that is not a
+        base-move re-review), counted from each review row's round."""
+        return self.db.execute("SELECT COUNT(DISTINCT round) FROM reviews WHERE item=? AND kind IN "
+                               "('adversarial', 'red-team') AND state='findings' AND base_move=0",
+                               (item["id"],)).fetchone()[0]
+
+    def b33(self, lineage, obs=None):
+        """(used, budget) of the lineage's model-run budget B33."""
+        row = self.db.execute("SELECT b33_used FROM lineage_budget WHERE lineage=?", (lineage,)).fetchone()
+        pol = obs.get("policy") if isinstance(obs, dict) and isinstance(obs.get("policy"), dict) else {}
+        budget = pol["b33"] if type(pol.get("b33")) is int and pol["b33"] > 0 else self.B33_RUNS
+        return (row[0] if row else 0), budget
+
+    def charge_b33(self, lineage, n=1):
+        """Charge n model runs to the lineage (AC-8: at the launch intent, never refunded)."""
+        self.db.execute("INSERT INTO lineage_budget(lineage, b33_used) VALUES (?, ?) ON CONFLICT(lineage) DO UPDATE "
+                        "SET b33_used = b33_used + excluded.b33_used", (lineage, int(n)))
+
+    def _w15_spent(self, item, obs):
+        used, budget = self.b33(item["lineage"], obs)
+        b7, allowance = self.b7_used(item), self.b7_allowance(item)
+        parts = []
+        if b7 >= allowance:
+            parts.append("B7 %d of %d rounds blocked on the PR's own content" % (b7, allowance))
+        if used >= budget:
+            parts.append("B33 %d of %d model runs for the lineage" % (used, budget))
+        return "; ".join(parts)
+
+    def _w23_lost(self, item):
+        """W23: this item's sent W21 update (attempted or readback-pending) whose 10 min ran out with no H' read
+        back, or one the read-back already ended as lost (untyped error, inconclusive). Returns the send row."""
+        for rid, state in self.db.execute("SELECT request_id, state FROM w21_sends WHERE item=? AND state IN "
+                                          "('attempted', 'readback-pending', 'lost') ORDER BY seq",
+                                          (item["id"],)).fetchall():
+            if state == "lost" or self.clock.due(rid, "W23", self.W23_SECONDS):
+                return self._row("w21_sends", "request_id", rid)
+        return None
+
+    def _w12_check(self, item, obs):
+        """W12 / NEG-12: an independent headed GoodQA check record bound to H that passed. The recorder is not the
+        author, the owner, a spec reviewer or an evidence poster (the GoodQA reader supplies those; a missing one
+        fails closed)."""
+        rec = obs.get("check_record") if isinstance(obs, dict) else None
+        if not (isinstance(rec, dict) and rec.get("head") == item["head"] and rec.get("passed") is True
+                and rec.get("headed") is True and isinstance(rec.get("recorder"), str) and rec["recorder"]):
+            raise ContractError("W12 needs a passing headed check record bound to H")
+        excluded = set()
+        for name in ("author", "owner"):
+            if not (isinstance(obs.get(name), str) and obs[name]):
+                raise ContractError("W12 needs the %s to prove the recorder independent" % name)
+            excluded.add(obs[name])
+        for name in ("spec_reviewers", "evidence_posters"):
+            if not isinstance(obs.get(name), list):
+                raise ContractError("W12 needs the %s to prove the recorder independent" % name)
+            excluded |= set(obs[name])
+        if rec["recorder"] in excluded:
+            raise ContractError("W12 refuses a check recorded by the author, owner, a spec reviewer or an evidence "
+                                "poster")
 
     def _wi_guard(self, item, row_id, to, mark, unsettled, obs=None):
         """Guards of the wired rows: ledger facts read inside the transaction (T1) and fresh observations (T2).
@@ -835,20 +967,49 @@ class Contracts:
                 raise ContractError("W27 needs the spec core or the policy revision changed since ELIG passed")
         elif row_id == "W21":
             o = self._wi_obs(item, obs, "queue", "mergeable", "tip")
-            queue = o["queue"] if isinstance(o["queue"], dict) else {}
-            listed = {r[0] for r in self.db.execute("SELECT id FROM work_items WHERE repo=? AND state IN "
-                                                    "('pr-gate', 'merge-ready')", (item["repo"],))}
-            if set(queue) != listed:
-                raise ContractError("W21 needs an ELIG observation for every item in the repo's queue")
-            if self.queue_head(item["repo"], queue) != item["id"]:
-                raise ContractError("W21 is taken only by the head of the repo's merge queue")
-            failed = self.elig(item, queue[item["id"]])
+            self._queue_head_check(item, o, "W21")
+            failed = self.elig(item, o["queue"][item["id"]])
             if failed != ["e10"]:
                 raise ContractError("W21 needs every ELIG clause but e10 to hold, and the PR behind (e10)")
-            if o["mergeable"] is not True:
-                raise ContractError("W21 needs GitHub reporting the PR mergeable with no conflict")
+            if o["mergeable"] is not True or o.get("mergeable_state") in ("unknown", "dirty"):
+                raise ContractError("W21 needs GitHub reporting the PR mergeable with no conflict (NEG-5)")
             if item["w21_base"] == o["tip"]:
                 raise ContractError("an update-branch was already recorded for this item at the current B")
+        elif row_id == "W7":
+            failed = self.elig(item, obs)
+            if failed:
+                raise ContractError("W7 needs ELIG; failed: %s" % ", ".join(failed))
+            live = self._live_authority(item)
+            if live:
+                raise ContractError("W7: a non-terminal %s already exists for (repo, pr, B, H, revision)" % live)
+            pol = obs["policy"]
+            if not (isinstance(pol.get("grant_source"), str) and isinstance(pol.get("default_branch"), str)
+                    and pol["default_branch"] and type(obs.get("kill_epoch")) is int):
+                raise ContractError("W7 needs the policy's grant source and default branch and the kill epoch")
+        elif row_id == "W22":
+            o = self._wi_obs(item, obs, "queue", "mergeable", "mergeable_state")
+            self._queue_head_check(item, o, "W22")
+            if not (o["mergeable"] is False and o["mergeable_state"] == "dirty"):
+                raise ContractError("W22 needs GitHub reporting a conflict with the default branch (NEG-5: null or "
+                                    "unknown is neither W21 nor W22)")
+        elif row_id == "W19":
+            refusal = obs.get("refusal") if isinstance(obs, dict) else None
+            if not (isinstance(refusal, dict) and refusal.get("kind") in self.W19_KINDS
+                    and isinstance(refusal.get("detail"), str) and refusal["detail"]):
+                raise ContractError("W19 needs a typed admission or guard refusal (%s)" % ", ".join(self.W19_KINDS))
+        elif row_id == "W15":
+            if not self._w15_spent(item, obs):
+                raise ContractError("W15 fires only on B7 or B33 exhaustion")
+        elif row_id == "W23":
+            if not self._w23_lost(item):
+                raise ContractError("W23 needs a sent W21 update with no H' read back within 10 min")
+        elif row_id == "W11":
+            o = self._wi_obs(item, obs, "policy")
+            target = o["policy"].get("staging_target") if isinstance(o["policy"], dict) else None
+            if not (isinstance(target, str) and target):
+                raise ContractError("W11 needs the repo's policy record to name a staging target")
+        elif row_id == "W12":
+            self._w12_check(item, obs)
         if row_id in ("W4", "W13", "W14"):
             o = self._wi_obs(item, obs, "pr_state", "pr_head")
             want = {"W4": "OPEN", "W13": "CLOSED", "W14": "MERGED"}[row_id]
