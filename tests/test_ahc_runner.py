@@ -3737,6 +3737,38 @@ class StateMachineTests(TC.Base):
         self.assertEqual(self.move("W3", event_id=ev)["state"], "waiting-ask", "replay")
         self.assertEqual(len(self.notices_of("W3")), 2, "exactly once on replay")
 
+    def test_w03_without_finding_ids_still_escalates_flagged(self):
+        """goodqa#16204 (spec owner ruling, item 4): a findings receipt with no or malformed finding_ids still
+        records both notices, flagged; the producer writing finding_ids is a slice (b) obligation."""
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='adversarial'",
+                              (self.item["id"],)).fetchone()[0]
+        self.db.execute("UPDATE reviews SET state='findings', receipt=? WHERE id=?",
+                        (json.dumps({"verdict": "BLOCK", "finding_ids": [1, ""]}), rid))
+        self.assertEqual(self.move("W3")["state"], "waiting-ask")
+        text = "findings on adversarial %s: finding ids missing" % rid
+        self.assertEqual(self.notices_of("W3"), [("owner", text), ("ticket", text)])
+
+    def test_attempt_refused_for_a_row_of_a_finished_item(self):
+        """goodqa#16204 (spec owner ruling, item 1): an attempt never starts for a row whose item is terminal or
+        merged; the refusal is typed and changes nothing (no state, version, unit, uid or audit row)."""
+        for n, state in enumerate(("cancelled", "merged", "closed-unmerged", "superseded")):
+            with self.subTest(state=state):
+                item = self.admit(pr=40 + n)
+                rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='adversarial'",
+                                      (item["id"],)).fetchone()[0]
+                row = self.c.review(rid, "queued", expected_version=1, event_id=self.ev())
+                self.db.execute("UPDATE work_items SET state=? WHERE id=?", (state, item["id"]))
+                audit = self.db.execute("SELECT COUNT(*) FROM transitions").fetchone()[0]
+                with self.assertRaisesRegex(C.ContractError, "inert: item %s is %s" % (item["id"], state)):
+                    self.c.start_attempt(rid, "ahc-review-" + rid, self.UID, expected_version=row["version"],
+                                         event_id=self.ev())
+                after = self.c._row("reviews", "id", rid)
+                self.assertEqual((after["state"], after["version"], after["producer_unit"], after["producer_uid"]),
+                                 ("queued", row["version"], None, None))
+                self.assertEqual(self.db.execute("SELECT COUNT(*) FROM transitions").fetchone()[0], audit)
+        live = self.running_review(self.admit(pr=60), "adversarial")             # a live item's row still starts
+        self.assertEqual(live["state"], "running")
+
     def test_w08_merged_only_on_a_confirmed_effect(self):
         self.at("merge-ready")
         with self.assertRaisesRegex(C.ContractError, "confirmed"):
@@ -4301,6 +4333,26 @@ class StateMachineTests(TC.Base):
     # (b) adds the packet build (R2), the DynamicUser unit and its launch (R3), the socket FINAL and the R-c
     # usage-store refusal (R4), and the unit's findings result (R5).
     PENDING_RUNTIME = ("test_r02", "test_r03", "test_r04_rc_refuses_usage_store", "test_r05")
+
+    def test_every_slice_b_obligation_resolves_or_is_pinned(self):
+        """goodqa#16204: obligations ruled onto slice (b) are listed as `OBL.<test id>` in
+        docs/spec/ahc-m1-b-obligations.md and resolve like the spec ids (exact name, or name plus `_suffix`). The
+        unresolved ones are pinned exactly in PENDING_B, so the list only shrinks and slice (b) cannot close with
+        one dropped: a line removed from the doc, a new unpinned obligation, or a pinned one that now resolves all
+        fail here."""
+        import re
+        text = (HOOKS.parents[1] / "docs" / "spec" / "ahc-m1-b-obligations.md").read_text(encoding="utf-8")
+        names = set()
+        for path in sorted((HOOKS.parents[1] / "tests").glob("test_ahc*.py")):
+            names |= set(re.findall(r"^    def (test_\w+)", path.read_text(encoding="utf-8"), re.M))
+        ids = sorted(set(re.findall(r"OBL\.(test_\w+)", text)))
+        self.assertGreaterEqual(set(ids), set(self.PENDING_B), "an obligation was dropped from the doc")
+        missing = sorted(i for i in ids if not any(m == i or m.startswith(i + "_") for m in names))
+        self.assertEqual(missing, sorted(self.PENDING_B), "PENDING_B must equal the unresolved obligations")
+
+    # slice (b) obligations with no test yet (goodqa#16204 items 2 and 3; the W3 finding_ids assumption)
+    PENDING_B = ("test_b_scheduler_skips_rows_of_a_finished_item", "test_b_status_and_digest_show_inert_rows",
+                 "test_b_findings_producer_writes_finding_ids")
 
 
 if __name__ == "__main__":
