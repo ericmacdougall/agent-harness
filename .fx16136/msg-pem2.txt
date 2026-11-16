@@ -1,0 +1,13 @@
+docs(fx16136): revise the goodqa#16148 private-key spec to v2
+
+Why: both v1 reviews BLOCKed (Opus S1 to S8, Sonnet 1 to 5); the lead's rulings 1 to 9 keep design 2b and require a root-owned secrets dir, a compose-exact parse rule, env-file launches, redacted docker errors and a three-part unhold gate.
+
+What: .fx16136/spec-16148-pem.md v2 (lint PASS, core 89556e47) with frozen v1 and v2 copies and the v1-to-v2 diff; probe_rawenv.sh (compose 5.6.0 raw env_file behaviour, fake values); flatten_spec.py; ticket bodies for goodqa#16185.
+
+Testing: not run: spec only; `spec_flow.py lint` PASS; raw env_file behaviour probed on t2-dev with `docker compose config`.
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
