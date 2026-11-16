@@ -84,7 +84,9 @@ class OutputLimitExceeded(Exception):
 
 
 def _stop_bounded(process):
-    """Stop the group without retaining more output: TERM, drain-discard, KILL, drain-discard, reap."""
+    """Stop the group without retaining more output: TERM, drain-discard, KILL, drain-discard, reap.
+
+    stdin belongs to the feeder thread (it closes it); closing it here could block on the writer's lock."""
     pipes = [pipe for pipe in (process.stdout, process.stderr) if pipe is not None and not pipe.closed]
     signal_group(process.pid, signal.SIGTERM)
     grace = time.monotonic() + TERMINATION_GRACE_SECONDS
@@ -99,12 +101,11 @@ def _stop_bounded(process):
             drain_discarded(pipe, time.monotonic() + DISCARD_CLEANUP_SECONDS)
         except (OSError, ValueError):
             pass
-    for pipe in (process.stdin, process.stdout, process.stderr):
-        if pipe is not None and not pipe.closed:
-            try:
-                pipe.close()
-            except OSError:
-                pass
+    for pipe in pipes:
+        try:
+            pipe.close()
+        except OSError:
+            pass
     try:
         process.wait(timeout=DISCARD_CLEANUP_SECONDS)
     except subprocess.TimeoutExpired:
@@ -113,13 +114,26 @@ def _stop_bounded(process):
 
 def _bounded_capture(command, process, data, timeout, limit, decode):
     """communicate() with a ceiling on retained output: feed stdin from a thread (a large prompt cannot deadlock
-    against a full output pipe), read both pipes in fixed chunks, and stop the group once the ceiling is passed."""
+    against a full output pipe), read both pipes in fixed chunks, and stop the group once the ceiling is passed.
+    The feeder writes non-blocking and checks a stop flag, so a descendant that escaped the group and holds stdin
+    open without reading cannot block cleanup."""
     deadline = None if timeout is None else time.monotonic() + timeout
+    stop = threading.Event()
 
     def feed():
         try:
-            if data:
-                process.stdin.write(data)
+            descriptor = process.stdin.fileno()
+            os.set_blocking(descriptor, False)
+            view = memoryview(data or b'')
+            with selectors.DefaultSelector() as writable:
+                writable.register(descriptor, selectors.EVENT_WRITE)
+                while view and not stop.is_set():
+                    if not writable.select(0.1):
+                        continue
+                    try:
+                        view = view[os.write(descriptor, view[:DISCARD_CHUNK_BYTES]):]
+                    except BlockingIOError:
+                        continue
         except (OSError, ValueError):
             pass  # the child exited or was stopped; its output decides the outcome
         finally:
@@ -127,6 +141,11 @@ def _bounded_capture(command, process, data, timeout, limit, decode):
                 process.stdin.close()
             except (OSError, ValueError):
                 pass
+
+    def finish_feeder():
+        stop.set()
+        if feeder is not None:
+            feeder.join(DISCARD_CLEANUP_SECONDS)
 
     feeder = None
     if process.stdin is not None:
@@ -159,12 +178,11 @@ def _bounded_capture(command, process, data, timeout, limit, decode):
         except subprocess.TimeoutExpired:
             raise subprocess.TimeoutExpired(command, timeout) from None
     except BaseException:
+        stop.set()
         _stop_bounded(process)
-        if feeder is not None:
-            feeder.join(DISCARD_CLEANUP_SECONDS)
+        finish_feeder()
         raise
-    if feeder is not None:
-        feeder.join(DISCARD_CLEANUP_SECONDS)
+    finish_feeder()
     for pipe in captured:
         pipe.close()
     return subprocess.CompletedProcess(command, process.returncode, decode(captured[process.stdout]),

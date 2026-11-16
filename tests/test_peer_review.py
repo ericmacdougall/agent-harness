@@ -1824,6 +1824,43 @@ class ProviderOutputBoundTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
 
+    def test_escaped_descendant_holding_stdin_cannot_hang_cleanup(self):
+        """A child floods stdout and never reads its large prompt, while a descendant in its own session keeps the stdin
+        and stdout pipes open. Stopping at the ceiling must still return within the cleanup bound (the stdin feeder
+        must not be blocked forever on a pipe nobody reads)."""
+        import threading
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / 'grandchild'
+            child = ('import subprocess, sys, time\n'
+                     'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)\n'
+                     'open(sys.argv[1], "w").write(str(g.pid))\n'
+                     'chunk = b"{" + b"w" * 65535\nwhile True:\n    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+            outcome = []
+
+            def call():
+                outcome.append(self.module.run([sys.executable, '-c', child, str(pid_file)], 'prompt ' * 60_000,
+                                               Path(temp), timeout=30))
+
+            def reap_grandchild():
+                try:
+                    os.kill(int(pid_file.read_text()), 9)
+                except (OSError, ValueError):
+                    pass
+            self.addCleanup(reap_grandchild)
+            with patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True):
+                worker = threading.Thread(target=call, daemon=True)
+                started = time.monotonic()
+                worker.start()
+                worker.join(25)
+                hung = worker.is_alive()
+                elapsed = time.monotonic() - started
+                reap_grandchild()
+                worker.join(10)
+            self.assertFalse(hung, 'provider cleanup hung on the stdin pipe held by an escaped descendant')
+            self.assertLess(elapsed, 20)
+            code, stdout, stderr = outcome[0]
+            self.assertEqual((code, stderr), (126, 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'))
+
     def test_ordinary_provider_capture_is_unchanged(self):
         with tempfile.TemporaryDirectory() as temp:
             child = 'import sys\ndata = sys.stdin.read()\nprint(len(data))\nprint("note", file=sys.stderr)\n'
