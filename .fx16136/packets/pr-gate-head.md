@@ -1,7 +1,7 @@
 # PR review packet (whole PR): goodqa#16148 rw-ship job-secret gate, carrying the 1371 job-image forward-port and the 1373 job env-file content
 
 Tickets: GoodQA goodqa#16148 (gate and 1373 content), GoodQA goodqa#16136 (1371 content). Related tickets: goodqa#16195, #16196, #16198, #16208, #16210.
-Repo: ericmacdougall/bugtracker. Branch fix/16148-rwship-gate.
+Repo: ericmacdougall/bugtracker. Branch fix/16148-rwship-gate, draft PR #1377 into main.
 Base: origin/main 179c3ab1a8770c7bf184caef2a21798b8713a92b. It contains #1343, #1372 (2065c788) and #1369 (179c3ab1). #1366 was not among main's last 8 first-parent commits; its presence is not separately verified here.
 Expected HEAD: 679c278a1aad04dadddc53d9ae76722173161661 (pushed; fast-forward from 5ead8901 -> ab028a6b -> 679c278a)
 
@@ -132,7 +132,7 @@ exit 0
 
   On the same tree, test_rw_runtime_root.py alone gave 25 passed, and the full rerun above is green. The earlier full run on the ab028a6b join gave 1937 passed and 0 failed. 679c278a touches only ac13 files, which this test file does not use. The tracebacks of the failing run were not kept.
 
-  The likely cause is timing under load: the file waits on lock holders with fixed 0.3 s sleeps. That cause is unverified. Treat this as a known flake to ticket, not as evidence about this diff.
+  The likely cause is timing under load: the file waits on lock holders with fixed 0.3 s sleeps. That cause is unverified. It is ticketed as goodqa#16218; keep the tracebacks next time it reproduces. Treat it as a known flake, not as evidence about this diff.
 
 Fail first, commit-bound, from each change's own run (the failing and the fixed code at the stated commits):
 - **Section A (1371, recorded in the pr-fwd v2, v3 and v4 packets).**
@@ -172,6 +172,7 @@ Still PENDING_REAL_TEST, gated in the landing window: p16148-sampler-live, p1614
   - job_lines and presence_check: a held key under `labels` passed, and held keys were left out of the parity check.
   - rw-ship: an unhold could happen without the derive, env-name, trial-boot and gate (c) checks.
 - **Drift gate.** From the join until the host apply runs, the CC8.1 drift gate is red against the live VM. That fails closed: no release promotes until steps 1 and 2 of the window.
+- **Flaky test:** test_rw_runtime_root.py fails intermittently under load (5 failures, green on rerun), tracked in goodqa#16218. The likely cause is fixed 0.3 s lock-holder sleeps; that is unverified.
 - **Deferred:**
   - the Q1 cross-constant test (held-env.ts is now on main, so it can be written after this lands);
   - the rh port of the gate;
