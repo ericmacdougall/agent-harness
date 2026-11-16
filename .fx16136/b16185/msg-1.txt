@@ -1,0 +1,14 @@
+fix(job-dispatcher): docker failure says a category, never stderr
+
+Why: a failed docker run put docker's stderr, or err.message, into the 422 body, and from there into the API log and the job's lastErrorMessage. Both can echo the full argv, including every -e KEY=VALUE job secret (goodqa#16185).
+
+What: docker.ts adds describeDockerFailure, which always returns `docker run failed: CATEGORY (stderr N bytes)`. CATEGORY is one of guard_refused, image_not_found, invalid_reference, daemon_unreachable or other. At most one allow-listed first line is appended. A held-mode guard refusal is rebuilt from constants, so its text survives exactly for goodqa#16136 AC-13; the strings come from the real docker CLI through the real guard. Any other allowed line has the secret-source values removed from the full stderr, longest first. The line is dropped on any 8-byte residue (raw, base64 in three alignments, hex, JSON-escaped, decimal bytes, or with backslashes removed), on a short value appearing as a whole token, or on non-ASCII, then cut to 200 chars. dockerRunDetached takes secretValues; the server passes only the kind's base env values (goodqa#16148 P1), so the request env is never redacted. The unexpected-error log now carries the error name only. buildServer takes an optional log stream for tests.
+
+Testing: `npx vitest run` (apps/job-dispatcher, t2-dev) -> 315 passed, 14 skipped. `npx tsc --noEmit` -> exit 0. The new test/docker-failure-message.test.ts had 34 failures on origin/main e9449087 (value leaks and the missing category) and 0 after this change.
+
+Refs: GoodQA #16185, GoodQA #16148
+
+Risk: the 422 text changes shape. Callers only keep it as a message (job-dispatch.ts keeps 300 chars), and a 422 is still a definite not-started.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv

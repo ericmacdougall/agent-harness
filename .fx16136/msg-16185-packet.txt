@@ -1,0 +1,13 @@
+docs(fx16136): goodqa#16185 PR packet, probes and build scripts
+
+Why: build step 1 of goodqa#16148 (the goodqa#16185 fix, draft PR #1372) needs a reviewable packet and the probe and test inputs it cites, kept where they survive a restart.
+
+What: packets/pr-16185.md (HEAD 3b7cde1a, lint pass, sha 485f9983) with its head and tail parts; build_packet.py; the b16185 inputs (the new test file, the patch script and block, the NEG-5 variant script, the real-422 probe, the PR body, the source diff, the fail-first excerpt); the held-stderr probe and its note; the 16185 intent note.
+
+Testing: `python3 .fx16136/build_packet.py ... 3b7cde1a97478251ff15dde8c5a9768e7b4e493b` -> lint [] (pass), exit 0.
+
+Refs: GoodQA #16185, GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

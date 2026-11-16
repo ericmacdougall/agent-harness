@@ -1,0 +1,9 @@
+INTENT goodqa#16185 (first #16148 build step, spec v4 AC-7, NEG-5, NEG-11, NEG-17; build conditions P1 and R5). Branch fix/16185-docker-failure-category off origin/main e9449087, worktree t2-dev ~/repos/fx-16136/bt-16185. Change apps/job-dispatcher/src/docker.ts and server.ts:
+- A docker launch failure never forwards stderr, err.message or err.cmd. The message is "docker run failed: CATEGORY (stderr N bytes)". Categories: guard_refused, image_not_found, invalid_reference, daemon_unreachable, other.
+- R5: a held refusal is classified first, and its line is rebuilt from constants (HOLDABLE TRANSCODER_MODE=transcribe, literal in this PR per Q1). It never echoes stderr.
+- Other allow-listed first lines: secret-source values (base env only, P1) are removed from the full stderr, longest first. A value under 8 bytes that appears as a whole token drops the line. The line is also dropped if any 8-byte window of a value, or of its base64 (3 alignments), hex, JSON-escaped or decimal-byte-list form, remains, or if the line holds any byte outside printable ASCII. Then it is cut to 200 chars.
+- server: the unexpected-error log carries the error name only.
+Invariants: no env value from a secret source in any 422, 504 or 500 body or log; the request env is never redacted; the held reason text is exact.
+Risks: (1) over-redaction hides the useful line; mitigated because the category is always present. (2) A secret under 8 bytes inside a longer token survives; this is the residual risk named in R5.
+Failing-first: new test/docker-failure-message.test.ts, run against main first (must fail), plus NEG-5 broken variants.
+PENDING_REAL_TEST 16185-real-422: the real docker CLI through the real guard (t2-dev, held and not on the allow-list) gives a dispatcher 422 body equal to the category form with the held text intact, and with a planted fake base value absent.

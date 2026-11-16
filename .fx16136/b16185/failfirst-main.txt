@@ -1,0 +1,16 @@
+⎯⎯⎯⎯⎯⎯ Failed Tests 34 ⎯⎯⎯⎯⎯⎯⎯
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > plain echo
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > argv echo
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > env-file content echo
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > invalid UTF-8 byte list
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > JSON-escaped
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > backslash-escaped
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > base64 echo
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > base64 echo, other alignment
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > hex echo
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > straddles the 200-char cut
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > part of the value
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > non-ASCII around the value
+AssertionError: expected false to be true // Object.is equality
+ FAIL  test/docker-failure-message.test.ts > AC-7 / NEG-11: no secret-source value in any form survives > never forwards err.message or err.cmd (they hold the full argv)
+AssertionError: expected 'docker run failed before starting a c…' to be 'docker run failed: other (stderr 0 by…' // Object.is equality
