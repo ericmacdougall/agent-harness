@@ -178,8 +178,8 @@ V = [
         ("or any(s != \"passed\" or anc.get(br) is not True for _k, s, br in code)):",
          "or any(s != \"passed\" for _k, s, br in code)):")], CONTRACTS, SM),
     ("ELIG e1: the PR head is not compared with H", [
-        ("        if (not code or o[\"pr_head\"] != head or pol.get(\"revision\")",
-         "        if (not code or pol.get(\"revision\")")], CONTRACTS, SM),
+        ("if (not required <= {k for k, _s, _b in code} or o[\"pr_head\"] != head\n",
+         "if (not required <= {k for k, _s, _b in code}\n")], CONTRACTS, SM),
     ("ELIG e1: the policy revision read now is not compared (Q-A5.1)", [
         (" or pol.get(\"revision\") != item[\"policy_revision\"]\n", "\n")], CONTRACTS, SM),
     ("ELIG e2: the spec row is not bound to the core attached now", [
