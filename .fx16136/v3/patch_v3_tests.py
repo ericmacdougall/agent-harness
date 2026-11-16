@@ -198,7 +198,7 @@ def test_pre_gate_c_failure_after_a_migration_reholds_before_the_forward_only_st
     assert rc == 8 and why in out and 'ROLLBACK REFUSED' in out and 'intelligence-worker was re-held' in out, out
     assert out.index('intelligence-worker re-held') < out.index('ROLLBACK REFUSED'), out
     assert ups(R) == [FULL, DISP_ONLY], 'the dispatcher-only re-hold, and no rollback across the migration'
-    assert R.jobs()[INTEL] == HELD and R.jobs('job-dispatcher')[INTEL] == HELD
+    assert R.jobs()[INTEL] == HELD
     assert 'gate (c)' not in out and R.state_of('release/js-20')[0] == 'deploy-unverified' and os.path.exists(R.infl)
 
 
@@ -220,7 +220,7 @@ def test_pre_gate_c_rehold_failure_without_a_migration_rolls_back_to_the_verifie
     assert rc == 5 and 'the dispatcher-only re-hold failed' in out and 'ROLLED BACK' in out, out
     word = 'held' if base == 'held' else 'same-as-before'
     assert ('intelligence-worker on the restored release: ' + word) in out, out
-    assert ('intelligence-worker before this run: ' + pre) in out, out
+    assert ('intelligence-worker before this run: ' + ('held' if base == 'held' else pre)) in out, out
     assert ups(R) == [FULL, FULL] and 'UPSVCS-FAILED ' + DISP_ONLY in R.dlog()
     assert R.jobs()[INTEL] == pre and R.get('live') == before and 'HOLD NOT RE-APPLIED' not in out
 

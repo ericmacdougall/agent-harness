@@ -221,8 +221,12 @@ print("held" if "JOB_IMAGE_INTELLIGENCE_WORKER" in h else v)' "$1" 2>/dev/null; 
     [ "${MIG_APPLIED:-0}" = 0 ] || js_nohold "$1"
     say "$1; no migration was applied, so rolling the self-host stack back to $RB_API"
     rb_guard "rolling back ($1)" api || lost "rollback refused ($1); intelligence-worker is NOT re-held"
-    infl rollback; local v="" iw="" how=""
-    if sh_rollback; then for i in $(seq 1 18); do v=$(live_sha); [ -n "$BEFORE" ] && [ "$v" = "$BEFORE" ] && break; sleep 10; done; fi
+    infl rollback; local v="" iw="" how="" rbok=1
+    # a re-hold pin that went through (only its up failed) installed files of its own: undo it first, or the run's own
+    # restore is refused as stale (compose changed after this run installed it)
+    if grep -q '^{' "$RD/pin-${STAMP}h.txt" 2>/dev/null; then
+      vmctl restore --stamp "${STAMP}h" > "$RD/restore-${STAMP}h.txt" 2>&1 || { rbok=""; head -3 "$RD/restore-${STAMP}h.txt" | cut -c1-300 | tee -a "$LOG"; }; fi
+    if [ -n "$rbok" ] && sh_rollback; then for i in $(seq 1 18); do v=$(live_sha); [ -n "$BEFORE" ] && [ "$v" = "$BEFORE" ] && break; sleep 10; done; fi
     iw=$(js_intel "$(sh_state)")
     if [ "$iw" = held ]; then how=held; elif [ -n "$iw" ] && [ "$iw" = "$INTEL_PRE" ]; then how=same-as-before; fi
     say "intelligence-worker after the rollback: ${iw:-unreadable} (before this run: ${INTEL_PRE:-unreadable})"
