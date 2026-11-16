@@ -27,7 +27,7 @@ if sys.version_info < (3, 9):
              'native evidence only, not a helper receipt.')
 
 import review_diagnostics as diagnostics
-from process import run as run_process, signal_group
+from process import OutputLimitExceeded, run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
 import escalation as ladder
@@ -37,7 +37,15 @@ from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject
 
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
+# Verdict-bearing provider output (stderr, the last-message file and every stdout record, except the exempt Codex
+# command_execution output below) is bounded at 1 MB, as before goodqa#16170.
 PROVIDER_LIMIT = 1_000_000
+# goodqa#16170: Codex `exec --json` repeats each probe's full aggregated_output on stdout, so a valid review that runs
+# probes measured 1.08-2.68 MB on real receipts. That output never carries a verdict and is exempt from the bound
+# above; the raw ceiling bounds it instead. 16 MiB is about 6x the largest review observed, so a stream past it is a
+# runaway (OUTPUT_TOO_LARGE, fails closed). Capture stops there, so peak memory is the ceiling plus its decoded copy
+# and parsed records (roughly 5-6x, under 100 MB).
+PROVIDER_RAW_LIMIT = 16 * 2 ** 20
 _POLICY = []
 
 
@@ -244,17 +252,50 @@ def persist_raw_output(target, provider, code, stdout, stderr, last_message):
     return None
 
 
+def read_bounded(path, limit):
+    """The provider's last-message file, read to at most `limit` bytes (a longer one then fails the size bound)."""
+    try:
+        with open(path, 'rb') as handle:
+            return handle.read(limit).decode('utf-8', errors='replace')
+    except FileNotFoundError:
+        return ''
+
+
+def utf8_size(value):
+    return len(value.encode('utf-8', errors='replace'))
+
+
+def codex_bounded_size(record):
+    """Bytes of one Codex record that count against PROVIDER_LIMIT. Only a string `aggregated_output` of a
+    `command_execution` item in an `item.*` record is exempt: it is tool output, never read for a verdict (the verdict
+    comes only from the final agent_message, which must equal the last-message file). Every other field counts."""
+    item = record.get('item')
+    kind = record.get('type')
+    if (isinstance(kind, str) and kind.startswith('item.') and isinstance(item, dict)
+            and item.get('type') == 'command_execution' and isinstance(item.get('aggregated_output'), str)):
+        record = {**record, 'item': {key: value for key, value in item.items() if key != 'aggregated_output'}}
+    return utf8_size(json.dumps(record, ensure_ascii=False))
+
+
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
     """Validate supported terminal envelopes before extracting model verdict text."""
     invalid = provider_failure({})
+    too_large = {**invalid, 'reason': 'OUTPUT_TOO_LARGE'}
     if code == 124 and stderr == 'HARNESS_PROVIDER_TIMEOUT':
         return {**invalid, 'reason': 'TIMEOUT'}
     if code == 127 and stderr == 'HARNESS_PROVIDER_UNAVAILABLE':
         return {**invalid, 'reason': 'TRANSIENT_INFRA', 'fallback_allowed': True}
     if code == 125 and stderr == 'HARNESS_PROVIDER_IO_UNKNOWN':
         return {**invalid, 'reason': 'UNKNOWN'}
-    if sum(len(value.encode('utf-8', errors='replace')) for value in (stdout, stderr, last_message)) > PROVIDER_LIMIT:
-        return invalid
+    if code == 126 and stderr == 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE':
+        return too_large
+    # Raw ceiling first, before anything is parsed; then the verdict-bearing bound (goodqa#16170).
+    side = utf8_size(stderr) + utf8_size(last_message)
+    if len(stdout) > PROVIDER_RAW_LIMIT or utf8_size(stdout) > PROVIDER_RAW_LIMIT or side > PROVIDER_LIMIT:
+        return too_large
+    exempt = provider == 'codex' and stdout.lstrip().startswith(('{', '['))
+    if not exempt and side + utf8_size(stdout) > PROVIDER_LIMIT:
+        return too_large
     text, usage = '', None
     stripped = stdout.strip()
     structured = stripped.startswith(('{', '['))
@@ -269,6 +310,12 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         if not records or any(not isinstance(record, dict) for record in records):
             return invalid
         if provider == 'codex':
+            try:
+                bounded = side + sum(codex_bounded_size(record) for record in records)
+            except (ValueError, TypeError, RecursionError):
+                return invalid
+            if bounded > PROVIDER_LIMIT:
+                return too_large
             completed = []
             messages = []
             for record in records:
@@ -615,8 +662,11 @@ def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> t
     try:
         extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
         result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
-                             timeout=timeout, **extra)
+                             timeout=timeout, output_limit=PROVIDER_RAW_LIMIT, **extra)
         return result.returncode, result.stdout, result.stderr
+    except OutputLimitExceeded as error:
+        # The group is already stopped; keep a bounded prefix so the raw answer can still be saved for diagnosis.
+        return 126, error.stdout[:RAW_KEEP], 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'
     except FileNotFoundError:
@@ -1003,7 +1053,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             # The child is recorded for the usage guard's liveness rule when a run record exists.
                             code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
                                                        **({'on_spawn': run_record.note_child} if run_record else {}))
-                            last_message = last.read_text(errors='replace') if last.exists() else ''
+                            last_message = read_bounded(last, PROVIDER_LIMIT + 1)
                             outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
             local_detail = diagnostics.sanitize(error.message)
@@ -1019,7 +1069,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                     local_detail = diagnostics.sanitize(
                         '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
                         "--reason '<why>' --evidence '<proof>'`" % (provider, holder, base, base), 400)
-        if outcome.get('reason') == 'INVALID_OUTPUT' and (stdout or stderr or last_message):
+        if outcome.get('reason') in {'INVALID_OUTPUT', 'OUTPUT_TOO_LARGE'} and (stdout or stderr or last_message):
             saved = persist_raw_output(options.get('raw_target'), provider, code, stdout, stderr, last_message)
             if saved:
                 print('Reviewer output could not be parsed; the raw answer is saved (mode 600): ' + saved, file=sys.stderr)

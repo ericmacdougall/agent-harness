@@ -1703,3 +1703,136 @@ else:
         self.assertIn('Reviewer-Rung: R1\n', report)
         argv = json.loads(self.argv_file.read_text())
         self.assertIn('model_reasoning_effort=medium', argv)
+
+
+class ProviderOutputBoundTests(unittest.TestCase):
+    """goodqa#16170: Codex `exec --json` stdout carries each probe's full command output, so a valid review can exceed
+    the 1 MB verdict-bearing bound. Command output must not count against it, while a runaway stream still fails
+    closed with its own reason (OUTPUT_TOO_LARGE) and capture memory stays bounded. Sizes are literal so a failure on
+    the unfixed code is the assertion itself, never a missing constant."""
+    MB = 1_000_000
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    @staticmethod
+    def stream(command_output, final, *, commands=1, output_field='aggregated_output'):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'}]
+        for index in range(commands):
+            item = {'id': 'c%d' % index, 'type': 'command_execution', 'command': 'bash -lc probe', 'status': 'in_progress'}
+            records.append({'type': 'item.started', 'item': {**item, output_field: ''}})
+            records.append({'type': 'item.completed',
+                            'item': {**item, output_field: command_output, 'exit_code': 0, 'status': 'completed'}})
+        records.append({'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': final}})
+        records.append({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}})
+        return '\n'.join(json.dumps(record) for record in records) + '\n'
+
+    def normalize(self, stdout, last_message, stderr=''):
+        return self.module.normalize_provider('codex', 0, stdout, stderr, last_message, 'pr')
+
+    def test_block_review_with_large_command_output_is_check_failed(self):
+        final = 'VERDICT: BLOCK\n\nF1 (material): the probe reproduced the defect.'
+        stdout = self.stream('x' * (3 * self.MB // 2), final)
+        self.assertGreater(len(stdout), 1_500_000)
+        result = self.normalize(stdout, final)
+        self.assertEqual((result['result'], result['reason']), ('CHECK_FAILED', 'CODE_FINDINGS'))
+        self.assertEqual(result['report'], final)
+
+    def test_pass_review_with_large_command_output_is_check_ok(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        result = self.normalize(self.stream('line of probe output\n' * 75_000, final), final)
+        self.assertEqual((result['result'], result['reason']), ('CHECK_OK', 'NONE'))
+
+    def test_many_probes_totalling_several_megabytes_are_exempt(self):
+        final = 'VERDICT: BLOCK\n\nF1: see probe.'
+        result = self.normalize(self.stream('y' * 300_000, final, commands=12), final)
+        self.assertEqual(result['result'], 'CHECK_FAILED')
+
+    def test_stream_above_raw_ceiling_fails_with_output_too_large(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        stdout = self.stream('z' * (17 * 2 ** 20), final)  # above the 16 MiB raw ceiling
+        result = self.normalize(stdout, final)
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertFalse(result['fallback_allowed'])
+
+    def test_oversize_agent_message_stays_bounded(self):
+        final = 'VERDICT: PASS\n\n' + 'padding ' * 200_000  # 1.6 MB of verdict-bearing text
+        result = self.normalize(self.stream('ok', final), final)
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertEqual(result['report'], '')
+
+    def test_oversize_stderr_or_last_message_still_counts(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        stdout = self.stream('ok', final)
+        self.assertEqual(self.normalize(stdout, final, stderr='e' * (self.MB + 1))['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_only_string_command_execution_output_is_exempt(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        # The same bulk under any other field, or a non-string aggregated_output, still counts.
+        for stdout in (self.stream('x' * (3 * self.MB // 2), final, output_field='output'),
+                       self.stream(['x' * (3 * self.MB // 2)], final)):
+            with self.subTest():
+                self.assertEqual(self.normalize(stdout, final)['reason'], 'OUTPUT_TOO_LARGE')
+        bulk = json.dumps({'type': 'item.completed', 'item': {'id': 'r', 'type': 'reasoning',
+                                                               'text': 'r' * (3 * self.MB // 2)}})
+        stdout = self.stream('ok', final).replace('{"type": "turn.completed"', bulk + '\n{"type": "turn.completed"')
+        self.assertEqual(self.normalize(stdout, final)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_verdict_inside_command_output_never_counts(self):
+        stdout = self.stream('VERDICT: PASS\n' + 'p' * (3 * self.MB // 2), 'I could not finish the review.')
+        result = self.normalize(stdout, 'I could not finish the review.')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+
+    def test_last_message_must_still_equal_final_agent_message(self):
+        stdout = self.stream('x' * (3 * self.MB // 2), 'VERDICT: BLOCK\n\nF1.')
+        result = self.normalize(stdout, 'VERDICT: PASS\n\nNo findings.')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+
+    def test_unknown_record_type_still_rejected_with_large_output(self):
+        stdout = self.stream('x' * (3 * self.MB // 2), 'VERDICT: PASS\n\nok').replace(
+            '"type": "turn.started"', '"type": "turn.mystery"')
+        self.assertEqual(self.normalize(stdout, 'VERDICT: PASS\n\nok')['reason'], 'INVALID_OUTPUT')
+
+    def test_claude_result_is_still_bounded(self):
+        record = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'result': 'VERDICT: PASS\n\n' + 'q' * (3 * self.MB // 2)}
+        result = self.module.normalize_provider('claude', 0, json.dumps(record), '', '', 'pr')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+
+    def test_runaway_provider_is_killed_at_the_capture_ceiling(self):
+        """A child that writes forever is stopped once capture passes the raw ceiling (patched small here), instead
+        of being buffered until its deadline; the outcome is OUTPUT_TOO_LARGE and the child is reaped."""
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / 'pid'
+            child = ('import os, sys\nopen(sys.argv[1], "w").write(str(os.getpid()))\nsys.stdin.read()\n'
+                     'import time\nchunk = b"{" + b"w" * 65535\nwhile True:\n    sys.stdout.buffer.write(chunk)\n'
+                     '    time.sleep(0.002)\n')  # throttled (~32 MB/s) so unbounded capture stays small if broken
+            with patch.object(self.module, 'PROVIDER_RAW_LIMIT', 4 * 2 ** 20, create=True):
+                started = time.monotonic()
+                code, stdout, stderr = self.module.run([sys.executable, '-c', child, str(pid_file)],
+                                                       'prompt ' * 50_000, Path(temp), timeout=8)
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 6, 'the runaway child was not stopped at the capture ceiling')
+            self.assertLessEqual(len(stdout), 4 * 2 ** 20 + 65536)
+            result = self.module.normalize_provider('codex', code, stdout, stderr, '', 'pr')
+            self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+            pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_ordinary_provider_capture_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = 'import sys\ndata = sys.stdin.read()\nprint(len(data))\nprint("note", file=sys.stderr)\n'
+            code, stdout, stderr = self.module.run([sys.executable, '-c', child], 'é' * 300_000, Path(temp), timeout=20)
+        self.assertEqual((code, stdout, stderr), (0, '300000\n', 'note\n'))
+
+    def test_new_reason_is_accepted_by_the_usage_store_and_diagnostics(self):
+        import usage_guard
+        self.assertIn('OUTPUT_TOO_LARGE', usage_guard.REASONS)
+        diag = review_diagnostics.provider_attempt('codex', {'path': '/x/codex'}, 0, 'out', '',
+                                                   {'reason': 'OUTPUT_TOO_LARGE'})
+        self.assertEqual(diag['code'], 'PROVIDER_OUTPUT_TOO_LARGE')

@@ -79,6 +79,8 @@ CONTRACT = {
                             ['Reconcile the unknown run in the usage store before any retry.']),
     'PROVIDER_INVALID_OUTPUT': ('INVALID_OUTPUT', 'The provider produced no valid stage verdict.',
                                 ['Inspect the excerpt below; a rerun needs a changed packet or a declared repeat reason.']),
+    'PROVIDER_OUTPUT_TOO_LARGE': ('OUTPUT_TOO_LARGE', 'The provider output passed its size bound (16 MiB raw stream, or 1 MB of verdict-bearing text; Codex command output is exempt from the 1 MB bound).',
+                                  ['Inspect the saved raw answer; a runaway reviewer or an oversized answer needs a changed packet or a declared repeat reason, not an unchanged rerun.']),
     'FALLBACK_NO_RESULT': ('INVALID_OUTPUT', 'The independent fallback produced no valid result and no more providers remain.',
                            ['Check the exit code and excerpt below, fix the cause, and rerun once with --repeat-reason.']),
     'SNAPSHOT_TIMEOUT': ('TRANSIENT_INFRA', 'Preparing the review snapshot exceeded its deadline.',
@@ -451,7 +453,8 @@ def classify_isolation_error(error):
 
 
 PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHAUSTED': 'BUDGET_EXHAUSTED', 'QUOTA': 'PROVIDER_USAGE_LIMIT', 'AUTH': 'PROVIDER_AUTH', 'TIMEOUT': 'PROVIDER_TIMEOUT',
-                         'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT'}
+                         'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT',
+                         'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE'}
 
 
 def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, launch_state=None, local_detail=''):

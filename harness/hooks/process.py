@@ -4,6 +4,7 @@ import os
 import selectors
 import signal
 import subprocess
+import threading
 import time
 
 # Git removes its lock files from its SIGTERM handler; SIGKILL skips that cleanup.
@@ -72,8 +73,106 @@ def cleanup_discarded(process, sink=None):
         process.wait(timeout=DISCARD_CLEANUP_SECONDS)
 
 
+class OutputLimitExceeded(Exception):
+    """The child's combined stdout and stderr passed the caller's output_limit; its group was stopped.
+
+    stdout and stderr hold the bounded prefix captured before the stop (decoded like the normal result)."""
+
+    def __init__(self, command, limit, stdout, stderr):
+        super().__init__('output of %r exceeded %d bytes' % (command[0] if command else '', limit))
+        self.command, self.limit, self.stdout, self.stderr = command, limit, stdout, stderr
+
+
+def _stop_bounded(process):
+    """Stop the group without retaining more output: TERM, drain-discard, KILL, drain-discard, reap."""
+    pipes = [pipe for pipe in (process.stdout, process.stderr) if pipe is not None and not pipe.closed]
+    signal_group(process.pid, signal.SIGTERM)
+    grace = time.monotonic() + TERMINATION_GRACE_SECONDS
+    for pipe in pipes:
+        try:
+            drain_discarded(pipe, grace)
+        except (OSError, ValueError):
+            pass
+    signal_group(process.pid, signal.SIGKILL)
+    for pipe in pipes:
+        try:
+            drain_discarded(pipe, time.monotonic() + DISCARD_CLEANUP_SECONDS)
+        except (OSError, ValueError):
+            pass
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is not None and not pipe.closed:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    try:
+        process.wait(timeout=DISCARD_CLEANUP_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _bounded_capture(command, process, data, timeout, limit, decode):
+    """communicate() with a ceiling on retained output: feed stdin from a thread (a large prompt cannot deadlock
+    against a full output pipe), read both pipes in fixed chunks, and stop the group once the ceiling is passed."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def feed():
+        try:
+            if data:
+                process.stdin.write(data)
+        except (OSError, ValueError):
+            pass  # the child exited or was stopped; its output decides the outcome
+        finally:
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+    feeder = None
+    if process.stdin is not None:
+        feeder = threading.Thread(target=feed, daemon=True)
+        feeder.start()
+    captured = {process.stdout: bytearray(), process.stderr: bytearray()}
+    total = 0
+    try:
+        with selectors.DefaultSelector() as poller:
+            for pipe in captured:
+                poller.register(pipe, selectors.EVENT_READ)
+            while poller.get_map():
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for key, _ in poller.select(remaining):
+                    chunk = os.read(key.fileobj.fileno(), DISCARD_CHUNK_BYTES)
+                    if not chunk:
+                        poller.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > limit:
+                        captured[key.fileobj] += chunk[:max(0, len(chunk) - (total - limit))]
+                        raise OutputLimitExceeded(command, limit, decode(captured[process.stdout]),
+                                                  decode(captured[process.stderr]))
+                    captured[key.fileobj] += chunk
+        remaining = None if deadline is None else max(0, deadline - time.monotonic())
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(command, timeout) from None
+    except BaseException:
+        _stop_bounded(process)
+        if feeder is not None:
+            feeder.join(DISCARD_CLEANUP_SECONDS)
+        raise
+    if feeder is not None:
+        feeder.join(DISCARD_CLEANUP_SECONDS)
+    for pipe in captured:
+        pipe.close()
+    return subprocess.CompletedProcess(command, process.returncode, decode(captured[process.stdout]),
+                                       decode(captured[process.stderr]))
+
+
 def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
-        stream=False, discard_output=False, sink=None, on_spawn=None):
+        stream=False, discard_output=False, sink=None, on_spawn=None, output_limit=None):
     # Git and test runners spawn children that subprocess.run(timeout=...) leaves alive.
     # Malformed output from a child must not bypass a caller's rollback path.
     # Keep binary mode exact for callers that inspect Git object bytes.
@@ -83,10 +182,14 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
         raise ValueError('discard_output does not accept input')
     if sink is not None and not discard_output:
         raise ValueError('sink requires discard_output')
-    decoding = {'errors': 'replace'} if text else {}
+    bounded = output_limit is not None
+    if bounded and (stream or discard_output or type(output_limit) is not int or output_limit < 0):
+        raise ValueError('output_limit needs captured output and a nonnegative integer')
+    # Bounded capture reads raw bytes in fixed chunks and decodes them itself, like text mode would.
+    decoding = {'errors': 'replace'} if text and not bounded else {}
     # The discard path drains one merged pipe to preserve descendant EOF semantics.
     output = None if stream else subprocess.PIPE
-    process = subprocess.Popen(command, cwd=cwd, env=env, text=text,
+    process = subprocess.Popen(command, cwd=cwd, env=env, text=text and not bounded,
                                stdin=subprocess.PIPE if input is not None else None,
                                stdout=output,
                                stderr=subprocess.STDOUT if discard_output else output,
@@ -125,6 +228,14 @@ def run(command, *, cwd=None, env=None, timeout=None, input=None, text=True,
             except (OSError, subprocess.TimeoutExpired):
                 failure.cleanup_incomplete = True
             raise
+    if bounded:
+        if text:
+            data = input.encode('utf-8', errors='replace') if input is not None else None
+            def decode(raw):
+                return bytes(raw).decode('utf-8', errors='replace')
+        else:
+            data, decode = input, bytes
+        return _bounded_capture(command, process, data, timeout, output_limit, decode)
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)
     except BaseException:
