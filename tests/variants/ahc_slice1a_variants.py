@@ -101,6 +101,15 @@ V = [
         ("| R18 |", "| R17 | x | x | x | x | x | x | SMTests.test_r17 |\n| R18 |")],
      "docs/spec/ahc-m1-state-machine.md",
      ["tests.test_ahc_runner.StateMachineTests.test_every_spec_test_id_resolves_to_a_test"]),
+    ("W8/W26: the integration notice keyed by the event, not the op key", [
+        ("            self._wi_notice(\"op:%s\" % key, item, row_id, \"ticket\", text)\n",
+         "            self._wi_notice(event_id, item, row_id, \"ticket\", text)\n")], CONTRACTS, SM),
+    ("W8/W26: no owner notice for a closed-in-flight item (L7)", [
+        ("            if item[\"marks\"] == \"closed-in-flight\":", "            if False:")], CONTRACTS, SM),
+    ("W25: no ticket notice naming the op", [
+        ("            self._wi_notice(event_id, item, row_id, \"ticket\", \"%s ended %s; item %s\" % (\n",
+         "            (lambda *a: None)(event_id, item, row_id, \"ticket\", \"%s ended %s; item %s\" % (\n")],
+     CONTRACTS, SM),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
          '                if prior[0] == "work_item":\n')], CONTRACTS, SM),
