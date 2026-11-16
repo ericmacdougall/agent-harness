@@ -1,0 +1,13 @@
+docs(fx16136): revise the goodqa#16148 private-key spec to v3
+
+Why: the v2 delta review (Sonnet BLOCK 8e93dbbd, Opus ACCEPT with must-dos M1 and M2) needs a real-engine env-file proof, a fixed-category docker failure message, and a hold re-apply before any rollback when the boot gate fails.
+
+What: .fx16136/spec-16148-pem.md v3 (lint PASS, core e002c59f), frozen copy and the v2-to-v3 diff, and spec16148_v3.py. Adds the real-engine round trip and post-deploy argv scan (AC-6), M1 (AC-7, also for goodqa#16185), M2 and N4 (AC-8), N1 to N3, NEG-10 to NEG-13, and Sonnet's smaller items.
+
+Testing: not run: spec only; `spec_flow.py lint` PASS.
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
