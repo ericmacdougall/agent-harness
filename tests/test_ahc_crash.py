@@ -210,6 +210,12 @@ def invariants(root):
         for gid, held, st in db.execute("SELECT id, cap_held, state FROM grants"):
             if st in ("validated", "active", "reserved", "consumed") and held != 1:
                 problems.append("grant %s in %s released its CAP1 slot" % (gid, st))
+        if "work_items" in tables:       # T3 and T6: one audit row per applied WorkItem row, never a doubled move
+            for iid, version in db.execute("SELECT id, version FROM work_items"):
+                n = db.execute("SELECT COUNT(*) FROM transitions WHERE entity='work_item' AND id=?",
+                               (iid,)).fetchone()[0]
+                if n != version:
+                    problems.append("work item %s at version %d has %d audit rows" % (iid, version, n))
     finally:
         db.close()
     log = Path(root) / "authority.jsonl"
@@ -294,6 +300,20 @@ def scenario_contracts(root, clock):
             o = op()
             c.confirm(o["key"], {"at": clock.t, "tip": head, "pr_merged": True}, expected_version=o["version"],
                       event_id="pr%d-e3" % pr)
+    # Slice 1 (a): one WorkItem through W1, W2, W5 and W6. Each move is retried with the expected version it had
+    # BEFORE it first ran, so after a crash past its COMMIT the retry carries a stale version and must land as the
+    # T6 no-op; before the COMMIT it applies. admit_item is itself idempotent (NEG-11).
+    item = c.admit_item("o/r", 7, H1, BASE, POLICY, "1" * 64, "d" * 64, event_id="wi-w1")
+    db.execute("UPDATE reviews SET state='passed' WHERE item=? AND state='required'", (item["id"],))
+    obs = {"id": "obs-wi", "at": clock.t, "repo": "o/r", "pr": 7, "pr_state": "OPEN", "pr_head": H1, "tip": BASE,
+           "draft": False, "compare": "ahead", "b_r_ancestors": {BASE: True}, "attached_core": "1" * 64,
+           "open_findings": 0, "paths": ["lib/x.py"], "foreign_closing_keyword": False,
+           "policy": {"revision": POLICY, "readable": True, "allowlisted": True, "enabled": True,
+                      "checks_green": True},
+           "kill_switch": False, "chk_cas": True, "canary_age": 60}
+    for version, row, extra in ((1, "W2", {}), (2, "W5", {"kill_switch": True}), (3, "W6", {})):
+        c.wi_move(item["id"], row, expected_version=version, event_id="wi-%s" % row.lower(), actor="ahc-core",
+                  obs=dict(obs, **extra))
     led.close()
 
 
