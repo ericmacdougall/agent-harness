@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS operations (
   head TEXT NOT NULL, base TEXT NOT NULL, policy_revision TEXT NOT NULL,
   generation INTEGER NOT NULL, params TEXT, params_sha256 TEXT NOT NULL, grant_id TEXT,
   state TEXT NOT NULL, dispatch_count INTEGER NOT NULL DEFAULT 0, proven_absent INTEGER NOT NULL DEFAULT 0,
-  dispatched_at REAL, request_id TEXT, refusal TEXT, probe_at REAL, escalate_at REAL,
+  dispatched_at REAL, wait_mono REAL, wait_boot TEXT, request_id TEXT, refusal TEXT, probe_at REAL, escalate_at REAL,
   readbacks INTEGER NOT NULL DEFAULT 0, proof TEXT, evidence TEXT, incident INTEGER NOT NULL DEFAULT 0,
   pr_unmarked INTEGER NOT NULL DEFAULT 0, settled_at REAL, tombstone INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
@@ -1293,6 +1293,7 @@ class Contracts:
             now = self.now()
             return self._op_move(key, "dispatched", expected_version, event_id, "ahc-merge", {
                 "dispatch_count": row["dispatch_count"] + 1, "dispatched_at": now, "request_id": request_id,
+                "wait_mono": float(self._mono()), "wait_boot": self.boot_id,    # E13's wait starts here (D-a3)
                 "probe_at": now + B55_REQUEST_SECONDS}, observation=obs,
                 request={"method": "updateRefs", "beforeOid": row["base"], "afterOid": row["head"], "force": False})
 
@@ -1351,6 +1352,19 @@ class Contracts:
         if self._bh_entry(row, read):
             raise ContractError("the activity log shows (B, H): the update applied, confirm instead")
 
+    def e13_wait_start(self, key):
+        """The monotonic stamp E13's minimum delays count from: the dispatch's, when it was on this boot. After a
+        restart onto another boot the old stamp means nothing, so the wait restarts from this boot's first call
+        here, which is recorded. This only ever delays E13 (fails closed). It is bookkeeping, not a transition: no
+        version change and no audit row."""
+        with self.tx():
+            row = self._row_or_raise(key)
+            if row["wait_boot"] == self.boot_id and isinstance(row["wait_mono"], (int, float)):
+                return float(row["wait_mono"])
+            start = float(self._mono())
+            self.db.execute("UPDATE operations SET wait_mono=?, wait_boot=? WHERE key=?", (start, self.boot_id, key))
+            return start
+
     def fence(self, key, error, reads, *, expected_version, event_id):
         """E13 dispatched | outcome-unknown -> fenced (p2): an error response or no response (error names it),
         followed by two complete activity reads, the first at least 2 min after the dispatch and the second at
@@ -1361,15 +1375,17 @@ class Contracts:
             raise ContractError("a fence names the error response or 'no-response'")
         if not isinstance(reads, (list, tuple)) or len(reads) != 2:
             raise ContractError("a fence needs exactly two activity reads")
+        start = self.e13_wait_start(key)
         with self.tx():
             row = self._row_or_raise(key)
-            sent = float(row["dispatched_at"] or 0)
             first, second = reads
             for read in reads:
-                self._off_bh(row, read)
-            if float(first["at"]) < sent + E13_FIRST_READ_SECONDS:
-                raise ContractError("E13's first read is at least 2 min after the dispatch (activity lag)")
-            if float(second["at"]) - float(first["at"]) < E13_READ_GAP_SECONDS:
+                self._off_bh(row, read)                 # each fresh, so each is from this boot (T2, D-a3)
+            # elapsed time on the monotonic clock only, never wall stamps (spec owner T-2, goodqa#16193)
+            if row["wait_boot"] != self.boot_id or float(first["mono"]) < start + E13_FIRST_READ_SECONDS:
+                raise ContractError("E13's first read is at least 2 min after the dispatch, or after the restart "
+                                    "that restarted the wait (activity lag)")
+            if float(second["mono"]) - float(first["mono"]) < E13_READ_GAP_SECONDS:
                 raise ContractError("E13's two reads are at least 60 s apart")
             return self._op_move(key, "fenced", expected_version, event_id, "ahc-core", {
                 "proof": "p2", "refusal": error, "evidence": _canon({"error": error, "reads": list(reads)}),

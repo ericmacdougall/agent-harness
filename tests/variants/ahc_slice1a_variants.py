@@ -83,6 +83,16 @@ V = [
          "< self.OBSERVATION_SECONDS:\n"),
         (" or not num(obs.get(\"at\")) or not num(obs.get(\"mono\")):", " or not num(obs.get(\"at\")):")],
      CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
+    ("goodqa#16193: E13 delays measured on wall stamps (the merged behaviour)", [
+        ("            if row[\"wait_boot\"] != self.boot_id or float(first[\"mono\"]) < start + E13_FIRST_READ_SECONDS:\n",
+         "            if float(first[\"at\"]) < float(row[\"dispatched_at\"] or 0) + E13_FIRST_READ_SECONDS:\n"),
+        ("            if float(second[\"mono\"]) - float(first[\"mono\"]) < E13_READ_GAP_SECONDS:\n",
+         "            if float(second[\"at\"]) - float(first[\"at\"]) < E13_READ_GAP_SECONDS:\n")],
+     CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
+    ("goodqa#16193: a restart keeps the old boot's wait stamp", [
+        ("            if row[\"wait_boot\"] == self.boot_id and isinstance(row[\"wait_mono\"], (int, float)):\n",
+         "            if isinstance(row[\"wait_mono\"], (int, float)):\n")],
+     CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
          '                if prior[0] == "work_item":\n')], CONTRACTS, SM),

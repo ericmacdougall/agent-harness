@@ -708,6 +708,50 @@ class OperationTests(Base):
         self.assertEqual(self.c.fence(op["key"], "no-response", [ok1, ok2], expected_version=op["version"],
                                       event_id=self.ev())["state"], "fenced")
 
+    def test_e13_monotonic_wall_jump_forward_does_not_shorten_the_wait(self):
+        """goodqa#16193, spec owner T-2: E13's delays are measured on the monotonic clock. Here the wall clock
+        jumps forward an hour right after the dispatch while only 30 s pass on the monotonic clock."""
+        mono = [self.clock.t]
+        self.c = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: mono[0], boot_id=BOOT)
+        g, op = self.dispatched()
+        sent = mono[0]
+        self.clock.t += 3600                                         # wall: an hour later
+        mono[0] = sent + 90
+        # by their wall stamps these reads are an hour after the dispatch and 60 s apart: wall time would accept them
+        early = [self.read(at=self.clock.t - 60, mono=sent + 30), self.read(mono=sent + 90)]
+        with self.assertRaisesRegex(C.ContractError, "at least 2 min"):
+            self.c.fence(op["key"], "no-response", early, expected_version=op["version"], event_id=self.ev())
+        mono[0] = sent + C.E13_FIRST_READ_SECONDS + C.E13_READ_GAP_SECONDS
+        ok = [self.read(mono=sent + C.E13_FIRST_READ_SECONDS), self.read(mono=mono[0])]
+        self.assertEqual(self.c.fence(op["key"], "no-response", ok, expected_version=op["version"],
+                                      event_id=self.ev())["state"], "fenced")
+
+    def test_e13_monotonic_a_restart_restarts_the_wait(self):
+        g, op = self.dispatched()
+        sent = self.clock.t
+        # restarted onto another boot: its monotonic clock starts near zero, the dispatch's stamp means nothing
+        boot2, mono = "boot-after-restart", [5.0]
+        c2 = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: mono[0], boot_id=boot2)
+
+        def read2(m, **kw):
+            return self.read(mono=m, boot=boot2, **kw)
+        mono[0] = 500.0                  # both reads would be 2 min "after the dispatch" if old stamps counted
+        late = [read2(440.0), read2(500.0)]
+        self.clock.t = sent + 1000
+        with self.assertRaisesRegex(C.ContractError, "restart"):
+            c2.fence(op["key"], "no-response", late, expected_version=op["version"], event_id=self.ev())
+        row = c2._row("operations", "key", op["key"])
+        self.assertEqual((row["wait_boot"], row["wait_mono"], row["version"]), (boot2, 500.0, op["version"]),
+                         "the wait restarted at the restart's own stamp; bookkeeping, no version change")
+        with self.assertRaises(C.ContractError):                      # the old boot's reads are stale here
+            c2.fence(op["key"], "no-response", [self.read(), self.read()], expected_version=op["version"],
+                     event_id=self.ev())
+        mono[0] = 500.0 + C.E13_FIRST_READ_SECONDS + C.E13_READ_GAP_SECONDS
+        ok = [read2(500.0 + C.E13_FIRST_READ_SECONDS), read2(mono[0])]
+        self.assertEqual(c2.fence(op["key"], "no-response", ok, expected_version=op["version"],
+                                  event_id=self.ev())["state"], "fenced")
+        self.assertEqual(c2.e13_wait_start(op["key"]), 500.0, "a second call on the same boot keeps the stamp")
+
     def test_e13_a_fenced_op_never_yields_a_new_grant_or_generation(self):
         g, op = self.fenced()
         self.assertEqual(self.c.intend(self.params(), lease_ok=True, event_id=self.ev())["key"], op["key"],
