@@ -1,0 +1,20 @@
+fix(release-harness): close the five 1377 v2 review findings
+
+Why: receipt bugtracker-pr1377-gate-v2 BLOCKed 51ae3d52 with F1 High (a quoted root key measured the wrong containerd store), F2 High (failures before gate (c) left intelligence-worker unheld), F3 Med (boot said ok while every launch was 501), F4 Med (a second key assignment passed gate (b)) and F5 Med (an out-of-range float time hid a failure).
+
+What:
+- F1 selfhost-ctl.py: the containerd config is read with tomllib when it imports. Without it (python < 3.11) a strict reader accepts above the first table only comments, blanks and one bare key set to a plain string, literal string, decimal integer, true/false or one-line string array; quoted or dotted keys, inline tables, escapes and multi-line strings refuse. Both refuse a non-empty imports, root or imports spelled in another case, a repeated root and a root that is not an absolute existing path.
+- F2 rw-ship.sh: once the switch up ran and until gate (c) passes, every failure re-holds intelligence-worker first (dispatcher only), then the forward-only stop after a migration or the rollback before one. If the re-hold fails after a migration: exit 8 HOLD NOT RE-APPLIED. Before one (lead ruling wa5b72dea2cf): undo a half-done re-hold, roll back, and exit 5 only when the live API is back at BEFORE and the restored intelligence-worker line is held or byte for byte the value read before the run; otherwise exit 8. That value is read from the pre-run VM state; unreadable refuses the release before anything (exit 2). The partial re-pin failure stays out: nothing was recreated yet.
+- F3 job-env-file.ts: launch and boot share one conflict check, so boot reports the JOB_ENV_/JOB_ENVFILE_ conflict, the trial boot exits 1, and gate (c) maps the line to error:conflict.
+- F4 envfile-key: count is every non-comment line naming the key (any syntax, a JOB_ENV_ twin included), canonical the byte-exact lines; gate (b) passes only 1 and 1.
+- F5 ac13-count.py: the +-2**53 bound applies to floats too.
+
+Testing:
+- `ff.sh base` (new tests, 51ae3d52 code, t2-dev) -> ac13 1 failed (the receipt reproducer PASSed), ctl_gate 16 failed, f1 42 failed, jobsecret 19 failed, vitest 2 failed.
+- `ff.sh fixed` plus reruns -> ac13 2 passed, ctl_gate 27 passed, f1 77 passed, jobsecret 48 passed, vitest 32 passed.
+- `pytest -q test_rw_ship_selfhost.py test_rw_release_authority_d2.py test_selfhost_ctl.py test_selfhost_ctl_gate.py test_selfhost_ctl_job_secrets.py test_rw_ship_jobsecret_gate.py test_ac13_count.py` -> 1996 passed, 1 skipped, 1 failed (negative control no-migration-hold, now run with intelligence-worker held; with the new held forward-only test -k -> 4 passed).
+- `npx tsc --noEmit` -> exit 0; `npx vitest run` (apps/job-dispatcher) -> 458 passed, 15 skipped.
+
+Refs: GoodQA #16148
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
