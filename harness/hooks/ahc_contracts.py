@@ -172,13 +172,34 @@ class AuthorityLog:
 
 # ------------------------------------------------------------------ common guard and action
 
-class Contracts:
-    """Transitions over one connection. `now` is injectable for tests; `authority` is an AuthorityLog."""
+def _boot_id():
+    """This boot's id (D-a3): monotonic stamps compare only within one boot. On Linux it is the kernel's boot id.
+    Elsewhere it is an id for this process, so an observation stamped by another process counts as stale, which
+    fails closed."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if value:
+            return "linux:" + value
+    except OSError:
+        pass
+    return "process:%d:%s" % (os.getpid(), os.urandom(8).hex())
 
-    def __init__(self, db, authority, now=None):
+
+class Contracts:
+    """Transitions over one connection. `now` (wall clock: log stamps and the CAP1 UTC day), `mono` (monotonic
+    clock: observation age, T2/D-a3) and `boot_id` are injectable for tests; `authority` is an AuthorityLog."""
+
+    def __init__(self, db, authority, now=None, mono=None, boot_id=None):
         self.db = db
         self.authority = authority
         self._now = now or time.time
+        self._mono = mono or time.monotonic
+        self.boot_id = boot_id or _boot_id()
+
+    def stamp(self, obs):
+        """An observation row stamped as read now: wall time for the log, plus this boot's monotonic stamp that
+        T2 measures age on. Producers call this at the moment they read the facts."""
+        return dict(obs, at=self.now(), mono=float(self._mono()), boot=self.boot_id)
 
     def now(self):
         return float(self._now())
@@ -1148,9 +1169,15 @@ class Contracts:
         return new
 
     def _fresh(self, obs):
-        if not isinstance(obs, dict) or not isinstance(obs.get("at"), (int, float)) or isinstance(obs["at"], bool):
-            raise ContractError("the guard needs an observation row with its time (T2)")
-        if self.now() - float(obs["at"]) >= self.OBSERVATION_SECONDS or float(obs["at"]) > self.now():
+        def num(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+        if not isinstance(obs, dict) or not num(obs.get("at")) or not num(obs.get("mono")):
+            raise ContractError("the guard needs an observation row with its time and monotonic stamp (T2)")
+        # D-a3: age is measured on the monotonic clock, never the wall clock, which can step (NTP, a manual set).
+        # A stamp from another boot is meaningless, so the observation is stale.
+        if obs.get("boot") != self.boot_id:
+            raise ContractError("observation is from another boot; its age is unknown (T2, D-a3)")
+        if not 0 <= float(self._mono()) - float(obs["mono"]) < self.OBSERVATION_SECONDS:
             raise ContractError("observation is stale (over 2 min) or from the future (T2)")
 
     @staticmethod

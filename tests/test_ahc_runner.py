@@ -3720,7 +3720,7 @@ class StateMachineTests(TC.Base):
         o = {"id": "obs-%d" % self.n, "at": self.clock.t, "repo": "o/r", "pr": 5, "pr_state": "OPEN",
              "pr_head": TC.H1, "tip": TC.BASE}
         o.update(changes)
-        return o
+        return TC.stamped(o)
 
     def test_w24_marks_and_keeps_the_item_then_w25_ends_it(self):
         self.at("merge-ready")
@@ -3855,14 +3855,14 @@ class StateMachineTests(TC.Base):
     def eligible(self, item=None, **changes):
         """A fresh ELIG observation under which every clause holds for `item`."""
         item = item or self.c._row("work_items", "id", self.item["id"])
-        o = self.pr(pr=item["pr"], pr_head=item["head"], tip=item["base"], draft=False, compare="ahead",
-                    b_r_ancestors={item["base"]: True}, attached_core=item["spec_core"], open_findings=0,
-                    paths=["harness/lib/x.py"], foreign_closing_keyword=False,
-                    policy={"revision": item["policy_revision"], "readable": True, "allowlisted": True,
-                            "enabled": True, "checks_green": True},
-                    kill_switch=False, chk_cas=True, canary_age=3600)
-        o.update(changes)
-        return o
+        fields = dict(pr=item["pr"], pr_head=item["head"], tip=item["base"], draft=False, compare="ahead",
+                      b_r_ancestors={item["base"]: True}, attached_core=item["spec_core"], open_findings=0,
+                      paths=["harness/lib/x.py"], foreign_closing_keyword=False,
+                      policy={"revision": item["policy_revision"], "readable": True, "allowlisted": True,
+                              "enabled": True, "checks_green": True},
+                      kill_switch=False, chk_cas=True, canary_age=3600)
+        fields.update(changes)
+        return self.pr(**fields)            # pr() stamps, so a changed `at` moves the monotonic stamp too
 
     def pass_reviews(self, item=None):
         self.db.execute("UPDATE reviews SET state='passed' WHERE item=?", ((item or self.item)["id"],))
