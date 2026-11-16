@@ -256,9 +256,9 @@ class ReviewTests(Base):
         with self.assertRaises(C.ContractError):   # a late receipt for a superseded row authorizes nothing
             self.c.review(unknown["id"], "passed", expected_version=r["version"], event_id=self.ev(),
                           receipt=self.receipt(packet_sha256="9" * 64), peer_uid=self.UID)
-        with self.assertRaises(C.ContractError):   # and the shortcut is gone from the table
-            other = self.walk(self.row(kind="adversarial", packet_sha256="7" * 64), "queued", "running",
-                              "outcome-unknown")
+        other = self.walk(self.row(kind="adversarial", packet_sha256="7" * 64), "queued", "running",
+                          "outcome-unknown")
+        with self.assertRaisesRegex(C.ContractError, "no transition outcome-unknown -> superseded"):
             self.c.review(other["id"], "superseded", expected_version=other["version"], event_id=self.ev(),
                           successor="rv-new")
 
