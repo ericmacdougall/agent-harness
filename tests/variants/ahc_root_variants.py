@@ -1,25 +1,37 @@
-"""Failing-first controls for ahc's root ownership (goodqa#16049 slice 1; PR 258 v1, v2 and v3 repairs).
+"""Failing-first controls for ahc's root ownership (goodqa#16049 slice 1; PR 258 v1 to v5 repairs).
 
 Each variant applies an exact, unique text swap to one source file, runs the root tests, and restores the source
-from a `.vs.bak` copy in `finally`. Every variant must make the tests fail; the summary names any that did not.
+from a `.vs.bak` copy in `finally`. Every variant must make the tests fail. Each variant's outcome is one of:
+  * caught: unittest ran tests and some failed (the expected result);
+  * survived: the tests passed with the variant applied;
+  * timed out: the tests did not finish in TIMEOUT seconds (their process group is killed). Inconclusive, never a
+    catch: a hang can be infrastructure trouble as easily as the variant (PR 258 v5 F2);
+  * broken: no tests ran, a test module failed to import, or unittest exited with another status. Inconclusive.
+The exit status is 0 only when every variant was caught; 1 when any survived or was inconclusive; 2 when an anchor
+is not unique, a swap does not compile, or a `.vs.bak` from an interrupted run is in the way. That stops the run
+with the source restored (a leftover `.vs.bak` is never overwritten).
 Run from the repo root: `python3 -B tests/variants/ahc_root_variants.py [output-file]`. It mutates tracked files
-while it runs, so do not commit or run other suites at the same time. Not collected by unittest (no test_ prefix).
+while it runs, so do not commit or run other suites at the same time. Not collected by unittest (no test_ prefix);
+tests/test_ahc_root_variants.py checks the runner itself and that every anchor is still unique.
 """
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, ".ahc-local", "variants_root.out")
 SRC = "harness/hooks/ahc_core.py"
 RUNNER = "harness/hooks/ahc_runner.py"
 FS = "harness/hooks/ahc_fs.py"
 CLONE = "harness/hooks/ahc_clone.py"
+TIMEOUT = 900
 T = ["tests.test_ahc_core.RootOwnershipTests", "tests.test_ahc_clone", "tests.test_ahc_fs",
      "tests.test_ahc_runner.IngestValidationTests",
      "tests.test_ahc_runner.UntrustedReadTests", "tests.test_ahc_runner.FileTransportOptInTests",
-     "tests.test_ahc_runner.SchemaTests"]
+     "tests.test_ahc_runner.SchemaTests", "tests.test_ahc_crash.RestoreIntentTests",
+     "tests.test_ahc_crash.RestoreRecoveryTableTests"]
 V = [
     ("the root ownership check dropped (ensure only makes directories)", [
         ("    def ensure(self):\n        self.claim_root()\n", "    def ensure(self):\n        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)\n")]),
@@ -166,7 +178,7 @@ V = [
          "                fs.rename(self.paths.root, Path(str(self.path) + extra), Path(str(self.path) + suffix + extra))\n"
          "        fs.remove_temps(self.paths.root, self.path)\n")], RUNNER),
     ("v4 restore: the intent is kept after a copy failure with the live file in place", [
-        ("                fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)\n", "                pass\n")],
+        ("        fs.unlink(self.paths.root, self._intent_path(), missing_ok=True)\n", "        pass\n")],
      RUNNER),
     ("v4 restore: no size check before the migration", [
         ("        if size > RESTORE_MAX_BYTES:\n", "        if False:\n")], RUNNER),
@@ -174,37 +186,160 @@ V = [
         ("        fs.remove_temps(self.paths.root, self.path)                 # an earlier attempt's unpublished copy\n",
          "        pass\n")], RUNNER),
     ("v4 fs: copy_to_temp enforces no cap (both the descriptor and the running checks dropped)", [
-        ("            if info.st_size > max_bytes:\n", "            if False:\n"),
+        ("            if info.st_size > max_bytes:\n"
+         "                raise TooLarge(\"%s is %d bytes, over the %d-byte cap\" % (sname, info.st_size, max_bytes))\n",
+         "            if False:\n"
+         "                raise TooLarge(\"%s is %d bytes, over the %d-byte cap\" % (sname, info.st_size, max_bytes))\n"),
         ("                    if total > max_bytes:\n", "                    if False:\n")], FS),
     ("v4 fs: remove_temps matches any name", [
         ("            if pattern.match(entry):\n", "            if entry.endswith(\".tmp\"):\n")], FS),
+    # PR 258 v5 F1: an interrupted restore is finished from the files; an intact live ledger is never stranded
+    ("v5 resume: the backup's availability is checked before the files decide (the receipt's defect)", [
+        ("        log = logging.getLogger(\"ahc\")\n",
+         "        if not self.path.with_name(name).is_file():\n"
+         "            raise SchemaError(\"interrupted-restore record %s names no backup beside the ledger; refusing to \"\n"
+         "                              \"open\" % intent.name)\n"
+         "        log = logging.getLogger(\"ahc\")\n")], RUNNER),
+    ("v5 restore: a failed copy abandons even when the live database is absent", [
+        ("            if os.path.lexists(str(self.path)):                     # never moved (step 3 passed)\n",
+         "            if True:\n")], RUNNER),
+    ("v5 restore: the runner asks for no digest check on the copy", [
+        ("expect_sha256=sha256,", "expect_sha256=None,")], RUNNER),
+    ("v5 fs: copy_to_temp ignores expect_sha256", [
+        ("                if expect_sha256 is not None and digest.hexdigest() != expect_sha256:\n",
+         "                if False:\n")], FS),
+    ("v5 backup: the proven backup's digest is not recorded", [
+        ("            self.verified[target.name] = fs.digest_file(self.paths.root, target, RESTORE_MAX_BYTES)\n",
+         "            fs.digest_file(self.paths.root, target, RESTORE_MAX_BYTES)\n")], RUNNER),
+    ("v5 restore: a found publish is not recognised (moved aside again)", [
+        ("        if os.path.lexists(str(self.path)) and self._is_backup_copy(self.path, sha256):\n",
+         "        if False:\n")], RUNNER),
+    ("v5 restore: the v4 residual (a found publish is moved aside over the failed database)", [
+        ("        if os.path.lexists(str(self.path)) and self._is_backup_copy(self.path, sha256):\n",
+         "        if False:\n"),
+        ("            if os.path.lexists(str(target)):\n", "            if False:\n")], RUNNER),
+    ("v5 restore: a taken move target is renamed over", [
+        ("            if os.path.lexists(str(target)):\n", "            if False:\n")], RUNNER),
+    ("v5 restore: move targets are checked only as each is renamed (nothing checked before the copy)", [
+        ("            pairs.append((source, target))\n", "            yield source, target\n")], RUNNER),
+    ("v5 restore: a -journal is left beside the restored copy", [
+        ("        for extra in (\"\",) + SQLITE_SIDECARS:\n", "        for extra in (\"\", \"-wal\", \"-shm\"):\n")],
+     RUNNER),
+    ("v5 resume: an abandoned restore stops the start", [
+        ("            log.warning(\"abandoned the interrupted ledger restore: %s; opening that database\", abandoned)\n",
+         "            raise\n")], RUNNER),
+    ("v5 resume: a record with a control character in the backup name is accepted", [
+        ("re.fullmatch(r\"[A-Za-z0-9._-]+\", name)", "\"/\" not in name")], RUNNER),
 ]
-out, survivors = [], []
-for entry in V:
-    name, swaps = entry[0], entry[1]
-    src = os.path.join(ROOT, entry[2] if len(entry) > 2 else SRC)
-    bak = src + ".vs.bak"
-    shutil.copyfile(src, bak)
+
+CAUGHT, SURVIVED, TIMED_OUT, BROKEN = "caught", "survived", "timed out", "broken"
+INCONCLUSIVE = (TIMED_OUT, BROKEN)
+
+
+class AnchorError(Exception):
+    """A swap's text is not exactly once in its source (or a variant could not be set up): the run stops."""
+
+
+def apply_swaps(text, swaps, name):
+    for old, new in swaps:
+        if text.count(old) != 1:
+            raise AnchorError("anchor not unique for %s (%d): %r" % (name, text.count(old), old[:70]))
+        text = text.replace(old, new)
+    return text
+
+
+def run_tests(cmd, cwd, timeout):
+    """(returncode, stderr) of the test command. On timeout the command's whole process group (the crash children
+    of tests.test_ahc_crash included) is killed before TimeoutExpired is raised, so a hang leaves nothing behind."""
+    proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
     try:
-        text = open(bak).read()
-        for old, new in swaps:
-            if text.count(old) != 1:
-                sys.exit("anchor not unique for %s (%d): %r" % (name, text.count(old), old[:70]))
-            text = text.replace(old, new)
-        open(src, "w").write(text)
+        _out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
         try:
-            proc = subprocess.run([sys.executable, "-B", "-m", "unittest"] + T, cwd=ROOT, capture_output=True,
-                                  text=True, timeout=900)
-        except subprocess.TimeoutExpired:   # a hang is recorded and the run goes on; it is not a survivor
-            out.append("== variant %s rc=timeout (tests did not finish in 900 s)" % name)
-            continue
-        lines = [l for l in proc.stderr.splitlines() if l.startswith(("FAIL:", "ERROR:", "Ran ", "FAILED", "OK"))]
-        out.append("== variant %s rc=%d\n%s" % (name, proc.returncode, "\n".join(lines)))
-        if proc.returncode == 0:
-            survivors.append(name)
-    finally:
-        shutil.copyfile(bak, src)
-        os.remove(bak)
-out.append("SUMMARY: %d variants, %d did not fail: %s" % (len(V), len(survivors), survivors))
-open(OUT, "w").write("\n".join(out) + "\n")
-print("\n".join(out))
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:       # a descendant in another session holds a pipe: stop reading it
+            pass
+        raise
+    return proc.returncode, err
+
+
+def classify(returncode, stderr):
+    """caught only when unittest ran tests and some failed. Exit 0 is a survivor. No "Ran N" line, 0 tests, a
+    test module that failed to import, or another exit status is broken: the variant was not really tested."""
+    ran = re.search(r"^Ran (\d+) tests?\b", stderr, re.M)
+    if ran is None or int(ran.group(1)) == 0 or "unittest.loader._FailedTest" in stderr:
+        return BROKEN
+    if returncode == 0:
+        return SURVIVED
+    if returncode == 1 and re.search(r"^(FAIL|ERROR):", stderr, re.M):
+        return CAUGHT
+    return BROKEN
+
+
+def run_variants(variants=None, tests=None, root=ROOT, runner=run_tests, timeout=TIMEOUT):
+    """Apply each variant, run the tests, restore the source. Returns (lines, {name: outcome}). Raises AnchorError
+    (the source restored) when an anchor is not unique or a backup copy from an interrupted run is in the way."""
+    variants = V if variants is None else variants
+    tests = T if tests is None else tests
+    lines, outcomes = [], {}
+    for entry in variants:
+        name, swaps = entry[0], entry[1]
+        src = os.path.join(root, entry[2] if len(entry) > 2 else SRC)
+        bak = src + ".vs.bak"
+        if os.path.lexists(bak):    # an interrupted run: bak may hold the only clean copy; never overwrite it
+            raise AnchorError("%s exists (an interrupted run?): compare it with %s and remove it" % (bak, src))
+        shutil.copyfile(src, bak)
+        try:
+            with open(bak) as handle:
+                text = apply_swaps(handle.read(), swaps, name)
+            compile(text, src, "exec")              # a swap that breaks the syntax would be caught vacuously
+            with open(src, "w") as handle:
+                handle.write(text)
+            try:
+                returncode, stderr = runner([sys.executable, "-B", "-m", "unittest"] + list(tests), root, timeout)
+            except subprocess.TimeoutExpired:
+                outcomes[name] = TIMED_OUT
+                lines.append("== variant %s rc=timeout (tests did not finish in %s s): inconclusive" % (name, timeout))
+                continue
+            outcomes[name] = classify(returncode, stderr)
+            kept = [l for l in stderr.splitlines() if l.startswith(("FAIL:", "ERROR:", "Ran ", "FAILED", "OK"))]
+            lines.append("== variant %s rc=%d %s\n%s" % (name, returncode, outcomes[name], "\n".join(kept)))
+        except SyntaxError as error:
+            raise AnchorError("variant %s does not compile: %s" % (name, error)) from None
+        finally:
+            shutil.copyfile(bak, src)
+            os.remove(bak)
+    return lines, outcomes
+
+
+def summary(outcomes):
+    def named(kind):
+        return [n for n, o in outcomes.items() if o == kind]
+    return ("SUMMARY: %d variants: %d caught, %d survived %s, %d timed out (inconclusive) %s, %d broken "
+            "(inconclusive) %s" % (len(outcomes), len(named(CAUGHT)), len(named(SURVIVED)), named(SURVIVED),
+                                   len(named(TIMED_OUT)), named(TIMED_OUT), len(named(BROKEN)), named(BROKEN)))
+
+
+def main(argv=None, **kwargs):
+    """Exit status: 0 when every variant was caught, 1 when any survived or was inconclusive, 2 on AnchorError."""
+    argv = sys.argv[1:] if argv is None else argv
+    out = argv[0] if argv else os.path.join(ROOT, ".ahc-local", "variants_root.out")
+    try:
+        lines, outcomes = run_variants(**kwargs)
+    except AnchorError as error:
+        print("ahc_root_variants: %s" % error, file=sys.stderr)
+        return 2
+    lines.append(summary(outcomes))
+    with open(out, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    return 0 if outcomes and all(o == CAUGHT for o in outcomes.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
