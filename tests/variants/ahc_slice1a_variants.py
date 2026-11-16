@@ -175,8 +175,8 @@ V = [
          "            if False:\n                raise ContractError(\"W24's observation")], CONTRACTS, SM),
     # ELIG (step 5): each clause, the fail-closed paths, the queue and the rows that read it
     ("ELIG e1: B_r ancestry not checked", [
-        ("or any(s != \"passed\" or anc.get(br) is not True for s, br, _p, _r in code)):",
-         "or any(s != \"passed\" for s, br, _p, _r in code)):")], CONTRACTS, SM),
+        ("or any(s != \"passed\" or anc.get(br) is not True for _k, s, br in code)):",
+         "or any(s != \"passed\" for _k, s, br in code)):")], CONTRACTS, SM),
     ("ELIG e1: the PR head is not compared with H", [
         ("        if (not code or o[\"pr_head\"] != head or pol.get(\"revision\")",
          "        if (not code or pol.get(\"revision\")")], CONTRACTS, SM),
@@ -244,6 +244,35 @@ V = [
     ("T7 precedence: G8 and G9 outrank the WorkItem rows", [
         ('    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")\n',
          '    T7_ORDER = ("G8", "G9", "W4", "W13", "W14", "W18", "W19", "W17")\n')], CONTRACTS, SM),
+    # PR 268 v1 receipt findings F1-F4
+    ("PR268 F1: e2 ignores the policy revision (old pass counts after W27)", [
+        ('"AND policy_revision=? AND packet_sha256=?",', '"AND ? IS NOT NULL AND packet_sha256=?",')],
+     CONTRACTS, SM),
+    ("PR268 F2: the successor drops red_team", [
+        ('red_team=bool(item["red_team"]))', 'red_team=False)')], CONTRACTS, SM),
+    ("PR268 F2: admit does not store red_team", [
+        ('packet_sha256, "pr-gate", 1, now, now, 1 if red_team else 0))', 'packet_sha256, "pr-gate", 1, now, now, 0))')],
+     CONTRACTS, SM),
+    ("PR268 F2: e1 does not require every required kind", [
+        ("if (not required <= {k for k, _s, _b in code} or", "if (not code or")], CONTRACTS, SM),
+    ("PR268 F3: W20 cancels no review", [
+        ('        if row_id == "W20":\n            # PR 268 F3', '        if False:\n            # PR 268 F3')],
+     CONTRACTS, SM),
+    ("PR268 F3: W20 leaves outcome-unknown rows", [
+        ("\"('running', 'outcome-unknown') ORDER BY id\",", "\"('running') ORDER BY id\",")], CONTRACTS, SM),
+    ("PR268 F3: W20 R14 event ids not derived from the move's event", [
+        ('event_id="%s-r14-%s" % (event_id, rid),\n                            cause="owner cancelled',
+         'event_id="ev-%s" % rid,\n'
+         '                            cause="owner cancelled')], CONTRACTS, SM),
+    ("PR268 F4: W3 writes no owner notice", [
+        ('            self._wi_notice(event_id, item, row_id, "owner", text)\n        elif row_id == "W10":',
+         '            pass\n        elif row_id == "W10":')], CONTRACTS, SM),
+    ("PR268 F4: W3 omits the finding ids", [
+        ('", ".join(self._finding_ids(receipt)) or "no finding ids"', '"no finding ids"')], CONTRACTS, SM),
+    ("PR268 F4: W10 writes no incident", [
+        ('            self._wi_notice(event_id, item, row_id, "incident", text)\n'
+         '            self._wi_notice(event_id, item, row_id, "ticket", text)',
+         '            self._wi_notice(event_id, item, row_id, "ticket", text)')], CONTRACTS, SM),
 ]
 out, survivors, inconclusive = [], [], []
 for name, swaps, rel, tests in V:

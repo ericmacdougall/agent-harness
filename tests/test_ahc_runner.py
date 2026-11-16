@@ -3686,13 +3686,56 @@ class StateMachineTests(TC.Base):
         with self.assertRaisesRegex(C.ContractError, "does not leave"):
             self.move("W20")
 
+    UID = 41001
+
+    def running_review(self, item, kind):
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind=?", (item["id"], kind)).fetchone()[0]
+        row = self.c.review(rid, "queued", expected_version=1, event_id=self.ev())
+        return self.c.start_attempt(rid, "ahc-review-" + rid, self.UID, expected_version=row["version"],
+                                    event_id=self.ev())
+
+    def test_w20_cancels_running_and_outcome_unknown_reviews_and_refuses_a_late_result(self):
+        """PR 268 F3: W20's obligation, a running Review row goes to cancelling (R14), in the same transaction."""
+        self.item = self.admit(pr=7, red_team=True)      # its own PR: a resubmit at pr 5 is the fixture (NEG-11)
+        running = self.running_review(self.item, "adversarial")
+        unknown = self.running_review(self.item, "red-team")
+        unknown = self.c.review(unknown["id"], "outcome-unknown", expected_version=unknown["version"],
+                                event_id=self.ev())
+        ev = self.ev()
+        self.assertEqual(self.move("W20", event_id=ev)["state"], "cancelled")
+        for row in (running, unknown):
+            after = self.c._row("reviews", "id", row["id"])
+            self.assertEqual(after["state"], "cancelling", row["kind"])
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM transitions WHERE event_id=?",
+                                             ("%s-r14-%s" % (ev, row["id"]),)).fetchone()[0], 1, "replay-safe id")
+            receipt = {"repo": "o/r", "pr": 7, "head": TC.H1, "snapshot_base": TC.BASE, "packet_sha256": TC.PKT,
+                       "policy_revision": TC.POLICY, "verdict": "PASS"}
+            with self.assertRaises(C.ContractError):              # a result arriving after the cancel
+                self.c.review(row["id"], "passed", expected_version=after["version"], event_id=self.ev(),
+                              receipt=receipt, peer_uid=self.UID)
+        self.assertEqual(self.move("W20", event_id=ev)["state"], "cancelled", "a replay is the T6 no-op")
+        self.assertEqual(self.c._row("reviews", "id", running["id"])["state"], "cancelling")
+
     # ---- ledger-fact rows
+
+    def notices_of(self, row):
+        return sorted((k, t) for k, t in self.db.execute("SELECT kind, text FROM wi_notices WHERE item=? AND "
+                                                         "row_id=?", (self.item["id"], row)))
 
     def test_w03_findings_on_a_review_row_of_this_item(self):
         with self.assertRaisesRegex(C.ContractError, "findings"):
             self.move("W3")
-        self.db.execute("UPDATE reviews SET state='findings' WHERE item=? AND kind='adversarial'", (self.item["id"],))
-        self.assertEqual(self.move("W3")["state"], "waiting-ask")
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='adversarial'",
+                              (self.item["id"],)).fetchone()[0]
+        self.db.execute("UPDATE reviews SET state='findings', receipt=? WHERE id=?",
+                        (json.dumps({"verdict": "BLOCK", "finding_ids": ["F1", "F2"]}), rid))
+        ev = self.ev()
+        self.assertEqual(self.move("W3", event_id=ev)["state"], "waiting-ask")
+        # PR 268 F4: a ticket comment with the finding ids, and an owner notice, written with the move
+        text = "findings on adversarial %s: F1, F2" % rid
+        self.assertEqual(self.notices_of("W3"), [("owner", text), ("ticket", text)])
+        self.assertEqual(self.move("W3", event_id=ev)["state"], "waiting-ask", "replay")
+        self.assertEqual(len(self.notices_of("W3")), 2, "exactly once on replay")
 
     def test_w08_merged_only_on_a_confirmed_effect(self):
         self.at("merge-ready")
@@ -3709,7 +3752,13 @@ class StateMachineTests(TC.Base):
     def test_w10_held_goes_to_waiting_ask_and_w26_settles_it(self):
         self.at("merge-ready")
         _g, op = self.held()
-        self.assertEqual(self.move("W10")["state"], "waiting-ask")
+        ev = self.ev()
+        self.assertEqual(self.move("W10", event_id=ev)["state"], "waiting-ask")
+        # PR 268 F4: an incident and a ticket comment, written with the move, exactly once
+        text = "%s held; a person decides" % op["key"]
+        self.assertEqual(self.notices_of("W10"), [("incident", text), ("ticket", text)])
+        self.move("W10", event_id=ev)
+        self.assertEqual(len(self.notices_of("W10")), 2, "exactly once on replay")
         with self.assertRaisesRegex(C.ContractError, "confirmed"):
             self.move("W26")
         # E10 is exercised in OperationTests; here only the ledger fact W26 reads matters
@@ -3810,6 +3859,31 @@ class StateMachineTests(TC.Base):
         self.assertEqual((item["state"], item["elig_core"], item["elig_policy"]), ("merge-ready", TC.CORE1, TC.POLICY))
 
     # ---- observation rows (T2)
+
+    def test_w04_w24_a_successor_keeps_every_required_review_kind(self):
+        """PR 268 F2: a red-team-required item's successor (W4 or W24) gets its own red-team row, and ELIG holds
+        only once that row has passed too."""
+        for row in ("W4", "W24"):
+            with self.subTest(row=row):
+                pr = 30 if row == "W4" else 31
+                self.item = self.admit(pr=pr, red_team=True)
+                self.assertEqual(self.item["red_team"], 1)
+                if row == "W4":
+                    self.at("merge-ready")
+                    item = self.move("W4", obs=self.pr(pr=pr, pr_head=TC.H2), successor_packet="e" * 64)
+                else:
+                    self.at("merge-ready")
+                    self.dispatched(pr=pr)
+                    item = self.move("W24", mark="head-moved", obs=self.pr(pr=pr, pr_head=TC.H2),
+                                     successor_packet="e" * 64)
+                succ = self.c._row("work_items", "id", item["successor"])
+                self.assertEqual(succ["red_team"], 1, "the classification is inherited")
+                kinds = sorted(k for (k,) in self.db.execute("SELECT kind FROM reviews WHERE item=?", (succ["id"],)))
+                self.assertEqual(kinds, ["adversarial", "red-team", "spec"])
+                self.db.execute("UPDATE reviews SET state='passed' WHERE item=? AND kind != 'red-team'", (succ["id"],))
+                self.assertIn("e1", self.c.elig(succ, self.eligible(succ)), "the red-team review has not passed")
+                self.db.execute("DELETE FROM reviews WHERE item=? AND kind='red-team'", (succ["id"],))
+                self.assertIn("e1", self.c.elig(succ, self.eligible(succ)), "a missing required kind fails e1")
 
     def test_w04_head_moved_supersedes_with_a_successor_and_abandons_an_unsent_intent(self):
         self.at("merge-ready")
@@ -4092,6 +4166,14 @@ class StateMachineTests(TC.Base):
         self.assertEqual(kinds, [("adversarial", "required"), ("spec", "required")])
         self.assertEqual(self.state("operations", "key", op["key"]), "abandoned", "E9")
         self.assertEqual(self.c.elig(item, self.eligible(item)), ["e1", "e2"])
+        # PR 268 F1: complete the replacement reviews; the item regains ELIG and takes W2 to merge-ready, even
+        # though the old policy's spec pass (same core) stays terminal beside the new one
+        self.db.execute("UPDATE reviews SET state='passed' WHERE item=? AND policy_revision='policy-r2'",
+                        (item["id"],))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reviews WHERE item=? AND kind='spec' AND "
+                                         "state='passed'", (item["id"],)).fetchone()[0], 2)
+        self.assertEqual(self.c.elig(item, self.eligible(item)), [])
+        self.assertEqual(self.move("W2", obs=self.eligible(item))["state"], "merge-ready")
 
     def test_w27_waits_under_t7(self):
         self.pass_reviews()

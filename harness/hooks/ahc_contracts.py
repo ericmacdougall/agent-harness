@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS work_items (
   base TEXT NOT NULL, policy_revision TEXT NOT NULL, spec_core TEXT NOT NULL, packet_sha256 TEXT NOT NULL,
   state TEXT NOT NULL, marks TEXT NOT NULL DEFAULT '', successor TEXT, cause TEXT, version INTEGER NOT NULL,
   created REAL NOT NULL, updated REAL NOT NULL, elig_core TEXT, elig_policy TEXT, w21_base TEXT,
+  red_team INTEGER NOT NULL DEFAULT 0 CHECK (red_team IN (0, 1)),
   CHECK (state IN ('pr-gate', 'merge-ready', 'waiting-dep', 'waiting-ask', 'exhausted', 'merged',
                    'headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled')),
   CHECK (marks IN ('', 'head-moved', 'closed-in-flight')));
@@ -357,10 +358,13 @@ class Contracts:
             iid = "wi-" + _sha({"repo": repo, "pr": int(pr), "head": head, "base": base, "event": event_id})[:24]
             self._g0("work_item", None, None, event_id, actor, {(None, "pr-gate"): (actor,)}, None, "pr-gate")
             now = self.now()
+            # PR 268 F2: the class's required review kinds are stored on the item, so a successor (W4, W24)
+            # requires the same kinds and e1 can check that none is missing
             self.db.execute("INSERT INTO work_items(id, lineage, repo, pr, head, base, policy_revision, spec_core, "
-                            "packet_sha256, state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "packet_sha256, state, version, created, updated, red_team) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (iid, self.lineage_of(repo, pr), repo, int(pr), head, base, policy_revision, spec_core,
-                             packet_sha256, "pr-gate", 1, now, now))
+                             packet_sha256, "pr-gate", 1, now, now, 1 if red_team else 0))
             kinds = ("adversarial", "spec") + (("red-team",) if red_team else ())
             for kind in kinds:
                 code = kind in self.ATTEMPT_KINDS
@@ -369,6 +373,15 @@ class Contracts:
                                     spec_core="" if code else spec_core)
             self._a0("work_item", iid, None, "pr-gate", event_id, actor, row="W1")
             return self._row("work_items", "id", iid)
+
+    @staticmethod
+    def _finding_ids(receipt):
+        """The finding ids a findings receipt names (its `finding_ids` list); anything malformed names none."""
+        try:
+            ids = json.loads(receipt).get("finding_ids") if receipt else None
+        except (ValueError, AttributeError):
+            return []
+        return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
 
     def _item_effects(self, item):
         return self.db.execute("SELECT key, state, version FROM operations WHERE item=? AND head=?",
@@ -444,17 +457,22 @@ class Contracts:
         head, tip = item["head"], o["tip"]
         pol = o["policy"] if isinstance(o["policy"], dict) else {}
         # e1: every required code Review row passed for (H, packet, policy revision); each B_r an ancestor of B
-        code = self.db.execute("SELECT state, snapshot_base, packet_sha256, policy_revision FROM reviews WHERE "
+        code = self.db.execute("SELECT kind, state, snapshot_base FROM reviews WHERE "
                                "item=? AND head=? AND kind IN ('adversarial', 'red-team') AND policy_revision=? "
                                "AND packet_sha256=?", (item["id"], head, item["policy_revision"],
                                                       item["packet_sha256"])).fetchall()
         anc = o["b_r_ancestors"] if isinstance(o["b_r_ancestors"], dict) else {}
-        if (not code or o["pr_head"] != head or pol.get("revision") != item["policy_revision"]
-                or any(s != "passed" or anc.get(br) is not True for s, br, _p, _r in code)):
+        required = {"adversarial"} | ({"red-team"} if item["red_team"] else set())   # PR 268 F2: none missing
+        if (not required <= {k for k, _s, _b in code} or o["pr_head"] != head
+                or pol.get("revision") != item["policy_revision"]
+                or any(s != "passed" or anc.get(br) is not True for _k, s, br in code)):
             failed.append("e1")
-        # e2: the spec row for the spec core attached NOW has passed
-        spec = self.db.execute("SELECT state FROM reviews WHERE item=? AND head=? AND kind='spec' AND spec_core=?",
-                               (item["id"], head, o["attached_core"])).fetchall()
+        # e2: the spec row for the spec core attached NOW, at this item's packet and policy revision, has passed
+        # (PR 268 F1: after W27 the old revision's pass stays terminal beside the replacement and must not count)
+        spec = self.db.execute("SELECT state FROM reviews WHERE item=? AND head=? AND kind='spec' AND spec_core=? "
+                               "AND policy_revision=? AND packet_sha256=?",
+                               (item["id"], head, o["attached_core"], item["policy_revision"],
+                                item["packet_sha256"])).fetchall()
         if o["attached_core"] != item["spec_core"] or [s for (s,) in spec] != ["passed"]:
             failed.append("e2")
         if o["open_findings"] != 0 or isinstance(o["open_findings"], bool):
@@ -583,7 +601,8 @@ class Contracts:
         if not (isinstance(packet_sha256, str) and len(packet_sha256) == 64 and _is_oid(packet_sha256)):
             raise ContractError("the successor at H' needs its own packet sha256")
         succ = self.admit_item(item["repo"], item["pr"], new_head, item["base"], item["policy_revision"],
-                               item["spec_core"], packet_sha256, event_id=event_id + "-successor")
+                               item["spec_core"], packet_sha256, event_id=event_id + "-successor",
+                               red_team=bool(item["red_team"]))
         return succ["id"]
 
     def _wi_effects(self, item, row_id, event_id, obs):
@@ -616,6 +635,14 @@ class Contracts:
                 if kind in made and rid != made[kind]:
                     self.review(rid, "superseded", expected_version=version, event_id="%s-r12-%s" % (event_id, rid),
                                 successor=made[kind], cause="spec core or policy changed (W27)")
+        if row_id == "W20":
+            # PR 268 F3: the owner withdrew the item; an attempt that may still run is stopped first (R14), so no
+            # result can settle its row afterwards (cancelling accepts none; R15 settles it once the unit is gone)
+            for rid, version in self.db.execute("SELECT id, version FROM reviews WHERE item=? AND state IN "
+                                                "('running', 'outcome-unknown') ORDER BY id",
+                                                (item["id"],)).fetchall():
+                self.review(rid, "cancelling", expected_version=version, event_id="%s-r14-%s" % (event_id, rid),
+                            cause="owner cancelled (W20)")
         if row_id in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):
             for key, state, version in self._item_effects(item):
                 if state == "intent":                                # E9: an intent never sent is abandoned
@@ -626,6 +653,21 @@ class Contracts:
                             % (self._row("work_items", "id", item["id"])["cause"]))
         elif row_id == "W17":
             self._wi_notice(event_id, item, row_id, "ticket", "protected path; main integrates by hand")
+        elif row_id == "W3":
+            # PR 268 F4: escalate with the finding ids of every findings row (from its bound receipt)
+            parts = []
+            for rid, kind, receipt in self.db.execute("SELECT id, kind, receipt FROM reviews WHERE item=? AND "
+                                                      "state='findings' ORDER BY kind, id", (item["id"],)):
+                parts.append("%s %s: %s" % (kind, rid, ", ".join(self._finding_ids(receipt)) or "no finding ids"))
+            text = "findings on " + "; ".join(parts)
+            self._wi_notice(event_id, item, row_id, "ticket", text)
+            self._wi_notice(event_id, item, row_id, "owner", text)
+        elif row_id == "W10":
+            # PR 268 F4: the Effect is held; a person decides (the grant stays reserved; W26 settles it)
+            keys = [k for k, state, _v in self._item_effects(item) if state == "held"]
+            text = "%s held; a person decides" % ", ".join(keys)
+            self._wi_notice(event_id, item, row_id, "incident", text)
+            self._wi_notice(event_id, item, row_id, "ticket", text)
         elif row_id in ("W8", "W26"):
             # keyed by the op key, not the event, so the integration is announced exactly once (W26: a restart
             # cannot repeat it); recorded as integrated at H only, never at a successor's H'
