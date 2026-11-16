@@ -3453,5 +3453,217 @@ class LiveIsolationTests(unittest.TestCase):
         self.assertEqual(after_state, before_state)
 
 
+from tests import test_ahc_contracts as TC  # noqa: E402
+
+C = TC.C
+
+
+class StateMachineTests(TC.Base):
+    """WorkItem (spec M-1 v2g16, W1-W27) through the production transition function Contracts.wi_move. Slice 1 (a),
+    shadow only: these rows write the ledger and send nothing. Rows whose guards need ELIG, observations, budgets
+    or main's stamp are wired in later steps and are refused until then (test_unwired_rows_fail_closed)."""
+
+    def setUp(self):
+        super().setUp()
+        self.item = self.admit()
+
+    def admit(self, **kw):
+        args = dict(repo="O/R", pr=5, head=TC.H1, base=TC.BASE, policy_revision=TC.POLICY, spec_core=TC.CORE1,
+                    packet_sha256=TC.PKT, event_id=self.ev())
+        args.update(kw)
+        return self.c.admit_item(**args)
+
+    def move(self, row, item=None, **kw):
+        item = item or self.c._row("work_items", "id", self.item["id"])
+        kw.setdefault("actor", C.Contracts.WI_TRANSITIONS[row][2])
+        kw.setdefault("event_id", self.ev())
+        return self.c.wi_move(item["id"], row, expected_version=item["version"], **kw)
+
+    def at(self, state):
+        """Put the fixture item in `state` directly, for guard tests of rows that leave it."""
+        self.db.execute("UPDATE work_items SET state=? WHERE id=?", (state, self.item["id"]))
+
+    def reserved(self, **changes):          # the Effect fixtures, bound to this item (operations.item)
+        g = self.active_grant(**{k: v for k, v in changes.items() if k in C.Contracts.SCOPE})
+        op = self.c.intend(self.params(**changes), item=self.item["id"], lease_ok=True, event_id=self.ev())
+        g = self.reserve(g, op)
+        return g, self.c._row("operations", "key", op["key"])
+
+    def confirmed(self):
+        g, op = self.dispatched()
+        return g, self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
+
+    def abandoned(self):
+        g, op = self.absent_p("p1")
+        return g, self.after(op, self.read(tip=TC.BASE))
+
+    def wstate(self):
+        return self.state("work_items", "id", self.item["id"])
+
+    # ---- W1 and NEG-11
+
+    def test_w01_admits_into_pr_gate_with_bound_review_rows(self):
+        self.assertEqual((self.item["state"], self.item["repo"], self.item["head"]), ("pr-gate", "o/r", TC.H1))
+        rows = self.db.execute("SELECT kind, head, snapshot_base, spec_core FROM reviews WHERE item=? ORDER BY kind",
+                               (self.item["id"],)).fetchall()
+        self.assertEqual(rows, [("adversarial", TC.H1, TC.BASE, ""), ("spec", TC.H1, "", TC.CORE1)])
+        red = self.admit(pr=6, red_team=True)
+        kinds = {r[0] for r in self.db.execute("SELECT kind FROM reviews WHERE item=?", (red["id"],))}
+        self.assertEqual(kinds, {"adversarial", "spec", "red-team"})
+
+    def test_neg11_a_resubmit_or_owner_action_never_moves_the_item(self):
+        again = self.admit()
+        self.assertEqual((again["id"], again["version"], again["state"]),
+                         (self.item["id"], self.item["version"], "pr-gate"), "a resubmit attaches to the item")
+        for row in ("W2", "W3", "W4", "W16", "W27"):
+            with self.subTest(row=row), self.assertRaisesRegex(C.ContractError, "NEG-11"):
+                self.move(row, actor="owner")
+        self.assertEqual(self.c._row("work_items", "id", self.item["id"])["version"], self.item["version"])
+
+    def test_w20_the_owner_cancels_its_own_item_from_pr_gate_only(self):
+        with self.assertRaises(C.ContractError):
+            self.move("W20", actor="ahc-core")
+        self.assertEqual(self.move("W20")["state"], "cancelled")
+        self.at("waiting-ask")
+        with self.assertRaisesRegex(C.ContractError, "does not leave"):
+            self.move("W20")
+
+    # ---- ledger-fact rows
+
+    def test_w03_findings_on_a_review_row_of_this_item(self):
+        with self.assertRaisesRegex(C.ContractError, "findings"):
+            self.move("W3")
+        self.db.execute("UPDATE reviews SET state='findings' WHERE item=? AND kind='adversarial'", (self.item["id"],))
+        self.assertEqual(self.move("W3")["state"], "waiting-ask")
+
+    def test_w08_merged_only_on_a_confirmed_effect(self):
+        self.at("merge-ready")
+        with self.assertRaisesRegex(C.ContractError, "confirmed"):
+            self.move("W8")
+        self.confirmed()
+        self.assertEqual(self.move("W8")["state"], "merged")
+
+    def test_w09_abandoned_unmarked_back_to_pr_gate(self):
+        self.at("merge-ready")
+        self.abandoned()
+        self.assertEqual(self.move("W9")["state"], "pr-gate")
+
+    def test_w10_held_goes_to_waiting_ask_and_w26_settles_it(self):
+        self.at("merge-ready")
+        _g, op = self.held()
+        self.assertEqual(self.move("W10")["state"], "waiting-ask")
+        with self.assertRaisesRegex(C.ContractError, "confirmed"):
+            self.move("W26")
+        # E10 is exercised in OperationTests; here only the ledger fact W26 reads matters
+        self.db.execute("UPDATE operations SET state='confirmed' WHERE key=?", (op["key"],))
+        self.assertEqual(self.move("W26")["state"], "merged")
+
+    def test_w24_marks_and_keeps_the_item_then_w25_ends_it(self):
+        self.at("merge-ready")
+        with self.assertRaisesRegex(C.ContractError, "unsettled"):
+            self.move("W24", mark="head-moved")
+        _g, op = self.dispatched()
+        item = self.move("W24", mark="head-moved")
+        self.assertEqual((item["state"], item["marks"]), ("merge-ready", "head-moved"))
+        with self.assertRaisesRegex(C.ContractError, "already marked"):
+            self.move("W24", mark="closed-in-flight")
+        with self.assertRaisesRegex(C.ContractError, "abandoned"):
+            self.move("W25", to="superseded")
+        self.db.execute("UPDATE operations SET state='abandoned' WHERE key=?", (op["key"],))
+        with self.assertRaisesRegex(C.ContractError, "W25 sends a head-moved item to superseded"):
+            self.move("W25", to="closed-unmerged")
+        with self.assertRaisesRegex(C.ContractError, "takes W25"):
+            self.move("W9")
+        self.assertEqual(self.move("W25", to="superseded")["state"], "superseded")
+
+    # ---- T6, T7 and the Q-A5.2 invariant
+
+    def test_t6_a_replay_is_a_no_op_even_with_a_stale_version(self):
+        ev = self.ev()
+        first = self.move("W20", event_id=ev)
+        again = self.c.wi_move(self.item["id"], "W20", expected_version=self.item["version"], event_id=ev,
+                               actor="owner")
+        self.assertEqual((again["state"], again["version"]), (first["state"], first["version"]))
+        n = self.db.execute("SELECT COUNT(*) FROM transitions WHERE event_id=?", (ev,)).fetchone()[0]
+        self.assertEqual(n, 1, "one audit row (T3)")
+        other = self.admit(pr=7)
+        with self.assertRaisesRegex(C.ContractError, "another subject"):
+            self.c.wi_move(other["id"], "W20", expected_version=other["version"], event_id=ev, actor="owner")
+
+    def test_t7_an_unsettled_effect_allows_only_its_own_rows(self):
+        for setup in (self.dispatched, self.held, self.fenced, lambda: self.absent_p("p1")):
+            with self.subTest(setup=getattr(setup, "__name__", "absent-proven")):
+                self.db.execute("DELETE FROM operations")
+                self.db.execute("DELETE FROM grants")
+                self.at("merge-ready")
+                setup()
+                for row in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):
+                    with self.assertRaisesRegex(C.ContractError, "T7"):
+                        self.move(row)
+                self.at("pr-gate")
+                for row in ("W2", "W3", "W15", "W19", "W20", "W21", "W22", "W23"):   # W15 and W20 too
+                    with self.assertRaisesRegex(C.ContractError, "T7"):
+                        self.move(row)
+                self.assertEqual(self.move("W24", mark="head-moved")["marks"], "head-moved")
+                self.db.execute("UPDATE work_items SET marks='' WHERE id=?", (self.item["id"],))
+
+    def test_note8_absent_proven_waits_then_moves_once_abandoned_or_held(self):
+        self.at("merge-ready")
+        _g, op = self.absent_p("p1")
+        with self.assertRaisesRegex(C.ContractError, "T7"):
+            self.move("W5")
+        self.after(op, self.read(tip=TC.BASE))                    # E8: abandoned
+        self.assertEqual(self.move("W9")["state"], "pr-gate")
+
+    def test_qa52_no_row_enters_waiting_dep_or_exhausted_with_an_unsettled_effect(self):
+        for row, (src, dst, _a) in C.Contracts.WI_TRANSITIONS.items():
+            if row in C.Contracts.T7_ALLOWED:
+                self.assertFalse({"waiting-dep", "exhausted"} & set(dst), "%s would strand a send" % row)
+        self.at("waiting-ask")
+        _g, op = self.dispatched()
+        with self.assertRaisesRegex(C.ContractError, "T7"):
+            self.move("W16", to="pr-gate", actor="main")
+
+    def test_unwired_rows_fail_closed(self):
+        for row in ("W2", "W6", "W7", "W11", "W12", "W15", "W21", "W22", "W23"):
+            src = C.Contracts.WI_TRANSITIONS[row][0][0]
+            self.at(src)
+            to = C.Contracts.WI_TRANSITIONS[row][1][0]
+            with self.subTest(row=row), self.assertRaisesRegex(C.ContractError, "not wired"):
+                self.move(row, to=to)
+        self.assertEqual(self.c._row("work_items", "id", self.item["id"])["version"], self.item["version"])
+
+    # ---- precedence (T7)
+
+    def test_t7_precedence(self):
+        S = C.Contracts.select_row
+        self.assertEqual(S(["W2", "W17"], False), "W17", "a protected path beats W2")
+        self.assertEqual(S(["W18", "W4"], False), "W4")
+        self.assertEqual(S(["W17", "G8"], False), "W17")
+        self.assertEqual(S(["W2", "G9"], False), "G9", "a kill-switch revoke beats an unranked WorkItem row")
+        self.assertEqual(S(["W23", "W22", "W21"], False), "W21", "numeric order, not table order")
+        self.assertEqual(S(["W4", "W8"], True), "W8", "W4 waits under T7")
+        self.assertIsNone(S(["W4", "W5"], True))
+        with self.assertRaises(C.ContractError):
+            S(["G1"], False)
+
+    def test_every_workitem_test_id_resolves_to_a_test(self):
+        import re
+        text = (HOOKS.parents[1] / "docs" / "spec" / "ahc-m1-state-machine.md").read_text(encoding="utf-8")
+        part = text.split("### Entity: WorkItem", 1)[1].split("### Entity:", 1)[0]
+        ids = sorted(set(re.findall(r"SMTests\.(test_\w+)", part)))
+        self.assertEqual(len(ids), 38, "11 states and 27 rows")
+        missing = [i for i in ids if not any(n == i or n.startswith(i + "_") for n in dir(self))]
+        self.assertLessEqual(set(missing), set(self.PENDING_IDS), "a test id the spec names has no test")
+
+    # Spec test ids not yet covered by a test of that name; each step of slice 1 (a) shrinks this list.
+    PENDING_IDS = (
+        "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask", "test_wi_exhausted",
+        "test_wi_merged", "test_wi_headed_verified", "test_wi_handed", "test_wi_superseded", "test_wi_closed_unmerged",
+        "test_wi_cancelled", "test_w02", "test_w04", "test_w05", "test_w06", "test_w07", "test_w11", "test_w12",
+        "test_w13", "test_w14", "test_w15", "test_w16", "test_w17", "test_w18", "test_w19", "test_w21", "test_w22",
+        "test_w23", "test_w25", "test_w26", "test_w27")
+
+
 if __name__ == "__main__":
     unittest.main()

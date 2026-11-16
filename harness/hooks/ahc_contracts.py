@@ -76,6 +76,16 @@ CREATE TABLE IF NOT EXISTS contract_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 INSERT OR IGNORE INTO contract_meta(k, v) VALUES ('authority_epoch', '1');
 CREATE TABLE IF NOT EXISTS repo_flags (
   repo TEXT PRIMARY KEY, merging_off INTEGER NOT NULL, cause TEXT, actor TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS work_items (
+  id TEXT PRIMARY KEY, lineage TEXT NOT NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
+  base TEXT NOT NULL, policy_revision TEXT NOT NULL, spec_core TEXT NOT NULL, packet_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL, marks TEXT NOT NULL DEFAULT '', successor TEXT, cause TEXT, version INTEGER NOT NULL,
+  created REAL NOT NULL, updated REAL NOT NULL,
+  CHECK (state IN ('pr-gate', 'merge-ready', 'waiting-dep', 'waiting-ask', 'exhausted', 'merged',
+                   'headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled')),
+  CHECK (marks IN ('', 'head-moved', 'closed-in-flight')));
+CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_live_per_head ON work_items(repo, pr, head)
+  WHERE state NOT IN ('headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled');
 CREATE TABLE IF NOT EXISTS transitions (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, id TEXT NOT NULL, from_state TEXT,
   to_state TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL, at REAL NOT NULL, data TEXT);
@@ -261,6 +271,180 @@ class Contracts:
         "W26": (("pr-gate", "waiting-dep", "waiting-ask", "exhausted"), ("merged",), "ahc-core"),
         "W27": (("merge-ready",), ("pr-gate",), "ahc-core"),
     }
+    WI_TERMINAL = tuple(s for s, (cls, _o, _a) in WI_STATES.items() if cls == "terminal")
+    # T7: an Effect in one of these states is unsettled. The spec lists dispatched, outcome-unknown, held and fenced;
+    # absent-proven is unsettled too (spec owner ruling, note 8: E7 can re-dispatch it). intent is not: an unsent
+    # intent is abandoned by E9 when the item leaves merge-ready.
+    T7_UNSETTLED = ("dispatched", "outcome-unknown", "held", "fenced", "absent-proven")
+    T7_ALLOWED = ("W8", "W9", "W10", "W24", "W25", "W26")      # the only rows that move an item with one (T7)
+    # T7 precedence when two guards hold at once. G8 and G9 are Grant rows evaluated in the same tick (ruling
+    # Q-A5.3); select_row orders them with the WorkItem rows and never treats them as WorkItem rows.
+    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")
+    GRANT_ROWS = ("G8", "G9")
+    # Rows whose guard reads only ledger facts are applied here. Rows whose guard needs ELIG, an observation, a
+    # budget or main's stamp are wired in later steps of slice 1 (a); until then they are refused (fail closed).
+    WI_WIRED = ("W3", "W8", "W9", "W10", "W20", "W24", "W25", "W26")
+
+    @classmethod
+    def select_row(cls, holding, unsettled):
+        """T7: which row moves the item when every row in `holding` has its guard satisfied. With an unsettled
+        Effect only T7_ALLOWED rows (and the Grant rows) qualify; then the T7 order; then the lowest-numbered row
+        (numerically: W21 before W22 before W23). Returns None when nothing qualifies."""
+        rows = []
+        for r in holding:
+            if r not in cls.WI_TRANSITIONS and r not in cls.GRANT_ROWS:
+                raise ContractError("unknown row %r" % r)
+            if unsettled and r not in cls.T7_ALLOWED and r not in cls.GRANT_ROWS:
+                continue
+            rows.append(r)
+        if not rows:
+            return None
+        ranked = [r for r in cls.T7_ORDER if r in rows]
+        if ranked:
+            return ranked[0]
+        return min(rows, key=lambda r: int(r[1:]))
+
+    @staticmethod
+    def lineage_of(repo, pr):
+        return "ln-" + _sha({"repo": str(repo).lower(), "pr": int(pr)})[:24]
+
+    def admit_item(self, repo, pr, head, base, policy_revision, spec_core, packet_sha256, *, event_id,
+                   actor="ahc-core", red_team=False):
+        """W1 (entry) -> pr-gate for (lineage, H, B), creating the required Review rows bound to (repo, pr, H, B):
+        adversarial and spec, plus red-team when the class requires it. NEG-11: a resubmit at the same head returns
+        the live item unchanged; no state, version or Review row moves."""
+        if actor != self.WI_TRANSITIONS["W1"][2]:
+            raise ContractError("W1: only ahc-core admits an item")
+        repo = str(repo).lower()
+        for name, value in (("head", head), ("base", base)):
+            if not _is_oid(value):
+                raise ContractError("an item's %s is a full sha" % name)
+        if head == base:
+            raise ContractError("an item's head equals its base; nothing to integrate")
+        with self.tx():
+            live = self.db.execute("SELECT id FROM work_items WHERE repo=? AND pr=? AND head=? AND state NOT IN (%s)"
+                                   % ",".join("?" * len(self.WI_TERMINAL)),
+                                   (repo, int(pr), head) + self.WI_TERMINAL).fetchone()
+            if live:
+                return self._row("work_items", "id", live[0])
+            iid = "wi-" + _sha({"repo": repo, "pr": int(pr), "head": head, "base": base, "event": event_id})[:24]
+            self._g0("work_item", None, None, event_id, actor, {(None, "pr-gate"): (actor,)}, None, "pr-gate")
+            now = self.now()
+            self.db.execute("INSERT INTO work_items(id, lineage, repo, pr, head, base, policy_revision, spec_core, "
+                            "packet_sha256, state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (iid, self.lineage_of(repo, pr), repo, int(pr), head, base, policy_revision, spec_core,
+                             packet_sha256, "pr-gate", 1, now, now))
+            kinds = ("adversarial", "spec") + (("red-team",) if red_team else ())
+            for kind in kinds:
+                code = kind in self.ATTEMPT_KINDS
+                self.require_review(kind, repo, pr, head, packet_sha256, policy_revision, item=iid,
+                                    event_id="%s-%s" % (event_id, kind), snapshot_base=base if code else "",
+                                    spec_core="" if code else spec_core)
+            self._a0("work_item", iid, None, "pr-gate", event_id, actor, row="W1")
+            return self._row("work_items", "id", iid)
+
+    def _item_effects(self, item):
+        return self.db.execute("SELECT key, state, version FROM operations WHERE item=? AND head=?",
+                               (item["id"], item["head"])).fetchall()
+
+    def item_unsettled(self, item):
+        """T7: the item has an Effect for its H in an unsettled state."""
+        return any(state in self.T7_UNSETTLED for _k, state, _v in self._item_effects(item))
+
+    def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None):
+        """The one WorkItem transition function (T1 to T7). One BEGIN IMMEDIATE; the guard re-reads its ledger
+        facts; the state change and one audit row commit together (T3). A replay of the same event for the same
+        item and row is a no-op that returns the current row (T6), checked before the version so a post-crash replay
+        with a stale expected version still lands as a no-op."""
+        with self.tx():
+            item = self._row("work_items", "id", iid)
+            if item is None:
+                raise ContractError("no work item %s" % iid)
+            prior = self.db.execute("SELECT entity, id, data FROM transitions WHERE event_id=?",
+                                    (event_id,)).fetchone() if isinstance(event_id, str) else None
+            if prior is not None:
+                data = json.loads(prior[2]) if prior[2] else {}
+                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:
+                    return item                                     # T6: a replay is a no-op
+                raise ContractError("event id %s was already applied to another subject" % event_id)
+            if row_id not in self.WI_TRANSITIONS:
+                raise ContractError("unknown WorkItem row %r" % row_id)
+            src, dst, row_actor = self.WI_TRANSITIONS[row_id]
+            if actor != row_actor:
+                if actor == "owner":   # NEG-11: an owner's resubmit or ack never moves an item; only W20 is theirs
+                    raise ContractError("NEG-11: an owner action moves a work item only by W20 (cancel)")
+                raise ContractError("%s is taken by %s, not %r" % (row_id, row_actor, actor))
+            frm = item["state"]
+            if frm not in src:
+                raise ContractError("%s does not leave %s" % (row_id, frm))
+            if row_id == "W24":
+                to = frm                                            # W24 keeps the item where it is
+            elif to is None:
+                if len(dst) != 1:
+                    raise ContractError("%s needs its target, one of %s" % (row_id, ", ".join(dst)))
+                to = dst[0]
+            if to not in dst:
+                raise ContractError("%s goes to %s, not %r" % (row_id, ", ".join(dst), to))
+            if item["version"] != expected_version:
+                raise VersionConflict("work item version is %s, caller expected %s" % (item["version"],
+                                                                                         expected_version))
+            if not isinstance(event_id, str) or not event_id:
+                raise ContractError("an event id is required")
+            unsettled = self.item_unsettled(item)
+            if unsettled and row_id not in self.T7_ALLOWED:
+                raise ContractError("T7: %s waits while the item's Effect is unsettled" % row_id)
+            if unsettled and to in ("waiting-dep", "exhausted"):
+                # Q-A5.2: unreachable through the table under T7; kept as an invariant so a future row cannot put
+                # an in-flight send where no row settles it. Raised as an incident, never applied.
+                raise ContractError("incident: %s would put an item with an unsettled Effect in %s" % (row_id, to))
+            if row_id not in self.WI_WIRED:
+                raise ContractError("%s is not wired in this build of slice 1 (a); refused, fail closed" % row_id)
+            mark = self._wi_guard(item, row_id, to, mark, unsettled)
+            self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), version=version+1, "
+                            "updated=? WHERE id=?", (to, mark, cause, self.now(), iid))
+            self._a0("work_item", iid, frm, to, event_id, actor, row=row_id, cause=cause)
+            return self._row("work_items", "id", iid)
+
+    def _wi_guard(self, item, row_id, to, mark, unsettled):
+        """Ledger-fact guards of the wired rows, read inside the transaction (T1). Returns the item's marks after
+        the row."""
+        effects = {state for _k, state, _v in self._item_effects(item)}
+        marks = item["marks"]
+        if row_id == "W3":
+            findings = self.db.execute("SELECT 1 FROM reviews WHERE item=? AND head=? AND state='findings'",
+                                       (item["id"], item["head"])).fetchone()
+            if not findings:
+                raise ContractError("W3 needs a Review row of this item ending findings")
+        elif row_id in ("W8", "W26"):
+            if "confirmed" not in effects:
+                raise ContractError("%s needs a confirmed Effect of this item for its H" % row_id)
+        elif row_id == "W9":
+            if "abandoned" not in effects or unsettled:
+                raise ContractError("W9 needs the item's Effect abandoned")
+            if marks:
+                raise ContractError("W9 is for an unmarked item; a %s item takes W25" % marks)
+        elif row_id == "W10":
+            if "held" not in effects:
+                raise ContractError("W10 needs the item's Effect held")
+        elif row_id == "W24":
+            if not unsettled:
+                raise ContractError("W24 applies only while the item's Effect is unsettled")
+            if mark not in (None, "", "head-moved", "closed-in-flight"):
+                raise ContractError("W24 marks head-moved or closed-in-flight, not %r" % mark)
+            if mark and marks and mark != marks:
+                raise ContractError("the item is already marked %s" % marks)
+            return mark or marks
+        elif row_id == "W25":
+            if "abandoned" not in effects or unsettled:
+                raise ContractError("W25 needs the item's Effect abandoned")
+            want = {"head-moved": "superseded", "closed-in-flight": "closed-unmerged"}.get(marks)
+            if want != to:
+                raise ContractError("W25 sends a %s item to %s" % (marks or "unmarked", want))
+        elif row_id == "W20":
+            pass                                                    # the owner cancels its own item from pr-gate
+        if mark not in (None, ""):
+            raise ContractError("only W24 sets a mark")
+        return marks
 
     # -------------------------------------------------------------- Review (3.3)
 
