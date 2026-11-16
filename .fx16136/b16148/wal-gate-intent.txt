@@ -1,0 +1,47 @@
+INTENT goodqa#16148 step 3: the rw-ship unhold gate (spec v4 AC-8, P3, P4, NEG-12, NEG-19, the per-deploy derive stream; plus D1, goodqa#16198).
+
+Where:
+- New branch fix/16148-rwship-gate in t2-dev ~/repos/fx-16136/bt-16148-gate, off bff96cc5 (1371, the main copy), with 97bfac51 (1373) merged in. The merge is uncommitted so far and had no conflicts.
+- The rh copy (1370, c4a1d054) gets a port branch afterwards.
+- The frozen heads are untouched.
+
+Plan:
+- Pre-switch (selfhost path, after the image ids are verified):
+  - stream derive with an explicit timeout;
+  - parse exactly one written or unchanged line;
+  - unheld: (a) and (b), where (b) is a names-only count of the key line in dispatcher.env;
+  - unheld: the P3 isolated trial boot of IMG_DISP (--rm, --network none, no socket, fake token, no env_file, a fresh temp secrets dir with a fake value, 60 s timeout = fail);
+  - on failure, exit 2 with nothing switched;
+  - held: a REFUSED derive only warns.
+- Post-switch gate (c): read the new job-dispatcher container (id and start time differ from the pre-switch one) and require the exact line `job env file INTELLIGENCE_WORKER__GITHUB_APP_PRIVATE_KEY: ok`.
+- On (c) failing or unreadable:
+  - a hold-only re-pin with its own stamp (every other pin unchanged, plus --job-hold JOB_IMAGE_INTELLIGENCE_WORKER), then recreate only the dispatcher and the guard;
+  - if migrations were applied, exit 8 with intelligence held; otherwise roll back.
+  - P4/NEG-19: a failed re-pin or recreate exits 8 at once, prints HOLD NOT RE-APPLIED and the manual command (key names), and raises the alert.
+- The deploy record carries status words only.
+
+Assumptions (ASSUMPTION until the lead rules):
+- where derive is read from (bound set);
+- whether the trial boot has a defined exit path;
+- what PR scope this carries.
+
+Invariants:
+- no secret value in argv, logs, the deploy record or WAL;
+- no intelligence container can start after a failed (c);
+- no service but the dispatcher and the guard is recreated by the hold path;
+- a REFUSED derive never switches an unholding release.
+
+Risks:
+
+| Risk | Mitigation |
+|---|---|
+| The restore fence refuses the rollback after a hold re-pin, which uses a new stamp | test the (c)-fail-then-rollback case end to end first |
+| selfhost-ctl.py is bound and exists in two copies | needs a new recreate verb; rebind 73 only when the lead says |
+| The trial boot hangs | 60 s timeout counted as a failure |
+| Integration: test_selfhost_ctl_job_secrets.py pin() lacks job args on 1371 and fails on the merged tree | fix in this PR, and flag the merge-order risk |
+
+Negative cases: NEG-12, NEG-19; garbled derive in 4 forms; an ssh failure; the boot line only in the old container; an error and an ignored line; a missing key name; the trial argv.
+
+Checks:
+- PENDING_REAL_TEST p16148-gate-c-live: on the first unholding deploy, the deploy record shows gate (c) ok, read from the new dispatcher container id.
+- PENDING_REAL_TEST p16148-trial-boot-live: the real trial boot on the VM prints ok within 60 s and leaves no container.
