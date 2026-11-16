@@ -2134,3 +2134,69 @@ def contextlib_exit_stack(patches):
     for name, (target, value) in patches.items():
         stack.enter_context(patch.object(target, name, value))
     return stack
+
+
+class ProviderOutputBoundDelta3Tests(unittest.TestCase):
+    """Review harness-pr266-v3 (goodqa#16170): a failed child record of any exception type whose cleanup could not
+    prove the group gone is UNKNOWN (no pool release, no fallback launch); a genuine missing executable still falls
+    back."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta3_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    def options(self, note_child):
+        import types
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=note_child)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        return {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+
+    def test_failed_record_raising_file_not_found_with_unreapable_child_is_unknown(self):
+        spawned = []
+
+        def note_child(child):
+            spawned.append(child)
+            raise FileNotFoundError(2, 'children.json vanished')
+        options = self.options(note_child)
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture) as launches, \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(caught.exception.outcome['fallback_allowed'])
+            self.assertFalse(options['store'].release_pool.called, 'a child that may be alive must keep its pool')
+            self.assertEqual(launches.call_count, 1, 'no fallback provider may launch while the child may be alive')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    def test_control_genuine_missing_executable_still_falls_back(self):
+        options = self.options(lambda child: None)
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(self.module, 'run_process', side_effect=FileNotFoundError(2, 'no such reviewer')) as launches:
+            with self.assertRaises(self.module.ReviewFailure) as caught:
+                self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+        self.assertEqual(launches.call_count, 2, 'a missing executable allows the one independent fallback')
+        self.assertEqual(caught.exception.outcome['reason'], 'TRANSIENT_INFRA')
+        self.assertTrue(options['store'].release_pool.called, 'nothing ran, so the pool is released')

@@ -740,20 +740,24 @@ def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> t
     environment['PATH'] = diagnostics.child_path(
         environment.get('PATH', ''), [*_CHILD_PATH_ROOTS, *diagnostics.untrusted_roots(snapshot=cwd)])
     try:
-        extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
-        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
-                             timeout=timeout, output_limit=PROVIDER_RAW_LIMIT, **extra)
-        return result.returncode, result.stdout, result.stderr
-    except GuardError as error:
-        # A failed child record (on_spawn) whose cleanup could not prove the group gone: ownership is unknown, so the
-        # reason becomes UNKNOWN (pool kept until reconciliation; launch-unconfirmed diagnostic kept).
-        if getattr(error, 'cleanup_incomplete', False):
+        try:
+            extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
+            result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
+                                 timeout=timeout, output_limit=PROVIDER_RAW_LIMIT, **extra)
+            return result.returncode, result.stdout, result.stderr
+        except Exception as error:
+            # Checked before any classification (review harness-pr266-v3): an error marked cleanup_incomplete (a
+            # failed child record of any type whose group could not be proven gone, or CleanupIncomplete itself)
+            # means ownership is unknown, never a missing CLI or another known end. UNKNOWN keeps the pool reserved
+            # and allows no fallback; a failed child record keeps its launch-unconfirmed diagnostic. Unmarked errors
+            # are re-raised to the classification below.
+            if not getattr(error, 'cleanup_incomplete', False):
+                raise
+            if isinstance(error, CleanupIncomplete):
+                return 125, '', 'HARNESS_PROVIDER_IO_UNKNOWN'
+            detail = error.message if isinstance(error, GuardError) else type(error).__name__
             raise GuardError('UNKNOWN', 'The child record failed and the child could not be proven stopped: '
-                             + str(error.message)) from error
-        raise
-    except CleanupIncomplete:
-        # The process group may still be alive: ownership is unknown, so the pool stays reserved until reconciliation.
-        return 125, '', 'HARNESS_PROVIDER_IO_UNKNOWN'
+                             + str(detail)) from error
     except OutputLimitExceeded as error:
         # The group is stopped and reaped; keep a bounded prefix so the raw answer can still be saved for diagnosis.
         return 126, error.stdout[:RAW_KEEP], 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'
