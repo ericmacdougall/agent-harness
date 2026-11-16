@@ -51,8 +51,11 @@ def dispose_stamp_parts(argv) -> list:
 
 
 def is_dispose_argv(argv) -> bool:
-    """True for `ack ... --disposition ...`: the only ahc command that needs main's stamp."""
+    """True for `ack ... --disposition ...` and for `w16 ...` (AC-6, main's WorkItem disposition): the ahc
+    commands that need main's stamp."""
     argv = [str(a) for a in argv or []]
+    if argv and argv[0] == "w16":
+        return True
     return bool(argv) and argv[0] == "ack" and any(a == "--disposition" or a.startswith("--disposition=")
                                                    for a in argv[1:])
 TIMEOUT_RC = 124

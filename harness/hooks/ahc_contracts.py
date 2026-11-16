@@ -352,7 +352,7 @@ class Contracts:
     # Rows whose guard reads only ledger facts are applied here. Rows whose guard needs ELIG, an observation, a
     # budget or main's stamp are wired in later steps of slice 1 (a); until then they are refused (fail closed).
     WI_WIRED = ("W2", "W3", "W4", "W5", "W6", "W7", "W8", "W9", "W10", "W11", "W12", "W13", "W14", "W15", "W17",
-                "W18", "W19", "W20", "W21", "W22", "W23", "W24", "W25", "W26", "W27")
+                "W18", "W19", "W20", "W21", "W22", "W23", "W24", "W25", "W26", "W27", "W16")
     B7_ROUNDS = 2                 # bound B7: review rounds blocked on the PR's own content
     B33_RUNS = 8                  # bound B33: model runs per root lineage (ASSUMPTION: the policy's `b33` overrides)
     W19_KINDS = ("allowlist", "argv", "integrity")
@@ -523,6 +523,7 @@ class Contracts:
                 return True
         return False
 
+    LATEST_ROUND = " AND round = (SELECT MAX(x.round) FROM reviews x WHERE x.item = reviews.item AND x.kind = reviews.kind)"
     ELIG_FIELDS = ("pr_state", "pr_head", "draft", "tip", "compare", "b_r_ancestors", "attached_core",
                    "open_findings", "paths", "foreign_closing_keyword", "policy", "kill_switch", "chk_cas",
                    "canary_age")
@@ -540,10 +541,11 @@ class Contracts:
         head, tip = item["head"], o["tip"]
         pol = o["policy"] if isinstance(o["policy"], dict) else {}
         # e1: every required code Review row passed for (H, packet, policy revision); each B_r an ancestor of B
+        # AC-6: per kind, only the latest round that has rows of that kind; earlier rounds are audit only
         code = self.db.execute("SELECT kind, state, snapshot_base FROM reviews WHERE "
                                "item=? AND head=? AND kind IN ('adversarial', 'red-team') AND policy_revision=? "
-                               "AND packet_sha256=?", (item["id"], head, item["policy_revision"],
-                                                      item["packet_sha256"])).fetchall()
+                               "AND packet_sha256=?" + self.LATEST_ROUND,
+                               (item["id"], head, item["policy_revision"], item["packet_sha256"])).fetchall()
         anc = o["b_r_ancestors"] if isinstance(o["b_r_ancestors"], dict) else {}
         required = {"adversarial"} | ({"red-team"} if item["red_team"] else set())   # PR 268 F2: none missing
         if (not required <= {k for k, _s, _b in code} or o["pr_head"] != head
@@ -553,7 +555,7 @@ class Contracts:
         # e2: the spec row for the spec core attached NOW, at this item's packet and policy revision, has passed
         # (PR 268 F1: after W27 the old revision's pass stays terminal beside the replacement and must not count)
         spec = self.db.execute("SELECT state FROM reviews WHERE item=? AND head=? AND kind='spec' AND spec_core=? "
-                               "AND policy_revision=? AND packet_sha256=?",
+                               "AND policy_revision=? AND packet_sha256=?" + self.LATEST_ROUND,
                                (item["id"], head, o["attached_core"], item["policy_revision"],
                                 item["packet_sha256"])).fetchall()
         if o["attached_core"] != item["spec_core"] or [s for (s,) in spec] != ["passed"]:
@@ -598,7 +600,7 @@ class Contracts:
         return None
 
     def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None, obs=None,
-                successor_packet=None):
+                successor_packet=None, proof=None):
         """The one WorkItem transition function (T1 to T7). One BEGIN IMMEDIATE; the guard re-reads its ledger
         facts; the state change and one audit row commit together (T3). A replay of the same event for the same
         item and row is a no-op that returns the current row (T6), checked before the version so a post-crash replay
@@ -646,7 +648,7 @@ class Contracts:
                 raise ContractError("incident: %s would put an item with an unsettled Effect in %s" % (row_id, to))
             if row_id not in self.WI_WIRED:
                 raise ContractError("%s is not wired in this build of slice 1 (a); refused, fail closed" % row_id)
-            mark = self._wi_guard(item, row_id, to, mark, unsettled, obs)
+            mark = self._wi_guard(item, row_id, to, mark, unsettled, obs, proof)
             base = obs["tip"] if row_id == "W18" else item["base"]
             successor = None
             if row_id == "W4" or (row_id == "W24" and mark == "head-moved" and not item["successor"]):
@@ -673,7 +675,7 @@ class Contracts:
             self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), base=?, "
                             "successor=COALESCE(?, successor), version=version+1, updated=?%s WHERE id=?" % sets,
                             (to, mark, cause, base, successor, self.now()) + tuple(extra.values()) + (iid,))
-            self._wi_effects(item, row_id, event_id, obs)
+            self._wi_effects(item, row_id, event_id, obs, proof)
             self._a0("work_item", iid, frm, to, event_id, actor, row=row_id, cause=cause,
                      obs=obs.get("id") if isinstance(obs, dict) else None)
             return self._row("work_items", "id", iid)
@@ -708,7 +710,7 @@ class Contracts:
                                red_team=bool(item["red_team"]))
         return succ["id"]
 
-    def _wi_effects(self, item, row_id, event_id, obs):
+    def _wi_effects(self, item, row_id, event_id, obs, proof=None):
         """The Effects column of the applied row, in the same transaction (T3)."""
         if row_id == "W4":
             new = self._row("work_items", "id", self._row("work_items", "id", item["id"])["successor"])
@@ -731,7 +733,8 @@ class Contracts:
                                                  new["policy_revision"], item=item["id"],
                                                  event_id="%s-%s" % (event_id, kind),
                                                  snapshot_base=item["base"] if code else "",
-                                                 spec_core="" if code else new["spec_core"])["id"]
+                                                 spec_core="" if code else new["spec_core"],
+                                                 round=self.current_round(item["id"]))["id"]
             for rid, kind, state, version in self.db.execute(
                     "SELECT id, kind, state, version FROM reviews WHERE item=? AND state IN ('required', 'queued', "
                     "'infra-wait')", (item["id"],)).fetchall():
@@ -751,6 +754,21 @@ class Contracts:
                 if state == "intent":                                # E9: an intent never sent is abandoned
                     self.abandon_unsent(key, expected_version=version, event_id="%s-e9-%s" % (event_id, key),
                                         reason="item left by %s" % row_id)
+        if row_id == "W16":
+            # AC-6: the proof is spent in this transaction. W16 never resets B7 or B33 and leaves the findings rows
+            # terminal. An extension of N rounds raises the W15 allowance by N (b7_allowance reads the used proof)
+            # and requires round r+1 code rows at the same H, charged to B7.
+            self.db.execute("UPDATE w16_proofs SET used=1 WHERE proof_id=?", (proof,))
+            row = self._row("w16_proofs", "proof_id", proof)
+            if row is not None and row["target"] == "pr-gate" and row["extension"] > 0:
+                nxt = self.current_round(item["id"]) + 1
+                for kind, base in self.db.execute(
+                        "SELECT kind, snapshot_base FROM reviews WHERE item=? AND kind IN ('adversarial', 'red-team') "
+                        "AND round=(SELECT MAX(x.round) FROM reviews x WHERE x.item=reviews.item AND x.kind="
+                        "reviews.kind) GROUP BY kind ORDER BY kind", (item["id"],)).fetchall():
+                    self.require_review(kind, item["repo"], item["pr"], item["head"], item["packet_sha256"],
+                                        item["policy_revision"], item=item["id"], snapshot_base=base, round=nxt,
+                                        event_id="%s-r%d-%s" % (event_id, nxt, kind))
         if row_id == "W7":
             # G1 and E1 only: the grant and the Effect intent are written; in shadow nothing dispatches them
             pol = obs["policy"]
@@ -867,6 +885,64 @@ class Contracts:
                             key + self.OP_TERMINAL).fetchone()
         return "Effect %s" % e[0] if e else None
 
+    def current_round(self, iid):
+        """The item's latest review round (1 for a new or migrated item)."""
+        r = self.db.execute("SELECT MAX(round) FROM reviews WHERE item=?", (iid,)).fetchone()[0]
+        return int(r or 1)
+
+    def accepted_findings(self, iid):
+        """Finding ids main's used W16 proofs accepted into a named ticket. They clear e3 (W3) only, never e1."""
+        out = set()
+        for acc, ticket in self.db.execute("SELECT accepted, ticket FROM w16_proofs WHERE item=? AND used=1",
+                                           (iid,)).fetchall():
+            if isinstance(ticket, str) and ticket:
+                out |= {a for a in json.loads(acc or "[]") if isinstance(a, str)}
+        return out
+
+    def _unaccepted_findings(self, item):
+        """Findings rows of this item at H with a finding id not accepted into a ticket (a row naming no valid id
+        is never accepted)."""
+        accepted = self.accepted_findings(item["id"])
+        out = []
+        for rid, receipt in self.db.execute("SELECT id, receipt FROM reviews WHERE item=? AND head=? AND "
+                                            "state='findings' ORDER BY id", (item["id"], item["head"])).fetchall():
+            ids = self._finding_ids(receipt)
+            if not ids or not set(ids) <= accepted:
+                out.append(rid)
+        return out
+
+    W16_ARGV = re.compile(r"[0-9a-f]{64}")
+
+    def record_w16_proof(self, proof_id, item, target, expected_version, argv_sha256, *, accepted=(), ticket=None,
+                         extension=0):
+        """AC-6: the proof of one stamped `w16` CLI command, recorded by that command only after claim_main proved
+        main's one-shot stamp for exactly its argv. wi_move W16 needs this proof id, never an actor string."""
+        if not (isinstance(proof_id, str) and proof_id.startswith("w16-")) or target not in ("pr-gate", "cancelled"):
+            raise ContractError("a W16 proof names its id and a target, pr-gate or cancelled")
+        if type(expected_version) is not int or not self.W16_ARGV.fullmatch(str(argv_sha256)):
+            raise ContractError("a W16 proof binds the expected version and the stamped argv digest")
+        if type(extension) is not int or extension < 0 or (extension and target != "pr-gate"):
+            raise ContractError("an extension is a count of rounds, and only back to pr-gate")
+        kept, dropped = self.finding_ids(list(accepted))
+        if dropped or (kept and not (isinstance(ticket, str) and ticket)):
+            raise ContractError("accepted finding ids are valid ids, accepted into a named ticket")
+        with self.tx():
+            self.db.execute("INSERT INTO w16_proofs(proof_id, item, target, expected_version, argv_sha256, accepted, "
+                            "ticket, extension, used, created) VALUES (?,?,?,?,?,?,?,?,0,?)",
+                            (proof_id, item, target, expected_version, argv_sha256, _canon(kept), ticket,
+                             extension, self.now()))
+            return self._row("w16_proofs", "proof_id", proof_id)
+
+    def _w16_proof(self, item, to, proof):
+        """NEG-15: W16 needs an unused stamped proof for this item, this target and this version."""
+        row = self._row("w16_proofs", "proof_id", proof) if isinstance(proof, str) else None
+        if row is None:
+            raise ContractError("W16 needs main's verified stamp proof id; an actor string is not proof")
+        if row["used"]:
+            raise ContractError("W16 proof %s was already used" % proof)
+        if (row["item"], row["target"], row["expected_version"]) != (item["id"], to, item["version"]):
+            raise ContractError("W16 proof %s is for another item, target or version" % proof)
+
     def b7_allowance(self, item):
         """B7 plus every budget extension a used W16 proof recorded for this item (AC-6)."""
         ext = self.db.execute("SELECT COALESCE(SUM(extension), 0) FROM w16_proofs WHERE item=? AND used=1 AND "
@@ -889,8 +965,9 @@ class Contracts:
 
     def charge_b33(self, lineage, n=1):
         """Charge n model runs to the lineage (AC-8: at the launch intent, never refunded)."""
-        self.db.execute("INSERT INTO lineage_budget(lineage, b33_used) VALUES (?, ?) ON CONFLICT(lineage) DO UPDATE "
-                        "SET b33_used = b33_used + excluded.b33_used", (lineage, int(n)))
+        with self.tx():
+            self.db.execute("INSERT INTO lineage_budget(lineage, b33_used) VALUES (?, ?) ON CONFLICT(lineage) DO UPDATE "
+                            "SET b33_used = b33_used + excluded.b33_used", (lineage, int(n)))
 
     def _w15_spent(self, item, obs):
         used, budget = self.b33(item["lineage"], obs)
@@ -933,7 +1010,7 @@ class Contracts:
             raise ContractError("W12 refuses a check recorded by the author, owner, a spec reviewer or an evidence "
                                 "poster")
 
-    def _wi_guard(self, item, row_id, to, mark, unsettled, obs=None):
+    def _wi_guard(self, item, row_id, to, mark, unsettled, obs=None, proof=None):
         """Guards of the wired rows: ledger facts read inside the transaction (T1) and fresh observations (T2).
         Returns the item's marks after the row."""
         effects = {state for _k, state, _v in self._item_effects(item)}
@@ -1031,10 +1108,11 @@ class Contracts:
             if not fact:
                 raise ContractError("W24's observation does not show what its mark %r claims" % (mark or ""))
         if row_id == "W3":
-            findings = self.db.execute("SELECT 1 FROM reviews WHERE item=? AND head=? AND state='findings'",
-                                       (item["id"], item["head"])).fetchone()
-            if not findings:
-                raise ContractError("W3 needs a Review row of this item ending findings")
+            if not self._unaccepted_findings(item):
+                raise ContractError("W3 needs a Review row of this item ending findings (not all accepted into a "
+                                    "named ticket by main's W16)")
+        elif row_id == "W16":
+            self._w16_proof(item, to, proof)
         elif row_id in ("W8", "W26"):
             if "confirmed" not in effects:
                 raise ContractError("%s needs a confirmed Effect of this item for its H" % row_id)

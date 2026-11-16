@@ -4449,14 +4449,9 @@ class StateMachineTests(TC.Base):
         text = "update-branch %s at B %s was lost; no second update until main's W16" % (rid, TC.BASE)
         self.assertEqual(self.notices_of("W23"), [("owner", text), ("ticket", text)])
 
-    def test_unwired_rows_fail_closed(self):
-        for row in ("W16",):
-            src = C.Contracts.WI_TRANSITIONS[row][0][0]
-            self.at(src)
-            to = C.Contracts.WI_TRANSITIONS[row][1][0]
-            with self.subTest(row=row), self.assertRaisesRegex(C.ContractError, "not wired"):
-                self.move(row, to=to)
-        self.assertEqual(self.c._row("work_items", "id", self.item["id"])["version"], self.item["version"])
+    def test_every_row_but_w1_is_wired(self):
+        """Slice 1 (b) wires the last rows; W1 is admission (admit_item), never a move."""
+        self.assertEqual(sorted(C.Contracts.WI_WIRED), sorted(r for r in C.Contracts.WI_TRANSITIONS if r != "W1"))
 
     # ---- slice (b) obligations (goodqa#16204, AC-9, NEG-25)
 
@@ -4586,7 +4581,7 @@ class StateMachineTests(TC.Base):
         "WorkItem": (
             "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask",
             "test_wi_exhausted", "test_wi_merged", "test_wi_headed_verified", "test_wi_handed",
-            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w16"),
+            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled"),
         "Review": (
             "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
             "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",
@@ -5204,6 +5199,160 @@ class EgressTests(_WorkItemFixture):
         out = []
         self.assertEqual(ahc_shadow.deliver_digest(self.c, out.append), (2, 0))
         self.assertTrue(all(line.startswith("shadow ") for line in out))
+
+
+class W16Tests(_WorkItemFixture):
+    """AC-6: W16 only from main's stamped CLI proof; extensions add a round of code rows; e1 and e2 read only the
+    latest round per kind; accepted findings clear W3 (e3) only."""
+
+    eligible = StateMachineTests.eligible
+    pr = StateMachineTests.pr
+
+    def proof(self, target="pr-gate", item=None, version=None, **kw):
+        item = self.c._row("work_items", "id", (item or self.item)["id"])
+        self.n += 1
+        pid = "w16-%024d" % self.n
+        self.c.record_w16_proof(pid, item["id"], target, item["version"] if version is None else version,
+                                "e" * 64, **kw)
+        return pid
+
+    def findings(self, rid, ids):
+        self.db.execute("UPDATE reviews SET state='findings', receipt=? WHERE id=?",
+                        (json.dumps({"verdict": "BLOCK", "finding_ids": ids}), rid))
+
+    def rows(self, kind):
+        return self.db.execute("SELECT id, round, state FROM reviews WHERE item=? AND kind=? ORDER BY round",
+                               (self.item["id"], kind)).fetchall()
+
+    def test_w16_needs_main_s_verified_proof_for_this_item_target_and_version(self):
+        """NEG-15: actor "main" with no proof id, or with a proof for another item, another target or a stale
+        version, is refused; a proof is spent once."""
+        self.at("waiting-ask")
+        with self.assertRaisesRegex(C.ContractError, "not proof"):
+            self.move("W16", to="pr-gate", actor="main")
+        with self.assertRaisesRegex(C.ContractError, "not proof"):
+            self.move("W16", to="pr-gate", actor="main", proof="w16-made-up")
+        self.at("waiting-ask")
+        other = self.admit(pr=12)
+        cases = [self.proof(item=other), self.proof(target="cancelled"), self.proof(version=self.item["version"] + 7)]
+        for pid in cases:
+            self.at("waiting-ask")              # a variant that lets one through must not strand the rest
+            with self.subTest(pid=pid), self.assertRaisesRegex(C.ContractError, "another item, target or version"):
+                self.move("W16", to="pr-gate", actor="main", proof=pid)
+        self.at("waiting-ask")
+        pid = self.proof()
+        with self.assertRaisesRegex(C.ContractError, "taken by main"):
+            self.move("W16", to="pr-gate", actor="ahc-core", proof=pid)
+        self.assertEqual(self.move("W16", to="pr-gate", actor="main", proof=pid)["state"], "pr-gate")
+        self.at("waiting-ask")
+        with self.assertRaisesRegex(C.ContractError, "already used"):
+            self.move("W16", to="pr-gate", actor="main", proof=pid)
+
+    def test_w16_to_pr_gate_leaves_b7_b33_and_findings_rows_unchanged(self):
+        rid = self.rows("adversarial")[0][0]
+        self.findings(rid, ["F1"])
+        with self.c.tx():
+            self.c.charge_b33(self.item["lineage"], 3)
+        self.move("W3")
+        before = (self.c.b7_used(self.item), self.c.b33(self.item["lineage"]), self.c.b7_allowance(self.item))
+        self.move("W16", to="pr-gate", actor="main", proof=self.proof(accepted=["F1"], ticket="GoodQA goodqa#1",
+                                                                       extension=1))
+        self.assertEqual((self.c.b7_used(self.item), self.c.b33(self.item["lineage"])), before[:2])
+        self.assertEqual(self.c.b7_allowance(self.item), before[2] + 1, "the extension raises the allowance only")
+        self.assertEqual(self.c._row("reviews", "id", rid)["state"], "findings", "findings rows stay terminal")
+
+    def test_w16_extension_round_flow_neg38(self):
+        """NEG-38: W16 to pr-gate with a 1-round extension creates round 2 code rows at H; the round 1 findings
+        rows and the passing round 1 spec review are kept. e1 is false while a round 2 code row is unfinished and
+        holds once it passes, with the round 1 spec review still counting; W2 then applies. A spec core change
+        after that takes W27, which creates the replacement spec row in round 2, and W2 waits for it."""
+        spec = self.rows("spec")[0][0]
+        self.db.execute("UPDATE reviews SET state='passed' WHERE id=?", (spec,))
+        r1 = self.rows("adversarial")[0][0]
+        self.findings(r1, ["F1", "F2"])
+        self.move("W3")
+        self.move("W16", to="pr-gate", actor="main",
+                  proof=self.proof(accepted=["F1", "F2"], ticket="GoodQA goodqa#1", extension=1))
+        code = self.rows("adversarial")
+        self.assertEqual([(r, s) for _i, r, s in code], [(1, "findings"), (2, "required")])
+        self.assertEqual(self.rows("spec"), [(spec, 1, "passed")])
+        with self.assertRaisesRegex(C.ContractError, "W3 needs"):
+            self.move("W3")                            # every finding id was accepted into a ticket
+        self.assertEqual(self.c.elig(self.c._row("work_items", "id", self.item["id"]), self.eligible()), ["e1"])
+        self.db.execute("UPDATE reviews SET state='passed' WHERE id=?", (code[1][0],))
+        item = self.c._row("work_items", "id", self.item["id"])
+        self.assertEqual(self.c.elig(item, self.eligible()), [], "round 2 passed; round 1 spec still counts")
+        self.assertEqual(self.move("W2", obs=self.eligible())["state"], "merge-ready")
+        item = self.c._row("work_items", "id", self.item["id"])
+        changed = self.eligible(attached_core=TC.CORE2)
+        self.assertEqual(self.move("W27", obs=changed)["state"], "pr-gate")
+        specs = self.rows("spec")
+        self.assertEqual([(r, s) for _i, r, s in specs], [(1, "passed"), (2, "required")])
+        item = self.c._row("work_items", "id", self.item["id"])
+        self.assertEqual(self.c.elig(item, changed), ["e2"])
+        self.db.execute("UPDATE reviews SET state='passed' WHERE id=?", (specs[1][0],))
+        self.assertEqual(self.c.elig(item, changed), [])
+        self.assertEqual(self.move("W2", obs=changed)["state"], "merge-ready")
+
+    def test_w16_with_unaccepted_finding_ids_w3_fires_again(self):
+        r1 = self.rows("adversarial")[0][0]
+        self.findings(r1, ["F1", "F2"])
+        self.move("W3")
+        self.move("W16", to="pr-gate", actor="main",
+                  proof=self.proof(accepted=["F1"], ticket="GoodQA goodqa#1", extension=1))
+        self.assertEqual(self.c._unaccepted_findings(self.c._row("work_items", "id", self.item["id"])), [r1])
+        self.assertEqual(self.move("W3")["state"], "waiting-ask")
+
+    def test_w16_accepted_ids_need_a_named_ticket(self):
+        with self.assertRaisesRegex(C.ContractError, "named ticket"):
+            self.proof(accepted=["F1"])
+        with self.assertRaisesRegex(C.ContractError, "only back to pr-gate"):
+            self.proof(target="cancelled", extension=1)
+
+
+class W16CliTests(Base):
+    """AC-6: the `w16` command records its proof and applies W16 in one transaction, and only with main's stamp
+    (claim_main); `w16` argv needs the stamp like a disposition."""
+
+    def setUp(self):
+        super().setUp()
+        ledger = runner.Ledger(self.paths)
+        try:
+            c = runner.open_contracts(ledger, self.paths)
+            self.item = c.admit_item("o/r", 5, "a" * 40, "b" * 40, "policy-r1", "1" * 64, "d" * 64,
+                                     event_id="ev-admit")
+            ledger.db.execute("UPDATE work_items SET state='waiting-ask' WHERE id=?", (self.item["id"],))
+        finally:
+            ledger.close()
+
+    def argv(self, target="cancelled", version=None):
+        return ["w16", self.item["id"], "--target", target, "--expected-version",
+                str(self.item["version"] if version is None else version)]
+
+    def test_w16_cli_needs_the_stamp_and_spends_one_proof(self):
+        self.assertTrue(core.is_dispose_argv(self.argv()))
+        with self.assertRaisesRegex(core.Refused, "stamp"):
+            runner.w16(self.paths, self.argv(), main_proven=False, item=self.item["id"], target="cancelled",
+                       expected_version=self.item["version"])
+        with self.assertRaisesRegex(core.Refused, "version"):
+            runner.w16(self.paths, self.argv(version=9), main_proven=True, item=self.item["id"], target="cancelled",
+                       expected_version=9)
+        row = runner.w16(self.paths, self.argv(), main_proven=True, item=self.item["id"], target="cancelled",
+                         expected_version=self.item["version"])
+        self.assertEqual(row["state"], "cancelled")
+        ledger = runner.Ledger(self.paths)
+        try:
+            proofs = ledger.db.execute("SELECT item, target, used FROM w16_proofs").fetchall()
+            self.assertEqual([tuple(p) for p in proofs], [(self.item["id"], "cancelled", 1)],
+                             "the refused attempt left no proof behind")
+        finally:
+            ledger.close()
+
+    def test_main_without_a_stamp_is_refused_by_the_cli(self):
+        with mock.patch.object(runner, "claim_main", return_value=False), \
+                mock.patch.object(runner.core, "Paths", lambda *a, **k: self.paths):
+            rc = runner.main(self.argv())
+        self.assertEqual(rc, 2)
 
 if __name__ == "__main__":
     unittest.main()

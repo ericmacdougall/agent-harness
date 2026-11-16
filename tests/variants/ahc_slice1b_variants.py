@@ -246,6 +246,40 @@ ENTRIES.update({
              "            if True:\n")], CONTRACTS)]},
 })
 
+W16 = "tests.test_ahc_runner.W16Tests."
+ENTRIES.update({
+    "AC-6/NEG-15 W16 proof binding": {
+        "tests": [W16 + "test_w16_needs_main_s_verified_proof_for_this_item_target_and_version"],
+        "mutations": [("the proof's item, target and version are not checked", [
+            ('        if (row["item"], row["target"], row["expected_version"]) != (item["id"], to, item["version"]):\n',
+             "        if False:\n")], CONTRACTS),
+                      ("an actor string without a proof is accepted", [
+            ("        if row is None:\n            raise ContractError(\"W16 needs main's verified stamp proof id; "
+             "an actor string is not proof\")\n",
+             "        if row is None:\n            return\n")], CONTRACTS)]},
+    "AC-6/NEG-15 W16 keeps the counters": {
+        "tests": [W16 + "test_w16_to_pr_gate_leaves_b7_b33_and_findings_rows_unchanged"],
+        "mutations": [("W16 resets B33", [
+            ('            self.db.execute("UPDATE w16_proofs SET used=1 WHERE proof_id=?", (proof,))\n',
+             '            self.db.execute("UPDATE w16_proofs SET used=1 WHERE proof_id=?", (proof,))\n'
+             '            self.db.execute("UPDATE lineage_budget SET b33_used=0 WHERE lineage=?", (item["lineage"],))\n')],
+             CONTRACTS)]},
+    "AC-6/NEG-38 latest round and round identity": {
+        "tests": [W16 + "test_w16_extension_round_flow_neg38"],
+        "mutations": [("e1 and e2 read every round", [
+            ('    LATEST_ROUND = " AND round = (SELECT MAX(x.round) FROM reviews x WHERE x.item = reviews.item AND '
+             'x.kind = reviews.kind)"\n', '    LATEST_ROUND = ""\n')], CONTRACTS),
+                      ("require_review ignores the round", [
+            ('"AND packet_sha256=? AND policy_revision=? AND spec_core=? AND round=?",',
+             '"AND packet_sha256=? AND policy_revision=? AND spec_core=? AND ?>0",')], CONTRACTS)]},
+    "AC-6 W3 acceptance": {
+        "tests": [W16 + "test_w16_with_unaccepted_finding_ids_w3_fires_again",
+                  W16 + "test_w16_extension_round_flow_neg38"],
+        "mutations": [("accepting some finding ids clears W3", [
+            ("            if not ids or not set(ids) <= accepted:\n", "            if not ids or not set(ids) & accepted:\n")],
+             CONTRACTS)]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")

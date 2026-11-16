@@ -2339,6 +2339,39 @@ def ack(paths, iid, owner, now=None, disposition=None, main_proven=False, config
 
 # ---------------------------------------------------------------- text helpers
 
+def open_contracts(ledger, paths):
+    """The WorkItem/Review/Grant/Effect transition functions over this ledger's connection, with the local
+    authority log beside the ledger (a ledger.sqlite3.* name, which every ahc root check accepts)."""
+    return ahc_contracts.Contracts(ledger.db, ahc_contracts.AuthorityLog(paths.root / AUTHORITY_LOG))
+
+
+AUTHORITY_LOG = "ledger.sqlite3.authority.jsonl"
+SHADOW_DIGEST = "ledger.sqlite3.shadow-digest.md"
+
+
+def w16(paths, argv, *, main_proven, item, target, expected_version, accept=(), ticket=None, extension=0):
+    """AC-6 / NEG-15: main's WorkItem disposition. Applied only from this command, only when claim_main proved
+    main's one-shot stamp for exactly `argv`; the proof (bound to the item, the target, the expected version and
+    the argv digest) is recorded and spent in the same transaction as the W16 move. The tick never applies W16."""
+    if not main_proven:
+        raise core.Refused("w16 needs main's stamp for exactly this command; an actor name is not proof")
+    digest = core.dispose_stamp_parts(argv)[0]
+    ledger = Ledger(paths, migrate=False)
+    try:
+        c = open_contracts(ledger, paths)
+        proof = "w16-" + hashlib.sha256(("%s|%s|%r" % (digest, c.boot_id, c._mono())).encode()).hexdigest()[:24]
+        try:
+            with c.tx():
+                c.record_w16_proof(proof, item, target, expected_version, digest, accepted=list(accept),
+                                   ticket=ticket, extension=extension)
+                return c.wi_move(item, "W16", expected_version=expected_version, event_id="w16:" + proof,
+                                 actor="main", to=target, proof=proof)
+        except ahc_contracts.ContractError as error:
+            raise core.Refused(str(error)) from None
+    finally:
+        ledger.close()
+
+
 def _short(value, limit=300):
     return redact.redact(str(value)).replace("\n", " ")[:limit]
 
@@ -2749,6 +2782,14 @@ def build_parser():
     a.add_argument("--owner", required=True)
     a.add_argument("--disposition", help="reason text: stop D20 escalation for this item (owner or verified main, "
                                          "per the state's rule)")
+    w = sub.add_parser("w16", help="main only (stamped): move a WorkItem from waiting-ask, exhausted or "
+                                    "waiting-dep back to pr-gate, or cancel it (AC-6)")
+    w.add_argument("item")
+    w.add_argument("--target", choices=("pr-gate", "cancelled"), required=True)
+    w.add_argument("--expected-version", type=int, required=True)
+    w.add_argument("--accept", default="", help="comma-separated finding ids accepted into --ticket")
+    w.add_argument("--ticket")
+    w.add_argument("--extension", type=int, default=0, help="extra B7 review rounds (pr-gate only)")
     sub.add_parser("status", help="item states, pending effects, the email route and the units")
     for name, text in (("install", "write and start the systemd user units ahc-core and ahc-review (t2-dev)"),
                        ("uninstall", "stop and remove the units; keep the ledger, clones and inbox")):
@@ -2812,6 +2853,16 @@ def main(argv=None):
             print("refused: %s" % error, file=sys.stderr)
             return 2
         return 0
+    if args.cmd == "w16":
+        try:
+            row = w16(paths, list(sys.argv[1:] if argv is None else argv), main_proven=main_proven, item=args.item,
+                      target=args.target, expected_version=args.expected_version,
+                      accept=[a for a in args.accept.split(",") if a], ticket=args.ticket, extension=args.extension)
+            print("%s %s version %d" % (row["id"], row["state"], row["version"]))
+        except core.Refused as error:
+            print("refused: %s" % error, file=sys.stderr)
+            return 2
+        return 0
     if args.cmd in ("install", "uninstall"):
         import ahc_install  # noqa: PLC0415
         action = ahc_install.install if args.cmd == "install" else ahc_install.uninstall
@@ -2829,6 +2880,9 @@ def main(argv=None):
             pending = ledger.db.execute("SELECT COUNT(*) AS n FROM effects WHERE status IN ('pending', 'intent')"
                                         ).fetchone()["n"]
             print("pending effects: %d" % pending)
+            import ahc_shadow  # noqa: PLC0415
+            for line in ahc_shadow.status_lines(open_contracts(ledger, paths)):
+                print(line)
             route = ledger.db.execute("SELECT k, v FROM meta WHERE k IN ('email_route', 'email_route_reason')")
             route = {row["k"]: row["v"] for row in route}
             print("email route: %s%s" % (route.get("email_route", "not checked"),

@@ -229,6 +229,8 @@ NOW_INVENTORY = {
         'timer:B47 expires_at wall record; the clock row starts here'),
     ('ahc_contracts', 'Contracts.readback_missed', 'self.now'): (2,
         'timer:B37 probe_at wall record and the updated stamp; the clock row restarts here'),
+    ('ahc_contracts', 'Contracts.record_w16_proof', 'self.now'): (1,
+        "stamp:the W16 proof row's created time"),
     ('ahc_contracts', 'Contracts.require_review', 'self.now'): (1,
         "stamp:the review row's created time"),
     ('ahc_contracts', 'Contracts.reserve_grant', 'self.now'): (1,
