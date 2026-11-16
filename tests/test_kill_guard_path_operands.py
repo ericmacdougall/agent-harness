@@ -94,6 +94,64 @@ BLOCK = [
     "python3 - " + TEST_TS + " <<'EOF'\nimport os\nos.kill(4242, 9)\nEOF",
 ]
 
+RUNNER = "python3 runner.py -- "
+KILL_PY = "tools/kill-all.py"
+
+# PR 265 review F1: a wrapper's option values and operands must not be read as the command it runs, or the real
+# command (a kill-named .py) is exempted. Every row here was allowed at bdc78e1c.
+WRAPPER_VALUE_ESCAPES = [
+    RUNNER + "env -C /srv " + KILL_PY,  # F1 as reported
+    RUNNER + "sudo -u bob -g staff " + KILL_PY,  # F1 as reported
+    RUNNER + "env -u A -u B " + KILL_PY,
+    RUNNER + "env -u NAME -C /srv " + KILL_PY,
+    RUNNER + "env -C /srv -u NAME VAR=1 " + KILL_PY,
+    RUNNER + "env --chdir /srv " + KILL_PY,
+    RUNNER + "sudo -Eu bob -g staff " + KILL_PY,  # combined short options
+    RUNNER + "sudo -E -u bob -g staff " + KILL_PY,
+    RUNNER + "sudo -D /srv " + KILL_PY,
+    RUNNER + "env sudo -u bob -g staff " + KILL_PY,
+    RUNNER + "sudo -- env -C /srv " + KILL_PY,
+    RUNNER + "xargs -a /tmp/list " + KILL_PY,  # a wrapper with no exact grammar: no exemption
+    RUNNER + "conda run -n myenv " + KILL_PY,
+    RUNNER + "flock /tmp/l " + KILL_PY,  # a bare operand of unknown arity
+    RUNNER + "chroot /mnt " + KILL_PY,
+    RUNNER + "script /dev/null " + KILL_PY,
+    RUNNER + "gtimeout 5 ./kill-all.py",  # the GNU g-prefixed name of a listed wrapper
+    # the same defect after a nested interpreter or shell: its option value is not the script
+    RUNNER + "python3 -X dev " + KILL_PY,
+    RUNNER + "python3 -W ignore " + KILL_PY,
+    RUNNER + "node -r ./preload.js ./kill-all.mjs",
+    RUNNER + "bash -o pipefail " + KILL_PY,
+]
+
+# The variants the review asked for that bdc78e1c already refused; pinned so the exact grammars keep refusing them.
+WRAPPER_VALUE_PINNED = [
+    RUNNER + "env -u NAME " + KILL_PY,
+    RUNNER + "env VAR=1 " + KILL_PY,
+    RUNNER + "env -iu NAME " + KILL_PY,  # combined short options
+    RUNNER + "env --chdir=/srv " + KILL_PY,
+    RUNNER + "timeout -s KILL 5 " + KILL_PY,
+    RUNNER + "timeout -s KILL -k 3 5 " + KILL_PY,
+    RUNNER + "timeout --signal=KILL 5 " + KILL_PY,
+    RUNNER + "nice -n 5 " + KILL_PY,
+    RUNNER + "nice -n 5 -- " + KILL_PY,
+    RUNNER + "sudo -E " + KILL_PY,
+    RUNNER + "sudo -Eu bob " + KILL_PY,
+    RUNNER + "stdbuf -o L " + KILL_PY,
+    RUNNER + "taskset 0x3 " + KILL_PY,
+    RUNNER + "X=1 " + KILL_PY,
+    RUNNER + "-v " + KILL_PY,
+]
+
+BLOCK += WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED
+
+# Wrapper forms the exact grammars do count, so a test path after the command they run stays exempt.
+ALLOW += [
+    PGPOOL + "env CI=1 npx vitest run " + TEST_TS,
+    PGPOOL + "timeout 600 dbtest-any.sh /srv/wt /srv/wt.log " + TEST_TS,
+    PGPOOL + "env -u NODE_OPTIONS sudo -u ci -- npx -y vitest run " + TEST_TS,
+]
+
 # Refusals that reach the path predicate itself (the structural rules let them through), so widening the predicate
 # to "any token" must flip them. Kept separate so the mutation check below cannot pass vacuously.
 PREDICATE_REFUSALS = [
@@ -134,6 +192,25 @@ class PathOperands(unittest.TestCase):
                     "python3 runner.py -- tools/kill-all.py", "python3 runner.py /usr/bin/pkill -f vite"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(verdict(cmd), ("block", "script-kill"))
+
+    def test_wrapper_option_values_do_not_exempt_the_command(self):
+        """PR 265 review F1: the command a wrapper runs keeps the script-kill refusal whatever its options are."""
+        for cmd in WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(verdict(cmd), ("block", "script-kill"))
+
+    def test_wrapper_grammar_finds_the_command(self):
+        """The grammar counts option values and operands; anything outside it gives up (None)."""
+        cases = {
+            ("env", "-C", "/srv", "x.py"): 3, ("sudo", "-u", "bob", "-g", "staff", "x.py"): 5,
+            ("timeout", "-s", "KILL", "5", "x.py"): 4, ("nice", "-n", "5", "x.py"): 3,
+            ("env", "-u", "A", "--", "V=1", "x.py"): 5,("sudo", "--", "x.py"): 2,
+            ("sudo", "-Eu", "bob", "x.py"): None, ("env", "-S", "a b", "x.py"): None,
+            ("xargs", "x.py"): None, ("timeout", "5"): None, ("env", "-C"): None,
+        }
+        for words, want in cases.items():
+            with self.subTest(words=words):
+                self.assertEqual(kg.wrapper_command_index(words[0], list(words), 1), want)
 
     def test_predicate_refusals_are_in_the_refusal_set(self):
         self.assertTrue(set(PREDICATE_REFUSALS) <= set(BLOCK))

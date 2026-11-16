@@ -128,6 +128,57 @@ PATH_OPERAND_CHARS = re.compile(r'[A-Za-z0-9_.@+/-]+')
 # The value of these options is the program itself (code or a module), so the words after it are its arguments.
 PROGRAM_OPTS = frozenset(('-c', '-m', '-e', '-E', '-p', '--eval', '--print'))
 PYTHON_NOVALUE_OPT = re.compile(r'-[IuBsSOqbPdER]+')  # python3 -I, -u, -IB ...: no value follows
+# PR 265 review F1: the only wrappers whose words before the command path_operand_indexes can count exactly, as
+# (options that take no value, options that take one value, operands before the command, NAME=VALUE allowed).
+# Anything else after a wrapper (another option, a short-option cluster such as `-Eu`, a glued value, or any wrapper
+# not listed here) is ambiguous, and an ambiguous parse means no word of the command is exempt.
+WRAPPER_GRAMMAR = {
+    'env': (frozenset(('-', '-i', '--ignore-environment', '-0', '--null', '-v', '--debug')),
+            frozenset(('-u', '--unset', '-C', '--chdir', '-P')), 0, True),
+    'sudo': (frozenset(('-E', '-H', '-n', '-S', '-b', '-P', '-A', '-B', '-k', '--preserve-env', '--set-home',
+                        '--non-interactive', '--stdin', '--background', '--askpass', '--bell', '--reset-timestamp')),
+             frozenset(('-u', '--user', '-g', '--group', '-D', '--chdir', '-C', '--close-from', '-p', '--prompt',
+                        '-R', '--chroot', '-r', '--role', '-t', '--type', '-T', '--command-timeout', '-U',
+                        '--other-user')), 0, True),
+    'timeout': (frozenset(('--foreground', '--preserve-status', '-v', '--verbose')),
+                frozenset(('-s', '--signal', '-k', '--kill-after')), 1, False),
+    'nice': (frozenset(), frozenset(('-n', '--adjustment')), 0, False),
+    'nohup': (frozenset(), frozenset(), 0, False),
+    'time': (frozenset(('-p',)), frozenset(), 0, False),
+    'exec': (frozenset(('-c', '-l')), frozenset(('-a',)), 0, False),
+    'npx': (frozenset(('-y', '--yes')), frozenset(('-p', '--package')), 0, False),
+}
+
+
+def wrapper_command_index(name, texts, j):
+    """PR 265 review F1: `texts[j:]` follow the wrapper `name`. Return the index of the word the wrapper runs, or
+    None when the wrapper's words cannot be counted exactly (an unlisted wrapper, an option not in its grammar, a
+    cluster, a glued short value, or a line that ends before the command). Options are read only before the first
+    operand, as these wrappers do (`env`, `sudo`, `timeout` and `nice` stop at the first non-option)."""
+    grammar = WRAPPER_GRAMMAR.get(name)
+    if grammar is None:
+        return None
+    novalue, value, operands, assignments = grammar
+    n = len(texts)
+    while j < n:
+        t = texts[j]
+        if t == '--':
+            j += 1
+            break
+        if t in novalue:
+            j += 1
+        elif t in value:
+            j += 2
+        elif t.startswith('--') and '=' in t and t.split('=', 1)[0] in value:
+            j += 1
+        elif t.startswith('-'):
+            return None
+        else:
+            break
+    while assignments and j < n and ASSIGNMENT_WORD.fullmatch(texts[j]):
+        j += 1
+    j += operands
+    return j if j < n else None
 
 
 def path_operand(word, kill_re):
@@ -1573,26 +1624,33 @@ def make_analyzer_class(cg):
             from_opt = program > 0 and texts[program - 1] in PROGRAM_OPTS  # -c CODE, -m MODULE: the value is the program
             if not from_opt and '/' not in texts[program] and '.' not in texts[program]:
                 return set()  # a subcommand (`deno run X`, `bun run X`, `node inspect X`), not a script: scan all
-            out, command_pos, after_wrapper = set(), False, False
-            for j in range(program + 1, len(texts)):
+            # A `--`, a wrapper, a shell or an interpreter name starts a command line; the word that runs is never
+            # exempt. PR 265 review F1: a wrapper's words are counted only by its exact grammar
+            # (wrapper_command_index), and an option or assignment where the command should be is ambiguous. Any
+            # ambiguity returns nothing, which keeps the full scan (fail closed).
+            out, command_pos, j = set(), False, program + 1
+            while j < len(texts):
                 t, prev = texts[j], texts[j - 1]
                 name_j = cg.norm_name(t)
-                if t == '--' or name_j in WRAPPER_NAMES or name_j in cg.SHELLS or name_j in cg.INTERPRETERS \
-                        or INTERPRETER_NAME.fullmatch(name_j):
-                    command_pos, after_wrapper = True, name_j in WRAPPER_NAMES  # a command line follows
+                if name_j.startswith('g') and name_j[1:] in GNU_PREFIXED:
+                    name_j = name_j[1:]  # gtimeout, genv, gnice ...
+                if name_j in WRAPPER_NAMES:
+                    j = wrapper_command_index(name_j, texts, j + 1)
+                    if j is None:
+                        return set()
+                    command_pos = True
                     continue
-                if command_pos:  # find the word that runs; it is never exempt
-                    if t.startswith('-') or re.fullmatch(r'[0-9][0-9.]*[smhd]?', t) or ASSIGNMENT_WORD.fullmatch(t):
-                        continue  # `timeout 5`, `env -i`, `env X=1`
-                    if after_wrapper and '/' not in t and '.' not in t:
-                        after_wrapper = False  # the wrapper's tool or subcommand: `npx vitest`, `uv run`
-                        continue
-                    command_pos = after_wrapper = False
+                if t == '--' or name_j in cg.SHELLS or name_j in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name_j):
+                    command_pos, j = True, j + 1
                     continue
-                if prev.startswith('-'):
-                    continue  # may be that option's value (`--require ./x.js`)
-                if path_operand(args[j], self.script_kill):
-                    out.add(j)
+                if command_pos:
+                    if t.startswith('-') or ASSIGNMENT_WORD.fullmatch(t):
+                        return set()  # a shell's, interpreter's or runner's option whose value is unknown
+                    command_pos, j = False, j + 1  # the word that runs
+                    continue
+                if not prev.startswith('-') and path_operand(args[j], self.script_kill):
+                    out.add(j)  # a word right after an option may be its value (`--require ./x.js`)
+                j += 1
             return out
 
         def check_interpreter(self, name, texts, cmd, args=None):
