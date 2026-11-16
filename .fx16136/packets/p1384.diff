@@ -1,0 +1,586 @@
+diff --git a/infra/release-harness/rw-ship.sh b/infra/release-harness/rw-ship.sh
+index 90d8bf65a5d..ab3e25895c8 100755
+--- a/infra/release-harness/rw-ship.sh
++++ b/infra/release-harness/rw-ship.sh
+@@ -744,8 +744,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+     b=$(docker image inspect -f '{{.Size}}' "$i" 2>/dev/null); [[ "$b" =~ ^[0-9]+$ ]] || b=x; [ "$b" = x ] && { LOADBYTES=x; break; }
+     LOADBYTES=$((LOADBYTES + b)); done
+   if [ "$LOADBYTES" = x ]; then VMNEED=x; else VMNEED=$(( (2 * LOADBYTES + (1 << 30) - 1) >> 30 )); [ "$VMNEED" -ge "$SH_VM_MIN_FREE_GB" ] || VMNEED=$SH_VM_MIN_FREE_GB; fi
+-  VMDISK=$(vmctl disk 2>/dev/null | grep -m1 '^{'); VMFREE=$(printf '%s' "$VMDISK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["free_gb"])' 2>/dev/null)
+-  say "VM image store: $(printf '%s' "${VMDISK:-unresolved}" | cut -c1-900); need ${VMNEED}G (2 x ${LOADBYTES} bytes to load, floor ${SH_VM_MIN_FREE_GB}G)"
++  VMOUT=$(vmctl disk 2>/dev/null); VMDISK=$(printf '%s\n' "$VMOUT" | grep -m1 '^{'); VMWHY=$(printf '%s\n' "$VMOUT" | grep -m1 '^REFUSED ' | cut -c1-400)
++  VMFREE=$(printf '%s' "$VMDISK" | python3 -c 'import json,sys; print(json.load(sys.stdin)["free_gb"])' 2>/dev/null)
++  say "VM image store: $(printf '%s' "${VMDISK:-unresolved${VMWHY:+ ($VMWHY)}}" | cut -c1-900); need ${VMNEED}G (2 x ${LOADBYTES} bytes to load, floor ${SH_VM_MIN_FREE_GB}G)"
+   [ "$VMNEED" != x ] && [ "${VMFREE:-0}" -ge "$VMNEED" ] 2>/dev/null || { say "NO DISK on the VM (infrastructure, exit 11): ${VMFREE:-?}G free on $SH_APP, ${VMNEED}G needed before loading seven images; nothing switched"; dbx "$NAME" deploy-failed "$BEFORE" "infrastructure: ${VMFREE:-?}G free on the VM (needs $SH_VM_MIN_FREE_GB); nothing went live; run $RD"; exit 11; }
+   say "images to $SH_APP: docker save | docker load"
+   docker save "$IMG_API" "$IMG_WEB" "$IMG_DISP" "${JOBIMGS[@]}" | ssh -o ConnectTimeout=15 -o BatchMode=yes -o ServerAliveInterval=30 "$SH_APP" 'sudo docker load' > "$RD/image-load.log" 2>&1
+diff --git a/infra/release-harness/selfhost-ctl.py b/infra/release-harness/selfhost-ctl.py
+index 4ecaa4e75aa..491576ca9bc 100644
+--- a/infra/release-harness/selfhost-ctl.py
++++ b/infra/release-harness/selfhost-ctl.py
+@@ -121,6 +121,137 @@ def out(obj):
+     sys.stdout.write((obj if isinstance(obj, str) else json.dumps(obj, sort_keys=True)) + '\n'); sys.stdout.flush()
+ 
+ 
++# ---- receipt bth-pr73-v5 F1: which containerd serves docker, and where it keeps its data
++CTD_DEFAULT_CONFIG = '/etc/containerd/config.toml'   # containerd's own defaults when its command line names neither
++CTD_DEFAULT_ROOT = '/var/lib/containerd'
++CTD_DEFAULT_SOCKETS = ('/run/containerd/containerd.sock', '/var/run/docker/containerd/containerd.sock')
++DOCKERD_DEFAULT_CONFIG = '/etc/docker/daemon.json'
++
++
++class NoListener(Refused):
++    """Nothing listens on a socket path (the default-socket probe tolerates this for one of its two paths)."""
++
++
++def proc_argv(pid):
++    try: raw = open('/proc/%s/cmdline' % pid, 'rb').read()
++    except OSError: raise Refused('process %s went away or cannot be read' % pid)
++    args = raw.decode('utf-8', 'surrogateescape').split('\0')
++    if args and args[-1] == '': args.pop()
++    if not args: raise Refused('process %s has no command line' % pid)
++    return args
++
++
++def proc_comm(pid):
++    try: return open('/proc/%s/comm' % pid).read().strip()
++    except OSError: return ''
++
++
++def cli_flags(args, names, prog):
++    """Values of the long flags NAMES ({spelling: key}) in ARGS[1:]: --x v, --x=v, -x v (Go flag forms). A repeated flag
++    or one without a value refuses."""
++    opts, i = {}, 1
++    while i < len(args):
++        a = args[i]; i += 1
++        if not a.startswith('-') or a in ('-', '--'): continue
++        name, eq, val = a.lstrip('-').partition('=')
++        if name not in names: continue
++        if not eq:
++            if i >= len(args): raise Refused('%s --%s has no value' % (prog, name))
++            val = args[i]; i += 1
++        key = names[name]
++        if key in opts: raise Refused('%s --%s is given twice' % (prog, key))
++        if not val.startswith('/') and not val.startswith('unix:///') or '\n' in val:
++            raise Refused('%s --%s is not an absolute path' % (prog, key))
++        opts[key] = val
++    return opts
++
++
++def socket_holders(path):
++    """Pids holding the one listening unix socket bound at PATH. /proc/net/unix gives its inode; holders are looked for
++    among the processes of the socket file's owner (only they can have bound it; the ctl runs as root on the VM), each in
++    this pid namespace. NoListener when none listens; several listening inodes, an unreadable process of that owner,
++    or a holder in another pid namespace refuse."""
++    want = os.path.realpath(path)
++    try: rows = open('/proc/net/unix').read().split('\n')[1:]
++    except OSError as e: raise Refused('cannot read /proc/net/unix: %s' % type(e).__name__)
++    inodes = set()
++    for row in rows:
++        f = row.split(None, 7)                               # Num RefCount Protocol Flags Type St Inode Path
++        if len(f) == 8 and f[3] == '00010000' and f[5] == '01' and f[7].startswith('/') and os.path.realpath(f[7]) == want:
++            inodes.add(f[6])
++    if not inodes: raise NoListener('nothing listens on %s' % path)
++    if len(inodes) > 1: raise Refused('%d sockets listen on %s, expected exactly one' % (len(inodes), path))
++    tag = 'socket:[%s]' % inodes.pop()
++    try: uid = os.stat(want).st_uid
++    except OSError as e: raise Refused('cannot stat the socket %s: %s' % (path, type(e).__name__))
++    myns = os.readlink('/proc/self/ns/pid')
++    holders, hidden = [], []
++
++    def unreadable(pid):
++        # as root (always so on the VM: `sudo python3 -`) every process can be read, so one that cannot is a refusal;
++        # unprivileged (the test suite), processes of another security context are reported only if nothing holds PATH
++        if os.geteuid() == 0: raise Refused('cannot inspect process %s (holder search for %s)' % (pid, path))
++        hidden.append(pid)
++    for pid in sorted((x for x in os.listdir('/proc') if x.isdigit()), key=int):
++        try:
++            if os.stat('/proc/' + pid).st_uid != uid: continue
++            fds = os.listdir('/proc/%s/fd' % pid)
++        except FileNotFoundError: continue                   # exited meanwhile
++        except PermissionError: unreadable(pid); continue
++        for fd in fds:
++            try: hit = os.readlink('/proc/%s/fd/%s' % (pid, fd)) == tag
++            except FileNotFoundError: hit = False
++            except PermissionError: unreadable(pid); break
++            if hit:
++                try: ns = os.readlink('/proc/%s/ns/pid' % pid)
++                except OSError: raise Refused('cannot inspect process %s (holder search for %s)' % (pid, path))
++                if ns != myns: raise Refused('the holder of %s is in another pid namespace' % path)
++                holders.append(pid); break
++    if not holders and hidden: raise Refused('cannot inspect %d processes; no holder of %s found' % (len(hidden), path))
++    return holders
++
++
++def containerd_root_at(path):
++    holders = socket_holders(path)
++    if len(holders) != 1:
++        raise Refused('%d processes hold the containerd socket %s, expected exactly one' % (len(holders), path))
++    return containerd_root_of(proc_argv(holders[0]))
++
++
++def containerd_root_of(args):
++    """The existing data root (realpath) of the containerd process with command line ARGS: its --root, else the
++    top-level root of its --config file (containerd's default config and root when unnamed). Keys inside [tables]
++    (plugin root_path and the like) are not the daemon root. A non-empty imports, a repeated top-level root, an
++    unreadable named config or a root that does not exist refuse."""
++    opts = cli_flags(args, {'root': 'root', 'config': 'config', 'c': 'config'}, 'containerd')
++    if 'root' in opts: root = opts['root']
++    else:
++        cfg = opts.get('config', CTD_DEFAULT_CONFIG)
++        try: text = open(cfg).read()
++        except FileNotFoundError:
++            if 'config' in opts: raise Refused('containerd --config %s does not exist' % cfg)
++            text = ''
++        except (OSError, UnicodeDecodeError) as e: raise Refused('cannot read the containerd config %s: %s' % (cfg, type(e).__name__))
++        top = []
++        for line in text.split('\n'):
++            if re.match(r'^\s*\[', line): break
++            top.append(line)
++        body = '\n'.join(top)
++        im = re.search(r'^\s*imports\s*=\s*\[([^\]]*)\]', body, re.M)
++        if (im and re.sub(r'(#[^\n]*)|[\s,]', '', im.group(1))) or (not im and re.search(r'^\s*imports\s*=', body, re.M)):
++            raise Refused('the containerd config %s uses imports, which can override its root' % cfg)
++        hits = [l for l in top if re.match(r'^\s*root\s*=', l)]
++        if len(hits) > 1: raise Refused('the containerd config %s sets root %d times' % (cfg, len(hits)))
++        if not hits: root = CTD_DEFAULT_ROOT
++        else:
++            m = re.match(r'^\s*root\s*=\s*(["\x27])([^"\x27\\\n]*)\1\s*(#.*)?$', hits[0])
++            if not m or not m.group(2).startswith('/'): raise Refused('the containerd config %s has an unreadable root' % cfg)
++            root = m.group(2)
++    real = os.path.realpath(root)
++    if not os.path.isdir(real): raise Refused('the containerd root %s does not exist' % root)
++    return real
++
++
+ def docker(*a, check=False, timeout=None, cwd=None):
+     r = subprocess.run(['docker', *a], capture_output=True, text=True, timeout=timeout, cwd=cwd)
+     if check and r.returncode != 0:
+@@ -244,14 +375,62 @@ class Stack:
+         root = r.stdout.strip() if r.returncode == 0 else ''
+         if not root.startswith('/') or '\n' in root: raise Refused('cannot resolve the docker data root (docker info DockerRootDir)')
+         roots = [root]
+-        if self.store_is_containerd():
+-            try: c = subprocess.run(['containerd', 'config', 'dump'], capture_output=True, text=True, timeout=60)
+-            except (OSError, subprocess.SubprocessError) as e: raise Refused('cannot run containerd config dump: %s' % type(e).__name__)
+-            m = re.search(r'^root\s*=\s*(["\x27])([^"\x27\n]+)\1\s*$', c.stdout, re.M) if c.returncode == 0 else None
+-            if not m or not m.group(2).startswith('/'): raise Refused('cannot resolve the containerd root (containerd config dump)')
+-            roots.append(m.group(2))
++        if self.store_is_containerd(): roots.append(self.containerd_root())
+         return roots
+ 
++    def containerd_root(self):
++        """Receipt bth-pr73-v5 F1: the data root of the containerd that serves THIS docker, never a default `containerd
++        config dump`. The endpoint comes from, in order: docker info .Containerd.Address (Docker Engine 27+); the one
++        dockerd's --containerd flag; its daemon.json "containerd" key; else the two default sockets (system containerd
++        and dockerd's own managed one), of which exactly one may be live, or both with the same root. The one process
++        holding that endpoint's one listening socket is found through /proc (the ctl runs as root on the VM), and its own
++        --root, or the top-level root of its own --config file, is the store. Every unresolved or ambiguous step refuses
++        with its own message; rw-ship then reports the store unresolved and stops (NO DISK, exit 11) before any load."""
++        try: r = docker('info', '-f', '{{json .Containerd}}', timeout=60)
++        except (OSError, subprocess.SubprocessError) as e: raise Refused('cannot run docker info for the containerd address: %s' % type(e).__name__)
++        try: info = json.loads(r.stdout) if r.returncode == 0 else None
++        except ValueError: info = None
++        addr = info.get('Address') if isinstance(info, dict) else None
++        if addr in (None, ''):                              # Docker < 27 has no .Containerd: ask the daemon itself
++            dargs = proc_argv(self.dockerd_pid())
++            opts = cli_flags(dargs, {'containerd': 'containerd', 'config-file': 'config-file'}, 'dockerd')
++            if 'containerd' in opts: addr = opts['containerd']
++            else:
++                cfg = opts.get('config-file', DOCKERD_DEFAULT_CONFIG)
++                try: d = json.loads(open(cfg).read())
++                except FileNotFoundError:
++                    if 'config-file' in opts: raise Refused('dockerd --config-file %s does not exist' % cfg)
++                    d = {}
++                except (OSError, ValueError, UnicodeDecodeError): raise Refused('dockerd daemon.json %s cannot be parsed' % cfg)
++                if not isinstance(d, dict): raise Refused('dockerd daemon.json %s cannot be parsed' % cfg)
++                addr = d.get('containerd') or None
++        if addr is not None:
++            if isinstance(addr, str) and addr.startswith('unix://'): addr = addr[len('unix://'):]
++            if not isinstance(addr, str) or not addr.startswith('/') or '\n' in addr:
++                raise Refused('docker\'s containerd address is not an absolute unix socket path')
++            return containerd_root_at(addr)
++        live = {}
++        for s in CTD_DEFAULT_SOCKETS:
++            try: live[s] = containerd_root_at(s)
++            except NoListener: pass
++        if not live: raise Refused('no containerd listens on either default socket (%s)' % ', '.join(CTD_DEFAULT_SOCKETS))
++        if len(set(live.values())) > 1:
++            raise Refused('both default containerd sockets are live with different roots (%s); docker\'s store is ambiguous'
++                          % ', '.join('%s=%s' % kv for kv in sorted(live.items())))
++        return next(iter(live.values()))
++
++    def dockerd_pid(self):
++        """The one dockerd holding docker's own API socket (the endpoint this docker CLI talks to)."""
++        try: r = docker('context', 'inspect', '-f', '{{.Endpoints.docker.Host}}', timeout=60)
++        except (OSError, subprocess.SubprocessError) as e: raise Refused('cannot read docker\'s API endpoint: %s' % type(e).__name__)
++        host = r.stdout.strip() if r.returncode == 0 else ''
++        if not host.startswith('unix:///') or '\n' in host: raise Refused('docker\'s API endpoint is not a local unix socket; dockerd cannot be found')
++        try: holders = socket_holders(host[len('unix://'):])
++        except NoListener: raise Refused('no dockerd: nothing listens on docker\'s API socket %s' % host[len('unix://'):])
++        ds = [pid for pid in holders if proc_comm(pid) == 'dockerd']
++        if len(ds) != 1: raise Refused('%d dockerd processes hold docker\'s API socket, expected exactly one' % len(ds))
++        return ds[0]
++
+     def free_gb(self, path):
+         try: r = subprocess.run(['df', '-Pk', path], capture_output=True, text=True, timeout=60)
+         except (OSError, subprocess.SubprocessError) as e: raise Refused('cannot measure %s: %s' % (path, type(e).__name__))
+diff --git a/infra/release-harness/test_rw_ship_selfhost.py b/infra/release-harness/test_rw_ship_selfhost.py
+index 2abc36f00ad..adc13afd001 100644
+--- a/infra/release-harness/test_rw_ship_selfhost.py
++++ b/infra/release-harness/test_rw_ship_selfhost.py
+@@ -76,12 +76,16 @@ def W(n, v): json.dump(v, open(os.path.join(st, n), 'w'), indent=1)
+ def mark(n): return os.path.exists(os.path.join(os.environ['FAKE_STATE'], n))
+ def markv(n): return open(os.path.join(os.environ['FAKE_STATE'], n)).read().strip()
+ def log(m): open(os.path.join(os.environ['FAKE_STATE'], 'docker.log'), 'a').write('%s %s\n' % (side, m))
++if a[0] == 'info' and '.Containerd' in ' '.join(a):         # F1: Docker 27+ names its containerd; older engines fail
++    if mark('ctd-info-old'): print('template: :1:7: executing "" at <.Containerd>: can\'t evaluate field Containerd', file=sys.stderr); sys.exit(1)
++    print(json.dumps({'Address': markv('ctd-address') if mark('ctd-address') else '', 'Namespaces': {'Containers': 'moby'}})); sys.exit(0)
+ if a[0] == 'info' and 'DriverStatus' not in ' '.join(a): print(os.environ['FAKE_STATE']); sys.exit(0)
+ if a[:2] == ['buildx', 'inspect']:
+     if mark('container-builder'):
+         print('Driver: docker-container\nNodes:\nEndpoint: default\nStatus: running'); sys.exit(0)
+     print('Driver: docker\nNodes:\nEndpoint: unix:///var/run/docker.sock\nStatus: running'); sys.exit(0)
+ if a[:2] == ['context', 'show']: print('default'); sys.exit(0)
++if a[:2] == ['context', 'inspect'] and side == 'remote' and mark('docker-api'): print('unix://' + markv('docker-api')); sys.exit(0)
+ if a[0] == 'context':
+     print('ssh://unaccounted-builder' if mark('remote-docker') else 'unix:///var/run/docker.sock'); sys.exit(0)
+ imgs = J('images-%s.json' % side, {})
+@@ -328,13 +332,14 @@ CONTAINERD = r'''#!/usr/bin/env bash
+ [ "$*" = "config dump" ] || exit 2
+ [ -e "$FAKE_STATE/containerd-fail" ] && exit 1
+ [ -e "$FAKE_STATE/containerd-noroot" ] && { echo "version = 2"; exit 0; }
+-printf "version = 2\nroot = '%s'\nstate = '/run/containerd'\n" "$FAKE_STATE/containerd-root"
++r=containerd-root; [ -e "$FAKE_STATE/ctd-dump-alt" ] && r=alt-root     # F1: a default config naming another store
++printf "version = 2\nroot = '%s'\nstate = '/run/containerd'\n" "$FAKE_STATE/$r"
+ '''
+ 
+ VMDF = r'''#!/usr/bin/env bash
+ # fake df for the VM side only: FAKE_STATE/vmdf-docker or vmdf-containerd = free KiB, or "fail"; otherwise the real df
+ if [ "${FAKE_SIDE:-}" = remote ] && [ "$1" = -Pk ]; then
+-  case "$2" in "$FAKE_STATE") n=docker;; "$FAKE_STATE/containerd-root") n=containerd;; *) n="";; esac
++  S=$(realpath -m "$FAKE_STATE"); case "$(realpath -m "$2")" in "$S") n=docker;; "$S/containerd-root") n=containerd;; "$S/alt-root") n=alt;; *) n="";; esac
+   if [ -n "$n" ]; then
+     v=104857600; [ -e "$FAKE_STATE/vmdf-$n" ] && v=$(cat "$FAKE_STATE/vmdf-$n")
+     [ "$v" = fail ] && exit 1
+@@ -346,6 +351,59 @@ exit 127
+ '''
+ 
+ 
++FAKEPROC = r"""import json, os, socket, sys, time
++c = os.environ.get('FP_COMM', '')
++if c: open('/proc/self/comm', 'w').write(c)
++s = None
++if os.environ.get('FP_LISTEN'):
++    s = socket.socket(socket.AF_UNIX); s.bind(os.environ['FP_LISTEN']); s.listen(8)
++elif os.environ.get('FP_FD'):
++    s = socket.socket(fileno=int(os.environ['FP_FD']))
++if os.environ.get('FP_CHILD_ARGS') and s is not None:      # a second process holding the same listening socket
++    os.set_inheritable(s.fileno(), True)
++    e = dict(os.environ, FP_FD=str(s.fileno()), FP_COMM=os.environ.get('FP_CHILD_COMM', c), FP_READY=os.environ['FP_READY'] + '.child')
++    for k in ('FP_LISTEN', 'FP_CHILD_ARGS', 'FP_CHILD_COMM'): e.pop(k, None)
++    if os.fork() == 0: os.execve(sys.executable, [sys.executable, sys.argv[0]] + json.loads(os.environ['FP_CHILD_ARGS']), e)
++open(os.environ['FP_READY'], 'w').write(str(os.getpid()))
++while True: time.sleep(60)
++"""
++_FAKEPROCS = []
++
++
++def fakeproc(procs, sk, comm, sock, args, child_args=None, child_comm=None):
++    """Start a process named COMM with command line ARGS that listens on SOCK (or holds nothing when SOCK is None);
++    CHILD_ARGS adds a second process holding the same socket. Returns once each one is up."""
++    import time as _t
++    script = os.path.join(sk, 'fakeproc.py')
++    if not os.path.exists(script): open(script, 'w').write(FAKEPROC)
++    ready = os.path.join(sk, 'ready-%d' % len(procs))
++    e = dict(os.environ, FP_COMM=comm, FP_READY=ready)
++    if sock: e['FP_LISTEN'] = sock
++    if child_args is not None: e['FP_CHILD_ARGS'] = json.dumps(child_args); e['FP_CHILD_COMM'] = child_comm or comm
++    pr = subprocess.Popen([sys.executable, script] + list(args), env=e, start_new_session=True,
++                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    procs.append(pr); _FAKEPROCS.append(pr)
++    want = [ready] + ([ready + '.child'] if child_args is not None else [])
++    for _ in range(200):
++        if all(os.path.exists(w) for w in want): return pr
++        if pr.poll() is not None: break
++        _t.sleep(0.05)
++    raise AssertionError('fake %s did not start' % comm)
++
++
++def _kill_fakeprocs(procs):
++    import signal as _sig
++    for pr in procs:
++        try: os.killpg(pr.pid, _sig.SIGKILL)
++        except (ProcessLookupError, PermissionError): pass
++        try: pr.wait(timeout=5)
++        except Exception: pass
++
++
++import atexit as _atexit                                     # noqa: E402
++_atexit.register(lambda: _kill_fakeprocs(_FAKEPROCS))
++
++
+ class SRoot(base.Root):
+     def __init__(self, b, freeze_until='2020-01-01T00:00:00Z', extra_conf=''):
+         super().__init__(b)
+@@ -357,6 +415,13 @@ class SRoot(base.Root):
+         open(os.path.join(b, 'bin', 'selfhost-ctl.py'), 'w').write(open(CTL).read())
+         for path, body in ((os.path.join(b, 'stub', 'containerd'), CONTAINERD), (os.path.join(b, 'stub', 'df'), VMDF)):
+             open(path, 'w').write(body); os.chmod(path, 0o755)
++        # F1: the VM's dockerd (holding docker's API socket) and the containerd docker reports, rooted in the fixture
++        import tempfile as _tf
++        self.sk = _tf.mkdtemp(prefix='f1-'); self.fprocs = []
++        os.makedirs(os.path.join(self.st, 'containerd-root'), exist_ok=True); os.makedirs(os.path.join(self.st, 'alt-root'), exist_ok=True)
++        fakeproc(self.fprocs, self.sk, 'dockerd', os.path.join(self.sk, 'docker.sock'), ['-H', 'fd://'])
++        fakeproc(self.fprocs, self.sk, 'containerd', os.path.join(self.sk, 'ctd.sock'), ['--root', os.path.join(self.st, 'containerd-root')])
++        self.put('docker-api', os.path.join(self.sk, 'docker.sock')); self.put('ctd-address', os.path.join(self.sk, 'ctd.sock'))
+         node = os.path.join(b, 'stub/node')
+         body = Path(node).read_text() if 'Path' in globals() else open(node).read()
+         body = body.replace("else:\n    log('NODE '", "elif a and (a[0].endswith('dockerfile-tzdata-policy.mjs') or a[0].endswith('build-boundary.mjs')): pass\nelse:\n    log('NODE '")
+@@ -398,6 +463,11 @@ class SRoot(base.Root):
+     def env(self, smoke, **kw):
+         kw.setdefault('DEPLOY_TARGET', 'selfhost'); return super().env(smoke, **kw)
+ 
++    def cleanup(self):
++        _kill_fakeprocs(getattr(self, 'fprocs', []))
++        import shutil as _sh; _sh.rmtree(getattr(self, 'sk', ''), ignore_errors=True) if getattr(self, 'sk', '') else None
++        super().cleanup()
++
+     def runlogs(self):
+         d = os.path.join(self.F, 'biz/release-waves/deploys'); s = ''
+         for root, _, fs in os.walk(d):
+@@ -1279,6 +1349,19 @@ def test_guard_not_reporting_hold_after_switch_rolls_back(R):
+     assert R.pins() == BASE_PINS and R.jobs() == BASE_JOBS and R.get('live') == before
+ 
+ 
++def test_transcribe_hold_old_guard_that_just_listens_holds_transcode(R):
++    """F2 (bth-pr73-v5): an older guard names GUARD_HELD_ENV in its source but ignores it and keeps listening, so the probe
++    only ends at its timeout (rc 124). A timeout is not proof of support: the whole transcode image is held, its line
++    emptied, no guard line written, and the other job images still ship pinned."""
++    _guard_source(R, False, text=True); R.put('guard-old-timeout', ''); _conf(R, 'SELFHOST_JOB_HOLD', 'transcribe')
++    sha = R.release('release/wave-61o'); rc, out = R.run('release/wave-61o', sha)
++    assert rc == 0, out
++    assert 'probe rc=124' in out and 'guard lacks GUARD_HELD_ENV' in out, out
++    j = R.jobs(); assert j['JOB_IMAGE_TRANSCODE'] == HELD, j
++    assert all(re.fullmatch(r'goodqa-[a-z-]+@sha256:[0-9a-f]{64}', v) for k, v in j.items() if k != 'JOB_IMAGE_TRANSCODE'), j
++    assert _guard_line(R) == [] and 'GUARDPROBE' in R.dlog(), _guard_line(R)
++
++
+ def test_guard_hold_line_written_and_recorded(tmp_path):
+     """AC-16: ctl writes exactly one GUARD_HELD_ENV line in the create-guard block; state reports it; a pin without
+     --guard-hold removes it again (the hold is per release, never left behind silently)."""
+@@ -1350,10 +1433,22 @@ def test_vm_disk_docker_root_full_refuses_while_containerd_root_has_room(R):
+     R.put('vmdf-docker', '0'); _vm_disk_refused(R, 'release/wave-60d2', 'docker full')
+ 
+ 
+-@pytest.mark.parametrize('mark', ['containerd-fail', 'containerd-noroot'])
++@pytest.mark.parametrize('mark', ['no-listener', 'old-docker-no-dockerd'])
+ def test_vm_disk_unresolved_containerd_root_refuses(R, mark):
+-    R.put(mark, ''); out = _vm_disk_refused(R, 'release/wave-60d3', mark)
+-    assert 'unresolved' in out, out
++    # F1 retarget: these cases used to break the bare `containerd config dump` (containerd-fail / containerd-noroot),
++    # which the ctl no longer runs. Now: docker names a socket nobody listens on; an old docker with no dockerd found.
++    if mark == 'no-listener': R.put('ctd-address', os.path.join(R.sk, 'gone.sock')); why = 'nothing listens on'
++    else: R.put('ctd-info-old', ''); R.put('docker-api', os.path.join(R.sk, 'gone.sock')); why = 'no dockerd'
++    out = _vm_disk_refused(R, 'release/wave-60d3', mark)
++    assert 'unresolved (REFUSED' in out and why in out, out
++
++
++def test_vm_disk_measures_dockers_containerd_not_the_default_config(R):
++    """F1 (bth-pr73-v5): docker's own containerd keeps its store in a full root; a default `containerd config dump`
++    names another root with ample space. The gate must measure docker's store, refuse and load nothing."""
++    R.put('vmdf-containerd', '0'); R.put('ctd-dump-alt', '')
++    out = _vm_disk_refused(R, 'release/wave-60d8', 'active full, default has room')
++    assert '"free_gb": 0' in out and 'containerd-root' in out and 'alt-root' not in out, out
+ 
+ 
+ def test_vm_disk_stat_failure_refuses(R):
+@@ -1586,3 +1681,188 @@ def test_resolved_compose_dropping_a_held_key_is_refused(tmp_path):
+     rc, o = ctl(*PIN_HELD)
+     assert rc == 3 and 'job-dispatcher environment does not carry exactly the job image lines' in o and 'JOB_IMAGE_INTELLIGENCE_WORKER=missing' in o, o
+     assert snap() == before
++
++
++
++# ---- receipt bth-pr73-v5 F1: which containerd serves docker (each refusal has its own reason)
++class _F1:
++    pass
++
++
++@pytest.fixture
++def F1(tmp_path, monkeypatch):
++    import importlib.util, shutil, tempfile as _tf
++    h = _F1(); h.st = tmp_path / 'state'; h.st.mkdir(); stub = tmp_path / 'stub'; stub.mkdir()
++    for name, body in (('docker', DOCKER), ('containerd', CONTAINERD)):
++        (stub / name).write_text(body); os.chmod(stub / name, 0o755)
++    h.sk = _tf.mkdtemp(prefix='f1-'); h.procs = []
++    for d in ('containerd-root', 'alt-root', 'root-b', 'default-root'): (h.st / d).mkdir()
++    (h.st / 'ctd-dump-alt').write_text('')                  # a bare `containerd config dump` would say alt-root
++    monkeypatch.setenv('PATH', str(stub) + ':' + os.environ['PATH'])
++    monkeypatch.setenv('FAKE_STATE', str(h.st)); monkeypatch.setenv('FAKE_SIDE', 'remote')
++    spec = importlib.util.spec_from_file_location('selfhost_ctl_f1', CTL); M = importlib.util.module_from_spec(spec); spec.loader.exec_module(M)
++    h.M = M; h.sock = lambda n: os.path.join(h.sk, n); h.root = lambda n='containerd-root': os.path.realpath(str(h.st / n))
++    if hasattr(M, 'CTD_DEFAULT_SOCKETS'):
++        monkeypatch.setattr(M, 'CTD_DEFAULT_SOCKETS', (h.sock('system.sock'), h.sock('managed.sock')))
++        monkeypatch.setattr(M, 'DOCKERD_DEFAULT_CONFIG', str(tmp_path / 'daemon.json'))
++        monkeypatch.setattr(M, 'CTD_DEFAULT_CONFIG', str(tmp_path / 'no-default-containerd.toml'))
++        monkeypatch.setattr(M, 'CTD_DEFAULT_ROOT', str(h.st / 'default-root'))
++    h.put = lambda n, v='': (h.st / n).write_text(v)
++    h.run = lambda *a, **k: fakeproc(h.procs, h.sk, *a, **k)
++    h.dockerd = lambda args=(), **k: (h.run('dockerd', h.sock('docker.sock'), list(args), **k), h.put('docker-api', h.sock('docker.sock')))
++    h.ctd = lambda sock, args, **k: h.run('containerd', h.sock(sock), list(args), **k)
++    stk = M.Stack.__new__(M.Stack)
++
++    def measured():
++        roots = stk.store_roots()
++        assert roots[0] == str(h.st) and len(roots) == 2, roots
++        return roots[1]
++    h.measured = measured
++    yield h
++    _kill_fakeprocs(h.procs); shutil.rmtree(h.sk, ignore_errors=True)
++
++
++def _refused(h, why):
++    with pytest.raises(h.M.Refused) as e: h.measured()
++    assert why in str(e.value), str(e.value)
++
++
++def test_f1_docker_info_address_names_the_store(F1):
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')]); F1.put('ctd-address', F1.sock('ctd.sock'))
++    assert F1.measured() == F1.root()
++
++
++def test_f1_address_through_unix_scheme_and_config_file(F1):
++    cfg = F1.st / 'ctd.toml'
++    cfg.write_text("version = 2\nroot = '%s'   # the daemon root\nimports = []\n[plugins.'io.containerd.grpc.v1.cri']\n  root = '/elsewhere'\n"
++                   "[plugins.'io.containerd.snapshotter.v1.overlayfs']\n  root_path = '/elsewhere2'\n" % (F1.st / 'containerd-root'))
++    F1.ctd('ctd.sock', ['--config', str(cfg)]); F1.put('ctd-address', 'unix://' + F1.sock('ctd.sock'))
++    assert F1.measured() == F1.root()
++
++
++def test_f1_section_only_root_means_the_default_root(F1):
++    cfg = F1.st / 'ctd.toml'; cfg.write_text("version = 2\n[plugins.x]\n  root = '%s'\n" % (F1.st / 'containerd-root'))
++    F1.ctd('ctd.sock', ['-c', str(cfg)]); F1.put('ctd-address', F1.sock('ctd.sock'))
++    assert F1.measured() == F1.root('default-root')
++
++
++@pytest.mark.parametrize('body,why', [
++    ("imports = ['/etc/containerd/conf.d/*.toml']\nroot = '%(r)s'\n", 'uses imports'),
++    ("imports = [\n  '/x.toml',\n]\nroot = '%(r)s'\n", 'uses imports'),
++    ("root = '%(r)s'\nroot = '/other'\n", 'sets root 2 times'),
++    ("root = 'relative/root'\n", 'has an unreadable root'),
++    ("root = '%(r)s/missing'\n", 'does not exist'),
++])
++def test_f1_containerd_config_refusals(F1, body, why):
++    cfg = F1.st / 'ctd.toml'; cfg.write_text(body % {'r': F1.st / 'containerd-root'})
++    F1.ctd('ctd.sock', ['--config', str(cfg)]); F1.put('ctd-address', F1.sock('ctd.sock'))
++    _refused(F1, why)
++
++
++def test_f1_named_config_missing_refuses(F1):
++    F1.ctd('ctd.sock', ['--config', str(F1.st / 'nope.toml')]); F1.put('ctd-address', F1.sock('ctd.sock'))
++    _refused(F1, 'does not exist')
++
++
++def test_f1_relative_address_refuses(F1):
++    F1.put('ctd-address', 'run/containerd.sock'); _refused(F1, 'not an absolute unix socket path')
++
++
++def test_f1_nobody_listens_on_the_address(F1):
++    F1.put('ctd-address', F1.sock('gone.sock')); _refused(F1, 'nothing listens on')
++
++
++def test_f1_two_processes_hold_the_containerd_socket(F1):
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')], child_args=['--root', str(F1.st / 'root-b')])
++    F1.put('ctd-address', F1.sock('ctd.sock')); _refused(F1, '2 processes hold the containerd socket')
++
++
++def test_f1_two_listening_sockets_at_one_path_refuse(F1):
++    # a restarted containerd while the old one still listens: the path is unlinked and bound again
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'root-b')]); os.unlink(F1.sock('ctd.sock'))
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')])
++    F1.put('ctd-address', F1.sock('ctd.sock')); _refused(F1, '2 sockets listen on')
++
++
++# Docker < 27: no .Containerd in docker info; the one dockerd says where its containerd is
++def test_f1_old_docker_dockerd_containerd_flag(F1):
++    F1.put('ctd-info-old'); F1.dockerd(['--containerd', F1.sock('ctd.sock')])
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')])
++    assert F1.measured() == F1.root()
++
++
++def test_f1_old_docker_daemon_json_containerd(F1):
++    dj = F1.st / 'dj.json'; dj.write_text(json.dumps({'containerd': F1.sock('ctd.sock')}))
++    F1.put('ctd-info-old'); F1.dockerd(['--config-file=%s' % dj]); F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')])
++    assert F1.measured() == F1.root()
++
++
++def test_f1_old_docker_default_daemon_json_unparseable_refuses(F1):
++    open(F1.M.DOCKERD_DEFAULT_CONFIG, 'w').write('{"containerd": ')
++    F1.put('ctd-info-old'); F1.dockerd(); _refused(F1, 'cannot be parsed')
++
++
++@pytest.mark.parametrize('live', ['managed', 'system'])
++def test_f1_old_docker_default_uses_the_one_live_socket(F1, live):
++    F1.put('ctd-info-old'); F1.dockerd(); F1.ctd(live + '.sock', ['--root', str(F1.st / 'containerd-root')])
++    assert F1.measured() == F1.root()
++
++
++def test_f1_old_docker_both_default_sockets_with_different_roots_refuse(F1):
++    F1.put('ctd-info-old'); F1.dockerd()
++    F1.ctd('system.sock', ['--root', str(F1.st / 'alt-root')]); F1.ctd('managed.sock', ['--root', str(F1.st / 'containerd-root')])
++    _refused(F1, 'both default containerd sockets are live with different roots')
++
++
++def test_f1_old_docker_both_default_sockets_with_one_root_agree(F1):
++    F1.put('ctd-info-old'); F1.dockerd()
++    F1.ctd('system.sock', ['--root', str(F1.st / 'containerd-root')]); F1.ctd('managed.sock', ['--root=%s' % (F1.st / 'containerd-root')])
++    assert F1.measured() == F1.root()
++
++
++def test_f1_old_docker_no_default_socket_refuses(F1):
++    F1.put('ctd-info-old'); F1.dockerd(); _refused(F1, 'no containerd listens on either default socket')
++
++
++def test_f1_old_docker_no_dockerd_refuses(F1):
++    F1.put('ctd-info-old'); F1.put('docker-api', F1.sock('docker.sock')); _refused(F1, 'no dockerd')
++
++
++def test_f1_old_docker_two_dockerd_refuse(F1):
++    F1.put('ctd-info-old'); F1.dockerd(['--containerd', F1.sock('ctd.sock')], child_args=['--containerd', F1.sock('ctd.sock')])
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')]); _refused(F1, '2 dockerd processes')
++
++
++def test_f1_old_docker_socket_activation_holder_is_not_a_second_dockerd(F1):
++    # systemd's docker.socket also holds the API socket; only processes named dockerd count
++    F1.put('ctd-info-old'); F1.dockerd(['-H', 'fd://', '--containerd', F1.sock('ctd.sock')], child_args=['--system'], child_comm='systemd')
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')])
++    assert F1.measured() == F1.root()
++
++
++def test_f1_unreadable_process_refuses_as_root(F1, monkeypatch):
++    # on the VM the ctl is root: the holder is readable, but another process of the socket owner is not, and it might
++    # hold the socket too, so the gate refuses instead of trusting the one holder it could see
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')]); F1.put('ctd-address', F1.sock('ctd.sock'))
++    other = F1.run('other', None, [])
++    assert F1.measured() == F1.root()                       # unprivileged: the hidden process does not change the answer
++    real = os.listdir
++
++    def listdir(d):
++        if str(d) == '/proc/%d/fd' % other.pid: raise PermissionError(13, 'denied')
++        return real(d)
++    monkeypatch.setattr(F1.M.os, 'listdir', listdir); monkeypatch.setattr(F1.M.os, 'geteuid', lambda: 0)
++    _refused(F1, 'cannot inspect process ')               # `other`, or any other unreadable process of this owner
++
++
++def test_f1_unreadable_processes_without_a_holder_refuse_unprivileged(F1, monkeypatch):
++    # unprivileged (the test suite) a process that cannot be read is skipped, but if no readable process holds the
++    # socket, the gate refuses instead of guessing
++    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')]); F1.put('ctd-address', F1.sock('ctd.sock'))
++    real = os.listdir
++
++    def listdir(d):
++        if str(d).startswith('/proc/') and str(d).endswith('/fd'): raise PermissionError(13, 'denied')
++        return real(d)
++    monkeypatch.setattr(F1.M.os, 'listdir', listdir); monkeypatch.setattr(F1.M.os, 'geteuid', lambda: 1000)
++    _refused(F1, 'no holder of')
