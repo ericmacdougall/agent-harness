@@ -1,0 +1,27 @@
+goodqa#16148 code-review delta (review a5a2642f: PASS, five LOW findings). Lead ruling: fix F2, F3 and F4; ticket F1 and F5. All pushed; nothing is merged or deployed.
+
+Fixes:
+- PR #1372 (fix/16185) is now c9d61ac1aa3a575781e5e5fc9430bee993be1e86, with F4: SCAN_LIMIT 4096 before the residue scan. Failing first: 2 failed before the fix (the 1 MiB case and a deterministic case), 40 passed after. Full suite 319 passed; tsc 0.
+- PR #1373 (fix/16148) is now 97bfac5172322d3eddc3cf7d43e951421624dd67:
+  - f29da184 adds F2 (derive unlinks the name on a post-rename mismatch) and F3 (the sampler reads a pflag cluster; -e(cluster) is BAD). Failing first: derive FAILED (failures=2, the swap tests) and sampler FAILED (failures=1).
+  - Merge 97bfac51 brings in c9d61ac1. It is a merge, not a rebase, so no published ref is rewritten. Its added and removed lines are identical to c9d61ac1.
+
+Evidence at 97bfac51 (all exit 0):
+- vitest 363 passed;
+- tsc;
+- derive and host 61 and 61 OK;
+- wrapper and sampler 20 OK;
+- node 23 of 23;
+- pytest 1584 passed.
+Sampler variants S1 to S5 all FAILED.
+
+Tickets:
+- goodqa#16195 (F1): the write order. It is a spec change, because it flips NEG-14 and H2.
+- goodqa#16196 (F5): the root-only tests must not pass by skipping in CI.
+
+Packets (harness worktree .fx16136/packets, pushed at 6ed6e6a7):
+- delta-16148.md, sha 34872d41df67, for the a5a2642f delta review.
+- pr-16185-v2.md, sha d5e705677ff0.
+- pr-16148-v2.md, sha e4f28fe152d5.
+
+The review report and its probes were moved to work/<session>/agent-a9dc66afb96703739/review-16148/ and not committed.
