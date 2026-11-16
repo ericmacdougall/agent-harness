@@ -99,3 +99,12 @@ Checkpoint: each green step committed and pushed on the feature branch; tests ar
 - `--env-file` cannot carry a newline. A job env value holding one is refused with a named error, where `-e` used to accept it. Today's base env comes from single-line raw env_files, so no current value changes.
 - The worker receives the value exactly as stored in api.env. If api.env holds a form decodePrivateKey does not accept, the worker fails at its own startup with its own error (Level 2), never silently.
 - Domain: auth and secrets. Two reviews from different models are required before attach.
+
+## Reviews
+
+Spec core sha256: `e002c59f11652005a7f0d24e4b832a1ef372f09638476d4de0cb7de3a729a1df`
+
+| Role | Verdict | Reviewer | Kind | Source | Bound to |
+|---|---|---|---|---|---|
+| acceptance | ACCEPT | a9c212c3b8fbe5530 (red-team) | agent | WAL-verified red-team agent | current |
+| adversarial | ACCEPT | a5a2642f07434bbc9 (red-team) | agent | WAL-verified red-team agent | current |

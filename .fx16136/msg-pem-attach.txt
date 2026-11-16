@@ -1,0 +1,13 @@
+docs(fx16136): record the goodqa#16148 spec v3 attach
+
+Why: both reviewers accepted spec v3 (core e002c59f); spec_flow attach re-renders the Reviews section and reads the review sidecar and the Opus report at the path it was recorded with.
+
+What: spec-16148-pem.md with the generated Reviews section, spec-16148-pem.md.reviews.json, and the Opus v3 report (sha 10af3756) restored at its recorded path so the attach record stays reproducible. Attached as ticket comment b34b1299.
+
+Testing: not run: spec record only; `spec_flow.py attach` RECORDED.
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

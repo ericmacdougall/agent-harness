@@ -1,0 +1,37 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a9c212c3b8fbe5530",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-af3f19d243286a8a7/review-16148/review-sonnet-acceptance-pem-v3.md",
+    "sha256": "8b69ddb0e3e116666ef989ce5a56a23ef87923a034a5a6570548b6728fee8f3e"
+   },
+   "role": "acceptance",
+   "core_sha": "e002c59f11652005a7f0d24e4b832a1ef372f09638476d4de0cb7de3a729a1df",
+   "at": "2026-11-16T01:38:26.115852+00:00",
+   "key": "agent:a9c212c3b8fbe5530"
+  },
+  {
+   "kind": "agent",
+   "identity": "a5a2642f07434bbc9",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-a9dc66afb96703739/.fx16136/review-opus-adversarial-16148-pem-v3.md",
+    "sha256": "10af3756519e034aa9ab4337e6f00adaf8883875ad5e105a257a875530fce690"
+   },
+   "role": "adversarial",
+   "core_sha": "e002c59f11652005a7f0d24e4b832a1ef372f09638476d4de0cb7de3a729a1df",
+   "at": "2026-11-16T01:38:55.141252+00:00",
+   "key": "agent:a5a2642f07434bbc9"
+  }
+ ]
+}
