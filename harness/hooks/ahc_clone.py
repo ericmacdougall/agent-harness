@@ -64,8 +64,19 @@ class CloneError(RuntimeError):
 
 
 def _git(args, cwd=None, env=None, timeout=GIT_TIMEOUT, check=True, allow_file=False):
-    argv = ["git", *SAFE, *(FILE_TRANSPORT if allow_file else []), *args]
-    rc, out, err = ahc_core.run_argv(argv, timeout, cwd=cwd, env={**(env or os.environ), **GIT_ENV})
+    """One git child in AC-13's git form: the resolved absolute git, SAFE, and the form's minimal environment
+    (goodqa#16049 slice 1 (b) replaces the merge of the daemon's whole environment; `env` is accepted for old
+    callers and ignored). Under an active launch policy its resolved git and env are used."""
+    import ahc_guard  # noqa: PLC0415
+    policy = ahc_guard.active()
+    if policy is not None and "git" in policy.exe:
+        git, genv = policy.exe["git"], policy.env("git")
+    else:
+        home = str(Path.home())
+        dirs = ahc_guard.trusted_dirs(home)
+        git, genv = ahc_guard.resolve("git", dirs) or "git", ahc_guard.form_env("git", dirs, home)
+    argv = [git, *SAFE, *(FILE_TRANSPORT if allow_file else []), *args]
+    rc, out, err = ahc_core.run_argv(argv, timeout, cwd=cwd, env=genv)
     if check and rc != 0:
         raise CloneError(f"git {args[0]} failed (exit {rc}): {err.strip()[-300:]}")
     return SimpleNamespace(returncode=rc, stdout=out, stderr=err)

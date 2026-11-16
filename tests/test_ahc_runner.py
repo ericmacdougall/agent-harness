@@ -3505,7 +3505,7 @@ class OwnerCopyTests(Base):
         real = ahc_clone.ahc_core.run_argv
 
         def recording(argv, timeout, cwd=None, env=None):
-            if argv and argv[0] == "git":
+            if argv and os.path.basename(argv[0]) == "git":   # AC-13: an absolute resolved git
                 calls.append(cwd)
             return real(argv, timeout, cwd=cwd, env=env)
 
