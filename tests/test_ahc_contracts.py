@@ -17,6 +17,15 @@ OTHER = "8" * 40      # some other tip, neither B nor H
 PKT = "d" * 64
 POLICY = "policy-r1"
 CORE1, CORE2 = "1" * 64, "2" * 64     # two attached spec cores (Q-A6)
+BOOT = "test-boot"                    # the boot id the Contracts under test run in (D-a3)
+
+
+def stamped(o):
+    """An observation stamped the way Contracts.stamp does: the monotonic stamp follows the test clock's `at`
+    (one fake clock drives both), and the boot is the test boot unless a test sets another."""
+    o.setdefault("mono", o.get("at"))
+    o.setdefault("boot", BOOT)
+    return o
 
 
 class Clock:
@@ -35,7 +44,7 @@ class Base(unittest.TestCase):
         C.apply_schema(self.db)
         self.clock = Clock()
         self.log = C.AuthorityLog(Path(self.tmp.name) / "authority.jsonl")
-        self.c = C.Contracts(self.db, self.log, now=self.clock)
+        self.c = C.Contracts(self.db, self.log, now=self.clock, mono=self.clock, boot_id=BOOT)
         self.n = 0
 
     def ev(self):
@@ -90,7 +99,7 @@ class Base(unittest.TestCase):
         o = {"at": self.clock.t, "kill_switch": False, "kill_epoch": self.KILL, "pr_state": "OPEN", "pr_head": head,
              "draft": False, "tip": base, "compare": "ahead", "checks_green": True}
         o.update(changes)
-        return o
+        return stamped(o)
 
     def send(self, op):
         return self.c.dispatch(op["key"], self.obs(op), expected_version=op["version"], event_id=self.ev(),
@@ -107,13 +116,13 @@ class Base(unittest.TestCase):
     def read(self, tip=OTHER, entries=(), complete=True, **changes):
         r = {"at": self.clock.t, "tip": tip, "activity": {"complete": complete, "entries": list(entries)}}
         r.update(changes)
-        return r
+        return stamped(r)
 
     def readback(self, **changes):
         """E3 by the tip: the default branch is exactly H."""
         r = {"at": self.clock.t, "tip": H1, "pr_merged": True}
         r.update(changes)
-        return r
+        return stamped(r)
 
     def gstate(self, g):
         return self.state("grants", "id", g["id"])
@@ -534,6 +543,36 @@ class OperationTests(Base):
         with self.assertRaisesRegex(C.ContractError, "never yields a new generation"):
             self.c.intend(self.params(pr=6), lease_ok=True, event_id=self.ev())
 
+    def test_t2_age_is_monotonic_and_ignores_wall_clock_steps(self):
+        """D-a3: a wall-clock step (NTP, a manual set) changes neither verdict. A 3 h old observation is stale
+        however the wall clock was set back, and a fresh one stays fresh after the wall clock jumps."""
+        g, op = self.reserved()
+        mono = [self.clock.t]
+        c = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: mono[0], boot_id=BOOT)
+        old = self.obs(mono=mono[0] - 3 * 3600)                   # the wall stamp `at` still reads "now"
+        with self.assertRaisesRegex(C.ContractError, "stale"):
+            c.dispatch(op["key"], old, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
+                       mirror_read_back=True)
+        fresh = self.obs(at=self.clock.t + 3600, mono=mono[0] - 30)   # wall clock ahead by an hour
+        self.clock.t -= 7200                                           # then set back two hours
+        op = c.dispatch(op["key"], fresh, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
+                        mirror_read_back=True)
+        self.assertEqual(op["state"], "dispatched")
+
+    def test_stamp_uses_this_boot_and_the_real_monotonic_clock(self):
+        c = C.Contracts(self.db, self.log)
+        o = c.stamp({"tip": BASE})
+        self.assertEqual((o["tip"], o["boot"]), (BASE, c.boot_id))
+        self.assertTrue(c.boot_id.startswith(("linux:", "process:")), c.boot_id)
+        c._fresh(o)                                                      # fresh as stamped
+        with self.assertRaisesRegex(C.ContractError, "another boot"):
+            C.Contracts(self.db, self.log, boot_id="linux:another-boot")._fresh(o)
+        if c.boot_id.startswith("process:"):           # no kernel boot id: another process's stamp is stale
+            with self.assertRaisesRegex(C.ContractError, "another boot"):
+                C.Contracts(self.db, self.log)._fresh(o)
+        with self.assertRaisesRegex(C.ContractError, "stale"):
+            c._fresh(dict(o, mono=o["mono"] - C.Contracts.OBSERVATION_SECONDS))
+
     def test_e02_every_guard_is_checked_and_nothing_counts_on_refusal(self):
         g, op = self.reserved()
         bad = {"kill switch": self.obs(kill_switch=True), "kill switch unread": self.obs(kill_switch=None),
@@ -543,7 +582,12 @@ class OperationTests(Base):
                "behind": self.obs(compare="behind"), "compare unread": self.obs(compare=None),
                "red check": self.obs(checks_green=False),
                "stale": self.obs(at=self.clock.t - C.Contracts.OBSERVATION_SECONDS),
-               "future": self.obs(at=self.clock.t + 1), "no time": self.obs(at=None), "bool time": self.obs(at=True)}
+               "future": self.obs(at=self.clock.t + 1), "no time": self.obs(at=None), "bool time": self.obs(at=True),
+               # D-a3: the age is the monotonic stamp's, whatever the wall-clock stamp says
+               "mono stale, wall fresh": self.obs(mono=self.clock.t - C.Contracts.OBSERVATION_SECONDS),
+               "mono future": self.obs(mono=self.clock.t + 1), "no mono": self.obs(mono=None),
+               "bool mono": self.obs(mono=True), "mono as text": self.obs(mono=str(self.clock.t)),
+               "other boot": self.obs(boot="another-boot"), "no boot": self.obs(boot=None)}
         for name, o in bad.items():
             with self.subTest(name), self.assertRaises(C.ContractError):
                 self.c.dispatch(op["key"], o, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
@@ -737,7 +781,7 @@ class OperationTests(Base):
             self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
         for actor in ("ahc-core", "reconcile"):
             with self.subTest(actor), self.assertRaises(C.ContractError):
-                self.c.settle_held(op["key"], {"at": self.clock.t, "tip": OTHER}, expected_version=op["version"],
+                self.c.settle_held(op["key"], stamped({"at": self.clock.t, "tip": OTHER}), expected_version=op["version"],
                                    event_id=self.ev(), actor=actor)
         op = self.c.settle_held(op["key"], {"note": "PR closed by hand; outcome unknown"},
                                 expected_version=op["version"], event_id=self.ev(), actor="main")

@@ -69,6 +69,20 @@ V = [
         ("            self._a0(\"work_item\", iid, frm, to, event_id, actor, row=row_id, cause=cause,\n",
          "            (lambda *a, **k: None)(\"work_item\", iid, frm, to, event_id, actor, row=row_id, cause=cause,\n")],
      CONTRACTS, ["tests.test_ahc_crash.CrashPointTests"]),
+    # D-a3: observation age on the monotonic clock, bound to this boot
+    ("D-a3: age measured on the wall clock (the merged behaviour)", [
+        ("        if not 0 <= float(self._mono()) - float(obs[\"mono\"]) < self.OBSERVATION_SECONDS:\n",
+         "        if not 0 <= self.now() - float(obs[\"at\"]) < self.OBSERVATION_SECONDS:\n")],
+     CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
+    ("D-a3: a stamp from another boot accepted", [
+        ("        if obs.get(\"boot\") != self.boot_id:\n", "        if False:\n")],
+     CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
+    ("D-a3: a missing monotonic stamp accepted as now", [
+        ("        if not 0 <= float(self._mono()) - float(obs[\"mono\"]) < self.OBSERVATION_SECONDS:\n",
+         "        if not 0 <= float(self._mono()) - float(obs.get(\"mono\") or self._mono()) "
+         "< self.OBSERVATION_SECONDS:\n"),
+        (" or not num(obs.get(\"at\")) or not num(obs.get(\"mono\")):", " or not num(obs.get(\"at\")):")],
+     CONTRACTS, ["tests.test_ahc_contracts.OperationTests"]),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
          '                if prior[0] == "work_item":\n')], CONTRACTS, SM),
