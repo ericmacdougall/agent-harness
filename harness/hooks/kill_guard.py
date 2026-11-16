@@ -1627,8 +1627,10 @@ def make_analyzer_class(cg):
             # A `--`, a wrapper, a shell or an interpreter name starts a command line; the word that runs is never
             # exempt. PR 265 review F1: a wrapper's words are counted only by its exact grammar
             # (wrapper_command_index), and an option or assignment where the command should be is ambiguous. Any
-            # ambiguity returns nothing, which keeps the full scan (fail closed).
-            out, command_pos, j = set(), False, program + 1
+            # ambiguity returns nothing, which keeps the full scan (fail closed). When the word that runs is bare (no
+            # '/' or '.'), it may be a tool or subcommand whose next word is what really runs (`npx tsx X`,
+            # `deno run X`, `docker exec web X`), so that next word is not exempt either (`hold`).
+            out, command_pos, hold, j = set(), False, False, program + 1
             while j < len(texts):
                 t, prev = texts[j], texts[j - 1]
                 name_j = cg.norm_name(t)
@@ -1646,7 +1648,10 @@ def make_analyzer_class(cg):
                 if command_pos:
                     if t.startswith('-') or ASSIGNMENT_WORD.fullmatch(t):
                         return set()  # a shell's, interpreter's or runner's option whose value is unknown
-                    command_pos, j = False, j + 1  # the word that runs
+                    command_pos, hold, j = False, '/' not in t and '.' not in t, j + 1  # the word that runs
+                    continue
+                if hold:
+                    hold, j = False, j + 1  # the word after a bare tool or subcommand (`vitest run`, `tsx X`)
                     continue
                 if not prev.startswith('-') and path_operand(args[j], self.script_kill):
                     out.add(j)  # a word right after an option may be its value (`--require ./x.js`)

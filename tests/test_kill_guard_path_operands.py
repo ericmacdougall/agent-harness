@@ -143,7 +143,21 @@ WRAPPER_VALUE_PINNED = [
     RUNNER + "-v " + KILL_PY,
 ]
 
-BLOCK += WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED
+# A bare word that a wrapper, shell or interpreter runs may be a tool or subcommand, so the word after it is what
+# really runs. The first five were refused at bdc78e1c and allowed at 4d6a9d0; the rest were allowed at both.
+WRAPPER_SUBCOMMANDS = [
+    RUNNER + "npx tsx tools/kill-all.ts",
+    RUNNER + "env tsx tools/kill-all.ts",
+    RUNNER + "timeout 5 tsx tools/kill-all.ts",
+    RUNNER + "npx vitest tools/kill-all.ts",
+    "python3 runner.py docker exec web " + KILL_PY,
+    RUNNER + "deno run tools/kill-all.ts",
+    RUNNER + "bun x tools/kill-all.ts",
+    RUNNER + "node inspect kill-all.js",
+    RUNNER + "bash run " + KILL_PY,
+]
+
+BLOCK += WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED + WRAPPER_SUBCOMMANDS
 
 # Wrapper forms the exact grammars do count, so a test path after the command they run stays exempt.
 ALLOW += [
@@ -195,7 +209,7 @@ class PathOperands(unittest.TestCase):
 
     def test_wrapper_option_values_do_not_exempt_the_command(self):
         """PR 265 review F1: the command a wrapper runs keeps the script-kill refusal whatever its options are."""
-        for cmd in WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED:
+        for cmd in WRAPPER_VALUE_ESCAPES + WRAPPER_VALUE_PINNED + WRAPPER_SUBCOMMANDS:
             with self.subTest(cmd=cmd):
                 self.assertEqual(verdict(cmd), ("block", "script-kill"))
 
