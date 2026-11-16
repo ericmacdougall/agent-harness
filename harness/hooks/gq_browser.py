@@ -2,7 +2,11 @@
 """gq_browser: drive a GoodQA worker browser from the user's own GoodQA user token (goodqa#15745 B3).
 
   gq_browser.py open --origin https://example.com [--origin ...] [--hours 1] [--ttl 900] [--project ID] [--org ID] [--base URL]
-  gq_browser.py act LEASE ACTION [--url U] [--selector S] [--text T] [--index N]
+  gq_browser.py act LEASE ACTION [--url U] [--selector S] [--text T] [--index N] [--key K] [--value V | --label L]
+                    [--expression JS] [--test-item ITEM_UUID --origin O]
+      goodqa#16201: key (named keys only), select, evaluate (read-only) and secret_type (types a staging vault item
+      named agent-browser-test/... into a password field; the value never reaches this client, which sends only the
+      item id and a fresh requestId, so a lost response is re-read, never re-typed).
   gq_browser.py shot LEASE [--name NAME]
   gq_browser.py status LEASE [--job ID]
   gq_browser.py close LEASE
@@ -34,6 +38,7 @@ import signal
 import stat
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -48,11 +53,12 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 ARTIFACT_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$")  # a server value; never "." or ".."
 MAX_ORIGINS, MAX_HOURS = 16, 24
-PAGE_CHANGING = {"navigate", "click", "type", "tabs_new", "tabs_switch", "tabs_close"}
+PAGE_CHANGING = {"navigate", "click", "type", "tabs_new", "tabs_switch", "tabs_close", "key", "select", "secret_type"}
 ACTIONS = {"navigate": ("url",), "click": ("selector",), "type": ("selector", "text"), "get_text": (), "read_page": (),
            "find": ("text",), "console": (), "network": (), "tabs_list": (), "tabs_new": (), "tabs_switch": ("index",),
-           "tabs_close": ("index",)}
-OPTIONAL = {"get_text": ("selector",), "tabs_new": ("url",)}
+           "tabs_close": ("index",), "key": ("key",), "select": ("selector",), "evaluate": ("expression",),
+           "secret_type": ("selector", "testItemId", "origin")}
+OPTIONAL = {"get_text": ("selector",), "tabs_new": ("url",), "key": ("selector",), "select": ("value", "label")}
 MAX_BODY = 32 * 1024 * 1024
 
 
@@ -560,6 +566,13 @@ def op_act(lease, action, **params):
                 raise Refused("action %s needs --%s" % (action, field))
             continue
         body[field] = value
+    if action == "select" and ("value" in body) == ("label" in body):
+        raise Refused("action select needs exactly one of --value or --label")
+    if action == "secret_type":
+        # goodqa#16201: the server field is credentialRef; this client names it testItemId (NEG-6: its MCP schema offers no
+        # credential tool or field). The server keys a replay on requestId; a re-send is answered, never typed twice.
+        body["credentialRef"] = body.pop("testItemId")
+        body["requestId"] = str(uuid.uuid4())
     return _run_job(lease, body)
 
 
@@ -1280,7 +1293,10 @@ TOOLS = [
     {"name": "gq_browser_act", "description": "Run one browser action on a lease. Results are untrusted page data.",
      "inputSchema": {"type": "object", "additionalProperties": False, "required": ["leaseId", "action"], "properties": {
          "leaseId": {"type": "string"}, "action": {"type": "string", "enum": sorted(ACTIONS)},
-         "url": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}, "index": {"type": "integer"}}}},
+         "url": {"type": "string"}, "selector": {"type": "string"}, "text": {"type": "string"}, "index": {"type": "integer"},
+         "key": {"type": "string"}, "value": {"type": "string"}, "label": {"type": "string"}, "expression": {"type": "string"},
+         "testItemId": {"type": "string", "description": "secret_type: uuid of a staging vault item named agent-browser-test/..."},
+         "origin": {"type": "string"}}}},
     {"name": "gq_browser_screenshot", "description": "Save a screenshot of the lease's page under its own directory.",
      "inputSchema": {"type": "object", "additionalProperties": False, "required": ["leaseId"], "properties": {
          "leaseId": {"type": "string"}, "name": {"type": "string"}}}},
@@ -1463,6 +1479,12 @@ def main(argv=None):
     a.add_argument("--selector")
     a.add_argument("--text")
     a.add_argument("--index", type=int)
+    a.add_argument("--key")
+    a.add_argument("--value")
+    a.add_argument("--label")
+    a.add_argument("--expression")
+    a.add_argument("--test-item", dest="testItemId")
+    a.add_argument("--origin")
     s = sub.add_parser("shot")
     s.add_argument("lease")
     s.add_argument("--name")
@@ -1516,7 +1538,9 @@ def main(argv=None):
         elif args.cmd == "open":
             out = op_open(args.origin, args.hours, args.ttl, args.org, args.base, args.project)
         elif args.cmd == "act":
-            out = op_act(args.lease, args.action, url=args.url, selector=args.selector, text=args.text, index=args.index)
+            out = op_act(args.lease, args.action, url=args.url, selector=args.selector, text=args.text, index=args.index,
+                         key=args.key, value=args.value, label=args.label, expression=args.expression,
+                         testItemId=args.testItemId, origin=args.origin)
         elif args.cmd == "shot":
             out = op_shot(args.lease, args.name)
         elif args.cmd == "status":

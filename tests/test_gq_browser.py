@@ -28,7 +28,7 @@ SESSION_ID = "55555555-5555-4555-8555-555555555555"
 ME = "66666666-6666-4666-8666-666666666666"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 ALL_ACTIONS = ["navigate", "click", "type", "get_text", "read_page", "find", "console", "network", "tabs_list", "tabs_new",
-               "tabs_switch", "tabs_close", "screenshot", "unknown"]
+               "tabs_switch", "tabs_close", "screenshot", "key", "select", "evaluate", "secret_type", "unknown"]
 JOB_ACTIONS = {"%08x-0000-4000-8000-000000000000" % (i + 1): a for i, a in enumerate(ALL_ACTIONS)}  # job ids are uuids
 
 
@@ -492,6 +492,39 @@ class ActTest(Base):
             self.assertEqual(out["result"]["action"], args[0])
         sent = [r["body"]["action"] for r in self.api.calls("POST", "/actions")]
         self.assertIn("tabs_close", sent)
+
+    def test_16201_key_select_evaluate_secret_type_bodies(self):
+        item = "77777777-7777-4777-8777-777777777777"
+        origin = "https://solve-screen-answer-staging.framebright-sync.workers.dev"
+        for args in (["key", "--key", "Tab"], ["key", "--key", "Enter", "--selector", "#pair-key"],
+                     ["select", "--selector", "#theme-mode", "--value", "dark"], ["select", "--selector", "#theme-mode", "--label", "Dark"],
+                     ["evaluate", "--expression", "document.title"],
+                     ["secret_type", "--selector", "#pair-key", "--test-item", item, "--origin", origin],
+                     ["secret_type", "--selector", "#pair-key", "--test-item", item, "--origin", origin]):
+            out = json.loads(self.e.run("act", self.lease, *args, check=0).stdout)
+            self.assertIs(out["untrusted"], True)
+            self.assertEqual(out["result"]["action"], args[0])
+        bodies = [r["body"] for r in self.api.calls("POST", "/actions")]
+        self.assertIn({"action": "key", "key": "Tab"}, bodies)
+        self.assertIn({"action": "key", "key": "Enter", "selector": "#pair-key"}, bodies)
+        self.assertIn({"action": "select", "selector": "#theme-mode", "value": "dark"}, bodies)
+        self.assertIn({"action": "select", "selector": "#theme-mode", "label": "Dark"}, bodies)
+        self.assertIn({"action": "evaluate", "expression": "document.title"}, bodies)
+        typed = [b for b in bodies if b["action"] == "secret_type"]
+        self.assertEqual(len(typed), 2)
+        for b in typed:
+            # The item id, the selector and the origin only: no value field exists, and each call has its own requestId.
+            self.assertEqual(set(b), {"action", "selector", "credentialRef", "origin", "requestId"})
+            self.assertRegex(b["requestId"], r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+        self.assertNotEqual(typed[0]["requestId"], typed[1]["requestId"])
+
+    def test_16201_refusals_send_nothing(self):
+        for args in (["select", "--selector", "#theme-mode"], ["select", "--selector", "#t", "--value", "a", "--label", "b"],
+                     ["secret_type", "--selector", "#pair-key", "--test-item", "77777777-7777-4777-8777-777777777777"],
+                     ["key"], ["evaluate"]):
+            p = self.e.run("act", self.lease, *args)
+            self.assertEqual(p.returncode, 2, args)
+        self.assertEqual([r for r in self.api.calls("POST", "/actions") if r["body"]["action"] in ("select", "secret_type", "key", "evaluate")], [])
 
     def test_neg6_no_credential_action(self):
         p = self.e.run("act", self.lease, "credential", "--selector", "#p")
