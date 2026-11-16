@@ -268,11 +268,20 @@ V = [
         ('            self._wi_notice(event_id, item, row_id, "owner", text)\n        elif row_id == "W10":',
          '            pass\n        elif row_id == "W10":')], CONTRACTS, SM),
     ("PR268 F4: W3 omits the finding ids", [
-        ('", ".join(self._finding_ids(receipt)) or "no finding ids"', '"no finding ids"')], CONTRACTS, SM),
+        ('", ".join(self._finding_ids(receipt)) or "finding ids missing"', '"finding ids missing"')], CONTRACTS, SM),
     ("PR268 F4: W10 writes no incident", [
         ('            self._wi_notice(event_id, item, row_id, "incident", text)\n'
          '            self._wi_notice(event_id, item, row_id, "ticket", text)',
          '            self._wi_notice(event_id, item, row_id, "ticket", text)')], CONTRACTS, SM),
+    # goodqa#16204 follow-up (spec owner ruling)
+    ("16204: start_attempt starts a finished item's row", [
+        ('if owner and (owner[1] in self.WI_TERMINAL or owner[1] == "merged"):', "if False:")], CONTRACTS, SM),
+    ("16204: a merged item's row is not inert", [
+        ('if owner and (owner[1] in self.WI_TERMINAL or owner[1] == "merged"):',
+         "if owner and owner[1] in self.WI_TERMINAL:")], CONTRACTS, SM),
+    ("16204: an obligation dropped from the slice (b) list", [
+        ("| OBL.test_b_status_and_digest_show_inert_rows |", "| (dropped) |")],
+     "docs/spec/ahc-m1-b-obligations.md", SM),
 ]
 out, survivors, inconclusive = [], [], []
 for name, swaps, rel, tests in V:

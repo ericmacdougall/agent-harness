@@ -658,7 +658,7 @@ class Contracts:
             parts = []
             for rid, kind, receipt in self.db.execute("SELECT id, kind, receipt FROM reviews WHERE item=? AND "
                                                       "state='findings' ORDER BY kind, id", (item["id"],)):
-                parts.append("%s %s: %s" % (kind, rid, ", ".join(self._finding_ids(receipt)) or "no finding ids"))
+                parts.append("%s %s: %s" % (kind, rid, ", ".join(self._finding_ids(receipt)) or "finding ids missing"))
             text = "findings on " + "; ".join(parts)
             self._wi_notice(event_id, item, row_id, "ticket", text)
             self._wi_notice(event_id, item, row_id, "owner", text)
@@ -873,6 +873,12 @@ class Contracts:
         if not isinstance(unit, str) or not unit or type(uid) is not int or uid <= 0:
             raise ContractError("running needs the attempt's unit name and its allocated uid")
         with self.tx():
+            # goodqa#16204 (spec owner ruling): a row of a finished item is inert; no attempt starts for it, and
+            # nothing changes. The scheduler skipping such rows is a slice (b) obligation.
+            owner = self.db.execute("SELECT w.id, w.state FROM reviews r JOIN work_items w ON w.id = r.item "
+                                    "WHERE r.id=?", (rid,)).fetchone()
+            if owner and (owner[1] in self.WI_TERMINAL or owner[1] == "merged"):
+                raise ContractError("inert: item %s is %s; no attempt starts for its review rows" % owner)
             self.review(rid, "running", expected_version=expected_version, event_id=event_id, actor=actor)
             self.db.execute("UPDATE reviews SET producer_unit=?, producer_uid=? WHERE id=?", (unit, uid, rid))
             return self._row("reviews", "id", rid)
