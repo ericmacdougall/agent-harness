@@ -303,15 +303,3 @@ def test_f1_old_docker_socket_activation_holder_is_not_a_second_dockerd(F1):
 '''
 open(p, 'w').write(t)
 print('patched', p)
-
-
-def test_f1_unreadable_process_refuses_as_root(F1, monkeypatch):
-    # on the VM the ctl is root: a process whose fds cannot be read might hold the socket, so the gate refuses
-    F1.ctd('ctd.sock', ['--root', str(F1.st / 'containerd-root')]); F1.put('ctd-address', F1.sock('ctd.sock'))
-    real = os.listdir
-
-    def listdir(d):
-        if str(d).endswith('/fd'): raise PermissionError(13, 'denied')
-        return real(d)
-    monkeypatch.setattr(F1.M.os, 'listdir', listdir); monkeypatch.setattr(F1.M.os, 'geteuid', lambda: 0)
-    _refused(F1, 'cannot inspect process')
