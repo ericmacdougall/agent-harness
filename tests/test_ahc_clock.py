@@ -93,3 +93,20 @@ class ClockTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BootIdTests(unittest.TestCase):
+    """Main's ruling 4 (slice 1 (b)): once AC-13's sysctl form landed, the production boot id is the host's, not
+    per-process, so a restart on the same boot keeps every timer's elapsed known."""
+
+    def test_default_boot_id_is_the_host_s_and_stable_across_processes(self):
+        import subprocess  # noqa: PLC0415
+        if not (sys.platform == "darwin" or Path("/proc/sys/kernel/random/boot_id").exists()):
+            self.skipTest("no host boot id on this platform")
+        mine = clock.Clock(sqlite3.connect(":memory:")).boot_id
+        self.assertTrue(mine.startswith(("macos:", "linux:")), mine)
+        hooks = str(Path(__file__).resolve().parents[1] / "harness" / "hooks")
+        other = subprocess.run([sys.executable, "-I", "-c", "import sys, sqlite3; sys.path.insert(0, sys.argv[1]); "
+                                "import ahc_clock; print(ahc_clock.Clock(sqlite3.connect(':memory:')).boot_id)", hooks],
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(other.stdout.strip(), mine, other.stderr)

@@ -13,6 +13,7 @@ unknown and the timer takes its direction's conservative action at once (see DIR
 """
 import os
 import time
+import sys
 from pathlib import Path
 
 # A timer's direction decides how the two clocks combine and what an unknown elapsed (a new boot) means.
@@ -87,7 +88,12 @@ class Clock:
         self.db = db
         self._wall = wall or time.time
         self._boot = boot or boot_clock
-        self.boot_id = boot_id if boot_id is not None else (read_boot_id() or process_boot_id())
+        if boot_id is None:
+            # main's ruling 4: macOS reads kern.bootsessionuuid once AC-13 (the sysctl form) has landed
+            import ahc_guard  # noqa: PLC0415
+            boot_id = read_boot_id(run=ahc_guard.sysctl_run if sys.platform == "darwin" else None) or \
+                process_boot_id()
+        self.boot_id = boot_id
 
     # ------------------------------------------------------------ wall half
 
