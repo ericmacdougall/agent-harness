@@ -308,11 +308,12 @@ def scenario_contracts(root, clock):
     # T6 no-op; before the COMMIT it applies. admit_item is itself idempotent (NEG-11).
     item = c.admit_item("o/r", 7, H1, BASE, POLICY, "1" * 64, "d" * 64, event_id="wi-w1")
     db.execute("UPDATE reviews SET state='passed' WHERE item=? AND state='required'", (item["id"],))
+    os.environ["AHC_W21_SEND"] = "1"          # AC-7: W21 is applied only with the flag and the policy field on
     obs = {"id": "obs-wi", "at": clock.t, "mono": clock.t, "boot": "crash-boot", "repo": "o/r", "pr": 7, "pr_state": "OPEN", "pr_head": H1, "tip": BASE,
            "draft": False, "compare": "ahead", "b_r_ancestors": {BASE: True}, "attached_core": "1" * 64,
            "open_findings": 0, "paths": ["lib/x.py"], "foreign_closing_keyword": False,
            "policy": {"revision": POLICY, "readable": True, "allowlisted": True, "enabled": True,
-                      "checks_green": True},
+                      "checks_green": True, "w21": True},
            "kill_switch": False, "chk_cas": True, "canary_age": 60}
     # W21 first: the one WorkItem row that writes the authority log (seam contracts.authority) before its COMMIT.
     # A crash between the two must leave one log line and, on the retry, one recorded update.
@@ -1242,6 +1243,63 @@ class NamedPointTests(unittest.TestCase):
                     self.assertEqual(resumed.returncode, 0, resumed.stderr[-1500:])
                     self.assertEqual(check(root), [])
                     self.assertEqual(check(counted), [], "the uncrashed run")
+
+
+
+def scenario_w21_send(root, clock):
+    """AC-7 / NEG-18: one W21 intent and one sender pass with the flag on. The fake gh appends each call to
+    calls.txt; a restart runs reconciliation first, then the pass again, so a crash anywhere sends at most once."""
+    import ahc_w21  # noqa: PLC0415
+    os.environ["AHC_W21_SEND"] = "1"
+    led = runner.Ledger(core.Paths(root))
+    c = C.Contracts(led.db, C.AuthorityLog(Path(root) / "authority.jsonl"), now=clock, mono=clock,
+                    boot_id="crash-boot")
+    item = c.admit_item("o/r", 7, H1, BASE, POLICY, "1" * 64, "d" * 64, event_id="w21-w1")
+    led.db.execute("UPDATE reviews SET state='passed' WHERE item=?", (item["id"],))
+    calls = Path(root) / "calls.txt"
+
+    def gh(args, timeout):
+        with open(str(calls), "a", encoding="utf-8") as handle:     # test-only record of each gh call
+            handle.write(" ".join(args) + "\n")
+        return (0, "", "") if args[2] == "PUT" else (0, json.dumps({"head": {"sha": H1}}), "")
+    sender = ahc_w21.Sender(c, gh, lambda args: None, lambda: {"on": False, "epoch": 1, "mono": clock.t,
+                                                                "shared": True},
+                            lambda repo: True, lambda args, cwd: (1, ""), lambda repo, head, base: "/clone")
+    sender.reconcile()                  # startup reconciliation runs before any new W21
+    if not _done(led.db, "w21-row"):
+        item = c._row("work_items", "id", item["id"])
+        o = {"at": clock.t, "mono": clock.t, "boot": "crash-boot", "repo": "o/r", "pr": 7, "pr_state": "OPEN",
+             "pr_head": H1, "tip": BASE, "draft": False, "compare": "behind", "b_r_ancestors": {BASE: True},
+             "attached_core": "1" * 64, "open_findings": 0, "paths": ["lib/x.py"], "foreign_closing_keyword": False,
+             "policy": {"revision": POLICY, "readable": True, "allowlisted": True, "enabled": True,
+                        "checks_green": True, "w21": True},
+             "kill_switch": False, "chk_cas": True, "canary_age": 60}
+        c.wi_move(item["id"], "W21", expected_version=item["version"], event_id="w21-row", actor="ahc-core",
+                  obs=dict(o, queue={item["id"]: o}, mergeable=True))
+    sender.pump()
+    led.close()
+
+
+def check_w21_send(root):
+    """At most one update-branch call, one send row, and the row never cancelled once attempted."""
+    calls = Path(root) / "calls.txt"
+    puts = [l for l in calls.read_text().splitlines() if " PUT " in l] if calls.exists() else []
+    db = sqlite3.connect("file:%s?mode=ro" % live_db(root), uri=True)
+    try:
+        rows = db.execute("SELECT state, attempted_at FROM w21_sends").fetchall()
+    finally:
+        db.close()
+    out = [] if len(puts) <= 1 else ["%d update-branch calls" % len(puts)]
+    out += [] if len(rows) == 1 else ["%d send rows" % len(rows)]
+    out += ["an attempted row was cancelled" for state, at in rows if state == "cancelled" and at is not None]
+    if puts and rows and rows[0][0] not in ("attempted", "readback-pending"):
+        out.append("a sent row is %s" % rows[0][0])
+    return out
+
+
+NAMED_SCENARIOS["w21_send"] = scenario_w21_send
+NAMED_POINTS["w21.before_send"] = ("w21_send", check_w21_send)
+NAMED_POINTS["w21.after_send"] = ("w21_send", check_w21_send)
 
 
 if __name__ == "__main__":

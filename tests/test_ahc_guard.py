@@ -186,6 +186,8 @@ class NoModelInDaemonTests(_GuardFixture):
 
     def test_neg45_w21_put_needs_the_flag_and_the_armed_expectation(self):
         put = self.gh("api", "--method", "PUT", "repos/o/r/pulls/5/update-branch", "-f", "expected_head_sha=" + A)
+        import ahc_w21  # noqa: PLC0415
+        self.assertEqual(put, self.gh(*ahc_w21.put_args("o/r", 5, A)), "the sender's PUT is the guard's one form")
         with mock.patch.dict(os.environ, {"AHC_W21_SEND": "0"}):
             self.policy.arm_w21(put)
             self.refuse_argv("gh", put, name="gh")

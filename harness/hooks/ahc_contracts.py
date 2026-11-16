@@ -10,10 +10,12 @@ off-host authority record (AuthorityLog is a local, fsynced, append-only file la
 adds a GoodQA comment readback on top, in the runner), and the Attempt entity.
 """
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
+import sqlite3
 import time
 from pathlib import Path
 
@@ -190,6 +192,35 @@ class AuthorityLog:
             raise AuthorityError("authority record unreadable: %s" % type(error).__name__) from None
 
     def append(self, record):
+        """AC-7: an exclusive flock beside the log is held around the read-check-append, so two processes appending
+        the same event id write one line."""
+        directory = Path(os.path.abspath(os.path.dirname(self.path) or "."))
+        try:
+            os.makedirs(str(directory), mode=0o700, exist_ok=True)   # the log's own directory; fs checks it next
+            lock = self._open_lock(directory)
+        except OSError as error:
+            raise AuthorityError("authority lock not taken: %s" % type(error).__name__) from None
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return self._append_locked(record)
+        finally:
+            os.close(lock)
+
+    LOCK_OPEN_TRIES = 100
+
+    def _open_lock(self, directory):
+        """The lock file, created on first use. On macOS two processes opening it with O_CREAT at the same moment
+        can get ENOENT (reproduced: 75 of 160 concurrent opens, slice1b-build2/edits/race_probe.py); the open is
+        retried a bounded number of times, then fails closed."""
+        path = directory / (os.path.basename(self.path) + ".lock")
+        for _ in range(self.LOCK_OPEN_TRIES - 1):
+            try:
+                return fs.open_file(directory, path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+            except FileNotFoundError:
+                time.sleep(0.001)
+        return fs.open_file(directory, path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+
+    def _append_locked(self, record):
         rows = self.records()
         for row in rows:
             if row.get("event_id") == record["event_id"]:
@@ -198,8 +229,7 @@ class AuthorityLog:
                 return row["seq"]
         entry = dict(record, seq=len(rows) + 1, label=self.label)
         try:
-            directory = Path(os.path.abspath(os.path.dirname(self.path) or "."))
-            os.makedirs(str(directory), mode=0o700, exist_ok=True)   # the log's own directory; fs checks it next
+            directory = Path(os.path.abspath(os.path.dirname(self.path) or "."))   # made by append, under the lock
             crash_before("contracts.authority")
             # the log's directory is its root: it must be ours at 0700, and the append never follows a link
             fs.append_file(directory, directory / os.path.basename(self.path), _canon(entry) + "\n")
@@ -595,6 +625,8 @@ class Contracts:
             "w.id", (str(repo).lower(),)).fetchall()
         for iid, _admitted in rows:
             item = self._row("work_items", "id", iid)
+            if self.w21_successor(item):
+                return iid                    # AC-7 / NEG-21: W21's successor at H' keeps the head while it checks
             if iid in observations and not self.elig(item, observations[iid], skip=("e10",)):
                 return iid
         return None
@@ -665,11 +697,7 @@ class Contracts:
             elif row_id == "W27":
                 extra = {"spec_core": obs["attached_core"], "policy_revision": obs["policy"]["revision"]}
             elif row_id == "W21":
-                # authority log first (T4): the record of the one update-branch this item may get at this B. Slice
-                # 1 (a) is shadow only: nothing is sent; slice 1 (b)'s ahc-merge sends it after this row commits.
-                self.authority.append({"event_id": event_id, "item": iid, "row": "W21", "repo": item["repo"],
-                                       "pr": item["pr"], "expected_head_sha": item["head"], "base": obs["tip"],
-                                       "action": "update-branch (recorded, not sent)"})
+                self._w21_record(item, obs["tip"])
                 extra = {"w21_base": obs["tip"]}
             sets = "".join(", %s=?" % k for k in extra)
             self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), base=?, "
@@ -706,6 +734,72 @@ class Contracts:
             return False, str(error)
         finally:
             self.db.execute("ROLLBACK")
+
+    # -------------------------------------------------------------- AC-7: W21's keyed send record
+
+    W21_OPEN = ("intent", "attempted", "readback-pending")
+
+    def _w21_record(self, item, base):
+        """In the W21 transaction: one w21_sends row in state intent and its authority line. seq counts the
+        item's earlier rows at B; request id, event id and the line's content are functions of (item, B, seq)
+        alone (no time stamp, no GitHub response id), so a retry after a rolled-back transaction writes the same
+        line and the log accepts it as the same record (NEG-42)."""
+        seq = self.db.execute("SELECT COUNT(*) FROM w21_sends WHERE item=? AND base=?",
+                              (item["id"], base)).fetchone()[0] + 1
+        key = _sha({"item": item["id"], "base": base, "seq": seq})
+        rid, aev = "w21-" + key[:32], "w21:" + key[:32]
+        self.authority.append({"event_id": aev, "item": item["id"], "row": "W21", "repo": item["repo"],
+                               "pr": item["pr"], "expected_head_sha": item["head"], "base": base, "send_seq": seq,
+                               "request_id": rid, "action": "update-branch"})
+        now = self.now()
+        try:
+            self.db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, "
+                            "version, created, updated) VALUES (?,?,?,?,?,?,?,?,'intent',1,?,?)",
+                            (rid, item["id"], item["repo"], item["pr"], base, item["head"], seq, aev, now, now))
+        except sqlite3.IntegrityError:
+            raise ContractError("W21: another unresolved send holds the repo's slot") from None
+        return rid
+
+    def _w21_move(self, rid, frm, to, why, sets="", args=()):
+        with self.tx():
+            cur = self.db.execute("UPDATE w21_sends SET state=?, version=version+1, updated=?%s WHERE request_id=? "
+                                  "AND state IN (%s)" % (sets, ",".join("?" * len(frm))),
+                                  (to, self.now()) + tuple(args) + (rid,) + tuple(frm))
+            if cur.rowcount != 1:
+                return False
+            self._a0("w21_send", rid, frm[0] if len(frm) == 1 else None, to, "w21-%s:%s" % (to, rid), "ahc-core",
+                     reason=why)
+            if to == "attempted":
+                self.clock.start(rid, "W23", self.W23_SECONDS)
+            return True
+
+    def w21_attempt(self, rid):
+        """intent -> attempted, committed before the call; False when another process or tick moved it first."""
+        return self._w21_move(rid, ("intent",), "attempted", "send", ", attempted_at=?", (self.now(),))
+
+    def w21_cancel(self, rid, reason):
+        """intent -> cancelled, only in a transaction that proves attempted was never committed for the row (still
+        intent, no attempted time stamp). The repo slot is released; the item keeps the queue head."""
+        with self.tx():
+            row = self._row("w21_sends", "request_id", rid)
+            if row is None or row["state"] != "intent" or row["attempted_at"] is not None:
+                return False
+            return self._w21_move(rid, ("intent",), "cancelled", reason, ", reason=?", (str(reason)[:300],))
+
+    def w21_sent(self, rid, gh_request_id):
+        return self._w21_move(rid, ("attempted",), "readback-pending", "sent", ", gh_request_id=?",
+                              (gh_request_id,))
+
+    def w21_resolve(self, rid, new_head):
+        """attempted or readback-pending -> resolved with H' (the caller checked the four read-back rules)."""
+        return self._w21_move(rid, ("attempted", "readback-pending"), "resolved", "read back", ", new_head=?",
+                              (new_head,))
+
+    def w21_successor(self, item):
+        """Whether the item is W21's successor at H' (a resolved send of its PR whose H' is the item's head)."""
+        return item is not None and self.db.execute(
+            "SELECT 1 FROM w21_sends WHERE repo=? AND pr=? AND state='resolved' AND new_head=?",
+            (item["repo"], item["pr"], item["head"])).fetchone() is not None
 
     def inert_rows(self, iid):
         """AC-9: the item's review rows that wait for an attempt (required, queued, infra-wait) while the item is
@@ -786,6 +880,9 @@ class Contracts:
             # terminal. An extension of N rounds raises the W15 allowance by N (b7_allowance reads the used proof)
             # and requires round r+1 code rows at the same H, charged to B7.
             self.db.execute("UPDATE w16_proofs SET used=1 WHERE proof_id=?", (proof,))
+            self.db.execute("UPDATE w21_sends SET state='resolved', reason=?, version=version+1, updated=? WHERE "
+                            "item=? AND state='lost'", ("resolved by main's W16 proof %s" % proof, self.now(),
+                                                        item["id"]))
             row = self._row("w16_proofs", "proof_id", proof)
             if row is not None and row["target"] == "pr-gate" and row["extension"] > 0:
                 nxt = self.current_round(item["id"]) + 1
@@ -1070,14 +1167,28 @@ class Contracts:
             if (core, revision) == (item["elig_core"], item["elig_policy"]):
                 raise ContractError("W27 needs the spec core or the policy revision changed since ELIG passed")
         elif row_id == "W21":
+            if os.environ.get("AHC_W21_SEND") != "1":
+                # AC-7 / NEG-16: with the flag off W21 is not applied at all (no log line, no w21_base, no call)
+                raise ContractError("W21 is not applied: AHC_W21_SEND is not exactly 1")
             o = self._wi_obs(item, obs, "queue", "mergeable", "tip")
             self._queue_head_check(item, o, "W21")
+            pol = (o["queue"].get(item["id"]) or {}).get("policy") if isinstance(o["queue"], dict) else None
+            if not (isinstance(pol, dict) and pol.get("w21") is True):
+                raise ContractError("W21 needs the repo policy at its current revision to allow it (policy w21)")
+            if self.db.execute("SELECT 1 FROM w21_sends WHERE item=? AND state IN ('intent', 'attempted', "
+                               "'readback-pending', 'lost')", (item["id"],)).fetchone():
+                raise ContractError("W21: the item has an unresolved or lost send; no second update until it "
+                                    "resolves (a lost one by main's W16)")
+            if self.db.execute("SELECT 1 FROM w21_sends WHERE repo=? AND state IN ('intent', 'attempted', "
+                               "'readback-pending')", (item["repo"],)).fetchone():
+                raise ContractError("W21: another item of the repo has an unresolved send")
             failed = self.elig(item, o["queue"][item["id"]])
             if failed != ["e10"]:
                 raise ContractError("W21 needs every ELIG clause but e10 to hold, and the PR behind (e10)")
             if o["mergeable"] is not True or o.get("mergeable_state") in ("unknown", "dirty"):
                 raise ContractError("W21 needs GitHub reporting the PR mergeable with no conflict (NEG-5)")
-            if item["w21_base"] == o["tip"]:
+            if self.db.execute("SELECT 1 FROM w21_sends WHERE item=? AND base=? AND state != 'cancelled'",
+                               (item["id"], o["tip"])).fetchone():
                 raise ContractError("an update-branch was already recorded for this item at the current B")
         elif row_id == "W7":
             failed = self.elig(item, obs)

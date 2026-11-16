@@ -525,6 +525,132 @@ ENTRIES.update({
 })
 
 
+W21 = "tests.test_ahc_runner.W21Tests."
+W21_PY = "harness/hooks/ahc_w21.py"
+
+ENTRIES.update({
+    "AC-7/NEG-17 attempted commits before the one call": {
+        "tests": [W21 + "test_ac7_attempted_commits_before_the_one_call_and_a_lost_response_is_never_resent",
+                  W21 + "test_neg17_two_processes_race_one_intent_row_and_exactly_one_sends"],
+        "mutations": [
+            ("the call is made before the intent->attempted CAS", [
+                ('        if not self.c.w21_attempt(rid):\n'
+                 '            return None                                    # another process or tick took it, or it is not intent\n',
+                 '        self.gh(put_args(row["repo"], row["pr"], row["head"]), 30)\n'
+                 '        if not self.c.w21_attempt(rid):\n'
+                 '            return None\n')], W21_PY),
+            ("the CAS is a plain update that does not check the state", [
+                ('        return self._w21_move(rid, ("intent",), "attempted", "send", ", attempted_at=?", (self.now(),))\n',
+                 '        self.db.execute("UPDATE w21_sends SET state=\'attempted\', attempted_at=? WHERE request_id=?",\n'
+                 '                        (self.now(), rid))\n'
+                 '        return True\n')], CONTRACTS)]},
+    "AC-7/NEG-16 the flag gates W21 itself": {
+        "tests": [W21 + "test_neg16_with_the_flag_off_w21_is_not_applied_at_all"],
+        "mutations": [
+            ("flag off still writes the intent and the log line", [
+                ('            if os.environ.get("AHC_W21_SEND") != "1":\n', '            if False:\n')], CONTRACTS),
+            ("a truthy flag value enables the sender", [
+                ('    return os.environ.get(FLAG) == "1"\n',
+                 '    return os.environ.get(FLAG, "").strip().lower() in ("1", "true")\n')], W21_PY),
+            ("the repo policy field is not required", [
+                ('            if not (isinstance(pol, dict) and pol.get("w21") is True):\n', '            if False:\n')],
+             CONTRACTS)]},
+    "AC-7/NEG-19/NEG-41 controls re-read at the send decision": {
+        "tests": [W21 + "test_neg19_and_neg41_a_blocking_control_cancels_the_intent_keeps_the_head_then_refires_once",
+                  W21 + "test_ac7_send_itself_re_reads_the_controls_for_any_caller"],
+        "mutations": [
+            ("a direct send skips the controls", [
+                ('        why = self.blocked(row)\n', '        why = None\n')], W21_PY),
+            ("only the flag is re-read at the send decision", [
+                ('        why = self.blocked(row)\n',
+                 '        why = None if enabled() else "flag"\n')], W21_PY),
+            ("a stale kill reading is accepted", [
+                ('                not 0 <= float(self.c._mono()) - float(mono) <= KILL_MAX_AGE:\n',
+                 '                False:\n')], W21_PY),
+            ("cancel leaves the row holding the repo slot", [
+                ('            return self._w21_move(rid, ("intent",), "cancelled", reason, ", reason=?", (str(reason)[:300],))\n',
+                 '            return True\n')], CONTRACTS)]},
+    "AC-7 cancel only from intent": {
+        "tests": [W21 + "test_ac7_cancel_is_reachable_only_from_intent_and_restart_cancels_intent_only"],
+        "mutations": [
+            ("cancel is allowed from attempted", [
+                ('            if row is None or row["state"] != "intent" or row["attempted_at"] is not None:\n',
+                 '            if row is None:\n'),
+                ('            return self._w21_move(rid, ("intent",), "cancelled", reason, ", reason=?", (str(reason)[:300],))\n',
+                 '            return self._w21_move(rid, ("intent", "attempted"), "cancelled", reason, ", reason=?",\n'
+                 '                                  (str(reason)[:300],))\n')], CONTRACTS),]},
+    "AC-7/NEG-20 read-back records only ahc's update": {
+        "tests": [W21 + "test_neg20_neg21_readback_records_only_ahcs_update_and_the_successor_keeps_the_head"],
+        "mutations": [
+            ("the tree check is dropped (an evil merge passes)", [
+                ('        if not tree or tree != merged:\n', '        if not tree:\n')], W21_PY),
+            ("parent1 is not checked", [
+                ('        if p1 != row["head"] or not (p2 and SHA.fullmatch(p2)):\n',
+                 '        if not (p2 and SHA.fullmatch(p2)):\n')], W21_PY)]},
+    "AC-7/NEG-21 the successor keeps the queue head": {
+        "tests": [W21 + "test_neg20_neg21_readback_records_only_ahcs_update_and_the_successor_keeps_the_head"],
+        "mutations": [("no successor exception", [
+            ('            if self.w21_successor(item):\n', '            if False:\n')], CONTRACTS)]},
+    "AC-7/NEG-37 lost blocks the item until main's W16": {
+        "tests": [W21 + "test_neg37_after_a_lost_update_the_next_item_takes_w21_and_the_lost_item_waits_for_w16",
+                  W21 + "test_ac7_attempted_commits_before_the_one_call_and_a_lost_response_is_never_resent"],
+        "mutations": [
+            ("W16 does not resolve the lost send", [
+                ('            self.db.execute("UPDATE w21_sends SET state=\'resolved\', reason=?, version=version+1, updated=? WHERE "\n',
+                 '            self.db.execute("UPDATE w21_sends SET reason=?, version=version+1, updated=? WHERE "\n')],
+             CONTRACTS),
+            ("the per-item block is dropped", [
+                ('            if self.db.execute("SELECT 1 FROM w21_sends WHERE item=? AND state IN (\'intent\', \'attempted\', "\n',
+                 '            if self.db.execute("SELECT 1 FROM w21_sends WHERE item=? AND 0 AND state IN (\'intent\', \'attempted\', "\n')],
+             CONTRACTS),
+            ("a lost send also blocks the repo", [
+                ('            if self.db.execute("SELECT 1 FROM w21_sends WHERE repo=? AND state IN (\'intent\', \'attempted\', "\n'
+                 '                               "\'readback-pending\')", (item["repo"],)).fetchone():\n',
+                 '            if self.db.execute("SELECT 1 FROM w21_sends WHERE repo=? AND state IN (\'intent\', \'attempted\', "\n'
+                 '                               "\'readback-pending\', \'lost\')", (item["repo"],)).fetchone():\n')],
+             CONTRACTS)]},
+    "AC-7 one unresolved send per repo": {
+        "tests": [W21 + "test_ac7_one_unresolved_send_per_repo_by_the_guard_and_by_the_index"],
+        "mutations": [
+            ("the per-repo guard is dropped", [
+                ('            if self.db.execute("SELECT 1 FROM w21_sends WHERE repo=? AND state IN (\'intent\', \'attempted\', "\n',
+                 '            if self.db.execute("SELECT 1 FROM w21_sends WHERE repo=? AND 0 AND state IN (\'intent\', \'attempted\', "\n')],
+             CONTRACTS),
+            ("the partial unique index is dropped", [
+                ('CREATE UNIQUE INDEX IF NOT EXISTS w21_one_unresolved_per_repo ON w21_sends(repo)\n',
+                 'CREATE INDEX IF NOT EXISTS w21_one_unresolved_per_repo ON w21_sends(repo)\n')], CONTRACTS)]},
+    "AC-7/NEG-42 retry writes the same line": {
+        "tests": [W21 + "test_neg42_a_retry_after_a_rolled_back_w21_writes_the_same_line_and_sends_once"],
+        "mutations": [
+            ("the line carries a time stamp", [
+                ('                               "request_id": rid, "action": "update-branch"})\n',
+                 '                               "request_id": rid, "action": "update-branch", "at": self.now()})\n')],
+             CONTRACTS),
+            ("the request id is random", [
+                ('        rid, aev = "w21-" + key[:32], "w21:" + key[:32]\n',
+                 '        rid, aev = "w21-" + os.urandom(8).hex(), "w21:" + os.urandom(8).hex()\n')], CONTRACTS)]},
+    "AC-7 authority log flock": {
+        "tests": [W21 + "test_ac7_the_authority_append_holds_an_exclusive_flock",
+                  W21 + "test_neg17_two_processes_race_one_intent_row_and_exactly_one_sends"],
+        "mutations": [("the read-check-append runs without the lock", [
+            ('            fcntl.flock(lock, fcntl.LOCK_EX)\n', '            pass\n')], CONTRACTS)]},
+    "AC-7/NEG-18 named send points": {
+        "tests": ["tests.test_ahc_crash.NamedPointTests.test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants"],
+        "mutations": [
+            ("w21.before_send is not a crash point", [('        crash_at("w21.before_send")\n', '')], W21_PY),
+            ("restart re-sends an attempted row", [
+                ('        for (rid,) in self.c.db.execute("SELECT request_id FROM w21_sends WHERE state=\'intent\' ORDER BY created, "\n',
+                 '        for (rid,) in self.c.db.execute("SELECT request_id FROM w21_sends WHERE state IN (\'intent\', \'attempted\') ORDER BY created, "\n'),
+                ('        if row is None or row["state"] != "intent":\n            return None\n',
+                 '        if row is None or row["state"] not in ("intent", "attempted"):\n            return None\n'),
+                ('        why = self.blocked(row)\n', '        why = None if row["state"] == "attempted" else self.blocked(row)\n'),
+                ('        if not self.c.w21_attempt(rid):\n'
+                 '            return None                                    # another process or tick took it, or it is not intent\n',
+                 '        if not self.c.w21_attempt(rid) and self.c._row("w21_sends", "request_id", rid)["state"] != "attempted":\n'
+                 '            return None\n')], W21_PY)]},
+})
+
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:
