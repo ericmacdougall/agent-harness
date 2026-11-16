@@ -3611,5 +3611,697 @@ class LiveIsolationTests(unittest.TestCase):
         self.assertEqual(after_state, before_state)
 
 
+from tests import test_ahc_contracts as TC  # noqa: E402
+
+C = TC.C
+
+
+class StateMachineTests(TC.Base):
+    """WorkItem (spec M-1 v2g16, W1-W27) through the production transition function Contracts.wi_move. Slice 1 (a),
+    shadow only: these rows write the ledger and send nothing. Rows whose guards need ELIG, observations, budgets
+    or main's stamp are wired in later steps and are refused until then (test_unwired_rows_fail_closed)."""
+
+    def setUp(self):
+        super().setUp()
+        self.item = self.admit()
+
+    def admit(self, **kw):
+        args = dict(repo="O/R", pr=5, head=TC.H1, base=TC.BASE, policy_revision=TC.POLICY, spec_core=TC.CORE1,
+                    packet_sha256=TC.PKT, event_id=self.ev())
+        args.update(kw)
+        return self.c.admit_item(**args)
+
+    def move(self, row, item=None, **kw):
+        item = item or self.c._row("work_items", "id", self.item["id"])
+        kw.setdefault("actor", C.Contracts.WI_TRANSITIONS[row][2])
+        kw.setdefault("event_id", self.ev())
+        return self.c.wi_move(item["id"], row, expected_version=item["version"], **kw)
+
+    def at(self, state):
+        """Put the fixture item in `state` directly, for guard tests of rows that leave it."""
+        self.db.execute("UPDATE work_items SET state=? WHERE id=?", (state, self.item["id"]))
+
+    def reserved(self, **changes):          # the Effect fixtures, bound to this item (operations.item)
+        g = self.active_grant(**{k: v for k, v in changes.items() if k in C.Contracts.SCOPE})
+        op = self.c.intend(self.params(**changes), item=self.item["id"], lease_ok=True, event_id=self.ev())
+        g = self.reserve(g, op)
+        return g, self.c._row("operations", "key", op["key"])
+
+    def confirmed(self):
+        g, op = self.dispatched()
+        return g, self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
+
+    def abandoned(self):
+        g, op = self.absent_p("p1")
+        return g, self.after(op, self.read(tip=TC.BASE))
+
+    def wstate(self):
+        return self.state("work_items", "id", self.item["id"])
+
+    # ---- W1 and NEG-11
+
+    def test_w01_admits_into_pr_gate_with_bound_review_rows(self):
+        self.assertEqual((self.item["state"], self.item["repo"], self.item["head"]), ("pr-gate", "o/r", TC.H1))
+        rows = self.db.execute("SELECT kind, head, snapshot_base, spec_core FROM reviews WHERE item=? ORDER BY kind",
+                               (self.item["id"],)).fetchall()
+        self.assertEqual(rows, [("adversarial", TC.H1, TC.BASE, ""), ("spec", TC.H1, "", TC.CORE1)])
+        red = self.admit(pr=6, red_team=True)
+        kinds = {r[0] for r in self.db.execute("SELECT kind FROM reviews WHERE item=?", (red["id"],))}
+        self.assertEqual(kinds, {"adversarial", "spec", "red-team"})
+
+    def test_neg11_a_resubmit_or_owner_action_never_moves_the_item(self):
+        again = self.admit()
+        self.assertEqual((again["id"], again["version"], again["state"]),
+                         (self.item["id"], self.item["version"], "pr-gate"), "a resubmit attaches to the item")
+        for row in ("W2", "W3", "W4", "W16", "W27"):
+            with self.subTest(row=row), self.assertRaisesRegex(C.ContractError, "NEG-11"):
+                self.move(row, actor="owner")
+        self.assertEqual(self.c._row("work_items", "id", self.item["id"])["version"], self.item["version"])
+
+    def test_w20_the_owner_cancels_its_own_item_from_pr_gate_only(self):
+        with self.assertRaises(C.ContractError):
+            self.move("W20", actor="ahc-core")
+        self.assertEqual(self.move("W20")["state"], "cancelled")
+        self.at("waiting-ask")
+        with self.assertRaisesRegex(C.ContractError, "does not leave"):
+            self.move("W20")
+
+    UID = 41001
+
+    def running_review(self, item, kind):
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind=?", (item["id"], kind)).fetchone()[0]
+        row = self.c.review(rid, "queued", expected_version=1, event_id=self.ev())
+        return self.c.start_attempt(rid, "ahc-review-" + rid, self.UID, expected_version=row["version"],
+                                    event_id=self.ev())
+
+    def test_w20_cancels_running_and_outcome_unknown_reviews_and_refuses_a_late_result(self):
+        """PR 268 F3: W20's obligation, a running Review row goes to cancelling (R14), in the same transaction."""
+        self.item = self.admit(pr=7, red_team=True)      # its own PR: a resubmit at pr 5 is the fixture (NEG-11)
+        running = self.running_review(self.item, "adversarial")
+        unknown = self.running_review(self.item, "red-team")
+        unknown = self.c.review(unknown["id"], "outcome-unknown", expected_version=unknown["version"],
+                                event_id=self.ev())
+        ev = self.ev()
+        self.assertEqual(self.move("W20", event_id=ev)["state"], "cancelled")
+        for row in (running, unknown):
+            after = self.c._row("reviews", "id", row["id"])
+            self.assertEqual(after["state"], "cancelling", row["kind"])
+            self.assertEqual(self.db.execute("SELECT COUNT(*) FROM transitions WHERE event_id=?",
+                                             ("%s-r14-%s" % (ev, row["id"]),)).fetchone()[0], 1, "replay-safe id")
+            receipt = {"repo": "o/r", "pr": 7, "head": TC.H1, "snapshot_base": TC.BASE, "packet_sha256": TC.PKT,
+                       "policy_revision": TC.POLICY, "verdict": "PASS"}
+            with self.assertRaises(C.ContractError):              # a result arriving after the cancel
+                self.c.review(row["id"], "passed", expected_version=after["version"], event_id=self.ev(),
+                              receipt=receipt, peer_uid=self.UID)
+        self.assertEqual(self.move("W20", event_id=ev)["state"], "cancelled", "a replay is the T6 no-op")
+        self.assertEqual(self.c._row("reviews", "id", running["id"])["state"], "cancelling")
+
+    # ---- ledger-fact rows
+
+    def notices_of(self, row):
+        return sorted((k, t) for k, t in self.db.execute("SELECT kind, text FROM wi_notices WHERE item=? AND "
+                                                         "row_id=?", (self.item["id"], row)))
+
+    def test_w03_findings_on_a_review_row_of_this_item(self):
+        with self.assertRaisesRegex(C.ContractError, "findings"):
+            self.move("W3")
+        rid = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='adversarial'",
+                              (self.item["id"],)).fetchone()[0]
+        self.db.execute("UPDATE reviews SET state='findings', receipt=? WHERE id=?",
+                        (json.dumps({"verdict": "BLOCK", "finding_ids": ["F1", "F2"]}), rid))
+        ev = self.ev()
+        self.assertEqual(self.move("W3", event_id=ev)["state"], "waiting-ask")
+        # PR 268 F4: a ticket comment with the finding ids, and an owner notice, written with the move
+        text = "findings on adversarial %s: F1, F2" % rid
+        self.assertEqual(self.notices_of("W3"), [("owner", text), ("ticket", text)])
+        self.assertEqual(self.move("W3", event_id=ev)["state"], "waiting-ask", "replay")
+        self.assertEqual(len(self.notices_of("W3")), 2, "exactly once on replay")
+
+    def test_w08_merged_only_on_a_confirmed_effect(self):
+        self.at("merge-ready")
+        with self.assertRaisesRegex(C.ContractError, "confirmed"):
+            self.move("W8")
+        self.confirmed()
+        self.assertEqual(self.move("W8")["state"], "merged")
+
+    def test_w09_abandoned_unmarked_back_to_pr_gate(self):
+        self.at("merge-ready")
+        self.abandoned()
+        self.assertEqual(self.move("W9")["state"], "pr-gate")
+
+    def test_w10_held_goes_to_waiting_ask_and_w26_settles_it(self):
+        self.at("merge-ready")
+        _g, op = self.held()
+        ev = self.ev()
+        self.assertEqual(self.move("W10", event_id=ev)["state"], "waiting-ask")
+        # PR 268 F4: an incident and a ticket comment, written with the move, exactly once
+        text = "%s held; a person decides" % op["key"]
+        self.assertEqual(self.notices_of("W10"), [("incident", text), ("ticket", text)])
+        self.move("W10", event_id=ev)
+        self.assertEqual(len(self.notices_of("W10")), 2, "exactly once on replay")
+        with self.assertRaisesRegex(C.ContractError, "confirmed"):
+            self.move("W26")
+        # E10 is exercised in OperationTests; here only the ledger fact W26 reads matters
+        self.db.execute("UPDATE operations SET state='confirmed' WHERE key=?", (op["key"],))
+        self.assertEqual(self.move("W26")["state"], "merged")
+
+    def pr(self, **changes):
+        o = {"id": "obs-%d" % self.n, "at": self.clock.t, "repo": "o/r", "pr": 5, "pr_state": "OPEN",
+             "pr_head": TC.H1, "tip": TC.BASE}
+        o.update(changes)
+        return TC.stamped(o)
+
+    def test_w24_marks_and_keeps_the_item_then_w25_ends_it(self):
+        self.at("merge-ready")
+        moved = self.pr(pr_head=TC.H2)
+        with self.assertRaisesRegex(C.ContractError, "unsettled"):
+            self.move("W24", mark="head-moved", obs=moved, successor_packet="e" * 64)
+        _g, op = self.dispatched()
+        with self.assertRaisesRegex(C.ContractError, "does not show"):
+            self.move("W24", mark="head-moved", obs=self.pr(), successor_packet="e" * 64)
+        with self.assertRaisesRegex(C.ContractError, "own packet"):
+            self.move("W24", mark="head-moved", obs=moved)
+        item = self.move("W24", mark="head-moved", obs=moved, successor_packet="e" * 64)
+        self.assertEqual((item["state"], item["marks"]), ("merge-ready", "head-moved"))
+        succ = self.c._row("work_items", "id", item["successor"])
+        self.assertEqual((succ["head"], succ["state"]), (TC.H2, "pr-gate"), "the successor exists at once")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM operations WHERE item=?", (succ["id"],)).fetchone()[0],
+                         0, "the successor inherits no Effect")
+        self.assertEqual(self.state("reviews", "id", self.db.execute(
+            "SELECT id FROM reviews WHERE item=? AND kind='adversarial'", (self.item["id"],)).fetchone()[0]),
+            "required", "W24 changes no Review row of this item")
+        with self.assertRaisesRegex(C.ContractError, "already marked"):
+            self.move("W24", mark="closed-in-flight", obs=self.pr(pr_state="CLOSED"))
+        with self.assertRaisesRegex(C.ContractError, "abandoned"):
+            self.move("W25", to="superseded")
+        self.db.execute("UPDATE operations SET state='abandoned' WHERE key=?", (op["key"],))
+        with self.assertRaisesRegex(C.ContractError, "W25 sends a head-moved item to superseded"):
+            self.move("W25", to="closed-unmerged")
+        with self.assertRaisesRegex(C.ContractError, "takes W25"):
+            self.move("W9")
+        self.assertEqual(self.move("W25", to="superseded")["state"], "superseded")
+
+    def notices(self, row):
+        return sorted(self.db.execute("SELECT kind, event_id, text FROM wi_notices WHERE item=? AND row_id=?",
+                                      (self.item["id"], row)).fetchall())
+
+    def test_w25_closed_in_flight_ends_closed_unmerged_with_a_notice_naming_the_op(self):
+        self.at("waiting-ask")
+        _g, op = self.dispatched()
+        self.move("W24", mark="closed-in-flight", obs=self.pr(pr_state="CLOSED"))
+        with self.assertRaisesRegex(C.ContractError, "abandoned"):
+            self.move("W25", to="closed-unmerged")                     # T7: the Effect is still unsettled
+        self.db.execute("UPDATE operations SET state='abandoned' WHERE key=?", (op["key"],))
+        with self.assertRaisesRegex(C.ContractError, "closed-in-flight item to closed-unmerged"):
+            self.move("W25", to="superseded")
+        with self.assertRaisesRegex(C.ContractError, "goes to"):
+            self.move("W25", to="merged")
+        ev = self.ev()
+        self.assertEqual(self.move("W25", to="closed-unmerged", event_id=ev)["state"], "closed-unmerged")
+        self.assertEqual(self.notices("W25"), [("ticket", ev, "%s ended abandoned; item closed-unmerged" % op["key"])])
+
+    def test_w26_a_confirmed_effect_merges_from_every_listed_state_and_announces_once(self):
+        for n, frm in enumerate(("pr-gate", "waiting-dep", "waiting-ask", "exhausted")):
+            with self.subTest(frm=frm):
+                self.item = self.admit(pr=20 + n)
+                self.at(frm)
+                with self.assertRaisesRegex(C.ContractError, "confirmed"):
+                    self.move("W26")
+                g, op = self.dispatched(pr=20 + n)
+                op = self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
+                self.assertEqual(self.gstate(g), "consumed", "G4 already consumed the grant at the confirm")
+                self.assertEqual(self.move("W26")["state"], "merged")
+                text = "integrated at %s by %s" % (TC.H1, op["key"])
+                self.assertEqual(self.notices("W26"), [("digest", "op:" + op["key"], text),
+                                                       ("ticket", "op:" + op["key"], text)],
+                                 "keyed by the op key: one ticket comment and one digest line")
+        self.item = self.admit(pr=40)                      # a closed-in-flight item also tells the owner (L7)
+        self.at("waiting-ask")
+        _g, op = self.dispatched(pr=40)
+        self.move("W24", mark="closed-in-flight", obs=self.pr(pr=40, pr_state="CLOSED"))
+        self.db.execute("UPDATE operations SET state='confirmed' WHERE key=?", (op["key"],))
+        self.move("W26")
+        self.assertIn("owner", [k for k, _e, _t in self.notices("W26")])
+        with self.assertRaisesRegex(C.ContractError, "W26"):               # merged is terminal: no second W26
+            self.move("W26")
+
+    def test_w06_back_to_merge_ready_only_from_waiting_dep_under_elig_rereading_core_and_policy(self):
+        self.pass_reviews()
+        with self.assertRaisesRegex(C.ContractError, "W6"):
+            self.move("W6", obs=self.eligible())                      # pr-gate is not W6's source
+        self.at("waiting-dep")
+        for bad in (dict(attached_core=TC.CORE2), dict(policy=dict(self.eligible()["policy"], revision="policy-r2")),
+                    dict(at=self.clock.t - C.Contracts.OBSERVATION_SECONDS), dict(boot="another-boot")):
+            with self.subTest(bad=bad), self.assertRaises(C.ContractError):
+                self.move("W6", obs=self.eligible(**bad))
+        self.assertEqual(self.wstate(), "waiting-dep")
+        item = self.move("W6", obs=self.eligible(), cause=None)
+        self.assertEqual((item["state"], item["elig_core"], item["elig_policy"]), ("merge-ready", TC.CORE1, TC.POLICY))
+
+    # ---- observation rows (T2)
+
+    def test_w04_w24_a_successor_keeps_every_required_review_kind(self):
+        """PR 268 F2: a red-team-required item's successor (W4 or W24) gets its own red-team row, and ELIG holds
+        only once that row has passed too."""
+        for row in ("W4", "W24"):
+            with self.subTest(row=row):
+                pr = 30 if row == "W4" else 31
+                self.item = self.admit(pr=pr, red_team=True)
+                self.assertEqual(self.item["red_team"], 1)
+                if row == "W4":
+                    self.at("merge-ready")
+                    item = self.move("W4", obs=self.pr(pr=pr, pr_head=TC.H2), successor_packet="e" * 64)
+                else:
+                    self.at("merge-ready")
+                    self.dispatched(pr=pr)
+                    item = self.move("W24", mark="head-moved", obs=self.pr(pr=pr, pr_head=TC.H2),
+                                     successor_packet="e" * 64)
+                succ = self.c._row("work_items", "id", item["successor"])
+                self.assertEqual(succ["red_team"], 1, "the classification is inherited")
+                kinds = sorted(k for (k,) in self.db.execute("SELECT kind FROM reviews WHERE item=?", (succ["id"],)))
+                self.assertEqual(kinds, ["adversarial", "red-team", "spec"])
+                self.db.execute("UPDATE reviews SET state='passed' WHERE item=? AND kind != 'red-team'", (succ["id"],))
+                self.assertIn("e1", self.c.elig(succ, self.eligible(succ)), "the red-team review has not passed")
+                self.db.execute("DELETE FROM reviews WHERE item=? AND kind='red-team'", (succ["id"],))
+                self.assertIn("e1", self.c.elig(succ, self.eligible(succ)), "a missing required kind fails e1")
+
+    def test_w04_head_moved_supersedes_with_a_successor_and_abandons_an_unsent_intent(self):
+        self.at("merge-ready")
+        op = self.c.intend(self.params(), item=self.item["id"], lease_ok=True, event_id=self.ev())
+        stale = self.pr(pr_head=TC.H2, at=self.clock.t - C.Contracts.OBSERVATION_SECONDS)
+        for bad, msg in ((None, "observation"), (stale, "stale"), (self.pr(pr_head=TC.H2, pr=6), "another"),
+                         (self.pr(), "moved away"), (self.pr(pr_head=TC.H2, pr_state="CLOSED"), "OPEN"),
+                         (self.pr(pr_head="x"), "full sha")):
+            with self.subTest(msg=msg), self.assertRaisesRegex(C.ContractError, msg):
+                self.move("W4", obs=bad, successor_packet="e" * 64)
+        item = self.move("W4", obs=self.pr(pr_head=TC.H2), successor_packet="e" * 64)
+        self.assertEqual(item["state"], "superseded")
+        succ = self.c._row("work_items", "id", item["successor"])
+        self.assertEqual((succ["head"], succ["state"], succ["lineage"]), (TC.H2, "pr-gate", self.item["lineage"]))
+        old = dict(self.db.execute("SELECT kind, state FROM reviews WHERE item=?", (self.item["id"],)).fetchall())
+        self.assertEqual(old, {"adversarial": "superseded", "spec": "superseded"})
+        self.assertEqual(self.state("operations", "key", op["key"]), "abandoned", "E9")
+
+    def test_w13_closed_without_integration_escalates(self):
+        with self.assertRaisesRegex(C.ContractError, "CLOSED"):
+            self.move("W13", obs=self.pr())
+        ev = self.ev()
+        self.assertEqual(self.move("W13", obs=self.pr(pr_state="CLOSED"), event_id=ev)["state"], "closed-unmerged")
+        self.assertEqual(self.db.execute("SELECT kind FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                         [("ticket",)], "a failure terminal escalates (R2)")
+
+    def test_w14_merged_out_of_band_raises_an_incident(self):
+        ev = self.ev()
+        self.assertEqual(self.move("W14", obs=self.pr(pr_state="MERGED"), event_id=ev)["state"], "merged")
+        self.assertEqual(self.db.execute("SELECT kind FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                         [("incident",)])
+
+    def test_w14_is_refused_when_this_items_effect_made_the_merge(self):
+        self.at("merge-ready")
+        self.confirmed()
+        with self.assertRaisesRegex(C.ContractError, "W8"):
+            self.move("W14", obs=self.pr(pr_state="MERGED"))
+
+    def test_w18_base_moved_rebinds_b_and_classifies_the_move_from_the_ledger(self):
+        with self.assertRaisesRegex(C.ContractError, "moved from B"):
+            self.move("W18", obs=self.pr(fast_forward=True))
+        for ff, kind in ((True, "digest"), (False, "incident")):
+            with self.subTest(ff=ff):
+                self.db.execute("UPDATE work_items SET base=?, state='pr-gate' WHERE id=?", (TC.BASE, self.item["id"]))
+                ev = self.ev()
+                item = self.move("W18", obs=self.pr(tip=TC.B2, fast_forward=ff, explained=True), event_id=ev)
+                self.assertEqual((item["state"], item["base"]), ("pr-gate", TC.B2))
+                self.assertEqual(self.db.execute("SELECT kind FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                                 [(kind,)], "a caller's 'explained' flag is ignored")
+
+    # ---- T6, T7 and the Q-A5.2 invariant
+
+    def test_t6_a_replay_is_a_no_op_even_with_a_stale_version(self):
+        ev = self.ev()
+        first = self.move("W20", event_id=ev)
+        again = self.c.wi_move(self.item["id"], "W20", expected_version=self.item["version"], event_id=ev,
+                               actor="owner")
+        self.assertEqual((again["state"], again["version"]), (first["state"], first["version"]))
+        n = self.db.execute("SELECT COUNT(*) FROM transitions WHERE event_id=?", (ev,)).fetchone()[0]
+        self.assertEqual(n, 1, "one audit row (T3)")
+        other = self.admit(pr=7)
+        with self.assertRaisesRegex(C.ContractError, "another subject"):
+            self.c.wi_move(other["id"], "W20", expected_version=other["version"], event_id=ev, actor="owner")
+
+    def test_t7_an_unsettled_effect_allows_only_its_own_rows(self):
+        for setup in (self.dispatched, self.held, self.fenced, lambda: self.absent_p("p1")):
+            with self.subTest(setup=getattr(setup, "__name__", "absent-proven")):
+                self.db.execute("DELETE FROM operations")
+                self.db.execute("DELETE FROM grants")
+                self.at("merge-ready")
+                setup()
+                for row in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):
+                    with self.assertRaisesRegex(C.ContractError, "T7"):
+                        self.move(row)
+                self.at("pr-gate")
+                for row in ("W2", "W3", "W15", "W19", "W20", "W21", "W22", "W23"):   # W15 and W20 too
+                    with self.assertRaisesRegex(C.ContractError, "T7"):
+                        self.move(row)
+                self.assertEqual(self.move("W24", mark="", obs=self.pr(tip=TC.B2))["marks"], "")
+
+    def test_note8_absent_proven_waits_then_moves_once_abandoned_or_held(self):
+        self.at("merge-ready")
+        _g, op = self.absent_p("p1")
+        with self.assertRaisesRegex(C.ContractError, "T7"):
+            self.move("W5")
+        self.after(op, self.read(tip=TC.BASE))                    # E8: abandoned
+        self.assertEqual(self.move("W9")["state"], "pr-gate")
+
+    def test_qa52_no_row_enters_waiting_dep_or_exhausted_with_an_unsettled_effect(self):
+        for row, (src, dst, _a) in C.Contracts.WI_TRANSITIONS.items():
+            if row in C.Contracts.T7_ALLOWED:
+                self.assertFalse({"waiting-dep", "exhausted"} & set(dst), "%s would strand a send" % row)
+        self.at("waiting-ask")
+        _g, op = self.dispatched()
+        with self.assertRaisesRegex(C.ContractError, "T7"):
+            self.move("W16", to="pr-gate", actor="main")
+
+    # ---- ELIG, the merge queue and the rows that read it (step 5)
+
+    def eligible(self, item=None, **changes):
+        """A fresh ELIG observation under which every clause holds for `item`."""
+        item = item or self.c._row("work_items", "id", self.item["id"])
+        fields = dict(pr=item["pr"], pr_head=item["head"], tip=item["base"], draft=False, compare="ahead",
+                      b_r_ancestors={item["base"]: True}, attached_core=item["spec_core"], open_findings=0,
+                      paths=["harness/lib/x.py"], foreign_closing_keyword=False,
+                      policy={"revision": item["policy_revision"], "readable": True, "allowlisted": True,
+                              "enabled": True, "checks_green": True},
+                      kill_switch=False, chk_cas=True, canary_age=3600)
+        fields.update(changes)
+        return self.pr(**fields)            # pr() stamps, so a changed `at` moves the monotonic stamp too
+
+    def pass_reviews(self, item=None):
+        self.db.execute("UPDATE reviews SET state='passed' WHERE item=?", ((item or self.item)["id"],))
+
+    def test_w02_elig_holds_only_when_every_clause_does(self):
+        with self.assertRaisesRegex(C.ContractError, "e1, e2"):
+            self.move("W2", obs=self.eligible())                   # the Review rows have not passed
+        self.pass_reviews()
+        pol = dict(self.eligible()["policy"])
+        cases = {
+            "e1": [dict(pr_head=TC.H2), dict(b_r_ancestors={}), dict(b_r_ancestors={TC.BASE: "yes"}),
+                   dict(policy=dict(pol, revision="policy-r2"))],
+            "e2": [dict(attached_core=TC.CORE2)],
+            "e3": [dict(open_findings=1), dict(open_findings=True), dict(open_findings=None)],
+            "e4": [dict(paths=[".claude/settings.json"]), dict(paths=[]), dict(paths="x.py"),
+                   dict(foreign_closing_keyword=True), dict(foreign_closing_keyword=None)],
+            "e5": [dict(policy=dict(pol, enabled=False)), dict(policy=dict(pol, checks_green="true")),
+                   dict(policy=dict(pol, allowlisted=None)), dict(policy=None)],
+            "e6": [dict(kill_switch=True), dict(kill_switch=None)],
+            "e8": [dict(draft=True), dict(pr_state="CLOSED")],
+            "e9": [dict(chk_cas=False), dict(canary_age=86400), dict(canary_age=None), dict(canary_age=True)],
+            "e10": [dict(compare="behind"), dict(compare=None)],
+        }
+        for clause, variants in cases.items():
+            for v in variants:
+                with self.subTest(clause=clause, v=v):
+                    with self.assertRaisesRegex(C.ContractError, r"\b%s\b" % clause):
+                        self.move("W2", obs=self.eligible(**v))
+        self.c.CAP1_PER_DAY = 0                                        # e7: the day's CAP1 slots are spent
+        with self.assertRaisesRegex(C.ContractError, r"\be7\b"):
+            self.move("W2", obs=self.eligible())
+        del self.c.CAP1_PER_DAY
+        self.db.execute("INSERT INTO repo_flags VALUES ('o/r', 1, 'canary failed', 'ahc-core', 0)")
+        with self.assertRaisesRegex(C.ContractError, r"\be5\b"):
+            self.move("W2", obs=self.eligible())
+        self.db.execute("DELETE FROM repo_flags")
+        self.db.execute("INSERT INTO contract_meta VALUES ('authority_frozen', '1')")
+        with self.assertRaisesRegex(C.ContractError, r"\be6\b"):
+            self.move("W2", obs=self.eligible())
+        self.db.execute("DELETE FROM contract_meta WHERE k='authority_frozen'")
+        stale = self.eligible(at=self.clock.t - C.Contracts.OBSERVATION_SECONDS)
+        with self.assertRaisesRegex(C.ContractError, "e1, e2, e3, e4, e5, e6, e7, e8, e9, e10"):
+            self.move("W2", obs=stale)
+        item = self.move("W2", obs=self.eligible())
+        self.assertEqual((item["state"], item["elig_core"], item["elig_policy"]),
+                         ("merge-ready", TC.CORE1, TC.POLICY))
+
+    def test_neg6_protected_paths(self):
+        P = C.Contracts.protected_path
+        for path in (".claude/settings.json", "sub/dir/CLAUDE.md", ".github/workflows/ci.yml", ".codex/config.toml",
+                     "conftest.py", "tests/conftest.py", "a/CODEOWNERS", ".mcp.json", "harness/hooks/ahc_x.py",
+                     "docs/spec/ahc-m1-state-machine.md", "pyproject.toml", "../escape", "/abs", "", None):
+            with self.subTest(path=path):
+                self.assertTrue(P(path))
+        for path in ("harness/lib/x.py", "README.md", "docs/github/notes.md", "src/claude.py"):
+            with self.subTest(path=path):
+                self.assertFalse(P(path))
+        self.assertTrue(P("config/policy.json", extra=("config/policy.json",)))
+
+    def test_w06_mirror_cause_clears_only_on_a_fresh_mirror_ok_and_every_cause_must_clear(self):
+        """Spec owner ruling on note 12: the mirror is a W5 cause of its own. W6 clears it only on a fresh
+        mirror_ok True (a stale True counts as missing). With both causes recorded, W6 needs both cleared. The
+        item escalates once on entry and does not loop W5/W6 while the mirror is down."""
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        ev = self.ev()
+        item = self.move("W5", obs=self.eligible(mirror_ok=False, kill_switch=True), event_id=ev,
+                         cause="ELIG failed: e6")                  # a caller's cause never replaces the derived one
+        self.assertEqual(item["cause"], "ELIG failed: e6; mirror undeliverable", "both causes are recorded")
+        refused = {"ELIG cleared, mirror still down": self.eligible(mirror_ok=False),
+                   "ELIG cleared, mirror unread": self.eligible(),
+                   "mirror up, ELIG still failing": self.eligible(mirror_ok=True, kill_switch=True),
+                   "stale mirror_ok True": self.eligible(mirror_ok=True,
+                                                         at=self.clock.t - C.Contracts.OBSERVATION_SECONDS),
+                   "mirror_ok True from another boot": self.eligible(mirror_ok=True, boot="another-boot"),
+                   "mirror_ok as text": self.eligible(mirror_ok="true")}
+        for name, obs in refused.items():
+            with self.subTest(name), self.assertRaises(C.ContractError):
+                self.move("W6", obs=obs)
+        for _poll in range(5):                                   # N polls with the mirror down: no loop
+            with self.assertRaises(C.ContractError):
+                self.move("W6", obs=self.eligible(mirror_ok=False))
+            with self.assertRaisesRegex(C.ContractError, "W5"):       # W5's source is merge-ready only
+                self.move("W5", obs=self.eligible(mirror_ok=False))
+        self.assertEqual(self.wstate(), "waiting-dep")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM wi_notices WHERE item=? AND row_id='W5'",
+                                         (self.item["id"],)).fetchone()[0], 1, "one escalation, not one per poll")
+        self.assertEqual(self.move("W6", obs=self.eligible(mirror_ok=True))["state"], "merge-ready")
+
+    def test_w05_and_w06_waiting_dep_and_back(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        with self.assertRaisesRegex(C.ContractError, "W5 needs"):
+            self.move("W5", obs=self.eligible())
+        with self.assertRaisesRegex(C.ContractError, "W5 needs"):
+            self.move("W5", obs=self.eligible(open_findings=1))      # e3 is not a W5 cause
+        ev = self.ev()
+        item = self.move("W5", obs=self.eligible(kill_switch=True), event_id=ev)
+        self.assertEqual((item["state"], item["cause"]), ("waiting-dep", "ELIG failed: e6"))
+        self.assertEqual(self.db.execute("SELECT kind FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                         [("ticket",)])
+        with self.assertRaisesRegex(C.ContractError, "e6"):
+            self.move("W6", obs=self.eligible(kill_switch=True))
+        self.assertEqual(self.move("W6", obs=self.eligible())["state"], "merge-ready")
+        ev = self.ev()
+        item = self.move("W5", obs=self.eligible(mirror_ok=False), event_id=ev)
+        self.assertEqual((item["state"], item["cause"]), ("waiting-dep", "mirror undeliverable"))
+        self.assertEqual(self.db.execute("SELECT text FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                         [("waiting on a dependency: mirror undeliverable",)])
+        # W6 needs the recorded cause cleared: ELIG alone does not show the mirror is deliverable again
+        for obs in (self.eligible(mirror_ok=False), self.eligible()):
+            with self.subTest(obs=obs.get("mirror_ok")), self.assertRaisesRegex(C.ContractError, "mirror"):
+                self.move("W6", obs=obs)
+        self.assertEqual(self.move("W6", obs=self.eligible(mirror_ok=True))["state"], "merge-ready")
+
+    def test_w17_protected_path_goes_to_main(self):
+        self.pass_reviews()
+        with self.assertRaisesRegex(C.ContractError, "e4"):
+            self.move("W17", obs=self.eligible())
+        for paths in ([".github/workflows/ci.yml"], ["ok.py", "sub/AGENTS.md"]):
+            with self.subTest(paths=paths):
+                self.at("pr-gate")
+                self.assertEqual(self.move("W17", obs=self.eligible(paths=paths))["state"], "waiting-ask")
+        self.assertEqual(C.Contracts.select_row(["W2", "W17"], False), "W17")
+
+    def test_w27_spec_core_change_fails_e2_and_replaces_the_spec_row(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        old_spec = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='spec'",
+                                   (self.item["id"],)).fetchone()[0]
+        with self.assertRaisesRegex(C.ContractError, "changed"):
+            self.move("W27", obs=self.eligible())
+        changed = self.eligible(attached_core=TC.CORE2)
+        self.assertEqual(self.c.elig(self.c._row("work_items", "id", self.item["id"]), changed), ["e2"],
+                         "Q-A5.1: a spec-core change fails e2, not e1")
+        item = self.move("W27", obs=changed)
+        self.assertEqual((item["state"], item["spec_core"], item["policy_revision"]), ("pr-gate", TC.CORE2, TC.POLICY))
+        rows = dict(self.db.execute("SELECT id, state FROM reviews WHERE item=? AND kind='spec'", (item["id"],)))
+        self.assertEqual(rows[old_spec], "passed", "the old pass stays terminal")
+        new_spec = [r for r in rows if r != old_spec]
+        self.assertEqual([rows[r] for r in new_spec], ["required"])
+        self.assertEqual(self.c.elig(item, self.eligible(item)), ["e2"], "e2 fails until the new spec row passes")
+        with self.assertRaisesRegex(C.ContractError, "W27"):          # pr-gate is not W27's source: no re-fire
+            self.move("W27", obs=changed)
+        self.db.execute("UPDATE reviews SET state='passed' WHERE id=?", (new_spec[0],))
+        self.assertEqual(self.c.elig(item, self.eligible(item)), [])
+        # the core attached now must be the item's own core: an older core's pass, still terminal, never counts
+        self.assertEqual(self.c.elig(item, self.eligible(item, attached_core=TC.CORE1)), ["e2"])
+
+    def test_neg18_a_missing_spec_row_fails_e2(self):
+        self.pass_reviews()
+        self.db.execute("DELETE FROM reviews WHERE item=? AND kind='spec'", (self.item["id"],))
+        item = self.c._row("work_items", "id", self.item["id"])
+        self.assertEqual(self.c.elig(item, self.eligible(item)), ["e2"])
+        with self.assertRaisesRegex(C.ContractError, r"\be2\b"):
+            self.move("W2", obs=self.eligible(item))
+
+    def test_w27_policy_change_fails_e1_and_replaces_every_row(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        pol = dict(self.eligible()["policy"], revision="policy-r2")
+        changed = self.eligible(policy=pol)
+        self.assertEqual(self.c.elig(self.c._row("work_items", "id", self.item["id"]), changed), ["e1"],
+                         "Q-A5.1: a policy change fails e1, not e2")
+        op = self.c.intend(self.params(), item=self.item["id"], lease_ok=True, event_id=self.ev())
+        item = self.move("W27", obs=changed)
+        self.assertEqual((item["state"], item["policy_revision"]), ("pr-gate", "policy-r2"))
+        kinds = sorted(self.db.execute("SELECT kind, state FROM reviews WHERE item=? AND policy_revision='policy-r2'",
+                                       (item["id"],)).fetchall())
+        self.assertEqual(kinds, [("adversarial", "required"), ("spec", "required")])
+        self.assertEqual(self.state("operations", "key", op["key"]), "abandoned", "E9")
+        self.assertEqual(self.c.elig(item, self.eligible(item)), ["e1", "e2"])
+        # PR 268 F1: complete the replacement reviews; the item regains ELIG and takes W2 to merge-ready, even
+        # though the old policy's spec pass (same core) stays terminal beside the new one
+        self.db.execute("UPDATE reviews SET state='passed' WHERE item=? AND policy_revision='policy-r2'",
+                        (item["id"],))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM reviews WHERE item=? AND kind='spec' AND "
+                                         "state='passed'", (item["id"],)).fetchone()[0], 2)
+        self.assertEqual(self.c.elig(item, self.eligible(item)), [])
+        self.assertEqual(self.move("W2", obs=self.eligible(item))["state"], "merge-ready")
+
+    def test_w27_waits_under_t7(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        self.dispatched()
+        with self.assertRaisesRegex(C.ContractError, "T7"):
+            self.move("W27", obs=self.eligible(attached_core=TC.CORE2))
+
+    def queue_of(self, *items, **per_item):
+        return {i["id"]: self.eligible(self.c._row("work_items", "id", i["id"]), **per_item.get(i["id"], {}))
+                for i in items}
+
+    def test_queue_head_is_the_oldest_eligible_lineage(self):
+        self.pass_reviews()
+        self.clock.t += 1
+        newer = self.admit(pr=6)
+        self.pass_reviews(newer)
+        self.assertEqual(self.c.queue_head("o/r", self.queue_of(self.item, newer)), self.item["id"])
+        q = self.queue_of(self.item, newer, **{self.item["id"]: {"kill_switch": True}})
+        self.assertEqual(self.c.queue_head("o/r", q), newer["id"], "an ineligible older item is skipped")
+        q = self.queue_of(self.item, newer, **{self.item["id"]: {"compare": "behind"}})
+        self.assertEqual(self.c.queue_head("o/r", q), self.item["id"], "e10 is not required of the head")
+        self.assertEqual(self.c.queue_head("o/r", {newer["id"]: q[newer["id"]]}), newer["id"])
+
+    def test_w21_records_one_update_for_the_queue_head_and_sends_nothing(self):
+        self.pass_reviews()
+        self.clock.t += 1
+        newer = self.admit(pr=6)
+        self.pass_reviews(newer)
+        behind = {self.item["id"]: {"compare": "behind"}, newer["id"]: {"compare": "behind"}}
+
+        def w21_obs(**kw):
+            return self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=True, **kw)
+        with self.assertRaisesRegex(C.ContractError, "head"):
+            self.move("W21", item=newer, obs=dict(w21_obs(), pr=6))
+        with self.assertRaisesRegex(C.ContractError, "every item"):
+            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, **behind), mergeable=True))
+        with self.assertRaisesRegex(C.ContractError, "mergeable"):
+            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=None))
+        ahead = self.pr(queue=self.queue_of(self.item, newer), mergeable=True)
+        with self.assertRaisesRegex(C.ContractError, "behind"):
+            self.move("W21", obs=ahead)
+        before = len(self.log.records())
+        item = self.move("W21", obs=w21_obs())
+        self.assertEqual((item["state"], item["w21_base"]), ("pr-gate", TC.BASE))
+        recs = self.log.records()[before:]
+        self.assertEqual([(r["row"], r["expected_head_sha"], r["action"]) for r in recs],
+                         [("W21", TC.H1, "update-branch (recorded, not sent)")], "authority log first, no send")
+        with self.assertRaisesRegex(C.ContractError, "already recorded"):
+            self.move("W21", obs=w21_obs())
+
+    def test_unwired_rows_fail_closed(self):
+        for row in ("W7", "W11", "W12", "W15", "W16", "W19", "W22", "W23"):
+            src = C.Contracts.WI_TRANSITIONS[row][0][0]
+            self.at(src)
+            to = C.Contracts.WI_TRANSITIONS[row][1][0]
+            with self.subTest(row=row), self.assertRaisesRegex(C.ContractError, "not wired"):
+                self.move(row, to=to)
+        self.assertEqual(self.c._row("work_items", "id", self.item["id"])["version"], self.item["version"])
+
+    # ---- precedence (T7)
+
+    def test_t7_precedence(self):
+        S = C.Contracts.select_row
+        self.assertEqual(S(["W2", "W17"], False), "W17", "a protected path beats W2")
+        self.assertEqual(S(["W18", "W4"], False), "W4")
+        self.assertEqual(S(["W17", "G8"], False), "W17")
+        self.assertEqual(S(["W2", "G9"], False), "G9", "a kill-switch revoke beats an unranked WorkItem row")
+        self.assertEqual(S(["W23", "W22", "W21"], False), "W21", "numeric order, not table order")
+        self.assertEqual(S(["W4", "W8"], True), "W8", "W4 waits under T7")
+        self.assertIsNone(S(["W4", "W5"], True))
+        with self.assertRaises(C.ContractError):
+            S(["G1"], False)
+
+    def test_every_spec_test_id_resolves_to_a_test(self):
+        """Spec owner ruling T-1: a spec test id (`SMTests.<id>`) resolves by exact name, or name plus a `_suffix`,
+        in any tests/test_ahc*.py class. The ids with no such test yet are pinned exactly per entity in PENDING,
+        so the list can only shrink: a new gap fails, and so does a pending id that now resolves until it is
+        removed from the list. R17 and G6 are retired ids and must not reappear."""
+        import re
+        text = (HOOKS.parents[1] / "docs" / "spec" / "ahc-m1-state-machine.md").read_text(encoding="utf-8")
+        names = set()
+        for path in sorted((HOOKS.parents[1] / "tests").glob("test_ahc*.py")):
+            names |= set(re.findall(r"^    def (test_\w+)", path.read_text(encoding="utf-8"), re.M))
+        counts = {"WorkItem": 38, "Review": 28, "Grant": 15, "Effect": 24}
+        for entity, n in counts.items():
+            part = text.split("### Entity: %s" % entity, 1)[1].split("### Entity:", 1)[0]
+            rows = {line.strip("|").split("|")[0].strip() for line in part.splitlines() if line.startswith("| ")}
+            self.assertFalse(rows & self.RETIRED_ROWS, "%s: a retired row id reappeared" % entity)
+            ids = sorted(set(re.findall(r"SMTests\.(test_\w+)", part)))
+            with self.subTest(entity=entity):
+                self.assertEqual(len(ids), n)
+                missing = sorted(i for i in ids if not any(m == i or m.startswith(i + "_") for m in names))
+                self.assertEqual(missing, sorted(self.PENDING[entity]),
+                                 "%s: PENDING must equal the ids with no test of that name" % entity)
+        self.assertLessEqual(set(self.PENDING_RUNTIME), {i for p in self.PENDING.values() for i in p} | names)
+
+    # Retired by the spec (v2g16 lines 395 and 424): R17 moved to a follow-up ticket, G6 is covered by G5.
+    RETIRED_ROWS = {"R17", "G6"}
+
+    # Spec test ids with no test of that name yet, pinned per entity. Slice 1 (a) is capped here (main): the state
+    # ids, R2 to R19, E6 and E11 are closed by goodqa#16197, and each unwired W row by the commit that wires it.
+    # PENDING_RUNTIME names the ids whose runtime half slice 1 (b) also closes.
+    PENDING = {
+        "WorkItem": (
+            "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask",
+            "test_wi_exhausted", "test_wi_merged", "test_wi_headed_verified", "test_wi_handed",
+            "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled", "test_w07",
+            "test_w11", "test_w12", "test_w15", "test_w16", "test_w19", "test_w22", "test_w23"),
+        "Review": (
+            "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
+            "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",
+            "test_r03", "test_r04_rc_refuses_usage_store", "test_r05", "test_r06", "test_r07", "test_r08",
+            "test_r09", "test_r10", "test_r11", "test_r12", "test_r13", "test_r14", "test_r15", "test_r16",
+            "test_r18", "test_r19"),
+        "Grant": (
+            "test_g_validated", "test_g_active", "test_g_reserved", "test_g_consumed", "test_g_retired",
+            "test_g_expired", "test_g_revoked"),
+        "Effect": (
+            "test_e_intent", "test_e_dispatched", "test_e_absent_proven", "test_e_fenced", "test_e_outcome_unknown",
+            "test_e_held", "test_e_confirmed", "test_e_abandoned", "test_e06", "test_e11"),
+    }
+
+    # Ids whose runtime half belongs to slice 1 (b), with the ruling (T-1): the ledger part is tested in 1 (a);
+    # (b) adds the packet build (R2), the DynamicUser unit and its launch (R3), the socket FINAL and the R-c
+    # usage-store refusal (R4), and the unit's findings result (R5).
+    PENDING_RUNTIME = ("test_r02", "test_r03", "test_r04_rc_refuses_usage_store", "test_r05")
+
+
 if __name__ == "__main__":
     unittest.main()

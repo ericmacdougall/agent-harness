@@ -1180,5 +1180,129 @@ class RootOwnershipTests(unittest.TestCase):
             self.assertFalse(core._ahc_root_name(name), name)
 
 
+class TransitionTableTests(unittest.TestCase):
+    """AC-1 (spec M-1 v2g16, core 0130008d): the vendored State machine section passes the checker, and the code's
+    tables equal it. WorkItem is compared row by row; Review, Grant and Effect, whose code tables are keyed by
+    (from, to) and carry no row ids, are compared edge by edge with each spec actor permitted by the code."""
+
+    SPEC = HOOKS.parents[1] / "docs" / "spec" / "ahc-m1-state-machine.md"
+    CHECKER = HOOKS.parents[1] / "scripts" / "ahc_check_state_tables.py"
+    # Actor sets are compared for equality. The differences below are pinned exactly, so none can widen or appear
+    # silently; each is in the slice 1a amendment notes for the spec owner to rule (note 7):
+    # - R3 to R6: the spec's actor column says ahc-review, but the merged code also lets ahc-core record the
+    #   attempt's start and result (the result arrives over core's socket).
+    # - E10: the spec's actor column says main, but its guard text says "the reconcile finds ..."; the code lets
+    #   the reconcile confirm, and only the reconcile fence, a held op.
+    KNOWN_ACTOR_DRIFT = {
+        ("Review", "queued", "running"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Review", "running", "passed"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Review", "running", "findings"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Review", "running", "infra-wait"): ("ahc-review", ("ahc-core", "ahc-review")),
+        ("Effect", "held", "confirmed"): ("main", ("main", "reconcile")),
+        ("Effect", "held", "fenced"): ("main", ("reconcile",)),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ahc_check_state_tables", str(cls.CHECKER))
+        cls.chk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.chk)
+        import ahc_contracts
+        cls.C = ahc_contracts.Contracts
+        cls.contracts = ahc_contracts
+        cls.text = cls.SPEC.read_text(encoding="utf-8")
+        cls.tables = cls.chk.entity_tables(cls.text)
+
+    def workitem_diff(self, states, transitions):
+        spec_states, spec_trans = self.tables["WorkItem"]
+        code_trans = {tid: (frozenset(f), frozenset(t), a) for tid, (f, t, a) in transitions.items()}
+        out = []
+        for name in sorted(set(spec_states) | set(states)):
+            if spec_states.get(name) != (tuple(states[name]) if name in states else None):
+                out.append(("state", name, spec_states.get(name), states.get(name)))
+        for tid in sorted(set(spec_trans) | set(code_trans)):
+            if spec_trans.get(tid) != code_trans.get(tid):
+                out.append(("row", tid, spec_trans.get(tid), code_trans.get(tid)))
+        return out
+
+    def edge_diff(self, entity, table):
+        _states, trans = self.tables[entity]
+        spec = {}
+        for tid, (src, dst, actor) in trans.items():
+            for s in src - {"(entry)"}:
+                for d in dst - {s}:
+                    spec.setdefault((s, d), set()).add((tid, actor))
+        out = [("spec-only", k, sorted(spec[k])) for k in sorted(set(spec) - set(table))]
+        out += [("code-only", k, table[k]) for k in sorted(set(table) - set(spec))]
+        for k in sorted(set(spec) & set(table)):
+            actors = {a for _tid, a in spec[k]}
+            drift = self.KNOWN_ACTOR_DRIFT.get((entity,) + k)
+            if drift is not None:
+                if ({drift[0]}, set(drift[1])) != (actors, set(table[k])):
+                    out.append(("drift-changed", k, sorted(actors), table[k]))
+            elif actors != set(table[k]):
+                out.append(("actor", k, sorted(actors), table[k]))
+        return out
+
+    def test_vendored_section_is_pinned_to_the_attached_core(self):
+        self.assertEqual(self.chk.embedded_core(self.text), self.contracts.SPEC_CORE_SHA256)
+        self.assertEqual(self.contracts.SPEC_CORE_SHA256,
+                         "0130008d4280234e1320b0d433a5dcfabe210dda228b2e9893745ae40a2b006f")
+        self.assertIsNone(self.chk.embedded_core("no header\n" + self.text), "a header-less copy has no core")
+
+    def test_checker_passes_the_vendored_section(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = self.chk.main(str(self.SPEC))
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertIn("WorkItem: 11 states; Review: 9 states; Grant: 7 states; Effect: 8 states", buf.getvalue())
+
+    def test_workitem_tables_equal_the_spec(self):
+        self.assertEqual(self.workitem_diff(self.C.WI_STATES, self.C.WI_TRANSITIONS), [])
+        self.assertEqual(sorted(self.C.WI_TRANSITIONS, key=lambda t: int(t[1:])),
+                         ["W%d" % n for n in range(1, 28)], "every row W1 to W27, no gaps (Q-A5.4)")
+
+    def test_one_row_mutation_is_caught(self):
+        for tid in ("W2", "W17", "W24", "W27"):
+            frm, to, actor = self.C.WI_TRANSITIONS[tid]
+            for bad in ((frm, ("cancelled",), actor), (frm, to, "owner"), (frm + ("merged",), to, actor)):
+                mutated = dict(self.C.WI_TRANSITIONS, **{tid: bad})
+                with self.subTest(tid=tid, bad=bad):
+                    self.assertNotEqual(self.workitem_diff(self.C.WI_STATES, mutated), [])
+        dropped = {k: v for k, v in self.C.WI_TRANSITIONS.items() if k != "W26"}
+        self.assertNotEqual(self.workitem_diff(self.C.WI_STATES, dropped), [])
+        states = dict(self.C.WI_STATES, merged=("terminal", "success", "none"))
+        self.assertNotEqual(self.workitem_diff(states, self.C.WI_TRANSITIONS), [])
+
+    def test_review_grant_effect_edges_equal_the_spec(self):
+        for entity, table in (("Review", self.C.REVIEW), ("Grant", self.C.GRANT), ("Effect", self.C.OP)):
+            with self.subTest(entity=entity):
+                self.assertEqual(self.edge_diff(entity, table), [])
+
+    def test_edge_mutation_is_caught(self):
+        review = dict(self.C.REVIEW)
+        review[("outcome-unknown", "superseded")] = ("ahc-core",)       # the pre-R14 shortcut
+        self.assertIn("code-only", [d[0] for d in self.edge_diff("Review", review)])
+        op = dict(self.C.OP)
+        op[("held", "fenced")] = ("ahc-core",)
+        self.assertIn("drift-changed", [d[0] for d in self.edge_diff("Effect", op)])
+        grant = dict(self.C.GRANT)
+        grant[("active", "reserved")] = ("ahc-core", "main")         # a wider actor set, not only a missing one
+        self.assertIn("actor", [d[0] for d in self.edge_diff("Grant", grant)])
+        # every pinned drift still exists: a fixed one must be removed from the pin, not left to hide a new one
+        for (entity, frm, to) in self.KNOWN_ACTOR_DRIFT:
+            table = {"Review": self.C.REVIEW, "Effect": self.C.OP}[entity]
+            self.assertIn((frm, to), table)
+
+    def test_vendored_section_and_checker_are_protected_paths(self):
+        import ahc_runner
+        for path in ("docs/spec/ahc-m1-state-machine.md", "scripts/ahc_check_state_tables.py"):
+            with self.subTest(path=path):
+                self.assertTrue(ahc_runner._is_protected(path))
+
+
 if __name__ == "__main__":
     unittest.main()

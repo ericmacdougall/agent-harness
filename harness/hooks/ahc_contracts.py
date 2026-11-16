@@ -19,6 +19,10 @@ from pathlib import Path
 import ahc_fs as fs
 from ahc_crash import crash_after, crash_before
 
+# The attached spec these tables implement: M-1 v2g16 (goodqa#16049, attach comment 1a9b9eaf). The vendored copy of
+# its State machine section, docs/spec/ahc-m1-state-machine.md, names this core in its header (AC-1).
+SPEC_CORE_SHA256 = "0130008d4280234e1320b0d433a5dcfabe210dda228b2e9893745ae40a2b006f"
+
 # Bounds from design v3 1.1 (the only numbers here)
 B10_DISPATCHES = 3            # physical dispatches per operation key, in total, the first included
 B37_PROBE_SECONDS = 60        # readback rate per unknown outcome
@@ -34,7 +38,8 @@ E13_READ_GAP_SECONDS = 60            # and its second read at least 60 s after t
 
 # Schema v4 (spec ahc-m1-v2g2, folded into v4 by the spec owner's ruling: no v4 ledger was ever installed). Code
 # review rows bind (repo, pr, H, B_r, packet, revision); spec rows store snapshot_base '' (never NULL, so the
-# unique key still de-duplicates). Grants are scoped (repo, pr, H, B); operations keyed (repo, pr, B, H, revision,
+# unique key still de-duplicates). Spec rows also bind the spec core they review (`spec_core`, folded into v4 by the
+# spec owner's slice 1a ruling Q-A6); code rows store ''. Grants are scoped (repo, pr, H, B); operations keyed (repo, pr, B, H, revision,
 # g). There is no candidate M: integration is a fast-forward of the default branch from B to H.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -42,7 +47,10 @@ CREATE TABLE IF NOT EXISTS reviews (
   snapshot_base TEXT NOT NULL, packet_sha256 TEXT NOT NULL, policy_revision TEXT NOT NULL, state TEXT NOT NULL,
   version INTEGER NOT NULL, receipt TEXT, successor TEXT, producer_unit TEXT, producer_uid INTEGER,
   data TEXT NOT NULL DEFAULT '{}', created REAL NOT NULL, updated REAL NOT NULL,
-  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision));
+  spec_core TEXT NOT NULL DEFAULT '',
+  CHECK ((kind = 'spec' AND length(spec_core) = 64 AND spec_core NOT GLOB '*[^0-9a-f]*')
+         OR (kind != 'spec' AND spec_core = '')),
+  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, spec_core));
 CREATE TABLE IF NOT EXISTS grants (
   id TEXT PRIMARY KEY, kind TEXT NOT NULL, source TEXT NOT NULL, principal TEXT NOT NULL,
   repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, base TEXT NOT NULL,
@@ -57,7 +65,7 @@ CREATE TABLE IF NOT EXISTS operations (
   head TEXT NOT NULL, base TEXT NOT NULL, policy_revision TEXT NOT NULL,
   generation INTEGER NOT NULL, params TEXT, params_sha256 TEXT NOT NULL, grant_id TEXT,
   state TEXT NOT NULL, dispatch_count INTEGER NOT NULL DEFAULT 0, proven_absent INTEGER NOT NULL DEFAULT 0,
-  dispatched_at REAL, request_id TEXT, refusal TEXT, probe_at REAL, escalate_at REAL,
+  dispatched_at REAL, wait_mono REAL, wait_boot TEXT, request_id TEXT, refusal TEXT, probe_at REAL, escalate_at REAL,
   readbacks INTEGER NOT NULL DEFAULT 0, proof TEXT, evidence TEXT, incident INTEGER NOT NULL DEFAULT 0,
   pr_unmarked INTEGER NOT NULL DEFAULT 0, settled_at REAL, tombstone INTEGER NOT NULL DEFAULT 0,
   version INTEGER NOT NULL, created REAL NOT NULL, updated REAL NOT NULL);
@@ -68,6 +76,21 @@ CREATE TABLE IF NOT EXISTS contract_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 INSERT OR IGNORE INTO contract_meta(k, v) VALUES ('authority_epoch', '1');
 CREATE TABLE IF NOT EXISTS repo_flags (
   repo TEXT PRIMARY KEY, merging_off INTEGER NOT NULL, cause TEXT, actor TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS work_items (
+  id TEXT PRIMARY KEY, lineage TEXT NOT NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
+  base TEXT NOT NULL, policy_revision TEXT NOT NULL, spec_core TEXT NOT NULL, packet_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL, marks TEXT NOT NULL DEFAULT '', successor TEXT, cause TEXT, version INTEGER NOT NULL,
+  created REAL NOT NULL, updated REAL NOT NULL, elig_core TEXT, elig_policy TEXT, w21_base TEXT,
+  red_team INTEGER NOT NULL DEFAULT 0 CHECK (red_team IN (0, 1)),
+  CHECK (state IN ('pr-gate', 'merge-ready', 'waiting-dep', 'waiting-ask', 'exhausted', 'merged',
+                   'headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled')),
+  CHECK (marks IN ('', 'head-moved', 'closed-in-flight')));
+CREATE UNIQUE INDEX IF NOT EXISTS work_items_one_live_per_head ON work_items(repo, pr, head)
+  WHERE state NOT IN ('headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled');
+CREATE TABLE IF NOT EXISTS wi_notices (
+  event_id TEXT NOT NULL, item TEXT NOT NULL, row_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL,
+  created REAL NOT NULL, delivered REAL,
+  CHECK (kind IN ('incident', 'ticket', 'owner', 'digest')), PRIMARY KEY (event_id, kind));
 CREATE TABLE IF NOT EXISTS transitions (
   seq INTEGER PRIMARY KEY AUTOINCREMENT, entity TEXT NOT NULL, id TEXT NOT NULL, from_state TEXT,
   to_state TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, actor TEXT NOT NULL, at REAL NOT NULL, data TEXT);
@@ -150,13 +173,34 @@ class AuthorityLog:
 
 # ------------------------------------------------------------------ common guard and action
 
-class Contracts:
-    """Transitions over one connection. `now` is injectable for tests; `authority` is an AuthorityLog."""
+def _boot_id():
+    """This boot's id (D-a3): monotonic stamps compare only within one boot. On Linux it is the kernel's boot id.
+    Elsewhere it is an id for this process, so an observation stamped by another process counts as stale, which
+    fails closed."""
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        if value:
+            return "linux:" + value
+    except OSError:
+        pass
+    return "process:%d:%s" % (os.getpid(), os.urandom(8).hex())
 
-    def __init__(self, db, authority, now=None):
+
+class Contracts:
+    """Transitions over one connection. `now` (wall clock: log stamps and the CAP1 UTC day), `mono` (monotonic
+    clock: observation age, T2/D-a3) and `boot_id` are injectable for tests; `authority` is an AuthorityLog."""
+
+    def __init__(self, db, authority, now=None, mono=None, boot_id=None):
         self.db = db
         self.authority = authority
         self._now = now or time.time
+        self._mono = mono or time.monotonic
+        self.boot_id = boot_id or _boot_id()
+
+    def stamp(self, obs):
+        """An observation row stamped as read now: wall time for the log, plus this boot's monotonic stamp that
+        T2 measures age on. Producers call this at the moment they read the facts."""
+        return dict(obs, at=self.now(), mono=float(self._mono()), boot=self.boot_id)
 
     def now(self):
         return float(self._now())
@@ -201,6 +245,559 @@ class Contracts:
                         "VALUES (?,?,?,?,?,?,?,?)", (entity, ident, frm, to, event_id, actor, self.now(),
                                                      _canon(data) if data else None))
 
+    # -------------------------------------------------------------- WorkItem (spec M-1 v2g16, W1-W27)
+
+    # Shadow only in slice 1 (a): the P0 item machine in ahc_runner stays authoritative until the cutover, and no
+    # WorkItem row sends anything. These tables equal the vendored spec section one to one (AC-1,
+    # tests.test_ahc_core.TransitionTableTests). States: name -> (class, outcome, next actor).
+    WI_STATES = {
+        "pr-gate": ("active", "-", "ahc-review"),
+        "merge-ready": ("active", "-", "ahc-core"),
+        "waiting-dep": ("waiting", "-", "ahc-core"),
+        "waiting-ask": ("waiting", "-", "main"),
+        "exhausted": ("waiting", "-", "main"),
+        "merged": ("waiting", "-", "ahc-core"),
+        "headed-verified": ("terminal", "success", "none"),
+        "handed-to-staging": ("terminal", "neutral", "none"),
+        "superseded": ("terminal", "neutral", "none"),
+        "closed-unmerged": ("terminal", "failure", "none"),
+        "cancelled": ("terminal", "neutral", "none"),
+    }
+    _WI_LIVE = ("pr-gate", "merge-ready", "waiting-dep", "waiting-ask", "exhausted")
+    _WI_INFLIGHT = ("merge-ready", "pr-gate", "waiting-ask")      # where an unsettled Effect can be (T7, W24)
+    # Rows: id -> (from states, to states, actor). W24 keeps the item where it is, so its To is its From.
+    WI_TRANSITIONS = {
+        "W1": (("(entry)",), ("pr-gate",), "ahc-core"),
+        "W2": (("pr-gate",), ("merge-ready",), "ahc-core"),
+        "W3": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W4": (_WI_LIVE, ("superseded",), "ahc-core"),
+        "W5": (("merge-ready",), ("waiting-dep",), "ahc-core"),
+        "W6": (("waiting-dep",), ("merge-ready",), "ahc-core"),
+        "W7": (("merge-ready",), ("merge-ready",), "ahc-core"),
+        "W8": (("merge-ready",), ("merged",), "ahc-core"),
+        "W9": (("merge-ready",), ("pr-gate",), "ahc-core"),
+        "W10": (("merge-ready",), ("waiting-ask",), "ahc-core"),
+        "W11": (("merged",), ("handed-to-staging",), "ahc-core"),
+        "W12": (("merged",), ("headed-verified",), "ahc-core"),
+        "W13": (_WI_LIVE, ("closed-unmerged",), "ahc-core"),
+        "W14": (_WI_LIVE, ("merged",), "ahc-core"),
+        "W15": (("pr-gate",), ("exhausted",), "ahc-core"),
+        "W16": (("waiting-ask", "exhausted", "waiting-dep"), ("pr-gate", "cancelled"), "main"),
+        "W17": (("pr-gate", "merge-ready", "waiting-dep"), ("waiting-ask",), "ahc-core"),
+        "W18": (("pr-gate", "merge-ready", "waiting-dep"), ("pr-gate",), "ahc-core"),
+        "W19": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W20": (("pr-gate",), ("cancelled",), "owner"),
+        "W21": (("pr-gate",), ("pr-gate",), "ahc-core"),
+        "W22": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W23": (("pr-gate",), ("waiting-ask",), "ahc-core"),
+        "W24": (_WI_INFLIGHT, _WI_INFLIGHT, "ahc-core"),
+        "W25": (_WI_INFLIGHT, ("superseded", "closed-unmerged"), "ahc-core"),
+        # W26 from waiting-dep and exhausted is defensive (spec owner ruling Q-A5.2): T7 keeps an unsettled Effect
+        # out of those states, but a confirmed merge found there is still recorded, never lost.
+        "W26": (("pr-gate", "waiting-dep", "waiting-ask", "exhausted"), ("merged",), "ahc-core"),
+        "W27": (("merge-ready",), ("pr-gate",), "ahc-core"),
+    }
+    WI_TERMINAL = tuple(s for s, (cls, _o, _a) in WI_STATES.items() if cls == "terminal")
+    # T7: an Effect in one of these states is unsettled. The spec lists dispatched, outcome-unknown, held and fenced;
+    # absent-proven is unsettled too (spec owner ruling, note 8: E7 can re-dispatch it). intent is not: an unsent
+    # intent is abandoned by E9 when the item leaves merge-ready.
+    T7_UNSETTLED = ("dispatched", "outcome-unknown", "held", "fenced", "absent-proven")
+    T7_ALLOWED = ("W8", "W9", "W10", "W24", "W25", "W26")      # the only rows that move an item with one (T7)
+    # T7 precedence when two guards hold at once. G8 and G9 are Grant rows evaluated in the same tick (ruling
+    # Q-A5.3); select_row orders them with the WorkItem rows and never treats them as WorkItem rows.
+    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")
+    GRANT_ROWS = ("G8", "G9")
+    # Rows whose guard reads only ledger facts are applied here. Rows whose guard needs ELIG, an observation, a
+    # budget or main's stamp are wired in later steps of slice 1 (a); until then they are refused (fail closed).
+    WI_WIRED = ("W2", "W3", "W4", "W5", "W6", "W8", "W9", "W10", "W13", "W14", "W17", "W18", "W20", "W21", "W24",
+                "W25", "W26", "W27")
+    PR_STATES = ("OPEN", "CLOSED", "MERGED")
+
+    @classmethod
+    def select_row(cls, holding, unsettled):
+        """T7: which row moves the item when every row in `holding` has its guard satisfied. With an unsettled
+        Effect only T7_ALLOWED rows (and the Grant rows) qualify; then the T7 order; then the lowest-numbered row
+        (numerically: W21 before W22 before W23). Returns None when nothing qualifies."""
+        rows = []
+        for r in holding:
+            if r not in cls.WI_TRANSITIONS and r not in cls.GRANT_ROWS:
+                raise ContractError("unknown row %r" % r)
+            if unsettled and r not in cls.T7_ALLOWED and r not in cls.GRANT_ROWS:
+                continue
+            rows.append(r)
+        if not rows:
+            return None
+        ranked = [r for r in cls.T7_ORDER if r in rows]
+        if ranked:
+            return ranked[0]
+        return min(rows, key=lambda r: int(r[1:]))
+
+    @staticmethod
+    def lineage_of(repo, pr):
+        return "ln-" + _sha({"repo": str(repo).lower(), "pr": int(pr)})[:24]
+
+    def admit_item(self, repo, pr, head, base, policy_revision, spec_core, packet_sha256, *, event_id,
+                   actor="ahc-core", red_team=False):
+        """W1 (entry) -> pr-gate for (lineage, H, B), creating the required Review rows bound to (repo, pr, H, B):
+        adversarial and spec, plus red-team when the class requires it. NEG-11: a resubmit at the same head returns
+        the live item unchanged; no state, version or Review row moves."""
+        if actor != self.WI_TRANSITIONS["W1"][2]:
+            raise ContractError("W1: only ahc-core admits an item")
+        repo = str(repo).lower()
+        for name, value in (("head", head), ("base", base)):
+            if not _is_oid(value):
+                raise ContractError("an item's %s is a full sha" % name)
+        if head == base:
+            raise ContractError("an item's head equals its base; nothing to integrate")
+        with self.tx():
+            live = self.db.execute("SELECT id FROM work_items WHERE repo=? AND pr=? AND head=? AND state NOT IN (%s)"
+                                   % ",".join("?" * len(self.WI_TERMINAL)),
+                                   (repo, int(pr), head) + self.WI_TERMINAL).fetchone()
+            if live:
+                return self._row("work_items", "id", live[0])
+            iid = "wi-" + _sha({"repo": repo, "pr": int(pr), "head": head, "base": base, "event": event_id})[:24]
+            self._g0("work_item", None, None, event_id, actor, {(None, "pr-gate"): (actor,)}, None, "pr-gate")
+            now = self.now()
+            # PR 268 F2: the class's required review kinds are stored on the item, so a successor (W4, W24)
+            # requires the same kinds and e1 can check that none is missing
+            self.db.execute("INSERT INTO work_items(id, lineage, repo, pr, head, base, policy_revision, spec_core, "
+                            "packet_sha256, state, version, created, updated, red_team) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (iid, self.lineage_of(repo, pr), repo, int(pr), head, base, policy_revision, spec_core,
+                             packet_sha256, "pr-gate", 1, now, now, 1 if red_team else 0))
+            kinds = ("adversarial", "spec") + (("red-team",) if red_team else ())
+            for kind in kinds:
+                code = kind in self.ATTEMPT_KINDS
+                self.require_review(kind, repo, pr, head, packet_sha256, policy_revision, item=iid,
+                                    event_id="%s-%s" % (event_id, kind), snapshot_base=base if code else "",
+                                    spec_core="" if code else spec_core)
+            self._a0("work_item", iid, None, "pr-gate", event_id, actor, row="W1")
+            return self._row("work_items", "id", iid)
+
+    @staticmethod
+    def _finding_ids(receipt):
+        """The finding ids a findings receipt names (its `finding_ids` list); anything malformed names none."""
+        try:
+            ids = json.loads(receipt).get("finding_ids") if receipt else None
+        except (ValueError, AttributeError):
+            return []
+        return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
+
+    def _item_effects(self, item):
+        return self.db.execute("SELECT key, state, version FROM operations WHERE item=? AND head=?",
+                               (item["id"], item["head"])).fetchall()
+
+    def item_unsettled(self, item):
+        """T7: the item has an Effect for its H in an unsettled state."""
+        return any(state in self.T7_UNSETTLED for _k, state, _v in self._item_effects(item))
+
+    def _wi_obs(self, item, obs, *fields):
+        """T2: a GitHub fact in a guard is a fresh observation row (under 2 min, never from the future) for this
+        item's repo and PR, carrying the named fields. A missing, stale, foreign or malformed one fails closed."""
+        self._fresh(obs)
+        if str(obs.get("repo", "")).lower() != item["repo"] or obs.get("pr") != item["pr"]:
+            raise ContractError("the observation is for another repo or PR")
+        for f in fields:
+            if f not in obs:
+                raise ContractError("the observation has no %s" % f)
+        if "pr_state" in fields and obs["pr_state"] not in self.PR_STATES:
+            raise ContractError("unknown PR state %r" % obs["pr_state"])
+        for f in ("pr_head", "tip"):
+            if f in fields and not _is_oid(obs[f]):
+                raise ContractError("the observation's %s is not a full sha" % f)
+        return obs
+
+    def _wi_notice(self, event_id, item, row_id, kind, text):
+        """An escalation written in the row's own transaction (T3); delivery is the outbox's job (H5, later)."""
+        self.db.execute("INSERT INTO wi_notices(event_id, item, row_id, kind, text, created) VALUES (?,?,?,?,?,?)",
+                        (event_id, item["id"], row_id, kind, text, self.now()))
+
+    # NEG-6 protected paths (spec M-1 v2g16). A pattern without a slash matches the file name at any depth; one
+    # with a slash matches the full path from the repo root. Renames are checked on both paths (the caller lists
+    # both). The policy file and the test configuration files named under Required checks are added per repo by
+    # the policy record (`extra_protected`).
+    MIRROR_CAUSE = "mirror undeliverable"     # W5's cause when ELIG holds but the mirror cannot be delivered
+
+    NEG6 = ("merge_gate*", "peer_review*", "caller_identity*", "usage_guard*", "commit_policy*", "ahc*",
+            "settings*.json", "hooks_manifest.json", ".github/**", "CODEOWNERS", ".claude/**", ".mcp.json",
+            ".codex/**", "CLAUDE.md", "AGENTS.md", "conftest*", "pytest.ini", "setup.cfg", "tox.ini",
+            "pyproject.toml", "tests/__init__.py")
+
+    @classmethod
+    def protected_path(cls, path, extra=()):
+        import fnmatch
+        if not isinstance(path, str) or not path or path.startswith("/") or ".." in path.split("/"):
+            return True                                               # an unreadable path counts as protected
+        name = path.rsplit("/", 1)[-1]
+        for pat in cls.NEG6 + tuple(extra):
+            if pat.endswith("/**"):
+                if path.startswith(pat[:-2]):
+                    return True
+            elif "/" in pat:
+                if fnmatch.fnmatchcase(path, pat):
+                    return True
+            elif fnmatch.fnmatchcase(name, pat):
+                return True
+        return False
+
+    ELIG_FIELDS = ("pr_state", "pr_head", "draft", "tip", "compare", "b_r_ancestors", "attached_core",
+                   "open_findings", "paths", "foreign_closing_keyword", "policy", "kill_switch", "chk_cas",
+                   "canary_age")
+
+    def elig(self, item, obs, skip=()):
+        """ELIG (spec M-1 v2g16), one definition for W2, W6, the queue head and (b)'s G1/E2. Returns the failed
+        clauses, empty when ELIG holds. Ledger facts are read here, inside the caller's transaction (T1); GitHub,
+        GoodQA and policy facts come from one fresh observation row (T2). Every clause fails closed: a missing,
+        malformed or stale field fails its clause, never passes it."""
+        failed = []
+        try:
+            o = self._wi_obs(item, obs, *self.ELIG_FIELDS)
+        except ContractError:
+            return ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10"]
+        head, tip = item["head"], o["tip"]
+        pol = o["policy"] if isinstance(o["policy"], dict) else {}
+        # e1: every required code Review row passed for (H, packet, policy revision); each B_r an ancestor of B
+        code = self.db.execute("SELECT kind, state, snapshot_base FROM reviews WHERE "
+                               "item=? AND head=? AND kind IN ('adversarial', 'red-team') AND policy_revision=? "
+                               "AND packet_sha256=?", (item["id"], head, item["policy_revision"],
+                                                      item["packet_sha256"])).fetchall()
+        anc = o["b_r_ancestors"] if isinstance(o["b_r_ancestors"], dict) else {}
+        required = {"adversarial"} | ({"red-team"} if item["red_team"] else set())   # PR 268 F2: none missing
+        if (not required <= {k for k, _s, _b in code} or o["pr_head"] != head
+                or pol.get("revision") != item["policy_revision"]
+                or any(s != "passed" or anc.get(br) is not True for _k, s, br in code)):
+            failed.append("e1")
+        # e2: the spec row for the spec core attached NOW, at this item's packet and policy revision, has passed
+        # (PR 268 F1: after W27 the old revision's pass stays terminal beside the replacement and must not count)
+        spec = self.db.execute("SELECT state FROM reviews WHERE item=? AND head=? AND kind='spec' AND spec_core=? "
+                               "AND policy_revision=? AND packet_sha256=?",
+                               (item["id"], head, o["attached_core"], item["policy_revision"],
+                                item["packet_sha256"])).fetchall()
+        if o["attached_core"] != item["spec_core"] or [s for (s,) in spec] != ["passed"]:
+            failed.append("e2")
+        if o["open_findings"] != 0 or isinstance(o["open_findings"], bool):
+            failed.append("e3")
+        paths = o["paths"]
+        if (not isinstance(paths, list) or not paths or o["foreign_closing_keyword"] is not False
+                or any(self.protected_path(p, pol.get("extra_protected", ())) for p in paths)):
+            failed.append("e4")
+        flags = self.db.execute("SELECT merging_off FROM repo_flags WHERE repo=?", (item["repo"],)).fetchone()
+        if (pol.get("readable") is not True or pol.get("allowlisted") is not True or pol.get("enabled") is not True
+                or pol.get("checks_green") is not True or (flags and flags[0])):
+            failed.append("e5")
+        frozen = self.db.execute("SELECT v FROM contract_meta WHERE k='authority_frozen'").fetchone()
+        if o["kill_switch"] is not False or (frozen and frozen[0] == "1"):
+            failed.append("e6")
+        if self.cap_used(item["repo"]) >= self.CAP1_PER_DAY:
+            failed.append("e7")
+        if o["pr_state"] != "OPEN" or o["draft"] is not False:
+            failed.append("e8")
+        age = o["canary_age"]
+        if o["chk_cas"] is not True or not isinstance(age, (int, float)) or isinstance(age, bool) or not 0 <= age < 86400:
+            failed.append("e9")
+        if o["compare"] != "ahead" or tip == head:
+            failed.append("e10")
+        return [c for c in failed if c not in skip]
+
+    def queue_head(self, repo, observations):
+        """The merge queue head for a repo: among its items in pr-gate or merge-ready, ordered by lineage
+        admission time, the oldest for which every ELIG clause except e10 holds. `observations` maps item id to
+        its ELIG observation; an item without one is not eligible. (The W21-successor exception is wired with
+        W21's readback in slice 1 (b).)"""
+        rows = self.db.execute(
+            "SELECT w.id, (SELECT MIN(created) FROM work_items x WHERE x.lineage = w.lineage) AS admitted "
+            "FROM work_items w WHERE w.repo=? AND w.state IN ('pr-gate', 'merge-ready') ORDER BY admitted, w.created, "
+            "w.id", (str(repo).lower(),)).fetchall()
+        for iid, _admitted in rows:
+            item = self._row("work_items", "id", iid)
+            if iid in observations and not self.elig(item, observations[iid], skip=("e10",)):
+                return iid
+        return None
+
+    def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None, obs=None,
+                successor_packet=None):
+        """The one WorkItem transition function (T1 to T7). One BEGIN IMMEDIATE; the guard re-reads its ledger
+        facts; the state change and one audit row commit together (T3). A replay of the same event for the same
+        item and row is a no-op that returns the current row (T6), checked before the version so a post-crash replay
+        with a stale expected version still lands as a no-op."""
+        with self.tx():
+            item = self._row("work_items", "id", iid)
+            if item is None:
+                raise ContractError("no work item %s" % iid)
+            prior = self.db.execute("SELECT entity, id, data FROM transitions WHERE event_id=?",
+                                    (event_id,)).fetchone() if isinstance(event_id, str) else None
+            if prior is not None:
+                data = json.loads(prior[2]) if prior[2] else {}
+                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:
+                    return item                                     # T6: a replay is a no-op
+                raise ContractError("event id %s was already applied to another subject" % event_id)
+            if row_id not in self.WI_TRANSITIONS:
+                raise ContractError("unknown WorkItem row %r" % row_id)
+            src, dst, row_actor = self.WI_TRANSITIONS[row_id]
+            if actor != row_actor:
+                if actor == "owner":   # NEG-11: an owner's resubmit or ack never moves an item; only W20 is theirs
+                    raise ContractError("NEG-11: an owner action moves a work item only by W20 (cancel)")
+                raise ContractError("%s is taken by %s, not %r" % (row_id, row_actor, actor))
+            frm = item["state"]
+            if frm not in src:
+                raise ContractError("%s does not leave %s" % (row_id, frm))
+            if row_id == "W24":
+                to = frm                                            # W24 keeps the item where it is
+            elif to is None:
+                if len(dst) != 1:
+                    raise ContractError("%s needs its target, one of %s" % (row_id, ", ".join(dst)))
+                to = dst[0]
+            if to not in dst:
+                raise ContractError("%s goes to %s, not %r" % (row_id, ", ".join(dst), to))
+            if item["version"] != expected_version:
+                raise VersionConflict("work item version is %s, caller expected %s" % (item["version"],
+                                                                                         expected_version))
+            if not isinstance(event_id, str) or not event_id:
+                raise ContractError("an event id is required")
+            unsettled = self.item_unsettled(item)
+            if unsettled and row_id not in self.T7_ALLOWED:
+                raise ContractError("T7: %s waits while the item's Effect is unsettled" % row_id)
+            if unsettled and to in ("waiting-dep", "exhausted"):
+                # Q-A5.2: unreachable through the table under T7; kept as an invariant so a future row cannot put
+                # an in-flight send where no row settles it. Raised as an incident, never applied.
+                raise ContractError("incident: %s would put an item with an unsettled Effect in %s" % (row_id, to))
+            if row_id not in self.WI_WIRED:
+                raise ContractError("%s is not wired in this build of slice 1 (a); refused, fail closed" % row_id)
+            mark = self._wi_guard(item, row_id, to, mark, unsettled, obs)
+            base = obs["tip"] if row_id == "W18" else item["base"]
+            successor = None
+            if row_id == "W4" or (row_id == "W24" and mark == "head-moved" and not item["successor"]):
+                successor = self._wi_successor(item, obs["pr_head"], successor_packet, event_id)
+            extra = {}
+            if row_id in ("W2", "W6"):                      # the values ELIG passed on, for W27
+                extra = {"elig_core": item["spec_core"], "elig_policy": item["policy_revision"]}
+            elif row_id == "W5":
+                # every cause that holds is recorded (note 12 ruling); W6 needs each one cleared
+                failed = self.elig(item, obs)
+                causes = (["ELIG failed: %s" % ", ".join(failed)] if failed else []) + \
+                    ([self.MIRROR_CAUSE] if obs.get("mirror_ok") is False else [])
+                cause = "; ".join(causes)                     # derived, never taken from the caller
+            elif row_id == "W27":
+                extra = {"spec_core": obs["attached_core"], "policy_revision": obs["policy"]["revision"]}
+            elif row_id == "W21":
+                # authority log first (T4): the record of the one update-branch this item may get at this B. Slice
+                # 1 (a) is shadow only: nothing is sent; slice 1 (b)'s ahc-merge sends it after this row commits.
+                self.authority.append({"event_id": event_id, "item": iid, "row": "W21", "repo": item["repo"],
+                                       "pr": item["pr"], "expected_head_sha": item["head"], "base": obs["tip"],
+                                       "action": "update-branch (recorded, not sent)"})
+                extra = {"w21_base": obs["tip"]}
+            sets = "".join(", %s=?" % k for k in extra)
+            self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), base=?, "
+                            "successor=COALESCE(?, successor), version=version+1, updated=?%s WHERE id=?" % sets,
+                            (to, mark, cause, base, successor, self.now()) + tuple(extra.values()) + (iid,))
+            self._wi_effects(item, row_id, event_id, obs)
+            self._a0("work_item", iid, frm, to, event_id, actor, row=row_id, cause=cause,
+                     obs=obs.get("id") if isinstance(obs, dict) else None)
+            return self._row("work_items", "id", iid)
+
+    def _wi_successor(self, item, new_head, packet_sha256, event_id):
+        """W4 and W24: the successor item at H' (W1). It never inherits this item's grant, Effect or Review rows;
+        under W4 this item's open Review rows for H go to superseded or, while an attempt may run, cancelling."""
+        if not (isinstance(packet_sha256, str) and len(packet_sha256) == 64 and _is_oid(packet_sha256)):
+            raise ContractError("the successor at H' needs its own packet sha256")
+        succ = self.admit_item(item["repo"], item["pr"], new_head, item["base"], item["policy_revision"],
+                               item["spec_core"], packet_sha256, event_id=event_id + "-successor",
+                               red_team=bool(item["red_team"]))
+        return succ["id"]
+
+    def _wi_effects(self, item, row_id, event_id, obs):
+        """The Effects column of the applied row, in the same transaction (T3)."""
+        if row_id == "W4":
+            new = self._row("work_items", "id", self._row("work_items", "id", item["id"])["successor"])
+            by_kind = {k: rid for k, rid in self.db.execute("SELECT kind, id FROM reviews WHERE item=?", (new["id"],))}
+            kinds = dict(self.db.execute("SELECT id, kind FROM reviews WHERE item=?", (item["id"],)).fetchall())
+            self.supersede_reviews(item["repo"], item["pr"], new["head"],
+                                   lambda rid: by_kind.get(kinds.get(rid)) or new["id"], event_id + "-r12")
+        if row_id == "W27":
+            # SLICE-AT-3: replacement rows for the new core or policy revision; the old passed rows stay terminal
+            # and, bound to the old values, no longer satisfy e1 or e2. Queued or infra-wait rows are superseded
+            # (R12 lists W27).
+            new = self._row("work_items", "id", item["id"])
+            made = {}
+            for kind in sorted({k for (k,) in self.db.execute("SELECT kind FROM reviews WHERE item=?",
+                                                              (item["id"],))}):
+                if kind != "spec" and new["policy_revision"] == item["policy_revision"]:
+                    continue                              # a core change alone needs only a new spec row
+                code = kind in self.ATTEMPT_KINDS
+                made[kind] = self.require_review(kind, item["repo"], item["pr"], item["head"], item["packet_sha256"],
+                                                 new["policy_revision"], item=item["id"],
+                                                 event_id="%s-%s" % (event_id, kind),
+                                                 snapshot_base=item["base"] if code else "",
+                                                 spec_core="" if code else new["spec_core"])["id"]
+            for rid, kind, state, version in self.db.execute(
+                    "SELECT id, kind, state, version FROM reviews WHERE item=? AND state IN ('required', 'queued', "
+                    "'infra-wait')", (item["id"],)).fetchall():
+                if kind in made and rid != made[kind]:
+                    self.review(rid, "superseded", expected_version=version, event_id="%s-r12-%s" % (event_id, rid),
+                                successor=made[kind], cause="spec core or policy changed (W27)")
+        if row_id == "W20":
+            # PR 268 F3: the owner withdrew the item; an attempt that may still run is stopped first (R14), so no
+            # result can settle its row afterwards (cancelling accepts none; R15 settles it once the unit is gone)
+            for rid, version in self.db.execute("SELECT id, version FROM reviews WHERE item=? AND state IN "
+                                                "('running', 'outcome-unknown') ORDER BY id",
+                                                (item["id"],)).fetchall():
+                self.review(rid, "cancelling", expected_version=version, event_id="%s-r14-%s" % (event_id, rid),
+                            cause="owner cancelled (W20)")
+        if row_id in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):
+            for key, state, version in self._item_effects(item):
+                if state == "intent":                                # E9: an intent never sent is abandoned
+                    self.abandon_unsent(key, expected_version=version, event_id="%s-e9-%s" % (event_id, key),
+                                        reason="item left by %s" % row_id)
+        if row_id == "W5":
+            self._wi_notice(event_id, item, row_id, "ticket", "waiting on a dependency: %s"
+                            % (self._row("work_items", "id", item["id"])["cause"]))
+        elif row_id == "W17":
+            self._wi_notice(event_id, item, row_id, "ticket", "protected path; main integrates by hand")
+        elif row_id == "W3":
+            # PR 268 F4: escalate with the finding ids of every findings row (from its bound receipt)
+            parts = []
+            for rid, kind, receipt in self.db.execute("SELECT id, kind, receipt FROM reviews WHERE item=? AND "
+                                                      "state='findings' ORDER BY kind, id", (item["id"],)):
+                parts.append("%s %s: %s" % (kind, rid, ", ".join(self._finding_ids(receipt)) or "no finding ids"))
+            text = "findings on " + "; ".join(parts)
+            self._wi_notice(event_id, item, row_id, "ticket", text)
+            self._wi_notice(event_id, item, row_id, "owner", text)
+        elif row_id == "W10":
+            # PR 268 F4: the Effect is held; a person decides (the grant stays reserved; W26 settles it)
+            keys = [k for k, state, _v in self._item_effects(item) if state == "held"]
+            text = "%s held; a person decides" % ", ".join(keys)
+            self._wi_notice(event_id, item, row_id, "incident", text)
+            self._wi_notice(event_id, item, row_id, "ticket", text)
+        elif row_id in ("W8", "W26"):
+            # keyed by the op key, not the event, so the integration is announced exactly once (W26: a restart
+            # cannot repeat it); recorded as integrated at H only, never at a successor's H'
+            key = [k for k, state, _v in self._item_effects(item) if state == "confirmed"][0]
+            text = "integrated at %s by %s" % (item["head"], key)
+            self._wi_notice("op:%s" % key, item, row_id, "ticket", text)
+            self._wi_notice("op:%s" % key, item, row_id, "digest", text)
+            if item["marks"] == "closed-in-flight":                                    # L7
+                self._wi_notice("op:%s" % key, item, row_id, "owner", "the closed PR's H %s was integrated; revert "
+                                "by a normal PR if unwanted" % item["head"])
+        elif row_id == "W25":
+            key, state, _v = [e for e in self._item_effects(item) if e[1] == "abandoned"][0]
+            self._wi_notice(event_id, item, row_id, "ticket", "%s ended %s; item %s" % (
+                key, state, self._row("work_items", "id", item["id"])["state"]))
+        elif row_id == "W13":
+            self._wi_notice(event_id, item, row_id, "ticket", "closed without integration at %s" % item["head"])
+        elif row_id == "W14":
+            self._wi_notice(event_id, item, row_id, "incident", "PR shows merged; no confirmed ahc Effect made it")
+        elif row_id == "W18" and not self.db.execute(
+                "SELECT 1 FROM operations WHERE repo=? AND state='confirmed' AND head=? AND base=?",
+                (item["repo"], obs["tip"], item["base"])).fetchone():
+            # L1, L2: a move no confirmed ahc Effect explains (read from the ledger, never from the caller)
+            kind = "digest" if obs.get("fast_forward") is True else "incident"
+            self._wi_notice(event_id, item, row_id, kind, "default branch moved %s -> %s" % (item["base"],
+                                                                                            obs["tip"]))
+
+    def _wi_guard(self, item, row_id, to, mark, unsettled, obs=None):
+        """Guards of the wired rows: ledger facts read inside the transaction (T1) and fresh observations (T2).
+        Returns the item's marks after the row."""
+        effects = {state for _k, state, _v in self._item_effects(item)}
+        marks = item["marks"]
+        if row_id in ("W2", "W6"):
+            failed = self.elig(item, obs)
+            if failed:
+                raise ContractError("%s needs ELIG; failed: %s" % (row_id, ", ".join(failed)))
+            # W6: every recorded cause has cleared (spec owner ruling on note 12). An ELIG cause is covered by ELIG
+            # holding, on this fresh observation; a mirror cause is not an ELIG clause, so the same fresh
+            # observation must show mirror_ok True. A stale or other-boot observation already failed ELIG above.
+            if row_id == "W6" and self.MIRROR_CAUSE in (item["cause"] or "").split("; ") \
+                    and obs.get("mirror_ok") is not True:
+                raise ContractError("W6 needs the mirror deliverable again (the recorded cause)")
+        elif row_id == "W5":
+            failed = self.elig(item, obs)
+            mirror_down = isinstance(obs, dict) and obs.get("mirror_ok") is False
+            if not (set(failed) & {"e5", "e6", "e7", "e8", "e10"}) and not mirror_down:
+                raise ContractError("W5 needs ELIG failing on e5, e6, e7, e8 or e10, or the mirror undeliverable")
+        elif row_id == "W17":
+            if "e4" not in self.elig(item, obs):
+                raise ContractError("W17 needs a protected path or a foreign closing keyword (e4)")
+        elif row_id == "W27":
+            o = self._wi_obs(item, obs, "attached_core", "policy")
+            pol = o["policy"] if isinstance(o["policy"], dict) else {}
+            core, revision = o["attached_core"], pol.get("revision")
+            if not (isinstance(core, str) and len(core) == 64 and _is_oid(core)) or not isinstance(revision, str) \
+                    or not revision:
+                raise ContractError("W27 needs the attached spec core and the policy revision read now")
+            if (core, revision) == (item["elig_core"], item["elig_policy"]):
+                raise ContractError("W27 needs the spec core or the policy revision changed since ELIG passed")
+        elif row_id == "W21":
+            o = self._wi_obs(item, obs, "queue", "mergeable", "tip")
+            queue = o["queue"] if isinstance(o["queue"], dict) else {}
+            listed = {r[0] for r in self.db.execute("SELECT id FROM work_items WHERE repo=? AND state IN "
+                                                    "('pr-gate', 'merge-ready')", (item["repo"],))}
+            if set(queue) != listed:
+                raise ContractError("W21 needs an ELIG observation for every item in the repo's queue")
+            if self.queue_head(item["repo"], queue) != item["id"]:
+                raise ContractError("W21 is taken only by the head of the repo's merge queue")
+            failed = self.elig(item, queue[item["id"]])
+            if failed != ["e10"]:
+                raise ContractError("W21 needs every ELIG clause but e10 to hold, and the PR behind (e10)")
+            if o["mergeable"] is not True:
+                raise ContractError("W21 needs GitHub reporting the PR mergeable with no conflict")
+            if item["w21_base"] == o["tip"]:
+                raise ContractError("an update-branch was already recorded for this item at the current B")
+        if row_id in ("W4", "W13", "W14"):
+            o = self._wi_obs(item, obs, "pr_state", "pr_head")
+            want = {"W4": "OPEN", "W13": "CLOSED", "W14": "MERGED"}[row_id]
+            if o["pr_state"] != want:
+                raise ContractError("%s needs the PR %s, the readback says %s" % (row_id, want, o["pr_state"]))
+            if row_id == "W4" and o["pr_head"] == item["head"]:
+                raise ContractError("W4 needs the PR head moved away from H")
+            if row_id == "W14" and "confirmed" in effects:
+                raise ContractError("W14 is for a merge no confirmed ahc Effect made; this item's Effect did (W8)")
+        elif row_id == "W18":
+            o = self._wi_obs(item, obs, "tip", "fast_forward")
+            if o["tip"] == item["base"]:
+                raise ContractError("W18 needs the default branch moved from B")
+        elif row_id == "W24":
+            o = self._wi_obs(item, obs, "pr_state", "pr_head", "tip")
+            moved = o["pr_head"] != item["head"]
+            fact = {"head-moved": moved, "closed-in-flight": o["pr_state"] == "CLOSED",
+                    "": o["pr_state"] == "MERGED" or o["tip"] != item["base"]}.get(mark or "")
+            if not fact:
+                raise ContractError("W24's observation does not show what its mark %r claims" % (mark or ""))
+        if row_id == "W3":
+            findings = self.db.execute("SELECT 1 FROM reviews WHERE item=? AND head=? AND state='findings'",
+                                       (item["id"], item["head"])).fetchone()
+            if not findings:
+                raise ContractError("W3 needs a Review row of this item ending findings")
+        elif row_id in ("W8", "W26"):
+            if "confirmed" not in effects:
+                raise ContractError("%s needs a confirmed Effect of this item for its H" % row_id)
+        elif row_id == "W9":
+            if "abandoned" not in effects or unsettled:
+                raise ContractError("W9 needs the item's Effect abandoned")
+            if marks:
+                raise ContractError("W9 is for an unmarked item; a %s item takes W25" % marks)
+        elif row_id == "W10":
+            if "held" not in effects:
+                raise ContractError("W10 needs the item's Effect held")
+        elif row_id == "W24":
+            if not unsettled:
+                raise ContractError("W24 applies only while the item's Effect is unsettled")
+            if mark not in (None, "", "head-moved", "closed-in-flight"):
+                raise ContractError("W24 marks head-moved or closed-in-flight, not %r" % mark)
+            if mark and marks and mark != marks:
+                raise ContractError("the item is already marked %s" % marks)
+            return mark or marks
+        elif row_id == "W25":
+            if "abandoned" not in effects or unsettled:
+                raise ContractError("W25 needs the item's Effect abandoned")
+            want = {"head-moved": "superseded", "closed-in-flight": "closed-unmerged"}.get(marks)
+            if want != to:
+                raise ContractError("W25 sends a %s item to %s" % (marks or "unmarked", want))
+        elif row_id == "W20":
+            pass                                                    # the owner cancels its own item from pr-gate
+        if mark not in (None, ""):
+            raise ContractError("only W24 sets a mark")
+        return marks
+
     # -------------------------------------------------------------- Review (3.3)
 
     # M-1 spec (ahc-m1-v1, Review table R1-R13): kinds adversarial and spec, plus red-team where the class requires
@@ -222,21 +819,22 @@ class Contracts:
         ("running", "findings"): P,           # R5
         ("running", "infra-wait"): P,         # R6
         ("running", "outcome-unknown"): D,    # R7
-        ("running", "cancelling"): D,         # R12 via cancelling (ruling 2)
-        ("cancelling", "superseded"): D,
+        ("running", "cancelling"): D,         # R14: the subject changed (W4, W9, W18) or the owner cancelled (W20)
+        ("cancelling", "superseded"): D,      # R15: the unit is gone; a later result is stored as late only
         ("outcome-unknown", "passed"): D,     # R8
         ("outcome-unknown", "findings"): D,   # R8
         ("outcome-unknown", "queued"): D,     # R9
-        ("outcome-unknown", "superseded"): D,  # R12: a receipt arriving later authorizes nothing
+        ("outcome-unknown", "cancelling"): D,  # R14 (v2g16): its unit may still be running, so it is stopped first
         ("infra-wait", "queued"): D,          # R10
         ("infra-wait", "superseded"): D,      # R12
     }
 
     def require_review(self, kind, repo, pr, head, packet_sha256, policy_revision, item=None, event_id=None,
-                       actor="ahc-core", snapshot_base=""):
+                       actor="ahc-core", snapshot_base="", spec_core=""):
         """none -> required, or the existing row for this exact binding (idempotent). R1: a code kind is bound to
         (repo, pr, H, B_r, packet, revision), where B_r is the default-branch tip at queue time and differs from H;
-        a spec kind has no B_r and stores ''."""
+        a spec kind has no B_r and stores '', and is bound to the spec core it reviews (Q-A6), so a new attached
+        core at the same head, packet and policy is a new row (W27) and the old pass cannot satisfy e2."""
         if kind not in self.REVIEW_KINDS:
             raise ContractError("unknown review kind %r" % kind)
         if actor not in self.D:
@@ -244,10 +842,17 @@ class Contracts:
         if kind in self.ATTEMPT_KINDS:
             if not isinstance(snapshot_base, str) or not _is_oid(snapshot_base) or snapshot_base == head:
                 raise ContractError("a code review is bound to its snapshot base B_r (a full sha other than H)")
-        elif snapshot_base != "":
-            raise ContractError("a spec review has no snapshot base")
+            if spec_core != "":
+                raise ContractError("a code review carries no spec core")
+        else:
+            if snapshot_base != "":
+                raise ContractError("a spec review has no snapshot base")
+            if not (isinstance(spec_core, str) and len(spec_core) == 64 and _is_oid(spec_core)):
+                raise ContractError("a spec review is bound to the full sha256 spec core it reviews")
         binding = {"kind": kind, "repo": str(repo).lower(), "pr": int(pr), "head": head,
                    "snapshot_base": snapshot_base, "packet_sha256": packet_sha256, "policy_revision": policy_revision}
+        if kind == "spec":       # code rows keep their pre-Q-A6 ids
+            binding["spec_core"] = spec_core
         rid = "rv-" + _sha(binding)[:24]
         with self.tx():
             existing = self._row("reviews", "id", rid)
@@ -255,9 +860,10 @@ class Contracts:
                 return existing
             now = self.now()
             self.db.execute("INSERT INTO reviews(id, kind, item, repo, pr, head, snapshot_base, packet_sha256, "
-                            "policy_revision, state, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            "policy_revision, state, version, created, updated, spec_core) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (rid, kind, item, binding["repo"], binding["pr"], head, snapshot_base, packet_sha256,
-                             policy_revision, "required", 1, now, now))
+                             policy_revision, "required", 1, now, now, spec_core))
             self._a0("review", rid, None, "required", event_id or "ev-" + rid + "-required", actor)
             return self._row("reviews", "id", rid)
 
@@ -311,6 +917,9 @@ class Contracts:
         if row["snapshot_base"]:      # R4: a code receipt names the B_r the reviewer diffed against
             want["snapshot_base"] = row["snapshot_base"]
             got["snapshot_base"] = receipt.get("snapshot_base")
+        if row["kind"] == "spec":     # R11 (Q-A6): the attach record is for the core this row reviews
+            want["spec_core"] = row["spec_core"]
+            got["spec_core"] = receipt.get("spec_core")
         if got != want:
             raise ContractError("receipt is bound to another subject: %s" % sorted(k for k in want
                                                                                    if want[k] != got[k]))
@@ -319,16 +928,17 @@ class Contracts:
             raise ContractError("receipt verdict %r does not match %s" % (verdict, to))
 
     def supersede_reviews(self, repo, pr, head, successor_of, event_prefix, actor="ahc-core"):
-        """R12, a changed head: every non-terminal row for (repo, pr) at another head is superseded; a running row
-        goes to cancelling first and settles to superseded once its unit is stopped. A receipt that arrives for a
-        superseded row authorizes nothing. successor_of(row id) names the new row."""
+        """R12 and R14, a changed head: every required, queued or infra-wait row for (repo, pr) at another head is
+        superseded (R12); a running or outcome-unknown row goes to cancelling first (R14) and settles to superseded
+        once its unit is stopped (R15). A receipt that arrives for either authorizes nothing. successor_of(row id)
+        names the new row."""
         out = []
         with self.tx():
             rows = self.db.execute("SELECT id, state, version FROM reviews WHERE repo=? AND pr=? AND head != ? "
                                    "AND state NOT IN ('passed', 'findings', 'superseded', 'cancelling')",
                                    (str(repo).lower(), int(pr), head)).fetchall()
             for rid, state, version in rows:
-                to = "cancelling" if state == "running" else "superseded"
+                to = "cancelling" if state in ("running", "outcome-unknown") else "superseded"
                 self.review(rid, to, expected_version=version, event_id="%s-%s" % (event_prefix, rid), actor=actor,
                             successor=successor_of(rid) if to == "superseded" else None, cause="head-changed")
                 out.append((rid, to))
@@ -627,9 +1237,15 @@ class Contracts:
         return new
 
     def _fresh(self, obs):
-        if not isinstance(obs, dict) or not isinstance(obs.get("at"), (int, float)) or isinstance(obs["at"], bool):
-            raise ContractError("the guard needs an observation row with its time (T2)")
-        if self.now() - float(obs["at"]) >= self.OBSERVATION_SECONDS or float(obs["at"]) > self.now():
+        def num(v):
+            return isinstance(v, (int, float)) and not isinstance(v, bool)
+        if not isinstance(obs, dict) or not num(obs.get("at")) or not num(obs.get("mono")):
+            raise ContractError("the guard needs an observation row with its time and monotonic stamp (T2)")
+        # D-a3: age is measured on the monotonic clock, never the wall clock, which can step (NTP, a manual set).
+        # A stamp from another boot is meaningless, so the observation is stale.
+        if obs.get("boot") != self.boot_id:
+            raise ContractError("observation is from another boot; its age is unknown (T2, D-a3)")
+        if not 0 <= float(self._mono()) - float(obs["mono"]) < self.OBSERVATION_SECONDS:
             raise ContractError("observation is stale (over 2 min) or from the future (T2)")
 
     @staticmethod
@@ -745,6 +1361,7 @@ class Contracts:
             now = self.now()
             return self._op_move(key, "dispatched", expected_version, event_id, "ahc-merge", {
                 "dispatch_count": row["dispatch_count"] + 1, "dispatched_at": now, "request_id": request_id,
+                "wait_mono": float(self._mono()), "wait_boot": self.boot_id,    # E13's wait starts here (D-a3)
                 "probe_at": now + B55_REQUEST_SECONDS}, observation=obs,
                 request={"method": "updateRefs", "beforeOid": row["base"], "afterOid": row["head"], "force": False})
 
@@ -803,6 +1420,19 @@ class Contracts:
         if self._bh_entry(row, read):
             raise ContractError("the activity log shows (B, H): the update applied, confirm instead")
 
+    def e13_wait_start(self, key):
+        """The monotonic stamp E13's minimum delays count from: the dispatch's, when it was on this boot. After a
+        restart onto another boot the old stamp means nothing, so the wait restarts from this boot's first call
+        here, which is recorded. This only ever delays E13 (fails closed). It is bookkeeping, not a transition: no
+        version change and no audit row."""
+        with self.tx():
+            row = self._row_or_raise(key)
+            if row["wait_boot"] == self.boot_id and isinstance(row["wait_mono"], (int, float)):
+                return float(row["wait_mono"])
+            start = float(self._mono())
+            self.db.execute("UPDATE operations SET wait_mono=?, wait_boot=? WHERE key=?", (start, self.boot_id, key))
+            return start
+
     def fence(self, key, error, reads, *, expected_version, event_id):
         """E13 dispatched | outcome-unknown -> fenced (p2): an error response or no response (error names it),
         followed by two complete activity reads, the first at least 2 min after the dispatch and the second at
@@ -813,15 +1443,17 @@ class Contracts:
             raise ContractError("a fence names the error response or 'no-response'")
         if not isinstance(reads, (list, tuple)) or len(reads) != 2:
             raise ContractError("a fence needs exactly two activity reads")
+        start = self.e13_wait_start(key)
         with self.tx():
             row = self._row_or_raise(key)
-            sent = float(row["dispatched_at"] or 0)
             first, second = reads
             for read in reads:
-                self._off_bh(row, read)
-            if float(first["at"]) < sent + E13_FIRST_READ_SECONDS:
-                raise ContractError("E13's first read is at least 2 min after the dispatch (activity lag)")
-            if float(second["at"]) - float(first["at"]) < E13_READ_GAP_SECONDS:
+                self._off_bh(row, read)                 # each fresh, so each is from this boot (T2, D-a3)
+            # elapsed time on the monotonic clock only, never wall stamps (spec owner T-2, goodqa#16193)
+            if row["wait_boot"] != self.boot_id or float(first["mono"]) < start + E13_FIRST_READ_SECONDS:
+                raise ContractError("E13's first read is at least 2 min after the dispatch, or after the restart "
+                                    "that restarted the wait (activity lag)")
+            if float(second["mono"]) - float(first["mono"]) < E13_READ_GAP_SECONDS:
                 raise ContractError("E13's two reads are at least 60 s apart")
             return self._op_move(key, "fenced", expected_version, event_id, "ahc-core", {
                 "proof": "p2", "refusal": error, "evidence": _canon({"error": error, "reads": list(reads)}),

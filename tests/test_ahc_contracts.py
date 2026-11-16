@@ -16,6 +16,16 @@ B2 = "9" * 40         # a moved default-branch tip
 OTHER = "8" * 40      # some other tip, neither B nor H
 PKT = "d" * 64
 POLICY = "policy-r1"
+CORE1, CORE2 = "1" * 64, "2" * 64     # two attached spec cores (Q-A6)
+BOOT = "test-boot"                    # the boot id the Contracts under test run in (D-a3)
+
+
+def stamped(o):
+    """An observation stamped the way Contracts.stamp does: the monotonic stamp follows the test clock's `at`
+    (one fake clock drives both), and the boot is the test boot unless a test sets another."""
+    o.setdefault("mono", o.get("at"))
+    o.setdefault("boot", BOOT)
+    return o
 
 
 class Clock:
@@ -34,7 +44,7 @@ class Base(unittest.TestCase):
         C.apply_schema(self.db)
         self.clock = Clock()
         self.log = C.AuthorityLog(Path(self.tmp.name) / "authority.jsonl")
-        self.c = C.Contracts(self.db, self.log, now=self.clock)
+        self.c = C.Contracts(self.db, self.log, now=self.clock, mono=self.clock, boot_id=BOOT)
         self.n = 0
 
     def ev(self):
@@ -89,7 +99,7 @@ class Base(unittest.TestCase):
         o = {"at": self.clock.t, "kill_switch": False, "kill_epoch": self.KILL, "pr_state": "OPEN", "pr_head": head,
              "draft": False, "tip": base, "compare": "ahead", "checks_green": True}
         o.update(changes)
-        return o
+        return stamped(o)
 
     def send(self, op):
         return self.c.dispatch(op["key"], self.obs(op), expected_version=op["version"], event_id=self.ev(),
@@ -106,13 +116,13 @@ class Base(unittest.TestCase):
     def read(self, tip=OTHER, entries=(), complete=True, **changes):
         r = {"at": self.clock.t, "tip": tip, "activity": {"complete": complete, "entries": list(entries)}}
         r.update(changes)
-        return r
+        return stamped(r)
 
     def readback(self, **changes):
         """E3 by the tip: the default branch is exactly H."""
         r = {"at": self.clock.t, "tip": H1, "pr_merged": True}
         r.update(changes)
-        return r
+        return stamped(r)
 
     def gstate(self, g):
         return self.state("grants", "id", g["id"])
@@ -153,7 +163,47 @@ class ReviewTests(Base):
         args = dict(kind="adversarial", repo="O/R", pr=5, head=H1, packet_sha256=PKT, policy_revision=POLICY)
         args.update(kw)
         args.setdefault("snapshot_base", "" if args["kind"] == "spec" else BASE)
+        args.setdefault("spec_core", CORE1 if args["kind"] == "spec" else "")
         return self.c.require_review(**args)
+
+    # ---- Q-A6 (spec owner ruling on slice 1a): a spec row is bound to the spec core it reviewed
+
+    def spec_pass(self, row, core):
+        return self.c.review(row["id"], "passed", expected_version=row["version"], event_id=self.ev(),
+                             receipt=self.receipt(packet_sha256=row["packet_sha256"], snapshot_base=None,
+                                                  spec_core=core))
+
+    def test_qa6_a_new_spec_core_at_the_same_subject_is_a_new_row(self):
+        old = self.row(kind="spec")
+        new = self.row(kind="spec", spec_core=CORE2)
+        self.assertNotEqual(new["id"], old["id"], "same head, packet and policy, new core: a replacement row")
+        self.assertEqual((old["spec_core"], new["spec_core"]), (CORE1, CORE2))
+        self.assertEqual(self.spec_pass(old, CORE1)["state"], "passed")
+        self.assertEqual(self.state("reviews", "id", new["id"]), "required", "the old pass does not carry over")
+
+    def test_qa6_a_spec_row_needs_a_full_core_and_a_code_row_has_none(self):
+        for bad in ("", None, "A" * 64, "a" * 40, CORE1 + "0"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(C.ContractError, "spec core"):
+                self.row(kind="spec", spec_core=bad)
+        with self.assertRaisesRegex(C.ContractError, "spec core"):
+            self.row(kind="adversarial", spec_core=CORE1)
+        with self.assertRaises(sqlite3.IntegrityError):     # the CHECK holds even for a direct write
+            self.db.execute("INSERT INTO reviews(id, kind, repo, pr, head, snapshot_base, packet_sha256, "
+                            "policy_revision, state, version, created, updated, spec_core) VALUES "
+                            "('rv-x', 'spec', 'o/r', 5, ?, '', ?, ?, 'required', 1, 0, 0, '')", (H1, PKT, POLICY))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.execute("INSERT INTO reviews(id, kind, repo, pr, head, snapshot_base, packet_sha256, "
+                            "policy_revision, state, version, created, updated, spec_core) VALUES "
+                            "('rv-y', 'adversarial', 'o/r', 5, ?, ?, ?, ?, 'required', 1, 0, 0, ?)",
+                            (H1, BASE, PKT, POLICY, CORE1))
+
+    def test_qa6_r11_passes_a_spec_row_only_on_an_attach_record_for_its_core(self):
+        row = self.row(kind="spec")
+        for core in (CORE2, None, ""):
+            with self.subTest(core=core), self.assertRaisesRegex(C.ContractError, "spec_core"):
+                self.spec_pass(row, core)
+        self.assertEqual(self.state("reviews", "id", row["id"]), "required")
+        self.assertEqual(self.spec_pass(row, CORE1)["state"], "passed")
 
     def walk(self, row, *states, **kw):
         for to in states:
@@ -200,7 +250,7 @@ class ReviewTests(Base):
     def test_spec_row_passes_from_required_on_its_attach_record_only(self):
         spec = self.row(kind="spec", packet_sha256="5" * 64)
         self.c.review(spec["id"], "passed", expected_version=spec["version"], event_id=self.ev(),
-                      receipt=self.receipt(packet_sha256="5" * 64))
+                      receipt=self.receipt(packet_sha256="5" * 64, spec_core=CORE1))
         adversarial = self.row()
         with self.assertRaises(C.ContractError):   # an attempt kind never passes without running
             self.result(adversarial)
@@ -241,15 +291,26 @@ class ReviewTests(Base):
         passed = self.result(self.walk(self.row(kind="red-team", packet_sha256="8" * 64), "queued", "running"),
                              receipt=self.receipt(packet_sha256="8" * 64))
         moved = dict(self.c.supersede_reviews("o/r", 5, H2, lambda rid: "rv-new", "sup"))
+        # v2g16 R14: an outcome-unknown row's unit may still be running, so it is cancelled first, like a running
+        # row; it never jumps straight to superseded (the pre-R14 shortcut, flipped in slice 1a).
         self.assertEqual(moved, {queued["id"]: "superseded", running["id"]: "cancelling",
-                                 unknown["id"]: "superseded", spec["id"]: "superseded"})
+                                 unknown["id"]: "cancelling", spec["id"]: "superseded"})
         self.assertEqual(self.state("reviews", "id", passed["id"]), "passed", "history never changes")
-        r = self.db.execute("SELECT version FROM reviews WHERE id=?", (running["id"],)).fetchone()[0]
-        self.c.review(running["id"], "superseded", expected_version=r, event_id=self.ev())
+        for rid in (running["id"], unknown["id"]):
+            r = self.c._row("reviews", "id", rid)
+            with self.assertRaises(C.ContractError):   # R15: a result arriving while cancelling authorizes nothing
+                self.c.review(rid, "passed", expected_version=r["version"], event_id=self.ev(),
+                              receipt=self.receipt(packet_sha256=r["packet_sha256"]), peer_uid=self.UID)
+            self.c.review(rid, "superseded", expected_version=r["version"], event_id=self.ev())
         r = self.c._row("reviews", "id", unknown["id"])
         with self.assertRaises(C.ContractError):   # a late receipt for a superseded row authorizes nothing
             self.c.review(unknown["id"], "passed", expected_version=r["version"], event_id=self.ev(),
                           receipt=self.receipt(packet_sha256="9" * 64), peer_uid=self.UID)
+        other = self.walk(self.row(kind="adversarial", packet_sha256="7" * 64), "queued", "running",
+                          "outcome-unknown")
+        with self.assertRaisesRegex(C.ContractError, "no transition outcome-unknown -> superseded"):
+            self.c.review(other["id"], "superseded", expected_version=other["version"], event_id=self.ev(),
+                          successor="rv-new")
 
     def test_r01_code_rows_bind_the_snapshot_base_and_spec_rows_store_empty(self):
         row = self.row()
@@ -482,6 +543,36 @@ class OperationTests(Base):
         with self.assertRaisesRegex(C.ContractError, "never yields a new generation"):
             self.c.intend(self.params(pr=6), lease_ok=True, event_id=self.ev())
 
+    def test_t2_age_is_monotonic_and_ignores_wall_clock_steps(self):
+        """D-a3: a wall-clock step (NTP, a manual set) changes neither verdict. A 3 h old observation is stale
+        however the wall clock was set back, and a fresh one stays fresh after the wall clock jumps."""
+        g, op = self.reserved()
+        mono = [self.clock.t]
+        c = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: mono[0], boot_id=BOOT)
+        old = self.obs(mono=mono[0] - 3 * 3600)                   # the wall stamp `at` still reads "now"
+        with self.assertRaisesRegex(C.ContractError, "stale"):
+            c.dispatch(op["key"], old, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
+                       mirror_read_back=True)
+        fresh = self.obs(at=self.clock.t + 3600, mono=mono[0] - 30)   # wall clock ahead by an hour
+        self.clock.t -= 7200                                           # then set back two hours
+        op = c.dispatch(op["key"], fresh, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
+                        mirror_read_back=True)
+        self.assertEqual(op["state"], "dispatched")
+
+    def test_stamp_uses_this_boot_and_the_real_monotonic_clock(self):
+        c = C.Contracts(self.db, self.log)
+        o = c.stamp({"tip": BASE})
+        self.assertEqual((o["tip"], o["boot"]), (BASE, c.boot_id))
+        self.assertTrue(c.boot_id.startswith(("linux:", "process:")), c.boot_id)
+        c._fresh(o)                                                      # fresh as stamped
+        with self.assertRaisesRegex(C.ContractError, "another boot"):
+            C.Contracts(self.db, self.log, boot_id="linux:another-boot")._fresh(o)
+        if c.boot_id.startswith("process:"):           # no kernel boot id: another process's stamp is stale
+            with self.assertRaisesRegex(C.ContractError, "another boot"):
+                C.Contracts(self.db, self.log)._fresh(o)
+        with self.assertRaisesRegex(C.ContractError, "stale"):
+            c._fresh(dict(o, mono=o["mono"] - C.Contracts.OBSERVATION_SECONDS))
+
     def test_e02_every_guard_is_checked_and_nothing_counts_on_refusal(self):
         g, op = self.reserved()
         bad = {"kill switch": self.obs(kill_switch=True), "kill switch unread": self.obs(kill_switch=None),
@@ -491,7 +582,12 @@ class OperationTests(Base):
                "behind": self.obs(compare="behind"), "compare unread": self.obs(compare=None),
                "red check": self.obs(checks_green=False),
                "stale": self.obs(at=self.clock.t - C.Contracts.OBSERVATION_SECONDS),
-               "future": self.obs(at=self.clock.t + 1), "no time": self.obs(at=None), "bool time": self.obs(at=True)}
+               "future": self.obs(at=self.clock.t + 1), "no time": self.obs(at=None), "bool time": self.obs(at=True),
+               # D-a3: the age is the monotonic stamp's, whatever the wall-clock stamp says
+               "mono stale, wall fresh": self.obs(mono=self.clock.t - C.Contracts.OBSERVATION_SECONDS),
+               "mono future": self.obs(mono=self.clock.t + 1), "no mono": self.obs(mono=None),
+               "bool mono": self.obs(mono=True), "mono as text": self.obs(mono=str(self.clock.t)),
+               "other boot": self.obs(boot="another-boot"), "no boot": self.obs(boot=None)}
         for name, o in bad.items():
             with self.subTest(name), self.assertRaises(C.ContractError):
                 self.c.dispatch(op["key"], o, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
@@ -612,6 +708,50 @@ class OperationTests(Base):
         self.assertEqual(self.c.fence(op["key"], "no-response", [ok1, ok2], expected_version=op["version"],
                                       event_id=self.ev())["state"], "fenced")
 
+    def test_e13_monotonic_wall_jump_forward_does_not_shorten_the_wait(self):
+        """goodqa#16193, spec owner T-2: E13's delays are measured on the monotonic clock. Here the wall clock
+        jumps forward an hour right after the dispatch while only 30 s pass on the monotonic clock."""
+        mono = [self.clock.t]
+        self.c = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: mono[0], boot_id=BOOT)
+        g, op = self.dispatched()
+        sent = mono[0]
+        self.clock.t += 3600                                         # wall: an hour later
+        mono[0] = sent + 90
+        # by their wall stamps these reads are an hour after the dispatch and 60 s apart: wall time would accept them
+        early = [self.read(at=self.clock.t - 60, mono=sent + 30), self.read(mono=sent + 90)]
+        with self.assertRaisesRegex(C.ContractError, "at least 2 min"):
+            self.c.fence(op["key"], "no-response", early, expected_version=op["version"], event_id=self.ev())
+        mono[0] = sent + C.E13_FIRST_READ_SECONDS + C.E13_READ_GAP_SECONDS
+        ok = [self.read(mono=sent + C.E13_FIRST_READ_SECONDS), self.read(mono=mono[0])]
+        self.assertEqual(self.c.fence(op["key"], "no-response", ok, expected_version=op["version"],
+                                      event_id=self.ev())["state"], "fenced")
+
+    def test_e13_monotonic_a_restart_restarts_the_wait(self):
+        g, op = self.dispatched()
+        sent = self.clock.t
+        # restarted onto another boot: its monotonic clock starts near zero, the dispatch's stamp means nothing
+        boot2, mono = "boot-after-restart", [5.0]
+        c2 = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: mono[0], boot_id=boot2)
+
+        def read2(m, **kw):
+            return self.read(mono=m, boot=boot2, **kw)
+        mono[0] = 500.0                  # both reads would be 2 min "after the dispatch" if old stamps counted
+        late = [read2(440.0), read2(500.0)]
+        self.clock.t = sent + 1000
+        with self.assertRaisesRegex(C.ContractError, "restart"):
+            c2.fence(op["key"], "no-response", late, expected_version=op["version"], event_id=self.ev())
+        row = c2._row("operations", "key", op["key"])
+        self.assertEqual((row["wait_boot"], row["wait_mono"], row["version"]), (boot2, 500.0, op["version"]),
+                         "the wait restarted at the restart's own stamp; bookkeeping, no version change")
+        with self.assertRaises(C.ContractError):                      # the old boot's reads are stale here
+            c2.fence(op["key"], "no-response", [self.read(), self.read()], expected_version=op["version"],
+                     event_id=self.ev())
+        mono[0] = 500.0 + C.E13_FIRST_READ_SECONDS + C.E13_READ_GAP_SECONDS
+        ok = [read2(500.0 + C.E13_FIRST_READ_SECONDS), read2(mono[0])]
+        self.assertEqual(c2.fence(op["key"], "no-response", ok, expected_version=op["version"],
+                                  event_id=self.ev())["state"], "fenced")
+        self.assertEqual(c2.e13_wait_start(op["key"]), 500.0, "a second call on the same boot keeps the stamp")
+
     def test_e13_a_fenced_op_never_yields_a_new_grant_or_generation(self):
         g, op = self.fenced()
         self.assertEqual(self.c.intend(self.params(), lease_ok=True, event_id=self.ev())["key"], op["key"],
@@ -685,7 +825,7 @@ class OperationTests(Base):
             self.c.confirm(op["key"], self.readback(), expected_version=op["version"], event_id=self.ev())
         for actor in ("ahc-core", "reconcile"):
             with self.subTest(actor), self.assertRaises(C.ContractError):
-                self.c.settle_held(op["key"], {"at": self.clock.t, "tip": OTHER}, expected_version=op["version"],
+                self.c.settle_held(op["key"], stamped({"at": self.clock.t, "tip": OTHER}), expected_version=op["version"],
                                    event_id=self.ev(), actor=actor)
         op = self.c.settle_held(op["key"], {"note": "PR closed by hand; outcome unknown"},
                                 expected_version=op["version"], event_id=self.ev(), actor="main")
