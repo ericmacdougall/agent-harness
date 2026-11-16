@@ -122,6 +122,129 @@ QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
+# goodqa#16124: an operand that is only a file name (test/qac-kill-switch-ceiling.test.ts) is not signalling.
+PATH_OPERAND_EXTS = ('.ts', '.tsx', '.js', '.mjs', '.py', '.go', '.rs')
+PATH_OPERAND_CHARS = re.compile(r'[A-Za-z0-9_.@+/-]+')
+
+
+def path_operand(word, kill_re):
+    """True when `word` is a plain path-shaped operand whose kill word, if any, is only part of a file name: a literal
+    word (unquoted, no expansion, glob or substitution) of path characters, not an option, whose last component ends
+    in a listed test or source extension, or which has a '/' and whose last component holds no kill word. So
+    `test/qac-kill-switch.test.ts` and `kill-notes/README` pass; `pkill`, `/usr/bin/pkill`, `bin/kill`,
+    `scripts/kill-all.sh`, `'kill 4242'` and `--script=x/kill.py` do not. Where the word sits is decided by the
+    caller (test_runner_exemptions); this only judges its shape."""
+    text = word.text
+    if word.dynamic or word.subs or word.glob or word.quoted or word.raw != text:
+        return False
+    if not text or text.startswith('-') or not PATH_OPERAND_CHARS.fullmatch(text):
+        return False
+    base = text.rsplit('/', 1)[-1]
+    if not base:
+        return False
+    if base.lower().endswith(PATH_OPERAND_EXTS):
+        return True
+    return '/' in text and not kill_re.search(base)
+
+
+# PR 265 rescue (receipts v1 and v2): the exemption is an allowlist. A test path is exempt only when the WHOLE
+# interpreter command is one of the exact test-runner lines below; any other word, option, wrapper, runner or
+# subcommand anywhere in the command means no exemption, and the full script-kill scan applies. There is no generic
+# wrapper or runner parsing: unknown means scan.
+PYTHON_TEST_FLAGS = frozenset(('-I', '-u', '-B'))  # python3 -I lanes/pgpool.py ...: flags that take no value
+PGPOOL_SCRIPT = re.compile(r'(?:.*/)?lanes/pgpool\.py')
+PGPOOL_RUN_OPTS = frozenset(('--job', '--lane', '--ttl', '--mode', '--template', '--database'))  # each takes a value
+DBTEST_SCRIPT = re.compile(r'dbtest-any\.sh|(?:/|~/)[A-Za-z0-9_.@+/-]*/dbtest-any\.sh')
+TEST_DIRS = frozenset(('test', 'tests', '__tests__'))
+
+
+def plain_word(word):
+    """A literal word: no expansion, substitution, glob or brace alternatives, so the shell passes exactly this one
+    word and the grammar's slot count is the real argv count."""
+    return (not (word.dynamic or word.subs or word.glob) and bool(word.text) and len(word.alts) == 1
+            and word.overflow is None)
+
+
+def is_test_path(word, kill_re):
+    """A test-file operand: a path_operand that is a relative path written only with plain names (no leading `/`,
+    no empty, `.` or `..` component; path_operand already refuses `~`, quotes and expansions), that has a test/,
+    tests/ or __tests__/ directory component, and whose file name is test-shaped (`.test.`, `.spec.`, `test_` or
+    `test-`). PR 265 review v3: `tests/../tools/kill-all.js` names a file outside the test directory, so it is not
+    a test path. `tools/kill-all.ts`, `tools/kill-all.test.ts` and `tests/kill-all.py` are not test paths either,
+    so a runner given them keeps the full scan. A symlink inside a test directory cannot be seen statically."""
+    if not path_operand(word, kill_re):
+        return False
+    text = word.text
+    if text.startswith('/'):
+        return False
+    parts = text.split('/')
+    if any(p in ('', '.', '..') for p in parts):
+        return False
+    base = parts[-1].lower()
+    return (any(p in TEST_DIRS for p in parts[:-1])
+            and ('.test.' in base or '.spec.' in base or base.startswith(('test_', 'test-'))))
+
+
+def _test_paths(args, i, kill_re):
+    """Indexes of args[i:] when every one of them (at least one) is a test path, else None."""
+    if i >= len(args) or not all(is_test_path(a, kill_re) for a in args[i:]):
+        return None
+    return set(range(i, len(args)))
+
+
+def _pgpool_inner(args, i, kill_re):
+    """The command after pgpool's `--`, which must be exactly one of:
+    `[~/|/...]dbtest-any.sh WT LOG TEST [-t NAME]`, `npx [-y] vitest run TEST...` or
+    `pnpm --filter PKG exec vitest run TEST...`. Only TEST words are exempt; WT, LOG, PKG and NAME stay scanned."""
+    texts = [a.text for a in args]
+    rest = texts[i:]
+    if rest and DBTEST_SCRIPT.fullmatch(rest[0]):
+        if len(rest) not in (4, 6) or rest[1].startswith('-') or rest[2].startswith('-'):
+            return None
+        if len(rest) == 6 and rest[4] != '-t':
+            return None
+        test = i + 3
+        return {test} if is_test_path(args[test], kill_re) else None
+    if rest[:2] == ['npx', 'vitest'] and rest[2:3] == ['run']:
+        return _test_paths(args, i + 3, kill_re)
+    if rest[:3] == ['npx', '-y', 'vitest'] and rest[3:4] == ['run']:
+        return _test_paths(args, i + 4, kill_re)
+    if len(rest) > 6 and rest[0] == 'pnpm' and rest[1] == '--filter' and not rest[2].startswith('-') \
+            and rest[3:6] == ['exec', 'vitest', 'run']:
+        return _test_paths(args, i + 6, kill_re)
+    return None
+
+
+def test_runner_exemptions(name, args, kill_re):
+    """goodqa#16124: the indexes of `args` (the words after interpreter `name`) that are test paths of one of these
+    exact lines, and so are file names rather than signalling code:
+      G1 python3 [-I|-u|-B]... lanes/pgpool.py run [--job|--lane|--ttl|--mode|--template|--database V]... -- INNER
+         (INNER as _pgpool_inner says)
+      G2 python3 [-I|-u|-B]... -m pytest TEST...
+      G3 node --test TEST...
+    Every word must be literal (plain_word). Anything else returns the empty set, which keeps the full scan."""
+    if kill_re is None or not args or not all(plain_word(a) for a in args):
+        return set()
+    texts = [a.text for a in args]
+    if name.startswith('python'):
+        i = 0
+        while i < len(texts) and texts[i] in PYTHON_TEST_FLAGS:
+            i += 1
+        if texts[i:i + 2] == ['-m', 'pytest']:
+            return _test_paths(args, i + 2, kill_re) or set()  # G2
+        if i + 1 < len(texts) and PGPOOL_SCRIPT.fullmatch(texts[i]) and texts[i + 1] == 'run':  # G1
+            i, seen = i + 2, set()
+            while i < len(texts) and texts[i] in PGPOOL_RUN_OPTS and texts[i] not in seen:
+                if i + 1 >= len(texts) or texts[i + 1].startswith('-'):
+                    return set()
+                seen.add(texts[i])
+                i += 2
+            if i < len(texts) and texts[i] == '--':
+                return _pgpool_inner(args, i + 1, kill_re) or set()
+        return set()
+    if name == 'node' and texts[:1] == ['--test']:
+        return _test_paths(args, 1, kill_re) or set()  # G3
+    return set()
 RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
@@ -1519,6 +1642,11 @@ def make_analyzer_class(cg):
             return '--pid' in seen and '--reason' in seen
 
         def check_interpreter(self, name, texts, cmd, args=None):
+            if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
+                skip = test_runner_exemptions(name, args, self.script_kill)
+                if skip:
+                    keep = [k for k in range(len(args)) if k not in skip]
+                    texts, args = [texts[k] for k in keep], [args[k] for k in keep]
             texts = self.drop_script_arguments(texts, args)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
