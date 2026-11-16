@@ -13,11 +13,13 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 import ahc_clock
 import ahc_fs as fs
+import ahc_scan
 from ahc_crash import crash_after, crash_before
 
 # The attached spec these tables implement: M-1 v2g16 (goodqa#16049, attach comment 1a9b9eaf). The vendored copy of
@@ -336,6 +338,8 @@ class Contracts:
         "W27": (("merge-ready",), ("pr-gate",), "ahc-core"),
     }
     WI_TERMINAL = tuple(s for s, (cls, _o, _a) in WI_STATES.items() if cls == "terminal")
+    FINISHED = WI_TERMINAL + ("merged",)          # goodqa#16204: a row of such an item is inert
+    INERT_FROM = ("required", "queued", "infra-wait")
     # T7: an Effect in one of these states is unsettled. The spec lists dispatched, outcome-unknown, held and fenced;
     # absent-proven is unsettled too (spec owner ruling, note 8: E7 can re-dispatch it). intent is not: an unsent
     # intent is abandoned by E9 when the item leaves merge-ready.
@@ -412,14 +416,31 @@ class Contracts:
             self._a0("work_item", iid, None, "pr-gate", event_id, actor, row="W1")
             return self._row("work_items", "id", iid)
 
-    @staticmethod
-    def _finding_ids(receipt):
+    # AC-9 (goodqa#16204 item 4): a finding id is a short token, and a receipt names at most 64 of them
+    FINDING_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,31}")
+    FINDING_IDS_MAX = 64
+
+    @classmethod
+    def finding_ids(cls, raw):
+        """(kept, dropped): the ids that match FINDING_ID in full, in order, up to the 64th; everything else (a
+        non-string, an id over 32 characters, one holding a space, or any id after the 64th) is dropped and
+        counted, so the caller can flag it."""
+        kept, dropped = [], 0
+        for i in raw if isinstance(raw, list) else ():
+            if isinstance(i, str) and cls.FINDING_ID.fullmatch(i) and len(kept) < cls.FINDING_IDS_MAX:
+                kept.append(i)
+            else:
+                dropped += 1
+        return kept, dropped
+
+    @classmethod
+    def _finding_ids(cls, receipt):
         """The finding ids a findings receipt names (its `finding_ids` list); anything malformed names none."""
         try:
             ids = json.loads(receipt).get("finding_ids") if receipt else None
         except (ValueError, AttributeError):
             return []
-        return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
+        return cls.finding_ids(ids)[0]
 
     def _item_effects(self, item):
         return self.db.execute("SELECT key, state, version FROM operations WHERE item=? AND head=?",
@@ -446,9 +467,29 @@ class Contracts:
         return obs
 
     def _wi_notice(self, event_id, item, row_id, kind, text):
-        """An escalation written in the row's own transaction (T3); delivery is the outbox's job (H5, later)."""
+        """AC-14: the one egress chokepoint. Every outward text (a row's notices, E12's PR comment, the digest
+        lines) is written here, in the row's own transaction (T3), and only after the R5 scan. An exposure is never
+        stored: the quarantine row records that it happened and an incident (without the text) takes its place. A
+        prefix-only finding restricts the text to structured fields. Delivery reads only this table, and in this
+        slice goes only to the shadow digest (ahc_shadow.deliver_digest)."""
+        now = self.now()
+        findings = ahc_scan.scan_report(str(text).encode("utf-8", "replace"), path="notice")
+        tier = ahc_scan.verdict(findings)
+        if tier["action"] == ahc_scan.QUARANTINE:
+            reason = "R5 quarantined the %s notice of %s (%d exposure(s)); text withheld" % (kind, row_id,
+                                                                                           tier["exposures"])
+            self.db.execute("INSERT OR IGNORE INTO wi_quarantine(event_id, item, row_id, kind, reason, created) "
+                            "VALUES (?,?,?,?,?,?)", (event_id, item["id"], row_id, kind, reason, now))
+            self.db.execute("INSERT OR IGNORE INTO wi_notices(event_id, item, row_id, kind, text, created) "
+                            "VALUES (?,?,?,?,?,?)", ("r5:%s:%s" % (event_id, kind), item["id"], row_id, "incident",
+                                                     reason, now))
+            return None
+        if tier["action"] == ahc_scan.RESTRICT:
+            text = "%s notice of %s restricted to structured fields by R5: %s" % (
+                kind, row_id, ahc_scan.render_structured(findings))
         self.db.execute("INSERT INTO wi_notices(event_id, item, row_id, kind, text, created) VALUES (?,?,?,?,?,?)",
-                        (event_id, item["id"], row_id, kind, text, self.now()))
+                        (event_id, item["id"], row_id, kind, text, now))
+        return text
 
     # NEG-6 protected paths (spec M-1 v2g16). A pattern without a slash matches the file name at any depth; one
     # with a slash matches the full path from the repo root. Renames are checked on both paths (the caller lists
@@ -633,6 +674,26 @@ class Contracts:
                      obs=obs.get("id") if isinstance(obs, dict) else None)
             return self._row("work_items", "id", iid)
 
+    def inert_rows(self, iid):
+        """AC-9: the item's review rows that wait for an attempt (required, queued, infra-wait) while the item is
+        finished (terminal or merged). Such a row is never offered (ahc_shadow.ReviewScheduler)."""
+        item = self._row("work_items", "id", iid)
+        if item is None or item["state"] not in self.FINISHED:
+            return []
+        return self.db.execute("SELECT id, kind, state FROM reviews WHERE item=? AND state IN (%s) ORDER BY kind, id"
+                               % ",".join("?" * len(self.INERT_FROM)), (iid,) + self.INERT_FROM).fetchall()
+
+    def offerable_rows(self, limit=None):
+        """AC-9 (goodqa#16204 item 2): queued review rows the scheduler may offer, oldest first. A row whose item
+        is finished (terminal or merged), or whose row is blocked by startup reconciliation (AC-13, NEG-49), is
+        never offered, so it never takes an attempt slot or loops on start_attempt's inert refusal."""
+        rows = self.db.execute(
+            "SELECT r.id FROM reviews r JOIN work_items w ON w.id = r.item WHERE r.state='queued' AND w.state NOT IN "
+            "(%s) AND r.id NOT IN (SELECT row FROM review_blocks) ORDER BY r.updated, r.id"
+            % ",".join("?" * len(self.FINISHED)), self.FINISHED).fetchall()
+        rows = [self._row("reviews", "id", rid) for (rid,) in rows]
+        return rows if limit is None else rows[:limit]
+
     def _wi_successor(self, item, new_head, packet_sha256, event_id):
         """W4 and W24: the successor item at H' (W1). It never inherits this item's grant, Effect or Review rows;
         under W4 this item's open Review rows for H go to superseded or, while an attempt may run, cancelling."""
@@ -724,7 +785,15 @@ class Contracts:
             self._wi_notice(event_id, item, row_id, "ticket", "closed without integration at %s" % item["head"])
         elif row_id == "W14":
             self._wi_notice(event_id, item, row_id, "incident", "PR shows merged; no confirmed ahc Effect made it")
-        elif row_id == "W18" and not self.db.execute(
+        if row_id in self.WI_TRANSITIONS and self._row("work_items", "id", item["id"])["state"] in self.FINISHED:
+            # AC-9 (goodqa#16204 item 3): rows the finished item leaves required, queued or in infra-wait are inert;
+            # the digest names them with the item's actual state, never as queued
+            inert = self.inert_rows(item["id"])
+            if inert:
+                state = self._row("work_items", "id", item["id"])["state"]
+                self._wi_notice("inert:%s" % event_id, item, "inert", "digest", "; ".join(
+                    "review %s %s: inert: item %s" % (kind, rid, state) for rid, kind, _s in inert))
+        if row_id == "W18" and not self.db.execute(
                 "SELECT 1 FROM operations WHERE repo=? AND state='confirmed' AND head=? AND base=?",
                 (item["repo"], obs["tip"], item["base"])).fetchone():
             # L1, L2: a move no confirmed ahc Effect explains (read from the ledger, never from the caller)
@@ -1452,6 +1521,13 @@ class Contracts:
             new = self._op_move(key, "confirmed", expected_version, event_id, actor,
                                 {"evidence": _canon(obs), "pr_unmarked": 1 if unmarked else 0})
             self._claim(new, obs, "confirm")
+            if unmarked and new["item"]:
+                # E12: a digest line, and ahc's PR comment with H's sha. Both go through the outbox (AC-14); the
+                # comment is written there and never delivered in this slice (no PR comment in shadow).
+                owner = {"id": new["item"]}
+                text = "integrated at %s by %s; the PR did not show merged within 10 min" % (new["head"], key)
+                self._wi_notice("e12:%s" % key, owner, "E12", "ticket", "ahc PR comment: " + text)
+                self._wi_notice("e12:%s" % key, owner, "E12", "digest", text)
             return new
 
     def absent(self, key, proof, evidence, *, expected_version, event_id):

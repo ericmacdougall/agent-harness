@@ -174,6 +174,43 @@ ENTRIES.update({
              "            return max(0.0, float(self._wall()) - float(mono))\n")], CLOCK)]},
 })
 
+EG = "tests.test_ahc_runner.EgressTests."
+SM = "tests.test_ahc_runner.StateMachineTests."
+SHADOW = "harness/hooks/ahc_shadow.py"
+ENTRIES.update({
+    "AC-14/NEG-31 chokepoint scan": {
+        "tests": [EG + "test_w03_notice_with_a_runtime_token_is_quarantined",
+                  EG + "test_every_notice_kind_with_an_embedded_token_is_quarantined"],
+        "mutations": [("a notice is written without the R5 scan (the chokepoint bypassed)", [
+            ('        if tier["action"] == ahc_scan.QUARANTINE:\n            reason = "R5 quarantined',
+             '        if False:\n            reason = "R5 quarantined')], CONTRACTS)]},
+    "AC-14 delivery rescans": {
+        "tests": [EG + "test_delivery_rescans_a_row_written_around_the_chokepoint"],
+        "mutations": [("delivery writes a row without scanning it again", [
+            ('            if tier["action"] != ahc_scan.CLEAN:\n', '            if False:\n')], SHADOW)]},
+    "AC-14 E12 comment in the outbox": {
+        "tests": [EG + "test_e12_comment_is_written_to_the_outbox_and_delivered_only_to_the_digest"],
+        "mutations": [("E12 writes no comment or digest line", [
+            ('            if unmarked and new["item"]:\n', '            if False:\n')], CONTRACTS)]},
+    "AC-9/NEG-25 scheduler skips finished items": {
+        "tests": [SM + "test_b_scheduler_skips_rows_of_a_finished_item"],
+        "mutations": [("the scheduler offers rows of finished items", [
+            ('            % ",".join("?" * len(self.FINISHED)), self.FINISHED).fetchall()\n',
+             '            % "?", ("none",)).fetchall()\n')], CONTRACTS)]},
+    "AC-9 status shows inert rows": {
+        "tests": [SM + "test_b_status_and_digest_show_inert_rows"],
+        "mutations": [("status shows the row's own state", [
+            ('        return "inert: item %s" % owner["state"]\n', '        return row["state"]\n')], SHADOW),
+                      ("the digest gets no inert line", [
+            ("            if inert:\n                state = ", "            if False:\n                state = ")],
+             CONTRACTS)]},
+    "AC-9/NEG-25 finding id rule": {
+        "tests": [SM + "test_b_findings_producer_writes_finding_ids"],
+        "mutations": [("any non-empty string is a finding id, with no cap", [
+            ("            if isinstance(i, str) and cls.FINDING_ID.fullmatch(i) and len(kept) < cls.FINDING_IDS_MAX:\n",
+             "            if isinstance(i, str) and i:\n")], CONTRACTS)]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")

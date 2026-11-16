@@ -2,14 +2,16 @@
  "files": {
   "ahc_clock.py": "c9c538e56a192c5c81127a3931cea29ca14f9544591bef39671647e1e5ad6005",
   "ahc_clone.py": "b0c8d4a804ba8dfe881184fdf02c13b2ac0f31c2329d10627860fe8a2ba0b810",
-  "ahc_contracts.py": "30ac73a3934da8b74049e01032512550d4205f9004f817149e073be60f9b33b2",
+  "ahc_contracts.py": "2fd8741d5f96711ecdd21d94044f143f1a506398a741c2863e07e36d05623762",
   "ahc_core.py": "46f56614400cd66fba17a104daeca6f54df90a72a45be76c42f67c6404cd494e",
   "ahc_crash.py": "e9e2c7fd1121a4edd5d662fbf62b22501a075e6cdfdb9ae0da945643fbe94e69",
   "ahc_fs.py": "cfffa4a962c7286aacd69be1215669bf54c087bc91655af5cf3968a58c5a9a90",
   "ahc_install.py": "4c3514f3df7d99a5f22a10fb6f3faace921d1a20b4b31ae51833a505c923f4cd",
   "ahc_migrate.py": "e84130b3128e18e456ddd1cb07e5f40a19c7325fa1489748954bd615bcc61593",
   "ahc_packet.py": "0c6e8fd1440c79ec3050c2f8c7945112e9c227335696e7b2bb9be146e3d352a4",
-  "ahc_runner.py": "d0dd85b7576aad17db6e8791399caaaf26837337b0de4955bde4663d4f48cc46"
+  "ahc_runner.py": "d0dd85b7576aad17db6e8791399caaaf26837337b0de4955bde4663d4f48cc46",
+  "ahc_scan.py": "30b001910cf78995fd0b94e6c9bf88a0abeb3bbc5de161d386ebaa585b9d829b",
+  "ahc_shadow.py": "77b744afcb175fd85e1415f972b07ea2679e72cf89d1c46a6a7a735699a26a17"
  },
  "note": "v5 entry-point sha256 list; regenerate with scripts/ahc_release_hashes.py"
 }
