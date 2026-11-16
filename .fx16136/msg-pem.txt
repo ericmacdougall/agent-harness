@@ -1,0 +1,13 @@
+docs(fx16136): draft the goodqa#16148 private-key spec v1
+
+Why: main chose the file-mounted secret design (2b, via the lead) for the intelligence worker's GitHub App key; the spec needs two reviews before any build.
+
+What: .fx16136/spec-16148-pem.md (lint PASS, core 1f8408d2): host-side derive script, read-only dispatcher mount, per-launch JOB_ENV_KIND__VAR_FILE injection failing closed per kind with 501, release wiring, rotation, and a fake-key no-value proof; fix_pem_spec.py.
+
+Testing: not run: spec only; `spec_flow.py lint` PASS.
+
+Refs: GoodQA #16148
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
