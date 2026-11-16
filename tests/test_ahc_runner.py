@@ -3850,8 +3850,203 @@ class StateMachineTests(TC.Base):
         with self.assertRaisesRegex(C.ContractError, "T7"):
             self.move("W16", to="pr-gate", actor="main")
 
+    # ---- ELIG, the merge queue and the rows that read it (step 5)
+
+    def eligible(self, item=None, **changes):
+        """A fresh ELIG observation under which every clause holds for `item`."""
+        item = item or self.c._row("work_items", "id", self.item["id"])
+        o = self.pr(pr=item["pr"], pr_head=item["head"], tip=item["base"], draft=False, compare="ahead",
+                    b_r_ancestors={item["base"]: True}, attached_core=item["spec_core"], open_findings=0,
+                    paths=["harness/lib/x.py"], foreign_closing_keyword=False,
+                    policy={"revision": item["policy_revision"], "readable": True, "allowlisted": True,
+                            "enabled": True, "checks_green": True},
+                    kill_switch=False, chk_cas=True, canary_age=3600)
+        o.update(changes)
+        return o
+
+    def pass_reviews(self, item=None):
+        self.db.execute("UPDATE reviews SET state='passed' WHERE item=?", ((item or self.item)["id"],))
+
+    def test_w02_elig_holds_only_when_every_clause_does(self):
+        with self.assertRaisesRegex(C.ContractError, "e1, e2"):
+            self.move("W2", obs=self.eligible())                   # the Review rows have not passed
+        self.pass_reviews()
+        pol = dict(self.eligible()["policy"])
+        cases = {
+            "e1": [dict(pr_head=TC.H2), dict(b_r_ancestors={}), dict(b_r_ancestors={TC.BASE: "yes"}),
+                   dict(policy=dict(pol, revision="policy-r2"))],
+            "e2": [dict(attached_core=TC.CORE2)],
+            "e3": [dict(open_findings=1), dict(open_findings=True), dict(open_findings=None)],
+            "e4": [dict(paths=[".claude/settings.json"]), dict(paths=[]), dict(paths="x.py"),
+                   dict(foreign_closing_keyword=True), dict(foreign_closing_keyword=None)],
+            "e5": [dict(policy=dict(pol, enabled=False)), dict(policy=dict(pol, checks_green="true")),
+                   dict(policy=dict(pol, allowlisted=None)), dict(policy=None)],
+            "e6": [dict(kill_switch=True), dict(kill_switch=None)],
+            "e8": [dict(draft=True), dict(pr_state="CLOSED")],
+            "e9": [dict(chk_cas=False), dict(canary_age=86400), dict(canary_age=None), dict(canary_age=True)],
+            "e10": [dict(compare="behind"), dict(compare=None)],
+        }
+        for clause, variants in cases.items():
+            for v in variants:
+                with self.subTest(clause=clause, v=v):
+                    with self.assertRaisesRegex(C.ContractError, r"\b%s\b" % clause):
+                        self.move("W2", obs=self.eligible(**v))
+        self.c.CAP1_PER_DAY = 0                                        # e7: the day's CAP1 slots are spent
+        with self.assertRaisesRegex(C.ContractError, r"\be7\b"):
+            self.move("W2", obs=self.eligible())
+        del self.c.CAP1_PER_DAY
+        self.db.execute("INSERT INTO repo_flags VALUES ('o/r', 1, 'canary failed', 'ahc-core', 0)")
+        with self.assertRaisesRegex(C.ContractError, r"\be5\b"):
+            self.move("W2", obs=self.eligible())
+        self.db.execute("DELETE FROM repo_flags")
+        self.db.execute("INSERT INTO contract_meta VALUES ('authority_frozen', '1')")
+        with self.assertRaisesRegex(C.ContractError, r"\be6\b"):
+            self.move("W2", obs=self.eligible())
+        self.db.execute("DELETE FROM contract_meta WHERE k='authority_frozen'")
+        stale = self.eligible(at=self.clock.t - C.Contracts.OBSERVATION_SECONDS)
+        with self.assertRaisesRegex(C.ContractError, "e1, e2, e3, e4, e5, e6, e7, e8, e9, e10"):
+            self.move("W2", obs=stale)
+        item = self.move("W2", obs=self.eligible())
+        self.assertEqual((item["state"], item["elig_core"], item["elig_policy"]),
+                         ("merge-ready", TC.CORE1, TC.POLICY))
+
+    def test_neg6_protected_paths(self):
+        P = C.Contracts.protected_path
+        for path in (".claude/settings.json", "sub/dir/CLAUDE.md", ".github/workflows/ci.yml", ".codex/config.toml",
+                     "conftest.py", "tests/conftest.py", "a/CODEOWNERS", ".mcp.json", "harness/hooks/ahc_x.py",
+                     "docs/spec/ahc-m1-state-machine.md", "pyproject.toml", "../escape", "/abs", "", None):
+            with self.subTest(path=path):
+                self.assertTrue(P(path))
+        for path in ("harness/lib/x.py", "README.md", "docs/github/notes.md", "src/claude.py"):
+            with self.subTest(path=path):
+                self.assertFalse(P(path))
+        self.assertTrue(P("config/policy.json", extra=("config/policy.json",)))
+
+    def test_w05_and_w06_waiting_dep_and_back(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        with self.assertRaisesRegex(C.ContractError, "W5 needs"):
+            self.move("W5", obs=self.eligible())
+        with self.assertRaisesRegex(C.ContractError, "W5 needs"):
+            self.move("W5", obs=self.eligible(open_findings=1))      # e3 is not a W5 cause
+        ev = self.ev()
+        item = self.move("W5", obs=self.eligible(kill_switch=True), event_id=ev)
+        self.assertEqual((item["state"], item["cause"]), ("waiting-dep", "ELIG failed: e6"))
+        self.assertEqual(self.db.execute("SELECT kind FROM wi_notices WHERE event_id=?", (ev,)).fetchall(),
+                         [("ticket",)])
+        with self.assertRaisesRegex(C.ContractError, "e6"):
+            self.move("W6", obs=self.eligible(kill_switch=True))
+        self.assertEqual(self.move("W6", obs=self.eligible())["state"], "merge-ready")
+        self.assertEqual(self.move("W5", obs=self.eligible(mirror_ok=False))["state"], "waiting-dep")
+
+    def test_w17_protected_path_goes_to_main(self):
+        self.pass_reviews()
+        with self.assertRaisesRegex(C.ContractError, "e4"):
+            self.move("W17", obs=self.eligible())
+        for paths in ([".github/workflows/ci.yml"], ["ok.py", "sub/AGENTS.md"]):
+            with self.subTest(paths=paths):
+                self.at("pr-gate")
+                self.assertEqual(self.move("W17", obs=self.eligible(paths=paths))["state"], "waiting-ask")
+        self.assertEqual(C.Contracts.select_row(["W2", "W17"], False), "W17")
+
+    def test_w27_spec_core_change_fails_e2_and_replaces_the_spec_row(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        old_spec = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind='spec'",
+                                   (self.item["id"],)).fetchone()[0]
+        with self.assertRaisesRegex(C.ContractError, "changed"):
+            self.move("W27", obs=self.eligible())
+        changed = self.eligible(attached_core=TC.CORE2)
+        self.assertEqual(self.c.elig(self.c._row("work_items", "id", self.item["id"]), changed), ["e2"],
+                         "Q-A5.1: a spec-core change fails e2, not e1")
+        item = self.move("W27", obs=changed)
+        self.assertEqual((item["state"], item["spec_core"], item["policy_revision"]), ("pr-gate", TC.CORE2, TC.POLICY))
+        rows = dict(self.db.execute("SELECT id, state FROM reviews WHERE item=? AND kind='spec'", (item["id"],)))
+        self.assertEqual(rows[old_spec], "passed", "the old pass stays terminal")
+        new_spec = [r for r in rows if r != old_spec]
+        self.assertEqual([rows[r] for r in new_spec], ["required"])
+        self.assertEqual(self.c.elig(item, self.eligible(item)), ["e2"], "e2 fails until the new spec row passes")
+        self.db.execute("UPDATE reviews SET state='passed' WHERE id=?", (new_spec[0],))
+        self.assertEqual(self.c.elig(item, self.eligible(item)), [])
+        # the core attached now must be the item's own core: an older core's pass, still terminal, never counts
+        self.assertEqual(self.c.elig(item, self.eligible(item, attached_core=TC.CORE1)), ["e2"])
+
+    def test_neg18_a_missing_spec_row_fails_e2(self):
+        self.pass_reviews()
+        self.db.execute("DELETE FROM reviews WHERE item=? AND kind='spec'", (self.item["id"],))
+        item = self.c._row("work_items", "id", self.item["id"])
+        self.assertEqual(self.c.elig(item, self.eligible(item)), ["e2"])
+        with self.assertRaisesRegex(C.ContractError, r"\be2\b"):
+            self.move("W2", obs=self.eligible(item))
+
+    def test_w27_policy_change_fails_e1_and_replaces_every_row(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        pol = dict(self.eligible()["policy"], revision="policy-r2")
+        changed = self.eligible(policy=pol)
+        self.assertEqual(self.c.elig(self.c._row("work_items", "id", self.item["id"]), changed), ["e1"],
+                         "Q-A5.1: a policy change fails e1, not e2")
+        op = self.c.intend(self.params(), item=self.item["id"], lease_ok=True, event_id=self.ev())
+        item = self.move("W27", obs=changed)
+        self.assertEqual((item["state"], item["policy_revision"]), ("pr-gate", "policy-r2"))
+        kinds = sorted(self.db.execute("SELECT kind, state FROM reviews WHERE item=? AND policy_revision='policy-r2'",
+                                       (item["id"],)).fetchall())
+        self.assertEqual(kinds, [("adversarial", "required"), ("spec", "required")])
+        self.assertEqual(self.state("operations", "key", op["key"]), "abandoned", "E9")
+        self.assertEqual(self.c.elig(item, self.eligible(item)), ["e1", "e2"])
+
+    def test_w27_waits_under_t7(self):
+        self.pass_reviews()
+        self.move("W2", obs=self.eligible())
+        self.dispatched()
+        with self.assertRaisesRegex(C.ContractError, "T7"):
+            self.move("W27", obs=self.eligible(attached_core=TC.CORE2))
+
+    def queue_of(self, *items, **per_item):
+        return {i["id"]: self.eligible(self.c._row("work_items", "id", i["id"]), **per_item.get(i["id"], {}))
+                for i in items}
+
+    def test_queue_head_is_the_oldest_eligible_lineage(self):
+        self.pass_reviews()
+        self.clock.t += 1
+        newer = self.admit(pr=6)
+        self.pass_reviews(newer)
+        self.assertEqual(self.c.queue_head("o/r", self.queue_of(self.item, newer)), self.item["id"])
+        q = self.queue_of(self.item, newer, **{self.item["id"]: {"kill_switch": True}})
+        self.assertEqual(self.c.queue_head("o/r", q), newer["id"], "an ineligible older item is skipped")
+        q = self.queue_of(self.item, newer, **{self.item["id"]: {"compare": "behind"}})
+        self.assertEqual(self.c.queue_head("o/r", q), self.item["id"], "e10 is not required of the head")
+        self.assertEqual(self.c.queue_head("o/r", {newer["id"]: q[newer["id"]]}), newer["id"])
+
+    def test_w21_records_one_update_for_the_queue_head_and_sends_nothing(self):
+        self.pass_reviews()
+        self.clock.t += 1
+        newer = self.admit(pr=6)
+        self.pass_reviews(newer)
+        behind = {self.item["id"]: {"compare": "behind"}, newer["id"]: {"compare": "behind"}}
+
+        def w21_obs(**kw):
+            return self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=True, **kw)
+        with self.assertRaisesRegex(C.ContractError, "head"):
+            self.move("W21", item=newer, obs=dict(w21_obs(), pr=6))
+        with self.assertRaisesRegex(C.ContractError, "every item"):
+            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, **behind), mergeable=True))
+        with self.assertRaisesRegex(C.ContractError, "mergeable"):
+            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=None))
+        ahead = self.pr(queue=self.queue_of(self.item, newer), mergeable=True)
+        with self.assertRaisesRegex(C.ContractError, "behind"):
+            self.move("W21", obs=ahead)
+        before = len(self.log.records())
+        item = self.move("W21", obs=w21_obs())
+        self.assertEqual((item["state"], item["w21_base"]), ("pr-gate", TC.BASE))
+        recs = self.log.records()[before:]
+        self.assertEqual([(r["row"], r["expected_head_sha"], r["action"]) for r in recs],
+                         [("W21", TC.H1, "update-branch (recorded, not sent)")], "authority log first, no send")
+        with self.assertRaisesRegex(C.ContractError, "already recorded"):
+            self.move("W21", obs=w21_obs())
+
     def test_unwired_rows_fail_closed(self):
-        for row in ("W2", "W6", "W7", "W11", "W12", "W15", "W21", "W22", "W23"):
+        for row in ("W7", "W11", "W12", "W15", "W16", "W19", "W22", "W23"):
             src = C.Contracts.WI_TRANSITIONS[row][0][0]
             self.at(src)
             to = C.Contracts.WI_TRANSITIONS[row][1][0]
@@ -3886,9 +4081,9 @@ class StateMachineTests(TC.Base):
     PENDING_IDS = (
         "test_wi_pr_gate", "test_wi_merge_ready", "test_wi_waiting_dep", "test_wi_waiting_ask", "test_wi_exhausted",
         "test_wi_merged", "test_wi_headed_verified", "test_wi_handed", "test_wi_superseded", "test_wi_closed_unmerged",
-        "test_wi_cancelled", "test_w02", "test_w05", "test_w06", "test_w07", "test_w11", "test_w12",
-        "test_w15", "test_w16", "test_w17", "test_w19", "test_w21", "test_w22",
-        "test_w23", "test_w25", "test_w26", "test_w27")
+        "test_wi_cancelled", "test_w06", "test_w07", "test_w11", "test_w12",
+        "test_w15", "test_w16", "test_w19", "test_w22",
+        "test_w23", "test_w25", "test_w26")
 
 
 if __name__ == "__main__":

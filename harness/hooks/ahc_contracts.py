@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS work_items (
   id TEXT PRIMARY KEY, lineage TEXT NOT NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL,
   base TEXT NOT NULL, policy_revision TEXT NOT NULL, spec_core TEXT NOT NULL, packet_sha256 TEXT NOT NULL,
   state TEXT NOT NULL, marks TEXT NOT NULL DEFAULT '', successor TEXT, cause TEXT, version INTEGER NOT NULL,
-  created REAL NOT NULL, updated REAL NOT NULL,
+  created REAL NOT NULL, updated REAL NOT NULL, elig_core TEXT, elig_policy TEXT, w21_base TEXT,
   CHECK (state IN ('pr-gate', 'merge-ready', 'waiting-dep', 'waiting-ask', 'exhausted', 'merged',
                    'headed-verified', 'handed-to-staging', 'superseded', 'closed-unmerged', 'cancelled')),
   CHECK (marks IN ('', 'head-moved', 'closed-in-flight')));
@@ -287,7 +287,8 @@ class Contracts:
     GRANT_ROWS = ("G8", "G9")
     # Rows whose guard reads only ledger facts are applied here. Rows whose guard needs ELIG, an observation, a
     # budget or main's stamp are wired in later steps of slice 1 (a); until then they are refused (fail closed).
-    WI_WIRED = ("W3", "W4", "W8", "W9", "W10", "W13", "W14", "W18", "W20", "W24", "W25", "W26")
+    WI_WIRED = ("W2", "W3", "W4", "W5", "W6", "W8", "W9", "W10", "W13", "W14", "W17", "W18", "W20", "W21", "W24",
+                "W25", "W26", "W27")
     PR_STATES = ("OPEN", "CLOSED", "MERGED")
 
     @classmethod
@@ -377,6 +378,101 @@ class Contracts:
         self.db.execute("INSERT INTO wi_notices(event_id, item, row_id, kind, text, created) VALUES (?,?,?,?,?,?)",
                         (event_id, item["id"], row_id, kind, text, self.now()))
 
+    # NEG-6 protected paths (spec M-1 v2g16). A pattern without a slash matches the file name at any depth; one
+    # with a slash matches the full path from the repo root. Renames are checked on both paths (the caller lists
+    # both). The policy file and the test configuration files named under Required checks are added per repo by
+    # the policy record (`extra_protected`).
+    NEG6 = ("merge_gate*", "peer_review*", "caller_identity*", "usage_guard*", "commit_policy*", "ahc*",
+            "settings*.json", "hooks_manifest.json", ".github/**", "CODEOWNERS", ".claude/**", ".mcp.json",
+            ".codex/**", "CLAUDE.md", "AGENTS.md", "conftest*", "pytest.ini", "setup.cfg", "tox.ini",
+            "pyproject.toml", "tests/__init__.py")
+
+    @classmethod
+    def protected_path(cls, path, extra=()):
+        import fnmatch
+        if not isinstance(path, str) or not path or path.startswith("/") or ".." in path.split("/"):
+            return True                                               # an unreadable path counts as protected
+        name = path.rsplit("/", 1)[-1]
+        for pat in cls.NEG6 + tuple(extra):
+            if pat.endswith("/**"):
+                if path.startswith(pat[:-2]):
+                    return True
+            elif "/" in pat:
+                if fnmatch.fnmatchcase(path, pat):
+                    return True
+            elif fnmatch.fnmatchcase(name, pat):
+                return True
+        return False
+
+    ELIG_FIELDS = ("pr_state", "pr_head", "draft", "tip", "compare", "b_r_ancestors", "attached_core",
+                   "open_findings", "paths", "foreign_closing_keyword", "policy", "kill_switch", "chk_cas",
+                   "canary_age")
+
+    def elig(self, item, obs, skip=()):
+        """ELIG (spec M-1 v2g16), one definition for W2, W6, the queue head and (b)'s G1/E2. Returns the failed
+        clauses, empty when ELIG holds. Ledger facts are read here, inside the caller's transaction (T1); GitHub,
+        GoodQA and policy facts come from one fresh observation row (T2). Every clause fails closed: a missing,
+        malformed or stale field fails its clause, never passes it."""
+        failed = []
+        try:
+            o = self._wi_obs(item, obs, *self.ELIG_FIELDS)
+        except ContractError:
+            return ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10"]
+        head, tip = item["head"], o["tip"]
+        pol = o["policy"] if isinstance(o["policy"], dict) else {}
+        # e1: every required code Review row passed for (H, packet, policy revision); each B_r an ancestor of B
+        code = self.db.execute("SELECT state, snapshot_base, packet_sha256, policy_revision FROM reviews WHERE "
+                               "item=? AND head=? AND kind IN ('adversarial', 'red-team') AND policy_revision=? "
+                               "AND packet_sha256=?", (item["id"], head, item["policy_revision"],
+                                                      item["packet_sha256"])).fetchall()
+        anc = o["b_r_ancestors"] if isinstance(o["b_r_ancestors"], dict) else {}
+        if (not code or o["pr_head"] != head or pol.get("revision") != item["policy_revision"]
+                or any(s != "passed" or anc.get(br) is not True for s, br, _p, _r in code)):
+            failed.append("e1")
+        # e2: the spec row for the spec core attached NOW has passed
+        spec = self.db.execute("SELECT state FROM reviews WHERE item=? AND head=? AND kind='spec' AND spec_core=?",
+                               (item["id"], head, o["attached_core"])).fetchall()
+        if o["attached_core"] != item["spec_core"] or [s for (s,) in spec] != ["passed"]:
+            failed.append("e2")
+        if o["open_findings"] != 0 or isinstance(o["open_findings"], bool):
+            failed.append("e3")
+        paths = o["paths"]
+        if (not isinstance(paths, list) or not paths or o["foreign_closing_keyword"] is not False
+                or any(self.protected_path(p, pol.get("extra_protected", ())) for p in paths)):
+            failed.append("e4")
+        flags = self.db.execute("SELECT merging_off FROM repo_flags WHERE repo=?", (item["repo"],)).fetchone()
+        if (pol.get("readable") is not True or pol.get("allowlisted") is not True or pol.get("enabled") is not True
+                or pol.get("checks_green") is not True or (flags and flags[0])):
+            failed.append("e5")
+        frozen = self.db.execute("SELECT v FROM contract_meta WHERE k='authority_frozen'").fetchone()
+        if o["kill_switch"] is not False or (frozen and frozen[0] == "1"):
+            failed.append("e6")
+        if self.cap_used(item["repo"]) >= self.CAP1_PER_DAY:
+            failed.append("e7")
+        if o["pr_state"] != "OPEN" or o["draft"] is not False:
+            failed.append("e8")
+        age = o["canary_age"]
+        if o["chk_cas"] is not True or not isinstance(age, (int, float)) or isinstance(age, bool) or not 0 <= age < 86400:
+            failed.append("e9")
+        if o["compare"] != "ahead" or tip == head:
+            failed.append("e10")
+        return [c for c in failed if c not in skip]
+
+    def queue_head(self, repo, observations):
+        """The merge queue head for a repo: among its items in pr-gate or merge-ready, ordered by lineage
+        admission time, the oldest for which every ELIG clause except e10 holds. `observations` maps item id to
+        its ELIG observation; an item without one is not eligible. (The W21-successor exception is wired with
+        W21's readback in slice 1 (b).)"""
+        rows = self.db.execute(
+            "SELECT w.id, (SELECT MIN(created) FROM work_items x WHERE x.lineage = w.lineage) AS admitted "
+            "FROM work_items w WHERE w.repo=? AND w.state IN ('pr-gate', 'merge-ready') ORDER BY admitted, w.created, "
+            "w.id", (str(repo).lower(),)).fetchall()
+        for iid, _admitted in rows:
+            item = self._row("work_items", "id", iid)
+            if iid in observations and not self.elig(item, observations[iid], skip=("e10",)):
+                return iid
+        return None
+
     def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None, obs=None,
                 successor_packet=None):
         """The one WorkItem transition function (T1 to T7). One BEGIN IMMEDIATE; the guard re-reads its ledger
@@ -431,9 +527,24 @@ class Contracts:
             successor = None
             if row_id == "W4" or (row_id == "W24" and mark == "head-moved" and not item["successor"]):
                 successor = self._wi_successor(item, obs["pr_head"], successor_packet, event_id)
+            extra = {}
+            if row_id in ("W2", "W6"):                      # the values ELIG passed on, for W27
+                extra = {"elig_core": item["spec_core"], "elig_policy": item["policy_revision"]}
+            elif row_id == "W5":
+                cause = cause or "ELIG failed: %s" % ", ".join(self.elig(item, obs)) or "mirror undeliverable"
+            elif row_id == "W27":
+                extra = {"spec_core": obs["attached_core"], "policy_revision": obs["policy"]["revision"]}
+            elif row_id == "W21":
+                # authority log first (T4): the record of the one update-branch this item may get at this B. Slice
+                # 1 (a) is shadow only: nothing is sent; slice 1 (b)'s ahc-merge sends it after this row commits.
+                self.authority.append({"event_id": event_id, "item": iid, "row": "W21", "repo": item["repo"],
+                                       "pr": item["pr"], "expected_head_sha": item["head"], "base": obs["tip"],
+                                       "action": "update-branch (recorded, not sent)"})
+                extra = {"w21_base": obs["tip"]}
+            sets = "".join(", %s=?" % k for k in extra)
             self.db.execute("UPDATE work_items SET state=?, marks=?, cause=COALESCE(?, cause), base=?, "
-                            "successor=COALESCE(?, successor), version=version+1, updated=? WHERE id=?",
-                            (to, mark, cause, base, successor, self.now(), iid))
+                            "successor=COALESCE(?, successor), version=version+1, updated=?%s WHERE id=?" % sets,
+                            (to, mark, cause, base, successor, self.now()) + tuple(extra.values()) + (iid,))
             self._wi_effects(item, row_id, event_id, obs)
             self._a0("work_item", iid, frm, to, event_id, actor, row=row_id, cause=cause,
                      obs=obs.get("id") if isinstance(obs, dict) else None)
@@ -456,12 +567,39 @@ class Contracts:
             kinds = dict(self.db.execute("SELECT id, kind FROM reviews WHERE item=?", (item["id"],)).fetchall())
             self.supersede_reviews(item["repo"], item["pr"], new["head"],
                                    lambda rid: by_kind.get(kinds.get(rid)) or new["id"], event_id + "-r12")
-        if row_id in ("W4", "W13", "W14", "W18"):
+        if row_id == "W27":
+            # SLICE-AT-3: replacement rows for the new core or policy revision; the old passed rows stay terminal
+            # and, bound to the old values, no longer satisfy e1 or e2. Queued or infra-wait rows are superseded
+            # (R12 lists W27).
+            new = self._row("work_items", "id", item["id"])
+            made = {}
+            for kind in sorted({k for (k,) in self.db.execute("SELECT kind FROM reviews WHERE item=?",
+                                                              (item["id"],))}):
+                if kind != "spec" and new["policy_revision"] == item["policy_revision"]:
+                    continue                              # a core change alone needs only a new spec row
+                code = kind in self.ATTEMPT_KINDS
+                made[kind] = self.require_review(kind, item["repo"], item["pr"], item["head"], item["packet_sha256"],
+                                                 new["policy_revision"], item=item["id"],
+                                                 event_id="%s-%s" % (event_id, kind),
+                                                 snapshot_base=item["base"] if code else "",
+                                                 spec_core="" if code else new["spec_core"])["id"]
+            for rid, kind, state, version in self.db.execute(
+                    "SELECT id, kind, state, version FROM reviews WHERE item=? AND state IN ('required', 'queued', "
+                    "'infra-wait')", (item["id"],)).fetchall():
+                if kind in made and rid != made[kind]:
+                    self.review(rid, "superseded", expected_version=version, event_id="%s-r12-%s" % (event_id, rid),
+                                successor=made[kind], cause="spec core or policy changed (W27)")
+        if row_id in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):
             for key, state, version in self._item_effects(item):
                 if state == "intent":                                # E9: an intent never sent is abandoned
                     self.abandon_unsent(key, expected_version=version, event_id="%s-e9-%s" % (event_id, key),
                                         reason="item left by %s" % row_id)
-        if row_id == "W13":
+        if row_id == "W5":
+            self._wi_notice(event_id, item, row_id, "ticket", "waiting on a dependency: %s"
+                            % (self._row("work_items", "id", item["id"])["cause"]))
+        elif row_id == "W17":
+            self._wi_notice(event_id, item, row_id, "ticket", "protected path; main integrates by hand")
+        elif row_id == "W13":
             self._wi_notice(event_id, item, row_id, "ticket", "closed without integration at %s" % item["head"])
         elif row_id == "W14":
             self._wi_notice(event_id, item, row_id, "incident", "PR shows merged; no confirmed ahc Effect made it")
@@ -478,6 +616,43 @@ class Contracts:
         Returns the item's marks after the row."""
         effects = {state for _k, state, _v in self._item_effects(item)}
         marks = item["marks"]
+        if row_id in ("W2", "W6"):
+            failed = self.elig(item, obs)
+            if failed:
+                raise ContractError("%s needs ELIG; failed: %s" % (row_id, ", ".join(failed)))
+        elif row_id == "W5":
+            failed = self.elig(item, obs)
+            mirror_down = isinstance(obs, dict) and obs.get("mirror_ok") is False
+            if not (set(failed) & {"e5", "e6", "e7", "e8", "e10"}) and not mirror_down:
+                raise ContractError("W5 needs ELIG failing on e5, e6, e7, e8 or e10, or the mirror undeliverable")
+        elif row_id == "W17":
+            if "e4" not in self.elig(item, obs):
+                raise ContractError("W17 needs a protected path or a foreign closing keyword (e4)")
+        elif row_id == "W27":
+            o = self._wi_obs(item, obs, "attached_core", "policy")
+            pol = o["policy"] if isinstance(o["policy"], dict) else {}
+            core, revision = o["attached_core"], pol.get("revision")
+            if not (isinstance(core, str) and len(core) == 64 and _is_oid(core)) or not isinstance(revision, str) \
+                    or not revision:
+                raise ContractError("W27 needs the attached spec core and the policy revision read now")
+            if (core, revision) == (item["elig_core"], item["elig_policy"]):
+                raise ContractError("W27 needs the spec core or the policy revision changed since ELIG passed")
+        elif row_id == "W21":
+            o = self._wi_obs(item, obs, "queue", "mergeable", "tip")
+            queue = o["queue"] if isinstance(o["queue"], dict) else {}
+            listed = {r[0] for r in self.db.execute("SELECT id FROM work_items WHERE repo=? AND state IN "
+                                                    "('pr-gate', 'merge-ready')", (item["repo"],))}
+            if set(queue) != listed:
+                raise ContractError("W21 needs an ELIG observation for every item in the repo's queue")
+            if self.queue_head(item["repo"], queue) != item["id"]:
+                raise ContractError("W21 is taken only by the head of the repo's merge queue")
+            failed = self.elig(item, queue[item["id"]])
+            if failed != ["e10"]:
+                raise ContractError("W21 needs every ELIG clause but e10 to hold, and the PR behind (e10)")
+            if o["mergeable"] is not True:
+                raise ContractError("W21 needs GitHub reporting the PR mergeable with no conflict")
+            if item["w21_base"] == o["tip"]:
+                raise ContractError("an update-branch was already recorded for this item at the current B")
         if row_id in ("W4", "W13", "W14"):
             o = self._wi_obs(item, obs, "pr_state", "pr_head")
             want = {"W4": "OPEN", "W13": "CLOSED", "W14": "MERGED"}[row_id]
