@@ -452,6 +452,78 @@ ENTRIES.update({
             ('    if req.get("ahc_local"):\n', "    if False:\n")], OBSERVE)]},
 })
 
+SB = "tests.test_ahc_runner.ShadowBoundaryTests."
+ST = "tests.test_ahc_runner.ShadowTickTests."
+SI = "tests.test_ahc_runner.ShadowIntegratedTests."
+CRASH = "harness/hooks/ahc_crash.py"
+_PUMP = '        if self.w21 is not None:\n            summary["w21"] = self.w21.pump()\n'
+
+
+def _inject(call):
+    """A mutation that adds one gh call on the shadow tick's path, through the producer's gh."""
+    return [(_PUMP, "        self.producer._gh(%r, 30)\n" % (call,) + _PUMP)]
+
+
+ENTRIES.update({
+    "AC-3/NEG-7 zero mutating calls": {
+        "tests": [SI + "test_ac3_integrated_tick_zero_mutating_calls_one_pipeline_per_repo"],
+        "mutations": [
+            ("a PUT merge on the tick path", _inject(["api", "--method", "PUT", "repos/o/r/pulls/9/" + "mer" + "ge"]),
+             SHADOW),
+            ("a GraphQL updateRefs on the tick path",
+             _inject(["api", "graphql", "-f", "query=mutation { updateRefs(input: {}) { clientMutationId } }"]),
+             SHADOW),
+            ("a gh pr comment on the tick path", _inject(["pr", "comment", "9", "-b", "x"]), SHADOW)]},
+    "AC-3/NEG-8 one pipeline per repo": {
+        "tests": [SI + "test_ac3_integrated_tick_zero_mutating_calls_one_pipeline_per_repo",
+                  SI + "test_neg8_a_repo_with_a_live_legacy_item_stays_legacy"],
+        "mutations": [
+            ("a listed repo with a live legacy item goes shadow", [
+                ("    if shadow_on() and repo in listed and repo not in legacy_live_repos(db):\n",
+                 "    if shadow_on() and repo in listed:\n")], SHADOW),
+            ("a shadow repo's submit enters the legacy pipeline", [
+                ('        if ahc_shadow.pipeline_of(ledger.db, norm["repo"], config) == "shadow":\n',
+                 "        if False:\n")], RUNNER_PY)]},
+    "AC-3 AHC_SHADOW exact value": {
+        "tests": [SB + "test_ac3_only_the_exact_value_1_enables_shadow"],
+        "mutations": [("a truthy value enables shadow", [
+            ('    return os.environ.get(SHADOW_ENV) == "1"\n',
+             '    return os.environ.get(SHADOW_ENV, "").strip() in ("1", "true", "yes")\n')], SHADOW)]},
+    "AC-3 mutating-call classifier": {
+        "tests": [SB + "test_neg7_every_mutating_call_form_is_named"],
+        "mutations": [("gh verbs other than api are treated as reads", [
+            ("    if args[0] != \"api\":\n        return True\n", "    if args[0] != \"api\":\n        return False\n")],
+            SHADOW)]},
+    "AC-4/NEG-9 event id": {
+        "tests": [ST + "test_neg9_w5_w6_w5_with_identical_facts_each_apply_and_each_item_moves_once_per_tick",
+                  ST + "test_ac4_event_id_is_a_function_of_observation_item_and_row_only"],
+        "mutations": [("the event id ignores the observation", [
+            ("json.dumps([obs_id, item, row])", "json.dumps([item, row])")], SHADOW)]},
+    "AC-4/NEG-10 version CAS and guard re-read": {
+        "tests": [ST + "test_neg10_two_ticks_on_one_ledger_apply_each_move_exactly_once"],
+        "mutations": [("neither the version nor the From state is re-read", [
+            ("            if frm not in src:\n                raise ContractError(\"%s does not leave %s\" % (row_id, "
+             "frm))\n            if row_id == \"W24\":\n",
+             "            if row_id == \"W24\":\n"),
+            ("            if item[\"version\"] != expected_version:\n                raise VersionConflict(",
+             "            if False:\n                raise VersionConflict(")], CONTRACTS)]},
+    "AC-4 admission through an observation": {
+        "tests": [ST + "test_ac4_admission_is_refused_when_the_head_moved",
+                  ST + "test_ac4_a_held_request_is_admitted_through_one_observation"],
+        "mutations": [("admission ignores a moved head", [
+            ('                if obs["pr_head"] != req["head"] or obs["pr_state"] != "OPEN":\n',
+             '                if obs["pr_state"] != "OPEN":\n')], SHADOW)]},
+    "AC-4 named crash points": {
+        "tests": ["tests.test_ahc_crash.NamedPointTests."
+                  "test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants"],
+        "mutations": [("the tick has no crash point after the producer stamps", [
+            ('        crash_at("tick.observed")\n', "        pass\n")], SHADOW)]},
+    "AC-13 tick raises incidents": {
+        "tests": ["tests.test_ahc_runner.TickIncidentTests.test_ac13_the_tick_raises_collected_refusals_as_incidents"],
+        "mutations": [("collected refusals are never raised", [
+            ("        while policy.incidents:\n", "        while False:\n")], RUNNER_PY)]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")

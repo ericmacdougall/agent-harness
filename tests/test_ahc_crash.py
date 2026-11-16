@@ -487,6 +487,7 @@ def _prepare_interrupted(backup, live):
 SCENARIOS = {"contracts": scenario_contracts, "files": scenario_files, "migrate": scenario_migrate,
              "restore": scenario_restore, "restore_lost_backup": scenario_restore_lost_backup,
              "restore_partial_backup": scenario_restore_partial_backup}
+NAMED_SCENARIOS = {}    # AC-4: scenarios for the named points only (never run against every seam)
 PREPARED = {}           # scenario -> prepare(root): its starting files, built by the parent
 CHUNKS = {}             # scenario -> the restore copy chunk the child uses (ahc_fs.COPY_CHUNK otherwise)
 # What every crash point of a restore scenario must converge to, checked on the uncrashed run (each restart must
@@ -552,7 +553,7 @@ class ChildScenario(unittest.TestCase):
         time.time = lambda: clock.t + next(counter) * 1e-3       # deterministic wall clock for the runner
         time.time_ns = lambda: int(time.time() * 1e9)
         ahc_crash.observe(lambda point, n: digest(root))
-        SCENARIOS[name](root, clock)
+        (SCENARIOS.get(name) or NAMED_SCENARIOS[name])(root, clock)
 
 
 # ---------------------------------------------------------------- the parent
@@ -1155,6 +1156,92 @@ class InventoryTests(unittest.TestCase):
     def test_known_failures_each_name_a_reason(self):
         for key, reason in KNOWN_FAILURES.items():
             self.assertTrue(reason, key)
+
+
+
+# ---------------------------------------------------------------- AC-4: the named crash points (ahc_crash.POINTS)
+# goodqa#16049 slice 1 (b), spec r9 AC-4: a tick scenario drives each named point; a crash there and a restart keep
+# the scenario's invariants (each move applied once by the CAS; a send at most once).
+
+class _CrashProducer:
+    """A deterministic producer for the shadow tick scenario: each read is stamped and persisted (ahc_observe's
+    contract) and carries facts under which only W5 holds for a merge-ready item (the mirror is down)."""
+
+    def __init__(self, c):
+        self.c, self.incidents = c, []
+
+    def observe(self, repo, pr, *, item=None, clone=None, snapshot_bases=(), base=None):
+        stamp = self.c.first_read_stamp()
+        row = self.c._row("work_items", "id", item)
+        fields = dict(pr=pr, pr_head=row["head"], pr_state="OPEN", tip=row["base"], draft=False, compare="ahead",
+                      b_r_ancestors={row["base"]: True}, attached_core=row["spec_core"], open_findings=0,
+                      paths=["lib/x.py"], foreign_closing_keyword=False, mergeable=True, mergeable_state="clean",
+                      policy={"revision": POLICY, "readable": True, "allowlisted": True, "enabled": True,
+                              "checks_green": True},
+                      kill_switch=False, chk_cas=True, canary_age=60, mirror_ok=False)
+        self.c.record_observation(stamp, repo, pr, item, {"test": "crash"}, [], fields)
+        return self.c.load_observation(stamp["id"])
+
+
+def scenario_shadow_tick(root, clock):
+    """One merge-ready WorkItem and one shadow tick (AC-4). The fixture steps are idempotent by event id, so a
+    restart resumes; the tick itself re-observes and the version CAS lets W5 apply exactly once."""
+    import ahc_shadow  # noqa: PLC0415
+    os.environ["AHC_SHADOW"] = "1"
+    led = runner.Ledger(core.Paths(root))
+    c = C.Contracts(led.db, C.AuthorityLog(Path(root) / "authority.jsonl"), now=clock, mono=clock,
+                    boot_id="crash-boot")
+    item = c.admit_item("o/r", 7, H1, BASE, POLICY, "1" * 64, "d" * 64, event_id="sh-w1")
+    if not _done(led.db, "sh-ready"):
+        with c.tx():
+            led.db.execute("UPDATE reviews SET state='passed' WHERE item=?", (item["id"],))
+            led.db.execute("UPDATE work_items SET state='merge-ready', version=version+1 WHERE id=?", (item["id"],))
+            led.db.execute("INSERT INTO transitions(entity, id, from_state, to_state, event_id, actor, at, data) "
+                           "VALUES ('fixture', ?, 'pr-gate', 'merge-ready', 'sh-ready', 'test', ?, '{}')",
+                           (item["id"], clock.t))
+    ahc_shadow.ShadowTick(c, _CrashProducer(c), lambda repo, head, base: "/clone",
+                          {"shadow_repos": ["o/r"]}).tick()
+    led.close()
+
+
+def check_shadow_tick(root):
+    """The shadow scenario's restart invariants: W5 applied exactly once and the item in waiting-dep."""
+    db = sqlite3.connect("file:%s?mode=ro" % live_db(root), uri=True)
+    try:
+        rows = [json.loads(d)["row"] for (d,) in db.execute(
+            "SELECT data FROM transitions WHERE entity='work_item' ORDER BY seq")]
+        state = db.execute("SELECT state FROM work_items").fetchone()[0]
+    finally:
+        db.close()
+    out = [] if rows == ["W1", "W5"] else ["moves %r, not W1 then W5 once" % rows]
+    return out + ([] if state == "waiting-dep" else ["state %s, not waiting-dep" % state])
+
+
+NAMED_SCENARIOS["shadow_tick"] = scenario_shadow_tick
+NAMED_POINTS = {"tick.observed": ("shadow_tick", check_shadow_tick)}
+
+
+class NamedPointTests(unittest.TestCase):
+    """AC-4: every named point is registered, counted by its tick scenario, and a crash there then a restart keeps
+    the scenario's invariants."""
+
+    def test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants(self):
+        self.assertEqual(set(NAMED_POINTS), set(ahc_crash.POINTS), "every named point has a scenario")
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, (point, (scenario, check)) in enumerate(sorted(NAMED_POINTS.items())):
+                with self.subTest(point=point):
+                    counted = Path(tmp) / ("count-%d" % n)
+                    counted.mkdir(mode=0o700)
+                    self.assertIn("%s:at@1" % point, counting_pass(counted, scenario), "the scenario reaches it")
+                    root = Path(tmp) / ("crash-%d" % n)
+                    root.mkdir(mode=0o700)
+                    died = run_child(root, scenario, seam="%s:at@1" % point)
+                    self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT, died.stderr[-1500:])
+                    self.assertIn("%s %s:at@1" % (ahc_crash.MARKER, point), died.stderr)
+                    resumed = run_child(root, scenario, phase="resume")
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr[-1500:])
+                    self.assertEqual(check(root), [])
+                    self.assertEqual(check(counted), [], "the uncrashed run")
 
 
 if __name__ == "__main__":

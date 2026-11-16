@@ -680,6 +680,33 @@ class Contracts:
                      obs=obs.get("id") if isinstance(obs, dict) else None)
             return self._row("work_items", "id", iid)
 
+    def wi_holds(self, iid, row_id, obs, *, to=None, mark=None):
+        """AC-4: whether row_id's guard holds for the item on this observation, without applying it. The same
+        preconditions as wi_move (From state, T7) and the row's guard run inside one transaction that is always
+        rolled back, so nothing (a timer row included) is written. Returns (True, None) or (False, reason)."""
+        if self.db.in_transaction:
+            raise ContractError("wi_holds runs outside a transaction")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            item = self._row("work_items", "id", iid)
+            if item is None or row_id not in self.WI_TRANSITIONS or row_id not in self.WI_WIRED:
+                return False, "no such item or row"
+            src, dst, _actor = self.WI_TRANSITIONS[row_id]
+            if item["state"] not in src:
+                return False, "%s does not leave %s" % (row_id, item["state"])
+            to = item["state"] if row_id == "W24" else (to or (dst[0] if len(dst) == 1 else None))
+            if to not in dst:
+                return False, "%s needs its target" % row_id
+            unsettled = self.item_unsettled(item)
+            if unsettled and row_id not in self.T7_ALLOWED:
+                return False, "T7"
+            self._wi_guard(item, row_id, to, mark, unsettled, obs, None)
+            return True, None
+        except ContractError as error:
+            return False, str(error)
+        finally:
+            self.db.execute("ROLLBACK")
+
     def inert_rows(self, iid):
         """AC-9: the item's review rows that wait for an attempt (required, queued, infra-wait) while the item is
         finished (terminal or merged). Such a row is never offered (ahc_shadow.ReviewScheduler)."""

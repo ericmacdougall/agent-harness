@@ -5354,5 +5354,325 @@ class W16CliTests(Base):
             rc = runner.main(self.argv())
         self.assertEqual(rc, 2)
 
+
+# ---------------------------------------------------------------- AC-3 / AC-4: the shadow boundary and tick
+# goodqa#16049 slice 1 (b), spec r9 AC-3, AC-4, NEG-7 to NEG-10.
+
+from tests import test_ahc_observe as TO  # noqa: E402
+
+SHADOW_REPO = "ericmacdougall/agent-fabric"
+
+
+class FakeProducer:
+    """An injected observation producer: each observe() is one read, stamped at its first read with its own id and
+    persisted, exactly as ahc_observe.Producer does; `facts(repo, pr, item)` returns the fields (or raises
+    ahc_observe.ObservationRefused). Every read is counted."""
+
+    def __init__(self, contracts, facts):
+        self.c, self.facts, self.reads, self.incidents = contracts, facts, [], []
+
+    def observe(self, repo, pr, *, item=None, clone=None, snapshot_bases=(), base=None):
+        stamp = self.c.first_read_stamp()
+        fields = dict(self.facts(repo, pr, item), repo=repo, pr=pr)
+        self.c.record_observation(stamp, repo, pr, item, {"test": "fake"}, [], fields)
+        self.reads.append(stamp["id"])
+        return self.c.load_observation(stamp["id"])
+
+
+class _ShadowFixture(TC.Base):
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"AHC_SHADOW": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        import ahc_shadow  # noqa: PLC0415
+        self.S = ahc_shadow
+        self.config = {"shadow_repos": ["o/r"]}
+        self.changes = {}
+
+    def eligible(self, item):
+        f = dict(pr=item["pr"], pr_head=item["head"], pr_state="OPEN", tip=item["base"], draft=False,
+                 compare="ahead", b_r_ancestors={item["base"]: True}, attached_core=item["spec_core"],
+                 open_findings=0, paths=["harness/lib/x.py"], foreign_closing_keyword=False, mergeable=True,
+                 mergeable_state="clean",
+                 policy={"revision": item["policy_revision"], "readable": True, "allowlisted": True, "enabled": True,
+                         "checks_green": True},
+                 kill_switch=False, chk_cas=True, canary_age=3600, mirror_ok=True)
+        f.update(self.changes)
+        return f
+
+    def facts(self, repo, pr, item):
+        if item is None:                                   # admission: the PR at the requested head
+            return dict(pr=pr, pr_head=self.changes.get("pr_head", TC.H1), pr_state="OPEN", tip=TC.BASE,
+                        policy={"revision": TC.POLICY}, attached_core=TC.CORE1)
+        return self.eligible(self.c._row("work_items", "id", item))
+
+    def shadow_tick(self, contracts=None):
+        c = contracts or self.c
+        producer = FakeProducer(c, lambda repo, pr, item: self.facts(repo, pr, item))
+        return self.S.ShadowTick(c, producer, lambda repo, head, base: "/clone", self.config), producer
+
+    def ready_item(self, pr=5):
+        item = self.c.admit_item("o/r", pr, TC.H1, TC.BASE, TC.POLICY, TC.CORE1, TC.PKT, event_id=self.ev())
+        self.db.execute("UPDATE reviews SET state='passed' WHERE item=?", (item["id"],))
+        self.db.execute("UPDATE work_items SET state='merge-ready', version=version+1 WHERE id=?", (item["id"],))
+        return self.c._row("work_items", "id", item["id"])
+
+    def moves(self, iid):
+        return [(json.loads(d)["row"], e) for e, d in self.db.execute(
+            "SELECT event_id, data FROM transitions WHERE entity='work_item' AND id=? ORDER BY seq", (iid,))]
+
+
+class ShadowBoundaryTests(_ShadowFixture):
+    """AC-3: AHC_SHADOW and the shadow list put a repo in exactly one pipeline; mutating calls are named."""
+
+    def test_ac3_only_the_exact_value_1_enables_shadow(self):
+        for value in (None, "", "0", "true", "1 ", "yes", "01"):
+            env = {k: v for k, v in os.environ.items() if k != "AHC_SHADOW"}
+            if value is not None:
+                env["AHC_SHADOW"] = value
+            with self.subTest(value=value), mock.patch.dict(os.environ, env, clear=True):
+                self.assertFalse(self.S.shadow_on())
+                self.assertEqual(self.S.pipeline_of(self.db, "o/r", self.config), "legacy")
+        self.assertTrue(self.S.shadow_on())
+        self.assertEqual(self.S.pipeline_of(self.db, "O/R", self.config), "shadow")
+        self.assertEqual(self.S.pipeline_of(self.db, "o/other", self.config), "legacy", "not on the list")
+
+    def test_neg7_every_mutating_call_form_is_named(self):
+        verb_m = "mer" + "ge"
+        mutating = [("gh", ["api", "--method", "PUT", "repos/o/r/pulls/5/" + verb_m]),
+                    ("gh", ["api", "-X", "PATCH", "repos/o/r/pulls/5"]),
+                    ("gh", ["api", "graphql", "-f", "query=mutation { updateRefs(input: {}) { clientMutationId } }"]),
+                    ("gh", ["api", "repos/o/r/issues/5/comments", "-f", "body=x"]),
+                    ("gh", ["api", "--input", "f.json", "repos/o/r/pulls/5"]),
+                    ("gh", ["pr", verb_m, "5"]), ("gh", ["pr", "comment", "5", "-b", "x"]),
+                    ("gh", ["pr", "edit", "5"]), ("gh", ["issue", "create"]), ("git", ["push", "origin", "x"]),
+                    ("git", ["-C", "/c", "push"]), ("git", ["update-ref", "refs/heads/x", TC.H1])]
+        reads = [("gh", ["api", "--method", "GET", "repos/o/r/pulls/5"]), ("gh", ["api", "repos/o/r/pulls/5"]),
+                 ("gh", ["pr", "view", "5", "-R", "o/r", "--json", "number"]),
+                 ("git", ["-C", "/c", "log", "--format=%H", "%s..%s" % (TC.BASE, TC.H1)]),
+                 ("git", ["fetch", "origin"]), ("git", ["merge-tree", "--write-tree", TC.H1, TC.BASE])]
+        for tool, args in mutating:
+            with self.subTest(args=args):
+                self.assertTrue(self.S.is_mutating(tool, args))
+        for tool, args in reads:
+            with self.subTest(args=args):
+                self.assertFalse(self.S.is_mutating(tool, args))
+
+    def test_ac3_the_tick_never_applies_w1_w16_or_w20_and_w21_only_through_its_sender(self):
+        self.assertFalse({"W1", "W16", "W20", "W21"} & set(self.S.TICK_ROWS))
+        self.assertEqual(set(self.S.TICK_ROWS) | {"W1", "W16", "W20", "W21"}, set(C.Contracts.WI_TRANSITIONS))
+
+
+class ShadowTickTests(_ShadowFixture):
+    """AC-4: admit, observe, select (T7) and move each item at most once per tick; event id f(obs, item, row)."""
+
+    def test_ac4_event_id_is_a_function_of_observation_item_and_row_only(self):
+        e = self.S.event_id
+        self.assertEqual(e("obs:b:1.0:1", "wi-1", "W5"), e("obs:b:1.0:1", "wi-1", "W5"))
+        self.assertEqual(len({e("o1", "i", "W5"), e("o2", "i", "W5"), e("o1", "j", "W5"), e("o1", "i", "W6")}), 4)
+
+    def test_ac4_a_held_request_is_admitted_through_one_observation(self):
+        key = self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
+                                            "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+        tick, producer = self.shadow_tick()
+        summary = tick.tick()
+        self.assertEqual(len(summary["admitted"]), 1)
+        item = self.c._row("work_items", "id", summary["admitted"][0])
+        self.assertEqual((item["state"], item["head"], item["base"]), ("pr-gate", TC.H1, TC.BASE))
+        self.assertEqual(self.moves(item["id"]), [("W1", self.S.event_id(producer.reads[0], key, "W1"))])
+        again = self.shadow_tick()[0].tick()
+        self.assertEqual(again["admitted"], [], "the request is consumed once")
+
+    def test_ac4_admission_is_refused_when_the_head_moved(self):
+        self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
+                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+        self.changes["pr_head"] = TC.H2
+        summary = self.shadow_tick()[0].tick()
+        self.assertEqual(summary["admitted"], [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM work_items").fetchone()[0], 0)
+        self.assertTrue(any("head moved" in why for _k, why in summary["refused"]), summary["refused"])
+
+    def test_neg9_w5_w6_w5_with_identical_facts_each_apply_and_each_item_moves_once_per_tick(self):
+        item, other = self.ready_item(5), self.ready_item(6)
+        rows = []
+        for mirror in (False, True, False):
+            self.changes["mirror_ok"] = mirror
+            tick, producer = self.shadow_tick()
+            before = {i: len(self.moves(i)) for i in (item["id"], other["id"])}
+            summary = tick.tick()
+            for i in (item["id"], other["id"]):
+                self.assertLessEqual(len(self.moves(i)) - before[i], 1, "an item moved twice in one tick")
+            row, ev = self.moves(item["id"])[-1]
+            read = [o for o in producer.reads if self.db.execute(
+                "SELECT item FROM observations WHERE id=?", (o,)).fetchone()[0] == item["id"]][0]
+            self.assertEqual(ev, self.S.event_id(read, item["id"], row), "event id f(obs, item, row)")
+            rows.append((row, self.c._row("work_items", "id", item["id"])["state"]))
+            self.assertEqual(summary["conflicts"], [])
+        self.assertEqual(rows, [("W5", "waiting-dep"), ("W6", "merge-ready"), ("W5", "waiting-dep")])
+
+    def test_ac4_a_refused_observation_moves_nothing(self):
+        item = self.ready_item()
+        import ahc_observe  # noqa: PLC0415
+
+        def refuse(repo, pr, iid):
+            raise ahc_observe.ObservationRefused("truncated read")
+        self.facts = refuse
+        summary = self.shadow_tick()[0].tick()
+        self.assertEqual(self.moves(item["id"])[1:], [], "nothing after W1 admission")
+        self.assertTrue(summary["refused"])
+
+    def test_neg10_two_ticks_on_one_ledger_apply_each_move_exactly_once(self):
+        import sqlite3  # noqa: PLC0415
+        path = Path(self.tmp.name) / "shared.sqlite3"
+        dbs = [sqlite3.connect(str(path), isolation_level=None, timeout=10) for _ in range(2)]
+        for db in dbs:
+            self.addCleanup(db.close)
+        C.apply_schema(dbs[0])
+        cs = [C.Contracts(db, self.log, now=self.clock, mono=self.clock, boot_id=TC.BOOT) for db in dbs]
+        self.c, self.db = cs[0], dbs[0]
+        item = self.ready_item()
+        self.changes["mirror_ok"] = False
+        tick_a, _pa = self.shadow_tick(cs[0])
+        tick_b, _pb = self.shadow_tick(cs[1])
+        real = cs[0].wi_move
+        ran = []
+
+        def interleaved(*a, **kw):
+            if not ran:
+                ran.append(tick_b.tick())                 # the other daemon applies first, between A's read and move
+            return real(*a, **kw)
+        cs[0].wi_move = interleaved
+        summary_a = tick_a.tick()
+        self.assertEqual([r for r, _e in self.moves(item["id"])], ["W1", "W5"], "exactly one apply")
+        self.assertEqual(len(ran[0]["moved"]), 1)
+        self.assertEqual(summary_a["moved"], [], "A applies nothing once B has applied")
+        lost = [c[:2] for c in summary_a["conflicts"]] + [(i, why.split(":")[0]) for i, why in summary_a["refused"]]
+        self.assertEqual(lost, [(item["id"], "W5")], "A loses on the version CAS or the guard re-read")
+
+
+
+class ShadowDeps(Deps):
+    """The legacy fakes plus the shadow parts: the production observation producer over an injected gh (FakeGh,
+    which records every argv) and a real local git repository standing in for the daemon clone."""
+
+    def __init__(self, gh, clone_root, local, gq, **kw):
+        super().__init__(**kw)
+        self.fake_gh, self.clone_root, self.local, self.gq = gh, clone_root, local, gq
+
+    def shadow_parts(self, contracts):
+        import ahc_observe  # noqa: PLC0415
+        producer = ahc_observe.Producer(contracts, self.fake_gh, TO.real_git, lambda r, p, i: dict(self.gq),
+                                        lambda r: dict(self.local))
+        return producer, (lambda repo, head, base: self.clone_root), None
+
+
+class ShadowIntegratedTests(Base):
+    """AC-3 / NEG-7 / NEG-8: one daemon tick over a legacy item and a shadow WorkItem through the production tick
+    (runner.tick), the production producer and the legacy fakes. Every gh argv on every path is recorded and none
+    may mutate; the shadow repo never enters the legacy pipeline."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"AHC_SHADOW": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        import ahc_shadow  # noqa: PLC0415
+        self.S = ahc_shadow
+        self.config = dict(self.config, repos=[REPO, SHADOW_REPO], shadow_repos=[SHADOW_REPO])
+        self.git = TO.Repo(self.home / "shadow-clone")
+        self.base = self.git.commit({"README": "r\n"}, "base")
+        self.head = self.git.commit({"src/b.py": "b\n"}, "pr change", parent=self.base)
+        self.gh = TO.FakeGh()
+        pre = "repos/%s" % SHADOW_REPO
+        self.gh.set(pre + "/pulls/9", TO.pull_json(self.head, number=9, repo=SHADOW_REPO, changed=1))
+        self.gh.set(pre + "/git/ref/heads/main", {"object": {"sha": self.base}})
+        self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % self.head,
+                    TO.page({"total_count": 1, "check_runs": [TO.run("test", head=self.head)]}))
+        self.gh.set(pre + "/commits/%s/statuses?per_page=100" % self.head, TO.page([]))
+        local = {"policy": {"revision": "policy-r1", "default_branch": "main", "readable": True,
+                            "allowlisted": True, "enabled": True,
+                            "required_checks": {"contexts": ["test"], "app": "github-actions"}},
+                 "kill_switch": False, "kill_epoch": 1, "chk_cas": True, "canary": None}
+        self.deps = ShadowDeps(self.gh, self.git.root, local, {"attached_core": "1" * 64, "open_findings": 0,
+                                                               "mirror_ok": True})
+
+    def submit_shadow(self):
+        req = {"repo": SHADOW_REPO, "pr": 9, "head": self.head, "base": self.base, "packet": str(self.packet),
+               "ticket": "GoodQA goodqa#16049", "owner": "agent-abc123"}
+        return core.submit(self.paths, self.config, req)
+
+    def all_gh_argv(self):
+        legacy = [list(a[1:]) if a and a[0] == "gh" else list(a) for a in self.deps.gh_calls]
+        return legacy + [list(a) for a in self.gh.calls]
+
+    def ledger_rows(self, sql, args=()):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return [tuple(r) for r in ledger.db.execute(sql, args).fetchall()]
+        finally:
+            ledger.close()
+
+    def test_ac3_integrated_tick_zero_mutating_calls_one_pipeline_per_repo(self):
+        legacy_id = self.submit()
+        shadow = self.submit_shadow()
+        self.assertEqual(shadow.get("pipeline"), "shadow", "a shadow repo's submit is held for the shadow tick")
+        first = self.run_all(self.deps)
+        self.assertEqual(len(first["shadow"]["admitted"]), 1, first.get("shadow"))
+        second = self.run_all(self.deps)                     # a restart: a new ledger connection and producer
+        self.assertIn("shadow", second)
+        # NEG-8: the shadow repo is never a legacy item, never launched through deps.review, never settled there
+        self.assertEqual(self.ledger_rows("SELECT id FROM items WHERE lineage LIKE ?", (SHADOW_REPO + "|%",)), [])
+        self.assertEqual([r[0] for r in self.ledger_rows("SELECT id FROM items")], [legacy_id])
+        self.assertEqual(len(self.deps.review_calls), 1, "one authorized launch for the legacy item")
+        self.assertFalse(any(SHADOW_REPO in " ".join(map(str, a)) for a in self.deps.review_calls))
+        items = self.ledger_rows("SELECT repo, pr, head, state FROM work_items")
+        self.assertEqual(items, [(SHADOW_REPO, 9, self.head, "pr-gate")])
+        # no E2 dispatch: no Effect left intent in shadow
+        self.assertEqual(self.ledger_rows("SELECT key FROM operations WHERE state != 'intent'"), [])
+        # NEG-7: zero mutating calls across both ticks, on the legacy and the shadow paths
+        calls = self.all_gh_argv()
+        self.assertTrue(self.gh.calls, "the shadow path read GitHub through the recorded gh")
+        self.assertEqual([a for a in calls if self.S.is_mutating("gh", a)], [])
+
+    def test_neg8_a_repo_with_a_live_legacy_item_stays_legacy(self):
+        legacy_id = self.submit()
+        self.config["shadow_repos"] = [SHADOW_REPO, REPO]
+        ledger = runner.Ledger(self.paths)
+        try:
+            self.assertEqual(self.S.pipeline_of(ledger.db, REPO, self.config), "legacy")
+            self.assertEqual(self.S.pipeline_of(ledger.db, SHADOW_REPO, self.config), "shadow")
+        finally:
+            ledger.close()
+        self.assertTrue(legacy_id)
+
+
+
+class TickIncidentTests(Base):
+    """AC-13: a refused launch or connection raises an incident. The guard collects each refusal in the active
+    policy's `incidents`; the core tick raises every collected one into the outbox (wi_notices, kind incident,
+    through the AC-14 chokepoint) and drains the list, whether or not shadow is on."""
+
+    def test_ac13_the_tick_raises_collected_refusals_as_incidents(self):
+        import ahc_guard  # noqa: PLC0415
+        policy = ahc_guard.Policy.for_test(self.paths.root, {}, repos=[REPO])
+        policy.incidents.extend(["git: -c core.pager refused", "socket.connect refused"])
+        ahc_guard.install(policy)
+        try:
+            self.run_all(Deps())
+        finally:
+            ahc_guard.deactivate()
+        self.assertEqual(policy.incidents, [], "every collected refusal is raised once and drained")
+        ledger = runner.Ledger(self.paths)
+        try:
+            rows = [tuple(r) for r in ledger.db.execute(
+                "SELECT item, kind, text FROM wi_notices WHERE kind='incident' ORDER BY rowid")]
+        finally:
+            ledger.close()
+        self.assertEqual([(i, k) for i, k, _t in rows], [(runner.SYSTEM_ITEM, "incident")] * 2)
+        self.assertIn("core.pager", rows[0][2])
+        self.assertIn("socket.connect", rows[1][2])
+
+
 if __name__ == "__main__":
     unittest.main()

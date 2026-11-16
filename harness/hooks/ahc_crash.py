@@ -94,6 +94,20 @@ def _seam(name, when):
         os._exit(CRASH_EXIT)
 
 
+# AC-4 (goodqa#16049 slice 1 (b)): named crash points. Unlike a seam, each is one point between two steps of a tick
+# (not around one durable write), driven by its own tick scenario whose restart invariants the test states.
+POINTS = (
+    "tick.observed",           # ShadowTick: after the producer stamped and persisted an observation, before any move
+)
+
+
+def crash_at(name):
+    """A named crash point (POINTS); a name outside the registry is a programming error."""
+    if name not in POINTS:
+        raise ValueError("unregistered crash point %r" % name)
+    _seam(name, "at")
+
+
 def crash_before(name):
     _seam(name, "before")
 
