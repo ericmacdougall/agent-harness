@@ -1,0 +1,38 @@
+feat(job-dispatcher): hold transcription at the guard (GUARD_HELD_ENV)
+
+Why: goodqa#16136 restores the job images of the dispatcher. Main ruled that
+recording transcription stays held, so nothing launches toward a VERTEX_AI_*
+path, while MP4 transcodes run. Transcription is the same transcode image
+selected by TRANSCODER_MODE=transcribe, so an image pin cannot hold it alone.
+
+What:
+- apps/job-dispatcher/src/held-env.ts (new): parseHeldEnv refuses startup on
+  anything but one supported pair (TRANSCODER_MODE=transcribe). heldEnvViolation
+  refuses a create whose Env names the held key (name trimmed and upper-cased)
+  with the held value (trimmed and lower-cased). It also refuses: a repeated
+  held key, the key without "=", control characters or NUL in its value, an Env
+  that is not an array of strings, and any non-null Entrypoint. Cmd stays
+  allowed, because it is argv after the image ENTRYPOINT (MP4 sends
+  [attachmentId, runId]). This is an honest-path policy, not a boundary against
+  a compromised dispatcher.
+- create-guard.ts: GuardConfig.heldEnv; validateContainerCreateBody takes the
+  hold and checks it after the image allowlist. Unset means unchanged behavior.
+- create-guard-main.ts: reads GUARD_HELD_ENV and names it in the startup line
+  (heldEnv=KEY=VALUE or heldEnv=none). The release runner checks that line
+  after the switch.
+- apps/transcoder/src/mode.ts (new): transcoderMode(), the exact worker mode
+  parse, now used by index.ts. The guard tests import it and pin the two
+  together.
+
+Testing: on t2-dev, apps/job-dispatcher pnpm exec vitest run test/held-env.test.ts
+failed first (module missing), then 62 passed. The full unit suite without
+docker integration (vitest run --exclude "**/*.docker.test.ts" --exclude
+"**/*.e2e.*") has 323 passed. tsc --noEmit is clean for job-dispatcher and
+transcoder. Seven broken variants of held-env.ts (no value or key
+normalization, no repeat, control-char, array or Entrypoint refusal, hold
+ignored) each fail held-env.test.ts (1 to 22 failures).
+
+Refs: GoodQA #16136
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv

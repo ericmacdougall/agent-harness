@@ -1,0 +1,16 @@
+Release-script source of truth, reconciled (fixer for #16136, with #16130 part 2 owner; read-only on t2-dev):
+
+1. The binding is not enforced. biz/release-waves/ship.conf has no RELEASE_BINDING key. The 20261115T202223Z ship.log says "release scripts: UNBOUND (no RELEASE_BINDING in ship.conf)". The file config/goodqa-release/bin/RELEASE_BINDING ("commit 5a78109ac2d3 path infra/release-harness") is only a record.
+
+2. ~/release-kit/ship.sh executes ~/repos/harness/config/goodqa-release/bin/rw-ship.sh (and streams selfhost-ctl.py from that dir). Those bytes equal bugtracker commit 5a78109 (2026-11-04, not on bugtracker main), path infra/release-harness, for rw-ship.sh, selfhost-ctl.py, rw-runtime.sh and rw-rollback.sh. Bugtracker main has 33 later, unshipped commits to infra/release-harness.
+
+3. A second entry point exists. ~/repos/harness/bin/rw-ship.sh is used by ship-fast.sh, wave-loop.sh and wave-revert-ship.sh. It differs from both, and no wave-loop timer is active. Tonight's ship used ship.sh, so the config copy.
+
+Route for #16136 (lead's ruling, option A):
+- Fix bugtracker infra/release-harness on a branch from 5a78109 (fix/16136-job-images-rh), with a Codex receipt on that diff.
+- Harness PR restaging config/goodqa-release/bin and the RELEASE_BINDING record to the fix commit. It has its own receipt, and the before-shas are recorded for rollback.
+- Forward-port to bugtracker main as a second PR.
+
+The #16130 staging-gate edit likely needs the same route; the two owners will stack their bugtracker commits.
+
+The fast path (ship-fast and wave-loop on bin/rw-ship.sh) is unchanged by this fix. A later run through it keeps the job pins already in compose.yaml, because it re-pins only the four service image lines, so it does not regress production.

@@ -1,0 +1,49 @@
+fix(release-harness): build, load and pin the four job images
+
+Why: goodqa#16136. Since the 2026-10-14 cutover the self-host compose pins all
+four JOB_IMAGE_* values to registry digests that were never on the app host,
+so every scan, transcode, suggest-fix and intelligence launch has failed with
+a 422. The release runner rebuilt only api, web and the dispatcher.
+
+What:
+- rw-ship.sh builds the job images from the release SHA, loads them with the
+  app images (VM free-disk check first, SELFHOST_VM_MIN_FREE_GB default 20;
+  build floor now 30 GB for seven images), checks their ids on the VM and pins
+  each as goodqa-JOB@sha256:<VM image id>. SELFHOST_JOB_HOLD (default
+  intelligence-worker,transcribe; none lifts it; unknown kinds refuse before
+  any build) keeps a held kind on its current line. transcribe is held at the
+  guard (--guard-hold TRANSCODER_MODE=transcribe) only when the built
+  dispatcher image refuses a malformed GUARD_HELD_ENV at startup (probed by
+  behavior). Otherwise the whole transcode image stays held. After the switch
+  the job refs must still resolve and the running guard must report the hold,
+  or the stack rolls back. The deploy record lists jobHolds.
+- selfhost-ctl.py: pin takes --job-image KEY=REF, --job-hold KEY and
+  --guard-hold. All four keys must be named once, each ref must be the own
+  repo of its key by digest, and the store must be containerd. The prepared
+  compose is resolved with docker compose config, and every release-managed
+  ref must be on the host (third-party images only warn). Held lines are
+  marked # held. state adds jobs, jobs_held, jobs_missing and guard_hold
+  outside the fp core. restore warns for jobs down and core images missing,
+  and never blocks. up runs with --pull never. New disk and guard-log commands.
+- README: job image section, including that the harness bin/rw-ship.sh
+  (ship-fast, wave-loop) does not rebuild job images, and never prune -a.
+- test_rw_ship_selfhost.py: fake docker gains store info, resolved config,
+  --pull, guard probe and guard logs. Adds job image tests for ship, ctl,
+  state, restore, holds, guard coupling and a real compose anchor test
+  (RW_REAL_COMPOSE=1).
+
+Testing: `RW_REAL_COMPOSE=1 python -m pytest -q -rA infra/release-harness/test_rw_ship_selfhost.py`
+(on t2-dev, repo root).
+Against the 5a78109 scripts the new tests failed first (43 failed, then 11
+more for the v2.1 tests). After the fix: 4 failed, 76 passed, with
+test_real_compose_resolves_anchor_for_both_services PASSED (not skipped). The
+4 failures are the ThroughputProcess failures of the 5a78109 baseline
+(failed-set diff identical). test_selfhost_ctl.py is out of sync with this CLI
+at 5a78109 as well: 940 failed, 642 passed, failed set identical to baseline.
+
+Refs: GoodQA #16136
+Risk: the job images are loaded, never pushed; a prune -a on the app host stops
+those kinds until the next full release (goodqa#16149, goodqa#16150).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv

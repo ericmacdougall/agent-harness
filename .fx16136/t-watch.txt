@@ -1,0 +1,7 @@
+Source: ticket:GoodQA goodqa#16136 (spec v2 AC-6 and NEG-11; adversarial review C2c).
+
+After #16136, `selfhost-ctl.py state` reports each JOB_IMAGE_* ref and puts any unresolved non-held ref in `missing`. Nothing calls it on a schedule. A job image that stops resolving after a release (an untag, a prune or a host rebuild) would again be silent until a user notices missing scans or recordings.
+
+Wanted: a recurring read-only check, for example alongside the existing ship-sample-watch.timer on t2-dev, that runs `state` against the production app host through the release kit's own ssh path and alerts on a non-empty `missing`. It should also alert when the dispatcher logs 422 on /jobs/*/run above a small threshold over 30 minutes.
+
+It must run no database query and change nothing.

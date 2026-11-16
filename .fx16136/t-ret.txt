@@ -1,0 +1,12 @@
+Source: ticket:GoodQA goodqa#16136 (spec v2 NEG-11; adversarial review F2).
+
+After #16136, every self-host release loads seven images (api, web, job-dispatcher and four job images) under per-release tags on the production app host. Nothing prunes old tags, and no retention rule exists anywhere: grep of harness config/goodqa-release and bugtracker infra/selfhost.
+
+The job images are not used by any long-running container, so the usual disk-pressure response, `docker image prune -a`, deletes exactly the current job images. That silently breaks every dispatcher job again: the same failure #16136 fixes, which went unnoticed for a month.
+
+Wanted:
+- A retention rule run by the release runner after a verified release: keep the current tags and the previous release's tags (the rollback target); remove older goodqa-* release tags; never touch the pinned refs.
+- A runbook line: never `docker image prune -a` on the app host.
+- A test.
+
+Production host disk on 2026-11-15: 172G free of 193G, with 33 images and 10.9 GB reclaimable, so this is not urgent for disk but is needed to prevent a prune accident.
