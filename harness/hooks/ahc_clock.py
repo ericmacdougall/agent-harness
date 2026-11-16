@@ -11,6 +11,7 @@ the boot id at start and the boot-clock reading at start (the anchor). On the sa
 minus the anchor, so a restart never resets it. On a new boot id, or when the boot id cannot be read, elapsed is
 unknown and the timer takes its direction's conservative action at once (see DIRECTIONS).
 """
+import os
 import time
 from pathlib import Path
 
@@ -38,9 +39,16 @@ TIMERS = {
 }
 
 
+def process_boot_id():
+    """The fallback when no boot id can be read: an id for this process. Elapsed is then known within the process
+    and unknown to any other process, which takes the conservative action (never a wait that cannot end)."""
+    return "process:%d:%s" % (os.getpid(), os.urandom(8).hex())
+
+
 def read_boot_id(run=None):
     """This boot's id, or None when it cannot be read: Linux's kernel boot id, macOS's kern.bootsessionuuid (the
-    one sysctl form AC-13 allows). None makes every timer's elapsed unknown, which is the conservative case."""
+    one sysctl form AC-13 allows, through the caller's launcher `run(argv, timeout)`). None makes every timer's
+    elapsed unknown, which is the conservative case."""
     try:
         value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         if value:
@@ -79,7 +87,7 @@ class Clock:
         self.db = db
         self._wall = wall or time.time
         self._boot = boot or boot_clock
-        self.boot_id = boot_id if boot_id is not None else read_boot_id()
+        self.boot_id = boot_id if boot_id is not None else (read_boot_id() or process_boot_id())
 
     # ------------------------------------------------------------ wall half
 
@@ -142,14 +150,18 @@ class Clock:
             return None
         return max(0.0, float(self._boot()) - float(anchor))
 
-    def due(self, owner, name):
-        """Whether the timer's deadline counts as passed, by its direction (AC-10). A missing row counts as its
-        conservative case: due for escalation and expiry, not due for a monitor, wait or retention (which then
-        start a fresh full window)."""
+    def due(self, owner, name, duration=None):
+        """Whether the timer's deadline counts as passed, by its direction (AC-10). A missing row (a row written
+        before v5, or a lost one) counts as its conservative case: due for an escalation or an expiry; for a
+        monitor, wait or retention a fresh full window starts now (when `duration` is given) and it is not due."""
         direction = TIMERS[name]
         row = self._row(owner, name)
         if row is None:
-            return direction in (ESCALATION, EXPIRY)
+            if direction in (ESCALATION, EXPIRY):
+                return True
+            if duration is not None:
+                self.start(owner, name, duration)
+            return False
         deadline, duration, _boot, _anchor = row
         wall_passed = self.effective_wall() >= float(deadline)
         elapsed = self.elapsed(owner, name)
@@ -163,3 +175,120 @@ class Clock:
                                            self.effective_wall() + float(duration), owner, name))
             return False
         return wall_passed and elapsed >= float(duration)
+
+    # ------------------------------------------------------------ canary age
+
+    def canary_age(self, canary, github_date=None):
+        """E9's canary_age: from the recorded (boot, mono) canary result on this boot, or from GitHub's server Date
+        (the canary's recorded server Date and a fresh one), never from the local wall clock. A canary from an
+        earlier boot with no Date pair is stale: None."""
+        if not isinstance(canary, dict):
+            return None
+        mono = canary.get("mono")
+        if canary.get("boot") == self.boot_id and self.boot_id is not None and isinstance(mono, (int, float)) \
+                and not isinstance(mono, bool):
+            return max(0.0, float(self._boot()) - float(mono))
+        then = canary.get("github_date")
+        if isinstance(then, (int, float)) and isinstance(github_date, (int, float)) \
+                and not isinstance(then, bool) and not isinstance(github_date, bool):
+            return max(0.0, float(github_date) - float(then))
+        return None
+
+
+# Every wall-clock read in the ahc modules outside this service (AC-10's static inventory): (module, function) ->
+# (count, use). A use is "timer:<name>" when the read feeds a timer (each such timer also has a clock-service row)
+# or "stamp:<why>" for a log stamp or a recorded fact that never decides a deadline.
+NOW_INVENTORY = {
+    ('ahc_clone', '_quarantine', 'time.time_ns'): (1,
+        'stamp:a unique quarantine directory name'),
+    ('ahc_contracts', 'Contracts._a0', 'self.now'): (1,
+        "stamp:the transition audit row's time"),
+    ('ahc_contracts', 'Contracts._attribute', 'self.now'): (1,
+        'stamp:the recorded time of an activity attribution'),
+    ('ahc_contracts', 'Contracts._grant_move', 'self.now'): (1,
+        "stamp:the grant row's updated time"),
+    ('ahc_contracts', 'Contracts._op_move', 'self.now'): (2,
+        'stamp:updated and settled_at (the B48/LATE_WATCH wall record; their clock rows start in TIMERS_ON_ENTRY)'),
+    ('ahc_contracts', 'Contracts._wi_notice', 'self.now'): (1,
+        "stamp:the notice row's time"),
+    ('ahc_contracts', 'Contracts.admit_item', 'self.now'): (1,
+        'stamp:admission time (lineage order, not a deadline)'),
+    ('ahc_contracts', 'Contracts.dispatch', 'self.now'): (1,
+        'timer:B55 and E12 wall record (dispatched_at, probe_at); clock rows start on entry'),
+    ('ahc_contracts', 'Contracts.expire_grants', 'self.now'): (1,
+        'timer:B47 wall half; the clock row decides too'),
+    ('ahc_contracts', 'Contracts.fence', 'self.now'): (1,
+        'timer:FENCED escalate_at wall record; the clock row starts on entry'),
+    ('ahc_contracts', 'Contracts.fence_held', 'self.now'): (1,
+        'timer:FENCED escalate_at wall record; the clock row starts on entry'),
+    ('ahc_contracts', 'Contracts.intend', 'self.now'): (1,
+        'stamp:created and updated'),
+    ('ahc_contracts', 'Contracts.issue_grant', 'self.now'): (1,
+        'timer:B47 expires_at wall record; the clock row starts here'),
+    ('ahc_contracts', 'Contracts.readback_missed', 'self.now'): (2,
+        'timer:B37 probe_at wall record and the updated stamp; the clock row restarts here'),
+    ('ahc_contracts', 'Contracts.require_review', 'self.now'): (1,
+        "stamp:the review row's created time"),
+    ('ahc_contracts', 'Contracts.reserve_grant', 'self.now'): (1,
+        'timer:B47 wall half; the clock row decides too'),
+    ('ahc_contracts', 'Contracts.retain', 'self.now'): (1,
+        'timer:B48 wall half; the clock row decides too'),
+    ('ahc_contracts', 'Contracts.review', 'self.now'): (1,
+        "stamp:the review row's updated time"),
+    ('ahc_contracts', 'Contracts.set_merging.write', 'self.now'): (1,
+        "stamp:the merging mark's time"),
+    ('ahc_contracts', 'Contracts.stamp', 'self.now'): (1,
+        "stamp:an observation's wall stamp for the log; T2 age uses its (boot, mono) stamp"),
+    ('ahc_contracts', 'Contracts.unknown', 'self.now'): (1,
+        'timer:B37 and B42 wall record (probe_at, escalate_at); clock rows start on entry'),
+    ('ahc_contracts', 'Contracts.wi_move', 'self.now'): (1,
+        "stamp:the work item's updated time"),
+    ('ahc_core', 'submit', 'time.time'): (1,
+        "stamp:the queued item's submitted time"),
+    ('ahc_install', 'install', 'time.time'): (1,
+        "stamp:the install record's time"),
+    ('ahc_runner', 'Journal.append', 'time.time'): (1,
+        "stamp:the journal entry's time"),
+    ('ahc_runner', 'Ledger.backup', 'time.time_ns'): (1,
+        'stamp:a unique backup file name'),
+    ('ahc_runner', 'Ledger.restore', 'time.time_ns'): (1,
+        'stamp:a unique moved-aside file name'),
+    ('ahc_runner', 'LiveDeps.clock', 'time.time'): (1,
+        "gate1:the Gate 1 runner's injectable wall clock (Worker.now); its timers are listed below"),
+    ('ahc_runner', 'Worker._effect_done', 'self.now'): (1,
+        "stamp:the effect row's done time"),
+    ('ahc_runner', 'Worker.conclude', 'self.now'): (3,
+        'stamp:conclusion and digest times'),
+    ('ahc_runner', 'Worker.dispatch_effects', 'self.now'): (1,
+        'stamp:the effect dispatch time'),
+    ('ahc_runner', 'Worker.email_route', 'self.now'): (1,
+        "stamp:the email route row's time"),
+    ('ahc_runner', 'Worker.escalate', 'self.now'): (1,
+        "stamp:the escalation row's time"),
+    ('ahc_runner', 'Worker.escalate_overdue', 'self.now'): (1,
+        "gate1:D20 overdue escalation, wall only (slice 1(a) runner; not in AC-10's list; follow-up)"),
+    ('ahc_runner', 'Worker.fail', 'self.now'): (1,
+        'stamp:the failure time'),
+    ('ahc_runner', 'Worker.head_readback', 'self.now'): (1,
+        'stamp:the readback time'),
+    ('ahc_runner', 'Worker.lease', 'self.now'): (1,
+        "gate1:the item lease expiry, wall only (slice 1(a) runner; not in AC-10's list; follow-up)"),
+    ('ahc_runner', 'Worker.process', 'self.now'): (3,
+        'stamp:step times in the journal and rows'),
+    ('ahc_runner', 'Worker.prune_packets', 'self.now'): (1,
+        "gate1:packet pruning age, wall only (slice 1(a) runner; not in AC-10's list; follow-up)"),
+    ('ahc_runner', 'Worker.recheck_pass', 'self.now'): (1,
+        'stamp:the recheck time'),
+    ('ahc_runner', 'Worker.review', 'self.now'): (2,
+        'stamp:review start and end times'),
+    ('ahc_runner', 'Worker.settle', 'self.now'): (1,
+        'stamp:the settle time'),
+    ('ahc_runner', '_quarantine', 'time.time_ns'): (1,
+        'stamp:a unique quarantine name'),
+    ('ahc_runner', '_quarantine_report_dir', 'time.time_ns'): (1,
+        'stamp:a unique report directory name'),
+    ('ahc_runner', 'ack', 'time.time'): (1,
+        "stamp:the ack record's time"),
+    ('ahc_runner', 'admit', 'time.time'): (1,
+        "stamp:the admit record's time"),
+}

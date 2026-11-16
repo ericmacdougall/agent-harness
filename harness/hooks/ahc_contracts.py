@@ -16,6 +16,7 @@ import os
 import time
 from pathlib import Path
 
+import ahc_clock
 import ahc_fs as fs
 from ahc_crash import crash_after, crash_before
 
@@ -229,8 +230,10 @@ class Contracts:
         self.db = db
         self.authority = authority
         self._now = now or time.time
-        self._mono = mono or time.monotonic
+        self._mono = mono or ahc_clock.boot_clock      # AC-10: CLOCK_BOOTTIME where the platform has it
         self.boot_id = boot_id or _boot_id()
+        # AC-10: every timer reads this one clock service (effective wall plus boot-clock elapsed)
+        self.clock = ahc_clock.Clock(db, wall=self._now, boot=self._mono, boot_id=self.boot_id)
 
     def stamp(self, obs):
         """An observation row stamped as read now: wall time for the log, plus this boot's monotonic stamp that
@@ -1021,7 +1024,8 @@ class Contracts:
         return int(row[0]) if row else 1
 
     def utc_day(self, at=None):
-        return int((self.now() if at is None else at) // 86400)
+        """CAP1's UTC day, on the effective wall (AC-10: it never goes backwards across restarts)."""
+        return int((self.clock.effective_wall() if at is None else at) // 86400)
 
     def cap_used(self, repo, day=None):
         return self.db.execute("SELECT COUNT(*) FROM grants WHERE repo=? AND cap_day=? AND cap_held=1",
@@ -1071,6 +1075,7 @@ class Contracts:
                             (gid, kind, source, principal, repo, pr, head, base, policy_revision, 1,
                              now + lifetime, "validated", epoch, kill_epoch, day, 1, seq, 1, now, now))
             self._a0("grant", gid, None, "validated", event_id, "ahc-core", principal=principal)
+            self.clock.start(gid, "B47", lifetime)                  # AC-10: expiry on either clock
             return self._row("grants", "id", gid)
 
     def _grant_move(self, gid, to, expected_version, event_id, actor, operation=None, **data):
@@ -1111,7 +1116,7 @@ class Contracts:
             if mirror_read_back is not True:
                 raise ContractError("reserve needs the mirror comment read back from the ticket")
             self._current_epochs(row, kill_epoch)
-            if row["expires_at"] <= self.now():
+            if row["expires_at"] <= self.now() or self.clock.due(gid, "B47"):
                 raise ContractError("grant is past expiry: no new reservation")
             if row["operation"]:
                 raise ContractError("grant is already reserved for %s" % row["operation"])
@@ -1145,9 +1150,12 @@ class Contracts:
         """G7 sweep. A reserved grant past expiry has NO transition while its operation is unsettled."""
         out = []
         with self.tx():
-            for gid, version in self.db.execute(
-                    "SELECT id, version FROM grants WHERE state IN ('validated', 'active') AND expires_at <= ?",
-                    (self.now(),)).fetchall():
+            now = self.now()
+            for gid, version, expires in self.db.execute(
+                    "SELECT id, version, expires_at FROM grants WHERE state IN ('validated', 'active') ORDER BY id"
+                    ).fetchall():
+                if not (expires <= now or self.clock.due(gid, "B47")):     # AC-10: expired on either clock
+                    continue
                 self._grant_move(gid, "expired", version, "%s-%s" % (event_prefix, gid), "ahc-core")
                 out.append(gid)
         return out
@@ -1282,6 +1290,8 @@ class Contracts:
             sets["settled_at"] = self.now()
         assignments = ", ".join("%s=?" % k for k in sets) + ", version=version+1"
         self.db.execute("UPDATE operations SET %s WHERE key=?" % assignments, list(sets.values()) + [key])
+        for name, seconds in self.TIMERS_ON_ENTRY.get(to, ()):
+            self.clock.start(key, name, seconds)                     # AC-10: each timer's row and anchor
         self._a0("operation", key, frm, to, event_id, actor, **data)
         new = self._row("operations", "key", key)
         if to in self.OP_TERMINAL:
@@ -1437,8 +1447,7 @@ class Contracts:
             if not self._applied(row, obs):
                 raise ContractError("readback does not show the update B -> H applied")
             unmarked = obs.get("pr_merged") is not True
-            if unmarked and row["state"] != "held" and \
-                    self.now() - float(row["dispatched_at"] or 0) < self.PR_MARK_SECONDS:
+            if unmarked and row["state"] != "held" and not self.clock.due(key, "E12"):
                 raise ContractError("the PR is not shown merged yet; wait up to 10 min before E12")
             new = self._op_move(key, "confirmed", expected_version, event_id, actor,
                                 {"evidence": _canon(obs), "pr_unmarked": 1 if unmarked else 0})
@@ -1542,9 +1551,12 @@ class Contracts:
 
     def unknown(self, key, *, expected_version, event_id, restart=False):
         """E5 dispatched -> outcome-unknown when B55 passed or a restart found no conclusive readback."""
+        # B55 is a wait (both clocks). It is read before the transaction: a new boot's re-anchor must commit even
+        # when this call is refused, or every refused call would restart the wait again (AC-10)
+        waited = restart or self.clock.due(key, "B55", B55_REQUEST_SECONDS)
         with self.tx():
             row = self._row_or_raise(key)
-            if not restart and self.now() < float(row["probe_at"] or 0):
+            if not waited:
                 raise ContractError("the request has not timed out yet (B55)")
             now = self.now()
             return self._op_move(key, "outcome-unknown", expected_version, event_id, "ahc-core", {
@@ -1565,6 +1577,7 @@ class Contracts:
                                      {"readbacks": count, "incident": 1, "probe_at": None})
             self.db.execute("UPDATE operations SET readbacks=?, probe_at=?, version=version+1, updated=? WHERE key=?",
                             (count, self.now() + B37_PROBE_SECONDS, self.now(), key))
+            self.clock.start(key, "B37", B37_PROBE_SECONDS)
             return self._row("operations", "key", key)
 
     def after_absence(self, key, params, read, *, expected_version, event_id, lease_ok):
@@ -1648,14 +1661,24 @@ class Contracts:
     # ---- L5 late-apply watch and the per-repo merging switch
 
     LATE_WATCH_SECONDS = 30 * 86400
+    # AC-10: the timers an operation starts when it enters a state (clock-service rows keyed by the operation)
+    TIMERS_ON_ENTRY = {
+        "dispatched": (("E12", PR_MARK_SECONDS), ("B55", B55_REQUEST_SECONDS)),
+        "outcome-unknown": (("B37", B37_PROBE_SECONDS), ("B42", B42_INCIDENT_SECONDS)),
+        "fenced": (("FENCED", FENCED_ESCALATE_SECONDS),),
+        "confirmed": (("B48", B48_RETENTION_SECONDS),),
+        "abandoned": (("B48", B48_RETENTION_SECONDS), ("LATE_WATCH", LATE_WATCH_SECONDS)),
+    }
 
     def watched(self, repo):
         """What the late-apply watch checks on every repo poll: every fenced op (no expiry) and every op abandoned
         in the last 30 days, each with the (B, H) whose update must not appear."""
-        return [dict(zip(("key", "base", "head", "state"), r)) for r in self.db.execute(
+        rows = self.db.execute(
             "SELECT key, base, head, state FROM operations WHERE repo=? AND (state='fenced' OR "
-            "(state='abandoned' AND settled_at >= ?)) ORDER BY created, key",
-            (str(repo).lower(), self.now() - self.LATE_WATCH_SECONDS))]
+            "(state='abandoned' AND tombstone=0)) ORDER BY created, key", (str(repo).lower(),)).fetchall()
+        # AC-10: LATE_WATCH is a monitoring window; it stops only when both clocks agree it ended
+        return [dict(zip(("key", "base", "head", "state"), r)) for r in rows
+                if r[3] == "fenced" or not self.clock.due(r[0], "LATE_WATCH", self.LATE_WATCH_SECONDS)]
 
     def late_apply(self, key, evidence, *, event_id):
         """L5: a read found an abandoned operation's update applied (tip == H, or the (B, H) activity entry). The
@@ -1752,7 +1775,10 @@ class Contracts:
         is never tombstoned."""
         cutoff = self.now() - B48_RETENTION_SECONDS
         with self.tx():
-            cur = self.db.execute("UPDATE operations SET tombstone=1, params=NULL, evidence=NULL WHERE tombstone=0 "
-                                  "AND state IN ('confirmed', 'abandoned') AND settled_at IS NOT NULL "
-                                  "AND settled_at <= ?", (cutoff,))
-            return cur.rowcount
+            keys = [k for (k,) in self.db.execute(
+                "SELECT key FROM operations WHERE tombstone=0 AND state IN ('confirmed', 'abandoned') "
+                "AND settled_at IS NOT NULL AND settled_at <= ? ORDER BY key", (cutoff,)).fetchall()
+                if self.clock.due(k, "B48", B48_RETENTION_SECONDS)]       # AC-10: retention needs both clocks
+            for k in keys:
+                self.db.execute("UPDATE operations SET tombstone=1, params=NULL, evidence=NULL WHERE key=?", (k,))
+            return len(keys)
