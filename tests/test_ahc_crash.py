@@ -1108,7 +1108,7 @@ class StateDigestTests(unittest.TestCase):
 
 
 class InventoryTests(unittest.TestCase):
-    MODULES = ("ahc_contracts", "ahc_runner")
+    MODULES = ("ahc_contracts", "ahc_runner", "ahc_clock", "ahc_migrate")
 
     def found(self, overrides=None):
         out = {}

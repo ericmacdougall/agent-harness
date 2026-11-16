@@ -100,6 +100,7 @@ ENTRIES.update({
              '"SELECT id FROM reviews WHERE ? IS NOT NULL AND kind=? AND')], CONTRACTS)]},
 })
 CK = "tests.test_ahc_clock.ClockTests."
+CC = "tests.test_ahc_contracts.ClockTests."
 CLOCK = "harness/hooks/ahc_clock.py"
 ENTRIES.update({
     "AC-10 wall never backwards": {
@@ -119,14 +120,58 @@ ENTRIES.update({
              "        return wall_passed or elapsed >= float(duration)\n")], CLOCK)]},
     "AC-10 new boot is unknown elapsed": {
         "tests": [CK + "test_escalation_fires_on_either_clock_and_on_a_new_boot",
-                  CK + "test_wait_needs_both_clocks_and_restarts_on_a_new_boot"],
+                  CK + "test_wait_needs_both_clocks_and_restarts_on_a_new_boot",
+                  CC + "test_new_boot_near_b47_expiry_expires_at_once_with_wall_back_or_forward",
+                  CC + "test_new_boot_mid_wait_restarts_the_full_wait"],
         "mutations": [("a new boot keeps the old anchor", [
             (" or boot != self.boot_id:", ":")], CLOCK)]},
     "AC-10 elapsed from the boot clock": {
-        "tests": [CK + "test_elapsed_comes_from_the_boot_clock_not_the_wall"],
+        "tests": [CK + "test_elapsed_comes_from_the_boot_clock_not_the_wall",
+                  CC + "test_crash_loop_every_5_min_for_1_h_keeps_elapsed"],
         "mutations": [("elapsed is derived from wall timestamps", [
             ("        return max(0.0, float(self._boot()) - float(anchor))\n",
              "        return max(0.0, self.effective_wall() - (float(_deadline) - float(_duration)))\n")], CLOCK)]},
+    "AC-10 restart keeps the anchor": {
+        "tests": [CC + "test_crash_loop_every_5_min_for_1_h_keeps_elapsed"],
+        "mutations": [("a restart resets every anchor", [
+            ("        self.boot_id = boot_id if boot_id is not None else (read_boot_id() or process_boot_id())\n",
+             "        self.boot_id = boot_id if boot_id is not None else (read_boot_id() or process_boot_id())\n"
+             "        db.execute('UPDATE timers SET anchor=?', (float(self._boot()),))\n")], CLOCK)]},
+    "AC-10 re-anchor commits on a refusal": {
+        "tests": [CC + "test_new_boot_mid_wait_restarts_the_full_wait"],
+        "mutations": [("the B55 wait is read inside the refusing transaction", [
+            ('        waited = restart or self.clock.due(key, "B55", B55_REQUEST_SECONDS)\n        with self.tx():\n'
+             '            row = self._row_or_raise(key)\n            if not waited:',
+             '        with self.tx():\n            row = self._row_or_raise(key)\n'
+             '            if not (restart or self.clock.due(key, "B55", B55_REQUEST_SECONDS)):')], CONTRACTS)]},
+    "AC-10 B47 on either clock": {
+        "tests": [CC + "test_b47_expiry_on_either_clock_with_wall_steps"],
+        "mutations": [("the grant sweep reads the wall only", [
+            ('                if not (expires <= now or self.clock.due(gid, "B47")):',
+             '                if not (expires <= now):')], CONTRACTS)]},
+    "AC-10 LATE_WATCH and B48 need both clocks": {
+        "tests": [CC + "test_wall_forward_alone_never_ends_a_monitor_or_retention",
+                  CC + "test_new_boot_near_late_watch_end_keeps_watching_with_wall_steps"],
+        "mutations": [("the watch and retention end on the wall alone", [
+            ('                if r[3] == "fenced" or not self.clock.due(r[0], "LATE_WATCH", self.LATE_WATCH_SECONDS)]',
+             '                if r[3] == "fenced"]'),
+            ('                if self.clock.due(k, "B48", B48_RETENTION_SECONDS)]', '                if True]')],
+            CONTRACTS)]},
+    "AC-10 CAP1 day never backwards": {
+        "tests": [CC + "test_cap1_day_never_goes_backwards_on_a_wall_step_back"],
+        "mutations": [("CAP1's day reads the raw wall", [
+            ("        return int((self.clock.effective_wall() if at is None else at) // 86400)",
+             "        return int((self.now() if at is None else at) // 86400)")], CONTRACTS)]},
+    "AC-10 static inventory": {
+        "tests": [CC + "test_every_wall_clock_read_outside_the_clock_service_is_inventoried"],
+        "mutations": [("an uninventoried wall read", [
+            ('            self.clock.start(key, "B37", B37_PROBE_SECONDS)\n',
+             '            self.clock.start(key, "B37", B37_PROBE_SECONDS + 0 * self.now())\n')], CONTRACTS)]},
+    "AC-10 canary age": {
+        "tests": [CC + "test_canary_age_from_boot_and_mono_or_github_date_never_the_wall"],
+        "mutations": [("canary age from the local wall", [
+            ("            return max(0.0, float(self._boot()) - float(mono))\n",
+             "            return max(0.0, float(self._wall()) - float(mono))\n")], CLOCK)]},
 })
 
 

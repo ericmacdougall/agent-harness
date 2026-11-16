@@ -1111,5 +1111,163 @@ class LegacyTests(Base):
             {"table": "operations_v3_legacy", "id": "k1", "state": "held", "repo": None}])
 
 
+class ClockTests(Base):
+    """AC-10: one clock service. The wall clock and the boot clock are separate fakes here; a restart is a new
+    Contracts on the same ledger, and a reboot is a new boot id."""
+    DAY = 86400
+
+    def setUp(self):
+        super().setUp()
+        self.boot = [5000.0]
+        self.boot_id = BOOT
+        self.restart()
+
+    def restart(self, boot_id=None):
+        if boot_id is not None:
+            self.boot_id = boot_id
+        self.c = C.Contracts(self.db, self.log, now=self.clock, mono=lambda: self.boot[0], boot_id=self.boot_id)
+        return self.c
+
+    def obs(self, row=None, **changes):
+        o = super().obs(row, **changes)
+        o.update(mono=self.boot[0], boot=self.boot_id)
+        return o
+
+    def readback(self, **changes):
+        r = super().readback(**changes)
+        r.update(mono=self.boot[0], boot=self.boot_id)
+        return r
+
+    def tick(self, seconds, wall=True):
+        self.boot[0] += seconds
+        if wall:
+            self.clock.t += seconds
+
+    def test_cap1_day_never_goes_backwards_on_a_wall_step_back(self):
+        day = self.c.utc_day()
+        self.clock.t -= self.DAY
+        self.assertEqual(self.restart().utc_day(), day, "a restart after a 1-day step back keeps the day")
+        self.clock.t += 2 * self.DAY
+        self.assertEqual(self.restart().utc_day(), day + 1)
+
+    def test_b47_expiry_on_either_clock_with_wall_steps(self):
+        g = self.active_grant()
+        self.clock.t -= self.DAY                              # wall back a day: elapsed still runs out
+        self.tick(C.B47_GRANT_SECONDS - 1, wall=False)
+        self.assertEqual(self.restart().expire_grants("x"), [])
+        self.tick(1, wall=False)
+        self.assertEqual(self.restart().expire_grants("x"), [g["id"]], "elapsed alone expires a grant")
+        g2 = self.active_grant(pr=6)
+        self.clock.t += self.DAY                              # wall forward a day: expired with no elapsed
+        self.assertEqual(self.restart().expire_grants("x"), [g2["id"]], "the wall alone expires a grant")
+
+    def test_new_boot_near_b47_expiry_expires_at_once_with_wall_back_or_forward(self):
+        for step in (-self.DAY, self.DAY):
+            with self.subTest(step=step):
+                self.boot_id = BOOT
+                g = self.active_grant(pr=20 + (step > 0))
+                self.tick(C.B47_GRANT_SECONDS - 60, wall=False)
+                self.clock.t += step if step < 0 else 0
+                self.assertEqual(self.restart(boot_id="linux:new-%d" % step).expire_grants("x"), [g["id"]],
+                                 "a new boot leaves elapsed unknown: an expiry counts as expired")
+
+    def test_crash_loop_every_5_min_for_1_h_keeps_elapsed(self):
+        g, op = self.dispatched()
+        for _ in range(12):                                   # 12 restarts, 5 min apart, the wall stepping back
+            self.tick(300, wall=False)
+            self.clock.t -= 1
+            self.restart()
+        self.assertEqual(self.c.clock.elapsed(op["key"], "B55"), 3600.0, "restarts never reset elapsed")
+        self.assertTrue(self.c.clock.due(op["key"], "E12"), "an escalation fires on elapsed alone")
+        with self.assertRaisesRegex(C.ContractError, "B55"):   # a wait needs both clocks; the wall half lags
+            self.c.unknown(op["key"], expected_version=op["version"], event_id=self.ev())
+        self.clock.t += self.DAY
+        self.assertEqual(self.c.unknown(op["key"], expected_version=op["version"], event_id=self.ev())["state"],
+                         "outcome-unknown")
+
+    def test_new_boot_mid_wait_restarts_the_full_wait(self):
+        g, op = self.dispatched()
+        self.tick(C.B55_REQUEST_SECONDS - 10)
+        c = self.restart(boot_id="linux:second-boot")
+        self.tick(20)
+        with self.assertRaisesRegex(C.ContractError, "B55"):
+            c.unknown(op["key"], expected_version=op["version"], event_id=self.ev())
+        self.tick(C.B55_REQUEST_SECONDS)
+        try:
+            row = c.unknown(op["key"], expected_version=op["version"], event_id=self.ev())
+        except C.ContractError as error:
+            self.fail("the restarted wait never ended (its re-anchor was rolled back?): %s" % error)
+        self.assertEqual(row["state"], "outcome-unknown")
+
+    def settled_abandoned(self):
+        g, op = self.reserved()
+        return self.c.abandon_unsent(op["key"], expected_version=op["version"], event_id=self.ev(), reason="cancel")
+
+    def test_new_boot_near_late_watch_end_keeps_watching_with_wall_steps(self):
+        op = self.settled_abandoned()
+        self.tick(C.Contracts.LATE_WATCH_SECONDS - 60)
+        self.assertIn(op["key"], [w["key"] for w in self.restart().watched("o/r")])
+        for step in (-self.DAY, self.DAY):
+            self.clock.t += step
+            self.assertIn(op["key"], [w["key"] for w in self.restart(boot_id="linux:b%d" % step).watched("o/r")],
+                          "a new boot re-anchors the monitor with the full duration")
+        self.tick(C.Contracts.LATE_WATCH_SECONDS - 1)
+        self.assertIn(op["key"], [w["key"] for w in self.c.watched("o/r")])
+        self.tick(1)
+        self.assertNotIn(op["key"], [w["key"] for w in self.c.watched("o/r")])
+
+    def test_wall_forward_alone_never_ends_a_monitor_or_retention(self):
+        op = self.settled_abandoned()
+        self.clock.t += 10 * C.Contracts.LATE_WATCH_SECONDS
+        self.assertIn(op["key"], [w["key"] for w in self.restart().watched("o/r")])
+        self.assertEqual(self.c.retain(), 0, "B48 deletes only when both clocks agree")
+        self.tick(C.B48_RETENTION_SECONDS, wall=False)
+        self.assertEqual(self.c.retain(), 1)
+
+    def test_canary_age_from_boot_and_mono_or_github_date_never_the_wall(self):
+        canary = {"boot": BOOT, "mono": self.boot[0]}
+        self.tick(30)
+        self.clock.t += 10 ** 6
+        self.assertEqual(self.c.clock.canary_age(canary), 30.0)
+        self.assertIsNone(self.restart(boot_id="linux:other").clock.canary_age(canary), "an earlier boot is stale")
+        self.assertEqual(self.c.clock.canary_age(dict(canary, github_date=100.0), github_date=160.0), 60.0)
+
+    def test_every_wall_clock_read_outside_the_clock_service_is_inventoried(self):
+        import ahc_clock
+        found = _now_calls()
+        missing = {k: n for k, n in found.items() if ahc_clock.NOW_INVENTORY.get(k, (None,))[0] != n}
+        stale = sorted(k for k in ahc_clock.NOW_INVENTORY if k not in found)
+        self.assertEqual((missing, stale), ({}, []), "self.now()/time.time calls missing from ahc_clock.NOW_INVENTORY")
+        for k, (n, use) in ahc_clock.NOW_INVENTORY.items():
+            self.assertRegex(use, r"^(stamp|timer|gate1):.{8,}", k)
+
+
+def _now_calls():
+    import ast
+    import collections
+    out = collections.Counter()
+    for path in sorted(HOOKS.glob("ahc_*.py")):
+        if path.name == "ahc_clock.py":
+            continue
+        stack = []
+
+        class Visit(ast.NodeVisitor):
+            def scope(self, node):
+                stack.append(node.name)
+                self.generic_visit(node)
+                stack.pop()
+            visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = scope
+
+            def visit_Call(self, node):
+                f = node.func
+                if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and (
+                        (f.value.id == "self" and f.attr == "now") or
+                        (f.value.id == "time" and f.attr in ("time", "time_ns"))):
+                    out[(path.stem, ".".join(stack), "%s.%s" % (f.value.id, f.attr))] += 1
+                self.generic_visit(node)
+        Visit().visit(ast.parse(path.read_text(encoding="utf-8")))
+    return dict(out)
+
+
 if __name__ == "__main__":
     unittest.main()

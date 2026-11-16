@@ -296,6 +296,36 @@ INVENTORY = {
            "runner.backup seam; restore reopen: after the runner.restore_copy seam)"),
     ("ahc_runner", "Ledger.__init__", "sql:PRAGMA"): (
         2, "exempt:connection settings (journal_mode=WAL, synchronous=FULL), re-applied at every open"),
+    # AC-10 clock service: its rows are written on the caller's connection, inside the caller's transaction
+    # (the contracts.commit seam) or as one autocommit statement whose loss only restarts a window conservatively
+    ("ahc_clock", "Clock.due", "sql:UPDATE"): (
+        1, "exempt:a new-boot re-anchor of one timer row; lost on a crash, the next read re-anchors again (later)"),
+    ("ahc_clock", "Clock.effective_wall", "sql:INSERT"): (
+        1, "exempt:raises the wall high-water mark; a lost raise is re-done by the next read (max of wall and mark)"),
+    ("ahc_clock", "Clock.reset_hwm", "sql:INSERT"): (
+        2, "exempt:main's stamped reset, inside the CLI command's transaction (contracts.commit)"),
+    ("ahc_clock", "Clock.start", "sql:INSERT"): (
+        1, "exempt:a timer row written inside the caller's transition transaction (contracts.commit)"),
+    ("ahc_clock", "Clock.stop", "sql:DELETE"): (
+        1, "exempt:removes a timer row inside the caller's transaction (contracts.commit)"),
+    ("ahc_migrate", "set_fence", "sql:INSERT"): (1, "seam:runner.v5_fence"),
+    ("ahc_migrate", "set_fence", "sql:COMMIT"): (1, "seam:runner.v5_fence"),
+    ("ahc_migrate", "clear_fence", "sql:UPDATE"): (
+        1, "exempt:clears the fence on a refusal before any change; a crash leaves the fence, which refuses safely"),
+    ("ahc_migrate", "clear_fence", "sql:DELETE"): (
+        1, "exempt:clears the fence on a refusal before any change; a crash leaves the fence, which refuses safely"),
+    ("ahc_migrate", "clear_fence", "sql:COMMIT"): (
+        1, "exempt:clears the fence on a refusal before any change; a crash leaves the fence, which refuses safely"),
+    ("ahc_migrate", "maint_lock", "fs.open_file"): (
+        1, "exempt:opens or creates the empty maintenance flock file; no state"),
+    ("ahc_migrate", "wait_role_lock", "fs.open_file"): (
+        1, "exempt:opens or creates the empty role flock file; no state"),
+    ("ahc_migrate", "rebuild_changed_tables", "sql:ALTER"): (1, _MIG),
+    ("ahc_migrate", "rebuild_changed_tables", "sql:DROP"): (1, _MIG),
+    ("ahc_migrate", "rebuild_changed_tables", "sql:DYNAMIC"): (2, _MIG),
+    ("ahc_migrate", "rebuild_changed_tables", "sql:INSERT"): (1, _MIG),
+    ("ahc_migrate", "schema_objects", "sql:DYNAMIC"): (1, "exempt:an in-memory database; no file"),
+    ("ahc_migrate", "schema_objects", "sqlite3.connect"): (1, "exempt:an in-memory database (':memory:'); no file"),
     ("ahc_runner", "Ledger._migrate_to_v5", "sqlite.backup"): (1, "exempt:a call to Ledger.backup (seam runner.backup)"),
     ("ahc_runner", "Ledger._v5_gate", "sql:PRAGMA"): (
         2, "exempt:connection settings (journal_mode=WAL, synchronous=FULL) on the migrator's connection"),
