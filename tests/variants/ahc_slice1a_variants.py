@@ -110,6 +110,17 @@ V = [
         ("            self._wi_notice(event_id, item, row_id, \"ticket\", \"%s ended %s; item %s\" % (\n",
          "            (lambda *a: None)(event_id, item, row_id, \"ticket\", \"%s ended %s; item %s\" % (\n")],
      CONTRACTS, SM),
+    ("W5: the merged cause expression (a mirror cause recorded as 'ELIG failed: ')", [
+        ("                cause = cause or (\"ELIG failed: %s\" % \", \".join(failed) if failed else self.MIRROR_CAUSE)\n",
+         "                cause = cause or \"ELIG failed: %s\" % \", \".join(failed) or self.MIRROR_CAUSE\n")],
+     CONTRACTS, SM),
+    ("W6: a mirror cause not required to clear", [
+        ("            if row_id == \"W6\" and item[\"cause\"] == self.MIRROR_CAUSE and obs.get(\"mirror_ok\") is not True:\n",
+         "            if False:\n")], CONTRACTS, SM),
+    ("AC-18: W21's authority line keyed per call, so a crash retry writes a second line", [
+        ("                self.authority.append({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",",
+         "                self.authority.append({\"event_id\": event_id + os.urandom(4).hex(), \"item\": iid, \"row\": \"W21\",")],
+     CONTRACTS, ["tests.test_ahc_crash.CrashPointTests"]),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
          '                if prior[0] == "work_item":\n')], CONTRACTS, SM),

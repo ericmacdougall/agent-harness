@@ -403,6 +403,8 @@ class Contracts:
     # with a slash matches the full path from the repo root. Renames are checked on both paths (the caller lists
     # both). The policy file and the test configuration files named under Required checks are added per repo by
     # the policy record (`extra_protected`).
+    MIRROR_CAUSE = "mirror undeliverable"     # W5's cause when ELIG holds but the mirror cannot be delivered
+
     NEG6 = ("merge_gate*", "peer_review*", "caller_identity*", "usage_guard*", "commit_policy*", "ahc*",
             "settings*.json", "hooks_manifest.json", ".github/**", "CODEOWNERS", ".claude/**", ".mcp.json",
             ".codex/**", "CLAUDE.md", "AGENTS.md", "conftest*", "pytest.ini", "setup.cfg", "tox.ini",
@@ -552,7 +554,8 @@ class Contracts:
             if row_id in ("W2", "W6"):                      # the values ELIG passed on, for W27
                 extra = {"elig_core": item["spec_core"], "elig_policy": item["policy_revision"]}
             elif row_id == "W5":
-                cause = cause or "ELIG failed: %s" % ", ".join(self.elig(item, obs)) or "mirror undeliverable"
+                failed = self.elig(item, obs)
+                cause = cause or ("ELIG failed: %s" % ", ".join(failed) if failed else self.MIRROR_CAUSE)
             elif row_id == "W27":
                 extra = {"spec_core": obs["attached_core"], "policy_revision": obs["policy"]["revision"]}
             elif row_id == "W21":
@@ -655,6 +658,10 @@ class Contracts:
             failed = self.elig(item, obs)
             if failed:
                 raise ContractError("%s needs ELIG; failed: %s" % (row_id, ", ".join(failed)))
+            # W6: the recorded cause has cleared. An ELIG cause is covered by ELIG holding; a mirror cause is not
+            # an ELIG clause, so the observation must show the mirror deliverable again.
+            if row_id == "W6" and item["cause"] == self.MIRROR_CAUSE and obs.get("mirror_ok") is not True:
+                raise ContractError("W6 needs the mirror deliverable again (the recorded cause)")
         elif row_id == "W5":
             failed = self.elig(item, obs)
             mirror_down = isinstance(obs, dict) and obs.get("mirror_ok") is False
