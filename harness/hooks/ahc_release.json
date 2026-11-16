@@ -6,6 +6,7 @@
   "ahc_core.py": "e078ee019e05953166b3958caa0132b9eccd8d63189b56fba2ae1e4b72a6fee2",
   "ahc_crash.py": "e9e2c7fd1121a4edd5d662fbf62b22501a075e6cdfdb9ae0da945643fbe94e69",
   "ahc_fs.py": "cfffa4a962c7286aacd69be1215669bf54c087bc91655af5cf3968a58c5a9a90",
+  "ahc_guard.py": "90108516a3609cb300304f965d2dc46d25dfcceb5aaf3756c438eb795142bdfe",
   "ahc_install.py": "4c3514f3df7d99a5f22a10fb6f3faace921d1a20b4b31ae51833a505c923f4cd",
   "ahc_migrate.py": "e84130b3128e18e456ddd1cb07e5f40a19c7325fa1489748954bd615bcc61593",
   "ahc_packet.py": "0c6e8fd1440c79ec3050c2f8c7945112e9c227335696e7b2bb9be146e3d352a4",

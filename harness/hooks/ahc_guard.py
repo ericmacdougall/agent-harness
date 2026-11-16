@@ -72,6 +72,11 @@ GH_HEADERS = ("Accept: application/vnd.github+json", "X-GitHub-Api-Version: 2022
 PR_FIELDS = frozenset(("number", "state", "headRefOid", "mergeCommit", "baseRefName", "baseRefOid", "isDraft",
                        "mergeable", "mergeStateStatus", "body", "updatedAt", "changedFiles", "headRepository",
                        "headRepositoryOwner", "title", "url"))
+# Legacy helpers: the installed scripts only (never a path from config), and the keys of their environment, whose
+# values are fixed when the policy is made (ASSUMPTION: the helpers run model CLIs and ah, which need the daemon's
+# own PATH and HOME; every other inherited key, such as GIT_* or a provider key, is dropped).
+HELPER_SCRIPTS = {"ah": "ah.py", "ops_watch": "ops_watch.py", "peer_review": "peer_review.py"}
+HELPER_ENV_KEYS = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "XDG_RUNTIME_DIR")
 W21_PUT = re.compile(r"repos/(?P<repo>[^/]+/[^/]+)/pulls/(?P<pr>[1-9][0-9]{0,9})/update-branch")
 
 
@@ -128,7 +133,7 @@ class Policy:
     are never injectable through config or env."""
 
     def __init__(self, root, *, repos=(), home=None, trusted_dirs=TRUSTED_DIRS, helpers=None, unit_scope="--user",
-                 gh_token=None, _stubs=None, _allow_file=False, _python=None):
+                 gh_auth=None, _stubs=None, _allow_file=False, _python=None):
         self.root = os.path.realpath(str(root))
         self.clones = os.path.join(self.root, "clones")
         self.repos = {str(r).lower() for r in repos}
@@ -137,15 +142,19 @@ class Policy:
         self.path_env = ":".join(self.trusted)
         self.allow_file = bool(_allow_file)
         self.unit_scope = unit_scope if unit_scope in ("--user", "") else "--user"
-        self.gh_token = gh_token
+        self.gh_auth = gh_auth
         self.exe = {}
         for name in EXECUTABLES:
             path = (_stubs or {}).get(name) if _stubs is not None else self._resolve(name)
             if path and not trusted_file_problem(path):
                 self.exe[name] = str(path)
         self.python = str(_python or sys.executable)
+        self.helper_env = {k: os.environ[k] for k in HELPER_ENV_KEYS if k in os.environ}
+        self.helper_env["LC_ALL"] = "C"
+        if helpers is None:
+            helpers = {n: os.path.join(self.home, ".claude", "hooks", f) for n, f in HELPER_SCRIPTS.items()}
         self.helpers = {}               # name -> (script path, sha256): pinned at start (ASSUMPTION: not ahc release
-        for name, script in (helpers or {}).items():   # files, so their hash is the one read when the daemon starts)
+        for name, script in helpers.items():           # files, so their hash is the one read when the daemon starts)
             problem = trusted_file_problem(script)
             if problem is None:
                 self.helpers[name] = (str(script), hashlib.sha256(Path(script).read_bytes()).hexdigest())
@@ -176,14 +185,19 @@ class Policy:
             base.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"})
         elif name == "gh":
             base.update({"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"})
-            if self.gh_token:
-                base["GH_TOKEN"] = self.gh_token
+            if self.gh_auth:
+                base["GH_TOKEN"] = self.gh_auth
         return base
 
     def argv(self, name, args):
         if name not in self.exe:
             raise LaunchRefused("%s is not resolved from the trusted directories" % name)
         return [self.exe[name]] + [str(a) for a in args]
+
+    def helper_argv(self, name, args):
+        if name not in self.helpers:
+            raise LaunchRefused("helper %s is not an installed, trusted script" % name)
+        return [self.python, self.helpers[name][0]] + [str(a) for a in args]
 
     def git_prefix(self):
         import ahc_clone  # noqa: PLC0415
@@ -333,7 +347,7 @@ class Policy:
         if not (m and m.group("repo").lower() in self.repos and args[4] == "-f"
                 and re.fullmatch(r"expected_head_sha=[0-9a-f]{40}", args[5])):
             self.refuse("gh api PUT: only W21's update-branch form")
-        if armed is None or list(args) != armed[1:] and [self.exe.get("gh")] + list(args) != armed:
+        if armed is None or [self.exe.get("gh")] + list(args) != armed:
             self.refuse("gh api PUT: no armed W21 expectation, or a different one")
 
     # systemd-run and systemctl ---------------------------------------------------------------------------------
@@ -406,6 +420,8 @@ class Policy:
     }
 
     def _check_helper(self, args, env):
+        if env != self.helper_env:
+            self.refuse("python helper: the environment differs from the helper form's fixed environment")
         if len(args) < 2 or args[1].startswith("-"):
             self.refuse("python: only a bound helper script, never -c, -m or flags")
         for name, (script, sha) in self.helpers.items():
@@ -486,11 +502,15 @@ def active():
     return _ACTIVE
 
 
-def run(name, args, cwd, timeout, policy=None):
-    """The production launcher: the resolved executable, its minimal env and an explicit cwd under the root.
-    Returns (rc, stdout, stderr) as ahc_core.run_argv does."""
+def run(policy, name, args, timeout, cwd=None):
+    """The production launcher for one form: the resolved executable, its minimal env and an explicit cwd under the
+    root (default: the root). The policy builds the form whether or not it is the active (enforcing) one, so a CLI
+    process launches the same way the daemon does. Returns (rc, stdout, stderr) as ahc_core.run_argv does."""
     import ahc_core  # noqa: PLC0415
-    policy = policy or _ACTIVE
-    if policy is None:
-        raise LaunchRefused("no launch policy is active")
-    return ahc_core.run_argv(policy.argv(name, args), timeout, cwd=str(cwd), env=policy.env(name))
+    return ahc_core.run_argv(policy.argv(name, args), timeout, cwd=str(cwd or policy.root), env=policy.env(name))
+
+
+def run_helper(policy, name, args, timeout):
+    """The production launcher for a legacy Python helper (installed script, fixed env, cwd the root)."""
+    import ahc_core  # noqa: PLC0415
+    return ahc_core.run_argv(policy.helper_argv(name, args), timeout, cwd=policy.root, env=dict(policy.helper_env))
