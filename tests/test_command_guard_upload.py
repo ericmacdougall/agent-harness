@@ -629,6 +629,49 @@ class UploadRefusals(UploadBase):
         self.assertEqual(self.rcats(), [])
 
 
+@unittest.skipUnless(os.environ.get('CG_BIG_TEST') == '1', 'builds 120,000 small files; set CG_BIG_TEST=1 (t2-dev)')
+class UploadScale(UploadBase):
+    """D1: the upload route's Python memory does not grow with the entry count, and a 100,000-entry approval is
+    re-checked by the hook inside its budget."""
+
+    def build(self, root, dirs, per_dir):
+        for d in range(dirs):
+            sub = root / ('d%04d' % d)
+            sub.mkdir(parents=True)
+            for f in range(per_dir):
+                (sub / ('f%03d.txt' % f)).write_bytes(b'x')
+        age(root)
+
+    def peak(self, root):
+        import tracemalloc
+        tracemalloc.start()
+        try:
+            entry = self.approve(path=root, remote='dropbox:backups/mac/%s.tar.zst' % root.name)
+            return entry, tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_memory_does_not_grow_with_entries_and_the_hook_rechecks_in_time(self):
+        small = self.target.parent / ('small-%d' % time.monotonic_ns())
+        large = self.target.parent / ('large-%d' % time.monotonic_ns())
+        self.build(small, 200, 100)    # 20,000 files
+        self.build(large, 1000, 100)   # 100,000 files
+        entry_small, peak_small = self.peak(small)
+        entry_large, peak_large = self.peak(large)
+        self.assertEqual(entry_large['files'], 100000)
+        growth = peak_large - peak_small
+        print('\nD1 peak traced memory: 20,000 files %.1f MiB, 100,000 files %.1f MiB, growth %.1f MiB'
+              % (peak_small / 2 ** 20, peak_large / 2 ** 20, growth / 2 ** 20))
+        # an entry list costs about 400 bytes per entry: 80,000 more entries would add about 30 MiB
+        self.assertLess(growth, 8 << 20)
+        started = time.monotonic()
+        self.assertTrue(cg.marker_covers(str(large), home=str(self.home)))
+        took = time.monotonic() - started
+        print('D1 hook-time re-check of 100,000 files: %.2f s (budget %.2f s)'
+              % (took, cg.recheck_seconds(entry_large['stat_entries'])))
+        self.assertLess(took, cg.recheck_seconds(entry_large['stat_entries']))
+
+
 class UploadCli(UploadBase):
     def test_cli_needs_wal_and_takes_no_other_backup_route(self):
         wal = self.home / 'wal.jsonl'
