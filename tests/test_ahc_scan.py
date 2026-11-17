@@ -32,13 +32,15 @@ def own(findings):
 
 
 def corpus_files(root=ROOT):
-    """The repo's own .py and .md files: the tracked ones when git is there, else a walk skipping dot dirs."""
+    """The repo's own .py and .md files and its test fixtures (tests/data, R5): the tracked ones when git is there,
+    else a walk skipping dot dirs."""
     try:
-        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "*.py", "*.md"], capture_output=True,
-                             check=True).stdout
+        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "*.py", "*.md", "tests/data/*"],
+                             capture_output=True, check=True).stdout
         return sorted(p for p in out.decode().split("\0") if p)
     except (OSError, subprocess.CalledProcessError):
-        return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.suffix in (".py", ".md")
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*") if (p.suffix in (".py", ".md") or
+                      p.relative_to(root).parts[:2] == ("tests", "data"))
                       and p.is_file() and not any(part.startswith(".") or part in ("node_modules", "__pycache__")
                                                   for part in p.relative_to(root).parts))
 

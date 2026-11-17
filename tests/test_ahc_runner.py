@@ -4602,8 +4602,8 @@ class StateMachineTests(TC.Base):
             "test_wi_superseded", "test_wi_closed_unmerged", "test_wi_cancelled"),
         "Review": (
             "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
-            "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",
-            "test_r05", "test_r06", "test_r07", "test_r08",
+            "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded",
+            "test_r06", "test_r07", "test_r08",
             "test_r09", "test_r10", "test_r11", "test_r12", "test_r13", "test_r14", "test_r15", "test_r16",
             "test_r18", "test_r19"),
         "Grant": (
@@ -4617,7 +4617,7 @@ class StateMachineTests(TC.Base):
     # Ids whose runtime half belongs to slice 1 (b), with the ruling (T-1): the ledger part is tested in 1 (a);
     # (b) adds the packet build (R2), the DynamicUser unit and its launch (R3), the socket FINAL and the R-c
     # usage-store refusal (R4), and the unit's findings result (R5).
-    PENDING_RUNTIME = ("test_r02", "test_r05")
+    PENDING_RUNTIME = ()
 
     def test_every_slice_b_obligation_resolves_or_is_pinned(self):
         """goodqa#16204: obligations ruled onto slice (b) are listed as `OBL.<test id>` in
