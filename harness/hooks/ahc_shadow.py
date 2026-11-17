@@ -127,6 +127,13 @@ from ahc_crash import crash_at  # noqa: E402
 
 SHADOW_ENV = "AHC_SHADOW"
 REQUEST_PREFIX = "shadow_req:"
+# goodqa#16262: a held request's hold record sits beside it under its own prefix, outside REQUEST_PREFIX's LIKE
+HOLD_PREFIX = "shadow_hold:"
+
+
+def hold_key(request_key):
+    """The hold record's key for a request key (shadow_req:<repo>#<pr>@<head> -> shadow_hold:<repo>#<pr>@<head>)."""
+    return HOLD_PREFIX + request_key[len(REQUEST_PREFIX):]
 # Rows the tick evaluates. W1 is admission; W16 is main's stamped CLI (AC-6) and W20 the owner's cancel, so the tick
 # never applies them. W21 is evaluated only when AC-7's send flag is on (ahc_w21).
 TICK_ROWS = tuple(r for r in C.Contracts.WI_TRANSITIONS if r not in ("W1", "W16", "W20", "W21"))
@@ -258,6 +265,19 @@ class ShadowTick:
             req = json.loads(value)
             if pipeline_of(self.c.db, req["repo"], self.config) != "shadow":
                 continue
+            # goodqa#16262 d5 AC-3 (e), NEG-13: a request at a live item's (repo, pr, head) is a duplicate. It is
+            # consumed before `_observe` (no admission read, no GoodQA reader call, no hold, no R2 queueing), with
+            # admit_item's own live-item predicate; admit_item's live return stays as the in-transaction recheck.
+            with self.c.tx():
+                live = self.c.db.execute(
+                    "SELECT id FROM work_items WHERE repo=? AND pr=? AND head=? AND state NOT IN (%s)"
+                    % ",".join("?" * len(C.Contracts.WI_TERMINAL)),
+                    (str(req["repo"]).lower(), int(req["pr"]), req["head"]) + C.Contracts.WI_TERMINAL).fetchone()
+                if live:
+                    self.c.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (key, hold_key(key)))
+            if live:
+                summary["duplicates"].append((key, "duplicate of live item %s" % live[0]))
+                continue
             if self.c.db.execute("SELECT 1 FROM work_items WHERE repo=? AND pr=? AND head!=? AND state IN (%s)"
                                  % ",".join("?" * len(C.Contracts._WI_LIVE)),
                                  (req["repo"], req["pr"], req["head"]) + C.Contracts._WI_LIVE).fetchone():
@@ -334,7 +354,8 @@ class ShadowTick:
         return holding, args
 
     def tick(self, tag="tick"):
-        summary = {"admitted": [], "moved": [], "refused": [], "conflicts": [], "incidents": [], "observed": []}
+        summary = {"admitted": [], "duplicates": [], "moved": [], "refused": [], "conflicts": [], "incidents": [],
+                   "observed": []}
         self.admit_requests(summary)
         for repo in self._repos():
             items = [self.c._row("work_items", "id", i) for (i,) in self.c.db.execute(
