@@ -2818,7 +2818,7 @@ class LiveDeps:
             return {"policy": dict(record) if isinstance(record, dict) else {}, "kill_switch": None,
                     "kill_epoch": contracts.authority_epoch(), "chk_cas": None, "canary": None}
 
-        def goodqa(repo, pr, item):
+        def goodqa(repo, pr, head, ticket):      # goodqa#16262: the ahc-facts reader is wired next
             return None
         producer = ahc_observe.Producer.for_live(contracts, self.policy, goodqa, local)
         return producer, (lambda repo, head, base: self.clone(repo, head, base)), None

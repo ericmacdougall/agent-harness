@@ -131,7 +131,8 @@ class Base(unittest.TestCase):
                              mono=self.clock, boot_id=BOOT)
         self.repo = Repo(Path(self.tmp.name) / "clone")
         self.base = self.repo.commit({"README": "r\n", "src/a.py": "a\n"}, "base")
-        self.head = self.repo.commit({"src/b.py": "b\n"}, "pr change", parent=self.base)
+        # goodqa#16262: owner commits carry the canonical Refs line, so W1 calls the reader for goodqa#5
+        self.head = self.repo.commit({"src/b.py": "b\n"}, "pr change\n\nRefs: GoodQA #5", parent=self.base)
         self.gh = FakeGh()
         self.policy = {"revision": POLICY_REV, "default_branch": "main", "readable": True, "allowlisted": True,
                        "enabled": True, "required_checks": {"contexts": ["test"], "app": "github-actions"}}
@@ -149,7 +150,12 @@ class Base(unittest.TestCase):
         self.gh.set("repos/o/r/commits/%s/statuses?per_page=100" % head, page(statuses or []))
 
     def producer(self, gh=None):
-        return O.Producer(self.c, gh or self.gh, real_git, lambda r, p, i: dict(self.gq),
+        self.reader_calls = getattr(self, "reader_calls", [])
+
+        def reader(r, p, h, ticket):
+            self.reader_calls.append((r, p, h, ticket))
+            return dict(self.gq)
+        return O.Producer(self.c, gh or self.gh, real_git, reader,
                           lambda r: dict(self.local, policy=dict(self.policy)))
 
     def observe(self, producer=None, **kw):
@@ -359,6 +365,79 @@ class ProducerTests(Base):
                     self.fail("a bad body read (%s) raised %r instead of ObservationRefused" % (why, error))
                 else:
                     self.fail("a bad body read (%s) was accepted" % why)
+
+
+class RefsTests(Base):
+    """goodqa#16262 d5 RULED-4 check 1 and the reader's argument: at W1 the producer parses Refs from the M..H commit
+    bodies; every commit has exactly one `Refs: GoodQA #N` line and all name the same N. A problem skips the reader
+    and does not refuse the observation; a live item calls the reader with its lineage's binding."""
+
+    def at(self, *messages):
+        """A PR head whose M..H commits carry `messages`, wired as PR 5."""
+        parent = self.base
+        for msg in messages:
+            parent = self.repo.commit({"src/n%d.py" % len(msg): msg + "\n"}, msg, parent=parent)
+        self.wire(parent, self.base, changed=len({len(m) for m in messages}))
+        return parent
+
+    def test_parse_refs_accepts_only_one_canonical_line_per_commit_naming_one_ticket(self):
+        ok = O.parse_refs(["a\n\nRefs: GoodQA #5\n", "b\n\nWhy: x\nRefs: GoodQA #5\n"])
+        self.assertEqual(ok, (("goodqa", 5), None))
+        for messages, why in (([], "no commits"),
+                              (["a\n\nRefs: GoodQA #5\n", "b\n\nRefs: GoodQA #6\n"], "two tickets"),
+                              (["a\n\nRefs: GoodQA #5\n", "b\n"], "a commit without Refs"),
+                              (["a\n\nRefs: goodqa #5\n"], "lowercase project"),
+                              (["a\n\nRefs: GoodQA goodqa#5\n"], "the request form"),
+                              (["a\n\nRefs: GoodQA #05\n"], "a leading zero"),
+                              (["a\n\nRefs: GoodQA #5 \n"], "a trailing space"),
+                              (["a\n\nRefs: GoodQA #1234567890\n"], "ten digits"),
+                              (["a\n\nRefs: GoodQA #5\nRefs: GoodQA #5\n"], "two lines in one commit")):
+            with self.subTest(why=why):
+                ticket, problem = O.parse_refs(messages)
+                self.assertIsNone(ticket)
+                self.assertTrue(isinstance(problem, str) and problem.startswith("refs: "), problem)
+
+    def test_w1_calls_the_reader_with_the_refs_ticket_and_records_it(self):
+        o = self.observe_ok()
+        self.assertEqual(self.reader_calls, [(REPO, 5, self.head, ("goodqa", 5))])
+        self.assertEqual((o["refs_ticket"], o["refs_problem"], o["attached_core"]), ("goodqa#5", None, CORE))
+
+    def test_w1_with_a_refs_problem_skips_the_reader_and_is_not_refused(self):
+        for messages in (("a\n\nRefs: GoodQA #5", "b\n\nRefs: GoodQA #6"), ("no refs here",)):
+            with self.subTest(messages=messages):
+                self.reader_calls = []
+                self.at(*messages)
+                o = self.observe_ok()
+                self.assertEqual(self.reader_calls, [], "no reader call on a Refs problem")
+                self.assertIsNone(o["refs_ticket"])
+                self.assertTrue(o["refs_problem"].startswith("refs: "))
+                self.assertEqual((o["attached_core"], o["spec_ticket"]), (None, None))
+
+    def test_spec_ticket_is_the_readers_parsed_label_and_null_without_a_core(self):
+        self.gq = dict(self.gq, spec_ticket="goodqa#5")
+        self.assertEqual(self.observe_ok()["spec_ticket"], "goodqa#5")
+        for bad in ("GoodQA goodqa#5", "goodqa#05", 5, None):
+            with self.subTest(bad=bad):
+                self.gq = dict(self.gq, spec_ticket=bad)
+                self.assertIsNone(self.observe_ok()["spec_ticket"])
+        self.gq = dict(self.gq, attached_core=None, spec_ticket="goodqa#5")
+        self.assertIsNone(self.observe_ok()["spec_ticket"], "invariant: no core, no spec_ticket")
+
+    def test_a_live_item_calls_the_reader_with_its_lineage_binding_and_never_parses_refs(self):
+        iid = self.c.admit_item(REPO, 5, self.head, self.base, POLICY_REV, CORE, PKT, event_id="adm",
+                                ticket=("goodqa", 7))["id"]
+        self.at("later\n\nRefs: GoodQA #9")                   # a W4 push naming another ticket (NEG-8)
+        self.reader_calls = []
+        o = self.observe_ok(item=iid)
+        self.assertEqual([call[3] for call in self.reader_calls], [("goodqa", 7)], "the binding, never Z")
+        self.assertEqual((o["refs_ticket"], o["refs_problem"]), (None, None))
+
+    def test_an_unbound_live_item_gets_no_reader_call(self):
+        iid = self.item()["id"]                               # NEG-12: admitted without a ticket
+        self.reader_calls = []
+        o = self.observe_ok(item=iid)
+        self.assertEqual(self.reader_calls, [])
+        self.assertIsNone(o["attached_core"])
 
 
 class ChecksEvidenceTests(Base):

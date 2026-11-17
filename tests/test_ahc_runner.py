@@ -5894,7 +5894,7 @@ class ShadowDeps(Deps):
 
     def shadow_parts(self, contracts):
         import ahc_observe  # noqa: PLC0415
-        producer = ahc_observe.Producer(contracts, self.fake_gh, TO.real_git, lambda r, p, i: dict(self.gq),
+        producer = ahc_observe.Producer(contracts, self.fake_gh, TO.real_git, lambda r, p, h, t: dict(self.gq),
                                         lambda r: dict(self.local))
         return producer, (lambda repo, head, base: self.clone_root), None
 

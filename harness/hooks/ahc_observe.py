@@ -54,6 +54,30 @@ class ObservationRefused(RuntimeError):
         self.rate_limited = rate_limited
 
 
+# goodqa#16262 d5: the commit form of a ticket, matched in full against one line; project goodqa
+REFS_LINE = re.compile(r"Refs: GoodQA #([1-9][0-9]{0,8})")
+
+
+def parse_refs(messages, shas=None):
+    """RULED-4 check 1 at W1: every M..H commit body has exactly one line matching REFS_LINE in full (lines split
+    on \\n only, so a trailing \\r or space does not match), and all name the same number. Returns
+    (("goodqa", N), None) or (None, "refs: <which>")."""
+    messages = list(messages)
+    if not messages:
+        return None, "refs: no commits in M..H"
+    numbers = set()
+    for i, msg in enumerate(messages):
+        found = [m for m in (REFS_LINE.fullmatch(line) for line in str(msg).split("\n")) if m]
+        if len(found) != 1:
+            who = (shas[i][:12] if shas and i < len(shas) and shas[i] else "#%d" % (i + 1))
+            return None, "refs: commit %s has %d canonical Refs lines (needs exactly one `Refs: GoodQA #N`)" % (
+                who, len(found))
+        numbers.add(int(found[0].group(1)))
+    if len(numbers) != 1:
+        return None, "refs: the commits name %s" % ", ".join("goodqa#%d" % n for n in sorted(numbers))
+    return ("goodqa", numbers.pop()), None
+
+
 def foreign_closing_keyword(text, repo):
     """True when `text` carries a closing keyword that names a repository other than `repo` (L9)."""
     for m in CLOSING.finditer(text or ""):
@@ -215,7 +239,7 @@ def bound_green(evidence, repo, base, head, revision):
 
 class Producer:
     """Builds observations. `gh(args, timeout)` and `git(args, cwd, timeout)` return (rc, stdout, stderr) and are
-    the AC-13 production forms (`for_live`) or injected fakes in tests; `goodqa(repo, pr, item)` returns a dict of
+    the AC-13 production forms (`for_live`) or injected fakes in tests; `goodqa(repo, pr, head, ticket)` returns a dict of
     GoodQA facts; `local(repo)` returns the local config facts for the repo: {"policy": record, "kill_switch",
     "kill_epoch", "chk_cas", "canary"} (canary is the recorded (boot, mono) canary result)."""
 
@@ -376,7 +400,9 @@ class Producer:
             raise ObservationRefused("changed_files %r disagrees with the local M..H list (%d) (NEG-3)"
                                      % (changed, count))
         _rc, log = self._gitrun(s, ["log", "--format=%H%x00%B%x00", "%s..%s" % (merge_base, head)], clone)
-        messages = [m for m in log.split("\0")[1::2]]
+        parts = log.split("\0")
+        messages = [m for m in parts[1::2]]
+        shas = [x.strip() for x in parts[0::2]][:len(messages)]
         anc = {b: self._ancestor(s, clone, b, tip) for b in bases if SHA.fullmatch(str(b))}
         ff = None
         if isinstance(base, str) and SHA.fullmatch(base) and base != tip:
@@ -392,10 +418,23 @@ class Producer:
         state = "MERGED" if p2.get("merged") is True else {"open": "OPEN", "closed": "CLOSED"}.get(p2.get("state"))
         if state is None:
             raise ObservationRefused("unknown PR state %r" % p2.get("state"))
-        gq = self._goodqa(repo, pr, item)
-        if not isinstance(gq, dict):
-            raise ObservationRefused("the GoodQA reader returned nothing")
+        # goodqa#16262 d5: the reader is called with the Refs ticket at W1 (check 1 here: a problem skips the call
+        # and does not refuse the observation) and with the lineage's binding for a live item (unbound: no call).
+        # The request's own ticket is never passed.
+        refs_ticket = refs_problem = None
+        if item is None:
+            refs_ticket, refs_problem = parse_refs(messages, shas)
+            ticket = refs_ticket
+        else:
+            ticket = self.c.lineage_ticket(item)
+        if ticket is None:
+            gq = {}
+        else:
+            gq = self._goodqa(repo, pr, head, ticket)
+            if not isinstance(gq, dict):
+                raise ObservationRefused("the GoodQA reader returned nothing")
         s["attach"] = self._spec_core_text(gq)
+        spec_ticket = C.parse_ticket_text(gq.get("spec_ticket")) if gq.get("attached_core") is not None else None
         canary_age = self.c.clock.canary_age(local.get("canary"))
         fields = {
             "repo": repo, "pr": pr, "pr_head": head, "pr_state": state, "draft": p2.get("draft"),
@@ -410,6 +449,8 @@ class Producer:
             "chk_cas": local.get("chk_cas"), "canary_age": canary_age,
             "attached_core": gq.get("attached_core"), "open_findings": gq.get("open_findings"),
             "mirror_ok": gq.get("mirror_ok"),
+            "refs_ticket": C.ticket_text(refs_ticket) if refs_ticket else None, "refs_problem": refs_problem,
+            "spec_ticket": C.ticket_text(spec_ticket) if spec_ticket else None,
         }
         for k in ("check_record", "author", "owner", "spec_reviewers", "evidence_posters"):
             if k in gq:

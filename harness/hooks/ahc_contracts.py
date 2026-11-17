@@ -162,6 +162,21 @@ def canonical_ticket(ticket):
     raise ContractError("a ticket is the canonical pair (project, number)")
 
 
+TICKET_TEXT = re.compile(r"([a-z0-9-]+)#([1-9][0-9]{0,8})")
+
+
+def ticket_text(ticket):
+    """goodqa#16262: the serialized form `project#N` of a canonical ticket (observations, reader output, config)."""
+    project, number = canonical_ticket(ticket)
+    return "%s#%d" % (project, number)
+
+
+def parse_ticket_text(value):
+    """The canonical ticket of a `project#N` string matched in full, or None (anything else is unparseable)."""
+    m = TICKET_TEXT.fullmatch(value) if isinstance(value, str) else None
+    return (m.group(1), int(m.group(2))) if m else None
+
+
 class VersionConflict(ContractError):
     """G0: the row changed since the caller read it."""
 
@@ -432,6 +447,13 @@ class Contracts:
     @staticmethod
     def lineage_of(repo, pr):
         return "ln-" + _sha({"repo": str(repo).lower(), "pr": int(pr)})[:24]
+
+    def lineage_ticket(self, item_id):
+        """goodqa#16262: the canonical ticket the item's lineage is bound to (W1's lineage_tickets row), or None for
+        an unbound lineage (NEG-12: no reader call)."""
+        row = self.db.execute("SELECT t.project, t.number FROM work_items w JOIN lineage_tickets t "
+                              "ON t.lineage = w.lineage WHERE w.id=?", (item_id,)).fetchone()
+        return (row[0], int(row[1])) if row else None
 
     def admit_item(self, repo, pr, head, base, policy_revision, spec_core, packet_sha256, *, event_id,
                    actor="ahc-core", red_team=False, ticket=None):
