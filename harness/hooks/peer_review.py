@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
@@ -621,6 +622,22 @@ def git(repo: Path, *args: str, timeout: float = 120, snapshot: bool = False) ->
     return result.stdout
 
 
+def require_complete_repository(repo: Path) -> None:
+    """Refuse a partial clone (promisor remote) with its own message.
+
+    Runs before the source state inspection too: in a partial clone that inspection can need
+    missing objects, which isolated Git may not fetch, and would fail with an unrelated message
+    (goodqa#16271). Any answer other than "no such key" is a refusal.
+    """
+    partial = run_process(['git', '-C', str(repo), 'config', '--local', '--get-regexp',
+                          r'^(extensions\.partialclone|remote\..*\.promisor)$'],
+                         env=git_environment(), timeout=30)
+    if partial.returncode == 0:
+        raise OSError('partial repositories are unsupported for review')
+    if partial.returncode != 1:
+        raise OSError('isolated Git operation failed (config)')
+
+
 def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = None,
                   timeout: float = DEFAULT_SNAPSHOT_TIMEOUT) -> str | None:
     """Copy only the reviewed commit and one base commit into a fresh repository.
@@ -655,11 +672,7 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             path = repo / path
         if path.exists():
             raise OSError('grafts and alternate object stores are unsupported for review')
-    partial = run_process(['git', '-C', str(repo), 'config', '--local', '--get-regexp',
-                          r'^(extensions\.partialclone|remote\..*\.promisor)$'],
-                         env=git_environment(), timeout=30)
-    if partial.returncode != 1:
-        raise OSError('partial repositories are unsupported for review')
+    require_complete_repository(repo)
     fmt = git(repo, 'rev-parse', '--show-object-format').strip()
     if fmt not in ('sha1', 'sha256'):
         raise OSError('unsupported Git object format')
@@ -690,6 +703,10 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             raise OSError('--snapshot-base must be an ancestor of the reviewed commit')
     snapshot.mkdir(mode=0o700)
     git(snapshot, 'init', '--quiet', '--template=', f'--object-format={fmt}')
+    # Persist the inert symlink representation in the snapshot itself: a reviewer's Git that
+    # runs without this helper's environment (checkout, reset, stash) must not materialize a
+    # committed symlink as a real one (goodqa#16271).
+    git(snapshot, 'config', '--local', 'core.symlinks', 'false')
     slow_git(snapshot, '-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--no-tags',
              '--no-write-fetch-head', '--no-recurse-submodules', '--depth=1', str(repo), *commits)
     for name in ('info/grafts', 'objects/info/alternates'):
@@ -858,8 +875,8 @@ def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
         raise OSError('Git status inspection failed')
     if status.stdout:
         return head.stdout.strip(), status.stdout
-    require_unflagged_index(repo)
-    require_no_special_entries(repo, allow_symlinks=not snapshot)
+    tracked = require_unflagged_index(repo)
+    require_no_special_entries(repo, allow_symlinks=not snapshot, tracked=tracked)
     diff = run_process(['git', '-C', str(repo), 'diff', '--no-ext-diff', '--no-textconv',
                         '--binary', 'HEAD', '--'], env=env, timeout=30)
     if diff.returncode or diff.stdout:
@@ -867,23 +884,57 @@ def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
     return head.stdout.strip(), status.stdout
 
 
-def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True) -> None:
-    """Git status omits FIFOs and sockets; reject them with bounded metadata reads."""
+class ScanLimitExceeded(OSError):
+    """A bounded metadata scan or listing ran out of its time, size or entry budget.
+
+    This is never evidence of a special file, and is reported with its own message and code.
+    """
+
+
+class SpecialEntry(OSError):
+    """Internal marker: the scan met a FIFO, socket, device or a refused symlink."""
+
+
+# The metadata scan is bounded by a floor plus a per-tracked-entry allowance. A fixed 5 s bound
+# refused a clean 62k-entry checkout under ordinary concurrent load (goodqa#16271): measured about
+# 27 us per entry idle and 80 us at 12 concurrent scans on the Mac, so 500 us leaves about 6x
+# headroom. The entry cap keeps the worst case bounded: 5 + 250000 * 0.0005 = 130 seconds.
+SCAN_BASE_SECONDS = 5.0
+SCAN_SECONDS_PER_ENTRY = 0.0005
+SCAN_MAX_ENTRIES = 250_000
+SCAN_MAX_DEPTH = 64
+
+
+def scan_budget(tracked: int) -> float:
+    """Wall-clock budget for one worktree metadata scan of a tree with `tracked` index entries."""
+    return SCAN_BASE_SECONDS + SCAN_SECONDS_PER_ENTRY * min(max(int(tracked), 0), SCAN_MAX_ENTRIES)
+
+
+def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True, tracked: int = 0) -> None:
+    """Git status omits FIFOs and sockets; reject them with bounded metadata reads.
+
+    The three refusals carry distinct messages and never filenames: a budget overrun
+    ("exceeded limits"), a special file, and an entry that changed or could not be read.
+    """
     inspected = [0]
-    deadline = time.monotonic() + 5
+    budget = scan_budget(tracked)
+    deadline = time.monotonic() + budget
     # A review snapshot has no legitimate ignored content, so scan all of it.
     ignored = ignored_directory_prefixes(repo, deadline) if allow_symlinks else set()
 
     def visit(directory: int, depth: int, relative: tuple[str, ...]) -> None:
-        if depth > 64:
-            raise OSError('worktree metadata scan exceeded limits')
+        if depth > SCAN_MAX_DEPTH:
+            raise ScanLimitExceeded(f'directory depth over {SCAN_MAX_DEPTH}')
         with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.name == '.git':
                     continue
                 inspected[0] += 1
-                if inspected[0] > 250_000 or time.monotonic() > deadline:
-                    raise OSError('worktree metadata scan exceeded limits')
+                if inspected[0] > SCAN_MAX_ENTRIES:
+                    raise ScanLimitExceeded(f'more than {SCAN_MAX_ENTRIES} entries')
+                if time.monotonic() > deadline:
+                    raise ScanLimitExceeded(f'time budget of {budget:.0f} s for {tracked} tracked entries '
+                                            f'used up after {inspected[0]} entries')
                 info = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):
                     child_relative = (*relative, entry.name)
@@ -896,17 +947,23 @@ def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True) -> No
                     finally:
                         os.close(child)
                 elif not (stat.S_ISREG(info.st_mode) or (allow_symlinks and stat.S_ISLNK(info.st_mode))):
-                    raise OSError('worktree contains an unsafe special file')
+                    raise SpecialEntry()
 
+    # Do not include filenames or private file contents in diagnostics.
     try:
         root = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             visit(root, 0, ())
         finally:
             os.close(root)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        # Do not include filenames or private file contents in diagnostics.
-        raise OSError('worktree metadata scan refused a special or unstable entry') from error
+    except ScanLimitExceeded as error:
+        raise ScanLimitExceeded(f'worktree metadata scan exceeded limits ({error})') from error
+    except SpecialEntry as error:
+        raise OSError('worktree metadata scan refused a special file (FIFO, socket, device'
+                      + (')' if allow_symlinks else ' or symlink in a review snapshot)')) from error
+    except OSError as error:
+        name = errno.errorcode.get(error.errno, type(error).__name__) if error.errno else type(error).__name__
+        raise OSError(f'worktree metadata scan refused an entry that changed or could not be read ({name})') from error
 
 
 def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int) -> bytes:
@@ -921,13 +978,13 @@ def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not selector.select(remaining):
-                    raise OSError('Git listing exceeded time budget')
+                    raise ScanLimitExceeded('Git listing exceeded time budget')
                 chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(data)))
                 if not chunk:
                     break
                 data.extend(chunk)
                 if len(data) > limit:
-                    raise OSError('Git listing exceeded size budget')
+                    raise ScanLimitExceeded('Git listing exceeded size budget')
         if process.wait(timeout=max(0.1, deadline - time.monotonic())):
             raise OSError('Git listing failed')
     finally:
@@ -940,8 +997,8 @@ def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int
     return bytes(data)
 
 
-def require_unflagged_index(repo: Path) -> None:
-    """Reject index flags that make status and diff hide tracked edits."""
+def require_unflagged_index(repo: Path) -> int:
+    """Reject index flags that make status and diff hide tracked edits; return the entry count."""
     deadline = time.monotonic() + 5
     records = bounded_git_listing(repo, ['ls-files', '-v', '-z'], deadline, 40_000_000)
     count = 0
@@ -949,10 +1006,11 @@ def require_unflagged_index(repo: Path) -> None:
         if not record:
             continue
         count += 1
-        if count > 250_000 or time.monotonic() > deadline:
-            raise OSError('Git index listing exceeded limits')
+        if count > SCAN_MAX_ENTRIES or time.monotonic() > deadline:
+            raise ScanLimitExceeded('Git index listing exceeded limits')
         if len(record) < 3 or record[:2] != b'H ':
             raise OSError('Git index contains a hidden or unsupported entry flag (%r)' % record[:1].decode('ascii', 'replace'))
+    return count
 
 
 def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
@@ -1647,6 +1705,7 @@ def main() -> int:
         evidence.close()
         parser.error('--expected-head is required for code-inspection and PR review')
     try:
+        require_complete_repository(repo)
         before = repo_state(repo)
     except (OSError, subprocess.TimeoutExpired) as error:
         target.close()

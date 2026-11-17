@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -58,7 +59,8 @@ class ContractTests(unittest.TestCase):
         'FALLBACK_NO_RESULT', 'SNAPSHOT_TIMEOUT', 'SNAPSHOT_GIT_FAILED', 'SNAPSHOT_PARTIAL_CLONE',
         'SNAPSHOT_SPARSE_INDEX', 'SNAPSHOT_HIDDEN_INDEX_FLAG', 'SNAPSHOT_SHALLOW', 'SNAPSHOT_GRAFTS_ALTERNATES',
         'SNAPSHOT_CASE_COLLISION', 'SNAPSHOT_GITLINK', 'SNAPSHOT_SOURCE_CHANGED', 'PYTHON_UNSUPPORTED',
-        'ISOLATION_FAILED', 'REVIEW_NOT_STARTED', 'REVIEW_LAUNCH_UNCONFIRMED'}
+        'ISOLATION_FAILED', 'REVIEW_NOT_STARTED', 'REVIEW_LAUNCH_UNCONFIRMED',
+        'WORKTREE_SCAN_LIMIT', 'WORKTREE_SPECIAL_ENTRY'}
 
     def test_code_set_is_pinned(self):
         self.assertEqual(set(rd.CONTRACT), self.EXPECTED_CODES)
@@ -569,6 +571,302 @@ class SnapshotShapeTests(unittest.TestCase):
         self.assertEqual(self.code_of(caught.exception), 'SNAPSHOT_GIT_FAILED')
 
 
+class _SlowEntry:
+    """A real directory entry whose metadata read costs simulated wall time."""
+
+    def __init__(self, entry, clock, modes):
+        self._entry, self._clock, self._modes = entry, clock, modes
+        self.name = entry.name
+
+    def stat(self, *, follow_symlinks=True):
+        self._clock.offset += self._clock.cost
+        info = self._entry.stat(follow_symlinks=follow_symlinks)
+        mode = self._modes.get(self.name)
+        if mode is None:
+            return info
+        return os.stat_result((mode, *tuple(info)[1:]))
+
+
+class _SlowScandir:
+    def __init__(self, iterator, clock, modes):
+        self._iterator, self._clock, self._modes = iterator, clock, modes
+
+    def __enter__(self):
+        self._iterator.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._iterator.__exit__(*exc)
+
+    def __iter__(self):
+        return (_SlowEntry(entry, self._clock, self._modes) for entry in self._iterator)
+
+
+class _ScanClock:
+    """Real time plus a simulated offset that only metadata reads advance.
+
+    Git listings and selectors keep real time; only the per-entry scan is slowed, which is the
+    shape of the goodqa#16271 failure (a large tree on a loaded host).
+    """
+
+    def __init__(self, cost):
+        self.cost, self.offset = cost, 0.0
+
+    def monotonic(self):
+        return time.monotonic() + self.offset
+
+
+class WorktreeScanTests(unittest.TestCase):
+    """goodqa#16271: the bounded metadata scan behind repo_state, in source and snapshot mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_peer_review()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(os.path.realpath(self.temp.name))
+        self.repo = self.root / 'repo'
+        self.repo.mkdir()
+        self.git('init', '-q', '-b', 'main')
+        self.git('config', 'user.name', 'F')
+        self.git('config', 'user.email', 'f@example.invalid')
+        (self.repo / 'app.txt').write_text('x\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'one')
+
+    def git(self, *args, cwd=None, env=None):
+        return subprocess.run(['git', '-C', str(cwd or self.repo), *args], check=True, capture_output=True,
+                              text=True, env=env).stdout
+
+    def commit_tree(self, count):
+        tree = self.repo / 'src'
+        tree.mkdir()
+        for index in range(count):
+            (tree / f'f{index}.txt').write_text('t\n')
+        self.git('add', 'src')
+        self.git('commit', '-qm', 'tree')
+
+    @staticmethod
+    def fakes(cost, modes=None):
+        """This module's clock and directory listing, slowed per metadata read."""
+        clock = _ScanClock(cost)
+        fake_time = types.SimpleNamespace(monotonic=clock.monotonic, time=time.time, sleep=time.sleep)
+        real_scandir = os.scandir
+        fake_os = types.SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith('__')})
+        fake_os.scandir = lambda target: _SlowScandir(real_scandir(target), clock, modes or {})
+        return clock, fake_time, fake_os
+
+    def slowed(self, cost):
+        """Patch only this module's clock and directory listing for the whole test; returns the clock."""
+        clock, fake_time, fake_os = self.fakes(cost)
+        for name, value in (('time', fake_time), ('os', fake_os)):
+            patcher = patch.object(self.module, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return clock
+
+    def refusal(self, call):
+        with self.assertRaises(OSError) as caught:
+            call()
+        return caught.exception, rd.classify_isolation_error(caught.exception)['code']
+
+    # ---- the cause: a fixed 5 s bound refused a large clean tree on a loaded host
+
+    def test_large_clean_tree_slower_than_five_seconds_passes_source_repo_state(self):
+        """Failing first: origin/main refuses this clean tree with 'refused a special or unstable entry'."""
+        self.commit_tree(3000)
+        clock = self.slowed(0.0018)  # about 5.4 s of simulated metadata reads for 3000 entries
+        head, status = self.module.repo_state(self.repo)
+        self.assertEqual(status, '')
+        self.assertGreater(clock.offset, 5.0, 'the fixture must exceed the old fixed bound')
+
+    def test_large_clean_tree_slower_than_five_seconds_passes_snapshot_scan(self):
+        self.commit_tree(3000)
+        self.slowed(0.0018)
+        self.module.require_no_special_entries(self.repo, allow_symlinks=False, tracked=3001)
+
+    # ---- NEG (d): a limit is never skipped and never reported as a special file
+
+    def test_time_budget_overrun_is_reported_as_a_limit_not_a_special_file(self):
+        """Failing first: origin/main reports a budget overrun as 'a special or unstable entry'."""
+        self.commit_tree(300)
+        self.slowed(0.1)  # 30 s simulated, far over 5 + 300 * 0.0005 s
+        error, code = self.refusal(lambda: self.module.repo_state(self.repo))
+        self.assertIn('exceeded limits', str(error))
+        self.assertNotIn('special', str(error))
+        self.assertEqual(code, 'WORKTREE_SCAN_LIMIT')
+
+    def test_entry_cap_and_depth_cap_are_limits(self):
+        self.commit_tree(50)
+        with patch.object(self.module, 'SCAN_MAX_ENTRIES', 10):
+            error, code = self.refusal(lambda: self.module.require_no_special_entries(self.repo, tracked=51))
+        self.assertIn('more than 10 entries', str(error))
+        self.assertEqual(code, 'WORKTREE_SCAN_LIMIT')
+        deep = self.root / 'deep'
+        (deep / '/'.join('d' * 3)).mkdir(parents=True)
+        with patch.object(self.module, 'SCAN_MAX_DEPTH', 1):
+            error, code = self.refusal(lambda: self.module.require_no_special_entries(deep, allow_symlinks=False))
+        self.assertIn('depth over 1', str(error))
+        self.assertEqual(code, 'WORKTREE_SCAN_LIMIT')
+
+    def test_budget_is_bounded_and_scales_with_tracked_entries(self):
+        budget = self.module.scan_budget
+        self.assertEqual(budget(0), 5.0)
+        self.assertEqual(budget(-7), 5.0)
+        self.assertAlmostEqual(budget(62_170), 5.0 + 62_170 * 0.0005)
+        self.assertEqual(budget(10 ** 9), budget(self.module.SCAN_MAX_ENTRIES))
+        self.assertLessEqual(budget(10 ** 9), 130.0)
+
+    def test_index_listing_over_the_cap_is_a_limit(self):
+        self.commit_tree(20)
+        with patch.object(self.module, 'SCAN_MAX_ENTRIES', 5):
+            error, code = self.refusal(lambda: self.module.require_unflagged_index(self.repo))
+        self.assertEqual(code, 'WORKTREE_SCAN_LIMIT')
+        self.assertEqual(self.module.require_unflagged_index(self.repo), 21)
+
+    # ---- NEG (b): FIFOs, sockets, devices and (in a snapshot) every symlink stay refused
+
+    def bind_socket(self, directory, name):
+        import socket
+        holder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(holder.close)
+        cwd = os.getcwd()
+        os.chdir(directory)  # AF_UNIX paths are short; bind relative to the fixture directory
+        try:
+            holder.bind(name)
+        finally:
+            os.chdir(cwd)
+
+    def assert_special(self, call):
+        error, code = self.refusal(call)
+        self.assertIn('special file', str(error))
+        self.assertNotIn('exceeded limits', str(error))
+        self.assertEqual(code, 'WORKTREE_SPECIAL_ENTRY')
+        return error
+
+    def test_fifo_socket_and_device_refused_in_source_and_snapshot_mode(self):
+        for kind in ('fifo', 'socket', 'device'):
+            for snapshot in (False, True):
+                with self.subTest(kind=kind, snapshot=snapshot):
+                    target = self.repo / f'{kind}.node'
+                    modes = {}
+                    if kind == 'fifo':
+                        os.mkfifo(target)
+                    elif kind == 'socket':
+                        self.bind_socket(self.repo, target.name)
+                    else:
+                        target.write_text('')  # reported as a character device by the patched listing
+                        modes[target.name] = stat.S_IFCHR | 0o600
+                    with patch.object(self.module, 'os', self.fakes(0.0, modes)[2]):
+                        self.assert_special(lambda: self.module.require_no_special_entries(
+                            self.repo, allow_symlinks=not snapshot))
+                    target.unlink()
+
+    def test_absolute_and_escaping_symlinks_refused_in_a_snapshot(self):
+        outside = self.root / 'outside.txt'
+        outside.write_text('never read\n')
+        for name, target in (('abs', outside), ('escape', Path('..') / 'outside.txt'),
+                             ('inside', Path('app.txt'))):
+            with self.subTest(name=name):
+                link = self.repo / name
+                link.symlink_to(target)
+                self.assert_special(lambda: self.module.require_no_special_entries(self.repo, allow_symlinks=False))
+                link.unlink()
+
+    # ---- NEG (c): ignored or untracked special entries stay refused in a snapshot
+
+    def test_ignored_and_untracked_special_entries_refused_in_snapshot_mode(self):
+        (self.repo / '.gitignore').write_text('node_modules/\n')
+        self.git('add', '.gitignore')
+        self.git('commit', '-qm', 'ignore')
+        vendor = self.repo / 'node_modules'
+        vendor.mkdir()
+        os.mkfifo(vendor / 'pipe')
+        (vendor / 'link').symlink_to(self.root)
+        # The source checkout prunes ignored directories; a snapshot scans everything.
+        self.module.require_no_special_entries(self.repo, allow_symlinks=True, tracked=2)
+        self.assert_special(lambda: self.module.require_no_special_entries(self.repo, allow_symlinks=False, tracked=2))
+        shutil.rmtree(vendor)
+        os.mkfifo(self.repo / 'untracked-pipe')
+        self.assert_special(lambda: self.module.require_no_special_entries(self.repo, allow_symlinks=False, tracked=2))
+        error = self.assert_special(lambda: self.module.repo_state(self.repo))
+        self.assertNotIn('untracked-pipe', str(error))
+
+    def test_vanished_entry_is_neither_a_limit_nor_a_special_file(self):
+        class Vanishing:
+            def __init__(self, entry):
+                self.name = entry.name
+
+            def stat(self, *, follow_symlinks=True):
+                raise FileNotFoundError(2, 'gone')
+
+        real_scandir = os.scandir
+
+        class Listing:
+            def __init__(self, target):
+                self.inner = real_scandir(target)
+
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+
+            def __iter__(self):
+                return (Vanishing(entry) for entry in self.inner)
+
+        fake_os = types.SimpleNamespace(**{name: getattr(os, name) for name in dir(os) if not name.startswith('__')})
+        fake_os.scandir = Listing
+        with patch.object(self.module, 'os', fake_os):
+            error, code = self.refusal(lambda: self.module.require_no_special_entries(self.repo))
+        self.assertIn('changed or could not be read (ENOENT)', str(error))
+        self.assertNotIn('special', str(error))
+        self.assertNotIn('exceeded limits', str(error))
+        self.assertEqual(code, 'ISOLATION_FAILED')
+
+    # ---- NEG (a): the snapshot never holds a filesystem symlink a reviewer could follow
+
+    def test_snapshot_keeps_committed_symlinks_inert_even_for_env_scrubbed_git(self):
+        """Failing first: on origin/main an env-scrubbed `git checkout -- .` makes a real symlink."""
+        (self.repo / 'bin').mkdir()
+        (self.repo / 'bin/tool.py').write_text('print(1)\n')
+        (self.repo / 'tests/owning').mkdir(parents=True)
+        (self.repo / 'tests/owning/tool.py').symlink_to('../../bin/tool.py')
+        (self.repo / 'abs-link').symlink_to(self.root / 'outside.txt')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'links')
+        head = self.git('rev-parse', 'HEAD').strip()
+        snap = self.root / 'snap'
+        self.module.make_snapshot(self.repo, snap, head)
+
+        def links():
+            return sorted(str(p.relative_to(snap)) for p in snap.rglob('*')
+                          if p.is_symlink() and '.git' not in p.relative_to(snap).parts)
+
+        self.assertEqual(links(), [])
+        self.assertEqual(self.module.repo_state(snap, snapshot=True), (head, ''))
+        scrubbed = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(self.root),
+                    'GIT_CONFIG_NOSYSTEM': '1'}
+        for args in (('status', '--porcelain'), ('checkout', '--', '.'), ('reset', '-q', '--hard'), ('stash', '-q')):
+            with self.subTest(args=args):
+                self.git(*args, cwd=snap, env=scrubbed)
+                self.assertEqual(links(), [])
+                self.assertEqual(self.git('status', '--porcelain', cwd=snap, env=scrubbed), '')
+        self.assertEqual(self.module.repo_state(snap, snapshot=True), (head, ''))
+
+    def test_partial_clone_refused_before_source_state_inspection(self):
+        self.git('config', 'extensions.partialclone', 'origin')
+        error, code = self.refusal(lambda: self.module.require_complete_repository(self.repo))
+        self.assertEqual(code, 'SNAPSHOT_PARTIAL_CLONE')
+        self.git('config', '--unset', 'extensions.partialclone')
+        self.module.require_complete_repository(self.repo)
+        error, code = self.refusal(lambda: self.module.require_complete_repository(self.root / 'not-a-repo'))
+        self.assertNotEqual(code, 'SNAPSHOT_PARTIAL_CLONE')
+
+
 class EndToEndTests(unittest.TestCase):
     """Real peer_review.py process against fake reviewer executables."""
 
@@ -849,6 +1147,19 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn('code=SNAPSHOT_PARTIAL_CLONE', result.stderr)
         self.assertIn('git clone --no-local', result.stderr)
+
+    def test_partial_clone_is_named_before_the_source_scan_via_the_real_cli(self):
+        """Failing first (goodqa#16271): origin/main reports the source scan, not the partial clone."""
+        subprocess.run(['git', '-C', str(self.repo), 'config', 'extensions.partialclone', 'origin'], check=True)
+        os.mkfifo(self.repo / 'untracked-pipe')  # Git status omits it; only the metadata scan sees it
+        result = self.invoke(stage='code-inspection')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('code=SNAPSHOT_PARTIAL_CLONE', result.stderr)
+        self.assertNotIn('code=WORKTREE_SPECIAL_ENTRY', result.stderr)
+        subprocess.run(['git', '-C', str(self.repo), 'config', '--unset', 'extensions.partialclone'], check=True)
+        result = self.invoke(stage='code-inspection')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('code=WORKTREE_SPECIAL_ENTRY', result.stderr)
 
     def test_assume_unchanged_flag_is_actionable_via_the_real_cli(self):
         subprocess.run(['git', '-C', str(self.repo), 'update-index', '--assume-unchanged', 'app.txt'], check=True)
