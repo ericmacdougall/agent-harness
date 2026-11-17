@@ -94,6 +94,62 @@ Details for the hostile fixture follow. It has exposure-tier findings (a key-blo
 
 **Owner ruling (agent message, ASSUMPTION; owner WAL wbf5d92d5ea4).** The DynamicUser socket-reachability gap routes to goodqa#16274 and #16275 and does not block the merge.
 
+## PR 272 review round 2 (code inspection at bbaff656, four findings, all fixed)
+
+One invariant now holds across F4 to F6: a launch intent leaves `open` or `started` only once its unit is confirmed inactive, failed or gone. Reconciliation and the sweep walk the ledger's intents, not only the units systemd lists.
+
+**F4, crash windows (high).**
+- *Fix (a).* After the listed-unit pass, `Reconciler.run` visits every open or started intent whose unit systemd does not list (`reconcile_absent`). An open one is orphaned with its charge kept (NEG-22), so the row launches again.
+- *Fix (b).* `start_attempt(..., intent=)` binds the row to running and moves its intent open to started in one transaction, so no crash can leave a running row on an open intent.
+- *Recovery of an earlier ledger.* A ledger written before this fix may hold a running row on an open intent. Reconciliation moves that intent to started (`recover_bound`) instead of orphaning it; the sweep then settles the row through R7.
+- *Named crash points.* `r3.intent_committed` and `r3.attempt_bound` are new. `check_r3_launch` now also requires a running row's intent to be started, and no row to be queued behind a live intent.
+- *Tests.*
+  - `RuntimeTests.test_f4_a_crash_before_the_unit_starts_is_orphaned_and_the_row_launches_again`;
+  - `test_f4_b_a_crash_right_after_start_attempt_leaves_a_started_intent_that_the_sweep_settles`;
+  - `test_f4_reconciliation_recovers_a_running_row_whose_intent_is_still_open` (unit listed, and unit gone);
+  - `NamedPointTests` over the two new points.
+
+**F5, cleanup without a confirmed stop (high).**
+- *Fix.* `stop_confirmed` sends the stop, then requires `ActiveState` inactive or failed within the reconciliation bound (`STOP_BOUND`, 60 s, at most 61 polls). The stop's return value is never the confirmation.
+- *Unconfirmed.* `Launcher.abandon` keeps the intent open, so `launch_intent` starts no second unit, blocks the row and records an incident. Each tick the sweep retries the stop; on confirmation it closes the intent and lifts the block.
+- *Reconciliation.* `reconcile_owned` treats an active unit of a closed or orphaned intent as inconsistent. It records an incident and stops the unit through the guard's startup recovery rule (`slice_ok` when the unit is in the review slice).
+- *The sweep's R7 branch had the same unconfirmed stop.* A unit that outlived its bound now keeps its intent started until a stop is confirmed.
+- *Tests.*
+  - `RuntimeTests.test_f5_an_unconfirmed_cleanup_stop_keeps_the_intent_and_no_replacement_unit_starts` (stop returns False, and stop returns True while the unit stays active);
+  - `test_f5_reconciliation_stops_an_active_unit_whose_intent_is_closed_or_orphaned`, with every show and stop passed through the real guard.
+
+**F6, cancellation never completed (medium).**
+- *Fix.* The sweep handles a cancelling row: it stops the unit, confirms the stop, applies R15 (cancelling to superseded) and closes the intent. A failed stop keeps the row cancelling and the intent started; a later tick, also after a restart, finishes the job. A cancelling row with no live intent (an outcome-unknown row cancelled after its unit was confirmed stopped) goes straight to R15.
+- *Tests.*
+  - `ReviewTickTests.test_f6_w20_owner_cancel_stops_the_unit_and_settles_the_row_superseded`: a failed stop, then a restart;
+  - `test_f6_w4_head_supersede_stops_the_unit_and_settles_the_row_superseded`, through the tick;
+  - `RuntimeTests.test_f6_a_cancelled_outcome_unknown_row_settles_superseded`.
+
+**F7, the scheduler bypassed the policy's B33 (medium).**
+- *Fix.* `launch_intent` takes the budget from `Contracts.launch_budget`. That is the policy record of the latest stored observation for the item's (repo, pr), the record W15 evaluates. A caller's `budget_obs` can only lower it.
+- `launch_intent` also refuses a row of an exhausted item until main's W16 disposition.
+- `offerable_rows` skips rows of exhausted items and rows whose lineage has spent its B33, so a refused row cannot hold the slot.
+- *Tests.*
+  - `RuntimeTests.test_f7_launch_intent_takes_b33_from_the_items_recorded_policy`;
+  - `test_f7_launch_intent_refuses_a_row_of_an_exhausted_item`;
+  - `test_f7_offerable_rows_skip_exhausted_items_and_spent_lineages`;
+  - `ReviewTickTests.test_f7_a_policy_b33_of_one_stops_every_launch_and_charge_after_the_first`: b33=1 and two queued rows of one lineage give one start and one charge over three ticks.
+
+**ASSUMPTIONs added in round 2 (builder, unconfirmed).**
+- *Policy budget with no stored observation.* The default B33 (8, D-8) applies. The production tick observes every live item before it schedules, so an item normally has one.
+- *Observation scope.* The policy record is read from the latest observation for the item's (repo, pr), so a W4 successor at the same PR uses the policy its predecessor was observed with until it is observed itself.
+- *A digest mismatch fails closed.* An observation whose fields fail their digest makes the launch refuse, and the row is not offered.
+- *A failed or refused show is not an end.* Before this change, the sweep read `show` returning nothing as "the unit ended". It now treats that as unknown and retries; only the bound (R7 "outlived its bound") gives the row up.
+- *The sweep can wait up to the stop bound per unconfirmed unit in one tick.* Production uses the same 60 s bound as reconciliation; tests poll with no sleep.
+- *Recovery of an earlier ledger's open intent under a running row promotes it to started.* The other option was to stop the unit and give the row up through R7. Promotion keeps an attempt that may still deliver its result.
+
+**Variants.** Each finding has an entry, and every mutation is killed by a test that isolates its half of a defence in series:
+- "PR 272 F4 …": 4 mutations;
+- "PR 272 F5 …": 4;
+- "PR 272 F6 …": 3;
+- "PR 272 F7 …": 5, including the integrated tick with every gate removed.
+- Five older anchors moved onto the round-2 code with the same mutation intent: NEG-25 finished items, NEG-22 the unit is not stopped, NEG-22 the charge is refunded, NEG-49 the unbounded stop, and option A's ended unit.
+
 ## Owner rulings carried in this build (agent messages, ASSUMPTION)
 
 - **(a)** The Mac only.

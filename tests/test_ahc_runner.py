@@ -5915,6 +5915,84 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertEqual(len(second["scheduled"]["started"]), 1, "the retried reconciliation lifts the gate")
         self.assertEqual(len(self.runner.started), 1)
 
+    def contracts(self):
+        ledger = runner.Ledger(self.paths)
+        self.addCleanup(ledger.close)
+        return runner.open_contracts(ledger, self.paths)
+
+    def launched(self):
+        """Submit PR 9, run one tick, and return the launched row, its intent and its unit."""
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        self.run_all(self.deps)
+        (a, _pr, state, _r, _w), = self.code_rows()
+        self.assertEqual(state, "running")
+        (iid, unit), = self.ledger_rows("SELECT id, unit FROM launch_intents WHERE row=?", (a,))
+        return a, iid, unit
+
+    def test_f6_w20_owner_cancel_stops_the_unit_and_settles_the_row_superseded(self):
+        """PR 272 F6: the owner cancels (W20) while the attempt runs. The review stage stops the unit, confirms it
+        stopped and applies R15 (cancelling -> superseded), closing the intent. A failed stop keeps the row
+        cancelling and the intent started, and the stage finishes the job after a restart."""
+        a, iid, unit = self.launched()
+        c = self.contracts()
+        (item,), = c.db.execute("SELECT item FROM reviews WHERE id=?", (a,)).fetchall()
+        row = c._row("work_items", "id", item)
+        c.wi_move(item, "W20", expected_version=row["version"], event_id="t-w20", actor="owner")
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (a,)), [("cancelling",)])
+        real_stop = self.runner.stop
+        self.runner.stop = lambda u: False                      # the stop is refused: nothing changes
+        self.run_all(self.deps)
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (a,)), [("cancelling",)])
+        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents WHERE id=?", (iid,)), [("started",)])
+        self.assertIn(unit, self.runner.live)
+        self.runner.stop = real_stop
+        self.policy = self.R.ahc_guard.Policy.for_test(self.paths.root, dict(self.policy.exe),
+                                                       trusted_dirs=self.policy.trusted)     # a restart
+        runner.startup_reconcile(self.paths, self.policy, runner=self.runner)
+        self.run_all(self.deps)
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (a,)), [("superseded",)])
+        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents WHERE id=?", (iid,)), [("closed",)])
+        self.assertNotIn(unit, self.runner.live)
+        self.assertEqual(len(self.runner.started), 1, "a cancelled item starts nothing")
+
+    def test_f6_w4_head_supersede_stops_the_unit_and_settles_the_row_superseded(self):
+        """PR 272 F6: the PR's head moves (W4) while the attempt for H runs. In the same tick the review stage
+        stops the old unit and settles its row to superseded (R15); the successor's row is offered after."""
+        a, iid, unit = self.launched()
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change", parent=self.base)
+        pre = "repos/%s" % SHADOW_REPO
+        self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
+        self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
+                    TO.page({"total_count": 1, "check_runs": [TO.run("test", head=head3)]}))
+        self.gh.set(pre + "/commits/%s/statuses?per_page=100" % head3, TO.page([]))
+        self.assertEqual(self.submit_pr(9, head3).get("pipeline"), "shadow")
+        self.run_all(self.deps)
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (a,)), [("superseded",)])
+        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents WHERE id=?", (iid,)), [("closed",)])
+        self.assertIn(unit, self.runner.stopped)
+        self.assertNotIn(unit, self.runner.live)
+
+    def test_f7_a_policy_b33_of_one_stops_every_launch_and_charge_after_the_first(self):
+        """PR 272 F7: policy b33=1 and two queued reviews of one lineage. After the first charge no further
+        launch or charge happens, through the integrated tick (scheduler, launcher, launch_intent)."""
+        self.deps.local["policy"]["b33"] = 1
+        a, iid, unit = self.launched()
+        c = self.contracts()
+        row = c._row("reviews", "id", a)
+        second = c.require_review("red-team", row["repo"], row["pr"], row["head"], row["packet_sha256"],
+                                  row["policy_revision"], item=row["item"], event_id="t-second",
+                                  snapshot_base=row["snapshot_base"])
+        c.review(second["id"], "queued", expected_version=second["version"], event_id="t-second-q")
+        self.play_wrapper(a, "VERDICT: PASS")
+        for _ in range(3):
+            self.run_all(self.deps)
+        self.assertEqual(len(self.runner.started), 1, "no launch after the policy's budget is spent")
+        (lineage,), = self.ledger_rows("SELECT w.lineage FROM work_items w JOIN reviews r ON r.item = w.id "
+                                       "WHERE r.id=?", (a,))
+        self.assertEqual(self.ledger_rows("SELECT b33_used FROM lineage_budget WHERE lineage=?", (lineage,)),
+                         [(1,)], "one charge")
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (second["id"],)), [("queued",)])
+
     def test_ac9_a_block_reports_finding_ids_reach_w3_and_main_accepts_them(self):
         """PR 272 F3: the finding ids of a BLOCK report core read itself are in the settled row's receipt; W3
         escalates with them; once main's W16 accepts them into a named ticket, the row no longer counts as

@@ -1370,17 +1370,28 @@ def check_r3_launch(root):
         intents = db.execute("SELECT id, unit, state FROM launch_intents").fetchall()
         used = (db.execute("SELECT COALESCE(SUM(b33_used), 0) FROM lineage_budget").fetchone() or (0,))[0]
         running = db.execute("SELECT producer_unit FROM reviews WHERE state='running'").fetchall()
+        queued = db.execute("SELECT COUNT(*) FROM reviews WHERE state='queued'").fetchone()[0]
     finally:
         db.close()
+    states = {u: s for _i, u, s in intents}
     out = [] if len(live) <= 1 else ["%d live units for the row" % len(live)]
     out += [] if used == len(intents) else ["B33 used %d for %d intents" % (used, len(intents))]
     out += ["orphaned intent %s has a live unit" % i for i, u, s in intents if s == "orphaned" and u in live]
     out += ["running row bound to %s, not the live unit" % r for (r,) in running if live and r not in live]
+    # PR 272 F4: a running row's intent is started (never open or orphaned), and no row is stranded queued behind
+    # a live intent after the restart
+    out += ["running row bound to %s whose intent is %s" % (r, states.get(r)) for (r,) in running
+            if states.get(r) != "started"]
+    out += ["the row is queued behind a live intent" for _ in range(queued)
+            if any(s in ("open", "started") for s in states.values())]
+    out += [] if running or queued else ["the row is neither running nor launchable"]
     return out
 
 
 NAMED_SCENARIOS["r3_launch"] = scenario_r3_launch
 NAMED_POINTS["r3.unit_started"] = ("r3_launch", check_r3_launch)
+NAMED_POINTS["r3.intent_committed"] = ("r3_launch", check_r3_launch)    # PR 272 F4 (a)
+NAMED_POINTS["r3.attempt_bound"] = ("r3_launch", check_r3_launch)       # PR 272 F4 (b)
 
 
 if __name__ == "__main__":

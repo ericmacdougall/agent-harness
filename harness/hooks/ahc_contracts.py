@@ -783,8 +783,11 @@ class Contracts:
                                (rid,)).fetchone():
                 raise ContractError("a unit for row %s may still be live; no second unit starts" % rid)
             item = self._row("work_items", "id", row["item"]) if row["item"] else None
+            if item is not None and item["state"] == "exhausted":
+                raise ContractError("item %s is exhausted; no launch until main's W16 disposition (PR 272 F7)"
+                                    % item["id"])
             lineage = item["lineage"] if item else rid
-            used, budget = self.b33(lineage, budget_obs)
+            used, budget = self.launch_budget(item, budget_obs) if item else self.b33(lineage, budget_obs)
             if used >= budget:
                 raise ContractError("B33 spent: %d of %d model runs for the lineage; the row stops launching"
                                     % (used, budget))
@@ -906,13 +909,35 @@ class Contracts:
     def offerable_rows(self, limit=None):
         """AC-9 (goodqa#16204 item 2): queued review rows the scheduler may offer, oldest first. A row whose item
         is finished (terminal or merged), or whose row is blocked by startup reconciliation (AC-13, NEG-49), is
-        never offered, so it never takes an attempt slot or loops on start_attempt's inert refusal."""
+        never offered, so it never takes an attempt slot or loops on start_attempt's inert refusal. PR 272 F7: nor
+        is a row of an exhausted item (until main's W16 disposition) or of a lineage that has spent the policy's
+        B33, which launch_intent would refuse every tick while it held the slot."""
+        held = self.FINISHED + ("exhausted",)
         rows = self.db.execute(
-            "SELECT r.id FROM reviews r JOIN work_items w ON w.id = r.item WHERE r.state='queued' AND w.state NOT IN "
-            "(%s) AND r.id NOT IN (SELECT row FROM review_blocks) ORDER BY r.updated, r.id"
-            % ",".join("?" * len(self.FINISHED)), self.FINISHED).fetchall()
-        rows = [self._row("reviews", "id", rid) for (rid,) in rows]
-        return rows if limit is None else rows[:limit]
+            "SELECT r.id, r.item FROM reviews r JOIN work_items w ON w.id = r.item WHERE r.state='queued' AND w.state "
+            "NOT IN (%s) AND r.id NOT IN (SELECT row FROM review_blocks) ORDER BY r.updated, r.id"
+            % ",".join("?" * len(held)), held).fetchall()
+        out = []
+        for rid, iid in rows:
+            try:
+                used, budget = self.launch_budget(self._row("work_items", "id", iid))
+            except ContractError:
+                continue                                  # an observation that fails its digest: never offered
+            if used < budget:
+                out.append(self._row("reviews", "id", rid))
+        return out if limit is None else out[:limit]
+
+    def launch_budget(self, item, budget_obs=None):
+        """PR 272 F7: (used, budget) of the item's lineage B33 at launch. The budget is the policy record of the
+        latest stored observation of the item's (repo, pr), the record W15 evaluates; with none stored, the default
+        (an ASSUMPTION, deviations doc, PR 272 round 2). A caller's budget_obs can only lower it. An observation
+        that fails its digest raises."""
+        found = self.db.execute("SELECT id FROM observations WHERE repo=? AND pr=? ORDER BY rowid DESC LIMIT 1",
+                                (str(item["repo"]).lower(), int(item["pr"]))).fetchone()
+        used, budget = self.b33(item["lineage"], self.load_observation(found[0]) if found else None)
+        if budget_obs is not None:
+            budget = min(budget, self.b33(item["lineage"], budget_obs)[1])
+        return used, budget
 
     def _wi_successor(self, item, new_head, packet_sha256, event_id, base=None):
         """W4 and W24: the successor item at H' (W1). It never inherits this item's grant, Effect or Review rows;
@@ -1459,9 +1484,11 @@ class Contracts:
             self._a0("review", rid, None, "required", event_id or "ev-" + rid + "-required", actor)
             return self._row("reviews", "id", rid)
 
-    def start_attempt(self, rid, unit, uid, *, expected_version, event_id, actor="ahc-review"):
+    def start_attempt(self, rid, unit, uid, *, expected_version, event_id, actor="ahc-review", intent=None):
         """R3 queued -> running: binds the row to the one attempt unit core started and the uid systemd allocated to
-        it (read by core from the unit, never from the attempt). Only that uid's result can settle the row."""
+        it (read by core from the unit, never from the attempt). Only that uid's result can settle the row. With
+        `intent`, the launch intent moves open -> started in the same transaction (PR 272 F4): no crash can leave
+        a running row on an open intent."""
         if not isinstance(unit, str) or not unit or type(uid) is not int or uid <= 0:
             raise ContractError("running needs the attempt's unit name and its allocated uid")
         with self.tx():
@@ -1473,6 +1500,12 @@ class Contracts:
                 raise ContractError("inert: item %s is %s; no attempt starts for its review rows" % owner)
             self.review(rid, "running", expected_version=expected_version, event_id=event_id, actor=actor)
             self.db.execute("UPDATE reviews SET producer_unit=?, producer_uid=? WHERE id=?", (unit, uid, rid))
+            if intent is not None:
+                li = self._row("launch_intents", "id", intent)
+                if li is None or li["row"] != rid or li["unit"] != unit:
+                    raise ContractError("launch intent %s is not this row's intent for %s" % (intent, unit))
+                if not self.intent_move(intent, ("open",), "started", "start_attempt bound the unit"):
+                    raise ContractError("launch intent %s is not open; the row is not bound" % intent)
             return self._row("reviews", "id", rid)
 
     def review(self, rid, to, *, expected_version, event_id, actor="ahc-core", receipt=None, unit_gone=None,
