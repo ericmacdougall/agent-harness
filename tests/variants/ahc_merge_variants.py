@@ -50,10 +50,10 @@ ENTRIES = {
     "send before the dispatch commit": {
         "tests": [EF + "test_01_success_tip_h_activity_entry_pr_merged"],
         "mutations": [("the request leaves before E2 commits", [
-            ("            try:\n                obs = self.observe(row, epoch)\n",
+            ("            try:\n                obs = self.observe(row, epoch, canary)\n",
              '            early = self._send({"repo": row["repo"], "ref": "refs/heads/%s" % self._branch(row), '
              '"beforeOid": row["base"], "afterOid": reviewed, "force": False})\n'
-             "            try:\n                obs = self.observe(row, epoch)\n"),
+             "            try:\n                obs = self.observe(row, epoch, canary)\n"),
             ("            result = self._send(payload)\n", "            result = early\n")], MERGE)]},
     "no beforeOid": {
         "tests": [EF + "test_01_success_tip_h_activity_entry_pr_merged"],
@@ -133,6 +133,30 @@ ENTRIES = {
         "mutations": [("an absent-proven op with H on the branch goes to the confirm path", [
             (SETTLE, SETTLE.replace('if state == "absent-proven":', 'if state == "absent-proven" and done is not '
                                                                      'True:'))], MERGE)]},
+    # ---- PR #270 review round 1 (Codex R1 at 517de8b): one entry per finding
+    "F1 canary age at E2": {
+        "tests": [EF + "test_14_an_expired_or_unstamped_canary_at_e2_sends_nothing"],
+        "mutations": [("E2 ignores the canary facts", [
+            ('            if canary is None:\n                return Outcome("refused", "the CHK-CAS canary is '
+             'expired', '            if False:\n                return Outcome("refused", "the CHK-CAS canary is '
+             'expired')], MERGE),
+                      ("the age has no upper bound", [
+            ("not 0 <= age < CANARY_MAX_SECONDS:", "not 0 <= age:")], MERGE)]},
+    "F2 the deadline cancels the local send": {
+        "tests": [T9 + "test_a_send_paused_before_the_transport_never_starts_after_a_fence"],
+        "mutations": [("the deadline abandons the worker without cancelling it", [
+            ("            stopped = gate.cancel()\n", '            stopped = "abandoned"\n')], MERGE),
+                      ("the transport is called without the gate", [
+            ('payload["force"], self.send_deadline, gate=gate)', 'payload["force"], self.send_deadline)')],
+                       MERGE)]},
+    "F3 an interrupted canary invalidates the old pass": {
+        "tests": [T + "CanaryTests.test_an_interrupted_failed_canary_never_leaves_the_old_pass_authoritative"],
+        "mutations": [("no in-progress record at the start", [
+            ('            self._record(repo, "in-progress", False, {}, bool(prior.get("escalated")) and not '
+             'prior.get("passed"))\n', "")], MERGE),
+                      ("an exception mid-canary escapes without a failed record or merging off", [
+            ('                error = "%s during the canary" % type(exc).__name__\n', "                raise\n")],
+                       MERGE)]},
 }
 
 # an entry's extra_tests are mapped too (the classifier mutation is killed by them)
