@@ -2062,6 +2062,8 @@ class Contracts:
             problems = []
             if obs.get("kill_switch") is not False:
                 problems.append("kill switch on or unread")
+            if self.merging_off(row["repo"]):          # T9 disable, E14, a failed canary: the repo's merging is off
+                problems.append("the repo's merging is off")
             if obs.get("pr_state") != "OPEN" or obs.get("pr_head") != row["head"] or obs.get("draft") is not False:
                 problems.append("PR not open and ready at H")
             if obs.get("tip") != row["base"]:

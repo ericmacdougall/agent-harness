@@ -525,6 +525,18 @@ class OperationTests(Base):
             with self.subTest(b=b, h=h), self.assertRaises(C.ContractError):
                 C.Contracts.operation_key("o/r", 5, b, h, POLICY, 0)
 
+    def test_e02_a_repo_with_merging_off_never_dispatches(self):
+        """T9 disable and E14: while repo_flags.merging_off is set, E2 refuses and the op stays in intent; main
+        turning merging back on lets it dispatch. Found by tests.test_ahc_merge.T9Tests (a disabled repo's intent
+        passed E2); fails on the base without the guard line."""
+        _g, op = self.reserved()
+        self.c.set_merging("o/r", off=True, cause="main: stop this repo", actor="main")
+        with self.assertRaisesRegex(C.ContractError, "merging is off"):
+            self.send(op)
+        self.assertEqual(self.c._row("operations", "key", op["key"])["state"], "intent")
+        self.c.set_merging("o/r", off=False, cause="main: resume", actor="main")
+        self.assertEqual(self.send(self.c._row("operations", "key", op["key"]))["state"], "dispatched")
+
     def test_e01_intent_is_idempotent_fast_forward_only_and_needs_a_lease(self):
         with self.assertRaises(C.ContractError):
             self.c.intend(self.params(), lease_ok=False, event_id=self.ev())
