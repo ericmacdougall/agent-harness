@@ -1366,7 +1366,7 @@ def scenario_r3_launch(root, clock, settle=False):
                   % (live["head"], live["packet_sha256"])).encode()
         Path(ahc_review.attempt_paths(root, intent["unit"], live, "")["output"]).write_bytes(report)
         final = {"row": live["id"], "intent": intent["id"], "invocation_id": fr.show(intent["unit"], ())["InvocationID"],
-                 "report_sha256": hashlib.sha256(report).hexdigest()}
+                 "report_sha256": hashlib.sha256(report).hexdigest(), "exit_status": 0}
         ahc_review.settle_final(c, root, fr, 4242, json.dumps(final).encode())
     if settle:
         ahc_review.ReviewStage(c, launcher, None).sweep({k: [] for k in ("settled", "unverified", "unknown",

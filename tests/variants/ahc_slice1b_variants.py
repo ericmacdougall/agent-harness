@@ -845,8 +845,9 @@ ENTRIES.update({
                   RT + "test_r04_option_a_every_mismatch_settles_nothing"],
         "mutations": [
             ("core takes the wrapper's verdict field", [
-                ('    verdict = report_verdict(raw, row)\n',
-                 '    verdict = json.loads(data.decode("utf-8")).get("verdict") or report_verdict(raw, row)\n')],
+                ('    verdict = report_verdict(raw, row) if rc in (ahc_core.EXIT_PASS, ahc_core.EXIT_BLOCK) else None\n',
+                 '    verdict = json.loads(data.decode("utf-8")).get("verdict") or (report_verdict(raw, row) if rc in '
+                 '(ahc_core.EXIT_PASS, ahc_core.EXIT_BLOCK) else None)\n')],
              REVIEW_PY),
             ("the report sha256 is not checked", [
                 ('    if hashlib.sha256(raw).hexdigest() != fin["report_sha256"]:\n', '    if False:\n')], REVIEW_PY),
@@ -1089,6 +1090,30 @@ ENTRIES.update({
             ("production builds the runner without the wrapper", [
                 ('        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) and wrapper.is_file() else None\n',
                  '        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) else None\n')], REVIEW_PY)]},
+})
+
+# PR 273 receipt (main's exact-head BLOCK at 3932ba67): r273-F1..F3, labelled apart from the f532d495 F1-F4
+R273 = "tests.test_ahc_contracts.RuntimeTests.test_r273_"
+AHC_CORE = "harness/hooks/ahc_core.py"
+ENTRIES.update({
+    "PR 273 receipt F1 a pass needs the helper's exit 0 in the completion signal": {
+        "tests": [R273 + "f1_a_bound_pass_report_left_after_a_failed_publication_check_never_passes",
+                  R273 + "f1_the_verdict_carrying_final_forms_apply_the_same_exit_rule",
+                  RTT + "test_r273_f1_a_pass_report_with_a_failed_publication_exit_settles_outcome_unknown_through_the_tick"],
+        "mutations": [
+            ("settle_final ignores the helper's exit status", [
+                ('    verdict = report_verdict(raw, row) if rc in (ahc_core.EXIT_PASS, ahc_core.EXIT_BLOCK) else None\n',
+                 '    verdict = report_verdict(raw, row)\n'),
+                ('    if verdict is None or ahc_core.helper_outcome(rc, verdict) is None:\n', '    if verdict is None:\n')],
+             REVIEW_PY),
+            ("helper_outcome lets a PASS through with any exit status", [
+                ('        return verdict if rc == EXIT_PASS else None\n', '        return verdict\n')], AHC_CORE),
+            ("the completion signal takes a JSON boolean as the helper's integer exit status", [
+                ('    if type(doc.get(FINAL_STATUS)) is not int:\n', '    if not isinstance(doc.get(FINAL_STATUS), int):\n')],
+             REVIEW_PY),
+            ("helper_outcome reads a boolean exit status as 1 or 0", [
+                ('    if type(rc) is not int:\n        return None\n', '    if not isinstance(rc, int):\n        return None\n')],
+             AHC_CORE)]},
 })
 
 

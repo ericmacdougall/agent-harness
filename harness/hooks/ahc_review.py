@@ -58,6 +58,9 @@ REPORT_NAME = "report.md"
 REVIEW_MAX = 3600                     # RuntimeMaxSec of an attempt unit (ASSUMPTION: one hour)
 SETTLE_GRACE = 300                    # seconds past REVIEW_MAX before core gives a silent unit up (outcome-unknown)
 FINAL_KEYS = ("row", "intent", "invocation_id", "report_sha256")
+# PR 273 receipt F1: the wrapper's completion signal also carries the helper's own exit status (a JSON integer), the
+# status peer_review returned after its final publication check. Core never accepts a report's verdict without it.
+FINAL_STATUS = "exit_status"
 
 
 def parse_unit(name):
@@ -489,7 +492,11 @@ def read_final(sock, limit=FINAL_MAX):
     return b"".join(chunks)
 
 
-def _final(data):
+def _final(data, exit_status=None):
+    """(row state, receipt) of a verdict-carrying FINAL (the R4 socket form and R-c). The helper's exit status is
+    core's own read for R-c (`exit_status`), else the FINAL's integer `exit_status`; the verdict holds only where
+    ahc_core.helper_outcome lets that status carry it (PR 273 receipt F1), so a report left after a failed final
+    publication check never settles a pass."""
     try:
         doc = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -497,6 +504,10 @@ def _final(data):
     if not isinstance(doc, dict) or doc.get("verdict") not in ("PASS", "BLOCK", "PASS-WITH-TICKETS") or \
             not isinstance(doc.get("receipt"), dict):
         raise C.ContractError("the FINAL has no verdict and receipt")
+    rc = doc.get(FINAL_STATUS) if exit_status is None else exit_status
+    if ahc_core.helper_outcome(rc, doc["verdict"]) is None:
+        raise C.ContractError("unverified-producer: the helper's exit status %r does not carry the verdict %s"
+                              % (rc, doc["verdict"]))
     return ("passed" if doc["verdict"] == "PASS" else "findings"), doc["receipt"]
 
 
@@ -521,7 +532,7 @@ def settle_rc(contracts, rid, *, source, final_bytes, invocation_id, expected_in
                               "core started")
     if len(final_bytes) > FINAL_MAX:
         raise C.ContractError("the FINAL is longer than %d bytes; refused" % FINAL_MAX)
-    to, receipt = _final(final_bytes)
+    to, receipt = _final(final_bytes, exit_status=exit_status)
     row = contracts._row("reviews", "id", rid)
     return contracts.review(rid, to, expected_version=row["version"], event_id="r4c:%s:%d" % (rid, row["version"]),
                             actor="ahc-review", receipt=receipt, peer_uid=row["producer_uid"])
@@ -620,15 +631,18 @@ def r2_queue(contracts, rid, packet):
 # ------------------------------------------------------------------ option A: completion signal and core-read report
 
 def completion(data):
-    """The FINAL under option A: a completion signal only (row, intent, InvocationID, the report's sha256). Every
-    other key, a verdict or a receipt included, is ignored: core never takes a verdict from the wrapper."""
+    """The FINAL under option A: a completion signal only (row, intent, InvocationID, the report's sha256) and the
+    helper's exit status, a JSON integer (PR 273 receipt F1; a boolean is refused). Every other key, a verdict or a
+    receipt included, is ignored: core never takes a verdict from the wrapper."""
     try:
         doc = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise C.ContractError("the FINAL is not JSON") from None
     if not isinstance(doc, dict) or not all(isinstance(doc.get(k), str) and doc.get(k) for k in FINAL_KEYS):
         raise C.ContractError("the FINAL lacks %s" % ", ".join(FINAL_KEYS))
-    return {k: doc[k] for k in FINAL_KEYS}
+    if type(doc.get(FINAL_STATUS)) is not int:
+        raise C.ContractError("the FINAL lacks the helper's integer %s" % FINAL_STATUS)
+    return dict({k: doc[k] for k in FINAL_KEYS}, **{FINAL_STATUS: doc[FINAL_STATUS]})
 
 
 def report_verdict(raw, row):
@@ -695,7 +709,16 @@ def settle_final(contracts, root, runner, uid, data):
         raise C.ContractError("unverified-producer: the report is %s" % error.kind) from None
     if hashlib.sha256(raw).hexdigest() != fin["report_sha256"]:
         raise C.ContractError("unverified-producer: the report's sha256 is not the FINAL's")
-    verdict = report_verdict(raw, row)
+    rc = fin[FINAL_STATUS]
+    # PR 273 receipt F1: peer_review returns 2 after a failed final publication check and may leave a digest-bound
+    # historical report. The attempt ended without a current signoff: outcome-unknown, never a verdict from that report.
+    verdict = report_verdict(raw, row) if rc in (ahc_core.EXIT_PASS, ahc_core.EXIT_BLOCK) else None
+    if verdict is None or ahc_core.helper_outcome(rc, verdict) is None:
+        why = "the helper exited %d%s: no current signoff" % (rc, " with %s" % verdict if verdict else "")
+        moved = contracts.settle_attempt(rid, "outcome-unknown", intent["id"], expected_version=row["version"],
+                                         event_id="r4f:%s" % intent["id"], reason=why, cause=why)
+        crash_at("r3.settled")
+        return moved
     import ahc_shadow  # noqa: PLC0415 - the producer's receipt (AC-9 item 4); ahc_shadow imports this module lazily
     ids = report_finding_ids(raw) if verdict != "PASS" else []
     receipt = ahc_shadow.findings_receipt(row, verdict, ids, report_sha256=fin["report_sha256"],

@@ -1725,7 +1725,7 @@ class RuntimeTests(Base):
         row = self.queued()
         row = self.c.start_attempt(row["id"], "ahc-review-x", os.getuid(), expected_version=row["version"],
                                    event_id=self.ev())
-        b.sendall(json.dumps({"verdict": "PASS", "receipt": self.receipt()}).encode())
+        b.sendall(json.dumps({"verdict": "PASS", "receipt": self.receipt(), "exit_status": 0}).encode())
         b.shutdown(socket.SHUT_WR)
         self.assertEqual(self.R.receive_final(self.c, a, row["id"])["state"], "passed")
         other = self.queued(pr=6)
@@ -1734,7 +1734,8 @@ class RuntimeTests(Base):
         c2, d2 = socket.socketpair()
         self.addCleanup(c2.close)
         self.addCleanup(d2.close)
-        d2.sendall(json.dumps({"verdict": "PASS", "receipt": self.receipt(pr=6), "peer_uid": os.getuid() + 1}).encode())
+        d2.sendall(json.dumps({"verdict": "PASS", "receipt": self.receipt(pr=6), "peer_uid": os.getuid() + 1,
+                               "exit_status": 0}).encode())
         d2.shutdown(socket.SHUT_WR)
         with self.assertRaisesRegex(C.ContractError, "unverified-producer"):
             self.R.receive_final(self.c, c2, other["id"])
@@ -1846,7 +1847,7 @@ class RuntimeTests(Base):
         out = Path(self.R.attempt_paths(self.root, unit, row, "")["output"])
         out.write_bytes(report)
         final = {"row": row["id"], "intent": intent["id"], "invocation_id": self.runner.invocation[unit],
-                 "report_sha256": hashlib.sha256(report).hexdigest()}
+                 "report_sha256": hashlib.sha256(report).hexdigest(), "exit_status": 0}
         return row, unit, out, final
 
     def settle(self, final, uid=None):
@@ -2086,6 +2087,63 @@ class RuntimeTests(Base):
         self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "passed")
         self.assertEqual(self.intent_state(unit), "closed")
         self.assertNotIn(unit, self.runner.live)
+
+    def test_r273_f1_a_bound_pass_report_left_after_a_failed_publication_check_never_passes(self):
+        """PR 273 receipt F1: peer_review exits 2 after a failed final publication check and may leave a digest-bound
+        historical report. A correctly bound PASS report with any exit status but 0 settles outcome-unknown, never
+        passed; a completion signal with no integer exit status (absent, true, false, a string) settles nothing.
+        Controls: exit 0 with PASS passes; exit 3 with BLOCK is findings."""
+        for rc, want in ((2, "outcome-unknown"), (4, "outcome-unknown"), (1, "outcome-unknown"),
+                         (3, "outcome-unknown"), (0, "passed")):
+            with self.subTest(rc=rc):
+                row, unit, _out, final = self.launched("VERDICT: PASS")
+                moved = self.settle(dict(final, exit_status=rc))
+                self.assertEqual(moved["state"], want)
+                self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], want)
+                self.assertEqual(self.intent_state(unit), "stopping", "the attempt ended either way")
+        row, _unit, _out, final = self.launched("VERDICT: BLOCK")
+        self.assertEqual(self.settle(dict(final, exit_status=3))["state"], "findings", "BLOCK holds with exit 3")
+        for bad in ("absent", True, False, "0", None):
+            with self.subTest(exit_status=bad):
+                row, unit, _out, final = self.launched("VERDICT: PASS")
+                doc = dict(final)
+                if bad == "absent":
+                    doc.pop("exit_status")
+                else:
+                    doc["exit_status"] = bad
+                with self.assertRaisesRegex(C.ContractError, "integer exit_status"):
+                    self.settle(doc)
+                self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "running")
+                self.assertEqual(self.intent_state(unit), "started")
+
+    def test_r273_f1_the_verdict_carrying_final_forms_apply_the_same_exit_rule(self):
+        """PR 273 receipt F1 for the other completion forms (R4's socket FINAL and R-c): a PASS with exit 2 or a
+        boolean status is refused (unverified-producer) and the row stays running; ahc_core.verify_receipt and the
+        daemon share ahc_core.helper_outcome."""
+        import socket  # noqa: PLC0415
+        if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+            self.skipTest("no peer credential support")
+        for rc in (2, True, None):
+            with self.subTest(rc=rc):
+                row = self.queued(pr=70 + (rc if type(rc) is int else 9 if rc else 8))
+                row = self.c.start_attempt(row["id"], "ahc-review-%s" % row["id"][-6:], os.getuid(),
+                                           expected_version=row["version"], event_id=self.ev())
+                a, b = socket.socketpair()
+                self.addCleanup(a.close)
+                self.addCleanup(b.close)
+                doc = {"verdict": "PASS", "receipt": self.receipt(pr=row["pr"])}
+                if rc is not None:
+                    doc["exit_status"] = rc
+                b.sendall(json.dumps(doc).encode())
+                b.shutdown(socket.SHUT_WR)
+                with self.assertRaisesRegex(C.ContractError, "unverified-producer"):
+                    self.R.receive_final(self.c, a, row["id"])
+                self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "running")
+        import ahc_core  # noqa: PLC0415
+        self.assertEqual([ahc_core.helper_outcome(rc, v) for rc, v in (
+            (0, "PASS"), (0, "PASS-WITH-TICKETS"), (0, "BLOCK"), (3, "BLOCK"), (3, "PASS"), (2, "PASS"), (2, "BLOCK"),
+            (4, "PASS"), (True, "BLOCK"), (False, "PASS"))],
+            ["PASS", "PASS-WITH-TICKETS", "BLOCK", "BLOCK", None, None, None, None, None, None])
 
     def test_rescue_f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop(self):
         """F1, structurally: intent_move has no edge to closed or orphaned, no module call moves an intent to one,
