@@ -5643,6 +5643,33 @@ class ShadowTickTests(_ShadowFixture):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM work_items").fetchone()[0], 0)
         self.assertTrue(any("head moved" in why for _k, why in summary["refused"]), summary["refused"])
 
+    def test_16262_ac3e_a_same_head_resubmit_for_a_live_item_is_consumed_before_any_observation(self):
+        """goodqa#16262 d5 AC-3 (e), NEG-13: a request at a live item's (repo, pr, head) is a duplicate. It is
+        deleted before `_observe`: no admission read (so no GoodQA reader call), no hold, no R2 queueing, and the
+        item, its reviews and its binding are unchanged."""
+        item = self.c.admit_item("o/r", 5, TC.H1, TC.BASE, TC.POLICY, TC.CORE1, TC.PKT, event_id=self.ev())
+        before = (self.c._row("work_items", "id", item["id"]),
+                  self.db.execute("SELECT * FROM reviews WHERE item=? ORDER BY kind", (item["id"],)).fetchall())
+        admission_reads = []
+        facts = self.facts
+        self.facts = lambda repo, pr, it: (admission_reads.append((repo, pr)) if it is None else None) or facts(
+            repo, pr, it)
+        for _ in range(5):
+            key = self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
+                                                "packet_sha256": TC.PKT, "owner": "agent-x",
+                                                "ticket": "GoodQA goodqa#5"})
+            summary = self.shadow_tick()[0].tick()
+            self.assertEqual(summary["admitted"], [])
+            self.assertIsNone(self.db.execute("SELECT 1 FROM contract_meta WHERE k=?", (key,)).fetchone(),
+                              "the duplicate request is consumed")
+            self.assertIn("duplicate of live item %s" % item["id"], json.dumps(summary))
+        self.assertEqual(admission_reads, [], "a duplicate never reaches the producer (or the GoodQA reader)")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM contract_meta WHERE k LIKE 'shadow_hold:%'")
+                         .fetchone()[0], 0, "a duplicate is never held")
+        after = (self.c._row("work_items", "id", item["id"]),
+                 self.db.execute("SELECT * FROM reviews WHERE item=? ORDER BY kind", (item["id"],)).fetchall())
+        self.assertEqual(after, before, "the live item and its reviews are unchanged")
+
     def test_neg9_w5_w6_w5_with_identical_facts_each_apply_and_each_item_moves_once_per_tick(self):
         item, other = self.ready_item(5), self.ready_item(6)
         rows = []
