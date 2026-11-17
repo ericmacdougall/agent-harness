@@ -778,6 +778,43 @@ ENTRIES.update({
 })
 
 
+SCAN_PY = "harness/hooks/ahc_scan.py"
+
+ENTRIES.update({
+    "AC-8 R2 test_r02 core-built packet": {
+        "tests": [RT + "test_r02_core_builds_the_packet_from_its_own_snapshot_and_lints_it",
+                  RT + "test_r02_the_build_fails_closed_and_queues_only_its_own_packet"],
+        "mutations": [
+            ("NEG-23: the fence does not escape its terminator", [
+                ('    body = str(text).replace("\\\\", "\\\\\\\\").replace("<<<", "<<\\\\<")\n', '    body = str(text)\n')],
+             REVIEW_PY),
+            ("the owner section is not linted", [
+                ('    findings = lint((("diff", diff), ("commit messages", messages), ("owner section", owner_text)))\n',
+                 '    findings = lint((("diff", diff), ("commit messages", messages)))\n')], REVIEW_PY),
+            ("the commit messages are not linted", [
+                ('    findings = lint((("diff", diff), ("commit messages", messages), ("owner section", owner_text)))\n',
+                 '    findings = lint((("diff", diff), ("owner section", owner_text)))\n')], REVIEW_PY),
+            ("a failed git read builds a packet anyway", [
+                ('        if rc != 0:\n            raise C.ContractError("R2: git %s failed; the packet is not built" % args[0])\n',
+                 '        if rc != 0:\n            return ""\n')], REVIEW_PY),
+            ("any packet queues the row", [
+                ('    if (packet["sha256"], packet["head"], packet["snapshot_base"]) != (row["packet_sha256"], row["head"],\n',
+                 '    if False and (packet["sha256"], packet["head"], packet["snapshot_base"]) != (row["packet_sha256"], row["head"],\n')],
+             REVIEW_PY)]},
+    "AC-8 R5 test_r05 encodings and corpus": {
+        "tests": [RT + "test_r05_every_encoding_and_alignment_reaches_the_tiers_and_the_corpus_covers_fixtures"],
+        "mutations": [
+            ("the fixtures leave the corpus", [
+                ('        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "*.py", "*.md", "tests/data/*"],\n',
+                 '        out = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "*.py", "*.md"],\n')],
+             "tests/test_ahc_scan.py"),
+            ("the exemption list is not a protected path", [
+                ('    return any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED) or path.startswith(".claude/")\n',
+                 '    return (any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED) and "corpus_exempt" not in name) or path.startswith(".claude/")\n')],
+             RUNNER_PY)]},
+})
+
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:

@@ -237,6 +237,30 @@
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
+ "tests/data/ahc_scan_corpus_exempt.json": {
+  "counts": {
+   "bearer:prefix": 8,
+   "redact:named-credential:prefix": 65
+  },
+  "reason": "this exemption list names rule kinds (bearer, named-credential) in its own counts and reasons; no value"
+ },
+ "tests/data/merge_gate_corpus.json": {
+  "counts": {
+   "bearer:prefix": 1,
+   "github-classic:prefix": 2
+  },
+  "reason": "merge-gate command corpus: bare public token prefixes and the Bearer scheme in command text; no value"
+ },
+ "tests/data/review_diagnostics_hostile.json": {
+  "counts": {
+   "anthropic": 1,
+   "high-entropy": 1,
+   "pem": 1,
+   "redact:anthropic": 1,
+   "redact:pem": 1
+  },
+  "reason": "ASSUMPTION (goodqa#16049 slice 1b): synthetic hostile fixture of the peer-review diagnostics tests (fake key block and fake token tail, commit 117e8af); not a credential. R5 wants test secrets built at run time; moving them is a follow-up for that stream"
+ },
  "tests/live_guard_canary.py": {
   "counts": {
    "redact:named-credential:prefix": 3
