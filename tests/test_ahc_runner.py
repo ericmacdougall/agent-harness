@@ -4484,9 +4484,14 @@ class StateMachineTests(TC.Base):
         import ahc_shadow  # noqa: PLC0415
         launched = []
 
-        def launch(row):
+        def launch(row):                  # the Launcher's contract: bind the row, return (status, detail)
             launched.append(row["id"])
-            return "ahc-review-%s-i1" % row["id"], self.UID
+            unit = "ahc-review-%s-i1" % row["id"]
+            try:
+                self.c.start_attempt(row["id"], unit, self.UID, expected_version=row["version"], event_id=self.ev())
+            except C.ContractError as error:
+                return "refused", str(error)
+            return "running", unit
 
         dead = []
         cancelled = self.admit(pr=70)
@@ -4603,7 +4608,7 @@ class StateMachineTests(TC.Base):
         "Review": (
             "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
             "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded",
-            "test_r06", "test_r07", "test_r08",
+            "test_r06", "test_r08",
             "test_r09", "test_r10", "test_r11", "test_r12", "test_r13", "test_r14", "test_r15", "test_r16",
             "test_r18", "test_r19"),
         "Grant": (
@@ -5396,6 +5401,14 @@ class FakeProducer:
         self.reads.append(stamp["id"])
         return self.c.load_observation(stamp["id"])
 
+    def _git(self, args, cwd, timeout):
+        """Core's git in the clone for the R2 packet (a fixed one-file change)."""
+        if args[0] == "log":
+            return 0, "%s\0feat: a change\0" % args[-1].split("..")[-1], ""
+        if "--name-only" in args:
+            return 0, "src/a.py\0", ""
+        return 0, "diff --git a/src/a.py b/src/a.py\n-x = 1\n+x = 2\n", ""
+
 
 class _ShadowFixture(TC.Base):
     def setUp(self):
@@ -5664,6 +5677,106 @@ class ShadowIntegratedTests(Base):
             ledger.close()
         self.assertTrue(legacy_id)
 
+
+
+class ReviewTickTests(ShadowIntegratedTests):
+    """AC-8 with AC-4 (owner ruling, option A): one tick admits, binds the item to core's R2 packet, queues the code
+    row and offers it to the R3 Launcher; the next tick settles the completion signal that arrived on core's socket
+    (peer uid read by core, report read by core) and offers the next row. Zero mutating gh calls throughout."""
+
+    def setUp(self):
+        super().setUp()
+        import ahc_guard  # noqa: PLC0415
+        import ahc_review  # noqa: PLC0415
+        from tests import test_ahc_contracts as TCX  # noqa: PLC0415
+        self.R = ahc_review
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir(mode=0o700)
+        stubs = {}
+        for name in ("systemd-run", "systemctl"):
+            p = bin_dir / name
+            p.write_text("#!/bin/sh\nexit 0\n")
+            os.chmod(str(p), 0o755)
+            stubs[name] = str(p)
+        self.policy = ahc_guard.Policy.for_test(self.paths.root, stubs, trusted_dirs=(str(bin_dir),))
+        self.runner = TCX._FakeRunner(os.getuid())
+        deps, git_root = self.deps, self.git.root
+        state = {}
+
+        def review_stage(contracts, clone):
+            launcher = ahc_review.Launcher.for_test(contracts, self.policy, "/opt/ahc/peer_review.py", self.runner,
+                                                    self.paths.root, clone=lambda repo, head, base: str(git_root))
+            if "inbox" not in state:
+                state["inbox"] = ahc_review.FinalInbox(self.paths.root)
+                self.addCleanup(state["inbox"].close)
+            return ahc_review.ReviewStage(contracts, launcher, state["inbox"], sandbox_repo=SHADOW_REPO)
+        deps.review_stage = review_stage
+        self.head2 = self.git.commit({"src/c.py": "c\n"}, "second change", parent=self.base)
+        pre = "repos/%s" % SHADOW_REPO
+        self.gh.set(pre + "/pulls/10", TO.pull_json(self.head2, number=10, repo=SHADOW_REPO, changed=1))
+        self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % self.head2,
+                    TO.page({"total_count": 1, "check_runs": [TO.run("test", head=self.head2)]}))
+        self.gh.set(pre + "/commits/%s/statuses?per_page=100" % self.head2, TO.page([]))
+
+    def submit_pr(self, pr, head):
+        req = {"repo": SHADOW_REPO, "pr": pr, "head": head, "base": self.base, "packet": str(self.packet),
+               "ticket": "GoodQA goodqa#16049", "owner": "agent-abc123"}
+        return core.submit(self.paths, self.config, req)
+
+    def code_rows(self):
+        return self.ledger_rows("SELECT r.id, w.pr, r.state, r.packet_sha256, w.packet_sha256 FROM reviews r JOIN "
+                                "work_items w ON w.id = r.item WHERE r.kind='adversarial' ORDER BY w.pr")
+
+    def play_wrapper(self, rid, verdict_line, final_verdict=None):
+        """The completion wrapper's part, played by the test: the report in the attempt's directory, then the
+        completion signal on core's socket (this process's uid is the uid the fake runner reported)."""
+        import socket  # noqa: PLC0415
+        (iid, unit), = self.ledger_rows("SELECT id, unit FROM launch_intents WHERE row=? AND state='started'", (rid,))
+        (head, packet), = self.ledger_rows("SELECT head, packet_sha256 FROM reviews WHERE id=?", (rid,))
+        report = ("Reviewer: test\nStage: pr\nReviewed HEAD: %s\nReviewed packet SHA-256: %s\n\n%s\nbody\n"
+                  % (head, packet, verdict_line)).encode()
+        out = self.paths.root / "reports" / ("%s-%s" % (rid, iid)) / "report.md"
+        out.write_bytes(report)
+        final = {"row": rid, "intent": iid, "invocation_id": self.runner.invocation[unit],
+                 "report_sha256": hashlib.sha256(report).hexdigest()}
+        if final_verdict:
+            final["verdict"] = final_verdict                  # never read: core takes the verdict from the report
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(str(self.paths.root / "sock" / "review.sock"))
+            s.sendall(json.dumps(final).encode())
+        finally:
+            s.close()
+
+    def test_ac8_the_tick_admits_schedules_r3_settles_through_the_peer_uid_and_offers_the_next_row(self):
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        self.assertEqual(self.submit_pr(10, self.head2).get("pipeline"), "shadow")
+        first = self.run_all(self.deps)["shadow"]
+        self.assertEqual(len(first["admitted"]), 2, first)
+        rows = self.code_rows()
+        for rid, _pr, _state, row_sha, item_sha in rows:
+            stored = self.paths.root / "packets" / ("%s.md" % row_sha)
+            self.assertEqual(row_sha, item_sha, "the item and its rows are bound to one packet")
+            self.assertEqual(hashlib.sha256(stored.read_bytes()).hexdigest(), row_sha, "core's R2 packet is stored")
+            self.assertIn("UNTRUSTED AUTHOR TEXT", stored.read_text())
+        self.assertEqual(sorted(r[2] for r in rows), ["queued", "running"], "one slot: one row is launched")
+        a = [r[0] for r in rows if r[2] == "running"][0]
+        b = [r[0] for r in rows if r[2] == "queued"][0]
+        self.assertEqual(first["scheduled"]["started"], [a])
+        self.assertEqual(len(self.runner.started), 1)
+        self.play_wrapper(a, "VERDICT: PASS")
+        second = self.run_all(self.deps)["shadow"]
+        self.assertEqual(second["review"]["settled"], [(a, "passed")], second["review"])
+        self.assertEqual(second["scheduled"]["started"], [b], "the next row is offered once the slot is free")
+        self.play_wrapper(b, "VERDICT: BLOCK", final_verdict="PASS")
+        third = self.run_all(self.deps)["shadow"]
+        self.assertEqual(third["review"]["settled"], [(b, "findings")], "the report's verdict, never the FINAL's")
+        self.assertEqual({r[0]: r[2] for r in self.code_rows()}, {a: "passed", b: "findings"})
+        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents ORDER BY created"),
+                         [("closed",), ("closed",)])
+        self.assertEqual(len(self.runner.stopped), 2, "each settled unit is stopped")
+        mutating = [a for a in self.all_gh_argv() if self.S.is_mutating("gh", a)]
+        self.assertEqual(mutating, [], "zero mutating gh calls with the review step in the tick")
 
 
 class TickIncidentTests(Base):

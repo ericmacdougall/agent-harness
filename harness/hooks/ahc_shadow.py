@@ -5,12 +5,17 @@
   after the R5 scan. Delivery here re-scans each text (a second gate, never the only one) and, in this slice,
   delivers only to the shadow digest file. Nothing is sent to a PR, a ticket or an inbox.
 - The review scheduler (AC-9, goodqa#16204 item 2): it offers only Contracts.offerable_rows, so a row of a
-  terminal or merged item never takes an attempt slot.
+  terminal or merged item never takes an attempt slot. In the tick it offers rows to the R3 Launcher of the injected
+  ahc_review.ReviewStage (AC-8; owner ruling: the tick schedules R3), after the stage settles completion signals.
+- R2 at admission (option A, ASSUMPTION): core builds the review packet from its own clone at W1 and binds the item
+  and its review rows to that packet's sha256; the owner's packet sha is listed in the packet's fenced owner
+  section. A packet that cannot be built leaves the request held (fail closed, retried next tick).
 - Status (AC-9 item 3): a review row of a finished item renders as "inert: item <state>", never as queued.
 - The findings result producer (AC-9 item 4): a findings receipt carries `finding_ids`, filtered to the id rule and
   capped at 64, with the dropped count flagged.
 
-No function here makes a network call or launches a child; every time stamp comes from the Contracts clock.
+No function here makes a network call or launches a child itself: reads go through the injected producer and
+review attempts through the injected ReviewStage (AC-13 forms). Every time stamp comes from the Contracts clock.
 """
 from __future__ import annotations
 
@@ -74,9 +79,9 @@ def status_lines(contracts):
 
 
 class ReviewScheduler:
-    """Offers queued review rows to the R3 runner, at most `slots` per tick. `launch(row)` starts the row's
-    attempt unit and returns (unit, uid) as core read them; it is injected (the bound R3 runner in production, a
-    fake in tests). A refusal from start_attempt is recorded in the result, never retried in the same tick."""
+    """Offers queued review rows to R3, at most `slots` per tick. `launch(row)` is the R3 Launcher's launch
+    (ahc_review.Launcher: intent, unit, start_attempt) and returns (status, detail); "running" means the row is bound
+    to its unit. Anything else is recorded in the result, never retried in the same tick."""
 
     def __init__(self, contracts, launch, slots=1):
         self.c = contracts
@@ -87,13 +92,11 @@ class ReviewScheduler:
         offered, started, refused = [], [], []
         for row in self.c.offerable_rows(limit=self.slots):
             offered.append(row["id"])
-            unit, uid = self.launch(row)
-            try:
-                self.c.start_attempt(row["id"], unit, uid, expected_version=row["version"],
-                                     event_id="%s-start-%s" % (event_prefix, row["id"]))
+            status, detail = self.launch(row)
+            if status == "running":
                 started.append(row["id"])
-            except C.ContractError as error:
-                refused.append((row["id"], str(error)))
+            else:
+                refused.append((row["id"], "%s: %s" % (status, detail)))
         return {"offered": offered, "started": started, "refused": refused}
 
 
@@ -215,13 +218,16 @@ class ShadowTick:
     wi_move; WorkItems take no lease. A refused observation moves nothing. Nothing here dispatches an Effect or
     writes to GitHub."""
 
-    def __init__(self, contracts, producer, clone, config, digest_append=None, w21=None):
+    def __init__(self, contracts, producer, clone, config, digest_append=None, w21=None, review=None,
+                 store_packet=None):
         self.c = contracts
         self.producer = producer
         self.clone = clone
         self.config = config
         self.digest_append = digest_append
         self.w21 = w21                       # AC-7: the W21 sender (ahc_w21.Sender), or None (W21 not evaluated)
+        self.review = review                 # AC-8: ahc_review.ReviewStage, or None (no review step)
+        self.store_packet = store_packet     # R2: writes a built packet where the R3 unit reads it
 
     def _repos(self):
         return sorted({str(r).lower() for r in self.config.get("shadow_repos") or []
@@ -259,8 +265,15 @@ class ShadowTick:
             obs = self._observe(summary, req["repo"], req["pr"], base=req.get("base"), head=req["head"])
             if obs is None:
                 continue
+            packet = None
+            if obs["pr_head"] == req["head"] and obs["pr_state"] == "OPEN":
+                try:
+                    packet = self.r2_packet(req, obs, base=obs["tip"])
+                except Exception as error:  # noqa: BLE001 - R2 fails closed: the request stays held
+                    summary["refused"].append((key, "admission: the R2 packet was not built: %s" % str(error)[:200]))
+                    continue
             with self.c.tx():
-                if obs["pr_head"] != req["head"] or obs["pr_state"] != "OPEN":
+                if packet is None:
                     reason = "head moved or PR not open at admission"
                 else:
                     reason = None
@@ -268,13 +281,37 @@ class ShadowTick:
                     core = obs.get("attached_core")
                     try:
                         item = self.c.admit_item(req["repo"], req["pr"], req["head"], obs["tip"], rev, core,
-                                                 req["packet_sha256"], event_id=event_id(obs["id"], key, "W1"))
+                                                 packet["sha256"], event_id=event_id(obs["id"], key, "W1"))
+                        self.r2_queue_item(item, packet)
                         summary["admitted"].append(item["id"])
                     except C.ContractError as error:
                         reason = str(error)
                 if reason:
                     summary["refused"].append((key, "admission: %s" % reason))
                 self.c.db.execute("DELETE FROM contract_meta WHERE k=?", (key,))
+
+    def r2_packet(self, req, obs, base):
+        """R2 (option A): core's packet for (repo, pr, H) against B_r = `base`, built from core's own clone through the
+        producer's git (AC-13 forms) and stored for the R3 unit. The owner's request is the fenced owner section."""
+        import ahc_review  # noqa: PLC0415
+        clone = self.clone(req["repo"], req["head"], base)
+        owner = "\n".join("%s: %s" % (k, req.get(k)) for k in ("repo", "pr", "head", "base", "owner", "ticket",
+                                                              "packet_sha256"))
+        packet = ahc_review.build_packet(
+            lambda args: self.producer._git(args, clone, 60)[:2], repo=req["repo"], pr=req["pr"], base=base,
+            head=req["head"], acceptance=obs.get("acceptance") or "", spec_core=obs.get("attached_core") or "",
+            owner_text="The owner's request (its own packet is not core's input; its sha256 is listed):\n" + owner)
+        if self.store_packet is not None:
+            self.store_packet(packet)
+        return packet
+
+    def r2_queue_item(self, item, packet):
+        """R2 required -> queued for every attempt-kind row of the item bound to this packet."""
+        import ahc_review  # noqa: PLC0415
+        for (rid,) in self.c.db.execute("SELECT id FROM reviews WHERE item=? AND state='required' AND kind IN (%s) "
+                                        "ORDER BY id" % ",".join("?" * len(C.Contracts.ATTEMPT_KINDS)),
+                                        (item["id"],) + C.Contracts.ATTEMPT_KINDS).fetchall():
+            ahc_review.r2_queue(self.c, rid, packet)
 
     def candidates(self, item, obs):
         """Every tick row whose guard holds for the item on this observation, with the target and mark it needs."""
@@ -319,6 +356,9 @@ class ShadowTick:
                 if item["id"] not in observed:
                     continue
                 self._move(summary, item["id"], dict(observed[item["id"]], queue=queue))
+        if self.review is not None:
+            summary["review"] = self.review.settle()
+            summary["scheduled"] = ReviewScheduler(self.c, self.review.launch_row, slots=self.review.slots).tick(tag)
         if self.w21 is not None:
             summary["w21"] = self.w21.pump()
         if self.digest_append is not None:

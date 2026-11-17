@@ -14,6 +14,17 @@
   unit matching no intent is shown, stopped only when it is in ahc-review.slice, and raises an incident either way;
   a refused stop, or a stop not confirmed inactive or failed within 60 s, blocks the row its name parses to. A later
   reconciliation lifts the block once the unit is inactive, failed or gone. The role unit never matches.
+- Option A (owner ruling on goodqa#16049, ASSUMPTION, a MATERIAL deviation from r9's R3 row): the unit runs
+  detached (no --pipe). Its command line, bound byte for byte in the intent digest, is the completion wrapper
+  followed by `peer_review pr --repo <core's clone at H> --packet <core's R2 packet> --output <the attempt's report>`
+  and the r9 binding flags. The unit may write only its own report directory. When peer_review exits the wrapper sends
+  core a FINAL that is a completion signal only (row, intent, InvocationID, the report's sha256). Core reads the
+  report itself (no-follow, bounded), checks the sha256, the reviewed packet sha (the row's R2 packet) and the reviewed
+  head H, and takes the verdict from the header-block position only (r1 F4). Anything else in a FINAL, a verdict
+  included, is ignored; any mismatch is unverified-producer and settles nothing. A unit that ends with no FINAL, or
+  outlives its bound, goes to outcome-unknown. The wrapper is not shipped in this slice (PENDING_REAL_TEST
+  PRT-r3-wrapper, follow-up ticket): without it, or without systemd, the production Launcher has no runner and every
+  launch goes to infra-wait.
 - R4 (peer_uid, receive_final): core reads the peer uid from the socket itself (SO_PEERCRED on Linux, LOCAL_PEERCRED
   on macOS), so a FINAL settles a row only when that uid is the one bound at R3. Under R-c (sandbox only) a FINAL
   settles only from the stdout pipe of the unit core started, bound to the InvocationID and the clean exit core read
@@ -30,13 +41,23 @@ import struct
 import sys
 import time
 
+from pathlib import Path
+
 import ahc_contracts as C
+import ahc_core
+import ahc_fs
 import ahc_guard
 from ahc_crash import crash_at
 
 UNIT_RE = re.compile(r"ahc-review-(?P<row>rv-[0-9a-f]{24})-(?P<intent>[0-9a-f]{16})\.service")
 STOP_BOUND = 60.0                     # seconds per unit to confirm a reconciliation stop (NEG-49)
 FINAL_MAX = 1 << 20                   # bytes; a longer FINAL is refused, never truncated
+WRAPPER = "ahc_review_final.py"       # the R3 completion wrapper (not shipped: PENDING_REAL_TEST PRT-r3-wrapper)
+SOCKET_NAME = "sock/review.sock"      # core's AF_UNIX inbox for completion signals, under the root
+REPORT_NAME = "report.md"
+REVIEW_MAX = 3600                     # RuntimeMaxSec of an attempt unit (ASSUMPTION: one hour)
+SETTLE_GRACE = 300                    # seconds past REVIEW_MAX before core gives a silent unit up (outcome-unknown)
+FINAL_KEYS = ("row", "intent", "invocation_id", "report_sha256")
 
 
 def parse_unit(name):
@@ -45,10 +66,25 @@ def parse_unit(name):
     return (m.group("row"), m.group("intent")) if m else (None, None)
 
 
-def r3_command(policy, unit, row, *, helper_script, python=None):
-    """The full R3 systemd-run command line for one review row: the bound, unstamped peer_review argv (R3 row:
-    --github-repo/--pr, --no-main-stamp, --expected-head H, --base B_r, no --author-harness) in the daemon's review
-    slice. The template is fixed in code; nothing from config or the environment enters it."""
+def attempt_paths(root, unit, row, clone):
+    """The files of one attempt: the wrapper, core's socket, the clone at H, the row's R2 packet and the attempt's
+    report directory and report. Every one is fixed by core and bound in the intent's digest."""
+    rid, iid = parse_unit(unit)
+    if rid is None or rid != row["id"]:
+        raise C.ContractError("R3: %r is not an attempt unit of row %s" % (unit, row["id"]))
+    root = Path(root)
+    out_dir = root / "reports" / ("%s-%s" % (rid, iid))
+    return {"wrapper": str(Path(__file__).resolve().parent / WRAPPER), "socket": str(root / SOCKET_NAME),
+            "clone": str(clone), "packet": str(root / "packets" / ("%s.md" % row["packet_sha256"])),
+            "intent": iid, "out_dir": str(out_dir), "output": str(out_dir / REPORT_NAME)}
+
+
+def r3_command(policy, unit, row, *, helper_script, attempt, python=None):
+    """The full R3 systemd-run command line for one review row: the completion wrapper, then the bound, unstamped
+    peer_review argv (R3 row: --github-repo/--pr, --no-main-stamp, --expected-head H, --base B_r, no
+    --author-harness; option A adds --repo, --packet and --output) in the daemon's review slice. The unit runs
+    detached, may write only its report directory, and stays loaded after it exits (RemainAfterExit) so core can read
+    its InvocationID. The template is fixed in code; nothing from config or the environment enters it."""
     exe = policy.exe.get("systemd-run")
     if not exe:
         raise ahc_guard.LaunchRefused("systemd-run is not resolved from the trusted directories")
@@ -57,10 +93,14 @@ def r3_command(policy, unit, row, *, helper_script, python=None):
     if not base:
         raise C.ContractError("R3 needs the row's snapshot base B_r")
     return [exe] + scope + [
-        "--unit=" + unit, "--slice=" + ahc_guard.REVIEW_SLICE, "--collect", "--quiet", "--pipe",
+        "--unit=" + unit, "--slice=" + ahc_guard.REVIEW_SLICE, "--collect", "--quiet",
         "--property=DynamicUser=yes", "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes",
-        "--setenv=LC_ALL=C",
+        "--property=RemainAfterExit=yes", "--property=RuntimeMaxSec=%d" % REVIEW_MAX,
+        "--property=ReadWritePaths=" + attempt["out_dir"], "--setenv=LC_ALL=C",
+        "--", str(python or policy.python), attempt["wrapper"], "--socket", attempt["socket"], "--row", row["id"],
+        "--intent", attempt["intent"], "--report", attempt["output"],
         "--", str(python or policy.python), str(helper_script), "pr",
+        "--repo", attempt["clone"], "--packet", attempt["packet"], "--output", attempt["output"],
         "--github-repo", row["repo"], "--pr", str(int(row["pr"])), "--no-main-stamp",
         "--expected-head", row["head"], "--base", base,
     ]
@@ -99,6 +139,12 @@ class SystemdRunner:
             return None
         return [line.split()[0] for line in out.splitlines() if line.strip()]
 
+    def grant_output(self, out_dir, uid):
+        """Let the unit's dynamic uid write its report directory, and nobody else. Not implemented in this slice
+        (PENDING_REAL_TEST PRT-r3-grant on t2-dev); never a world-writable fallback, because the packet sha and H
+        are not secret and anyone who can write the report could plant a PASS."""
+        raise ahc_guard.LaunchRefused("R3: the report directory grant is not implemented (PRT-r3-grant)")
+
     def uid(self, unit):
         """The uid systemd allocated to the unit: the owner of its main process (Linux /proc). None when unknown."""
         props = self.show(unit, ("MainPID",)) or {}
@@ -112,14 +158,17 @@ class SystemdRunner:
 class Launcher:
     """R3. Production builds the SystemdRunner itself; Launcher.for_test is the only way to inject a runner."""
 
-    def __init__(self, contracts, policy, helper_script):
-        self.c, self.policy, self.helper = contracts, policy, helper_script
-        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) else None
+    def __init__(self, contracts, policy, helper_script, root, clone):
+        self.c, self.policy, self.helper, self.root, self.clone = contracts, policy, helper_script, Path(root), clone
+        wrapper = Path(__file__).resolve().parent / WRAPPER
+        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) and wrapper.is_file() else None
 
     @classmethod
-    def for_test(cls, contracts, policy, helper_script, runner):
+    def for_test(cls, contracts, policy, helper_script, runner, root, clone=None):
         launcher = cls.__new__(cls)
         launcher.c, launcher.policy, launcher.helper, launcher.runner = contracts, policy, helper_script, runner
+        launcher.root = Path(root)
+        launcher.clone = clone or (lambda repo, head, base: str(Path(root) / "clones" / "test"))
         return launcher
 
     def launch(self, rid, *, budget_obs=None, sandbox_repo=None):
@@ -133,11 +182,23 @@ class Launcher:
             # R-c runs in the agent account's user manager: allowed only for the policy's named sandbox repo
             return "refused", "R-c is allowed only for the sandbox repo"
         try:
+            clone = self.clone(row["repo"], row["head"], row["snapshot_base"])
+        except Exception as error:  # noqa: BLE001 - a clone failure fails closed before any intent or charge
+            return "refused", "R3: no clone at H: %s: %s" % (type(error).__name__, str(error)[:200])
+        try:
             intent, argv = self.c.launch_intent(rid, row["version"], lambda unit: r3_command(
-                self.policy, unit, row, helper_script=self.helper), budget_obs=budget_obs)
+                self.policy, unit, row, helper_script=self.helper,
+                attempt=attempt_paths(self.root, unit, row, clone)), budget_obs=budget_obs)
         except C.ContractError as error:
             return "refused", str(error)
         unit = intent["unit"]
+        attempt = attempt_paths(self.root, unit, row, clone)
+        try:
+            ahc_fs.make_dirs(self.root, self.root / "reports")
+            ahc_fs.make_fresh_dir(self.root, attempt["out_dir"])
+        except OSError as error:
+            self.c.intent_move(intent["id"], ("open",), "closed", "report directory: %s" % type(error).__name__)
+            return "refused", "R3: the attempt's report directory could not be made fresh"
         self.policy.intent_units.add(unit)
         self.policy.arm_unit(argv, intent["cmd_sha256"])
         rc, _out, err = self.runner.start(argv)
@@ -146,6 +207,10 @@ class Launcher:
         try:
             if rc != 0 or uid is None:
                 raise C.ContractError("the unit did not start or reported no uid: %s" % str(err)[:200])
+            try:
+                self.runner.grant_output(attempt["out_dir"], uid)
+            except (OSError, ahc_guard.LaunchRefused) as error:
+                raise C.ContractError("the report directory was not granted: %s" % error) from None
             self.c.start_attempt(rid, unit, uid, expected_version=row["version"], event_id="r3:%s" % intent["id"])
         except C.ContractError as error:
             self.runner.stop(unit)                 # NEG-22: stopped; the B33 charge committed at intent stays
@@ -413,5 +478,158 @@ def r2_queue(contracts, rid, packet):
                             cause="r2 packet built; lint findings %d" % len(packet["lint"]))
 
 
-__all__ = ["Launcher", "Reconciler", "build_packet", "fence", "lint", "r2_queue", "SystemdRunner", "parse_unit", "peer_uid", "r3_command", "read_final",
+# ------------------------------------------------------------------ option A: completion signal and core-read report
+
+def completion(data):
+    """The FINAL under option A: a completion signal only (row, intent, InvocationID, the report's sha256). Every
+    other key, a verdict or a receipt included, is ignored: core never takes a verdict from the wrapper."""
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise C.ContractError("the FINAL is not JSON") from None
+    if not isinstance(doc, dict) or not all(isinstance(doc.get(k), str) and doc.get(k) for k in FINAL_KEYS):
+        raise C.ContractError("the FINAL lacks %s" % ", ".join(FINAL_KEYS))
+    return {k: doc[k] for k in FINAL_KEYS}
+
+
+def report_verdict(raw, row):
+    """The verdict of a peer_review report, read by core: stage pr, `Reviewed HEAD` = H and `Reviewed packet
+    SHA-256` = the row's R2 packet in the header block, and the verdict from the first line after that block only
+    (ahc_core's r1 F4 rule). PASS, PASS-WITH-TICKETS or BLOCK; anything else raises (unverified-producer)."""
+    try:
+        fields, first = ahc_core._parse_report(raw.decode("utf-8", errors="replace"))
+    except ValueError as error:
+        raise C.ContractError("unverified-producer: the report is invalid: %s" % error) from None
+    if fields.get("Stage") != "pr":
+        raise C.ContractError("unverified-producer: the report's stage is not pr")
+    if fields.get("Reviewed HEAD") != row["head"]:
+        raise C.ContractError("unverified-producer: the report reviewed another head")
+    if fields.get("Reviewed packet SHA-256") != row["packet_sha256"]:
+        raise C.ContractError("unverified-producer: the report reviewed another packet than the row's R2 packet")
+    if ahc_core._BLOCK_LINE.fullmatch(first):
+        return "BLOCK"
+    match = ahc_core._PASS_LINE.fullmatch(first)
+    if not match:
+        raise C.ContractError("unverified-producer: no verdict at the header-block position")
+    return match.group(1)
+
+
+def settle_final(contracts, root, runner, uid, data):
+    """R4/R5 under option A: settle one running row from a completion signal that arrived on core's socket from
+    `uid` (the kernel's peer credential). The row, its started intent and its unit must match; the uid must be the one
+    bound at R3; the unit's InvocationID must be the signal's; the report must be a regular file (no-follow, bounded)
+    whose sha256 is the signal's. The verdict comes from the report only. Any mismatch raises and settles nothing."""
+    fin = completion(data)
+    rid = fin["row"]
+    row = contracts._row("reviews", "id", rid)
+    if row is None or row["state"] != "running":
+        raise C.ContractError("the FINAL names no running row")
+    intent = contracts._row("launch_intents", "id", fin["intent"])
+    if intent is None or intent["row"] != rid or intent["state"] != "started" or intent["unit"] != row["producer_unit"]:
+        raise C.ContractError("unverified-producer: the FINAL names another attempt than the row's started unit")
+    if type(uid) is not int or uid != row["producer_uid"]:
+        raise C.ContractError("unverified-producer: the FINAL did not come from the attempt unit bound to this row")
+    props = runner.show(intent["unit"], ("InvocationID",)) or {}
+    if not props.get("InvocationID") or props.get("InvocationID") != fin["invocation_id"]:
+        raise C.ContractError("unverified-producer: the InvocationID is not the unit's")
+    # core's own root is resolved once (macOS: /var -> /private/var); every component below it is opened
+    # no-follow by read_regular_resolved, so a link inside the root is never followed
+    output = attempt_paths(os.path.realpath(str(root)), intent["unit"], row, "")["output"]
+    try:
+        raw = ahc_core.read_regular_resolved(output, ahc_core.REPORT_MAX_BYTES)
+    except ahc_core.Unreadable as error:
+        raise C.ContractError("unverified-producer: the report is %s" % error.kind) from None
+    if hashlib.sha256(raw).hexdigest() != fin["report_sha256"]:
+        raise C.ContractError("unverified-producer: the report's sha256 is not the FINAL's")
+    verdict = report_verdict(raw, row)
+    receipt = {"repo": row["repo"], "pr": row["pr"], "head": row["head"], "packet_sha256": row["packet_sha256"],
+               "policy_revision": row["policy_revision"], "verdict": verdict, "finding_ids": [],
+               "report_sha256": fin["report_sha256"], "invocation_id": fin["invocation_id"]}
+    if row["snapshot_base"]:
+        receipt["snapshot_base"] = row["snapshot_base"]
+    moved = contracts.review(rid, "passed" if verdict == "PASS" else "findings", expected_version=row["version"],
+                             event_id="r4f:%s" % intent["id"], actor="ahc-review", receipt=receipt, peer_uid=uid)
+    contracts.intent_move(intent["id"], ("started",), "closed", "settled: %s" % verdict)
+    runner.stop(intent["unit"])
+    return moved
+
+
+class FinalInbox:
+    """Core's AF_UNIX listener for completion signals, polled once per tick without blocking. Each connection's peer
+    uid is read by core from the kernel before its bytes are read."""
+
+    def __init__(self, root, path=None):
+        self.path = str(path or Path(root) / SOCKET_NAME)
+        ahc_fs.make_dirs(root, Path(self.path).parent)
+        ahc_fs.unlink(root, self.path, missing_ok=True)          # a socket left by an earlier daemon
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(self.path)
+        self.sock.listen(16)
+        self.sock.setblocking(False)
+
+    def poll(self, errors):
+        got = []
+        while True:
+            try:
+                conn, _addr = self.sock.accept()
+            except (BlockingIOError, InterruptedError):
+                return got
+            try:
+                conn.settimeout(2.0)
+                got.append((peer_uid(conn), read_final(conn)))
+            except (OSError, C.ContractError) as error:
+                errors.append("a completion signal was refused: %s" % str(error)[:200])
+            finally:
+                conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+class ReviewStage:
+    """The shadow tick's review step: settle the completion signals that arrived, give up units that ended without
+    one (outcome-unknown, condition 4), and offer queued rows of live items to R3 through the Launcher."""
+
+    def __init__(self, contracts, launcher, inbox, slots=1, sandbox_repo=None):
+        self.c, self.launcher, self.inbox, self.slots = contracts, launcher, inbox, int(slots)
+        self.sandbox_repo = sandbox_repo     # R-c (a --user scope) runs only for this repo; production names none
+
+    def launch_row(self, row):
+        return self.launcher.launch(row["id"], sandbox_repo=self.sandbox_repo)
+
+    def settle(self):
+        out = {"settled": [], "unverified": [], "unknown": []}
+        runner = self.launcher.runner
+        if runner is None:
+            return out
+        for uid, data in self.inbox.poll(out["unverified"]):
+            try:
+                moved = settle_final(self.c, self.launcher.root, runner, uid, data)
+                out["settled"].append((moved["id"], moved["state"]))
+            except C.ContractError as error:
+                out["unverified"].append(str(error)[:300])
+        self.sweep(out)
+        return out
+
+    def sweep(self, out):
+        runner = self.launcher.runner
+        now = self.c.now()
+        for iid, rid, unit, started in self.c.db.execute(
+                "SELECT id, row, unit, updated FROM launch_intents WHERE state='started' ORDER BY id").fetchall():
+            row = self.c._row("reviews", "id", rid)
+            if row is None or row["state"] != "running" or row["producer_unit"] != unit:
+                continue
+            props = runner.show(unit, ("ActiveState", "Result", "InvocationID"))
+            ended = props is None or props.get("ActiveState") in ("inactive", "failed")
+            if not ended and now - started <= REVIEW_MAX + SETTLE_GRACE:
+                continue
+            runner.stop(unit)
+            why = "the unit ended with no completion signal" if ended else "the unit outlived its bound"
+            self.c.review(rid, "outcome-unknown", expected_version=row["version"], event_id="r7:%s" % iid,
+                          cause=why)
+            self.c.intent_move(iid, ("started",), "closed", why)
+            out["unknown"].append(rid)
+
+
+__all__ = ["FinalInbox", "Launcher", "Reconciler", "ReviewStage", "attempt_paths", "completion", "report_verdict", "settle_final", "build_packet", "fence", "lint", "r2_queue", "SystemdRunner", "parse_unit", "peer_uid", "r3_command", "read_final",
            "receive_final", "settle_rc"]

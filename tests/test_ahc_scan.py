@@ -5,6 +5,7 @@ Every secret here is built at run time from a seeded generator and the scanner's
 holds no token-shaped literal, and the clean-corpus test checks that (it scans this file too)."""
 import base64
 import binascii
+import hashlib
 import json
 import random
 import re
@@ -597,9 +598,13 @@ class CleanCorpusTests(unittest.TestCase):
 
     def test_the_corpus_matches_the_exemption_list_exactly(self):
         exempt = json.loads(EXEMPT.read_text())
-        listed = {path: entry["counts"] for path, entry in exempt.items()}
+        # an entry that pins the file's sha256 covers exactly those bytes: any edit drops the exemption
+        listed = {path: entry["counts"] for path, entry in exempt.items()
+                  if "sha256" not in entry or hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == entry["sha256"]}
         for path, entry in exempt.items():
             self.assertTrue(entry.get("reason"), "every exemption names its reason: %s" % path)
+        self.assertRegex(exempt["tests/data/review_diagnostics_hostile.json"].get("sha256", ""), "^[0-9a-f]{64}$",
+                         "the fixture exemption added by slice 1 (b) R5 pins the fixture's bytes")
         actual = corpus_counts()
         unlisted = {p: c for p, c in actual.items() if p not in listed}
         self.assertEqual(unlisted, {}, "files with credential shapes that are not exempted")

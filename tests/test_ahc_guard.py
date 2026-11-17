@@ -503,7 +503,8 @@ elif args[:1] == ["stop"]:
             self.rows[name] = self.c.review(r["id"], "queued", expected_version=r["version"], event_id="q-" + name)
         row = self.rows["A"]
         self.intent, self.argv = self.c.launch_intent(row["id"], row["version"], lambda unit: self.R.r3_command(
-            self.policy, unit, row, helper_script=str(self.helper)))
+            self.policy, unit, row, helper_script=str(self.helper),
+            attempt=self.R.attempt_paths(Path(self.tmp.name), unit, row, "/clone")))
         self.units = {"A": self.intent["unit"], "B": "ahc-review-%s-%s.service" % (self.rows["B"]["id"], "b" * 16),
                       "C": "ahc-review-%s-%s.service" % (self.rows["C"]["id"], "c" * 16)}
         slices = {"A": "ahc-review.slice", "B": "ahc-review.slice", "C": "user.slice"}

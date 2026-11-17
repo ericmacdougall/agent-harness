@@ -1277,13 +1277,14 @@ class _FakeRunner:
 
     def __init__(self, uid):
         self.uid_value, self.started, self.stopped, self.on_start = uid, [], [], None
-        self.live, self.slice = set(), {}
+        self.live, self.slice, self.invocation, self.granted, self.ended = set(), {}, {}, [], set()
 
     def start(self, argv):
         self.started.append(list(argv))
         unit = [a for a in argv if a.startswith("--unit=")][0][len("--unit="):]
         self.live.add(unit)
         self.slice[unit] = "ahc-review.slice"
+        self.invocation[unit] = "%032x" % len(self.started)
         if self.on_start:
             self.on_start()
         return 0, "", ""
@@ -1296,12 +1297,22 @@ class _FakeRunner:
         self.live.discard(unit)
         return True
 
+    def grant_output(self, out_dir, uid):
+        self.granted.append((out_dir, uid))
+
     def show(self, unit, props):
-        return {"Slice": self.slice.get(unit, "user.slice"),
-                "ActiveState": "active" if unit in self.live else "inactive"}
+        return {"Slice": self.slice.get(unit, "user.slice"), "InvocationID": self.invocation.get(unit, ""),
+                "ActiveState": "active" if unit in self.live and unit not in self.ended else "inactive"}
 
     def list_units(self):
         return sorted(self.live)
+
+
+class _NoInbox:
+    """A completion inbox with nothing in it."""
+
+    def poll(self, errors):
+        return []
 
 
 class RuntimeTests(Base):
@@ -1327,7 +1338,9 @@ class RuntimeTests(Base):
         self.policy = ahc_guard.Policy.for_test(Path(self.tmp.name) / "root", stubs, trusted_dirs=(str(bin_dir),))
         self.helper = str(Path(self.tmp.name) / "peer_review.py")
         self.runner = _FakeRunner(self.UID)
-        self.launcher = ahc_review.Launcher.for_test(self.c, self.policy, self.helper, self.runner)
+        self.root = Path(self.tmp.name) / "ahcroot"
+        self.root.mkdir(mode=0o700)
+        self.launcher = ahc_review.Launcher.for_test(self.c, self.policy, self.helper, self.runner, self.root)
 
     def queued(self, **kw):
         return self.walk(self.row(**kw), "queued")
@@ -1358,9 +1371,23 @@ class RuntimeTests(Base):
         self.assertEqual(self.policy.armed["systemd-run"], (argv, intent["cmd_sha256"]), "armed with that line")
         self.assertIn("--slice=ahc-review.slice", argv)
         self.assertEqual(argv[0], self.policy.exe["systemd-run"])
-        self.assertEqual(argv[argv.index("--") + 1:], [self.policy.python, self.helper, "pr", "--github-repo",
-                                                       row["repo"], "--pr", "5", "--no-main-stamp", "--expected-head",
-                                                       H1, "--base", BASE])
+        out_dir = str(self.root / "reports" / ("%s-%s" % (row["id"], intent["id"])))
+        wrapper = str(Path(self.R.__file__).resolve().parent / self.R.WRAPPER)
+        self.assertIn("--property=ReadWritePaths=" + out_dir, argv, "the unit may write its report directory only")
+        self.assertNotIn("--pipe", argv, "option A: detached")
+        first = argv.index("--")
+        second = argv.index("--", first + 1)
+        self.assertEqual(argv[first + 1:second], [self.policy.python, wrapper, "--socket",
+                                                  str(self.root / "sock" / "review.sock"), "--row", row["id"], "--intent",
+                                                  intent["id"], "--report", out_dir + "/report.md"])
+        self.assertEqual(argv[second + 1:], [self.policy.python, self.helper, "pr", "--repo",
+                                             str(self.root / "clones" / "test"), "--packet",
+                                             str(self.root / "packets" / (row["packet_sha256"] + ".md")), "--output",
+                                             out_dir + "/report.md", "--github-repo", row["repo"], "--pr", "5",
+                                             "--no-main-stamp", "--expected-head", H1, "--base", BASE])
+        self.assertTrue(os.path.isdir(out_dir) and os.listdir(out_dir) == [], "a fresh, empty report directory")
+        self.assertEqual(os.stat(out_dir).st_mode & 0o777, 0o700, "never world-writable")
+        self.assertEqual(self.runner.granted, [(out_dir, self.UID)], "granted to the unit's uid after it was read")
         self.assertFalse([a for a in argv if "author-harness" in a or "main-stamp" in a and a != "--no-main-stamp"])
         self.assertEqual((intent["state"], intent["charge"]), ("started", 1))
         self.assertEqual(self.used(row), 1)
@@ -1393,11 +1420,12 @@ class RuntimeTests(Base):
     def test_r03_without_isolation_the_row_goes_to_infra_wait_and_no_runner_comes_from_config(self):
         import inspect  # noqa: PLC0415
         self.assertEqual(list(inspect.signature(self.R.Launcher.__init__).parameters),
-                         ["self", "contracts", "policy", "helper_script"], "the runner is injectable only for tests")
+                         ["self", "contracts", "policy", "helper_script", "root", "clone"],
+                         "the runner is injectable only for tests")
         bare = self.G.Policy.for_test(Path(self.tmp.name) / "root", {}, trusted_dirs=())
         row = self.queued()
         try:
-            status = self.R.Launcher(self.c, bare, self.helper).launch(row["id"])[0]
+            status = self.R.Launcher(self.c, bare, self.helper, self.root, lambda *a: "/clone").launch(row["id"])[0]
         except Exception as error:  # noqa: BLE001 - a launch attempt without isolation is the failure under test
             self.fail("launch without isolation raised %s: %s" % (type(error).__name__, error))
         self.assertEqual(status, "infra-wait")
@@ -1412,7 +1440,8 @@ class RuntimeTests(Base):
     def test_neg36_an_orphan_unit_is_stopped_once_charged_once_and_settles_nothing(self):
         row = self.queued()
         intent, argv = self.c.launch_intent(row["id"], row["version"], lambda unit: self.R.r3_command(
-            self.policy, unit, row, helper_script=self.helper))
+            self.policy, unit, row, helper_script=self.helper,
+            attempt=self.R.attempt_paths(self.root, unit, row, "/clone")))
         self.runner.start(argv)                     # the crash: the unit runs, start_attempt never happened
         self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "refused",
                          "no second unit while the first may be live")
@@ -1548,6 +1577,79 @@ class RuntimeTests(Base):
         exempt = str(TS.EXEMPT.relative_to(TS.ROOT))
         self.assertIn(exempt, files)
         self.assertTrue(ahc_runner._is_protected(exempt), "the exemption list is a NEG-6 protected path")
+
+    # ---- option A settle negatives (owner conditions 1-4)
+
+    def launched(self, verdict_line="VERDICT: PASS", head=None, packet=None):
+        self.prs = getattr(self, "prs", 40) + 1
+        row = self.queued(pr=self.prs)
+        status, unit = self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        self.assertEqual(status, "running", unit)
+        intent = self.c._row("launch_intents", "unit", unit)
+        row = self.c._row("reviews", "id", row["id"])
+        report = ("Reviewer: t\nStage: pr\nReviewed HEAD: %s\nReviewed packet SHA-256: %s\n\n%s\n"
+                  % (head or row["head"], packet or row["packet_sha256"], verdict_line)).encode()
+        out = Path(self.R.attempt_paths(self.root, unit, row, "")["output"])
+        out.write_bytes(report)
+        final = {"row": row["id"], "intent": intent["id"], "invocation_id": self.runner.invocation[unit],
+                 "report_sha256": hashlib.sha256(report).hexdigest()}
+        return row, unit, out, final
+
+    def settle(self, final, uid=None):
+        return self.R.settle_final(self.c, self.root, self.runner, self.UID if uid is None else uid,
+                                   json.dumps(final).encode())
+
+    def test_r04_option_a_settles_only_from_the_core_read_report(self):
+        row, _unit, _out, final = self.launched("VERDICT: BLOCK")
+        moved = self.settle(dict(final, verdict="PASS", receipt={"verdict": "PASS"}))
+        self.assertEqual(moved["state"], "findings", "the FINAL's verdict and receipt are ignored")
+        self.assertEqual(json.loads(moved["receipt"])["verdict"], "BLOCK")
+        row2, _u, _o, final2 = self.launched("VERDICT: PASS", head=None)
+        self.assertEqual(self.settle(final2)["state"], "passed")
+
+    def test_r04_option_a_every_mismatch_settles_nothing(self):
+        cases = []
+        row, unit, out, final = self.launched()
+        cases.append(("report sha", final, dict(final, report_sha256="0" * 64), None))
+        cases.append(("invocation id", final, dict(final, invocation_id="f" * 32), None))
+        cases.append(("peer uid", final, final, self.UID + 1))
+        cases.append(("another intent", final, dict(final, intent="0" * 16), None))
+        for name, _f, bad, uid in cases:
+            with self.subTest(name), self.assertRaisesRegex(C.ContractError, "unverified-producer"):
+                self.settle(bad, uid=uid)
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "running")
+        for name, kw, line in (("another head", {"head": H2}, "VERDICT: PASS"),
+                               ("another packet", {"packet": "e" * 64}, "VERDICT: PASS"),
+                               ("verdict only in the body", {}, "Summary first\n\nVERDICT: PASS")):
+            with self.subTest(name):
+                r, _u, _o, f = self.launched(line, **kw)
+                with self.assertRaisesRegex(C.ContractError, "unverified-producer"):
+                    self.settle(f)
+                self.assertEqual(self.c._row("reviews", "id", r["id"])["state"], "running")
+        for name in ("missing", "symlink"):
+            with self.subTest(name):
+                r, _u, o, f = self.launched()
+                elsewhere = Path(self.tmp.name) / ("elsewhere-%s.md" % name)
+                elsewhere.write_bytes(o.read_bytes())
+                o.unlink()
+                if name == "symlink":
+                    o.symlink_to(elsewhere)
+                with self.assertRaisesRegex(C.ContractError, "unverified-producer: the report is"):
+                    self.settle(f)
+
+    def test_r07_option_a_a_unit_that_ends_or_outlives_its_bound_with_no_final_is_outcome_unknown(self):
+        stage = self.R.ReviewStage(self.c, self.launcher, _NoInbox())
+        ended, unit_e, _o, _f = self.launched()
+        quiet, unit_q, _o2, _f2 = self.launched()
+        self.runner.ended.add(unit_e)
+        out = stage.settle()
+        self.assertEqual(out["unknown"], [ended["id"]], "ended with no completion signal")
+        self.assertEqual(self.c._row("reviews", "id", quiet["id"])["state"], "running")
+        self.clock.t += self.R.REVIEW_MAX + self.R.SETTLE_GRACE + 1
+        self.assertEqual(stage.settle()["unknown"], [quiet["id"]], "outlived its bound")
+        self.assertEqual([self.c._row("reviews", "id", r["id"])["state"] for r in (ended, quiet)],
+                         ["outcome-unknown", "outcome-unknown"])
+        self.assertEqual(sorted(self.runner.stopped), sorted([unit_e, unit_q]))
 
     def test_r04_rc_refuses_usage_store(self):
         row = self.queued()

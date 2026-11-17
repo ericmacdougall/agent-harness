@@ -259,7 +259,8 @@
    "redact:anthropic": 1,
    "redact:pem": 1
   },
-  "reason": "ASSUMPTION (goodqa#16049 slice 1b): synthetic hostile fixture of the peer-review diagnostics tests (fake key block and fake token tail, commit 117e8af); not a credential. R5 wants test secrets built at run time; moving them is a follow-up for that stream"
+  "reason": "ASSUMPTION (goodqa#16049 slice 1b): synthetic hostile fixture of the peer-review diagnostics tests (fake key block and fake token tail, commit 117e8af); not a credential. R5 wants test secrets built at run time; moving them is a follow-up for that stream",
+  "sha256": "be3b1311a8fa32c6fe2776b46fc53e589693c40ea3a3e9772c965425b52585c6"
  },
  "tests/live_guard_canary.py": {
   "counts": {

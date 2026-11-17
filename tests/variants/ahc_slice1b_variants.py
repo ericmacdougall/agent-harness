@@ -511,8 +511,8 @@ ENTRIES.update({
         "tests": [ST + "test_ac4_admission_is_refused_when_the_head_moved",
                   ST + "test_ac4_a_held_request_is_admitted_through_one_observation"],
         "mutations": [("admission ignores a moved head", [
-            ('                if obs["pr_head"] != req["head"] or obs["pr_state"] != "OPEN":\n',
-             '                if obs["pr_state"] != "OPEN":\n')], SHADOW)]},
+            ('            if obs["pr_head"] == req["head"] and obs["pr_state"] == "OPEN":\n',
+             '            if obs["pr_state"] == "OPEN":\n')], SHADOW)]},
     "AC-4 named crash points": {
         "tests": ["tests.test_ahc_crash.NamedPointTests."
                   "test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants"],
@@ -690,11 +690,11 @@ ENTRIES.update({
                   RT + "test_r03_rc_is_allowed_only_for_the_sandbox_repo"],
         "mutations": [
             ("a runner is injectable through the constructor", [
-                ('    def __init__(self, contracts, policy, helper_script):\n        self.c, self.policy, self.helper = contracts, policy, helper_script\n',
-                 '    def __init__(self, contracts, policy, helper_script, runner=None):\n        self.c, self.policy, self.helper = contracts, policy, helper_script\n')],
+                ('    def __init__(self, contracts, policy, helper_script, root, clone):\n',
+                 '    def __init__(self, contracts, policy, helper_script, root, clone, runner=None):\n')],
              REVIEW_PY),
             ("production always builds the runner", [
-                ('        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) else None\n',
+                ('        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) and wrapper.is_file() else None\n',
                  '        self.runner = SystemdRunner(policy)\n')], REVIEW_PY),
             ("R-c on any repo", [
                 ('        if self.policy.unit_scope == "--user" and row["repo"] != sandbox_repo:\n', '        if False:\n')],
@@ -812,6 +812,68 @@ ENTRIES.update({
                 ('    return any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED) or path.startswith(".claude/")\n',
                  '    return (any(fnmatch.fnmatch(name, pattern) for pattern in PROTECTED) and "corpus_exempt" not in name) or path.startswith(".claude/")\n')],
              RUNNER_PY)]},
+})
+
+
+RTT = "tests.test_ahc_runner.ReviewTickTests."
+OPT_A = RTT + "test_ac8_the_tick_admits_schedules_r3_settles_through_the_peer_uid_and_offers_the_next_row"
+
+ENTRIES.update({
+    "AC-8 option A: the tick schedules R3": {
+        "tests": [OPT_A],
+        "mutations": [
+            ("the tick drops the scheduler call", [
+                ('            summary["scheduled"] = ReviewScheduler(self.c, self.review.launch_row, slots=self.review.slots).tick(tag)\n',
+                 '            summary["scheduled"] = {"offered": [], "started": [], "refused": []}\n')], SHADOW),
+            ("admission keeps the owner's packet sha", [
+                ('                                                 packet["sha256"], event_id=event_id(obs["id"], key, "W1"))\n',
+                 '                                                 req["packet_sha256"], event_id=event_id(obs["id"], key, "W1"))\n')],
+             SHADOW),
+            ("the tick never settles completion signals", [
+                ('            summary["review"] = self.review.settle()\n',
+                 '            summary["review"] = {"settled": [], "unverified": [], "unknown": []}\n')], SHADOW)]},
+    "AC-8 option A: core reads the verdict from the report": {
+        "tests": [OPT_A, RT + "test_r04_option_a_settles_only_from_the_core_read_report",
+                  RT + "test_r04_option_a_every_mismatch_settles_nothing"],
+        "mutations": [
+            ("core takes the wrapper's verdict field", [
+                ('    verdict = report_verdict(raw, row)\n',
+                 '    verdict = json.loads(data.decode("utf-8")).get("verdict") or report_verdict(raw, row)\n')],
+             REVIEW_PY),
+            ("the report sha256 is not checked", [
+                ('    if hashlib.sha256(raw).hexdigest() != fin["report_sha256"]:\n', '    if False:\n')], REVIEW_PY),
+            ("the InvocationID is not checked", [
+                ('    if not props.get("InvocationID") or props.get("InvocationID") != fin["invocation_id"]:\n',
+                 '    if False:\n')], REVIEW_PY),
+            ("the reviewed packet sha is not checked", [
+                ('    if fields.get("Reviewed packet SHA-256") != row["packet_sha256"]:\n', '    if False:\n')],
+             REVIEW_PY),
+            ("the reviewed head is not checked", [
+                ('    if fields.get("Reviewed HEAD") != row["head"]:\n', '    if False:\n')], REVIEW_PY),
+            ("a verdict anywhere in the report counts", [
+                ('    match = ahc_core._PASS_LINE.fullmatch(first)\n',
+                 '    match = ahc_core._PASS_LINE.search(raw.decode("utf-8", errors="replace"))\n')], REVIEW_PY),
+            ("the report is read following links", [
+                ('        raw = ahc_core.read_regular_resolved(output, ahc_core.REPORT_MAX_BYTES)\n    except ahc_core.Unreadable as error:\n',
+                 '        raw = open(output, "rb").read()\n    except OSError as error:\n        error.kind = "absent"\n')],
+             REVIEW_PY)]},
+    "AC-8 option A: outcome-unknown and the report directory": {
+        "tests": [RT + "test_r07_option_a_a_unit_that_ends_or_outlives_its_bound_with_no_final_is_outcome_unknown",
+                  RT + "test_r03_the_intent_binds_the_full_command_line_and_charges_b33_once"],
+        "mutations": [
+            ("a unit that ended is waited on", [
+                ('            ended = props is None or props.get("ActiveState") in ("inactive", "failed")\n',
+                 '            ended = False\n')], REVIEW_PY),
+            ("a silent unit is waited on forever", [
+                ('            if not ended and now - started <= REVIEW_MAX + SETTLE_GRACE:\n',
+                 '            if not ended:\n')], REVIEW_PY),
+            ("the report directory is not granted to the unit's uid", [
+                ('                self.runner.grant_output(attempt["out_dir"], uid)\n', '                pass\n')],
+             REVIEW_PY),
+            ("no fresh report directory", [
+                ('            ahc_fs.make_fresh_dir(self.root, attempt["out_dir"])\n',
+                 '            os.makedirs(attempt["out_dir"], exist_ok=True)\n            os.chmod(attempt["out_dir"], 0o777)\n')],
+             REVIEW_PY)]},
 })
 
 
