@@ -5828,6 +5828,27 @@ class W1CheckTests(_ShadowFixture):
         self.assertEqual(len(self.tick()["admitted"]), 1)
         self.assertEqual(self.db.execute("SELECT event_id FROM lineage_tickets").fetchall(), [("earlier-w1",)])
 
+    def test_ac7_status_names_each_held_request_and_its_reason_and_the_items_spec_core(self):
+        """AC-7: `ahc status` shows a held request with its named reason, a waiting one as waiting, and an admitted
+        item's spec_core in full (the click-tester compares it with the attached core)."""
+        self.admission.update(refs_ticket=None, refs_problem="refs: the commits name goodqa#5, goodqa#6")
+        held = self.queue()
+        waiting = self.queue(pr=6, ticket="GoodQA goodqa#6")
+        self.assertIn("request o/r#6 %s waiting for admission" % TC.H1[:12], self.S.status_lines(self.c))
+        self.tick()
+        lines = self.S.status_lines(self.c)
+        self.assertIn("request o/r#5 %s held (permanent): refs: the commits name goodqa#5, goodqa#6" % TC.H1[:12],
+                      lines)
+        self.assertFalse([x for x in lines if held in x or waiting in x], "a line names the request, not its key")
+        self.db.execute("DELETE FROM contract_meta WHERE k LIKE 'shadow_%'")
+        self.admission.clear()
+        self.queue()
+        self.tick()
+        item = [x for x in self.S.status_lines(self.c) if x.startswith("item ")]
+        self.assertEqual(len(item), 1, item)
+        self.assertIn("core=%s" % TC.CORE1, item[0])
+        self.assertFalse([x for x in self.S.status_lines(self.c) if x.startswith("request ")], "admitted: consumed")
+
     def test_ruled2_a_reader_failure_is_not_a_hold_and_leaves_a_due_hold_unchanged(self):
         key = self.queue()
         self.admission["refuse"] = True

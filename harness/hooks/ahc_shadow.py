@@ -66,12 +66,25 @@ def review_status(contracts, row):
 
 
 def status_lines(contracts):
-    """`ahc status` lines for the WorkItem ledger: each item, then each of its review rows."""
+    """`ahc status` lines for the WorkItem ledger: each owner request not yet admitted (waiting, or held with its
+    named reason: goodqa#16262 AC-7), then each item with its spec core, then each of its review rows."""
     out = []
     db = contracts.db
+    for key, value in db.execute("SELECT k, v FROM contract_meta WHERE k LIKE ? ORDER BY k",
+                                 (REQUEST_PREFIX + "%",)).fetchall():
+        req = json.loads(value)
+        label = "request %s#%s %s" % (req.get("repo"), req.get("pr"), str(req.get("head"))[:12])
+        raw = _meta(contracts, hold_key(key))
+        if raw is None:
+            out.append("%s waiting for admission" % label)
+            continue
+        hold = json.loads(raw)
+        when = "" if hold.get("kind") != "retryable" else ", next tick %s" % hold.get("next_tick")
+        out.append("%s held (%s%s): %s" % (label, hold.get("kind"), when, hold.get("reason")))
     for (iid,) in db.execute("SELECT id FROM work_items ORDER BY created, id").fetchall():
         item = contracts._row("work_items", "id", iid)
-        out.append("item %s %-17s %s#%s %s" % (iid, item["state"], item["repo"], item["pr"], item["head"][:12]))
+        out.append("item %s %-17s %s#%s %s core=%s" % (iid, item["state"], item["repo"], item["pr"],
+                                                       item["head"][:12], item["spec_core"]))
         for (rid,) in db.execute("SELECT id FROM reviews WHERE item=? ORDER BY round, kind, id", (iid,)).fetchall():
             row = contracts._row("reviews", "id", rid)
             out.append("  review %s %s r%d: %s" % (row["kind"], rid, row["round"], review_status(contracts, row)))

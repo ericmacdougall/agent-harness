@@ -1397,5 +1397,16 @@ ENTRIES.update({
              SHADOW)]},
 })
 
+ENTRIES.update({
+    "goodqa#16262 AC-7 status names a held request's reason": {
+        "tests": [W1C + "test_ac7_status_names_each_held_request_and_its_reason_and_the_items_spec_core"],
+        "mutations": [
+            ("status shows a hold without its reason", [
+                ('        out.append("%s held (%s%s): %s" % (label, hold.get("kind"), when, hold.get("reason")))\n',
+                 '        out.append("%s held (%s%s)" % (label, hold.get("kind"), when))\n')], SHADOW),
+            ("status omits waiting requests", [
+                ('            out.append("%s waiting for admission" % label)\n', '            pass\n')], SHADOW)]},
+})
+
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
