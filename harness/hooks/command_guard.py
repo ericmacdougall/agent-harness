@@ -171,7 +171,9 @@ DEFAULT_POLICY = {
 # goodqa#16374 AC-3d: basenames a cleanup moves to ~/secret-quarantine by name (never read); the list mac_reclaim used
 SECRET_FILE_NAME = re.compile(r'(^\.env($|\.)|\.env$|\.pem$|\.key$|\.p12$|\.pfx$|^id_(rsa|dsa|ecdsa|ed25519)|'
                               r'^credentials|\.keychain|^service-account.*\.json$|^\.npmrc$|^\.netrc$|^kubeconfig$|'
-                              r'^\.git-credentials$|^\.pgpass$|token\.json$|^secrets?\.(json|ya?ml|toml)$)', re.I)
+                              r'^\.git-credentials$|^\.pgpass$|token\.json$|^secrets?\.(json|ya?ml|toml)$|'
+                              # goodqa#16374 red-team M1: credential files named the same in any tool home
+                              r'^auth\.json$|^\.credentials\.json$|^hosts\.yml$|^user-token$|^\.vault-token$)', re.I)
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
 BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
@@ -8657,9 +8659,8 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
     return entry
 
 
-def _store_entry(entry, real, now, home=None, under_lock=None):
-    """MAC `entry` with the local key and write it to the marker, replacing any live entry for the same path.
-    `under_lock`, when given, runs while the marker lock is held and before the write; raising aborts the write."""
+def _host_key(home=None):
+    """The host-local MAC key (created 0600 in a 0700 state dir on first use)."""
     sd = state_dir(home)
     sd.mkdir(parents=True, exist_ok=True)
     os.chmod(str(sd), 0o700)
@@ -8670,7 +8671,14 @@ def _store_entry(entry, real, now, home=None, under_lock=None):
             handle.write(_secrets.token_bytes(32))
     except FileExistsError:
         pass
-    key = _read_small(key_path, 256)
+    return _read_small(key_path, 256)
+
+
+def _store_entry(entry, real, now, home=None, under_lock=None):
+    """MAC `entry` with the local key and write it to the marker, replacing any live entry for the same path.
+    `under_lock`, when given, runs while the marker lock is held and before the write; raising aborts the write."""
+    sd = state_dir(home)
+    key = _host_key(home)
     entry['mac'] = _mac(key, entry)
     import fcntl
     lock = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -8783,6 +8791,14 @@ UPLOAD_MAX_DEPTH = 128  # one open directory descriptor per level; macOS's defau
 PINNED_MAX_FILES = 100000
 
 
+def _entry_key(st):
+    """64-bit key of an entry's (inode, ctime_ns): a file deleted and replaced after the check reuses an inode
+    number on ext4 but not its ctime (red-team E2)."""
+    import struct
+    return int.from_bytes(hashlib.blake2b(struct.pack('<QQ', st.st_ino, st.st_ctime_ns & ((1 << 64) - 1)),
+                                          digest_size=8).digest(), 'little')
+
+
 def _upload_iter_fd(real, limits, deadline, known):
     """The send-side walk: yield (member, full, lstat, opener) in the same archive order as _upload_iter, but through
     directory descriptors opened O_NOFOLLOW|O_DIRECTORY from a root whose identity is checked, so a directory replaced
@@ -8796,8 +8812,9 @@ def _upload_iter_fd(real, limits, deadline, known):
     base = os.path.basename(real)
 
     def seen(st):
-        i = bisect.bisect_left(known, st.st_ino)
-        if i >= len(known) or known[i] != st.st_ino or st.st_dev != root_st.st_dev:
+        key = _entry_key(st)
+        i = bisect.bisect_left(known, key)
+        if i >= len(known) or known[i] != key or st.st_dev != root_st.st_dev:
             raise ValueError('an entry appeared or was replaced after the check; nothing of it was sent')
 
     def opener_for(dfd, name, st, full):
@@ -8863,13 +8880,16 @@ def _upload_iter_fd(real, limits, deadline, known):
         os.close(rfd)
 
 
-def _credential_tier(rel, compiled):
+def _credential_tier(rel, compiled, member=None, full=None):
     """2 for the loose secret-name list, 1 for a real credential path (`credential_path_regexes`), 0 for neither or
-    for a name `credential_allow_regexes` clears (`.env.example`)."""
+    for a name `credential_allow_regexes` clears (`.env.example`). Tier 1 is matched against the unit-relative path,
+    the member path (which keeps the unit's own name, so a unit that IS `.codex` still shows `.codex/auth.json`) and
+    the absolute path (red-team M1)."""
     path = '/' + rel
     if any(rx.search(path) for rx in compiled.cred_allow):
         return 0
-    if any(rx.search(path) for rx in compiled.cred):
+    variants = [path] + ['/' + member] * bool(member) + [full] * bool(full)
+    if any(rx.search(v) for rx in compiled.cred for v in variants):
         return 1
     return 2 if SECRET_FILE_NAME.search(posixpath.basename(rel)) else 0
 
@@ -8900,17 +8920,19 @@ def _counted_credentials(real, entries, compiled):
     Returns (problems, pinned): `pinned` maps each exempted tier-2 file to its HEAD blob id, and the stream re-checks
     the exact bytes it sends against that id (Codex r5 F1: a file swapped after this check never leaves the host). A
     `.git/config` whose remote URL carries userinfo (`https://user:token@host`) counts as a tier-1 credential."""
-    problems, head_pushed, pinned = [], {}, {}
+    problems, head_pushed, pinned, gitdirs = [], {}, {}, {}
     stop = real if os.path.isdir(real) else os.path.dirname(real)
     for member, full, st in entries:
         if not stat.S_ISREG(st.st_mode) or len(problems) >= 50:
             continue
         rel = member.split('/', 1)[1] if '/' in member else member
-        if '/.git/' in '/' + member + '/':
-            if _is_git_config(member) and _git_config_has_userinfo(full, st):
-                problems.append('credential in a git remote URL %s' % rel)
+        in_gitdir = _in_real_gitdir(full, gitdirs)
+        if in_gitdir and _is_git_config(member) and _git_config_has_userinfo(full, st):
+            problems.append('credential in a git remote URL %s' % rel)
             continue
-        tier = _credential_tier(rel, compiled)
+        tier = _credential_tier(rel, compiled, member, full)
+        if in_gitdir and tier == 2:
+            continue  # git's own files (objects, refs, hooks) are not credential names; tier 1 still counts
         if not tier:
             continue
         if tier == 2 and st.st_size > PINNED_MAX_BYTES:
@@ -8967,6 +8989,19 @@ def _git_config_has_userinfo(full, st):
         return True
     with os.fdopen(fd, 'rb') as handle:
         return bool(_USERINFO_URL.search(handle.read(1 << 20)))
+
+
+def _in_real_gitdir(full, cache):
+    """True when `full` lies inside a directory named .git that is a real gitdir (it holds HEAD and objects/);
+    a plain directory named .git gets no exemption (red-team E1)."""
+    parts = full.split(os.sep)
+    if '.git' not in parts[:-1]:
+        return False
+    gitdir = os.sep.join(parts[:len(parts) - 1 - parts[:-1][::-1].index('.git')])
+    if gitdir not in cache:
+        cache[gitdir] = os.path.isfile(os.path.join(gitdir, 'HEAD')) and \
+            os.path.isdir(os.path.join(gitdir, 'objects')) and not os.path.islink(gitdir)
+    return cache[gitdir]
 
 
 def _is_git_config(member):
@@ -9195,6 +9230,7 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
     thread = threading.Thread(target=pump, daemon=True)
     thread.start()
     manifest = {'sha': hashlib.sha256(), 'files': 0}
+    gitdirs = {}
 
     def record(rel, size, digest):
         if manifest['files']:
@@ -9220,10 +9256,11 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                     tar.addfile(info)
                 else:
                     rel = member.split('/', 1)[1] if '/' in member else member
-                    in_git = '/.git/' in '/' + member + '/'
-                    if compiled is not None and not in_git and full not in pinned and \
-                            _credential_tier(rel, compiled):
-                        raise ValueError('credential file %s appeared after the check; nothing of it was sent' % rel)
+                    if compiled is not None and full not in pinned:
+                        tier = _credential_tier(rel, compiled, member, full)
+                        if tier == 1 or (tier == 2 and not _in_real_gitdir(full, gitdirs)):
+                            raise ValueError('credential file %s appeared after the check; nothing of it was sent'
+                                             % rel)
                     fd = opener() if opener is not None else _open_regular(full, st)
                     try:
                         info.type, info.size = tarfile.REGTYPE, st.st_size
@@ -9280,8 +9317,7 @@ def _ledger_path(home=None):
 
 def ledger_append(row, home=None):
     """Append one MAC'd backup-ledger row (the record AC-1 and AC-4 trust; DROPBOX_INDEX.jsonl is only a report)."""
-    sd = state_dir(home)
-    key = _read_small(sd / KEY_NAME, 256)
+    key = _host_key(home)
     row = dict(row)
     row['mac'] = _mac(key, row)
     fd = os.open(str(_ledger_path(home)), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -9362,6 +9398,7 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
     limits = policy['marker']
     now = time.time() if now is None else now
     transport = transport or RcloneUpload(policy=policy)
+    transport.deadline = None  # a reused transport starts without the previous upload's deadline
     real = os.path.realpath(path)
     compiled = Compiled(policy, home=home)
     try:
@@ -9376,6 +9413,11 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         if ttl <= 0 or ttl > int(limits['max_ttl_seconds']):
             raise ValueError('ttl must be between 1 and %d seconds' % int(limits['max_ttl_seconds']))
         _check_upload_remote(remote, policy, transport)
+        segs = Compiled._segs(real)
+        for d in compiled.cred_dirs:
+            if segs[:len(d)] == d or d[:len(segs)] == segs:
+                raise ValueError('the path is, is inside, or holds a credential directory (%s); it cannot be '
+                                 'uploaded' % '/'.join(d[-2:]))
         recent = int(limits.get('recent_change_seconds', 600))
         if recent > 0 and _recent_change(real, recent, now, limits, budget=120.0):
             raise ValueError('something under the path changed in the last %d seconds (a live log?); wait and '
@@ -9385,12 +9427,16 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         walk_budget = max(120.0, float(limits['max_walk_seconds']) * 600)
         seen = {'files': 0, 'bytes': 0}
         import array
-        known = array.array('Q')  # every checked entry's inode: 8 bytes per entry, the only per-entry state kept
+        known = array.array('Q')  # every checked entry's (inode, ctime) key: 8 bytes per entry
+        links = {}  # inode -> (st_nlink, names inside the unit, first member) for files with more than one link
 
         def first_pass():
             # unreadable or swapped files refuse before anything is sent; one streaming walk, no entry list
             for member, full, st in _upload_iter(real, limits, time.monotonic() + walk_budget):
-                known.append(st.st_ino)
+                known.append(_entry_key(st))
+                if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                    nlink, inside, first = links.get(st.st_ino, (st.st_nlink, 0, member))
+                    links[st.st_ino] = (nlink, inside + 1, first)
                 if stat.S_ISREG(st.st_mode):
                     os.close(_open_regular(full, st))
                     seen['files'] += 1
@@ -9399,6 +9445,11 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
                         raise ValueError('tree is larger than the approval limit')
                 yield member, full, st
         problems, pinned = _counted_credentials(real, first_pass(), compiled)
+        outside = sorted(first for nlink, inside, first in links.values() if nlink > inside)
+        if outside:
+            # red-team M2: the other name of the inode lies outside the unit, so these bytes are not the unit's
+            raise ValueError('hard link to a file outside the unit: %s; replace it with a copy of a file you know is '
+                             'not a credential, or remove it' % ', '.join(outside[:8]))
         if not seen['files']:
             raise ValueError('nothing to approve: the path holds no files')
         tree_bytes = seen['bytes']
@@ -9442,19 +9493,28 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
              'archive_sha256': sha, 'archive_bytes': sent_bytes, 'dropbox_hash': dbx, 'verified_at': now,
              'expires_at': now + ttl, 'nonce': _secrets.token_hex(8),
              'rclone_subcommands': sorted(set(getattr(transport, 'subcommands', []) or []))}
-    _store_entry(entry, real, now, home)
     host = socket.gethostname().split('.')[0][:64]
     date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
-    ledger_append({'path': real, 'identity': identity, 'stat_sha256': stat_digest, 'archive': remote,
-                   'dropbox_hash': dbx,
-                   'archive_sha256': sha, 'archive_bytes': sent_bytes, 'host': host, 'date': date}, home=home)
-    base = os.path.realpath(str(home or _pinned_home()))
-    rel_home = os.path.relpath(real, base) if real.startswith(base + os.sep) else real
-    index_record({'path': rel_home, 'bytes': tree_bytes, 'regen_dropped_bytes': 0, 'secrets_quarantined': 0,
-                  'date': date, 'archive': remote, 'sha256': sha, 'archive_bytes': sent_bytes,
-                  'source': 'command_guard approve-delete --upload', 'git': None,
-                  'verified': 'Dropbox content hash and size of the stored object matched the bytes sent',
-                  'dropbox_hash': dbx, 'stat_sha256': stat_digest, 'host': host, 'kind': UPLOAD_KIND}, home=home)
+    try:
+        # red-team E3: the backup is recorded first; the approval is stored only once every record is written
+        ledger_append({'path': real, 'identity': identity, 'stat_sha256': stat_digest, 'archive': remote,
+                       'dropbox_hash': dbx, 'archive_sha256': sha, 'archive_bytes': sent_bytes, 'host': host,
+                       'date': date}, home=home)
+        base = os.path.realpath(str(home or _pinned_home()))
+        rel_home = os.path.relpath(real, base) if real.startswith(base + os.sep) else real
+        index_record({'path': rel_home, 'bytes': tree_bytes, 'regen_dropped_bytes': 0, 'secrets_quarantined': 0,
+                      'date': date, 'archive': remote, 'sha256': sha, 'archive_bytes': sent_bytes,
+                      'source': 'command_guard approve-delete --upload', 'git': None,
+                      'verified': 'Dropbox content hash and size of the stored object matched the bytes sent',
+                      'dropbox_hash': dbx, 'stat_sha256': stat_digest, 'host': host, 'kind': UPLOAD_KIND},
+                     home=home)
+        _store_entry(entry, real, now, home)
+    except (OSError, ValueError) as error:
+        audit('refused', {'path': real, 'remote': remote, 'kind': UPLOAD_KIND,
+                          'reason': 'the backup is stored but its records could not be written: %s' % str(error)[:160]},
+              home=home, wal=wal)
+        raise ValueError('the backup %s is stored but its records could not be written (%s); nothing was approved'
+                         % (remote, str(error)[:120]))
     audit('approved', entry, home=home, wal=wal)
     return entry
 

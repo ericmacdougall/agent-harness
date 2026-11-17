@@ -198,7 +198,15 @@ class UploadBase(Fixture):
         return [c for c in self.calls() if c and c[0] == 'rcat']
 
     def transport(self):
-        return cg.RcloneUpload(rclone=str(self.rclone), policy=self.policy)
+        # one transport per test, so its recorded subcommands show whether any upload ever started
+        if getattr(self, '_shared_transport', None) is None:
+            self._shared_transport = cg.RcloneUpload(rclone=str(self.rclone), policy=self.policy)
+        return self._shared_transport
+
+    def assert_never_uploaded(self):
+        # the fake's call log can miss an rcat the guard killed at once; the transport's own record cannot
+        self.assertEqual(self.rcats(), [])
+        self.assertNotIn('rcat', self.transport().subcommands)
 
     def approve(self, remote=None, path=None, transport=None, **kw):
         return cg.approve_delete_upload(str(path or self.target), remote or self.remote,
@@ -343,14 +351,16 @@ class UploadApproval(UploadBase):
         real = cg._counted_credentials
 
         def classify_then_swap(*a, **kw):
-            result = real(*a, **kw)
+            return real(*a, **kw)
+
+        def swap():
             with open(str(fixture), 'r+b') as handle:
                 handle.write(swapped)
-            return result
+        classify_then_swap.swap = swap
         plain = self.store / 'plain-zstd'
         plain.write_text('#!/bin/sh\nexec cat\n')  # no compression, so the received bytes show the tar content
         plain.chmod(0o755)
-        with mock.patch.object(cg, '_counted_credentials', classify_then_swap):
+        with self.swap_in_stream('fixtures/x-token.json', lambda: classify_then_swap.swap()):
             message = self.refused('changed after it was checked', zstd=str(plain))
         self.assertIn('x-token.json', message)
         received = (self.store / 'received.bin').read_bytes() if (self.store / 'received.bin').exists() else b''
@@ -365,6 +375,18 @@ class UploadApproval(UploadBase):
             action()
             return result
         return mock.patch.object(cg, '_counted_credentials', check_then_act)
+
+    def swap_in_stream(self, suffix, action):
+        """Run `action` inside the send-side walk, right after it checked the entry ending in `suffix` and before
+        the stream reads it: the window only the byte binding closes."""
+        real_iter = cg._upload_iter_fd
+
+        def wrapped(*a, **kw):
+            for item in real_iter(*a, **kw):
+                if item[0].endswith(suffix):
+                    action()
+                yield item
+        return mock.patch.object(cg, '_upload_iter_fd', wrapped)
 
     def plain_zstd(self):
         plain = self.store / 'plain-zstd'
@@ -385,8 +407,14 @@ class UploadApproval(UploadBase):
         def inject():
             with open(str(config), 'ab') as handle:
                 handle.write(b'[remote "m"]\n\turl = https://u:INJECTEDTOKEN@example.invalid/x.git\n')
-        with self.swap_after_check(inject):
-            self.refused('changed after', zstd=self.plain_zstd())
+        with self.swap_after_check(inject):  # before the send walk: the (inode, ctime) key refuses it
+            self.refused('after the check', zstd=self.plain_zstd())
+        self.assertNotIn(b'INJECTEDTOKEN', self.received())
+        git(repo, 'config', '--remove-section', 'remote.m')
+        age(self.target)
+        with self.swap_in_stream('/.git/config', inject):  # inside the send walk: the byte binding refuses it
+            self.refused('changed after', zstd=self.plain_zstd(), remote='dropbox:backups/mac/%s-in.tar.zst'
+                         % self.target.name)
         self.assertNotIn(b'INJECTEDTOKEN', self.received())
 
     def test_a_credential_file_created_after_the_check_is_never_sent(self):
@@ -398,7 +426,7 @@ class UploadApproval(UploadBase):
         def rename():
             os.rename(str(self.target / 'sub/b.txt'), str(self.target / 'sub' / dotenv))
         with self.swap_after_check(rename):
-            self.refused('appeared after the check', zstd=self.plain_zstd())
+            self.refused('after the check', zstd=self.plain_zstd())
         self.assertNotIn(b'PLANTEDVALUE', self.received())
 
     def test_git_config_forms(self):
@@ -459,12 +487,73 @@ class UploadApproval(UploadBase):
             self.refused('after the check', zstd=self.plain_zstd())
         self.assertNotIn(b'MOVEDINSECRET', self.received())
 
+    def test_a_unit_that_is_a_credential_home_is_refused(self):
+        # red-team M1: the unit's own name is the directory context the location rules need
+        for name, rel in (('.codex', 'auth.json'), ('codex-home', 'auth.json'), ('.claude', '.credentials.json'),
+                          ('claude-config', '.credentials.json'), ('gh', 'hosts.yml'), ('goodqa', 'user-token'),
+                          ('vault', '.vault-token'), ('.kube', 'config')):
+            with self.subTest(unit=name):
+                unit = self.target / ('u-%d' % time.monotonic_ns()) / name
+                (unit / rel).parent.mkdir(parents=True, exist_ok=True)
+                (unit / rel).write_text('DUMMY\n')
+                age(unit)
+                message = self.refused('credential', path=unit, remote='dropbox:backups/mac/%s-%d.tar.zst'
+                                       % (name.strip('.'), time.monotonic_ns()))
+                self.assertIn(rel, message)
+        self.assert_never_uploaded()
+
+    def test_a_unit_inside_or_above_a_credential_dir_is_refused(self):
+        for path in (self.home / '.ssh/old', self.home / '.config'):
+            path.mkdir(parents=True, exist_ok=True)
+            (path / 'x.txt').write_text('x\n')
+            age(path)
+            with self.subTest(path=str(path)):
+                self.refused('credential directory', path=path)
+        self.assert_never_uploaded()
+
+    def test_a_hard_link_to_an_outside_file_is_refused(self):
+        # red-team M2: the inode's other name is outside the unit
+        outside = self.target.parent / ('outside-%d.txt' % time.monotonic_ns())
+        outside.write_text('LINKEDSECRET\n')
+        self.addCleanup(lambda: outside.exists() and outside.unlink())
+        os.link(str(outside), str(self.target / 'notes.txt'))
+        age(self.target)
+        self.refused('hard link to a file outside the unit')
+        self.assert_never_uploaded()
+        # two names inside the unit are fine
+        outside.unlink()
+        os.link(str(self.target / 'notes.txt'), str(self.target / 'sub/notes-copy.txt'))
+        age(self.target)
+        self.approve()
+
+    def test_only_a_real_gitdir_skips_the_loose_name_list(self):
+        # red-team E1: a plain directory named .git carries no exemption; tier 1 counts inside a real gitdir
+        fake = self.target / 'vendor/.git'
+        fake.mkdir(parents=True)
+        (fake / 'secrets.json').write_text('{}\n')
+        age(self.target)
+        self.refused('credential file')
+        shutil.rmtree(str(self.target / 'vendor'))
+        repo = self.repo({'main.go': 'package x\n'})
+        (repo / '.git/info/.env').write_text('A=1\n')
+        age(self.target)
+        self.refused('credential file')
+
+    def test_no_approval_without_its_records(self):
+        # red-team E3: a failed index write leaves no usable approval
+        with mock.patch.object(cg, 'index_record', side_effect=OSError('read-only file system')):
+            self.refused('records could not be written')
+        self.assertFalse(cg.marker_covers(str(self.target), home=str(self.home)))
+
     def test_a_git_remote_url_with_userinfo_counts(self):
         repo = self.repo({'main.go': 'package x\n'})
         git(repo, 'remote', 'add', 'mirror', 'https://someone:not-a-real-token@example.invalid/x.git')
         age(self.target)
-        self.refused('credential in a git remote URL')
-        self.assertEqual(self.rcats(), [])
+        transport = self.transport()
+        message = self.refused('credential in a git remote URL', transport=transport)
+        # refused by the check, before any upload started (the stream's own byte check is a second layer)
+        self.assertNotIn('changed after the check', message)
+        self.assertNotIn('rcat', transport.subcommands)
 
     def test_dropbox_hash_matches_the_block_construction(self):
         self.assertEqual(cg.DropboxHash.of_bytes(b''), hashlib.sha256(b'').hexdigest())
@@ -537,7 +626,7 @@ class UploadRefusals(UploadBase):
         self.policy = copy.deepcopy(self.policy)
         self.policy['marker']['max_upload_entries'] = 3
         self.refused('more than 3 entries')
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
     def test_a_slow_approval_stat_pass_is_refused(self):
         # D1: an approval the hook could not re-check in time is never written
@@ -586,14 +675,14 @@ class UploadRefusals(UploadBase):
             with self.subTest(remote=remote):
                 with self.assertRaises(ValueError):
                     self.approve(remote=remote)
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
     def test_globs_and_protected_roots_are_refused(self):
         for path in (str(self.target) + '/*', str(self.home / '.claude'), str(self.home / '.agent-harness/work')):
             with self.subTest(path=path):
                 with self.assertRaises(ValueError):
                     self.approve(path=path)
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
     def test_a_tree_changed_during_the_upload_is_refused(self):
         transport = self.transport()
@@ -608,7 +697,7 @@ class UploadRefusals(UploadBase):
     def test_a_recent_change_is_refused_before_any_upload(self):
         (self.target / 'sub/b.txt').write_text('new\n')
         self.refused('changed in the last')
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
     def test_special_and_unreadable_files_are_refused_within_the_budget(self):
         # NEG-18: a FIFO is never opened (opening one for read would block forever)
@@ -622,7 +711,7 @@ class UploadRefusals(UploadBase):
         self.addCleanup(locked.chmod, 0o600)
         age(self.target)
         self.refused('read', remote='dropbox:backups/mac/%s-2.tar.zst' % self.target.name)
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
     def test_the_archive_route_does_not_hang_on_a_fifo(self):
         # E1: the shared tree_manifest gets the same protection
@@ -647,7 +736,7 @@ class UploadRefusals(UploadBase):
                 self.assertIn(rel.rsplit('/', 1)[-1], message)
                 self.assertIn('secret-quarantine', message)
                 path.unlink()
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
     def repo(self, files, pushed=True):
         return UploadApproval.repo(self, files, pushed)
@@ -683,7 +772,7 @@ class UploadRefusals(UploadBase):
             return st
         with mock.patch.object(cg, '_lstat', lstat):
             self.refused('device')
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
 
 @unittest.skipUnless(os.environ.get('CG_BIG_TEST') == '1', 'builds 120,000 small files; set CG_BIG_TEST=1 (t2-dev)')
@@ -739,7 +828,7 @@ class UploadCli(UploadBase):
                 code = cg.main(['approve-delete', '--path', str(self.target), '--upload', self.remote,
                                 '--wal', str(wal)] + extra)
                 self.assertEqual(code, 2)
-        self.assertEqual(self.rcats(), [])
+        self.assert_never_uploaded()
 
 
 if __name__ == '__main__':
