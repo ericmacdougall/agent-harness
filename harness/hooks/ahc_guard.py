@@ -84,6 +84,23 @@ HELPER_ENV_KEYS = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "TMPDIR", "XDG_RUN
 W21_PUT = re.compile(r"repos/(?P<repo>[^/]+/[^/]+)/pulls/(?P<pr>[1-9][0-9]{0,9})/update-branch")
 
 
+RELEASE_LIST = Path(__file__).resolve().parent / "ahc_release.json"
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def release_helpers(path=None):
+    """{helper name: sha256} from the installed release list's "helpers" section. A missing or unreadable list, or
+    a malformed entry, binds nothing, so every helper launch is refused (fail closed)."""
+    try:
+        data = json.loads(Path(path or RELEASE_LIST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    helpers = data.get("helpers") if isinstance(data, dict) else None
+    if not isinstance(helpers, dict):
+        return {}
+    return {n: h for n, h in helpers.items() if n in HELPER_SCRIPTS and isinstance(h, str) and SHA256_HEX.fullmatch(h)}
+
+
 class LaunchRefused(RuntimeError):
     """A launch, connection or import the daemon's policy does not allow (AC-13)."""
 
@@ -163,7 +180,7 @@ class Policy:
     are never injectable through config or env."""
 
     def __init__(self, root, *, repos=(), home=None, trusted_dirs=None, helpers=None, unit_scope="--user",
-                 gh_auth=None, _stubs=None, _allow_file=False, _python=None):
+                 gh_auth=None, release=None, _stubs=None, _allow_file=False, _python=None):
         self.root = os.path.realpath(str(root))
         self.clones = os.path.join(self.root, "clones")
         self.repos = {str(r).lower() for r in repos}
@@ -183,11 +200,14 @@ class Policy:
         self.helper_env["LC_ALL"] = "C"
         if helpers is None:
             helpers = {n: os.path.join(self.home, ".claude", "hooks", f) for n, f in HELPER_SCRIPTS.items()}
-        self.helpers = {}               # name -> (script path, sha256): pinned at start (ASSUMPTION: not ahc release
-        for name, script in helpers.items():           # files, so their hash is the one read when the daemon starts)
-            problem = trusted_file_problem(script)
-            if problem is None:
-                self.helpers[name] = (str(script), hashlib.sha256(Path(script).read_bytes()).hexdigest())
+        # name -> (installed script path, sha256 from the release list): r9 AC-13 binds each helper to its hash in
+        # ahc_release.json (owner ruling e); a helper with no release entry is not bound, so it is refused
+        self.release = dict(release) if release is not None else release_helpers()
+        self.helpers = {}
+        for name, script in helpers.items():
+            want = self.release.get(name)
+            if trusted_file_problem(script) is None and isinstance(want, str) and SHA256_HEX.fullmatch(want):
+                self.helpers[name] = (str(script), want)
         self.armed = {}                 # "systemd-run" -> (argv, digest); "w21" -> argv
         self.intent_units = set()       # units of committed R3 launch intents
         self.reconciling = False        # startup reconciliation (AC-8, NEG-49)
@@ -197,7 +217,11 @@ class Policy:
 
     @classmethod
     def for_test(cls, root, stubs, **kw):
-        """Test constructor only: each executable resolves to the given stub path."""
+        """Test constructor only: each executable resolves to the given stub path. Unless the test passes its own
+        release list, the given helper files are their own release entries."""
+        if "release" not in kw and kw.get("helpers"):
+            kw["release"] = {n: hashlib.sha256(Path(p).read_bytes()).hexdigest() for n, p in kw["helpers"].items()
+                             if os.path.isfile(str(p))}
         return cls(root, _stubs=dict(stubs), **kw)
 
     def _resolve(self, name):
@@ -448,7 +472,7 @@ class Policy:
                 continue
             problem = trusted_file_problem(script)
             if problem or hashlib.sha256(Path(script).read_bytes()).hexdigest() != sha:
-                self.refuse("helper %s changed since the daemon started" % name)
+                self.refuse("helper %s does not match its sha256 in the release list" % name)
             if not self.HELPER_ARGS[name](args[2:]):
                 self.refuse("helper %s: arguments outside its pattern" % name)
             return name

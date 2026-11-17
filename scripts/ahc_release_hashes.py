@@ -22,16 +22,25 @@ def current():
     return {n: hashlib.sha256((HOOKS / n).read_bytes()).hexdigest() for n in names}
 
 
+def helpers():
+    """The legacy helper scripts the daemon may launch (ahc_guard.HELPER_SCRIPTS), bound by hash (r9 AC-13)."""
+    sys.path.insert(0, str(HOOKS))
+    import ahc_guard  # noqa: PLC0415
+    return {n: hashlib.sha256((HOOKS / f).read_bytes()).hexdigest() for n, f in ahc_guard.HELPER_SCRIPTS.items()}
+
+
 def main(argv):
-    want = {"files": current(), "note": "v5 entry-point sha256 list; regenerate with scripts/ahc_release_hashes.py"}
+    want = {"files": current(), "helpers": helpers(),
+            "note": "v5 entry-point and legacy-helper sha256 list; regenerate with scripts/ahc_release_hashes.py"}
     if "--write" in argv:
         LIST.write_text(json.dumps(want, indent=1, sort_keys=True) + "\n")
         return 0
     have = json.loads(LIST.read_text())
-    if have.get("files") != want["files"]:
-        print("ahc_release.json is stale: %s" % sorted(k for k in set(have.get("files", {})) | set(want["files"])
-                                                      if have.get("files", {}).get(k) != want["files"].get(k)))
-        return 1
+    for part in ("files", "helpers"):
+        if have.get(part) != want[part]:
+            print("ahc_release.json is stale (%s): %s" % (part, sorted(
+                k for k in set(have.get(part, {})) | set(want[part]) if have.get(part, {}).get(k) != want[part].get(k))))
+            return 1
     return 0
 
 

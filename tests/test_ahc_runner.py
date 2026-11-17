@@ -3,6 +3,9 @@ and digest, with a journal that makes every step idempotent and restart-safe. Al
 GoodQA goodqa#16034 AC-6, AC-7, AC-9; NEG-9 (Gate 1 part), NEG-12, NEG-15, NEG-16."""
 import hashlib
 import os
+import sqlite3
+import subprocess
+import time
 import json
 import sys
 import tempfile
@@ -4263,21 +4266,30 @@ class StateMachineTests(TC.Base):
         self.assertEqual(self.c.queue_head("o/r", {newer["id"]: q[newer["id"]]}), newer["id"])
 
     def test_w21_records_one_update_for_the_queue_head_and_sends_nothing(self):
+        """W21 writes the keyed intent record and its authority line; the move itself sends nothing (AC-7's sender
+        does, from the committed row). It needs AHC_W21_SEND=1 and the repo policy's w21 field (NEG-16)."""
+        env = mock.patch.dict(os.environ, {"AHC_W21_SEND": "1"})
+        env.start()
+        self.addCleanup(env.stop)
         self.pass_reviews()
         self.clock.t += 1
         newer = self.admit(pr=6)
         self.pass_reviews(newer)
-        behind = {self.item["id"]: {"compare": "behind"}, newer["id"]: {"compare": "behind"}}
+        pol = dict(self.eligible()["policy"], w21=True)
+        behind = {self.item["id"]: {"compare": "behind", "policy": pol},
+                  newer["id"]: {"compare": "behind", "policy": pol}}
 
         def w21_obs(**kw):
             return self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=True, **kw)
         with self.assertRaisesRegex(C.ContractError, "head"):
             self.move("W21", item=newer, obs=dict(w21_obs(), pr=6))
         with self.assertRaisesRegex(C.ContractError, "every item"):
-            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, **behind), mergeable=True))
+            self.move("W21", obs=self.pr(queue=self.queue_of(self.item, **{self.item["id"]: behind[self.item["id"]]}),
+                                         mergeable=True))
         with self.assertRaisesRegex(C.ContractError, "mergeable"):
             self.move("W21", obs=self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=None))
-        ahead = self.pr(queue=self.queue_of(self.item, newer), mergeable=True)
+        ahead = self.pr(queue=self.queue_of(self.item, newer, **{i: {"policy": pol} for i in behind}),
+                        mergeable=True)
         with self.assertRaisesRegex(C.ContractError, "behind"):
             self.move("W21", obs=ahead)
         before = len(self.log.records())
@@ -4285,8 +4297,13 @@ class StateMachineTests(TC.Base):
         self.assertEqual((item["state"], item["w21_base"]), ("pr-gate", TC.BASE))
         recs = self.log.records()[before:]
         self.assertEqual([(r["row"], r["expected_head_sha"], r["action"]) for r in recs],
-                         [("W21", TC.H1, "update-branch (recorded, not sent)")], "authority log first, no send")
-        with self.assertRaisesRegex(C.ContractError, "already recorded"):
+                         [("W21", TC.H1, "update-branch")], "authority log first, no send")
+        self.assertEqual(self.db.execute("SELECT state FROM w21_sends").fetchall(), [("intent",)])
+        with self.assertRaisesRegex(C.ContractError, "unresolved or lost send"):
+            self.move("W21", obs=w21_obs())
+        rid = self.db.execute("SELECT request_id FROM w21_sends").fetchone()[0]
+        self.assertTrue(self.c.w21_attempt(rid) and self.c.w21_resolve(rid, TC.H2))
+        with self.assertRaisesRegex(C.ContractError, "already recorded"):    # one update per (item, B), ever
             self.move("W21", obs=w21_obs())
 
     # ---- AC-5: W7, W11, W12, W15, W19, W22 and W23 (slice 1 (b))
@@ -4413,8 +4430,9 @@ class StateMachineTests(TC.Base):
         for mergeable, state in ((None, "unknown"), (None, "dirty"), (False, "unknown"), (True, "clean")):
             with self.subTest(mergeable=mergeable, state=state), self.assertRaisesRegex(C.ContractError, "conflict"):
                 self.move("W22", obs=obs(mergeable=mergeable, mergeable_state=state))
-        behind = {self.item["id"]: {"compare": "behind"}}
-        with self.assertRaisesRegex(C.ContractError, "NEG-5"):
+        pol = dict(self.eligible()["policy"], w21=True)
+        behind = {self.item["id"]: {"compare": "behind", "policy": pol}, newer["id"]: {"policy": pol}}
+        with mock.patch.dict(os.environ, {"AHC_W21_SEND": "1"}), self.assertRaisesRegex(C.ContractError, "NEG-5"):
             self.move("W21", obs=self.pr(queue=self.queue_of(self.item, newer, **behind), mergeable=True,
                                          mergeable_state="unknown"))
         with self.assertRaisesRegex(C.ContractError, "head"):
@@ -5353,6 +5371,675 @@ class W16CliTests(Base):
                 mock.patch.object(runner.core, "Paths", lambda *a, **k: self.paths):
             rc = runner.main(self.argv())
         self.assertEqual(rc, 2)
+
+
+# ---------------------------------------------------------------- AC-3 / AC-4: the shadow boundary and tick
+# goodqa#16049 slice 1 (b), spec r9 AC-3, AC-4, NEG-7 to NEG-10.
+
+from tests import test_ahc_observe as TO  # noqa: E402
+
+SHADOW_REPO = "ericmacdougall/agent-fabric"
+
+
+class FakeProducer:
+    """An injected observation producer: each observe() is one read, stamped at its first read with its own id and
+    persisted, exactly as ahc_observe.Producer does; `facts(repo, pr, item)` returns the fields (or raises
+    ahc_observe.ObservationRefused). Every read is counted."""
+
+    def __init__(self, contracts, facts):
+        self.c, self.facts, self.reads, self.incidents = contracts, facts, [], []
+
+    def observe(self, repo, pr, *, item=None, clone=None, snapshot_bases=(), base=None):
+        stamp = self.c.first_read_stamp()
+        fields = dict(self.facts(repo, pr, item), repo=repo, pr=pr)
+        self.c.record_observation(stamp, repo, pr, item, {"test": "fake"}, [], fields)
+        self.reads.append(stamp["id"])
+        return self.c.load_observation(stamp["id"])
+
+
+class _ShadowFixture(TC.Base):
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"AHC_SHADOW": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        import ahc_shadow  # noqa: PLC0415
+        self.S = ahc_shadow
+        self.config = {"shadow_repos": ["o/r"]}
+        self.changes = {}
+
+    def eligible(self, item):
+        f = dict(pr=item["pr"], pr_head=item["head"], pr_state="OPEN", tip=item["base"], draft=False,
+                 compare="ahead", b_r_ancestors={item["base"]: True}, attached_core=item["spec_core"],
+                 open_findings=0, paths=["harness/lib/x.py"], foreign_closing_keyword=False, mergeable=True,
+                 mergeable_state="clean",
+                 policy={"revision": item["policy_revision"], "readable": True, "allowlisted": True, "enabled": True,
+                         "checks_green": True},
+                 kill_switch=False, chk_cas=True, canary_age=3600, mirror_ok=True)
+        f.update(self.changes)
+        return f
+
+    def facts(self, repo, pr, item):
+        if item is None:                                   # admission: the PR at the requested head
+            return dict(pr=pr, pr_head=self.changes.get("pr_head", TC.H1), pr_state="OPEN", tip=TC.BASE,
+                        policy={"revision": TC.POLICY}, attached_core=TC.CORE1)
+        return self.eligible(self.c._row("work_items", "id", item))
+
+    def shadow_tick(self, contracts=None):
+        c = contracts or self.c
+        producer = FakeProducer(c, lambda repo, pr, item: self.facts(repo, pr, item))
+        return self.S.ShadowTick(c, producer, lambda repo, head, base: "/clone", self.config), producer
+
+    def ready_item(self, pr=5):
+        item = self.c.admit_item("o/r", pr, TC.H1, TC.BASE, TC.POLICY, TC.CORE1, TC.PKT, event_id=self.ev())
+        self.db.execute("UPDATE reviews SET state='passed' WHERE item=?", (item["id"],))
+        self.db.execute("UPDATE work_items SET state='merge-ready', version=version+1 WHERE id=?", (item["id"],))
+        return self.c._row("work_items", "id", item["id"])
+
+    def moves(self, iid):
+        return [(json.loads(d)["row"], e) for e, d in self.db.execute(
+            "SELECT event_id, data FROM transitions WHERE entity='work_item' AND id=? ORDER BY seq", (iid,))]
+
+
+class ShadowBoundaryTests(_ShadowFixture):
+    """AC-3: AHC_SHADOW and the shadow list put a repo in exactly one pipeline; mutating calls are named."""
+
+    def test_ac3_only_the_exact_value_1_enables_shadow(self):
+        for value in (None, "", "0", "true", "1 ", "yes", "01"):
+            env = {k: v for k, v in os.environ.items() if k != "AHC_SHADOW"}
+            if value is not None:
+                env["AHC_SHADOW"] = value
+            with self.subTest(value=value), mock.patch.dict(os.environ, env, clear=True):
+                self.assertFalse(self.S.shadow_on())
+                self.assertEqual(self.S.pipeline_of(self.db, "o/r", self.config), "legacy")
+        self.assertTrue(self.S.shadow_on())
+        self.assertEqual(self.S.pipeline_of(self.db, "O/R", self.config), "shadow")
+        self.assertEqual(self.S.pipeline_of(self.db, "o/other", self.config), "legacy", "not on the list")
+
+    def test_neg7_every_mutating_call_form_is_named(self):
+        verb_m = "mer" + "ge"
+        mutating = [("gh", ["api", "--method", "PUT", "repos/o/r/pulls/5/" + verb_m]),
+                    ("gh", ["api", "-X", "PATCH", "repos/o/r/pulls/5"]),
+                    ("gh", ["api", "graphql", "-f", "query=mutation { updateRefs(input: {}) { clientMutationId } }"]),
+                    ("gh", ["api", "repos/o/r/issues/5/comments", "-f", "body=x"]),
+                    ("gh", ["api", "--input", "f.json", "repos/o/r/pulls/5"]),
+                    ("gh", ["pr", verb_m, "5"]), ("gh", ["pr", "comment", "5", "-b", "x"]),
+                    ("gh", ["pr", "edit", "5"]), ("gh", ["issue", "create"]), ("git", ["push", "origin", "x"]),
+                    ("git", ["-C", "/c", "push"]), ("git", ["update-ref", "refs/heads/x", TC.H1])]
+        reads = [("gh", ["api", "--method", "GET", "repos/o/r/pulls/5"]), ("gh", ["api", "repos/o/r/pulls/5"]),
+                 ("gh", ["pr", "view", "5", "-R", "o/r", "--json", "number"]),
+                 ("git", ["-C", "/c", "log", "--format=%H", "%s..%s" % (TC.BASE, TC.H1)]),
+                 ("git", ["fetch", "origin"]), ("git", ["merge-tree", "--write-tree", TC.H1, TC.BASE])]
+        for tool, args in mutating:
+            with self.subTest(args=args):
+                self.assertTrue(self.S.is_mutating(tool, args))
+        for tool, args in reads:
+            with self.subTest(args=args):
+                self.assertFalse(self.S.is_mutating(tool, args))
+
+    def test_ac3_the_tick_never_applies_w1_w16_or_w20_and_w21_only_through_its_sender(self):
+        self.assertFalse({"W1", "W16", "W20", "W21"} & set(self.S.TICK_ROWS))
+        self.assertEqual(set(self.S.TICK_ROWS) | {"W1", "W16", "W20", "W21"}, set(C.Contracts.WI_TRANSITIONS))
+
+
+class ShadowTickTests(_ShadowFixture):
+    """AC-4: admit, observe, select (T7) and move each item at most once per tick; event id f(obs, item, row)."""
+
+    def test_ac4_event_id_is_a_function_of_observation_item_and_row_only(self):
+        e = self.S.event_id
+        self.assertEqual(e("obs:b:1.0:1", "wi-1", "W5"), e("obs:b:1.0:1", "wi-1", "W5"))
+        self.assertEqual(len({e("o1", "i", "W5"), e("o2", "i", "W5"), e("o1", "j", "W5"), e("o1", "i", "W6")}), 4)
+
+    def test_ac4_a_held_request_is_admitted_through_one_observation(self):
+        key = self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
+                                            "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+        tick, producer = self.shadow_tick()
+        summary = tick.tick()
+        self.assertEqual(len(summary["admitted"]), 1)
+        item = self.c._row("work_items", "id", summary["admitted"][0])
+        self.assertEqual((item["state"], item["head"], item["base"]), ("pr-gate", TC.H1, TC.BASE))
+        self.assertEqual(self.moves(item["id"]), [("W1", self.S.event_id(producer.reads[0], key, "W1"))])
+        again = self.shadow_tick()[0].tick()
+        self.assertEqual(again["admitted"], [], "the request is consumed once")
+
+    def test_ac4_admission_is_refused_when_the_head_moved(self):
+        self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
+                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+        self.changes["pr_head"] = TC.H2
+        summary = self.shadow_tick()[0].tick()
+        self.assertEqual(summary["admitted"], [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM work_items").fetchone()[0], 0)
+        self.assertTrue(any("head moved" in why for _k, why in summary["refused"]), summary["refused"])
+
+    def test_neg9_w5_w6_w5_with_identical_facts_each_apply_and_each_item_moves_once_per_tick(self):
+        item, other = self.ready_item(5), self.ready_item(6)
+        rows = []
+        for mirror in (False, True, False):
+            self.changes["mirror_ok"] = mirror
+            tick, producer = self.shadow_tick()
+            before = {i: len(self.moves(i)) for i in (item["id"], other["id"])}
+            summary = tick.tick()
+            for i in (item["id"], other["id"]):
+                self.assertLessEqual(len(self.moves(i)) - before[i], 1, "an item moved twice in one tick")
+            row, ev = self.moves(item["id"])[-1]
+            read = [o for o in producer.reads if self.db.execute(
+                "SELECT item FROM observations WHERE id=?", (o,)).fetchone()[0] == item["id"]][0]
+            self.assertEqual(ev, self.S.event_id(read, item["id"], row), "event id f(obs, item, row)")
+            rows.append((row, self.c._row("work_items", "id", item["id"])["state"]))
+            self.assertEqual(summary["conflicts"], [])
+        self.assertEqual(rows, [("W5", "waiting-dep"), ("W6", "merge-ready"), ("W5", "waiting-dep")])
+
+    def test_ac4_a_refused_observation_moves_nothing(self):
+        item = self.ready_item()
+        import ahc_observe  # noqa: PLC0415
+
+        def refuse(repo, pr, iid):
+            raise ahc_observe.ObservationRefused("truncated read")
+        self.facts = refuse
+        summary = self.shadow_tick()[0].tick()
+        self.assertEqual(self.moves(item["id"])[1:], [], "nothing after W1 admission")
+        self.assertTrue(summary["refused"])
+
+    def test_neg10_two_ticks_on_one_ledger_apply_each_move_exactly_once(self):
+        import sqlite3  # noqa: PLC0415
+        path = Path(self.tmp.name) / "shared.sqlite3"
+        dbs = [sqlite3.connect(str(path), isolation_level=None, timeout=10) for _ in range(2)]
+        for db in dbs:
+            self.addCleanup(db.close)
+        C.apply_schema(dbs[0])
+        cs = [C.Contracts(db, self.log, now=self.clock, mono=self.clock, boot_id=TC.BOOT) for db in dbs]
+        self.c, self.db = cs[0], dbs[0]
+        item = self.ready_item()
+        self.changes["mirror_ok"] = False
+        tick_a, _pa = self.shadow_tick(cs[0])
+        tick_b, _pb = self.shadow_tick(cs[1])
+        real = cs[0].wi_move
+        ran = []
+
+        def interleaved(*a, **kw):
+            if not ran:
+                ran.append(tick_b.tick())                 # the other daemon applies first, between A's read and move
+            return real(*a, **kw)
+        cs[0].wi_move = interleaved
+        summary_a = tick_a.tick()
+        self.assertEqual([r for r, _e in self.moves(item["id"])], ["W1", "W5"], "exactly one apply")
+        self.assertEqual(len(ran[0]["moved"]), 1)
+        self.assertEqual(summary_a["moved"], [], "A applies nothing once B has applied")
+        lost = [c[:2] for c in summary_a["conflicts"]] + [(i, why.split(":")[0]) for i, why in summary_a["refused"]]
+        self.assertEqual(lost, [(item["id"], "W5")], "A loses on the version CAS or the guard re-read")
+
+
+
+class ShadowDeps(Deps):
+    """The legacy fakes plus the shadow parts: the production observation producer over an injected gh (FakeGh,
+    which records every argv) and a real local git repository standing in for the daemon clone."""
+
+    def __init__(self, gh, clone_root, local, gq, **kw):
+        super().__init__(**kw)
+        self.fake_gh, self.clone_root, self.local, self.gq = gh, clone_root, local, gq
+
+    def shadow_parts(self, contracts):
+        import ahc_observe  # noqa: PLC0415
+        producer = ahc_observe.Producer(contracts, self.fake_gh, TO.real_git, lambda r, p, i: dict(self.gq),
+                                        lambda r: dict(self.local))
+        return producer, (lambda repo, head, base: self.clone_root), None
+
+
+class ShadowIntegratedTests(Base):
+    """AC-3 / NEG-7 / NEG-8: one daemon tick over a legacy item and a shadow WorkItem through the production tick
+    (runner.tick), the production producer and the legacy fakes. Every gh argv on every path is recorded and none
+    may mutate; the shadow repo never enters the legacy pipeline."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"AHC_SHADOW": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        import ahc_shadow  # noqa: PLC0415
+        self.S = ahc_shadow
+        self.config = dict(self.config, repos=[REPO, SHADOW_REPO], shadow_repos=[SHADOW_REPO])
+        self.git = TO.Repo(self.home / "shadow-clone")
+        self.base = self.git.commit({"README": "r\n"}, "base")
+        self.head = self.git.commit({"src/b.py": "b\n"}, "pr change", parent=self.base)
+        self.gh = TO.FakeGh()
+        pre = "repos/%s" % SHADOW_REPO
+        self.gh.set(pre + "/pulls/9", TO.pull_json(self.head, number=9, repo=SHADOW_REPO, changed=1))
+        self.gh.set(pre + "/git/ref/heads/main", {"object": {"sha": self.base}})
+        self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % self.head,
+                    TO.page({"total_count": 1, "check_runs": [TO.run("test", head=self.head)]}))
+        self.gh.set(pre + "/commits/%s/statuses?per_page=100" % self.head, TO.page([]))
+        local = {"policy": {"revision": "policy-r1", "default_branch": "main", "readable": True,
+                            "allowlisted": True, "enabled": True,
+                            "required_checks": {"contexts": ["test"], "app": "github-actions"}},
+                 "kill_switch": False, "kill_epoch": 1, "chk_cas": True, "canary": None}
+        self.deps = ShadowDeps(self.gh, self.git.root, local, {"attached_core": "1" * 64, "open_findings": 0,
+                                                               "mirror_ok": True})
+
+    def submit_shadow(self):
+        req = {"repo": SHADOW_REPO, "pr": 9, "head": self.head, "base": self.base, "packet": str(self.packet),
+               "ticket": "GoodQA goodqa#16049", "owner": "agent-abc123"}
+        return core.submit(self.paths, self.config, req)
+
+    def all_gh_argv(self):
+        legacy = [list(a[1:]) if a and a[0] == "gh" else list(a) for a in self.deps.gh_calls]
+        return legacy + [list(a) for a in self.gh.calls]
+
+    def ledger_rows(self, sql, args=()):
+        ledger = runner.Ledger(self.paths)
+        try:
+            return [tuple(r) for r in ledger.db.execute(sql, args).fetchall()]
+        finally:
+            ledger.close()
+
+    def test_ac3_integrated_tick_zero_mutating_calls_one_pipeline_per_repo(self):
+        legacy_id = self.submit()
+        shadow = self.submit_shadow()
+        self.assertEqual(shadow.get("pipeline"), "shadow", "a shadow repo's submit is held for the shadow tick")
+        first = self.run_all(self.deps)
+        self.assertEqual(len(first["shadow"]["admitted"]), 1, first.get("shadow"))
+        second = self.run_all(self.deps)                     # a restart: a new ledger connection and producer
+        self.assertIn("shadow", second)
+        # NEG-8: the shadow repo is never a legacy item, never launched through deps.review, never settled there
+        self.assertEqual(self.ledger_rows("SELECT id FROM items WHERE lineage LIKE ?", (SHADOW_REPO + "|%",)), [])
+        self.assertEqual([r[0] for r in self.ledger_rows("SELECT id FROM items")], [legacy_id])
+        self.assertEqual(len(self.deps.review_calls), 1, "one authorized launch for the legacy item")
+        self.assertFalse(any(SHADOW_REPO in " ".join(map(str, a)) for a in self.deps.review_calls))
+        items = self.ledger_rows("SELECT repo, pr, head, state FROM work_items")
+        self.assertEqual(items, [(SHADOW_REPO, 9, self.head, "pr-gate")])
+        # no E2 dispatch: no Effect left intent in shadow
+        self.assertEqual(self.ledger_rows("SELECT key FROM operations WHERE state != 'intent'"), [])
+        # NEG-7: zero mutating calls across both ticks, on the legacy and the shadow paths
+        calls = self.all_gh_argv()
+        self.assertTrue(self.gh.calls, "the shadow path read GitHub through the recorded gh")
+        self.assertEqual([a for a in calls if self.S.is_mutating("gh", a)], [])
+
+    def test_neg8_a_repo_with_a_live_legacy_item_stays_legacy(self):
+        legacy_id = self.submit()
+        self.config["shadow_repos"] = [SHADOW_REPO, REPO]
+        ledger = runner.Ledger(self.paths)
+        try:
+            self.assertEqual(self.S.pipeline_of(ledger.db, REPO, self.config), "legacy")
+            self.assertEqual(self.S.pipeline_of(ledger.db, SHADOW_REPO, self.config), "shadow")
+        finally:
+            ledger.close()
+        self.assertTrue(legacy_id)
+
+
+
+class TickIncidentTests(Base):
+    """AC-13: a refused launch or connection raises an incident. The guard collects each refusal in the active
+    policy's `incidents`; the core tick raises every collected one into the outbox (wi_notices, kind incident,
+    through the AC-14 chokepoint) and drains the list, whether or not shadow is on."""
+
+    def test_ac13_the_tick_raises_collected_refusals_as_incidents(self):
+        import ahc_guard  # noqa: PLC0415
+        policy = ahc_guard.Policy.for_test(self.paths.root, {}, repos=[REPO])
+        policy.incidents.extend(["git: -c core.pager refused", "socket.connect refused"])
+        ahc_guard.install(policy)
+        try:
+            self.run_all(Deps())
+        finally:
+            ahc_guard.deactivate()
+        self.assertEqual(policy.incidents, [], "every collected refusal is raised once and drained")
+        ledger = runner.Ledger(self.paths)
+        try:
+            rows = [tuple(r) for r in ledger.db.execute(
+                "SELECT item, kind, text FROM wi_notices WHERE kind='incident' ORDER BY rowid")]
+        finally:
+            ledger.close()
+        self.assertEqual([(i, k) for i, k, _t in rows], [(runner.SYSTEM_ITEM, "incident")] * 2)
+        self.assertIn("core.pager", rows[0][2])
+        self.assertIn("socket.connect", rows[1][2])
+
+
+
+RACE_CHILD = r"""
+import json, os, sqlite3, sys, time
+from pathlib import Path
+import ahc_contracts as C, ahc_w21
+root, rid, me = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+os.environ["AHC_W21_SEND"] = "1"
+db = sqlite3.connect(str(root / "ledger.sqlite3"), isolation_level=None, timeout=30)
+c = C.Contracts(db, C.AuthorityLog(root / "authority.jsonl"), now=lambda: 1000.0, mono=lambda: 1000.0,
+                boot_id="race-boot")
+def gh(args, timeout):
+    with open(str(root / "calls.txt"), "a", encoding="utf-8") as handle:
+        handle.write(me + " " + " ".join(args) + "\n")
+    return 0, "", ""
+s = ahc_w21.Sender(c, gh, lambda args: None, lambda: {"on": False, "epoch": 1, "mono": 1000.0, "shared": True},
+                   lambda repo: True, lambda a, cwd: (1, ""), lambda r, h, b: "/clone")
+while not (root / "go").exists():
+    time.sleep(0.001)
+for _ in range(20):                          # the same record, appended by both processes at once
+    c.authority.append({"event_id": "w21:race", "item": "wi-race", "row": "W21", "repo": "o/r", "pr": 5,
+                        "expected_head_sha": "H", "base": "B", "send_seq": 1, "request_id": rid,
+                        "action": "update-branch"})
+print(json.dumps({"me": me, "sent": s.send(rid)}))
+"""
+
+
+class W21Tests(TC.Base):
+    """AC-7: W21 behind AHC_W21_SEND, one keyed send record, attempted committed before the one call, the kill
+    re-read, cancel only from intent, the read-back rules and the queue head (NEG-16 to NEG-21, NEG-37, NEG-41
+    phases 1 and 2, NEG-42)."""
+
+    admit = StateMachineTests.admit
+    move = StateMachineTests.move
+    pass_reviews = StateMachineTests.pass_reviews
+    eligible = StateMachineTests.eligible
+    pr = StateMachineTests.pr
+    queue_of = StateMachineTests.queue_of
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"AHC_W21_SEND": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        import ahc_w21  # noqa: PLC0415
+        self.W = ahc_w21
+        self.item = self.admit()
+        self.pass_reviews()
+        self.clock.t += 1
+        self.newer = self.admit(pr=6)
+        self.pass_reviews(self.newer)
+        self.gh_calls, self.head_after, self.put_rc = [], TC.H1, 0
+        self.kill = {"on": False, "epoch": 1, "mono": self.clock.t, "shared": True}
+        self.allowed = True
+
+    def behind(self, *items, **policy):
+        items = items or (self.item, self.newer)
+        out = {}
+        for i in items:
+            row = self.c._row("work_items", "id", i["id"])
+            pol = dict(self.eligible(row)["policy"], w21=True)
+            pol.update(policy)
+            out[i["id"]] = self.eligible(row, compare="behind", policy=pol)
+        return out
+
+    def w21_obs(self, item=None, **policy):
+        item = item or self.item
+        return self.pr(pr=item["pr"], queue=self.behind(**policy), mergeable=True, mergeable_state="behind")
+
+    def w21(self, item=None, **policy):
+        item = item or self.item
+        return self.move("W21", item=self.c._row("work_items", "id", item["id"]), obs=self.w21_obs(item, **policy))
+
+    def w21_ok(self):
+        """A W21 the test needs to apply: its refusal is a failure of the test, not an error."""
+        try:
+            return self.w21()
+        except C.ContractError as error:
+            self.fail("W21 was refused: %s" % error)
+
+    def sends(self):
+        return [tuple(r) for r in self.db.execute("SELECT item, state, seq FROM w21_sends ORDER BY created, seq")]
+
+    def fake_gh(self, args, timeout):
+        self.gh_calls.append(list(args))
+        if args[2] == "PUT":
+            row = self.db.execute("SELECT state FROM w21_sends WHERE state IN ('intent', 'attempted')").fetchone()
+            self.at_call = (self.db.in_transaction, row[0] if row else None)
+            return self.put_rc, "", "" if self.put_rc == 0 else "timeout"
+        return 0, json.dumps({"head": {"sha": self.head_after}}), ""
+
+    def sender(self, git=None):
+        return self.W.Sender(self.c, self.fake_gh, lambda args: None, lambda: dict(self.kill),
+                             lambda repo: self.allowed, git or (lambda args, cwd: (1, "")),
+                             lambda repo, head, base: "/clone")
+
+    def puts(self):
+        return [a for a in self.gh_calls if a[2] == "PUT"]
+
+    def test_neg16_with_the_flag_off_w21_is_not_applied_at_all(self):
+        before = len(self.log.records())
+        for value in (None, "0", "", "true", "1 "):
+            env = {k: v for k, v in os.environ.items() if k != "AHC_W21_SEND"}
+            if value is not None:
+                env["AHC_W21_SEND"] = value
+            with self.subTest(value=value), mock.patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(C.ContractError, "AHC_W21_SEND"):
+                    self.w21()
+                self.assertEqual(self.sender().pump()["sent"], [])
+                with self.assertRaisesRegex(C.ContractError, "W23 needs"):
+                    self.move("W23")
+        self.assertEqual((len(self.log.records()), self.sends(), self.gh_calls), (before, [], []))
+        self.assertIsNone(self.c._row("work_items", "id", self.item["id"])["w21_base"])
+        with self.assertRaisesRegex(C.ContractError, "policy w21"):
+            self.w21(w21=False)
+        self.assertEqual(self.w21()["w21_base"], TC.BASE)
+        self.assertEqual(self.sends(), [(self.item["id"], "intent", 1)])
+        line = self.log.records()[-1]
+        self.assertEqual((line["row"], line["action"], line["send_seq"]), ("W21", "update-branch", 1))
+        for value in (None, "0", "", "true", "1 "):
+            env = {k: v for k, v in os.environ.items() if k != "AHC_W21_SEND"}
+            if value is not None:
+                env["AHC_W21_SEND"] = value
+            if self.sends()[-1][1] != "intent":
+                self.db.execute("UPDATE w21_sends SET state='cancelled' WHERE state != 'cancelled'")  # free the slot
+                with self.c.tx():                                   # a fresh intent record, the next seq at B
+                    self.c._w21_record(self.c._row("work_items", "id", self.item["id"]), TC.BASE)
+            with self.subTest(sender_flag=value), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(self.sender().pump()["sent"], [])
+                self.assertEqual(self.sends()[-1][1], "cancelled")
+        self.assertEqual(self.puts(), [])
+
+    def test_ac7_attempted_commits_before_the_one_call_and_a_lost_response_is_never_resent(self):
+        self.w21()
+        self.put_rc = 1                                          # the response is lost
+        self.assertEqual(len(self.sender().pump()["sent"]), 1)
+        self.assertEqual(self.at_call, (False, "attempted"), "the sender acts only on a committed attempted row")
+        for _ in range(3):
+            self.sender().pump()
+            self.sender().reconcile()
+        self.assertEqual(len(self.puts()), 1, "NEG-17: exactly one update-branch call")
+        self.assertEqual(self.sends(), [(self.item["id"], "attempted", 1)], "one unresolved row, never cancelled")
+        self.assertEqual(self.puts()[0], self.W.put_args("o/r", 5, TC.H1))
+        self.clock.t += 5
+        self.db.execute("UPDATE work_items SET state='pr-gate' WHERE id=?", (self.item["id"],))
+        with self.assertRaisesRegex(C.ContractError, "the item has an unresolved or lost send"):    # new B
+            self.move("W21", item=self.c._row("work_items", "id", self.item["id"]),
+                      obs=dict(self.w21_obs(), tip=TC.H2))
+
+    def test_neg42_a_retry_after_a_rolled_back_w21_writes_the_same_line_and_sends_once(self):
+        real = C.crash_before
+        hits = []
+
+        def die_once(name):
+            if name == "contracts.commit" and not hits:
+                hits.append(name)
+                raise SystemExit("crash after the authority line, before the commit")
+            return real(name)
+        with mock.patch.object(C, "crash_before", die_once), self.assertRaises(SystemExit):
+            self.w21()
+        self.db.execute("ROLLBACK")                              # the process died: SQLite rolls the tx back
+        self.assertEqual(self.sends(), [])
+        lines = len(self.log.records())
+        self.clock.t += 1
+        try:
+            self.w21()
+        except Exception as error:  # noqa: BLE001 - any refusal of the retry is the failure under test
+            self.fail("the retry was refused: %s: %s" % (type(error).__name__, error))
+        self.assertEqual(len(self.log.records()), lines, "the log accepts the retry as the same record")
+        self.sender().pump()
+        self.assertEqual(len(self.puts()), 1)
+
+    def test_neg19_and_neg41_a_blocking_control_cancels_the_intent_keeps_the_head_then_refires_once(self):
+        controls = [("kill on", dict(on=True), True, {}), ("stale reading", dict(mono=self.clock.t - 6), True, {}),
+                    ("not shared", dict(shared=False), True, {}), ("policy", {}, False, {}),
+                    ("flag 0", {}, True, {"AHC_W21_SEND": "0"})]
+        for n, (name, kill, allowed, env) in enumerate(controls, start=1):
+            with self.subTest(control=name):
+                self.clock.t += 1
+                self.kill = {"on": False, "epoch": 1, "mono": self.clock.t, "shared": True}
+                self.w21_ok()
+                self.kill.update(kill)
+                self.allowed = allowed
+                with mock.patch.dict(os.environ, env):
+                    out = self.sender().pump()
+                self.assertEqual((out["sent"], self.puts()), ([], []), "the injected gh sees no call")
+                row = self.db.execute("SELECT state, reason, seq FROM w21_sends ORDER BY seq DESC").fetchone()
+                self.assertEqual((row[0], row[2]), ("cancelled", n))
+                self.assertTrue(row[1])
+                self.assertEqual(self.db.execute("SELECT COUNT(*) FROM w21_sends WHERE state IN ('intent', "
+                                                 "'attempted', 'readback-pending')").fetchone()[0], 0, "slot released")
+                with self.assertRaisesRegex(C.ContractError, "head"):          # the first item keeps the head
+                    self.move("W21", item=self.c._row("work_items", "id", self.newer["id"]),
+                              obs=dict(self.w21_obs(self.newer), pr=6))
+                self.allowed = True
+        self.kill = {"on": False, "epoch": 1, "mono": self.clock.t, "shared": True}
+        rids = {r[0] for r in self.db.execute("SELECT request_id FROM w21_sends")}
+        self.w21_ok()                                           # restored: seq 6, a new request id, sent once
+        self.assertEqual(len(self.sender().pump()["sent"]), 1)
+        self.assertEqual(len(self.puts()), 1)
+        new = self.db.execute("SELECT request_id, seq, state FROM w21_sends WHERE state != 'cancelled'").fetchone()
+        self.assertNotIn(new[0], rids)
+        self.assertEqual(new[1:], (len(controls) + 1, "readback-pending"))
+
+    def test_ac7_send_itself_re_reads_the_controls_for_any_caller(self):
+        for name, kill in (("unknown reading", None), ("kill on", {"on": True}), ("stale", {"mono": -10})):
+            with self.subTest(name):
+                self.clock.t += 1
+                self.w21_ok()
+                rid = self.db.execute("SELECT request_id FROM w21_sends WHERE state='intent'").fetchone()[0]
+                reading = None if kill is None else dict({"on": False, "epoch": 1, "mono": self.clock.t,
+                                                          "shared": True}, **kill)
+                sender = self.W.Sender(self.c, self.fake_gh, lambda args: None, lambda: reading, lambda repo: True,
+                                       lambda args, cwd: (1, ""), lambda repo, head, base: "/clone")
+                self.assertEqual(sender.send(rid), "cancelled")
+                self.assertEqual(self.puts(), [], "a direct send call never bypasses the controls")
+
+    def test_ac7_cancel_is_reachable_only_from_intent_and_restart_cancels_intent_only(self):
+        self.w21()
+        rid = self.db.execute("SELECT request_id FROM w21_sends").fetchone()[0]
+        self.sender().reconcile()
+        self.assertEqual(self.c._row("w21_sends", "request_id", rid)["state"], "cancelled", "restart: intent row")
+        self.clock.t += 1
+        self.w21()
+        rid = self.db.execute("SELECT request_id FROM w21_sends WHERE state='intent'").fetchone()[0]
+        self.assertTrue(self.c.w21_attempt(rid))
+        self.assertFalse(self.c.w21_cancel(rid, "flag off"), "an attempted row is never cancelled")
+        self.sender().reconcile()
+        self.assertEqual(self.c._row("w21_sends", "request_id", rid)["state"], "attempted")
+        self.assertEqual(self.puts(), [], "reconciliation never sends")
+
+    def test_neg20_neg21_readback_records_only_ahcs_update_and_the_successor_keeps_the_head(self):
+        g = TO.Repo(Path(self.tmp.name) / "rb")
+        base = g.commit({"a.txt": "a\n"}, "base")
+        head = g.commit({"b.txt": "b\n"}, "pr", parent=base)
+        tip = g.commit({"c.txt": "c\n"}, "main", parent=base)
+        tree = TO.git(g.root, "merge-tree", "--write-tree", head, tip).splitlines()[0]
+        good = TO.git(g.root, "commit-tree", tree, "-p", head, "-p", tip, "-m", "update")
+        evil = TO.git(g.root, "commit-tree", TO.git(g.root, "rev-parse", base + "^{tree}"), "-p", head, "-p", tip,
+                      "-m", "evil")
+        swapped = TO.git(g.root, "commit-tree", tree, "-p", base, "-p", tip, "-m", "parent1 is B, not H")
+        item = self.admit(pr=8, head=head, base=base)
+        self.pass_reviews(item)
+
+        def real_git(args, cwd):
+            rc, out, _err = TO.real_git(args, g.root, 30)
+            return rc, out
+        for name, new, ours in (("evil merge", evil, False), ("parent1 not H", swapped, False), ("ahc's", good, True)):
+            with self.subTest(name):
+                self.db.execute("UPDATE w21_sends SET state='cancelled'")      # earlier cases, kept as audit
+                with self.c.tx():
+                    rid = self.c._w21_record(self.c._row("work_items", "id", item["id"]), tip)
+                self.assertTrue(self.c.w21_attempt(rid))
+                self.head_after = new
+                self.sender(git=real_git).pump()
+                state = self.c._row("w21_sends", "request_id", rid)["state"]
+                self.assertEqual(state, "resolved" if ours else "attempted", name)
+        succ = self.admit(pr=8, head=good, base=tip)
+        self.assertTrue(self.c.w21_successor(succ))
+        q = self.queue_of(self.item, self.newer)
+        self.assertEqual(self.c.queue_head("o/r", q), self.item["id"])
+        self.db.execute("UPDATE work_items SET created=0 WHERE id IN (?, ?)", (item["id"], succ["id"]))
+        self.assertEqual(self.c.queue_head("o/r", q), succ["id"], "NEG-21: the successor in checks keeps the head")
+
+    def test_neg17_two_processes_race_one_intent_row_and_exactly_one_sends(self):
+        """NEG-17, in two real processes on one file ledger: both see the committed intent row and call send at
+        the same moment; the intent->attempted CAS lets exactly one of them make the update-branch call."""
+        root = Path(self.tmp.name) / "race"
+        root.mkdir(mode=0o700)                                  # ahc_fs refuses a log directory that is not 0700
+        db = sqlite3.connect(str(root / "ledger.sqlite3"), isolation_level=None)
+        C.apply_schema(db)
+        db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, version, "
+                   "created, updated) VALUES ('w21-race', 'wi-race', 'o/r', 5, ?, ?, 1, 'w21:race', 'intent', 1, 1, "
+                   "1)", (TC.BASE, TC.H1))
+        db.close()
+        child = root / "child.py"
+        child.write_text(RACE_CHILD)
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(HOOKS), os.environ.get("PYTHONPATH", "")]))
+        procs = [subprocess.Popen([sys.executable, "-B", str(child), str(root), "w21-race", me], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for me in "AB"]
+        time.sleep(0.5)                                         # both children are waiting on the go file
+        (root / "go").write_text("")
+        results = []
+        for p in procs:
+            out, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, err[-800:])
+            results.append(json.loads(out.strip().splitlines()[-1]))
+        puts = [l for l in (root / "calls.txt").read_text().splitlines() if " PUT " in l]
+        self.assertEqual(len(puts), 1, "exactly one update-branch call across both processes")
+        lines = (root / "authority.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 1, "one log line for one record across both processes")
+        self.assertEqual(sorted(str(r["sent"]) for r in results), ["None", "sent"])
+        db = sqlite3.connect(str(root / "ledger.sqlite3"))
+        self.addCleanup(db.close)
+        self.assertEqual(db.execute("SELECT state, version FROM w21_sends").fetchall(), [("readback-pending", 3)])
+
+    def test_ac7_one_unresolved_send_per_repo_by_the_guard_and_by_the_index(self):
+        self.w21()
+        q = self.behind()
+        q[self.item["id"]] = dict(q[self.item["id"]], kill_switch=True)     # the older item no longer heads
+        with self.assertRaisesRegex(C.ContractError, "another item of the repo has an unresolved send"):
+            self.move("W21", item=self.c._row("work_items", "id", self.newer["id"]),
+                      obs=self.pr(pr=6, queue=q, mergeable=True))
+        for state in ("intent", "attempted", "readback-pending"):
+            with self.subTest(state=state), self.assertRaises(sqlite3.IntegrityError):
+                self.db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, "
+                                "version, created, updated) VALUES (?, 'wi-x', 'o/r', 9, ?, ?, 1, ?, ?, 1, 1, 1)",
+                                ("w21-x-" + state, TC.BASE, TC.H2, "w21:x-" + state, state))
+
+    def test_ac7_the_authority_append_holds_an_exclusive_flock(self):
+        import fcntl  # noqa: PLC0415
+        lock_path = str(self.log.path) + ".lock"
+        probes = []
+        real = C.AuthorityLog._append_locked
+
+        def probe(log, record):
+            fd = os.open(lock_path, os.O_WRONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                probes.append("free")
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except BlockingIOError:
+                probes.append("held")
+            finally:
+                os.close(fd)
+            return real(log, record)
+        with mock.patch.object(C.AuthorityLog, "_append_locked", probe):
+            self.w21()
+        self.assertEqual(probes, ["held"], "the read-check-append runs under the exclusive lock")
+
+    def test_neg37_after_a_lost_update_the_next_item_takes_w21_and_the_lost_item_waits_for_w16(self):
+        self.w21()
+        rid = self.db.execute("SELECT request_id FROM w21_sends").fetchone()[0]
+        self.assertTrue(self.c.w21_attempt(rid))
+        self.clock.t += C.Contracts.W23_SECONDS
+        self.assertEqual(self.move("W23")["state"], "waiting-ask")
+        self.assertEqual(self.c._row("w21_sends", "request_id", rid)["state"], "lost")
+        self.kill["mono"] = self.clock.t
+        try:
+            moved = self.move("W21", item=self.c._row("work_items", "id", self.newer["id"]),
+                              obs=dict(self.pr(pr=6, queue=self.behind(self.newer), mergeable=True)))
+        except C.ContractError as error:
+            self.fail("a lost send blocked the next item: %s" % error)
+        self.assertEqual(moved["w21_base"], TC.BASE, "the next item takes W21")
+        item = self.c._row("work_items", "id", self.item["id"])
+        self.c.record_w16_proof("w16-w21", item["id"], "pr-gate", item["version"], "e" * 64)
+        self.move("W16", to="pr-gate", actor="main", proof="w16-w21")
+        self.assertEqual(self.c._row("w21_sends", "request_id", rid)["state"], "resolved", "main's W16 resolves it")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -186,6 +186,8 @@ class NoModelInDaemonTests(_GuardFixture):
 
     def test_neg45_w21_put_needs_the_flag_and_the_armed_expectation(self):
         put = self.gh("api", "--method", "PUT", "repos/o/r/pulls/5/update-branch", "-f", "expected_head_sha=" + A)
+        import ahc_w21  # noqa: PLC0415
+        self.assertEqual(put, self.gh(*ahc_w21.put_args("o/r", 5, A)), "the sender's PUT is the guard's one form")
         with mock.patch.dict(os.environ, {"AHC_W21_SEND": "0"}):
             self.policy.arm_w21(put)
             self.refuse_argv("gh", put, name="gh")
@@ -381,6 +383,40 @@ class LegacyProductionPathTests(_GuardFixture):
         line = (self.marks / "git").read_text()
         self.assertTrue(line.startswith(" ".join(ahc_clone.SAFE)), line)
         self.assertIn("-C %s log --format=%%H%%x09%%s %s" % (clone, RANGE), line)
+
+    def test_helper_sha_binds_to_the_release_list_not_the_file_at_start(self):
+        """Owner ruling (e): the helper's expected sha256 is the release list's. A helper whose file differs from its
+        release entry is refused even when it has not changed since the daemon started; a helper with no entry, or
+        an unreadable list, binds nothing."""
+        import hashlib  # noqa: PLC0415
+        py, env = self.policy.python, dict(self.policy.helper_env)
+        good = hashlib.sha256(self.helper.read_bytes()).hexdigest()
+        stubs = {n: p for n, p in self.policy.exe.items()}
+        for name, release in (("other sha", {"ah": "0" * 64}), ("no entry", {}), ("malformed", {"ah": "x"})):
+            with self.subTest(name):
+                p = guard.Policy.for_test(self.root, stubs, repos=["o/r"], trusted_dirs=(str(self.stubs),),
+                                          helpers={"ah": str(self.helper)}, release=release)
+                with self.assertRaises(guard.LaunchRefused):
+                    p.check_launch(py, [py, str(self.helper), "ticket", "comment"], str(self.root), env)
+        p = guard.Policy.for_test(self.root, stubs, repos=["o/r"], trusted_dirs=(str(self.stubs),),
+                                  helpers={"ah": str(self.helper)}, release={"ah": good})
+        self.assertEqual(p.check_launch(py, [py, str(self.helper), "ticket", "comment"], str(self.root), env), "ah")
+        missing = Path(self.root) / "no-release.json"
+        self.assertEqual(guard.release_helpers(missing), {})
+
+    def test_the_shipped_release_list_binds_each_helper_to_its_repo_file(self):
+        import hashlib  # noqa: PLC0415
+        bound = guard.release_helpers()
+        self.assertEqual(set(bound), set(guard.HELPER_SCRIPTS))
+        for name, script in guard.HELPER_SCRIPTS.items():
+            self.assertEqual(bound[name], hashlib.sha256((HOOKS / script).read_bytes()).hexdigest(), name)
+        import importlib.util  # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location("ahc_release_hashes",
+                                                      str(HOOKS.parents[1] / "scripts" / "ahc_release_hashes.py"))
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        self.assertEqual(script.helpers(), bound, "the generator writes the same helpers section")
+        self.assertEqual(script.main([]), 0, "the shipped list is current")
 
     def test_legacy_helper_from_config_must_be_the_installed_one(self):
         other = self.helper.parent / "other.py"

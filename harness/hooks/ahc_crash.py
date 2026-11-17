@@ -94,6 +94,22 @@ def _seam(name, when):
         os._exit(CRASH_EXIT)
 
 
+# AC-4 (goodqa#16049 slice 1 (b)): named crash points. Unlike a seam, each is one point between two steps of a tick
+# (not around one durable write), driven by its own tick scenario whose restart invariants the test states.
+POINTS = (
+    "tick.observed",           # ShadowTick: after the producer stamped and persisted an observation, before any move
+    "w21.before_send",         # ahc_w21.Sender: after attempted commits, before the update-branch call (AC-7)
+    "w21.after_send",          # ahc_w21.Sender: after the call, before the read-back record (AC-7)
+)
+
+
+def crash_at(name):
+    """A named crash point (POINTS); a name outside the registry is a programming error."""
+    if name not in POINTS:
+        raise ValueError("unregistered crash point %r" % name)
+    _seam(name, "at")
+
+
 def crash_before(name):
     _seam(name, "before")
 
@@ -282,8 +298,10 @@ _MIG = "exempt:a MIGRATIONS step, run only inside Ledger._schema's transaction; 
 INVENTORY = {
     # PR 258 v3: every write under the root goes through ahc_fs (dir-fd, O_NOFOLLOW, O_EXCL temp, rename by fd),
     # so a site is one fs.<op> call; its temp write, fsync and rename happen inside that call, before it returns.
-    ("ahc_contracts", "AuthorityLog.append", "fs.append_file"): (1, "seam:contracts.authority"),
+    ("ahc_contracts", "AuthorityLog._append_locked", "fs.append_file"): (1, "seam:contracts.authority"),
     ("ahc_contracts", "AuthorityLog.append", "os.makedirs"): (1, _DIR),
+    ("ahc_contracts", "AuthorityLog._open_lock", "fs.open_file"): (2, "exempt:the empty flock file beside the log (AC-7); "
+                                                                 "no state, created once and never written"),
     ("ahc_contracts", "Contracts.tx", "sql:COMMIT"): (1, "seam:contracts.commit"),
     ("ahc_contracts", "apply_schema", "sql:DYNAMIC"): (
         1, "exempt:idempotent DDL (CREATE ... IF NOT EXISTS, INSERT OR IGNORE), re-run at every open; no data"),
