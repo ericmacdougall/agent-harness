@@ -5111,7 +5111,7 @@ class MigrationV5Tests(Base):
         want = sorted([str(self.home / ".config" / "systemd" / "user" / "ahc-core.service"),
                        str(self.home / ".config" / "systemd" / "user" / "ahc-review.service"),
                        str(self.home / ".local" / "bin" / "ahc")])
-        self.assertEqual(record["files"], want)
+        self.assertEqual(record.get("files"), want, "install records the launch files it wrote")
         self.assertEqual(sorted(inst.installed_files(self.home)), want)
 
     def test_r247_f5_an_altered_or_missing_launch_file_refuses_the_migration(self):
