@@ -62,3 +62,10 @@ venv/**
 __pycache__/**
 .gradle/**
 .cache/**
+# goodqa#16123: names Dropbox refuses outright (rclone backend/dropbox rule, matched case-insensitively). rclone reports
+# each as a hard error, so none may ever be offered. Mac litter and sync-client files, never logs.
+.DS_Store
+desktop.ini
+thumbs.db
+.dropbox
+.dropbox.attr

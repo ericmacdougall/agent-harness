@@ -101,6 +101,46 @@ if argv and argv[0] == "copy":
         open(counter, "w").write(str(spent))
         sys.exit(0)
     real = os.environ.get("FAKE_DELEGATE")
+    if real and os.environ.get("FAKE_DISALLOW"):
+        # A Dropbox-like remote (rclone's own rule in backend/dropbox): these names are refused one by one, the copy
+        # carries on for the rest and exits 1 with "Failed to copy: file name ... is disallowed - not uploading".
+        import re, subprocess
+        rx = re.compile(r"(?i)(^|/)(desktop\\.ini|thumbs\\.db|\\.ds_store|icon\\r|\\.dropbox|\\.dropbox.attr)$")
+        sep = argv.index("--")
+        src, dst = argv[sep + 1:]
+        if "--files-from-raw" in argv:
+            mode = "chunk"
+            offered = [l for l in open(argv[argv.index("--files-from-raw") + 1]).read().splitlines() if l]
+        else:
+            mode = "plain"
+            filt = []
+            for i, a in enumerate(argv[:sep]):
+                if a in ("--exclude-from", "--min-age", "--max-size"):
+                    filt += [a, argv[i + 1]]
+                elif a == "--ignore-case":
+                    filt.append(a)
+            out = subprocess.run([real, "lsf", "-R", "--files-only"] + filt + ["--", src], capture_output=True, text=True)
+            offered = [l for l in out.stdout.splitlines() if l]
+        with open(os.environ["FAKE_LOG"] + ".offered", "a") as h:
+            for name in offered:
+                h.write(mode + "\\t" + name + "\\n")
+        bad = [n for n in offered if rx.search(n)]
+        rc = subprocess.run([real] + argv).returncode
+        for n in bad:
+            gone = os.path.join(dst, n)
+            if os.path.exists(gone):
+                os.unlink(gone)
+        extra = os.environ.get("FAKE_DISALLOW_PLUS")
+        if (bad or extra) and rc == 0 and "--log-file" in argv:
+            with open(argv[argv.index("--log-file") + 1], "a") as h:
+                for n in bad:
+                    h.write('2026/11/15 11:03:06 ERROR : %%s: Failed to copy: file name "%%s" is disallowed - not uploading\\n' %% (n, os.path.basename(n)))
+                if extra:
+                    h.write("2026/11/15 11:03:06 ERROR : %%s: Failed to copy: %%s\\n" %% (extra, os.environ.get("FAKE_DISALLOW_PLUS_WHY", "read: input/output error")))
+                h.write("2026/11/15 11:03:06 ERROR : Can't retry any of the errors - not attempting retries\\n")
+                h.write("2026/11/15 11:03:07 NOTICE: Failed to copy with %%d errors: last error was: file name \\".DS_Store\\" is disallowed - not uploading\\n" %% (len(bad) + (1 if extra else 0)))
+            rc = 1
+        sys.exit(rc)
     if real:
         os.execv(real, [real] + argv)
 sys.exit(0)
@@ -596,6 +636,173 @@ class Locking(Case):
             self.assertEqual(proc.returncode, 0)
         primaries = [c for c in self.copies() if c[-2].endswith(".claude/projects")]
         self.assertEqual(len(primaries), 1)
+
+
+REFUSED = {".ds_store", "desktop.ini", "thumbs.db", ".dropbox", ".dropbox.attr"}
+DS_PATHS = [".DS_Store", "a/.DS_Store", "a/b/c/.DS_Store", "t1/.DS_Store", "t1/deep/er/.DS_Store", "p1/sub/.DS_Store"]
+EXTRA_REFUSED = ["desktop.ini", "Thumbs.db", ".dropbox", ".dropbox.attr", "sub/DESKTOP.INI"]
+
+
+class DisallowedNames(Case):
+    """goodqa#16123: Dropbox refuses a few file names outright (rclone's backend/dropbox rule) and rclone reports each as
+    a hard error, so one .DS_Store in the work tree failed every copy for two days. The script must not offer those
+    names, must carry on when the remote still refuses one, and must keep failing on anything else."""
+
+    def setUp(self):
+        super().setUp()
+        if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
+            self.skipTest("rclone not installed (the local remote and listings use it)")
+
+    def plant(self):
+        for source in SOURCES:
+            for name in DS_PATHS + EXTRA_REFUSED:
+                self.put(f"{source}/{name}", b"mac litter\n")
+
+    def run_refusing(self, **extra):
+        return self.local_run(FAKE_DISALLOW="1", **extra)
+
+    def offered(self, mode):
+        path = Path(str(self.calls) + ".offered")
+        rows = [l.split("\t", 1) for l in path.read_text().splitlines()] if path.exists() else []
+        return [name for m, name in rows if m == mode]
+
+    def excludes_without_names(self):
+        keep = [l for l in (SCRIPT.parent / "log-backup.excludes").read_text().splitlines() if l.strip().lower() not in REFUSED]
+        path = self.tmp / "no-names.excludes"
+        path.write_text("\n".join(keep) + "\n")
+        return path
+
+    def log_tail(self):
+        return (self.logs / "log-backup.log").read_text()[-3000:]
+
+    def test_the_repo_exclude_file_names_every_name_the_remote_refuses(self):
+        lines = {l.strip().lower() for l in (SCRIPT.parent / "log-backup.excludes").read_text().splitlines()}
+        self.assertTrue(REFUSED <= lines, REFUSED - lines)
+
+    def test_a_tree_with_refused_names_at_several_depths_backs_up_cleanly_through_both_copy_paths(self):
+        self.plant()
+        done = self.run_refusing()
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + self.log_tail())
+        self.assertTrue(self.last_ok().exists())
+        self.assertTrue(self.bulk_ok().exists())
+        files = self.remote_files()
+        for rel in ORDINARY:
+            self.assertIn(rel, files)
+        self.assertFalse([f for f in files if f.lower().rsplit("/", 1)[-1] in REFUSED])
+        plain, chunk = self.offered("plain"), self.offered("chunk")
+        self.assertTrue(plain, "the plain copy path ran")
+        self.assertTrue(chunk, "the files-from path ran")
+        self.assertFalse([n for n in plain + chunk if n.lower().rsplit("/", 1)[-1] in REFUSED], plain + chunk)
+
+    def test_a_stale_checkpoint_list_that_still_names_a_refused_file_is_filtered_before_the_copy(self):
+        """The Mac's pass was listed before the exclude was edited; its pending list kept the file. Here the exclude
+        list lacks the names (as the old list did), so the listing carries them; the chunk sent must not."""
+        self.plant()
+        done = self.run_refusing(LOG_BACKUP_EXCLUDES=str(self.excludes_without_names()))
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + self.log_tail())
+        self.assertTrue(self.bulk_ok().exists())
+        chunk = self.offered("chunk")
+        self.assertIn("t1/notes.md", chunk)
+        self.assertFalse([n for n in chunk if n.lower().rsplit("/", 1)[-1] in REFUSED], chunk)
+
+    def test_a_refusal_that_still_reaches_the_remote_is_counted_and_does_not_fail_the_run(self):
+        self.plant()
+        done = self.run_refusing(LOG_BACKUP_EXCLUDES=str(self.excludes_without_names()))
+        self.assertEqual(done.returncode, 0, done.stderr.decode() + self.log_tail())
+        self.assertTrue(self.last_ok().exists())
+        self.assertTrue([n for n in self.offered("plain") if n.lower().rsplit("/", 1)[-1] in REFUSED],
+                        "the stub really offered refused names on the plain path")
+        self.assertIn("refused by the remote by name", (self.logs / "log-backup.log").read_text())
+        self.assertRegex((self.logs / "log-backup.refused").read_text(), r"refused=[1-9]")
+
+    def test_a_genuinely_failing_file_beside_a_refused_name_still_fails_the_run(self):
+        self.plant()
+        done = self.run_refusing(LOG_BACKUP_EXCLUDES=str(self.excludes_without_names()), FAKE_DISALLOW_PLUS="p1/a.jsonl",
+                                 LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+        self.assertIn("copy failed after", (self.logs / "log-backup.log").read_text())
+
+    def test_a_rate_limit_error_beside_a_refused_name_still_fails_the_run(self):
+        self.plant()
+        done = self.run_refusing(LOG_BACKUP_EXCLUDES=str(self.excludes_without_names()), FAKE_DISALLOW_PLUS="x",
+                                 FAKE_DISALLOW_PLUS_WHY="too_many_write_operations/", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+
+    def test_a_failure_with_no_refused_name_in_the_log_still_fails_the_run(self):
+        done = self.run_script(FAKE_FAIL_FIRST="1000", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.last_ok().exists())
+
+
+FAULTY_GREP = """#!%(python)s
+import os, subprocess, sys, signal
+args = sys.argv[1:]
+mode = os.environ.get("GREP_FAULT", "")
+if mode and "-Eiv" in args and any(a.endswith("chunk.paths") for a in args):
+    out = subprocess.run(["/usr/bin/grep"] + args, capture_output=True).stdout.splitlines(True)
+    sys.stdout.buffer.write(b"".join(out[:1]))   # a short list on stdout, whatever the status
+    sys.stdout.flush()
+    if mode == "exit2":
+        sys.exit(2)
+    if mode == "interrupted":
+        os.kill(os.getpid(), signal.SIGKILL)
+    if mode == "short-exit0":
+        sys.exit(0)
+os.execv("/usr/bin/grep", ["grep"] + args)
+"""
+
+
+class ChunkFilterFailure(Case):
+    """PR #259 review (High): a chunk filter that fails or is cut short must never send a short list, replace the chunk,
+    or move the cursor; the files it dropped would later count as backed up."""
+
+    def setUp(self):
+        super().setUp()
+        if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
+            self.skipTest("rclone not installed")
+        self.names = [f".agent-harness/work/w{i}/f{i}.md" for i in range(9)]
+        for i, rel in enumerate(self.names):
+            self.put(rel, b"ordinary %d\n" % i)
+        fakebin = self.tmp / "fakebin"
+        fakebin.mkdir()
+        grep = fakebin / "grep"
+        grep.write_text(FAULTY_GREP % {"python": sys.executable})
+        grep.chmod(0o755)
+        self.path = f"{fakebin}:/usr/bin:/bin"
+
+    def work_remote(self):
+        return {f for f in self.remote_files() if f.startswith(".agent-harness/work/")}
+
+    def cursor(self):
+        path = self.logs / "log-backup.bulk.d" / ".agent-harness_work" / "cursor"
+        return path.read_text().strip() if path.exists() else None
+
+    def faulty_then_good(self, mode):
+        bad = self.local_run(PATH=self.path, GREP_FAULT=mode, LOG_BACKUP_BULK_CHUNK="3")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertFalse(self.bulk_ok().exists())
+        self.assertIn(self.cursor(), (None, "0"), "the cursor must not move past a chunk that was not sent")
+        self.assertEqual(self.work_remote(), set(), "nothing from the faulted chunk may have been uploaded")
+        self.assertIn("cannot filter the .agent-harness/work chunk", (self.logs / "log-backup.log").read_text())
+        good = self.local_run(PATH=self.path, LOG_BACKUP_BULK_CHUNK="3")   # same PATH, no fault
+        self.assertEqual(good.returncode, 0, good.stderr.decode())
+        self.assertTrue(set(self.names) <= self.work_remote(), set(self.names) - self.work_remote())
+        self.assertTrue(self.bulk_ok().exists())
+
+    def test_a_filter_that_prints_part_of_the_list_and_exits_2_sends_nothing_and_loses_nothing(self):
+        self.faulty_then_good("exit2")
+
+    def test_a_filter_that_is_interrupted_sends_nothing_and_loses_nothing(self):
+        self.faulty_then_good("interrupted")
+
+    def test_a_filter_that_exits_0_with_a_short_list_is_caught_by_the_counts(self):
+        self.faulty_then_good("short-exit0")
 
 
 class BulkResume(Case):

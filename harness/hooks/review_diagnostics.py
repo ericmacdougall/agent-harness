@@ -79,6 +79,8 @@ CONTRACT = {
                             ['Reconcile the unknown run in the usage store before any retry.']),
     'PROVIDER_INVALID_OUTPUT': ('INVALID_OUTPUT', 'The provider produced no valid stage verdict.',
                                 ['Inspect the excerpt below; a rerun needs a changed packet or a declared repeat reason.']),
+    'PROVIDER_OUTPUT_TOO_LARGE': ('OUTPUT_TOO_LARGE', 'The provider output passed its size bound (16 MiB raw stream, or 1 MB of verdict-bearing text; Codex command output is exempt from the 1 MB bound).',
+                                  ['Inspect the saved raw answer; a runaway reviewer or an oversized answer needs a changed packet or a declared repeat reason, not an unchanged rerun.']),
     'FALLBACK_NO_RESULT': ('INVALID_OUTPUT', 'The independent fallback produced no valid result and no more providers remain.',
                            ['Check the exit code and excerpt below, fix the cause, and rerun once with --repeat-reason.']),
     'SNAPSHOT_TIMEOUT': ('TRANSIENT_INFRA', 'Preparing the review snapshot exceeded its deadline.',
@@ -102,6 +104,12 @@ CONTRACT = {
                          ['Review the submodule repositories separately; the packet must list their commits.']),
     'SNAPSHOT_SOURCE_CHANGED': ('TRANSIENT_INFRA', 'The source checkout changed during the review.',
                                 ['Commit or stash changes, keep the worktree untouched while reviewing, rerun.']),
+    'WORKTREE_SCAN_LIMIT': ('TRANSIENT_INFRA', 'The bounded worktree metadata scan or Git listing used up its time, entry or depth budget before finishing. It is not evidence of a special file.',
+                            ['Rerun once when the host is less loaded, or run the review from a full clone on the fleet (T2).',
+                             'Trees over 250000 entries or 64 directory levels are unsupported; the budget is 5 seconds plus 0.5 ms per tracked entry.']),
+    'WORKTREE_SPECIAL_ENTRY': ('TRANSIENT_INFRA', 'The worktree holds a FIFO, socket or device file (or, in a review snapshot, a filesystem symlink) that Git status does not show.',
+                               ['Find it with `find <repo> -path <repo>/.git -prune -o ! -type f ! -type d -print` and remove it, then rerun.',
+                                'A committed symlink is checked out as a plain file in the snapshot; a real one there means something rewrote the snapshot.']),
     'PYTHON_UNSUPPORTED': ('TRANSIENT_INFRA', 'The Python interpreter is older than 3.9.',
                            ['Run with python3.9 or newer, for example `python3.12 ~/.claude/hooks/peer_review.py ...`.']),
     'ISOLATION_FAILED': ('UNKNOWN', 'Review isolation failed for a reason without a specific code.',
@@ -438,6 +446,8 @@ def classify_isolation_error(error):
         (r"hidden or unsupported (?:entry )?flags? \('S'\)", 'SNAPSHOT_SPARSE_INDEX'),
         (r'hidden or unsupported (?:entry )?flags?', 'SNAPSHOT_HIDDEN_INDEX_FLAG'),
         (r'differ only by case', 'SNAPSHOT_CASE_COLLISION'),
+        (r'metadata scan exceeded limits|Git (?:index )?listing exceeded', 'WORKTREE_SCAN_LIMIT'),
+        (r'metadata scan refused a special file', 'WORKTREE_SPECIAL_ENTRY'),
         (r'gitlinks', 'SNAPSHOT_GITLINK'),
         (r'source changed|worktree changed during|HEAD or worktree changed', 'SNAPSHOT_SOURCE_CHANGED'),
         (r'isolated Git operation failed', 'SNAPSHOT_GIT_FAILED'),
@@ -451,7 +461,8 @@ def classify_isolation_error(error):
 
 
 PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHAUSTED': 'BUDGET_EXHAUSTED', 'QUOTA': 'PROVIDER_USAGE_LIMIT', 'AUTH': 'PROVIDER_AUTH', 'TIMEOUT': 'PROVIDER_TIMEOUT',
-                         'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT'}
+                         'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT',
+                         'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE'}
 
 
 def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, launch_state=None, local_detail=''):

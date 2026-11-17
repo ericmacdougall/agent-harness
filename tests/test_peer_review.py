@@ -1703,3 +1703,500 @@ else:
         self.assertIn('Reviewer-Rung: R1\n', report)
         argv = json.loads(self.argv_file.read_text())
         self.assertIn('model_reasoning_effort=medium', argv)
+
+
+class ProviderOutputBoundTests(unittest.TestCase):
+    """goodqa#16170: Codex `exec --json` stdout carries each probe's full command output, so a valid review can exceed
+    the 1 MB verdict-bearing bound. Command output must not count against it, while a runaway stream still fails
+    closed with its own reason (OUTPUT_TOO_LARGE) and capture memory stays bounded. Sizes are literal so a failure on
+    the unfixed code is the assertion itself, never a missing constant."""
+    MB = 1_000_000
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    @staticmethod
+    def stream(command_output, final, *, commands=1, output_field='aggregated_output'):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'}]
+        for index in range(commands):
+            item = {'id': 'c%d' % index, 'type': 'command_execution', 'command': 'bash -lc probe', 'status': 'in_progress'}
+            records.append({'type': 'item.started', 'item': {**item, output_field: ''}})
+            records.append({'type': 'item.completed',
+                            'item': {**item, output_field: command_output, 'exit_code': 0, 'status': 'completed'}})
+        records.append({'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': final}})
+        records.append({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}})
+        return '\n'.join(json.dumps(record) for record in records) + '\n'
+
+    def normalize(self, stdout, last_message, stderr=''):
+        return self.module.normalize_provider('codex', 0, stdout, stderr, last_message, 'pr')
+
+    def test_block_review_with_large_command_output_is_check_failed(self):
+        final = 'VERDICT: BLOCK\n\nF1 (material): the probe reproduced the defect.'
+        stdout = self.stream('x' * (3 * self.MB // 2), final)
+        self.assertGreater(len(stdout), 1_500_000)
+        result = self.normalize(stdout, final)
+        self.assertEqual((result['result'], result['reason']), ('CHECK_FAILED', 'CODE_FINDINGS'))
+        self.assertEqual(result['report'], final)
+
+    def test_pass_review_with_large_command_output_is_check_ok(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        result = self.normalize(self.stream('line of probe output\n' * 75_000, final), final)
+        self.assertEqual((result['result'], result['reason']), ('CHECK_OK', 'NONE'))
+
+    def test_many_probes_totalling_several_megabytes_are_exempt(self):
+        final = 'VERDICT: BLOCK\n\nF1: see probe.'
+        result = self.normalize(self.stream('y' * 300_000, final, commands=12), final)
+        self.assertEqual(result['result'], 'CHECK_FAILED')
+
+    def test_stream_above_raw_ceiling_fails_with_output_too_large(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        stdout = self.stream('z' * (17 * 2 ** 20), final)  # above the 16 MiB raw ceiling
+        result = self.normalize(stdout, final)
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertFalse(result['fallback_allowed'])
+
+    def test_oversize_agent_message_stays_bounded(self):
+        final = 'VERDICT: PASS\n\n' + 'padding ' * 200_000  # 1.6 MB of verdict-bearing text
+        result = self.normalize(self.stream('ok', final), final)
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertEqual(result['report'], '')
+
+    def test_oversize_stderr_or_last_message_still_counts(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        stdout = self.stream('ok', final)
+        self.assertEqual(self.normalize(stdout, final, stderr='e' * (self.MB + 1))['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_only_string_command_execution_output_is_exempt(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        # The same bulk under any other field, or a non-string aggregated_output, still counts.
+        for stdout in (self.stream('x' * (3 * self.MB // 2), final, output_field='output'),
+                       self.stream(['x' * (3 * self.MB // 2)], final)):
+            with self.subTest():
+                self.assertEqual(self.normalize(stdout, final)['reason'], 'OUTPUT_TOO_LARGE')
+        bulk = json.dumps({'type': 'item.completed', 'item': {'id': 'r', 'type': 'reasoning',
+                                                               'text': 'r' * (3 * self.MB // 2)}})
+        stdout = self.stream('ok', final).replace('{"type": "turn.completed"', bulk + '\n{"type": "turn.completed"')
+        self.assertEqual(self.normalize(stdout, final)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_verdict_inside_command_output_never_counts(self):
+        stdout = self.stream('VERDICT: PASS\n' + 'p' * (3 * self.MB // 2), 'I could not finish the review.')
+        result = self.normalize(stdout, 'I could not finish the review.')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+
+    def test_last_message_must_still_equal_final_agent_message(self):
+        stdout = self.stream('x' * (3 * self.MB // 2), 'VERDICT: BLOCK\n\nF1.')
+        result = self.normalize(stdout, 'VERDICT: PASS\n\nNo findings.')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+
+    def test_unknown_record_type_still_rejected_with_large_output(self):
+        stdout = self.stream('x' * (3 * self.MB // 2), 'VERDICT: PASS\n\nok').replace(
+            '"type": "turn.started"', '"type": "turn.mystery"')
+        self.assertEqual(self.normalize(stdout, 'VERDICT: PASS\n\nok')['reason'], 'INVALID_OUTPUT')
+
+    def test_claude_result_is_still_bounded(self):
+        record = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'result': 'VERDICT: PASS\n\n' + 'q' * (3 * self.MB // 2)}
+        result = self.module.normalize_provider('claude', 0, json.dumps(record), '', '', 'pr')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+
+    def test_runaway_provider_is_killed_at_the_capture_ceiling(self):
+        """A child that writes forever is stopped once capture passes the raw ceiling (patched small here), instead
+        of being buffered until its deadline; the outcome is OUTPUT_TOO_LARGE and the child is reaped."""
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / 'pid'
+            child = ('import os, sys\nopen(sys.argv[1], "w").write(str(os.getpid()))\nsys.stdin.read()\n'
+                     'import time\nchunk = b"{" + b"w" * 65535\nwhile True:\n    sys.stdout.buffer.write(chunk)\n'
+                     '    time.sleep(0.002)\n')  # throttled (~32 MB/s) so unbounded capture stays small if broken
+            with patch.object(self.module, 'PROVIDER_RAW_LIMIT', 4 * 2 ** 20, create=True):
+                started = time.monotonic()
+                code, stdout, stderr = self.module.run([sys.executable, '-c', child, str(pid_file)],
+                                                       'prompt ' * 50_000, Path(temp), timeout=8)
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 6, 'the runaway child was not stopped at the capture ceiling')
+            self.assertLessEqual(len(stdout), 4 * 2 ** 20 + 65536)
+            result = self.module.normalize_provider('codex', code, stdout, stderr, '', 'pr')
+            self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+            pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_escaped_descendant_holding_stdin_cannot_hang_cleanup(self):
+        """A child floods stdout and never reads its large prompt, while a descendant in its own session keeps the stdin
+        and stdout pipes open. Stopping at the ceiling must still return within the cleanup bound (the stdin feeder
+        must not be blocked forever on a pipe nobody reads)."""
+        import threading
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / 'grandchild'
+            child = ('import subprocess, sys, time\n'
+                     'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)\n'
+                     'open(sys.argv[1], "w").write(str(g.pid))\n'
+                     'chunk = b"{" + b"w" * 65535\nwhile True:\n    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+            outcome = []
+
+            def call():
+                outcome.append(self.module.run([sys.executable, '-c', child, str(pid_file)], 'prompt ' * 60_000,
+                                               Path(temp), timeout=30))
+
+            def reap_grandchild():
+                try:
+                    os.kill(int(pid_file.read_text()), 9)
+                except (OSError, ValueError):
+                    pass
+            self.addCleanup(reap_grandchild)
+            with patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True):
+                worker = threading.Thread(target=call, daemon=True)
+                started = time.monotonic()
+                worker.start()
+                worker.join(25)
+                hung = worker.is_alive()
+                elapsed = time.monotonic() - started
+                reap_grandchild()
+                worker.join(10)
+            self.assertFalse(hung, 'provider cleanup hung on the stdin pipe held by an escaped descendant')
+            self.assertLess(elapsed, 20)
+            code, stdout, stderr = outcome[0]
+            self.assertEqual((code, stderr), (126, 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'))
+
+    def test_ordinary_provider_capture_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = 'import sys\ndata = sys.stdin.read()\nprint(len(data))\nprint("note", file=sys.stderr)\n'
+            code, stdout, stderr = self.module.run([sys.executable, '-c', child], 'é' * 300_000, Path(temp), timeout=20)
+        self.assertEqual((code, stdout, stderr), (0, '300000\n', 'note\n'))
+
+    def test_new_reason_is_accepted_by_the_usage_store_and_diagnostics(self):
+        import usage_guard
+        self.assertIn('OUTPUT_TOO_LARGE', usage_guard.REASONS)
+        diag = review_diagnostics.provider_attempt('codex', {'path': '/x/codex'}, 0, 'out', '',
+                                                   {'reason': 'OUTPUT_TOO_LARGE'})
+        self.assertEqual(diag['code'], 'PROVIDER_OUTPUT_TOO_LARGE')
+
+
+class ProviderOutputBoundDeltaTests(unittest.TestCase):
+    """Review harness-pr266-v1 (goodqa#16170): F1 a stop that cannot be confirmed is UNKNOWN and keeps the pool,
+    F2 the TERM grace period is kept after the child closes its pipes, F3 parse memory is bounded by record count,
+    record size and JSON node count, not only by raw bytes."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    FLOOD = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n'
+             '    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+
+    def test_f1_unconfirmed_stop_is_unknown_and_keeps_the_pool(self):
+        import types
+        spawned = []
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=spawned.append)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        options = {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                   'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                   'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+        # Survives its pipes closing (EPIPE), like a child stuck in uninterruptible cleanup.
+        flood = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n    try:\n'
+                 '        sys.stdout.buffer.write(chunk)\n        time.sleep(0.002)\n'
+                 '    except (OSError, ValueError):\n        time.sleep(0.05)\n')
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', flood], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture), \
+                    patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True), \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(store.release_pool.called, 'a child that may be alive must keep its pool reservation')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    def test_f2_term_grace_is_kept_after_the_child_closes_its_pipes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / 'cleaned-up'
+            child = ('import os, signal, sys, time\n'
+                     'def on_term(signum, frame):\n'
+                     '    os.close(1)\n    os.close(2)\n    time.sleep(0.4)\n'
+                     '    open(sys.argv[1], "w").write("done")\n    os._exit(0)\n'
+                     'signal.signal(signal.SIGTERM, on_term)\n' + self.FLOOD)
+            with self.assertRaises(self.process.OutputLimitExceeded):
+                self.process.run([sys.executable, '-c', child, str(marker)], input='', timeout=20,
+                                 output_limit=2 ** 20)
+            self.assertTrue(marker.exists(), 'the TERM handler was killed before it finished its cleanup')
+
+    def normalize(self, stdout):
+        return self.module.normalize_provider('codex', 0, stdout, '', 'VERDICT: PASS\n\nok', 'pr')
+
+    def test_f3_many_tiny_records_fail_fast_with_bounded_memory(self):
+        import tracemalloc
+        stdout = '{}\n' * 2_000_000  # 6 MB, far below the raw ceiling
+        tracemalloc.start()
+        try:
+            result = self.normalize(stdout)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertLess(peak, 64 * 2 ** 20, 'parsing retained %d bytes for 6 MB of tiny records' % peak)
+
+    def test_f3_many_tiny_objects_in_one_document_fail(self):
+        for stdout in ('[' + ','.join(['{}'] * 1_000_000) + ']',
+                       json.dumps({'type': 'item.completed',
+                                   'item': {'type': 'command_execution', 'aggregated_output': 'x',
+                                            'junk': [{}] * 200_000}}) + '\n'):
+            with self.subTest(size=len(stdout)):
+                self.assertEqual(self.normalize(stdout)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_f3_one_huge_record_above_the_record_cap_fails(self):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'id': 'c', 'type': 'command_execution', 'command': 'probe',
+                                                       'aggregated_output': 'h' * (9 * 2 ** 20)}},
+                   {'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': 'VERDICT: PASS\n\nok'}},
+                   {'type': 'turn.completed'}]
+        stdout = '\n'.join(json.dumps(record) for record in records)  # one 9 MiB line, under the 16 MiB ceiling
+        self.assertEqual(self.normalize(stdout)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_f3_verdict_bound_stops_parsing_early(self):
+        """Once the verdict-bearing bound is passed, later records are not parsed."""
+        bulk = json.dumps({'type': 'item.completed', 'item': {'id': 'r', 'type': 'reasoning', 'text': 'r' * 600_000}})
+        stdout = bulk + '\n' + bulk + '\n' + '{"type": "turn.completed"}\n' * 3
+        calls = []
+        real = json.loads
+
+        def counting(text, *args, **kwargs):
+            calls.append(len(text))
+            return real(text, *args, **kwargs)
+        with patch.object(self.module.json, 'loads', side_effect=counting):
+            result = self.normalize(stdout)
+        self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
+        self.assertLessEqual(len([size for size in calls if size < 100]), 0, 'records after the bound were parsed')
+
+
+class ProviderOutputBoundDelta2Tests(unittest.TestCase):
+    """Review harness-pr266-v2 (goodqa#16170): F1 the node count must use constant auxiliary memory and reject an
+    oversized line before decoding it; F2/F3 any cleanup that cannot prove the process group is gone is UNKNOWN, so
+    the provider pool stays reserved."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta2_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    FINAL = 'VERDICT: PASS\n\nok'
+
+    def stream(self, command):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'id': 'c', 'type': 'command_execution', 'command': 'probe',
+                                                       'aggregated_output': command}},
+                   {'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': self.FINAL}},
+                   {'type': 'turn.completed'}]
+        return '\n'.join(json.dumps(record) for record in records)
+
+    def test_f1_escape_heavy_output_parses_with_bounded_memory(self):
+        import tracemalloc
+        stdout = self.stream('\\' * 500_000)  # 1 MB of escaped backslashes in one command output
+        self.assertGreater(len(stdout), 1_000_000)
+        tracemalloc.start()
+        try:
+            result = self.module.normalize_provider('codex', 0, stdout, '', self.FINAL, 'pr')
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result['result'], 'CHECK_OK')
+        self.assertLess(peak, 8 * 2 ** 20, 'node counting allocated %d bytes for 1 MB of escapes' % peak)
+
+    def test_f1_line_over_the_record_cap_is_rejected_before_decoding(self):
+        stdout = self.stream('h' * (9 * 2 ** 20))
+        sizes = []
+        real = json.loads
+
+        def counting(text, *args, **kwargs):
+            sizes.append(len(text))
+            return real(text, *args, **kwargs)
+        with patch.object(self.module.json, 'loads', side_effect=counting):
+            result = self.module.normalize_provider('codex', 0, stdout, '', self.FINAL, 'pr')
+        self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
+        self.assertFalse([size for size in sizes if size > 8 * 2 ** 20], 'an oversized line was decoded')
+
+    def test_f2_failed_child_record_with_unreapable_child_keeps_the_pool(self):
+        import types
+        spawned = []
+
+        def note_child(child):
+            spawned.append(child)
+            raise self.module.GuardError('INVALID_OUTPUT', 'Too many recorded children')
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=note_child)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        options = {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                   'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                   'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture), \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(store.release_pool.called, 'a child that may be alive must keep its pool reservation')
+            self.assertEqual(options['attempts'][-1]['code'], 'REVIEW_LAUNCH_UNCONFIRMED')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    FLOOD = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n'
+             '    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+
+    def run_with_survivor(self, temp, **patches):
+        """A leader that floods stdout and leaves a same-group descendant with its pipes closed."""
+        pid_file = Path(temp) / 'descendant'
+        child = ('import subprocess, sys\n'
+                 'd = subprocess.Popen([sys.executable, "-c", "import os, time\\nos.close(0); os.close(1); os.close(2)'
+                 '\\ntime.sleep(30)"])\n'
+                 'open(sys.argv[1], "w").write(str(d.pid))\n' + self.FLOOD)
+
+        def reap():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(reap)
+        with patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3), \
+                patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True):
+            with contextlib_exit_stack(patches) as _:
+                started = time.monotonic()
+                outcome = self.module.run([sys.executable, '-c', child, str(pid_file)], '', Path(temp), timeout=20)
+        return outcome, time.monotonic() - started
+
+    def test_f3_reaped_leader_with_surviving_group_member_is_unknown(self):
+        def leader_only(pid, signum):  # group signalling cannot reach the descendant
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+        with tempfile.TemporaryDirectory() as temp:
+            (code, _stdout, stderr), elapsed = self.run_with_survivor(
+                temp, **{'signal_group': (self.process, leader_only)})
+        self.assertEqual((code, stderr), (125, 'HARNESS_PROVIDER_IO_UNKNOWN'))
+        self.assertEqual(self.module.normalize_provider('codex', code, '', stderr, '', 'pr')['reason'], 'UNKNOWN')
+        self.assertLess(elapsed, 10)
+
+    def test_f3_denied_liveness_signal_is_unknown(self):
+        real = os.killpg
+
+        def denied_probe(pgid, signum):
+            if signum == 0:
+                raise PermissionError('denied')
+            return real(pgid, signum)
+        with tempfile.TemporaryDirectory() as temp:
+            (code, _stdout, stderr), _ = self.run_with_survivor(
+                temp, **{'killpg': (self.process.os, denied_probe)})
+        self.assertEqual((code, stderr), (125, 'HARNESS_PROVIDER_IO_UNKNOWN'))
+
+
+def contextlib_exit_stack(patches):
+    import contextlib
+    stack = contextlib.ExitStack()
+    for name, (target, value) in patches.items():
+        stack.enter_context(patch.object(target, name, value))
+    return stack
+
+
+class ProviderOutputBoundDelta3Tests(unittest.TestCase):
+    """Review harness-pr266-v3 (goodqa#16170): a failed child record of any exception type whose cleanup could not
+    prove the group gone is UNKNOWN (no pool release, no fallback launch); a genuine missing executable still falls
+    back."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta3_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    def options(self, note_child):
+        import types
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=note_child)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        return {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+
+    def test_failed_record_raising_file_not_found_with_unreapable_child_is_unknown(self):
+        spawned = []
+
+        def note_child(child):
+            spawned.append(child)
+            raise FileNotFoundError(2, 'children.json vanished')
+        options = self.options(note_child)
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture) as launches, \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(caught.exception.outcome['fallback_allowed'])
+            self.assertFalse(options['store'].release_pool.called, 'a child that may be alive must keep its pool')
+            self.assertEqual(launches.call_count, 1, 'no fallback provider may launch while the child may be alive')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    def test_control_genuine_missing_executable_still_falls_back(self):
+        options = self.options(lambda child: None)
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(self.module, 'run_process', side_effect=FileNotFoundError(2, 'no such reviewer')) as launches:
+            with self.assertRaises(self.module.ReviewFailure) as caught:
+                self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+        self.assertEqual(launches.call_count, 2, 'a missing executable allows the one independent fallback')
+        self.assertEqual(caught.exception.outcome['reason'], 'TRANSIENT_INFRA')
+        self.assertTrue(options['store'].release_pool.called, 'nothing ran, so the pool is released')

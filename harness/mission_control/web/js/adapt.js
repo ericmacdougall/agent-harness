@@ -1,6 +1,7 @@
 // Pure mapping from the Mission Control server's JSON (GoodQA #15585) to the view model the panels render.
 // No DOM, no network: tested with `node --test harness/mission_control/web/tests/`.
 // Every string stays a string; panels render with textContent only.
+import { ownerCounts } from './owner-groups.js';
 
 const str = (value, max = 4000) => (typeof value === 'string' ? value : value == null ? '' : String(value)).slice(0, max);
 const isoFromEpoch = seconds => (typeof seconds === 'number' && Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null);
@@ -48,11 +49,15 @@ export function ownerHold(r, last) {
   return { severe: SEVERE(r?.state) && !held, held, disposition, waitNote };
 }
 
+// Rows the server sent that the page could not show or place: dropped by shape, or with a role it does not know.
+export const ownersLoss = (rows, owners) => (Array.isArray(rows) ? Math.max(0, rows.length - owners.length) : rows == null ? 0 : 1)
+  + owners.filter(o => o.role_unknown).length;
 export function owners(rows, items = []) {
   if (!Array.isArray(rows)) return [];
-  return rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
+  const out = rows.filter(r => r && typeof r === 'object' && r.agent_id).map(r => {
     const id = str(r.agent_id, 80);
-    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket === r.ticket));
+    // goodqa#15920: tickets compare by key, so "GoodQA goodqa#1" on an owner links to "goodqa#1" on an initiative
+    const linked = items.find(i => (ownerKey(i.owner) && id.toLowerCase().startsWith(ownerKey(i.owner))) || (r.ticket && i.ticket && ticketKey(i.ticket) === ticketKey(r.ticket)));
     const last = r.last_item && typeof r.last_item === 'object' ? r.last_item : null;
     const at = validIso(last?.at) || null;
     const active = [validIso(last?.active_at), at, validIso(r.last_activity)].filter(Boolean).sort().pop() || null;
@@ -67,18 +72,183 @@ export function owners(rows, items = []) {
       last_item: { at, active, event: str(last?.event, 40), note: str(last?.note, 200) || 'No work item recorded yet' },
       progress: validIso(last?.progress_at) ? { at: last.progress_at, event: str(last.progress_event, 40), note: str(last.progress_note, 160) } : null,
       initiative_id: linked ? linked.id : null,
+      // goodqa#15920: the server's cap role; anything unknown is parked (shown, never counted)
+      // T242-2: an unknown role is still shown (parked, never counted), and the store counts it as a row the page
+      // could not place, so the owners claim is partial rather than a short count shown as current
+      role: ['live', 'parked', 'helper'].includes(r.role) ? r.role : 'parked', role_unknown: !['live', 'parked', 'helper'].includes(r.role), source: r.source === 'ah' ? 'ah' : str(r.source, 20),
+      serves: r.serves ? str(r.serves, 80) : null,
+      decision_required: r.decision_required === true,
+      session: str(r.session, 64),
+      ah_stale: r.ah_stale === true,
     };
   });
+  // a helper takes the initiative of the owner it serves
+  const byId = new Map(out.map(o => [o.agent_id, o]));
+  for (const o of out) if (o.role === 'helper' && o.serves && byId.has(o.serves)) o.initiative_id = byId.get(o.serves).initiative_id;
+  return out;
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners' };
+  't2-dev': 't2-dev', 'file-drop': 'Event drops', sources: 'Event drops', 'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', 'owner-policy': 'Owner/helper type policy', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
+// A Source health row. `truth` is the server's status truth for the source (collectors.read_truth); `state` is the CSS
+// class and `label` the word shown, both from status and truth together, so a source that reads but is partial or
+// stale is never shown as plain "ok".
 export function sources(rows) {
   if (!Array.isArray(rows)) return [];
-  return rows.filter(r => r && r.name).map(r => ({
-    id: str(r.name, 40), name: SOURCE_NAMES[r.name] || str(r.name, 40), state: ['ok', 'error', 'off', 'stale'].includes(r.status) ? r.status : 'error',
-    checked: isoFromEpoch(r.checked) || new Date(0).toISOString(), note: str(r.detail, 200) || (r.status === 'ok' ? 'Reading normally.' : ''),
-  }));
+  return rows.filter(r => r && r.name).map(r => {
+    const status = ['ok', 'error', 'off'].includes(r.status) ? r.status : 'error';
+    const truth = truthOf(r.truth);
+    const okAt = isoFromEpoch(r.ok_at) || '';
+    const label = status === 'off' ? 'off' : status === 'error' ? `error · ${truth}` : truth === 'current' ? 'ok' : truth;
+    const state = status === 'error' ? 'error' : status === 'off' ? 'off' : truth === 'current' ? 'ok' : 'stale';
+    const detail = str(r.detail, 200);
+    const last = truth === 'stale' && okAt ? ` Last good read ${clock(okAt)}.` : truth === 'unknown' && status !== 'off' ? ' No good read yet.' : '';
+    return { id: str(r.name, 40), name: SOURCE_NAMES[r.name] || str(r.name, 40), status, truth, okAt, label, state, detail,
+      checked: isoFromEpoch(r.checked) || new Date(0).toISOString(), note: `${detail || (state === 'ok' ? 'Reading normally.' : '')}${last}`.trim() };
+  });
+}
+
+// ---- status truth (review PR 234 v3 F1, v2 F2): whether a zero or "none" may be stated. The server computes the value
+// once per source (collectors.read_truth): current, partial, stale or unknown. The page only checks it against the
+// vocabulary (anything else, or a source it has not heard from, is unknown) and takes the worst across the sources a
+// claim depends on. A zero or "none" is stated only when that is current; otherwise the page says what it knows.
+export const TRUTHS = Object.freeze(['current', 'partial', 'stale', 'unknown']);
+export const truthOf = value => (TRUTHS.includes(value) ? value : 'unknown');
+export function worst(...values) {
+  const list = values.flat();
+  return list.length ? TRUTHS[Math.max(...list.map(v => TRUTHS.indexOf(truthOf(v))))] : 'unknown';
+}
+// an absolute time: a relative age in a panel that is not repainted on the clock would freeze
+export const clock = iso => (validIso(iso) ? `${new Date(iso).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time');
+// ---- the gate (goodqa#15920, PR 234 v7). The server composes one read per dataset from the sources that feed it
+// (collectors.FEEDS, collectors.Truth) and sends it as `reads`, before the rows. The page declares only which datasets
+// a claim reads (CLAIMS) and states every count and every "none" through claim()/gate(). Nothing here names a source:
+// a new source is added on the server, a new claim is one line in CLAIMS, a new state key one line in STATE_DATASETS.
+// tests/truth-gate.test.mjs derives each panel's datasets with a recording Proxy and fails on any difference.
+export const CLAIMS = Object.freeze({
+  blockers: ['status', 'asks', 'owners', 'initiatives'],
+  deploys: ['status', 'events'],
+  goals: ['goals'],
+  requirements: ['requirements'],
+  archive: ['requirements', 'asks'],
+  needs: ['asks'],
+  owners: ['owners'],
+  initiatives: ['initiatives'],
+  activity: ['events'],
+  progress: ['owners', 'events'],
+  decisions: ['status'],
+  chat: ['chat'],
+});
+// Which dataset each key of the store's state belongs to. null: page-local (a click, a filter, the clock), or the
+// truth data itself. A key that is missing here fails the gate test, so new server data cannot be shown ungated.
+export const STATE_DATASETS = Object.freeze({
+  owners: 'owners', ownerRows: 'owners',
+  asks: 'asks', asksResolved: 'asks', asksStale: 'asks', asksFlagged: 'asks', asksCleared: 'asks', asksArchive: 'asks',
+  asksArchiveTotal: 'asks', asksSession: 'asks', asksSweptAt: 'asks',
+  initiatives: 'initiatives', initiativesStale: 'initiatives', initiativesError: 'initiatives',
+  events: 'events', lastEvent: 'events', feedSnapshot: 'events',
+  messages: 'chat', chat: 'chat', sessions: 'chat', mainSession: 'chat', chatAvailability: 'chat', pending: 'chat',
+  'ledger.goals': 'goals', 'ledger.requirements': 'requirements', 'ledger.status': 'status', 'ledger.generated': null,
+  reads: null, loss: null, sources: null, connection: null, lastData: null, host: null, now: null,
+  decisions: null, filters: null, selection: null, highlight: null, tab: null, responder: null, session: null,
+  motion: null, motionPreference: null, reducedMotion: null, feedPaused: null, buffered: null, ownerFilter: null,
+  ownersAll: null, ownerFolds: null, fallback: null, showQuiet: null, theme: null, coverage: null,
+});
+// Reads that are not dependencies, each with the reason: the data can only reveal more, never hide.
+export const SAFE_READS = Object.freeze({
+  needs: { chat: 'a reply or decision on its way takes an ask off the waiting count only when its record is on hand; a missing chat read leaves every ask waiting' },
+  initiatives: { asks: 'an initiative card adds "N open asks" only when it holds some' },
+});
+const DATASET_NAMES = { goals: 'Goals', requirements: 'Requirements', status: 'Status', asks: 'Asks', owners: 'Owners', initiatives: 'Initiatives', events: 'Activity feed', chat: 'Chat' };
+const FACT_NAMES = { 'ledger:goals': 'Goal ledger (ah goals)', 'ledger:requirements': 'Requirements (ah requirements)', 'ledger:status': 'Status (ah status)',
+  'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', sources: 'Event drops' };
+const LEDGER_DATASETS = ['goals', 'requirements', 'status'];
+// The facts one dataset rests on: the server's read of it, the truth carried inside its own snapshot (ledger parts,
+// which arrive with their rows), and rows this page could not show. No read from the server is unknown, never fine.
+function datasetFacts(state, dataset) {
+  const read = state.reads && typeof state.reads === 'object' ? state.reads[dataset] : null;
+  const list = Array.isArray(read?.facts) ? read.facts.filter(f => f && typeof f === 'object') : [];
+  const facts = list.map(f => ({ id: str(f.id, 40), name: FACT_NAMES[f.id] || SOURCE_NAMES[f.id] || str(f.id, 40), truth: truthOf(f.truth), at: validIso(f.at) || '', error: str(f.error, 300) }));
+  if (!facts.length) facts.push({ id: `dataset:${dataset}`, name: DATASET_NAMES[dataset] || dataset, truth: 'unknown', at: '', error: '' });
+  // the composed truth can only be worse than its facts (a server that says less than its facts is not believed)
+  const composed = truthOf(read?.truth);
+  if (TRUTHS.indexOf(composed) > Math.max(...facts.map(f => TRUTHS.indexOf(f.truth)))) facts.push({ id: `dataset:${dataset}`, name: DATASET_NAMES[dataset] || dataset, truth: composed, at: '', error: '' });
+  if (LEDGER_DATASETS.includes(dataset)) {
+    const part = state.ledger?.[dataset] || {};
+    const id = `ledger:${dataset}`;
+    const mine = { id, name: FACT_NAMES[id], truth: truthOf(part.truth), at: part.at || '', error: str(part.error, 300) };
+    const at = facts.findIndex(f => f.id === id);
+    if (at < 0) facts.push(mine);
+    else if (TRUTHS.indexOf(mine.truth) >= TRUTHS.indexOf(facts[at].truth)) facts[at] = { ...mine, error: mine.error || facts[at].error };
+    if (part.lost > 0) facts.push({ id: `page:${dataset}`, name: 'This page', truth: 'partial', at: '', error: `${part.lost} rows could not be shown` });
+  }
+  const lost = state.loss?.[dataset];
+  if (lost > 0) facts.push({ id: `page:${dataset}`, name: 'This page', truth: 'partial', at: '', error: `${lost} rows could not be shown` });
+  return facts;
+}
+// Every claim also rests on the link to the server: while the page is not live (connecting, reconnecting, offline,
+// signed out, or a state it does not know) nothing newer can arrive, so what it shows is at best the data received up
+// to the last message (stale), or unknown when none came. Only 'live' adds nothing.
+const LINK_WORDS = { connecting: 'connecting', reconnecting: 'reconnecting', offline: 'offline', expired: 'signed out' };
+function linkFact(state) {
+  if (state.connection === 'live') return null;
+  const at = Number.isFinite(state.lastData) && state.lastData > 0 ? new Date(state.lastData).toISOString() : '';
+  return { id: 'connection', name: 'Connection to Mission Control', truth: at ? 'stale' : 'unknown', at,
+    error: `not connected (${LINK_WORDS[state.connection] || 'no live stream'})` };
+}
+// A test seam: observe.claim(id) is called for every claim made (tests/truth-gate.test.mjs derives which claims a panel uses).
+export const observe = { claim: null };
+export function claim(state, id) {
+  observe.claim?.(id);
+  const s = state || {};
+  const datasets = CLAIMS[id] || [];
+  const seen = new Set();
+  const facts = [...datasets.flatMap(dataset => datasetFacts(s, dataset)), linkFact(s)].filter(f => f && !seen.has(f.id) && seen.add(f.id));
+  const truth = datasets.length ? worst(facts.map(f => f.truth)) : 'unknown';
+  return { id, truth, datasets, facts, bad: facts.filter(f => f.truth !== 'current') };
+}
+// The one way a panel states a count or a "none": gate(state, 'owners').count(n), .none('No owners are running.',
+// 'owners'), .note('none need attention'). Each says what is actually known when the claim is not current.
+export function gate(state, id) {
+  const c = claim(state, id);
+  return { ...c, current: c.truth === 'current', count: (n, bare = false) => countText(n, c, bare), none: (current, noun) => noneText(c, current, noun),
+    note: current => tileNote(c, current), lines: () => truthLines(c) };
+}
+const names = list => list.map(f => f.name).join(', ').replace(/, ([^,]*)$/, ' and $1');
+// One line per source that is not current, for the notice beside the claim.
+export function truthLines(c) {
+  return c.bad.map(f => f.id === 'connection'
+    ? `${f.name}: ${f.error}. ${f.at ? `Showing what was received up to ${clock(f.at)}; nothing newer is known.` : 'Nothing has been received yet.'}`
+    : f.truth === 'unknown'
+    ? `${f.name}: not read successfully yet${f.error ? ` (${f.error})` : ''}. Nothing from it is shown as zero.`
+    : f.truth === 'stale'
+      ? `${f.name}: showing the last good read from ${clock(f.at)}. Later reads failed${f.error ? `: ${f.error}` : ''}.`
+      : `${f.name}: the last read was partial, so some records may be missing${f.error ? ` (${f.error})` : ''}.`);
+}
+// The empty-list sentence: `current` only when the claim is current, otherwise what is actually known.
+export function noneText(c, current, noun) {
+  if (c.truth === 'current') return current;
+  if (c.truth === 'partial') return `No ${noun} in what could be read. The read was partial, so there may be some.`;
+  if (c.truth === 'stale') {
+    const times = c.bad.filter(f => f.truth === 'stale' && f.at).map(f => f.at).sort();
+    return `No ${noun} as of the last good read (${clock(times[0])}). Later reads failed, so this is not current.`;
+  }
+  const unknown = c.bad.filter(f => f.truth === 'unknown');
+  return `Not known: ${names(unknown)} ${unknown.some(f => f.error) ? 'could not be read' : 'has not been read yet'}, so Mission Control cannot say there are no ${noun}.`;
+}
+// A count: a bare 0 is itself a claim, so an unknown zero is "?" and a partial count says there may be more. A stale
+// count is the last good read's; `bare` marks a count with no note beside it, which then says so itself.
+export function countText(n, c, bare = false) {
+  const truth = typeof c === 'string' ? truthOf(c) : c.truth;
+  if (truth === 'unknown') return n ? `${n}+` : '?';
+  if (truth === 'stale' && bare) return `${n} (stale)`;
+  return truth === 'partial' ? `${n}+` : String(n);
+}
+export function tileNote(c, current) {
+  if (c.truth === 'current') return current;
+  if (c.truth === 'partial') return 'partial read: there may be more';
+  if (c.truth === 'stale') return `not current: last good read ${clock(c.bad.filter(f => f.at).map(f => f.at).sort()[0])}`;
+  return 'unknown: not read yet';
 }
 
 export function event(raw) {
@@ -262,7 +432,11 @@ export function replyStatus(message, time, gap) {
 // check publishes its own verdicts; `coverage` (id -> {status, reason, action}) overrides when present.
 export const STALLED_AFTER_MS = 90 * 60 * 1000;
 const FINISHED = /\b(done|live|complete|completed|shipped|cancel+ed|parked|on hold)\b/i;
-export function atRisk(initiatives = [], owners = [], events = [], now = Date.now(), coverage = null, limit = 6) {
+// `known` is the truth of the owner and progress sources (claim 'owners' and 'progress'): a verdict of no owner or no
+// progress is given only from current sources; otherwise the row is UNKNOWN with the reason (review PR 234 v3 F1 audit).
+export function atRisk(initiatives = [], owners = [], events = [], now = Date.now(), coverage = null, limit = 6, known = {}) {
+  // review PR 234 v5 F2: a caller that passes no truth gets no verdict of no owner or no progress (unknown, like the rest)
+  const ownersKnown = truthOf(known?.owners), progressKnown = truthOf(known?.progress);
   const rows = [];
   for (const item of initiatives) {
     if (!item || FINISHED.test(item.state || '')) continue;
@@ -281,9 +455,15 @@ export function atRisk(initiatives = [], owners = [], events = [], now = Date.no
     const last = stamps.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0] || null;
     const since = last ? now - Date.parse(last.at) : Infinity;
     let status, reason;
-    if (!working.length && !decided) {
+    if (!working.length && !decided && ownersKnown !== 'current') {
+      status = 'unknown';
+      reason = `owner coverage unknown: the owner sources are ${ownersKnown}`;
+    } else if (!working.length && !decided) {
       status = 'uncovered';
       reason = linked.length ? `no working owner (${linked.map(o => `${o.name} ${o.state}`).join(', ')}) and no recorded decision` : 'no owner and no recorded decision';
+    } else if (since > STALLED_AFTER_MS && progressKnown !== 'current') {
+      status = 'unknown';
+      reason = `progress unknown: the owner and work-log sources are ${progressKnown}`;
     } else if (since > STALLED_AFTER_MS) {
       status = 'stalled';
       reason = last ? `no real progress since ${last.what}` : 'no result, commit or deploy recorded yet';
@@ -299,6 +479,218 @@ export function atRisk(initiatives = [], owners = [], events = [], now = Date.no
     rows.push({ id: item.id, initiative: item.initiative, ticket: item.ticket, status, reason,
       action: (external && str(external.action, 200)) || action, last: last ? last.at : null, since });
   }
-  const order = { uncovered: 0, stalled: 1, moving: 2 };
+  const order = { uncovered: 0, unknown: 1, stalled: 2, moving: 3 };
   return rows.sort((a, b) => order[a.status] - order[b.status] || b.since - a.since).slice(0, limit);
+}
+
+
+// ---- ledger (goodqa#15920): goals, requirements and evidence-only status, as the server's Ledger source reports them.
+// Everything is clamped again here: the page never trusts a field's type or length, and renders with textContent only.
+// The producer's vocabulary (harness/hooks/goals_view.py; review PR 234 v2 F1). Only DONE_LIVE is done; LIVE_TESTED and
+// LIVE_UNTESTED are live but not done; everything else is open. A state this page does not know is shown as written, open.
+export const GOAL_STATE = Object.freeze({
+  DONE_LIVE: 'Done: deployed and tested live', LIVE_TESTED: 'Live and tested, no deploy record (not done)',
+  LIVE_UNTESTED: 'Deployed, not tested live', VERIFIED: 'Tested, not live yet', FAILING: 'Failing: newest test failed',
+  UNCONFIRMED: 'Unconfirmed: evidence changed since attach (not done)', IN_PROGRESS: 'In progress', DEFERRED: 'Deferred',
+  RETIRED: 'Retired', UNKNOWN: 'No record either way',
+});
+export const GOAL_DONE = Object.freeze(new Set(['DONE_LIVE']));
+export const GOAL_LIVE_NOT_DONE = Object.freeze(new Set(['LIVE_TESTED', 'LIVE_UNTESTED']));
+const LIST_CAP = 2000;
+const rows = value => (Array.isArray(value) ? value.filter(x => x && typeof x === 'object' && !Array.isArray(x)) : []);
+const int = value => (Number.isInteger(value) ? value : 0);
+const part = (raw, extra) => ({ stale: raw?.stale === true, error: str(raw?.error, 300), at: validIso(raw?.at) || '', failed_at: validIso(raw?.failed_at) || '', truth: truthOf(raw?.truth), ...extra });
+// rows the server sent that this page does not show (a shape or a cap it did not expect): the gate reads the part as partial
+const lostOf = (raw, kept) => (raw === undefined ? 0 : Array.isArray(raw) ? Math.max(0, raw.length - kept) : 1);
+
+function evidenceRow(raw) {
+  return { id: str(raw.id, 40), kind: str(raw.kind, 20), verdict: str(raw.verdict, 12).toUpperCase(), at: validIso(raw.at) || '', check: str(raw.check, 80), by: str(raw.by, 40), note: str(raw.note, 400) };
+}
+function statusRow(raw) {
+  return { id: str(raw.id, 40), agent: str(raw.agent, 40), at: validIso(raw.at) || '', event: str(raw.event, 20), note: str(raw.note, 500), check: str(raw.check, 80), verdict: str(raw.verdict, 12).toUpperCase() };
+}
+const STATUS_LISTS = ['verified', 'live', 'pending', 'failed', 'claimed', 'blockers', 'commits', 'asks_open', 'decisions', 'assumptions', 'live_legacy'];
+
+export function ledger(snapshot) {
+  const root = snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot) ? snapshot : {};
+  const goals = root.goals && typeof root.goals === 'object' ? root.goals : {};
+  const reqs = root.requirements && typeof root.requirements === 'object' ? root.requirements : {};
+  const status = root.status && typeof root.status === 'object' ? root.status : {};
+  const requirementItems = rows(reqs.items).slice(0, LIST_CAP).map(r => ({
+    id: str(r.id, 64), kind: 'requirement', text: str(r.text, 700), clipped: r.clipped === true, text_len: Number.isInteger(r.text_len) ? r.text_len : 0, at: validIso(r.at) || '', session: str(r.session, 64), owner: str(r.owner, 60), ticket: str(r.ticket, 60),
+    source: str(r.source, 300), state: str(r.state, 40), bucket: r.bucket === 'archived' ? 'archived' : 'live', rule: str(r.rule, 8) || 'live', rule_title: str(r.rule_title, 40),
+    reason: str(r.reason, 300), evidence_ref: str(r.evidence_ref, 120), has_evidence: r.has_evidence === true,
+    expires_in_s: Number.isFinite(r.expires_in_s) ? r.expires_in_s : null, digest: str(r.digest, 40), unowned_note: str(r.unowned_note, 200), user_sourced: r.user_sourced === true, evidence_text: str(r.evidence_text, 300),
+    manual: r.manual && typeof r.manual === 'object' ? { action: r.manual.action === 'restore' ? 'restore' : 'archive', at: str(r.manual.at, 40), reason: str(r.manual.reason, 300), id: str(r.manual.id, 40), by: str(r.manual.by, 80) } : null,
+  })).filter(r => r.id);
+  const summary = { live: 0, archived: 0, rules: {}, manual_user: 0 };
+  for (const r of requirementItems) {
+    summary[r.bucket] += 1; summary.rules[r.rule] = (summary.rules[r.rule] || 0) + 1;
+    if (r.bucket === 'archived' && r.rule === 'M' && r.user_sourced) summary.manual_user += 1;
+  }
+  const out = {
+    goals: part(goals, { items: rows(goals.items).slice(0, 100).map(g => {
+      const evidence = rows(g.evidence).slice(0, 20).map(evidenceRow);
+      const problems = g.problems && typeof g.problems === 'object' ? g.problems : {};
+      return { id: str(g.id, 64), title: str(g.title, 300), ticket: str(g.ticket, 60), state: (typeof g.state === 'string' ? g.state.slice(0, 40).toUpperCase().replace(/[^A-Z_]/g, '') : '') || 'UNKNOWN',
+        ledger_status: str(g.ledger_status, 40), priority: Number.isInteger(g.priority) ? g.priority : null, target: str(g.target, 400),
+        owners: Array.isArray(g.owners) ? g.owners.slice(0, 10).map(o => str(o, 60)) : [], deferral: str(g.deferral, 300),
+        problems: { missing: int(problems.missing), tampered: int(problems.tampered), unpinned: int(problems.unpinned) },
+        evidence, evidence_total: Number.isInteger(g.evidence_total) ? g.evidence_total : evidence.length };
+    }).filter(g => g.id), total: int(goals.total) }),
+    requirements: part(reqs, { items: requirementItems, total: Number.isInteger(reqs.total) ? reqs.total : requirementItems.length, truncated: reqs.truncated === true, summary }),
+    status: part(status, { counts: status.counts && typeof status.counts === 'object' ? Object.fromEntries(Object.entries(status.counts).slice(0, 20).map(([k, v]) => [str(k, 30), int(v)])) : {},
+      owners: { counts: {}, attention: [], live: [], undisposed: [], ...(status.owners && typeof status.owners === 'object' ? { attention: arr(status.owners.attention), live: arr(status.owners.live), undisposed: arr(status.owners.undisposed) } : {}) },
+      since_s: int(status.since_s), entries: int(status.entries), ...unreadPart(status),
+      ...Object.fromEntries(STATUS_LISTS.map(k => [k, rows(status[k]).slice(0, 60).map(statusRow)])) }),
+    generated: validIso(root.generated) || '',
+  };
+  out.goals.lost = lostOf(goals.items, out.goals.items.length);
+  out.requirements.lost = lostOf(reqs.items, out.requirements.items.length);
+  out.status.lost = STATUS_LISTS.reduce((sum, k) => sum + lostOf(status[k], out.status[k].length), 0);
+  return out;
+}
+function arr(value) { return Array.isArray(value) ? value.slice(0, 20).map(v => str(v, 40)) : []; }
+// review PR 234 v2 F2: the WALs `ah status` could not read. The server fails closed (count -1 when unknown); here the
+// flag is believed only when it is exactly true, and the list is clamped again.
+function unreadPart(status) {
+  const raw = status.unread && typeof status.unread === 'object' && !Array.isArray(status.unread) ? status.unread : {};
+  const count = Number.isInteger(raw.count) && raw.count >= -1 ? raw.count : 0;
+  const items = rows(raw.items).slice(0, 10).map(r => ({ wal: str(r.wal, 80), agent: str(r.agent, 40), reason: str(r.reason, 200) }));
+  return { incomplete: status.incomplete === true, unread: { count, items } };
+}
+export function unreadLine(status) {
+  if (!status?.incomplete) return '';
+  const n = status.unread?.count;
+  return `Incomplete: ${n > 0 ? `${n} session log${n === 1 ? '' : 's'}` : 'some session logs'} could not be read, so blockers, deploys and tests recorded there are missing here.`;
+}
+
+// Archived asks (server) and archived requirements (ledger) as one list, newest first. Each row keeps the rule and reason
+// that put it there. The page removes nothing: a row that stops matching comes back on the next snapshot.
+export function archiveAsk(raw) {
+  return { id: str(raw.id, 40), kind: 'ask', text: str(raw.text, 700), at: validIso(raw.at) || '', owner: str(raw.owner, 60), ticket: str(raw.ticket, 60), session: str(raw.session, 64),
+    rule: str(raw.rule, 8) || 'R1', rule_title: str(raw.rule_title, 40), reason: str(raw.reason, 300), evidence_ref: str(raw.evidence_ref, 120), decision: str(raw.decision, 40),
+    resolution: str(raw.resolution, 300), resolved_at: validIso(raw.resolved_at) || '', ask_reason: str(raw.ask_reason, 300), bucket: 'archived' };
+}
+export function archiveRows(asks, requirements) {
+  const list = [...rows(asks).map(archiveAsk), ...rows(requirements).filter(r => r.bucket === 'archived')];
+  return list.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) || (a.id < b.id ? -1 : 1));
+}
+
+const DEAL_KIND = {
+  pending: { label: 'PENDING', symbol: '…', tone: 'pending' }, failed: { label: 'FAILED', symbol: '✕', tone: 'bad' },
+  live: { label: 'DEPLOYED', symbol: '↑', tone: 'ok' }, verified: { label: 'TESTED', symbol: '✓', tone: 'ok' },
+};
+// Recent deploys and live tests: ledger records first-class, plus deploy and release events from the live feed.
+export function dealRows(status, events = [], limit = 8) {
+  const out = [];
+  for (const key of ['pending', 'failed', 'live', 'verified']) {
+    for (const row of status?.[key] || []) out.push({ id: row.id, ...DEAL_KIND[key], at: row.at, text: row.note, check: row.check, agent: row.agent, source: 'ledger', verdict: row.verdict });
+  }
+  for (const event of Array.isArray(events) ? events : []) {
+    if (!event || event.historic || !['deploy', 'release'].includes(event.kind)) continue;
+    out.push({ id: `event:${event.id}`, label: event.kind === 'deploy' ? 'DEPLOYED' : 'RELEASED', symbol: '↑', tone: 'ok', at: event.ts, text: event.summary, check: event.subject?.repo || '', agent: event.actor?.agent || '', source: 'feed', verdict: '' });
+  }
+  return out.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) || (a.id < b.id ? -1 : 1)).slice(0, limit);
+}
+
+export function blockerRows(status, flagged = [], owners = [], initiatives = []) {
+  const out = [];
+  for (const row of status?.blockers || []) out.push({ id: row.id, source: 'status', title: 'Blocker', text: row.note, at: row.at, agent: row.agent });
+  for (const ask of flagged || []) out.push({ id: `ask:${ask.id}`, source: 'ask', title: 'Untraceable ask', text: `${ask.text || ask.id} (${ask.flagged || 'no traceable source'})`, at: ask.at || '', agent: ask.owner || '' });
+  for (const owner of owners || []) if (owner.severe) out.push({ id: `owner:${owner.agent_id}`, source: 'owner', title: `Owner ${owner.state}`, text: `${owner.name}: ${owner.task || ''}`, at: owner.last_item?.active || '', agent: owner.agent_id });
+  for (const item of initiatives || []) if (/blocked/i.test(item.state)) out.push({ id: `initiative:${item.id}`, source: 'initiative', title: 'Initiative blocked', text: `${item.initiative}: ${item.next_step || item.note || ''}`, at: '', agent: item.owner || '' });
+  return out.sort((a, b) => (Date.parse(b.at) || 0) - (Date.parse(a.at) || 0) || (a.id < b.id ? -1 : 1));
+}
+
+// ---- the other zero or "none" claims (review PR 234 v3 F1 audit), as pure text so they are testable without a DOM
+const padded = text => (/^\d+$/.test(text) ? text.padStart(2, '0') : text);
+export function needsSummary(state, waiting, stale) {
+  const c = claim(state, 'needs');
+  const sure = c.truth === 'current';
+  return {
+    claim: c, count: waiting ? String(waiting) : countText(0, c),
+    label: (waiting ? `Needs you: ${waiting} open ask${waiting === 1 ? '' : 's'}` : sure ? 'Needs you: nothing waiting on you' : `Needs you: ${tileNote(c, '')}`) + (stale ? `, ${stale} stale` : ''),
+    title: waiting ? `(${waiting}) ` : sure ? '' : '(?) ',
+    empty: noneText(c, stale ? 'Nothing new needs you. Older open asks are under Stale.' : 'Nothing needs you right now.', 'asks waiting on you'),
+  };
+}
+export function ownersEmpty(state, filtered) {
+  const c = claim(state, 'owners');
+  return filtered ? noneText(c, 'No owners in this state.', 'owners in this state') : noneText(c, 'No owners are running.', 'owners');
+}
+export const ownerCount = (state, n) => padded(countText(n, claim(state, 'owners'), true));
+export function initiativesEmpty(state) {
+  if ((state.sources || []).find(s => s.id === 'initiatives')?.status === 'off') return 'No initiatives file is configured.';
+  return noneText(claim(state, 'initiatives'), 'No initiatives in the file.', 'initiatives');
+}
+export const initiativeCount = (state, n) => padded(countText(n, claim(state, 'initiatives'), true));
+export const atRiskEmpty = state => noneText(claim(state, 'initiatives'), 'Nothing open to rank.', 'open initiatives to rank');
+export function noProgress(state) {
+  const c = claim(state, 'progress');
+  return c.truth === 'current' ? 'no progress recorded' : `progress unknown (${tileNote(c, '')})`;
+}
+export function noAction(state) {
+  const c = claim(state, 'owners');
+  return c.truth === 'current' ? 'Main: no action recorded' : `Main: action unknown (${tileNote(c, '')})`;
+}
+// An initiative's "Updated" line: "No activity recorded" and "no activity for over 30 min" only from current sources.
+export function updatedText(state, live, ageOf, prefix = '') {
+  const c = claim(state, 'progress');
+  const sure = c.truth === 'current';
+  if (!live.updated) return sure ? 'No activity recorded' : `Activity unknown: ${tileNote(c, '')}`;
+  return `${prefix}${ageOf(live.updated)}${live.stale ? (sure ? ' · no activity for over 30 min' : ' · no newer activity seen; its sources are not current') : ''}`;
+}
+export const feedEmpty = state => noneText(claim(state, 'activity'), 'Listening for signals…', 'work items');
+// The page holds the newest EVENTS_HELD events: at the cap a count of them is a floor, never the whole feed.
+export const EVENTS_HELD = 150;
+export const feedCount = (state, n) => { const text = countText(n, claim(state, 'activity'), true); return (state.events || []).length >= EVENTS_HELD && /^\d+$/.test(text) ? `${text}+` : text; };
+// The owner of an initiative: "no live owner" and "no owner" only from current owner sources.
+export function ownerLineText(state, owner, item, { full = true, none = 'no owner' } = {}) {
+  if (owner) return full ? `${owner.name} · ${owner.runtime} · ${owner.state}` : `${owner.name} · ${owner.state}`;
+  const sure = claim(state, 'owners').truth === 'current';
+  if (item?.owner) return `${item.owner} · ${sure ? 'no live owner' : 'live owner unknown'}`;
+  return sure ? none : 'owner unknown';
+}
+export const ownerCountTitle = (state, shown, total) => `${shown} shown of ${total} matching, ${countText(state.owners.length, claim(state, 'owners'), true)} owners in all`;
+export const hubCounts = state => ({ owners: countText(state.owners.length, claim(state, 'owners'), true), initiatives: countText(state.initiatives.length, claim(state, 'initiatives'), true) });
+// An owner row's "No work item recorded yet": its work items come from the WAL tailer.
+const NO_ITEM = new Set(['No work item recorded yet', 'No work item yet']);
+export const workItemText = (state, note) => (NO_ITEM.has(note) && claim(state, 'owners').truth !== 'current' ? 'Work items unknown: the work-log source is not current' : note);
+// The topology status line: "Owners linked. Signals flowing." only while owner and work-log sources are current.
+export const sceneText = (state, text) => (state.connection === 'live' && claim(state, 'progress').truth !== 'current'
+  ? 'Connected. Some owner or work-log sources are not current; see Source health.' : text);
+
+// The ledger rows beyond the ones the server sends (it keeps 30 per status list but counts them all). Every count the
+// page states from a status list uses statusCount, never the list's length (review PR 234 v6).
+export const hiddenRows = (status, key) => Math.max(0, int(status?.counts?.[key]) - (status?.[key] || []).length);
+export const statusCount = (status, key) => (status?.[key] || []).length + hiddenRows(status, key);
+export const hiddenBlockers = status => hiddenRows(status, 'blockers');
+export const hiddenDeals = status => ['pending', 'failed', 'live', 'verified'].reduce((sum, key) => sum + hiddenRows(status, key), 0);
+export function missionTiles(state) {
+  const led = state.ledger || ledger(null);
+  const view = state.ledger ? state : { ...state, ledger: led };
+  const goals = led.goals.items;
+  const done = goals.filter(g => GOAL_DONE.has(g.state)).length;
+  const liveNotDone = goals.filter(g => GOAL_LIVE_NOT_DONE.has(g.state)).length;
+  const total = Math.max(goals.length, led.goals.total);
+  const open = total - done - liveNotDone;
+  const counts = ownerCounts(state.owners || []);
+  const live = counts.live, attention = counts.attention;
+  const waiting = (state.asks || []).filter(ask => waitingOnUser(state.messages, ask) && state.decisions?.[ask.id]?.status !== 'sending').length;
+  const blockers = blockerRows(led.status, state.asksFlagged || [], state.owners || [], state.initiatives || []).length + hiddenBlockers(led.status);
+  const reqs = led.requirements.summary;
+  const risky = (state.initiatives || []).filter(i => /at risk|blocked/i.test(i.state)).length;
+  const c = Object.fromEntries(['goals', 'owners', 'needs', 'blockers', 'requirements'].map(id => [id, claim(view, id)]));
+  const off = id => c[id].truth !== 'current';
+  const tiles = [
+    { id: 'goals', label: 'Goals done live', value: `${countText(done, c.goals)} / ${countText(total, c.goals)}`, note: tileNote(c.goals, `${liveNotDone} live, not done · ${open} open`), target: 'mission-panel', alert: off('goals') },
+    { id: 'owners', label: 'Owners live', value: countText(live, c.owners), note: [counts.codexLive ? `${countText(counts.codexLive, c.owners)} live Codex` : '', attention ? `${attention} need attention` : tileNote(c.owners, 'none need attention')].filter(Boolean).join(' · '), target: 'owners-panel', alert: off('owners') },
+    { id: 'asks', label: 'Needs you', value: countText(waiting, c.needs), note: waiting ? 'waiting on your answer' : tileNote(c.needs, 'nothing waiting'), target: 'needs-panel', alert: off('needs') },
+    { id: 'blockers', label: 'Blockers', value: countText(blockers, c.blockers), note: tileNote(c.blockers, risky ? `${risky} initiatives at risk` : 'across status, asks, owners'), target: 'blockers-panel', alert: off('blockers') },
+    { id: 'requirements', label: 'Requirements live', value: countText(reqs.live, c.requirements), note: tileNote(c.requirements, `${reqs.archived} archived`), target: 'requirements', alert: off('requirements') },
+  ];
+  // Your own requirements archived from the dashboard: any process holding a launch link can make that click, so they are counted here until looked at.
+  if (reqs.manual_user > 0) tiles.push({ id: 'manual-user', label: 'Your requirements archived from the dashboard', value: String(reqs.manual_user), note: 'review and restore', target: 'archive-manual-user', alert: true });
+  return tiles;
 }
