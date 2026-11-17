@@ -720,7 +720,8 @@ class Ledger:
             return []
         want = ahc_install.installed_files(Path.home())
         recorded = record.get("files")
-        if recorded is not None and sorted(recorded) != sorted(want):
+        if recorded is not None and (not isinstance(recorded, list) or not all(isinstance(f, str) for f in recorded)
+                                     or sorted(recorded) != sorted(want)):
             raise MigrationRefused("migration-preflight: the install record names %s, but this ahc installs %s; re-run "
                                    "`ahc install --apply`; nothing was written" % (recorded, sorted(want)))
         return [(path, hashlib.sha256(text.encode("utf-8")).hexdigest()) for path, text in sorted(want.items())]

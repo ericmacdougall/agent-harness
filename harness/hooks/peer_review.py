@@ -859,7 +859,7 @@ def read_packet(path: Path) -> PacketEvidence:
 
 AHC_RELEASE = 'harness/hooks/ahc_release.json'
 AHC_RELEASE_FILE = re.compile(r'ahc_[a-z0-9_]{1,60}\.py')
-AHC_RELEASE_HELPER = re.compile(r'[a-z][a-z0-9_]{0,40}')  # helper N is the script harness/hooks/N.py (ahc_guard)
+AHC_RELEASE_HELPER = re.compile(r'[a-z][a-z0-9_]{0,40}')  # a helper name in ahc_guard.HELPER_SCRIPTS
 AHC_RELEASE_SHA = re.compile(r'[0-9a-f]{64}')
 AHC_RELEASE_FIX = ('run `python3 scripts/ahc_release_hashes.py --write` and commit harness/hooks/ahc_release.json in '
                    'the same change')
@@ -891,15 +891,37 @@ def _release_parts(text: str, where: str) -> tuple[dict, dict]:
     return parts[0], parts[1]
 
 
+def _declared(snapshot: Path, rel: str, name: str, kind: type):
+    """The literal value HEAD assigns to `name` at module level in `rel`: parsed with ast.literal_eval, never run."""
+    import ast  # noqa: PLC0415
+    path = snapshot / rel
+    try:
+        tree = ast.parse(path.read_bytes(), filename=rel)
+    except (OSError, SyntaxError, ValueError):
+        raise ValueError(f'{rel} cannot be parsed at HEAD') from None
+    values = [node.value for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)]
+    if len(values) != 1:
+        raise ValueError(f'{rel} {name} must be assigned exactly once at module level')
+    try:
+        value = ast.literal_eval(values[0])
+    except ValueError:
+        raise ValueError(f'{rel} {name} is not a literal') from None
+    if not isinstance(value, kind):
+        raise ValueError(f'{rel} {name} is not a {kind.__name__}')
+    return value
+
+
 def ahc_release_problem(snapshot: Path, head: str, base: str | None) -> tuple[str | None, str | None]:
     """The PR-stage gate for the ahc release list (goodqa#16049, PR 247 F4): (problem, manifest sha256).
 
     agent-harness runs no GitHub CI, so a merge needs this review's authorization or an audited waiver; checking
-    here is what makes a stale list block a merge. It reads the snapshot as data only and never runs the reviewed
-    commit's own scripts/ahc_release_hashes.py: the list must parse, every listed module and helper must be a
-    regular file at HEAD whose sha256 matches, every name the base's list carried must still be listed while its file
-    exists, and every ahc_*.py module HEAD's install.py ships must be listed. A repository with no list at HEAD or
-    at the base is not checked (other repositories use this review too); deleting the base's list is a problem.
+    here is what makes a stale list block a merge. It applies the predicate of scripts/ahc_release_hashes.py --check
+    without running any of the reviewed commit's code: the expected names are HEAD's own declarations, read as
+    literals (install.py HOOKS: its ahc_*.py modules; harness/hooks/ahc_guard.py HELPER_SCRIPTS: helper name to
+    script). The list's "files" and "helpers" must name exactly those, each a regular file at HEAD (no symlink or
+    submodule) whose sha256 matches. A repository with no list at HEAD or at the base is not checked (other
+    repositories use this review too); deleting the base's list is a problem.
     """
     head_tree = _hook_tree(snapshot, head)
     base_tree = _hook_tree(snapshot, base) if base else {}
@@ -913,25 +935,29 @@ def ahc_release_problem(snapshot: Path, head: str, base: str | None) -> tuple[st
             raise ValueError(f'{AHC_RELEASE} is not a regular file at HEAD')
         raw = (snapshot / AHC_RELEASE).read_bytes()
         files, helpers = _release_parts(raw.decode('utf-8'), 'HEAD')
-        if base_tree.get('ahc_release.json') in {'100644', '100755'}:
-            base_files, base_helpers = _release_parts(
-                git(snapshot, 'show', f'{base}:{AHC_RELEASE}', snapshot=True), 'the base')
-            stale += [f'{part} {name} (dropped from the list)' for part, earlier, now in (
-                ('files', base_files, files), ('helpers', {n + '.py': n for n in base_helpers},
-                                               {n + '.py': n for n in helpers}))
-                for name in sorted(earlier) if name in head_tree and name not in now]
-        install = snapshot / 'install.py'
-        shipped = install.read_text(encoding='utf-8', errors='replace') if install.is_file() else ''
-        stale += [f'files {name} (shipped by install.py, not listed)' for name in sorted(head_tree)
-                  if AHC_RELEASE_FILE.fullmatch(name) and f'"{name}"' in shipped and name not in files]
-        for part, entries, script in (('files', files, lambda n: n), ('helpers', helpers, lambda n: n + '.py')):
+        shipped = _declared(snapshot, 'install.py', 'HOOKS', tuple)
+        declared = _declared(snapshot, 'harness/hooks/ahc_guard.py', 'HELPER_SCRIPTS', dict)
+        if not all(isinstance(n, str) for n in shipped) or not all(
+                isinstance(k, str) and AHC_RELEASE_HELPER.fullmatch(k) and isinstance(v, str)
+                and re.fullmatch(r'[a-z][a-z0-9_]{0,60}\.py', v) for k, v in declared.items()):
+            raise ValueError('install.py HOOKS or ahc_guard.HELPER_SCRIPTS holds a name that is not a plain file name')
+        modules = {n for n in shipped if AHC_RELEASE_FILE.fullmatch(n)}
+        stale += [f'files {n} (shipped by install.py, not listed)' for n in sorted(modules - set(files))]
+        stale += [f'files {n} (listed, but install.py does not ship it)' for n in sorted(set(files) - modules)]
+        stale += [f'helpers {n} (declared by ahc_guard.HELPER_SCRIPTS, not listed)'
+                  for n in sorted(set(declared) - set(helpers))]
+        stale += [f'helpers {n} (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)'
+                  for n in sorted(set(helpers) - set(declared))]
+        for part, entries, script in (('files', files, lambda n: n), ('helpers', helpers, declared.get)):
             for name, digest in sorted(entries.items()):
+                if script(name) is None:
+                    continue
                 if head_tree.get(script(name)) not in {'100644', '100755'}:
                     stale.append(f'{part} {name} (no regular file at HEAD)')
                 elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes()).hexdigest() != digest:
                     stale.append(f'{part} {name} (sha256 differs)')
     except (ValueError, UnicodeDecodeError) as error:
-        return f'{error}; {AHC_RELEASE_FIX}', None
+        return f'{AHC_RELEASE} cannot be checked: {error}; {AHC_RELEASE_FIX}', None
     if stale:
         return (f'{AHC_RELEASE} is stale at HEAD: ' + '; '.join(stale[:12]) + '. The ahc daemon refuses these until '
                 f'the list matches: {AHC_RELEASE_FIX}'), None

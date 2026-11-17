@@ -5095,13 +5095,19 @@ class MigrationV5Tests(Base):
                                              out=lambda line: None), 0)
         if record is not None:
             (self.paths.root / ahc_install.RECORD).write_text(record)
+        self.inst_module = ahc_install
         env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
         env.start()
         self.addCleanup(env.stop)
         return ahc_install
 
     def assert_refused_before_the_fence(self, pattern):
-        self.expect_refusal(runner.MigrationRefused, pattern)
+        try:
+            self.expect_refusal(runner.MigrationRefused, pattern)
+        except AssertionError:
+            raise
+        except Exception as error:   # a crash (exit 1, restart) is not a refusal (exit 3): it must fail, not error
+            self.fail("the preflight raised %r instead of refusing" % (error,))
         self.assertEqual(self.version(), "4", "refused before the fence: nothing written")
         self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak")), "no backup taken")
 
@@ -5130,6 +5136,11 @@ class MigrationV5Tests(Base):
                         path.unlink()
                         pattern = re.escape(str(path)) + " unreadable"
                     self.assert_refused_before_the_fence(pattern + ".*ahc install --apply")
+                    # the named remedy works on this host: the real installer rewrites it and the migration runs
+                    self.assertEqual(self.inst_module.install(self.paths, self.home, True, run=FakeHost(),
+                                                             system="Linux", out=lambda line: None), 0)
+                    self.must_open().close()
+                    self.assertEqual(self.version(), "5")
 
     def test_r247_f5_a_legacy_record_without_files_still_checks_the_launch_files(self):
         # what a 4d45fe40 install wrote: no "files" key; the preflight must not skip this host's launch files
@@ -5141,7 +5152,10 @@ class MigrationV5Tests(Base):
         for label, record, pattern in (
                 ("other paths", json.dumps({"linger_before": False, "files": ["/elsewhere/ahc-core.service"]}),
                  "install record names"),
-                ("not json", "{", "install record .* cannot be read")):
+                ("not json", "{", "install record .* cannot be read"),
+                ("files not a list", json.dumps({"linger_before": False, "files": {"a": 1}}), "install record names"),
+                ("files of mixed type", json.dumps({"linger_before": False, "files": [1, "x"]}),
+                 "install record names")):
             with self.subTest(label):
                 self.setUp()
                 self.installed_old(record=record)

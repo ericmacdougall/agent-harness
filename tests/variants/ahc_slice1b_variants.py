@@ -1386,7 +1386,12 @@ ENTRIES.update({
                   PRT + "test_r247_f4_dropping_a_listed_helper_refuses_the_pr_review",
                   PRT + "test_r247_f4_an_unlisted_shipped_module_refuses_the_pr_review",
                   PRT + "test_r247_f4_a_malformed_or_deleted_list_refuses_the_pr_review",
-                  PRT + "test_r247_f4_a_regenerated_list_passes_and_the_report_names_it"],
+                  PRT + "test_r247_f4_a_regenerated_list_passes_and_the_report_names_it",
+                  PRT + "test_r247_f4_a_newly_declared_helper_that_is_not_listed_refuses",
+                  PRT + "test_r247_f4_a_listed_helper_nothing_declares_refuses",
+                  PRT + "test_r247_f4_a_module_no_longer_shipped_leaves_the_list_and_passes",
+                  PRT + "test_r247_f4_a_listed_name_nothing_declares_refuses",
+                  PRT + "test_r247_f4_a_declaration_that_is_not_a_literal_refuses"],
         "mutations": [
             ("the pr stage never runs the release check", [
                 ("            if args.stage == 'pr':\n                # Before any provider budget",
@@ -1394,12 +1399,17 @@ ENTRIES.update({
             ("listed hashes are not compared", [
                 ("                elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes())"
                  ".hexdigest() != digest:\n", "                elif False:\n")], PEER_PY),
-            ("a name dropped from the base's list is accepted", [
-                ("for name in sorted(earlier) if name in head_tree and name not in now]",
-                 "for name in sorted(earlier) if name in head_tree and name not in now and False]")], PEER_PY),
             ("a module install.py ships may go unlisted", [
-                ("""and f'"{name}"' in shipped and name not in files]""",
-                 """and f'"{name}"' in shipped and name not in files and False]""")], PEER_PY),
+                ("for n in sorted(modules - set(files))]", "for n in []]")], PEER_PY),
+            ("a listed module install.py does not ship is accepted", [
+                ("for n in sorted(set(files) - modules)]", "for n in []]")], PEER_PY),
+            ("a declared helper may go unlisted", [
+                ("for n in sorted(set(declared) - set(helpers))]", "for n in []]")], PEER_PY),
+            ("a listed helper nothing declares is accepted", [
+                ("for n in sorted(set(helpers) - set(declared))]", "for n in []]")], PEER_PY),
+            ("a computed declaration is read as empty", [
+                ("        raise ValueError(f'{rel} {name} is not a literal') from None\n",
+                 "        return kind()\n")], PEER_PY),
             ("deleting the base's list is accepted", [
                 ("        if 'ahc_release.json' in base_tree:\n", "        if False:\n")], PEER_PY),
             ("the passing report does not name the list", [
@@ -1420,8 +1430,10 @@ ENTRIES.update({
             ("the installer records no launch files", [
                 ('"user": _user(), "files": files}', '"user": _user()}')], INSTALL_PY),
             ("a record naming other paths is accepted", [
-                ('        if recorded is not None and sorted(recorded) != sorted(want):\n',
-                 '        if False:\n')], RUNNER_PY),
+                ('        if recorded is not None and (not isinstance(recorded, list)',
+                 '        if False and (not isinstance(recorded, list)')], RUNNER_PY),
+            ("a mixed-type files list crashes the preflight", [
+                ('or not all(isinstance(f, str) for f in recorded)\n', 'or False\n')], RUNNER_PY),
             ("an unreadable record counts as no install", [
                 ('            if os.path.lexists(str(record_path)):\n', '            if False:\n')], RUNNER_PY)]},
 })
