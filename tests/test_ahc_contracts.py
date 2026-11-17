@@ -2019,6 +2019,37 @@ class RuntimeTests(Base):
         self.assertEqual(self.intent_state(unit), "closed")
         self.assertNotIn(unit, self.runner.live)
 
+    def test_rescue_f1_the_observed_t2_dev_triple_active_exited_success_is_ended_but_never_a_stop(self):
+        """F1, pinned to the property triple the coordinator owner observed on t2-dev for an exited
+        RemainAfterExit unit: ActiveState=active, SubState=exited, Result=success. The injected runner returns
+        exactly that triple while the unit is loaded. The sweep must treat it as ended (R7 now), must not take
+        ActiveState or Result=success as a confirmed stop (a stop that reports success while the triple persists
+        leaves the intent live), and retires the intent only once show reports inactive."""
+        row, unit, _o, _f = self.launched()
+        triple = {"ActiveState": "active", "SubState": "exited", "Result": "success"}
+        seen, base_show = [], self.runner.show
+
+        def show(u, props):
+            if u == unit and u in self.runner.live:
+                seen.append(tuple(props))
+                return dict(triple)
+            return base_show(u, props)
+
+        self.runner.show = show
+        self.runner.sticky.add(unit)
+        out = self.stage().settle()
+        self.assertTrue(seen, "the sweep read the unit's properties")
+        self.assertEqual(out["unknown"], [row["id"]], "active/exited/success with no completion signal is ended")
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "outcome-unknown")
+        self.assertIn(self.intent_state(unit), self.LIVE, "active/exited/success is not a confirmed stop")
+        self.assertIn(unit, self.runner.live)
+        self.stage().settle()
+        self.assertIn(self.intent_state(unit), self.LIVE, "a second pass still does not trust the triple")
+        self.runner.sticky.discard(unit)
+        self.stage().settle()
+        self.assertEqual(self.intent_state(unit), "closed")
+        self.assertNotIn(unit, self.runner.live)
+
     def test_rescue_f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop(self):
         """F1, structurally: intent_move has no edge to closed or orphaned, no module call moves an intent to one,
         and intent_retire refuses an observation that is not inactive or failed."""

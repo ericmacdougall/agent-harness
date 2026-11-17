@@ -1040,8 +1040,14 @@ ENTRIES.update({
                   RX + "f1_a_crash_between_settlement_and_the_stop_leaves_cleanup_that_is_finished",
                   RX + "f1_remain_after_exit_an_exited_unit_is_given_up_and_still_stopped_before_it_retires",
                   RX + "f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop",
-                  RX + "f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form"],
+                  RX + "f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form",
+                  RX + "f1_the_observed_t2_dev_triple_active_exited_success_is_ended_but_never_a_stop"],
         "mutations": [
+            ("Result=success counts as a confirmed stop (the t2-dev triple active/exited/success)", [
+                ('            state = (runner.show(unit, ("ActiveState",)) or {}).get("ActiveState")\n',
+                 '            props = runner.show(unit, ("ActiveState", "Result")) or {}\n'
+                 '            state = "inactive" if props.get("Result") == "success" else props.get("ActiveState")\n')],
+             REVIEW_PY),
             ("a settled attempt's intent closes before its unit is stopped", [
                 ('            if not self.intent_move(iid, ("started",), "stopping", reason, retire_to="closed"):\n',
                  '            if not self.db.execute("UPDATE launch_intents SET state=\'closed\' WHERE id=?", (iid,)).rowcount:\n')],
