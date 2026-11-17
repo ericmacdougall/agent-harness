@@ -422,7 +422,8 @@ class LegacyProductionPathTests(_GuardFixture):
 
     def test_r247_f4_helper_drift_fails_the_check_and_ci_runs_it_before_the_tests(self):
         """PR 247 receipt F4: a helper changed without regenerating the list fails `--check` with the fix named, and
-        CI runs that check as its own step, so the drift is caught at merge time, not by a refused launch."""
+        the CI workflow carries the check as its own step. That step is dormant while Actions are off for
+        agent-harness; the enforced merge-time gate is the PR review (tests.test_peer_review r247_f4)."""
         import contextlib  # noqa: PLC0415
         import importlib.util  # noqa: PLC0415
         import io  # noqa: PLC0415

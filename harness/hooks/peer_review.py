@@ -857,6 +857,87 @@ def read_packet(path: Path) -> PacketEvidence:
         raise ValueError('packet invalid or changed while being read') from None
 
 
+AHC_RELEASE = 'harness/hooks/ahc_release.json'
+AHC_RELEASE_FILE = re.compile(r'ahc_[a-z0-9_]{1,60}\.py')
+AHC_RELEASE_HELPER = re.compile(r'[a-z][a-z0-9_]{0,40}')  # helper N is the script harness/hooks/N.py (ahc_guard)
+AHC_RELEASE_SHA = re.compile(r'[0-9a-f]{64}')
+AHC_RELEASE_FIX = ('run `python3 scripts/ahc_release_hashes.py --write` and commit harness/hooks/ahc_release.json in '
+                   'the same change')
+
+
+def _hook_tree(snapshot: Path, rev: str) -> dict[str, str]:
+    """{basename: git mode} for the entries directly under harness/hooks/ at rev, read from the snapshot's objects."""
+    tree = {}
+    for entry in git(snapshot, 'ls-tree', '-z', rev, '--', 'harness/hooks/', snapshot=True).split('\0'):
+        meta, tab, path = entry.partition('\t')
+        if tab:
+            tree[path.rsplit('/', 1)[-1]] = meta.split(' ', 1)[0]
+    return tree
+
+
+def _release_parts(text: str, where: str) -> tuple[dict, dict]:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError(f'{AHC_RELEASE} at {where} is not JSON') from None
+    parts = []
+    for part, names in (('files', AHC_RELEASE_FILE), ('helpers', AHC_RELEASE_HELPER)):
+        value = data.get(part) if isinstance(data, dict) else None
+        if not isinstance(value, dict) or not all(
+                isinstance(k, str) and names.fullmatch(k) and isinstance(v, str) and AHC_RELEASE_SHA.fullmatch(v)
+                for k, v in value.items()):
+            raise ValueError(f'{AHC_RELEASE} at {where} has a malformed "{part}" map')
+        parts.append(value)
+    return parts[0], parts[1]
+
+
+def ahc_release_problem(snapshot: Path, head: str, base: str | None) -> tuple[str | None, str | None]:
+    """The PR-stage gate for the ahc release list (goodqa#16049, PR 247 F4): (problem, manifest sha256).
+
+    agent-harness runs no GitHub CI, so a merge needs this review's authorization or an audited waiver; checking
+    here is what makes a stale list block a merge. It reads the snapshot as data only and never runs the reviewed
+    commit's own scripts/ahc_release_hashes.py: the list must parse, every listed module and helper must be a
+    regular file at HEAD whose sha256 matches, every name the base's list carried must still be listed while its file
+    exists, and every ahc_*.py module HEAD's install.py ships must be listed. A repository with no list at HEAD or
+    at the base is not checked (other repositories use this review too); deleting the base's list is a problem.
+    """
+    head_tree = _hook_tree(snapshot, head)
+    base_tree = _hook_tree(snapshot, base) if base else {}
+    if 'ahc_release.json' not in head_tree:
+        if 'ahc_release.json' in base_tree:
+            return f'{AHC_RELEASE} exists at the base but not at HEAD; the ahc daemon refuses every entry point', None
+        return None, None
+    stale = []
+    try:
+        if head_tree['ahc_release.json'] not in {'100644', '100755'}:
+            raise ValueError(f'{AHC_RELEASE} is not a regular file at HEAD')
+        raw = (snapshot / AHC_RELEASE).read_bytes()
+        files, helpers = _release_parts(raw.decode('utf-8'), 'HEAD')
+        if base_tree.get('ahc_release.json') in {'100644', '100755'}:
+            base_files, base_helpers = _release_parts(
+                git(snapshot, 'show', f'{base}:{AHC_RELEASE}', snapshot=True), 'the base')
+            stale += [f'{part} {name} (dropped from the list)' for part, earlier, now in (
+                ('files', base_files, files), ('helpers', {n + '.py': n for n in base_helpers},
+                                               {n + '.py': n for n in helpers}))
+                for name in sorted(earlier) if name in head_tree and name not in now]
+        install = snapshot / 'install.py'
+        shipped = install.read_text(encoding='utf-8', errors='replace') if install.is_file() else ''
+        stale += [f'files {name} (shipped by install.py, not listed)' for name in sorted(head_tree)
+                  if AHC_RELEASE_FILE.fullmatch(name) and f'"{name}"' in shipped and name not in files]
+        for part, entries, script in (('files', files, lambda n: n), ('helpers', helpers, lambda n: n + '.py')):
+            for name, digest in sorted(entries.items()):
+                if head_tree.get(script(name)) not in {'100644', '100755'}:
+                    stale.append(f'{part} {name} (no regular file at HEAD)')
+                elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes()).hexdigest() != digest:
+                    stale.append(f'{part} {name} (sha256 differs)')
+    except (ValueError, UnicodeDecodeError) as error:
+        return f'{error}; {AHC_RELEASE_FIX}', None
+    if stale:
+        return (f'{AHC_RELEASE} is stale at HEAD: ' + '; '.join(stale[:12]) + '. The ahc daemon refuses these until '
+                f'the list matches: {AHC_RELEASE_FIX}'), None
+    return None, hashlib.sha256(raw).hexdigest()
+
+
 def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
     """Capture a clean reviewed commit without reading untracked content.
 
@@ -1891,6 +1972,14 @@ def main() -> int:
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
             options['repo'] = repo
+            if args.stage == 'pr':
+                # Before any provider budget: a stale ahc release list never earns a merge authorization (PR 247 F4).
+                release_problem, options['release_manifest'] = ahc_release_problem(snapshot, before[0], base)
+                if release_problem:
+                    print('Review refused: ' + release_problem, file=sys.stderr)
+                    target.close()
+                    evidence.close()
+                    return 2
             _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
             resolutions = {name: diagnostics.discover_executable(
                 name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
@@ -2008,6 +2097,9 @@ def main() -> int:
                  + hashlib.sha256(options['domain_section'].encode('utf-8')).hexdigest() + "\n")
     elif options.get('domain_disabled'):
         note += f"Domain gates: disabled by {options['domain_disabled']}.\n"
+    if options.get('release_manifest'):
+        note += (f"ahc release list: current at this HEAD ({AHC_RELEASE} SHA-256 "
+                 f"{options['release_manifest']})\n")
     finalized = False
     reference = None
     announced = False
