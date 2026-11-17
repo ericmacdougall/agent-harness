@@ -591,5 +591,57 @@ elif args[:1] == ["stop"]:
         self.assertIn(self.rows["B"]["id"], lifted, "a later reconciliation lifts the block once B is inactive")
 
 
+
+class Ac12KitTests(unittest.TestCase):
+    """AC-12 run kit (scripts/ahc_ac12_live_gate.py), off-host parts: the probe unit carries the R3 template's
+    RuntimeMaxSec and ReadWritePaths, its socket sits under the daemon root's sock/ as in production, a path a
+    DynamicUser cannot traverse is reported as a kit/path finding before any unit starts, and a unit that never
+    connects is reported as "kit: no connection within Ns", not as a peer-uid failure."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ahc_ac12_live_gate", Path(__file__).resolve().parents[1] / "scripts" / "ahc_ac12_live_gate.py")
+        cls.kit = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.kit)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(os.path.realpath(self.tmp.name))
+
+    def test_ac12_plan_carries_runtime_bound_and_the_one_writable_path(self):
+        cmd = self.kit.plan("system", "u.service", "/r/sock/k.sock", "/w/probe.cred", "/w/out", "/usr/bin/python3")
+        self.assertIn("--property=DynamicUser=yes", cmd)
+        self.assertIn("--property=ReadWritePaths=/w/out", cmd)
+        self.assertTrue(any(c.startswith("--property=RuntimeMaxSec=") for c in cmd))
+        doc = self.kit.__doc__
+        for prop in ("RuntimeMaxSec", "ReadWritePaths", "DynamicUser", "RemainAfterExit"):
+            self.assertIn(prop, doc)
+
+    def test_ac12_socket_is_under_the_daemon_roots_sock_dir(self):
+        root = self.base / "ahc"
+        self.assertEqual(Path(self.kit.socket_path(root, "abc")).parent, root / "sock")
+
+    def test_ac12_a_dir_others_cannot_traverse_is_a_kit_path_finding(self):
+        root = self.base / "home" / ".agent-harness" / "ahc"
+        (root / "sock").mkdir(parents=True)
+        for d in (self.base, self.base / "home", self.base / "home" / ".agent-harness", root, root / "sock"):
+            os.chmod(d, 0o711)
+        self.assertEqual(self.kit.untraversable(root / "sock" / "k.sock", below=self.base.parent), [])
+        os.chmod(root, 0o700)
+        blocked = self.kit.untraversable(root / "sock" / "k.sock", below=self.base.parent)
+        self.assertEqual(blocked, [str(root)])
+
+    def test_ac12_no_connection_is_reported_as_a_kit_timeout(self):
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(srv.close)
+        srv.bind(str(self.base / "k.sock"))
+        srv.listen(1)
+        with self.assertRaises(self.kit.KitTimeout) as cm:
+            self.kit.accept_within(srv, 0.05)
+        self.assertIn("kit: no connection within", str(cm.exception))
+
 if __name__ == "__main__":
     unittest.main()

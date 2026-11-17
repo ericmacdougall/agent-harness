@@ -603,8 +603,12 @@ class CleanCorpusTests(unittest.TestCase):
                   if "sha256" not in entry or hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == entry["sha256"]}
         for path, entry in exempt.items():
             self.assertTrue(entry.get("reason"), "every exemption names its reason: %s" % path)
-        self.assertRegex(exempt["tests/data/review_diagnostics_hostile.json"].get("sha256", ""), "^[0-9a-f]{64}$",
-                         "the fixture exemption added by slice 1 (b) R5 pins the fixture's bytes")
+        # the data-fixture exemptions added by slice 1 (b) R5 pin the fixture's bytes; the exemption list's own entry
+        # cannot (a file holding its own sha256 is a fixed point), so it is bound by its exact per-rule counts only
+        for fixture in ("tests/data/review_diagnostics_hostile.json", "tests/data/merge_gate_corpus.json"):
+            self.assertRegex(exempt[fixture].get("sha256", ""), "^[0-9a-f]{64}$",
+                             "the fixture exemption pins the fixture's bytes: %s" % fixture)
+        self.assertNotIn("sha256", exempt["tests/data/ahc_scan_corpus_exempt.json"])
         actual = corpus_counts()
         unlisted = {p: c for p, c in actual.items() if p not in listed}
         self.assertEqual(unlisted, {}, "files with credential shapes that are not exempted")
@@ -617,6 +621,17 @@ class CleanCorpusTests(unittest.TestCase):
         for rel in ("harness/hooks/ahc_scan.py", "tests/test_ahc_scan.py"):
             with self.subTest(rel):
                 self.assertEqual(S.scan_report((ROOT / rel).read_bytes(), rel), [])
+
+    def test_a_pinned_exemption_drops_on_any_edit(self):
+        exempt = json.loads(EXEMPT.read_text())
+        rel = "tests/data/merge_gate_corpus.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / rel
+            target.parent.mkdir(parents=True)
+            target.write_bytes((ROOT / rel).read_bytes() + b"\n")
+            self.assertNotEqual(hashlib.sha256(target.read_bytes()).hexdigest(), exempt[rel]["sha256"],
+                                "one appended byte no longer matches the pin, so the exemption no longer applies")
+            self.assertEqual(hashlib.sha256((ROOT / rel).read_bytes()).hexdigest(), exempt[rel]["sha256"])
 
     def test_a_planted_secret_in_an_exempt_file_changes_its_count(self):
         exempt = json.loads(EXEMPT.read_text())

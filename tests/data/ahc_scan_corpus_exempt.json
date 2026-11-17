@@ -249,7 +249,8 @@
    "bearer:prefix": 1,
    "github-classic:prefix": 2
   },
-  "reason": "merge-gate command corpus: bare public token prefixes and the Bearer scheme in command text; no value"
+  "reason": "merge-gate command corpus (pre-existing fixture): bare public token prefixes and the Bearer scheme in command text; prefix tier only, no value. Pinned by sha256 (slice 1b addendum)",
+  "sha256": "7075418f7060fc030108a15cf9116bdd47a4746f56dec226a0ae0fd2e05c8893"
  },
  "tests/data/review_diagnostics_hostile.json": {
   "counts": {

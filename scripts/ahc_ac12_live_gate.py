@@ -2,7 +2,11 @@
 """AC-12 live-gate run kit (goodqa#16049 slice 1 (b), spec r9). NOT run by this slice: it runs on the Linux host main
 names (t2-dev), before the coordinator runs live, and its result is recorded as a REALLY_TESTED entry there.
 
-One real R3-shaped unit is started with the daemon's template properties and checked leg by leg:
+One real R3-shaped unit is started with the R3 template's properties: DynamicUser (system scope), --collect,
+NoNewPrivileges, PrivateTmp, RemainAfterExit, RuntimeMaxSec (a probe bound of 300 s; the daemon uses 3600) and
+ReadWritePaths naming one fresh 0700 directory, plus LoadCredential and LC_ALL=C. Its socket is created under the
+daemon root's sock/ directory (default ~/.agent-harness/ahc/sock), as core's review.sock is in production. It is
+checked leg by leg:
   L1  DynamicUser (system manager) or the sandbox's `systemd-run --user` deviation (R-c): the unit's uid is
       allocated by systemd and differs from core's.
   L2  LoadCredential: the unit reads a non-secret probe credential from $CREDENTIALS_DIRECTORY.
@@ -11,8 +15,13 @@ One real R3-shaped unit is started with the daemon's template properties and che
 The remaining live-gate items are on the checklist this script prints (the R3 completion wrapper and the report
 grant are PENDING_REAL_TEST PRT-r3-wrapper and PRT-r3-grant; the coordinator stays in shadow, W21 off).
 
+Results that are the kit's or the path's, not the daemon's, are reported apart from the legs:
+  exit 3  "path: ... not traversable by other uids": a directory above the socket denies search to a DynamicUser,
+          found before any unit starts (with the production layout this is itself the PRT-peercred finding).
+  exit 4  "kit: no connection within Ns": the unit never connected; ActiveState/Result are printed.
+
 Usage:  python3 scripts/ahc_ac12_live_gate.py --dry-run            # print the plan and the checklist only
-        python3 scripts/ahc_ac12_live_gate.py --scope system|user  # run the probe unit (Linux, systemd)
+        python3 scripts/ahc_ac12_live_gate.py --scope system|user [--root DIR]  # run the probe unit (Linux)
 Exit 0 only when every leg passes. No secret is used: the probe credential is a fixed public string.
 """
 from __future__ import annotations
@@ -56,10 +65,43 @@ s.close()
 """
 
 
-def plan(scope, unit, sock, cred, python):
+PROBE_MAX_SEC = 300
+ACCEPT_SECONDS = 60
+
+
+class KitTimeout(Exception):
+    """The probe unit never connected: a kit or host finding, not a daemon peer-uid failure."""
+
+
+def socket_path(root, tag):
+    """The probe's socket under the daemon root's sock/ (core's own socket there is review.sock)."""
+    return str(Path(root) / "sock" / ("ac12-%s.sock" % tag))
+
+
+def untraversable(sock, below=None):
+    """Directories from / down to the socket's directory that deny search (o+x) to a uid that is neither owner nor
+    group, as a DynamicUser is. Empty means a dynamic uid can reach the socket's directory. `below` (tests only)
+    limits the walk to directories under it."""
+    parent = Path(sock).parent.resolve()
+    chain = list(reversed(parent.parents)) + [parent]
+    if below is not None:
+        chain = [d for d in chain if Path(below).resolve() in d.parents]
+    return [str(d) for d in chain if not os.stat(str(d)).st_mode & 0o001]
+
+
+def accept_within(srv, seconds):
+    srv.settimeout(seconds)
+    try:
+        return srv.accept()[0]
+    except socket.timeout:
+        raise KitTimeout("kit: no connection within %ss (the unit did not reach the socket)" % seconds) from None
+
+
+def plan(scope, unit, sock, cred, out_dir, python):
     sr = ["systemd-run"] + (["--user"] if scope == "user" else [])
     props = ["--unit=" + unit, "--slice=ahc-review.slice", "--collect", "--quiet",
              "--property=NoNewPrivileges=yes", "--property=PrivateTmp=yes", "--property=RemainAfterExit=yes",
+             "--property=RuntimeMaxSec=%d" % PROBE_MAX_SEC, "--property=ReadWritePaths=" + out_dir,
              "--property=LoadCredential=probe:" + cred, "--setenv=LC_ALL=C"]
     if scope == "system":
         props.insert(4, "--property=DynamicUser=yes")
@@ -71,25 +113,34 @@ def main(argv=None):
     ap.add_argument("--scope", choices=("system", "user"), default="system")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--work", default=str(Path.home() / ".agent-harness" / "ahc-ac12"))
+    ap.add_argument("--root", default=str(Path.home() / ".agent-harness" / "ahc"), help="the daemon root")
     args = ap.parse_args(argv)
-    unit = "ahc-review-ac12-%s.service" % uuid.uuid4().hex[:12]
+    tag = uuid.uuid4().hex[:12]
+    unit = "ahc-review-ac12-%s.service" % tag
     work = Path(args.work) / time.strftime("%Y%m%dT%H%M%S")
-    sock, cred = str(work / "core.sock"), str(work / "probe.cred")
-    cmd = plan(args.scope, unit, sock, cred, "/usr/bin/python3")
+    sock, cred, out_dir = socket_path(args.root, tag), str(work / "probe.cred"), str(work / "out")
+    cmd = plan(args.scope, unit, sock, cred, out_dir, "/usr/bin/python3")
     if args.dry_run or not sys.platform.startswith("linux"):
         print("plan (not run%s):" % ("" if args.dry_run else ": not Linux"))
         print("  " + " ".join(c if c != CLIENT else "<client>" for c in cmd))
         print(CHECKLIST)
         return 0 if args.dry_run else 2
     import ahc_review  # noqa: PLC0415 - the daemon's own peer-uid reader
+    Path(sock).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    blocked = untraversable(sock) if args.scope == "system" else []
+    if blocked:
+        print("path: %s not traversable by other uids: a DynamicUser unit cannot reach %s (kit/path finding, "
+              "not a daemon fault; with the production layout this is the PRT-peercred finding)"
+              % (", ".join(blocked), sock))
+        return 3
     work.mkdir(parents=True, mode=0o711)
+    os.mkdir(out_dir, 0o700)
     Path(cred).write_text(PROBE_TEXT)
     os.chmod(cred, 0o644)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock)
     os.chmod(sock, 0o666)                      # the probe unit's dynamic uid must connect; core checks its uid
     srv.listen(1)
-    srv.settimeout(60)
     legs = {}
     ctl = ["systemctl"] + (["--user"] if args.scope == "user" else [])
     try:
@@ -97,7 +148,13 @@ def main(argv=None):
         if started.returncode != 0:
             print("systemd-run failed: %s" % started.stderr.strip()[:300])
             return 1
-        conn, _ = srv.accept()
+        try:
+            conn = accept_within(srv, ACCEPT_SECONDS)
+        except KitTimeout as error:
+            state = subprocess.run(ctl + ["show", "-p", "ActiveState,Result", unit], capture_output=True, text=True,
+                                   timeout=30).stdout.split()
+            print("%s; unit %s" % (error, " ".join(state)))
+            return 4
         peer = ahc_review.peer_uid(conn)
         msg = json.loads(ahc_review.read_final(conn).decode())
         conn.close()
@@ -112,6 +169,10 @@ def main(argv=None):
     finally:
         subprocess.run(ctl + ["stop", unit], capture_output=True, timeout=30)
         srv.close()
+        try:
+            os.unlink(sock)
+        except FileNotFoundError:
+            pass
     for leg, ok in legs.items():
         print("%s  %s" % ("PASS" if ok else "FAIL", leg))
     (work / "result.json").write_text(json.dumps({"unit": unit, "scope": args.scope, "legs": legs}, indent=1))

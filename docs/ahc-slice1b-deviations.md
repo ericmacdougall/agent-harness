@@ -28,6 +28,7 @@ Every entry here was ruled by an agent. A ruling attributed to "the owner" (coor
   - The production grant is not built (PRT-r3-grant, goodqa#16275). There is deliberately no world-writable fallback, because a writable report lets anyone plant a PASS.
 - **Condition 4: completion.** Completion is read through the allowed `systemctl show` forms. A unit that ends with no FINAL, or outlives REVIEW_MAX plus 300 s, goes to outcome-unknown, never PASS.
 - **Condition 5: no runner injection in production.** The wrapper stub and the runner are injectable only through `Launcher.for_test`.
+- **Likely gap, not settled (PRT-peercred).** Core's socket is `<root>/sock/review.sock`, and the daemon creates the root 0700 (`~/.agent-harness/ahc`). A DynamicUser unit is neither owner nor group, so it likely cannot reach the socket to send its FINAL. Every launch would then end in outcome-unknown, which fails closed. The AC-12 kit's preflight settles this on t2-dev, and the fix belongs with goodqa#16274/#16275.
 - **Condition 6: the wrapper is not shipped.** It is PRT-r3-wrapper, goodqa#16274, an AC-12 live-gate item. Until it ships, the production Launcher has no runner and every R3 launch goes to infra-wait.
 
 *Admission.* W1 binds the item and its rows to core's R2 packet sha256. The owner's packet sha is listed inside the fenced owner section, and the shadow queue holds only that sha. A packet that cannot be built leaves the request held (fail closed).
@@ -43,11 +44,19 @@ Every entry here was ruled by an agent. A ruling attributed to "the owner" (coor
 - the report is read following links;
 - an ended unit is waited on;
 - no grant;
-- no fresh directory.
+- the report directory is made world-writable (`os.makedirs` + `chmod 0777` instead of `ahc_fs.make_fresh_dir`). The variant is named "the report directory is made world-writable (makedirs + chmod 0777), not fresh".
 
-**A-2. The R5 exemption covers `tests/data/review_diagnostics_hostile.json`.** This file has exposure-tier findings (a key-block shape and a token tail).
+**A-2. R5 corpus-scan exemptions added on this branch** (`tests/data/ahc_scan_corpus_exempt.json`, 3 entries; ASSUMPTION). tests/test_ahc_scan.py CleanCorpusTests requires every listed file to yield exactly its listed per-rule counts, and every unlisted file to yield none. A pinned entry also covers only the bytes whose sha256 it names.
+
+| File | Tier | Why it is safe | Pinned |
+|---|---|---|---|
+| `tests/data/review_diagnostics_hostile.json` | exposure (`pem`, `anthropic`, `high-entropy`, plus redact rules) | synthetic hostile fixture of the peer-review diagnostics tests; see below | yes, sha256 `be3b1311…85c6` |
+| `tests/data/merge_gate_corpus.json` | prefix only (3 prefix-tier findings: one auth-scheme word, two public token prefixes; exact counts in the exemption file) | pre-existing merge-gate command corpus (55ce595). Bare public token prefixes and an auth-scheme word in command text; no value follows a prefix | yes, sha256 `7075418f…8893` (addendum) |
+| `tests/data/ahc_scan_corpus_exempt.json` | prefix only (73 prefix-tier findings across two rule kinds; exact counts in its own entry) | the exemption list names scanner rule kinds in its own keys and reasons; it holds no values | no, ASSUMPTION: a file cannot hold its own sha256 (fixed point). It is bound by its exact per-rule counts, so any new shape or any exposure-tier finding in it fails the scan |
+
+Details for the hostile fixture follow. It has exposure-tier findings (a key-block shape and a token tail).
 - *How it was confirmed synthetic, without printing values.* The fixture predates this slice: commits f119894 and 117e8af, peer-review stream. Its own `_comment` says it holds hostile values interpolated into printed diagnostics, read only by tests/test_review_diagnostics.py. Its fields are named `private_key_block` and `fake_token_tail`. tests/test_review_diagnostics.py loads it to test redaction.
-- *Owner condition.* The entry pins the file's sha256, so any edit drops the exemption and the scan fires (tests/test_ahc_scan.py, CleanCorpusTests).
+- *Owner condition.* The entry pins the file's sha256, so any edit drops the exemption and the scan fires (tests/test_ahc_scan.py, CleanCorpusTests). The addendum also pins the merge-gate corpus; `test_a_pinned_exemption_drops_on_any_edit` covers it.
 - *Follow-up for that stream.* Build the values at run time.
 
 **A-3. The tick schedules R3.** This is an owner ruling. One slot per tick, oldest offerable row first. Live shadow stays inert until a GoodQA reader exists (goodqa#16262, ruling g); after that the path is complete, apart from A-1's two PENDING_REAL_TEST items.
@@ -79,6 +88,10 @@ Every entry here was ruled by an agent. A ruling attributed to "the owner" (coor
   - The open-file probe runs through the active policy's lsof/fuser form: resolved executable, minimal env, cwd at the root, and checked before launch.
   - `Ledger._migrate_guarded` opens `policy.migrating` for the migration only. Before this change, a daemon migration under the installed guard was refused (cwd `/`, gate closed).
 - **AC-12.** The run kit is scripts/ahc_ac12_live_gate.py. It is not run. It needs a Linux host main names (t2-dev).
+  - Its probe unit carries the R3 template's properties: `RuntimeMaxSec` (300 s for the probe; the daemon uses 3600), `ReadWritePaths` (one fresh 0700 directory), DynamicUser, RemainAfterExit, NoNewPrivileges, PrivateTmp and `--collect`.
+  - Its socket sits under the daemon root's `sock/` (default `~/.agent-harness/ahc/sock/ac12-<id>.sock`), as core's `review.sock` does in production.
+  - Before any unit starts, the kit reports any directory above the socket that denies search to other uids (exit 3, "path: … not traversable by other uids"). The production root is created 0700, so on a default layout this check is expected to fire, and that result *is* the PRT-peercred socket-reachability finding.
+  - A unit that never connects is reported as "kit: no connection within 60s" with its ActiveState/Result (exit 4). Both results are kept apart from the four legs, so a kit or path failure is never read as a daemon peer-uid fault. Tests: test_ahc_guard.Ac12KitTests.
 
 ## Spec Verify-by → test path
 
