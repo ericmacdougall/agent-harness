@@ -40,6 +40,8 @@ def main(argv):
         if have.get(part) != want[part]:
             print("ahc_release.json is stale (%s): %s" % (part, sorted(
                 k for k in set(have.get(part, {})) | set(want[part]) if have.get(part, {}).get(k) != want[part].get(k))))
+            print("the ahc daemon refuses these until the list matches: run `python3 scripts/ahc_release_hashes.py "
+                  "--write` and commit harness/hooks/ahc_release.json in the same change")
             return 1
     return 0
 

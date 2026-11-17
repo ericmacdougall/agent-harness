@@ -420,6 +420,33 @@ class LegacyProductionPathTests(_GuardFixture):
         self.assertEqual(script.helpers(), bound, "the generator writes the same helpers section")
         self.assertEqual(script.main([]), 0, "the shipped list is current")
 
+    def test_r247_f4_helper_drift_fails_the_check_and_ci_runs_it_before_the_tests(self):
+        """PR 247 receipt F4: a helper changed without regenerating the list fails `--check` with the fix named, and
+        CI runs that check as its own step, so the drift is caught at merge time, not by a refused launch."""
+        import contextlib  # noqa: PLC0415
+        import importlib.util  # noqa: PLC0415
+        import io  # noqa: PLC0415
+        import json as _json  # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location("ahc_release_hashes_f4",
+                                                      str(HOOKS.parents[1] / "scripts" / "ahc_release_hashes.py"))
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        stale = Path(self.root) / "ahc_release.json"
+        data = _json.loads(script.LIST.read_text())
+        data["helpers"]["ah"] = "0" * 64                        # ah.py changed on main; the list was not rewritten
+        stale.write_text(_json.dumps(data))
+        script.LIST = stale
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = script.main(["--check"])
+        self.assertEqual(rc, 1, out.getvalue())
+        self.assertIn("stale (helpers): ['ah']", out.getvalue())
+        self.assertIn("ahc_release_hashes.py --write", out.getvalue())
+        ci = (HOOKS.parents[1] / ".github" / "workflows" / "ci.yml").read_text()
+        step = "run: python3 -I scripts/ahc_release_hashes.py --check"
+        self.assertIn(step, ci, "CI runs the release-list check")
+        self.assertLess(ci.index(step), ci.index("python3 -m unittest discover"), "before the long test step")
+
     def test_legacy_helper_from_config_must_be_the_installed_one(self):
         other = self.helper.parent / "other.py"
         other.write_text(self.helper.read_text())
