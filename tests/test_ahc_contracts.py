@@ -2050,6 +2050,43 @@ class RuntimeTests(Base):
         self.assertEqual(self.intent_state(unit), "closed")
         self.assertNotIn(unit, self.runner.live)
 
+    def test_rescue_f1_a_final_sent_just_after_the_drain_by_a_unit_that_then_exits_is_settled_not_given_up(self):
+        """F1 ordering. A successful unit's wrapper sends FINAL and then exits, leaving the t2-dev triple
+        (active/exited/success). When both happen just after a tick's inbox drain, that tick must not see the exit
+        and give the row up (R7, outcome-unknown) before the next drain reads the FINAL: a valid PASS would be lost
+        and the attempt charged. The tick reads ended() before its drain, so an exit it acts on implies the FINAL,
+        sent before the exit, was already queued for that drain."""
+        row, unit, _o, final = self.launched("VERDICT: PASS")
+        triple = {"ActiveState": "active", "SubState": "exited", "Result": "success"}
+        exited, base_show, test = [], self.runner.show, self
+
+        def show(u, props):
+            if u == unit and exited and u in self.runner.live:
+                return dict(base_show(u, props), **triple)   # the unit's Slice and InvocationID, with the triple
+            return base_show(u, props)
+
+        class LateFinal:
+            queue = []
+
+            def poll(self, errors):
+                got, LateFinal.queue = LateFinal.queue, []
+                if not exited:                     # the wrapper sends FINAL just after this drain, then exits
+                    LateFinal.queue = [(test.UID, json.dumps(final).encode())]
+                    exited.append(True)
+                return got
+
+        self.runner.show = show
+        first = self.stage(LateFinal()).settle()
+        self.assertEqual(first["unknown"], [], "the exit came after this tick's drain: no R7 on this tick")
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "running")
+        self.assertIn(self.intent_state(unit), self.LIVE)
+        second = self.stage(LateFinal()).settle()
+        self.assertEqual(second["settled"], [(row["id"], "passed")], second)
+        self.assertEqual(second["unknown"], [], second)
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "passed")
+        self.assertEqual(self.intent_state(unit), "closed")
+        self.assertNotIn(unit, self.runner.live)
+
     def test_rescue_f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop(self):
         """F1, structurally: intent_move has no edge to closed or orphaned, no module call moves an intent to one,
         and intent_retire refuses an observation that is not inactive or failed."""

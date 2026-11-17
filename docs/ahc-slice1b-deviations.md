@@ -169,11 +169,13 @@ The round-2 invariant above did not hold on every path: `settle_final` closed a 
   - the sweep and both reconciliation passes.
 - *RemainAfterExit.* `ReviewStage.ended` counts ActiveState active with SubState exited as ended, so R7 fires at once instead of after REVIEW_MAX. It is never a confirmed stop: only inactive or failed after a stop retires an intent. This closes the round-2 disclosure on `ended()`; real systemd behaviour is still the AC-12 gate.
   - Field observation (the coordinator owner, on t2-dev, relayed by main; an agent report, not reproduced by the rescue): an exited RemainAfterExit unit reads `ActiveState=active`, `SubState=exited`, `Result=success`. That confirms neither ActiveState nor `Result=success` is a stop confirmation, and that `ended()` must read SubState. A test pins exactly that triple.
+  - *Ordering.* That triple is also what every successful unit shows right after its wrapper sends FINAL. Read after the inbox drain, a unit that sent FINAL and exited between the drain and the sweep would be given up by R7, and a valid verdict lost. `ReviewStage.settle` therefore reads `ended_units()` before the drain and the sweep acts only on that observation. This relies on the completion contract that the wrapper (goodqa#16274) must keep: its connect and send return before its process exits (ASSUMPTION until the wrapper ships).
 - *Tests* (`tests.test_ahc_contracts.RuntimeTests`):
   - `test_rescue_f1_a_valid_final_never_retires_the_intent_before_its_unit_is_confirmed_stopped`: stop returns False, returns True while the unit stays active, or is refused;
   - `test_rescue_f1_a_crash_between_settlement_and_the_stop_leaves_cleanup_that_is_finished`: the next sweep, and a restart through the real guard;
   - `test_rescue_f1_remain_after_exit_an_exited_unit_is_given_up_and_still_stopped_before_it_retires`;
   - `test_rescue_f1_the_observed_t2_dev_triple_active_exited_success_is_ended_but_never_a_stop`: the injected runner returns exactly active/exited/success;
+  - `test_rescue_f1_a_final_sent_just_after_the_drain_by_a_unit_that_then_exits_is_settled_not_given_up`: FINAL and the exit land just after a drain; no R7 that tick, PASS on the next;
   - `test_rescue_f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop`, including a source scan;
   - `test_rescue_f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form`;
   - `tests.test_ahc_crash.NamedPointTests` with `r3.settled`.
@@ -200,7 +202,7 @@ The round-2 invariant above did not hold on every path: `settle_final` closed a 
 **Variants.**
 - Eighteen anchors moved onto the rescue code with the same mutation intent. They cover NEG-22 (2), NEG-25, NEG-36 (2), NEG-49, option A's two R7 mutations, test_r03's `--author-harness`, F4 (3), F5 (4) and F6 (2).
 - Three new entries:
-  - "PR 272 rescue F1 …" (8 mutations, including "Result=success counts as a confirmed stop");
+  - "PR 272 rescue F1 …" (9 mutations, including "Result=success counts as a confirmed stop" and "the sweep reads ended() after the inbox drain");
   - "PR 272 rescue F2 …" (2);
   - "PR 272 rescue A-1 …" (1).
 
