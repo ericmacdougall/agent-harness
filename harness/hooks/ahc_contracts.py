@@ -136,11 +136,30 @@ CREATE TABLE IF NOT EXISTS w16_proofs (
 CREATE TABLE IF NOT EXISTS wi_quarantine (
   event_id TEXT NOT NULL, item TEXT NOT NULL, row_id TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL,
   created REAL NOT NULL, PRIMARY KEY (event_id, kind));
+CREATE TABLE IF NOT EXISTS lineage_tickets (
+  lineage TEXT PRIMARY KEY, repo TEXT NOT NULL, pr INTEGER NOT NULL, project TEXT NOT NULL, number INTEGER NOT NULL,
+  bound_at REAL NOT NULL, event_id TEXT NOT NULL, CHECK (number > 0));
 """
 
 
 class ContractError(ValueError):
     """A transition that the contract does not allow, or whose guard is false. Nothing was written."""
+
+
+class BindingMismatch(ContractError):
+    """goodqa#16262 RULED-4 check 5: the lineage is bound to another ticket. Raised before any write."""
+
+
+TICKET_PROJECT = re.compile(r"[a-z0-9-]+")
+
+
+def canonical_ticket(ticket):
+    """goodqa#16262 F1: the canonical ticket is the pair (project, number), project a lowercase slug and number a
+    positive int under 10**9 (no bool). Anything else raises ContractError."""
+    if (isinstance(ticket, tuple) and len(ticket) == 2 and isinstance(ticket[0], str)
+            and TICKET_PROJECT.fullmatch(ticket[0]) and type(ticket[1]) is int and 0 < ticket[1] < 10 ** 9):
+        return ticket
+    raise ContractError("a ticket is the canonical pair (project, number)")
 
 
 class VersionConflict(ContractError):
@@ -415,12 +434,19 @@ class Contracts:
         return "ln-" + _sha({"repo": str(repo).lower(), "pr": int(pr)})[:24]
 
     def admit_item(self, repo, pr, head, base, policy_revision, spec_core, packet_sha256, *, event_id,
-                   actor="ahc-core", red_team=False):
+                   actor="ahc-core", red_team=False, ticket=None):
         """W1 (entry) -> pr-gate for (lineage, H, B), creating the required Review rows bound to (repo, pr, H, B):
         adversarial and spec, plus red-team when the class requires it. NEG-11: a resubmit at the same head returns
-        the live item unchanged; no state, version or Review row moves."""
+        the live item unchanged; no state, version or Review row moves.
+
+        goodqa#16262 RULED-4 check 5 (RT-18): `ticket`, the canonical (project, number) from the commits' Refs, is
+        passed only by the W1 request path. The lineage binding is W1's first write: INSERT OR IGNORE, then a
+        read-back; another stored ticket raises BindingMismatch before anything is written. A successor's call
+        (W4, W24, W21) passes no ticket, writes no row and inherits the binding through the lineage key."""
         if actor != self.WI_TRANSITIONS["W1"][2]:
             raise ContractError("W1: only ahc-core admits an item")
+        if ticket is not None:
+            ticket = canonical_ticket(ticket)
         repo = str(repo).lower()
         for name, value in (("head", head), ("base", base)):
             if not _is_oid(value):
@@ -433,9 +459,18 @@ class Contracts:
                                    (repo, int(pr), head) + self.WI_TERMINAL).fetchone()
             if live:
                 return self._row("work_items", "id", live[0])
+            now = self.now()
+            if ticket is not None:
+                lineage = self.lineage_of(repo, pr)
+                self.db.execute("INSERT OR IGNORE INTO lineage_tickets(lineage, repo, pr, project, number, bound_at, "
+                                "event_id) VALUES (?,?,?,?,?,?,?)",
+                                (lineage, repo, int(pr), ticket[0], ticket[1], now, event_id))
+                stored = tuple(self.db.execute("SELECT project, number FROM lineage_tickets WHERE lineage=?",
+                                               (lineage,)).fetchone())
+                if stored != ticket:
+                    raise BindingMismatch("lineage bound to %s#%d" % stored)
             iid = "wi-" + _sha({"repo": repo, "pr": int(pr), "head": head, "base": base, "event": event_id})[:24]
             self._g0("work_item", None, None, event_id, actor, {(None, "pr-gate"): (actor,)}, None, "pr-gate")
-            now = self.now()
             # PR 268 F2: the class's required review kinds are stored on the item, so a successor (W4, W24)
             # requires the same kinds and e1 can check that none is missing
             self.db.execute("INSERT INTO work_items(id, lineage, repo, pr, head, base, policy_revision, spec_core, "

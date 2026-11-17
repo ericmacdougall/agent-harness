@@ -2402,5 +2402,78 @@ class _ListInbox:
         return out
 
 
+class LineageBindingTests(Base):
+    """goodqa#16262 d5 RULED-4 check 5 (red-team RT-18): W1 binds a lineage to its Refs ticket with INSERT OR IGNORE
+    plus a read-back, as its first write. A matching re-admission reuses the row, a mismatch raises BindingMismatch
+    before any write, a same-head resubmit for a live item is a no-op, and a call without a ticket writes no row."""
+
+    def admit(self, head, ticket=None, pr=5):
+        kw = {} if ticket is None else {"ticket": ticket}
+        return self.c.admit_item("o/r", pr, head, BASE, POLICY, CORE1, PKT, event_id=self.ev(), **kw)
+
+    def bound(self, lineage):
+        return self.db.execute("SELECT project, number FROM lineage_tickets WHERE lineage=?", (lineage,)).fetchall()
+
+    def counts(self):
+        return tuple(self.db.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
+                     for t in ("work_items", "reviews", "transitions"))
+
+    def cancel(self, item):
+        self.db.execute("UPDATE work_items SET state='cancelled', version=version+1 WHERE id=?", (item["id"],))
+
+    def test_w1_with_a_ticket_binds_the_lineage(self):
+        item = self.admit(H1, ("goodqa", 5))
+        self.assertEqual(self.bound(item["lineage"]), [("goodqa", 5)])
+
+    def test_a_same_head_resubmit_for_a_live_item_is_a_noop_whatever_its_ticket(self):
+        item = self.admit(H1, ("goodqa", 5))
+        before = self.counts()
+        again = self.admit(H1, ("goodqa", 6))
+        self.assertEqual(again["id"], item["id"])
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(self.bound(item["lineage"]), [("goodqa", 5)])
+
+    def test_rt18_readmission_reuses_a_matching_binding_and_refuses_a_mismatch_before_any_write(self):
+        item = self.admit(H1, ("goodqa", 5))
+        self.cancel(item)
+        before = self.counts()
+        with self.assertRaises(C.BindingMismatch) as ctx:
+            self.admit(H2, ("goodqa", 6))
+        self.assertIsInstance(ctx.exception, C.ContractError)
+        self.assertIn("lineage bound to goodqa#5", str(ctx.exception))
+        self.assertEqual(self.counts(), before, "a mismatch writes nothing")
+        again = self.admit(H2, ("goodqa", 5))
+        self.assertEqual((again["state"], again["lineage"]), ("pr-gate", item["lineage"]))
+        self.assertEqual(self.bound(item["lineage"]), [("goodqa", 5)], "the row is reused, never updated")
+
+    def test_rt18_a_mismatch_caught_inside_an_enclosing_transaction_commits_nothing(self):
+        """The shadow tick calls admit_item inside its own tx() and catches ContractError there (tx() does not
+        nest, goodqa#16325); the mismatch must raise before admit_item's first write."""
+        item = self.admit(H1, ("goodqa", 5))
+        self.cancel(item)
+        before = self.counts()
+        with self.c.tx():
+            try:
+                self.admit(H2, ("goodqa", 6))
+            except C.ContractError:
+                pass
+        self.assertEqual(self.counts(), before)
+
+    def test_a_call_without_a_ticket_writes_no_row_and_leaves_a_binding_alone(self):
+        unbound = self.admit(H1, pr=7)                       # NEG-12: a lineage admitted before the binding
+        self.assertEqual(self.bound(unbound["lineage"]), [])
+        item = self.admit(H1, ("goodqa", 5))
+        self.cancel(item)
+        succ = self.admit(H2)                                # a successor's call (W4, W24, W21) passes no ticket
+        self.assertEqual(succ["lineage"], item["lineage"])
+        self.assertEqual(self.bound(item["lineage"]), [("goodqa", 5)])
+
+    def test_a_ticket_must_be_a_canonical_pair(self):
+        for bad in (("GoodQA", 5), ("goodqa", 0), ("goodqa", "5"), ("goodqa", True), "goodqa#5", ("goodqa", 5, 1)):
+            with self.subTest(bad=bad), self.assertRaises(C.ContractError):
+                self.admit(H1, bad, pr=9)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM work_items").fetchone()[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
