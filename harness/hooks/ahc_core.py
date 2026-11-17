@@ -576,6 +576,21 @@ def _parse_report(text):
 EXIT_PASS, EXIT_ERROR, EXIT_BLOCK, EXIT_ADVISORY = 0, 2, 3, 4   # peer_review.py main()
 
 
+def helper_outcome(rc, verdict):
+    """The one rule for what a peer_review exit status lets its report's verdict mean (AC-5 here, and the R3 option A
+    completion in ahc_review.settle_final, PR 273 receipt F1). PASS and PASS-WITH-TICKETS need exit 0; BLOCK holds
+    with exit 0 or 3 (the safe direction). Anything else, exit 2 included, is None: no current signoff, because
+    peer_review leaves a digest-bound historical report after a failed final publication check. `rc` must be a real
+    int (a JSON true or false is refused, never read as 1 or 0)."""
+    if type(rc) is not int:
+        return None
+    if verdict == "BLOCK":
+        return "BLOCK" if rc in (EXIT_PASS, EXIT_BLOCK) else None
+    if verdict in ("PASS", "PASS-WITH-TICKETS"):
+        return verdict if rc == EXIT_PASS else None
+    return None
+
+
 def verify_receipt(rc, report_path, head, packet_path, report_bytes=None):
     """{"verdict": PASS|PASS-WITH-TICKETS|BLOCK|ADVISORY|INVALID|ERROR, "reason"} (spec AC-5, NEG-5).
 
@@ -614,6 +629,6 @@ def verify_receipt(rc, report_path, head, packet_path, report_bytes=None):
     if not match:
         return {"verdict": "INVALID", "reason": "the first line after the header block is not a supported verdict"}
     verdict = match.group(1)
-    if rc != EXIT_PASS:
+    if helper_outcome(rc, verdict) is None:
         return {"verdict": "ERROR", "reason": f"verdict {verdict} with exit {rc}"}
     return {"verdict": verdict, "reason": ""}

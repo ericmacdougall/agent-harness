@@ -5846,7 +5846,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         return self.ledger_rows("SELECT r.id, w.pr, r.state, r.packet_sha256, w.packet_sha256 FROM reviews r JOIN "
                                 "work_items w ON w.id = r.item WHERE r.kind='adversarial' ORDER BY w.pr")
 
-    def play_wrapper(self, rid, verdict_line, final_verdict=None, body="body\n"):
+    def play_wrapper(self, rid, verdict_line, final_verdict=None, body="body\n", exit_status=0):
         """The completion wrapper's part, played by the test: the report in the attempt's directory, then the
         completion signal on core's socket (this process's uid is the uid the fake runner reported)."""
         import socket  # noqa: PLC0415
@@ -5857,7 +5857,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         out = self.paths.root / "reports" / ("%s-%s" % (rid, iid)) / "report.md"
         out.write_bytes(report)
         final = {"row": rid, "intent": iid, "invocation_id": self.runner.invocation[unit],
-                 "report_sha256": hashlib.sha256(report).hexdigest()}
+                 "report_sha256": hashlib.sha256(report).hexdigest(), "exit_status": exit_status}
         if final_verdict:
             final["verdict"] = final_verdict                  # never read: core takes the verdict from the report
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -5896,6 +5896,19 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertEqual(len(self.runner.stopped), 2, "each settled unit is stopped")
         mutating = [a for a in self.all_gh_argv() if self.S.is_mutating("gh", a)]
         self.assertEqual(mutating, [], "zero mutating gh calls with the review step in the tick")
+
+    def test_r273_f1_a_pass_report_with_a_failed_publication_exit_settles_outcome_unknown_through_the_tick(self):
+        """PR 273 receipt F1, end to end: the wrapper (played here) leaves a correctly bound PASS report and signals
+        on core's socket that peer_review exited 2 (its failed final publication check). The tick settles the row
+        outcome-unknown, never passed, and still stops the unit and retires its intent."""
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        first = self.run_all(self.deps)["shadow"]
+        (a,) = first["scheduled"]["started"]
+        self.play_wrapper(a, "VERDICT: PASS", exit_status=2)
+        second = self.run_all(self.deps)["shadow"]
+        self.assertEqual(second["review"]["settled"], [(a, "outcome-unknown")], second["review"])
+        self.assertEqual({r[0]: r[2] for r in self.code_rows()}, {a: "outcome-unknown"})
+        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents"), [("closed",)])
 
     def test_neg36_a_failed_unit_listing_closes_every_launch_until_a_reconciliation_succeeds(self):
         """PR 272 F2: list-units fails at startup. No R3 attempt starts, also for a row queued afterwards with no
