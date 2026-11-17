@@ -4673,6 +4673,31 @@ def old_tree(commit, pin):
     return hooks
 
 
+HOLD_ROLE_CHILD = (
+    "import sys, time; sys.path.insert(0, sys.argv[1]); import ahc_core, ahc_runner; "
+    "h = ahc_runner.acquire_lock(ahc_core.Paths(sys.argv[2]), sys.argv[3]); "
+    "print('held' if h is not None else 'busy', flush=True); time.sleep(30)")
+
+STARTUP_CHILD = r"""
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+import ahc_core, ahc_runner
+paths, role, go = ahc_core.Paths(sys.argv[2]), sys.argv[3], sys.argv[4]
+ahc_runner.Ledger.LOCK_WAIT = 3.0
+handle = ahc_runner.acquire_lock(paths, role)
+print("locked" if handle is not None else "busy", flush=True)
+while not os.path.exists(go):
+    time.sleep(0.02)
+start = time.monotonic()
+try:
+    # the migrating open each role's startup reconciliation made at 084a610b (core's tick makes it every tick)
+    ahc_runner.Ledger(paths, migrate=True).close()
+    print("ok %.2f" % (time.monotonic() - start), flush=True)
+except Exception as error:
+    print("error %.2f %s: %s" % (time.monotonic() - start, type(error).__name__, error), flush=True)
+"""
+
+
 def run_old(hooks, home, code):
     """Run `code` in a child process on the old tree (its own ahc_core and ahc_runner) against `home`."""
     import subprocess
@@ -4988,6 +5013,60 @@ class MigrationV5Tests(Base):
         self.assertIn(os.getpid(), holders)
 
     # ---- locks: a live connection, a role, and the restore publish
+
+    # ---- PR 272 F1: a running role and the migration locks
+
+    def hold_role(self, role):
+        holder = subprocess.Popen([sys.executable, "-I", "-B", "-c", HOLD_ROLE_CHILD, str(HOOKS), str(self.home), role],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.terminate(), holder.wait(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def test_f1_a_current_v5_ledger_opens_while_the_review_role_runs(self):
+        """PR 272 F1: the running review daemon holds its role lock for its life; core's tick opens the existing v5
+        ledger (migrate=True) without waiting on it: an unfenced v5 ledger needs no migration and no role lock."""
+        self.open_v5().close()
+        self.hold_role("review")
+        start = time.monotonic()
+        try:
+            runner.Ledger(self.paths, migrate=True).close()
+        except runner.SchemaError as error:
+            self.fail("a core tick on a current v5 ledger was refused: %s" % error)
+        self.assertLess(time.monotonic() - start, 1.0, "no wait on the other role's lock")
+
+    def test_f1_both_roles_start_together_on_a_v5_ledger(self):
+        """PR 272 F1: ahc-core and ahc-review start at once, each holding its own role lock, and each opens the
+        current v5 ledger with migrate=True: neither waits on the other's lock, so they cannot deadlock."""
+        self.open_v5().close()
+        go = self.home / "go"
+        procs = {}
+        for role in ("core", "review"):
+            procs[role] = subprocess.Popen([sys.executable, "-I", "-B", "-c", STARTUP_CHILD, str(HOOKS),
+                                            str(self.home), role, str(go)], stdout=subprocess.PIPE, text=True)
+        try:
+            for role, proc in procs.items():
+                self.assertEqual(proc.stdout.readline().strip(), "locked", role)
+            go.write_text("go")
+            lines = {role: proc.stdout.readline().strip() for role, proc in procs.items()}
+        finally:
+            for proc in procs.values():
+                proc.terminate()
+                proc.wait()
+                proc.stdout.close()
+        for role, line in lines.items():
+            self.assertTrue(line.startswith("ok "), "%s: %s" % (role, line))
+            self.assertLess(float(line.split()[1]), 2.0, "%s waited: %s" % (role, line))
+
+    def test_neg27_a_migration_with_another_role_running_still_refuses(self):
+        """NEG-27 kept: a ledger that needs the v5 migration is not migrated while another role holds its lock."""
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        db = self.db()
+        db.execute("UPDATE meta SET v='4' WHERE k='schema_version'")
+        db.close()
+        self.hold_role("review")
+        self.expect_refusal(runner.MigrationRefused, "migration-locks: the review role lock is held")
+        self.assertEqual(self.version(), "4", "nothing was written")
 
     def test_v5_waits_for_an_open_connection_and_refuses_without_writing(self):
         """NEG-27: a review-role connection is open in another process; migration waits on the maint flock and
@@ -5767,14 +5846,14 @@ class ReviewTickTests(ShadowIntegratedTests):
         return self.ledger_rows("SELECT r.id, w.pr, r.state, r.packet_sha256, w.packet_sha256 FROM reviews r JOIN "
                                 "work_items w ON w.id = r.item WHERE r.kind='adversarial' ORDER BY w.pr")
 
-    def play_wrapper(self, rid, verdict_line, final_verdict=None):
+    def play_wrapper(self, rid, verdict_line, final_verdict=None, body="body\n"):
         """The completion wrapper's part, played by the test: the report in the attempt's directory, then the
         completion signal on core's socket (this process's uid is the uid the fake runner reported)."""
         import socket  # noqa: PLC0415
         (iid, unit), = self.ledger_rows("SELECT id, unit FROM launch_intents WHERE row=? AND state='started'", (rid,))
         (head, packet), = self.ledger_rows("SELECT head, packet_sha256 FROM reviews WHERE id=?", (rid,))
-        report = ("Reviewer: test\nStage: pr\nReviewed HEAD: %s\nReviewed packet SHA-256: %s\n\n%s\nbody\n"
-                  % (head, packet, verdict_line)).encode()
+        report = ("Reviewer: test\nStage: pr\nReviewed HEAD: %s\nReviewed packet SHA-256: %s\n\n%s\n%s"
+                  % (head, packet, verdict_line, body)).encode()
         out = self.paths.root / "reports" / ("%s-%s" % (rid, iid)) / "report.md"
         out.write_bytes(report)
         final = {"row": rid, "intent": iid, "invocation_id": self.runner.invocation[unit],
@@ -5817,6 +5896,60 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertEqual(len(self.runner.stopped), 2, "each settled unit is stopped")
         mutating = [a for a in self.all_gh_argv() if self.S.is_mutating("gh", a)]
         self.assertEqual(mutating, [], "zero mutating gh calls with the review step in the tick")
+
+    def test_neg36_a_failed_unit_listing_closes_every_launch_until_a_reconciliation_succeeds(self):
+        """PR 272 F2: list-units fails at startup. No R3 attempt starts, also for a row queued afterwards with no
+        intent of its own, until a later reconciliation (retried before a launch) succeeds."""
+        listing = {"ok": False}
+        real = self.runner.list_units
+        self.runner.list_units = lambda: real() if listing["ok"] else None
+        out = runner.startup_reconcile(self.paths, self.policy, runner=self.runner)
+        self.assertTrue(any("list-units failed" in t for t in out["incidents"]), out)
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        first = self.run_all(self.deps)["shadow"]
+        self.assertEqual(len(first["admitted"]), 1, first)
+        self.assertEqual(first["scheduled"]["started"], [], first["scheduled"])
+        self.assertEqual(self.runner.started, [], "zero start calls while reconciliation has not succeeded")
+        listing["ok"] = True
+        second = self.run_all(self.deps)["shadow"]
+        self.assertEqual(len(second["scheduled"]["started"]), 1, "the retried reconciliation lifts the gate")
+        self.assertEqual(len(self.runner.started), 1)
+
+    def test_ac9_a_block_reports_finding_ids_reach_w3_and_main_accepts_them(self):
+        """PR 272 F3: the finding ids of a BLOCK report core read itself are in the settled row's receipt; W3
+        escalates with them; once main's W16 accepts them into a named ticket, the row no longer counts as
+        unaccepted."""
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        self.run_all(self.deps)
+        (a, _pr, state, _r, _w), = self.code_rows()
+        self.assertEqual(state, "running")
+        self.play_wrapper(a, "VERDICT: BLOCK", body="F1 \u2014 High \u2014 locks on every tick.\n\n"
+                                                    "## F2 - Medium - reconciliation gate.\n")
+        second = self.run_all(self.deps)["shadow"]
+        self.assertEqual(second["review"]["settled"], [(a, "findings")], second["review"])
+        ledger = runner.Ledger(self.paths)
+        self.addCleanup(ledger.close)
+        c = runner.open_contracts(ledger, self.paths)
+        row = c._row("reviews", "id", a)
+        receipt = json.loads(row["receipt"])
+        self.assertEqual(receipt["finding_ids"], ["F1", "F2"], "the ids come from the report core read")
+        self.assertNotIn("finding_ids_dropped", receipt)
+        item = c._row("work_items", "id", row["item"])
+        if item["state"] == "pr-gate":
+            c.wi_move(item["id"], "W3", expected_version=item["version"], event_id="t-w3", actor="ahc-core")
+        item = c._row("work_items", "id", row["item"])
+        self.assertEqual(item["state"], "waiting-ask")
+        texts = [t for (t,) in ledger.db.execute("SELECT text FROM wi_notices WHERE item=?", (item["id"],))]
+        self.assertTrue(any("F1, F2" in t for t in texts), texts)
+        c.record_w16_proof("w16-f3-accept", item["id"], "pr-gate", item["version"], "e" * 64,
+                           accepted=["F1", "F2"], ticket="GoodQA goodqa#16049")
+        c.wi_move(item["id"], "W16", expected_version=item["version"], event_id="t-w16", actor="main",
+                  to="pr-gate", proof="w16-f3-accept")
+        item = c._row("work_items", "id", row["item"])
+        self.assertEqual(c._unaccepted_findings(item), [], "main's acceptance clears the findings row")
+        import ahc_contracts  # noqa: PLC0415
+        with self.assertRaises(ahc_contracts.ContractError, msg="no unaccepted findings left: W3 does not fire"):
+            c.wi_move(item["id"], "W3", expected_version=item["version"], event_id="t-w3b", actor="ahc-core")
 
 
 class TickIncidentTests(Base):
@@ -6219,9 +6352,28 @@ class StartupReconcileTests(Base):
     def test_ac8_the_daemon_reconciles_before_its_first_tick(self):
         import inspect  # noqa: PLC0415
         src = inspect.getsource(runner.main)
-        self.assertIn("startup_reconcile(paths, policy)", src, "the daemon reconciles at start")
-        self.assertLess(src.index("startup_reconcile(paths, policy)"), src.index("tick(paths, config, deps"),
+        call = "startup_reconcile(paths, policy, role=args.role)"
+        self.assertTrue(call in src, "the daemon reconciles at start, for its role: %s" % call)
+        self.assertLess(src.index(call), src.index("tick(paths, config, deps"),
                         "reconciliation runs before the first tick can start an attempt")
+
+    def test_f1_only_core_reconciles_and_migrates_at_start(self):
+        """PR 272 F1: R3 launches only from core's tick, so only core (or an all-in-one run) reconciles at start;
+        the review role never opens a migrating ledger there."""
+        import ahc_guard  # noqa: PLC0415
+        from tests.test_ahc_contracts import _FakeRunner  # noqa: PLC0415
+        fake = _FakeRunner(4242)
+        opened = []
+        real = runner.Ledger.__init__
+
+        def spy(ledger, paths, migrate=True):
+            opened.append(migrate)
+            real(ledger, paths, migrate=migrate)
+        with mock.patch.object(runner.Ledger, "__init__", spy):
+            out = runner.startup_reconcile(self.paths, ahc_guard.Policy.for_test(self.paths.root, {}), runner=fake,
+                                           role="review")
+        self.assertEqual(opened, [], "the review role opens no ledger for reconciliation")
+        self.assertIn("skipped", out)
 
 
 if __name__ == "__main__":

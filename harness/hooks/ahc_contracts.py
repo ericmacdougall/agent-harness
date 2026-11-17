@@ -739,6 +739,28 @@ class Contracts:
     # -------------------------------------------------------------- AC-8: R3 launch intents
 
     LIVE_INTENT = ("open", "started")
+    RECONCILE_STATES = ("running", "ok", "failed")
+
+    def reconcile_state(self, state, detail=""):
+        """PR 272 F2: the outcome of the latest reconciliation of review units: `running` when one starts, `ok` or
+        `failed` when it ends. Anything but `ok` (a failure, or one interrupted by a crash) closes every R3 launch."""
+        if state not in self.RECONCILE_STATES:
+            raise ContractError("unknown reconciliation state %r" % state)
+        with self.tx():
+            self.db.execute("INSERT INTO contract_meta(k, v) VALUES ('r3_reconcile', ?) ON CONFLICT(k) DO UPDATE "
+                            "SET v=excluded.v", (_canon({"state": state, "detail": str(detail)[:300]}),))
+
+    def reconcile_open(self):
+        """R3 launches are allowed only after a reconciliation that succeeded. ASSUMPTION: a ledger that has never
+        been reconciled is open, because the daemon reconciles before its first tick (pinned by
+        StartupReconcileTests) and a host without review isolation starts no unit at all."""
+        row = self.db.execute("SELECT v FROM contract_meta WHERE k='r3_reconcile'").fetchone()
+        if row is None:
+            return True
+        try:
+            return json.loads(row[0]).get("state") == "ok"
+        except (TypeError, ValueError, AttributeError):
+            return False
 
     def launch_intent(self, rid, expected_version, command, *, budget_obs=None):
         """R3, before the unit starts: one durable launch intent (intent id, row id, row version, unit name
@@ -754,6 +776,9 @@ class Contracts:
                 raise ContractError("R3 launches only a queued row at its expected version")
             if self.db.execute("SELECT 1 FROM review_blocks WHERE row=?", (rid,)).fetchone():
                 raise ContractError("row %s is blocked by startup reconciliation; no launch intent" % rid)
+            if not self.reconcile_open():
+                raise ContractError("the last reconciliation of review units did not succeed; no attempt starts "
+                                    "until one does (fail closed)")
             if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN ('open', 'started')",
                                (rid,)).fetchone():
                 raise ContractError("a unit for row %s may still be live; no second unit starts" % rid)

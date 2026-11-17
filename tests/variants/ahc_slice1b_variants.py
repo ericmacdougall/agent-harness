@@ -910,6 +910,40 @@ ENTRIES.update({
 })
 
 
+ENTRIES.update({
+    "PR 272 F1 a current v5 ledger takes no migration lock; only core reconciles": {
+        "tests": ["tests.test_ahc_runner.MigrationV5Tests.test_f1_a_current_v5_ledger_opens_while_the_review_role_runs",
+                  "tests.test_ahc_runner.MigrationV5Tests.test_f1_both_roles_start_together_on_a_v5_ledger",
+                  "tests.test_ahc_runner.StartupReconcileTests.test_f1_only_core_reconciles_and_migrates_at_start"],
+        "mutations": [
+            ("a current v5 ledger still waits on both role locks", [
+                ('        if self._v5_current():\n            return\n        root = self.paths.root\n',
+                 '        root = self.paths.root\n')], RUNNER_PY),
+            ("the review role reconciles (and opens a migrating ledger) at start", [
+                ('    if role not in ("core", "all"):\n        return {"skipped"',
+                 '    if False:\n        return {"skipped"')], RUNNER_PY)]},
+    "PR 272 F2 no R3 launch until a reconciliation succeeds": {
+        "tests": ["tests.test_ahc_runner.ReviewTickTests.test_neg36_a_failed_unit_listing_closes_every_launch_until_a_reconciliation_succeeds",
+                  "tests.test_ahc_contracts.RuntimeTests.test_neg36_launch_intent_refuses_until_a_reconciliation_succeeds"],
+        "mutations": [
+            ("launch_intent ignores the reconciliation gate", [
+                ('            if not self.reconcile_open():\n                raise ContractError("the last reconciliation',
+                 '            if False:\n                raise ContractError("the last reconciliation')], CONTRACTS),
+            ("the Launcher never retries reconciliation", [
+                ('            Reconciler(self.c, self.policy, self.runner).run()\n            if not self.c.reconcile_open():',
+                 '            if not self.c.reconcile_open():')], REVIEW_PY),
+            ("a list-units failure is recorded as success", [
+                ('self.c.reconcile_state("failed", "list-units failed")',
+                 'self.c.reconcile_state("ok", "list-units failed")')], REVIEW_PY)]},
+    "PR 272 F3 the settled receipt names the report's finding ids": {
+        "tests": ["tests.test_ahc_runner.ReviewTickTests.test_ac9_a_block_reports_finding_ids_reach_w3_and_main_accepts_them"],
+        "mutations": [
+            ("the receipt names no finding id", [
+                ('    ids = report_finding_ids(raw) if verdict != "PASS" else []\n', '    ids = []\n')], REVIEW_PY),
+            ("a heading marker hides the id", [
+                ('(?:#{1,6}[ \\t]+|[-*][ \\t]+)?(?:Finding', '(?:Finding')], REVIEW_PY)]},
+})
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:
