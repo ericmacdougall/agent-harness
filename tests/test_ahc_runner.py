@@ -4471,6 +4471,18 @@ class StateMachineTests(TC.Base):
         """Slice 1 (b) wires the last rows; W1 is admission (admit_item), never a move."""
         self.assertEqual(sorted(C.Contracts.WI_WIRED), sorted(r for r in C.Contracts.WI_TRANSITIONS if r != "W1"))
 
+    def test_unwired_rows_fail_closed(self):
+        """A row left out of WI_WIRED is refused before its guard runs, even when the move is otherwise valid, and
+        the item is untouched. Every real row is wired now, so the check is exercised by unwiring W4 (#247 run)."""
+        from unittest import mock
+        before = self.c._row("work_items", "id", self.item["id"])
+        with mock.patch.object(C.Contracts, "WI_WIRED", tuple(r for r in C.Contracts.WI_WIRED if r != "W4")):
+            with self.assertRaisesRegex(C.ContractError, "W4 is not wired"):
+                self.move("W4", obs=self.pr(pr_head=TC.H2), successor_packet="e" * 64)
+        self.assertEqual(dict(self.c._row("work_items", "id", self.item["id"])), dict(before))
+        self.assertEqual(self.move("W4", obs=self.pr(pr_head=TC.H2), successor_packet="e" * 64)["state"],
+                         "superseded", "the same move is applied once W4 is wired")
+
     # ---- slice (b) obligations (goodqa#16204, AC-9, NEG-25)
 
     def _queued(self, item, kind="adversarial"):
@@ -4637,11 +4649,16 @@ class StateMachineTests(TC.Base):
             names |= set(re.findall(r"^    def (test_\w+)", path.read_text(encoding="utf-8"), re.M))
         ids = sorted(set(re.findall(r"OBL\.(test_\w+)", text)))
         self.assertGreaterEqual(set(ids), set(self.PENDING_B), "an obligation was dropped from the doc")
+        # once resolved, an obligation stays listed: the doc is the record of where it was met (#247 variant run)
+        self.assertGreaterEqual(set(ids), set(self.RESOLVED_B), "a resolved obligation was dropped from the doc")
         missing = sorted(i for i in ids if not any(m == i or m.startswith(i + "_") for m in names))
         self.assertEqual(missing, sorted(self.PENDING_B), "PENDING_B must equal the unresolved obligations")
 
     # slice (b) obligations with no test yet (goodqa#16204 items 2 and 3; the W3 finding_ids assumption)
     PENDING_B = ()
+    # slice (b) obligations already resolved by a test; the doc keeps listing them
+    RESOLVED_B = ("test_b_findings_producer_writes_finding_ids", "test_b_scheduler_skips_rows_of_a_finished_item",
+                  "test_b_status_and_digest_show_inert_rows")
 
 
 # ---------------------------------------------------------------------------------------------------------------

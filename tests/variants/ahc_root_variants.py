@@ -75,18 +75,20 @@ V = [
     ("v1: state directories not walked (no nested check)", [
         ("                bad.extend(_tree_problems(root / name, clones=(name == \"clones\")))\n",
          "                pass\n")]),
-    ("v1: no strict tree (items/ and clones/ contents unchecked)", [
-        ('STRICT_TREES = frozenset(("items", "clones"))\n', "STRICT_TREES = frozenset()\n")]),
+    # anchors follow dd4bb01b, which added "packets" to the strict trees (core's stored R2 packets)
+    ("v1: no strict tree (items/, clones/ and packets/ contents unchecked)", [
+        ('STRICT_TREES = frozenset(("items", "clones", "packets"))\n', "STRICT_TREES = frozenset()\n")]),
     ("v1: shared directories walked strictly (a submitter's link halts ahc)", [
-        ('STRICT_TREES = frozenset(("items", "clones"))\n', "STRICT_TREES = ROOT_DIRS\n")]),
+        ('STRICT_TREES = frozenset(("items", "clones", "packets"))\n', "STRICT_TREES = ROOT_DIRS\n")]),
     ("v1: a clone's .git not checked at start", [
         ("            for path, want_dir in ((directory / name, True), (directory / name / \".git\", True)):\n",
          "            for path, want_dir in ((directory / name, True),):\n")]),
     ("v1: ledger opened by plain sqlite3.connect (no nofollow descriptor, no inode compare)", [
-        ("        self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)\n"
-         "        self.db.row_factory = sqlite3.Row\n        try:\n            self.db.execute(\"PRAGMA journal_mode=WAL\")\n",
-         "        self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)\n"
-         "        self.db.row_factory = sqlite3.Row\n        try:\n            self.db.execute(\"PRAGMA journal_mode=WAL\")\n")],
+        # anchor follows c21eb32a, which moved the open inside the maint-lock try (12-space indent)
+        ("            self.db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)\n"
+         "            self.db.row_factory = sqlite3.Row\n            self.db.execute(\"PRAGMA journal_mode=WAL\")\n",
+         "            self.db = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)\n"
+         "            self.db.row_factory = sqlite3.Row\n            self.db.execute(\"PRAGMA journal_mode=WAL\")\n")],
      RUNNER),
     ("v1: no device/inode compare after sqlite opens", [
         ("        if after is None or stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (info.st_dev, "
