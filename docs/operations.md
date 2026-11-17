@@ -627,7 +627,7 @@ It refuses on any of these:
 - a truncated or corrupt stream, or a `zstd` error; every gzip member is read, as `gzip -dc` and bsdtar read them, and anything but zero padding after the end of the tar refuses;
 - a failed download, or a `.sha256` file or listing larger than its limit;
 - an absolute member path, a member path containing `..`, or a path named twice by members of any type (compared after Unicode NFC and case folding);
-- a symlink, hardlink or special member, or a symlink in the local tree (only regular files and directories are compared);
+- a hardlink or special member; a symlink member is accepted only when the local tree has the same link with the identical target string, and every local symlink must be such a member (goodqa#16374 AC-3a; links are never followed);
 - more than 4 members per local file plus 1000, decompressed data larger than twice the tree plus 256 MiB, or a read longer than the timeout;
 - a local file that changed between hashing and the end of verification;
 - `--no-backup` given with the archive flags;
@@ -636,6 +636,25 @@ It refuses on any of these:
 macOS bsdtar stores extended attributes as AppleDouble `._name` companions that its own `tar -tvf` does not list. Such a member is ignored when it is not a local file, starts with the AppleDouble magic `00 05 16 07`, and its sibling is in the archive.
 
 The approval and its use in the audit log record the archive URL and its sha256. Verifying takes one full download and a hash of the local tree.
+
+**Upload without a download (goodqa#16374 AC-2).** The user, 2026-11-17: "once dropbox says it synced it, trust that". The preferred route lets the guard make the archive itself:
+
+```bash
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal dir or file> \
+  --upload dropbox:<dir>/<name>.tar.zst --wal <WAL path>
+```
+
+The guard walks the tree without following links, builds the tar stream itself from the files it reads (layout `tar -C <parent> -cf - <name>`; a single file is its basename), compresses it with `zstd -3`, hashes the exact bytes it sends with the Dropbox content hash, and streams them with `rclone rcat --immutable`. It then asks Dropbox for the stored object's content hash (`rclone hashsum dropbox`) and size (`lsjson`) and approves only when both match the bytes sent and the tree's stat manifest is unchanged. Nothing is downloaded. On approval it writes the `.sha256` sidecar, a MAC'd row in `~/.agent-harness/state/backup-ledger.jsonl` (the record teardown and the sweep trust), a row in `~/DROPBOX_INDEX.jsonl`, and regenerates the generated block of `~/DROPBOX_INDEX.md` (text outside the block is kept). Restore one unit: `rclone cat <archive> | zstd -dc | tar -xf - -C <parent of the path>`.
+
+It refuses, before anything is sent:
+
+- a destination (or its `.sha256`) that already exists, letter case ignored, as Dropbox ignores it;
+- a remote that is not `REMOTE:dir/name.tar.zst` with plain segments, or not a named `dropbox` remote;
+- a FIFO, socket or device anywhere in the tree (never opened, so nothing hangs), an unreadable file, or another device (a mount point) inside it;
+- a credential file. Tier 1 (the guard's credential path list: `rclone.conf`, `.codex/auth.json`, `*.p8`, `*.key`, `.env`, ssh keys and the rest) always counts, unless the allow list clears it (`.env.example`); a tracked tier-1 file keeps the unit ("tracked credential"). Tier 2 (the looser secret-name list: `credentials*`, `*token.json`, `secrets.json` and so on) counts unless the file is tracked, identical to HEAD, in a repo whose HEAD a remote-tracking ref contains. Move an untracked one first with `mv -n SRC ~/secret-quarantine/<same relative path>`;
+- anything changed in the last 10 minutes, over the entry or byte limits, or combined with `--remote`, `--archive`, `--no-backup` or `--backup-verified-sha256`.
+
+After sending, it refuses on a failed zstd or rcat, a stored hash or size that differs from the bytes sent, or a tree that changed during the upload. The shared `tree_manifest` used by `--remote` and `--archive` also refuses special files instead of opening them.
 
 The approval is single use, signed with a local key and bound to the exact realpath, device, inode and a stat manifest. The hook consumes it under a lock, so of two commands racing for one approval exactly one runs. Every approval, refusal and use goes to `~/.agent-harness/state/log-delete-audit.jsonl` and to the WAL; report it in the ticket status. `revoke-delete` removes every approval.
 

@@ -48,6 +48,7 @@ import shlex
 import shutil
 import stat
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -7960,15 +7961,16 @@ class Verifier:
 
 
 def dropbox_content_hash(path):
-    """Dropbox content_hash: sha256 over the concatenated sha256 of each 4 MiB block."""
-    outer = hashlib.sha256()
+    """Dropbox content_hash: sha256 over the concatenated sha256 of each 4 MiB block (one implementation:
+    DropboxHash, goodqa#16374 AC-2)."""
+    h = DropboxHash()
     with open(path, 'rb') as handle:
         while True:
-            block = handle.read(4 * 1024 * 1024)
+            block = handle.read(1 << 20)
             if not block:
                 break
-            outer.update(hashlib.sha256(block).digest())
-    return outer.hexdigest()
+            h.update(block)
+    return h.hexdigest()
 
 
 def _file_hash(path, kind):
@@ -8420,6 +8422,8 @@ def tree_manifest(path, limits):
                 full = os.path.join(root, name)
                 if os.path.islink(full):
                     continue
+                if not stat.S_ISREG(os.lstat(full).st_mode):  # goodqa#16374: a FIFO read would block forever
+                    raise ValueError('special file (FIFO, socket or device) in the tree: %s' % _clip_path(full))
                 files.append((os.path.relpath(full, path).replace(os.sep, '/'), full))
                 if len(files) > int(limits['max_walk_entries']):
                     raise ValueError('too many files to approve at once; approve subdirectories')
@@ -8436,7 +8440,7 @@ def tree_manifest(path, limits):
             raise ValueError('hashing exceeded its time budget')
         h = hashlib.sha256()
         size = 0
-        with open(full, 'rb') as handle:
+        with os.fdopen(_open_regular(full, os.lstat(full)), 'rb') as handle:
             while True:
                 block = handle.read(1 << 20)
                 if not block:
@@ -8636,6 +8640,504 @@ def _store_entry(entry, real, now, home=None, under_lock=None):
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         os.close(lock)
+    return entry
+
+
+# --------------------------------------------------------------------------- guard-built upload (goodqa#16374 AC-2)
+#
+# The user, 2026-11-17: "remove the safety guard to re-download the folder.. once dropbox says it synced it, trust
+# that". `approve-delete --upload` therefore never downloads: the guard builds the tar stream itself from the files it
+# reads (so the archive is bound to the tree by construction, not by an uploader's word), compresses it with zstd,
+# hashes the exact bytes it sends with the Dropbox content hash, streams them with `rclone rcat --immutable` to a
+# destination that did not exist, and approves only when Dropbox reports the same content hash and size for the stored
+# object and the tree's stat manifest is unchanged. No reader opens a FIFO, socket or device, and a tree holding a
+# counted credential file is refused (hard rule 1: never transit a secret).
+
+UPLOAD_KIND = 'dropbox-upload'
+LEDGER_NAME = 'backup-ledger.jsonl'
+INDEX_MD_BEGIN = '<!-- command_guard approve-delete --upload rows: begin (generated; edit outside this block) -->'
+INDEX_MD_END = '<!-- command_guard approve-delete --upload rows: end -->'
+UPLOAD_REMOTE_RE = re.compile(r'^([A-Za-z0-9_-]{1,64}):([A-Za-z0-9._@+=-]+(?:/[A-Za-z0-9._@+=-]+)*\.tar\.zst)$')
+_lstat = os.lstat  # one seam, so a test can present another device without a real mount
+
+
+def _open_regular(full, st):
+    """An fd for `full` opened with O_NONBLOCK|O_NOFOLLOW and confirmed by fstat to be the same regular file that
+    lstat saw; a FIFO is never opened for read (it would block forever), a swapped file refuses."""
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError('special file (FIFO, socket or device) in the tree: %s' % _clip_path(full))
+    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(full, flags)
+    except OSError as error:
+        raise ValueError('cannot read %s (%s)' % (_clip_path(full), error.strerror or 'error'))
+    fst = os.fstat(fd)
+    if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+        os.close(fd)
+        raise ValueError('file changed type or identity while being read: %s' % _clip_path(full))
+    return fd
+
+
+def _clip_path(path):
+    text = str(path)
+    return text if len(text) <= 160 else '...' + text[-157:]
+
+
+def _upload_walk(real, limits, deadline):
+    """[(member name, full path, lstat)] in archive order (`tar -C parent -cf - name` layout; a single file is its
+    basename). Links are never followed; a FIFO, socket, device or an entry on another device refuses the tree."""
+    root_st = _lstat(real)
+    base = os.path.basename(real)
+    cap = int(limits.get('max_approve_files', 20000))
+    if stat.S_ISREG(root_st.st_mode):
+        return [(base, real, root_st)]
+    if not stat.S_ISDIR(root_st.st_mode):
+        raise ValueError('special file (FIFO, socket or device): only a directory or regular file can be uploaded')
+    found, stack = [], [(base, real)]
+    while stack:
+        if time.monotonic() > deadline:
+            raise ValueError('walking the tree exceeded its time budget')
+        member, full = stack.pop()
+        st = _lstat(full)
+        if st.st_dev != root_st.st_dev:
+            raise ValueError('another device (a mount point) inside the tree: %s; unmount it or approve the parts '
+                             'separately' % _clip_path(full))
+        if stat.S_ISLNK(st.st_mode):
+            target = os.readlink(full)
+            if '\n' in target or '\x00' in target:
+                raise ValueError('symlink target holds a newline: %s' % _clip_path(full))
+        elif not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+            raise ValueError('special file (FIFO, socket or device) in the tree: %s' % _clip_path(full))
+        found.append((member, full, st))
+        if len(found) > cap:
+            raise ValueError('more than %d entries; approve smaller subtrees' % cap)
+        if stat.S_ISDIR(st.st_mode):
+            with os.scandir(full) as it:
+                names = sorted(e.name for e in it)
+            stack.extend((member + '/' + n, os.path.join(full, n)) for n in reversed(names))
+    return found
+
+
+def _credential_tier(rel, compiled):
+    """2 for the loose secret-name list, 1 for a real credential path (`credential_path_regexes`), 0 for neither or
+    for a name `credential_allow_regexes` clears (`.env.example`)."""
+    path = '/' + rel
+    if any(rx.search(path) for rx in compiled.cred_allow):
+        return 0
+    if any(rx.search(path) for rx in compiled.cred):
+        return 1
+    return 2 if SECRET_FILE_NAME.search(posixpath.basename(rel)) else 0
+
+
+def _git_quiet(repo, *args, timeout=30):
+    done = subprocess.run([_git_bin()] + _SAFE_GIT[1:] + ['-C', repo] + list(args), env=_git_env(),
+                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          timeout=timeout, check=False)
+    return done.returncode, done.stdout[:1 << 20]
+
+
+def _repo_of(full, stop):
+    """The nearest directory at or above `full`'s parent, up to `stop`, that holds a `.git`; None outside a repo."""
+    cur = os.path.dirname(full)
+    while True:
+        if os.path.lexists(os.path.join(cur, '.git')):
+            return cur
+        if cur == stop or len(cur) <= len(stop) or cur == os.path.dirname(cur):
+            return None
+        cur = os.path.dirname(cur)
+
+
+def _counted_credentials(real, entries, compiled):
+    """[(problem text)] for the credential files the AC-2 two-tier predicate counts (red-team r2 N1, r3b E1/E2):
+    tier 1 always counts (a tracked one keeps the unit as "tracked credential"); tier 2 counts unless the file is
+    tracked, unmodified against HEAD, in a repo whose HEAD a remote-tracking ref contains. A git error counts."""
+    problems, head_pushed = [], {}
+    stop = real if os.path.isdir(real) else os.path.dirname(real)
+    for member, full, st in entries:
+        if not stat.S_ISREG(st.st_mode) or '/.git/' in '/' + member + '/':
+            continue
+        rel = member.split('/', 1)[1] if '/' in member else member
+        tier = _credential_tier(rel, compiled)
+        if not tier:
+            continue
+        repo = _repo_of(full, stop)
+        tracked = clean = pushed = False
+        if repo is not None:
+            rel_repo = os.path.relpath(full, repo)
+            try:
+                tracked = _git_quiet(repo, 'ls-files', '--error-unmatch', '--', rel_repo)[0] == 0
+                if tracked:
+                    # read-only: `git diff HEAD` would refresh (rewrite) .git/index and so change the tree being
+                    # approved; compare the working file's blob id with HEAD's instead
+                    c1, head_blob = _git_quiet(repo, 'rev-parse', '--verify', '-q', 'HEAD:' + rel_repo)
+                    # --no-filters: a repo-config clean filter would run a command; a filtered file then differs
+                    # from HEAD and counts (fails closed)
+                    c2, work_blob = _git_quiet(repo, 'hash-object', '--no-filters', '--', rel_repo)
+                    clean = c1 == 0 and c2 == 0 and head_blob.strip() == work_blob.strip() and bool(head_blob.strip())
+                    if repo not in head_pushed:
+                        code, out = _git_quiet(repo, 'for-each-ref', '--contains', 'HEAD', '--format=%(refname)',
+                                               'refs/remotes')
+                        head_pushed[repo] = code == 0 and bool(out.strip())
+                    pushed = head_pushed[repo]
+            except (OSError, subprocess.SubprocessError, ValueError):
+                tracked = clean = pushed = False
+        if tier == 1 and tracked:
+            problems.append('tracked credential %s (keep this unit; it cannot be uploaded)' % rel)
+        elif tier == 1 or not (tracked and clean and pushed):
+            problems.append('credential file %s' % rel)
+    return problems
+
+
+class DropboxHash:
+    """Dropbox content_hash, streaming: sha256 over the concatenated sha256 of each 4 MiB block (shared by
+    `dropbox_content_hash`, the `--upload` route and mac_reclaim)."""
+    BLOCK = 4 * 1024 * 1024
+
+    def __init__(self):
+        self.outer, self.cur, self.n = hashlib.sha256(), hashlib.sha256(), 0
+
+    def update(self, data):
+        mv = memoryview(data)
+        while mv:
+            take = min(self.BLOCK - self.n, len(mv))
+            self.cur.update(mv[:take])
+            self.n += take
+            mv = mv[take:]
+            if self.n == self.BLOCK:
+                self.outer.update(self.cur.digest())
+                self.cur, self.n = hashlib.sha256(), 0
+
+    def hexdigest(self):
+        if self.n:
+            self.outer.update(self.cur.digest())
+            self.cur, self.n = hashlib.sha256(), 0
+        return self.outer.hexdigest()
+
+    @classmethod
+    def of_bytes(cls, data):
+        h = cls()
+        h.update(data)
+        return h.hexdigest()
+
+
+class RcloneUpload:
+    """rclone transport for `approve-delete --upload`: listremotes, lsjson, rcat --immutable and hashsum dropbox.
+    It has no download method at all; rclone output is parsed, never printed."""
+
+    def __init__(self, rclone=None, policy=None, timeout=900):
+        self.rclone = rclone or _pinned_tool('rclone')
+        self.timeout = timeout
+        self.policy = policy
+        self.after_upload = None  # a test seam: runs after the stream, before the stored object is checked
+
+    def _run(self, argv, data=None):
+        try:
+            done = subprocess.run([self.rclone] + argv, input=data, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, timeout=self.timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError('rclone could not run (%s)' % type(error).__name__)
+        return done.returncode, done.stdout[:64 << 20], done.stderr[:4096].decode('utf-8', 'replace')
+
+    def remote_types(self):
+        return RcloneVerifier(rclone=self.rclone).remote_types()
+
+    def listing(self, remote):
+        """[(name, size, is_dir)] of the object or directory `remote`, or None when it does not exist."""
+        code, out, err = self._run(['lsjson', '--', remote])
+        if code != 0:
+            if code == 3 or 'not found' in err.lower():
+                return None
+            raise ValueError('rclone lsjson failed (exit %s)' % code)
+        try:
+            rows = json.loads(out.decode('utf-8') or '[]')
+            return [(str(r['Name']), int(r.get('Size', -1)), bool(r.get('IsDir'))) for r in rows]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError('rclone lsjson output is not a listing')
+
+    def exists(self, remote):
+        """Case-insensitive: Dropbox paths ignore letter case, so `X.tar.zst` blocks `x.tar.zst`."""
+        parent, name = remote.rsplit('/', 1) if '/' in remote.split(':', 1)[1] else (remote.split(':', 1)[0] + ':',
+                                                                                     remote.split(':', 1)[1])
+        rows = self.listing(parent)
+        return bool(rows) and any(n.casefold() == name.casefold() for n, _s, _d in rows)
+
+    def rcat(self, remote):
+        return subprocess.Popen([self.rclone, 'rcat', '--immutable', '--', remote], stdin=subprocess.PIPE,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def put_small(self, remote, data):
+        code, _out, _err = self._run(['rcat', '--immutable', '--', remote], data=data)
+        if code != 0:
+            raise ValueError('writing %s failed (exit %s)' % (remote.rsplit('/', 1)[-1][:80], code))
+
+    def server_hash(self, remote):
+        code, out, _err = self._run(['hashsum', 'dropbox', '--', remote])
+        lines = [line for line in out.decode('utf-8', 'replace').splitlines() if line.strip()]
+        if code != 0 or len(lines) != 1:
+            raise ValueError('Dropbox returned no content hash for the stored object')
+        m = re.match(r'^([0-9a-f]{64})\s+(.+)$', lines[0].strip())
+        if not m:
+            raise ValueError('Dropbox content hash output is not a hash')
+        return m.group(1)
+
+    def size(self, remote):
+        rows = self.listing(remote)
+        if not rows or len(rows) != 1 or rows[0][2]:
+            raise ValueError('the stored object is missing (size check)')
+        return rows[0][1]
+
+
+def _check_upload_remote(remote, policy, transport):
+    m = UPLOAD_REMOTE_RE.match(remote or '')
+    if not m or any(seg in ('.', '..', '') for seg in m.group(2).split('/')):
+        raise ValueError('--upload must be REMOTE:dir/name.tar.zst with plain path segments (no globs, no ..)')
+    _check_remote(remote, policy, transport)
+
+
+class _ReadCounter:
+    """File-like over an fd: hashes what tarfile reads (the manifest entry) and refuses a short file."""
+
+    def __init__(self, fd):
+        self.fd, self.sha, self.size = fd, hashlib.sha256(), 0
+
+    def read(self, n=-1):
+        data = os.read(self.fd, n if n and n > 0 else 1 << 20)
+        self.sha.update(data)
+        self.size += len(data)
+        return data
+
+
+def _stream_upload(real, entries, transport, remote, zstd, deadline):
+    """Build tar | zstd from `entries` and send it with rcat; returns (dropbox hash, sha256, bytes, manifest)."""
+    import tarfile
+    import threading
+    sent = {'dbx': DropboxHash(), 'sha': hashlib.sha256(), 'bytes': 0, 'error': None}
+    comp = subprocess.Popen([zstd, '-q', '-3', '-c'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    up = transport.rcat(remote)
+
+    def pump():
+        try:
+            while True:
+                block = comp.stdout.read(1 << 20)
+                if not block:
+                    break
+                sent['dbx'].update(block)
+                sent['sha'].update(block)
+                sent['bytes'] += len(block)
+                up.stdin.write(block)
+        except Exception as error:  # noqa: BLE001 - reported as a refusal below
+            sent['error'] = error
+        finally:
+            try:
+                up.stdin.close()
+            except OSError:
+                pass
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    manifest = []
+    try:
+        with tarfile.open(fileobj=comp.stdin, mode='w|', format=tarfile.PAX_FORMAT) as tar:
+            for member, full, st in entries:
+                if time.monotonic() > deadline:
+                    raise ValueError('the upload exceeded its time budget')
+                info = tarfile.TarInfo(member)
+                info.mtime, info.mode = int(st.st_mtime), stat.S_IMODE(st.st_mode)
+                info.uid, info.gid = st.st_uid, st.st_gid
+                if stat.S_ISDIR(st.st_mode):
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+                elif stat.S_ISLNK(st.st_mode):
+                    info.type, info.linkname = tarfile.SYMTYPE, os.readlink(full)
+                    tar.addfile(info)
+                else:
+                    fd = _open_regular(full, st)
+                    try:
+                        info.type, info.size = tarfile.REGTYPE, st.st_size
+                        reader = _ReadCounter(fd)
+                        tar.addfile(info, reader)  # tarfile raises on a short file
+                        if os.read(fd, 1):
+                            raise ValueError('a file grew while it was read: %s' % _clip_path(full))
+                    finally:
+                        os.close(fd)
+                    rel = member.split('/', 1)[1] if '/' in member else member
+                    manifest.append((rel, reader.size, reader.sha.hexdigest()))
+        comp.stdin.close()
+        code = comp.wait(timeout=max(1.0, deadline - time.monotonic()))
+        thread.join(max(1.0, deadline - time.monotonic()))
+        up_code = up.wait(timeout=max(1.0, deadline - time.monotonic()))
+    except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
+        for proc in (comp, up):
+            if proc.poll() is None:
+                proc.terminate()
+        raise ValueError('the upload stream failed: %s' % str(error)[:160])
+    if sent['error'] is not None or thread.is_alive():
+        raise ValueError('the upload stream failed while sending')
+    if code != 0:
+        raise ValueError('zstd failed (exit %s)' % code)
+    if up_code != 0:
+        raise ValueError('rclone rcat upload failed (exit %s)' % up_code)
+    return sent['dbx'].hexdigest(), sent['sha'].hexdigest(), sent['bytes'], manifest
+
+
+def _ledger_path(home=None):
+    return state_dir(home) / LEDGER_NAME
+
+
+def ledger_append(row, home=None):
+    """Append one MAC'd backup-ledger row (the record AC-1 and AC-4 trust; DROPBOX_INDEX.jsonl is only a report)."""
+    sd = state_dir(home)
+    key = _read_small(sd / KEY_NAME, 256)
+    row = dict(row)
+    row['mac'] = _mac(key, row)
+    fd = os.open(str(_ledger_path(home)), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, 'a') as handle:
+        handle.write(json.dumps(row, sort_keys=True) + '\n')
+    return row
+
+
+def ledger_lookup(path, stat_sha256, home=None):
+    """The newest valid ledger row for exactly `path` with this stat digest, or None. Rows without a valid MAC under
+    this host's key (hand-written, edited or copied from another host) never count."""
+    sd = state_dir(home)
+    try:
+        key = _read_small(sd / KEY_NAME, 256)
+        lines = _ledger_path(home).read_text(encoding='utf-8', errors='replace').splitlines()[-200000:]
+    except (OSError, ValueError):
+        return None
+    real = os.path.realpath(path)
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get('path') != real or row.get('stat_sha256') != stat_sha256:
+            continue
+        if key and hmac.compare_digest(_mac(key, row), str(row.get('mac', ''))):
+            return row
+    return None
+
+
+def _index_paths(home=None):
+    base = Path(home or _pinned_home())
+    return base / 'DROPBOX_INDEX.jsonl', base / 'DROPBOX_INDEX.md'
+
+
+def index_record(row, home=None):
+    """Append a ~/DROPBOX_INDEX.jsonl row (existing keys kept) and regenerate the --upload block of the .md."""
+    jsonl, md = _index_paths(home)
+    fd = os.open(str(jsonl), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, 'a') as handle:
+        handle.write(json.dumps(row, sort_keys=True) + '\n')
+    rows = []
+    for line in jsonl.read_text(encoding='utf-8', errors='replace').splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict) and item.get('kind') == UPLOAD_KIND:
+            rows.append(item)
+    block = [INDEX_MD_BEGIN, '## Uploaded through command_guard approve-delete --upload (%d)' % len(rows), '',
+             'Restore one: `rclone cat ARCHIVE | zstd -dc | tar -xf - -C <the parent of PATH>`', '',
+             '| Path | Bytes | Archive | Dropbox hash | Date | Host |', '|---|---:|---|---|---|---|']
+    for item in rows:
+        block.append('| `~/%s` | %s | `%s` | `%s` | %s | %s |' % (
+            item.get('path', ''), item.get('bytes', ''), item.get('archive', ''),
+            str(item.get('dropbox_hash', ''))[:16], item.get('date', ''), item.get('host', '')))
+    block.append(INDEX_MD_END)
+    text = md.read_text(encoding='utf-8', errors='replace') if md.exists() else '# What moved to Dropbox\n'
+    if INDEX_MD_BEGIN in text and INDEX_MD_END in text:
+        head, rest = text.split(INDEX_MD_BEGIN, 1)
+        tail = rest.split(INDEX_MD_END, 1)[1]
+        text = head.rstrip('\n') + '\n\n' + '\n'.join(block) + tail
+    else:
+        text = text.rstrip('\n') + '\n\n' + '\n'.join(block) + '\n'
+    tmp = md.with_name('.%s.%d.tmp' % (md.name, os.getpid()))
+    tmp.write_text(text, encoding='utf-8')
+    os.replace(str(tmp), str(md))
+
+
+def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, policy=None, now=None, wal=None,
+                          zstd=None):
+    """Upload `path` as one guard-built .tar.zst and approve its delete once Dropbox reports the sent content hash.
+    Raises ValueError on refusal (audited)."""
+    policy = policy or load_policy()
+    limits = policy['marker']
+    now = time.time() if now is None else now
+    transport = transport or RcloneUpload(policy=policy)
+    real = os.path.realpath(path)
+    compiled = Compiled(policy, home=home)
+    try:
+        if any(ch in path for ch in GLOB_CHARS) or '$' in path:
+            raise ValueError('spell out the literal path; globs and variables cannot be approved')
+        if not os.path.lexists(real):
+            raise ValueError('path does not exist')
+        reason = _approval_refusal(real, policy, home=home)
+        if reason:
+            raise ValueError(reason)
+        ttl = int(ttl or limits['default_ttl_seconds'])
+        if ttl <= 0 or ttl > int(limits['max_ttl_seconds']):
+            raise ValueError('ttl must be between 1 and %d seconds' % int(limits['max_ttl_seconds']))
+        _check_upload_remote(remote, policy, transport)
+        recent = int(limits.get('recent_change_seconds', 600))
+        if recent > 0 and _recent_change(real, recent, now, limits):
+            raise ValueError('something under the path changed in the last %d seconds (a live log?); wait and '
+                             'retry' % recent)
+        stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        entries = _upload_walk(real, limits, time.monotonic() + max(60.0, float(limits['max_walk_seconds']) * 600))
+        files = [e for e in entries if stat.S_ISREG(e[2].st_mode)]
+        if not files:
+            raise ValueError('nothing to approve: the path holds no files')
+        for _member, full, st in files:  # unreadable or swapped files refuse before anything is sent
+            os.close(_open_regular(full, st))
+        tree_bytes = sum(e[2].st_size for e in files)
+        if tree_bytes > int(limits['max_hash_bytes']):
+            raise ValueError('tree is larger than the approval limit')
+        problems = _counted_credentials(real, entries, compiled)
+        if problems:
+            raise ValueError('the tree holds %s; move each untracked one with `mv -n SRC ~/secret-quarantine/'
+                             '<same relative path>` first, never upload it' % '; '.join(problems[:8]))
+        if transport.exists(remote) or transport.exists(remote + '.sha256'):
+            raise ValueError('the destination already exists on the remote (letter case ignored); pick a new name')
+        deadline = time.monotonic() + max(900.0, tree_bytes / float(2 << 20))
+        dbx, sha, sent_bytes, manifest = _stream_upload(real, entries, transport, remote,
+                                                        zstd or _pinned_tool('zstd'), deadline)
+        if transport.after_upload is not None:
+            transport.after_upload()
+        stored_hash = transport.server_hash(remote)
+        if stored_hash != dbx:
+            raise ValueError('Dropbox content hash of the stored object differs from the bytes sent')
+        stored_size = transport.size(remote)
+        if stored_size != sent_bytes:
+            raise ValueError('stored size %s differs from the %d bytes sent' % (stored_size, sent_bytes))
+        stat_digest = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        if stat_digest != stat_before:
+            raise ValueError('the tree changed while it was uploaded; upload it again to a new name')
+        if recent > 0 and _recent_change(real, recent, time.time(), limits):
+            raise ValueError('something under the path changed while it was uploaded; retry with a new name')
+        transport.put_small(remote + '.sha256', ('%s  %s\n' % (sha, remote.rsplit('/', 1)[-1])).encode())
+        identity = list(_identity(real))
+    except (ValueError, OSError) as error:
+        audit('refused', {'path': real, 'remote': remote, 'reason': str(error)[:200], 'kind': UPLOAD_KIND},
+              home=home, wal=wal)
+        raise ValueError(str(error)) if isinstance(error, OSError) else error
+    entry = {'path': real, 'identity': identity, 'files': len(manifest), 'manifest_sha256': manifest_digest(manifest),
+             'stat_sha256': stat_digest, 'remote': remote, 'archive': remote, 'kind': UPLOAD_KIND,
+             'archive_sha256': sha, 'archive_bytes': sent_bytes, 'dropbox_hash': dbx, 'verified_at': now,
+             'expires_at': now + ttl, 'nonce': _secrets.token_hex(8)}
+    _store_entry(entry, real, now, home)
+    host = socket.gethostname().split('.')[0][:64]
+    date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
+    ledger_append({'path': real, 'stat_sha256': stat_digest, 'archive': remote, 'dropbox_hash': dbx,
+                   'archive_sha256': sha, 'archive_bytes': sent_bytes, 'host': host, 'date': date}, home=home)
+    base = os.path.realpath(str(home or _pinned_home()))
+    rel_home = os.path.relpath(real, base) if real.startswith(base + os.sep) else real
+    index_record({'path': rel_home, 'bytes': tree_bytes, 'regen_dropped_bytes': 0, 'secrets_quarantined': 0,
+                  'date': date, 'archive': remote, 'sha256': sha, 'archive_bytes': sent_bytes,
+                  'source': 'command_guard approve-delete --upload', 'git': None,
+                  'verified': 'Dropbox content hash and size of the stored object matched the bytes sent',
+                  'dropbox_hash': dbx, 'stat_sha256': stat_digest, 'host': host, 'kind': UPLOAD_KIND}, home=home)
+    audit('approved', entry, home=home, wal=wal)
     return entry
 
 
@@ -9667,6 +10169,9 @@ def main(argv=None):
     appr.add_argument('--archive', help='named rclone remote of ONE tar archive (.tar, .tar.gz or .tar.zst) of --path, '
                                         'whose members start with the directory name of --path (goodqa#15068)')
     appr.add_argument('--archive-sha256', dest='archive_sha256', help='remote .sha256 file of --archive')
+    appr.add_argument('--upload', help='goodqa#16374: REMOTE:dir/name.tar.zst; the guard builds the archive from the '
+                      'files it reads, uploads it with rclone rcat --immutable and approves once Dropbox reports the '
+                      'same content hash and size (no download)')
     appr.add_argument('--archive-listing', dest='archive_listing', help='remote `tar -tvf` listing of --archive')
     appr.add_argument('--no-backup', action='store_true',
                       help='user-approved deletion without a backup: a clean, pushed git working tree or a detached '
@@ -9709,6 +10214,21 @@ def main(argv=None):
         return 0 if healthy else 1
     if args.cmd == 'replay':
         print(json.dumps(replay(args.paths), indent=1))
+        return 0
+    if args.cmd == 'approve-delete' and args.upload:
+        if args.remote or args.archive or args.archive_sha256 or args.archive_listing or args.no_backup or \
+                args.user_source or args.digest:
+            print('approve-delete refused: --upload is its own backup route; it takes no --remote, --archive, '
+                  '--no-backup, --user-source or --backup-verified-sha256', file=sys.stderr)
+            return 2
+        try:
+            entry = approve_delete_upload(args.path, args.upload, ttl=args.ttl, wal=args.wal)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            print('approve-delete refused: %s' % error, file=sys.stderr)
+            return 2
+        print(json.dumps({'status': 'APPROVED', 'kind': UPLOAD_KIND, 'path': entry['path'],
+                          'expires_at': entry['expires_at'], 'files': entry['files'], 'archive': entry['archive'],
+                          'archive_sha256': entry['archive_sha256'], 'dropbox_hash': entry['dropbox_hash']}))
         return 0
     if args.cmd == 'approve-delete' and (args.no_backup or args.user_source) and \
             (args.archive or args.archive_sha256 or args.archive_listing):

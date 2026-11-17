@@ -1,0 +1,446 @@
+"""goodqa#16374 AC-2: approve-delete --upload trusts Dropbox's server-side content hash instead of a download.
+
+The guard builds the tar stream itself from the files it reads, compresses it with zstd, hashes the exact bytes it
+sends with the Dropbox content hash, streams them with `rclone rcat --immutable`, then compares Dropbox's stored hash
+and size. A fake `rclone` executable stands in for the remote: it stores objects in a folder tree, computes the
+Dropbox content hash of what it stored with its own independent implementation (or a wrong one on request) and records
+every subcommand, so the tests can prove that nothing is ever downloaded (`cat`, `copy`, `copyto`, `sync`, `check`
+never run).
+"""
+import hashlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import textwrap
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_command_guard import Fixture, cg  # noqa: E402
+
+PAST = time.time() - 3600
+FAKE_RCLONE = textwrap.dedent('''\
+    #!%(python)s
+    import hashlib, json, os, sys
+    store = os.environ["FAKE_RCLONE_STORE"]
+    argv = sys.argv[1:]
+    with open(os.path.join(store, "calls.jsonl"), "a") as log:
+        log.write(json.dumps(argv) + "\\n")
+    words = [a for a in argv if not a.startswith("-")]
+    def obj(remote):
+        name, _, rest = remote.partition(":")
+        return os.path.join(store, "objects", name, *[p for p in rest.split("/") if p])
+    def dbx(path):
+        # independent of the guard's DropboxHash: whole 4 MiB blocks read straight from the stored file
+        outer = hashlib.sha256()
+        with open(path, "rb") as h:
+            while True:
+                block = h.read(4 << 20)
+                if not block:
+                    break
+                outer.update(hashlib.sha256(block).digest())
+        return outer.hexdigest()
+    mode_file = os.path.join(store, "mode")
+    mode = open(mode_file).read().strip() if os.path.exists(mode_file) else ""
+    cmd = words[0] if words else ""
+    if cmd == "listremotes":
+        print("dropbox:  dropbox"); print("local:    local"); sys.exit(0)
+    if cmd == "rcat":
+        data = sys.stdin.buffer.read()
+        target = obj(words[-1])
+        main_object = not words[-1].endswith(".sha256")
+        if mode == "rcat-fail" and main_object:
+            sys.exit(5)
+        if "--immutable" in argv and os.path.exists(target):
+            sys.stderr.write("immutable: refusing to overwrite"); sys.exit(4)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as h:
+            h.write(data[:-7] if mode == "truncate" and main_object else data)
+        sys.exit(0)
+    if cmd == "lsjson":
+        path = obj(words[-1])
+        if os.path.isfile(path):
+            size = os.path.getsize(path) + (1 if mode == "size" else 0)
+            print(json.dumps([{"Path": os.path.basename(path), "Name": os.path.basename(path), "Size": size,
+                               "IsDir": False}]))
+            sys.exit(0)
+        if os.path.isdir(path):
+            print(json.dumps([{"Path": n, "Name": n, "Size": os.path.getsize(os.path.join(path, n)),
+                               "IsDir": os.path.isdir(os.path.join(path, n))} for n in sorted(os.listdir(path))]))
+            sys.exit(0)
+        sys.stderr.write("directory not found"); sys.exit(3)
+    if cmd == "hashsum":
+        path = obj(words[-1])
+        if mode == "hash-empty":
+            sys.exit(0)
+        if mode == "hash-garbled":
+            print("not a hash"); sys.exit(0)
+        if not os.path.isfile(path):
+            sys.exit(3)
+        value = "0" * 64 if mode == "hash-wrong" else dbx(path)
+        print("%%s  %%s" %% (value, os.path.basename(path))); sys.exit(0)
+    sys.stderr.write("fake rclone: refused subcommand " + cmd); sys.exit(9)
+''')
+DOWNLOADS = ('cat', 'copy', 'copyto', 'sync', 'check', 'cryptcheck', 'mount', 'serve', 'move', 'moveto', 'bisync')
+
+
+def age(root):
+    root = Path(root)
+    for p in sorted(root.rglob('*'), reverse=True) + [root]:
+        os.utime(str(p), (PAST, PAST), follow_symlinks=False)
+
+
+def expected_members(root):
+    """{member name: ('d', None) | ('l', target) | ('f', bytes)} for `tar -C parent -cf - name` of root."""
+    root = Path(root)
+    base = root.name
+    if root.is_file():
+        return {base: ('f', root.read_bytes())}
+    found = {base: ('d', None)}
+    for path in root.rglob('*'):
+        name = base + '/' + path.relative_to(root).as_posix()
+        if path.is_symlink():
+            found[name] = ('l', os.readlink(str(path)))
+        elif path.is_dir():
+            found[name] = ('d', None)
+        else:
+            found[name] = ('f', path.read_bytes())
+    return found
+
+
+def stored_members(data):
+    """The same map, read independently from the stored .tar.zst bytes (zstd CLI plus tarfile)."""
+    plain = subprocess.run(['zstd', '-dc'], input=data, stdout=subprocess.PIPE, check=True).stdout
+    found = {}
+    with tarfile.open(fileobj=io.BytesIO(plain), mode='r:') as tar:
+        for m in tar.getmembers():
+            if m.issym():
+                found[m.name] = ('l', m.linkname)
+            elif m.isdir():
+                found[m.name] = ('d', None)
+            elif m.isfile():
+                found[m.name] = ('f', tar.extractfile(m).read())
+            else:
+                found[m.name] = ('?', m.type)
+    return found
+
+
+def git(cwd, *args):
+    env = dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@e', GIT_COMMITTER_NAME='t',
+               GIT_COMMITTER_EMAIL='t@e', GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1')
+    subprocess.run(['git', '-C', str(cwd)] + list(args), check=True, env=env, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
+
+
+class UploadBase(Fixture):
+    def setUp(self):
+        self.store = Path(tempfile.mkdtemp(prefix='fake-rclone-'))
+        self.addCleanup(shutil.rmtree, str(self.store), True)
+        self.rclone = self.store / 'rclone'
+        self.rclone.write_text(FAKE_RCLONE % {'python': sys.executable})
+        self.rclone.chmod(0o755)
+        os.environ['FAKE_RCLONE_STORE'] = str(self.store)
+        self.addCleanup(os.environ.pop, 'FAKE_RCLONE_STORE', None)
+        self.target = self.home / '.agent-harness/work/S' / ('unit-%d' % time.monotonic_ns())
+        (self.target / 'sub').mkdir(parents=True)
+        (self.target / 'a.bin').write_bytes(os.urandom(5 << 20))  # more than one 4 MiB Dropbox block once packed
+        (self.target / 'sub/b.txt').write_text('bee\n' * 1000)
+        os.symlink('a.bin', str(self.target / 'alias'))
+        (self.target / 'empty').mkdir()
+        age(self.target)
+        self.remote = 'dropbox:backups/mac/%s.tar.zst' % self.target.name
+
+    def mode(self, value):
+        (self.store / 'mode').write_text(value)
+
+    def stored(self, remote):
+        name, _, rest = remote.partition(':')
+        return self.store.joinpath('objects', name, *rest.split('/'))
+
+    def calls(self):
+        path = self.store / 'calls.jsonl'
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def rcats(self):
+        return [c for c in self.calls() if c and c[0] == 'rcat']
+
+    def transport(self):
+        return cg.RcloneUpload(rclone=str(self.rclone), policy=self.policy)
+
+    def approve(self, remote=None, path=None, transport=None):
+        return cg.approve_delete_upload(str(path or self.target), remote or self.remote,
+                                        transport=transport or self.transport(), home=str(self.home),
+                                        policy=self.policy)
+
+    def refused(self, fragment, **kw):
+        started = time.monotonic()
+        with self.assertRaises(ValueError) as caught:
+            self.approve(**kw)
+        self.assertLess(time.monotonic() - started, 30, 'a refusal must come within its time budget')
+        self.assertIn(fragment, str(caught.exception))
+        self.assertFalse(cg.marker_covers(str(kw.get('path') or self.target), home=str(self.home)))
+        return str(caught.exception)
+
+    def assert_no_download(self):
+        for argv in self.calls():
+            self.assertNotIn(argv[0], DOWNLOADS, argv)
+
+
+class UploadApproval(UploadBase):
+    def test_matching_server_hash_approves_without_any_download(self):
+        entry = self.approve()
+        self.assertTrue(cg.marker_covers(str(self.target), home=str(self.home)))
+        self.assertEqual(entry['kind'], 'dropbox-upload')
+        data = self.stored(self.remote).read_bytes()
+        self.assertEqual(entry['dropbox_hash'], cg.DropboxHash.of_bytes(data))
+        self.assertEqual(entry['archive_sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(entry['archive_bytes'], len(data))
+        self.assert_no_download()
+        self.assertIn(['hashsum', 'dropbox', '--', self.remote], [c[:4] for c in self.calls()])
+        self.assertTrue(all('--immutable' in c for c in self.rcats()), self.rcats())
+        # Codex r3b F4: the stored archive holds exactly the tree (every member, content and link target, the empty
+        # directory too) with the `tar -C parent name` layout
+        self.assertEqual(stored_members(data), expected_members(self.target))
+        sidecar = self.stored(self.remote + '.sha256')
+        self.assertTrue(sidecar.read_text().startswith(entry['archive_sha256']))
+
+    def test_the_approval_records_the_ledger_and_the_index(self):
+        entry = self.approve()
+        row = cg.ledger_lookup(str(self.target), entry['stat_sha256'], home=str(self.home))
+        self.assertIsNotNone(row)
+        self.assertEqual(row['archive'], self.remote)
+        self.assertEqual(row['dropbox_hash'], entry['dropbox_hash'])
+        self.assertIsNone(cg.ledger_lookup(str(self.target), '0' * 64, home=str(self.home)))
+        index = [json.loads(line) for line in (self.home / 'DROPBOX_INDEX.jsonl').read_text().splitlines()]
+        self.assertEqual(index[-1]['archive'], self.remote)
+        self.assertEqual(index[-1]['dropbox_hash'], entry['dropbox_hash'])
+        self.assertEqual(index[-1]['kind'], 'dropbox-upload')
+        for key in ('path', 'bytes', 'date', 'sha256', 'archive_bytes', 'source', 'verified', 'stat_sha256', 'host'):
+            self.assertIn(key, index[-1])
+        self.assertFalse(index[-1]['path'].startswith('/'))
+        self.assertIn(self.remote, (self.home / 'DROPBOX_INDEX.md').read_text())
+
+    def test_the_index_md_keeps_hand_written_sections(self):
+        (self.home / 'DROPBOX_INDEX.md').write_text('# What moved to Dropbox\n\n## Hand section\n\nkeep me\n')
+        self.approve()
+        text = (self.home / 'DROPBOX_INDEX.md').read_text()
+        self.assertIn('keep me', text)
+        self.assertIn(self.remote, text)
+
+    def test_a_forged_ledger_row_does_not_count(self):
+        entry = self.approve()
+        ledger = self.home / '.agent-harness/state' / cg.LEDGER_NAME
+        row = json.loads(ledger.read_text().splitlines()[-1])
+        row['stat_sha256'] = 'f' * 64
+        with open(str(ledger), 'a') as handle:
+            handle.write(json.dumps(row) + '\n')
+        self.assertIsNone(cg.ledger_lookup(str(self.target), 'f' * 64, home=str(self.home)))
+        self.assertIsNotNone(cg.ledger_lookup(str(self.target), entry['stat_sha256'], home=str(self.home)))
+
+    def test_a_single_file_is_stored_as_its_basename(self):
+        remote = 'dropbox:backups/mac/a.bin.tar.zst'
+        self.approve(remote=remote, path=self.target / 'a.bin')
+        self.assertEqual(stored_members(self.stored(remote).read_bytes()), expected_members(self.target / 'a.bin'))
+
+    def repo(self, files, pushed=True):
+        repo = self.target / 'repo'
+        for rel, text in files.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
+        git(repo, 'init', '-q', '-b', 'main')
+        git(repo, 'add', '-A')
+        git(repo, 'commit', '-q', '-m', 'init')
+        if pushed:
+            hub = Path(tempfile.mkdtemp(prefix='hub-')) / 'hub.git'
+            self.addCleanup(shutil.rmtree, str(hub.parent), True)
+            git(hub.parent, 'init', '-q', '--bare', str(hub))
+            git(repo, 'remote', 'add', 'origin', str(hub))
+            git(repo, 'push', '-q', 'origin', 'main')
+            git(repo, 'fetch', '-q', 'origin')
+        return repo
+
+    def test_tracked_unmodified_credential_like_names_are_ordinary_content(self):
+        # red-team r2 N1 / r3b E1: a Go `credentials.go`, an `x-token.json` fixture and a `.env.example` tracked in
+        # a pushed repo are not secrets
+        repo = self.repo({'credentials.go': 'package x\n', 'fixtures/x-token.json': '{}\n', '.env.example': 'A=\n'})
+        age(self.target)
+        self.approve()
+        self.assertTrue((repo / 'credentials.go').exists())
+
+    def test_dropbox_hash_matches_the_block_construction(self):
+        self.assertEqual(cg.DropboxHash.of_bytes(b''), hashlib.sha256(b'').hexdigest())
+        block = b'x' * (4 << 20)
+        want = hashlib.sha256(hashlib.sha256(block).digest() + hashlib.sha256(b'y').digest()).hexdigest()
+        h = cg.DropboxHash()
+        for piece in (block[:1000], block[1000:], b'y'):
+            h.update(piece)
+        self.assertEqual(h.hexdigest(), want)
+        path = self.target / 'a.bin'
+        self.assertEqual(cg.dropbox_content_hash(str(path)), cg.DropboxHash.of_bytes(path.read_bytes()))
+
+
+class UploadRefusals(UploadBase):
+    def test_a_wrong_server_hash_is_refused(self):
+        self.mode('hash-wrong')
+        self.refused('hash')
+        self.assert_no_download()
+
+    def test_a_wrong_server_size_is_refused(self):
+        self.mode('size')
+        self.refused('size')
+
+    def test_empty_or_garbled_hashsum_output_is_refused(self):
+        for mode in ('hash-empty', 'hash-garbled'):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.refused('hash', remote='dropbox:backups/mac/%s-%s.tar.zst' % (self.target.name, mode))
+
+    def test_a_truncated_upload_is_refused(self):
+        self.mode('truncate')
+        self.refused('hash')
+
+    def test_a_failed_rcat_is_refused(self):
+        self.mode('rcat-fail')
+        self.refused('upload')
+
+    def test_an_existing_destination_is_refused_in_any_letter_case(self):
+        self.approve()
+        os.utime(str(self.target), (PAST, PAST))
+        before = len(self.rcats())
+        shouted = self.remote.replace('backups/mac/unit-', 'BACKUPS/MAC/UNIT-')
+        for remote in (self.remote, shouted):
+            with self.subTest(remote=remote):
+                with self.assertRaises(ValueError) as caught:
+                    self.approve(remote=remote)
+                self.assertIn('exists', str(caught.exception))
+                self.assertIn('new name', str(caught.exception))
+        self.assertEqual(len(self.rcats()), before)
+
+    def test_remote_shapes_are_refused_before_any_upload(self):
+        for remote in ('local:backups/x.tar.zst', 'dropbox:backups/x.zip', 'dropbox:backups/../x.tar.zst',
+                       'dropbox:backups/*.tar.zst', '/tmp/x.tar.zst', 'dropbox:', ':dropbox:x.tar.zst'):
+            with self.subTest(remote=remote):
+                with self.assertRaises(ValueError):
+                    self.approve(remote=remote)
+        self.assertEqual(self.rcats(), [])
+
+    def test_globs_and_protected_roots_are_refused(self):
+        for path in (str(self.target) + '/*', str(self.home / '.claude'), str(self.home / '.agent-harness/work')):
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    self.approve(path=path)
+        self.assertEqual(self.rcats(), [])
+
+    def test_a_tree_changed_during_the_upload_is_refused(self):
+        transport = self.transport()
+        target = self.target
+
+        def touch():
+            (target / 'sub/b.txt').write_text('changed\n')
+            os.utime(str(target / 'sub/b.txt'), (PAST, PAST))
+        transport.after_upload = touch
+        self.refused('changed', transport=transport)
+
+    def test_a_recent_change_is_refused_before_any_upload(self):
+        (self.target / 'sub/b.txt').write_text('new\n')
+        self.refused('changed in the last')
+        self.assertEqual(self.rcats(), [])
+
+    def test_special_and_unreadable_files_are_refused_within_the_budget(self):
+        # NEG-18: a FIFO is never opened (opening one for read would block forever)
+        os.mkfifo(str(self.target / 'pipe'))
+        age(self.target)
+        self.refused('special')
+        os.unlink(str(self.target / 'pipe'))
+        locked = self.target / 'locked.bin'
+        locked.write_bytes(b'x')
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o600)
+        age(self.target)
+        self.refused('read', remote='dropbox:backups/mac/%s-2.tar.zst' % self.target.name)
+        self.assertEqual(self.rcats(), [])
+
+    def test_the_archive_route_does_not_hang_on_a_fifo(self):
+        # E1: the shared tree_manifest gets the same protection
+        os.mkfifo(str(self.target / 'pipe'))
+        started = time.monotonic()
+        with self.assertRaises(ValueError) as caught:
+            cg.tree_manifest(str(self.target), self.policy['marker'])
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn('special', str(caught.exception))
+
+    def test_credential_files_are_refused_with_no_upload(self):
+        # NEG-19 / NEG-27: tier 1 always counts, tier 2 counts when untracked
+        for rel in ('rclone.conf', '.codex/auth.json', 'keys/AuthKey_X.p8', '.docker/config.json',
+                    '.config/gh/hosts.yml', '.env', 'notes/credentials.txt', 'x-token.json'):
+            with self.subTest(rel=rel):
+                path = self.target / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('placeholder\n')
+                age(self.target)
+                message = self.refused('credential', remote='dropbox:backups/mac/%s-%d.tar.zst' % (
+                    self.target.name, time.monotonic_ns()))
+                self.assertIn(rel.rsplit('/', 1)[-1], message)
+                self.assertIn('secret-quarantine', message)
+                path.unlink()
+        self.assertEqual(self.rcats(), [])
+
+    def repo(self, files, pushed=True):
+        return UploadApproval.repo(self, files, pushed)
+
+    def test_a_modified_tracked_credential_name_counts(self):
+        repo = self.repo({'credentials.json': '{}\n'})
+        (repo / 'credentials.json').write_text('{"changed": 1}\n')
+        age(self.target)
+        self.refused('credential')
+
+    def test_a_tracked_secret_on_an_unpushed_head_counts(self):
+        # NEG-32 / red-team r3b E2: committed locally, never pushed: not yet anywhere but here
+        self.repo({'secrets.json': '{}\n'}, pushed=False)
+        age(self.target)
+        self.refused('credential')
+
+    def test_a_tracked_real_credential_counts(self):
+        # tier 1 is never cleared by being tracked
+        self.repo({'deploy/rclone.conf': '[x]\n'})
+        age(self.target)
+        self.refused('tracked credential')
+
+    def test_another_device_inside_the_unit_is_refused(self):
+        real_lstat = os.lstat
+        sub = str(self.target / 'sub')
+
+        def lstat(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if str(path) == sub:
+                values = list(st)
+                values[2] = st.st_dev + 1  # st_dev
+                return os.stat_result(values)
+            return st
+        with mock.patch.object(cg, '_lstat', lstat):
+            self.refused('device')
+        self.assertEqual(self.rcats(), [])
+
+
+class UploadCli(UploadBase):
+    def test_cli_needs_wal_and_takes_no_other_backup_route(self):
+        wal = self.home / 'wal.jsonl'
+        wal.write_text('')
+        for extra in (['--remote', 'dropbox:x'], ['--archive', 'dropbox:x.tar.zst'], ['--no-backup'],
+                      ['--backup-verified-sha256', 'a' * 64]):
+            with self.subTest(extra=extra):
+                code = cg.main(['approve-delete', '--path', str(self.target), '--upload', self.remote,
+                                '--wal', str(wal)] + extra)
+                self.assertEqual(code, 2)
+        self.assertEqual(self.rcats(), [])
+
+
+if __name__ == '__main__':
+    unittest.main()
