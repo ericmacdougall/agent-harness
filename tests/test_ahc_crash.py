@@ -1341,6 +1341,9 @@ def scenario_r3_launch(root, clock):
         def show(self, unit, props):
             return {"Slice": "ahc-review.slice", "ActiveState": "active" if unit in self.live() else "inactive"}
 
+        def grant_output(self, out_dir, uid):
+            pass
+
         def list_units(self):
             return self.live()
     stub = Path(root) / "systemd-run"
@@ -1351,7 +1354,8 @@ def scenario_r3_launch(root, clock):
     fr = FileRunner()
     ahc_review.Reconciler(c, policy, fr, sleep=lambda s: None).run()
     if c._row("reviews", "id", row["id"])["state"] == "queued":
-        ahc_review.Launcher.for_test(c, policy, "/opt/ahc/peer_review.py", fr).launch(row["id"], sandbox_repo="o/r")
+        ahc_review.Launcher.for_test(c, policy, "/opt/ahc/peer_review.py", fr, root).launch(row["id"],
+                                                                                          sandbox_repo="o/r")
     led.close()
 
 

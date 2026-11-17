@@ -943,7 +943,7 @@ class RootOwnershipTests(unittest.TestCase):
     def test_a_symlink_one_level_down_in_an_ahc_only_tree_is_refused(self):
         """Nested, strict tier: a symlink inside items/ (the item journals) or clones/ (a clone directory) is
         refused before any state is touched. Only ahc writes there."""
-        self.assertEqual(core.STRICT_TREES, {"items", "clones"})
+        self.assertEqual(core.STRICT_TREES, {"items", "clones", "packets"})
         nested = {"items": "x.jsonl", "clones": "o__r"}
         for directory, name in sorted(nested.items()):
             for as_dir in (False, True):
@@ -968,7 +968,7 @@ class RootOwnershipTests(unittest.TestCase):
         per-operation behaviour is pinned by IngestValidationTests, UntrustedReadTests and PacketRetentionTests."""
         sys.path.insert(0, str(HOOKS))
         import ahc_runner as runner
-        self.assertEqual(core.SHARED_DIRS, {"queue", "inbox", "staging", "reports", "rejected"})
+        self.assertEqual(core.SHARED_DIRS, {"queue", "inbox", "staging", "reports", "rejected", "sock"})
         nested = {"staging": "a" * 64 + ".md", "inbox": "agent-abc123", "reports": "x-a1.md", "rejected": "x.json",
                   "queue": "x.json"}
         for directory, name in sorted(nested.items()):

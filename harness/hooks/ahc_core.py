@@ -145,13 +145,16 @@ ROOT_MARKER_TEXT = '{"owner": "ahc", "v": 1}\n'
 ROOT_MARKER_MAX = 4096
 ROOT_FILES = ("digest.md", "config.json", "install.json")
 ROOT_NAMES = frozenset((ROOT_MARKER, "staging", "queue", "items", "inbox", "clones", "reports", "rejected",
+                        "packets", "sock",
                         "ahc-core.lock", "ahc-review.lock", "ledger.sqlite3") + ROOT_FILES)
 ROOT_MARKER_TEMP = ".ahc-root.*.tmp"   # a claim interrupted before its marker link (see Paths._write_marker)
 ROOT_PATTERNS = ("ledger.sqlite3-*", "ledger.sqlite3.*", ".ledger.sqlite3.*.tmp", ROOT_MARKER_TEMP) + tuple(
     pattern for name in ROOT_FILES for pattern in (".%s.tmp" % name, ".%s.*.tmp" % name))
 
 
-ROOT_DIRS = frozenset(("staging", "queue", "items", "inbox", "clones", "reports", "rejected"))
+# AC-8 option A: packets/ holds core's R2 packets (written only by core); sock/ holds core's completion socket
+# (connected to by review units, so it is a shared directory; a socket file is never a plain entry).
+ROOT_DIRS = frozenset(("staging", "queue", "items", "inbox", "clones", "reports", "rejected", "packets", "sock"))
 # Two tiers below the top level (every top-level entry is always lstat-checked for its type):
 #   STRICT_TREES: written only by ahc's own code, so a link or special file anywhere in them refuses the start.
 #   SHARED_DIRS: other processes write into them by design (submitters drop queue entries, owners read and may
@@ -159,7 +162,7 @@ ROOT_DIRS = frozenset(("staging", "queue", "items", "inbox", "clones", "reports"
 #     report, `ahc submit --packet -` stages packets). A link there must never stop ahc (anyone who can submit
 #     could then halt it); instead every open of an entry in them is O_NOFOLLOW and regular-file checked at the
 #     operation, each with its own test (IngestValidationTests, UntrustedReadTests, PacketRetentionTests).
-STRICT_TREES = frozenset(("items", "clones"))
+STRICT_TREES = frozenset(("items", "clones", "packets"))
 SHARED_DIRS = ROOT_DIRS - STRICT_TREES
 TREE_PROBLEM_LIMIT = 50
 

@@ -2272,9 +2272,12 @@ def _shadow_pass(ledger, paths, config, deps, summary):
     parts = getattr(deps, "shadow_parts", None)
     if ahc_shadow.shadow_on() and parts is not None and config.get("shadow_repos"):
         producer, clone, w21 = parts(c)
+        stage = getattr(deps, "review_stage", None)
         t = ahc_shadow.ShadowTick(c, producer, clone, config, w21=w21,
                                   digest_append=lambda text: _append_private(paths.root, paths.root / SHADOW_DIGEST,
-                                                                             text))
+                                                                             text),
+                                  review=stage(c, clone) if stage is not None else None,
+                                  store_packet=lambda packet: store_r2_packet(paths.root, packet))
         summary["shadow"] = t.tick()
         for subject, why in summary["shadow"]["incidents"] + [("observations", w) for w in producer.incidents]:
             raise_incident(c, subject, why)
@@ -2282,6 +2285,16 @@ def _shadow_pass(ledger, paths, config, deps, summary):
     if policy is not None:
         while policy.incidents:
             raise_incident(c, "launch-guard", "AC-13 refused: %s" % policy.incidents.pop(0))
+
+
+def store_r2_packet(root, packet):
+    """R2: the built packet at root/packets/<sha256>.md, where the R3 unit's --packet names it (written once)."""
+    import ahc_fs  # noqa: PLC0415
+    path = Path(root) / "packets" / ("%s.md" % packet["sha256"])
+    try:
+        ahc_fs.write_file(root, path, packet["text"].encode("utf-8"), exclusive=True, create_dirs=True)
+    except FileExistsError:
+        pass                                          # the same sha names the same bytes
 
 
 def startup_reconcile(paths, policy, runner=None):
@@ -2737,6 +2750,18 @@ class LiveDeps:
             return None
         producer = ahc_observe.Producer.for_live(contracts, self.policy, goodqa, local)
         return producer, (lambda repo, head, base: self.clone(repo, head, base)), None
+
+    def review_stage(self, contracts, clone):
+        """AC-8: the shadow tick's review step: the production R3 Launcher (no runner, so infra-wait, unless systemd
+        and the completion wrapper are both present) and core's completion inbox, kept for the daemon's life."""
+        import ahc_review  # noqa: PLC0415
+        launcher = ahc_review.Launcher(contracts, self.policy, Path.home() / ".claude/hooks/peer_review.py",
+                                       self.paths.root, clone)
+        if launcher.runner is None:
+            return ahc_review.ReviewStage(contracts, launcher, None)
+        if getattr(self, "_inbox", None) is None:
+            self._inbox = ahc_review.FinalInbox(self.paths.root)
+        return ahc_review.ReviewStage(contracts, launcher, self._inbox)
 
     def merge_base(self, clone, head, base):
         import ahc_clone
