@@ -2790,6 +2790,9 @@ class LiveDeps:
 
         ASSUMPTION (goodqa#16049, open for main): no production GoodQA reader exists at this slice, so the reader
         returns nothing and every shadow observation is refused (fail closed: nothing is admitted or moved live).
+        The reader's contract includes the attached spec core's text, `spec_core_text` (PR 273 receipt F3): R2
+        copies its acceptance criteria and text into the packet only when it hashes to attached_core, and holds
+        otherwise.
         The local reader takes the repo's policy record from config `shadow_policy[repo]`; the kill switch, CAS and
         canary are unknown (None), so ELIG's e6 and e9 fail closed."""
         import ahc_observe  # noqa: PLC0415

@@ -5514,12 +5514,14 @@ class _ShadowFixture(TC.Base):
                          "checks_green": True},
                  kill_switch=False, chk_cas=True, canary_age=3600, mirror_ok=True)
         f.update(self.changes)
+        if f["attached_core"] in TC.SPECS:               # PR 273 receipt F3: the reader's verified core text
+            f.setdefault("spec_core_text", TC.SPECS[f["attached_core"]])
         return f
 
     def facts(self, repo, pr, item):
         if item is None:                                   # admission: the PR at the requested head
             return dict(pr=pr, pr_head=self.changes.get("pr_head", TC.H1), pr_state="OPEN", tip=TC.BASE,
-                        policy={"revision": TC.POLICY}, attached_core=TC.CORE1)
+                        policy={"revision": TC.POLICY}, attached_core=TC.CORE1, spec_core_text=TC.SPEC1)
         return self.eligible(self.c._row("work_items", "id", item))
 
     def shadow_tick(self, contracts=None):
@@ -5744,8 +5746,8 @@ class ShadowIntegratedTests(Base):
                             "allowlisted": True, "enabled": True,
                             "required_checks": {"contexts": ["test"], "app": "github-actions"}},
                  "kill_switch": False, "kill_epoch": 1, "chk_cas": True, "canary": None}
-        self.deps = ShadowDeps(self.gh, self.git.root, local, {"attached_core": "1" * 64, "open_findings": 0,
-                                                               "mirror_ok": True})
+        self.deps = ShadowDeps(self.gh, self.git.root, local, {"attached_core": TC.CORE1, "open_findings": 0,
+                                                               "mirror_ok": True, "spec_core_text": TC.SPEC1})
 
     def submit_shadow(self):
         req = {"repo": SHADOW_REPO, "pr": 9, "head": self.head, "base": self.base, "packet": str(self.packet),
@@ -5968,6 +5970,57 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents WHERE id=?", (iid,)), [("closed",)])
         self.assertNotIn(unit, self.runner.live)
         self.assertEqual(len(self.runner.started), 1, "a cancelled item starts nothing")
+
+    def stored_packet(self, rid):
+        (sha,), = self.ledger_rows("SELECT packet_sha256 FROM reviews WHERE id=?", (rid,))
+        data = (self.paths.root / "packets" / ("%s.md" % sha)).read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), sha)
+        return data.decode()
+
+    def assert_carries_the_core(self, text):
+        self.assertIn("## Acceptance criteria (from the attached spec core, sha256 %s)\n%s" % (
+            TC.CORE1, "- AC-1: x is 2. Verify by: tests.test_x.\n- AC-2: y is unchanged."), text)
+        self.assertIn("## Spec core (sha256 %s)\n# Spec one\n" % TC.CORE1, text)
+        self.assertIn("- NEG-1 (AC-1): x is never 3.", text, "the spec core text, not its digest alone")
+
+    def test_r273_f3_the_reviewer_gets_the_attached_cores_criteria_and_text_at_admission_and_for_a_successor(self):
+        """PR 273 receipt F3, producer to packet: the GoodQA reader returns the attached core's text; the production
+        Producer verifies it against attached_core and hands it to R2 without persisting it; the stored packet the
+        R3 unit reads carries the acceptance criteria and the spec text, at admission and for W4's successor."""
+        a, _iid, _unit = self.launched()
+        self.assert_carries_the_core(self.stored_packet(a))
+        fields = self.ledger_rows("SELECT fields FROM observations")
+        self.assertTrue(fields and not any("never 3" in f for (f,) in fields), "the text is never persisted")
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change", parent=self.base)
+        pre = "repos/%s" % SHADOW_REPO
+        self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
+        self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
+                    TO.page({"total_count": 1, "check_runs": [TO.run("test", head=head3)]}))
+        self.gh.set(pre + "/commits/%s/statuses?per_page=100" % head3, TO.page([]))
+        self.assertEqual(self.submit_pr(9, head3).get("pipeline"), "shadow")
+        self.run_all(self.deps)
+        succ = self.ledger_rows("SELECT id FROM reviews WHERE kind='adversarial' AND head=?", (head3,))
+        self.assertEqual(len(succ), 1, "W4 made the successor's code row")
+        self.assert_carries_the_core(self.stored_packet(succ[0][0]))
+
+    def test_r273_f3_without_the_attached_cores_text_no_packet_is_built_and_the_request_is_held(self):
+        """PR 273 receipt F3, negative: the reader returns the digest only, or a text that is not the attached core.
+        No packet is built and nothing is admitted; the request stays held and is admitted once the text arrives."""
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        self.deps.gq.pop("spec_core_text")
+        first = self.run_all(self.deps)["shadow"]
+        self.assertEqual(first["admitted"], [], first)
+        self.assertTrue(any("R2 packet was not built" in why for _k, why in first["refused"]), first["refused"])
+        self.deps.gq["spec_core_text"] = TC.SPEC2                    # a foreign text: the observation is refused
+        second = self.run_all(self.deps)["shadow"]
+        self.assertEqual(second["admitted"], [])
+        self.assertTrue(any("not the attached core" in why for _k, why in second["refused"]), second["refused"])
+        self.assertEqual(self.ledger_rows("SELECT id FROM work_items"), [])
+        self.deps.gq["spec_core_text"] = TC.SPEC1
+        third = self.run_all(self.deps)["shadow"]
+        self.assertEqual(len(third["admitted"]), 1, third)
+        (a, _pr, _state, _r, _w), = self.code_rows()
+        self.assert_carries_the_core(self.stored_packet(a))
 
     def test_f6_w4_head_supersede_stops_the_unit_and_settles_the_row_superseded(self):
         """PR 272 F6: the PR's head moves (W4) while the attempt for H runs. In the same tick the review stage

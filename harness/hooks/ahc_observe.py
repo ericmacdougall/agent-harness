@@ -9,7 +9,9 @@ One read session per observation. Each field has one named source:
 - local git over the fetched shas: compare, b_r_ancestors, fast_forward, paths (`diff --name-status --find-renames`
   of M..H, M = merge-base(B, H)) and the commit messages of M..H. No 3000-file or 250-commit API list is read.
 - GitHub by sha (READ_TEMPLATES "check_runs" and "statuses"): the AC-2 checks evidence.
-- GoodQA (injected reader): attached_core, open_findings, mirror_ok and the W12 check facts.
+- GoodQA (injected reader): attached_core, open_findings, mirror_ok and the W12 check facts, and the attached spec
+  core's text (`spec_core_text`, PR 273 receipt F3). The text must hash to attached_core or the observation is
+  refused; it is handed to R2 on the returned observation only and never persisted (the digest is).
 - local config and the recorded canary (AC-10): policy, kill_switch, kill_epoch, chk_cas, canary_age.
 
 Fail closed: a missing, truncated, oversized, foreign or malformed read refuses the whole observation
@@ -321,7 +323,19 @@ class Producer:
         if rows > self.c.OBSERVATION_ROW_CAP:
             self.incidents.append("observations table holds %d rows, over its cap %d" % (rows,
                                                                                          self.c.OBSERVATION_ROW_CAP))
-        return self.c.load_observation(stamp["id"])
+        return dict(self.c.load_observation(stamp["id"]), **s.get("attach", {}))
+
+    @staticmethod
+    def _spec_core_text(gq):
+        """PR 273 receipt F3: the attached spec core's raw bytes, verified against attached_core, for R2 only: kept
+        on the returned observation, never in the persisted fields. Absent: R2 holds; foreign: refused here."""
+        data = _spec_core_bytes(gq)
+        if data is None:
+            return {}
+        try:
+            return {"spec_core_text": data.decode("utf-8")}
+        except UnicodeDecodeError:
+            raise ObservationRefused("the GoodQA spec core text is not UTF-8") from None
 
     def _build(self, s, repo, pr, clone, bases, item, base=None):
         local = self._local(repo)
@@ -381,6 +395,7 @@ class Producer:
         gq = self._goodqa(repo, pr, item)
         if not isinstance(gq, dict):
             raise ObservationRefused("the GoodQA reader returned nothing")
+        s["attach"] = self._spec_core_text(gq)
         canary_age = self.c.clock.canary_age(local.get("canary"))
         fields = {
             "repo": repo, "pr": pr, "pr_head": head, "pr_state": state, "draft": p2.get("draft"),
@@ -400,6 +415,24 @@ class Producer:
             if k in gq:
                 fields[k] = gq[k]
         return fields
+
+
+SPEC_CORE_MAX = 1 << 20      # bytes; the same cap as ahc_review.SPEC_CORE_MAX
+
+
+def _spec_core_bytes(gq):
+    text = gq.get("spec_core_text")
+    if text is None:
+        return None
+    if isinstance(text, str):
+        text = text.encode("utf-8")
+    if not isinstance(text, bytes):
+        raise ObservationRefused("the GoodQA spec core text is not text")
+    if len(text) > SPEC_CORE_MAX:
+        raise ObservationRefused("the GoodQA spec core text is larger than %d bytes" % SPEC_CORE_MAX)
+    if hashlib.sha256(text).hexdigest() != gq.get("attached_core"):
+        raise ObservationRefused("the GoodQA spec core text is not the attached core (a foreign read)")
+    return text
 
 
 def stale_or_bad(contracts, obs):

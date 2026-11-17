@@ -577,12 +577,52 @@ def lint(sections):
     return found
 
 
-def build_packet(git, *, repo, pr, base, head, acceptance, spec_core, owner_text):
+SPEC_CORE_MAX = 1 << 20                   # bytes of the attached spec core text; a larger one fails the build (closed)
+AC_HEADING = re.compile(r"(?m)^## Acceptance criteria[ \t]*$")
+NEXT_HEADING = re.compile(r"(?m)^## ")
+
+
+def spec_inputs(spec_core_text, spec_core_sha):
+    """PR 273 receipt F3: (spec core text, acceptance criteria) for R2, both from the attached spec core itself.
+    The text is the attached core's bytes (spec_flow.spec_core, which ends before "## Reviews"); its sha256 must be
+    the attached core digest the item is bound to, so nothing unbound reaches the reviewer. The acceptance criteria
+    are the core's own "## Acceptance criteria" section, so they are hash-bound with it. Raises ContractError (the
+    packet is not built and the request or move is held) when the text is absent, oversized, not UTF-8, not the
+    attached core, or has no non-empty acceptance criteria section."""
+    if not (isinstance(spec_core_sha, str) and re.fullmatch(r"[0-9a-f]{64}", spec_core_sha)):
+        raise C.ContractError("R2: no attached spec core digest; the packet is not built")
+    if isinstance(spec_core_text, str):
+        data = spec_core_text.encode("utf-8")
+    elif isinstance(spec_core_text, bytes):
+        data = spec_core_text
+    else:
+        raise C.ContractError("R2: the attached spec core text is unavailable; the packet is not built")
+    if len(data) > SPEC_CORE_MAX:
+        raise C.ContractError("R2: the spec core text is larger than %d bytes; the packet is not built" % SPEC_CORE_MAX)
+    if hashlib.sha256(data).hexdigest() != spec_core_sha:
+        raise C.ContractError("R2: the spec core text is not the attached core %s; the packet is not built"
+                              % spec_core_sha[:12])
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise C.ContractError("R2: the spec core text is not UTF-8; the packet is not built") from None
+    found = AC_HEADING.search(text)
+    rest = text[found.end():] if found else ""
+    nxt = NEXT_HEADING.search(rest)
+    acceptance = (rest[:nxt.start()] if nxt else rest).strip("\n")
+    if not acceptance.strip():
+        raise C.ContractError("R2: the attached spec core has no acceptance criteria; the packet is not built")
+    return text, acceptance
+
+
+def build_packet(git, *, repo, pr, base, head, spec_core_text, spec_core_sha, owner_text):
     """R2: core builds the review packet from its own snapshot B_r..H through `git(args) -> (rc, out)` (production:
     AC-13's git form in the item's clone): the diff, the changed paths and the commit messages, plus the ticket's
-    acceptance criteria and the spec core. The owner's text is only a fenced section labelled untrusted. The diff,
-    the commit messages and the owner section are linted; the packet is hashed. Any failed or oversized read fails
-    the build (fail closed: R13's infra-wait)."""
+    acceptance criteria and the spec core, both taken from the attached spec core text verified against its digest
+    (spec_inputs; PR 273 receipt F3). The owner's text is only a fenced section labelled untrusted. The diff, the
+    commit messages and the owner section are linted; the packet is hashed. Any failed or oversized read, or a
+    missing or unbound spec core, fails the build (fail closed: the request or the move is held)."""
+    spec_text, acceptance = spec_inputs(spec_core_text, spec_core_sha)
     for name, sha in (("base", base), ("head", head)):
         if not (isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha)):
             raise C.ContractError("R2: %s is not a full sha" % name)
@@ -602,8 +642,8 @@ def build_packet(git, *, repo, pr, base, head, acceptance, spec_core, owner_text
     findings = lint((("diff", diff), ("commit messages", messages), ("owner section", owner_text)))
     lines = ["# ahc review packet (R2, built by core)",
              "repo: %s  pr: %d  head H: %s  snapshot base B_r: %s" % (repo, int(pr), head, base),
-             "", "## Acceptance criteria", str(acceptance).strip() or "(none)",
-             "", "## Spec core", str(spec_core or "(none)"),
+             "", "## Acceptance criteria (from the attached spec core, sha256 %s)" % spec_core_sha, acceptance,
+             "", "## Spec core (sha256 %s)" % spec_core_sha, spec_text.rstrip("\n"),
              "", "## Changed paths"] + ["- " + p for p in paths] + [
              "", "## Commit messages", messages or "(none)",
              "", "## Diff B_r..H", diff.rstrip("\n"),

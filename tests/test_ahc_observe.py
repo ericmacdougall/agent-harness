@@ -174,6 +174,33 @@ class Base(unittest.TestCase):
 class ProducerTests(Base):
     """AC-1: each field from its named source, one read session, persisted and loaded by id."""
 
+    def test_r273_f3_the_attached_cores_text_is_verified_handed_to_r2_and_never_persisted(self):
+        """PR 273 receipt F3: the reader's spec core text must hash to attached_core. A match rides on the returned
+        observation only (not in the persisted fields, whose digest the guards check); a foreign, oversized or
+        non-text value refuses the observation; no text leaves the observation without one (R2 then holds)."""
+        import hashlib  # noqa: PLC0415
+        spec = "# Spec\n\n## Acceptance criteria\n\n- AC-1: a. Verify by: t.\n"
+        self.gq = dict(self.gq, attached_core=hashlib.sha256(spec.encode()).hexdigest(), spec_core_text=spec)
+        o = self.observe_ok()
+        self.assertEqual(o["spec_core_text"], spec)
+        stored = json.loads(self.db.execute("SELECT fields FROM observations WHERE id=?", (o["id"],)).fetchone()[0])
+        self.assertNotIn("spec_core_text", stored)
+        self.assertEqual(stored["attached_core"], self.gq["attached_core"])
+        self.assertNotIn("spec_core_text", self.c.load_observation(o["id"]))
+        big = "x" * (O.SPEC_CORE_MAX + 1)
+        for name, text, core in (("foreign", spec + "tampered", self.gq["attached_core"]),
+                                 ("oversized", big, hashlib.sha256(big.encode()).hexdigest()),
+                                 ("not text", 42, self.gq["attached_core"]),
+                                 ("not utf-8", b"\xff", hashlib.sha256(b"\xff").hexdigest())):
+            with self.subTest(name):
+                self.gq = dict(self.gq, attached_core=core, spec_core_text=text)
+                before = self.rows()
+                with self.assertRaises(O.ObservationRefused):
+                    self.observe()
+                self.assertEqual(self.rows(), before, "a refused observation is not persisted")
+        self.gq = {k: v for k, v in self.gq.items() if k != "spec_core_text"}
+        self.assertNotIn("spec_core_text", self.observe_ok())
+
     def test_ac1_fields_come_from_their_named_sources(self):
         tip = self.repo.commit({"src/other.py": "o\n"}, "moved main", parent=self.base)
         self.wire(self.head, tip)
