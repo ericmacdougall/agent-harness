@@ -153,10 +153,58 @@ ENTRIES = {
         "tests": [T + "CanaryTests.test_an_interrupted_failed_canary_never_leaves_the_old_pass_authoritative"],
         "mutations": [("no in-progress record at the start", [
             ('            self._record(repo, "in-progress", False, {}, bool(prior.get("escalated")) and not '
-             'prior.get("passed"))\n', "")], MERGE),
+             'prior.get("passed"),\n                         attempt)\n', "")], MERGE),
                       ("an exception mid-canary escapes without a failed record or merging off", [
             ('                error = "%s during the canary" % type(exc).__name__\n', "                raise\n")],
                        MERGE)]},
+    # ---- PR #270 delta review (Codex R1 at bb0852c): F1 the raw canary stamp, F4 the canary attempt
+    "F1d the raw canary stamp is validated before its age": {
+        "tests": [EF + "test_14_a_non_finite_future_or_malformed_canary_stamp_at_e2_sends_nothing"],
+        "mutations": [("canary_facts trusts the clamped age without checking the raw stamp", [
+            ('        if canary_stamp_problem(facts["canary"], self.port.boot_id(), self.port.mono()) is not None:\n'
+             '            return None\n', "")], MERGE),
+                      ("a mono later than the boot clock passes the check", [
+            ("    if not value <= now:\n", "    if False:\n")], MERGE),
+                      ("a huge JSON int escapes the check as an exception", [
+            ("    except (OverflowError, ValueError):\n", "    except ValueError:\n")], MERGE)]},
+    "F1d each stamp condition on its own": {
+        "tests": [EF + "test_14_the_canary_stamp_validator_names_each_problem"],
+        "mutations": [("the boot check is dropped (masked at E2 by canary_age, killed by the validator test)", [
+            ('    if boot_id is None or canary.get("boot") != boot_id:\n', "    if False:\n")], MERGE),
+                      ("a non-finite mono passes the finiteness check (masked at E2 by the later checks)", [
+            ("    if not math.isfinite(value):\n", "    if False:\n")], MERGE),
+                      ("a boolean mono counts as a number", [
+            ("    if isinstance(mono, bool) or not isinstance(mono, (int, float)):\n",
+             "    if not isinstance(mono, (int, float)):\n")], MERGE),
+                      ("a negative mono passes the check", [
+            ("    if value < 0:\n", "    if False:\n")], MERGE)]},
+    "F4 same-repo canary attempts serialize": {
+        "tests": [T + "CanaryTests.test_a_second_canary_attempt_for_the_repo_is_deferred_while_the_first_runs"],
+        "mutations": [("the canary lock is opened but never taken", [
+            ("            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n", "            pass\n")], MERGE),
+                      ("a busy lock is treated as free", [
+            ("        if held_canary is None:\n            return Outcome(\"deferred\", \"another canary attempt",
+             "        if held_canary is None:\n            held_canary = -1\n        if False:\n"
+             "            return Outcome(\"deferred\", \"another canary attempt"),
+            ("    def unlock(fd):\n        try:\n", "    def unlock(fd):\n        if fd == -1:\n            return\n"
+                                                    "        try:\n")], MERGE)]},
+    "F4 the final record is a compare-and-write on the attempt id": {
+        "tests": [T + "CanaryTests.test_an_older_attempt_never_publishes_over_a_newer_marker"],
+        "mutations": [("the final record is written without comparing the attempt", [
+            ('        if not isinstance(current, dict) or current.get("attempt") != attempt:\n',
+             "        if False:\n")], MERGE),
+                      ("a removed record counts as this attempt's", [
+            ('        if not isinstance(current, dict) or current.get("attempt") != attempt:\n',
+             '        if isinstance(current, dict) and current.get("attempt") != attempt:\n')], MERGE)]},
+    "F4 an unusable canary lock fails closed": {
+        "tests": [T + "CanaryTests.test_an_unusable_canary_lock_defers_and_changes_nothing"],
+        "mutations": [("an unsafe lock file is ignored and the attempt runs", [
+            ("            except OSError:\n                return None\n"
+             "        if fd is None:\n            return None\n",
+             "            except OSError:\n                return -1\n"
+             "        if fd is None:\n            return None\n"),
+            ("    def unlock(fd):\n        try:\n", "    def unlock(fd):\n        if fd == -1:\n            return\n"
+                                                    "        try:\n")], MERGE)]},
 }
 
 # an entry's extra_tests are mapped too (the classifier mutation is killed by them)

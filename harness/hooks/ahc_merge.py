@@ -42,19 +42,24 @@ A-reconcile (ahc-merge runs E10's reconcile for held ops: confirm when applied, 
 A-prepare (the repo's GraphQL node id is read before the dispatch commit; a send without it fails closed, UNTYPED),
 A-cancel (a send cancelled at the deadline before it started is still reported NO_RESPONSE, never an absence proof),
 A-canary-inprogress (Canary.run writes the in-progress record after its read-only preparation and before the first
-canary-ref write; a preparation failure keeps the earlier deferred or refused outcome and the prior record).
+canary-ref write; a preparation failure keeps the earlier deferred or refused outcome and the prior record),
+A-canary-lock (same-repo canary attempts serialize on an exclusive flock of `canary-<repo>.lock` in the canary
+store, taken without waiting before the dispatch lock and held through the final record; a busy or unusable lock
+defers the attempt; a stale attempt that failed still turns merging off, the fail-closed direction).
 """
 from __future__ import annotations
 
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import stat
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import ahc_contracts as C
@@ -87,6 +92,8 @@ MERGE_INVENTORY = {
     ("ahc_merge", "KillStore.bump", "handle.write"): (1, "exempt:calls KillStore.write, which carries the seam"),
     ("ahc_merge", "Canary._record", "handle.write"): (1, "exempt:calls CanaryStore.write, which carries the seam"),
     ("ahc_merge", "CanaryStore.read", "fs.open_file"): (1, "exempt:a read-only open (O_RDONLY); no state"),
+    ("ahc_merge", "CanaryStore.try_lock", "fs.open_file"): (1, "exempt:the empty flock file of the repo's canary "
+                                                                "attempts (F4); no state, created once, never written"),
 }
 
 PROPOSED_CONTRACT_DIFFS = (
@@ -97,7 +104,36 @@ PROPOSED_CONTRACT_DIFFS = (
     "intent still passed E2; ahc_merge checks it itself meanwhile)",
     "Contracts.dispatch (E2 guard) checks e9: obs chk_cas is True and 0 <= canary_age < 86400, as ELIG does (PR #270 "
     "review F1; ahc_merge refuses an expired canary itself and carries both facts in E2's observation meanwhile)",
+    "ahc_clock.Clock.canary_age validates the raw (boot, mono) stamp as canary_stamp_problem does (finite, not "
+    "negative, at or below the boot clock) instead of clamping max(0, now - mono), so ELIG's e9 and the Contracts E2 "
+    "guard cannot read NaN, inf or a future stamp as age 0 (PR #270 delta review F1; ahc_merge checks the raw stamp "
+    "itself before it trusts the age meanwhile)",
 )
+
+
+def canary_stamp_problem(canary, boot_id, now):
+    """F1 (delta review of PR #270): the problem with a canary record's raw (boot, mono) stamp, or None when E2 may
+    read its age. Clock.canary_age clamps max(0, now - mono), so NaN, inf or a future mono would read as age 0; the
+    sender checks the raw stamp first: from the ledger's own (known) boot, and a mono that is a real number, finite,
+    not negative and at or below the boot clock `now`. Never raises (a huge JSON int fails float())."""
+    if not isinstance(canary, dict):
+        return "no canary stamp"
+    if boot_id is None or canary.get("boot") != boot_id:
+        return "the canary stamp is from another boot"
+    mono = canary.get("mono")
+    if isinstance(mono, bool) or not isinstance(mono, (int, float)):
+        return "the canary stamp's mono is not a number"
+    try:
+        value = float(mono)
+    except (OverflowError, ValueError):
+        return "the canary stamp's mono is not finite"
+    if not math.isfinite(value):
+        return "the canary stamp's mono is not finite"
+    if value < 0:
+        return "the canary stamp's mono is negative"
+    if not value <= now:
+        return "the canary stamp is later than the boot clock"
+    return None
 
 
 class SenderError(RuntimeError):
@@ -523,6 +559,10 @@ class LedgerPort:
     def mono(self):
         return float(self.c._mono())
 
+    def boot_id(self):
+        """The boot id of the ledger's clock (the one Clock.canary_age compares a stamp's boot with)."""
+        return self.c.clock.boot_id
+
     def reviewed_head(self, op):
         """The H the passed adversarial Review row of the op's item names, at the op's policy revision (latest round).
         The op's own head is never trusted alone: the two must agree, or nothing is sent."""
@@ -671,13 +711,46 @@ class CanaryStore:
     """The canary records e9 reads, one file per repo under `directory` (owned by `ahcmerge`), written through ahc_fs.
     Shaped for ahc_clock.Clock.canary_age: {"boot", "mono", "github_date"} plus the case results."""
 
+    LOCK_OPEN_TRIES = 100
+
     def __init__(self, directory):
         self.dir = Path(directory)
 
-    def _path(self, repo):
+    def _path(self, repo, suffix=".json"):
         if not REPO.fullmatch(str(repo)):
             raise SenderError("not a repo slug")
-        return self.dir / ("canary-%s.json" % str(repo).lower().replace("/", "__"))
+        return self.dir / ("canary-%s%s" % (str(repo).lower().replace("/", "__"), suffix))
+
+    def try_lock(self, repo):
+        """F4 (delta review of PR #270): the repo's canary-attempt lock, an exclusive flock of the empty file
+        `canary-<repo>.lock` beside the record, taken WITHOUT waiting. Returns its descriptor, or None when another
+        attempt holds it or the file is unusable (a link, not a regular file, not ours): fail closed. The open is
+        retried a bounded number of times on the macOS O_CREAT ENOENT race (as AuthorityLog._open_lock). The lock
+        goes with the process, so a dead attempt never wedges the next one."""
+        path, fd = self._path(repo, ".lock"), None
+        for _ in range(self.LOCK_OPEN_TRIES):
+            try:
+                fd = fs.open_file(self.dir, path, os.O_RDONLY | os.O_CREAT)
+                break
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+        if fd is None:
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    @staticmethod
+    def unlock(fd):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def write(self, record):
         crash_before("merge.canary_record")
@@ -723,6 +796,7 @@ class Canary:
         self.t, self.identity, self.store, self.port, self.lock, self.kill = (transport, identity, store, port, lock,
                                                                                kill)
         self.escalations = []
+        self.incidents = []
 
     def _cas(self, repo, before, after):
         return self.t.update_refs(repo, CANARY_REF, before, after, force=False, timeout=SEND_DEADLINE_SECONDS)
@@ -733,10 +807,10 @@ class Canary:
         except TransportError:
             return None
 
-    def _record(self, repo, state, passed, cases, escalated, error=None):
+    def _record(self, repo, state, passed, cases, escalated, attempt, error=None):
         rec = {"repo": str(repo).lower(), "identity": {"login": self.identity.login, "id": self.identity.id},
                "state": state, "passed": passed, "cases": cases, "boot": self.identity.boot_id,
-               "mono": self.port.mono(), "escalated": escalated}
+               "mono": self.port.mono(), "escalated": escalated, "attempt": attempt}
         if error:
             rec["error"] = error
         self.store.write(rec)
@@ -765,9 +839,27 @@ class Canary:
         Any failed case or exception after that persists a failed or inconclusive record and turns the repo's
         merging off (escalating once). ASSUMPTION A-canary-inprogress: the read-only preparation (the repo id, the
         tip and its two ancestors) runs first and keeps its earlier outcomes (deferred when not prepared, refused
-        without two ancestors), leaving the prior record as it was, since no case has run yet."""
+        without two ancestors), leaving the prior record as it was, since no case has run yet.
+
+        F4 (delta review of PR #270 at bb0852c): attempts for one repo serialize on the store's canary lock
+        (ASSUMPTION A-canary-lock), taken without waiting before the dispatch lock and held through the final record;
+        a busy or unusable lock defers the attempt before it reads or writes anything. Each attempt carries its own id
+        (a uuid4) from its in-progress marker on, and the final record is a compare-and-write under that lock: it is
+        published only while the stored record still names this attempt. Otherwise (a newer marker, or no record,
+        which only a breached lock allows) nothing is published, the attempt reports "stale" and records an incident;
+        a stale attempt that failed still turns merging off, the fail-closed direction."""
         if not self.identity.fresh():
             return Outcome("waiting-dep", "merge identity unavailable")
+        held_canary = self.store.try_lock(repo)
+        if held_canary is None:
+            return Outcome("deferred", "another canary attempt for this repo holds its lock, or the lock is unusable")
+        try:
+            return self._attempt(repo, branch, uuid.uuid4().hex)
+        finally:
+            self.store.unlock(held_canary)
+
+    def _attempt(self, repo, branch, attempt):
+        """One canary attempt, run while the caller holds the repo's canary lock."""
         cases, error = {}, None
         with self.lock.shared(SENDER_LOCK_WAIT_SECONDS) as held:
             epoch = self.kill.read() if held else {"on": True}
@@ -783,7 +875,8 @@ class Canary:
             if not (p and g):
                 return Outcome("refused", "the default branch needs two ancestors for the canary")
             prior = self.store.read(repo) or {}
-            self._record(repo, "in-progress", False, {}, bool(prior.get("escalated")) and not prior.get("passed"))
+            self._record(repo, "in-progress", False, {}, bool(prior.get("escalated")) and not prior.get("passed"),
+                         attempt)
             try:
                 self._cases(repo, tip, p, g, cases)
             except Exception as exc:              # any failure mid-attempt is a failed (inconclusive) canary
@@ -796,8 +889,16 @@ class Canary:
                 self.escalations.append("CHK-CAS canary failed for %s: %s" % (
                     repo, error or ", ".join(sorted(k for k, v in cases.items() if not v))))
                 escalated = True
+        current = self.store.read(repo)                  # F4: compare-and-write, under the repo's canary lock
+        if not isinstance(current, dict) or current.get("attempt") != attempt:
+            seen = current.get("attempt") if isinstance(current, dict) else None
+            self.incidents.append("stale CHK-CAS canary attempt %s for %s: the record names %s, so its %s result was "
+                                  "not published" % (attempt, repo, seen or "no attempt",
+                                                     "passing" if passed else "failing"))
+            return Outcome("stale", "the canary record no longer names this attempt; nothing was published",
+                           sent=True, record=None)
         rec = self._record(repo, "passed" if passed else ("inconclusive" if error else "failed"), passed, cases,
-                           escalated, error)
+                           escalated, attempt, error)
         return Outcome("passed" if passed else "failed", error or "", sent=True, record=rec)
 
 
@@ -843,9 +944,12 @@ class Sender:
         """e9 at E2 (F1): {"chk_cas": True, "canary_age": seconds} when the repo's CHK-CAS record passed under this
         identity and its age, read by the ledger's boot-aware Clock.canary_age (the clock ELIG uses), is at least 0
         and under CANARY_MAX_SECONDS; otherwise None (a missing, malformed, other-boot or expired stamp fails
-        closed)."""
+        closed). The raw stamp is checked first (canary_stamp_problem, delta review F1): canary_age clamps, so a NaN,
+        inf or future mono would otherwise read as age 0. The contract guard reads only the age this returns."""
         facts = self.cas.local_facts(repo, self.identity)
         if facts.get("chk_cas") is not True or not isinstance(facts.get("canary"), dict):
+            return None
+        if canary_stamp_problem(facts["canary"], self.port.boot_id(), self.port.mono()) is not None:
             return None
         age = self.port.canary_age(facts["canary"])
         if not isinstance(age, (int, float)) or isinstance(age, bool) or not 0 <= age < CANARY_MAX_SECONDS:
