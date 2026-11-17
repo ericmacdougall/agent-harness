@@ -96,7 +96,7 @@ Details for the hostile fixture follow. It has exposure-tier findings (a key-blo
 
 ## PR 272 review round 2 (code inspection at bbaff656, four findings, all fixed)
 
-One invariant now holds across F4 to F6: a launch intent leaves `open` or `started` only once its unit is confirmed inactive, failed or gone. Reconciliation and the sweep walk the ledger's intents, not only the units systemd lists.
+One invariant was meant to hold across F4 to F6: a launch intent leaves `open` or `started` only once its unit is confirmed inactive, failed or gone. (It did not hold for a settled FINAL; see the PR 272 rescue section below.) Reconciliation and the sweep walk the ledger's intents, not only the units systemd lists.
 
 **F4, crash windows (high).**
 - *Fix (a).* After the listed-unit pass, `Reconciler.run` visits every open or started intent whose unit systemd does not list (`reconcile_absent`). An open one is orphaned with its charge kept (NEG-22), so the row launches again.
@@ -149,6 +149,58 @@ One invariant now holds across F4 to F6: a launch intent leaves `open` or `start
 - "PR 272 F6 …": 3;
 - "PR 272 F7 …": 5, including the integrated tick with every gate removed.
 - Five older anchors moved onto the round-2 code with the same mutation intent: NEG-25 finished items, NEG-22 the unit is not stopped, NEG-22 the charge is refunded, NEG-49 the unbounded stop, and option A's ended unit.
+
+## PR 272 rescue (main's exact-head receipt at f532d495: BLOCK, F1-F4)
+
+The round-2 invariant above did not hold on every path: `settle_final` closed a started intent and then called `stop()` without confirming it. The sweep selected only open and started intents, so a failed stop after a valid FINAL was never retried. The rescue (agent ac329364439760e40) replaces per-call-site cleanup with one state machine.
+
+**F1, the unit lifecycle (high), fixed.**
+- *States.* `launch_intents.state` gains `stopping`, with `retire_to` (closed or orphaned). The flow is open → started → stopping → closed, or open → stopping → closed or orphaned. A terminal intent found with an active unit (a ledger an earlier build wrote) goes back to stopping with the same `retire_to`, and an incident is raised.
+- *One chokepoint.*
+  - `Contracts.intent_move` has no edge to a terminal state (`INTENT_EDGES`).
+  - `Contracts.intent_retire` is the only writer of closed or orphaned. It takes the ActiveState the caller observed after its stop and refuses anything but inactive or failed.
+  - In one transaction it ends the intent, applies R15 to a row that is cancelling on this unit, and lifts the block this unit holds (the old `unblock_row` was not unit-scoped; that is now fixed too).
+  - `ahc_review.retire` (stop, then show until inactive or failed, within `STOP_BOUND`) is its only caller. A stop's return value never confirms.
+- *Durable before the stop.* Every way an attempt ends only moves the intent to stopping, and does so before any stop: a verified FINAL and R7's outcome-unknown move it in the row's own transaction (`settle_attempt`); an abandoned launch, a cancelling row and a startup orphan move it with `intent_move`. A crash after that commit leaves the cleanup in the ledger. New named point `r3.settled`. `check_r3_launch` now fails on any terminal intent with a live unit.
+- *Retried everywhere.* `LIVE_INTENT` = open, started, stopping drives:
+  - the second-unit check in `launch_intent`;
+  - `live_intent_units`, which keeps a stopping unit in the guard's committed-intent form after a restart;
+  - `offerable_rows`, so a row with a live intent never takes the slot;
+  - the sweep and both reconciliation passes.
+- *RemainAfterExit.* `ReviewStage.ended` counts ActiveState active with SubState exited as ended, so R7 fires at once instead of after REVIEW_MAX. It is never a confirmed stop: only inactive or failed after a stop retires an intent. This closes the round-2 disclosure on `ended()`; real systemd behaviour is still the AC-12 gate.
+- *Tests* (`tests.test_ahc_contracts.RuntimeTests`):
+  - `test_rescue_f1_a_valid_final_never_retires_the_intent_before_its_unit_is_confirmed_stopped`: stop returns False, returns True while the unit stays active, or is refused;
+  - `test_rescue_f1_a_crash_between_settlement_and_the_stop_leaves_cleanup_that_is_finished`: the next sweep, and a restart through the real guard;
+  - `test_rescue_f1_remain_after_exit_an_exited_unit_is_given_up_and_still_stopped_before_it_retires`;
+  - `test_rescue_f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop`, including a source scan;
+  - `test_rescue_f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form`;
+  - `tests.test_ahc_crash.NamedPointTests` with `r3.settled`.
+- *Changed expectations.* Round 2's `test_f5_an_unconfirmed_cleanup…` and `test_f6_w20…` asserted that the barrier intent stayed `open` or `started`. It is now `stopping`. The barrier itself (no second unit, nothing terminal until confirmed) is asserted unchanged.
+
+**F2, the snapshot base (high), fixed.** peer_review takes its snapshot base only from `--snapshot-base`; `--base` is the commit-policy range. The R3 row (docs/spec/ahc-m1-state-machine.md, R3) binds "`--expected-head H` with snapshot base B_r, `--base B_r`". `r3_command` now passes `--snapshot-base B_r --base B_r`, both inside the launch digest.
+- *Tests.*
+  - `RuntimeTests.test_rescue_f2_the_r3_command_line_names_b_r_as_the_snapshot_base_inside_the_digest`.
+  - `R3SnapshotBaseTests.test_rescue_f2_the_real_helper_reviews_b_r_to_h_when_b_r_is_not_h_first_parent` runs the committed peer_review.py with the bound argv on a fixture where B_r is not H^1, with fake reviewer CLIs, and asserts the snapshot base and the reviewer's `git diff B_r HEAD`. At f532d495 the report showed H^1.
+- *Stated test deviation.* The `--github-repo/--pr` pair is removed from that run. The harness's merge-gate hook forbids a subagent from running a GitHub-bound PR review, and the binding is a GitHub read that does not touch the snapshot.
+
+**F3, the production AC-8 path.**
+- (a) A `--user` policy without `sandbox_repo` refuses. This conforms to spec r9 line 116: "R-c is allowed only for the repo the policy record names as the sandbox".
+- (b) and (c), the wrapper and the output grant, are deferred to goodqa#16274 and goodqa#16275. This is main's ruling (ASSUMPTION, an agent message, relayed by the coordinator owner), recorded as part of A-1. Line 116 requires production to fail closed to infra-wait "where isolation is unavailable", which it does. AC-12 (line 120) cannot pass without them, so they are forced before live.
+- New pin: `RuntimeTests.test_rescue_a1_every_production_r3_launch_goes_to_infra_wait_while_the_wrapper_is_absent`. It goes through `LiveDeps.review_stage` with `SystemdRunner.available` forced true, and asserts no intent, no charge and no start. A positive control (a wrapper file present) builds the production runner.
+
+**F4, the Linux live legs.** Out of scope for this merge, per main's ruling quoting spec r9 line 101 ("Out: Running live, and real systemd units. AC-12 is the gate before live.") and line 120 (AC-12 is "required before the coordinator runs live and not before the integration merge"). The run kit stays shipped. The focused unit suites, MigrationV5Tests included, also ran on t2-dev at the rescue head (see the packet). That is unit-level Linux evidence, not the AC-12 live gate.
+
+**ASSUMPTIONs added by the rescue (unconfirmed).**
+- *A pre-release v5 ledger is refused.* `launch_intents` is new in v5, and `CREATE TABLE IF NOT EXISTS` never alters an existing table. A v5 ledger written by a pre-rescue build therefore has a CHECK that refuses `stopping`, and `Ledger._check_intent_lifecycle` refuses to open it. No such ledger is expected outside test fixtures, because slice 1 (b) was never installed.
+- *An unlisted unit is still stopped once.* A non-terminal intent whose unit systemd does not list is retired through the same stop-then-show path. A stop of an unloaded unit is harmless, and its show reports inactive.
+- *An admitted B_r that is not an ancestor of H now fails closed.* peer_review refuses such a `--snapshot-base`, so the unit ends without a FINAL and the row goes outcome-unknown. Before F2 the reviewer silently diffed H^1..H. Admission does not check that B_r is an ancestor of H; that is a follow-up, not fixed here.
+
+**Variants.**
+- Eighteen anchors moved onto the rescue code with the same mutation intent. They cover NEG-22 (2), NEG-25, NEG-36 (2), NEG-49, option A's two R7 mutations, test_r03's `--author-harness`, F4 (3), F5 (4) and F6 (2).
+- Three new entries:
+  - "PR 272 rescue F1 …" (7 mutations);
+  - "PR 272 rescue F2 …" (2);
+  - "PR 272 rescue A-1 …" (1).
 
 ## Owner rulings carried in this build (agent messages, ASSUMPTION)
 
