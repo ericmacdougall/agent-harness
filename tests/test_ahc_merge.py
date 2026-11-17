@@ -919,6 +919,10 @@ class EffectTests(Base):
                 w.identity.check(w.gh, {REPO})                    # a fresh identity: only the canary is at issue
                 out = w.sender().dispatch(key)
                 self.assertEqual((out["state"], out["sent"]), ("refused", False), out)
+                # the sender's own e9 check refuses before any observation or E2 commit; the Contracts E2 guard
+                # (contract diff 5) is the second layer and would say "E2 not committed: ..." instead
+                self.assertEqual(out["why"], "the CHK-CAS canary is expired, from another boot, or has no valid stamp",
+                                 "the sender refuses the canary itself, before the contract guard")
                 self.assertEqual(w.gh.requests, [], "zero sends with an expired or unstamped canary")
                 self.assertEqual(w.op(key)["state"], "intent")
         w = self.world()
