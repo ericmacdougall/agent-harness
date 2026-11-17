@@ -1310,3 +1310,19 @@ ENTRIES.update({
                 ('        return dict(self.c.load_observation(stamp["id"]), **s.get("attach", {}))\n',
                  '        return self.c.load_observation(stamp["id"])\n')], "harness/hooks/ahc_observe.py")]},
 })
+
+STT = "tests.test_ahc_runner.ShadowTickTests."
+ENTRIES.update({
+    "PR 273 receipt F2 rows required after admission are queued by the tick": {
+        "tests": [RTR + "f2_a_w16_extension_round_is_queued_and_launched_by_the_next_tick",
+                  RTR + "f2_an_altered_or_missing_stored_packet_keeps_the_row_required_and_says_so",
+                  STT + "test_r273_f2_w27_replacement_code_rows_are_queued_and_offered_by_the_real_scheduler"],
+        "mutations": [
+            ("the tick never runs the R2 pass for later rows", [
+                ('        self.r2_required(summary)\n', '        pass\n')], SHADOW),
+            ("the stored packet is queued without checking its hash", [
+                ('    if hashlib.sha256(data).hexdigest() != sha:\n', '    if False:\n')], REVIEW_PY),
+            ("a row that cannot be queued is dropped from the tick's report", [
+                ('                summary["refused"].append((rid, "R2 for a later round: %s" % str(error)[:200]))\n',
+                 '                pass\n')], SHADOW)]},
+})

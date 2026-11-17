@@ -5602,6 +5602,61 @@ class ShadowTickTests(_ShadowFixture):
         again = self.shadow_tick()[0].tick()
         self.assertEqual(again["admitted"], [], "the request is consumed once")
 
+    def test_r273_f2_w27_replacement_code_rows_are_queued_and_offered_by_the_real_scheduler(self):
+        """PR 273 receipt F2 for W27: the policy revision changes while the item is merge-ready. The tick applies
+        W27, whose replacement code rows start required; the same tick's R2 pass queues them from the item's
+        stored packet and the real ReviewScheduler offers one to the launcher. Every earlier step goes through the
+        tick or the contract calls (admission, start_attempt, the bound receipts, W2); no row is written by hand."""
+        store, offered = {}, []
+
+        class Stage:
+            slots = 1
+
+            def settle(self):
+                return {}
+
+            def launch_row(self, row):
+                offered.append(row["id"])
+                return "held", "the test's launcher records the offer"
+
+        def tick():
+            producer = FakeProducer(self.c, lambda repo, pr, item: self.facts(repo, pr, item))
+            return self.S.ShadowTick(self.c, producer, lambda repo, head, base: "/clone", self.config, review=Stage(),
+                                     store_packet=lambda p: store.__setitem__(p["sha256"], p["text"].encode()),
+                                     load_packet=store.get).tick()
+        self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
+                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+        first = tick()
+        (iid,) = first["admitted"]
+        for rid, kind, version in self.db.execute("SELECT id, kind, version FROM reviews WHERE item=? ORDER BY id",
+                                                  (iid,)).fetchall():
+            row = self.c._row("reviews", "id", rid)
+            if kind == "spec":
+                receipt = {k: row[k] for k in ("repo", "pr", "head", "packet_sha256", "policy_revision",
+                                               "spec_core")}
+                self.c.review(rid, "passed", expected_version=version, event_id=self.ev(),
+                              receipt=dict(receipt, verdict="PASS"))
+                continue
+            row = self.c.start_attempt(rid, "ahc-review-%s" % rid[-6:], 4242, expected_version=version,
+                                       event_id=self.ev())
+            self.c.review(rid, "passed", expected_version=row["version"], event_id=self.ev(), peer_uid=4242,
+                          receipt=self.S.findings_receipt(row, "PASS", []))
+        tick()
+        self.assertEqual(self.c._row("work_items", "id", iid)["state"], "merge-ready", "W2 through the tick")
+        old = dict(self.eligible(self.c._row("work_items", "id", iid))["policy"])
+        self.changes["policy"] = dict(old, revision="policy-r2")
+        offered.clear()
+        third = tick()
+        self.assertEqual(self.c._row("work_items", "id", iid)["state"], "pr-gate", third)
+        new = [r for (r,) in self.db.execute("SELECT id FROM reviews WHERE item=? AND policy_revision='policy-r2' "
+                                             "AND kind IN ('adversarial', 'red-team') ORDER BY id", (iid,))]
+        self.assertTrue(new, "W27 made replacement code rows")
+        self.assertEqual(sorted(third["requeued"]), new, third)
+        self.assertEqual(offered, third["scheduled"]["offered"])
+        self.assertEqual(len(offered), 1, "the real scheduler offers a W27 replacement row (one slot)")
+        self.assertIn(offered[0], new)
+        self.assertEqual(self.c._row("reviews", "id", offered[0])["state"], "queued")
+
     def w21_resolved(self, item, tip, new_head):
         with self.c.tx():
             self.db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, "
@@ -6021,6 +6076,65 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertEqual(len(third["admitted"]), 1, third)
         (a, _pr, _state, _r, _w), = self.code_rows()
         self.assert_carries_the_core(self.stored_packet(a))
+
+    def extended(self):
+        """Round 1 settles BLOCK with F1 through the tick; W3 escalates; main's stamped proof applies W16 back to
+        pr-gate with a one-round extension (the contract move, no row written by the test). Returns (round 1 row,
+        round 2 row, contracts)."""
+        self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
+        self.run_all(self.deps)
+        (a, _pr, state, _r, _w), = self.code_rows()
+        self.play_wrapper(a, "VERDICT: BLOCK", body="F1 - High - a finding.\n")
+        self.assertEqual(self.run_all(self.deps)["shadow"]["review"]["settled"], [(a, "findings")])
+        ledger = runner.Ledger(self.paths)
+        self.addCleanup(ledger.close)
+        c = runner.open_contracts(ledger, self.paths)
+        item = c._row("work_items", "id", c._row("reviews", "id", a)["item"])
+        if item["state"] == "pr-gate":
+            c.wi_move(item["id"], "W3", expected_version=item["version"], event_id="t-w3", actor="ahc-core")
+            item = c._row("work_items", "id", item["id"])
+        c.record_w16_proof("w16-r273-f2", item["id"], "pr-gate", item["version"], "e" * 64, accepted=["F1"],
+                           ticket="GoodQA goodqa#16049", extension=1)
+        c.wi_move(item["id"], "W16", expected_version=item["version"], event_id="t-w16", actor="main",
+                  to="pr-gate", proof="w16-r273-f2")
+        (b,), = c.db.execute("SELECT id FROM reviews WHERE item=? AND kind='adversarial' AND round=2",
+                             (item["id"],)).fetchall()
+        self.assertEqual(c._row("reviews", "id", b)["state"], "required", "W16 creates round 2 required")
+        return a, b, c
+
+    def test_r273_f2_a_w16_extension_round_is_queued_and_launched_by_the_next_tick(self):
+        """PR 273 receipt F2: W16 with an extension creates round 2 code rows in required. The next tick's R2 pass
+        re-verifies the item's stored packet and queues the row, and the real scheduler launches it."""
+        _a, b, _c = self.extended()
+        started = len(self.runner.started)
+        tick = self.run_all(self.deps)["shadow"]
+        self.assertEqual(tick["requeued"], [b], tick)
+        self.assertEqual(tick["scheduled"]["started"], [b], tick["scheduled"])
+        self.assertEqual(len(self.runner.started), started + 1)
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (b,)), [("running",)])
+        again = self.run_all(self.deps)["shadow"]
+        self.assertEqual(again["requeued"], [], "idempotent: a queued or running row is not queued again")
+
+    def test_r273_f2_an_altered_or_missing_stored_packet_keeps_the_row_required_and_says_so(self):
+        """PR 273 receipt F2, negative: the stored packet no longer hashes to the row's sha (or is gone). The row
+        stays required, nothing launches, and every tick reports why; restoring the packet queues it."""
+        _a, b, _c = self.extended()
+        (sha,), = self.ledger_rows("SELECT packet_sha256 FROM reviews WHERE id=?", (b,))
+        path = self.paths.root / "packets" / ("%s.md" % sha)
+        good = path.read_bytes()
+        path.write_bytes(good.replace(b"head H:", b"head H: ", 1))
+        started = len(self.runner.started)
+        for _ in range(2):
+            tick = self.run_all(self.deps)["shadow"]
+            self.assertEqual(tick["requeued"], [])
+            self.assertTrue(any(r == b and "does not hash" in why for r, why in tick["refused"]), tick["refused"])
+        path.unlink()
+        tick = self.run_all(self.deps)["shadow"]
+        self.assertTrue(any(r == b and "missing" in why for r, why in tick["refused"]), tick["refused"])
+        self.assertEqual(len(self.runner.started), started)
+        self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (b,)), [("required",)])
+        path.write_bytes(good)
+        self.assertEqual(self.run_all(self.deps)["shadow"]["requeued"], [b])
 
     def test_f6_w4_head_supersede_stops_the_unit_and_settles_the_row_superseded(self):
         """PR 272 F6: the PR's head moves (W4) while the attempt for H runs. In the same tick the review stage

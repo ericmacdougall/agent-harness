@@ -2327,7 +2327,8 @@ def _shadow_pass(ledger, paths, config, deps, summary):
                                   digest_append=lambda text: _append_private(paths.root, paths.root / SHADOW_DIGEST,
                                                                              text),
                                   review=stage(c, clone) if stage is not None else None,
-                                  store_packet=lambda packet: store_r2_packet(paths.root, packet))
+                                  store_packet=lambda packet: store_r2_packet(paths.root, packet),
+                                  load_packet=lambda sha: load_r2_packet(paths.root, sha))
         summary["shadow"] = t.tick()
         for subject, why in summary["shadow"]["incidents"] + [("observations", w) for w in producer.incidents]:
             raise_incident(c, subject, why)
@@ -2345,6 +2346,20 @@ def store_r2_packet(root, packet):
         ahc_fs.write_file(root, path, packet["text"].encode("utf-8"), exclusive=True, create_dirs=True)
     except FileExistsError:
         pass                                          # the same sha names the same bytes
+
+
+def load_r2_packet(root, sha):
+    """PR 273 receipt F2: the stored R2 packet's bytes (root/packets/<sha>.md, read no-follow and bounded), or None
+    when it is absent. A malformed sha reads nothing."""
+    import ahc_core  # noqa: PLC0415
+    import ahc_review  # noqa: PLC0415
+    if not (isinstance(sha, str) and len(sha) == 64 and all(ch in "0123456789abcdef" for ch in sha)):
+        return None
+    path = os.path.join(os.path.realpath(str(root)), "packets", "%s.md" % sha)
+    try:
+        return ahc_core.read_regular_resolved(path, ahc_review.STORED_PACKET_MAX)
+    except ahc_core.Unreadable:
+        return None
 
 
 def startup_reconcile(paths, policy, runner=None, role="all"):

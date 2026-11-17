@@ -655,6 +655,38 @@ def build_packet(git, *, repo, pr, base, head, spec_core_text, spec_core_sha, ow
             "head": head, "paths": paths, "lint": findings}
 
 
+PACKET_HEADER = re.compile(r"repo: (?P<repo>\S+)  pr: (?P<pr>[0-9]+)  head H: (?P<head>[0-9a-f]{40})  "
+                           r"snapshot base B_r: (?P<base>[0-9a-f]{40})")
+STORED_PACKET_MAX = PACKET_MAX + SPEC_CORE_MAX + (1 << 16)
+
+
+def stored_packet(data, sha):
+    """PR 273 receipt F2: a packet core built and stored at R2 (root/packets/<sha>.md), read back for a row created
+    after its item's admission (W16's extension rounds, W27's replacements). It must hash to `sha` and open with
+    build_packet's own header naming (repo, pr, H, B_r); its lint findings are re-read from its section. Returns the
+    packet in build_packet's form plus repo and pr, for r2_queue, which still checks the row's binding. Raises
+    ContractError (the row stays required) when it is missing, altered or not one of core's packets."""
+    if data is None:
+        raise C.ContractError("R2: the stored packet %s is missing" % str(sha)[:12])
+    if hashlib.sha256(data).hexdigest() != sha:
+        raise C.ContractError("R2: the stored packet does not hash to %s" % str(sha)[:12])
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise C.ContractError("R2: the stored packet is not UTF-8") from None
+    lines = text.split("\n")
+    head = PACKET_HEADER.fullmatch(lines[1]) if len(lines) > 1 else None
+    if lines[0] != "# ahc review packet (R2, built by core)" or head is None:
+        raise C.ContractError("R2: the stored packet %s is not a core-built packet" % sha[:12])
+    lint = []
+    marker = "\n## Lint findings (reviewer-addressing text)\n"
+    if marker in text:
+        section = text.split(marker, 1)[1].split("\n\n## ", 1)[0]
+        lint = [ln[2:] for ln in section.split("\n") if ln.startswith("- ")]
+    return {"text": text, "sha256": sha, "repo": head.group("repo"), "pr": int(head.group("pr")),
+            "head": head.group("head"), "snapshot_base": head.group("base"), "lint": lint}
+
+
 def r2_queue(contracts, rid, packet):
     """R2 required -> queued, only for the core-built packet this row is bound to (packet sha, H and B_r); the lint
     findings go into the transition record."""
@@ -664,6 +696,8 @@ def r2_queue(contracts, rid, packet):
     if (packet["sha256"], packet["head"], packet["snapshot_base"]) != (row["packet_sha256"], row["head"],
                                                                      row["snapshot_base"]):
         raise C.ContractError("R2: the row is not bound to this core-built packet (sha, H or B_r differ)")
+    if "repo" in packet and (str(packet["repo"]).lower(), packet["pr"]) != (row["repo"], row["pr"]):
+        raise C.ContractError("R2: the packet names another repo or PR than the row")
     return contracts.review(rid, "queued", expected_version=row["version"], event_id="r2:%s:%d" % (rid, row["version"]),
                             cause="r2 packet built; lint findings %d" % len(packet["lint"]))
 

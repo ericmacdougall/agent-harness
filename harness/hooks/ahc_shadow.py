@@ -219,7 +219,7 @@ class ShadowTick:
     writes to GitHub."""
 
     def __init__(self, contracts, producer, clone, config, digest_append=None, w21=None, review=None,
-                 store_packet=None):
+                 store_packet=None, load_packet=None):
         self.c = contracts
         self.producer = producer
         self.clone = clone
@@ -228,6 +228,7 @@ class ShadowTick:
         self.w21 = w21                       # AC-7: the W21 sender (ahc_w21.Sender), or None (W21 not evaluated)
         self.review = review                 # AC-8: ahc_review.ReviewStage, or None (no review step)
         self.store_packet = store_packet     # R2: writes a built packet where the R3 unit reads it
+        self.load_packet = load_packet       # R2 (PR 273 receipt F2): sha -> the stored packet's bytes, or None
 
     def _repos(self):
         return sorted({str(r).lower() for r in self.config.get("shadow_repos") or []
@@ -305,6 +306,35 @@ class ShadowTick:
             self.store_packet(packet)
         return packet
 
+    def r2_required(self, summary):
+        """PR 273 receipt F2: R2 for code rows required after their item's admission, which no admission or
+        successor transaction queued: W16's extension rounds and W27's replacement rows (admission and W4/W24
+        successors queue theirs in the same transaction, so a row reaches here only through those two or an
+        interrupted queueing). Every required attempt-kind row of a pr-gate item in a shadow repo, bound to its
+        item's packet, is queued from that stored packet once it re-verifies (hash, core's header, repo, PR, H and
+        B_r) through r2_queue. Runs before the scheduler, every tick; idempotent (the row is then queued). A row
+        that cannot be queued stays required and is reported in `refused` each tick, never dropped silently."""
+        import ahc_review  # noqa: PLC0415
+        repos = self._repos()
+        if not repos:
+            return
+        rows = self.c.db.execute(
+            "SELECT r.id FROM reviews r JOIN work_items w ON w.id = r.item WHERE r.state='required' AND "
+            "w.state='pr-gate' AND r.packet_sha256 = w.packet_sha256 AND r.repo IN (%s) AND r.kind IN (%s) "
+            "ORDER BY r.id" % (",".join("?" * len(repos)), ",".join("?" * len(C.Contracts.ATTEMPT_KINDS))),
+            tuple(repos) + C.Contracts.ATTEMPT_KINDS).fetchall()
+        for (rid,) in rows:
+            row = self.c._row("reviews", "id", rid)
+            try:
+                if self.load_packet is None:
+                    raise C.ContractError("R2: no packet store to read the stored packet from")
+                packet = ahc_review.stored_packet(self.load_packet(row["packet_sha256"]), row["packet_sha256"])
+                with self.c.tx():
+                    ahc_review.r2_queue(self.c, rid, packet)
+                summary["requeued"].append(rid)
+            except C.ContractError as error:
+                summary["refused"].append((rid, "R2 for a later round: %s" % str(error)[:200]))
+
     def r2_queue_item(self, item, packet):
         """R2 required -> queued for every attempt-kind row of the item bound to this packet."""
         import ahc_review  # noqa: PLC0415
@@ -334,7 +364,8 @@ class ShadowTick:
         return holding, args
 
     def tick(self, tag="tick"):
-        summary = {"admitted": [], "moved": [], "refused": [], "conflicts": [], "incidents": [], "observed": []}
+        summary = {"admitted": [], "moved": [], "refused": [], "conflicts": [], "incidents": [], "observed": [],
+                   "requeued": []}
         self.admit_requests(summary)
         for repo in self._repos():
             items = [self.c._row("work_items", "id", i) for (i,) in self.c.db.execute(
@@ -356,6 +387,7 @@ class ShadowTick:
                 if item["id"] not in observed:
                     continue
                 self._move(summary, item["id"], dict(observed[item["id"]], queue=queue))
+        self.r2_required(summary)
         if self.review is not None:
             summary["review"] = self.review.settle()
             summary["scheduled"] = ReviewScheduler(self.c, self.review.launch_row, slots=self.review.slots).tick(tag)
