@@ -292,7 +292,9 @@ def scenario_contracts(root, clock):
                             mirror_read_back=True, kill_epoch=KILL)
         if not _done(db, "pr%d-e2" % pr):
             o = op()
-            obs = {"at": clock.t, "mono": clock.t, "boot": "crash-boot", "kill_switch": False, "kill_epoch": KILL, "pr_state": "OPEN", "pr_head": head,
+            # e9 at E2 (PR #270 bb0852c): Contracts.dispatch needs a passed, fresh CHK-CAS canary
+            obs = {"at": clock.t, "mono": clock.t, "boot": "crash-boot", "kill_switch": False, "kill_epoch": KILL,
+                   "chk_cas": True, "canary_age": 60, "pr_state": "OPEN", "pr_head": head,
                    "draft": False, "tip": BASE, "compare": "ahead", "checks_green": True}
             c.dispatch(o["key"], obs, expected_version=o["version"], event_id="pr%d-e2" % pr, lease_ok=True,
                        mirror_read_back=True)

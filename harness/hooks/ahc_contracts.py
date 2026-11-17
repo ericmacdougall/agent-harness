@@ -2062,6 +2062,12 @@ class Contracts:
             problems = []
             if obs.get("kill_switch") is not False:
                 problems.append("kill switch on or unread")
+            if self.merging_off(row["repo"]):          # T9 disable, E14, a failed canary: the repo's merging is off
+                problems.append("the repo's merging is off")
+            age = obs.get("canary_age")            # e9 at E2: the CHK-CAS canary passed, on this boot, under 24 h
+            if obs.get("chk_cas") is not True or not isinstance(age, (int, float)) or isinstance(age, bool) or \
+                    not 0 <= age < 86400:
+                problems.append("CHK-CAS canary not passed or older than 24 h (e9)")
             if obs.get("pr_state") != "OPEN" or obs.get("pr_head") != row["head"] or obs.get("draft") is not False:
                 problems.append("PR not open and ready at H")
             if obs.get("tip") != row["base"]:
