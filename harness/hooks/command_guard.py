@@ -8779,6 +8779,90 @@ def _upload_iter(real, limits, deadline):
             stack.extend((member + '/' + n, os.path.join(full, n)) for n in reversed(names))
 
 
+UPLOAD_MAX_DEPTH = 128  # one open directory descriptor per level; macOS's default soft limit is 256
+PINNED_MAX_FILES = 100000
+
+
+def _upload_iter_fd(real, limits, deadline, known):
+    """The send-side walk: yield (member, full, lstat, opener) in the same archive order as _upload_iter, but through
+    directory descriptors opened O_NOFOLLOW|O_DIRECTORY from a root whose identity is checked, so a directory replaced
+    by a symlink cannot lead outside the unit, and every entry must be one the check saw (its inode is in the sorted
+    array `known`): a file or directory moved in after the check is refused before any of it is sent (Codex PR-A r2
+    F1). `opener()` returns an fd for a regular file, opened relative to its pinned parent and fstat-confirmed."""
+    import bisect
+    flags_dir = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    flags_file = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    root_st = _lstat(real)
+    base = os.path.basename(real)
+
+    def seen(st):
+        i = bisect.bisect_left(known, st.st_ino)
+        if i >= len(known) or known[i] != st.st_ino or st.st_dev != root_st.st_dev:
+            raise ValueError('an entry appeared or was replaced after the check; nothing of it was sent')
+
+    def opener_for(dfd, name, st, full):
+        def opener():
+            try:
+                fd = os.open(name, flags_file, dir_fd=dfd) if dfd is not None else os.open(full, flags_file)
+            except OSError as error:
+                raise ValueError('cannot read %s (%s)' % (_clip_path(full), error.strerror or 'error'))
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode) or (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                os.close(fd)
+                raise ValueError('file changed type or identity while being read: %s' % _clip_path(full))
+            return fd
+        return opener
+
+    if stat.S_ISREG(root_st.st_mode):
+        seen(root_st)
+        yield base, real, root_st, opener_for(None, base, root_st, real)
+        return
+    if not stat.S_ISDIR(root_st.st_mode):
+        raise ValueError('special file (FIFO, socket or device): only a directory or regular file can be uploaded')
+
+    def open_dir(name, dfd, st, full):
+        try:
+            fd = os.open(name, flags_dir, dir_fd=dfd) if dfd is not None else os.open(full, flags_dir)
+        except OSError as error:
+            raise ValueError('cannot open directory %s (%s)' % (_clip_path(full), error.strerror or 'error'))
+        fst = os.fstat(fd)
+        if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+            os.close(fd)
+            raise ValueError('directory changed identity while being read: %s' % _clip_path(full))
+        return fd
+
+    def walk(dfd, member, full, depth):
+        if depth > UPLOAD_MAX_DEPTH:
+            raise ValueError('the tree is deeper than %d levels; approve subtrees' % UPLOAD_MAX_DEPTH)
+        for name in sorted(os.listdir(dfd)):
+            if time.monotonic() > deadline:
+                raise ValueError('walking the tree exceeded its time budget')
+            child_member, child_full = member + '/' + name, os.path.join(full, name)
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            seen(st)
+            if stat.S_ISLNK(st.st_mode):
+                yield child_member, child_full, st, None
+            elif stat.S_ISREG(st.st_mode):
+                yield child_member, child_full, st, opener_for(dfd, name, st, child_full)
+            elif stat.S_ISDIR(st.st_mode):
+                yield child_member, child_full, st, None
+                cfd = open_dir(name, dfd, st, child_full)
+                try:
+                    yield from walk(cfd, child_member, child_full, depth + 1)
+                finally:
+                    os.close(cfd)
+            else:
+                raise ValueError('special file (FIFO, socket or device) in the tree: %s' % _clip_path(child_full))
+
+    seen(root_st)
+    yield base, real, root_st, None
+    rfd = open_dir(real, None, root_st, real)
+    try:
+        yield from walk(rfd, base, real, 1)
+    finally:
+        os.close(rfd)
+
+
 def _credential_tier(rel, compiled):
     """2 for the loose secret-name list, 1 for a real credential path (`credential_path_regexes`), 0 for neither or
     for a name `credential_allow_regexes` clears (`.env.example`)."""
@@ -8858,6 +8942,10 @@ def _counted_credentials(real, entries, compiled):
         elif tier == 1 or not (tracked and clean and pushed):
             problems.append('credential file %s' % rel)
         else:
+            if len(pinned) >= PINNED_MAX_FILES:
+                problems.append('more than %d credential-named source files; approve smaller subtrees'
+                                % PINNED_MAX_FILES)
+                continue
             pinned[full] = head_blob.strip().decode('ascii', 'replace')
     return problems, pinned
 
@@ -9115,7 +9203,10 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
         manifest['files'] += 1
     try:
         with tarfile.open(fileobj=comp.stdin, mode='w|', format=tarfile.PAX_FORMAT) as tar:
-            for member, full, st in entries:
+            for item in entries:
+                member, full, st = item[:3]
+                opener = item[3] if len(item) > 3 else None
+                tar.members = []  # stream mode keeps every TarInfo otherwise (Codex PR-A r2 F3: memory per entry)
                 if time.monotonic() > deadline:
                     raise ValueError('the upload exceeded its time budget')
                 info = tarfile.TarInfo(member)
@@ -9133,7 +9224,7 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                     if compiled is not None and not in_git and full not in pinned and \
                             _credential_tier(rel, compiled):
                         raise ValueError('credential file %s appeared after the check; nothing of it was sent' % rel)
-                    fd = _open_regular(full, st)
+                    fd = opener() if opener is not None else _open_regular(full, st)
                     try:
                         info.type, info.size = tarfile.REGTYPE, st.st_size
                         if full in pinned or _is_git_config(member):
@@ -9293,10 +9384,13 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 120, max_entries=cap)
         walk_budget = max(120.0, float(limits['max_walk_seconds']) * 600)
         seen = {'files': 0, 'bytes': 0}
+        import array
+        known = array.array('Q')  # every checked entry's inode: 8 bytes per entry, the only per-entry state kept
 
         def first_pass():
             # unreadable or swapped files refuse before anything is sent; one streaming walk, no entry list
             for member, full, st in _upload_iter(real, limits, time.monotonic() + walk_budget):
+                known.append(st.st_ino)
                 if stat.S_ISREG(st.st_mode):
                     os.close(_open_regular(full, st))
                     seen['files'] += 1
@@ -9308,6 +9402,7 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         if not seen['files']:
             raise ValueError('nothing to approve: the path holds no files')
         tree_bytes = seen['bytes']
+        known = array.array('Q', sorted(known))
         if problems:
             raise ValueError('the tree holds %s; move each untracked one with `mv -n SRC ~/secret-quarantine/'
                              '<same relative path>` first, never upload it' % '; '.join(problems[:8]))
@@ -9319,7 +9414,8 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         deadline = time.monotonic() + budget
         transport.deadline = deadline  # remote verification and the sidecar end by the same deadline (F4)
         dbx, sha, sent_bytes, manifest_sha, files = _stream_upload(
-            real, _upload_iter(real, limits, deadline), transport, remote, zstd or _pinned_tool('zstd'), deadline,
+            real, _upload_iter_fd(real, limits, deadline, known), transport, remote, zstd or _pinned_tool('zstd'),
+            deadline,
             pinned=pinned, compiled=compiled)
         if transport.after_upload is not None:
             transport.after_upload()

@@ -37,8 +37,18 @@ FAKE_RCLONE = textwrap.dedent('''\
         log.write(json.dumps(argv) + "\\n")
     words = [a for a in argv if not a.startswith("-")]
     def obj(remote):
+        # Dropbox paths ignore letter case: resolve each part against what exists, on any host file system
         name, _, rest = remote.partition(":")
-        return os.path.join(store, "objects", name, *[p for p in rest.split("/") if p])
+        path = os.path.join(store, "objects", name)
+        for part in [p for p in rest.split("/") if p]:
+            match = part
+            if os.path.isdir(path):
+                for existing in os.listdir(path):
+                    if existing.casefold() == part.casefold():
+                        match = existing
+                        break
+            path = os.path.join(path, match)
+        return path
     def dbx(path):
         # independent of the guard's DropboxHash: whole 4 MiB blocks read straight from the stored file
         outer = hashlib.sha256()
@@ -380,9 +390,14 @@ class UploadApproval(UploadBase):
         self.assertNotIn(b'INJECTEDTOKEN', self.received())
 
     def test_a_credential_file_created_after_the_check_is_never_sent(self):
-        def plant():
-            (self.target / 'sub/.env').write_text('PLANTEDVALUE=1\n')
-        with self.swap_after_check(plant):
+        # a checked file renamed in the tree to a credential name keeps its inode, so the name is checked again
+        (self.target / 'sub/b.txt').write_text('PLANTEDVALUE=1\n')
+        age(self.target)
+        dotenv = '.' + 'env'
+
+        def rename():
+            os.rename(str(self.target / 'sub/b.txt'), str(self.target / 'sub' / dotenv))
+        with self.swap_after_check(rename):
             self.refused('appeared after the check', zstd=self.plain_zstd())
         self.assertNotIn(b'PLANTEDVALUE', self.received())
 
@@ -401,6 +416,48 @@ class UploadApproval(UploadBase):
         sub_config.write_text('[remote "origin"]\n\turl = https://u:p@example.invalid/lib.git\n')
         age(self.target)
         self.refused('credential in a git remote URL')
+
+    def test_a_directory_swapped_for_a_link_after_the_check_leaks_nothing(self):
+        # Codex PR-A r2 F1: the send-side walk goes through pinned directory descriptors
+        outside = Path(tempfile.mkdtemp(prefix='outside-'))
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (outside / 'b.txt').write_text('OUTSIDESECRET\n')
+
+        def swap():
+            os.rename(str(self.target / 'sub'), str(self.target / 'sub-old'))
+            os.symlink(str(outside), str(self.target / 'sub'))
+        with self.swap_after_check(swap):
+            self.refused('after the check', zstd=self.plain_zstd())
+        self.assertNotIn(b'OUTSIDESECRET', self.received())
+
+    def test_a_directory_swapped_mid_walk_leaks_nothing(self):
+        # the swap happens right after the stream wrote the directory's own member and before it lists the directory
+        outside = Path(tempfile.mkdtemp(prefix='outside-'))
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (outside / 'b.txt').write_text('MIDWALKSECRET\n')
+        real_addfile = tarfile.TarFile.addfile
+        target = self.target
+
+        def addfile(tar, info, fileobj=None):
+            result = real_addfile(tar, info, fileobj)
+            if info.isdir() and info.name.endswith('/sub') and not (target / 'sub-old').exists():
+                os.rename(str(target / 'sub'), str(target / 'sub-old'))
+                os.symlink(str(outside), str(target / 'sub'))
+            return result
+        with mock.patch.object(tarfile.TarFile, 'addfile', addfile):
+            self.refused('sub', zstd=self.plain_zstd())
+        self.assertNotIn(b'MIDWALKSECRET', self.received())
+
+    def test_a_file_moved_in_after_the_check_leaks_nothing(self):
+        outside = Path(tempfile.mkdtemp(prefix='outside-', dir=str(self.target.parent)))
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        (outside / 'notes.txt').write_text('MOVEDINSECRET\n')
+
+        def move_in():
+            os.rename(str(outside / 'notes.txt'), str(self.target / 'sub/aaa.txt'))
+        with self.swap_after_check(move_in):
+            self.refused('after the check', zstd=self.plain_zstd())
+        self.assertNotIn(b'MOVEDINSECRET', self.received())
 
     def test_a_git_remote_url_with_userinfo_counts(self):
         repo = self.repo({'main.go': 'package x\n'})
