@@ -186,9 +186,11 @@ def _pr_merge_policy(flags):
     gh's flag parser). `--delete-branch=false` and friends are read by value (red-team r1 finding 16): a value other
     than a plain true/false fails closed."""
     state = {}
+    longs = {"-s": "--squash", "-m": "--merge", "-r": "--rebase", "-d": "--delete-branch"}
     for name, value in flags:
         if name == "-=":  # a short boolean written `-d=false`: refuse rather than guess what gh will make of it
             return ["write boolean merge flags as --merge/--rebase/--delete-branch, without =value"]
+        name = longs.get(name, name)  # one flag, two spellings: `-d --delete-branch=false` is off (red-team r2 N3)
         if value is None:
             state[name] = True
         elif value.lower() in ("1", "t", "true"):

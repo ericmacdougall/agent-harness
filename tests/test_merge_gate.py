@@ -252,7 +252,11 @@ class MergePolicy(Base):
                               ("gh pr merge 5 --merge -d=false --match-head-commit {HEAD}", "without =value"),
                               ("gh pr merge 5 --merge -d --squash=yes --match-head-commit {HEAD}", "squash"),
                               ("gh pr merge 5 --merge --delete-branch --delete-branch=false --match-head-commit {HEAD}",
-                               "--delete-branch")):
+                               "--delete-branch"),
+                              # red-team r2 N3: short and long spellings are one flag
+                              ("gh pr merge 5 --merge -d --delete-branch=false --match-head-commit {HEAD}",
+                               "--delete-branch"),
+                              ("gh pr merge 5 -m --merge=false -d --match-head-commit {HEAD}", "--merge or --rebase")):
             for waived in (False, True):
                 with self.subTest(command=command, waived=waived):
                     if waived:
