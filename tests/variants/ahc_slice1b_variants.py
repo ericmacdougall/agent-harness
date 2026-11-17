@@ -870,7 +870,7 @@ ENTRIES.update({
             ("the report directory is not granted to the unit's uid", [
                 ('                self.runner.grant_output(attempt["out_dir"], uid)\n', '                pass\n')],
              REVIEW_PY),
-            ("no fresh report directory", [
+            ("the report directory is made world-writable (makedirs + chmod 0777), not fresh", [
                 ('            ahc_fs.make_fresh_dir(self.root, attempt["out_dir"])\n',
                  '            os.makedirs(attempt["out_dir"], exist_ok=True)\n            os.chmod(attempt["out_dir"], 0o777)\n')],
              REVIEW_PY)]},
