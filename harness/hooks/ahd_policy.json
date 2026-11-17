@@ -1,7 +1,10 @@
 {
   "schema": 1,
   "mode": "detector",
-  "restart": {"enabled": false, "note": "automatic restart (NEVER-LOSE.md S2) stays off until its blind re-review passes"},
+  "restart": {
+    "enabled": false,
+    "note": "automatic restart (NEVER-LOSE.md S2) stays off until its blind re-review passes"
+  },
   "tick_seconds": 60,
   "active_seconds": 600,
   "registered_owners": [],
@@ -44,5 +47,9 @@
   "clock_hold_ticks": 1,
   "no_evidence_window_seconds": 604800,
   "memory_cap_bytes": 1073741824,
-  "owners_wal_max_bytes": 268435456
+  "owners_wal_max_bytes": 268435456,
+  "queue": {
+    "max_active": 4,
+    "comment": "work queue cap per host (NEVER-LOSE.md 9b); `ah queue tick --cap N` overrides"
+  }
 }

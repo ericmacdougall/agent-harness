@@ -15,6 +15,8 @@ Tick (bounded to tick_budget_seconds of wall time; each step gets the remaining 
   5. alerts        diff the desired ahd alerts against the active ahd entries in the ring (read-only);
                    ah alert raise|clear for each transition; liveness raises are held 2 ticks after a clock jump
   6. spool         ah spool drain
+  7. queue         ah queue tick: promote or resume queued work into free slots under the cap (detector mode: it
+                   records and alerts; starting an owner is main's, or S2's once restart is enabled)
 """
 
 from __future__ import annotations
@@ -605,6 +607,7 @@ class Daemon:
         plan = plan_transitions(desired, ring, frozenset(hold), now=ts)
         sent = step("alerts", lambda: self.send(plan, deadline)) or 0
         step("spool", lambda: self.call("spool drain", [], deadline))
+        step("queue", lambda: self.call("queue tick", [], deadline))  # cap, rank, promote, resume (NEVER-LOSE.md 9b)
         summary.update(sessions=len(sessions), owners=sum(len((d or {}).get("owners") or []) for d in docs.values()),
                        asks_open=sum(1 for a in asks if a.get("state") in OPEN_STATES),
                        wal_asks_open=len(pending), desired=len(desired), transitions=len(plan), sent=sent,

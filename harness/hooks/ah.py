@@ -843,6 +843,30 @@ def precheck(op: str, args: dict) -> None:
             detail = args.get("detail", {})
             if not isinstance(detail, dict) or len(canonical(detail)) > 4096:
                 raise AhError("bad_request", "alert.raise: detail is a JSON object of at most 4 KiB")
+    elif op == "queue.add":
+        need("item", "title", "session", "priority", "source")
+        if not QUEUE_ITEM_RE.match(args["item"]):
+            raise AhError("bad_request", "queue.add: item is 1-64 characters of [A-Za-z0-9._-]")
+        if args["priority"] not in QUEUE_PRIORITIES:
+            raise AhError("bad_request", f"queue.add: priority is one of {', '.join(QUEUE_PRIORITIES)}")
+        if args.get("deadline") is not None and parse_ts(args["deadline"]) is None:
+            raise AhError("bad_request", "queue.add: deadline must be an ISO time")
+        if args.get("ticket") and not TICKET_RE.match(args["ticket"]):
+            raise AhError("bad_request", "queue.add: ticket must look like 'GoodQA <project>#<n>'")
+        blocked = args.get("blocked_by") or []
+        if not isinstance(blocked, list) or len(blocked) > 20 or not all(isinstance(b, str) and QUEUE_ITEM_RE.match(b)
+                                                                          for b in blocked):
+            raise AhError("bad_request", "queue.add: blocked_by is a list of at most 20 item ids")
+    elif op == "queue.rank":
+        need("item", "before", "source")
+        if args["item"] == args["before"]:
+            raise AhError("bad_request", "queue.rank: an item cannot go before itself")
+    elif op in ("queue.promote", "queue.resume"):
+        need("item")
+    elif op == "queue.pause":
+        need("item", "agent", "resume_at", "reason")
+        if parse_ts(args["resume_at"]) is None:
+            raise AhError("bad_request", "queue.pause: resume_at must be an ISO time")
     elif op == "ticket.comment":
         need("body")
         if not TICKET_RE.match(args.get("ticket") or ""):
@@ -1113,6 +1137,27 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             "severity": args["severity"] if raising else "info", "key": args["alert_key"],
             "message": args["message"] if raising else "cleared", "detail": args.get("detail") or {}},
             path=home / ".agent-harness" / "state" / "alerts.jsonl")
+    elif op in ("queue.add", "queue.rank", "queue.promote", "queue.pause", "queue.resume"):
+        added = {r["args"]["item"] for r in ledger if r.get("op") == "queue.add"}
+        if op in ("queue.add", "queue.rank"):
+            import provenance  # every queued item and every re-rank is a requirement and carries a source that resolves
+            try:
+                res = provenance.resolve(args["source"])
+            except Exception as e:  # a resolver crash is a rejection, never a silent pass
+                raise AhError("provenance", f"source check failed ({type(e).__name__})", 3)
+            if not res["ok"]:
+                first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
+                raise AhError("provenance", f"source rejected ({first['code']}): {first['message']}"[:300], 3)
+        if op == "queue.add":
+            if args["item"] in added:
+                raise AhError("queue_exists", f"queue item {args['item']!r} already exists", 3)
+            missing = [b for b in args.get("blocked_by") or [] if b not in added]
+            if missing:
+                raise AhError("bad_request", f"queue.add: blocked_by names unknown items: {', '.join(missing)}")
+        else:
+            for name in (args["item"], args.get("before")):
+                if name is not None and name not in added:
+                    raise AhError("bad_request", f"{op}: no queue item {name!r}")
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
     elif op == "task.dispose":
@@ -1401,6 +1446,203 @@ def apply_batch(home: Path, text: str, session: str) -> dict:
     return {"ok": True, "results": results}
 
 
+# ------------------------------------------------------------------ the work queue (NEVER-LOSE.md 9b, main WAL wf4ec9675ad6)
+
+QUEUE_PRIORITIES = ("P0", "P1", "P2", "P3")
+QUEUE_ITEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+QUEUE_DEFAULT_CAP = 4
+QUEUE_TAIL_BYTES = 65536
+QUEUE_PROMOTE_WARN_S = 15 * 60
+QUEUE_PROMOTE_HIGH_S = 60 * 60
+_OWNER_TO_QUEUE = {"live": "active", "quiet": "active", "finishing": "active", "SILENT": "active", "idle-helper": "active",
+                   "done": "finished", "handoff": "finished", "returned": "finished",
+                   "SILENT-HIGH": "stuck", "DROPPED": "stuck"}
+
+
+def queue_cap(home: Path) -> int:
+    """queue.max_active from ahd_policy.json beside this file (default 4)."""
+    try:
+        cap = int(json.loads(_bounded(Path(__file__).resolve().parent / "ahd_policy.json", 1 << 20))
+                  .get("queue", {}).get("max_active", QUEUE_DEFAULT_CAP))
+        return cap if 0 < cap <= 64 else QUEUE_DEFAULT_CAP
+    except (OSError, ValueError, TypeError, AttributeError):
+        return QUEUE_DEFAULT_CAP
+
+
+def queue_view(home: Path, now: float) -> dict:
+    """Fold the ledger into queue items with a derived state, ranked. State is never stored twice: it comes from
+    the item's registered owner (`ah task register --task <item>`), its dispositions and the queue.* rows."""
+    import work_queue  # noqa: PLC0415
+    led = _ledger(home)
+    items, order, promos, pauses, resumes, regs, done = {}, {}, {}, {}, {}, {}, set()
+    for r in led:
+        op, a = r.get("op"), r.get("args") or {}
+        at = parse_ts(r.get("received_at")) or 0.0
+        if op == "queue.add":
+            items[a["item"]] = {"item": a["item"], "title": a.get("title"), "ticket": a.get("ticket"),
+                                "session": a.get("session"), "priority": a["priority"], "added_at": at,
+                                "deadline": parse_ts(a["deadline"]) if a.get("deadline") else None,
+                                "blocked_by": list(a.get("blocked_by") or []), "source": a.get("source")}
+        elif op == "queue.rank" and a.get("item") in items and a.get("before") in items:
+            p = items[a["before"]]["priority"]
+            items[a["item"]]["priority"] = p
+            for lst in order.values():
+                if a["item"] in lst:
+                    lst.remove(a["item"])
+            lst = order.setdefault(p, [])
+            if a["before"] not in lst:
+                lst.append(a["before"])
+            lst.insert(lst.index(a["before"]), a["item"])
+        elif op == "queue.promote":
+            promos[a["item"]] = {"n": a.get("n", 1), "at": at}
+        elif op == "queue.pause":
+            pauses[a["item"]] = dict(a, at=at)
+        elif op == "queue.resume":
+            resumes[a["item"]] = {"at": at}
+        elif op == "task.register":
+            regs[a.get("task")] = a
+        elif op == "task.done":
+            done.add(a.get("task"))
+    docs = {}
+    for name, it in items.items():
+        reg = regs.get(name)
+        it["owner"] = reg.get("owner_agent") if reg else None
+        row = None
+        if reg:
+            s = reg.get("session")
+            if s not in docs:
+                try:
+                    docs[s] = {r["agent_id"]: r for r in owners(home, s, now=now)["owners"]}
+                except Exception:  # noqa: BLE001 - an unreadable session: the owner shows as missing (stuck)
+                    docs[s] = {}
+            row = docs[s].get(reg.get("owner_agent"))
+        it["owner_state"] = row["state"] if row else None
+        disp = (row or {}).get("disposition") or {}
+        pause, res = pauses.get(name), resumes.get(name)
+        paused = pause and (not res or res["at"] < pause["at"])
+        if pause:
+            it["resume_at"] = pause.get("resume_at")
+        if name in done or disp.get("kind") == "closed":
+            state = "done"
+        elif paused:
+            state = "paused-limit" if (parse_ts(pause["resume_at"]) or 0.0) > now else "resume-due"
+        elif not reg:
+            state = "promoted" if name in promos else "queued"
+        elif res and (row is None or (parse_ts(row.get("last_activity")) or 0.0) <= res["at"]):
+            state = "promoted"  # resumed: waiting for main to message the owner
+        elif row is None:
+            state = "stuck"
+        elif row["state"].startswith("waiting-on-") or (disp.get("kind") == "waiting" and disp.get("live")):
+            state = "waiting"
+        else:
+            state = _OWNER_TO_QUEUE.get(row["state"], "active")
+        it["state"] = state
+    ranked = work_queue.rank(list(items.values()), now, order=order)
+    return {"items": ranked, "order": order, "promos": promos, "pauses": pauses}
+
+
+def _limit_in_transcript(home: Path, session: str, agent: str, now: float):
+    """(resume_at, flags) when the owner's transcript ends on a usage-limit message; None otherwise. Reads at most the
+    last 64 KiB; interview material is never read (the RESTRICTED rule)."""
+    import work_queue  # noqa: PLC0415
+    base = home / ".claude" / "projects"
+    try:
+        projects = list(os.scandir(base))
+    except OSError:
+        return None
+    for proj in projects:
+        path = Path(proj.path) / session / "subagents" / f"agent-{agent}.jsonl"
+        if RESTRICTED.search(str(path)) or not path.is_file():
+            continue
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(max(0, path.stat().st_size - QUEUE_TAIL_BYTES))
+                lines = fh.read(QUEUE_TAIL_BYTES).splitlines()[-5:]
+        except OSError:
+            continue
+        for raw in reversed(lines):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            msg = rec.get("message") if isinstance(rec, dict) else None
+            content = msg.get("content") if isinstance(msg, dict) else None
+            texts = [c.get("text", "") for c in content if isinstance(c, dict)] if isinstance(content, list) else \
+                [content] if isinstance(content, str) else []
+            for text in texts:
+                hit = work_queue.parse_limit(str(text)[:4000], parse_ts(rec.get("timestamp")) or now)
+                if hit:
+                    return hit
+    return None
+
+
+def queue_tick(home: Path, cap: int | None = None) -> dict:
+    """One pass: record usage-limit pauses, then promote or resume the top dispatchable items into the free slots.
+    Every write has a key derived from what was observed, so a repeated tick writes nothing new."""
+    now = time.time()  # the writer clock that stamps received_at; no caller-chosen time
+    cap = cap or queue_cap(home)
+    view = queue_view(home, now)
+    paused = []
+    for it in view["items"]:
+        if it["state"] in ("active", "stuck", "finished") and it.get("owner") and \
+                it.get("owner_state") in ("finishing", "DROPPED", "SILENT-HIGH"):
+            reg = next((r["args"] for r in reversed(_ledger(home)) if r.get("op") == "task.register"
+                        and r["args"].get("task") == it["item"]), {})
+            hit = _limit_in_transcript(home, reg.get("session") or "", it["owner"], now)
+            if hit:
+                resume_at, flags = hit
+                r = write(home, "queue.pause", {"item": it["item"], "agent": it["owner"], "resume_at": iso(resume_at),
+                                            "reason": "usage-limit", "flags": flags}, "",
+                      f"qpause:{it['item']}:{it['owner']}:{int(resume_at)}")
+                if r.get("result") == "applied":
+                    paused.append(it["item"])
+    if paused:
+        view = queue_view(home, now)
+    promoted, resumed = [], []
+    for name in __import__("work_queue").plan(view["items"], cap):
+        it = next(i for i in view["items"] if i["item"] == name)
+        if it["state"] == "resume-due":
+            pause = view["pauses"][name]
+            r = write(home, "queue.resume", {"item": name}, "", f"qresume:{name}:{int(pause['at'])}")
+            if r.get("result") == "applied":
+                resumed.append(name)
+            _queue_alert(home, f"queue:resume:{name}", "warning",
+                         f"resume {pause['agent']} for queue item {name}: its usage limit reset at {pause['resume_at']}; "
+                         f"SendMessage to {pause['agent']} keeps its context", f"qalert:resume:{name}:{int(pause['at'])}")
+            continue
+        n = view["promos"].get(name, {}).get("n", 0) + 1
+        r = write(home, "queue.promote", {"item": name, "n": n}, "", f"qpromote:{name}:{n}")
+        if r.get("result") == "applied":
+            promoted.append(name)
+        _queue_alert(home, f"queue:promoted:{name}", "info",
+                     f"promoted {name} ({(it.get('title') or '')[:80]}): start an owner and register it with "
+                     f"`ah task register --task {name}`", f"qalert:promote:{name}:{n}:info")
+    for it in queue_view(home, now)["items"]:  # an unstarted promotion escalates; a started one clears
+        name, promo = it["item"], view["promos"].get(it["item"])
+        if it["state"] == "promoted" and promo and not it.get("owner"):
+            age = now - promo["at"]
+            sev = "high" if age >= QUEUE_PROMOTE_HIGH_S else "warning" if age >= QUEUE_PROMOTE_WARN_S else None
+            if sev:
+                _queue_alert(home, f"queue:promoted:{name}", sev, f"promoted {name} {int(age // 60)} min ago and no owner "
+                             f"has started it", f"qalert:promote:{name}:{promo['n']}:{sev}")
+        elif it.get("owner") and promo:
+            _queue_alert(home, f"queue:promoted:{name}", None, "", f"qalert:started:{name}:{promo['n']}")
+    running = sum(1 for i in queue_view(home, now)["items"] if i["state"] in ("active", "promoted"))
+    return {"ok": True, "cap": cap, "running": running, "promoted": promoted, "paused": paused, "resumed": resumed}
+
+
+def _queue_alert(home: Path, alert_key: str, severity, message: str, key: str) -> None:
+    """Raise (severity) or clear (None) a source=ah-queue ring alert through the audited writer; never fatal."""
+    try:
+        if severity:
+            write(home, "alert.raise", {"alert_key": alert_key, "source": "ah-queue", "severity": severity,
+                                        "message": message, "detail": {}}, "", key)
+        else:
+            write(home, "alert.clear", {"alert_key": alert_key, "source": "ah-queue"}, "", key)
+    except AhError:
+        pass
+
+
 def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float = 300.0) -> dict:
     """ahd is the deterministic manager (goodqa#14791): doctor fails while it is not running on this host. Running =
     its lock is held (a non-blocking flock attempt fails) or its heartbeat is fresher than max_beat_age."""
@@ -1494,6 +1736,20 @@ def build_parser():
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
     sub.add_parser("doctor", help="check the import chain and file hashes of this install")
+    qp = sub.add_parser("queue", help="the work queue: cap, rank, promotion (NEVER-LOSE.md 9b)")
+    qs = qp.add_subparsers(dest="sub", required=True)
+    qa = qs.add_parser("add")
+    for f in ("item", "title", "priority", "session", "source", "ticket", "deadline"):
+        qa.add_argument(f"--{f}")
+    qa.add_argument("--blocked-by", dest="blocked_by", action="append", default=[])
+    qa.add_argument("--key", required=True)
+    qr = qs.add_parser("rank")
+    for f in ("item", "before", "source"):
+        qr.add_argument(f"--{f}")
+    qr.add_argument("--key", required=True)
+    qs.add_parser("list")
+    qt = qs.add_parser("tick")
+    qt.add_argument("--cap", type=int)
     hb = sub.add_parser("heartbeat", help="record a service heartbeat (the file `ah doctor` reads)")
     hb.add_argument("action", choices=["beat"])
     hb.add_argument("--service", required=True)
@@ -1569,6 +1825,21 @@ def run(args, home: Path) -> dict:
         ev = [{"really_tested": i, "wal": args.wal or ""} for i in args.really_tested]
         ev += [{"commit": c, "repo": args.repo or ""} for c in args.commit]
         return write(home, "task.done", {"task": args.task, "evidence": ev}, s, args.key)
+    if cmd == "queue":
+        if args.sub == "add":
+            a = {k: getattr(args, k) for k in ("item", "title", "priority", "session", "source", "ticket", "deadline")
+                 if getattr(args, k) is not None}
+            a["blocked_by"] = args.blocked_by
+            return write(home, "queue.add", a, args.session or "", args.key)
+        if args.sub == "rank":
+            a = {k: getattr(args, k) for k in ("item", "before", "source") if getattr(args, k) is not None}
+            return write(home, "queue.rank", a, "", args.key)
+        if args.sub == "list":
+            now = time.time()  # the writer clock that stamps received_at; no caller-chosen time
+            view = queue_view(home, now)
+            return {"ok": True, "generated": iso(now), "cap": queue_cap(home), "items": view["items"]}
+        if args.sub == "tick":
+            return queue_tick(home, args.cap)
     if cmd == "heartbeat":
         return heartbeat(home, args.service, args.key)
     if cmd == "alert":

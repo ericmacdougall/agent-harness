@@ -19,6 +19,7 @@ The tick has a wall-time budget of 45 s. Each `ah` call gets the remaining budge
 | asks | the v1 ledger `~/.agent-harness/work-assignments.json` (JSON, read-only), and `ask` WAL entries with no `ask_resolved`. The #14465 ledger replaces v1 via `work_assignments.py status --json` once installed | — (read) |
 | alerts | diff the desired ahd alerts against this host's active `source=ahd` entries in the ring (read-only); raise new or escalated alerts, clear resolved ones. More than 10 transitions go in one `ah apply --batch -` | `ah alert raise\|clear` |
 | spool | drain queued writes (GoodQA) | `ah spool drain` |
+| queue | promote or resume queued work into the free slots under the cap; record usage-limit pauses (NEVER-LOSE.md 9b) | `ah queue tick` |
 
 Alert keys:
 

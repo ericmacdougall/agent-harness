@@ -64,3 +64,18 @@ The same hook in `subagent-stop` mode (registered on SubagentStop for every agen
 - `ah heartbeat beat --service <name> --key <K>` atomically replaces `~/.agent-harness/state/<name>/heartbeat.json` (service, host, at, key; mode 0600), the file the `ahd running` check reads. A beat is state, not history: it writes no ledger row. A symlink at the target is replaced, never followed, and a symlinked state directory is refused.
 - `ah alert raise --alert-key <K> --source <src> --key <K> --severity info|warning|high|critical --message <text> [--detail <JSON object>]` and `ah alert clear --alert-key <K> --source <src> --key <K>` are audited writes (ledger row `alert.raise|alert.clear`) that append one event to the ops ring with this host's short name, the name ahd's ring diff matches. A repeated `--key` returns `duplicate` and adds nothing to the ring.
 - `ah apply --batch -` reads JSON lines `{op, key, args}` from stdin (at most 1 MiB and 500 lines). Only `alert.raise` and `alert.clear` are accepted, and every line is validated before any is applied, so one bad line (another op, a bad severity, malformed JSON) refuses the whole batch with exit 2. Each line is then its own idempotent write; a failure part way returns `ok: false` with the results so far (exit 3), and ahd resends one by one, getting `duplicate` for the lines already applied.
+
+## Work queue (NEVER-LOSE.md 9b; user requirement, main WAL wf4ec9675ad6)
+
+- `ah queue add --item <id> --title <t> --priority P0|P1|P2|P3 --session <s> --source <citation> [--ticket <GoodQA p#N>] [--deadline <ISO>] [--blocked-by <id>]... --key <K>` adds one item. Every item is a requirement, so `--source` must resolve (the same provenance check as `ah task register`). `--blocked-by` must name items that already exist.
+- `ah queue rank --item <id> --before <other> --source <citation> --key <K>` records the user's order. The item takes the other item's priority and goes just before it. Explicitly ordered items rank ahead of unordered ones in their priority.
+- `ah queue list` prints each item with its rank, a derived state, whether it is dispatchable, and why not.
+  - The states are queued, promoted, active, waiting, stuck, finished, paused-limit, resume-due and done. They come from the item's registered owner (`ah task register --task <item>`), its disposition and the queue rows; no state is stored twice.
+  - The rank keys, in order: priority, a missed deadline, the user's order, a deadline within 48 h, how many open items it unblocks, age, then the id.
+- `ah queue tick [--cap N]` runs each minute as ahd step 7.
+  - It records a `queue.pause` when a stopped owner's transcript tail (at most 64 KiB, never interview material) ends on a Claude Code or Codex usage-limit message. The resume time is the named reset time in the named zone, UTC when no zone is given, and +5 h when no time is given; the row's flags say which.
+  - It then fills free slots under `queue.max_active` (ahd_policy.json, default 4) from the top of the dispatchable items. Only promoted and active items hold a slot, so waiting, stuck, paused and finished items free theirs.
+  - A promotion is a `queue.promote` row plus a ring alert `queue:promoted:<item>` (source `ah-queue`). The alert goes from info to warning after 15 min and to high after 1 h with no owner, and it clears when an owner registers.
+  - A resume-due item gets a `queue.resume` row and a `queue:resume:<item>` alert that names the agent to message. A resume keeps its context, where a new spawn would not.
+  - Every write has a key derived from what was seen, so a repeated tick writes nothing new.
+  - Q1 records and alerts but starts nothing; S2 spawns once restart is enabled.
