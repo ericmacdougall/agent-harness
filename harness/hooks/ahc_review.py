@@ -678,11 +678,16 @@ def stored_packet(data, sha):
     head = PACKET_HEADER.fullmatch(lines[1]) if len(lines) > 1 else None
     if lines[0] != "# ahc review packet (R2, built by core)" or head is None:
         raise C.ContractError("R2: the stored packet %s is not a core-built packet" % sha[:12])
-    lint = []
+    # The spec core sits raw before the lint section and the owner text after it, so either may hold a planted
+    # heading. The owner fence opener cannot occur inside the fenced body (fence escapes "<<<"), so its last
+    # occurrence is core's own owner section, and core's lint section is the last marker before it.
+    owner = text.rfind("\n\n## Owner section\n%s\n" % FENCE_OPEN)
     marker = "\n## Lint findings (reviewer-addressing text)\n"
-    if marker in text:
-        section = text.split(marker, 1)[1].split("\n\n## ", 1)[0]
-        lint = [ln[2:] for ln in section.split("\n") if ln.startswith("- ")]
+    at = text.rfind(marker, 0, owner) if owner >= 0 else -1
+    if at < 0:
+        raise C.ContractError("R2: the stored packet %s is not a core-built packet" % sha[:12])
+    section = text[at + len(marker):owner]
+    lint = [ln[2:] for ln in section.split("\n") if ln.startswith("- ")]
     return {"text": text, "sha256": sha, "repo": head.group("repo"), "pr": int(head.group("pr")),
             "head": head.group("head"), "snapshot_base": head.group("base"), "lint": lint}
 
