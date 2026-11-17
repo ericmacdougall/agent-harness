@@ -873,8 +873,8 @@ ENTRIES.update({
                 ('        return state in C.Contracts.CONFIRMED_INACTIVE or (state == "active" and props.get("SubState") == "exited")\n',
                  '        return False\n')], REVIEW_PY),
             ("a silent unit is waited on forever", [
-                ('                    if not ended and now - li["updated"] <= REVIEW_MAX + SETTLE_GRACE:\n',
-                 '                    if not ended:\n')], REVIEW_PY),
+                ('                    if not over and now - li["updated"] <= REVIEW_MAX + SETTLE_GRACE:\n',
+                 '                    if not over:\n')], REVIEW_PY),
             ("the report directory is not granted to the unit's uid", [
                 ('                self.runner.grant_output(attempt["out_dir"], uid)\n', '                pass\n')],
              REVIEW_PY),
@@ -1041,8 +1041,11 @@ ENTRIES.update({
                   RX + "f1_remain_after_exit_an_exited_unit_is_given_up_and_still_stopped_before_it_retires",
                   RX + "f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop",
                   RX + "f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form",
-                  RX + "f1_the_observed_t2_dev_triple_active_exited_success_is_ended_but_never_a_stop"],
+                  RX + "f1_the_observed_t2_dev_triple_active_exited_success_is_ended_but_never_a_stop",
+                  RX + "f1_a_final_sent_just_after_the_drain_by_a_unit_that_then_exits_is_settled_not_given_up"],
         "mutations": [
+            ("the sweep reads ended() after the inbox drain (a FINAL sent just before the exit is given up)", [
+                ('        self.sweep(out, ended)\n', '        self.sweep(out)\n')], REVIEW_PY),
             ("Result=success counts as a confirmed stop (the t2-dev triple active/exited/success)", [
                 ('            state = (runner.show(unit, ("ActiveState",)) or {}).get("ActiveState")\n',
                  '            props = runner.show(unit, ("ActiveState", "Result")) or {}\n'

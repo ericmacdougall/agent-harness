@@ -758,14 +758,31 @@ class ReviewStage:
         runner = self.launcher.runner
         if runner is None:
             return out
+        ended = self.ended_units()                 # before the drain: see ended_units
         for uid, data in self.inbox.poll(out["unverified"]):
             try:
                 moved = settle_final(self.c, self.launcher.root, runner, uid, data)
                 out["settled"].append((moved["id"], moved["state"]))
             except C.ContractError as error:
                 out["unverified"].append(str(error)[:300])
-        self.sweep(out)
+        self.sweep(out, ended)
         return out
+
+    def ended_units(self):
+        """The units of running rows' started intents whose process has ended, read BEFORE the tick drains the
+        inbox. The completion wrapper sends FINAL and only then exits (the R3 completion contract the wrapper,
+        goodqa#16274, must keep: its connect and send return before the process ends), so an exit observed before
+        the drain means that FINAL is already queued for the drain. Read after the drain instead, a unit that sent
+        FINAL and exited in between would be given up by R7 and a valid verdict lost; read here, it waits a tick."""
+        units = set()
+        for li in self.c.live_intents():
+            if li["state"] != "started":
+                continue
+            row = self.c._row("reviews", "id", li["row"])
+            if row is not None and row["producer_unit"] == li["unit"] and row["state"] == "running" \
+                    and self.ended(li["unit"]):
+                units.add(li["unit"])
+        return units
 
     def ended(self, unit):
         """The unit's main process is over: ActiveState inactive or failed, or active with SubState exited (the
@@ -781,7 +798,7 @@ class ReviewStage:
         state = props.get("ActiveState")
         return state in C.Contracts.CONFIRMED_INACTIVE or (state == "active" and props.get("SubState") == "exited")
 
-    def sweep(self, out):
+    def sweep(self, out, ended=None):
         """PR 272 rescue (F1): one pass over every non-terminal launch intent (open, started, stopping), as a state
         machine. Each step that ends an attempt only moves the intent to stopping, in the same transaction as the
         row's change where there is one; the one way out of stopping is `retire` (stop, then inactive or failed
@@ -791,7 +808,10 @@ class ReviewStage:
         - started, the row running on it: R7 once the unit ended with no completion signal or outlived its bound
           (outcome-unknown and stopping in one transaction); otherwise left running.
         - started, the row not running on it (cancelling for R15, settled, or rebound): -> stopping (closed).
-        - stopping: retire."""
+        - stopping: retire.
+        `ended` is the set settle() observed before its drain; a direct call (no drain) reads it now."""
+        if ended is None:
+            ended = self.ended_units()
         now = self.c.now()
         for li in self.c.live_intents():
             iid, rid, unit, state = li["id"], li["row"], li["unit"], li["state"]
@@ -803,10 +823,10 @@ class ReviewStage:
                 self.c.intent_move(iid, ("open",), "stopping", "abandoned launch", retire_to="closed")
             elif state == "started":
                 if bound and row["state"] == "running":
-                    ended = self.ended(unit)
-                    if not ended and now - li["updated"] <= REVIEW_MAX + SETTLE_GRACE:
+                    over = unit in ended
+                    if not over and now - li["updated"] <= REVIEW_MAX + SETTLE_GRACE:
                         continue
-                    why = "the unit ended with no completion signal" if ended else "the unit outlived its bound"
+                    why = "the unit ended with no completion signal" if over else "the unit outlived its bound"
                     self.c.settle_attempt(rid, "outcome-unknown", iid, expected_version=row["version"],
                                           event_id="r7:%s" % iid, reason=why, cause=why)
                     out["unknown"].append(rid)
