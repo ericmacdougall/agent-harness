@@ -1477,6 +1477,232 @@ class RuntimeTests(Base):
         intent, _argv = self.c.launch_intent(row["id"], row["version"], command)
         self.assertEqual(intent["state"], "open")
 
+    # ---- PR 272 round 2 (F4, F5, F7)
+
+    class Died(BaseException):
+        """A test-local process death: no except clause in the code under test catches it."""
+
+    def guarded(self, policy=None):
+        """The fake runner behind the real guard: every show and stop the code makes must pass the policy's
+        systemctl rule (the intent units, or the startup recovery rule)."""
+        policy, runner = policy or self.policy, self.runner
+        scope = [policy.unit_scope] if policy.unit_scope else []
+        real_show, real_stop = runner.show, runner.stop
+
+        def show(unit, props):
+            policy._check_systemctl(scope + ["show", "-p", ",".join(props), unit], None)
+            return real_show(unit, props)
+
+        def stop(unit):
+            policy._check_systemctl(scope + ["stop", unit], None)
+            return real_stop(unit)
+        runner.show, runner.stop = show, stop
+
+        def restore():
+            runner.show, runner.stop = real_show, real_stop
+        self.addCleanup(restore)
+        return restore
+
+    def reconcile(self, policy=None):
+        return self.R.Reconciler(self.c, policy or self.policy, self.runner, sleep=lambda s: None).run()
+
+    def restart_policy(self):
+        """A restarted daemon's policy: no intent unit is known until reconciliation reads the ledger."""
+        return self.G.Policy.for_test(self.policy.root, dict(self.policy.exe), trusted_dirs=self.policy.trusted)
+
+    def sweep(self):
+        return self.R.ReviewStage(self.c, self.launcher, _NoInbox()).settle()
+
+    def test_f4_a_crash_before_the_unit_starts_is_orphaned_and_the_row_launches_again(self):
+        """PR 272 F4 (a): the process dies after launch_intent committed and before the unit started. The restart's
+        reconciliation finds the open intent with no unit, orphans it with its charge kept (NEG-22), and the row
+        is not refused forever."""
+        row = self.queued()
+        real = self.runner.start
+
+        def die(argv):
+            raise self.Died()
+        self.runner.start = die
+        with self.assertRaises(self.Died):
+            self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        self.runner.start = real
+        (iid, state), = self.db.execute("SELECT id, state FROM launch_intents WHERE row=?", (row["id"],)).fetchall()
+        self.assertEqual((state, self.runner.started, self.used(row)), ("open", [], 1))
+        out = self.reconcile(self.restart_policy())
+        self.assertEqual(self.state("launch_intents", "id", iid), "orphaned", out)
+        self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "running")
+        self.assertEqual((len(self.runner.started), self.used(row)), (1, 2), "the first charge is never refunded")
+
+    def test_f4_b_a_crash_right_after_start_attempt_leaves_a_started_intent_that_the_sweep_settles(self):
+        """PR 272 F4 (b): start_attempt's commit binds the row to running and moves its intent to started together.
+        A crash right after it leaves an attempt that reconciliation keeps and the sweep gives up once its unit
+        ends (outcome-unknown, intent closed): the row is never stranded in running."""
+        row = self.queued()
+        real = self.c.start_attempt
+
+        def bound_then_die(*args, **kw):
+            real(*args, **kw)
+            raise self.Died()
+        self.c.start_attempt = bound_then_die
+        with self.assertRaises(self.Died):
+            self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        del self.c.start_attempt
+        (iid, unit, state), = self.db.execute("SELECT id, unit, state FROM launch_intents WHERE row=?",
+                                              (row["id"],)).fetchall()
+        self.assertEqual(self.state("reviews", "id", row["id"]), "running")
+        self.assertEqual(state, "started", "the running binding and the started intent commit in one transaction")
+        policy = self.restart_policy()
+        self.launcher.policy = policy
+        self.guarded(policy)
+        self.reconcile(policy)
+        self.assertEqual((self.state("launch_intents", "id", iid), unit in self.runner.live), ("started", True),
+                         "the row's one attempt is kept")
+        self.runner.ended.add(unit)
+        self.sweep()
+        self.assertEqual(self.state("reviews", "id", row["id"]), "outcome-unknown")
+        self.assertEqual(self.state("launch_intents", "id", iid), "closed")
+
+    def test_f4_reconciliation_recovers_a_running_row_whose_intent_is_still_open(self):
+        """PR 272 F4 (b), the ledger an earlier build could leave: the row is running on its unit and the intent
+        is still open. Reconciliation moves the intent to started (the row's binding committed) instead of
+        orphaning it under a running row; the sweep then settles the row once the unit is gone."""
+        for gone in (False, True):
+            with self.subTest(unit_gone=gone):
+                row = self.queued(pr=20 + gone)
+                intent, argv = self.c.launch_intent(row["id"], row["version"], lambda u: self.R.r3_command(
+                    self.policy, u, row, helper_script=self.helper,
+                    attempt=self.R.attempt_paths(self.root, u, row, "/clone")))
+                unit = intent["unit"]
+                self.runner.start(argv)                  # that build's sequence: the binding without the intent
+                self.c.start_attempt(row["id"], unit, self.UID, expected_version=row["version"], event_id=self.ev())
+                self.assertEqual(self.state("launch_intents", "unit", unit), "open")
+                if gone:
+                    self.runner.live.discard(unit)
+                policy = self.restart_policy()
+                self.launcher.policy = policy
+                self.reconcile(policy)
+                self.assertEqual(self.state("launch_intents", "unit", unit), "started")
+                self.assertEqual((self.state("reviews", "id", row["id"]), unit in self.runner.stopped),
+                                 ("running", False), "the bound attempt is neither orphaned nor stopped")
+                self.runner.ended.add(unit)
+                self.sweep()
+                self.assertEqual(self.state("reviews", "id", row["id"]), "outcome-unknown")
+                self.assertEqual(self.state("launch_intents", "unit", unit), "closed")
+
+    def test_f5_an_unconfirmed_cleanup_stop_keeps_the_intent_and_no_replacement_unit_starts(self):
+        """PR 272 F5: start_attempt fails and the cleanup stop is refused (False) or reports success while the unit
+        stays active. The intent stays open and the row blocked, so no second unit starts for the row; once the
+        unit is confirmed stopped, the sweep closes the intent and lifts the block."""
+        for n, mode in enumerate(("stop-false", "stays-active")):
+            with self.subTest(mode=mode):
+                row = self.queued(pr=30 + n)
+
+                def bump(rid=row["id"]):
+                    self.db.execute("UPDATE reviews SET version=version+1 WHERE id=?", (rid,))
+                self.runner.on_start = bump
+                real_stop = self.runner.stop
+
+                def stop(unit):
+                    self.runner.stopped.append(unit)
+                    return mode == "stays-active"
+                self.runner.stop = stop
+                before = len(self.runner.started)
+                self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "refused")
+                unit = self.unit_of(self.runner.started[-1])
+                self.assertEqual(self.state("launch_intents", "unit", unit), "open", "the barrier stays")
+                self.assertTrue(self.db.execute("SELECT 1 FROM review_blocks WHERE row=?", (row["id"],)).fetchone())
+                self.assertNotIn(row["id"], [r["id"] for r in self.c.offerable_rows()])
+                self.runner.on_start = None
+                row = self.c._row("reviews", "id", row["id"])
+                for _ in range(3):
+                    self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "refused")
+                self.assertEqual(len(self.runner.started), before + 1, "no replacement unit while one may run")
+                self.assertEqual(self.used(row), 1)
+                self.runner.stop = real_stop
+                self.sweep()
+                self.assertEqual(self.state("launch_intents", "unit", unit), "closed")
+                self.assertNotIn(unit, self.runner.live)
+                self.assertFalse(self.db.execute("SELECT 1 FROM review_blocks WHERE row=?", (row["id"],)).fetchone())
+                self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "running")
+
+    def test_f5_reconciliation_stops_an_active_unit_whose_intent_is_closed_or_orphaned(self):
+        """PR 272 F5: a unit still active although its intent is closed or orphaned is inconsistent state; the
+        restart's reconciliation stops it (through the guard's recovery rule) instead of skipping it."""
+        for n, state in enumerate(("closed", "orphaned")):
+            with self.subTest(state=state):
+                row = self.queued(pr=40 + n)
+                status, unit = self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+                self.assertEqual(status, "running")
+                self.db.execute("UPDATE launch_intents SET state=? WHERE unit=?", (state, unit))
+                policy = self.restart_policy()
+                restore = self.guarded(policy)
+                try:
+                    out = self.reconcile(policy)
+                finally:
+                    restore()
+                self.assertIn(unit, self.runner.stopped, out)
+                self.assertNotIn(unit, self.runner.live)
+                self.assertTrue(any(unit in t for t in out["incidents"]), out)
+
+    def test_f6_a_cancelled_outcome_unknown_row_settles_superseded(self):
+        """PR 272 F6: an outcome-unknown row whose unit the sweep already confirmed stopped goes to cancelling
+        (R14, as W20 moves it); the next sweep applies R15 (superseded), with no live intent left for the row."""
+        row = self.queued(pr=45)
+        status, unit = self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        self.assertEqual(status, "running")
+        self.runner.ended.add(unit)
+        self.sweep()
+        moved = self.c._row("reviews", "id", row["id"])
+        self.assertEqual((moved["state"], self.state("launch_intents", "unit", unit)), ("outcome-unknown", "closed"))
+        self.c.review(row["id"], "cancelling", expected_version=moved["version"], event_id=self.ev(),
+                      cause="owner cancelled (W20)")
+        self.sweep()
+        self.assertEqual(self.state("reviews", "id", row["id"]), "superseded")
+
+    def admitted_row(self, pr, kind="adversarial"):
+        item = self.c.admit_item("o/r", pr, H1, BASE, POLICY, CORE1, PKT, event_id=self.ev())
+        (rid,), = self.db.execute("SELECT id FROM reviews WHERE item=? AND kind=?", (item["id"], kind)).fetchall()
+        return item, self.walk(self.c._row("reviews", "id", rid), "queued")
+
+    def observe_policy(self, item, policy):
+        stamp = {"id": "obs-%s" % self.ev(), "boot": BOOT, "mono": self.clock.t, "seq": self.n, "at": self.clock.t}
+        self.c.record_observation(stamp, item["repo"], item["pr"], item["id"], {"test": True}, {}, {"policy": policy})
+
+    def test_f7_launch_intent_takes_b33_from_the_items_recorded_policy(self):
+        """PR 272 F7: with no budget passed by the caller, the launch gate uses the policy record of the item's
+        latest stored observation (the one W15 evaluates), not the default of eight."""
+        item, row = self.admitted_row(50)
+        self.observe_policy(item, {"revision": POLICY, "b33": 1})
+        self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "running")
+        second = self.walk(self.c.require_review("red-team", item["repo"], item["pr"], item["head"],
+                                                 item["packet_sha256"], POLICY, item=item["id"],
+                                                 event_id=self.ev(), snapshot_base=BASE), "queued")
+        status, why = self.launcher.launch(second["id"], sandbox_repo=second["repo"])
+        self.assertEqual(status, "refused")
+        self.assertIn("B33 spent: 1 of 1", why)
+        self.assertEqual((len(self.runner.started), self.used(row)), (1, 1), "no second unit, no second charge")
+
+    def test_f7_launch_intent_refuses_a_row_of_an_exhausted_item(self):
+        """PR 272 F7: an exhausted item takes no launch until main's disposition (W16), whatever its budget."""
+        item, row = self.admitted_row(51)
+        self.db.execute("UPDATE work_items SET state='exhausted' WHERE id=?", (item["id"],))
+        status, why = self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        self.assertEqual(status, "refused")
+        self.assertIn("exhausted", why)
+        self.assertEqual((self.runner.started, self.used(row)), ([], 0))
+
+    def test_f7_offerable_rows_skip_exhausted_items_and_spent_lineages(self):
+        """PR 272 F7: the scheduler is never offered a row of an exhausted item, nor a row whose lineage has spent
+        the policy's B33 (it would be refused every tick and hold the slot)."""
+        item, row = self.admitted_row(52)
+        self.assertIn(row["id"], [r["id"] for r in self.c.offerable_rows()])
+        self.db.execute("UPDATE work_items SET state='exhausted' WHERE id=?", (item["id"],))
+        self.assertNotIn(row["id"], [r["id"] for r in self.c.offerable_rows()], "exhausted")
+        self.db.execute("UPDATE work_items SET state='pr-gate' WHERE id=?", (item["id"],))
+        self.observe_policy(item, {"revision": POLICY, "b33": 2})
+        self.c.charge_b33(item["lineage"], 2)
+        self.assertNotIn(row["id"], [r["id"] for r in self.c.offerable_rows()], "B33 spent")
+
     def test_r04_the_peer_uid_comes_from_a_real_socketpair(self):
         import socket  # noqa: PLC0415
         if not (sys.platform.startswith("linux") or sys.platform == "darwin"):

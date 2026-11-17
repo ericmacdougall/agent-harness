@@ -101,6 +101,8 @@ POINTS = (
     "w21.before_send",         # ahc_w21.Sender: after attempted commits, before the update-branch call (AC-7)
     "w21.after_send",          # ahc_w21.Sender: after the call, before the read-back record (AC-7)
     "r3.unit_started",         # ahc_review.Launcher: after the unit started, before start_attempt (AC-8, NEG-36)
+    "r3.intent_committed",     # ahc_review.Launcher: after launch_intent committed, before the unit (PR 272 F4 a)
+    "r3.attempt_bound",        # ahc_review.Launcher: after start_attempt committed (PR 272 F4 b)
 )
 
 
