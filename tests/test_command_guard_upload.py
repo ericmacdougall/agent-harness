@@ -218,6 +218,8 @@ class UploadApproval(UploadBase):
         self.assertEqual(entry['archive_bytes'], len(data))
         self.assert_no_download()
         self.assertIn(['hashsum', 'dropbox', '--', archive], [c[:4] for c in self.calls()])
+        # the approval records which rclone subcommands ran: the live audit row is the no-download evidence
+        self.assertEqual(entry['rclone_subcommands'], ['hashsum dropbox', 'listremotes', 'lsjson', 'rcat'])
         # Codex r3b F4: the stored archive holds exactly the tree (every member, content and link target, the empty
         # directory too) with the `tar -C parent name` layout
         self.assertEqual(stored_members(data), expected_members(self.target))

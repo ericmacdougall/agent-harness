@@ -7776,7 +7776,7 @@ def audit(event, fields, home=None, wal=None, strict=False, to_file=True):
     record.update({k: v for k, v in fields.items() if k in ('path', 'remote', 'manifest_sha256', 'files', 'reason',
                                                              'expires_at', 'nonce', 'rule', 'kind', 'target',
                                                              'user_source', 'bytes', 'archive', 'archive_sha256',
-                                                             'archive_listing')})
+                                                             'archive_listing', 'dropbox_hash', 'rclone_subcommands')})
     try:
         import redact
         line = json.dumps(redact.redact_obj(record), sort_keys=True)  # values, so a span cannot eat JSON syntax
@@ -8870,8 +8870,10 @@ class RcloneUpload:
         self.timeout = timeout
         self.policy = policy
         self.after_upload = None  # a test seam: runs after the stream, before the stored object is checked
+        self.subcommands = []  # every rclone subcommand run (words only, no paths), recorded in the audit row
 
     def _run(self, argv, data=None):
+        self.subcommands.append(' '.join(argv[:2]) if argv[:1] == ['hashsum'] else argv[0])
         try:
             done = subprocess.run([self.rclone] + argv, input=data, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, timeout=self.timeout, check=False)
@@ -8880,6 +8882,7 @@ class RcloneUpload:
         return done.returncode, done.stdout[:64 << 20], done.stderr[:4096].decode('utf-8', 'replace')
 
     def remote_types(self):
+        self.subcommands.append('listremotes')
         return RcloneVerifier(rclone=self.rclone).remote_types()
 
     def listing(self, remote):
@@ -8903,6 +8906,7 @@ class RcloneUpload:
         return bool(rows) and any(n.casefold() == name.casefold() for n, _s, _d in rows)
 
     def rcat(self, remote):
+        self.subcommands.append('rcat')
         return subprocess.Popen([self.rclone, 'rcat', '--', remote], stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -9225,7 +9229,8 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
     entry = {'path': real, 'identity': identity, 'files': len(manifest), 'manifest_sha256': manifest_digest(manifest),
              'stat_sha256': stat_digest, 'remote': remote, 'archive': remote, 'kind': UPLOAD_KIND,
              'archive_sha256': sha, 'archive_bytes': sent_bytes, 'dropbox_hash': dbx, 'verified_at': now,
-             'expires_at': now + ttl, 'nonce': _secrets.token_hex(8)}
+             'expires_at': now + ttl, 'nonce': _secrets.token_hex(8),
+             'rclone_subcommands': sorted(set(getattr(transport, 'subcommands', []) or []))}
     _store_entry(entry, real, now, home)
     host = socket.gethostname().split('.')[0][:64]
     date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
@@ -10331,7 +10336,8 @@ def main(argv=None):
             return 2
         print(json.dumps({'status': 'APPROVED', 'kind': UPLOAD_KIND, 'path': entry['path'],
                           'expires_at': entry['expires_at'], 'files': entry['files'], 'archive': entry['archive'],
-                          'archive_sha256': entry['archive_sha256'], 'dropbox_hash': entry['dropbox_hash']}))
+                          'archive_sha256': entry['archive_sha256'], 'dropbox_hash': entry['dropbox_hash'],
+                          'rclone_subcommands': entry['rclone_subcommands']}))
         return 0
     if args.cmd == 'approve-delete' and (args.no_backup or args.user_source) and \
             (args.archive or args.archive_sha256 or args.archive_listing):
