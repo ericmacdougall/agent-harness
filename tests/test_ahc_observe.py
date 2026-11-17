@@ -182,6 +182,7 @@ class ProducerTests(Base):
         spec = "# Spec\n\n## Acceptance criteria\n\n- AC-1: a. Verify by: t.\n"
         self.gq = dict(self.gq, attached_core=hashlib.sha256(spec.encode()).hexdigest(), spec_core_text=spec)
         o = self.observe_ok()
+        self.assertIn("spec_core_text", o, "the verified text rides on the returned observation for R2")
         self.assertEqual(o["spec_core_text"], spec)
         stored = json.loads(self.db.execute("SELECT fields FROM observations WHERE id=?", (o["id"],)).fetchone()[0])
         self.assertNotIn("spec_core_text", stored)

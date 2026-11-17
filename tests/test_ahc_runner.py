@@ -5994,8 +5994,10 @@ class ReviewTickTests(ShadowIntegratedTests):
     def launched(self):
         """Submit PR 9, run one tick, and return the launched row, its intent and its unit."""
         self.assertEqual(self.submit_pr(9, self.head).get("pipeline"), "shadow")
-        self.run_all(self.deps)
-        (a, _pr, state, _r, _w), = self.code_rows()
+        tick = self.run_all(self.deps)
+        rows = self.code_rows()
+        self.assertEqual(len(rows), 1, "admission made one code row: %s" % (tick.get("shadow", tick),))
+        (a, _pr, state, _r, _w), = rows
         self.assertEqual(state, "running")
         (iid, unit), = self.ledger_rows("SELECT id, unit FROM launch_intents WHERE row=?", (a,))
         return a, iid, unit
