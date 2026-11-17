@@ -133,7 +133,7 @@ DEFAULT_POLICY = {
     'credential_parent_dirs': ['{home}/.config/goodqa', '{home}/.agent-harness/gq-browser'],
     'credential_dirs': ['{home}/.ssh', '{home}/.aws', '{home}/.config/rclone', '{home}/.claude/goodqa-hive',
                         '{home}/.gnupg', '{home}/.docker', '{home}/.config/gh', '{home}/.config/gcloud',
-                        '{home}/.kube'],
+                        '{home}/.kube', '{home}/secret-quarantine'],
     'credential_samples': ['{home}/.ssh/id_rsa', '{home}/.ssh/id_ed25519', '{home}/.ssh/id_ecdsa',
                            '{home}/.aws/credentials', '{home}/.config/rclone/rclone.conf', '{home}/.npmrc',
                            '{home}/.netrc', '{home}/.docker/config.json', '{home}/.claude/goodqa-hive/member.key',
@@ -6764,8 +6764,9 @@ class Analyzer:
 
     _LITERAL = r'[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+'
 
-    # goodqa#16374 AC-3d (goodqa#16362 proposal 3): `mv [-n] [--] /literal/src /literal/dest` and nothing else
-    LONE_MV = re.compile(r'^[ \t]*(?:/bin/)?mv(?:[ \t]+-n)?(?:[ \t]+--)?[ \t]+(' + _LITERAL + r')[ \t]+(' + _LITERAL
+    # goodqa#16374 AC-3d (goodqa#16362 proposal 3): `mv -n [--] /literal/src /literal/dest` and nothing else; -n so a
+    # file created at DEST after the check is never overwritten (red-team r1 finding 13)
+    LONE_MV = re.compile(r'^[ \t]*(?:/bin/)?mv[ \t]+-n(?:[ \t]+--)?[ \t]+(' + _LITERAL + r')[ \t]+(' + _LITERAL
                          + r')[ \t]*$')
 
     def _quarantine_move(self, src_word, dest_word):
@@ -6780,6 +6781,8 @@ class Analyzer:
         src, dest = src_word.text, dest_word.text
         if not (os.path.isabs(src) and os.path.isabs(dest)) or os.path.normpath(src) != src \
                 or os.path.normpath(dest) != dest or not SECRET_FILE_NAME.search(posixpath.basename(src)):
+            return False
+        if posixpath.basename(dest) != posixpath.basename(src):  # red-team r1 finding 12: a new name launders reads
             return False
         try:
             st = os.lstat(src)

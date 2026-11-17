@@ -1157,23 +1157,62 @@ SID_, UID_ = ApprovalResolution.SID, ApprovalResolution.UID
 
 
 class SessionJobs(KillBase):
-    """goodqa#16374 AC-3e: a background job the caller's own session started (its environment carries the caller's
-    CLAUDE_CODE_SESSION_ID and CLAUDE_PID, and it hangs under that live claude process) is stopped without
-    --foreign, audited as session-job with an info notice. Everything else keeps its refusal (NEG-11)."""
+    """goodqa#16374 AC-3e: a background job the calling agent started (its environment carries the caller's
+    CLAUDE_CODE_SESSION_ID and CLAUDE_PID, it hangs under that live claude process, and its cwd is inside the
+    caller's own agent-<id> work dir) is stopped without --foreign, audited as session-job with an info notice.
+    Everything else keeps its refusal (NEG-11), including a sibling owner's job (red-team r1 finding 10)."""
 
     def setUp(self):
         super().setUp()
         os.environ["CLAUDE_PID"] = "3000"
         self.addCleanup(os.environ.pop, "CLAUDE_PID", None)
+        self.work = Path(os.path.realpath(str(self.home))) / ".agent-harness" / "work" / "sess-1"
+        self.mine = self.work / "agent-a1b2c3d4"
+        self.sibling = self.work / "agent-e5f6a7b8"
+        for path in (self.mine / "jobs", self.sibling / "jobs", self.work / "mac-cleanup"):
+            path.mkdir(parents=True)
+        self.cd(self.mine)
 
-    def job(self, env=("sess-1", 3000), ppid=4100, chain=True, cmd="/usr/bin/python3 archive_push.py --id x"):
+    def cd(self, path):
+        before = os.getcwd()
+        os.chdir(str(path))
+        self.addCleanup(os.chdir, before)
+
+    def job(self, env=("sess-1", 3000), ppid=4100, chain=True, cmd="/usr/bin/python3 archive_push.py --id x",
+            cwd=None):
         extra = [proc(1300, ppid, cmd=cmd)]
         if chain:
             extra.append(proc(4100, 3000, cmd="/bin/zsh -c run", comm="/bin/zsh"))
         probe = self.base(*extra)
-        probe.cwds = {1300: "/Users/u/.agent-harness/work/sess-1/mac-cleanup"}
+        probe.cwds = {1300: str(cwd or self.mine / "jobs")}
         probe.claude_env = lambda pid: env if pid == 1300 else (None, None)
         return probe
+
+    def test_a_sibling_owners_job_stays_foreign(self):
+        # same session id and CLAUDE_PID (every owner of a session shares both), but the job runs in another
+        # agent's dir or at session level: refused without --foreign
+        for cwd in (self.sibling / "jobs", self.work / "mac-cleanup", self.work):
+            with self.subTest(cwd=cwd):
+                probe = self.job(cwd=cwd)
+                out = self.run_kill(probe, [1300])
+                self.assertEqual(out["results"][0]["status"], "refused", out)
+                self.assertIn("--foreign", out["results"][0]["detail"])
+                self.assertEqual(probe.sent, [])
+
+    def test_a_caller_outside_any_agent_dir_gets_no_session_job_scope(self):
+        for where in (self.work, self.work / "mac-cleanup"):
+            with self.subTest(where=where):
+                self.cd(where)
+                probe = self.job(cwd=self.mine / "jobs")
+                out = self.run_kill(probe, [1300])
+                self.assertEqual(out["results"][0]["status"], "refused", out)
+                self.assertEqual(probe.sent, [])
+
+    def test_agent_work_root(self):
+        self.assertEqual(ak.agent_work_root(self.home, "sess-1", str(self.mine / "jobs")), str(self.mine))
+        self.assertIsNone(ak.agent_work_root(self.home, "sess-1", str(self.work / "mac-cleanup")))
+        self.assertIsNone(ak.agent_work_root(self.home, "sess-2", str(self.mine)))
+        self.assertIsNone(ak.agent_work_root(self.home, "../x", str(self.mine)))
 
     def test_own_session_background_job_is_stopped_without_foreign(self):
         probe = self.job()

@@ -435,13 +435,18 @@ def in_own_scope(probe, table, pid, cwd, roots, worktree):
 
 
 def session_job(probe, table, pid, scope):
-    """goodqa#16374 AC-3e: True when `pid` is a background job of the caller's own session: its environment carries
-    the caller's CLAUDE_CODE_SESSION_ID and CLAUDE_PID, and it descends in the process table from that live claude
-    process. The env carries no agent id, so this is session ownership, not per-owner: such stops raise an info
-    notice. The claude process itself and the caller's ancestors are protected before this is reached."""
-    session, claude_pid = scope.get("session"), scope.get("claude_pid")
+    """goodqa#16374 AC-3e: True when `pid` is a background job the calling agent started: its environment carries
+    the caller's CLAUDE_CODE_SESSION_ID and CLAUDE_PID, it descends in the process table from that live claude
+    process, and its cwd is inside the caller's own agent-<id> work dir. Main and every owner of a session share the
+    session id and CLAUDE_PID (red-team r1 finding 10), so the env alone would let one owner stop a sibling's jobs;
+    the agent dir is what tells them apart. A caller outside any agent-<id> dir gets no session-job scope. The claude
+    process itself and the caller's ancestors are protected before this is reached."""
+    session, claude_pid, agent_root = scope.get("session"), scope.get("claude_pid"), scope.get("agent_root")
     getter = getattr(probe, "claude_env", None)
-    if not session or not claude_pid or getter is None:
+    if not session or not claude_pid or not agent_root or getter is None:
+        return False
+    cwd = probe.cwd(pid)
+    if not cwd or not (os.path.realpath(cwd) + os.sep).startswith(agent_root + os.sep):
         return False
     if tuple(getter(pid)) != (session, claude_pid):
         return False
@@ -458,6 +463,19 @@ def session_job(probe, table, pid, scope):
 
 
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+AGENT_DIR = re.compile(r"agent-[A-Za-z0-9]{6,64}")
+
+
+def agent_work_root(home, session, cwd):
+    """The real path of ~/.agent-harness/work/<session>/agent-<id> that holds `cwd`, or None."""
+    if not session or not SESSION_ID.fullmatch(session) or session in (".", ".."):
+        return None
+    base = os.path.realpath(os.path.join(str(home), ".agent-harness", "work", session))
+    real = os.path.realpath(cwd or "")
+    if not real.startswith(base + os.sep):
+        return None
+    first = real[len(base) + 1:].split(os.sep, 1)[0]
+    return os.path.join(base, first) if AGENT_DIR.fullmatch(first) else None
 
 
 def session_work_dir(home, session):
@@ -691,7 +709,7 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
     claude_pid = os.environ.get("CLAUDE_PID", "")
-    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
+    scope = {"agent_root": agent_work_root(home, session, os.getcwd()), "table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
              "session_spawns": session_spawns(home, session_dir) if session_dir else set(),
              "session": session or None, "claude_pid": int(claude_pid) if claude_pid.isdigit() else None}
     if approved_by:

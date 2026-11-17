@@ -181,14 +181,31 @@ def merge_command(pr, repo, head, method="merge"):
 SQUASH_REFUSAL = "squash merges are disabled (they drop the branch's own commits); merge with --merge or --rebase"
 
 
-def _pr_merge_policy(names):
-    """Hard merge-policy reasons for one `gh pr merge` flag set."""
+def _pr_merge_policy(flags):
+    """Hard merge-policy reasons for one `gh pr merge` flag list (in order; the last setting of a flag wins, as in
+    gh's flag parser). `--delete-branch=false` and friends are read by value (red-team r1 finding 16): a value other
+    than a plain true/false fails closed."""
+    state = {}
+    for name, value in flags:
+        if name == "-=":  # a short boolean written `-d=false`: refuse rather than guess what gh will make of it
+            return ["write boolean merge flags as --merge/--rebase/--delete-branch, without =value"]
+        if value is None:
+            state[name] = True
+        elif value.lower() in ("1", "t", "true"):
+            state[name] = True
+        elif value.lower() in ("0", "f", "false"):
+            state[name] = False
+        else:
+            state[name] = None  # unknown: squash counts as on, everything else as off
+
+    def on(*names):
+        return any(state.get(n) is True for n in names)
     problems = []
-    if names & {"--squash", "-s"}:
+    if on("--squash", "-s") or any(state.get(n, False) is None for n in ("--squash", "-s")):
         problems.append(SQUASH_REFUSAL)
-    elif not names & {"--merge", "-m", "--rebase", "-r"}:
+    elif not on("--merge", "-m", "--rebase", "-r"):
         problems.append("name the merge method: --merge or --rebase (squash merges are disabled)")
-    if not names & {"--delete-branch", "-d"}:
+    if not on("--delete-branch", "-d"):
         problems.append("add --delete-branch: a merged branch is deleted")
     return problems
 
@@ -771,7 +788,7 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         return [Merge("pr_merge", slug=slug, number=number, target=None if number else target,
                       head_vals=[v.lower() for v in _flag_values(flags, "--match-head-commit")],
                       auto="--auto" in names, repo_ok=explicit or repo_ok,
-                      binding="--match-head-commit <full head sha>", policy=_pr_merge_policy(names))]
+                      binding="--match-head-commit <full head sha>", policy=_pr_merge_policy(flags))]
     if pos[0] == "api" and len(pos) > 1:
         endpoint = re.sub(r"^https?://[^/]+/", "", pos[1]).lstrip("/")
         method = (_flag_values(flags, "-X", "--method") or [""])[-1].upper()

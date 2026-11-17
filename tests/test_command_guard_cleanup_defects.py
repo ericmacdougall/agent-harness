@@ -210,7 +210,7 @@ class SecretQuarantine(Fixture):
         self.dest = self.q / self.unit.name
         self.dest.mkdir(exist_ok=True)
 
-    def mv(self, src, dest=None, flags=''):
+    def mv(self, src, dest=None, flags='-n '):
         dest = dest or str(self.dest / os.path.basename(src))
         return self.decide('mv %s%s %s' % (flags, src, dest))[0]
 
@@ -218,8 +218,26 @@ class SecretQuarantine(Fixture):
         for name in ('.npmrc', 'server.key', '.env.local'):
             with self.subTest(name=name):
                 self.assertEqual(self.mv(str(self.unit / name)), 'allow')
-        self.assertEqual(self.mv(str(self.unit / '.npmrc'), flags='-n '), 'allow')
+        self.assertEqual(self.mv(str(self.unit / '.npmrc'), flags='-n -- '), 'allow')
         self.assertEqual(self.mv(str(self.unit / 'creds/credentials.json')), 'allow')
+
+    def test_the_move_needs_no_clobber_and_keeps_the_name(self):
+        # red-team r1 findings 12 and 13: without -n a file created at DEST between the check and the move is
+        # overwritten; a new name (.env -> notes.txt) would launder the credential-read block
+        src = str(self.unit / '.npmrc')
+        self.assertEqual(self.mv(src, flags=''), 'block')
+        self.assertEqual(self.mv(src, flags='-- '), 'block')
+        for name in ('notes.txt', 'npmrc', '.npmrc.bak'):
+            with self.subTest(name=name):
+                self.assertEqual(self.mv(src, dest=str(self.dest / name)), 'block')
+
+    def test_the_quarantine_is_a_credential_dir(self):
+        # red-team r1 finding 12: ~/secret-quarantine joins credential_dirs, so recursive and find-exec readers of it
+        # are credential reads too
+        for command in ('cat %s' % (self.dest / '.npmrc'), 'grep -r token %s' % self.q,
+                        'find %s -type f -exec cat {} +' % self.q):
+            with self.subTest(command=command):
+                self.assertEqual(self.decide(command)[0], 'block')
 
     def test_non_secret_and_log_names_stay_blocked(self):
         for name in ('notes.md', 'main.jsonl'):

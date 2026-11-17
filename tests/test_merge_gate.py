@@ -242,7 +242,17 @@ class MergePolicy(Base):
                               ("gh api -X PUT repos/o/r/pulls/5/merge -f sha={HEAD} -f merge_method=squash", "squash"),
                               ("gh api graphql -f query={SQ}mutation { mergePullRequest(input:{pullRequestId:"
                                "\"PR_kwDOabc\", expectedHeadOid:\"{HEAD}\", mergeMethod: SQUASH}) { clientMutationId "
-                               "} }{SQ}", "squash")):
+                               "} }{SQ}", "squash"),
+                              # red-team r1 finding 16: flags switched off by value
+                              ("gh pr merge 5 --merge --delete-branch=false --match-head-commit {HEAD}",
+                               "--delete-branch"),
+                              ("gh pr merge 5 --merge --delete-branch=0 --match-head-commit {HEAD}", "--delete-branch"),
+                              ("gh pr merge 5 --merge=false -d --match-head-commit {HEAD}", "--merge or --rebase"),
+                              ("gh pr merge 5 --rebase=f -d --match-head-commit {HEAD}", "--merge or --rebase"),
+                              ("gh pr merge 5 --merge -d=false --match-head-commit {HEAD}", "without =value"),
+                              ("gh pr merge 5 --merge -d --squash=yes --match-head-commit {HEAD}", "squash"),
+                              ("gh pr merge 5 --merge --delete-branch --delete-branch=false --match-head-commit {HEAD}",
+                               "--delete-branch")):
             for waived in (False, True):
                 with self.subTest(command=command, waived=waived):
                     if waived:
@@ -250,6 +260,12 @@ class MergePolicy(Base):
                     code, text, _ = self.decide(command)
                     self.assertEqual(code, 2, text)
                     self.assertIn(word, text)
+
+    def test_true_valued_flags_pass_the_policy(self):
+        for flags in ("--merge=true --delete-branch=true", "--rebase --delete-branch=1", "--squash=false --merge -d"):
+            with self.subTest(flags=flags):
+                code, text, _ = self.decide("gh pr merge 5 -R o/r %s --match-head-commit {HEAD}" % flags)
+                self.assertEqual(code, 0, text)
 
     def test_block_text_prints_the_builder_command(self):
         _, text, _ = self.decide("gh pr merge 5 --squash -d --match-head-commit {HEAD}")
