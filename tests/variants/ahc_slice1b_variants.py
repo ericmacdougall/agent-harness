@@ -651,6 +651,22 @@ ENTRIES.update({
 })
 
 
+LP = "tests.test_ahc_guard.LegacyProductionPathTests."
+
+ENTRIES.update({
+    "AC-13 helper sha from the release list": {
+        "tests": [LP + "test_helper_sha_binds_to_the_release_list_not_the_file_at_start",
+                  LP + "test_the_shipped_release_list_binds_each_helper_to_its_repo_file"],
+        "mutations": [
+            ("the helper sha is the file's at daemon start (owner ruling e)", [
+                ('            want = self.release.get(name)\n',
+                 '            want = hashlib.sha256(Path(script).read_bytes()).hexdigest()\n')], GUARD),
+            ("the shipped list carries no helpers section", [
+                ('    want = {"files": current(), "helpers": helpers(),\n',
+                 '    want = {"files": current(), "helpers": {},\n')], "scripts/ahc_release_hashes.py")]},
+})
+
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:
