@@ -115,8 +115,8 @@ class FakeGitHub(M.Transport):
         self.pause_before_start = None    # an Event: update_refs waits on it before starting the request (F2)
         self.paused = threading.Event()
         self.cancelled = 0
-        self.fail_reads = {}
-        self.die_reads = {}               # method name -> the call number that ends the "process" (Died)              # method name -> the call number (1-based) that raises TransportError (F3)
+        self.fail_reads = {}              # method name -> the call number (1-based) that raises TransportError (F3)
+        self.die_reads = {}               # method name -> the call number that ends the "process" (Died)
         self._calls = {}
         self._n = 0
 
@@ -1335,8 +1335,8 @@ class CanaryTests(Base):
         out = self.canary(w).run(REPO, "main")
         self.assertEqual(out["state"], "passed", out)
         rec = out["record"]
-        self.assertEqual(sorted(rec["cases"]), ["ancestors", "create", "fast-forward", "no-workflow",
-                                                "stale-before", "typed-non-fast-forward"])
+        self.assertEqual(sorted(rec["cases"]), ["create", "fast-forward", "no-workflow", "stale-before",
+                                                "typed-non-fast-forward"])
         self.assertEqual(rec["state"], "passed")
         ups = w.gh.updates()
         self.assertTrue(ups and all(u["ref"] == M.CANARY_REF and u["force"] is False for u in ups),
@@ -1402,6 +1402,32 @@ class CanaryTests(Base):
                                checks=lambda row: True, send_deadline=2.0).dispatch(key)
                 self.assertEqual(out["sent"], False)
                 self.assertEqual([u for u in w.gh.updates() if u["ref"] == MAIN], [], "no E2 send")
+
+    def test_a_failed_canary_preparation_keeps_the_prior_record_and_its_outcome(self):
+        """A-canary-inprogress: the read-only preparation runs before the in-progress record, so an unprepared repo
+        defers and a branch without two ancestors is refused, as before; neither writes the canary ref, changes the
+        prior record, turns merging off or escalates."""
+        for how in ("not prepared", "no two ancestors"):
+            with self.subTest(how=how):
+                w = self.world()
+                w.build()
+                before = w.canary.read(REPO)
+                c = M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill)
+                if how == "not prepared":
+                    def unprepared(repo):
+                        raise M.TransportError("repository id unreadable (scripted)")
+                    w.gh.prepare = unprepared
+                    want = "deferred"
+                else:
+                    w.gh.commits[w.gh.refs[MAIN]] = []
+                    want = "refused"
+                sent = len(w.gh.requests)
+                out = c.run(REPO, "main")
+                self.assertEqual(out["state"], want, out)
+                self.assertEqual(w.canary.read(REPO), before, "the prior record is untouched")
+                self.assertEqual(len(w.gh.requests), sent, "no canary-ref write")
+                self.assertFalse(w.c.merging_off(REPO))
+                self.assertEqual(c.escalations, [])
 
     def test_the_canary_runs_only_under_a_fresh_identity_and_an_off_switch(self):
         w = self.w
