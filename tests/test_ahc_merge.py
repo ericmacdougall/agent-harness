@@ -1101,6 +1101,11 @@ class T9Tests(Base):
                 again = run_child(w.root, "dispatch", key)               # ahc-merge restarts
                 self.assertEqual(again.returncode, 0, again.stderr[-800:])
                 self.assertEqual(FakeGitHub(w.gh.path).load().updates(), [], "zero requests for that op")
+                if which == "disable":
+                    # the sender's own layer refuses before any observation or E2 commit attempt; the Contracts E2
+                    # guard (b50729c) is the second layer and would say "E2 not committed: ..." instead
+                    self.assertEqual(json.loads(again.stdout.splitlines()[-1])["why"], "the repo's merging is off",
+                                     "the sender refuses a disabled repo itself, before the contract guard")
 
     def test_18_an_unconfirmed_stop_returns_incomplete_with_an_incident(self):
         for which in self.FENCES:
