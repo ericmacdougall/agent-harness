@@ -34,7 +34,8 @@ class VariantHarnessTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertTrue(entry["mutations"], "an entry needs at least one mutation")
                 for dotted in entry["tests"]:
-                    self.assertRegex(dotted, r"^tests\.test_ahc\w*\.\w+\.test_\w+$")
+                    # test_peer_review: the PR review is the ahc release-list gate (PR 247 F4)
+                    self.assertRegex(dotted, r"^tests\.test_(?:ahc\w*|peer_review)\.\w+\.test_\w+$")
 
     def test_slice1b_the_script_entry_point_runs_after_every_entry_is_registered(self):
         """An ENTRIES.update placed after `if __name__ == "__main__"` is seen on import (so the anchor test passes)
