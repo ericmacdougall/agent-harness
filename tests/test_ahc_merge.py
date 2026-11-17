@@ -41,6 +41,7 @@ PKT = "d" * 64
 KILL = 7
 LOGIN, UID_GH = "octo-merger", 4242
 MAIN = "refs/heads/main"
+E9_MAX_SECONDS = 86400          # spec e9: a canary older than 24 h fails (the literal Contracts.elig uses)
 
 
 def oid(label):
@@ -80,6 +81,10 @@ class Clock:
 
 # ---------------------------------------------------------------- the fake GitHub
 
+class Died(BaseException):
+    """A process death mid-call, in-process: not an Exception, so nothing in ahc_merge catches it."""
+
+
 class FakeGitHub(M.Transport):
     """In-process GitHub. `script` holds fault directives consumed by the next updateRefs, in order:
     None (normal), "lose" (applied, response lost), "drop" (not applied, no response), "untyped" (not applied, an
@@ -107,6 +112,12 @@ class FakeGitHub(M.Transport):
         self.on_send = None
         self.after_send = []          # one-shot callables run after the server processed the next updateRefs
         self.release = threading.Event()
+        self.pause_before_start = None    # an Event: update_refs waits on it before starting the request (F2)
+        self.paused = threading.Event()
+        self.cancelled = 0
+        self.fail_reads = {}
+        self.die_reads = {}               # method name -> the call number that ends the "process" (Died)              # method name -> the call number (1-based) that raises TransportError (F3)
+        self._calls = {}
         self._n = 0
 
     # ---- state helpers
@@ -165,7 +176,13 @@ class FakeGitHub(M.Transport):
         self._mark(ref)
         return M.SendResult(M.OK, "updateRefs answered")
 
-    def update_refs(self, repo, ref, before_oid, after_oid, force, timeout):
+    def update_refs(self, repo, ref, before_oid, after_oid, force, timeout, gate=None):
+        if self.pause_before_start is not None:      # F2: the worker stops before the transport starts the request
+            self.paused.set()
+            self.pause_before_start.wait(10.0)
+        if gate is not None and gate.begin() is None:
+            self.cancelled += 1                      # the sender cancelled first: no request is ever made
+            return M.SendResult(M.NO_RESPONSE, "cancelled before start")
         req = {"kind": "updateRefs", "repo": repo, "ref": ref, "beforeOid": before_oid, "afterOid": after_oid,
                "force": force, "ledger": self.on_send() if self.on_send else None}
         self.requests.append(req)
@@ -214,7 +231,15 @@ class FakeGitHub(M.Transport):
         return [r for r in self.requests if r["kind"] != "updateRefs"]
 
     # ---- reads
+    def _maybe_fail(self, name):
+        self._calls[name] = self._calls.get(name, 0) + 1
+        if self.fail_reads.get(name) == self._calls[name]:
+            raise M.TransportError("%s failed (scripted)" % name)
+        if self.die_reads.get(name) == self._calls[name]:
+            raise Died("the process died in %s (scripted)" % name)
+
     def read_ref(self, repo, ref):
+        self._maybe_fail("read_ref")
         if ref not in self.refs:
             raise M.TransportError("no such ref")
         return self.refs[ref]
@@ -238,9 +263,11 @@ class FakeGitHub(M.Transport):
         return "diverged"
 
     def commit_parents(self, repo, o):
+        self._maybe_fail("commit_parents")
         return list(self.commits.get(o, []))
 
     def workflow_runs(self, repo):
+        self._maybe_fail("workflow_runs")
         return self.runs
 
     def whoami(self):
@@ -871,6 +898,40 @@ class EffectTests(Base):
                 failed = w.c.elig(w.item(), w.obs(chk_cas=facts["chk_cas"], canary_age=age))
                 self.assertIn("e9", failed, "ELIG e9 fails without a passing CHK-CAS")
 
+    def test_14_an_expired_or_unstamped_canary_at_e2_sends_nothing(self):
+        """F1 (review of PR #270): e9 holds at E2 itself. The grant is reserved while the canary is fresh; the
+        canary then passes 24 h (or its stamp is from another boot, or malformed), and the dispatch sends nothing and
+        leaves the op in intent. Control: at 23 h 59 min it dispatches, with chk_cas and canary_age in E2's
+        observation."""
+        cases = (("expired", E9_MAX_SECONDS + 1, {}),
+                 ("another boot", 60, {"boot": "another-boot"}),
+                 ("malformed stamp", 60, {"mono": "soon"}),
+                 ("no stamp", 60, {"mono": None, "boot": None}))
+        for label, advance, stamp in cases:
+            with self.subTest(case=label):
+                w = self.world()
+                key = w.build()
+                self.assertEqual(w.grant(key)["state"], "reserved", "reserved while the canary was fresh")
+                if stamp:
+                    rec = dict(w.canary.read(REPO), **stamp)
+                    w.canary.write(rec)
+                w.clock.t += advance
+                w.identity.check(w.gh, {REPO})                    # a fresh identity: only the canary is at issue
+                out = w.sender().dispatch(key)
+                self.assertEqual((out["state"], out["sent"]), ("refused", False), out)
+                self.assertEqual(w.gh.requests, [], "zero sends with an expired or unstamped canary")
+                self.assertEqual(w.op(key)["state"], "intent")
+        w = self.world()
+        key = w.build()
+        w.gh.on_send = self.ledger_state(w, key)
+        w.clock.t += E9_MAX_SECONDS - 60
+        w.identity.check(w.gh, {REPO})
+        w.sender().dispatch(key)
+        self.assert_one_cas(w.gh, oid("B"), oid("H"))
+        data = json.loads(w.db.execute("SELECT data FROM transitions WHERE id=? AND to_state='dispatched'",
+                                       (key,)).fetchone()[0])
+        self.assertIn('"canary_age"', json.dumps(data), "the canary facts ride in E2's observation")
+
     def test_16_absent_proven_while_h_is_on_the_branch_abandons_with_an_incident(self):
         for answer in ("typed", "p3"):
             with self.subTest(answer=answer):
@@ -993,6 +1054,7 @@ class T9Tests(Base):
 
     def test_bounds_are_the_spec_values(self):
         self.assertEqual((M.SEND_DEADLINE_SECONDS, M.FENCE_BOUND_SECONDS), (30.0, 45.0))
+        self.assertEqual(M.CANARY_MAX_SECONDS, E9_MAX_SECONDS)
         self.assertEqual(M.Fence(None, None, None, None).bound, 45.0)
 
     def test_lock_modes(self):
@@ -1064,6 +1126,55 @@ class T9Tests(Base):
         out = s.dispatch(key)
         self.assertEqual((out["state"], out["sent"]), ("refused", False))
         self.assertEqual(w.gh.requests, [])
+
+    def test_a_send_paused_before_the_transport_never_starts_after_a_fence(self):
+        """F2 (review of PR #270): the worker is paused before the transport starts the request; the 30 s deadline
+        (0.3 s here) expires and dispatch returns, releasing the lock; each fence then completes; the pause is
+        released. No request may start: the deadline cancelled the local send before the lock was released."""
+        for which in ("kill", "revoke", "disable"):
+            with self.subTest(fence=which):
+                w = self.world()
+                key = w.build()
+                pause = threading.Event()
+                w.gh.pause_before_start = pause
+                s = w.sender(send_deadline=0.3)
+                out = s.dispatch(key)
+                self.assertTrue(w.gh.paused.is_set(), "the worker reached the pause before the transport")
+                self.assertEqual((out["result"], w.op(key)["state"]), (M.NO_RESPONSE, "dispatched"))
+                _f, res = self.fence(w, key, which, None)
+                self.assertEqual(res["result"], "%s complete" % which)
+                pause.set()
+                senders = [t for t in threading.enumerate() if t.name == "ahc-merge-send"]
+                for t in senders:
+                    t.join(5.0)
+                self.assertFalse(any(t.is_alive() for t in senders))
+                self.assertEqual(w.gh.updates(), [], "no request starts after the fence returned")
+                self.assertEqual(w.gh.cancelled, 1, "the paused send found its gate closed")
+
+    def test_the_send_gate_ends_and_reaps_a_started_gh_process(self):
+        """F2, GhTransport: the request's gh process starts only through the gate, and cancel ends and reaps it.
+        The stub stands in for gh (never GitHub): it waits, as a request with no response would."""
+        stub = Path(self.tmp.name) / "gh-stub"
+        stub.write_text("#!/bin/sh\nexec sleep 30\n")
+        os.chmod(str(stub), 0o755)
+        t = M.GhTransport(str(stub), self.tmp.name)
+        t._ids[REPO] = "R_test"
+        gate, box = M.SendGate(), {}
+        worker = threading.Thread(target=lambda: box.setdefault("r", t.update_refs(
+            REPO, MAIN, oid("B"), oid("H"), False, 30, gate=gate)), daemon=True)
+        worker.start()
+        end = time.monotonic() + 10
+        while gate.proc is None and time.monotonic() < end:
+            time.sleep(0.01)
+        self.assertIsNotNone(gate.proc, "the gh process started through the gate")
+        self.assertEqual(gate.cancel(), "stopped")
+        self.assertIsNotNone(gate.proc.returncode, "ended and reaped")
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        closed = M.SendGate()
+        self.assertEqual(closed.cancel(), "not-started")
+        res = t.update_refs(REPO, MAIN, oid("B"), oid("H"), False, 30, gate=closed)
+        self.assertEqual((res["outcome"], closed.proc), (M.NO_RESPONSE, None), "a closed gate starts nothing")
 
     FENCES = ("kill", "revoke", "disable")
 
@@ -1224,8 +1335,9 @@ class CanaryTests(Base):
         out = self.canary(w).run(REPO, "main")
         self.assertEqual(out["state"], "passed", out)
         rec = out["record"]
-        self.assertEqual(sorted(rec["cases"]), ["create", "fast-forward", "no-workflow", "stale-before",
-                                                "typed-non-fast-forward"])
+        self.assertEqual(sorted(rec["cases"]), ["ancestors", "create", "fast-forward", "no-workflow",
+                                                "stale-before", "typed-non-fast-forward"])
+        self.assertEqual(rec["state"], "passed")
         ups = w.gh.updates()
         self.assertTrue(ups and all(u["ref"] == M.CANARY_REF and u["force"] is False for u in ups),
                         "only refs/ahc/canary, never a branch, never force")
@@ -1255,6 +1367,41 @@ class CanaryTests(Base):
                 self.assertFalse(w.canary.chk_cas(REPO, w.identity))
                 c.run(REPO, "main")
                 self.assertEqual(len(c.escalations), 1, "escalated once until a pass")
+
+    def test_an_interrupted_failed_canary_never_leaves_the_old_pass_authoritative(self):
+        """F3 (review of PR #270): a prior pass, then an attempt in which one case fails (a non-fast-forward is
+        accepted) and the final read raises; and an attempt in which the process dies mid-run. After a restart,
+        chk_cas is false and nothing is sent; the failed attempt also turned merging off and escalated once."""
+        for how in ("a later read raises", "the process dies mid-run"):
+            with self.subTest(how=how):
+                w = self.world()
+                key = w.build()
+                c = M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill)
+                self.assertTrue(w.canary.chk_cas(REPO, w.identity), "the prior pass")
+                w.gh.accept_non_ff = True
+                if how == "a later read raises":
+                    w.gh.fail_reads = {"workflow_runs": 2}
+                    attempt(c.run, REPO, "main")
+                else:
+                    w.gh.die_reads = {"workflow_runs": 2}
+                    try:
+                        c.run(REPO, "main")
+                    except Died:
+                        pass
+                w.restart()                                   # a restart: a new store over the same files
+                store = M.CanaryStore(w.root / "canary")
+                self.assertFalse(store.chk_cas(REPO, w.identity), "the old pass is no longer authoritative")
+                self.assertFalse(store.local_facts(REPO, w.identity)["chk_cas"])
+                if how == "a later read raises":
+                    self.assertTrue(w.c.merging_off(REPO), "the failed attempt turned merging off")
+                    self.assertEqual(len(c.escalations), 1)
+                    self.assertEqual(store.read(REPO).get("state"), "inconclusive")
+                else:
+                    self.assertEqual(store.read(REPO).get("state"), "in-progress")
+                out = M.Sender(w.port, w.gh, w.lock(), w.kill, w.identity, store, allowlist={REPO},
+                               checks=lambda row: True, send_deadline=2.0).dispatch(key)
+                self.assertEqual(out["sent"], False)
+                self.assertEqual([u for u in w.gh.updates() if u["ref"] == MAIN], [], "no E2 send")
 
     def test_the_canary_runs_only_under_a_fresh_identity_and_an_off_switch(self):
         w = self.w
@@ -1422,12 +1569,12 @@ class CrashSeamTests(Base):
     """Each seam of the sender, crashed in a child process, then a restart over the same files."""
 
     def test_canary_record_seam(self):
-        for when, recorded in (("before", False), ("after", True)):
-            with self.subTest(when=when):
+        # write 1 is the in-progress record (F3: it invalidates the prior pass), write 2 the result
+        for when, n, recorded in (("before", 1, True), ("after", 1, False), ("before", 2, False), ("after", 2, True)):
+            with self.subTest(when=when, n=n):
                 w = self.world(files=True)
-                key = w.build()
-                os.unlink(str(w.canary._path(REPO)))
-                died = run_child(w.root, "canary", key, seam="merge.canary_record:%s@1" % when)
+                key = w.build()                  # build() leaves a passing record: the prior pass
+                died = run_child(w.root, "canary", key, seam="merge.canary_record:%s@%d" % (when, n))
                 self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT, died.stderr[-800:])
                 self.assertEqual(w.canary.chk_cas(REPO, w.identity), recorded)
                 again = run_child(w.root, "dispatch", key)
