@@ -5216,8 +5216,12 @@ class MigrationV5Tests(Base):
 
     def test_r247_f2_an_older_ledger_is_pending_and_an_unsupported_one_still_refuses(self):
         self.old_ledger()
-        with self.assertRaises(runner.MigrationPending):
-            runner.Ledger(self.paths, migrate=False)
+        try:
+            runner.Ledger(self.paths, migrate=False).close()
+            raised = None
+        except runner.SchemaError as error:          # a plain SchemaError here is the defect: fail, not error
+            raised = error
+        self.assertIsInstance(raised, runner.MigrationPending, "an older ledger is pending core's migration")
         db = self.db()
         db.execute("UPDATE meta SET v='9' WHERE k='schema_version'")
         db.close()
