@@ -3,12 +3,12 @@
 
 This is the one program that sends a write to GitHub for ahc. It runs as the OS user `ahcmerge`, never as the
 daemon: the daemon keeps refusing `gh api graphql` under its AC-13 guard. It holds no clone, builds no commit and
-runs no repository code. It makes exactly three kinds of write (spec Trust model, NEG-8, NEG-17):
+runs no repository code. It makes exactly two kinds of write (spec Trust model, NEG-8, NEG-17):
 - the E2 compare-and-swap: GraphQL `updateRefs` on `refs/heads/{default}` with beforeOid B, afterOid H (the head the
   passed adversarial Review row names) and force false;
-- W21's one REST update-branch for the merge-queue head, with expected_head_sha H;
 - the CHK-CAS canary on the scratch ref `refs/ahc/canary` (e9).
-There is no other send path: no plain push, no merge, squash or rebase commit, no force (NEG-19, L4).
+There is no other send path: no plain push, no merge, squash or rebase commit, no force (NEG-19, L4). W21's
+update-branch is NOT here: the owner's ruling puts it in the daemon behind AHC_W21_SEND (slice 1(b) spec r9 AC-7).
 
 What it does, by spec row:
 - E2 (`Sender.dispatch`): under the T9 dispatch lock held SHARED it re-reads the kill epoch, checks the merge identity
@@ -36,8 +36,7 @@ requests to ahc-core; that channel is not built). Proposed contract changes are 
 
 Agent-ruled choices, each labelled ASSUMPTION where it is made: A-port (above), A-kill (the kill-epoch file's
 place and shape), A-p3 (which gh errors prove a failure before any request byte), A-canary (the three commits and the
-zero-oid create and delete), A-attr (E3 attribution rides in the confirm evidence until a column exists), A-w21 (the
-W21 send record is written by this shim), A-lock (the T9 wording: the sender holds the lock shared, the fences take
+zero-oid create and delete), A-attr (E3 attribution rides in the confirm evidence until a column exists), A-lock (the T9 wording: the sender holds the lock shared, the fences take
 it exclusive, as spec T9 says; the brief's "exclusive dispatch flock" is read as the fence side).
 """
 from __future__ import annotations
@@ -71,7 +70,6 @@ REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 # a fixed module list and a scenario set, so registering them there is a proposed diff (PROPOSED_CONTRACT_DIFFS).
 MERGE_SEAMS = (
     "merge.send",           # around the one updateRefs request (after the dispatched row committed and was read back)
-    "merge.w21_send",       # around W21's one update-branch request (after its send record committed)
     "merge.canary_record",  # around the fsynced canary record that e9 reads
     "merge.kill_epoch",     # around the fsynced kill-epoch write (the fence side)
 )
@@ -80,18 +78,12 @@ MERGE_SEAMS = (
 MERGE_INVENTORY = {
     ("ahc_merge", "KillStore.write", "fs.write_file"): (1, "seam:merge.kill_epoch"),
     ("ahc_merge", "CanaryStore.write", "fs.write_file"): (1, "seam:merge.canary_record"),
-    ("ahc_merge", "LedgerPort.record_w21_send", "sql:INSERT"): (
-        1, "exempt:inside the port's transaction (contracts.commit); shim pending Contracts.record_w21_send"),
-    ("ahc_merge", "LedgerPort.w21_result", "sql:UPDATE"): (
-        1, "exempt:inside the port's transaction (contracts.commit); shim pending Contracts.resolve_w21_send"),
 }
 
 PROPOSED_CONTRACT_DIFFS = (
-    "Contracts.record_w21_send / resolve_w21_send (replace LedgerPort's SQL on w21_sends, A-w21)",
     "operations.attribution column and confirm(attribution=) (replace A-attr)",
     "observation field merge_identity_ok, read by W5/W6 as a cause like mirror_ok ('merge identity unavailable')",
     "ahc_crash.SEAMS += MERGE_SEAMS; InventoryTests.MODULES and test_ahc_fs.MODULES += ahc_merge",
-    "queue_head: the W21-successor exception (the successor keeps the head while in checks or re-review)",
 )
 
 
@@ -133,14 +125,11 @@ class Outcome(dict):
 # ---------------------------------------------------------------- the transport
 
 class Transport:
-    """The one interface to GitHub. Writes: update_refs, update_branch. Reads: read_ref, read_activity, read_pr,
+    """The one interface to GitHub. Writes: update_refs. Reads: read_ref, read_activity, read_pr,
     compare, commit_parents, workflow_runs, whoami, repo_permissions. Tests use an in-process fake; the real class is
     GhTransport, which tests never run against GitHub."""
 
     def update_refs(self, repo, ref, before_oid, after_oid, force, timeout):     # pragma: no cover - interface
-        raise NotImplementedError
-
-    def update_branch(self, repo, pr, expected_head_sha, timeout):                # pragma: no cover - interface
         raise NotImplementedError
 
 
@@ -243,21 +232,6 @@ class GhTransport(Transport):
         rc, out, err, timed_out = self._run(self.update_refs_argv(),
                                             self.update_refs_body(repo_id, ref, before_oid, after_oid), timeout)
         return classify_graphql(rc, out, err, timed_out)
-
-    def update_branch_argv(self, repo, pr, expected_head_sha):
-        # the same form ahc_guard._check_w21 accepts (gh api --method PUT .../update-branch -f expected_head_sha=H)
-        return [self.gh, "api", "--method", "PUT", "repos/%s/pulls/%d/update-branch" % (repo, int(pr)), "-f",
-                "expected_head_sha=%s" % expected_head_sha]
-
-    def update_branch(self, repo, pr, expected_head_sha, timeout):
-        rc, out, err, timed_out = self._run(self.update_branch_argv(repo, pr, expected_head_sha), None, timeout)
-        if timed_out:
-            return SendResult(NO_RESPONSE, "client deadline")
-        if rc == 0:
-            return SendResult(OK, "update-branch accepted")
-        if re.search(r"expected head sha|head sha didn't match|HTTP 422", str(err), re.I):
-            return SendResult(P1, "expected_head_sha refused", kind="expected-head")
-        return SendResult(UNTYPED, "gh exit %s" % rc)
 
     def read_ref(self, repo, ref):
         obj = self._get("repos/%s/git/ref/%s" % (repo, ref[len("refs/"):]))
@@ -427,8 +401,7 @@ class KillStore:
 class LedgerPort:
     """ASSUMPTION A-port. Every ledger read and write the sender makes goes through here. In tests it is an
     in-process shim over ahc_contracts.Contracts; in production `ahcmerge` cannot write the ledger (NEG-8), and these
-    calls become requests to ahc-core over its socket (not built). Only the W21 send record is written here directly
-    (A-w21), pending Contracts.record_w21_send."""
+    calls become requests to ahc-core over its socket (not built). The port writes nothing directly."""
 
     def __init__(self, contracts):
         self.c = contracts
@@ -518,6 +491,9 @@ class LedgerPort:
     def fence(self, key, error, reads, **kw):
         return self.c.fence(key, error, reads, **kw)
 
+    def fence_held(self, key, read, **kw):
+        return self.c.fence_held(key, read, **kw)
+
     def watch_confirm(self, key, obs, **kw):
         return self.c.watch_confirm(key, obs, **kw)
 
@@ -526,36 +502,6 @@ class LedgerPort:
 
     def set_merging(self, repo, **kw):
         return self.c.set_merging(repo, **kw)
-
-    # W21 (A-w21: shim SQL on w21_sends; the W21 row itself, authority log first, is Contracts.wi_move)
-    W23_SECONDS = 600
-
-    def w21_sends(self, item=None, repo=None):
-        cur = self.c.db.execute("SELECT * FROM w21_sends WHERE (? IS NULL OR item=?) AND (? IS NULL OR repo=?) "
-                                "ORDER BY created, seq", (item, item, repo, repo))
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-    def record_w21_send(self, item, request_id, event_id):
-        """The send record, committed BEFORE the request leaves (state attempted) with W23's 10 min clock."""
-        with self.c.tx():
-            seq = 1 + self.c.db.execute("SELECT COUNT(*) FROM w21_sends WHERE item=? AND base=?",
-                                        (item["id"], item["w21_base"])).fetchone()[0]
-            now = self.c.now()
-            self.c.db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, "
-                              "attempted_at, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                              (request_id, item["id"], item["repo"], item["pr"], item["w21_base"], item["head"], seq,
-                               event_id, "attempted", now, 1, now, now))
-            self.c.clock.start(request_id, "W23", self.W23_SECONDS)
-
-    def w21_result(self, request_id, state, reason, new_head=None, successor=None, notice=None):
-        with self.c.tx():
-            self.c.db.execute("UPDATE w21_sends SET state=?, reason=?, new_head=COALESCE(?, new_head), "
-                              "successor=COALESCE(?, successor), version=version+1, updated=? WHERE request_id=?",
-                              (state, reason, new_head, successor, self.c.now(), request_id))
-            if notice:
-                send = self.c._row("w21_sends", "request_id", request_id)
-                self.c._wi_notice("w21:%s" % request_id, {"id": send["item"]}, "W21", "owner", notice)
 
 
 # ---------------------------------------------------------------- AC-8: the merge identity
@@ -738,12 +684,11 @@ class Sender:
     checks are green for (repo, B, H, policy revision) (the core-recorded result, ASSUMPTION). `hooks` maps a point
     name to a callable, for tests only (production passes none)."""
 
-    def __init__(self, port, transport, lock, kill, identity, cas, *, allowlist, checks, branches=None,
+    def __init__(self, port, transport, lock, kill, identity, cas, *, allowlist, checks,
                  send_deadline=SEND_DEADLINE_SECONDS, hooks=None):
         self.port, self.t, self.lock, self.kill, self.identity, self.cas = (port, transport, lock, kill, identity,
                                                                              cas)
         self.allowlist = {str(r).lower() for r in allowlist}
-        self.branches = {str(k).lower(): v for k, v in (branches or {}).items()}   # repo -> default branch (policy)
         self.checks = checks
         self.send_deadline = float(send_deadline)
         self.hooks = dict(hooks or {})
@@ -934,6 +879,31 @@ class Sender:
         except C.ContractError as error:
             return Outcome(self.port.operation(key)["state"], "readback not recorded: %s" % error)
 
+    def reconcile(self, key):
+        """E10's reconcile for a held op (ASSUMPTION A-reconcile: ahc-merge runs it at start and on its tick): a fresh
+        read showing the update applied confirms it (attribution `observed`); a complete read with the tip neither B
+        nor H and no (B, H) entry fences it. Anything else leaves it held. Elapsed time is never evidence, and
+        nothing is ever sent for a held op."""
+        row = self.port.operation(key)
+        if row is None or row["state"] != "held":
+            return Outcome(row["state"] if row else "missing", "the reconcile reads back held ops only")
+        try:
+            read = self.readback(row)
+        except TransportError as error:
+            return Outcome("held", "reconcile inconclusive: %s" % error)
+        done = self.applied(row, read)
+        try:
+            if done is True:
+                self.port.confirm(key, dict(read, attribution="observed"), expected_version=row["version"],
+                                  event_id=self._ev(key, "e10"), actor="reconcile")
+                return Outcome("confirmed", "E10 by the reconcile (observed)", attribution="observed")
+            if done is False and read["tip"] != row["base"]:
+                self.port.fence_held(key, read, expected_version=row["version"], event_id=self._ev(key, "e10f"))
+                return Outcome("fenced", "E10: held, then fenced by a complete off read")
+        except C.ContractError as error:
+            return Outcome(self.port.operation(key)["state"], "reconcile not recorded: %s" % error)
+        return Outcome("held", "held: a person decides; nothing is sent")
+
     def _confirm(self, row, read):
         key = row["key"]
         if read.get("pr_merged") is not True and not self.port.due(key, "E12", C.Contracts.PR_MARK_SECONDS):
@@ -962,70 +932,6 @@ class Sender:
         self.port.fence(key, error, [first, read], expected_version=row["version"], event_id=self._ev(key, "e13"))
         self._e13.pop(key, None)
         return Outcome("fenced", "E13: the request may still apply if the branch is rewound to B (L5)")
-
-    # ------------------------------------------------------------ W21: the one update-branch
-
-    def update_branch(self, item_id):
-        """W21's send for the queue head, after Contracts.wi_move(W21) committed (authority log first) with w21_base
-        equal to the current tip. One send per (item, base); none while another W21 of the repo is unresolved or its
-        successor is still in checks or re-review."""
-        with self.lock.shared(SENDER_LOCK_WAIT_SECONDS) as held:
-            if not held:
-                return Outcome("deferred", "the dispatch lock is held by a kill, revoke or disable")
-            epoch = self.kill.read()
-            if epoch.get("on") is not False:
-                return Outcome("refused", "kill switch on or unreadable")
-            if not self.identity.fresh():
-                return Outcome("waiting-dep", "merge identity unavailable")
-            item = self.port.item(item_id)
-            if item is None or item["state"] != "pr-gate" or not item["w21_base"]:
-                return Outcome("refused", "no committed W21 row for this item")
-            if item["repo"] not in self.allowlist:
-                return Outcome("refused", "repo off the allowlist")
-            sends = self.port.w21_sends(repo=item["repo"])
-            if any(s["item"] == item["id"] and s["base"] == item["w21_base"] for s in sends):
-                return Outcome("refused", "an update-branch was already sent for this item at this B")
-            for s in sends:
-                if s["state"] in ("intent", "attempted", "readback-pending"):
-                    return Outcome("refused", "another W21 update of this repo is unresolved")
-                succ = self.port.item(s["successor"]) if s["successor"] else None
-                if s["state"] == "resolved" and succ is not None and succ["state"] in ("pr-gate", "merge-ready") \
-                        and succ["id"] != item["id"]:
-                    return Outcome("refused", "a W21 successor of this repo is still in checks or re-review")
-            rid = "w21-" + os.urandom(8).hex()
-            self.port.record_w21_send(item, rid, "w21-send:%s" % rid)
-            crash_before("merge.w21_send")
-            result = self.t.update_branch(item["repo"], item["pr"], expected_head_sha=item["head"],
-                                          timeout=self.send_deadline)
-            crash_after("merge.w21_send")
-        if result.get("outcome") == OK:
-            self.port.w21_result(rid, "readback-pending", "accepted; reading back H'")
-            return self.w21_readback(rid)
-        if result.get("outcome") == P1:
-            self.port.w21_result(rid, "resolved", "refused by expected_head_sha: the head moved (W4 follows)")
-            return Outcome("refused-by-server", "expected_head_sha refused", sent=True)
-        self.port.w21_result(rid, "readback-pending", "untyped or no response: %s" % result.get("detail"))
-        return self.w21_readback(rid)
-
-    def w21_readback(self, request_id):
-        """Read back H': first parent H, second parent an ancestor of, or equal to, the current tip. Without it, the
-        send stays pending and W23 (core) ends it after 10 min."""
-        send = [s for s in self.port.w21_sends() if s["request_id"] == request_id][0]
-        try:
-            pr = self.t.read_pr(send["repo"], send["pr"])
-            new = pr.get("head")
-            parents = self.t.commit_parents(send["repo"], new) if new and new != send["head"] else []
-            tip = self.t.read_ref(send["repo"], "refs/heads/%s" % self.branches[send["repo"]])
-            ok = len(parents) == 2 and parents[0] == send["head"] and (
-                parents[1] == tip or self.t.compare(send["repo"], parents[1], tip) in ("ahead", "identical"))
-        except (TransportError, KeyError):
-            ok = False
-        if not ok:
-            return Outcome("readback-pending", "no H' read back yet", sent=True)
-        self.port.w21_result(request_id, "resolved", "H' read back", new_head=new,
-                             notice="ahc merged the default branch into this PR's branch at %s; your next push must "
-                                    "start from H' %s" % (send["base"], new))
-        return Outcome("resolved", "H' read back", sent=True, new_head=new)
 
 
 # ---------------------------------------------------------------- T9: kill, revoke, disable
