@@ -8931,8 +8931,8 @@ def _counted_credentials(real, entries, compiled):
             problems.append('credential in a git remote URL %s' % rel)
             continue
         tier = _credential_tier(rel, compiled, member, full)
-        if in_gitdir and tier == 2:
-            continue  # git's own files (objects, refs, hooks) are not credential names; tier 1 still counts
+        if tier == 2 and _in_git_own_data(full, gitdirs):
+            continue  # git's own objects, refs and logs are not credential files; tier 1 still counts (r2 N1)
         if not tier:
             continue
         if tier == 2 and st.st_size > PINNED_MAX_BYTES:
@@ -9002,6 +9002,20 @@ def _in_real_gitdir(full, cache):
         cache[gitdir] = os.path.isfile(os.path.join(gitdir, 'HEAD')) and \
             os.path.isdir(os.path.join(gitdir, 'objects')) and not os.path.islink(gitdir)
     return cache[gitdir]
+
+
+_GIT_OWN_DATA = re.compile(r'^(?:(?:modules/.+?|worktrees/[^/]+)/)?(?:objects|refs|logs)/')
+
+
+def _in_git_own_data(full, cache):
+    """True when `full` lies under a real gitdir's objects/, refs/ or logs/ (also those of a submodule under
+    modules/ or a linked worktree under worktrees/). Only these skip the loose name list: a credential store kept
+    elsewhere in the gitdir (`credential.helper 'store --file=.git/credentials'`) counts (red-team r2 N1)."""
+    if not _in_real_gitdir(full, cache):
+        return False
+    parts = full.split(os.sep)
+    inner = '/'.join(parts[len(parts) - 1 - parts[:-1][::-1].index('.git'):])
+    return bool(_GIT_OWN_DATA.match(inner))
 
 
 def _is_git_config(member):
@@ -9184,6 +9198,14 @@ def _end_children(procs, grace=5.0):
             proc.wait(timeout=grace)
 
 
+def _close_quietly(stream):
+    try:
+        if stream is not None:
+            stream.close()
+    except (OSError, ValueError):
+        pass
+
+
 def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None, compiled=None):
     """Build tar | zstd from `entries` and send it with rcat; returns (dropbox hash, sha256, bytes, manifest sha256,
     files). The manifest digest is computed streaming (the manifest_digest format), so memory does not grow with the
@@ -9258,7 +9280,7 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                     rel = member.split('/', 1)[1] if '/' in member else member
                     if compiled is not None and full not in pinned:
                         tier = _credential_tier(rel, compiled, member, full)
-                        if tier == 1 or (tier == 2 and not _in_real_gitdir(full, gitdirs)):
+                        if tier == 1 or (tier == 2 and not _in_git_own_data(full, gitdirs)):
                             raise ValueError('credential file %s appeared after the check; nothing of it was sent'
                                              % rel)
                     fd = opener() if opener is not None else _open_regular(full, st)
@@ -9295,10 +9317,15 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
     except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
         watchdog.cancel()
         _end_children((comp, up))
+        thread.join(1.0)
+        for stream in (comp.stdin, comp.stdout, getattr(up, 'stdin', None)):
+            _close_quietly(stream)
         if sent['timed_out'] or isinstance(error, subprocess.TimeoutExpired) or time.monotonic() >= deadline:
             raise ValueError('the upload exceeded its time budget; it was stopped and nothing was approved')
         raise ValueError('the upload stream failed: %s' % str(error)[:160])
     watchdog.cancel()
+    if not thread.is_alive():
+        _close_quietly(comp.stdout)  # the pump has finished with it; one pipe per upload otherwise leaks
     if sent['timed_out']:
         raise ValueError('the upload exceeded its time budget; it was stopped and nothing was approved')
     if sent['error'] is not None or thread.is_alive():

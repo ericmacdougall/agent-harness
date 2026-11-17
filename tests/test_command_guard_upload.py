@@ -539,6 +539,19 @@ class UploadApproval(UploadBase):
         age(self.target)
         self.refused('credential file')
 
+    def test_a_credential_store_inside_a_real_gitdir_counts(self):
+        # red-team r2 N1: `credential.helper 'store --file=.git/credentials'` keeps plaintext tokens in the gitdir;
+        # only git's own data (objects/, refs/, logs/) skips the loose name list
+        repo = self.repo({'main.go': 'package x\n'})
+        for inner in ('credentials', 'modules/sub/credentials', 'worktrees/w1/credentials'):
+            path = repo / '.git' / inner
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('https://someone:not-a-real-token@example.invalid\n')
+            age(self.target)
+            self.refused('credential file')
+            path.unlink()
+        self.assert_never_uploaded()
+
     def test_no_approval_without_its_records(self):
         # red-team E3: a failed index write leaves no usable approval
         with mock.patch.object(cg, 'index_record', side_effect=OSError('read-only file system')):
