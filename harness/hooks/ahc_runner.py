@@ -704,23 +704,26 @@ class Ledger:
             return False
 
     def _installed_extras(self):
-        """(path, expected sha256) of the installed wrapper and unit files, when an install record says so. The
-        expected text is derived from the v5 code (ahc_install), never read from what is installed."""
+        """(path, expected sha256) of every launch file ahc install writes (both units and the wrapper), whenever an
+        install record exists (PR 247 F5). The paths come from this code and $HOME, never from the record, and the
+        expected text from the v5 code (ahc_install), never from what is installed: a missing or stale file is a
+        preflight failure. A 4d45fe40 record carries no "files" key and is checked the same way; a record whose
+        "files" disagree with this code's paths, or that exists but cannot be read, refuses. No record: nothing was
+        installed by ahc install (a test or a hand-run ledger), so there is nothing to check."""
         import ahc_install  # noqa: PLC0415
+        record_path = ahc_install._record_path(self.paths)
         record = ahc_install.read_record(self.paths)
-        if not record:
+        if record is None:
+            if os.path.lexists(str(record_path)):
+                raise MigrationRefused("migration-preflight: the install record %s cannot be read; re-run `ahc "
+                                       "install --apply`; nothing was written" % record_path)
             return []
-        out = []
-        for path in record.get("files", []) or []:
-            name = Path(path).name
-            text = None
-            if name in getattr(ahc_install, "UNITS", ()):
-                text = ahc_install.unit_text(name)
-            elif name == "ahc":
-                text = ahc_install.wrapper_text()
-            if text is not None and os.path.exists(path):
-                out.append((path, hashlib.sha256(text.encode("utf-8")).hexdigest()))
-        return out
+        want = ahc_install.installed_files(Path.home())
+        recorded = record.get("files")
+        if recorded is not None and sorted(recorded) != sorted(want):
+            raise MigrationRefused("migration-preflight: the install record names %s, but this ahc installs %s; re-run "
+                                   "`ahc install --apply`; nothing was written" % (recorded, sorted(want)))
+        return [(path, hashlib.sha256(text.encode("utf-8")).hexdigest()) for path, text in sorted(want.items())]
 
     def _probe(self, files):
         return ahc_migrate.open_file_holders(files, self.PROBE_RUN)

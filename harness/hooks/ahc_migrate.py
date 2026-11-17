@@ -249,17 +249,21 @@ def verify_entry_points(hooks_dir, extra=()):
             continue
         if got != want:
             problems.append("%s sha256 %s, release lists %s" % (name, got[:12], want[:12]))
+    launch = False
     for path, want in extra:
         try:
             got = file_sha256(path)
         except OSError as error:
             problems.append("%s unreadable (%s)" % (path, type(error).__name__))
+            launch = True
             continue
         if got != want:
             problems.append("%s does not match the v5 release" % path)
+            launch = True
     if problems:
-        raise MigrationRefused("preflight: installed entry points do not match the v5 release: %s"
-                               % "; ".join(problems))
+        raise MigrationRefused("preflight: installed entry points do not match the v5 release: %s%s"
+                               % ("; ".join(problems), "; re-run `ahc install --apply` to rewrite the wrapper and "
+                                  "unit files" if launch else ""))
 
 
 # ---------------------------------------------------------------- layouts and the generic rebuild

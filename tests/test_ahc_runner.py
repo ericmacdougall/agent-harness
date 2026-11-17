@@ -3,6 +3,7 @@ and digest, with a journal that makes every step idempotent and restart-safe. Al
 GoodQA goodqa#16034 AC-6, AC-7, AC-9; NEG-9 (Gate 1 part), NEG-12, NEG-15, NEG-16."""
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -5082,6 +5083,78 @@ class MigrationV5Tests(Base):
         self.expect_refusal(runner.MigrationRefused, "preflight: installed entry points.*ahc_runner.py")
         self.assertEqual(self.version(), "4")
         self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak")))
+
+    # ---- PR 247 F5: the preflight checks the launch files the real installer wrote
+
+    def installed_old(self, record=None):
+        """A 4d45fe40 ledger on a host where the real `ahc install --apply` wrote both units and the wrapper. HOME is
+        this test's home, so the runner derives the same launch-file paths the installer used."""
+        import ahc_install
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        self.assertEqual(ahc_install.install(self.paths, self.home, True, run=FakeHost(), system="Linux",
+                                             out=lambda line: None), 0)
+        if record is not None:
+            (self.paths.root / ahc_install.RECORD).write_text(record)
+        env = mock.patch.dict(os.environ, {"HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        return ahc_install
+
+    def assert_refused_before_the_fence(self, pattern):
+        self.expect_refusal(runner.MigrationRefused, pattern)
+        self.assertEqual(self.version(), "4", "refused before the fence: nothing written")
+        self.assertFalse(list(self.paths.root.glob("ledger.sqlite3.pre-v5.*.bak")), "no backup taken")
+
+    def test_r247_f5_the_installer_records_its_launch_files(self):
+        inst = self.installed_old()
+        record = json.loads((self.paths.root / inst.RECORD).read_text())
+        want = sorted([str(self.home / ".config" / "systemd" / "user" / "ahc-core.service"),
+                       str(self.home / ".config" / "systemd" / "user" / "ahc-review.service"),
+                       str(self.home / ".local" / "bin" / "ahc")])
+        self.assertEqual(record["files"], want)
+        self.assertEqual(sorted(inst.installed_files(self.home)), want)
+
+    def test_r247_f5_an_altered_or_missing_launch_file_refuses_the_migration(self):
+        launch = {"ahc-core": Path(".config/systemd/user/ahc-core.service"),
+                  "ahc-review": Path(".config/systemd/user/ahc-review.service"), "wrapper": Path(".local/bin/ahc")}
+        for name, rel in launch.items():
+            for change in ("altered", "removed"):
+                with self.subTest(file=name, change=change):
+                    self.setUp()
+                    self.installed_old()
+                    path = self.home / rel
+                    if change == "altered":
+                        path.write_text(path.read_text() + "# left over from 4d45fe40\n")
+                        pattern = re.escape(str(path)) + " does not match the v5 release"
+                    else:
+                        path.unlink()
+                        pattern = re.escape(str(path)) + " unreadable"
+                    self.assert_refused_before_the_fence(pattern + ".*ahc install --apply")
+
+    def test_r247_f5_a_legacy_record_without_files_still_checks_the_launch_files(self):
+        # what a 4d45fe40 install wrote: no "files" key; the preflight must not skip this host's launch files
+        self.installed_old(record=json.dumps({"linger_before": False, "installed_at": 1.0, "user": "fixture"}))
+        (self.home / ".local" / "bin" / "ahc").unlink()
+        self.assert_refused_before_the_fence(r"\.local/bin/ahc unreadable")
+
+    def test_r247_f5_a_record_naming_other_files_or_unreadable_refuses(self):
+        for label, record, pattern in (
+                ("other paths", json.dumps({"linger_before": False, "files": ["/elsewhere/ahc-core.service"]}),
+                 "install record names"),
+                ("not json", "{", "install record .* cannot be read")):
+            with self.subTest(label):
+                self.setUp()
+                self.installed_old(record=record)
+                self.assert_refused_before_the_fence(pattern)
+
+    def test_r247_f5_current_launch_files_migrate_and_no_record_means_nothing_installed(self):
+        self.installed_old()
+        self.must_open().close()
+        self.assertEqual(self.version(), "5")
+        self.setUp()
+        self.make_old("4d45fe40", PIN_4D45, populate=False)     # no install record: a hand-run or test ledger
+        self.must_open().close()
+        self.assertEqual(self.version(), "5")
 
     def test_v5_release_list_is_current(self):
         import subprocess

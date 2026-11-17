@@ -95,6 +95,14 @@ def wrapper_text() -> str:
     return ("#!/bin/sh\n%s\nexec /usr/bin/env python3 -I \"$HOME/.claude/hooks/ahc_runner.py\" \"$@\"\n" % WRAPPER_MARK)
 
 
+def installed_files(home: Path) -> dict:
+    """{path: expected text} of every launch file install writes: both unit files and the ~/.local/bin wrapper. The
+    migration preflight checks these against this code's text (PR 247 F5), never against what is installed."""
+    files = {str(unit_dir(home) / ("%s.service" % name)): unit_text(name) for name in UNITS}
+    files[str(home / ".local" / "bin" / "ahc")] = wrapper_text()
+    return files
+
+
 def _user() -> str:
     return os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
 
@@ -161,8 +169,9 @@ def install(paths, home: Path, apply: bool, run=default_run, system=None, out=pr
     paths.ensure()
     record = read_record(paths)
     linger = linger_on(run)
+    files = sorted(installed_files(home))
     if record is None:
-        record = {"linger_before": linger, "installed_at": now or time.time(), "user": _user()}
+        record = {"linger_before": linger, "installed_at": now or time.time(), "user": _user(), "files": files}
         out("%srecord install state %s (lingering was %s)" % (verb, _record_path(paths),
                                                              {True: "on", False: "off", None: "unknown"}[linger]))
         if apply:
@@ -170,6 +179,11 @@ def install(paths, home: Path, apply: bool, run=default_run, system=None, out=pr
     else:
         out("keep the first install record %s (lingering was %s before ahc)"
             % (_record_path(paths), {True: "on", False: "off", None: "unknown"}[record.get("linger_before")]))
+        if record.get("files") != files:
+            # an earlier install (4d45fe40) recorded no launch files: add them, keeping linger_before
+            out("%srecord the installed launch files in %s" % (verb, _record_path(paths)))
+            if apply:
+                _write_in_root(paths, _record_path(paths), json.dumps(dict(record, files=files), sort_keys=True) + "\n")
     for name in UNITS:
         target = unit_dir(home) / ("%s.service" % name)
         if target.exists() and target.read_text(encoding="utf-8", errors="replace") != unit_text(name):

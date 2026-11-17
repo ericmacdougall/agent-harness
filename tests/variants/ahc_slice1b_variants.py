@@ -1377,6 +1377,54 @@ ENTRIES.update({
                 ('    present = [n for n in UNITS if (unit_dir(home) / ("%s.service" % n)).exists()]\n',
                  '    present = list(UNITS)\n')], INSTALL_PY)]},
 })
+PEER_PY = "harness/hooks/peer_review.py"
+PRT = "tests.test_peer_review.PeerReviewTests."
+ENTRIES.update({
+    "PR 247 F4 the PR review refuses a stale ahc release list": {
+        "tests": [PRT + "test_r247_f4_a_drifted_helper_refuses_the_pr_review_before_any_provider",
+                  PRT + "test_r247_f4_a_drifted_ahc_module_refuses_the_pr_review",
+                  PRT + "test_r247_f4_dropping_a_listed_helper_refuses_the_pr_review",
+                  PRT + "test_r247_f4_an_unlisted_shipped_module_refuses_the_pr_review",
+                  PRT + "test_r247_f4_a_malformed_or_deleted_list_refuses_the_pr_review",
+                  PRT + "test_r247_f4_a_regenerated_list_passes_and_the_report_names_it"],
+        "mutations": [
+            ("the pr stage never runs the release check", [
+                ("            if args.stage == 'pr':\n                # Before any provider budget",
+                 "            if False:\n                # Before any provider budget")], PEER_PY),
+            ("listed hashes are not compared", [
+                ("                elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes())"
+                 ".hexdigest() != digest:\n", "                elif False:\n")], PEER_PY),
+            ("a name dropped from the base's list is accepted", [
+                ("for name in sorted(earlier) if name in head_tree and name not in now]",
+                 "for name in sorted(earlier) if name in head_tree and name not in now and False]")], PEER_PY),
+            ("a module install.py ships may go unlisted", [
+                ("""and f'"{name}"' in shipped and name not in files]""",
+                 """and f'"{name}"' in shipped and name not in files and False]""")], PEER_PY),
+            ("deleting the base's list is accepted", [
+                ("        if 'ahc_release.json' in base_tree:\n", "        if False:\n")], PEER_PY),
+            ("the passing report does not name the list", [
+                ("    if options.get('release_manifest'):\n", "    if False:\n")], PEER_PY)]},
+    "PR 247 F5 the migration preflight checks the installed launch files": {
+        "tests": [MV + "test_r247_f5_the_installer_records_its_launch_files",
+                  MV + "test_r247_f5_an_altered_or_missing_launch_file_refuses_the_migration",
+                  MV + "test_r247_f5_a_legacy_record_without_files_still_checks_the_launch_files",
+                  MV + "test_r247_f5_a_record_naming_other_files_or_unreadable_refuses"],
+        "mutations": [
+            ("only the record's files key is checked (round 2)", [
+                ('        want = ahc_install.installed_files(Path.home())\n',
+                 '        want = {p: t for p, t in ahc_install.installed_files(Path.home()).items()\n'
+                 '                if p in (record.get("files") or [])}\n')], RUNNER_PY),
+            ("a missing launch file is skipped", [
+                ('            problems.append("%s unreadable (%s)" % (path, type(error).__name__))\n'
+                 '            launch = True\n', '            pass\n')], "harness/hooks/ahc_migrate.py"),
+            ("the installer records no launch files", [
+                ('"user": _user(), "files": files}', '"user": _user()}')], INSTALL_PY),
+            ("a record naming other paths is accepted", [
+                ('        if recorded is not None and sorted(recorded) != sorted(want):\n',
+                 '        if False:\n')], RUNNER_PY),
+            ("an unreadable record counts as no install", [
+                ('            if os.path.lexists(str(record_path)):\n', '            if False:\n')], RUNNER_PY)]},
+})
 
 
 if __name__ == "__main__":
