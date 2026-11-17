@@ -801,8 +801,10 @@ class EffectTests(Base):
         s.dispatch(key)
         self.assertTrue(w.gh.ancestor(oid("H"), w.gh.refs[MAIN]), "H is reachable")
         for _ in range(3):
-            w.tick(s, key, seconds=30)
+            out = w.tick(s, key, seconds=30)
             self.assertNotEqual(w.op(key)["state"], "confirmed", "reachability alone never confirms (E3)")
+            self.assertNotIn("not recorded", out["why"], "the sender never asks the ledger to confirm without a "
+                             "(B, H) entry or the tip at H (the ledger's own refusal is a second line, not the first)")
         w.gh.act_complete = True
         w.tick(s, key, seconds=30)
         row = w.op(key)
@@ -1047,6 +1049,19 @@ class T9Tests(Base):
         self.assertEqual(w.kill.read(), {"on": True, "epoch": KILL + 1})
         self.assertEqual(w.grant(key)["state"], "revoked", "G9")
         out = w.sender().dispatch(key)
+        self.assertEqual((out["state"], out["sent"]), ("refused", False))
+        self.assertEqual(w.gh.requests, [])
+
+    def test_the_epoch_is_re_read_under_the_lock_at_every_dispatch(self):
+        """A sender started before the kill: the epoch file turns on (the kill writes it before it revokes) and the
+        next dispatch, by the same sender object, sends nothing. The grant is still reserved here, so only the
+        sender's own re-read under the lock stops it."""
+        w = self.w
+        key = w.build()
+        s = w.sender()
+        w.kill.write(True, KILL + 1)
+        self.assertEqual(w.grant(key)["state"], "reserved")
+        out = s.dispatch(key)
         self.assertEqual((out["state"], out["sent"]), ("refused", False))
         self.assertEqual(w.gh.requests, [])
 
