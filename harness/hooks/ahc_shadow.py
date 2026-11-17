@@ -122,6 +122,7 @@ def findings_receipt(row, verdict, finding_ids, **extra):
 import hashlib  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 
 from ahc_crash import crash_at  # noqa: E402
 
@@ -155,6 +156,29 @@ def tick_seq(contracts):
 def _meta(contracts, key):
     row = contracts.db.execute("SELECT v FROM contract_meta WHERE k=?", (key,)).fetchone()
     return row[0] if row else None
+
+
+CORE_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def w1_hold(req, obs):
+    """goodqa#16262 d5 RULED-4 checks 1-4 for a W1 request against its observation: (kind, reason) of the first that
+    fails, or None. Check 5 (the lineage binding) is admit_item's. The reader was called only with the Refs ticket."""
+    if obs.get("refs_problem"):
+        return "permanent", str(obs["refs_problem"])                                          # check 1
+    refs = C.parse_ticket_text(obs.get("refs_ticket"))
+    if refs is None:                                            # fail closed: no check-1 result at all
+        return "retryable", "refs: the observation carries no Refs ticket"
+    label = C.ticket_text(refs)
+    if C.parse_request_ticket(req.get("ticket")) != refs:                                     # check 2 (RT-21)
+        return "retryable", "request ticket %s is not %s; resubmit with the ticket `GoodQA %s`" % (
+            json.dumps(req.get("ticket")), label, label)
+    core = obs.get("attached_core")
+    if not (isinstance(core, str) and CORE_HEX.fullmatch(core)):                              # check 3
+        return "retryable", "no attached spec on %s" % label
+    if C.parse_ticket_text(obs.get("spec_ticket")) != refs:                                   # check 4
+        return "retryable", "spec record names %s" % (obs.get("spec_ticket") or "no ticket")
+    return None
 
 
 def write_hold(contracts, key, read_value, read_hold, kind, reason):
@@ -352,33 +376,50 @@ class ShadowTick:
             obs = self._observe(summary, req["repo"], req["pr"], base=req.get("base"), head=req["head"])
             if obs is None:
                 continue
-            packet = None
-            if obs["pr_head"] == req["head"] and obs["pr_state"] == "OPEN":
-                try:
-                    packet = self.r2_packet(req, obs, base=obs["tip"])
-                except Exception as error:  # noqa: BLE001 - R2 fails closed: the request stays held
-                    summary["refused"].append((key, "admission: the R2 packet was not built: %s" % str(error)[:200]))
-                    continue
-            with self.c.tx():
-                if packet is None:
-                    reason = "head moved or PR not open at admission"
-                else:
-                    reason = None
-                    rev = (obs.get("policy") or {}).get("revision")
-                    core = obs.get("attached_core")
-                    try:
-                        # goodqa#16262: W1 binds the lineage to the Refs ticket the reader was called with
-                        item = self.c.admit_item(req["repo"], req["pr"], req["head"], obs["tip"], rev, core,
-                                                 packet["sha256"], event_id=event_id(obs["id"], key, "W1"),
-                                                 ticket=C.parse_ticket_text(obs.get("refs_ticket")))
-                        self.r2_queue_item(item, packet)
-                        summary["admitted"].append(item["id"])
-                    except C.ContractError as error:
-                        reason = str(error)
-                if reason:
-                    summary["refused"].append((key, "admission: %s" % reason))
-                # RT-19: every delete of a request takes its hold record
-                self.c.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (key, hold_key(key)))
+            if obs["pr_head"] != req["head"] or obs["pr_state"] != "OPEN":
+                self._drop_request(summary, key, "head moved or PR not open at admission")
+                continue
+            # goodqa#16262 d5 RULED-4 checks 1-4: a failure holds the request (compare-and-set on what this tick read)
+            failed = w1_hold(req, obs)
+            if failed:
+                self._hold(summary, key, value, raw, *failed)
+                continue
+            try:
+                packet = self.r2_packet(req, obs, base=obs["tip"])
+            except Exception as error:  # noqa: BLE001 - R2 fails closed: the request stays held
+                summary["refused"].append((key, "admission: the R2 packet was not built: %s" % str(error)[:200]))
+                continue
+            rev = (obs.get("policy") or {}).get("revision")
+            core = obs.get("attached_core")
+            try:
+                # One transaction this method opens itself: any error rolls back every admission write (the binding
+                # row, the item, its review rows and the R2 queueing), so nothing partial commits (goodqa#16325).
+                with self.c.tx():
+                    # goodqa#16262: W1 binds the lineage to the Refs ticket the reader was called with (check 5)
+                    item = self.c.admit_item(req["repo"], req["pr"], req["head"], obs["tip"], rev, core,
+                                             packet["sha256"], event_id=event_id(obs["id"], key, "W1"),
+                                             ticket=C.parse_ticket_text(obs.get("refs_ticket")))
+                    self.r2_queue_item(item, packet)
+                    # RT-19: every delete of a request takes its hold record
+                    self.c.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (key, hold_key(key)))
+            except C.BindingMismatch as error:
+                self._hold(summary, key, value, raw, "permanent", str(error))           # check 5: NEG-14
+                continue
+            except C.ContractError as error:
+                self._drop_request(summary, key, str(error))
+                continue
+            summary["admitted"].append(item["id"])
+
+    def _hold(self, summary, key, value, raw, kind, reason):
+        if write_hold(self.c, key, value, raw, kind, reason):
+            summary["held"].append((key, reason))
+        else:                                    # RT-20: changed since this tick read it; re-evaluated next tick
+            summary["conflicts"].append((key, "hold", "the request or its hold changed during the tick"))
+
+    def _drop_request(self, summary, key, reason):
+        summary["refused"].append((key, "admission: %s" % reason))
+        with self.c.tx():                        # RT-19: every delete of a request takes its hold record
+            self.c.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (key, hold_key(key)))
 
     def r2_packet(self, req, obs, base):
         """R2 (option A): core's packet for (repo, pr, H) against B_r = `base`, built from core's own clone through the

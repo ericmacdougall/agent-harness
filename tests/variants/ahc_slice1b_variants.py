@@ -511,8 +511,9 @@ ENTRIES.update({
         "tests": [ST + "test_ac4_admission_is_refused_when_the_head_moved",
                   ST + "test_ac4_a_held_request_is_admitted_through_one_observation"],
         "mutations": [("admission ignores a moved head", [
-            ('            if obs["pr_head"] == req["head"] and obs["pr_state"] == "OPEN":\n',
-             '            if obs["pr_state"] == "OPEN":\n')], SHADOW)]},
+            # anchor follows goodqa#16262: the guard is the negated form that drops the request
+            ('            if obs["pr_head"] != req["head"] or obs["pr_state"] != "OPEN":\n',
+             '            if obs["pr_state"] != "OPEN":\n')], SHADOW)]},
     "AC-4 named crash points": {
         "tests": ["tests.test_ahc_crash.NamedPointTests."
                   "test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants"],
@@ -834,8 +835,9 @@ ENTRIES.update({
                 ('            summary["scheduled"] = ReviewScheduler(self.c, self.review.launch_row, slots=self.review.slots).tick(tag)\n',
                  '            summary["scheduled"] = {"offered": [], "started": [], "refused": []}\n')], SHADOW),
             ("admission keeps the owner's packet sha", [
-                ('                                                 packet["sha256"], event_id=event_id(obs["id"], key, "W1"))\n',
-                 '                                                 req["packet_sha256"], event_id=event_id(obs["id"], key, "W1"))\n')],
+                # anchor follows goodqa#16262: admit_item runs in admit_requests' own transaction
+                ('                                             packet["sha256"], event_id=event_id(obs["id"], key, "W1"),\n',
+                 '                                             req["packet_sha256"], event_id=event_id(obs["id"], key, "W1"),\n')],
              SHADOW),
             ("the tick never settles completion signals", [
                 ('            summary["review"] = self.review.settle()\n',
@@ -1328,6 +1330,72 @@ ENTRIES.update({
                  '                pass\n')], SHADOW)]},
 })
 
+
+# goodqa#16262 d5 AC-3: the variants the criterion names, each of which must fail a named test.
+W1C = "tests.test_ahc_runner.W1CheckTests."
+CB = "tests.test_ahc_contracts.LineageBindingTests."
+RF = "tests.test_ahc_observe.RefsTests."
+BIND_BLOCK = (
+    '            if ticket is not None:\n'
+    '                lineage = self.lineage_of(repo, pr)\n'
+    '                self.db.execute("INSERT OR IGNORE INTO lineage_tickets(lineage, repo, pr, project, number, bound_at, "\n'
+    '                                "event_id) VALUES (?,?,?,?,?,?,?)",\n'
+    '                                (lineage, repo, int(pr), ticket[0], ticket[1], now, event_id))\n'
+    '                stored = tuple(self.db.execute("SELECT project, number FROM lineage_tickets WHERE lineage=?",\n'
+    '                                               (lineage,)).fetchone())\n'
+    '                if stored != ticket:\n'
+    '                    raise BindingMismatch("lineage bound to %s#%d" % stored)\n')
+WI_INSERT_END = '                             packet_sha256, "pr-gate", 1, now, now, 1 if red_team else 0))\n'
+ENTRIES.update({
+    "goodqa#16262 AC-3 the W1 binding (check 5)": {
+        "tests": [W1C + "test_ac3f_neg14_check5_a_lineage_bound_to_another_ticket_is_held_permanently_with_nothing_written",
+                  CB + "test_rt18_a_mismatch_caught_inside_an_enclosing_transaction_commits_nothing",
+                  CB + "test_ac3g_a_successor_writes_no_row_and_inherits_the_binding"],
+        "mutations": [
+            ("a plain INSERT on lineage_tickets (an IntegrityError escapes the tick)", [
+                ('self.db.execute("INSERT OR IGNORE INTO lineage_tickets(',
+                 'self.db.execute("INSERT INTO lineage_tickets(')], CONTRACTS),
+            ("the binding is written after the work_items INSERT", [
+                (BIND_BLOCK, ''),
+                (WI_INSERT_END, WI_INSERT_END + BIND_BLOCK)], CONTRACTS),
+            ("a successor writes a binding row", [
+                ('                               red_team=bool(item["red_team"]))\n        return succ["id"]\n',
+                 '                               red_team=bool(item["red_team"]), ticket=("goodqa", int(item["pr"])))\n'
+                 '        return succ["id"]\n')], CONTRACTS)]},
+    "goodqa#16262 AC-3 the W1 checks and holds": {
+        "tests": [W1C + "test_ac3b_check1_a_refs_problem_is_a_permanent_hold_until_a_new_head",
+                  W1C + "test_ac3c_check3_no_attached_spec_is_retryable_then_the_attach_admits_at_the_same_head",
+                  W1C + "test_ac3d_neg15_check2_request_ticket_is_parsed_strictly_and_names_the_required_form",
+                  RF + "test_w1_with_a_refs_problem_skips_the_reader_and_is_not_refused",
+                  RF + "test_a_live_item_calls_the_reader_with_its_lineage_binding_and_never_parses_refs",
+                  "tests.test_ahc_runner.ShadowTickTests."
+                  "test_16262_ac3e_a_same_head_resubmit_for_a_live_item_is_consumed_before_any_observation"],
+        "mutations": [
+            ("the binding takes the request's ticket and check 2 is skipped", [
+                ('                                             ticket=C.parse_ticket_text(obs.get("refs_ticket")))\n',
+                 '                                             ticket=C.parse_request_ticket(req.get("ticket")))\n'),
+                ('    if C.parse_request_ticket(req.get("ticket")) != refs:',
+                 '    if False:')], SHADOW),
+            ("a live item's reader call re-parses Refs", [
+                ('            ticket = self.c.lineage_ticket(item)\n',
+                 '            ticket = parse_refs(messages, shas)[0]\n')], OBSERVE),
+            ("a Refs failure refuses the observation", [
+                ('            refs_ticket, refs_problem = parse_refs(messages, shas)\n',
+                 '            refs_ticket, refs_problem = parse_refs(messages, shas)\n'
+                 '            if refs_problem:\n                raise ObservationRefused(refs_problem)\n')], OBSERVE),
+            ("a held request is deleted", [
+                ('            summary["held"].append((key, reason))\n',
+                 '            summary["held"].append((key, reason))\n'
+                 '            self.c.db.execute("DELETE FROM contract_meta WHERE k=?", (key,))\n')], SHADOW),
+            ("a retryable hold is never retried", [
+                ('                if hold.get("kind") != "retryable" or seq < int(hold.get("next_tick") or 0):\n',
+                 '                if True:\n')], SHADOW),
+            ("the request is observed before the duplicate lookup", [
+                ("            # admit_item's own live-item predicate; admit_item's live return stays as the in-transaction recheck.\n",
+                 "            # admit_item's own live-item predicate; admit_item's live return stays as the in-transaction recheck.\n"
+                 '            self._observe(summary, req["repo"], req["pr"], base=req.get("base"), head=req["head"])\n')],
+             SHADOW)]},
+})
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

@@ -171,6 +171,16 @@ def ticket_text(ticket):
     return "%s#%d" % (project, number)
 
 
+REQUEST_TICKET = re.compile(r"GoodQA ([a-z0-9-]+)#([1-9][0-9]{0,8})")
+
+
+def parse_request_ticket(value):
+    """goodqa#16262 d5: the request's ticket, `GoodQA project#N` matched in full after intake's looser TICKET_RE, as
+    the canonical pair; anything else (`GoodQA #5`, `GoodQA GoodQA#5`, a leading zero, `good_qa`) is None."""
+    m = REQUEST_TICKET.fullmatch(value) if isinstance(value, str) else None
+    return (m.group(1), int(m.group(2))) if m else None
+
+
 def parse_ticket_text(value):
     """The canonical ticket of a `project#N` string matched in full, or None (anything else is unparseable)."""
     m = TICKET_TEXT.fullmatch(value) if isinstance(value, str) else None

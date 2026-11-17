@@ -5521,6 +5521,7 @@ class _ShadowFixture(TC.Base):
         self.S = ahc_shadow
         self.config = {"shadow_repos": ["o/r"]}
         self.changes = {}
+        self.admission = {}             # goodqa#16262: overrides of the W1 observation (Refs, spec ticket, core)
 
     def eligible(self, item):
         f = dict(pr=item["pr"], pr_head=item["head"], pr_state="OPEN", tip=item["base"], draft=False,
@@ -5537,8 +5538,14 @@ class _ShadowFixture(TC.Base):
 
     def facts(self, repo, pr, item):
         if item is None:                                   # admission: the PR at the requested head
-            return dict(pr=pr, pr_head=self.changes.get("pr_head", TC.H1), pr_state="OPEN", tip=TC.BASE,
-                        policy={"revision": TC.POLICY}, attached_core=TC.CORE1, spec_core_text=TC.SPEC1)
+            if self.admission.get("refuse"):
+                import ahc_observe  # noqa: PLC0415
+                raise ahc_observe.ObservationRefused("the GoodQA reader failed (transport)")
+            f = dict(pr=pr, pr_head=self.changes.get("pr_head", TC.H1), pr_state="OPEN", tip=TC.BASE,
+                     policy={"revision": TC.POLICY}, attached_core=TC.CORE1, spec_core_text=TC.SPEC1,
+                     refs_ticket="goodqa#5", refs_problem=None, spec_ticket="goodqa#5")
+            f.update({k: v for k, v in self.admission.items() if k != "refuse"})
+            return f
         return self.eligible(self.c._row("work_items", "id", item))
 
     def shadow_tick(self, contracts=None):
@@ -5696,6 +5703,146 @@ class HoldRecordTests(_ShadowFixture):
         self.assertEqual(self.hold(key)["reason"], "first")
 
 
+class W1CheckTests(_ShadowFixture):
+    """goodqa#16262 d5 RULED-4 checks 1-5 at W1 (AC-3, NEG-3, NEG-14, NEG-15, RT-21). Check 1 comes from the producer
+    (refs_problem); checks 2-4 run in admit_requests against the observation, before the R2 packet; check 5 is
+    admit_item's binding. A failed check holds the request (never deletes it) and writes no item, review, binding
+    or R2 row. A reader failure is not a hold (RULED-2)."""
+
+    REQ = {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE, "packet_sha256": TC.PKT, "owner": "agent-x",
+           "ticket": "GoodQA goodqa#5"}
+
+    def queue(self, **change):
+        return self.S.queue_request(self.c, dict(self.REQ, **change))
+
+    def tick(self):
+        return self.shadow_tick()[0].tick()
+
+    def count(self, table):
+        return self.db.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
+
+    def hold(self, key):
+        row = self.db.execute("SELECT v FROM contract_meta WHERE k=?", (self.S.hold_key(key),)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def request(self, key):
+        row = self.db.execute("SELECT v FROM contract_meta WHERE k=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def binding(self):
+        row = self.db.execute("SELECT project, number FROM lineage_tickets WHERE lineage=?",
+                              (C.Contracts.lineage_of("o/r", 5),)).fetchone()
+        return tuple(row) if row else None
+
+    def assert_held(self, key, kind, needle, summary):
+        hold = self.hold(key)
+        self.assertIsNotNone(hold, summary)
+        self.assertEqual(hold["kind"], kind, hold)
+        self.assertIn(needle, hold["reason"])
+        self.assertIn((key, hold["reason"]), summary["held"])
+        self.assertIsNotNone(self.request(key), "a held request is kept")
+        self.assertEqual((self.count("work_items"), self.count("reviews"), self.binding()), (0, 0, None),
+                         "a hold writes no item, review row or binding")
+
+    def test_ac3a_all_checks_pass_admits_and_binds_the_refs_ticket(self):
+        key = self.queue()
+        summary = self.tick()
+        self.assertEqual(len(summary["admitted"]), 1, summary)
+        self.assertEqual(self.binding(), ("goodqa", 5))
+        self.assertEqual((self.request(key), self.hold(key)), (None, None))
+
+    def test_ac3b_check1_a_refs_problem_is_a_permanent_hold_until_a_new_head(self):
+        self.admission.update(refs_ticket=None, refs_problem="refs: the commits name goodqa#5, goodqa#6")
+        key = self.queue()
+        self.assert_held(key, "permanent", "refs: the commits name goodqa#5, goodqa#6", self.tick())
+        for _ in range(3):
+            self.assertIn(key, [k for k, _r in self.tick()["held"]], "a permanent hold is not re-evaluated")
+        self.admission.clear()
+        self.changes["pr_head"] = TC.H2
+        self.queue(head=TC.H2)
+        self.assertIsNone(self.request(key), "the new head replaced the held request")
+        self.assertEqual(len(self.tick()["admitted"]), 1)
+
+    def test_an_observation_without_a_refs_ticket_fails_closed(self):
+        self.admission.update(refs_ticket=None, refs_problem=None)
+        key = self.queue()
+        self.assert_held(key, "retryable", "Refs", self.tick())
+
+    def test_ac3d_neg15_check2_request_ticket_is_parsed_strictly_and_names_the_required_form(self):
+        for bad in ("GoodQA GoodQA#5", "GoodQA goodqa#05", "GoodQA #5", "GoodQA good_qa#5", "GoodQA otherproj#5",
+                    "GoodQA goodqa#6", "goodqa#5", None):
+            with self.subTest(ticket=bad):
+                self.db.execute("DELETE FROM contract_meta WHERE k LIKE 'shadow_%'")
+                key = self.queue(ticket=bad)
+                summary = self.tick()
+                self.assert_held(key, "retryable", "is not goodqa#5", summary)
+                self.assertIn("GoodQA goodqa#5", self.hold(key)["reason"], "RT-21: the reason names the form")
+        self.queue(ticket="GoodQA goodqa#5")                  # the same-head resubmit with the right ticket
+        self.assertEqual(len(self.tick()["admitted"]), 1)
+        self.assertEqual(self.binding(), ("goodqa", 5))
+
+    def test_ac3c_check3_no_attached_spec_is_retryable_then_the_attach_admits_at_the_same_head(self):
+        self.admission.update(attached_core=None, spec_core_text=None, spec_ticket=None)
+        key = self.queue()
+        self.assert_held(key, "retryable", "no attached spec on goodqa#5", self.tick())
+        self.admission.clear()
+        admitted = []
+        for _ in range(4):
+            admitted += self.tick()["admitted"]
+        self.assertEqual(len(admitted), 1, "re-evaluated after the backoff and admitted at the same H")
+
+    def test_check3_a_malformed_core_is_held_and_leaves_no_partial_item(self):
+        for core in ("A" * 64, "z" * 64, "1" * 63, ""):
+            with self.subTest(core=core):
+                self.db.execute("DELETE FROM contract_meta WHERE k LIKE 'shadow_%'")
+                self.admission.update(attached_core=core, spec_core_text=None)
+                key = self.queue()
+                self.assert_held(key, "retryable", "no attached spec on goodqa#5", self.tick())
+
+    def test_check4_a_spec_record_naming_another_ticket_is_retryable(self):
+        for spec, needle in (("goodqa#6", "spec record names goodqa#6"), (None, "spec record names")):
+            with self.subTest(spec=spec):
+                self.db.execute("DELETE FROM contract_meta WHERE k LIKE 'shadow_%'")
+                self.admission.update(spec_ticket=spec)
+                key = self.queue()
+                self.assert_held(key, "retryable", needle, self.tick())
+
+    def test_ac3f_neg14_check5_a_lineage_bound_to_another_ticket_is_held_permanently_with_nothing_written(self):
+        self.db.execute("INSERT INTO lineage_tickets(lineage, repo, pr, project, number, bound_at, event_id) "
+                        "VALUES (?, 'o/r', 5, 'goodqa', 7, 0, 'earlier-w1')", (C.Contracts.lineage_of("o/r", 5),))
+        key = self.queue()
+        try:
+            summary = self.tick()
+        except Exception as error:  # noqa: BLE001 - no IntegrityError from lineage_tickets reaches the tick (RT-18)
+            self.fail("the tick raised %r" % error)
+        hold = self.hold(key)
+        self.assertEqual((hold["kind"], hold["reason"]), ("permanent", "lineage bound to goodqa#7"), summary)
+        self.assertIsNotNone(self.request(key))
+        self.assertEqual((self.count("work_items"), self.count("reviews"), self.binding()), (0, 0, ("goodqa", 7)))
+        self.assertIn(key, [k for k, _r in self.tick()["held"]], "the next tick still completes and holds it")
+
+    def test_ac3f_a_resubmit_whose_refs_match_the_binding_reuses_the_row(self):
+        self.db.execute("INSERT INTO lineage_tickets(lineage, repo, pr, project, number, bound_at, event_id) "
+                        "VALUES (?, 'o/r', 5, 'goodqa', 5, 0, 'earlier-w1')", (C.Contracts.lineage_of("o/r", 5),))
+        self.queue()
+        self.assertEqual(len(self.tick()["admitted"]), 1)
+        self.assertEqual(self.db.execute("SELECT event_id FROM lineage_tickets").fetchall(), [("earlier-w1",)])
+
+    def test_ruled2_a_reader_failure_is_not_a_hold_and_leaves_a_due_hold_unchanged(self):
+        key = self.queue()
+        self.admission["refuse"] = True
+        self.tick()
+        self.assertEqual((self.hold(key), self.count("work_items")), (None, 0), "no hold on a reader failure")
+        self.admission.pop("refuse")
+        self.admission["spec_ticket"] = "goodqa#6"
+        self.tick()                                            # a retryable hold, count 1, due next tick
+        before = self.hold(key)
+        self.admission["refuse"] = True
+        self.tick()
+        self.assertEqual(self.hold(key), before, "a refused observation does not touch the hold")
+        self.assertIsNotNone(self.request(key))
+
+
 class ShadowTickTests(_ShadowFixture):
     """AC-4: admit, observe, select (T7) and move each item at most once per tick; event id f(obs, item, row)."""
 
@@ -5706,7 +5853,7 @@ class ShadowTickTests(_ShadowFixture):
 
     def test_ac4_a_held_request_is_admitted_through_one_observation(self):
         key = self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
-                                            "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+                                            "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "GoodQA goodqa#5"})
         tick, producer = self.shadow_tick()
         summary = tick.tick()
         self.assertEqual(len(summary["admitted"]), 1)
@@ -5740,7 +5887,7 @@ class ShadowTickTests(_ShadowFixture):
             t.load_packet = store.get          # as the runner wires it (load_r2_packet)
             return t.tick()
         self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
-                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "GoodQA goodqa#5"})
         first = tick()
         (iid,) = first["admitted"]
         for rid, kind, version in self.db.execute("SELECT id, kind, version FROM reviews WHERE item=? ORDER BY id",
@@ -5808,7 +5955,7 @@ class ShadowTickTests(_ShadowFixture):
 
     def test_ac4_admission_is_refused_when_the_head_moved(self):
         self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
-                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
+                                      "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "GoodQA goodqa#5"})
         self.changes["pr_head"] = TC.H2
         summary = self.shadow_tick()[0].tick()
         self.assertEqual(summary["admitted"], [])
@@ -5932,7 +6079,7 @@ class ShadowIntegratedTests(Base):
         self.git = TO.Repo(self.home / "shadow-clone")
         self.base = self.git.commit({"README": "r\n"}, "base")
         # goodqa#16262 d5: PR commits carry the canonical Refs line, so W1 calls the reader (check 1)
-        self.head = self.git.commit({"src/b.py": "b\n"}, "pr change\n\nRefs: GoodQA #9", parent=self.base)
+        self.head = self.git.commit({"src/b.py": "b\n"}, "pr change\n\nRefs: GoodQA #16049", parent=self.base)
         self.gh = TO.FakeGh()
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(self.head, number=9, repo=SHADOW_REPO, changed=1))
@@ -5945,7 +6092,8 @@ class ShadowIntegratedTests(Base):
                             "required_checks": {"contexts": ["test"], "app": "github-actions"}},
                  "kill_switch": False, "kill_epoch": 1, "chk_cas": True, "canary": None}
         self.deps = ShadowDeps(self.gh, self.git.root, local, {"attached_core": TC.CORE1, "open_findings": 0,
-                                                               "mirror_ok": True, "spec_core_text": TC.SPEC1})
+                                                               "mirror_ok": True, "spec_core_text": TC.SPEC1,
+                                                               "spec_ticket": "goodqa#16049"})
 
     def submit_shadow(self):
         req = {"repo": SHADOW_REPO, "pr": 9, "head": self.head, "base": self.base, "packet": str(self.packet),
@@ -6030,7 +6178,7 @@ class ReviewTickTests(ShadowIntegratedTests):
                 self.addCleanup(state["inbox"].close)
             return ahc_review.ReviewStage(contracts, launcher, state["inbox"], sandbox_repo=SHADOW_REPO)
         deps.review_stage = review_stage
-        self.head2 = self.git.commit({"src/c.py": "c\n"}, "second change\n\nRefs: GoodQA #9", parent=self.base)
+        self.head2 = self.git.commit({"src/c.py": "c\n"}, "second change\n\nRefs: GoodQA #16049", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/10", TO.pull_json(self.head2, number=10, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % self.head2,
@@ -6191,7 +6339,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assert_carries_the_core(self.stored_packet(a))
         fields = self.ledger_rows("SELECT fields FROM observations")
         self.assertTrue(fields and not any("never 3" in f for (f,) in fields), "the text is never persisted")
-        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #9", parent=self.base)
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #16049", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
@@ -6285,7 +6433,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         """PR 272 F6: the PR's head moves (W4) while the attempt for H runs. In the same tick the review stage
         stops the old unit and settles its row to superseded (R15); the successor's row is offered after."""
         a, iid, unit = self.launched()
-        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #9", parent=self.base)
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #16049", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
@@ -6303,7 +6451,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         request's hold record goes with it (no orphaned `shadow_hold:` key)."""
         import ahc_shadow  # noqa: PLC0415
         self.launched()
-        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #9", parent=self.base)
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #16049", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,

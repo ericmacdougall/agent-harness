@@ -2487,11 +2487,13 @@ class LineageBindingTests(Base):
         item = self.admit(H1, ("goodqa", 5))
         self.cancel(item)
         before = self.counts()
+        raised = []
         with self.c.tx():
             try:
                 self.admit(H2, ("goodqa", 6))
-            except C.ContractError:
-                pass
+            except Exception as error:  # noqa: BLE001 - asserted below: only a ContractError, never IntegrityError
+                raised.append(error)
+        self.assertEqual([type(e) for e in raised], [C.BindingMismatch], "only BindingMismatch reaches the caller")
         self.assertEqual(self.counts(), before)
 
     def test_a_call_without_a_ticket_writes_no_row_and_leaves_a_binding_alone(self):
@@ -2502,6 +2504,18 @@ class LineageBindingTests(Base):
         succ = self.admit(H2)                                # a successor's call (W4, W24, W21) passes no ticket
         self.assertEqual(succ["lineage"], item["lineage"])
         self.assertEqual(self.bound(item["lineage"]), [("goodqa", 5)])
+
+    def test_ac3g_a_successor_writes_no_row_and_inherits_the_binding(self):
+        """d5 AC-3 (g): W4, W24 and W21 build their successor through _wi_successor, which passes no ticket."""
+        unbound = self.admit(H1, pr=7)                       # NEG-12: a lineage admitted before the binding
+        succ = self.c._wi_successor(unbound, H2, PKT, self.ev())
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM lineage_tickets").fetchone()[0], 0,
+                         "a successor of an unbound lineage writes no row")
+        self.assertIsNone(self.c.lineage_ticket(succ))
+        bound = self.admit(H1, ("goodqa", 5))
+        succ = self.c._wi_successor(bound, H2, PKT, self.ev())
+        self.assertEqual(self.c.lineage_ticket(succ), ("goodqa", 5), "the successor inherits the binding")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM lineage_tickets").fetchone()[0], 1)
 
     def test_a_ticket_must_be_a_canonical_pair(self):
         for bad in (("GoodQA", 5), ("goodqa", 0), ("goodqa", "5"), ("goodqa", True), "goodqa#5", ("goodqa", 5, 1)):
