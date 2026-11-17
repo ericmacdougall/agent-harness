@@ -1284,9 +1284,6 @@ def main(argv):
     return 1 if bad or not reports else 0
 
 
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
-
 RTR = "tests.test_ahc_runner.ReviewTickTests.test_r273_"
 ENTRIES.update({
     "PR 273 receipt F3 the packet carries the attached core's criteria and text": {
@@ -1316,8 +1313,12 @@ ENTRIES.update({
     "PR 273 receipt F2 rows required after admission are queued by the tick": {
         "tests": [RTR + "f2_a_w16_extension_round_is_queued_and_launched_by_the_next_tick",
                   RTR + "f2_an_altered_or_missing_stored_packet_keeps_the_row_required_and_says_so",
-                  STT + "test_r273_f2_w27_replacement_code_rows_are_queued_and_offered_by_the_real_scheduler"],
+                  STT + "test_r273_f2_w27_replacement_code_rows_are_queued_and_offered_by_the_real_scheduler",
+                  RT + "test_r273_f2_a_stored_packet_rereads_the_lint_core_found_not_one_planted_in_the_spec_or_owner_text"],
         "mutations": [
+            ("the stored packet's lint is read from the first lint heading (a planted one in the spec)", [
+                ('    at = text.rfind(marker, 0, owner) if owner >= 0 else -1\n',
+                 '    at = text.find(marker) if owner >= 0 else -1\n')], REVIEW_PY),
             ("the tick never runs the R2 pass for later rows", [
                 ('        self.r2_required(summary)\n', '        pass\n')], SHADOW),
             ("the stored packet is queued without checking its hash", [
@@ -1326,3 +1327,7 @@ ENTRIES.update({
                 ('                summary["refused"].append((rid, "R2 for a later round: %s" % str(error)[:200]))\n',
                  '                pass\n')], SHADOW)]},
 })
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
