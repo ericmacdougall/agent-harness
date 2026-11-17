@@ -256,7 +256,13 @@ class MergePolicy(Base):
                               # red-team r2 N3: short and long spellings are one flag
                               ("gh pr merge 5 --merge -d --delete-branch=false --match-head-commit {HEAD}",
                                "--delete-branch"),
-                              ("gh pr merge 5 -m --merge=false -d --match-head-commit {HEAD}", "--merge or --rebase")):
+                              ("gh pr merge 5 -m --merge=false -d --match-head-commit {HEAD}", "--merge or --rebase"),
+                              # NEG-35 / Codex r4 F2: API merges cannot delete the branch
+                              ("gh api -X PUT repos/o/r/pulls/5/merge -f sha={HEAD} -f merge_method=merge",
+                               "cannot delete the branch"),
+                              ("gh api graphql -f query={SQ}mutation { mergePullRequest(input:{pullRequestId:"
+                               "\"PR_kwDOabc\", expectedHeadOid:\"{HEAD}\", mergeMethod: MERGE}) { clientMutationId "
+                               "} }{SQ}", "cannot delete the branch")):
             for waived in (False, True):
                 with self.subTest(command=command, waived=waived):
                     if waived:

@@ -179,6 +179,10 @@ def merge_command(pr, repo, head, method="merge"):
 
 
 SQUASH_REFUSAL = "squash merges are disabled (they drop the branch's own commits); merge with --merge or --rebase"
+# Codex r4 F2: neither the REST merge endpoint nor GraphQL mergePullRequest/enablePullRequestAutoMerge can delete the
+# branch, so they are refused outright and the block prints the one gh command that does
+API_MERGE_REFUSAL = ("direct REST and GraphQL merges are refused (they cannot delete the branch); merge with the "
+                     "gh pr merge command below")
 
 
 def _pr_merge_policy(flags):
@@ -1547,6 +1551,8 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
             soft.append("GitHub CI is switched off for this repository, so no check ran on this head; the merge needs "
                         "an exact-head waiver or a PR review authorization (peer_review.py pr --github-repo --pr)")
         hard.extend(merge.policy)  # goodqa#16374 AC-5: nothing lifts these
+        if merge.kind in ("rest", "graphql"):
+            hard.append(API_MERGE_REFUSAL)
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1566,7 +1572,7 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     reasons = [clean(r, 300) for r in (hard + soft)][:MAX_REASONS]
     where = f" of {clean(info['repo'])}#{info['pr']} (head {info['head'][:12]})" if info["head"] else ""
     text = f"merge-gate: BLOCKED merge{where}.\n" + "\n".join("  - " + r for r in reasons)
-    if merge.policy or merge.kind == "pr_merge":
+    if merge.policy or merge.kind in ("pr_merge", "rest", "graphql"):
         text += "\nThe merge command: " + merge_command(info["pr"] or merge.number or "<n>",
                                                         clean(info["repo"] or merge.slug or "owner/repo"),
                                                         info["head"] or "<full head sha>")
