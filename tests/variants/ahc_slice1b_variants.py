@@ -195,8 +195,8 @@ ENTRIES.update({
     "AC-9/NEG-25 scheduler skips finished items": {
         "tests": [SM + "test_b_scheduler_skips_rows_of_a_finished_item"],
         "mutations": [("the scheduler offers rows of finished items", [
-            ('            % ",".join("?" * len(held)), held).fetchall()\n',
-             '            % "?", ("none",)).fetchall()\n')], CONTRACTS)]},
+            ('            % (",".join("?" * len(held)), ",".join("?" * len(self.LIVE_INTENT))), held + self.LIVE_INTENT).fetchall()\n',
+             '            % ("?", ",".join("?" * len(self.LIVE_INTENT))), ("none",) + self.LIVE_INTENT).fetchall()\n')], CONTRACTS)]},
     "AC-9 status shows inert rows": {
         "tests": [SM + "test_b_status_and_digest_show_inert_rows"],
         "mutations": [("status shows the row's own state", [
@@ -683,8 +683,8 @@ ENTRIES.update({
                 ('            self.charge_b33(lineage)\n            self._a0("launch_intent", iid, None, "open",',
                  '            self._a0("launch_intent", iid, None, "open",')], CONTRACTS),
             ("the bound argv carries --author-harness", [
-                ('        "--expected-head", row["head"], "--base", base,\n',
-                 '        "--expected-head", row["head"], "--base", base, "--author-harness", "claude",\n')], REVIEW_PY)]},
+                ('        "--expected-head", row["head"], "--snapshot-base", base, "--base", base,\n',
+                 '        "--expected-head", row["head"], "--snapshot-base", base, "--base", base, "--author-harness", "claude",\n')], REVIEW_PY)]},
     "AC-8 R3 runner and isolation": {
         "tests": [RT + "test_r03_without_isolation_the_row_goes_to_infra_wait_and_no_runner_comes_from_config",
                   RT + "test_r03_rc_is_allowed_only_for_the_sandbox_repo"],
@@ -703,13 +703,13 @@ ENTRIES.update({
         "tests": [RT + "test_neg22_a_failed_start_attempt_stops_the_unit_and_keeps_the_charge_until_b33_is_spent"],
         "mutations": [
             ("the unit is not stopped", [
-                ('    try:\n        runner.stop(unit)\n    except ahc_guard.LaunchRefused:\n        return False\n'
-                 '    return unit_inactive(',
-                 '    try:\n        pass\n    except ahc_guard.LaunchRefused:\n        return False\n'
-                 '    return unit_inactive(')], REVIEW_PY),
+                ('    try:\n        runner.stop(unit)\n    except ahc_guard.LaunchRefused:\n        return None\n'
+                 '    return observed_inactive(',
+                 '    try:\n        pass\n    except ahc_guard.LaunchRefused:\n        return None\n'
+                 '    return observed_inactive(')], REVIEW_PY),
             ("the charge is refunded", [
-                ('            self.c.intent_move(intent["id"], ("open",), "closed", why)\n            return "refused", why\n',
-                 '            self.c.intent_move(intent["id"], ("open",), "closed", why)\n'
+                ('        if self.retire(intent["id"]):\n            return "refused", why\n',
+                 '        if self.retire(intent["id"]):\n'
                  '            self.c.db.execute("UPDATE lineage_budget SET b33_used = b33_used - 1")\n'
                  '            return "refused", why\n')], REVIEW_PY),
             ("B33 is not checked at intent", [
@@ -721,10 +721,12 @@ ENTRIES.update({
                   "tests.test_ahc_crash.NamedPointTests.test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants"],
         "mutations": [
             ("the orphan is not stopped", [
-                ('        if self.stop(out, unit, "orphan of intent %s" % intent["id"]):\n', '        if True:\n')], REVIEW_PY),
+                ('        self.retire(out, intent["id"], "unit of intent %s" % intent["id"])\n',
+                 '        self.c.intent_retire(intent["id"], "inactive", "not stopped")\n'
+                 '        out["orphaned"].append(intent["id"])\n')], REVIEW_PY),
             ("a second unit starts while one may be live", [
-                ('            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN (\'open\', \'started\')",\n',
-                 '            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND 0 AND state IN (\'open\', \'started\')",\n')],
+                ('            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN (%s)"\n',
+                 '            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND 0 AND state IN (%s)"\n')],
              CONTRACTS),
             ("startup reconciliation is skipped", [
                 ('            units = self.runner.list_units()\n', '            units = []\n')], REVIEW_PY)]},
@@ -742,10 +744,10 @@ ENTRIES.update({
                 ('        "--unit=" + unit, "--slice=" + ahc_guard.REVIEW_SLICE, "--collect",',
                  '        "--unit=" + unit, "--collect",')], REVIEW_PY),
             ("an unconfirmed stop is not bounded", [
-                ('        if contracts._mono() - start >= bound:\n            return False\n        sleep(1.0)\n'
-                 '    return False\n',
-                 '        if contracts._mono() - start >= bound:\n            return True\n        sleep(1.0)\n'
-                 '    return True\n')], REVIEW_PY)]},
+                ('        if contracts._mono() - start >= bound:\n            return None\n        sleep(1.0)\n'
+                 '    return None\n',
+                 '        if contracts._mono() - start >= bound:\n            return "inactive"\n        sleep(1.0)\n'
+                 '    return "inactive"\n')], REVIEW_PY)]},
     "AC-8 R4 peer uid": {
         "tests": [RT + "test_r04_the_peer_uid_comes_from_a_real_socketpair"],
         "mutations": [
@@ -868,11 +870,11 @@ ENTRIES.update({
                   RT + "test_r03_the_intent_binds_the_full_command_line_and_charges_b33_once"],
         "mutations": [
             ("a unit that ended is waited on", [
-                ('        return props is not None and props.get("ActiveState") in ("inactive", "failed")\n',
+                ('        return state in C.Contracts.CONFIRMED_INACTIVE or (state == "active" and props.get("SubState") == "exited")\n',
                  '        return False\n')], REVIEW_PY),
             ("a silent unit is waited on forever", [
-                ('            if not ended and now - started <= REVIEW_MAX + SETTLE_GRACE:\n',
-                 '            if not ended:\n')], REVIEW_PY),
+                ('                    if not ended and now - li["updated"] <= REVIEW_MAX + SETTLE_GRACE:\n',
+                 '                    if not ended:\n')], REVIEW_PY),
             ("the report directory is not granted to the unit's uid", [
                 ('                self.runner.grant_output(attempt["out_dir"], uid)\n', '                pass\n')],
              REVIEW_PY),
@@ -957,48 +959,51 @@ ENTRIES.update({
                 ("            if intent is not None:\n                li = self._row(\"launch_intents\", \"id\", intent)",
                  "            if False:\n                li = self._row(\"launch_intents\", \"id\", intent)")], CONTRACTS),
             ("reconciliation skips intents whose unit is not listed", [
-                ('                if intent["unit"] not in listed:\n',
+                ('                if li["unit"] not in listed:\n',
                  '                if False:\n')], REVIEW_PY),
             ("reconciliation orphans the listed unit of a bound running row", [
-                ("            if self.bound_running(intent):\n                self.recover_bound(out, intent)\n"
-                 "                return\n", "")], REVIEW_PY),
+                ('        if state == "open":\n            if self.bound_running(intent):\n                self.recover_bound(out, intent)\n'
+                 '                return\n', '        if state == "open":\n')], REVIEW_PY),
             ("reconciliation orphans the absent unit of a bound running row", [
-                ("        if self.bound_running(intent):\n            self.recover_bound(out, intent)\n        elif",
-                 "        if False:\n            pass\n        elif")], REVIEW_PY)]},
+                ('        if intent["state"] == "open":\n            if self.bound_running(intent):\n'
+                 '                self.recover_bound(out, intent)\n                return\n',
+                 '        if intent["state"] == "open":\n')], REVIEW_PY)]},
     "PR 272 F5 an intent closes only on a confirmed stop": {
         "tests": ["tests.test_ahc_contracts.RuntimeTests.test_f5_an_unconfirmed_cleanup_stop_keeps_the_intent_and_no_replacement_unit_starts",
                   "tests.test_ahc_contracts.RuntimeTests.test_f5_reconciliation_stops_an_active_unit_whose_intent_is_closed_or_orphaned"],
         "mutations": [
             ("the launch cleanup closes the intent whatever the stop did", [
-                ("        if self.stop_confirmed(unit):\n            self.c.intent_move(intent[\"id\"], (\"open\",), "
-                 "\"closed\", why)", "        if True:\n            self.c.intent_move(intent[\"id\"], (\"open\",), "
-                 "\"closed\", why)")], REVIEW_PY),
+                ('        if self.retire(intent["id"]):\n            return "refused", why\n',
+                 '        if self.c.intent_retire(intent["id"], "inactive", "unconfirmed"):\n            return "refused", why\n')],
+             REVIEW_PY),
             ("the stop's return value is taken as the confirmation", [
-                ("    try:\n        runner.stop(unit)\n    except ahc_guard.LaunchRefused:\n        return False\n"
-                 "    return unit_inactive(contracts, runner, unit, bound=bound, sleep=sleep)\n",
-                 "    try:\n        return bool(runner.stop(unit))\n    except ahc_guard.LaunchRefused:\n"
-                 "        return False\n")], REVIEW_PY),
-            ("the sweep never retries an abandoned launch", [
-                ("                if self.launcher.stop_confirmed(unit):\n",
-                 "                if False:\n")], REVIEW_PY),
+                ("    try:\n        runner.stop(unit)\n    except ahc_guard.LaunchRefused:\n        return None\n"
+                 "    return observed_inactive(contracts, runner, unit, bound=bound, sleep=sleep)\n",
+                 "    try:\n        return 'inactive' if runner.stop(unit) else None\n    except ahc_guard.LaunchRefused:\n"
+                 "        return None\n")], REVIEW_PY),
+            ("the sweep never retries a stopping intent (an abandoned launch)", [
+                ("            done = self.launcher.retire(iid)\n",
+                 "            done = self.launcher.retire(iid) if state != 'stopping' else None\n")], REVIEW_PY),
             ("reconciliation skips an active unit of a closed or orphaned intent", [
-                ('        if props.get("ActiveState") in ("inactive", "failed"):\n            return\n'
-                 '        self.incident(out, "reconciliation: %s is %s although',
-                 '        if True:\n            return\n'
-                 '        self.incident(out, "reconciliation: %s is %s although')], REVIEW_PY)]},
+                ('            if props.get("ActiveState") in C.Contracts.CONFIRMED_INACTIVE:\n                return\n'
+                 '            self.incident(out, "reconciliation: %s is %s although',
+                 '            if True:\n                return\n'
+                 '            self.incident(out, "reconciliation: %s is %s although')], REVIEW_PY)]},
     "PR 272 F6 cancellation stops the unit and completes R15": {
         "tests": ["tests.test_ahc_runner.ReviewTickTests.test_f6_w20_owner_cancel_stops_the_unit_and_settles_the_row_superseded",
                   "tests.test_ahc_runner.ReviewTickTests.test_f6_w4_head_supersede_stops_the_unit_and_settles_the_row_superseded",
                   "tests.test_ahc_contracts.RuntimeTests.test_f6_a_cancelled_outcome_unknown_row_settles_superseded"],
         "mutations": [
             ("the sweep leaves cancelling rows alone", [
-                ('            if bound and row["state"] == "cancelling":\n',
-                 '            if False:\n'),
+                ('                else:\n                    self.c.intent_move(iid, ("started",), "stopping", "the row is %s" % (',
+                 '                elif row["state"] == "cancelling":\n                    continue\n                else:\n'
+                 '                    self.c.intent_move(iid, ("started",), "stopping", "the row is %s" % ('),
                 ("\"SELECT id, version FROM reviews r WHERE state='cancelling' AND NOT EXISTS",
                  "\"SELECT id, version FROM reviews r WHERE state='never' AND NOT EXISTS")], REVIEW_PY),
             ("a cancellation completes without a confirmed stop", [
-                ("            if not self.launcher.stop_confirmed(unit):   # an ended unit too",
-                 "            if False:   # an ended unit too")], REVIEW_PY),
+                ('    observed = confirm_stopped(contracts, runner, li["unit"], bound=bound, sleep=sleep)\n'
+                 '    if observed is None:\n        return None\n',
+                 '    observed = "inactive"\n')], REVIEW_PY),
             ("an outcome-unknown row cancelled after its intent closed never settles", [
                 ("\"SELECT id, version FROM reviews r WHERE state='cancelling' AND NOT EXISTS",
                  "\"SELECT id, version FROM reviews r WHERE state='never' AND NOT EXISTS")], REVIEW_PY)]},
@@ -1027,6 +1032,55 @@ ENTRIES.update({
                 ("            if used < budget:\n                out.append(self._row(\"reviews\", \"id\", rid))\n",
                  "            if True:\n                out.append(self._row(\"reviews\", \"id\", rid))\n")], CONTRACTS)]},
 })
+
+RX = "tests.test_ahc_contracts.RuntimeTests.test_rescue_"
+ENTRIES.update({
+    "PR 272 rescue F1 the unit lifecycle is a durable state machine": {
+        "tests": [RX + "f1_a_valid_final_never_retires_the_intent_before_its_unit_is_confirmed_stopped",
+                  RX + "f1_a_crash_between_settlement_and_the_stop_leaves_cleanup_that_is_finished",
+                  RX + "f1_remain_after_exit_an_exited_unit_is_given_up_and_still_stopped_before_it_retires",
+                  RX + "f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop",
+                  RX + "f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form"],
+        "mutations": [
+            ("a settled attempt's intent closes before its unit is stopped", [
+                ('            if not self.intent_move(iid, ("started",), "stopping", reason, retire_to="closed"):\n',
+                 '            if not self.db.execute("UPDATE launch_intents SET state=\'closed\' WHERE id=?", (iid,)).rowcount:\n')],
+             CONTRACTS),
+            ("an active (exited) unit counts as a confirmed stop", [
+                ('        if state in C.Contracts.CONFIRMED_INACTIVE:\n            return state\n',
+                 '        if state in C.Contracts.CONFIRMED_INACTIVE or state == "active":\n            return "inactive"\n')],
+             REVIEW_PY),
+            ("RemainAfterExit: an active/exited unit is not ended", [
+                (' or (state == "active" and props.get("SubState") == "exited")\n', '\n')], REVIEW_PY),
+            ("stopping is not a live intent (the guard and the sweep forget it)", [
+                ('    LIVE_INTENT = ("open", "started", "stopping")\n', '    LIVE_INTENT = ("open", "started")\n')],
+             CONTRACTS),
+            ("intent_move takes a terminal target", [
+                ('        if to in self.TERMINAL_INTENT or any(', '        if any(')], CONTRACTS),
+            ("intent_retire accepts an unconfirmed observation", [
+                ('        if observed not in self.CONFIRMED_INACTIVE:\n            raise ContractError(',
+                 '        if False:\n            raise ContractError(')], CONTRACTS),
+            ("reconciliation leaves a stopping intent alone", [
+                ('        state = intent["state"]\n        if state == "started":\n',
+                 '        state = intent["state"]\n        if state in ("started", "stopping"):\n')], REVIEW_PY)]},
+    "PR 272 rescue F2 the bound argv carries --snapshot-base B_r": {
+        "tests": [RX + "f2_the_r3_command_line_names_b_r_as_the_snapshot_base_inside_the_digest",
+                  "tests.test_ahc_contracts.R3SnapshotBaseTests.test_rescue_f2_the_real_helper_reviews_b_r_to_h_when_b_r_is_not_h_first_parent",
+                  "tests.test_ahc_contracts.RuntimeTests.test_r03_the_intent_binds_the_full_command_line_and_charges_b33_once"],
+        "mutations": [
+            ("no --snapshot-base (peer_review snapshots H^1..H)", [
+                ('"--snapshot-base", base, "--base", base,\n', '"--base", base,\n')], REVIEW_PY),
+            ("--snapshot-base names H, not B_r", [
+                ('"--snapshot-base", base, "--base", base,\n', '"--snapshot-base", row["head"], "--base", base,\n')],
+             REVIEW_PY)]},
+    "PR 272 rescue A-1 production fails closed to infra-wait while the wrapper is absent": {
+        "tests": [RX + "a1_every_production_r3_launch_goes_to_infra_wait_while_the_wrapper_is_absent"],
+        "mutations": [
+            ("production builds the runner without the wrapper", [
+                ('        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) and wrapper.is_file() else None\n',
+                 '        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) else None\n')], REVIEW_PY)]},
+})
+
 
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")

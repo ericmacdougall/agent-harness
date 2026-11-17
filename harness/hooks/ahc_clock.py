@@ -222,6 +222,8 @@ NOW_INVENTORY = {
         "stamp:the launch intent's created and updated time (AC-8)"),
     ('ahc_contracts', 'Contracts.intent_move', 'self.now'): (1,
         "stamp:the launch intent's updated time (AC-8)"),
+    ('ahc_contracts', 'Contracts.intent_retire', 'self.now'): (1,
+        "stamp:the launch intent's updated time when a confirmed stop retires it (AC-8, PR 272 rescue F1)"),
     ('ahc_contracts', 'Contracts.block_row', 'self.now'): (1,
         "stamp:the time startup reconciliation blocked a row (AC-8, NEG-49)"),
     ('ahc_contracts', 'Contracts._w21_record', 'self.now'): (1,

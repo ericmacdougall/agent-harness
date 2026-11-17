@@ -1303,7 +1303,7 @@ NAMED_POINTS["w21.after_send"] = ("w21_send", check_w21_send)
 
 
 
-def scenario_r3_launch(root, clock):
+def scenario_r3_launch(root, clock, settle=False):
     """AC-8 / NEG-36: one queued review row and one R3 launch through Launcher.for_test. The fake runner records each
     unit it starts in units.txt and each stop in stopped.txt. A restart runs startup reconciliation first (its units
     are the started ones not yet stopped), then launches again unless the row already runs."""
@@ -1339,7 +1339,8 @@ def scenario_r3_launch(root, clock):
             return [u for u in lines(units) if u not in set(lines(stopped))]
 
         def show(self, unit, props):
-            return {"Slice": "ahc-review.slice", "ActiveState": "active" if unit in self.live() else "inactive"}
+            return {"Slice": "ahc-review.slice", "ActiveState": "active" if unit in self.live() else "inactive",
+                    "InvocationID": hashlib.sha256(unit.encode()).hexdigest()[:32]}
 
         def grant_output(self, out_dir, uid):
             pass
@@ -1353,10 +1354,31 @@ def scenario_r3_launch(root, clock):
     policy = ahc_guard.Policy.for_test(root, {"systemd-run": str(stub)}, trusted_dirs=(str(root),))
     fr = FileRunner()
     ahc_review.Reconciler(c, policy, fr, sleep=lambda s: None).run()
+    launcher = ahc_review.Launcher.for_test(c, policy, "/opt/ahc/peer_review.py", fr, root)
     if c._row("reviews", "id", row["id"])["state"] == "queued":
-        ahc_review.Launcher.for_test(c, policy, "/opt/ahc/peer_review.py", fr, root).launch(row["id"],
-                                                                                          sandbox_repo="o/r")
+        launcher.launch(row["id"], sandbox_repo="o/r")
+    if settle and c._row("reviews", "id", row["id"])["state"] == "running":
+        # PR 272 rescue F1: the completion wrapper's part, then core settles it (r3.settled is after that commit)
+        # and the same tick's sweep stops the unit and retires its intent
+        live = c._row("reviews", "id", row["id"])
+        intent = c._row("launch_intents", "unit", live["producer_unit"])
+        report = ("Reviewer: t\nStage: pr\nReviewed HEAD: %s\nReviewed packet SHA-256: %s\n\nVERDICT: PASS\n"
+                  % (live["head"], live["packet_sha256"])).encode()
+        Path(ahc_review.attempt_paths(root, intent["unit"], live, "")["output"]).write_bytes(report)
+        final = {"row": live["id"], "intent": intent["id"], "invocation_id": fr.show(intent["unit"], ())["InvocationID"],
+                 "report_sha256": hashlib.sha256(report).hexdigest()}
+        ahc_review.settle_final(c, root, fr, 4242, json.dumps(final).encode())
+    if settle:
+        ahc_review.ReviewStage(c, launcher, None).sweep({k: [] for k in ("settled", "unverified", "unknown",
+                                                                         "cancelled", "released", "held")})
     led.close()
+
+
+def scenario_r3_settle(root, clock):
+    """PR 272 rescue F1: scenario_r3_launch, then a valid FINAL settles the row and the sweep stops its unit. A crash
+    after the settle commit and before the stop must leave the cleanup durable: the restart's reconciliation stops
+    the unit before the intent is closed."""
+    scenario_r3_launch(root, clock, settle=True)
 
 
 def check_r3_launch(root):
@@ -1376,14 +1398,15 @@ def check_r3_launch(root):
     states = {u: s for _i, u, s in intents}
     out = [] if len(live) <= 1 else ["%d live units for the row" % len(live)]
     out += [] if used == len(intents) else ["B33 used %d for %d intents" % (used, len(intents))]
-    out += ["orphaned intent %s has a live unit" % i for i, u, s in intents if s == "orphaned" and u in live]
+    # PR 272 rescue F1: no terminal intent (closed or orphaned) ever has a live unit
+    out += ["%s intent %s has a live unit" % (s, i) for i, u, s in intents if s in ("closed", "orphaned") and u in live]
     out += ["running row bound to %s, not the live unit" % r for (r,) in running if live and r not in live]
     # PR 272 F4: a running row's intent is started (never open or orphaned), and no row is stranded queued behind
     # a live intent after the restart
     out += ["running row bound to %s whose intent is %s" % (r, states.get(r)) for (r,) in running
             if states.get(r) != "started"]
     out += ["the row is queued behind a live intent" for _ in range(queued)
-            if any(s in ("open", "started") for s in states.values())]
+            if any(s in ("open", "started", "stopping") for s in states.values())]
     out += [] if running or queued else ["the row is neither running nor launchable"]
     return out
 
@@ -1392,6 +1415,27 @@ NAMED_SCENARIOS["r3_launch"] = scenario_r3_launch
 NAMED_POINTS["r3.unit_started"] = ("r3_launch", check_r3_launch)
 NAMED_POINTS["r3.intent_committed"] = ("r3_launch", check_r3_launch)    # PR 272 F4 (a)
 NAMED_POINTS["r3.attempt_bound"] = ("r3_launch", check_r3_launch)       # PR 272 F4 (b)
+
+
+def check_r3_settle(root):
+    """The r3_launch invariants, and: the row is settled passed, its intent is closed and no unit is live."""
+    out = [o for o in check_r3_launch(root) if o != "the row is neither running nor launchable"]
+    units = (Path(root) / "units.txt").read_text().splitlines() if (Path(root) / "units.txt").exists() else []
+    stopped = (Path(root) / "stopped.txt").read_text().splitlines() if (Path(root) / "stopped.txt").exists() else []
+    db = sqlite3.connect("file:%s?mode=ro" % live_db(root), uri=True)
+    try:
+        rows = db.execute("SELECT state FROM reviews").fetchall()
+        intents = db.execute("SELECT state FROM launch_intents").fetchall()
+    finally:
+        db.close()
+    out += [] if rows == [("passed",)] else ["the row is %r, not passed" % (rows,)]
+    out += [] if intents == [("closed",)] else ["the intents are %r, not one closed" % (intents,)]
+    out += ["unit %s is still live" % u for u in units if u not in set(stopped)]
+    return out
+
+
+NAMED_SCENARIOS["r3_settle"] = scenario_r3_settle
+NAMED_POINTS["r3.settled"] = ("r3_settle", check_r3_settle)              # PR 272 rescue F1
 
 
 if __name__ == "__main__":

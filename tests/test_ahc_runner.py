@@ -5943,7 +5943,8 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.runner.stop = lambda u: False                      # the stop is refused: nothing changes
         self.run_all(self.deps)
         self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (a,)), [("cancelling",)])
-        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents WHERE id=?", (iid,)), [("started",)])
+        self.assertEqual(self.ledger_rows("SELECT state FROM launch_intents WHERE id=?", (iid,)), [("stopping",)],
+                         "the cleanup is durable and never terminal before a confirmed stop")
         self.assertIn(unit, self.runner.live)
         self.runner.stop = real_stop
         self.policy = self.R.ahc_guard.Policy.for_test(self.paths.root, dict(self.policy.exe),

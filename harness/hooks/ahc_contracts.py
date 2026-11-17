@@ -117,8 +117,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS w21_one_unresolved_per_repo ON w21_sends(repo)
 CREATE TABLE IF NOT EXISTS launch_intents (
   id TEXT PRIMARY KEY, row TEXT NOT NULL, row_version INTEGER NOT NULL, unit TEXT NOT NULL UNIQUE,
   cmd_sha256 TEXT NOT NULL, lineage TEXT NOT NULL, charge INTEGER NOT NULL, state TEXT NOT NULL, reason TEXT,
-  created REAL NOT NULL, updated REAL NOT NULL,
-  CHECK (state IN ('open', 'started', 'closed', 'orphaned')));
+  retire_to TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+  CHECK (state IN ('open', 'started', 'stopping', 'closed', 'orphaned')),
+  CHECK (retire_to IS NULL OR retire_to IN ('closed', 'orphaned')),
+  CHECK (state != 'stopping' OR retire_to IS NOT NULL));
 CREATE TABLE IF NOT EXISTS review_blocks (
   row TEXT PRIMARY KEY, unit TEXT NOT NULL, reason TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS lineage_budget (
@@ -738,7 +740,22 @@ class Contracts:
 
     # -------------------------------------------------------------- AC-8: R3 launch intents
 
-    LIVE_INTENT = ("open", "started")
+    # PR 272 rescue (F1, the unit lifecycle): a launch intent is a durable state machine over its unit.
+    #   open      the intent committed; the unit may have started (the launch is in progress, or it crashed)
+    #   started   start_attempt bound the row to the unit (one transaction, PR 272 F4)
+    #   stopping  the attempt is over (settled, given up, cancelled, abandoned or orphaned) and its unit must be
+    #             confirmed inactive before the intent ends; `retire_to` names the terminal state it will take
+    #   closed / orphaned   terminal: the unit was confirmed inactive or failed after a stop
+    # Every non-terminal state may have a live unit, so each one blocks a second unit for the row, keeps the unit
+    # in the guard's committed-intent form, and is retried by the review stage's sweep and by reconciliation. The
+    # only writer of a terminal state is intent_retire, which takes the confirmation the caller observed; there is
+    # no edge from open or started straight to a terminal state. A terminal intent found with an active unit (an
+    # earlier build's ledger) goes back to stopping, so its cleanup is durable again.
+    LIVE_INTENT = ("open", "started", "stopping")
+    TERMINAL_INTENT = ("closed", "orphaned")
+    INTENT_EDGES = frozenset({("open", "started"), ("open", "stopping"), ("started", "stopping"),
+                              ("closed", "stopping"), ("orphaned", "stopping")})
+    CONFIRMED_INACTIVE = ("inactive", "failed")
     RECONCILE_STATES = ("running", "ok", "failed")
 
     def reconcile_state(self, state, detail=""):
@@ -779,8 +796,8 @@ class Contracts:
             if not self.reconcile_open():
                 raise ContractError("the last reconciliation of review units did not succeed; no attempt starts "
                                     "until one does (fail closed)")
-            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN ('open', 'started')",
-                               (rid,)).fetchone():
+            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN (%s)"
+                               % ",".join("?" * len(self.LIVE_INTENT)), (rid,) + self.LIVE_INTENT).fetchone():
                 raise ContractError("a unit for row %s may still be live; no second unit starts" % rid)
             item = self._row("work_items", "id", row["item"]) if row["item"] else None
             if item is not None and item["state"] == "exhausted":
@@ -805,21 +822,78 @@ class Contracts:
                      cmd_sha256=digest)
             return self._row("launch_intents", "id", iid), argv
 
-    def intent_move(self, iid, frm, to, reason):
-        """A launch intent's CAS: open -> started (start_attempt bound the unit), open -> closed (start_attempt's CAS
-        failed and the unit was stopped), open -> orphaned (reconciliation found the unit with no start_attempt
-        record), started -> closed (the attempt ended). The charge is never touched."""
+    def intent_move(self, iid, frm, to, reason, *, retire_to=None):
+        """A launch intent's CAS along INTENT_EDGES: open -> started (start_attempt bound the unit); open, started,
+        closed or orphaned -> stopping with the terminal state it will take (`retire_to`). Never to a terminal
+        state: only intent_retire ends an intent, on a confirmed stop. The charge is never touched."""
+        frm = tuple(frm)
+        if to in self.TERMINAL_INTENT or any((f, to) not in self.INTENT_EDGES for f in frm):
+            raise ContractError("launch intent: %s -> %s is not an edge; an intent ends only through intent_retire "
+                                "on a confirmed stop" % ("/".join(frm), to))
+        if (to == "stopping") != (retire_to is not None) or (retire_to is not None and
+                                                             retire_to not in self.TERMINAL_INTENT):
+            raise ContractError("launch intent: stopping needs the terminal state it retires to")
         with self.tx():
-            cur = self.db.execute("UPDATE launch_intents SET state=?, reason=?, updated=? WHERE id=? AND state IN (%s)"
-                                  % ",".join("?" * len(frm)), (to, str(reason)[:300], self.now(), iid) + tuple(frm))
+            cur = self.db.execute("UPDATE launch_intents SET state=?, reason=?, retire_to=?, updated=? WHERE id=? "
+                                  "AND state IN (%s)" % ",".join("?" * len(frm)),
+                                  (to, str(reason)[:300], retire_to, self.now(), iid) + frm)
             if cur.rowcount != 1:
                 return False
-            self._a0("launch_intent", iid, None, to, "li-%s:%s" % (to, iid), "ahc-core", reason=str(reason)[:300])
+            self._a0("launch_intent", iid, None, to, "li-%s:%s:%d" % (to, iid, self._intent_seq(iid)), "ahc-core",
+                     reason=str(reason)[:300], retire_to=retire_to)
             return True
+
+    def _intent_seq(self, iid):
+        """How many transitions this intent has recorded: a terminal intent can return to stopping, so the event
+        id of each move must be unique per move, not per (state, intent)."""
+        return self.db.execute("SELECT COUNT(*) FROM transitions WHERE entity='launch_intent' AND id=?",
+                               (iid,)).fetchone()[0]
+
+    def intent_retire(self, iid, observed, reason):
+        """The one writer of a terminal intent state. `observed` is the ActiveState the caller read after its stop
+        (inactive or failed; anything else is refused). In one transaction: stopping -> retire_to, R15 (cancelling
+        -> superseded) for the row still bound to this unit, and the lift of a block held by this unit only.
+        Returns {"state", "r15"} or None when the intent is not stopping."""
+        if observed not in self.CONFIRMED_INACTIVE:
+            raise ContractError("launch intent %s: %r is not a confirmed stop" % (iid, observed))
+        with self.tx():
+            li = self._row("launch_intents", "id", iid)
+            if li is None or li["state"] != "stopping" or li["retire_to"] not in self.TERMINAL_INTENT:
+                return None
+            r15 = False
+            row = self._row("reviews", "id", li["row"])
+            if row is not None and row["producer_unit"] == li["unit"] and row["state"] == "cancelling":
+                self.review(row["id"], "superseded", expected_version=row["version"], event_id="r15:%s" % iid,
+                            cause="R15: the attempt unit is confirmed stopped")
+                r15 = True
+            self.db.execute("UPDATE launch_intents SET state=?, reason=?, updated=? WHERE id=? AND state='stopping'",
+                            (li["retire_to"], str(reason)[:300], self.now(), iid))
+            self.db.execute("DELETE FROM review_blocks WHERE row=? AND unit=?", (li["row"], li["unit"]))
+            self._a0("launch_intent", iid, None, li["retire_to"], "li-%s:%s:%d" % (li["retire_to"], iid,
+                                                                                  self._intent_seq(iid)),
+                     "ahc-core", reason=str(reason)[:300], observed=observed)
+            return {"state": li["retire_to"], "r15": r15}
+
+    def settle_attempt(self, rid, to, iid, *, expected_version, event_id, reason, **review):
+        """A started attempt ends: the row's transition (passed or findings from a verified FINAL, outcome-unknown
+        from R7) and the intent's started -> stopping commit in one transaction, so no crash can leave a settled
+        row whose unit nobody will stop. The unit is stopped and confirmed afterwards (intent_retire)."""
+        with self.tx():
+            moved = self.review(rid, to, expected_version=expected_version, event_id=event_id, **review)
+            if not self.intent_move(iid, ("started",), "stopping", reason, retire_to="closed"):
+                raise ContractError("launch intent %s is not started; the row is not settled" % iid)
+            return moved
+
+    def live_intents(self):
+        """Every intent that may still have a live unit (LIVE_INTENT), oldest first."""
+        cur = self.db.execute("SELECT * FROM launch_intents WHERE state IN (%s) ORDER BY id"
+                              % ",".join("?" * len(self.LIVE_INTENT)), self.LIVE_INTENT)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     def live_intent_units(self):
         """The units of committed intents that may still be live (the guard's committed-intent form)."""
-        return [u for (u,) in self.db.execute("SELECT unit FROM launch_intents WHERE state IN ('open', 'started')")]
+        return [li["unit"] for li in self.live_intents()]
 
     def block_row(self, rid, unit, reason):
         with self.tx():
@@ -827,9 +901,10 @@ class Contracts:
                             "DO UPDATE SET unit=excluded.unit, reason=excluded.reason", (rid, unit, str(reason)[:300],
                                                                                          self.now()))
 
-    def unblock_row(self, rid):
+    def unblock_row(self, rid, unit):
+        """Lift a row's block only when it is held by `unit` (a block raised for another unit stays)."""
         with self.tx():
-            return self.db.execute("DELETE FROM review_blocks WHERE row=?", (rid,)).rowcount == 1
+            return self.db.execute("DELETE FROM review_blocks WHERE row=? AND unit=?", (rid, unit)).rowcount == 1
 
     # -------------------------------------------------------------- AC-7: W21's keyed send record
 
@@ -915,8 +990,9 @@ class Contracts:
         held = self.FINISHED + ("exhausted",)
         rows = self.db.execute(
             "SELECT r.id, r.item FROM reviews r JOIN work_items w ON w.id = r.item WHERE r.state='queued' AND w.state "
-            "NOT IN (%s) AND r.id NOT IN (SELECT row FROM review_blocks) ORDER BY r.updated, r.id"
-            % ",".join("?" * len(held)), held).fetchall()
+            "NOT IN (%s) AND r.id NOT IN (SELECT row FROM review_blocks) AND r.id NOT IN (SELECT row FROM "
+            "launch_intents WHERE state IN (%s)) ORDER BY r.updated, r.id"
+            % (",".join("?" * len(held)), ",".join("?" * len(self.LIVE_INTENT))), held + self.LIVE_INTENT).fetchall()
         out = []
         for rid, iid in rows:
             try:
