@@ -316,7 +316,7 @@ class OrphanedStamps(Base):
 
     def test_m1_a_command_the_hook_itself_blocks_mints_nothing(self):
         # The reason text reads as a merge to find_merges, so decide() blocks the command; it never runs.
-        command = PLAIN.replace("'approved by main after review'", "'gh pr merge 7 -R o/r needs this'")
+        command = PLAIN.replace("'approved by main after review'", "'gh pr merge --delete-branch --merge 7 -R o/r needs this'")
         self.assert_no_stamp(command, expect_code=2)
 
     def test_l1_help_flag_does_not_end_the_hook_and_mints_nothing(self):

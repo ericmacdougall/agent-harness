@@ -212,6 +212,50 @@ class Base(unittest.TestCase):
         return code, text, gh
 
 
+class MergePolicy(Base):
+    """goodqa#16374 AC-5: never squash (in-branch steps are kept), always delete the branch, name the method."""
+
+    def waive(self):
+        mg.add_waiver(self.state, "o/r", 5, HEAD, "GoodQA #16374", "waiver must not lift a merge-policy refusal",
+                      approved_by="main:agent-1")
+
+    def test_builder_names_the_method_and_deletes_the_branch(self):
+        self.assertEqual(mg.merge_command(5, "o/r", HEAD),
+                         "gh pr merge 5 -R o/r --merge --delete-branch --match-head-commit " + HEAD)
+        self.assertEqual(mg.merge_command(5, "o/r", HEAD, method="rebase"),
+                         "gh pr merge 5 -R o/r --rebase --delete-branch --match-head-commit " + HEAD)
+        with self.assertRaises(ValueError):
+            mg.merge_command(5, "o/r", HEAD, method="squash")
+
+    def test_builder_output_passes_the_gate(self):
+        for method in ("merge", "rebase"):
+            code, text, _ = self.decide(mg.merge_command(5, "o/r", HEAD, method=method))
+            self.assertEqual(code, 0, text)
+        self.assertEqual(self.decide("gh pr merge 5 -r -d --match-head-commit {HEAD}")[0], 0)
+
+    def test_policy_refusals_hold_even_with_a_waiver(self):
+        for command, word in (("gh pr merge 5 --squash --delete-branch --match-head-commit {HEAD}", "squash"),
+                              ("gh pr merge 5 -s -d --match-head-commit {HEAD}", "squash"),
+                              ("gh pr merge 5 --auto --squash -d --match-head-commit {HEAD}", "squash"),
+                              ("gh pr merge 5 --merge --match-head-commit {HEAD}", "--delete-branch"),
+                              ("gh pr merge 5 --delete-branch --match-head-commit {HEAD}", "--merge or --rebase"),
+                              ("gh api -X PUT repos/o/r/pulls/5/merge -f sha={HEAD} -f merge_method=squash", "squash"),
+                              ("gh api graphql -f query={SQ}mutation { mergePullRequest(input:{pullRequestId:"
+                               "\"PR_kwDOabc\", expectedHeadOid:\"{HEAD}\", mergeMethod: SQUASH}) { clientMutationId "
+                               "} }{SQ}", "squash")):
+            for waived in (False, True):
+                with self.subTest(command=command, waived=waived):
+                    if waived:
+                        self.waive()
+                    code, text, _ = self.decide(command)
+                    self.assertEqual(code, 2, text)
+                    self.assertIn(word, text)
+
+    def test_block_text_prints_the_builder_command(self):
+        _, text, _ = self.decide("gh pr merge 5 --squash -d --match-head-commit {HEAD}")
+        self.assertIn("--merge --delete-branch --match-head-commit", text)
+
+
 class Corpus(unittest.TestCase):
     def test_corpus_is_not_empty(self):
         self.assertGreaterEqual(len(CORPUS["detection"]), 50)
@@ -244,7 +288,7 @@ class Decisions(Base):
                     self.assertIn("merge-gate", text)
 
     def test_block_text_is_sanitized(self):
-        _, text, _ = self.decide("gh pr merge 5 --match-head-commit {HEAD}", "evil_names")
+        _, text, _ = self.decide("gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}", "evil_names")
         self.assertNotIn("\x1b", text)
         self.assertNotIn("\x07", text)
         self.assertLess(len(text), 4000)
@@ -261,12 +305,12 @@ class Decisions(Base):
                 self.assertEqual(code, 2, text)
 
     def test_every_gh_call_is_read_only_and_bounded(self):
-        _, _, gh = self.decide("gh pr merge 5 --squash --match-head-commit {HEAD}", "green")
+        _, _, gh = self.decide("gh pr merge --delete-branch 5 --rebase --match-head-commit {HEAD}", "green")
         self.assertGreaterEqual(len(gh.calls), 4)
         self.assertEqual(max(gh.timeouts) <= mg.CALL_TIMEOUT_MAX, True)
 
     def test_depth_limit_blocks(self):
-        command = "gh pr merge 5 --match-head-commit " + HEAD
+        command = "gh pr merge --delete-branch --merge 5 --match-head-commit " + HEAD
         for _ in range(8):
             command = "bash -c " + shlex.quote(command)
         code, text, _ = self.decide(command, "green")
@@ -275,20 +319,20 @@ class Decisions(Base):
     def test_oversize_command_with_gh_blocks_without_gh_allows(self):
         big = "echo " + "x" * (mg.MAX_COMMAND_CHARS + 10)
         self.assertEqual(self.decide(big)[0], 0)
-        self.assertEqual(self.decide(big + " ; gh pr merge 5")[0], 2)
+        self.assertEqual(self.decide(big + " ; gh pr merge --delete-branch --merge 5")[0], 2)
 
     def test_old_harness_stub_is_the_failing_control(self):
         """The fake-gh red scenario must be blocked; an allow-everything gate (old harness) would return 0."""
-        code, _, _ = self.decide("gh pr merge 5 --match-head-commit {HEAD}", "red_netwatch")
+        code, _, _ = self.decide("gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}", "red_netwatch")
         self.assertEqual(code, 2)
-        code, _, _ = self.decide("gh pr merge 5 --match-head-commit {HEAD}", "pending_run")
+        code, _, _ = self.decide("gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}", "pending_run")
         self.assertEqual(code, 2)
-        code, _, _ = self.decide("gh pr merge 5 --match-head-commit {HEAD}", "zero_required")
+        code, _, _ = self.decide("gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}", "zero_required")
         self.assertEqual(code, 2)
 
 
 class Waivers(Base):
-    CMD = "gh pr merge 5 --match-head-commit {HEAD}"
+    CMD = "gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}"
 
     def waive(self, **over):
         args = dict(repo="o/r", pr=5, head=HEAD, ticket="GoodQA #14502",
@@ -312,7 +356,7 @@ class Waivers(Base):
 
     def test_waived_merge_still_needs_head_binding(self):
         self.waive()
-        code, text, _ = self.decide("gh pr merge 5", "red_netwatch")
+        code, text, _ = self.decide("gh pr merge --delete-branch --merge 5", "red_netwatch")
         self.assertEqual(code, 2, text)
 
     def test_expired_waiver(self):
@@ -371,7 +415,7 @@ class Waivers(Base):
         self.assertIn("asserted", text)
 
     def test_audit_has_command_hash_not_text(self):
-        self.decide("gh pr merge 5 --match-head-commit {HEAD} --body SECRETTOKEN123", "red_netwatch")
+        self.decide("gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD} --body SECRETTOKEN123", "red_netwatch")
         audit = (self.state / mg.AUDIT_FILE).read_text()
         self.assertNotIn("SECRETTOKEN123", audit)
         self.assertIn("block", audit)
@@ -434,7 +478,7 @@ class Hostile(Base):
         argv = {"tool_name": "shell", "tool_input": {"command": ["gh", "pr", "merge", "5", "--match-head-commit", HEAD]}}
         code, _ = self.run_main(json.dumps(argv).encode(), FakeGh(SCENARIOS["red_netwatch"]))
         self.assertEqual(code, 2)
-        bashc = {"tool_name": "local_shell", "tool_input": {"command": ["bash", "-lc", "gh pr merge 5 --match-head-commit " + HEAD]}}
+        bashc = {"tool_name": "local_shell", "tool_input": {"command": ["bash", "-lc", "gh pr merge --delete-branch --merge 5 --match-head-commit " + HEAD]}}
         self.assertEqual(self.run_main(json.dumps(bashc).encode(), FakeGh(SCENARIOS["red_netwatch"]))[0], 2)
         self.assertEqual(self.run_main(json.dumps(bashc).encode(), FakeGh(SCENARIOS["green"]))[0], 0)
         weird = {"tool_name": "Bash", "tool_input": {"command": {"a": 1}}}
@@ -450,7 +494,7 @@ class Hostile(Base):
 
         mg.evaluate_merge = boom
         try:
-            code, _ = self.run_main(json.dumps(bash("gh pr merge 5 --match-head-commit " + HEAD)).encode())
+            code, _ = self.run_main(json.dumps(bash("gh pr merge --delete-branch --merge 5 --match-head-commit " + HEAD)).encode())
             self.assertEqual(code, 2)
             code, _ = self.run_main(json.dumps(bash("echo hello")).encode())
             self.assertEqual(code, 0)
@@ -465,7 +509,7 @@ class Hostile(Base):
 
         mg.find_merges = deep
         try:
-            code, _ = self.run_main(json.dumps(bash("gh pr merge 5")).encode())
+            code, _ = self.run_main(json.dumps(bash("gh pr merge --delete-branch --merge 5")).encode())
             self.assertEqual(code, 2)
         finally:
             mg.find_merges = original
@@ -547,14 +591,14 @@ class Subprocess(unittest.TestCase):
         script = "#!/bin/sh\n(sleep 30; echo late > %s/late) &\nsleep 30\n" % marker_dir
         home, env = self.make_env(script)
         start = time.time()
-        result = self.hook(env, bash("gh pr merge 5 -R o/r --match-head-commit " + HEAD))
+        result = self.hook(env, bash("gh pr merge --delete-branch --merge 5 -R o/r --match-head-commit " + HEAD))
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertLess(time.time() - start, 15)
         self.assertIn(b"merge-gate", result.stderr)
 
     def test_huge_gh_output_is_cut_off(self):
         home, env = self.make_env("#!/bin/sh\nyes 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n")
-        result = self.hook(env, bash("gh pr merge 5 -R o/r --match-head-commit " + HEAD))
+        result = self.hook(env, bash("gh pr merge --delete-branch --merge 5 -R o/r --match-head-commit " + HEAD))
         self.assertEqual(result.returncode, 2, result.stderr)
 
     def test_stdin_that_never_closes_blocks(self):
@@ -563,7 +607,7 @@ class Subprocess(unittest.TestCase):
         proc = subprocess.Popen([sys.executable, str(HOOKS / "merge_gate.py"), "hook"], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         try:
-            proc.stdin.write(b'{"tool_name":"Bash","tool_input":{"command":"gh pr merge 5')
+            proc.stdin.write(b'{"tool_name":"Bash","tool_input":{"command":"gh pr merge --delete-branch --merge 5')
             proc.stdin.flush()
             code = proc.wait(timeout=15)
         finally:
@@ -579,7 +623,7 @@ class Subprocess(unittest.TestCase):
 
     def test_gh_failure_blocks(self):
         home, env = self.make_env("#!/bin/sh\necho boom >&2\nexit 1\n")
-        result = self.hook(env, bash("gh pr merge 5 -R o/r --match-head-commit " + HEAD))
+        result = self.hook(env, bash("gh pr merge --delete-branch --merge 5 -R o/r --match-head-commit " + HEAD))
         self.assertEqual(result.returncode, 2, result.stderr)
 
 
@@ -612,7 +656,7 @@ class Wiring(unittest.TestCase):
 
     def test_deny_shape_is_exit_two_with_stderr(self):
         out, err = io.StringIO(), io.StringIO()
-        data = json.dumps(bash("gh pr merge 5 --match-head-commit " + HEAD)).encode()
+        data = json.dumps(bash("gh pr merge --delete-branch --merge 5 --match-head-commit " + HEAD)).encode()
         code = mg.main(["hook", "--state-dir", tempfile.mkdtemp(prefix="mg-s-")], runner=FakeGh(SCENARIOS["red_netwatch"]),
                        stdin=io.BytesIO(data), stdout=out, stderr=err)
         self.assertEqual(code, 2)
@@ -641,7 +685,7 @@ class ActiveWorkflows(Base):
     head) zero checks are not a failure, but nothing was checked either, so the merge needs an exact-head waiver (or
     the one a bound PR review authorization writes) and is refused without one."""
 
-    CMD = "gh pr merge 5 --match-head-commit {HEAD}"
+    CMD = "gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}"
     RELEASE = "name: Release\non:\n  push:\n    tags: [\"v*\"]\npermissions:\n  contents: read\n"
 
     def scenario(self, files, **extra):
@@ -677,8 +721,8 @@ class ActiveWorkflows(Base):
                                         "app_id": 999}],
                    "skipped-run": [{"t": "run", "name": "ext", "status": "COMPLETED", "conclusion": "SKIPPED"}]}
         for label, checks in reports.items():
-            for command in (self.CMD, "gh pr merge 5 --auto --match-head-commit {HEAD}",
-                            "gh pr merge 5 --admin --squash --match-head-commit {HEAD}"):
+            for command in (self.CMD, "gh pr merge --delete-branch --merge 5 --auto --match-head-commit {HEAD}",
+                            "gh pr merge --delete-branch 5 --admin --rebase --match-head-commit {HEAD}"):
                 with self.subTest(label, command=command):
                     code, text, _ = self.merge(self.scenario([], checks=checks), command=command)
                     self.assertEqual(code, 2, text)
@@ -801,7 +845,7 @@ class ActiveWorkflows(Base):
 
     def test_head_binding_and_short_sha_still_required(self):
         sc = self.scenario([])
-        for command in ("gh pr merge 5", "gh pr merge 5 --match-head-commit aaaaaaa"):
+        for command in ("gh pr merge --delete-branch --merge 5", "gh pr merge --delete-branch --merge 5 --match-head-commit aaaaaaa"):
             with self.subTest(command):
                 self.assertEqual(self.merge(sc, command)[0], 2)
 
@@ -910,8 +954,8 @@ class FalsePositives15122(Base):
             with self.subTest(command):
                 self.assertEqual(self.kinds(command), ["unverifiable"], command)
                 self.assertEqual(self.decide(command)[0], 2, command)
-        for command in ("git push gh feat && gh pr merge 5 --match-head-commit {HEAD}",
-                        "git submodule foreach gh pr merge 5", "gh pr merge 5"):
+        for command in ("git push gh feat && gh pr merge --delete-branch --merge 5 --match-head-commit {HEAD}",
+                        "git submodule foreach gh pr merge --delete-branch --merge 5", "gh pr merge --delete-branch --merge 5"):
             with self.subTest(command):
                 self.assertTrue({"pr_merge", "unverifiable"} & set(self.kinds(command)), command)
                 self.assertEqual(self.decide(command, scenario="red_netwatch")[0], 2, command)
@@ -930,7 +974,7 @@ class FalsePositives15122(Base):
                         "SUB=view | true; gh pr $SUB 5", "for S in merge; do gh pr $S 5; done",
                         "SUB=view; eval SUB=merge; gh pr $SUB 5", "SUB=view; unset SUB; gh pr $SUB 5",
                         "SUB=view; source f; gh pr $SUB 5", "f() { SUB=view; }; f; gh pr $SUB 5",
-                        "GH=echo; $GH 'gh pr merge 5' | sh", "gh pr $SUB 5", "gh pr view 5; SUB=view; X=$SUB"):
+                        "GH=echo; $GH 'gh pr merge --delete-branch --merge 5' | sh", "gh pr $SUB 5", "gh pr view 5; SUB=view; X=$SUB"):
             with self.subTest(command):
                 kinds = self.kinds(command)
                 if command.endswith("X=$SUB"):

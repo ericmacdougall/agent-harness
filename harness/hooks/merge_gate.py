@@ -159,10 +159,38 @@ class Merge:
         self.repo_ok = kw.get("repo_ok", True)
         self.reason = kw.get("reason", "")
         self.binding = kw.get("binding", "--match-head-commit <full head sha>")
+        self.policy = list(kw.get("policy") or [])  # goodqa#16374 AC-5: merge-policy refusals, never lifted
 
     def key(self):
         return (self.kind, self.slug, self.number, self.target, tuple(self.head_vals), self.head_unknown,
-                tuple(self.node_ids), self.auto, self.repo_ok, self.reason)
+                tuple(self.node_ids), self.auto, self.repo_ok, self.reason, tuple(self.policy))
+
+
+# goodqa#16374 AC-5 (user, 2026-11-17: "branches must delete on merge, we dont squash so we dont lose in-branch work
+# steps"): the one merge command every hint and doc prints. Squash is never offered.
+MERGE_METHODS = ("merge", "rebase")
+
+
+def merge_command(pr, repo, head, method="merge"):
+    """`gh pr merge N -R owner/repo --merge|--rebase --delete-branch --match-head-commit SHA`."""
+    if method not in MERGE_METHODS:
+        raise ValueError("merge method must be merge or rebase; squash merges are disabled")
+    return "gh pr merge %s -R %s --%s --delete-branch --match-head-commit %s" % (pr, repo, method, head)
+
+
+SQUASH_REFUSAL = "squash merges are disabled (they drop the branch's own commits); merge with --merge or --rebase"
+
+
+def _pr_merge_policy(names):
+    """Hard merge-policy reasons for one `gh pr merge` flag set."""
+    problems = []
+    if names & {"--squash", "-s"}:
+        problems.append(SQUASH_REFUSAL)
+    elif not names & {"--merge", "-m", "--rebase", "-r"}:
+        problems.append("name the merge method: --merge or --rebase (squash merges are disabled)")
+    if not names & {"--delete-branch", "-d"}:
+        problems.append("add --delete-branch: a merged branch is deleted")
+    return problems
 
 
 def clean(text, limit=80):
@@ -743,7 +771,7 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         return [Merge("pr_merge", slug=slug, number=number, target=None if number else target,
                       head_vals=[v.lower() for v in _flag_values(flags, "--match-head-commit")],
                       auto="--auto" in names, repo_ok=explicit or repo_ok,
-                      binding="--match-head-commit <full head sha>")]
+                      binding="--match-head-commit <full head sha>", policy=_pr_merge_policy(names))]
     if pos[0] == "api" and len(pos) > 1:
         endpoint = re.sub(r"^https?://[^/]+/", "", pos[1]).lstrip("/")
         method = (_flag_values(flags, "-X", "--method") or [""])[-1].upper()
@@ -761,8 +789,10 @@ def _gh_merge(args, in_xargs, ctx, cwd):
         if m:
             slug = None if "{" in m.group(1) or "{" in m.group(2) else m.group(1) + "/" + m.group(2)
             shas = [f.split("=", 1)[1].lower() for f in fields if f.startswith("sha=")]
+            squash = any(re.match(r"^merge_method=\W*squash", f, re.I) for f in fields)
             return [Merge("rest", slug=slug, number=m.group(3), head_vals=shas, head_unknown="--input" in names,
-                          repo_ok=slug is not None or repo_ok, binding="-f sha=<full head sha>")]
+                          repo_ok=slug is not None or repo_ok, binding="-f sha=<full head sha>",
+                          policy=[SQUASH_REFUSAL] if squash else [])]
         if re.match(r"^repos/[^/]+/[^/]+/merges/?$", endpoint):
             return [Merge("unverifiable", reason="the branch merge endpoint has no pull request to check")]
     return []
@@ -807,7 +837,10 @@ def _graphql_from_text(text, values=None):
     occurrences = len(re.findall(r"expectedHeadOid", text))
     unknown = occurrences > len(heads) - len(values.get("expectedHeadOid", []))
     ids = sorted(set(re.findall(r"\bPR_[A-Za-z0-9_-]+", text)))
+    squash = re.search(r"mergeMethod\W{0,8}SQUASH", text, re.I) or \
+        any(str(v).upper() == "SQUASH" for v in values.get("mergeMethod", []))
     return Merge("graphql", head_vals=heads, head_unknown=unknown, node_ids=ids,
+                 policy=[SQUASH_REFUSAL] if squash else [],
                  auto=bool(re.search(r"enablePullRequestAutoMerge", text, re.I)),
                  binding="expectedHeadOid: \"<full head sha>\"")
 
@@ -824,8 +857,9 @@ def _http_scan(tokens):
     if m:
         slug = m.group(1) + "/" + m.group(2) if m.group(1) else None
         shas = [s.lower() for s in re.findall(r"\bsha\W{1,4}([0-9a-fA-F]{40,64})", text)]
+        squash = re.search(r"merge_method\W{1,6}squash", text, re.I)
         found.append(Merge("rest", slug=slug, number=m.group(3), head_vals=shas, repo_ok=slug is not None,
-                           binding="\"sha\": \"<full head sha>\""))
+                           binding="\"sha\": \"<full head sha>\"", policy=[SQUASH_REFUSAL] if squash else []))
     if re.search(r"/repos/[\w.-]+/[\w.-]+/merges\b", text):
         found.append(Merge("unverifiable", reason="the branch merge endpoint has no pull request to check"))
     return found
@@ -1493,6 +1527,7 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
             # needs positive evidence instead: an exact-head waiver, or the one a bound PR review authorization writes
             soft.append("GitHub CI is switched off for this repository, so no check ran on this head; the merge needs "
                         "an exact-head waiver or a PR review authorization (peer_review.py pr --github-repo --pr)")
+        hard.extend(merge.policy)  # goodqa#16374 AC-5: nothing lifts these
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1512,6 +1547,10 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     reasons = [clean(r, 300) for r in (hard + soft)][:MAX_REASONS]
     where = f" of {clean(info['repo'])}#{info['pr']} (head {info['head'][:12]})" if info["head"] else ""
     text = f"merge-gate: BLOCKED merge{where}.\n" + "\n".join("  - " + r for r in reasons)
+    if merge.policy or merge.kind == "pr_merge":
+        text += "\nThe merge command: " + merge_command(info["pr"] or merge.number or "<n>",
+                                                        clean(info["repo"] or merge.slug or "owner/repo"),
+                                                        info["head"] or "<full head sha>")
     if info["head"] and not hard:
         text += ("\nWait for the checks, or have the main agent record a single-use waiver: python3 "
                  f"{HERE / 'merge_gate.py'} waive --repo {info['repo']} --pr {info['pr']} --head {info['head']} "
@@ -2133,7 +2172,7 @@ def _fault(error, text, stderr):
     """A bug in the gate must not let a merge through, and must not block unrelated commands."""
     if GH_HINT.search(text) or STATE_NAMES.search(text):
         stderr.write(f"merge-gate: the gate failed ({type(error).__name__}) on a command that may merge; blocking. "
-                     "Run the merge as a plain `gh pr merge <n> -R owner/repo --match-head-commit <sha>`.\n")
+                     "Run the merge as a plain `%s`.\n" % merge_command("<n>", "owner/repo", "<sha>"))
         return 2
     stderr.write(f"merge-gate: warning, the gate failed ({type(error).__name__}); command not blocked.\n")
     return 0

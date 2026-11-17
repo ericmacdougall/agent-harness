@@ -65,7 +65,7 @@ def main():
     # Waiver flow: red merge blocked, waived once, replay blocked, other head blocked.
     state = home / ".agent-harness" / "state"
     (home / "scenario").write_text("red_netwatch")
-    cmd = f"gh pr merge 5 -R o/r --match-head-commit {HEAD}"
+    cmd = f"gh pr merge --delete-branch --merge 5 -R o/r --match-head-commit {HEAD}"
     payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(home), "session_id": "live-check"}
     waive = subprocess.run([args.python, str(script), "waive", "--state-dir", str(state), "--repo", "o/r", "--pr", "5",
                             "--head", HEAD, "--ticket", "GoodQA #14502", "--reason", "live check waiver for red",

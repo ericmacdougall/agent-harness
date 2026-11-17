@@ -1137,6 +1137,8 @@ Why: an owner merged netwatch PR #1 while its CI was red (staticcheck and Window
 
 What counts as a merge: `gh pr merge` (also `--auto` and `--admin`), `gh api` REST `pulls/<n>/merge`, GraphQL `mergePullRequest` and `enablePullRequestAutoMerge`, curl or an interpreter one-liner calling those endpoints, wrapped in `sh -c`, `bash -c`, `ssh`, `eval`, `xargs`, `env`, `timeout`, `sudo`, subshells, backticks, here-documents and pipes into a shell. Shapes that cannot be tied to one PR block with no waiver possible: the branch merge endpoint and `mergeBranch`, a GraphQL query read from a file or stdin that the hook cannot see, a target built at runtime, `xargs gh pr merge`, a repository that a `cd`, `ssh`, `GH_REPO` or `GH_HOST` could change (pass `-R owner/repo` or a PR URL). `gh pr merge --disable-auto` is not a merge.
 
+Merge policy (goodqa#16374 AC-5; the user, 2026-11-17: "branches must delete on merge, we dont squash so we dont lose in-branch work steps"): the merge command is `gh pr merge N -R owner/repo --merge --delete-branch --match-head-commit SHA` (or `--rebase` instead of `--merge`), built by `merge_gate.merge_command` and printed in every merge-gate block. The gate refuses, with no waiver possible, a `gh pr merge` with `--squash`/`-s`, one without `--delete-branch`/`-d`, one that names neither `--merge` nor `--rebase`, a REST merge with `merge_method=squash` and a GraphQL merge with `mergeMethod: SQUASH`. Every non-archived repository has squash merging disabled and `delete_branch_on_merge` on (OptinRouter excluded while held).
+
 What it checks, with a fake-gh-tested read of `gh pr view --json statusCheckRollup`, the check-runs and combined-status endpoints, branch protection on the base branch, rulesets and `gh pr checks --required`:
 
 - Every check run and status must be `success`. Pending, queued, in progress, failed, cancelled, timed out, action required, stale, startup failure and any unknown value block. The latest run per check name wins when every run has a timestamp.
@@ -1579,7 +1581,7 @@ These were specified on the redesign branch. Items marked landed are on main; th
 ### One-command merge (B3.8)
 
 `ah merge --pr N [--repo owner/name]` replaces the three-command ritual (`merge_gate.py waive`, `gh pr ready`,
-`gh pr merge --match-head-commit`). It fetches the PR head, requires a fresh exact-head `peer_review.py pr` ACCEPT
+`gh pr merge --merge --delete-branch --match-head-commit`). It fetches the PR head, requires a fresh exact-head `peer_review.py pr` ACCEPT
 receipt (PR #133 item 1 makes that receipt the waiver), marks the PR ready, merges with `--match-head-commit`, and
 writes one gate record. A stale or missing receipt refuses with the exact command to produce one. Not implemented. Since #141 (goodqa#15282) a merge in a repository with CI switched off needs that exact-head waiver or a bound PR review.
 

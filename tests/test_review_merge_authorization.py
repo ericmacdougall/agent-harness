@@ -201,14 +201,14 @@ class AuthorizationTests(unittest.TestCase):
 
     def decide(self, scenario="red_netwatch", command=None):
         gh = fixture.FakeGh(fixture.SCENARIOS[scenario])
-        command = command or "gh pr merge 5 --match-head-commit " + HEAD
+        command = command or "gh pr merge --delete-branch --merge 5 --match-head-commit " + HEAD
         return mg.decide(fixture.bash(command), gh, self.state)
 
     def test_pass_authorization_covers_unreadable_protection_without_waive_command(self):
         waiver = self.authorize()
         self.assertEqual((waiver["repo"], waiver["pr"], waiver["head"], waiver["report_sha256"]),
                          ("o/r", 5, HEAD, REPORT_SHA))
-        self.assertEqual(mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + HEAD),
+        self.assertEqual(mg.decide(fixture.bash("gh pr merge --delete-branch --merge 5 --match-head-commit " + HEAD),
                                    fixture.FakeGh(fixture.SCENARIOS["green_protection_unreadable"]),
                                    self.root / "none")[0], 2, "control: blocked without the authorization")
         code, text = self.decide("green_protection_unreadable")
@@ -343,10 +343,10 @@ class EndToEndTests(unittest.TestCase):
         original_head = fixture.HEAD
         fixture.HEAD = self.head
         try:
-            code, text = mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + self.head),
+            code, text = mg.decide(fixture.bash("gh pr merge --delete-branch --merge 5 --match-head-commit " + self.head),
                                    fixture.FakeGh(fixture.SCENARIOS["green_protection_unreadable"]), state)
             self.assertEqual(code, 0, text)
-            code, text = mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + self.head),
+            code, text = mg.decide(fixture.bash("gh pr merge --delete-branch --merge 5 --match-head-commit " + self.head),
                                    fixture.FakeGh(fixture.SCENARIOS["green_protection_unreadable"]), state)
             self.assertEqual(code, 2, text)
         finally:
