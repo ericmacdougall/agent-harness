@@ -323,6 +323,42 @@ class Persisted(M.Transport):
         return self.__getattr__("update_refs")(*a, **kw)
 
 
+BARRIER_SECONDS = 20.0          # every barrier wait is bounded: a deadlocked variant fails by assertion, not timeout
+
+
+class Parked(M.Transport):
+    """One canary attempt's own view of a shared FakeGitHub, for the F4 overlap tests: every call goes to `fake`;
+    the call named by `park_at` (name, n-th call) first sets `parked` and then waits for `go` (bounded), and the call
+    named by `die_on` raises Died (a process death) instead of running. Barriers, never sleeps."""
+
+    def __init__(self, fake, park_at=None, die_on=None):
+        self.fake, self.park_at, self.die_on = fake, park_at, die_on
+        self.parked, self.go = threading.Event(), threading.Event()
+        self.calls = {}
+
+    def _call(self, name, *a, **kw):
+        self.calls[name] = self.calls.get(name, 0) + 1
+        here = (name, self.calls[name])
+        if here == self.die_on:
+            raise Died("the attempt died in %s (scripted)" % name)
+        if here == self.park_at:
+            self.parked.set()
+            self.go.wait(BARRIER_SECONDS)
+        return getattr(self.fake, name)(*a, **kw)
+
+    def __getattr__(self, name):
+        attr = getattr(self.fake, name)
+        if not callable(attr):
+            return attr
+        return lambda *a, **kw: self._call(name, *a, **kw)
+
+    def prepare(self, *a, **kw):
+        return self._call("prepare", *a, **kw)
+
+    def update_refs(self, *a, **kw):
+        return self._call("update_refs", *a, **kw)
+
+
 
 # ---------------------------------------------------------------- the scenario
 
@@ -936,6 +972,81 @@ class EffectTests(Base):
                                        (key,)).fetchone()[0])
         self.assertIn('"canary_age"', json.dumps(data), "the canary facts ride in E2's observation")
 
+    # (label, the passed record's stamp fields replaced (None removes the field)); json writes and reads NaN and
+    # Infinity, so each value below round-trips through CanaryStore as written
+    BAD_STAMPS = (("NaN mono", {"mono": float("nan")}),
+                  ("+inf mono", {"mono": float("inf")}),
+                  ("-inf mono", {"mono": float("-inf")}),
+                  ("huge negative int mono", {"mono": -10 ** 400}),
+                  ("future mono", {"mono": "FUTURE"}),
+                  ("non-numeric mono", {"mono": "soon"}),
+                  ("boolean mono", {"mono": True}),
+                  ("missing mono", {"mono": None}),
+                  ("missing boot", {"boot": None}),
+                  ("wrong boot", {"boot": "another-boot"}))
+
+    def test_14_a_non_finite_future_or_malformed_canary_stamp_at_e2_sends_nothing(self):
+        """F1 (delta review of PR #270 at bb0852c): Clock.canary_age clamps max(0, now - mono), so a same-boot
+        passed record whose mono is NaN, +inf or later than the boot clock read as age 0 and authorized E2. The
+        sender validates the raw stamp before it trusts any age: a finite number, at or below the ledger's boot clock,
+        from the ledger's boot. Each case refuses with the sender's own text, sends nothing and leaves the op in
+        intent. Control: a stamp equal to the boot clock (age 0, the build() record) dispatches."""
+        for label, stamp in self.BAD_STAMPS:
+            with self.subTest(case=label):
+                w = self.world()
+                key = w.build()
+                rec = dict(w.canary.read(REPO))
+                for field, value in stamp.items():
+                    if value is None:
+                        rec.pop(field, None)
+                    else:
+                        rec[field] = w.clock.t + 3600 if value == "FUTURE" else value
+                w.canary.write(rec)
+                self.assertTrue(w.canary.chk_cas(REPO, w.identity), "a passed record: only the stamp is at issue")
+                ok, out = attempt(w.sender().dispatch, key)
+                self.assertTrue(ok, "a bad stamp is a refusal, never an exception: %r" % (out,))
+                self.assertEqual((out["state"], out["sent"]), ("refused", False), out)
+                self.assertEqual(out["why"], "the CHK-CAS canary is expired, from another boot, or has no valid stamp",
+                                 "the sender refuses the stamp itself, before the contract guard")
+                self.assertEqual(w.gh.requests, [], "zero sends with a %s" % label)
+                self.assertEqual(w.op(key)["state"], "intent")
+        w = self.world()
+        key = w.build()                                   # mono == the boot clock: age 0, the boundary
+        w.gh.on_send = self.ledger_state(w, key)
+        self.assertEqual(w.canary.read(REPO)["mono"], w.clock.t)
+        w.sender().dispatch(key)
+        self.assert_one_cas(w.gh, oid("B"), oid("H"))
+
+    def test_14_the_canary_stamp_validator_names_each_problem(self):
+        """F1: the pure raw-stamp check the sender runs before Clock.canary_age, one reason per problem (so each of
+        its conditions is proven on its own, even where canary_age would also have returned None)."""
+        check = getattr(M, "canary_stamp_problem", None)
+        self.assertTrue(callable(check), "ahc_merge has a raw canary-stamp validator")
+        now = 1000.0
+        good = {"boot": BOOT, "mono": 400.0}
+        self.assertIsNone(check(good, BOOT, now))
+        self.assertIsNone(check(dict(good, mono=now), BOOT, now), "a stamp equal to the boot clock is valid")
+        self.assertIsNone(check(dict(good, mono=7), BOOT, now), "an int mono is a number")
+        want = {"not a stamp": (None, "no canary stamp"),
+                "wrong boot": (dict(good, boot="another-boot"), "another boot"),
+                "no boot": ({"mono": 400.0}, "another boot"),
+                "ledger boot unknown": (good, "another boot"),
+                "no mono": ({"boot": BOOT}, "not a number"),
+                "string mono": (dict(good, mono="400"), "not a number"),
+                "bool mono": (dict(good, mono=True), "not a number"),
+                "NaN": (dict(good, mono=float("nan")), "not finite"),
+                "+inf": (dict(good, mono=float("inf")), "not finite"),
+                "-inf": (dict(good, mono=float("-inf")), "not finite"),
+                "huge int": (dict(good, mono=-10 ** 400), "not finite"),
+                "negative": (dict(good, mono=-1.0), "negative"),
+                "future": (dict(good, mono=now + 0.001), "later than the boot clock")}
+        for label, (stamp, reason) in want.items():
+            with self.subTest(case=label):
+                ok, got = attempt(check, stamp, None if label == "ledger boot unknown" else BOOT, now)
+                self.assertTrue(ok, "never raises: %r" % (got,))
+                self.assertIsInstance(got, str, "%s is a problem" % label)
+                self.assertIn(reason, got)
+
     def test_16_absent_proven_while_h_is_on_the_branch_abandons_with_an_incident(self):
         for answer in ("typed", "p3"):
             with self.subTest(answer=answer):
@@ -1432,6 +1543,128 @@ class CanaryTests(Base):
                 self.assertEqual(len(w.gh.requests), sent, "no canary-ref write")
                 self.assertFalse(w.c.merging_off(REPO))
                 self.assertEqual(c.escalations, [])
+
+    # ---- F4 (delta review of PR #270 at bb0852c): an older attempt never publishes over a newer one
+
+    def overlap(self, w):
+        """Attempt A, in a thread, parked at its barrier: after its last canary-ref write and before its result is
+        published. Only one thread runs at a time (A waits on an Event while the test acts), so the shared sqlite
+        connection and the fake are never used concurrently."""
+        key = w.build()
+        ta = Parked(w.gh, park_at=("workflow_runs", 2))
+        a = M.Canary(ta, w.identity, w.canary, w.port, w.lock(), w.kill)
+        box = {"key": key}
+
+        def run_a():
+            try:
+                box["out"] = a.run(REPO, "main")
+            except BaseException as error:        # noqa: BLE001 - reported by the test's assertion
+                box["error"] = error
+        thread = threading.Thread(target=run_a, daemon=True)
+        thread.start()
+        self.assertTrue(ta.parked.wait(BARRIER_SECONDS), "attempt A reached its barrier")
+        return a, ta, thread, box
+
+    def finish(self, ta, thread):
+        ta.go.set()
+        thread.join(BARRIER_SECONDS)
+        self.assertFalse(thread.is_alive(), "attempt A finished")
+
+    def test_a_second_canary_attempt_for_the_repo_is_deferred_while_the_first_runs(self):
+        """F4, the serialization: while A holds the repo's canary lock (parked before its publication), attempt B
+        is deferred: it writes no canary ref and no record, so A's in-progress marker stands and A's later PASS
+        replaces only A's own marker. (On bb0852c B ran under the shared lock: it replaced A's marker, died at its
+        first canary-ref write, and A's PASS then hid B's interrupted attempt.)"""
+        w = self.w
+        a, ta, thread, box = self.overlap(w)
+        try:
+            marker = w.canary.read(REPO)
+            self.assertEqual((marker["state"], marker["passed"]), ("in-progress", False))
+            tb = Parked(w.gh, die_on=("update_refs", 1))       # B, if it runs at all, dies at its first write
+            b = M.Canary(tb, w.identity, w.canary, w.port, w.lock(), w.kill)
+            try:
+                out_b = b.run(REPO, "main")
+            except Died as error:
+                out_b = {"state": "died", "why": str(error)}
+            self.assertEqual(out_b["state"], "deferred", out_b)
+            self.assertEqual(tb.calls.get("update_refs", 0), 0, "B sent no canary-ref write")
+            self.assertEqual(w.canary.read(REPO), marker, "B wrote no record: A's marker stands")
+        finally:
+            self.finish(ta, thread)
+        self.assertNotIn("error", box)
+        self.assertEqual(box["out"]["state"], "passed", box["out"])
+        self.assertTrue(w.canary.chk_cas(REPO, w.identity))
+        again = M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill).run(REPO, "main")
+        self.assertEqual(again["state"], "passed", "after A, the next attempt takes the lock and passes")
+        self.assertNotEqual(again["record"].get("attempt"), box["out"]["record"].get("attempt"))
+
+    def test_an_older_attempt_never_publishes_over_a_newer_marker(self):
+        """F4, the compare-and-write: A is parked before its publication and the record is changed under it, as a
+        newer attempt would change it if the lock were ever breached (another lock file, a replaced inode): a newer
+        in-progress marker, or no record at all. A then publishes nothing, reports stale and records an incident;
+        the newer marker (or the absence) stands, chk_cas is false, and E2 sends nothing."""
+        for how in ("a newer marker", "the record removed"):
+            with self.subTest(how=how):
+                w = self.world()
+                a, ta, thread, box = self.overlap(w)
+                key = box["key"]
+                try:
+                    mine = w.canary.read(REPO)
+                    newer = None
+                    if how == "a newer marker":
+                        newer = dict(mine, attempt="a-newer-attempt", state="in-progress", passed=False)
+                        w.canary.write(newer)
+                    else:
+                        os.unlink(str(w.canary._path(REPO)))
+                finally:
+                    self.finish(ta, thread)
+                self.assertNotIn("error", box)
+                self.assertNotEqual(box["out"]["state"], "passed", "a stale attempt never reports a pass")
+                store = M.CanaryStore(w.root / "canary")
+                self.assertFalse(store.chk_cas(REPO, w.identity), "no stale PASS is authoritative")
+                self.assertEqual(store.read(REPO), newer, "the newer marker (or the absence) stands")
+                self.assertTrue(any("stale" in text for text in getattr(a, "incidents", [])),
+                                "the stale publication is logged: %r" % (getattr(a, "incidents", None),))
+                out = M.Sender(w.port, w.gh, w.lock(), w.kill, w.identity, store, allowlist={REPO},
+                               checks=lambda row: True, send_deadline=2.0).dispatch(key)
+                self.assertEqual(out["sent"], False)
+                self.assertEqual([u for u in w.gh.updates() if u["ref"] == MAIN], [], "no E2 send")
+
+    def test_an_interrupted_attempt_leaves_no_pass_and_never_wedges_the_next(self):
+        """F4 with F3: an attempt that dies mid-run leaves its in-progress marker (no PASS; the lock goes with the
+        process), and the next attempt takes the lock, writes its own marker and publishes under its own id."""
+        w = self.w
+        w.build()
+        w.gh.die_reads = {"workflow_runs": 2}
+        try:
+            M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill).run(REPO, "main")
+        except Died:
+            pass
+        dead = w.canary.read(REPO)
+        self.assertEqual((dead["state"], dead["passed"]), ("in-progress", False))
+        self.assertFalse(w.canary.chk_cas(REPO, w.identity))
+        self.assertIsInstance(dead.get("attempt"), str, "the marker names its attempt")
+        out = M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill).run(REPO, "main")
+        self.assertEqual(out["state"], "passed", out)
+        self.assertIsInstance(out["record"].get("attempt"), str)
+        self.assertNotEqual(out["record"]["attempt"], dead["attempt"], "published under the new attempt's own id")
+        self.assertTrue(w.canary.chk_cas(REPO, w.identity))
+
+    def test_an_unusable_canary_lock_defers_and_changes_nothing(self):
+        """NEG-3: the repo's canary lock file is a link: the attempt fails closed (deferred), writes no canary ref,
+        leaves the prior record and merging as they were, and follows nothing."""
+        w = self.w
+        w.build()
+        before = w.canary.read(REPO)
+        target = w.root / "elsewhere"
+        os.symlink(str(target), str(w.root / "canary" / "canary-o__r.lock"))
+        sent = len(w.gh.requests)
+        out = M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill).run(REPO, "main")
+        self.assertEqual(out["state"], "deferred", out)
+        self.assertEqual(len(w.gh.requests), sent, "no canary-ref write")
+        self.assertEqual(w.canary.read(REPO), before)
+        self.assertFalse(w.c.merging_off(REPO))
+        self.assertFalse(target.exists(), "the link was not followed")
 
     def test_the_canary_runs_only_under_a_fresh_identity_and_an_off_switch(self):
         w = self.w
