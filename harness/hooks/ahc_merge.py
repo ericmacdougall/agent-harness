@@ -36,8 +36,10 @@ requests to ahc-core; that channel is not built). Proposed contract changes are 
 
 Agent-ruled choices, each labelled ASSUMPTION where it is made: A-port (above), A-kill (the kill-epoch file's
 place and shape), A-p3 (which gh errors prove a failure before any request byte), A-canary (the three commits and the
-zero-oid create and delete), A-attr (E3 attribution rides in the confirm evidence until a column exists), A-lock (the T9 wording: the sender holds the lock shared, the fences take
-it exclusive, as spec T9 says; the brief's "exclusive dispatch flock" is read as the fence side).
+zero-oid create and delete), A-attr (E3 attribution rides in the confirm evidence until a column exists),
+A-lock (the sender holds the lock shared and the fences take it exclusive, as spec T9 says; owner-confirmed),
+A-reconcile (ahc-merge runs E10's reconcile for held ops: confirm when applied, fence_held on a complete off read),
+A-prepare (the repo's GraphQL node id is read before the dispatch commit; a send without it fails closed, UNTYPED).
 """
 from __future__ import annotations
 
@@ -78,6 +80,9 @@ MERGE_SEAMS = (
 MERGE_INVENTORY = {
     ("ahc_merge", "KillStore.write", "fs.write_file"): (1, "seam:merge.kill_epoch"),
     ("ahc_merge", "CanaryStore.write", "fs.write_file"): (1, "seam:merge.canary_record"),
+    ("ahc_merge", "KillStore.bump", "handle.write"): (1, "exempt:calls KillStore.write, which carries the seam"),
+    ("ahc_merge", "Canary.run", "handle.write"): (1, "exempt:calls CanaryStore.write, which carries the seam"),
+    ("ahc_merge", "CanaryStore.read", "fs.open_file"): (1, "exempt:a read-only open (O_RDONLY); no state"),
 }
 
 PROPOSED_CONTRACT_DIFFS = (
@@ -130,6 +135,11 @@ class Transport:
     """The one interface to GitHub. Writes: update_refs. Reads: read_ref, read_activity, read_pr,
     compare, commit_parents, workflow_runs, whoami, repo_permissions. Tests use an in-process fake; the real class is
     GhTransport, which tests never run against GitHub."""
+
+    def prepare(self, repo):
+        """Everything the send needs that takes a read, done BEFORE the dispatch commit (a failure here refuses
+        E2 cleanly; after the commit a missing fact can only fail closed)."""
+        return None
 
     def update_refs(self, repo, ref, before_oid, after_oid, force, timeout):     # pragma: no cover - interface
         raise NotImplementedError
@@ -198,6 +208,7 @@ class GhTransport(Transport):
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(home), "LC_ALL": "C", "GH_PROMPT_DISABLED": "1",
                     "GH_NO_UPDATE_NOTIFIER": "1", "NO_COLOR": "1"}
         self._run = run or self._subprocess
+        self._ids = {}
 
     def _subprocess(self, argv, stdin, timeout):
         try:
@@ -225,12 +236,19 @@ class GhTransport(Transport):
         except ValueError:
             raise TransportError("gh api GET: not JSON") from None
 
+    def prepare(self, repo):
+        """The repository's GraphQL node id, read before the dispatch commit and cached for the send."""
+        repo_id = self._get("repos/%s" % repo).get("node_id")
+        if not isinstance(repo_id, str) or not repo_id:
+            raise TransportError("no repository node id")
+        self._ids[str(repo).lower()] = repo_id
+
     def update_refs(self, repo, ref, before_oid, after_oid, force, timeout):
         if force is not False:
             raise SenderError("force is never sent")
-        repo_id = self._get("repos/%s" % repo).get("node_id")
-        if not isinstance(repo_id, str) or not repo_id:
-            return SendResult(P3, "no repository id: nothing was sent", kind="tcp")
+        repo_id = self._ids.get(str(repo).lower())
+        if not repo_id:                     # never prepared: nothing is sent, and the result claims no absence
+            return SendResult(UNTYPED, "the send was not prepared (no repository id); nothing was sent")
         rc, out, err, timed_out = self._run(self.update_refs_argv(),
                                             self.update_refs_body(repo_id, ref, before_oid, after_oid), timeout)
         return classify_graphql(rc, out, err, timed_out)
@@ -648,6 +666,10 @@ class Canary:
             epoch = self.kill.read() if held else {"on": True}
             if not held or epoch.get("on") is not False:
                 return Outcome("deferred", "kill switch on, unreadable, or a fence holds the lock")
+            try:
+                self.t.prepare(repo)
+            except TransportError as error:
+                return Outcome("deferred", "canary not prepared: %s" % error)
             tip = self.t.read_ref(repo, "refs/heads/%s" % branch)
             p = (self.t.commit_parents(repo, tip) or [None])[0]
             g = (self.t.commit_parents(repo, p) or [None])[0] if p else None
@@ -723,6 +745,7 @@ class Sender:
     def observe(self, row, epoch):
         """The E2 guard's fresh observation (T2): the tip, the PR, compare B...H and the checks, plus the kill switch
         and epoch read under the lock."""
+        self.t.prepare(row["repo"])
         tip = self.t.read_ref(row["repo"], "refs/heads/%s" % self._branch(row))
         pr = self.t.read_pr(row["repo"], row["pr"])
         return self.port.stamp({"repo": row["repo"], "pr": row["pr"], "kill_switch": epoch["on"],

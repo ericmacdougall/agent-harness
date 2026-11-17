@@ -376,7 +376,8 @@ class World:
         W7, the grant activated and reserved: one op in intent, ready for E2."""
         gh = self.gh if isinstance(self.gh, FakeGitHub) else FakeGitHub(self.gh.path)
         if not gh.commits:
-            gh.commit("R")
+            gh.commit("R0")
+            gh.commit("R", oid("R0"))
             gh.commit("B", oid("R"))
             gh.commit("A", oid("B"))
             gh.commit("H", oid("A"))
@@ -1106,6 +1107,328 @@ class T9Tests(Base):
                                      "an incomplete revoke or disable does not claim to have acted")
                 proc.stdin.close()
                 proc.wait(timeout=20)
+
+
+# ---------------------------------------------------------------- AC-8: the merge identity
+
+class IdentityTests(Base):
+    """AC-8 and O1: the pinned login and numeric id, the 10 min check age, the scope record, refusal without contents
+    write, a warning on admin or all-repo scope."""
+
+    def ident(self):
+        return M.MergeIdentity(LOGIN, UID_GH, mono=self.w.clock, boot_id=BOOT)
+
+    def test_the_pinned_account_passes_and_records_its_scopes(self):
+        gh = FakeGitHub()
+        gh.user = {"login": LOGIN.upper(), "id": UID_GH, "scopes": ["public_repo"]}
+        i = self.ident()
+        rec = i.check(gh, {REPO})
+        self.assertEqual((rec["id"], rec["contents_write"], rec["admin"], rec["all_repo"], rec["warnings"]),
+                         (UID_GH, True, False, False, []))
+        self.assertTrue(i.fresh())
+        self.assertIn("identity: merges act as the user's own GitHub account %s (id %d)" % (LOGIN, UID_GH),
+                      i.status_lines())
+
+    def test_another_account_is_refused_with_an_incident(self):
+        for user in ({"login": LOGIN, "id": UID_GH + 1, "scopes": []},          # a renamed or recreated account
+                     {"login": "someone-else", "id": UID_GH, "scopes": []},
+                     {"login": LOGIN, "id": str(UID_GH), "scopes": []},
+                     {"login": LOGIN, "id": None, "scopes": []}):
+            with self.subTest(user=user):
+                gh = FakeGitHub()
+                gh.user = user
+                i = self.ident()
+                ok, err = attempt(i.check, gh, {REPO})
+                self.assertFalse(ok)
+                self.assertIsInstance(err, M.IdentityError)
+                self.assertTrue(i.incidents)
+                self.assertFalse(i.fresh(), "merging holds")
+
+    def test_no_contents_write_is_refused(self):
+        for perms in ({}, {"push": False}, {"pull": True}):
+            with self.subTest(perms=perms):
+                gh = FakeGitHub()
+                gh.perms = {REPO: perms}
+                i = self.ident()
+                ok, err = attempt(i.check, gh, {REPO})
+                self.assertFalse(ok)
+                self.assertIsInstance(err, M.IdentityError)
+                self.assertFalse(i.fresh())
+
+    def test_admin_or_all_repo_scope_warns(self):
+        for scopes, perms, admin, all_repo in ((["repo"], {"push": True}, False, True),
+                                               (None, {"push": True}, False, True),
+                                               (["public_repo", "admin:org"], {"push": True}, True, False),
+                                               (["public_repo"], {"push": True, "admin": True}, True, False)):
+            with self.subTest(scopes=scopes, perms=perms):
+                gh = FakeGitHub()
+                gh.user = {"login": LOGIN, "id": UID_GH, "scopes": scopes}
+                gh.perms = {REPO: perms}
+                rec = self.ident().check(gh, {REPO})
+                self.assertEqual((rec["admin"], rec["all_repo"]), (admin, all_repo))
+                self.assertEqual(len(rec["warnings"]), int(admin) + int(all_repo))
+                self.assertTrue(all(wn.startswith("WARNING") for wn in rec["warnings"]))
+
+    def test_the_check_is_stale_after_10_minutes_or_a_reboot_and_nothing_is_sent(self):
+        w = self.w
+        key = w.build()
+        w.clock.t += M.IDENTITY_FRESH_SECONDS
+        self.assertFalse(w.identity.fresh())
+        self.assertIn("merging: waiting-dep (merge identity unavailable)", w.identity.status_lines())
+        out = w.sender().dispatch(key)
+        self.assertEqual((out["state"], out["sent"]), ("waiting-dep", False))
+        self.assertEqual(w.gh.requests, [], "no send without an identity check in the last 10 min")
+        w.identity.check(w.gh, {REPO})
+        w.identity.boot_id = "another-boot"
+        self.assertFalse(w.identity.fresh(), "a check from another boot is not fresh")
+
+    def test_a_failed_recheck_clears_the_last_good_one(self):
+        w = self.w
+        key = w.build()
+        w.gh.user = dict(w.gh.user, id=UID_GH + 1)
+        attempt(w.identity.check, w.gh, {REPO})
+        self.assertEqual(w.sender().dispatch(key)["sent"], False)
+        self.assertEqual(w.gh.requests, [])
+
+
+# ---------------------------------------------------------------- e9: the CHK-CAS canary
+
+class CanaryTests(Base):
+
+    def canary(self, w):
+        w.build()
+        return M.Canary(w.gh, w.identity, w.canary, w.port, w.lock(), w.kill)
+
+    def test_the_canary_passes_on_the_scratch_ref_and_e9_reads_its_record(self):
+        w = self.w
+        out = self.canary(w).run(REPO, "main")
+        self.assertEqual(out["state"], "passed", out)
+        rec = out["record"]
+        self.assertEqual(sorted(rec["cases"]), ["create", "fast-forward", "no-workflow", "stale-before",
+                                                "typed-non-fast-forward"])
+        ups = w.gh.updates()
+        self.assertTrue(ups and all(u["ref"] == M.CANARY_REF and u["force"] is False for u in ups),
+                        "only refs/ahc/canary, never a branch, never force")
+        self.assertEqual(w.gh.refs[MAIN], oid("B"), "the default branch is untouched")
+        facts = w.canary.local_facts(REPO, w.identity)
+        self.assertTrue(facts["chk_cas"])
+        w.clock.t += 3600
+        self.assertEqual(w.c.clock.canary_age(facts["canary"]), 3600.0, "Clock.canary_age reads the record")
+        self.assertNotIn("e9", w.c.elig(w.item(), w.obs(chk_cas=True, canary_age=w.c.clock.canary_age(
+            facts["canary"]))))
+        w.clock.t += 86400
+        self.assertIn("e9", w.c.elig(w.item(), w.obs(chk_cas=True, canary_age=w.c.clock.canary_age(
+            facts["canary"]))), "a canary older than 24 h fails e9")
+
+    def test_a_failing_canary_turns_merging_off_and_escalates_once(self):
+        for fault in ("non-ff accepted", "workflow ran"):
+            with self.subTest(fault=fault):
+                w = self.world()
+                c = self.canary(w)
+                if fault == "non-ff accepted":
+                    w.gh.accept_non_ff = True
+                else:
+                    w.gh.runs_on_canary = True
+                out = c.run(REPO, "main")
+                self.assertEqual(out["state"], "failed")
+                self.assertTrue(w.c.merging_off(REPO))
+                self.assertFalse(w.canary.chk_cas(REPO, w.identity))
+                c.run(REPO, "main")
+                self.assertEqual(len(c.escalations), 1, "escalated once until a pass")
+
+    def test_the_canary_runs_only_under_a_fresh_identity_and_an_off_switch(self):
+        w = self.w
+        c = self.canary(w)
+        w.kill.write(True, KILL + 1)
+        self.assertEqual(c.run(REPO, "main")["state"], "deferred")
+        w.kill.write(False, KILL)
+        w.clock.t += M.IDENTITY_FRESH_SECONDS
+        self.assertEqual(c.run(REPO, "main")["state"], "waiting-dep")
+        self.assertEqual(w.gh.updates(), [])
+
+
+# ---------------------------------------------------------------- the transport (argv and classification only)
+
+class TransportTests(unittest.TestCase):
+    """GhTransport is never run against GitHub: an injected runner records argv and returns canned output."""
+
+    def gh(self, answers):
+        calls = []
+
+        def run(argv, stdin, timeout):
+            calls.append((argv, stdin))
+            return answers.pop(0)
+        return M.GhTransport("/usr/local/bin/gh", "/var/lib/ahcmerge", run=run), calls
+
+    def test_the_send_is_one_graphql_update_refs_with_force_false(self):
+        t, calls = self.gh([(0, json.dumps({"node_id": "R_x"}), "", False),
+                            (0, json.dumps({"data": {"updateRefs": {"clientMutationId": None}}}), "", False)])
+        t.prepare(REPO)
+        res = t.update_refs(REPO, MAIN, oid("B"), oid("H"), False, 30)
+        self.assertEqual(res["outcome"], M.OK)
+        argv, body = calls[-1]
+        self.assertEqual(argv[:3], ["/usr/local/bin/gh", "api", "graphql"])
+        self.assertEqual(argv[-2:], ["--input", "-"])
+        upd = json.loads(body)["variables"]["u"]
+        self.assertEqual(upd, [{"name": MAIN, "beforeOid": oid("B"), "afterOid": oid("H"), "force": False}])
+        ok, _ = attempt(t.update_refs, REPO, MAIN, oid("B"), oid("H"), True, 30)
+        self.assertFalse(ok, "force true is refused before anything is sent")
+        self.assertEqual(len(calls), 2)
+
+    def test_an_unprepared_send_sends_nothing_and_claims_no_absence(self):
+        t, calls = self.gh([])
+        res = t.update_refs(REPO, MAIN, oid("B"), oid("H"), False, 30)
+        self.assertEqual((res["outcome"], calls), (M.UNTYPED, []))
+
+    def test_classification(self):
+        ok = json.dumps({"data": {"updateRefs": {}}})
+        err = lambda m: json.dumps({"errors": [{"message": m}]})            # noqa: E731
+        cases = (((0, ok, "", False), M.OK, None),
+                 ((0, err("rejecting non-fast forward update"), "", False), M.P1, "non-fast-forward"),
+                 ((0, err("cannot lock ref 'refs/heads/main'"), "", False), M.P1, "ref-lock"),
+                 ((0, err("protected branch hook declined"), "", False), M.P1, "protected-ref"),
+                 ((0, err("Something went wrong while executing your query."), "", False), M.UNTYPED, None),
+                 ((1, "", "dial tcp: lookup api.github.com: no such host", False), M.P3, "dns"),
+                 ((1, "", "dial tcp 140.82.1.1:443: connect: connection refused", False), M.P3, "tcp"),
+                 ((1, "", "tls: handshake failure", False), M.P3, "tls"),
+                 ((1, "", "read tcp 10.0.0.2:5->140.82.1.1:443: read: connection reset by peer", False),
+                  M.NO_RESPONSE, None),
+                 ((1, "", "unexpected EOF", False), M.NO_RESPONSE, None),
+                 ((None, "", "", True), M.NO_RESPONSE, None),
+                 ((1, "", "HTTP 502", False), M.UNTYPED, None),
+                 ((0, "not json", "", False), M.UNTYPED, None),
+                 ((0, json.dumps({"data": {}}), "", False), M.UNTYPED, None))
+        for (rc, out, errtext, timed_out), want, kind in cases:
+            with self.subTest(out=out[:40], err=errtext[:40]):
+                res = M.classify_graphql(rc, out, errtext, timed_out)
+                self.assertEqual((res["outcome"], res["kind"]), (want, kind))
+
+    def test_whoami_reads_the_scope_header_and_never_a_token(self):
+        t, calls = self.gh([(0, "HTTP/2.0 200 OK\nX-Oauth-Scopes: repo, workflow\n\n" + json.dumps(
+            {"login": LOGIN, "id": UID_GH}), "", False)])
+        self.assertEqual(t.whoami(), {"login": LOGIN, "id": UID_GH, "scopes": ["repo", "workflow"]})
+        self.assertEqual(calls[0][0], ["/usr/local/bin/gh", "api", "--include", "user"])
+        self.assertNotIn("GH_TOKEN", t.env)
+        self.assertNotIn("GITHUB_TOKEN", t.env)
+
+    def test_a_full_activity_page_is_incomplete(self):
+        page = [{"id": n, "before": oid("B"), "after": oid("H"), "activity_type": "push"} for n in range(100)]
+        t, _ = self.gh([(0, json.dumps(page), "", False), (0, json.dumps(page[:3]), "", False)])
+        self.assertFalse(t.read_activity(REPO, "main")["complete"])
+        self.assertTrue(t.read_activity(REPO, "main")["complete"])
+
+    def test_gh_must_be_absolute(self):
+        ok, _ = attempt(M.GhTransport, "gh", "/var/lib/ahcmerge")
+        self.assertFalse(ok)
+
+
+import tests.test_ahc_guard as TG  # noqa: E402
+
+
+class DaemonGuardTests(TG._GuardFixture):
+    """AC-13: the daemon's guard keeps refusing the sender's GraphQL call; only ahc-merge (another OS user) sends."""
+
+    def test_the_daemon_guard_refuses_the_update_refs_argv(self):
+        t = M.GhTransport(self.policy.exe["gh"], str(self.root))
+        self.refuse_argv("gh", t.update_refs_argv(), name="gh")
+
+
+# ---------------------------------------------------------------- static rules for the new module
+
+class StaticTests(unittest.TestCase):
+    SRC = (HOOKS / "ahc_merge.py").read_text(encoding="utf-8")
+
+    def test_no_wall_clock_read(self):
+        import ast
+        bad = []
+        for node in ast.walk(ast.parse(self.SRC)):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "time" \
+                    and node.attr in ("time", "time_ns"):
+                bad.append(node.lineno)
+        self.assertEqual(bad, [], "AC-10: ahc_merge reads time only through the injected clocks")
+
+    def test_no_stamp_waiver_or_merge_gate(self):
+        import tests.test_ahc_core as TCORE
+        self.assertEqual(TCORE.CoreTests.stamp_violations(None, {"ahc_merge": self.SRC})
+                         if hasattr(TCORE, "CoreTests") else _stamp_violations(TCORE, self.SRC), [])
+
+    def test_no_other_send_path(self):
+        """NEG-19 / NEG-17: the module names no push, merge, force or update-branch send."""
+        import ast
+        tree = ast.parse(self.SRC)
+        docs = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs:
+                for bad in ("update-branch", "--force", "git push", "/merge", "mergePullRequest"):
+                    self.assertNotIn(bad, node.value, "line %d" % node.lineno)
+            if isinstance(node, ast.keyword) and node.arg == "force":
+                self.assertTrue(isinstance(node.value, ast.Constant) and node.value.value is False,
+                                "force is only ever the literal False (line %d)" % node.value.lineno)
+
+    def test_no_path_write_outside_ahc_fs(self):
+        import tests.test_ahc_fs as TFS
+        self.assertEqual(TFS.path_writes(self.SRC, "ahc_merge"), [])
+
+    def test_every_durable_write_is_listed_and_every_seam_has_both_calls(self):
+        found = ahc_crash.inventory(self.SRC, "ahc_merge")
+        problems = []
+        for key, n in sorted(found.items()):
+            if key not in M.MERGE_INVENTORY:
+                problems.append("unlisted %s" % "/".join(key))
+            elif M.MERGE_INVENTORY[key][0] != n:
+                problems.append("count %s" % "/".join(key))
+        for key, (_n, disposition) in M.MERGE_INVENTORY.items():
+            kind, _, detail = disposition.partition(":")
+            if key not in found:
+                problems.append("stale %s" % "/".join(key))
+            if kind == "seam" and detail not in M.MERGE_SEAMS or kind not in ("seam", "exempt") or not detail:
+                problems.append("disposition %s" % "/".join(key))
+        self.assertEqual(problems, [])
+        self.assertEqual(ahc_crash.seam_calls(self.SRC),
+                         {(s, wh): 1 for s in M.MERGE_SEAMS for wh in ("before", "after")})
+        self.assertFalse(set(M.MERGE_SEAMS) & set(ahc_crash.SEAMS), "registration is a proposed diff")
+
+
+def _stamp_violations(module, src):
+    for obj in vars(module).values():
+        if isinstance(obj, type) and hasattr(obj, "stamp_violations"):
+            return obj.stamp_violations(None, {"ahc_merge": src})
+    raise AssertionError("tests.test_ahc_core has no stamp_violations")
+
+
+# ---------------------------------------------------------------- AC-18: the sender's crash seams
+
+class CrashSeamTests(Base):
+    """Each seam of the sender, crashed in a child process, then a restart over the same files."""
+
+    def test_canary_record_seam(self):
+        for when, recorded in (("before", False), ("after", True)):
+            with self.subTest(when=when):
+                w = self.world(files=True)
+                key = w.build()
+                os.unlink(str(w.canary._path(REPO)))
+                died = run_child(w.root, "canary", key, seam="merge.canary_record:%s@1" % when)
+                self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT, died.stderr[-800:])
+                self.assertEqual(w.canary.chk_cas(REPO, w.identity), recorded)
+                again = run_child(w.root, "dispatch", key)
+                self.assertEqual(again.returncode, 0, again.stderr[-800:])
+                sent = [u for u in FakeGitHub(w.gh.path).load().updates() if u["ref"] == MAIN]
+                self.assertEqual(len(sent), 1 if recorded else 0, "no CHK-CAS record, no send")
+
+    def test_kill_epoch_seam(self):
+        for when, written in (("before", False), ("after", True)):
+            with self.subTest(when=when):
+                w = self.world(files=True)
+                key = w.build()
+                died = run_child(w.root, "kill", key, seam="merge.kill_epoch:%s@1" % when)
+                self.assertEqual(died.returncode, ahc_crash.CRASH_EXIT, died.stderr[-800:])
+                self.assertEqual(w.kill.read()["on"], written)
+                again = run_child(w.root, "dispatch", key)
+                self.assertEqual(again.returncode, 0, again.stderr[-800:])
+                sent = FakeGitHub(w.gh.path).load().updates()
+                self.assertEqual(len(sent), 0 if written else 1,
+                                 "a written epoch stops every later send; an unwritten one was never returned as "
+                                 "a completed kill")
 
 
 if __name__ == "__main__":
