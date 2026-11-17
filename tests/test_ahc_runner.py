@@ -5914,7 +5914,8 @@ class ShadowIntegratedTests(Base):
         self.config = dict(self.config, repos=[REPO, SHADOW_REPO], shadow_repos=[SHADOW_REPO])
         self.git = TO.Repo(self.home / "shadow-clone")
         self.base = self.git.commit({"README": "r\n"}, "base")
-        self.head = self.git.commit({"src/b.py": "b\n"}, "pr change", parent=self.base)
+        # goodqa#16262 d5: PR commits carry the canonical Refs line, so W1 calls the reader (check 1)
+        self.head = self.git.commit({"src/b.py": "b\n"}, "pr change\n\nRefs: GoodQA #9", parent=self.base)
         self.gh = TO.FakeGh()
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(self.head, number=9, repo=SHADOW_REPO, changed=1))
@@ -6012,7 +6013,7 @@ class ReviewTickTests(ShadowIntegratedTests):
                 self.addCleanup(state["inbox"].close)
             return ahc_review.ReviewStage(contracts, launcher, state["inbox"], sandbox_repo=SHADOW_REPO)
         deps.review_stage = review_stage
-        self.head2 = self.git.commit({"src/c.py": "c\n"}, "second change", parent=self.base)
+        self.head2 = self.git.commit({"src/c.py": "c\n"}, "second change\n\nRefs: GoodQA #9", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/10", TO.pull_json(self.head2, number=10, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % self.head2,
@@ -6173,7 +6174,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assert_carries_the_core(self.stored_packet(a))
         fields = self.ledger_rows("SELECT fields FROM observations")
         self.assertTrue(fields and not any("never 3" in f for (f,) in fields), "the text is never persisted")
-        head3 = self.git.commit({"src/d.py": "d\n"}, "third change", parent=self.base)
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #9", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
@@ -6267,7 +6268,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         """PR 272 F6: the PR's head moves (W4) while the attempt for H runs. In the same tick the review stage
         stops the old unit and settles its row to superseded (R15); the successor's row is offered after."""
         a, iid, unit = self.launched()
-        head3 = self.git.commit({"src/d.py": "d\n"}, "third change", parent=self.base)
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #9", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
@@ -6285,7 +6286,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         request's hold record goes with it (no orphaned `shadow_hold:` key)."""
         import ahc_shadow  # noqa: PLC0415
         self.launched()
-        head3 = self.git.commit({"src/d.py": "d\n"}, "third change", parent=self.base)
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change\n\nRefs: GoodQA #9", parent=self.base)
         pre = "repos/%s" % SHADOW_REPO
         self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
         self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,

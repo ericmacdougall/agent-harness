@@ -367,8 +367,10 @@ class ShadowTick:
                     rev = (obs.get("policy") or {}).get("revision")
                     core = obs.get("attached_core")
                     try:
+                        # goodqa#16262: W1 binds the lineage to the Refs ticket the reader was called with
                         item = self.c.admit_item(req["repo"], req["pr"], req["head"], obs["tip"], rev, core,
-                                                 packet["sha256"], event_id=event_id(obs["id"], key, "W1"))
+                                                 packet["sha256"], event_id=event_id(obs["id"], key, "W1"),
+                                                 ticket=C.parse_ticket_text(obs.get("refs_ticket")))
                         self.r2_queue_item(item, packet)
                         summary["admitted"].append(item["id"])
                     except C.ContractError as error:
