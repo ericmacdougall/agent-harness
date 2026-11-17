@@ -1193,6 +1193,23 @@ class Hook(SpecFlowCase):
         self.assertTrue(sf.TOOL_PATTERN.match("mcp__GoodQA__update_issue"))
         self.assertTrue(re.match(install.GOODQA_STATUS_TOOLS, "mcp__plugin_GoodQA_goodqa__call_api"))
 
+    def test_ahc_bookkeeping_note_is_never_a_record(self):
+        """goodqa#16034 AC-30: an ahc D24 freshness note never counts as evidence, a spec record or a click-test,
+        even when it carries a well-formed record block; an ordinary comment that merely quotes the label later on
+        is still read."""
+        good = sf.record_body("summary", {"v": 1, "kind": "evidence", "ac": ["AC-1"]})
+        plain = {"id": str(uuid.uuid4()), "body": good}
+        self.assertEqual(len(sf.ticket_records([plain], 65536)[0]), 1, "fixture: the same block is a valid record")
+        note = {"id": str(uuid.uuid4()), "body": sf.BOOKKEEPING_LABEL + ": receipt bookkeeping posted by ahc.\n" + good}
+        records, ignored = sf.ticket_records([note], 65536)
+        self.assertEqual(records, [])
+        self.assertIn(sf.BOOKKEEPING_LABEL, ignored[0])
+        import ahc_runner
+        self.assertTrue(sf.is_bookkeeping(ahc_runner.d24_note(
+            {"repo": "o/n", "pr": 7, "head": "a" * 40}, [("a" * 40, "feat(x): y")])),
+            "the daemon's note must carry exactly the label spec_flow skips")
+        self.assertFalse(sf.is_bookkeeping("Owner checkpoint. Not " + sf.BOOKKEEPING_LABEL))
+
     def test_deeply_nested_record_is_ignored(self):
         comment = {"id": str(uuid.uuid4()),
                    "body": f"x\n\n```{sf.RECORD_FENCE}\n" + "[" * 40 + "]" * 40 + "\n```"}

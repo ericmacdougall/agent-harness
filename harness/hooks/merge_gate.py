@@ -1639,6 +1639,116 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
+def pr_pass_evidence(evidence, *, with_base=False):
+    """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
+    With with_base=True it is (repo, pr, head, report_sha256, snapshot_base), where snapshot_base is the reviewer's
+    validated snapshot base B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling). A receipt without snapshot_base is
+    legacy and is refused there (ValueError naming LEGACY_NO_SNAPSHOT_BASE): absence never means "same as the
+    merge-base", and B_r is never inferred. The default 4-tuple path is unchanged and still accepts legacy receipts.
+
+    Pure: it reads only the evidence mapping a UsageStore.inspect() returned and writes nothing. It is the one
+    predicate for "this FINAL is a merge-eligible PR PASS", shared by add_review_waiver (main's merge gate) and the
+    ahc daemon (which never mints a waiver). Authority to merge is a separate fact; this only classifies evidence.
+    """
+    import usage_guard
+
+    if not isinstance(evidence, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    review = evidence.get('review')
+    if not isinstance(review, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
+    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
+    reviewer = review.get('reviewer', '')
+    reviewer_harness = review.get('reviewer_harness')
+    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
+    invocation = evidence.get('invocation') if isinstance(evidence.get('invocation'), dict) else {}
+    subject = evidence.get('subject') if isinstance(evidence.get('subject'), dict) else {}
+    if (evidence.get('review_finalization') != 'SETTLED'
+            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
+            or evidence.get('reason') != 'NONE'
+            or invocation.get('purpose') != 'peer-review-pr'
+            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
+            or review.get('findings') != [] or review.get('ticketed')
+            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
+            or subject.get('head') != review['head']
+            or review.get('author_harness') not in {'claude', 'openai'}
+            or reviewer_harness not in {'claude', 'openai'}
+            or reviewer_harness == review['author_harness']
+            or not expected_prefix or not isinstance(reviewer, str) or not reviewer.startswith(expected_prefix)
+            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
+        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
+    if with_base:
+        if 'snapshot_base' not in review:
+            raise ValueError('LEGACY_NO_SNAPSHOT_BASE: PR PASS evidence has no snapshot base B_r')
+        return review['repo'], review['pr'], review['head'], review['report_sha256'], review['snapshot_base']
+    return review['repo'], review['pr'], review['head'], review['report_sha256']
+
+
+_SHA40 = re.compile(r'[0-9a-f]{40}')
+
+
+AHC_BASE_COMPARE = ('identical', 'ahead')
+
+
+def ahc_bound_pass(evidence, binding):
+    """H/B_r binding for an ahc item (goodqa#16049 spec ahc-m1-v2g2 R4, E2): the PR PASS must be for the reviewed
+    head H, carry the snapshot base B_r the reviewer diffed against, and B_r must be the current default-branch tip
+    B or an ancestor of it. Returns (repo, pr, H, B_r, report_sha256) or raises ValueError. Replaces the withdrawn
+    candidate-M binding (v2e): integration is now a fast-forward of the default branch from B to H.
+
+    `binding` is core's record plus fresh GitHub readbacks, supplied by the caller (freshness is the caller's guard,
+    T2): repo, pr, head (H), base (B, the default-branch tip now), pr_head (the PR head as read back), and two
+    compare readback records {base, head, status}, each naming the two commits GitHub compared:
+    - base_compare, the compare B_r...B: base must be B_r (the receipt's snapshot base) and head must be B; status
+      'identical' exactly when B_r == B, otherwise 'ahead' (B is a proper descendant of B_r);
+    - head_compare, the compare B...H: base must be B and head must be H; status 'ahead' (H is a proper descendant
+      of B, so updating the default branch from B to H is a fast-forward).
+    It also requires pr_pass_evidence(with_base=True) to hold (a legacy receipt without B_r is refused, and so are
+    a same-vendor or unknown-author receipt), the FINAL's repo and PR to be the binding's, its Reviewed HEAD to
+    equal H, and the PR head to be H by readback. Every sha is full 40-hex.
+
+    Established when it returns: the PASS was for H reviewed against B_r; B_r is B or an ancestor of B; H
+    fast-forwards B; and the PR head is H, per readbacks the caller supplied. NOT established: that those readbacks
+    are fresh or genuine (the caller's T2 guard); that the default branch is still at B when the update is sent
+    (the update's beforeOid compare-and-swap, E2); that the commits B_r..B were reviewed (they were already on the
+    default branch, outside the PR's diff); and the author-harness derivation that excludes ahc's own update-branch
+    commits (parked with the held W21 work). Pure: it reads its arguments and writes nothing.
+    """
+    repo, pr, reviewed, report, snapshot_base = pr_pass_evidence(evidence, with_base=True)
+    if not isinstance(binding, dict):
+        raise ValueError('ahc binding needs the item record and its readbacks')
+    head, base = binding.get('head'), binding.get('base')
+    if not all(isinstance(v, str) and _SHA40.fullmatch(v) for v in (head, base)) or head == base:
+        raise ValueError('ahc binding record is malformed')
+    base_cmp = _compare_readback(binding.get('base_compare'), snapshot_base, base, 'B_r...B')
+    head_cmp = _compare_readback(binding.get('head_compare'), base, head, 'B...H')
+    if (repo_key(binding.get('repo')) is None or repo_key(binding['repo']) != repo_key(repo)
+            or type(pr) is not int or type(binding.get('pr')) is not int or binding['pr'] != pr):
+        raise ValueError('PR PASS is for another repo or PR')
+    if reviewed != head:
+        raise ValueError('PR PASS Reviewed HEAD is not H')
+    if binding.get('pr_head') != head:
+        raise ValueError('the PR head read back is not H')
+    if base_cmp not in AHC_BASE_COMPARE or (base_cmp == 'identical') != (snapshot_base == base):
+        raise ValueError('the snapshot base B_r is not B or an ancestor of B')
+    if head_cmp != 'ahead':
+        raise ValueError('H does not fast-forward B (compare B...H is not ahead)')
+    return repo, pr, head, snapshot_base, report
+
+
+def _compare_readback(record, want_base, want_head, name):
+    """A compare readback {base, head, status} is trusted only for the exact pair it names: base and head full
+    40-hex and equal to the expected commits. Returns its status."""
+    if (not isinstance(record, dict) or not isinstance(record.get('base'), str)
+            or not isinstance(record.get('head'), str) or not _SHA40.fullmatch(record['base'])
+            or not _SHA40.fullmatch(record['head']) or not isinstance(record.get('status'), str)):
+        raise ValueError('the %s compare readback is missing or malformed' % name)
+    if record['base'] != want_base or record['head'] != want_head:
+        raise ValueError('the %s compare readback is for another pair of commits' % name)
+    return record['status']
+
+
 def add_review_waiver(state_dir, reference, *, store=None, now=None):
     """Authorize only a loaded, settled, independent pure PR PASS FINAL.
 
@@ -1649,30 +1759,9 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None):
 
     store = store or usage_guard.UsageStore()
     evidence = store.inspect(reference)
-    review = evidence.get('review')
-    if not isinstance(review, dict):
-        raise ValueError('merge authorization needs typed PR review FINAL evidence')
-    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
-    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
-    reviewer = review.get('reviewer', '')
-    reviewer_harness = review.get('reviewer_harness')
-    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
-    if (evidence.get('review_finalization') != 'SETTLED'
-            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
-            or evidence.get('reason') != 'NONE'
-            or evidence.get('invocation', {}).get('purpose') != 'peer-review-pr'
-            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
-            or review.get('findings') != [] or review.get('ticketed')
-            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
-            or evidence.get('subject', {}).get('head') != review['head']
-            or review.get('author_harness') not in {'claude', 'openai'}
-            or reviewer_harness not in {'claude', 'openai'}
-            or reviewer_harness == review['author_harness']
-            or not expected_prefix or not reviewer.startswith(expected_prefix)
-            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
-        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
-    repo, pr, head = review['repo'], review['pr'], review['head']
-    report_sha256, final_sha256 = review['report_sha256'], reference['sha256']
+    repo, pr, head, report_sha256 = pr_pass_evidence(evidence)
+    reviewer = evidence['review'].get('reviewer', '')
+    final_sha256 = reference['sha256']
     state_dir = Path(state_dir)
     wid = "mgw-review-" + hashlib.sha256(
         f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}".encode("utf-8")).hexdigest()[:24]

@@ -857,6 +857,113 @@ def read_packet(path: Path) -> PacketEvidence:
         raise ValueError('packet invalid or changed while being read') from None
 
 
+AHC_RELEASE = 'harness/hooks/ahc_release.json'
+AHC_RELEASE_FILE = re.compile(r'ahc_[a-z0-9_]{1,60}\.py')
+AHC_RELEASE_HELPER = re.compile(r'[a-z][a-z0-9_]{0,40}')  # a helper name in ahc_guard.HELPER_SCRIPTS
+AHC_RELEASE_SHA = re.compile(r'[0-9a-f]{64}')
+AHC_RELEASE_FIX = ('run `python3 scripts/ahc_release_hashes.py --write` and commit harness/hooks/ahc_release.json in '
+                   'the same change')
+
+
+def _hook_tree(snapshot: Path, rev: str) -> dict[str, str]:
+    """{basename: git mode} for the entries directly under harness/hooks/ at rev, read from the snapshot's objects."""
+    tree = {}
+    for entry in git(snapshot, 'ls-tree', '-z', rev, '--', 'harness/hooks/', snapshot=True).split('\0'):
+        meta, tab, path = entry.partition('\t')
+        if tab:
+            tree[path.rsplit('/', 1)[-1]] = meta.split(' ', 1)[0]
+    return tree
+
+
+def _release_parts(text: str, where: str) -> tuple[dict, dict]:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError(f'{AHC_RELEASE} at {where} is not JSON') from None
+    parts = []
+    for part, names in (('files', AHC_RELEASE_FILE), ('helpers', AHC_RELEASE_HELPER)):
+        value = data.get(part) if isinstance(data, dict) else None
+        if not isinstance(value, dict) or not all(
+                isinstance(k, str) and names.fullmatch(k) and isinstance(v, str) and AHC_RELEASE_SHA.fullmatch(v)
+                for k, v in value.items()):
+            raise ValueError(f'{AHC_RELEASE} at {where} has a malformed "{part}" map')
+        parts.append(value)
+    return parts[0], parts[1]
+
+
+def _declared(snapshot: Path, rel: str, name: str, kind: type):
+    """The literal value HEAD assigns to `name` at module level in `rel`: parsed with ast.literal_eval, never run."""
+    import ast  # noqa: PLC0415
+    path = snapshot / rel
+    try:
+        tree = ast.parse(path.read_bytes(), filename=rel)
+    except (OSError, SyntaxError, ValueError):
+        raise ValueError(f'{rel} cannot be parsed at HEAD') from None
+    values = [node.value for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)]
+    if len(values) != 1:
+        raise ValueError(f'{rel} {name} must be assigned exactly once at module level')
+    try:
+        value = ast.literal_eval(values[0])
+    except ValueError:
+        raise ValueError(f'{rel} {name} is not a literal') from None
+    if not isinstance(value, kind):
+        raise ValueError(f'{rel} {name} is not a {kind.__name__}')
+    return value
+
+
+def ahc_release_problem(snapshot: Path, head: str, base: str | None) -> tuple[str | None, str | None]:
+    """The PR-stage gate for the ahc release list (goodqa#16049, PR 247 F4): (problem, manifest sha256).
+
+    agent-harness runs no GitHub CI, so a merge needs this review's authorization or an audited waiver; checking
+    here is what makes a stale list block a merge. It applies the predicate of scripts/ahc_release_hashes.py --check
+    without running any of the reviewed commit's code: the expected names are HEAD's own declarations, read as
+    literals (install.py HOOKS: its ahc_*.py modules; harness/hooks/ahc_guard.py HELPER_SCRIPTS: helper name to
+    script). The list's "files" and "helpers" must name exactly those, each a regular file at HEAD (no symlink or
+    submodule) whose sha256 matches. A repository with no list at HEAD or at the base is not checked (other
+    repositories use this review too); deleting the base's list is a problem.
+    """
+    head_tree = _hook_tree(snapshot, head)
+    base_tree = _hook_tree(snapshot, base) if base else {}
+    if 'ahc_release.json' not in head_tree:
+        if 'ahc_release.json' in base_tree:
+            return f'{AHC_RELEASE} exists at the base but not at HEAD; the ahc daemon refuses every entry point', None
+        return None, None
+    stale = []
+    try:
+        if head_tree['ahc_release.json'] not in {'100644', '100755'}:
+            raise ValueError(f'{AHC_RELEASE} is not a regular file at HEAD')
+        raw = (snapshot / AHC_RELEASE).read_bytes()
+        files, helpers = _release_parts(raw.decode('utf-8'), 'HEAD')
+        shipped = _declared(snapshot, 'install.py', 'HOOKS', tuple)
+        declared = _declared(snapshot, 'harness/hooks/ahc_guard.py', 'HELPER_SCRIPTS', dict)
+        if not all(isinstance(n, str) for n in shipped) or not all(
+                isinstance(k, str) and AHC_RELEASE_HELPER.fullmatch(k) and isinstance(v, str)
+                and re.fullmatch(r'[a-z][a-z0-9_]{0,60}\.py', v) for k, v in declared.items()):
+            raise ValueError('install.py HOOKS or ahc_guard.HELPER_SCRIPTS holds a name that is not a plain file name')
+        modules = {n for n in shipped if AHC_RELEASE_FILE.fullmatch(n)}
+        stale += [f'files {n} (shipped by install.py, not listed)' for n in sorted(modules - set(files))]
+        stale += [f'files {n} (listed, but install.py does not ship it)' for n in sorted(set(files) - modules)]
+        stale += [f'helpers {n} (declared by ahc_guard.HELPER_SCRIPTS, not listed)'
+                  for n in sorted(set(declared) - set(helpers))]
+        stale += [f'helpers {n} (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)'
+                  for n in sorted(set(helpers) - set(declared))]
+        for part, entries, script in (('files', files, lambda n: n), ('helpers', helpers, declared.get)):
+            for name, digest in sorted(entries.items()):
+                if script(name) is None:
+                    continue
+                if head_tree.get(script(name)) not in {'100644', '100755'}:
+                    stale.append(f'{part} {name} (no regular file at HEAD)')
+                elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes()).hexdigest() != digest:
+                    stale.append(f'{part} {name} (sha256 differs)')
+    except (ValueError, UnicodeDecodeError) as error:
+        return f'{AHC_RELEASE} cannot be checked: {error}; {AHC_RELEASE_FIX}', None
+    if stale:
+        return (f'{AHC_RELEASE} is stale at HEAD: ' + '; '.join(stale[:12]) + '. The ahc daemon refuses these until '
+                f'the list matches: {AHC_RELEASE_FIX}'), None
+    return None, hashlib.sha256(raw).hexdigest()
+
+
 def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
     """Capture a clean reviewed commit without reading untracked content.
 
@@ -1656,6 +1763,9 @@ def main() -> int:
                         help='Harness that wrote the change; the other harness reviews when available')
     parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
     parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
+    parser.add_argument('--no-main-stamp', action='store_true',
+                        help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
+                             'but can never mint a merge authorization (the ahc daemon always passes this)')
     args = parser.parse_args()
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
@@ -1735,7 +1845,10 @@ def main() -> int:
             parser.error(str(error))
         # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization
         import caller_identity
-        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
+        # goodqa#16049: a caller that is never the authority (the ahc daemon) opts out, so a run on a host where
+        # main has stamps can neither take main's authority nor burn main's stamp
+        if not args.no_main_stamp:
+            args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
         if args.main_stamp is None:
             print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
                   'review cannot authorize a merge.', file=sys.stderr)
@@ -1885,6 +1998,14 @@ def main() -> int:
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
             options['repo'] = repo
+            if args.stage == 'pr':
+                # Before any provider budget: a stale ahc release list never earns a merge authorization (PR 247 F4).
+                release_problem, options['release_manifest'] = ahc_release_problem(snapshot, before[0], base)
+                if release_problem:
+                    print('Review refused: ' + release_problem, file=sys.stderr)
+                    target.close()
+                    evidence.close()
+                    return 2
             _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
             resolutions = {name: diagnostics.discover_executable(
                 name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
@@ -2002,6 +2123,9 @@ def main() -> int:
                  + hashlib.sha256(options['domain_section'].encode('utf-8')).hexdigest() + "\n")
     elif options.get('domain_disabled'):
         note += f"Domain gates: disabled by {options['domain_disabled']}.\n"
+    if options.get('release_manifest'):
+        note += (f"ahc release list: current at this HEAD ({AHC_RELEASE} SHA-256 "
+                 f"{options['release_manifest']})\n")
     finalized = False
     reference = None
     announced = False
@@ -2042,6 +2166,12 @@ def main() -> int:
                                    author_harness=args.author_harness)
             if binding:
                 review_metadata.update(binding)
+            if base and base != before[0]:
+                # goodqa#16049 spec ahc-m1-v2g: the snapshot base B_r the reviewer diffed against, so the ahc
+                # binding can require B_r to be an ancestor of (or equal to) the current default-branch tip.
+                # Recorded on every PR review that has a base, explicit or the head^1 default, whatever its
+                # relation to the merge-base. Only a root commit (no base) omits it; ahc treats absence as legacy.
+                review_metadata['snapshot_base'] = base
         if ticketed_success:
             review_metadata['ticketed'] = [dict(record, report_sha256=report_sha256) for record in ticketed]
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
