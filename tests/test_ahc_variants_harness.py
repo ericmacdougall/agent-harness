@@ -36,6 +36,16 @@ class VariantHarnessTests(unittest.TestCase):
                 for dotted in entry["tests"]:
                     self.assertRegex(dotted, r"^tests\.test_ahc\w*\.\w+\.test_\w+$")
 
+    def test_slice1b_every_mutation_anchor_is_in_its_file_exactly_once(self):
+        """A stale anchor stops the whole harness run (SystemExit); catch it in the focused suite instead."""
+        h = _load()
+        for key, entry in h.ENTRIES.items():
+            for name, swaps, rel in entry["mutations"]:
+                text = (pathlib.Path(h.ROOT) / rel).read_text(encoding="utf-8")
+                for old, _new in swaps:
+                    with self.subTest(key=key, mutation=name):
+                        self.assertEqual(text.count(old), 1, "anchor %r in %s" % (old[:60], rel))
+
 
 if __name__ == "__main__":
     unittest.main()

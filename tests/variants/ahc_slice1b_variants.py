@@ -770,7 +770,8 @@ ENTRIES.update({
                   SR + "test_ac8_the_daemon_reconciles_before_its_first_tick"],
         "mutations": [
             ("the daemon does not reconcile at start", [
-                ('    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy), default=str))\n', '')],
+                ('    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy, role=args.role), default=str))\n',
+                 '')],
              RUNNER_PY),
             ("reconciliation findings are not raised", [
                 ('        for text in out["incidents"]:\n            raise_incident(contracts, "reconcile", text)\n', '')],
