@@ -1055,8 +1055,9 @@ ENTRIES.update({
             ("stopping is not a live intent (the guard and the sweep forget it)", [
                 ('    LIVE_INTENT = ("open", "started", "stopping")\n', '    LIVE_INTENT = ("open", "started")\n')],
              CONTRACTS),
-            ("intent_move takes a terminal target", [
-                ('        if to in self.TERMINAL_INTENT or any(', '        if any(')], CONTRACTS),
+            ("intent_move takes any edge, a terminal target included (both halves of the edge check removed)", [
+                ('        if to in self.TERMINAL_INTENT or any((f, to) not in self.INTENT_EDGES for f in frm):\n',
+                 '        if False:\n')], CONTRACTS),
             ("intent_retire accepts an unconfirmed observation", [
                 ('        if observed not in self.CONFIRMED_INACTIVE:\n            raise ContractError(',
                  '        if False:\n            raise ContractError(')], CONTRACTS),
