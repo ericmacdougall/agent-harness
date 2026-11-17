@@ -84,6 +84,8 @@ PROPOSED_CONTRACT_DIFFS = (
     "operations.attribution column and confirm(attribution=) (replace A-attr)",
     "observation field merge_identity_ok, read by W5/W6 as a cause like mirror_ok ('merge identity unavailable')",
     "ahc_crash.SEAMS += MERGE_SEAMS; InventoryTests.MODULES and test_ahc_fs.MODULES += ahc_merge",
+    "Contracts.dispatch (E2 guard) refuses while repo_flags.merging_off is set (found by T9Tests: a disabled repo's "
+    "intent still passed E2; ahc_merge checks it itself meanwhile)",
 )
 
 
@@ -503,6 +505,9 @@ class LedgerPort:
     def set_merging(self, repo, **kw):
         return self.c.set_merging(repo, **kw)
 
+    def merging_off(self, repo):
+        return self.c.merging_off(repo)
+
 
 # ---------------------------------------------------------------- AC-8: the merge identity
 
@@ -756,6 +761,8 @@ class Sender:
                                "row is never sent again (it settles by readback)")
             if row["repo"] not in self.allowlist:
                 return Outcome("refused", "repo off the allowlist")
+            if self.port.merging_off(row["repo"]):                   # T9 disable, E14: the repo's merging is off
+                return Outcome("refused", "the repo's merging is off")
             if not self.cas.chk_cas(row["repo"], self.identity):     # e9 / NEG-19: no other send path exists
                 return Outcome("refused", "CHK-CAS has not passed for this repo under the merge identity")
             reviewed = self.port.reviewed_head(row)                  # H from the passed Review row only

@@ -332,6 +332,15 @@ class World:
     def lock(self):
         return M.DispatchLock(self.lock_path)
 
+    def restart(self):
+        """A restart of ahc-core and ahc-merge over the same ledger: new Contracts, port and identity check; every
+        in-process memory (own-success, last error, the E13 first read) is gone."""
+        self.c = C.Contracts(self.db, C.AuthorityLog(self.root / "authority" / "log.jsonl"), now=self.clock,
+                             mono=self.clock, boot_id=BOOT)
+        self.port = M.LedgerPort(self.c)
+        self.identity = M.MergeIdentity(LOGIN, UID_GH, mono=self.clock, boot_id=BOOT)
+        self.identity.check(self.gh, {REPO})
+
     def sender(self, **kw):
         kw.setdefault("send_deadline", 2.0)
         return M.Sender(self.port, self.gh, self.lock(), self.kill, self.identity, self.canary, allowlist={REPO},
@@ -449,6 +458,14 @@ def _child_main(argv):
     w.identity.check(w.gh, {REPO})
     if phase == "dispatch":
         out = w.sender().dispatch(key)
+    elif phase == "gated":
+        def gate():
+            """The T9 test gate, right after the last epoch check: announce it, then wait. The test's terminator
+            ends this process by closing its stdin; it exits at once, as SIGKILL would end it (no cleanup)."""
+            (root / "paused").write_text(str(os.getpid()))
+            sys.stdin.read()
+            os._exit(137)
+        out = w.sender(hooks={"epoch-checked": gate}).dispatch(key)
     elif phase == "resume":
         s = w.sender()
         out = s.dispatch(key)
@@ -464,6 +481,58 @@ def _child_main(argv):
     else:
         raise SystemExit("unknown phase")
     sys.stdout.write(json.dumps(out, default=str) + "\n")
+
+
+def reap(proc):
+    """Cleanup for a spawned child: close its pipes (it exits on stdin EOF) and wait for it."""
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe and not pipe.closed:
+            pipe.close()
+    proc.wait(timeout=20)
+
+
+def spawn_child(root, phase, key):
+    """A long-running child `ahc-merge` (Popen): it pauses at the T9 gate until its stdin closes."""
+    env = dict(os.environ, AHC_CRASH_UNDER_TEST="1", PYTHONDONTWRITEBYTECODE="1")
+    env.pop(ahc_crash.ENV_SEAM, None)
+    code = ("import sys; sys.path.insert(0, %r); import tests.test_ahc_merge as T; T._child_main(sys.argv[1:])"
+            % str(ROOT))
+    return subprocess.Popen([sys.executable, "-B", "-c", code, str(root), phase, key], cwd=str(ROOT), env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+class ChildTerminator(M.Terminator):
+    """The test's stand-in for SystemdTerminator: ends the child by closing its stdin (the gate exits at once) and
+    confirms it gone by its exit status (the cgroup-empty check, PENDING_REAL_TEST t9-systemd-kill). `works=False`
+    models a stop that cannot be confirmed."""
+
+    def __init__(self, proc, works=True, kill_store=None):
+        self.proc, self.works, self.store = proc, works, kill_store
+        self.calls = []
+
+    def stop(self):
+        self.calls.append(("stop", self.store.read() if self.store else None))
+        if self.works and self.proc.stdin and not self.proc.stdin.closed:
+            self.proc.stdin.close()
+
+    def confirmed_gone(self):
+        self.calls.append(("confirm", None))
+        if not self.works:
+            return False
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            return False
+        return True
+
+
+def wait_for(path, seconds=20.0):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if Path(path).exists():
+            return True
+        time.sleep(0.02)
+    return False
 
 
 def attempt(fn, *a, **kw):
@@ -815,6 +884,228 @@ class EffectTests(Base):
                     "E16")
                 self.assertEqual(w.grant(key)["state"], "retired", "G5")
                 self.assertEqual(w.c.cap_used(REPO), 0, "the CAP1 slot is released")
+
+
+    # (13) the head race (L7). Each trace runs with and without a restart between the head move and E3.
+    def race(self, move, answer, restart):
+        w = self.world()
+        key = w.build()
+        w.gh.on_send = self.ledger_state(w, key)
+        w.gh.script = {"ok": [], "lose": ["lose"], "typed": ["typed"], "p2": ["delay"], "held": ["delay"],
+                       "fenced": ["delay"]}[answer]
+
+        mark = "head-moved" if move == "head" else "closed-in-flight"
+        extra = {"successor_packet": "e" * 64} if move == "head" else {}
+
+        def w24():                                         # core observes the move while the Effect is unsettled
+            obs = w.obs(pr_head=oid("H2")) if move == "head" else w.obs(pr_state="CLOSED")
+            item = w.move("W24", mark=mark, obs=obs, **extra)
+            self.assertIn(item["state"], ("merge-ready", "waiting-ask"), "W24 keeps the item where it is")
+
+        def race_move():                                   # after the final observation, before the server applies
+            if move == "head":
+                w.gh.prs[PR]["head"] = oid("H2")
+            else:
+                w.gh.prs[PR]["state"] = "CLOSED"
+            if answer != "held":
+                w24()
+        s = w.sender(hooks={"committed": race_move})
+        s.dispatch(key)
+        if answer == "held":
+            for _ in range(C.B37_PROBES + 2):
+                w.tick(s, key, seconds=C.B55_REQUEST_SECONDS)
+            self.assertEqual(w.op(key)["state"], "held")
+            w.move("W10")
+            w24()
+        if restart:
+            w.restart()
+            s = w.sender()
+        self.assertEqual(s.dispatch(key)["sent"], False, "never sent again")
+        if answer in ("ok", "lose"):
+            w.tick(s, key, seconds=C.Contracts.PR_MARK_SECONDS)          # E3, as E12: the PR never shows merged
+            self.assertEqual(w.op(key)["state"], "confirmed")
+            w.move("W8")
+        elif answer == "typed":
+            self.assertEqual(w.op(key)["state"], "abandoned", "E4 then E8")
+            self.assertEqual(w.move("W25", to="superseded")["state"], "superseded")
+        elif answer == "held":
+            w.gh.deliver()                                   # the request applies late, the tip still at B
+            self.assertEqual(s.reconcile(key)["state"], "confirmed", "E10 by the reconcile")
+            w.move("W26")
+        else:                                                # p2 / fenced: the tip leaves B, then E13
+            w.gh.push(MAIN, oid("S"))
+            w.tick(s, key, seconds=C.E13_FIRST_READ_SECONDS)
+            w.tick(s, key, seconds=C.E13_READ_GAP_SECONDS)
+            self.assertEqual((w.op(key)["state"], w.item()["state"]), ("fenced", "merge-ready"), "E13, T7")
+            if answer == "p2":                               # main's E15, then W25
+                row = w.op(key)
+                w.c.settle_fenced(key, {"support": "the request was dropped"}, expected_version=row["version"],
+                                  event_id=w.ev(), actor="main")
+                self.assertEqual(w.move("W25", to="closed-unmerged")["state"], "closed-unmerged")
+            else:                                            # rewind to B, late apply, E14, then W8
+                w.gh.push(MAIN, oid("B"))
+                w.gh.deliver()
+                s.settle(key)
+                self.assertEqual(w.op(key)["state"], "confirmed", "E14")
+                w.move("W8")
+        return w, key
+
+    def handovers(self, w, iid):
+        return sorted(k for (k,) in w.db.execute("SELECT kind FROM wi_notices WHERE item=? AND row_id IN "
+                                                 "('W8', 'W26')", (iid,)))
+
+    def assert_merged_at_h(self, w, key, move):
+        item = w.item()
+        self.assertEqual((item["state"], item["head"]), ("merged", oid("H")), "merged at H")
+        want = ["digest", "ticket"] + (["owner"] if move == "close" else [])
+        self.assertEqual(self.handovers(w, item["id"]), sorted(want), "exactly one notice and handover")
+        if move == "head":
+            succ = w.item(item["successor"])
+            self.assertEqual((succ["head"], succ["state"]), (oid("H2"), "pr-gate"), "W24 made H'")
+            self.assertEqual(w.db.execute("SELECT COUNT(*) FROM wi_notices WHERE item=? AND text LIKE "
+                                          "'%integrated%'", (succ["id"],)).fetchone()[0], 0,
+                             "H' is never reported as integrated")
+
+    def test_13_head_race(self):
+        for move in ("head", "close"):
+            for answer in ("ok", "lose", "held", "fenced"):
+                for restart in (False, True):
+                    with self.subTest(move=move, answer=answer, restart=restart):
+                        w, key = self.race(move, answer, restart)
+                        self.assert_merged_at_h(w, key, move)
+        for restart in (False, True):
+            with self.subTest(trace="head move then typed refusal", restart=restart):
+                w, key = self.race("head", "typed", restart)
+                self.assertEqual(w.item()["state"], "superseded")
+            with self.subTest(trace="closure then p2 then E15", restart=restart):
+                w, key = self.race("close", "p2", restart)
+                self.assertEqual(w.item()["state"], "closed-unmerged")
+
+
+# ---------------------------------------------------------------- T9: the dispatch lock and the three fences
+
+class T9Tests(Base):
+    """AC-6 (18) and NEG-13. The sender holds the dispatch flock SHARED; kill, revoke and disable take it EXCLUSIVE
+    within 45 s (the bound is injected small here), else terminate the sender and confirm it gone before acting."""
+
+    def test_bounds_are_the_spec_values(self):
+        self.assertEqual((M.SEND_DEADLINE_SECONDS, M.FENCE_BOUND_SECONDS), (30.0, 45.0))
+        self.assertEqual(M.Fence(None, None, None, None).bound, 45.0)
+
+    def test_lock_modes(self):
+        w = self.w
+        w.build()
+        a, b, x = w.lock(), w.lock(), w.lock()
+        self.assertTrue(a.acquire(M.fcntl.LOCK_SH, 0.1))
+        self.assertTrue(b.acquire(M.fcntl.LOCK_SH, 0.1), "two senders may share it")
+        self.assertFalse(x.acquire(M.fcntl.LOCK_EX, 0.1), "a fence waits while a sender holds it")
+        a.release()
+        b.release()
+        self.assertTrue(x.acquire(M.fcntl.LOCK_EX, 0.1))
+        self.assertFalse(a.acquire(M.fcntl.LOCK_SH, 0.1), "no sender while a fence holds it")
+        out = w.sender().dispatch(w.op_of(w.iid)["key"])
+        self.assertEqual((out["state"], out["sent"]), ("deferred", False))
+        x.release()
+        link = w.root / "lock-link"
+        os.symlink(str(w.lock_path), str(link))
+        ok, _ = attempt(M.DispatchLock(link).acquire, M.fcntl.LOCK_SH, 0.1)
+        self.assertFalse(ok, "the lock is never opened through a link")
+        self.assertFalse(M.DispatchLock(w.root / "absent.lock").__class__ is None)
+        ok, _ = attempt(M.DispatchLock(w.root / "absent.lock").acquire, M.fcntl.LOCK_SH, 0.1)
+        self.assertFalse(ok, "the lock file is never created by the sender")
+
+    def test_a_send_that_hangs_past_the_deadline_releases_the_lock_and_settles_by_readback(self):
+        w = self.w
+        key = w.build()
+        w.gh.on_send = self.ledger_state(w, key)
+        w.gh.script = ["hang"]
+        s = w.sender(send_deadline=0.3)
+        start = time.monotonic()
+        out = s.dispatch(key)
+        self.assertLess(time.monotonic() - start, 5.0)
+        self.assertEqual((out["result"], w.op(key)["state"]), (M.NO_RESPONSE, "dispatched"))
+        fence = M.Fence(w.port, w.lock(), w.kill, None, bound=0.5)
+        res = fence.kill_switch()
+        self.assertEqual(res["result"], "kill complete", "the lock was released at the deadline")
+        self.assertEqual(res["in_flight"], [key], "the request in flight is named, never reported stopped")
+        self.assertEqual(w.op(key)["state"], "dispatched")
+        w.gh.release.set()                         # the hung request reaches the server and applies
+        end = time.monotonic() + 5
+        while w.gh.refs[MAIN] != oid("H") and time.monotonic() < end:
+            time.sleep(0.01)
+        w.tick(s, key, seconds=C.Contracts.PR_MARK_SECONDS)
+        row = w.op(key)
+        self.assertEqual((row["state"], json.loads(row["evidence"])["attribution"]), ("confirmed", "observed"))
+        self.assertEqual(len(w.gh.updates()), 1)
+
+    def test_kill_with_no_sender_takes_the_lock_writes_the_epoch_and_revokes(self):
+        w = self.w
+        key = w.build()
+        res = M.Fence(w.port, w.lock(), w.kill, None, bound=0.5).kill_switch()
+        self.assertEqual((res["result"], res["epoch"]), ("kill complete", KILL + 1))
+        self.assertEqual(w.kill.read(), {"on": True, "epoch": KILL + 1})
+        self.assertEqual(w.grant(key)["state"], "revoked", "G9")
+        out = w.sender().dispatch(key)
+        self.assertEqual((out["state"], out["sent"]), ("refused", False))
+        self.assertEqual(w.gh.requests, [])
+
+    FENCES = ("kill", "revoke", "disable")
+
+    def fence(self, w, key, which, term):
+        f = M.Fence(w.port, w.lock(), w.kill, term, bound=0.5)
+        if which == "kill":
+            return f, f.kill_switch()
+        if which == "revoke":
+            return f, f.revoke(w.op(key)["grant_id"], source="main: stop this grant")
+        return f, f.disable(REPO, cause="main: stop this repo")
+
+    def test_18_a_paused_sender_is_terminated_and_confirmed_gone_before_the_fence_returns(self):
+        for which in self.FENCES:
+            with self.subTest(fence=which):
+                w = self.world(files=True)
+                key = w.build()
+                proc = spawn_child(w.root, "gated", key)
+                self.addCleanup(reap, proc)
+                self.assertTrue(wait_for(w.root / "paused"), "the child reached the gate after its epoch check")
+                term = ChildTerminator(proc, kill_store=w.kill)
+                f, res = self.fence(w, key, which, term)
+                self.assertEqual(res["result"], "%s complete" % which)
+                self.assertIsNotNone(proc.poll(), "the sender was gone before the fence returned")
+                self.assertEqual(proc.returncode, 137)
+                self.assertEqual([c[0] for c in term.calls[:2]], ["stop", "confirm"])
+                if which == "kill":
+                    self.assertEqual(term.calls[0][1], {"on": True, "epoch": KILL + 1},
+                                     "the kill wrote its epoch before the stop")
+                    self.assertEqual(w.grant(key)["state"], "revoked")
+                elif which == "revoke":
+                    self.assertEqual(w.grant(key)["state"], "revoked")
+                else:
+                    self.assertTrue(w.c.merging_off(REPO))
+                self.assertEqual(w.op(key)["state"], "intent", "paused before E2: nothing was dispatched")
+                again = run_child(w.root, "dispatch", key)               # ahc-merge restarts
+                self.assertEqual(again.returncode, 0, again.stderr[-800:])
+                self.assertEqual(FakeGitHub(w.gh.path).load().updates(), [], "zero requests for that op")
+
+    def test_18_an_unconfirmed_stop_returns_incomplete_with_an_incident(self):
+        for which in self.FENCES:
+            with self.subTest(fence=which):
+                w = self.world(files=True)
+                key = w.build()
+                proc = spawn_child(w.root, "gated", key)
+                self.addCleanup(reap, proc)
+                self.assertTrue(wait_for(w.root / "paused"))
+                f, res = self.fence(w, key, which, ChildTerminator(proc, works=False))
+                self.assertEqual(res["result"], "%s-incomplete" % which)
+                self.assertTrue(f.incidents, "an incident is raised")
+                self.assertIsNone(proc.poll(), "the sender is still there; nothing claims it stopped")
+                if which == "kill":
+                    self.assertEqual(w.kill.read()["on"], True, "the epoch is still written first")
+                else:
+                    self.assertEqual(w.grant(key)["state"] if which == "revoke" else
+                                     str(w.c.merging_off(REPO)), "reserved" if which == "revoke" else "False",
+                                     "an incomplete revoke or disable does not claim to have acted")
+                proc.stdin.close()
+                proc.wait(timeout=20)
 
 
 if __name__ == "__main__":
