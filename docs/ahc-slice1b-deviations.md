@@ -231,6 +231,11 @@ Main's receipt `receipts/pr273-3932ba67` (Codex, R1) found three new material fi
 
 **Correction.** Commit 3932ba67's Testing line said "325 OK" for crash, runner and clock; that was never observed (the run was 329 tests with one anchor failure, fixed before that commit). Corrected in 6f282748's message; the pushed commit is not rewritten.
 
+**Found in the rescue's own check before handoff (fixed after c2996016).**
+- *Stranded variant entries.* The r273-F2 and r273-F3 entries were appended after the harness script's `if __name__ == "__main__"` exit, so a script run never evaluated them (the t2-dev run at c2996016 counted 111 entries without them), while the anchor test, which imports the module, passed. The entry point is the last statement again, and `tests.test_ahc_variants_harness` fails if anything follows it.
+- *Lint re-read.* `stored_packet` took the first "## Lint findings" heading. The spec core sits raw before core's lint section, so a heading planted in it replaced core's findings in the W16/W27 queue record. It now takes the last lint heading before the owner fence opener, which `fence()` keeps out of the owner text; a packet without both is refused. `RuntimeTests.test_r273_f2_a_stored_packet_rereads_the_lint_core_found_not_one_planted_in_the_spec_or_owner_text`, and a variant mutant.
+- *Checked, no change.* The real r9 spec core (110,417 bytes, `e488a8cb…`) builds a 159 KB packet that `stored_packet` reads back (a manual probe). peer_review's main exits 0 for PASS and PASS-WITH-TICKETS, 3 for BLOCK and 2 on errors, as `helper_outcome` expects. The NEG-38 contract test that sets review states directly tests W16/e1/W2 eligibility, not the queue path, and is unchanged; the r273 tests write no row.
+
 ## Owner rulings carried in this build (agent messages, ASSUMPTION)
 
 - **(a)** The Mac only.
