@@ -108,7 +108,8 @@ class Base(unittest.TestCase):
     def obs(self, row=None, **changes):
         base, head = (row["base"], row["head"]) if row else (BASE, H1)
         o = {"at": self.clock.t, "kill_switch": False, "kill_epoch": self.KILL, "pr_state": "OPEN", "pr_head": head,
-             "draft": False, "tip": base, "compare": "ahead", "checks_green": True}
+             "draft": False, "tip": base, "compare": "ahead", "checks_green": True, "chk_cas": True,
+             "canary_age": 60.0}
         o.update(changes)
         return stamped(o)
 
@@ -524,6 +525,40 @@ class OperationTests(Base):
         for b, h in ((H1, H1), ("C" * 40, H1), (BASE, "a" * 12), ("", H1)):
             with self.subTest(b=b, h=h), self.assertRaises(C.ContractError):
                 C.Contracts.operation_key("o/r", 5, b, h, POLICY, 0)
+
+    def test_e02_a_repo_with_merging_off_never_dispatches(self):
+        """T9 disable and E14: while repo_flags.merging_off is set, E2 refuses and the op stays in intent; main
+        turning merging back on lets it dispatch. Found by tests.test_ahc_merge.T9Tests (a disabled repo's intent
+        passed E2); fails on the base without the guard line."""
+        _g, op = self.reserved()
+        self.c.set_merging("o/r", off=True, cause="main: stop this repo", actor="main")
+        with self.assertRaisesRegex(C.ContractError, "merging is off"):
+            self.send(op)
+        self.assertEqual(self.c._row("operations", "key", op["key"])["state"], "intent")
+        self.c.set_merging("o/r", off=False, cause="main: resume", actor="main")
+        self.assertEqual(self.send(self.c._row("operations", "key", op["key"]))["state"], "dispatched")
+
+    def test_e02_an_expired_or_unstamped_canary_never_dispatches(self):
+        """e9 at E2 (PR #270 review F1): ELIG checks the CHK-CAS canary at grant time, and E2 re-checks it, so a
+        canary that expired (24 h) or lost its stamp after the grant was reserved never dispatches; the op stays in
+        intent. Found by tests.test_ahc_merge (an expired canary passed E2); fails on the base without the guard."""
+        _g, op = self.reserved()
+
+        def attempt(o):
+            return self.c.dispatch(op["key"], o, expected_version=op["version"], event_id=self.ev(), lease_ok=True,
+                                   mirror_read_back=True)
+
+        missing = self.obs(op)
+        del missing["chk_cas"], missing["canary_age"]
+        bad = [("not passed", self.obs(op, chk_cas=False)), ("expired", self.obs(op, canary_age=86400.0)),
+               ("from the future", self.obs(op, canary_age=-1.0)), ("no age", self.obs(op, canary_age=None)),
+               ("a bool age", self.obs(op, canary_age=True)), ("no canary facts", missing)]
+        for label, o in bad:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(C.ContractError, "CHK-CAS"):
+                    attempt(o)
+                self.assertEqual(self.c._row("operations", "key", op["key"])["state"], "intent")
+        self.assertEqual(attempt(self.obs(op, canary_age=86399.0))["state"], "dispatched")
 
     def test_e01_intent_is_idempotent_fast_forward_only_and_needs_a_lease(self):
         with self.assertRaises(C.ContractError):
