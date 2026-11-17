@@ -2,7 +2,7 @@
  "files": {
   "ahc_clock.py": "fb98e637ddef6aacaed910573b62cdc0f293c0c21fbf17f4a8266b8357c918e6",
   "ahc_clone.py": "901121b4cbd2a4c0865f2ad759fb99f25d0d0610feeae6f57d50063764f44069",
-  "ahc_contracts.py": "947b314a822121aed119638b7b9e5f7216e9264a06aa3adb03403de4c05c5714",
+  "ahc_contracts.py": "a864c8d9e731e71796efca8e138a5a12c237cb24ccc01d1483972fc8f57e7dea",
   "ahc_core.py": "a5a085515270749eaf1aaa2134efe0717724685d62c35fd8909a4ccfd940e712",
   "ahc_crash.py": "f5b05ee7aa2e2cff2ebebdcd7f35d4efe777b60131d7f0383e0489c8aa1b4af1",
   "ahc_fs.py": "cfffa4a962c7286aacd69be1215669bf54c087bc91655af5cf3968a58c5a9a90",
