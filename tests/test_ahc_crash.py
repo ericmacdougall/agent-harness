@@ -1302,5 +1302,82 @@ NAMED_POINTS["w21.before_send"] = ("w21_send", check_w21_send)
 NAMED_POINTS["w21.after_send"] = ("w21_send", check_w21_send)
 
 
+
+def scenario_r3_launch(root, clock):
+    """AC-8 / NEG-36: one queued review row and one R3 launch through Launcher.for_test. The fake runner records each
+    unit it starts in units.txt and each stop in stopped.txt. A restart runs startup reconciliation first (its units
+    are the started ones not yet stopped), then launches again unless the row already runs."""
+    import ahc_guard  # noqa: PLC0415
+    import ahc_review  # noqa: PLC0415
+    led = runner.Ledger(core.Paths(root))
+    c = C.Contracts(led.db, C.AuthorityLog(Path(root) / "authority.jsonl"), now=clock, mono=clock,
+                    boot_id="crash-boot")
+    row = c.require_review("adversarial", "o/r", 7, H1, "d" * 64, POLICY, item="wi-crash", event_id="r3-req",
+                           snapshot_base=BASE)
+    if row["state"] == "required":
+        row = c.review(row["id"], "queued", expected_version=row["version"], event_id="r3-queued")
+    units, stopped = Path(root) / "units.txt", Path(root) / "stopped.txt"
+
+    def lines(path):
+        return path.read_text().splitlines() if path.exists() else []
+
+    class FileRunner:
+        def start(self, argv):
+            with open(str(units), "a", encoding="utf-8") as handle:       # test-only record of each start
+                handle.write([a for a in argv if a.startswith("--unit=")][0][len("--unit="):] + "\n")
+            return 0, "", ""
+
+        def uid(self, unit):
+            return 4242
+
+        def stop(self, unit):
+            with open(str(stopped), "a", encoding="utf-8") as handle:     # test-only record of each stop
+                handle.write(unit + "\n")
+            return True
+
+        def live(self):
+            return [u for u in lines(units) if u not in set(lines(stopped))]
+
+        def show(self, unit, props):
+            return {"Slice": "ahc-review.slice", "ActiveState": "active" if unit in self.live() else "inactive"}
+
+        def list_units(self):
+            return self.live()
+    stub = Path(root) / "systemd-run"
+    if not stub.exists():
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(stub), 0o755)
+    policy = ahc_guard.Policy.for_test(root, {"systemd-run": str(stub)}, trusted_dirs=(str(root),))
+    fr = FileRunner()
+    ahc_review.Reconciler(c, policy, fr, sleep=lambda s: None).run()
+    if c._row("reviews", "id", row["id"])["state"] == "queued":
+        ahc_review.Launcher.for_test(c, policy, "/opt/ahc/peer_review.py", fr).launch(row["id"], sandbox_repo="o/r")
+    led.close()
+
+
+def check_r3_launch(root):
+    """At most one live unit for the row; every intent charged exactly once; an intent without start_attempt that
+    reconciliation saw is orphaned with its unit stopped."""
+    units = (Path(root) / "units.txt").read_text().splitlines() if (Path(root) / "units.txt").exists() else []
+    stopped = (Path(root) / "stopped.txt").read_text().splitlines() if (Path(root) / "stopped.txt").exists() else []
+    live = [u for u in units if u not in set(stopped)]
+    db = sqlite3.connect("file:%s?mode=ro" % live_db(root), uri=True)
+    try:
+        intents = db.execute("SELECT id, unit, state FROM launch_intents").fetchall()
+        used = (db.execute("SELECT COALESCE(SUM(b33_used), 0) FROM lineage_budget").fetchone() or (0,))[0]
+        running = db.execute("SELECT producer_unit FROM reviews WHERE state='running'").fetchall()
+    finally:
+        db.close()
+    out = [] if len(live) <= 1 else ["%d live units for the row" % len(live)]
+    out += [] if used == len(intents) else ["B33 used %d for %d intents" % (used, len(intents))]
+    out += ["orphaned intent %s has a live unit" % i for i, u, s in intents if s == "orphaned" and u in live]
+    out += ["running row bound to %s, not the live unit" % r for (r,) in running if live and r not in live]
+    return out
+
+
+NAMED_SCENARIOS["r3_launch"] = scenario_r3_launch
+NAMED_POINTS["r3.unit_started"] = ("r3_launch", check_r3_launch)
+
+
 if __name__ == "__main__":
     unittest.main()

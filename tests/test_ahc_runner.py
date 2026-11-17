@@ -4603,7 +4603,7 @@ class StateMachineTests(TC.Base):
         "Review": (
             "test_rv_required", "test_rv_queued", "test_rv_running", "test_rv_cancelling", "test_rv_outcome_unknown",
             "test_rv_infra_wait", "test_rv_passed", "test_rv_findings", "test_rv_superseded", "test_r02",
-            "test_r03", "test_r04_rc_refuses_usage_store", "test_r05", "test_r06", "test_r07", "test_r08",
+            "test_r05", "test_r06", "test_r07", "test_r08",
             "test_r09", "test_r10", "test_r11", "test_r12", "test_r13", "test_r14", "test_r15", "test_r16",
             "test_r18", "test_r19"),
         "Grant": (
@@ -4617,7 +4617,7 @@ class StateMachineTests(TC.Base):
     # Ids whose runtime half belongs to slice 1 (b), with the ruling (T-1): the ledger part is tested in 1 (a);
     # (b) adds the packet build (R2), the DynamicUser unit and its launch (R3), the socket FINAL and the R-c
     # usage-store refusal (R4), and the unit's findings result (R5).
-    PENDING_RUNTIME = ("test_r02", "test_r03", "test_r04_rc_refuses_usage_store", "test_r05")
+    PENDING_RUNTIME = ("test_r02", "test_r05")
 
     def test_every_slice_b_obligation_resolves_or_is_pinned(self):
         """goodqa#16204: obligations ruled onto slice (b) are listed as `OBL.<test id>` in
@@ -6039,6 +6039,36 @@ class W21Tests(TC.Base):
         self.c.record_w16_proof("w16-w21", item["id"], "pr-gate", item["version"], "e" * 64)
         self.move("W16", to="pr-gate", actor="main", proof="w16-w21")
         self.assertEqual(self.c._row("w21_sends", "request_id", rid)["state"], "resolved", "main's W16 resolves it")
+
+
+
+class StartupReconcileTests(Base):
+    """AC-8 / NEG-36: the daemon reconciles review units at start, before its first tick, and raises each finding."""
+
+    def test_ac8_startup_reconciliation_stops_an_orphan_and_raises_its_incident(self):
+        import ahc_guard  # noqa: PLC0415
+        from tests.test_ahc_contracts import _FakeRunner  # noqa: PLC0415
+        policy = ahc_guard.Policy.for_test(self.paths.root, {})
+        fake = _FakeRunner(4242)
+        stray = "ahc-review-rv-%s-%s.service" % ("0" * 24, "2" * 16)
+        fake.live.add(stray)
+        fake.slice[stray] = "ahc-review.slice"
+        out = runner.startup_reconcile(self.paths, policy, runner=fake)
+        self.assertEqual(out["stopped"], [stray])
+        ledger = runner.Ledger(self.paths)
+        self.addCleanup(ledger.close)
+        texts = [r[0] for r in ledger.db.execute("SELECT text FROM wi_notices WHERE kind='incident'")]
+        self.assertTrue(any(stray in t for t in texts), texts)
+        self.assertEqual(policy.incidents, [], "drained into the outbox")
+        self.assertEqual(runner.startup_reconcile(self.paths, ahc_guard.Policy.for_test(self.paths.root, {})),
+                         {"skipped": "no review isolation on this host"})
+
+    def test_ac8_the_daemon_reconciles_before_its_first_tick(self):
+        import inspect  # noqa: PLC0415
+        src = inspect.getsource(runner.main)
+        self.assertIn("startup_reconcile(paths, policy)", src, "the daemon reconciles at start")
+        self.assertLess(src.index("startup_reconcile(paths, policy)"), src.index("tick(paths, config, deps"),
+                        "reconciliation runs before the first tick can start an attempt")
 
 
 if __name__ == "__main__":

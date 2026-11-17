@@ -2284,6 +2284,27 @@ def _shadow_pass(ledger, paths, config, deps, summary):
             raise_incident(c, "launch-guard", "AC-13 refused: %s" % policy.incidents.pop(0))
 
 
+def startup_reconcile(paths, policy, runner=None):
+    """AC-8 / NEG-36 / NEG-49: before any new attempt can start, list the ahc-review-* units and reconcile each
+    against its committed launch intent; every finding is raised as an incident. Without review isolation (no systemd
+    on this host, or the units not resolved by the guard) there is no unit to reconcile. `runner` is for tests."""
+    import ahc_review  # noqa: PLC0415
+    if runner is None:
+        if not ahc_review.SystemdRunner.available(policy):
+            return {"skipped": "no review isolation on this host"}
+        runner = ahc_review.SystemdRunner(policy)
+    ledger = Ledger(paths)
+    try:
+        contracts = open_contracts(ledger, paths)
+        out = ahc_review.Reconciler(contracts, policy, runner).run()
+        for text in out["incidents"]:
+            raise_incident(contracts, "reconcile", text)
+        del policy.incidents[:]
+        return out
+    finally:
+        ledger.close()
+
+
 def raise_incident(contracts, subject, text):
     """An incident in the outbox (wi_notices, kind incident) for the daemon itself, through the AC-14 chokepoint."""
     stamp = contracts.stamp({})
@@ -2993,7 +3014,8 @@ def main(argv=None):
     # AC-13: the daemon process enforces its launch, socket and import policy from here on
     # gh authenticates from its own config under HOME; the unit sets no gh credential variable, so the gh
     # form carries none (ASSUMPTION)
-    ahc_guard.install(ahc_guard.Policy(paths.root, repos=config.get("repos", []), home=paths.home))
+    policy = ahc_guard.install(ahc_guard.Policy(paths.root, repos=config.get("repos", []), home=paths.home))
+    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy), default=str))
     deps = LiveDeps(paths, config)
     while True:
         try:

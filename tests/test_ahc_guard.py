@@ -9,6 +9,7 @@ import ast
 import hashlib
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import ahc_clone  # noqa: E402
+import ahc_contracts as C  # noqa: E402
 import ahc_core  # noqa: E402
 import ahc_guard as guard  # noqa: E402
 
@@ -453,6 +455,104 @@ class GuardPolicyUnitTests(unittest.TestCase):
     def test_safe_prefix_is_ahc_clone_s(self):
         p = guard.Policy.for_test("/nonexistent-root", {})
         self.assertEqual(p.git_prefix(), ahc_clone.SAFE)
+
+
+
+class OrphanRecoveryTests(_GuardFixture):
+    """NEG-49 (AC-13, part of NEG-36's startup reconciliation), through the production launch guard: the R3 runner's
+    systemctl calls run AC-13's forms against a stub that keeps per-unit state and writes a stop sentinel."""
+
+    STUB = r'''#!%(python)s
+import os, sys
+state, marks = %(state)r, %(marks)r
+args = sys.argv[1:]
+if args[:1] == ["--user"]:
+    args = args[1:]
+def path(unit):
+    return os.path.join(state, unit + ".show")
+if args[:1] == ["list-units"]:
+    sys.stdout.write(open(os.path.join(state, "list")).read())
+elif args[:1] == ["show"]:
+    sys.stdout.write(open(path(args[3])).read())
+elif args[:1] == ["stop"]:
+    open(os.path.join(marks, "stop-" + args[1]), "w").close()
+    if not os.path.exists(os.path.join(state, args[1] + ".sticky")):
+        lines = [l for l in open(path(args[1])).read().splitlines() if not l.startswith("ActiveState=")]
+        open(path(args[1]), "w").write("\n".join(lines + ["ActiveState=inactive"]) + "\n")
+'''
+
+    def setUp(self):
+        super().setUp()
+        import ahc_review  # noqa: PLC0415
+        from tests import test_ahc_contracts as TC  # noqa: PLC0415
+        self.R, self.TC = ahc_review, TC
+        self.state = Path(self.tmp.name) / "unitstate"
+        self.state.mkdir()
+        stub = self.stubs / "systemctl"
+        stub.write_text(self.STUB % {"python": sys.executable, "state": str(self.state), "marks": str(self.marks)})
+        os.chmod(str(stub), 0o755)
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        C.apply_schema(self.db)
+        self.clock = TC.Clock()
+        self.c = C.Contracts(self.db, C.AuthorityLog(Path(self.tmp.name) / "authority.jsonl"), now=self.clock,
+                             mono=self.clock, boot_id=TC.BOOT)
+        self.rows = {}
+        for name, pr in (("A", 1), ("B", 2), ("C", 3)):
+            r = self.c.require_review("adversarial", "o/r", pr, TC.H1, TC.PKT, TC.POLICY, item="wi-%s" % name,
+                                      event_id="req-" + name, snapshot_base=TC.BASE)
+            self.rows[name] = self.c.review(r["id"], "queued", expected_version=r["version"], event_id="q-" + name)
+        row = self.rows["A"]
+        self.intent, self.argv = self.c.launch_intent(row["id"], row["version"], lambda unit: self.R.r3_command(
+            self.policy, unit, row, helper_script=str(self.helper)))
+        self.units = {"A": self.intent["unit"], "B": "ahc-review-%s-%s.service" % (self.rows["B"]["id"], "b" * 16),
+                      "C": "ahc-review-%s-%s.service" % (self.rows["C"]["id"], "c" * 16)}
+        slices = {"A": "ahc-review.slice", "B": "ahc-review.slice", "C": "user.slice"}
+        for name, unit in self.units.items():
+            (self.state / (unit + ".show")).write_text("Slice=%s\nActiveState=active\nSubState=running\n"
+                                                       % slices[name])
+        (self.state / "list").write_text("".join("%s loaded active running x\n" % u for u in
+                                                 list(self.units.values()) + ["ahc-review.service"]))
+
+    def reconcile(self):
+        def advance(seconds):
+            self.clock.t += seconds
+        self.clear()
+        return self.R.Reconciler(self.c, self.policy, self.R.SystemdRunner(self.policy), sleep=advance).run()
+
+    def stopped(self, name):
+        return self.mark("stop-" + self.units[name]) if name in self.units else self.mark("stop-" + name)
+
+    def test_neg49_orphan_recovery_through_the_production_launch_guard(self):
+        self.assertIn("--slice=ahc-review.slice", self.argv, "a real R3 intent carries the review slice")
+        self.assertEqual(self.intent["cmd_sha256"], guard.argv_digest(self.argv))
+        out = self.reconcile()
+        self.assertTrue(self.stopped("A") and self.stopped("B"), "A and B are shown, then stopped")
+        self.assertFalse(self.stopped("C"), "C's stop is refused before it runs: no sentinel")
+        self.assertFalse(self.stopped("ahc-review.service"), "the role unit is never stopped")
+        self.assertEqual(self.c._row("launch_intents", "id", self.intent["id"])["state"], "orphaned")
+        self.assertTrue(any(self.units["B"] in i for i in out["incidents"]), "B raises an incident")
+        self.assertTrue(any(self.units["C"] in i and "refused" in i for i in out["incidents"]), "C: refused, incident")
+        self.assertEqual(out["blocked"], [self.rows["C"]["id"]], "only C's row is blocked")
+        with self.assertRaisesRegex(C.ContractError, "blocked"):
+            self.c.launch_intent(self.rows["C"]["id"], self.rows["C"]["version"], lambda u: [u])
+        a = self.rows["A"]
+        self.c.launch_intent(a["id"], a["version"], lambda u: [u])        # A confirmed inactive: A's row may launch
+        self.clear()
+        with self.assertRaises(guard.LaunchRefused):                      # after reconciliation: no recovery stop
+            self.R.SystemdRunner(self.policy).stop(self.units["B"])
+        self.assertFalse(self.stopped("B"), "the late stop left no sentinel")
+
+    def test_neg49_a_unit_never_confirmed_inactive_blocks_its_row_after_60_s_and_nothing_else(self):
+        (self.state / (self.units["B"] + ".sticky")).write_text("")
+        start = self.clock.t
+        out = self.reconcile()
+        self.assertGreaterEqual(self.clock.t - start, self.R.STOP_BOUND, "the bound ran on the injected clock")
+        self.assertEqual(sorted(out["blocked"]), sorted([self.rows["B"]["id"], self.rows["C"]["id"]]))
+        self.assertEqual(self.c._row("launch_intents", "id", self.intent["id"])["state"], "orphaned")
+        (self.state / (self.units["B"] + ".sticky")).unlink()
+        (self.state / (self.units["B"] + ".show")).write_text("Slice=ahc-review.slice\nActiveState=inactive\n")
+        lifted = self.reconcile()["lifted"]
+        self.assertIn(self.rows["B"]["id"], lifted, "a later reconciliation lifts the block once B is inactive")
 
 
 if __name__ == "__main__":

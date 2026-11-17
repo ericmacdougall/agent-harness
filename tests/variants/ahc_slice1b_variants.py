@@ -667,6 +667,117 @@ ENTRIES.update({
 })
 
 
+RT = "tests.test_ahc_contracts.RuntimeTests."
+OR = "tests.test_ahc_guard.OrphanRecoveryTests."
+REVIEW_PY = "harness/hooks/ahc_review.py"
+
+ENTRIES.update({
+    "AC-8 R3 test_r03 launch intent": {
+        "tests": [RT + "test_r03_the_intent_binds_the_full_command_line_and_charges_b33_once"],
+        "mutations": [
+            ("the digest leaves the systemd-run properties out", [
+                ('            digest = hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode("utf-8")).hexdigest()\n',
+                 '            digest = hashlib.sha256(json.dumps(argv[argv.index("--"):], separators=(",", ":")).encode("utf-8")).hexdigest()\n')],
+             CONTRACTS),
+            ("no B33 charge at intent", [
+                ('            self.charge_b33(lineage)\n            self._a0("launch_intent", iid, None, "open",',
+                 '            self._a0("launch_intent", iid, None, "open",')], CONTRACTS),
+            ("the bound argv carries --author-harness", [
+                ('        "--expected-head", row["head"], "--base", base,\n',
+                 '        "--expected-head", row["head"], "--base", base, "--author-harness", "claude",\n')], REVIEW_PY)]},
+    "AC-8 R3 runner and isolation": {
+        "tests": [RT + "test_r03_without_isolation_the_row_goes_to_infra_wait_and_no_runner_comes_from_config",
+                  RT + "test_r03_rc_is_allowed_only_for_the_sandbox_repo"],
+        "mutations": [
+            ("a runner is injectable through the constructor", [
+                ('    def __init__(self, contracts, policy, helper_script):\n        self.c, self.policy, self.helper = contracts, policy, helper_script\n',
+                 '    def __init__(self, contracts, policy, helper_script, runner=None):\n        self.c, self.policy, self.helper = contracts, policy, helper_script\n')],
+             REVIEW_PY),
+            ("production always builds the runner", [
+                ('        self.runner = SystemdRunner(policy) if SystemdRunner.available(policy) else None\n',
+                 '        self.runner = SystemdRunner(policy)\n')], REVIEW_PY),
+            ("R-c on any repo", [
+                ('        if self.policy.unit_scope == "--user" and row["repo"] != sandbox_repo:\n', '        if False:\n')],
+             REVIEW_PY)]},
+    "AC-8/NEG-22 CAS failure": {
+        "tests": [RT + "test_neg22_a_failed_start_attempt_stops_the_unit_and_keeps_the_charge_until_b33_is_spent"],
+        "mutations": [
+            ("the unit is not stopped", [
+                ('            self.runner.stop(unit)                 # NEG-22: stopped; the B33 charge committed at intent stays\n',
+                 '            pass\n')], REVIEW_PY),
+            ("the charge is refunded", [
+                ('            self.c.intent_move(intent["id"], ("open",), "closed", "start_attempt failed: %s" % error)\n',
+                 '            self.c.intent_move(intent["id"], ("open",), "closed", "start_attempt failed: %s" % error)\n'
+                 '            self.c.db.execute("UPDATE lineage_budget SET b33_used = b33_used - 1")\n')], REVIEW_PY),
+            ("B33 is not checked at intent", [
+                ('            if used >= budget:\n                raise ContractError("B33 spent: %d of %d model runs for the lineage; the row stops launching"\n',
+                 '            if False:\n                raise ContractError("B33 spent: %d of %d model runs for the lineage; the row stops launching"\n')],
+             CONTRACTS)]},
+    "AC-8/NEG-36 orphan recovery": {
+        "tests": [RT + "test_neg36_an_orphan_unit_is_stopped_once_charged_once_and_settles_nothing",
+                  "tests.test_ahc_crash.NamedPointTests.test_ac4_named_points_are_counted_and_a_crash_at_each_keeps_the_invariants"],
+        "mutations": [
+            ("the orphan is not stopped", [
+                ('        if self.stop(out, unit, "orphan of intent %s" % intent["id"]):\n', '        if True:\n')], REVIEW_PY),
+            ("a second unit starts while one may be live", [
+                ('            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN (\'open\', \'started\')",\n',
+                 '            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND 0 AND state IN (\'open\', \'started\')",\n')],
+             CONTRACTS),
+            ("startup reconciliation is skipped", [
+                ('            units = self.runner.list_units()\n', '            units = []\n')], REVIEW_PY)]},
+    "AC-13/NEG-49 orphan recovery through the guard": {
+        "tests": [OR + "test_neg49_orphan_recovery_through_the_production_launch_guard",
+                  OR + "test_neg49_a_unit_never_confirmed_inactive_blocks_its_row_after_60_s_and_nothing_else"],
+        "mutations": [
+            ("the Slice check is dropped", [
+                ('            if self.reconciling and UNIT.fullmatch(unit) and unit in self.slice_ok:\n',
+                 '            if self.reconciling and UNIT.fullmatch(unit):\n')], GUARD),
+            ("the startup-only rule is dropped", [
+                ('            if self.reconciling and UNIT.fullmatch(unit) and unit in self.slice_ok:\n',
+                 '            if UNIT.fullmatch(unit) and unit in self.slice_ok:\n')], GUARD),
+            ("the R3 command line leaves --slice out", [
+                ('        "--unit=" + unit, "--slice=" + ahc_guard.REVIEW_SLICE, "--collect",',
+                 '        "--unit=" + unit, "--collect",')], REVIEW_PY),
+            ("an unconfirmed stop is not bounded", [
+                ('            if self.c._mono() - start >= self.bound:\n                return False\n',
+                 '            if self.c._mono() - start >= self.bound:\n                return True\n')], REVIEW_PY)]},
+    "AC-8 R4 peer uid": {
+        "tests": [RT + "test_r04_the_peer_uid_comes_from_a_real_socketpair"],
+        "mutations": [
+            ("the uid is the bound one, not the socket's", [
+                ('    uid = peer_uid(sock)\n    to, receipt = _final(read_final(sock))\n',
+                 '    uid = contracts._row("reviews", "id", rid)["producer_uid"]\n    to, receipt = _final(read_final(sock))\n')],
+             REVIEW_PY),
+            ("an oversize FINAL is truncated", [
+                ('        if size > limit:\n            raise C.ContractError("the FINAL is longer than %d bytes; refused" % limit)\n',
+                 '        if size > limit:\n            break\n')], REVIEW_PY)]},
+    "AC-8 R4 test_r04_rc_refuses_usage_store": {
+        "tests": [RT + "test_r04_rc_refuses_usage_store"],
+        "mutations": [
+            ("a usage-store FINAL is accepted", [
+                ('    if source != "stdout-pipe":\n', '    if False:\n')], REVIEW_PY),
+            ("the InvocationID is not compared", [
+                ('    if not invocation_id or invocation_id != expected_invocation or exit_status != 0:\n',
+                 '    if exit_status != 0:\n')], REVIEW_PY)]},
+})
+
+
+SR = "tests.test_ahc_runner.StartupReconcileTests."
+
+ENTRIES.update({
+    "AC-8/NEG-36 reconciliation at daemon start": {
+        "tests": [SR + "test_ac8_startup_reconciliation_stops_an_orphan_and_raises_its_incident",
+                  SR + "test_ac8_the_daemon_reconciles_before_its_first_tick"],
+        "mutations": [
+            ("the daemon does not reconcile at start", [
+                ('    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy), default=str))\n', '')],
+             RUNNER_PY),
+            ("reconciliation findings are not raised", [
+                ('        for text in out["incidents"]:\n            raise_incident(contracts, "reconcile", text)\n', '')],
+             RUNNER_PY)]},
+})
+
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:

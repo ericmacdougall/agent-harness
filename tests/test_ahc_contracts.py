@@ -1,6 +1,7 @@
 """ahc_contracts: Review, Grant and Operation (Effect) transitions per spec ahc-m1-v2g2 (goodqa#16049 M-1): the
 fast-forward of the default branch from B to the reviewed H, keyed (repo, pr, B, H, revision, g)."""
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -1267,6 +1268,215 @@ def _now_calls():
                 self.generic_visit(node)
         Visit().visit(ast.parse(path.read_text(encoding="utf-8")))
     return dict(out)
+
+
+
+class _FakeRunner:
+    """An in-process R3 runner (Launcher.for_test only): records starts and stops."""
+
+    def __init__(self, uid):
+        self.uid_value, self.started, self.stopped, self.on_start = uid, [], [], None
+        self.live, self.slice = set(), {}
+
+    def start(self, argv):
+        self.started.append(list(argv))
+        unit = [a for a in argv if a.startswith("--unit=")][0][len("--unit="):]
+        self.live.add(unit)
+        self.slice[unit] = "ahc-review.slice"
+        if self.on_start:
+            self.on_start()
+        return 0, "", ""
+
+    def uid(self, unit):
+        return self.uid_value
+
+    def stop(self, unit):
+        self.stopped.append(unit)
+        self.live.discard(unit)
+        return True
+
+    def show(self, unit, props):
+        return {"Slice": self.slice.get(unit, "user.slice"),
+                "ActiveState": "active" if unit in self.live else "inactive"}
+
+    def list_units(self):
+        return sorted(self.live)
+
+
+class RuntimeTests(Base):
+    """AC-8: the R3 launch intent and its runner, NEG-22, NEG-36, and R4's peer uid over a real socketpair."""
+
+    UID = ReviewTests.UID
+    row = ReviewTests.row
+    walk = ReviewTests.walk
+
+    def setUp(self):
+        super().setUp()
+        import ahc_guard  # noqa: PLC0415
+        import ahc_review  # noqa: PLC0415
+        self.G, self.R = ahc_guard, ahc_review
+        bin_dir = Path(self.tmp.name) / "bin"
+        bin_dir.mkdir(mode=0o700)
+        stubs = {}
+        for name in ("systemd-run", "systemctl"):
+            p = bin_dir / name
+            p.write_text("#!/bin/sh\nexit 0\n")
+            os.chmod(str(p), 0o755)
+            stubs[name] = str(p)
+        self.policy = ahc_guard.Policy.for_test(Path(self.tmp.name) / "root", stubs, trusted_dirs=(str(bin_dir),))
+        self.helper = str(Path(self.tmp.name) / "peer_review.py")
+        self.runner = _FakeRunner(self.UID)
+        self.launcher = ahc_review.Launcher.for_test(self.c, self.policy, self.helper, self.runner)
+
+    def queued(self, **kw):
+        return self.walk(self.row(**kw), "queued")
+
+    def used(self, row):
+        return self.c.b33(self.lineage(row))[0]
+
+    @staticmethod
+    def unit_of(argv):
+        return [a for a in argv if a.startswith("--unit=")][0][len("--unit="):]
+
+    def lineage(self, row):
+        item = self.c._row("work_items", "id", row["item"])
+        return item["lineage"] if item else row["id"]
+
+    def test_r03_the_intent_binds_the_full_command_line_and_charges_b33_once(self):
+        row = self.queued()
+        try:
+            status, unit = self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        except Exception as error:  # noqa: BLE001 - arming refuses a digest that is not the command line's
+            self.fail("the launch was refused: %s: %s" % (type(error).__name__, error))
+        self.assertEqual(status, "running", unit)
+        intent = self.c._row("launch_intents", "unit", unit)
+        self.assertEqual(unit, "ahc-review-%s-%s.service" % (row["id"], intent["id"]))
+        self.assertEqual(self.R.parse_unit(unit), (row["id"], intent["id"]))
+        argv = self.runner.started[0]
+        self.assertEqual(intent["cmd_sha256"], self.G.argv_digest(argv), "the digest covers the full command line")
+        self.assertEqual(self.policy.armed["systemd-run"], (argv, intent["cmd_sha256"]), "armed with that line")
+        self.assertIn("--slice=ahc-review.slice", argv)
+        self.assertEqual(argv[0], self.policy.exe["systemd-run"])
+        self.assertEqual(argv[argv.index("--") + 1:], [self.policy.python, self.helper, "pr", "--github-repo",
+                                                       row["repo"], "--pr", "5", "--no-main-stamp", "--expected-head",
+                                                       H1, "--base", BASE])
+        self.assertFalse([a for a in argv if "author-harness" in a or "main-stamp" in a and a != "--no-main-stamp"])
+        self.assertEqual((intent["state"], intent["charge"]), ("started", 1))
+        self.assertEqual(self.used(row), 1)
+        bound = self.c._row("reviews", "id", row["id"])
+        self.assertEqual((bound["state"], bound["producer_unit"], bound["producer_uid"]), ("running", unit, self.UID))
+        self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "refused")
+        self.assertEqual((len(self.runner.started), self.used(row)), (1, 1), "no second unit, no second charge")
+
+    def test_neg22_a_failed_start_attempt_stops_the_unit_and_keeps_the_charge_until_b33_is_spent(self):
+        row = self.queued()
+
+        def bump():
+            self.db.execute("UPDATE reviews SET version=version+1 WHERE id=?", (row["id"],))
+        self.runner.on_start = bump
+        budget = {"policy": {"b33": 3}}
+        results = [self.launcher.launch(row["id"], sandbox_repo=row["repo"], budget_obs=budget)[0] for _ in range(5)]
+        self.assertEqual(results, ["refused"] * 5)
+        self.assertEqual(len(self.runner.started), 3, "three units started, then B33 stops the launches")
+        self.assertEqual(self.runner.stopped, [self.unit_of(a) for a in self.runner.started],
+                         "every started unit was stopped")
+        self.assertEqual(self.used(row), 3, "each failed CAS charged once, none refunded")
+        states = [s for (s,) in self.db.execute("SELECT state FROM launch_intents WHERE row=?", (row["id"],))]
+        self.assertEqual(states, ["closed"] * 3)
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "queued")
+        self.runner.on_start, self.runner.uid_value = None, None          # a unit that reports no uid
+        other = self.queued(pr=6)
+        self.assertEqual(self.launcher.launch(other["id"], sandbox_repo=other["repo"])[0], "refused")
+        self.assertEqual((self.runner.stopped[-1], self.used(other)), (self.unit_of(self.runner.started[-1]), 1))
+
+    def test_r03_without_isolation_the_row_goes_to_infra_wait_and_no_runner_comes_from_config(self):
+        import inspect  # noqa: PLC0415
+        self.assertEqual(list(inspect.signature(self.R.Launcher.__init__).parameters),
+                         ["self", "contracts", "policy", "helper_script"], "the runner is injectable only for tests")
+        bare = self.G.Policy.for_test(Path(self.tmp.name) / "root", {}, trusted_dirs=())
+        row = self.queued()
+        try:
+            status = self.R.Launcher(self.c, bare, self.helper).launch(row["id"])[0]
+        except Exception as error:  # noqa: BLE001 - a launch attempt without isolation is the failure under test
+            self.fail("launch without isolation raised %s: %s" % (type(error).__name__, error))
+        self.assertEqual(status, "infra-wait")
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "infra-wait")
+        self.assertEqual(self.c.db.execute("SELECT COUNT(*) FROM launch_intents").fetchone()[0], 0)
+
+    def test_r03_rc_is_allowed_only_for_the_sandbox_repo(self):
+        row = self.queued()
+        self.assertEqual(self.launcher.launch(row["id"], sandbox_repo="o/sandbox")[0], "refused")
+        self.assertEqual((self.runner.started, self.used(row)), ([], 0))
+
+    def test_neg36_an_orphan_unit_is_stopped_once_charged_once_and_settles_nothing(self):
+        row = self.queued()
+        intent, argv = self.c.launch_intent(row["id"], row["version"], lambda unit: self.R.r3_command(
+            self.policy, unit, row, helper_script=self.helper))
+        self.runner.start(argv)                     # the crash: the unit runs, start_attempt never happened
+        self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "refused",
+                         "no second unit while the first may be live")
+        self.assertEqual(len(self.runner.started), 1)
+        stray = "ahc-review-rv-%s-%s.service" % ("0" * 24, "1" * 16)
+        self.runner.live.add(stray)
+        self.runner.slice[stray] = "ahc-review.slice"
+        out = self.R.Reconciler(self.c, self.policy, self.runner, sleep=lambda s: None).run()
+        self.assertEqual(sorted(out["stopped"]), sorted([intent["unit"], stray]))
+        self.assertEqual(out["orphaned"], [intent["id"]])
+        self.assertEqual(self.c._row("launch_intents", "id", intent["id"])["state"], "orphaned")
+        self.assertTrue(any(stray in i for i in out["incidents"]), "a unit matching no intent raises an incident")
+        self.assertEqual(self.used(row), 1, "charged once at intent, never again")
+        fresh = self.c._row("reviews", "id", row["id"])
+        self.assertIsNone(fresh["producer_uid"], "the row keeps no producer uid from the orphan")
+        self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "running")
+        self.assertEqual(len(self.runner.live), 1, "never more than one live unit for the row")
+
+    def test_r04_the_peer_uid_comes_from_a_real_socketpair(self):
+        import socket  # noqa: PLC0415
+        if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+            self.skipTest("no peer credential support")
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        self.assertEqual(self.R.peer_uid(a), os.getuid())
+        row = self.queued()
+        row = self.c.start_attempt(row["id"], "ahc-review-x", os.getuid(), expected_version=row["version"],
+                                   event_id=self.ev())
+        b.sendall(json.dumps({"verdict": "PASS", "receipt": self.receipt()}).encode())
+        b.shutdown(socket.SHUT_WR)
+        self.assertEqual(self.R.receive_final(self.c, a, row["id"])["state"], "passed")
+        other = self.queued(pr=6)
+        other = self.c.start_attempt(other["id"], "ahc-review-y", os.getuid() + 1,
+                                     expected_version=other["version"], event_id=self.ev())
+        c2, d2 = socket.socketpair()
+        self.addCleanup(c2.close)
+        self.addCleanup(d2.close)
+        d2.sendall(json.dumps({"verdict": "PASS", "receipt": self.receipt(pr=6), "peer_uid": os.getuid() + 1}).encode())
+        d2.shutdown(socket.SHUT_WR)
+        with self.assertRaisesRegex(C.ContractError, "unverified-producer"):
+            self.R.receive_final(self.c, c2, other["id"])
+        self.assertEqual(self.c._row("reviews", "id", other["id"])["state"], "running")
+        e, f = socket.socketpair()
+        self.addCleanup(e.close)
+        self.addCleanup(f.close)
+        with self.assertRaisesRegex(C.ContractError, "longer than"):
+            f.sendall(b"x" * 64)
+            f.shutdown(socket.SHUT_WR)
+            self.R.read_final(e, limit=16)
+
+    def test_r04_rc_refuses_usage_store(self):
+        row = self.queued()
+        row = self.c.start_attempt(row["id"], "ahc-review-z", os.getuid(), expected_version=row["version"],
+                                   event_id=self.ev())
+        final = json.dumps({"verdict": "PASS", "receipt": self.receipt()}).encode()
+        ok = dict(source="stdout-pipe", final_bytes=final, invocation_id="inv-1", expected_invocation="inv-1",
+                  exit_status=0)
+        for name, change in (("usage store", {"source": "usage-store"}), ("a file", {"source": "file"}),
+                             ("other invocation", {"invocation_id": "inv-2"}), ("no invocation", {"invocation_id": ""}),
+                             ("unclean exit", {"exit_status": 1})):
+            with self.subTest(name), self.assertRaisesRegex(C.ContractError, "unverified-producer"):
+                self.R.settle_rc(self.c, row["id"], **dict(ok, **change))
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "running")
+        self.assertEqual(self.R.settle_rc(self.c, row["id"], **ok)["state"], "passed")
 
 
 if __name__ == "__main__":

@@ -735,6 +735,73 @@ class Contracts:
         finally:
             self.db.execute("ROLLBACK")
 
+    # -------------------------------------------------------------- AC-8: R3 launch intents
+
+    LIVE_INTENT = ("open", "started")
+
+    def launch_intent(self, rid, expected_version, command, *, budget_obs=None):
+        """R3, before the unit starts: one durable launch intent (intent id, row id, row version, unit name
+        `ahc-review-{row}-{intent id}.service`, the sha256 of the full systemd-run command line `command(unit)`
+        returns, the budget charge). The B33 charge is committed in the same transaction and never refunded,
+        whatever happens to the unit (NEG-22). Refused while the row is blocked by startup reconciliation, while an
+        earlier intent for the row may still have a live unit, or when the lineage's B33 is spent."""
+        with self.tx():
+            row = self._row("reviews", "id", rid)
+            if row is None:
+                raise ContractError("no review row %s" % rid)
+            if row["state"] != "queued" or row["version"] != expected_version:
+                raise ContractError("R3 launches only a queued row at its expected version")
+            if self.db.execute("SELECT 1 FROM review_blocks WHERE row=?", (rid,)).fetchone():
+                raise ContractError("row %s is blocked by startup reconciliation; no launch intent" % rid)
+            if self.db.execute("SELECT 1 FROM launch_intents WHERE row=? AND state IN ('open', 'started')",
+                               (rid,)).fetchone():
+                raise ContractError("a unit for row %s may still be live; no second unit starts" % rid)
+            item = self._row("work_items", "id", row["item"]) if row["item"] else None
+            lineage = item["lineage"] if item else rid
+            used, budget = self.b33(lineage, budget_obs)
+            if used >= budget:
+                raise ContractError("B33 spent: %d of %d model runs for the lineage; the row stops launching"
+                                    % (used, budget))
+            n = self.db.execute("SELECT COUNT(*) FROM launch_intents WHERE row=?", (rid,)).fetchone()[0]
+            iid = _sha({"row": rid, "version": expected_version, "n": n})[:16]
+            unit = "ahc-review-%s-%s.service" % (rid, iid)
+            argv = [str(a) for a in command(unit)]
+            digest = hashlib.sha256(json.dumps(argv, separators=(",", ":")).encode("utf-8")).hexdigest()
+            now = self.now()
+            self.db.execute("INSERT INTO launch_intents(id, row, row_version, unit, cmd_sha256, lineage, charge, "
+                            "state, created, updated) VALUES (?,?,?,?,?,?,1,'open',?,?)",
+                            (iid, rid, expected_version, unit, digest, lineage, now, now))
+            self.charge_b33(lineage)
+            self._a0("launch_intent", iid, None, "open", "li-open:" + iid, "ahc-core", row=rid, unit=unit,
+                     cmd_sha256=digest)
+            return self._row("launch_intents", "id", iid), argv
+
+    def intent_move(self, iid, frm, to, reason):
+        """A launch intent's CAS: open -> started (start_attempt bound the unit), open -> closed (start_attempt's CAS
+        failed and the unit was stopped), open -> orphaned (reconciliation found the unit with no start_attempt
+        record), started -> closed (the attempt ended). The charge is never touched."""
+        with self.tx():
+            cur = self.db.execute("UPDATE launch_intents SET state=?, reason=?, updated=? WHERE id=? AND state IN (%s)"
+                                  % ",".join("?" * len(frm)), (to, str(reason)[:300], self.now(), iid) + tuple(frm))
+            if cur.rowcount != 1:
+                return False
+            self._a0("launch_intent", iid, None, to, "li-%s:%s" % (to, iid), "ahc-core", reason=str(reason)[:300])
+            return True
+
+    def live_intent_units(self):
+        """The units of committed intents that may still be live (the guard's committed-intent form)."""
+        return [u for (u,) in self.db.execute("SELECT unit FROM launch_intents WHERE state IN ('open', 'started')")]
+
+    def block_row(self, rid, unit, reason):
+        with self.tx():
+            self.db.execute("INSERT INTO review_blocks(row, unit, reason, created) VALUES (?,?,?,?) ON CONFLICT(row) "
+                            "DO UPDATE SET unit=excluded.unit, reason=excluded.reason", (rid, unit, str(reason)[:300],
+                                                                                         self.now()))
+
+    def unblock_row(self, rid):
+        with self.tx():
+            return self.db.execute("DELETE FROM review_blocks WHERE row=?", (rid,)).rowcount == 1
+
     # -------------------------------------------------------------- AC-7: W21's keyed send record
 
     W21_OPEN = ("intent", "attempted", "readback-pending")
