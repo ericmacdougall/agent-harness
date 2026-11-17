@@ -39,7 +39,10 @@ place and shape), A-p3 (which gh errors prove a failure before any request byte)
 zero-oid create and delete), A-attr (E3 attribution rides in the confirm evidence until a column exists),
 A-lock (the sender holds the lock shared and the fences take it exclusive, as spec T9 says; owner-confirmed),
 A-reconcile (ahc-merge runs E10's reconcile for held ops: confirm when applied, fence_held on a complete off read),
-A-prepare (the repo's GraphQL node id is read before the dispatch commit; a send without it fails closed, UNTYPED).
+A-prepare (the repo's GraphQL node id is read before the dispatch commit; a send without it fails closed, UNTYPED),
+A-cancel (a send cancelled at the deadline before it started is still reported NO_RESPONSE, never an absence proof),
+A-canary-inprogress (Canary.run writes the in-progress record after its read-only preparation and before the first
+canary-ref write; a preparation failure keeps the earlier deferred or refused outcome and the prior record).
 """
 from __future__ import annotations
 
@@ -92,6 +95,8 @@ PROPOSED_CONTRACT_DIFFS = (
     "ahc_crash.SEAMS += MERGE_SEAMS; InventoryTests.MODULES and test_ahc_fs.MODULES += ahc_merge",
     "Contracts.dispatch (E2 guard) refuses while repo_flags.merging_off is set (found by T9Tests: a disabled repo's "
     "intent still passed E2; ahc_merge checks it itself meanwhile)",
+    "Contracts.dispatch (E2 guard) checks e9: obs chk_cas is True and 0 <= canary_age < 86400, as ELIG does (PR #270 "
+    "review F1; ahc_merge refuses an expired canary itself and carries both facts in E2's observation meanwhile)",
 )
 
 
@@ -737,15 +742,8 @@ class Canary:
         self.store.write(rec)
         return rec
 
-    def _cases(self, repo, branch, cases):
+    def _cases(self, repo, tip, p, g, cases):
         """The CHK-CAS cases, filling `cases` as they run (so a later exception keeps what was observed)."""
-        self.t.prepare(repo)
-        tip = self.t.read_ref(repo, "refs/heads/%s" % branch)
-        p = (self.t.commit_parents(repo, tip) or [None])[0]
-        g = (self.t.commit_parents(repo, p) or [None])[0] if p else None
-        cases["ancestors"] = bool(p and g)
-        if not cases["ancestors"]:
-            return
         runs = self.t.workflow_runs(repo)
         cur = self._ref(repo)
         if cur:
@@ -762,9 +760,12 @@ class Canary:
         cases["no-workflow"] = self.t.workflow_runs(repo) == runs
 
     def run(self, repo, branch):
-        """F3 (review of PR #270): an attempt first replaces the prior record with an in-progress, not-passed one
-        (durably, before any GitHub call), so an interrupted attempt never leaves an older pass authoritative. Any
-        failed case or exception then persists a failed record and turns the repo's merging off (escalating once)."""
+        """F3 (review of PR #270): before its first canary-ref write, an attempt replaces the prior record with an
+        in-progress, not-passed one (durably), so an interrupted attempt never leaves an older pass authoritative.
+        Any failed case or exception after that persists a failed or inconclusive record and turns the repo's
+        merging off (escalating once). ASSUMPTION A-canary-inprogress: the read-only preparation (the repo id, the
+        tip and its two ancestors) runs first and keeps its earlier outcomes (deferred when not prepared, refused
+        without two ancestors), leaving the prior record as it was, since no case has run yet."""
         if not self.identity.fresh():
             return Outcome("waiting-dep", "merge identity unavailable")
         cases, error = {}, None
@@ -772,13 +773,22 @@ class Canary:
             epoch = self.kill.read() if held else {"on": True}
             if not held or epoch.get("on") is not False:
                 return Outcome("deferred", "kill switch on, unreadable, or a fence holds the lock")
+            try:
+                self.t.prepare(repo)
+            except TransportError as error:
+                return Outcome("deferred", "canary not prepared: %s" % error)
+            tip = self.t.read_ref(repo, "refs/heads/%s" % branch)
+            p = (self.t.commit_parents(repo, tip) or [None])[0]
+            g = (self.t.commit_parents(repo, p) or [None])[0] if p else None
+            if not (p and g):
+                return Outcome("refused", "the default branch needs two ancestors for the canary")
             prior = self.store.read(repo) or {}
             self._record(repo, "in-progress", False, {}, bool(prior.get("escalated")) and not prior.get("passed"))
             try:
-                self._cases(repo, branch, cases)
+                self._cases(repo, tip, p, g, cases)
             except Exception as exc:              # any failure mid-attempt is a failed (inconclusive) canary
                 error = "%s during the canary" % type(exc).__name__
-        passed = error is None and all(cases.values()) and len(cases) >= 6
+        passed = error is None and all(cases.values()) and len(cases) >= 5
         escalated = bool(prior.get("escalated")) and not prior.get("passed") and not passed
         if not passed:
             self.port.set_merging(repo, off=True, cause="CHK-CAS canary failed", actor="ahc-core")
@@ -810,7 +820,6 @@ class Sender:
         self._own_success = set()      # ops whose own CAS response arrived and reported success (this process only)
         self._last_error = {}          # op key -> the error text of its send (this process only)
         self._e13 = {}                 # op key -> the first quiet-window read (this process only)
-        self.workers = []              # send threads (tests join them; a cancelled one can never start a request)
         self._n = 0
 
     def _at(self, point):
@@ -931,7 +940,6 @@ class Sender:
                 box["r"] = SendResult(UNTYPED, "transport raised %s" % type(error).__name__)
 
         worker = threading.Thread(target=run, name="ahc-merge-send", daemon=True)
-        self.workers.append(worker)
         worker.start()
         worker.join(self.send_deadline)
         if worker.is_alive() or "r" not in box:
