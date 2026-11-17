@@ -299,7 +299,7 @@ class ShadowTick:
                                                               "packet_sha256"))
         packet = ahc_review.build_packet(
             lambda args: self.producer._git(args, clone, 60)[:2], repo=req["repo"], pr=req["pr"], base=base,
-            head=req["head"], acceptance=obs.get("acceptance") or "", spec_core=obs.get("attached_core") or "",
+            head=req["head"], spec_core_text=obs.get("spec_core_text"), spec_core_sha=obs.get("attached_core"),
             owner_text="The owner's request (its own packet is not core's input; its sha256 is listed):\n" + owner)
         if self.store_packet is not None:
             self.store_packet(packet)

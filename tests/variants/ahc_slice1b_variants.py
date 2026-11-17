@@ -1286,3 +1286,27 @@ def main(argv):
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
+
+RTR = "tests.test_ahc_runner.ReviewTickTests.test_r273_"
+ENTRIES.update({
+    "PR 273 receipt F3 the packet carries the attached core's criteria and text": {
+        "tests": [R273 + "f3_the_packet_carries_the_attached_cores_text_and_criteria_or_is_not_built",
+                  "tests.test_ahc_contracts.RuntimeTests.test_r02_core_builds_the_packet_from_its_own_snapshot_and_lints_it",
+                  "tests.test_ahc_observe.ProducerTests.test_r273_f3_the_attached_cores_text_is_verified_handed_to_r2_and_never_persisted",
+                  RTR + "f3_the_reviewer_gets_the_attached_cores_criteria_and_text_at_admission_and_for_a_successor",
+                  RTR + "f3_without_the_attached_cores_text_no_packet_is_built_and_the_request_is_held"],
+        "mutations": [
+            ("R2 takes the spec core text without checking it against the attached core", [
+                ('    if hashlib.sha256(data).hexdigest() != spec_core_sha:\n', '    if False:\n')], REVIEW_PY),
+            ("the packet renders the digest as the spec core", [
+                ('             "", "## Spec core (sha256 %s)" % spec_core_sha, spec_text.rstrip("\\n"),\n',
+                 '             "", "## Spec core (sha256 %s)" % spec_core_sha, spec_core_sha,\n')], REVIEW_PY),
+            ("a core without acceptance criteria still builds a packet", [
+                ('    if not acceptance.strip():\n', '    if False:\n')], REVIEW_PY),
+            ("the producer accepts a spec core text that is not the attached core", [
+                ('    if hashlib.sha256(text).hexdigest() != gq.get("attached_core"):\n', '    if False:\n')],
+             "harness/hooks/ahc_observe.py"),
+            ("the observation drops the verified text before R2", [
+                ('        return dict(self.c.load_observation(stamp["id"]), **s.get("attach", {}))\n',
+                 '        return self.c.load_observation(stamp["id"])\n')], "harness/hooks/ahc_observe.py")]},
+})
