@@ -103,6 +103,7 @@ POINTS = (
     "r3.unit_started",         # ahc_review.Launcher: after the unit started, before start_attempt (AC-8, NEG-36)
     "r3.intent_committed",     # ahc_review.Launcher: after launch_intent committed, before the unit (PR 272 F4 a)
     "r3.attempt_bound",        # ahc_review.Launcher: after start_attempt committed (PR 272 F4 b)
+    "r3.settled",              # ahc_review.settle_final: after the result and stopping commit, before the stop (F1)
 )
 
 

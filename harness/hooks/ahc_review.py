@@ -81,8 +81,9 @@ def attempt_paths(root, unit, row, clone):
 
 def r3_command(policy, unit, row, *, helper_script, attempt, python=None):
     """The full R3 systemd-run command line for one review row: the completion wrapper, then the bound, unstamped
-    peer_review argv (R3 row: --github-repo/--pr, --no-main-stamp, --expected-head H, --base B_r, no
-    --author-harness; option A adds --repo, --packet and --output) in the daemon's review slice. The unit runs
+    peer_review argv (R3 row: --github-repo/--pr, --no-main-stamp, --expected-head H with snapshot base B_r,
+    which is `--snapshot-base B_r` (PR 272 rescue F2: without it peer_review snapshots H^1..H), --base B_r for the
+    author-harness range, no --author-harness; option A adds --repo, --packet and --output) in the daemon's review slice. The unit runs
     detached, may write only its report directory, and stays loaded after it exits (RemainAfterExit) so core can read
     its InvocationID. The template is fixed in code; nothing from config or the environment enters it."""
     exe = policy.exe.get("systemd-run")
@@ -102,7 +103,7 @@ def r3_command(policy, unit, row, *, helper_script, attempt, python=None):
         "--", str(python or policy.python), str(helper_script), "pr",
         "--repo", attempt["clone"], "--packet", attempt["packet"], "--output", attempt["output"],
         "--github-repo", row["repo"], "--pr", str(int(row["pr"])), "--no-main-stamp",
-        "--expected-head", row["head"], "--base", base,
+        "--expected-head", row["head"], "--snapshot-base", base, "--base", base,
     ]
 
 
@@ -155,32 +156,58 @@ class SystemdRunner:
             return None
 
 
-def unit_inactive(contracts, runner, unit, *, bound=STOP_BOUND, sleep=time.sleep):
+def observed_inactive(contracts, runner, unit, *, bound=STOP_BOUND, sleep=time.sleep):
     """show -p ActiveState until the unit reports inactive or failed: at most `bound` seconds on the contracts' boot
-    clock and at most bound + 1 polls, so a stalled clock cannot hold the caller. A refused or failed show is never
-    a confirmation."""
+    clock and at most bound + 1 polls, so a stalled clock cannot hold the caller. Returns the state read (the
+    confirmation intent_retire records) or None. A refused or failed show is never a confirmation, and neither is
+    `active` with SubState `exited` (RemainAfterExit: the main process ended, the unit and its cgroup are still
+    there until a stop)."""
     start = contracts._mono()
     for _ in range(int(bound) + 1):
         try:
             state = (runner.show(unit, ("ActiveState",)) or {}).get("ActiveState")
         except ahc_guard.LaunchRefused:
-            return False
-        if state in ("inactive", "failed"):
-            return True
+            return None
+        if state in C.Contracts.CONFIRMED_INACTIVE:
+            return state
         if contracts._mono() - start >= bound:
-            return False
+            return None
         sleep(1.0)
-    return False
+    return None
 
 
-def stop_confirmed(contracts, runner, unit, *, bound=STOP_BOUND, sleep=time.sleep):
-    """PR 272 F5: a stop request, then the unit confirmed inactive or failed (unit_inactive). The stop's own return
-    value is never the confirmation; a refused stop is no confirmation either."""
+def unit_inactive(contracts, runner, unit, *, bound=STOP_BOUND, sleep=time.sleep):
+    return observed_inactive(contracts, runner, unit, bound=bound, sleep=sleep) is not None
+
+
+def confirm_stopped(contracts, runner, unit, *, bound=STOP_BOUND, sleep=time.sleep):
+    """A stop request, then the unit observed inactive or failed. The stop's own return value is never the
+    confirmation (a stop can report success while the unit stays active); a refused stop is no confirmation
+    either. Returns the observed state or None."""
     try:
         runner.stop(unit)
     except ahc_guard.LaunchRefused:
-        return False
-    return unit_inactive(contracts, runner, unit, bound=bound, sleep=sleep)
+        return None
+    return observed_inactive(contracts, runner, unit, bound=bound, sleep=sleep)
+
+
+def stop_confirmed(contracts, runner, unit, *, bound=STOP_BOUND, sleep=time.sleep):
+    return confirm_stopped(contracts, runner, unit, bound=bound, sleep=sleep) is not None
+
+
+def retire(contracts, runner, iid, *, bound=STOP_BOUND, sleep=time.sleep):
+    """PR 272 rescue (F1): the only path from a stopping intent to its terminal state. Stop the unit, confirm it
+    inactive or failed, then intent_retire (which applies R15 for a cancelling row and lifts this unit's block in
+    the same transaction). Unconfirmed: the intent stays stopping, so it still blocks a second unit, stays in the
+    guard's committed-intent form, and the next sweep or reconciliation retries it. Returns intent_retire's result
+    or None."""
+    li = contracts._row("launch_intents", "id", iid)
+    if li is None or li["state"] != "stopping":
+        return None
+    observed = confirm_stopped(contracts, runner, li["unit"], bound=bound, sleep=sleep)
+    if observed is None:
+        return None
+    return contracts.intent_retire(iid, observed, "the unit is confirmed %s after a stop" % observed)
 
 
 class Launcher:
@@ -204,18 +231,22 @@ class Launcher:
     def stop_confirmed(self, unit):
         return stop_confirmed(self.c, self.runner, unit, sleep=self.sleep)
 
+    def retire(self, iid):
+        return retire(self.c, self.runner, iid, sleep=self.sleep)
+
     def abandon(self, intent, why):
-        """NEG-22 and PR 272 F5: the unit is stopped and confirmed inactive before its intent closes (the B33 charge
-        committed with the intent stays). Not confirmed: the intent stays open, so launch_intent starts no second
-        unit for the row; the row is blocked and the review stage's sweep retries the stop every tick."""
+        """NEG-22: a launch that did not bind its row. The intent moves to stopping (retire_to closed) before any
+        stop, so a crash or a failed stop leaves durable cleanup; the B33 charge committed with the intent stays.
+        Not confirmed: the intent stays stopping, so launch_intent starts no second unit for the row; the row is
+        blocked and the review stage's sweep retries the stop every tick."""
         unit = intent["unit"]
-        if self.stop_confirmed(unit):
-            self.c.intent_move(intent["id"], ("open",), "closed", why)
+        self.c.intent_move(intent["id"], ("open",), "stopping", why, retire_to="closed")
+        if self.retire(intent["id"]):
             return "refused", why
         self.c.block_row(intent["row"], unit, "launch cleanup: the unit was not confirmed stopped")
         self.policy.incidents.append("R3: %s was not confirmed stopped after a failed launch; row %s is blocked"
                                      % (unit, intent["row"]))
-        return "refused", "%s; %s was not confirmed stopped, so its intent stays open and the row is blocked" % (
+        return "refused", "%s; %s was not confirmed stopped, so its intent stays stopping and the row is blocked" % (
             why, unit)
 
     def launch(self, rid, *, budget_obs=None, sandbox_repo=None):
@@ -245,14 +276,14 @@ class Launcher:
             return "refused", str(error)
         crash_at("r3.intent_committed")
         unit = intent["unit"]
+        self.policy.intent_units.add(unit)
         attempt = attempt_paths(self.root, unit, row, clone)
         try:
             ahc_fs.make_dirs(self.root, self.root / "reports")
             ahc_fs.make_fresh_dir(self.root, attempt["out_dir"])
         except OSError as error:
-            self.c.intent_move(intent["id"], ("open",), "closed", "report directory: %s" % type(error).__name__)
-            return "refused", "R3: the attempt's report directory could not be made fresh"
-        self.policy.intent_units.add(unit)
+            return self.abandon(intent, "R3: the attempt's report directory could not be made fresh (%s)"
+                                % type(error).__name__)
         self.policy.arm_unit(argv, intent["cmd_sha256"])
         rc, _out, err = self.runner.start(argv)
         crash_at("r3.unit_started")
@@ -274,7 +305,9 @@ class Launcher:
 
 
 class Reconciler:
-    """Startup reconciliation (NEG-36, NEG-49), run once before any new attempt can start."""
+    """Startup reconciliation (NEG-36, NEG-49), run once before any new attempt can start. Every non-terminal
+    intent is brought forward: an open one is recovered (its row is bound) or orphaned, a stopping one is retried,
+    and a terminal one whose unit is still active goes back to stopping. Every stop goes through `retire`."""
 
     def __init__(self, contracts, policy, runner, *, sleep=time.sleep, bound=STOP_BOUND):
         self.c, self.policy, self.runner = contracts, policy, runner
@@ -301,8 +334,25 @@ class Reconciler:
         if self.c.intent_move(intent["id"], ("open",), "started", "reconciliation: the row is bound to this unit"):
             out["recovered"].append(intent["id"])
 
-    def stop(self, out, unit, why):
-        """A stop through the guard; False (with the row blocked and an incident) when refused or unconfirmed."""
+    def retire(self, out, iid, why):
+        """A stopping intent's stop and confirmation (module `retire`); unconfirmed or refused, the row is blocked
+        and an incident raised, and the intent stays stopping for the sweep and the next reconciliation."""
+        li = self.c._row("launch_intents", "id", iid)
+        self.policy.intent_units.add(li["unit"])
+        done = retire(self.c, self.runner, iid, bound=self.bound, sleep=self.sleep)
+        if done is None:
+            self.incident(out, "reconciliation: %s not confirmed stopped within %d s (%s)" % (li["unit"], self.bound,
+                                                                                            why))
+            self.block(out, li["row"], li["unit"], "stop not confirmed within the bound")
+            return None
+        out["stopped"].append(li["unit"])
+        if done["state"] == "orphaned":
+            out["orphaned"].append(iid)
+        return done
+
+    def stop_unowned(self, out, unit, why):
+        """A unit with no committed intent: a recovery stop through the guard's startup rule, then confirmation.
+        False (with the row its name parses to blocked, and an incident) when refused or unconfirmed."""
         rid, _iid = parse_unit(unit)
         try:
             self.runner.stop(unit)
@@ -331,16 +381,15 @@ class Reconciler:
             units = self.runner.list_units()
             if units is None:
                 self.incident(out, "reconciliation: list-units failed; no attempt starts (fail closed)")
-                for (rid,) in self.c.db.execute("SELECT DISTINCT row FROM launch_intents WHERE state IN ('open', "
-                                                "'started')").fetchall():
-                    self.block(out, rid, "", "list-units failed")
+                for li in self.c.live_intents():
+                    self.block(out, li["row"], li["unit"], "list-units failed")
                 self.c.reconcile_state("failed", "list-units failed")
                 return out
             listed = set(units)
             for (rid, unit) in self.c.db.execute("SELECT row, unit FROM review_blocks").fetchall():
                 state = (self.runner.show(unit, ("ActiveState",)) or {}).get("ActiveState") if unit in listed else None
-                if unit not in listed or state in ("inactive", "failed"):
-                    if self.c.unblock_row(rid):
+                if unit not in listed or state in C.Contracts.CONFIRMED_INACTIVE:
+                    if self.c.unblock_row(rid, unit):
                         out["lifted"].append(rid)
             for unit in units:
                 if not ahc_guard.UNIT.fullmatch(unit):
@@ -350,11 +399,9 @@ class Reconciler:
                     self.reconcile_owned(out, unit, intent)
                 else:
                     self.reconcile_unowned(out, unit)
-            for (iid,) in self.c.db.execute("SELECT id FROM launch_intents WHERE state IN ('open', 'started') "
-                                            "ORDER BY id").fetchall():
-                intent = self.c._row("launch_intents", "id", iid)
-                if intent["unit"] not in listed:
-                    self.reconcile_absent(out, intent)
+            for li in self.c.live_intents():
+                if li["unit"] not in listed:
+                    self.reconcile_absent(out, li)
             self.c.reconcile_state("ok")
         finally:
             self.policy.reconciling = False      # the guard's startup-only rule: no recovery stop after this
@@ -362,48 +409,49 @@ class Reconciler:
 
     def reconcile_owned(self, out, unit, intent):
         props = self.runner.show(unit, ahc_guard.RECOVERY_PROPS) or {}
-        in_slice = props.get("Slice") == ahc_guard.REVIEW_SLICE
-        if not in_slice:
+        if props.get("Slice") != ahc_guard.REVIEW_SLICE:
             self.incident(out, "reconciliation: %s of a committed intent reports Slice %r" % (unit, props.get("Slice")))
-        if intent["state"] == "started":
-            return                                               # its attempt is the row's one live unit
+        state = intent["state"]
+        if state == "started":
+            return                                               # the row's one attempt; the sweep settles it
+        if state == "open":
+            if self.bound_running(intent):
+                self.recover_bound(out, intent)
+                return
+            self.c.intent_move(intent["id"], ("open",), "stopping", "no start_attempt record; stopped at startup",
+                               retire_to="orphaned")
+        elif state in C.Contracts.TERMINAL_INTENT:
+            # an earlier build closed or orphaned the intent without confirming its unit inactive: inconsistent
+            # state, made durable again (stopping, same terminal state) before the stop
+            if props.get("ActiveState") in C.Contracts.CONFIRMED_INACTIVE:
+                return
+            self.incident(out, "reconciliation: %s is %s although its intent %s is %s; stopping it"
+                          % (unit, props.get("ActiveState"), intent["id"], state))
+            self.c.intent_move(intent["id"], (state,), "stopping", "reconciliation: the unit of a %s intent is %s"
+                               % (state, props.get("ActiveState")), retire_to=state)
+        self.retire(out, intent["id"], "unit of intent %s" % intent["id"])
+
+    def reconcile_absent(self, out, intent):
+        """PR 272 F4: a non-terminal intent whose unit systemd does not list has no running unit (it never started,
+        or it is gone). Open: a row already bound to it keeps it (started; the sweep settles the row); otherwise
+        it is orphaned with its charge kept (NEG-22), so the row can launch again. Stopping: retired on the
+        confirmation. Started: the review stage's sweep gives the row up (R7) or completes its cancellation."""
         if intent["state"] == "open":
             if self.bound_running(intent):
                 self.recover_bound(out, intent)
                 return
-            self.policy.intent_units.add(unit)
-            if self.stop(out, unit, "orphan of intent %s" % intent["id"]):
-                self.c.intent_move(intent["id"], ("open",), "orphaned", "no start_attempt record; stopped at startup")
-                out["orphaned"].append(intent["id"])
+            self.c.intent_move(intent["id"], ("open",), "stopping", "no unit at startup: the launch never started "
+                               "it or it is gone; the charge stays", retire_to="orphaned")
+        elif intent["state"] != "stopping":
             return
-        # PR 272 F5: a closed or orphaned intent's unit must be gone; an active one is inconsistent state
-        if props.get("ActiveState") in ("inactive", "failed"):
-            return
-        self.incident(out, "reconciliation: %s is %s although its intent %s is %s; stopping it"
-                      % (unit, props.get("ActiveState"), intent["id"], intent["state"]))
-        if in_slice:
-            self.policy.slice_ok.add(unit)
-        self.stop(out, unit, "active unit of a %s intent" % intent["state"])
-
-    def reconcile_absent(self, out, intent):
-        """PR 272 F4: an open or started intent whose unit systemd does not list has no running unit (it never
-        started, or it is gone). Open: a row already bound to it keeps it (started; the sweep settles the row);
-        otherwise it is orphaned with its charge kept (NEG-22), so the row can launch again. Started: the review
-        stage's sweep gives the row up (R7) or completes its cancellation (R15)."""
-        if intent["state"] != "open":
-            return
-        if self.bound_running(intent):
-            self.recover_bound(out, intent)
-        elif self.c.intent_move(intent["id"], ("open",), "orphaned", "no unit at startup: the launch never started "
-                                "it or it is gone; the charge stays"):
-            out["orphaned"].append(intent["id"])
+        self.retire(out, intent["id"], "unlisted unit of intent %s" % intent["id"])
 
     def reconcile_unowned(self, out, unit):
         props = self.runner.show(unit, ahc_guard.RECOVERY_PROPS) or {}
         self.incident(out, "reconciliation: %s matches no committed intent (Slice %r)" % (unit, props.get("Slice")))
         if props.get("Slice") == ahc_guard.REVIEW_SLICE:
             self.policy.slice_ok.add(unit)
-        self.stop(out, unit, "unit with no intent")
+        self.stop_unowned(out, unit, "unit with no intent")
 
 
 # ------------------------------------------------------------------ R4: the peer uid and the FINAL
@@ -652,10 +700,13 @@ def settle_final(contracts, root, runner, uid, data):
     ids = report_finding_ids(raw) if verdict != "PASS" else []
     receipt = ahc_shadow.findings_receipt(row, verdict, ids, report_sha256=fin["report_sha256"],
                                           invocation_id=fin["invocation_id"])
-    moved = contracts.review(rid, "passed" if verdict == "PASS" else "findings", expected_version=row["version"],
-                             event_id="r4f:%s" % intent["id"], actor="ahc-review", receipt=receipt, peer_uid=uid)
-    contracts.intent_move(intent["id"], ("started",), "closed", "settled: %s" % verdict)
-    runner.stop(intent["unit"])
+    # PR 272 rescue (F1): the result and the intent's started -> stopping commit together; the unit is stopped
+    # and confirmed by the sweep that follows in the same settle() call, or, after a crash, by reconciliation
+    moved = contracts.settle_attempt(rid, "passed" if verdict == "PASS" else "findings", intent["id"],
+                                     expected_version=row["version"], event_id="r4f:%s" % intent["id"],
+                                     reason="settled: %s" % verdict, actor="ahc-review", receipt=receipt,
+                                     peer_uid=uid)
+    crash_at("r3.settled")
     return moved
 
 
@@ -717,60 +768,70 @@ class ReviewStage:
         return out
 
     def ended(self, unit):
-        """The unit reports inactive or failed. A failed or refused show is not an end (fail closed)."""
+        """The unit's main process is over: ActiveState inactive or failed, or active with SubState exited (the
+        unit runs with RemainAfterExit=yes, so after its process exits it stays active until stopped). A failed or
+        refused show is not an end (fail closed). An end is never a confirmed stop: the intent still retires
+        only after a stop and an observed inactive or failed state."""
         try:
-            props = self.launcher.runner.show(unit, ("ActiveState", "Result", "InvocationID"))
+            props = self.launcher.runner.show(unit, ("ActiveState", "SubState", "Result", "InvocationID"))
         except ahc_guard.LaunchRefused:
             return False
-        return props is not None and props.get("ActiveState") in ("inactive", "failed")
+        if props is None:
+            return False
+        state = props.get("ActiveState")
+        return state in C.Contracts.CONFIRMED_INACTIVE or (state == "active" and props.get("SubState") == "exited")
 
     def sweep(self, out):
-        """R7 (a unit that ended with no completion signal or outlived its bound), R15 (a cancelling row whose unit
-        is stopped) and abandoned launches. PR 272 F5/F6: an intent leaves open or started only once its unit is
-        confirmed inactive, failed or gone; until then the intent stays (with the row blocked for an open one)
-        and the stop is retried on the next tick, also after a restart."""
+        """PR 272 rescue (F1): one pass over every non-terminal launch intent (open, started, stopping), as a state
+        machine. Each step that ends an attempt only moves the intent to stopping, in the same transaction as the
+        row's change where there is one; the one way out of stopping is `retire` (stop, then inactive or failed
+        observed), which also applies R15 for a cancelling row. Unconfirmed, the intent stays stopping and the next
+        tick, or the next startup reconciliation, retries it.
+        - open, with no row bound to it: an abandoned or interrupted launch -> stopping (closed).
+        - started, the row running on it: R7 once the unit ended with no completion signal or outlived its bound
+          (outcome-unknown and stopping in one transaction); otherwise left running.
+        - started, the row not running on it (cancelling for R15, settled, or rebound): -> stopping (closed).
+        - stopping: retire."""
         now = self.c.now()
-        for iid, rid, unit, state, started in self.c.db.execute(
-                "SELECT id, row, unit, state, updated FROM launch_intents WHERE state IN ('open', 'started') "
-                "ORDER BY id").fetchall():
+        for li in self.c.live_intents():
+            iid, rid, unit, state = li["id"], li["row"], li["unit"], li["state"]
             row = self.c._row("reviews", "id", rid)
             bound = row is not None and row["producer_unit"] == unit
             if state == "open":
                 if bound and row["state"] == "running":
                     continue                       # an earlier build's binding: startup reconciliation recovers it
-                if self.launcher.stop_confirmed(unit):
-                    self.c.intent_move(iid, ("open",), "closed", "abandoned launch: the unit is confirmed stopped")
-                    self.c.unblock_row(rid)
-                    out["released"].append(rid)
+                self.c.intent_move(iid, ("open",), "stopping", "abandoned launch", retire_to="closed")
+            elif state == "started":
+                if bound and row["state"] == "running":
+                    ended = self.ended(unit)
+                    if not ended and now - li["updated"] <= REVIEW_MAX + SETTLE_GRACE:
+                        continue
+                    why = "the unit ended with no completion signal" if ended else "the unit outlived its bound"
+                    self.c.settle_attempt(rid, "outcome-unknown", iid, expected_version=row["version"],
+                                          event_id="r7:%s" % iid, reason=why, cause=why)
+                    out["unknown"].append(rid)
                 else:
+                    self.c.intent_move(iid, ("started",), "stopping", "the row is %s" % (
+                        row["state"] if row is not None else "gone"), retire_to="closed")
+            done = self.launcher.retire(iid)
+            if done is None:
+                if state == "open":
                     self.c.block_row(rid, unit, "launch cleanup: the unit was not confirmed stopped")
-                    out["held"].append(unit)
+                out["held"].append(unit)           # still stopping: no second unit for the row, retried next tick
                 continue
-            ended = self.ended(unit)
-            why = "the unit is confirmed stopped"
-            if bound and row["state"] == "running":
-                if not ended and now - started <= REVIEW_MAX + SETTLE_GRACE:
-                    continue
-                why = "the unit ended with no completion signal" if ended else "the unit outlived its bound"
-                row = self.c.review(rid, "outcome-unknown", expected_version=row["version"], event_id="r7:%s" % iid,
-                                    cause=why)
-                out["unknown"].append(rid)
-            if not self.launcher.stop_confirmed(unit):   # an ended unit too: RemainAfterExit keeps it until stopped
-                out["held"].append(unit)           # the intent stays started: no second unit for the row
-                continue
-            if bound and row["state"] == "cancelling":
-                self.c.review(rid, "superseded", expected_version=row["version"], event_id="r15:%s" % iid,
-                              cause="R15: the attempt unit is stopped")
+            out["released"].append(rid)
+            if done["r15"]:
                 out["cancelled"].append(rid)
-            self.c.intent_move(iid, ("started",), "closed", why)
-        # R15 for a cancelling row with no live intent: its unit was confirmed stopped when its intent closed
+        # R15 for a cancelling row with no live intent: its unit was confirmed stopped when its intent retired
         for rid, version in self.c.db.execute(
                 "SELECT id, version FROM reviews r WHERE state='cancelling' AND NOT EXISTS (SELECT 1 FROM "
-                "launch_intents i WHERE i.row = r.id AND i.state IN ('open', 'started')) ORDER BY id").fetchall():
+                "launch_intents i WHERE i.row = r.id AND i.state IN (%s)) ORDER BY id"
+                % ",".join("?" * len(C.Contracts.LIVE_INTENT)), C.Contracts.LIVE_INTENT).fetchall():
             self.c.review(rid, "superseded", expected_version=version, event_id="r15:%s:%d" % (rid, version),
                           cause="R15: the attempt unit was confirmed stopped")
             out["cancelled"].append(rid)
 
 
-__all__ = ["FinalInbox", "Launcher", "Reconciler", "ReviewStage", "attempt_paths", "stop_confirmed", "unit_inactive", "completion", "report_verdict", "settle_final", "build_packet", "fence", "lint", "r2_queue", "SystemdRunner", "parse_unit", "peer_uid", "r3_command", "read_final",
+__all__ = ["FinalInbox", "Launcher", "Reconciler", "ReviewStage", "attempt_paths", "stop_confirmed", "unit_inactive",
+           "confirm_stopped", "observed_inactive", "retire", "completion", "report_verdict", "settle_final", "build_packet", "fence", "lint", "r2_queue", "SystemdRunner", "parse_unit", "peer_uid", "r3_command", "read_final",
            "receive_final", "settle_rc"]

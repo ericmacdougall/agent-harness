@@ -563,9 +563,20 @@ class Ledger:
             raise SchemaError("ledger schema_version %d is not supported by this ahc (knows %d); refusing to start"
                               % (version, SCHEMA_VERSION))
         if version == SCHEMA_VERSION:
+            self._check_intent_lifecycle()
             return
         raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
                           "this process does not" % (version, SCHEMA_VERSION))
+
+    def _check_intent_lifecycle(self):
+        """PR 272 rescue (F1): launch_intents is new in v5 and was never released before its lifecycle had the
+        stopping state. A v5 ledger written by a pre-release build (CREATE TABLE IF NOT EXISTS never alters it) has
+        a CHECK that refuses stopping, so every cleanup would fail at runtime; refuse it at open instead (fail
+        closed). ASSUMPTION: no such ledger exists outside test fixtures, because slice 1 (b) was never installed."""
+        row = self.db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='launch_intents'").fetchone()
+        if row is not None and ("'stopping'" not in row[0] or "retire_to" not in row[0]):
+            raise SchemaError("ledger %s has a pre-release launch_intents table (no stopping state); refusing to "
+                              "open it" % self.path.name)
 
     # ------------------------------------------------------------ schema version 5 (AC-11)
 

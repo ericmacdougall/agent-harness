@@ -3,7 +3,9 @@ fast-forward of the default branch from B to the reviewed H, keyed (repo, pr, B,
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1278,6 +1280,9 @@ class _FakeRunner:
     def __init__(self, uid):
         self.uid_value, self.started, self.stopped, self.on_start = uid, [], [], None
         self.live, self.slice, self.invocation, self.granted, self.ended = set(), {}, {}, [], set()
+        # PR 272 rescue: `exited` units model RemainAfterExit=yes (the main process ended, the unit stays active
+        # with SubState exited until stopped); `sticky` units report a successful stop and stay active
+        self.exited, self.sticky = set(), set()
 
     def start(self, argv):
         self.started.append(list(argv))
@@ -1294,15 +1299,19 @@ class _FakeRunner:
 
     def stop(self, unit):
         self.stopped.append(unit)
-        self.live.discard(unit)
+        if unit not in self.sticky:
+            self.live.discard(unit)
+            self.exited.discard(unit)
         return True
 
     def grant_output(self, out_dir, uid):
         self.granted.append((out_dir, uid))
 
     def show(self, unit, props):
+        active = unit in self.live and unit not in self.ended
         return {"Slice": self.slice.get(unit, "user.slice"), "InvocationID": self.invocation.get(unit, ""),
-                "ActiveState": "active" if unit in self.live and unit not in self.ended else "inactive"}
+                "ActiveState": "active" if active else "inactive",
+                "SubState": ("exited" if unit in self.exited else "running") if active else "dead"}
 
     def list_units(self):
         return sorted(self.live)
@@ -1384,7 +1393,8 @@ class RuntimeTests(Base):
                                              str(self.root / "clones" / "test"), "--packet",
                                              str(self.root / "packets" / (row["packet_sha256"] + ".md")), "--output",
                                              out_dir + "/report.md", "--github-repo", row["repo"], "--pr", "5",
-                                             "--no-main-stamp", "--expected-head", H1, "--base", BASE])
+                                             "--no-main-stamp", "--expected-head", H1, "--snapshot-base", BASE,
+                                             "--base", BASE])
         self.assertTrue(os.path.isdir(out_dir) and os.listdir(out_dir) == [], "a fresh, empty report directory")
         self.assertEqual(os.stat(out_dir).st_mode & 0o777, 0o700, "never world-writable")
         self.assertEqual(self.runner.granted, [(out_dir, self.UID)], "granted to the unit's uid after it was read")
@@ -1609,7 +1619,8 @@ class RuntimeTests(Base):
                 before = len(self.runner.started)
                 self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "refused")
                 unit = self.unit_of(self.runner.started[-1])
-                self.assertEqual(self.state("launch_intents", "unit", unit), "open", "the barrier stays")
+                self.assertEqual(self.state("launch_intents", "unit", unit), "stopping",
+                                 "the barrier stays: cleanup is pending, never terminal")
                 self.assertTrue(self.db.execute("SELECT 1 FROM review_blocks WHERE row=?", (row["id"],)).fetchone())
                 self.assertNotIn(row["id"], [r["id"] for r in self.c.offerable_rows()])
                 self.runner.on_start = None
@@ -1908,6 +1919,311 @@ class RuntimeTests(Base):
                 self.R.settle_rc(self.c, row["id"], **dict(ok, **change))
         self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "running")
         self.assertEqual(self.R.settle_rc(self.c, row["id"], **ok)["state"], "passed")
+
+    # ---- PR 272 rescue (main's BLOCK at f532d495): F1 the unit lifecycle, F2 the snapshot base
+
+    LIVE = ("open", "started", "stopping")
+
+    def intent_state(self, unit):
+        return self.state("launch_intents", "unit", unit)
+
+    def stage(self, inbox=None):
+        return self.R.ReviewStage(self.c, self.launcher, inbox or _NoInbox())
+
+    def failing_stop(self, mode):
+        """The runner's stop for one failure mode: `false` returns False, `false-success` returns True, `refused`
+        raises the guard's LaunchRefused. In every mode the unit stays active."""
+        real = self.runner.stop
+
+        def stop(unit):
+            self.runner.stopped.append(unit)
+            if mode == "refused":
+                raise self.G.LaunchRefused("systemctl stop refused (test)")
+            return mode == "false-success"
+        self.runner.stop = stop
+        return real
+
+    def test_rescue_f1_a_valid_final_never_retires_the_intent_before_its_unit_is_confirmed_stopped(self):
+        """F1: a valid FINAL settles the row; the stop that follows fails (False), reports success while the unit
+        stays active, or is refused. The intent stays non-terminal and the unit stays in the committed-intent form;
+        every later sweep retries the stop, and the intent closes only once the unit is observed inactive."""
+        for mode in ("false", "false-success", "refused"):
+            with self.subTest(mode=mode):
+                row, unit, _out, final = self.launched("VERDICT: PASS")
+                real = self.failing_stop(mode)
+                inbox = _ListInbox([(self.UID, json.dumps(final).encode())])
+                try:
+                    out = self.stage(inbox).settle()
+                except self.G.LaunchRefused:
+                    self.fail("a refused stop escaped the review stage after the row settled")
+                self.assertEqual(out["settled"], [(row["id"], "passed")], out)
+                self.assertIn(self.intent_state(unit), self.LIVE, "never terminal while the unit may run")
+                self.assertIn(unit, self.runner.live)
+                tries = self.runner.stopped.count(unit)
+                self.stage().settle()
+                self.assertGreater(self.runner.stopped.count(unit), tries, "the next sweep retries the stop")
+                self.assertIn(self.intent_state(unit), self.LIVE)
+                self.runner.stop = real
+                self.stage().settle()
+                self.assertEqual(self.intent_state(unit), "closed")
+                self.assertNotIn(unit, self.runner.live)
+
+    def test_rescue_f1_a_crash_between_settlement_and_the_stop_leaves_cleanup_that_is_finished(self):
+        """F1: the process dies right after the FINAL settled the row and before its unit was stopped. The intent
+        is still non-terminal, so the next sweep (no restart) or the restart's reconciliation (through the real
+        guard) stops the unit and only then closes the intent."""
+        for path in ("sweep", "restart"):
+            with self.subTest(path=path):
+                row, unit, _out, final = self.launched("VERDICT: PASS")
+                real = self.runner.stop
+
+                def die(u):
+                    raise self.Died()
+                self.runner.stop = die
+                try:
+                    self.settle(final)
+                except self.Died:
+                    pass                                     # the death inside the settle step
+                self.runner.stop = real
+                self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "passed")
+                self.assertIn(self.intent_state(unit), self.LIVE, "the cleanup is durable across the crash")
+                self.assertIn(unit, self.runner.live)
+                if path == "sweep":
+                    self.stage().settle()
+                else:
+                    policy = self.restart_policy()
+                    self.launcher.policy = policy
+                    restore = self.guarded(policy)
+                    try:
+                        self.reconcile(policy)
+                    finally:
+                        restore()
+                        self.launcher.policy = self.policy
+                self.assertEqual(self.intent_state(unit), "closed")
+                self.assertNotIn(unit, self.runner.live)
+
+    def test_rescue_f1_remain_after_exit_an_exited_unit_is_given_up_and_still_stopped_before_it_retires(self):
+        """F1: with RemainAfterExit=yes a unit whose process ended reports ActiveState active, SubState exited. The
+        sweep treats that as ended (R7 at once, not after REVIEW_MAX), but never as a confirmed stop: a stop that
+        reports success while the unit stays active/exited leaves the intent stopping."""
+        row, unit, _o, _f = self.launched()
+        self.runner.exited.add(unit)
+        self.runner.sticky.add(unit)
+        out = self.stage().settle()
+        self.assertEqual(out["unknown"], [row["id"]], "an exited unit with no completion signal is given up now")
+        self.assertEqual(self.c._row("reviews", "id", row["id"])["state"], "outcome-unknown")
+        self.assertIn(self.intent_state(unit), self.LIVE, "active/exited is not a confirmed stop")
+        self.assertIn(unit, self.runner.live)
+        self.runner.sticky.discard(unit)
+        self.stage().settle()
+        self.assertEqual(self.intent_state(unit), "closed")
+        self.assertNotIn(unit, self.runner.live)
+
+    def test_rescue_f1_only_intent_retire_writes_a_terminal_state_and_only_on_a_confirmed_stop(self):
+        """F1, structurally: intent_move has no edge to closed or orphaned, no module call moves an intent to one,
+        and intent_retire refuses an observation that is not inactive or failed."""
+        row = self.queued()
+        intent, _argv = self.c.launch_intent(row["id"], row["version"], lambda unit: self.R.r3_command(
+            self.policy, unit, row, helper_script=self.helper,
+            attempt=self.R.attempt_paths(self.root, unit, row, "/clone")))
+        for terminal in ("closed", "orphaned"):
+            with self.subTest(terminal=terminal), self.assertRaises(C.ContractError):
+                self.c.intent_move(intent["id"], ("open",), terminal, "test")
+        self.assertEqual(self.state("launch_intents", "id", intent["id"]), "open")
+        hooks = Path(self.R.__file__).resolve().parent
+        for name in ("ahc_review.py", "ahc_contracts.py", "ahc_runner.py", "ahc_shadow.py"):
+            src = (hooks / name).read_text(encoding="utf-8")
+            self.assertEqual(re.findall(r'intent_move\([^)]*?\)\s*,\s*"(?:closed|orphaned)"', src, re.S), [], name)
+            self.assertEqual(re.findall(r"""launch_intents SET state\s*=\s*'(?:closed|orphaned)'""", src), [], name)
+        self.assertTrue(self.c.intent_move(intent["id"], ("open",), "stopping", "test", retire_to="closed"))
+        for unconfirmed in ("active", "deactivating", "", None):
+            with self.subTest(observed=unconfirmed), self.assertRaises(C.ContractError):
+                self.c.intent_retire(intent["id"], unconfirmed, "test")
+        self.assertEqual(self.state("launch_intents", "id", intent["id"]), "stopping")
+        self.assertEqual(self.c.intent_retire(intent["id"], "inactive", "test"), {"state": "closed", "r15": False})
+
+    def test_rescue_f1_a_stopping_intent_after_a_restart_is_retried_through_the_guards_intent_form(self):
+        """F1 with the guard: the settle-time stop fails and the daemon restarts. Reconciliation's own retry fails
+        too, so the row's unit is blocked and the intent stays stopping. Afterwards, outside reconciliation, the
+        sweep's stop must still pass the guard's committed-intent form (the restarted policy knows the unit only
+        from the ledger), and the intent closes on the confirmation."""
+        row, unit, _out, final = self.launched("VERDICT: PASS")
+        real = self.failing_stop("false")
+        self.stage(_ListInbox([(self.UID, json.dumps(final).encode())])).settle()
+        self.assertIn(self.intent_state(unit), self.LIVE)
+        policy = self.restart_policy()
+        self.launcher.policy = policy
+        self.guarded(policy)
+        out = self.reconcile(policy)
+        self.assertIn(self.intent_state(unit), self.LIVE, out)
+        self.assertTrue(any(unit in t for t in out["incidents"]), out)
+        self.assertFalse(policy.reconciling)
+        self.runner.stop = real
+        self.guarded(policy)
+        try:
+            self.stage().settle()
+        except self.G.LaunchRefused as error:
+            self.fail("the guard refused the sweep's stop of a stopping intent's unit: %s" % error)
+        self.assertEqual(self.intent_state(unit), "closed")
+        self.assertNotIn(unit, self.runner.live)
+        self.assertFalse(self.db.execute("SELECT 1 FROM review_blocks WHERE row=?", (row["id"],)).fetchone(),
+                         "the block held by this unit is lifted with the retire")
+
+    def test_rescue_a1_every_production_r3_launch_goes_to_infra_wait_while_the_wrapper_is_absent(self):
+        """Main's ruling on F3(b)(c) (deviation A-1, ASSUMPTION; spec r9 line 116: production "fails closed to
+        infra-wait where isolation is unavailable"): while ahc_review_final.py is not shipped (goodqa#16274),
+        every R3 launch through the production path (LiveDeps.review_stage -> Launcher's own constructor) goes to
+        infra-wait with no intent, no charge and no start, even on a host where systemd-run and systemctl
+        resolve (SystemdRunner.available forced true, as on Linux). Positive control: with a wrapper file present
+        the same path builds the production runner, so the test reaches the wrapper check."""
+        import ahc_runner  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+        wrapper = Path(self.R.__file__).resolve().parent / self.R.WRAPPER
+        self.assertFalse(wrapper.exists(), "the completion wrapper is not shipped in this slice (goodqa#16274)")
+        paths = type("P", (), {"root": self.root, "home": Path(self.tmp.name)})()
+        deps = ahc_runner.LiveDeps(paths, {"repos": ["o/r"]}, policy=self.policy)
+        clone = lambda repo, head, base: "/clone"  # noqa: E731
+        with mock.patch.object(self.R.SystemdRunner, "available", staticmethod(lambda policy: True)):
+            rows = [self.queued(pr=70 + n) for n in range(3)]
+            for row in rows:
+                stage = deps.review_stage(self.c, clone)
+                self.assertIsNone(stage.launcher.runner, "no runner without the wrapper")
+                self.assertEqual(stage.launch_row(row)[0], "infra-wait")
+                self.assertEqual(self.state("reviews", "id", row["id"]), "infra-wait")
+            self.assertEqual(self.c.db.execute("SELECT COUNT(*) FROM launch_intents").fetchone()[0], 0)
+            self.assertEqual([self.used(r) for r in rows], [0, 0, 0], "no B33 charge")
+            self.assertEqual(self.runner.started, [])
+            with mock.patch.object(self.R, "WRAPPER", Path(self.R.__file__).name):     # a file that exists
+                control = deps.review_stage(self.c, clone)
+                self.assertIsInstance(control.launcher.runner, self.R.SystemdRunner, "the control reaches the "
+                                                                                     "wrapper check")
+                control.inbox.close()
+
+    def test_rescue_f2_the_r3_command_line_names_b_r_as_the_snapshot_base_inside_the_digest(self):
+        """F2: peer_review's snapshot base comes only from --snapshot-base (its --base is the commit-policy range),
+        so the bound argv must carry --snapshot-base B_r, and the committed digest must cover it."""
+        row = self.queued()
+        status, unit = self.launcher.launch(row["id"], sandbox_repo=row["repo"])
+        self.assertEqual(status, "running", unit)
+        argv = self.runner.started[-1]
+        tail = argv[argv.index("--", argv.index("--") + 1) + 1:]
+        self.assertIn("--snapshot-base", tail, "peer_review would snapshot H^1..H")
+        self.assertEqual(tail[tail.index("--snapshot-base") + 1], row["snapshot_base"])
+        self.assertEqual(tail[tail.index("--base") + 1], row["snapshot_base"], "the R3 row's --base B_r stays")
+        digest = self.c._row("launch_intents", "unit", unit)["cmd_sha256"]
+        self.assertEqual(digest, self.G.argv_digest(argv))
+        other = list(argv)
+        other[len(argv) - len(tail) + tail.index("--snapshot-base") + 1] = "0" * 40
+        self.assertNotEqual(self.G.argv_digest(other), digest, "the snapshot base is inside the digest")
+
+
+class R3SnapshotBaseTests(unittest.TestCase):
+    """PR 272 rescue F2 against the real helper: the peer_review argv that r3_command binds (everything after the
+    wrapper's `--`) runs the committed harness/hooks/peer_review.py on a fixture repo whose B_r is not H^1, with
+    fake reviewer CLIs (no provider is reached). The reviewer must be handed the B_r..H diff.
+
+    Deviation, stated: the `--github-repo R --pr N` pair is removed from the argv before the run. The harness's
+    merge-gate hook forbids a subagent from running a GitHub-bound PR review, and the binding is a GitHub read
+    (verify_pr_binding) that does not touch the snapshot; `--no-main-stamp` and every other bound flag stay."""
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo)] + list(args), check=True, capture_output=True,
+                              text=True, env=dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null",
+                                                  GIT_CONFIG_NOSYSTEM="1")).stdout.strip()
+
+    def commit(self, name, text, summary):
+        (self.repo / name).write_text(text)
+        self.git("add", name)
+        message = ("docs(fixture): %s\n\nWhy: a fixture commit for the R3 snapshot-base test.\nWhat: %s.\n"
+                   "Testing: not run: fixture commit\nRefs: none (a disposable test fixture repo)\n"
+                   % (summary, summary))
+        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", message)
+        return self.git("rev-parse", "HEAD")
+
+    def setUp(self):
+        import ahc_guard  # noqa: PLC0415
+        import ahc_review  # noqa: PLC0415
+        from tests import test_peer_review as TPR  # noqa: PLC0415
+        self.G, self.R, self.TPR = ahc_guard, ahc_review, TPR
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        top = Path(self.tmp.name)
+        self.repo = top / "clone"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
+        self.b_r = self.commit("app.txt", "baseline\n", "the snapshot base B_r")
+        self.mid = self.commit("app.txt", "baseline\nfirst change\n", "the PR's first commit")
+        self.head = self.commit("app.txt", "baseline\nfirst change\nsecond change\n", "the PR's second commit")
+        self.assertNotEqual(self.git("rev-parse", self.head + "^1"), self.b_r, "the fixture needs B_r != H^1")
+        bin_dir = top / "bin"
+        bin_dir.mkdir(mode=0o700)
+        stub = bin_dir / "systemd-run"
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(str(stub), 0o755)
+        self.root = top / "ahcroot"
+        self.root.mkdir(mode=0o700)
+        self.policy = ahc_guard.Policy.for_test(self.root, {"systemd-run": str(stub)}, trusted_dirs=(str(bin_dir),))
+        self.fakes = top / "fakes"
+        self.fakes.mkdir(mode=0o700)
+        self.capture = top / "prompt.txt"
+        body = ("import os, sys\nfrom pathlib import Path\nprompt = sys.stdin.read()\n"
+                "Path(os.environ['R3_CAPTURE']).write_text(prompt)\n"
+                "if '--output-last-message' in sys.argv:\n"
+                "    Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS\\nok')\n"
+                "else:\n    print('VERDICT: PASS\\nok')\n")
+        for name in ("codex", "claude"):
+            path = self.fakes / name
+            path.write_text("#!%s\n%s" % (sys.executable, body))
+            path.chmod(0o700)
+        policy = top / "review-policy.json"
+        policy.write_text(json.dumps({"schema": 1, "known_install_locations": {"codex": [], "claude": []}}))
+        policy.chmod(0o600)
+        self.env = dict(os.environ, PATH=str(self.fakes) + os.pathsep + TPR.system_path(), R3_CAPTURE=str(self.capture),
+                        HARNESS_PROVENANCE_OFFLINE="1", AGENT_HARNESS_REVIEW_POLICY=str(policy),
+                        AGENT_HARNESS_USAGE_DIR=str(top / "usage"), AGENT_HARNESS_ESCALATION_DIR=str(top / "esc"))
+
+    def bound_tail(self):
+        """The peer_review argv r3_command binds for a row at (H, B_r), helper = the committed peer_review.py."""
+        row = {"id": "rv-" + "a" * 24, "repo": "o/r", "pr": 5, "head": self.head, "snapshot_base": self.b_r,
+               "packet_sha256": "e" * 64}
+        unit = "ahc-review-%s-%s.service" % (row["id"], "b" * 16)
+        attempt = self.R.attempt_paths(self.root, unit, row, self.repo)
+        argv = self.R.r3_command(self.policy, unit, row, helper_script=self.TPR.REVIEW, attempt=attempt,
+                                 python=sys.executable)
+        tail = argv[argv.index("--", argv.index("--") + 1) + 1:]
+        self.assertEqual(tail[:3], [sys.executable, str(self.TPR.REVIEW), "pr"])
+        return tail, attempt
+
+    def test_rescue_f2_the_real_helper_reviews_b_r_to_h_when_b_r_is_not_h_first_parent(self):
+        tail, attempt = self.bound_tail()
+        at = tail.index("--github-repo")
+        self.assertEqual(tail[at + 2], "--pr")
+        run = tail[:at] + tail[at + 4:]                      # the stated deviation: no GitHub binding in a subagent
+        self.assertIn("--no-main-stamp", run)
+        Path(attempt["packet"]).parent.mkdir(mode=0o700, parents=True)
+        Path(attempt["packet"]).write_text(
+            "Scope: the R3 snapshot-base fixture.\n" + self.TPR.PeerReviewTests.evidence(self.head))
+        Path(attempt["out_dir"]).parent.mkdir(mode=0o700, parents=True)
+        Path(attempt["out_dir"]).mkdir(mode=0o700)
+        done = subprocess.run(run, capture_output=True, text=True, env=self.env, timeout=120, cwd=str(self.root))
+        self.assertEqual(done.returncode, 0, done.stderr[-3000:])
+        report = Path(attempt["output"]).read_text()
+        prompt = self.capture.read_text()
+        self.assertIn("base %s)" % self.b_r, report, "the snapshot the reviewer received is based at B_r")
+        self.assertNotIn("base %s)" % self.mid, report, "not at H^1")
+        self.assertIn("git diff %s HEAD" % self.b_r, prompt, "the reviewer is told to diff B_r..H")
+        self.assertIn("Reviewed HEAD: %s" % self.head, report)
+
+
+class _ListInbox:
+    """A completion inbox that yields the given (uid, bytes) signals once."""
+
+    def __init__(self, items):
+        self.items = list(items)
+
+    def poll(self, errors):
+        out, self.items = self.items, []
+        return out
 
 
 if __name__ == "__main__":
