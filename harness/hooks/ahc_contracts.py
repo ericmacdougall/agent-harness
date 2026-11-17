@@ -632,7 +632,7 @@ class Contracts:
         return None
 
     def wi_move(self, iid, row_id, *, expected_version, event_id, actor, to=None, mark=None, cause=None, obs=None,
-                successor_packet=None, proof=None):
+                successor_packet=None, proof=None, successor_base=None):
         """The one WorkItem transition function (T1 to T7). One BEGIN IMMEDIATE; the guard re-reads its ledger
         facts; the state change and one audit row commit together (T3). A replay of the same event for the same
         item and row is a no-op that returns the current row (T6), checked before the version so a post-crash replay
@@ -684,7 +684,8 @@ class Contracts:
             base = obs["tip"] if row_id == "W18" else item["base"]
             successor = None
             if row_id == "W4" or (row_id == "W24" and mark == "head-moved" and not item["successor"]):
-                successor = self._wi_successor(item, obs["pr_head"], successor_packet, event_id)
+                successor = self._wi_successor(item, obs["pr_head"], successor_packet, event_id,
+                                               base=successor_base)
             extra = {}
             if row_id in ("W2", "W6"):                      # the values ELIG passed on, for W27
                 extra = {"elig_core": item["spec_core"], "elig_policy": item["policy_revision"]}
@@ -888,12 +889,16 @@ class Contracts:
         rows = [self._row("reviews", "id", rid) for (rid,) in rows]
         return rows if limit is None else rows[:limit]
 
-    def _wi_successor(self, item, new_head, packet_sha256, event_id):
+    def _wi_successor(self, item, new_head, packet_sha256, event_id, base=None):
         """W4 and W24: the successor item at H' (W1). It never inherits this item's grant, Effect or Review rows;
-        under W4 this item's open Review rows for H go to superseded or, while an attempt may run, cancelling."""
+        under W4 this item's open Review rows for H go to superseded or, while an attempt may run, cancelling.
+        `base` is the successor's B_r: W21's own update passes the tip the send merged (H'^2); otherwise the
+        item's base."""
         if not (isinstance(packet_sha256, str) and len(packet_sha256) == 64 and _is_oid(packet_sha256)):
             raise ContractError("the successor at H' needs its own packet sha256")
-        succ = self.admit_item(item["repo"], item["pr"], new_head, item["base"], item["policy_revision"],
+        if base is not None and not (isinstance(base, str) and len(base) == 40 and _is_oid(base)):
+            raise ContractError("the successor's B_r must be a full sha")
+        succ = self.admit_item(item["repo"], item["pr"], new_head, base or item["base"], item["policy_revision"],
                                item["spec_core"], packet_sha256, event_id=event_id + "-successor",
                                red_team=bool(item["red_team"]))
         return succ["id"]

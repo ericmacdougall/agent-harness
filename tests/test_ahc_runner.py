@@ -4703,7 +4703,8 @@ class MigrationV5Tests(Base):
 
     def setUp(self):
         super().setUp()
-        self._saved = (runner.Ledger.PROBE_RUN, runner.Ledger.HOOKS_DIR, runner.Ledger.LOCK_WAIT)
+        if not hasattr(self, "_saved"):          # tests re-run setUp in a loop: keep the class's own values
+            self._saved = (runner.Ledger.__dict__["PROBE_RUN"], runner.Ledger.HOOKS_DIR, runner.Ledger.LOCK_WAIT)
         runner.Ledger.LOCK_WAIT = 2.0
         self.live = self.paths.root / "ledger.sqlite3"
 
@@ -5393,6 +5394,7 @@ class FakeProducer:
 
     def __init__(self, contracts, facts):
         self.c, self.facts, self.reads, self.incidents = contracts, facts, [], []
+        self.revs, self.git_calls = {}, []
 
     def observe(self, repo, pr, *, item=None, clone=None, snapshot_bases=(), base=None):
         stamp = self.c.first_read_stamp()
@@ -5402,7 +5404,10 @@ class FakeProducer:
         return self.c.load_observation(stamp["id"])
 
     def _git(self, args, cwd, timeout):
-        """Core's git in the clone for the R2 packet (a fixed one-file change)."""
+        """Core's git in the clone for the R2 packet (a fixed one-file change) and rev-parse from `revs`."""
+        self.git_calls.append(list(args))
+        if args[0] == "rev-parse":
+            return (0, self.revs[args[-1]] + "\n", "") if args[-1] in self.revs else (1, "", "")
         if args[0] == "log":
             return 0, "%s\0feat: a change\0" % args[-1].split("..")[-1], ""
         if "--name-only" in args:
@@ -5441,6 +5446,7 @@ class _ShadowFixture(TC.Base):
     def shadow_tick(self, contracts=None):
         c = contracts or self.c
         producer = FakeProducer(c, lambda repo, pr, item: self.facts(repo, pr, item))
+        producer.revs = dict(getattr(self, "revs", {}))
         return self.S.ShadowTick(c, producer, lambda repo, head, base: "/clone", self.config), producer
 
     def ready_item(self, pr=5):
@@ -5514,6 +5520,40 @@ class ShadowTickTests(_ShadowFixture):
         self.assertEqual(self.moves(item["id"]), [("W1", self.S.event_id(producer.reads[0], key, "W1"))])
         again = self.shadow_tick()[0].tick()
         self.assertEqual(again["admitted"], [], "the request is consumed once")
+
+    def w21_resolved(self, item, tip, new_head):
+        with self.c.tx():
+            self.db.execute("INSERT INTO w21_sends(request_id, item, repo, pr, base, head, seq, event_id, state, "
+                            "attempted_at, new_head, version, created, updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            ("w21-%s-1" % item["id"], item["id"], item["repo"], item["pr"], tip, item["head"], 1,
+                             "ev-w21-" + item["id"], "resolved", 1.0, new_head, 1, 1.0, 1.0))
+
+    def test_ac7_w21_successor_at_h_prime_gets_core_r2_packet_with_b_r_parent2(self):
+        """r9 AC-7: W21's successor at H' is reviewed against B_r = parent2 (the tip the send merged, confirmed as
+        H'^2 in core's clone) with a full core-built R2 packet; its code rows are queued in the move's transaction,
+        at round 1 (no B7 round is charged)."""
+        tip = "d" * 40
+        item = self.ready_item()
+        self.w21_resolved(item, tip, TC.H2)
+        self.changes.update(pr_head=TC.H2, tip=tip, b_r_ancestors={TC.BASE: True, tip: True})
+        self.revs = {TC.H2 + "^2": "e" * 40}               # H'^2 is not the tip the send merged: fail closed
+        summary = self.shadow_tick()[0].tick()
+        self.assertTrue(any("H'^2 is not the tip" in why for _i, why in summary["refused"]), summary["refused"])
+        self.assertIsNone(self.c._row("work_items", "id", item["id"])["successor"])
+        self.revs = {TC.H2 + "^2": tip}
+        tick, producer = self.shadow_tick()
+        summary = tick.tick()
+        succ_id = self.c._row("work_items", "id", item["id"])["successor"]
+        self.assertTrue(succ_id, summary)
+        succ = self.c._row("work_items", "id", succ_id)
+        self.assertEqual((succ["head"], succ["base"]), (TC.H2, tip))
+        rows = self.db.execute("SELECT kind, state, snapshot_base, packet_sha256, round FROM reviews WHERE item=? "
+                               "ORDER BY kind", (succ_id,)).fetchall()
+        code = [r for r in rows if r[0] == "adversarial"][0]
+        self.assertEqual((code[1], code[2], code[4]), ("queued", tip, 1), "queued at B_r = parent2, round 1")
+        self.assertEqual(code[3], succ["packet_sha256"], "bound to core's R2 packet")
+        self.assertNotEqual(code[3], TC.PKT)
+        self.assertIn(["diff", "--no-color", "%s..%s" % (tip, TC.H2)], producer.git_calls, "B_r..H' is core's diff")
 
     def test_ac4_admission_is_refused_when_the_head_moved(self):
         self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,

@@ -372,16 +372,29 @@ class ShadowTick:
         if row is None:
             return None
         kw = dict(args.get(row, {}))
+        packet = None
         if row in ("W4", "W24") and (row == "W4" or kw.get("mark") == "head-moved"):
-            packet = self._successor_packet(item, obs["pr_head"])
+            try:
+                packet, base = self._successor_packet(item, obs)
+            except Exception as error:  # noqa: BLE001 - R2 fails closed: the move waits
+                summary["refused"].append((iid, "%s: the successor's R2 packet was not built: %s"
+                                           % (row, str(error)[:200])))
+                return None
             if packet is None:
                 summary["refused"].append((iid, "%s waits for the owner's packet at H'" % row))
                 return None
-            kw["successor_packet"] = packet
+            kw["successor_packet"], kw["successor_base"] = packet["sha256"], base
         ev = event_id(obs["id"], iid, row)
         try:
-            moved = self.c.wi_move(iid, row, expected_version=item["version"], event_id=ev, actor="ahc-core",
-                                   obs=obs, **kw)
+            if packet is None:
+                moved = self.c.wi_move(iid, row, expected_version=item["version"], event_id=ev, actor="ahc-core",
+                                       obs=obs, **kw)
+            else:
+                with self.c.tx():                   # the successor's code rows, in the move's transaction
+                    moved = self.c.wi_move(iid, row, expected_version=item["version"], event_id=ev,
+                                           actor="ahc-core", obs=obs, **kw)
+                    succ = self.c._row("work_items", "id", self.c._row("work_items", "id", iid)["successor"])
+                    self.r2_queue_item(succ, packet)
         except C.VersionConflict as error:
             summary["conflicts"].append((iid, row, str(error)))       # NEG-10: another tick applied first
             return None
@@ -395,11 +408,29 @@ class ShadowTick:
         summary["moved"].append((iid, row, moved["state"] if moved else None))
         return row
 
-    def _successor_packet(self, item, new_head):
-        """W4 and W24's successor at H' needs its own packet: the owner's held request for (repo, pr, H')
-        (ASSUMPTION: the tick never invents a packet; without one W4 waits)."""
+    def _successor_packet(self, item, obs):
+        """W4 and W24's successor at H' gets core's own R2 packet, returned with its B_r:
+        - W21's own update (a resolved send whose H' is the new head): B_r is the tip the send merged, which must be
+          H'^2 in core's clone (r9: B_r = parent2); the owner's held request, if any, is the fenced owner section.
+        - otherwise the owner's held request for (repo, pr, H') is needed (ASSUMPTION: without one W4 waits) and
+          B_r is the item's base.
+        (None, None) when neither holds."""
+        new_head = obs["pr_head"]
         key = "%s%s#%d@%s" % (REQUEST_PREFIX, item["repo"], item["pr"], new_head)
-        row = self.c.db.execute("SELECT v FROM contract_meta WHERE k=?", (key,)).fetchone()
-        if not row:
-            return None
-        return json.loads(row[0]).get("packet_sha256")
+        held = self.c.db.execute("SELECT v FROM contract_meta WHERE k=?", (key,)).fetchone()
+        held = json.loads(held[0]) if held else None
+        send = self.c.db.execute("SELECT base FROM w21_sends WHERE repo=? AND pr=? AND state='resolved' AND new_head=?",
+                                 (item["repo"], item["pr"], new_head)).fetchone()
+        if send:
+            base = send[0]
+            clone = self.clone(item["repo"], new_head, base)
+            rc, out, _err = self.producer._git(["rev-parse", "--verify", "--quiet", new_head + "^2"], clone, 30)
+            if rc != 0 or out.strip() != base:
+                raise C.ContractError("W21's successor: H'^2 is not the tip the send merged")
+            req = held or {"repo": item["repo"], "pr": item["pr"], "head": new_head, "base": base,
+                           "owner": "ahc (W21 update-branch, no owner request)", "ticket": "", "packet_sha256": ""}
+        elif held:
+            base, req = item["base"], held
+        else:
+            return None, None
+        return self.r2_packet(dict(req, head=new_head), obs, base=base), base

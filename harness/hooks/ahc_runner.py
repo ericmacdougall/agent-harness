@@ -490,6 +490,12 @@ def connect_nofollow(root, path, exclusive=False, **kwargs):
         os.close(fd)
 
 
+def _guarded_probe(argv, timeout):
+    """The open-file probe's launcher: AC-13's lsof/fuser form under the active policy (cwd at the root)."""
+    import ahc_guard  # noqa: PLC0415
+    return ahc_guard.probe_run(argv, timeout)
+
+
 class Ledger:
     """migrate=False (status, ack, the journal facade, the review role) refuses a ledger at an older schema instead
     of migrating it: only ahc-core, holding its lock, migrates, so a failed migration can never move the database
@@ -497,7 +503,7 @@ class Ledger:
 
     # Injectable for tests only (AC-11): the open-file probe's runner, the hooks directory whose entry points the
     # preflight verifies, and the bound on waiting for a role lock or the exclusive maint lock.
-    PROBE_RUN = staticmethod(ahc_migrate.default_run)
+    PROBE_RUN = staticmethod(lambda argv, timeout: _guarded_probe(argv, timeout))
     HOOKS_DIR = Path(__file__).resolve().parent
     LOCK_WAIT = ahc_migrate.ROLE_WAIT_SECONDS
 
@@ -598,7 +604,7 @@ class Ledger:
                 if version > SCHEMA_VERSION or version < 0:
                     raise SchemaError("ledger schema_version %d is not supported by this ahc (knows %d); refusing "
                                       "to start" % (version, SCHEMA_VERSION))
-                self._migrate_to_v5(version)
+                self._migrate_guarded(version)
             finally:
                 if self.db is not None:
                     self.db.close()
@@ -685,6 +691,19 @@ class Ledger:
 
     def _probe(self, files):
         return ahc_migrate.open_file_holders(files, self.PROBE_RUN)
+
+    def _migrate_guarded(self, n):
+        """AC-11 under AC-13: the active policy's migrating gate (lsof and fuser on the ledger files) is open only
+        for this migration, which only ahc-core runs, holding its lock."""
+        import ahc_guard  # noqa: PLC0415
+        policy = ahc_guard.active()
+        if policy is not None:
+            policy.migrating = True
+        try:
+            self._migrate_to_v5(n)
+        finally:
+            if policy is not None:
+                policy.migrating = False
 
     def _migrate_to_v5(self, n):
         """Steps 2-8 of AC-11 on the open connection, every lock held. n is the ledger's version (or the prior
