@@ -7819,7 +7819,8 @@ def _identity(path):
 
 
 def stat_manifest(path, limits, deadline=None):
-    """sha256 over (relative path, type, size, mtime_ns) of a tree; raises ValueError when over budget."""
+    """sha256 over (relative path, type, size, mtime_ns, device, inode, ctime_ns) of a tree; raises ValueError when
+    over budget."""
     max_entries = int(limits.get('max_approve_files', 20000))
     deadline = deadline if deadline is not None else time.monotonic() + float(limits['max_walk_seconds'])
     h = hashlib.sha256()
@@ -7836,6 +7837,9 @@ def stat_manifest(path, limits, deadline=None):
         kind = 'd' if os.path.isdir(current) and not os.path.islink(current) else ('l' if os.path.islink(current) else 'f')
         h.update(('%s\0%s\0%d\0%d\n' % (rel, kind, st.st_size if kind == 'f' else 0,
                                         st.st_mtime_ns if kind != 'd' else 0)).encode('utf-8', 'surrogateescape'))
+        # goodqa#16374 (Codex r5 F3): bind each entry's identity too. A same-length edit with its mtime restored
+        # still moves ctime, and a replaced file or directory has a new inode.
+        h.update(('#%d\0%d\0%d\n' % (st.st_dev, st.st_ino, st.st_ctime_ns if kind != 'd' else 0)).encode())
         if kind == 'l':
             # goodqa#16374 AC-3a: a link re-pointed after approval with its old mtime restored still voids it
             h.update(('->%s\n' % os.readlink(current)).encode('utf-8', 'surrogateescape'))
@@ -8648,9 +8652,11 @@ def _store_entry(entry, real, now, home=None, under_lock=None):
 # The user, 2026-11-17: "remove the safety guard to re-download the folder.. once dropbox says it synced it, trust
 # that". `approve-delete --upload` therefore never downloads: the guard builds the tar stream itself from the files it
 # reads (so the archive is bound to the tree by construction, not by an uploader's word), compresses it with zstd,
-# hashes the exact bytes it sends with the Dropbox content hash, streams them with `rclone rcat --immutable` to a
-# destination that did not exist, and approves only when Dropbox reports the same content hash and size for the stored
-# object and the tree's stat manifest is unchanged. No reader opens a FIFO, socket or device, and a tree holding a
+# hashes the exact bytes it sends with the Dropbox content hash, streams them with `rclone rcat` to a destination that
+# did not exist under a name the guard makes unique (`name.<8 hex>.tar.zst`; a live check on 2026-11-17 showed a second
+# `rcat --immutable` to the same Dropbox path overwrites it, so the flag protects nothing there), and approves only
+# when Dropbox reports the same content hash and size for the stored object and the tree's stat manifest is
+# unchanged. No reader opens a FIFO, socket or device, and a tree holding a
 # counted credential file is refused (hard rule 1: never transit a secret).
 
 UPLOAD_KIND = 'dropbox-upload'
@@ -8750,15 +8756,26 @@ def _repo_of(full, stop):
 def _counted_credentials(real, entries, compiled):
     """[(problem text)] for the credential files the AC-2 two-tier predicate counts (red-team r2 N1, r3b E1/E2):
     tier 1 always counts (a tracked one keeps the unit as "tracked credential"); tier 2 counts unless the file is
-    tracked, unmodified against HEAD, in a repo whose HEAD a remote-tracking ref contains. A git error counts."""
-    problems, head_pushed = [], {}
+    tracked, unmodified against HEAD, in a repo whose HEAD a remote-tracking ref contains. A git error counts.
+
+    Returns (problems, pinned): `pinned` maps each exempted tier-2 file to its HEAD blob id, and the stream re-checks
+    the exact bytes it sends against that id (Codex r5 F1: a file swapped after this check never leaves the host). A
+    `.git/config` whose remote URL carries userinfo (`https://user:token@host`) counts as a tier-1 credential."""
+    problems, head_pushed, pinned = [], {}, {}
     stop = real if os.path.isdir(real) else os.path.dirname(real)
     for member, full, st in entries:
-        if not stat.S_ISREG(st.st_mode) or '/.git/' in '/' + member + '/':
+        if not stat.S_ISREG(st.st_mode):
             continue
         rel = member.split('/', 1)[1] if '/' in member else member
+        if '/.git/' in '/' + member + '/':
+            if ('/' + member).endswith('/.git/config') and _git_config_has_userinfo(full, st):
+                problems.append('credential in a git remote URL %s' % rel)
+            continue
         tier = _credential_tier(rel, compiled)
         if not tier:
+            continue
+        if tier == 2 and st.st_size > PINNED_MAX_BYTES:
+            problems.append('credential file %s (too large to pin)' % rel)
             continue
         repo = _repo_of(full, stop)
         tracked = clean = pushed = False
@@ -8785,7 +8802,31 @@ def _counted_credentials(real, entries, compiled):
             problems.append('tracked credential %s (keep this unit; it cannot be uploaded)' % rel)
         elif tier == 1 or not (tracked and clean and pushed):
             problems.append('credential file %s' % rel)
-    return problems
+        else:
+            pinned[full] = head_blob.strip().decode('ascii', 'replace')
+    return problems, pinned
+
+
+PINNED_MAX_BYTES = 16 << 20
+_USERINFO_URL = re.compile(rb'[A-Za-z][A-Za-z0-9+.-]*://[^/@\s"\']+@')
+
+
+def _git_config_has_userinfo(full, st):
+    """True when a repo's config names a remote URL with userinfo; an unreadable or oversized config counts too."""
+    if st.st_size > (1 << 20):
+        return True
+    try:
+        fd = _open_regular(full, st)
+    except ValueError:
+        return True
+    with os.fdopen(fd, 'rb') as handle:
+        return bool(_USERINFO_URL.search(handle.read(1 << 20)))
+
+
+def _git_blob_id(data, like):
+    """The git blob id of `data` in the object format of `like` (40 hex: sha1, 64 hex: sha256)."""
+    header = b'blob %d\0' % len(data)
+    return (hashlib.sha256 if len(like) == 64 else hashlib.sha1)(header + data).hexdigest()
 
 
 class DropboxHash:
@@ -8821,7 +8862,7 @@ class DropboxHash:
 
 
 class RcloneUpload:
-    """rclone transport for `approve-delete --upload`: listremotes, lsjson, rcat --immutable and hashsum dropbox.
+    """rclone transport for `approve-delete --upload`: listremotes, lsjson, rcat and hashsum dropbox.
     It has no download method at all; rclone output is parsed, never printed."""
 
     def __init__(self, rclone=None, policy=None, timeout=900):
@@ -8862,11 +8903,11 @@ class RcloneUpload:
         return bool(rows) and any(n.casefold() == name.casefold() for n, _s, _d in rows)
 
     def rcat(self, remote):
-        return subprocess.Popen([self.rclone, 'rcat', '--immutable', '--', remote], stdin=subprocess.PIPE,
+        return subprocess.Popen([self.rclone, 'rcat', '--', remote], stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def put_small(self, remote, data):
-        code, _out, _err = self._run(['rcat', '--immutable', '--', remote], data=data)
+        code, _out, _err = self._run(['rcat', '--', remote], data=data)
         if code != 0:
             raise ValueError('writing %s failed (exit %s)' % (remote.rsplit('/', 1)[-1][:80], code))
 
@@ -8885,6 +8926,16 @@ class RcloneUpload:
         if not rows or len(rows) != 1 or rows[0][2]:
             raise ValueError('the stored object is missing (size check)')
         return rows[0][1]
+
+
+def _upload_suffix():
+    return _secrets.token_hex(4)
+
+
+def _unique_remote(remote):
+    """`dir/name.tar.zst` -> `dir/name.<8 hex>.tar.zst`: rcat cannot refuse an existing Dropbox object, so a name
+    nobody else picks is what keeps two uploads from replacing each other."""
+    return '%s.%s.tar.zst' % (remote[:-len('.tar.zst')], _upload_suffix())
 
 
 def _check_upload_remote(remote, policy, transport):
@@ -8907,14 +8958,40 @@ class _ReadCounter:
         return data
 
 
-def _stream_upload(real, entries, transport, remote, zstd, deadline):
-    """Build tar | zstd from `entries` and send it with rcat; returns (dropbox hash, sha256, bytes, manifest)."""
+def _end_children(procs, grace=5.0):
+    """TERM, then KILL after `grace`, and reap every child still running."""
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+    for proc in procs:
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=grace)
+
+
+def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None):
+    """Build tar | zstd from `entries` and send it with rcat; returns (dropbox hash, sha256, bytes, manifest).
+
+    A watchdog ends and reaps both children at `deadline`, so a stalled rcat (one that stops reading) cannot hang the
+    guard: the blocked write then fails and the upload is refused (Codex r5 F2). A file in `pinned` is read once into
+    memory and sent only when its git blob id still equals the HEAD blob that made it ordinary content (Codex r5 F1)."""
+    import io
     import tarfile
     import threading
-    sent = {'dbx': DropboxHash(), 'sha': hashlib.sha256(), 'bytes': 0, 'error': None}
+    pinned = pinned or {}
+    sent = {'dbx': DropboxHash(), 'sha': hashlib.sha256(), 'bytes': 0, 'error': None, 'timed_out': False}
     comp = subprocess.Popen([zstd, '-q', '-3', '-c'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
     up = transport.rcat(remote)
+
+    def expire():
+        sent['timed_out'] = True
+        _end_children((comp, up))
+    watchdog = threading.Timer(max(0.0, deadline - time.monotonic()), expire)
+    watchdog.daemon = True
+    watchdog.start()
 
     def pump():
         try:
@@ -8951,26 +9028,45 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline):
                     info.type, info.linkname = tarfile.SYMTYPE, os.readlink(full)
                     tar.addfile(info)
                 else:
+                    rel = member.split('/', 1)[1] if '/' in member else member
                     fd = _open_regular(full, st)
                     try:
                         info.type, info.size = tarfile.REGTYPE, st.st_size
-                        reader = _ReadCounter(fd)
-                        tar.addfile(info, reader)  # tarfile raises on a short file
-                        if os.read(fd, 1):
-                            raise ValueError('a file grew while it was read: %s' % _clip_path(full))
+                        if full in pinned:
+                            data = os.read(fd, PINNED_MAX_BYTES + 1)
+                            while len(data) <= PINNED_MAX_BYTES:
+                                more = os.read(fd, PINNED_MAX_BYTES + 1 - len(data))
+                                if not more:
+                                    break
+                                data += more
+                            if len(data) != st.st_size or _git_blob_id(data, pinned[full]) != pinned[full]:
+                                raise ValueError('credential-named file %s changed after it was checked; nothing of '
+                                                 'it was sent' % rel)
+                            reader = _ReadCounter(None)
+                            reader.sha.update(data)
+                            reader.size = len(data)
+                            tar.addfile(info, io.BytesIO(data))
+                        else:
+                            reader = _ReadCounter(fd)
+                            tar.addfile(info, reader)  # tarfile raises on a short file
+                            if os.read(fd, 1):
+                                raise ValueError('a file grew while it was read: %s' % _clip_path(full))
                     finally:
                         os.close(fd)
-                    rel = member.split('/', 1)[1] if '/' in member else member
                     manifest.append((rel, reader.size, reader.sha.hexdigest()))
         comp.stdin.close()
         code = comp.wait(timeout=max(1.0, deadline - time.monotonic()))
         thread.join(max(1.0, deadline - time.monotonic()))
         up_code = up.wait(timeout=max(1.0, deadline - time.monotonic()))
     except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
-        for proc in (comp, up):
-            if proc.poll() is None:
-                proc.terminate()
+        watchdog.cancel()
+        _end_children((comp, up))
+        if sent['timed_out'] or isinstance(error, subprocess.TimeoutExpired) or time.monotonic() >= deadline:
+            raise ValueError('the upload exceeded its time budget; it was stopped and nothing was approved')
         raise ValueError('the upload stream failed: %s' % str(error)[:160])
+    watchdog.cancel()
+    if sent['timed_out']:
+        raise ValueError('the upload exceeded its time budget; it was stopped and nothing was approved')
     if sent['error'] is not None or thread.is_alive():
         raise ValueError('the upload stream failed while sending')
     if code != 0:
@@ -8996,9 +9092,10 @@ def ledger_append(row, home=None):
     return row
 
 
-def ledger_lookup(path, stat_sha256, home=None):
-    """The newest valid ledger row for exactly `path` with this stat digest, or None. Rows without a valid MAC under
-    this host's key (hand-written, edited or copied from another host) never count."""
+def ledger_lookup(path, stat_sha256, identity, home=None):
+    """The newest valid ledger row for exactly `path`, this stat digest and this root identity ((st_dev, st_ino) of
+    the unit now), or None. A unit replaced at the same path has a new identity and so no backup. Rows without a valid
+    MAC under this host's key (hand-written, edited or copied from another host) never count."""
     sd = state_dir(home)
     try:
         key = _read_small(sd / KEY_NAME, 256)
@@ -9012,6 +9109,8 @@ def ledger_lookup(path, stat_sha256, home=None):
         except ValueError:
             continue
         if not isinstance(row, dict) or row.get('path') != real or row.get('stat_sha256') != stat_sha256:
+            continue
+        if row.get('identity') != [int(v) for v in identity]:
             continue
         if key and hmac.compare_digest(_mac(key, row), str(row.get('mac', ''))):
             return row
@@ -9058,7 +9157,7 @@ def index_record(row, home=None):
 
 
 def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, policy=None, now=None, wal=None,
-                          zstd=None):
+                          zstd=None, upload_timeout=None):
     """Upload `path` as one guard-built .tar.zst and approve its delete once Dropbox reports the sent content hash.
     Raises ValueError on refusal (audited)."""
     policy = policy or load_policy()
@@ -9093,15 +9192,17 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         tree_bytes = sum(e[2].st_size for e in files)
         if tree_bytes > int(limits['max_hash_bytes']):
             raise ValueError('tree is larger than the approval limit')
-        problems = _counted_credentials(real, entries, compiled)
+        problems, pinned = _counted_credentials(real, entries, compiled)
         if problems:
             raise ValueError('the tree holds %s; move each untracked one with `mv -n SRC ~/secret-quarantine/'
                              '<same relative path>` first, never upload it' % '; '.join(problems[:8]))
+        remote = _unique_remote(remote)
         if transport.exists(remote) or transport.exists(remote + '.sha256'):
             raise ValueError('the destination already exists on the remote (letter case ignored); pick a new name')
-        deadline = time.monotonic() + max(900.0, tree_bytes / float(2 << 20))
+        budget = float(upload_timeout) if upload_timeout else max(900.0, tree_bytes / float(2 << 20))
+        deadline = time.monotonic() + budget
         dbx, sha, sent_bytes, manifest = _stream_upload(real, entries, transport, remote,
-                                                        zstd or _pinned_tool('zstd'), deadline)
+                                                        zstd or _pinned_tool('zstd'), deadline, pinned=pinned)
         if transport.after_upload is not None:
             transport.after_upload()
         stored_hash = transport.server_hash(remote)
@@ -9128,7 +9229,8 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
     _store_entry(entry, real, now, home)
     host = socket.gethostname().split('.')[0][:64]
     date = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now))
-    ledger_append({'path': real, 'stat_sha256': stat_digest, 'archive': remote, 'dropbox_hash': dbx,
+    ledger_append({'path': real, 'identity': identity, 'stat_sha256': stat_digest, 'archive': remote,
+                   'dropbox_hash': dbx,
                    'archive_sha256': sha, 'archive_bytes': sent_bytes, 'host': host, 'date': date}, home=home)
     base = os.path.realpath(str(home or _pinned_home()))
     rel_home = os.path.relpath(real, base) if real.startswith(base + os.sep) else real
@@ -10170,7 +10272,8 @@ def main(argv=None):
                                         'whose members start with the directory name of --path (goodqa#15068)')
     appr.add_argument('--archive-sha256', dest='archive_sha256', help='remote .sha256 file of --archive')
     appr.add_argument('--upload', help='goodqa#16374: REMOTE:dir/name.tar.zst; the guard builds the archive from the '
-                      'files it reads, uploads it with rclone rcat --immutable and approves once Dropbox reports the '
+                      'files it reads, uploads it with rclone rcat to a new unique name (name.<8 hex>.tar.zst) and '
+                      'approves once Dropbox reports the '
                       'same content hash and size (no download)')
     appr.add_argument('--archive-listing', dest='archive_listing', help='remote `tar -tvf` listing of --archive')
     appr.add_argument('--no-backup', action='store_true',
