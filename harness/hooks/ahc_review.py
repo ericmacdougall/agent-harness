@@ -181,6 +181,11 @@ class Launcher:
         if self.policy.unit_scope == "--user" and row["repo"] != sandbox_repo:
             # R-c runs in the agent account's user manager: allowed only for the policy's named sandbox repo
             return "refused", "R-c is allowed only for the sandbox repo"
+        if not self.c.reconcile_open():
+            # PR 272 F2: the last reconciliation failed (or never finished); retry it before any launch
+            Reconciler(self.c, self.policy, self.runner).run()
+            if not self.c.reconcile_open():
+                return "refused", "R3: no attempt starts until a reconciliation of review units succeeds"
         try:
             clone = self.clone(row["repo"], row["head"], row["snapshot_base"])
         except Exception as error:  # noqa: BLE001 - a clone failure fails closed before any intent or charge
@@ -270,6 +275,7 @@ class Reconciler:
         out = {"stopped": [], "orphaned": [], "blocked": [], "lifted": [], "incidents": []}
         self.policy.intent_units.update(self.c.live_intent_units())
         self.policy.reconciling = True
+        self.c.reconcile_state("running")        # a crash before the end leaves R3 closed (PR 272 F2)
         try:
             units = self.runner.list_units()
             if units is None:
@@ -277,6 +283,7 @@ class Reconciler:
                 for (rid,) in self.c.db.execute("SELECT DISTINCT row FROM launch_intents WHERE state IN ('open', "
                                                 "'started')").fetchall():
                     self.block(out, rid, "", "list-units failed")
+                self.c.reconcile_state("failed", "list-units failed")
                 return out
             listed = set(units)
             for (rid, unit) in self.c.db.execute("SELECT row, unit FROM review_blocks").fetchall():
@@ -292,6 +299,7 @@ class Reconciler:
                     self.reconcile_owned(out, unit, intent)
                 else:
                     self.reconcile_unowned(out, unit)
+            self.c.reconcile_state("ok")
         finally:
             self.policy.reconciling = False      # the guard's startup-only rule: no recovery stop after this
         return out
@@ -514,6 +522,21 @@ def report_verdict(raw, row):
     return match.group(1)
 
 
+# PR 272 F3: peer_review's finding headings (peer_review.finding_ids, the same rule; the daemon does not import
+# peer_review): F<n> or R<n>, optionally suffixed, at the start of a line, after an optional heading or list marker.
+REPORT_FINDING = re.compile(r"(?m)^[ \t]*(?:#{1,6}[ \t]+|[-*][ \t]+)?(?:Finding[ \t]+)?((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*)\b")
+
+
+def report_finding_ids(raw):
+    """The finding ids a core-read report names, in order of first appearance. The caller applies the id rule and
+    the 64 cap (C.Contracts.finding_ids, through findings_receipt), which counts what it drops."""
+    out = []
+    for match in REPORT_FINDING.finditer(raw.decode("utf-8", errors="replace")):
+        if match.group(1) not in out:
+            out.append(match.group(1))
+    return out
+
+
 def settle_final(contracts, root, runner, uid, data):
     """R4/R5 under option A: settle one running row from a completion signal that arrived on core's socket from
     `uid` (the kernel's peer credential). The row, its started intent and its unit must match; the uid must be the one
@@ -542,11 +565,10 @@ def settle_final(contracts, root, runner, uid, data):
     if hashlib.sha256(raw).hexdigest() != fin["report_sha256"]:
         raise C.ContractError("unverified-producer: the report's sha256 is not the FINAL's")
     verdict = report_verdict(raw, row)
-    receipt = {"repo": row["repo"], "pr": row["pr"], "head": row["head"], "packet_sha256": row["packet_sha256"],
-               "policy_revision": row["policy_revision"], "verdict": verdict, "finding_ids": [],
-               "report_sha256": fin["report_sha256"], "invocation_id": fin["invocation_id"]}
-    if row["snapshot_base"]:
-        receipt["snapshot_base"] = row["snapshot_base"]
+    import ahc_shadow  # noqa: PLC0415 - the producer's receipt (AC-9 item 4); ahc_shadow imports this module lazily
+    ids = report_finding_ids(raw) if verdict != "PASS" else []
+    receipt = ahc_shadow.findings_receipt(row, verdict, ids, report_sha256=fin["report_sha256"],
+                                          invocation_id=fin["invocation_id"])
     moved = contracts.review(rid, "passed" if verdict == "PASS" else "findings", expected_version=row["version"],
                              event_id="r4f:%s" % intent["id"], actor="ahc-review", receipt=receipt, peer_uid=uid)
     contracts.intent_move(intent["id"], ("started",), "closed", "settled: %s" % verdict)

@@ -61,6 +61,39 @@ Details for the hostile fixture follow. It has exposure-tier findings (a key-blo
 
 **A-3. The tick schedules R3.** This is an owner ruling. One slot per tick, oldest offerable row first. Live shadow stays inert until a GoodQA reader exists (goodqa#16262, ruling g); after that the path is complete, apart from A-1's two PENDING_REAL_TEST items.
 
+## PR 272 review round 1 (code inspection at 084a610b, three material findings, all fixed)
+
+**F1, availability.** Before the fix, every core tick opened `Ledger(migrate=True)`, and the v5 gate waited on both role locks. The running review daemon holds its lock for life, so core refused after 60 s with schema exit 3, which does not restart.
+- *Fix.* `Ledger._v5_current` reads the version under the shared maint lock. A current, unfenced v5 ledger takes no migration lock.
+- *Upgrade path.* An upgrade or a fence still takes both role locks and the exclusive maint lock, and reads the version again under them. A migration with another role running still refuses (NEG-27, `test_neg27_a_migration_with_another_role_running_still_refuses`).
+- *Reconciliation.* `startup_reconcile` takes the role, and only core (or an all-in-one run) reconciles. The review role opens no ledger at start.
+- *Tests.*
+  - `MigrationV5Tests.test_f1_a_current_v5_ledger_opens_while_the_review_role_runs`, multiprocess;
+  - `test_f1_both_roles_start_together_on_a_v5_ledger`, two processes;
+  - `StartupReconcileTests.test_f1_only_core_reconciles_and_migrates_at_start`.
+
+**F2, fail-closed reconciliation.** Before the fix, a list-units failure blocked only rows with an open or started intent, so a freshly queued row could still launch.
+- *Fix.* A durable gate in `contract_meta` (`r3_reconcile`): `running` at the start of a reconciliation, then `ok` or `failed`.
+  - `launch_intent` refuses unless the gate is `ok`.
+  - `Launcher.launch` retries the reconciliation before a launch while the gate is closed.
+- *Tests.*
+  - `ReviewTickTests.test_neg36_a_failed_unit_listing_closes_every_launch_until_a_reconciliation_succeeds`: zero start calls, then the retry lifts the gate;
+  - `RuntimeTests.test_neg36_launch_intent_refuses_until_a_reconciliation_succeeds`.
+- *ASSUMPTION: a ledger never reconciled is open.* The daemon reconciles before its first tick (pinned by `test_ac8_the_daemon_reconciles_before_its_first_tick`), and a host without review isolation starts no unit.
+- *ASSUMPTION: the retry runs inside the tick.* It opens the guard's recovery-stop window (`policy.reconciling`) for that reconciliation only. No launch runs concurrently in the process.
+
+**F3, AC-9 acceptance flow.** Before the fix, `settle_final` built every receipt with `finding_ids: []`.
+- *Fix.* For a non-PASS verdict, core extracts the ids from the report it read itself (`report_finding_ids`). The receipt goes through `ahc_shadow.findings_receipt`, which applies the id rule and the 64 cap and keeps `finding_ids_dropped`.
+- *ASSUMPTION: the id rule.* It copies peer_review's `finding_ids` heading rule (`F<n>`/`R<n>`, optionally suffixed, at the start of a line). The daemon does not import peer_review.
+- *Test.* `ReviewTickTests.test_ac9_a_block_reports_finding_ids_reach_w3_and_main_accepts_them` follows a BLOCK report with F1 and F2 through settlement, W3 escalation naming both, and main's W16 acceptance into a named ticket, after which W3 no longer applies.
+
+**Variants.** Each fix has an entry; all are PROVEN:
+- "PR 272 F1 …": 2 of 2 mutations killed;
+- "PR 272 F2 …": 3 of 3;
+- "PR 272 F3 …": 2 of 2.
+
+**Owner ruling (agent message, ASSUMPTION; owner WAL wbf5d92d5ea4).** The DynamicUser socket-reachability gap routes to goodqa#16274 and #16275 and does not block the merge.
+
 ## Owner rulings carried in this build (agent messages, ASSUMPTION)
 
 - **(a)** The Mac only.

@@ -1460,6 +1460,23 @@ class RuntimeTests(Base):
         self.assertEqual(self.launcher.launch(row["id"], sandbox_repo=row["repo"])[0], "running")
         self.assertEqual(len(self.runner.live), 1, "never more than one live unit for the row")
 
+    def test_neg36_launch_intent_refuses_until_a_reconciliation_succeeds(self):
+        """PR 272 F2: after list-units failed, launch_intent refuses every row, including one with no intent, and
+        charges nothing; a reconciliation that succeeds lifts it."""
+        row = self.queued()
+        command = lambda unit: self.R.r3_command(self.policy, unit, row, helper_script=self.helper,  # noqa: E731
+                                                 attempt=self.R.attempt_paths(self.root, unit, row, "/clone"))
+        real = self.runner.list_units
+        self.runner.list_units = lambda: None
+        self.R.Reconciler(self.c, self.policy, self.runner, sleep=lambda s: None).run()
+        with self.assertRaises(C.ContractError):
+            self.c.launch_intent(row["id"], row["version"], command)
+        self.assertEqual(self.used(row), 0, "nothing charged")
+        self.runner.list_units = real
+        self.R.Reconciler(self.c, self.policy, self.runner, sleep=lambda s: None).run()
+        intent, _argv = self.c.launch_intent(row["id"], row["version"], command)
+        self.assertEqual(intent["state"], "open")
+
     def test_r04_the_peer_uid_comes_from_a_real_socketpair(self):
         import socket  # noqa: PLC0415
         if not (sys.platform.startswith("linux") or sys.platform == "darwin"):

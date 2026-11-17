@@ -569,11 +569,31 @@ class Ledger:
 
     # ------------------------------------------------------------ schema version 5 (AC-11)
 
+    def _v5_current(self):
+        """PR 272 F1: the version read under the shared maint lock, as every connection holds it (a migration in
+        progress holds it exclusive, so this waits for it). True for an unfenced v5 ledger (or one with no version
+        yet), which needs no migration and therefore none of the migration locks: the other role holds its role
+        lock for its whole life."""
+        shared = ahc_migrate.maint_lock(self.paths.root, shared=True)
+        db = None
+        try:
+            db = connect_nofollow(self.paths.root, self.path, timeout=30, isolation_level=None)
+            _check_sidecars(self.path)
+            version, fenced = ahc_migrate.read_version(db)
+            return version is None or (version == SCHEMA_VERSION and not fenced)
+        finally:
+            if db is not None:
+                db.close()
+            shared.close()
+
     def _v5_gate(self):
         """Migration runs only in v5 ahc-core, holding (1) the core role lock, then the review role lock, then the
         exclusive maint lock, each until the reopen. 4d45fe40's roles take their role locks but not the maint lock,
         so the role locks are what prove an old-version role has stopped. A lock not taken within LOCK_WAIT refuses
-        (nothing written). With the locks held, a v5 ledger is left as it is; anything older, or fenced, migrates."""
+        (nothing written). A current v5 ledger takes none of these locks (PR 272 F1); with the locks held, the
+        version is read again: a v5 ledger is left as it is; anything older, or fenced, migrates."""
+        if self._v5_current():
+            return
         root = self.paths.root
         held = []
         try:
@@ -2316,10 +2336,14 @@ def store_r2_packet(root, packet):
         pass                                          # the same sha names the same bytes
 
 
-def startup_reconcile(paths, policy, runner=None):
+def startup_reconcile(paths, policy, runner=None, role="all"):
     """AC-8 / NEG-36 / NEG-49: before any new attempt can start, list the ahc-review-* units and reconcile each
     against its committed launch intent; every finding is raised as an incident. Without review isolation (no systemd
-    on this host, or the units not resolved by the guard) there is no unit to reconcile. `runner` is for tests."""
+    on this host, or the units not resolved by the guard) there is no unit to reconcile. `runner` is for tests.
+    R3 attempts start only from core's tick, so only core (or an all-in-one run) reconciles; the review role opens
+    no ledger here, and so never a migrating one (PR 272 F1)."""
+    if role not in ("core", "all"):
+        return {"skipped": "the %s role starts no review attempt; ahc-core reconciles" % role}
     import ahc_review  # noqa: PLC0415
     if runner is None:
         if not ahc_review.SystemdRunner.available(policy):
@@ -3059,7 +3083,7 @@ def main(argv=None):
     # gh authenticates from its own config under HOME; the unit sets no gh credential variable, so the gh
     # form carries none (ASSUMPTION)
     policy = ahc_guard.install(ahc_guard.Policy(paths.root, repos=config.get("repos", []), home=paths.home))
-    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy), default=str))
+    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy, role=args.role), default=str))
     deps = LiveDeps(paths, config)
     while True:
         try:
