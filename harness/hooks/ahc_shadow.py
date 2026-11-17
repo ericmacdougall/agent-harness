@@ -134,6 +134,44 @@ HOLD_PREFIX = "shadow_hold:"
 def hold_key(request_key):
     """The hold record's key for a request key (shadow_req:<repo>#<pr>@<head> -> shadow_hold:<repo>#<pr>@<head>)."""
     return HOLD_PREFIX + request_key[len(REQUEST_PREFIX):]
+
+
+# goodqa#16262 d5 F2: retryable holds are re-evaluated after 1, 2, 4, 8, 16, then 32 shadow ticks (capped), counted
+# by shadow_tick_seq, which each tick increments once in its first transaction. Permanent holds wait for a new head.
+SEQ_KEY = "shadow_tick_seq"
+HOLD_KINDS = ("retryable", "permanent")
+
+
+def hold_wait(count):
+    """Ticks to wait after the `count`-th consecutive hold (1-based): 1, 2, 4, 8, 16, then 32."""
+    return min(2 ** (max(int(count), 1) - 1), 32)
+
+
+def tick_seq(contracts):
+    row = contracts.db.execute("SELECT v FROM contract_meta WHERE k=?", (SEQ_KEY,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _meta(contracts, key):
+    row = contracts.db.execute("SELECT v FROM contract_meta WHERE k=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def write_hold(contracts, key, read_value, read_hold, kind, reason):
+    """Hold the request at `key` (RT-20: a compare-and-set). The write happens only if the request is still exactly
+    `read_value` and its hold record still exactly `read_hold` (None: none) as the tick read them; otherwise nothing is
+    written and False is returned, and the request is re-evaluated on the next tick."""
+    if kind not in HOLD_KINDS:
+        raise ValueError("a hold is retryable or permanent")
+    with contracts.tx():
+        if _meta(contracts, key) != read_value or read_value is None or _meta(contracts, hold_key(key)) != read_hold:
+            return False
+        count = (json.loads(read_hold)["count"] if read_hold else 0) + 1
+        record = {"kind": kind, "reason": str(reason)[:300], "count": count,
+                  "next_tick": tick_seq(contracts) + hold_wait(count) if kind == "retryable" else None}
+        contracts.db.execute("INSERT OR REPLACE INTO contract_meta(k, v) VALUES (?, ?)",
+                             (hold_key(key), C._canon(record)))
+    return True
 # Rows the tick evaluates. W1 is admission; W16 is main's stamped CLI (AC-6) and W20 the owner's cancel, so the tick
 # never applies them. W21 is evaluated only when AC-7's send flag is on (ahc_w21).
 TICK_ROWS = tuple(r for r in C.Contracts.WI_TRANSITIONS if r not in ("W1", "W16", "W20", "W21"))
@@ -177,9 +215,30 @@ def queue_request(contracts, norm):
     legacy items table. Idempotent per (repo, pr, head)."""
     key = "%s%s#%d@%s" % (REQUEST_PREFIX, norm["repo"], int(norm["pr"]), norm["head"])
     with contracts.tx():
-        contracts.db.execute("INSERT OR IGNORE INTO contract_meta(k, v) VALUES (?, ?)",
-                             (key, C._canon({k: norm.get(k) for k in ("repo", "pr", "head", "base", "packet_sha256",
-                                                                      "owner", "ticket")})))
+        current = _meta(contracts, key)
+        if current is None:
+            # goodqa#16262 d5 F2: a request at a new head replaces any held request for the same (repo, pr), and its
+            # hold record (prefix compared exactly, never with LIKE wildcards)
+            prefix = "%s%s#%d@" % (REQUEST_PREFIX, norm["repo"], int(norm["pr"]))
+            for (other,) in contracts.db.execute("SELECT k FROM contract_meta WHERE substr(k, 1, ?) = ? AND k != ?",
+                                                 (len(prefix), prefix, key)).fetchall():
+                if _meta(contracts, hold_key(other)) is not None:
+                    contracts.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (other, hold_key(other)))
+            contracts.db.execute("INSERT INTO contract_meta(k, v) VALUES (?, ?)",
+                                 (key, C._canon({k: norm.get(k) for k in ("repo", "pr", "head", "base",
+                                                                          "packet_sha256", "owner", "ticket")})))
+        else:
+            # a same-head resubmit of a queued (never admitted: admission deletes the request) request replaces only
+            # its ticket, and resets a retryable hold's backoff so it is re-evaluated on the next tick
+            req = json.loads(current)
+            if norm.get("ticket") != req.get("ticket"):
+                req["ticket"] = norm.get("ticket")
+                contracts.db.execute("UPDATE contract_meta SET v=? WHERE k=?", (C._canon(req), key))
+                raw = _meta(contracts, hold_key(key))
+                hold = json.loads(raw) if raw else None
+                if hold and hold.get("kind") == "retryable":
+                    hold.update(count=0, next_tick=tick_seq(contracts))
+                    contracts.db.execute("UPDATE contract_meta SET v=? WHERE k=?", (C._canon(hold), hold_key(key)))
     return key
 
 
@@ -260,6 +319,7 @@ class ShadowTick:
         return obs
 
     def admit_requests(self, summary):
+        seq = tick_seq(self.c)
         rows = self.c.db.execute("SELECT k, v FROM contract_meta WHERE k LIKE ? ORDER BY k",
                                  (REQUEST_PREFIX + "%",)).fetchall()
         for key, value in rows:
@@ -279,6 +339,12 @@ class ShadowTick:
             if live:
                 summary["duplicates"].append((key, "duplicate of live item %s" % live[0]))
                 continue
+            raw = _meta(self.c, hold_key(key))
+            if raw is not None:
+                hold = json.loads(raw)
+                if hold.get("kind") != "retryable" or seq < int(hold.get("next_tick") or 0):
+                    summary["held"].append((key, hold.get("reason")))
+                    continue
             if self.c.db.execute("SELECT 1 FROM work_items WHERE repo=? AND pr=? AND head!=? AND state IN (%s)"
                                  % ",".join("?" * len(C.Contracts._WI_LIVE)),
                                  (req["repo"], req["pr"], req["head"]) + C.Contracts._WI_LIVE).fetchone():
@@ -309,7 +375,8 @@ class ShadowTick:
                         reason = str(error)
                 if reason:
                     summary["refused"].append((key, "admission: %s" % reason))
-                self.c.db.execute("DELETE FROM contract_meta WHERE k=?", (key,))
+                # RT-19: every delete of a request takes its hold record
+                self.c.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (key, hold_key(key)))
 
     def r2_packet(self, req, obs, base):
         """R2 (option A): core's packet for (repo, pr, H) against B_r = `base`, built from core's own clone through the
@@ -384,8 +451,11 @@ class ShadowTick:
         return holding, args
 
     def tick(self, tag="tick"):
-        summary = {"admitted": [], "duplicates": [], "moved": [], "refused": [], "conflicts": [], "incidents": [],
-                   "observed": [], "requeued": []}
+        summary = {"admitted": [], "duplicates": [], "held": [], "moved": [], "refused": [], "conflicts": [],
+                   "incidents": [], "observed": [], "requeued": []}
+        with self.c.tx():                     # goodqa#16262 F2: the hold backoff counts ticks
+            self.c.db.execute("INSERT INTO contract_meta(k, v) VALUES (?, '1') ON CONFLICT(k) DO UPDATE SET "
+                              "v = CAST(CAST(v AS INTEGER) + 1 AS TEXT)", (SEQ_KEY,))
         self.admit_requests(summary)
         for repo in self._repos():
             items = [self.c._row("work_items", "id", i) for (i,) in self.c.db.execute(

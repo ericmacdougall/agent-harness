@@ -5582,6 +5582,103 @@ class ShadowBoundaryTests(_ShadowFixture):
         self.assertEqual(set(self.S.TICK_ROWS) | {"W1", "W16", "W20", "W21"}, set(C.Contracts.WI_TRANSITIONS))
 
 
+class HoldRecordTests(_ShadowFixture):
+    """goodqa#16262 d5 F2: a held request keeps a `shadow_hold:` record beside it (outside the request pattern).
+    Retryable holds are re-evaluated with backoff 1, 2, 4, 8, 16, 32 (cap) counted in shadow ticks; permanent holds
+    wait for a new head, which replaces the held request. The hold write is a compare-and-set (RT-20), a same-head
+    resubmit replaces only the ticket and resets a retryable backoff, and every request delete takes its hold
+    (RT-19)."""
+
+    REQ = {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE, "packet_sha256": TC.PKT, "owner": "agent-x",
+           "ticket": "GoodQA goodqa#5"}
+
+    def queue(self, **change):
+        return self.S.queue_request(self.c, dict(self.REQ, **change))
+
+    def value(self, key):
+        row = self.db.execute("SELECT v FROM contract_meta WHERE k=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def hold(self, key):
+        raw = self.value(self.S.hold_key(key))
+        return json.loads(raw) if raw else None
+
+    def held_ticks(self, ticks):
+        """Run `ticks` shadow ticks; return, per tick, whether the request was skipped as held."""
+        out = []
+        for _ in range(ticks):
+            summary = self.shadow_tick()[0].tick()
+            out.append(any(k.startswith(self.S.REQUEST_PREFIX) for k, _why in summary["held"]))
+        return out
+
+    def test_the_hold_key_sits_outside_the_request_pattern(self):
+        key = self.queue()
+        self.assertTrue(self.S.write_hold(self.c, key, self.value(key), None, "permanent", "refs: no Refs line"))
+        hk = self.S.hold_key(key)
+        self.assertTrue(hk.startswith(self.S.HOLD_PREFIX))
+        keys = [k for (k,) in self.db.execute("SELECT k FROM contract_meta WHERE k LIKE ?",
+                                              (self.S.REQUEST_PREFIX + "%",))]
+        self.assertEqual(keys, [key])
+
+    def test_a_retryable_hold_backs_off_1_2_4_8_16_then_32_ticks(self):
+        self.assertEqual([self.S.hold_wait(n) for n in range(1, 9)], [1, 2, 4, 8, 16, 32, 32, 32])
+        key = self.queue()
+        for _ in range(3):                                   # the third hold waits 4 ticks
+            self.S.write_hold(self.c, key, self.value(key), self.value(self.S.hold_key(key)), "retryable",
+                              "no attached spec on goodqa#5")
+        self.assertEqual(self.hold(key)["count"], 3)
+        self.assertEqual(self.held_ticks(4), [True, True, True, False])
+        self.assertIsNone(self.value(key), "re-evaluated on the fourth tick and admitted")
+        self.assertIsNone(self.value(self.S.hold_key(key)), "admission deletes the hold with the request")
+
+    def test_a_permanent_hold_waits_for_a_new_head_which_replaces_it(self):
+        key = self.queue()
+        self.S.write_hold(self.c, key, self.value(key), None, "permanent", "refs: two tickets")
+        self.assertEqual(self.held_ticks(3), [True, True, True])
+        self.assertIsNotNone(self.value(key), "a held request is never deleted by its hold")
+        new = self.queue(head=TC.H2)
+        self.assertIsNone(self.value(key), "the new head replaces the held request")
+        self.assertIsNone(self.value(self.S.hold_key(key)))
+        self.assertIsNotNone(self.value(new))
+
+    def test_a_new_head_leaves_an_unheld_request_of_another_repo_alone(self):
+        other = self.S.queue_request(self.c, dict(self.REQ, repo="o/rx", pr=5))
+        key = self.queue()
+        self.S.write_hold(self.c, key, self.value(key), None, "permanent", "refs: two tickets")
+        self.queue(head=TC.H2)
+        self.assertIsNotNone(self.value(other))
+
+    def test_a_same_head_resubmit_replaces_only_the_ticket_and_resets_a_retryable_backoff(self):
+        key = self.queue(ticket="GoodQA goodqa#6")
+        for _ in range(4):
+            self.S.write_hold(self.c, key, self.value(key), self.value(self.S.hold_key(key)), "retryable",
+                              "request ticket GoodQA goodqa#6 is not goodqa#5")
+        self.queue(ticket="GoodQA goodqa#5", owner="agent-other")
+        req = json.loads(self.value(key))
+        self.assertEqual((req["ticket"], req["owner"]), ("GoodQA goodqa#5", "agent-x"), "only the ticket changes")
+        self.assertEqual(self.hold(key)["count"], 0)
+        self.assertEqual(self.held_ticks(1), [False], "re-evaluated on the next tick")
+
+    def test_rt19_a_head_moved_refusal_deletes_the_hold_with_the_request(self):
+        key = self.queue()
+        self.S.write_hold(self.c, key, self.value(key), None, "retryable", "no attached spec on goodqa#5")
+        self.changes["pr_head"] = TC.H2
+        self.held_ticks(1)
+        self.assertIsNone(self.value(key))
+        self.assertIsNone(self.value(self.S.hold_key(key)), "no orphaned hold record")
+
+    def test_rt20_the_hold_write_is_a_compare_and_set(self):
+        key = self.queue(ticket="GoodQA goodqa#6")
+        read = self.value(key)
+        self.queue(ticket="GoodQA goodqa#5")                 # corrected between the tick's read and its write
+        self.assertFalse(self.S.write_hold(self.c, key, read, None, "retryable", "stale"))
+        self.assertIsNone(self.value(self.S.hold_key(key)))
+        self.S.write_hold(self.c, key, self.value(key), None, "retryable", "first")
+        stale_hold = None                                    # the tick read no hold; one now exists
+        self.assertFalse(self.S.write_hold(self.c, key, self.value(key), stale_hold, "retryable", "second"))
+        self.assertEqual(self.hold(key)["reason"], "first")
+
+
 class ShadowTickTests(_ShadowFixture):
     """AC-4: admit, observe, select (T7) and move each item at most once per tick; event id f(obs, item, row)."""
 
