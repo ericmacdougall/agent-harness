@@ -205,6 +205,31 @@ The round-2 invariant above did not hold on every path: `settle_final` closed a 
   - "PR 272 rescue F1 …" (9 mutations, including "Result=success counts as a confirmed stop" and "the sweep reads ended() after the inbox drain");
   - "PR 272 rescue F2 …" (2);
   - "PR 272 rescue A-1 …" (1).
+- *The bound-edge window (goodqa#16307).* The sweep still decides "outlived its bound" after the drain, so a FINAL that lands after the drain on the very tick a unit crosses `REVIEW_MAX + SETTLE_GRACE` is given up (outcome-unknown, fails closed). Ancestry of B_r at admission is goodqa#16309.
+
+## PR 273 receipt (main's exact-head receipt at 3932ba67: BLOCK, r273-F1-F3)
+
+Main's receipt `receipts/pr273-3932ba67` (Codex, R1) found three new material findings. They are labelled r273-F1 to r273-F3, apart from the f532d495 receipt's F1-F4. Main's assignment is an agent message (ASSUMPTION); the fixes are the rescue agent's.
+
+**r273-F1 (high): a PASS needs the helper's exit 0.**
+- *Finding.* `settle_final` took a bound report's PASS with no proof that peer_review completed; peer_review exits 2 after a failed final publication check and may leave a digest-bound historical report (`ahc_core.verify_receipt` already rejected that).
+- *Fix.* The completion signal carries the helper's exit status, `exit_status`, a JSON integer (a boolean, string or absent key is refused). `ahc_core.helper_outcome` is the one rule, shared with `verify_receipt`: PASS and PASS-WITH-TICKETS need exit 0, BLOCK holds with 0 or 3. Any other status settles the row outcome-unknown (the intent still goes to stopping); never passed. `receive_final` and R-c apply the same rule; neither is called in production.
+- *Contract.* The wrapper (goodqa#16274) must forward peer_review's real exit status and hash the report after the helper exits (ASSUMPTION until it ships; recorded on the ticket).
+- *Tests.* `RuntimeTests.test_r273_f1_a_bound_pass_report_left_after_a_failed_publication_check_never_passes`, `…_the_verdict_carrying_final_forms_apply_the_same_exit_rule`, and end to end `ReviewTickTests.test_r273_f1_a_pass_report_with_a_failed_publication_exit_settles_outcome_unknown_through_the_tick`. The real helper was not driven to exit 2: that needs peer_review's publication check to fail mid-run; the protocol tests bind the status.
+
+**r273-F2 (medium): rows required after admission are queued.**
+- *Finding.* W16 extension rounds and W27 replacement code rows were created required and never queued (R2 ran only at admission and in the W4/W24 successor move).
+- *Fix.* `ShadowTick.r2_required` runs every tick before the scheduler: each required attempt-kind row of a pr-gate item in a shadow repo, bound to its item's packet, is queued from the stored packet (`ahc_review.stored_packet`: sha256, core's header, repo, PR, H, B_r; `r2_queue` checks the row). A row that cannot be queued stays required and is in the tick's `refused` every tick. The runner wires `load_r2_packet` (bounded, no-follow).
+- *Callers of require_review.* Admission and W4/W24 successors (`admit_item`, queued in their own transaction), W27 and W16 (this pass). Successor items carry their packet's B_r as their base, so W27's `item["base"]` and W16's copied snapshot base match the stored header.
+- *Tests.* W16 through `run_all`: extension, next tick, queued, launched by the real scheduler and Launcher; an altered or missing stored packet keeps the row required and is reported; W27 at the ShadowTick level through the real ReviewScheduler (offered to a recording launcher; the integrated harness cannot reach merge-ready because its canary is unknown and ELIG fails closed).
+- *Disclosed.* Later rounds reuse the admission-time packet, so after a W27 on a changed core and policy the code reviewer sees the admission-time core text (goodqa#16311).
+
+**r273-F3 (medium): the packet carries the attached core's criteria and text.**
+- *Finding.* R2 read `obs["acceptance"]`, which the producer never set, so the packet said "(none)", and "Spec core" held the 64-character digest.
+- *Fix.* The GoodQA reader's contract gains `spec_core_text`, the attached core's text (spec_flow.spec_core, whose sha256 is the attached core digest; checked on r9: `e488a8cb…`). The producer refuses an observation whose text does not hash to `attached_core` (or is over 1 MiB or not UTF-8) and hands the text to R2 on the returned observation only, never persisted. `build_packet` re-verifies it against the digest the item is bound to, takes the acceptance criteria from the core's own "Acceptance criteria" section (so they are hash-bound with it) and is not built without them: the request or move is held. The production reader still returns nothing (an existing ASSUMPTION), so nothing is admitted live.
+- *Tests.* `RuntimeTests.test_r273_f3_…` (eight refusals), `ProducerTests.test_r273_f3_…` (verified, carried, not persisted; foreign, oversized, non-text refused), and end to end `ReviewTickTests.test_r273_f3_…` at admission and for W4's successor, plus the held request.
+
+**Correction.** Commit 3932ba67's Testing line said "325 OK" for crash, runner and clock; that was never observed (the run was 329 tests with one anchor failure, fixed before that commit). Corrected in 6f282748's message; the pushed commit is not rewritten.
 
 ## Owner rulings carried in this build (agent messages, ASSUMPTION)
 
