@@ -573,6 +573,23 @@ def sysctl_run(argv, timeout):
     return SimpleNamespace(returncode=rc, stdout=out)
 
 
+def probe_run(argv, timeout):
+    """AC-11's open-file probe (lsof, or fuser) under AC-13: through the active policy's form (its resolved
+    executable, minimal env and the root as cwd), checked against the lsof/fuser rules (only while migrating, fixed
+    options, the ledger files) before it launches. Without a policy it is ahc_migrate's default (cwd /)."""
+    import ahc_core  # noqa: PLC0415
+    import ahc_migrate  # noqa: PLC0415
+    from types import SimpleNamespace  # noqa: PLC0415
+    policy = _ACTIVE
+    if policy is None:
+        return ahc_migrate.default_run(argv, timeout)
+    name = os.path.basename(str(argv[0]))
+    full = policy.argv(name, list(argv[1:]))
+    policy.check_launch(full[0], full, policy.root, policy.env(name))
+    rc, out, err = ahc_core.run_argv(full, timeout, cwd=policy.root, env=policy.env(name))
+    return SimpleNamespace(returncode=rc, stdout=out, stderr=err)
+
+
 def run_helper(policy, name, args, timeout, script=None):
     """The production launcher for a legacy Python helper: the interpreter, the script, the helper form's fixed
     env and the root as cwd. `script` (a configured path) is launched as given; under an active policy the hook

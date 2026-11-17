@@ -458,6 +458,41 @@ class GuardPolicyUnitTests(unittest.TestCase):
 
 
 
+class MigrateProbeTests(_GuardFixture):
+    """AC-11 steps 2 and 4 under the installed guard: the open-file probe launches through the policy's lsof form
+    with its cwd at the root, and only while ahc-core is migrating; Ledger opens that gate for the migration only."""
+
+    def test_ac11_the_probe_runs_through_the_policy_form_at_the_root_only_while_migrating(self):
+        import ahc_migrate  # noqa: PLC0415
+        import ahc_runner  # noqa: PLC0415
+        ledger = str(self.root / "ledger.sqlite3")
+        tools = {"lsof": self.policy.exe["lsof"]}
+        with self.assertRaises(ahc_migrate.ProbeError):
+            ahc_migrate.open_file_holders([ledger], ahc_runner.Ledger.PROBE_RUN, tools=tools)
+        self.assertFalse(self.mark("lsof"), "refused before launch when not migrating")
+        self.policy.migrating = True
+        try:
+            held = ahc_migrate.open_file_holders([ledger], ahc_runner.Ledger.PROBE_RUN, tools=tools)
+        except ahc_migrate.ProbeError as error:
+            self.fail("the probe was refused while migrating: %s" % error)
+        self.assertEqual(held, set())
+        self.assertTrue(self.mark("lsof"), "lsof ran through the policy's form")
+
+    def test_ac11_the_ledger_opens_the_migrating_gate_for_the_migration_only(self):
+        import ahc_runner  # noqa: PLC0415
+        seen = []
+        led = ahc_runner.Ledger.__new__(ahc_runner.Ledger)
+        led._migrate_to_v5 = lambda n: seen.append((n, self.policy.migrating))
+        self.assertFalse(self.policy.migrating)
+        led._migrate_guarded(4)
+        self.assertEqual(seen, [(4, True)])
+        self.assertFalse(self.policy.migrating, "closed again after the migration")
+        led._migrate_to_v5 = lambda n: 1 / 0
+        with self.assertRaises(ZeroDivisionError):
+            led._migrate_guarded(4)
+        self.assertFalse(self.policy.migrating, "closed again when the migration fails")
+
+
 class OrphanRecoveryTests(_GuardFixture):
     """NEG-49 (AC-13, part of NEG-36's startup reconciliation), through the production launch guard: the R3 runner's
     systemctl calls run AC-13's forms against a stub that keeps per-unit state and writes a stop sentinel."""

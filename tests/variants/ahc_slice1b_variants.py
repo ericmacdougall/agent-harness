@@ -877,6 +877,39 @@ ENTRIES.update({
 })
 
 
+ENTRIES.update({
+    "AC-7 W21 successor at H' (B_r = parent2, R2 packet)": {
+        "tests": ["tests.test_ahc_runner.ShadowTickTests.test_ac7_w21_successor_at_h_prime_gets_core_r2_packet_with_b_r_parent2"],
+        "mutations": [
+            ("the successor's B_r is the item's base", [
+                ('            kw["successor_packet"], kw["successor_base"] = packet["sha256"], base\n',
+                 '            kw["successor_packet"], kw["successor_base"] = packet["sha256"], None\n')], SHADOW),
+            ("H'^2 is not checked", [
+                ('            if rc != 0 or out.strip() != base:\n', '            if False:\n')], SHADOW),
+            ("the successor's rows are not queued", [
+                ('                    self.r2_queue_item(succ, packet)\n', '                    pass\n')], SHADOW),
+            ("a resolved send is not recognised (W4 waits forever)", [
+                ('        if send:\n            base = send[0]\n', '        if False:\n            base = send[0]\n')],
+             SHADOW)]},
+})
+
+
+ENTRIES.update({
+    "AC-11/AC-13 open-file probe under the guard": {
+        "tests": ["tests.test_ahc_guard.MigrateProbeTests.test_ac11_the_probe_runs_through_the_policy_form_at_the_root_only_while_migrating",
+                  "tests.test_ahc_guard.MigrateProbeTests.test_ac11_the_ledger_opens_the_migrating_gate_for_the_migration_only"],
+        "mutations": [
+            ("the probe runs at cwd /", [
+                ('    rc, out, err = ahc_core.run_argv(full, timeout, cwd=policy.root, env=policy.env(name))\n',
+                 '    rc, out, err = ahc_core.run_argv(full, timeout, cwd="/", env=policy.env(name))\n')], GUARD),
+            ("the ledger never opens the gate", [
+                ('            policy.migrating = True\n', '            policy.migrating = False\n')], RUNNER_PY),
+            ("the gate stays open after the migration", [
+                ('            if policy is not None:\n                policy.migrating = False\n',
+                 '            pass\n')], RUNNER_PY)]},
+})
+
+
 def run_tests(root, ids, noop=(), timeout=TIMEOUT):
     env = dict(os.environ, AHC_NOOP_TESTS=",".join(noop), PYTHONDONTWRITEBYTECODE="1")
     try:
