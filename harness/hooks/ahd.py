@@ -678,15 +678,24 @@ class Daemon:
             for op, key, flag, cur in plan:
                 args = {"alert_key": key, "source": SOURCE}
                 if op == "raise":
-                    args.update(severity=flag["severity"], message=flag.get("message", ""), detail=flag.get("detail") or {})
+                    args.update(severity=flag["severity"], message=str(flag.get("message", ""))[:MESSAGE_MAX],
+                                detail=flag.get("detail") or {})
                 lines.append(json.dumps({"op": f"alert.{op}", "key": self.key_for(op, key, flag or {}, cur),
                                          "args": args}, sort_keys=True))
-            rc, _ = self.call("apply", ["--batch", "-"], deadline, stdin="\n".join(lines) + "\n")
-            if rc == 0:
-                for op, key, flag, cur in plan:
+            rc, doc = self.call("apply", ["--batch", "-"], deadline, stdin="\n".join(lines) + "\n")
+            results = doc.get("results") if rc == 0 and isinstance(doc, dict) else None
+            if isinstance(results, list) and len(results) == len(plan):
+                oldest = None
+                for (op, key, flag, cur), res in zip(plan, results):
+                    if op == "raise" and isinstance(res, dict) and res.get("result") == "duplicate":
+                        # the same reassert as the single path: applied before, yet the ring no longer shows it
+                        if oldest is None:
+                            oldest = min((e.get("seq", 0) for e in read_ring()), default=0)
+                        self.call("alert raise", self.alert_args(op, key, flag, SOURCE, cur, f"-r{oldest}"), deadline)
                     if op == "raise":
                         self.ticket_comment(key, flag, deadline)
                 return len(plan)
+            # no per-line results (an older ah) or a failure part way: one at a time, where duplicates are handled
         sent = 0
         for op, key, flag, cur in plan:
             rc, doc = self.call(f"alert {op}", self.alert_args(op, key, flag, SOURCE, cur), deadline)

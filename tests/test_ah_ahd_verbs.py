@@ -61,9 +61,15 @@ class Heartbeat(Base):
         self.assertEqual((rec["service"], rec["host"]), ("ahd", ahd.host()))
         self.assertLess(abs(ah.parse_ts(rec["at"]) - time.time()), 30)
         self.assertEqual(beat.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(rec["pid"], os.getppid())
         check = ah.ahd_running_check(self.home)
-        self.assertTrue(check["ok"], check)
+        self.assertFalse(check["ok"], check)  # a beat from a shell or a test is not ahd (review minor 3)
+        rec["caller"] = "/usr/bin/python3 /home/u/.claude/hooks/ahd.py serve"
+        beat.write_text(json.dumps(rec))
+        self.assertTrue(ah.ahd_running_check(self.home)["ok"])
         self.assertNotIn("heartbeat.beat", self.ledger_ops())  # 1440 beats a day never grow the ledger
+        for d in (self.home / ".agent-harness", self.home / ".agent-harness" / "state", beat.parent):
+            self.assertEqual(d.stat().st_mode & 0o777, 0o700, d)  # every level ah created (review minor 6)
 
     def test_bad_service_and_symlinked_target_are_refused_safely(self):
         rc, _ = self.ah("heartbeat", "beat", "--service", "../x", "--key", "beat-key-000002")
@@ -77,6 +83,11 @@ class Heartbeat(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(outside.read_text(), "keep me")  # the link is replaced, never followed
         self.assertFalse((d / "heartbeat.json").is_symlink())
+        planted = d / f".heartbeat.{os.getpid()}.tmp"
+        planted.symlink_to(outside)
+        rc, _ = self.ah("heartbeat", "beat", "--service", "ahd", "--key", "beat-key-000004")
+        self.assertEqual(rc, 0)  # a planted temp-name link is removed, not followed (review minor 6)
+        self.assertEqual(outside.read_text(), "keep me")
 
 
 class Alerts(Base):
@@ -108,6 +119,35 @@ class Alerts(Base):
             rc, _ = self.ah(*argv)
             self.assertEqual(rc, 2, bad)
         self.assertEqual(self.ring(), [])
+
+    def test_oversized_keys_deep_json_and_symlinked_state_are_refused_before_any_write(self):
+        argv = list(self.RAISE)
+        argv[argv.index("--alert-key") + 1] = "\u00e9" * 200  # 200 characters, about 1.2 KiB escaped
+        rc, _ = self.ah(*argv)
+        self.assertEqual(rc, 2)  # review minor 1: refused in validation, no stuck intent row
+        line = json.dumps({"op": "alert.raise", "key": "deep-key-0001", "args": {"alert_key": "\u00e9" * 200,
+                                                                                  "source": "ahd", "severity": "info", "message": "m"}})
+        rc, _ = self.ah("apply", "--batch", "-", stdin=line + "\n")
+        self.assertEqual(rc, 2)
+        argv = list(self.RAISE)
+        argv[argv.index("--detail") + 1] = "[" * 5000 + "]" * 5000
+        argv[argv.index("--key") + 1] = "deep-json-0001"
+        rc, _ = self.ah(*argv)
+        self.assertEqual(rc, 2)  # review minor 6: not an internal RecursionError
+        self.assertEqual(self.ring(), [])
+        self.assertEqual([r for r in ah._ledger(self.home, include_intents=True) if r.get("state") == "intent"], [])
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        state = self.home / ".agent-harness" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        state.rename(self.home / "old-state")
+        state.symlink_to(elsewhere)
+        argv = list(self.RAISE)
+        argv[argv.index("--key") + 1] = "via-link-0001"
+        rc, _ = self.ah(*argv)
+        self.assertEqual(rc, 3)  # review minor 5: the same rule as heartbeat
+        self.assertFalse(list(elsewhere.glob("alerts*")))  # no ring through the link (the ah store's own path is a
+        # separate, pre-existing rule: ticketed, not changed here)
 
 
 class Apply(Base):
@@ -152,7 +192,47 @@ class AhdWithTheRealAh(Base):
         rc, doc = d.call("apply", ["--batch", "-"], deadline, stdin=line + "\n")
         self.assertEqual(rc, 0, doc)
         self.assertEqual(d.unsupported, {})  # nothing logged "not available yet"
+        self.assertTrue(d.acquire())  # a running ahd holds its lock; that is what doctor trusts first
+        self.addCleanup(d.release)
         self.assertTrue(ah.ahd_running_check(self.home)["ok"])
+
+    def daemon(self):
+        policy = ahd.load_policy()
+        policy["ah"] = [sys.executable, str(HOOKS / "ah.py")]
+        return ahd.Daemon(policy=policy)
+
+    def flags(self, n=12, message=None):
+        return {f"probe:s{i:02d}": {"severity": "warning", "message": message or f"probe {i}", "detail": {}, "kind": "probe",
+                                    "subject": f"s{i:02d}", "since": 1} for i in range(n)}
+
+    def test_the_batch_path_reasserts_alerts_a_foreign_clear_removed(self):
+        """Review M1: more than 10 transitions go through `ah apply`; a raise it reported as duplicate was swallowed,
+        so a same-UID `ah alert clear` of 11+ ahd alerts kept them cleared for good."""
+        d, flags = self.daemon(), self.flags()
+        deadline = ahd.mono() + 120
+        self.assertEqual(d.send([("raise", k, f, None) for k, f in flags.items()], deadline), len(flags))
+        for k in flags:
+            rc, _ = self.ah("alert", "clear", "--alert-key", k, "--source", "ahd", "--key", "foreign-" + k.replace(":", "-"))
+            self.assertEqual(rc, 0)
+        ring = ahd.ring_state(ahd.read_ring(), "ahd", ahd.host())
+        self.assertTrue(all(ring[k]["event"] == "clear" for k in flags))
+        d.send([("raise", k, f, ring[k]) for k, f in flags.items()], deadline)
+        ring = ahd.ring_state(ahd.read_ring(), "ahd", ahd.host())
+        self.assertEqual(sorted(k for k in flags if ring[k]["event"] == "raise"), sorted(flags))
+
+    def test_a_long_message_sent_in_a_batch_falls_back_without_a_key_conflict(self):
+        """Review minor 2: the batch sent the full text and the single call 400 characters: one key, two bodies."""
+        d, flags = self.daemon(), self.flags(message="x" * 900)
+        sent = []
+        real = d.runner
+        d.runner = lambda argv, timeout, stdin=None, env=None: (sent.append(stdin), real(argv, timeout, stdin))[1]
+        deadline = ahd.mono() + 120
+        d.send([("raise", k, f, None) for k, f in flags.items()], deadline)
+        lines = [json.loads(x) for x in sent[0].splitlines()]
+        self.assertTrue(all(len(x["args"]["message"]) == ahd.MESSAGE_MAX for x in lines))
+        k, f = next(iter(flags.items()))
+        rc, doc = d.call("alert raise", d.alert_args("raise", k, f, "ahd"), deadline)
+        self.assertEqual((rc, doc["result"]), (0, "duplicate"))  # the single path's body matches the batch's
 
 
 if __name__ == "__main__":

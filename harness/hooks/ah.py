@@ -831,7 +831,8 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", "task.pending: agent id and ISO at are required")
     elif op in ("alert.raise", "alert.clear"):
         need("alert_key", "source")
-        if not ALERT_KEY_RE.match(args["alert_key"]) or not ALERT_SOURCE_RE.match(args["source"]):
+        if not ALERT_KEY_RE.match(args["alert_key"]) or not ALERT_SOURCE_RE.match(args["source"]) \
+                or len(json.dumps(args["alert_key"])) > ALERT_KEY_ESCAPED_MAX:
             raise AhError("bad_request", f"{op}: alert_key is 1-200 characters, no spaces or control characters; source is "
                                          "lower-case [a-z0-9_.-], up to 32")
         if op == "alert.raise":
@@ -841,7 +842,11 @@ def precheck(op: str, args: dict) -> None:
             if len(args["message"]) > 1000:
                 raise AhError("bad_request", "alert.raise: message is at most 1000 characters")
             detail = args.get("detail", {})
-            if not isinstance(detail, dict) or len(canonical(detail)) > 4096:
+            try:
+                too_big = not isinstance(detail, dict) or len(canonical(detail)) > 4096
+            except (ValueError, RecursionError, TypeError):
+                too_big = True
+            if too_big:
                 raise AhError("bad_request", "alert.raise: detail is a JSON object of at most 4 KiB")
     elif op == "ticket.comment":
         need("body")
@@ -1107,12 +1112,13 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         out["wal"] = wid
     elif op in ("alert.raise", "alert.clear"):
         import ops_watch  # noqa: PLC0415 - installed beside ah; the ring's one writer implementation
+        state = safe_state_dir(home)  # the same no-symlink rule as heartbeat (review minor 5)
         raising = op == "alert.raise"
         out["ring_seq"] = ops_watch.emit({
             "host": ring_host(), "source": args["source"], "event": "raise" if raising else "clear",
             "severity": args["severity"] if raising else "info", "key": args["alert_key"],
             "message": args["message"] if raising else "cleared", "detail": args.get("detail") or {}},
-            path=home / ".agent-harness" / "state" / "alerts.jsonl")
+            path=state / "alerts.jsonl")
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
     elif op == "task.dispose":
@@ -1331,10 +1337,26 @@ def doctor() -> dict:
 ALERT_SEVERITIES = ("info", "warning", "high", "critical")  # ops_watch.SEVERITIES
 ALERT_KEY_RE = re.compile(r"^[^\s\x00-\x1f\x7f]{1,200}$")  # ahd keys embed task names; no spaces or controls
 ALERT_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,31}$")
+ALERT_KEY_ESCAPED_MAX = 300  # JSON-escaped bytes: a ring slot is 1 KiB and the key is never truncated
 SERVICE_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
 BATCH_MAX_BYTES = 1024 * 1024
 BATCH_MAX_LINES = 500
 BATCH_OPS = ("alert.raise", "alert.clear")  # apply is ahd's batching path for ring transitions, nothing else
+
+
+def safe_state_dir(home: Path, *parts: str) -> Path:
+    """~/.agent-harness/state[/parts...], created 0700 one level at a time; a symlink anywhere on the way is refused."""
+    path = home
+    for name in (".agent-harness", "state") + parts:
+        path = path / name
+        if path.is_symlink():
+            raise AhError("unsafe_path", f"{path} is a symlink; refusing to write through it", 3)
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            if not path.is_dir():
+                raise AhError("unsafe_path", f"{path} is not a directory", 3)
+    return path
 
 
 def ring_host() -> str:
@@ -1350,15 +1372,17 @@ def heartbeat(home: Path, service: str, key: str) -> dict:
         raise AhError("bad_request", "heartbeat: --service is lower-case [a-z0-9-], 2-32 characters")
     if not KEY_RE.match(key or ""):
         raise AhError("bad_request", "heartbeat: --key must be 8-128 chars of [A-Za-z0-9._:-]")
-    d = home / ".agent-harness" / "state" / service
-    for p in (home / ".agent-harness", home / ".agent-harness" / "state", d):
-        if p.is_symlink():
-            raise AhError("bad_request", f"heartbeat: {p} is a symlink; refusing to write through it", 3)
-    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    d = safe_state_dir(home, service)
     at = iso(time.time())
-    data = (json.dumps({"service": service, "host": ring_host(), "at": at, "key": key}) + "\n").encode()
+    caller = os.getppid()
+    data = (json.dumps({"service": service, "host": ring_host(), "at": at, "key": key, "pid": caller,
+                        "caller": _proc_command(caller)[:200]}) + "\n").encode()
     tmp = d / f".heartbeat.{os.getpid()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.unlink(tmp)  # our own name in our own 0700 directory: whatever sits there (a planted link) goes
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         os.write(fd, data)
         os.fsync(fd)
@@ -1366,6 +1390,21 @@ def heartbeat(home: Path, service: str, key: str) -> dict:
         os.close(fd)
     os.replace(tmp, d / "heartbeat.json")
     return {"ok": True, "result": "beat", "service": service, "at": at}
+
+
+def _proc_command(pid: int) -> str:
+    """The command line of pid (best effort, empty when unknown): /proc on Linux, ps elsewhere."""
+    try:
+        raw = _bounded(f"/proc/{int(pid)}/cmdline", 65536)
+        if raw:  # a size-0 proc file read by size comes back empty: then ps answers
+            return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        pass
+    try:
+        p = subprocess.run(["ps", "-o", "command=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5)
+        return p.stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
 
 
 def apply_batch(home: Path, text: str, session: str) -> dict:
@@ -1381,8 +1420,8 @@ def apply_batch(home: Path, text: str, session: str) -> dict:
     for n, ln in enumerate(lines, 1):
         try:
             row = json.loads(ln)
-        except ValueError:
-            raise AhError("bad_request", f"apply: line {n} is not JSON")
+        except (ValueError, RecursionError):
+            raise AhError("bad_request", f"apply: line {n} is not JSON (or nests too deep)")
         if not isinstance(row, dict) or row.get("op") not in BATCH_OPS or not isinstance(row.get("args"), dict) \
                 or not KEY_RE.match(str(row.get("key") or "")):
             raise AhError("bad_request", f"apply: line {n} must be {{op: {'|'.join(BATCH_OPS)}, key, args}}")
@@ -1421,12 +1460,17 @@ def ahd_running_check(home: Path, now: float | None = None, max_beat_age: float 
     except OSError:
         held = False
     beat = home / ".agent-harness" / "state" / "ahd" / "heartbeat.json"
-    beat_age = None
+    beat_age, from_ahd = None, False
     try:
         beat_age = now - beat.stat().st_mtime
-    except OSError:
+        rec = json.loads(_bounded(beat, 4096))
+        toks = str(rec.get("caller") or "").split()[:3] if isinstance(rec, dict) else []
+        from_ahd = any(os.path.basename(t) in ("ahd.py", "ahd") for t in toks)  # `python3 .../ahd.py serve`
+    except (OSError, ValueError):
         pass
-    ok = held or (beat_age is not None and beat_age <= max_beat_age)
+    # a beat written from a shell or an agent (`ah heartbeat beat` by hand) does not make ahd look alive; a same-UID
+    # process that names itself ahd can still forge one, and could equally hold the lock (same-UID residual)
+    ok = held or (beat_age is not None and beat_age <= max_beat_age and from_ahd)
     return {"check": "ahd running", "ok": ok, "lock_held": held, "heartbeat_age_s": None if beat_age is None else int(beat_age),
             "fix": None if ok else "python3 ~/.claude/hooks/ahd.py install --apply (or install.py --apply --services)"}
 
@@ -1576,7 +1620,7 @@ def run(args, home: Path) -> dict:
         if args.action == "raise":
             try:
                 detail = json.loads(args.detail) if args.detail else {}
-            except ValueError:
+            except (ValueError, RecursionError):
                 raise AhError("bad_request", "alert raise: --detail must be a JSON object")
             a.update(severity=args.severity, message=args.message or "", detail=detail)
         return write(home, f"alert.{args.action}", a, session_of(args, home) or "", args.key)
