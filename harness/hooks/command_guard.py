@@ -159,6 +159,12 @@ DEFAULT_POLICY = {
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                # goodqa#16374 AC-3c: 20 GiB refused real cleanup units; the hash deadline scales with the tree size
                'max_walk_seconds': 2.0, 'max_hash_bytes': 1 << 40, 'recent_change_seconds': 600,
+               # goodqa#16374 D1: the --upload route walks and hashes streaming, so its entry cap is 2,000,000; the
+               # --archive and --remote routes hold a comparison map in memory and keep their lower caps. The hook
+               # re-checks approvals within one shared budget, and an approval whose own stat pass took longer than
+               # approve_stat_max_seconds is never written (the hook could not re-check it in time).
+               'max_upload_entries': 2000000, 'hook_recheck_seconds': 20.0, 'approve_stat_max_seconds': 15.0,
+               'upload_min_bytes_per_second': 2 << 20,
                'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
 }
 
@@ -7818,10 +7824,10 @@ def _identity(path):
     return st.st_dev, st.st_ino
 
 
-def stat_manifest(path, limits, deadline=None):
+def stat_manifest(path, limits, deadline=None, max_entries=None, counted=False):
     """sha256 over (relative path, type, size, mtime_ns, device, inode, ctime_ns) of a tree; raises ValueError when
-    over budget."""
-    max_entries = int(limits.get('max_approve_files', 20000))
+    over budget. Memory follows the tree's breadth, not its entry count. With counted=True: (digest, entries)."""
+    max_entries = int(max_entries if max_entries is not None else limits.get('max_approve_files', 20000))
     deadline = deadline if deadline is not None else time.monotonic() + float(limits['max_walk_seconds'])
     h = hashlib.sha256()
     count = 0
@@ -7831,7 +7837,9 @@ def stat_manifest(path, limits, deadline=None):
         current = stack.pop()
         st = os.lstat(current)
         count += 1
-        if count > max_entries + 1 or time.monotonic() > deadline:
+        if count > max_entries + 1:
+            raise ValueError('more than %d entries; approve smaller subtrees' % max_entries)
+        if time.monotonic() > deadline:
             raise ValueError('tree is too large to check inside the time budget; approve a smaller subtree')
         rel = os.path.relpath(current, root)
         kind = 'd' if os.path.isdir(current) and not os.path.islink(current) else ('l' if os.path.islink(current) else 'f')
@@ -7846,7 +7854,26 @@ def stat_manifest(path, limits, deadline=None):
         if kind == 'd':
             with os.scandir(current) as it:
                 stack.extend(sorted((e.path for e in it), reverse=True))
-    return h.hexdigest()
+    return (h.hexdigest(), count) if counted else h.hexdigest()
+
+
+def _approval_stat(real, limits, max_entries=None):
+    """The stat digest an approval records, with its entry count; refuses when the pass took longer than the hook
+    could spend re-checking it (goodqa#16374 D1)."""
+    cutoff = float(limits.get('approve_stat_max_seconds', 15.0))
+    started = time.monotonic()
+    digest, count = stat_manifest(real, limits, deadline=started + max(60.0, cutoff), max_entries=max_entries,
+                                  counted=True)
+    took = time.monotonic() - started
+    if took > cutoff:
+        raise ValueError('checking the tree took %.1f s, longer than the %.0f s the delete hook may spend '
+                         're-checking it; approve smaller subtrees' % (took, cutoff))
+    return digest, count
+
+
+def recheck_seconds(entries):
+    """Hook-time re-check deadline for an approval that recorded `entries` stat entries (D1)."""
+    return min(20.0, 2.0 + 1e-5 * max(0, int(entries or 0)))
 
 
 class Approvals:
@@ -7860,6 +7887,8 @@ class Approvals:
         self.used = {}
         self.used_archive = {}  # path -> archive URL, for the delete receipt (goodqa#15068)
         self.no_backup = set()  # real paths covered by a no-backup entry: decide() then requires a sole delete
+        self.recheck_spent = 0.0  # goodqa#16374 D1: every re-check of one command shares one budget
+        self.recheck_exhausted = False
 
     def __call__(self, path):
         return self.covers(path)
@@ -7893,8 +7922,26 @@ class Approvals:
                     # no copy exists, so the state that made the deletion safe is checked again right now
                     if _no_backup_state(real, entry.get('target'), self.home) != entry.get('state'):
                         continue
-                elif stat_manifest(real, self.limits) != entry.get('stat_sha256'):
-                    continue
+                else:
+                    recorded = int(entry.get('stat_entries') or 0)
+                    budget = float(self.limits.get('hook_recheck_seconds', 20.0)) - self.recheck_spent
+                    own = recheck_seconds(recorded) if recorded else float(self.limits['max_walk_seconds'])
+                    if budget <= 0:
+                        self.recheck_exhausted = True
+                        continue
+                    started = time.monotonic()
+                    try:
+                        digest = stat_manifest(real, self.limits, deadline=started + min(own, budget),
+                                               max_entries=max(recorded, int(self.limits.get('max_approve_files',
+                                                                                             20000))))
+                    except ValueError:
+                        if time.monotonic() - started >= min(own, budget):
+                            self.recheck_exhausted = True
+                        raise
+                    finally:
+                        self.recheck_spent += time.monotonic() - started
+                    if digest != entry.get('stat_sha256'):
+                        continue
             except (OSError, ValueError):
                 continue
             if entry.get('kind') == NO_BACKUP_KIND:
@@ -8520,8 +8567,8 @@ def _first_symlink(path):
     return None
 
 
-def _recent_change(path, seconds, now, limits):
-    deadline = time.monotonic() + max(10.0, float(limits['max_walk_seconds']) * 10)
+def _recent_change(path, seconds, now, limits, budget=None):
+    deadline = time.monotonic() + (budget if budget else max(10.0, float(limits['max_walk_seconds']) * 10))
     for root, dirs, names in os.walk(path):
         for name in names + dirs:
             if time.monotonic() > deadline:
@@ -8589,7 +8636,7 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
         if not result.ok:
             raise ValueError('backup is not verified: checked=%d missing=%d mismatched=%d %s' % (
                 result.checked, len(result.missing), len(result.mismatched), (result.error or '')[:120]))
-        stat_digest = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        stat_digest, stat_entries = _approval_stat(real, limits)
         if stat_digest != stat_before:
             raise ValueError('the tree changed while its backup was being verified; back it up again and retry')
         if recent > 0 and _recent_change(real, recent, time.time(), limits):
@@ -8599,7 +8646,8 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
         audit('refused', {'path': real, 'remote': remote, 'reason': str(error)[:200]}, home=home, wal=wal)
         raise
     entry = {'path': real, 'identity': identity, 'files': len(manifest), 'manifest_sha256': digest,
-             'stat_sha256': stat_digest, 'remote': remote, 'verified_at': now, 'expires_at': now + ttl,
+             'stat_sha256': stat_digest, 'stat_entries': stat_entries, 'remote': remote, 'verified_at': now,
+             'expires_at': now + ttl,
              'nonce': _secrets.token_hex(8)}
     if archive is not None:
         entry.update({'kind': ARCHIVE_KIND, 'archive': remote, 'archive_sha256': verifier.verified_sha256,
@@ -8653,7 +8701,7 @@ def _store_entry(entry, real, now, home=None, under_lock=None):
 # that". `approve-delete --upload` therefore never downloads: the guard builds the tar stream itself from the files it
 # reads (so the archive is bound to the tree by construction, not by an uploader's word), compresses it with zstd,
 # hashes the exact bytes it sends with the Dropbox content hash, streams them with `rclone rcat` to a destination that
-# did not exist under a name the guard makes unique (`name.<8 hex>.tar.zst`; a live check on 2026-11-17 showed a second
+# did not exist under a name the guard makes unique (`name.<32 hex>.tar.zst`; a live check on 2026-11-17 showed a second
 # `rcat --immutable` to the same Dropbox path overwrites it, so the flag protects nothing there), and approves only
 # when Dropbox reports the same content hash and size for the stored object and the tree's stat manifest is
 # unchanged. No reader opens a FIFO, socket or device, and a tree holding a
@@ -8690,16 +8738,23 @@ def _clip_path(path):
 
 
 def _upload_walk(real, limits, deadline):
-    """[(member name, full path, lstat)] in archive order (`tar -C parent -cf - name` layout; a single file is its
-    basename). Links are never followed; a FIFO, socket, device or an entry on another device refuses the tree."""
+    """[(member name, full path, lstat)] in archive order; a list form of _upload_iter (tests and small trees)."""
+    return list(_upload_iter(real, limits, deadline))
+
+
+def _upload_iter(real, limits, deadline):
+    """Yield (member name, full path, lstat) in archive order (`tar -C parent -cf - name` layout; a single file is its
+    basename), streaming: memory follows the tree's breadth, not its entry count (goodqa#16374 D1). Links are never
+    followed; a FIFO, socket, device or an entry on another device refuses the tree."""
     root_st = _lstat(real)
     base = os.path.basename(real)
-    cap = int(limits.get('max_approve_files', 20000))
+    cap = int(limits.get('max_upload_entries', 2000000))
     if stat.S_ISREG(root_st.st_mode):
-        return [(base, real, root_st)]
+        yield base, real, root_st
+        return
     if not stat.S_ISDIR(root_st.st_mode):
         raise ValueError('special file (FIFO, socket or device): only a directory or regular file can be uploaded')
-    found, stack = [], [(base, real)]
+    count, stack = 0, [(base, real)]
     while stack:
         if time.monotonic() > deadline:
             raise ValueError('walking the tree exceeded its time budget')
@@ -8714,14 +8769,14 @@ def _upload_walk(real, limits, deadline):
                 raise ValueError('symlink target holds a newline: %s' % _clip_path(full))
         elif not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
             raise ValueError('special file (FIFO, socket or device) in the tree: %s' % _clip_path(full))
-        found.append((member, full, st))
-        if len(found) > cap:
+        count += 1
+        if count > cap:
             raise ValueError('more than %d entries; approve smaller subtrees' % cap)
+        yield member, full, st
         if stat.S_ISDIR(st.st_mode):
             with os.scandir(full) as it:
                 names = sorted(e.name for e in it)
             stack.extend((member + '/' + n, os.path.join(full, n)) for n in reversed(names))
-    return found
 
 
 def _credential_tier(rel, compiled):
@@ -8764,11 +8819,11 @@ def _counted_credentials(real, entries, compiled):
     problems, head_pushed, pinned = [], {}, {}
     stop = real if os.path.isdir(real) else os.path.dirname(real)
     for member, full, st in entries:
-        if not stat.S_ISREG(st.st_mode):
+        if not stat.S_ISREG(st.st_mode) or len(problems) >= 50:
             continue
         rel = member.split('/', 1)[1] if '/' in member else member
         if '/.git/' in '/' + member + '/':
-            if ('/' + member).endswith('/.git/config') and _git_config_has_userinfo(full, st):
+            if _is_git_config(member) and _git_config_has_userinfo(full, st):
                 problems.append('credential in a git remote URL %s' % rel)
             continue
         tier = _credential_tier(rel, compiled)
@@ -8808,7 +8863,10 @@ def _counted_credentials(real, entries, compiled):
 
 
 PINNED_MAX_BYTES = 16 << 20
-_USERINFO_URL = re.compile(rb'[A-Za-z][A-Za-z0-9+.-]*://[^/@\s"\']+@')
+# a URL whose userinfo can carry a secret: any userinfo on http(s), user:password on any scheme (red-team PR-A E1:
+# a user-only ssh://git@host URL is ordinary), and an http.extraheader (usually an Authorization header)
+_USERINFO_URL = re.compile(rb'(?:https?://[^/@\s"\']+@|[A-Za-z][A-Za-z0-9+.-]*://[^/@\s"\':]+:[^/@\s"\']+@|'
+                           rb'(?im:^\s*extraheader\s*=))')
 
 
 def _git_config_has_userinfo(full, st):
@@ -8821,6 +8879,25 @@ def _git_config_has_userinfo(full, st):
         return True
     with os.fdopen(fd, 'rb') as handle:
         return bool(_USERINFO_URL.search(handle.read(1 << 20)))
+
+
+def _is_git_config(member):
+    """A git config inside a repo's .git: config, config.worktree, and those of submodules and linked worktrees."""
+    path = '/' + member
+    return '/.git/' in path and path.rsplit('/', 1)[1] in ('config', 'config.worktree')
+
+
+def _read_pinned(fd, size, cap):
+    """Read a whole small file from `fd` once; ValueError when it is larger than `cap` or not `size` bytes."""
+    data = os.read(fd, cap + 1)
+    while len(data) <= cap:
+        more = os.read(fd, cap + 1 - len(data))
+        if not more:
+            break
+        data += more
+    if len(data) > cap or len(data) != size:
+        raise ValueError('changed size while it was read')
+    return data
 
 
 def _git_blob_id(data, like):
@@ -8871,12 +8948,20 @@ class RcloneUpload:
         self.policy = policy
         self.after_upload = None  # a test seam: runs after the stream, before the stored object is checked
         self.subcommands = []  # every rclone subcommand run (words only, no paths), recorded in the audit row
+        self.deadline = None  # monotonic; once set, every call ends by it (Codex PR-A F4)
 
     def _run(self, argv, data=None):
         self.subcommands.append(' '.join(argv[:2]) if argv[:1] == ['hashsum'] else argv[0])
+        timeout = self.timeout
+        if self.deadline is not None:
+            timeout = min(timeout, self.deadline - time.monotonic())
+            if timeout <= 0:
+                raise ValueError('the upload exceeded its time budget before rclone %s; nothing was approved' % argv[0])
         try:
             done = subprocess.run([self.rclone] + argv, input=data, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, timeout=self.timeout, check=False)
+                                  stderr=subprocess.PIPE, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired:
+            raise ValueError('rclone %s exceeded the upload\'s time budget; nothing was approved' % argv[0])
         except (OSError, subprocess.SubprocessError) as error:
             raise ValueError('rclone could not run (%s)' % type(error).__name__)
         return done.returncode, done.stdout[:64 << 20], done.stderr[:4096].decode('utf-8', 'replace')
@@ -8933,11 +9018,12 @@ class RcloneUpload:
 
 
 def _upload_suffix():
-    return _secrets.token_hex(4)
+    # 128 random bits (Codex PR-A F1): rcat cannot refuse an existing object, so two writers must never pick one name
+    return _secrets.token_hex(16)
 
 
 def _unique_remote(remote):
-    """`dir/name.tar.zst` -> `dir/name.<8 hex>.tar.zst`: rcat cannot refuse an existing Dropbox object, so a name
+    """`dir/name.tar.zst` -> `dir/name.<32 hex>.tar.zst`: rcat cannot refuse an existing Dropbox object, so a name
     nobody else picks is what keeps two uploads from replacing each other."""
     return '%s.%s.tar.zst' % (remote[:-len('.tar.zst')], _upload_suffix())
 
@@ -8975,8 +9061,12 @@ def _end_children(procs, grace=5.0):
             proc.wait(timeout=grace)
 
 
-def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None):
-    """Build tar | zstd from `entries` and send it with rcat; returns (dropbox hash, sha256, bytes, manifest).
+def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None, compiled=None):
+    """Build tar | zstd from `entries` and send it with rcat; returns (dropbox hash, sha256, bytes, manifest sha256,
+    files). The manifest digest is computed streaming (the manifest_digest format), so memory does not grow with the
+    entry count (D1). `entries` is walked again here, so every regular file's name is checked again: a credential-named
+    file that appeared after the check is refused before any of it is sent, and a `.git/config` is read once and sent
+    only if those exact bytes name no remote URL with userinfo (Codex PR-A F2).
 
     A watchdog ends and reaps both children at `deadline`, so a stalled rcat (one that stops reading) cannot hang the
     guard: the blocked write then fails and the upload is refused (Codex r5 F2). A file in `pinned` is read once into
@@ -9016,7 +9106,13 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                 pass
     thread = threading.Thread(target=pump, daemon=True)
     thread.start()
-    manifest = []
+    manifest = {'sha': hashlib.sha256(), 'files': 0}
+
+    def record(rel, size, digest):
+        if manifest['files']:
+            manifest['sha'].update(b'\n')
+        manifest['sha'].update(('%s\t%d\t%s' % (rel, size, digest)).encode())
+        manifest['files'] += 1
     try:
         with tarfile.open(fileobj=comp.stdin, mode='w|', format=tarfile.PAX_FORMAT) as tar:
             for member, full, st in entries:
@@ -9033,19 +9129,25 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                     tar.addfile(info)
                 else:
                     rel = member.split('/', 1)[1] if '/' in member else member
+                    in_git = '/.git/' in '/' + member + '/'
+                    if compiled is not None and not in_git and full not in pinned and \
+                            _credential_tier(rel, compiled):
+                        raise ValueError('credential file %s appeared after the check; nothing of it was sent' % rel)
                     fd = _open_regular(full, st)
                     try:
                         info.type, info.size = tarfile.REGTYPE, st.st_size
-                        if full in pinned:
-                            data = os.read(fd, PINNED_MAX_BYTES + 1)
-                            while len(data) <= PINNED_MAX_BYTES:
-                                more = os.read(fd, PINNED_MAX_BYTES + 1 - len(data))
-                                if not more:
-                                    break
-                                data += more
-                            if len(data) != st.st_size or _git_blob_id(data, pinned[full]) != pinned[full]:
+                        if full in pinned or _is_git_config(member):
+                            cap = PINNED_MAX_BYTES if full in pinned else (1 << 20)
+                            try:
+                                data = _read_pinned(fd, st.st_size, cap)
+                            except ValueError:
+                                raise ValueError('file %s changed after it was checked; nothing of it was sent' % rel)
+                            if full in pinned and _git_blob_id(data, pinned[full]) != pinned[full]:
                                 raise ValueError('credential-named file %s changed after it was checked; nothing of '
                                                  'it was sent' % rel)
+                            if _is_git_config(member) and _USERINFO_URL.search(data):
+                                raise ValueError('credential in a git remote URL %s (it changed after the check); '
+                                                 'nothing of it was sent' % rel)
                             reader = _ReadCounter(None)
                             reader.sha.update(data)
                             reader.size = len(data)
@@ -9057,7 +9159,7 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                                 raise ValueError('a file grew while it was read: %s' % _clip_path(full))
                     finally:
                         os.close(fd)
-                    manifest.append((rel, reader.size, reader.sha.hexdigest()))
+                    record(rel, reader.size, reader.sha.hexdigest())
         comp.stdin.close()
         code = comp.wait(timeout=max(1.0, deadline - time.monotonic()))
         thread.join(max(1.0, deadline - time.monotonic()))
@@ -9077,7 +9179,8 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
         raise ValueError('zstd failed (exit %s)' % code)
     if up_code != 0:
         raise ValueError('rclone rcat upload failed (exit %s)' % up_code)
-    return sent['dbx'].hexdigest(), sent['sha'].hexdigest(), sent['bytes'], manifest
+    return sent['dbx'].hexdigest(), sent['sha'].hexdigest(), sent['bytes'], manifest['sha'].hexdigest(), \
+        manifest['files']
 
 
 def _ledger_path(home=None):
@@ -9183,30 +9286,41 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
             raise ValueError('ttl must be between 1 and %d seconds' % int(limits['max_ttl_seconds']))
         _check_upload_remote(remote, policy, transport)
         recent = int(limits.get('recent_change_seconds', 600))
-        if recent > 0 and _recent_change(real, recent, now, limits):
+        if recent > 0 and _recent_change(real, recent, now, limits, budget=120.0):
             raise ValueError('something under the path changed in the last %d seconds (a live log?); wait and '
                              'retry' % recent)
-        stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 60)
-        entries = _upload_walk(real, limits, time.monotonic() + max(60.0, float(limits['max_walk_seconds']) * 600))
-        files = [e for e in entries if stat.S_ISREG(e[2].st_mode)]
-        if not files:
+        cap = int(limits.get('max_upload_entries', 2000000))
+        stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 120, max_entries=cap)
+        walk_budget = max(120.0, float(limits['max_walk_seconds']) * 600)
+        seen = {'files': 0, 'bytes': 0}
+
+        def first_pass():
+            # unreadable or swapped files refuse before anything is sent; one streaming walk, no entry list
+            for member, full, st in _upload_iter(real, limits, time.monotonic() + walk_budget):
+                if stat.S_ISREG(st.st_mode):
+                    os.close(_open_regular(full, st))
+                    seen['files'] += 1
+                    seen['bytes'] += st.st_size
+                    if seen['bytes'] > int(limits['max_hash_bytes']):
+                        raise ValueError('tree is larger than the approval limit')
+                yield member, full, st
+        problems, pinned = _counted_credentials(real, first_pass(), compiled)
+        if not seen['files']:
             raise ValueError('nothing to approve: the path holds no files')
-        for _member, full, st in files:  # unreadable or swapped files refuse before anything is sent
-            os.close(_open_regular(full, st))
-        tree_bytes = sum(e[2].st_size for e in files)
-        if tree_bytes > int(limits['max_hash_bytes']):
-            raise ValueError('tree is larger than the approval limit')
-        problems, pinned = _counted_credentials(real, entries, compiled)
+        tree_bytes = seen['bytes']
         if problems:
             raise ValueError('the tree holds %s; move each untracked one with `mv -n SRC ~/secret-quarantine/'
                              '<same relative path>` first, never upload it' % '; '.join(problems[:8]))
         remote = _unique_remote(remote)
         if transport.exists(remote) or transport.exists(remote + '.sha256'):
             raise ValueError('the destination already exists on the remote (letter case ignored); pick a new name')
-        budget = float(upload_timeout) if upload_timeout else max(900.0, tree_bytes / float(2 << 20))
+        rate = float(limits.get('upload_min_bytes_per_second', 2 << 20))
+        budget = float(upload_timeout) if upload_timeout else max(900.0, tree_bytes / max(rate, 1.0))
         deadline = time.monotonic() + budget
-        dbx, sha, sent_bytes, manifest = _stream_upload(real, entries, transport, remote,
-                                                        zstd or _pinned_tool('zstd'), deadline, pinned=pinned)
+        transport.deadline = deadline  # remote verification and the sidecar end by the same deadline (F4)
+        dbx, sha, sent_bytes, manifest_sha, files = _stream_upload(
+            real, _upload_iter(real, limits, deadline), transport, remote, zstd or _pinned_tool('zstd'), deadline,
+            pinned=pinned, compiled=compiled)
         if transport.after_upload is not None:
             transport.after_upload()
         stored_hash = transport.server_hash(remote)
@@ -9215,10 +9329,11 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         stored_size = transport.size(remote)
         if stored_size != sent_bytes:
             raise ValueError('stored size %s differs from the %d bytes sent' % (stored_size, sent_bytes))
-        stat_digest = stat_manifest(real, limits, deadline=time.monotonic() + 60)
+        stat_digest, stat_entries = _approval_stat(real, limits, max_entries=cap)
         if stat_digest != stat_before:
-            raise ValueError('the tree changed while it was uploaded; upload it again to a new name')
-        if recent > 0 and _recent_change(real, recent, time.time(), limits):
+            raise ValueError('the tree changed while it was uploaded (content, mtime, or metadata such as '
+                             'ctime or inode); upload it again to a new name')
+        if recent > 0 and _recent_change(real, recent, time.time(), limits, budget=120.0):
             raise ValueError('something under the path changed while it was uploaded; retry with a new name')
         transport.put_small(remote + '.sha256', ('%s  %s\n' % (sha, remote.rsplit('/', 1)[-1])).encode())
         identity = list(_identity(real))
@@ -9226,8 +9341,8 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
         audit('refused', {'path': real, 'remote': remote, 'reason': str(error)[:200], 'kind': UPLOAD_KIND},
               home=home, wal=wal)
         raise ValueError(str(error)) if isinstance(error, OSError) else error
-    entry = {'path': real, 'identity': identity, 'files': len(manifest), 'manifest_sha256': manifest_digest(manifest),
-             'stat_sha256': stat_digest, 'remote': remote, 'archive': remote, 'kind': UPLOAD_KIND,
+    entry = {'path': real, 'identity': identity, 'files': files, 'manifest_sha256': manifest_sha,
+             'stat_sha256': stat_digest, 'stat_entries': stat_entries, 'remote': remote, 'archive': remote, 'kind': UPLOAD_KIND,
              'archive_sha256': sha, 'archive_bytes': sent_bytes, 'dropbox_hash': dbx, 'verified_at': now,
              'expires_at': now + ttl, 'nonce': _secrets.token_hex(8),
              'rclone_subcommands': sorted(set(getattr(transport, 'subcommands', []) or []))}
@@ -10052,6 +10167,10 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                                                           INSTALL_FILES_FORM)), fmt)
         approvals = Approvals(compiled=c) if marker else None
         verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
+        if verdict == 'block' and approvals is not None and approvals.recheck_exhausted:
+            message += ('\nThe delete approvals could not all be re-checked inside the hook\'s %.0f s budget; '
+                        'delete one approved path per command.' % float(c.policy['marker'].get('hook_recheck_seconds',
+                                                                                              20.0)))
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
                                                              'already used or changed', 'approve again after a fresh '
@@ -10277,7 +10396,7 @@ def main(argv=None):
                                         'whose members start with the directory name of --path (goodqa#15068)')
     appr.add_argument('--archive-sha256', dest='archive_sha256', help='remote .sha256 file of --archive')
     appr.add_argument('--upload', help='goodqa#16374: REMOTE:dir/name.tar.zst; the guard builds the archive from the '
-                      'files it reads, uploads it with rclone rcat to a new unique name (name.<8 hex>.tar.zst) and '
+                      'files it reads, uploads it with rclone rcat to a new unique name (name.<32 hex>.tar.zst) and '
                       'approves once Dropbox reports the '
                       'same content hash and size (no download)')
     appr.add_argument('--archive-listing', dest='archive_listing', help='remote `tar -tvf` listing of --archive')

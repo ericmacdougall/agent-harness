@@ -7,6 +7,7 @@ Dropbox content hash of what it stored with its own independent implementation (
 every subcommand, so the tests can prove that nothing is ever downloaded (`cat`, `copy`, `copyto`, `sync`, `check`
 never run).
 """
+import copy
 import hashlib
 import io
 import json
@@ -90,6 +91,9 @@ FAKE_RCLONE = textwrap.dedent('''\
         sys.stderr.write("directory not found"); sys.exit(3)
     if cmd == "hashsum":
         path = obj(words[-1])
+        if mode == "hash-stall":
+            import time
+            time.sleep(120)
         if mode == "hash-empty":
             sys.exit(0)
         if mode == "hash-garbled":
@@ -211,7 +215,7 @@ class UploadApproval(UploadBase):
         self.assertTrue(cg.marker_covers(str(self.target), home=str(self.home)))
         self.assertEqual(entry['kind'], 'dropbox-upload')
         archive = entry['archive']
-        self.assertRegex(archive, '^' + re.escape(self.remote[:-len('.tar.zst')]) + r'\.[0-9a-f]{8}\.tar\.zst$')
+        self.assertRegex(archive, '^' + re.escape(self.remote[:-len('.tar.zst')]) + r'\.[0-9a-f]{32}\.tar\.zst$')
         data = self.stored(archive).read_bytes()
         self.assertEqual(entry['dropbox_hash'], cg.DropboxHash.of_bytes(data))
         self.assertEqual(entry['archive_sha256'], hashlib.sha256(data).hexdigest())
@@ -342,6 +346,62 @@ class UploadApproval(UploadBase):
         received = (self.store / 'received.bin').read_bytes() if (self.store / 'received.bin').exists() else b''
         self.assertNotIn(b'SWAPPED-AFTERCHECK', received)
 
+    def swap_after_check(self, action):
+        """Patch the credential check so `action` runs right after it returned (the race window)."""
+        real = cg._counted_credentials
+
+        def check_then_act(*a, **kw):
+            result = real(*a, **kw)
+            action()
+            return result
+        return mock.patch.object(cg, '_counted_credentials', check_then_act)
+
+    def plain_zstd(self):
+        plain = self.store / 'plain-zstd'
+        plain.write_text('#!/bin/sh\nexec cat\n')  # no compression, so the received bytes show the tar content
+        plain.chmod(0o755)
+        return str(plain)
+
+    def received(self):
+        path = self.store / 'received.bin'
+        return path.read_bytes() if path.exists() else b''
+
+    def test_a_git_config_rewritten_after_the_check_is_never_sent(self):
+        # Codex PR-A F2: the userinfo check and the upload use the same bytes of .git/config
+        repo = self.repo({'main.go': 'package x\n'})
+        age(self.target)
+        config = repo / '.git/config'
+
+        def inject():
+            with open(str(config), 'ab') as handle:
+                handle.write(b'[remote "m"]\n\turl = https://u:INJECTEDTOKEN@example.invalid/x.git\n')
+        with self.swap_after_check(inject):
+            self.refused('changed after', zstd=self.plain_zstd())
+        self.assertNotIn(b'INJECTEDTOKEN', self.received())
+
+    def test_a_credential_file_created_after_the_check_is_never_sent(self):
+        def plant():
+            (self.target / 'sub/.env').write_text('PLANTEDVALUE=1\n')
+        with self.swap_after_check(plant):
+            self.refused('appeared after the check', zstd=self.plain_zstd())
+        self.assertNotIn(b'PLANTEDVALUE', self.received())
+
+    def test_git_config_forms(self):
+        # red-team PR-A E1: a user-only ssh URL is ordinary; an extraheader and a submodule's userinfo URL count
+        repo = self.repo({'main.go': 'package x\n'})
+        git(repo, 'remote', 'add', 'mirror', 'ssh://git@example.invalid/x.git')
+        age(self.target)
+        self.approve()
+        git(repo, 'config', 'http.extraheader', 'AUTHORIZATION: placeholder')
+        age(self.target)
+        self.refused('credential in a git remote URL')
+        git(repo, 'config', '--unset', 'http.extraheader')
+        sub_config = repo / '.git/modules/lib/config'
+        sub_config.parent.mkdir(parents=True)
+        sub_config.write_text('[remote "origin"]\n\turl = https://u:p@example.invalid/lib.git\n')
+        age(self.target)
+        self.refused('credential in a git remote URL')
+
     def test_a_git_remote_url_with_userinfo_counts(self):
         repo = self.repo({'main.go': 'package x\n'})
         git(repo, 'remote', 'add', 'mirror', 'https://someone:not-a-real-token@example.invalid/x.git')
@@ -408,6 +468,47 @@ class UploadRefusals(UploadBase):
         second = self.approve()['archive']
         self.assertNotEqual(first.casefold(), second.casefold())
         self.assertEqual(self.stored(first).read_bytes(), kept)
+
+    def test_a_stalled_hash_check_ends_at_the_same_deadline(self):
+        # Codex PR-A F4: remote verification shares the upload's absolute deadline
+        self.mode('hash-stall')
+        started = time.monotonic()
+        self.refused('time budget', upload_timeout=3)
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_the_entry_cap_refuses_before_any_upload(self):
+        self.policy = copy.deepcopy(self.policy)
+        self.policy['marker']['max_upload_entries'] = 3
+        self.refused('more than 3 entries')
+        self.assertEqual(self.rcats(), [])
+
+    def test_a_slow_approval_stat_pass_is_refused(self):
+        # D1: an approval the hook could not re-check in time is never written
+        self.policy = copy.deepcopy(self.policy)
+        self.policy['marker']['approve_stat_max_seconds'] = 0.0
+        self.refused('re-checking it')
+
+    def test_the_upload_walk_streams(self):
+        import inspect
+        self.assertTrue(inspect.isgeneratorfunction(cg._upload_iter))
+        entry = self.approve()
+        self.assertEqual(entry['files'], 2)
+        self.assertEqual(entry['stat_entries'], 6)  # root, a.bin, alias, empty, sub, sub/b.txt
+
+    def test_the_hook_recheck_shares_one_budget(self):
+        entry = self.approve()
+        self.assertTrue(cg.marker_covers(str(self.target), home=str(self.home)))
+        self.assertAlmostEqual(cg.recheck_seconds(entry['stat_entries']), 2.0 + 6e-5)
+        self.assertEqual(cg.recheck_seconds(10 ** 7), 20.0)
+        tight = cg.Compiled(dict(self.policy, marker=dict(self.policy['marker'], hook_recheck_seconds=0.0)),
+                            home=str(self.home))
+        approvals = cg.Approvals(home=str(self.home), compiled=tight)
+        self.assertFalse(approvals.covers(str(self.target)))
+        self.assertTrue(approvals.recheck_exhausted)
+
+    def test_the_deadline_rate_is_a_policy_key(self):
+        # red-team PR-A E3: the stall test passes no upload_timeout; a rate this high gives the 900 s floor
+        self.assertEqual(self.policy['marker'].get('upload_min_bytes_per_second', 2 << 20), 2 << 20)
 
     def test_a_stalled_upload_is_stopped_at_its_deadline(self):
         # Codex r5 F2: an rcat that stays alive but stops reading cannot hang the guard. 32 MiB of incompressible
