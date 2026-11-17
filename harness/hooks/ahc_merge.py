@@ -64,6 +64,7 @@ FENCE_BOUND_SECONDS = 45.0          # T9: a kill, revoke or disable waits at mos
 IDENTITY_FRESH_SECONDS = 600        # AC-8 / M-1H: merging holds when the identity check is older than 10 min
 SENDER_LOCK_WAIT_SECONDS = 5.0      # the sender waits this long for the shared lock, then defers (a fence holds it)
 CANARY_REF = "refs/ahc/canary"
+CANARY_MAX_SECONDS = 86400          # e9: a canary result older than 24 h does not authorize E2 (as Contracts.elig)
 DISPATCH_LOCK_PATH = "/run/ahc/dispatch.lock"   # spec T9
 SHA = re.compile(r"[0-9a-f]{40}")
 REPO = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
@@ -81,7 +82,7 @@ MERGE_INVENTORY = {
     ("ahc_merge", "KillStore.write", "fs.write_file"): (1, "seam:merge.kill_epoch"),
     ("ahc_merge", "CanaryStore.write", "fs.write_file"): (1, "seam:merge.canary_record"),
     ("ahc_merge", "KillStore.bump", "handle.write"): (1, "exempt:calls KillStore.write, which carries the seam"),
-    ("ahc_merge", "Canary.run", "handle.write"): (1, "exempt:calls CanaryStore.write, which carries the seam"),
+    ("ahc_merge", "Canary._record", "handle.write"): (1, "exempt:calls CanaryStore.write, which carries the seam"),
     ("ahc_merge", "CanaryStore.read", "fs.open_file"): (1, "exempt:a read-only open (O_RDONLY); no state"),
 }
 
@@ -141,8 +142,51 @@ class Transport:
         E2 cleanly; after the commit a missing fact can only fail closed)."""
         return None
 
-    def update_refs(self, repo, ref, before_oid, after_oid, force, timeout):     # pragma: no cover - interface
+    def update_refs(self, repo, ref, before_oid, after_oid, force, timeout, gate=None):   # pragma: no cover
+        """Send one updateRefs. A transport passes `gate` (a SendGate) at the one irrevocable step, starting the
+        request (the gh subprocess, or the request itself): `gate.begin(start)` returns None once the sender has
+        cancelled, and then nothing may be sent."""
         raise NotImplementedError
+
+
+class SendGate:
+    """F2 (review of PR #270): the local send is cancellable, and its stop is confirmed before the T9 lock is
+    released. The worker passes through `begin` immediately before the irrevocable step. `cancel` (the sender, at
+    its deadline) either closes the gate before that step (nothing was or will be sent) or, after it, ends and reaps
+    the started process, so no local send capability outlives the lock. A request whose bytes already left settles
+    by readback, as before."""
+
+    PENDING, STARTED, CANCELLED = "pending", "started", "cancelled"
+
+    def __init__(self):
+        self._mu = threading.Lock()
+        self.state = self.PENDING
+        self.proc = None
+
+    def begin(self, start=None):
+        """Run `start()` (which starts the request and may return a Popen) only if not cancelled; None if cancelled.
+        Without `start` it returns True once the gate is passed (an in-process request)."""
+        with self._mu:
+            if self.state == self.CANCELLED:
+                return None
+            self.state = self.STARTED
+            self.proc = start() if start is not None else None
+            return self.proc if start is not None else True
+
+    def cancel(self):
+        """'not-started' when the gate closed first; 'stopped' when a started process was ended and reaped;
+        'started' when the request was in-process and had already been made (it settles by readback)."""
+        with self._mu:
+            if self.state == self.PENDING:
+                self.state = self.CANCELLED
+                return "not-started"
+            proc, self.state = self.proc, self.CANCELLED
+        if proc is None:
+            return "started"
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        return "stopped"
 
 
 # GraphQL errors. A stale beforeOid answers untyped when B is an ancestor of the tip and typed otherwise
@@ -243,14 +287,36 @@ class GhTransport(Transport):
             raise TransportError("no repository node id")
         self._ids[str(repo).lower()] = repo_id
 
-    def update_refs(self, repo, ref, before_oid, after_oid, force, timeout):
+    def _gated(self, argv, stdin, timeout, gate):
+        """The send's gh process, started only through the gate (F2), so the sender's cancel can end and reap it."""
+        proc = gate.begin(lambda: subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                   stderr=subprocess.PIPE, text=True, env=self.env))
+        if proc is None:
+            return None, "", "", "cancelled"
+        try:
+            out, err = proc.communicate(stdin, timeout=timeout)
+            return proc.returncode, out, err, False
+        except subprocess.TimeoutExpired:
+            gate.cancel()                   # end and reap it here too; the caller has given up on it
+            return None, "", "", True
+
+    def update_refs(self, repo, ref, before_oid, after_oid, force, timeout, gate=None):
         if force is not False:
             raise SenderError("force is never sent")
         repo_id = self._ids.get(str(repo).lower())
         if not repo_id:                     # never prepared: nothing is sent, and the result claims no absence
             return SendResult(UNTYPED, "the send was not prepared (no repository id); nothing was sent")
-        rc, out, err, timed_out = self._run(self.update_refs_argv(),
-                                            self.update_refs_body(repo_id, ref, before_oid, after_oid), timeout)
+        argv, body = self.update_refs_argv(), self.update_refs_body(repo_id, ref, before_oid, after_oid)
+        if gate is None:
+            rc, out, err, timed_out = self._run(argv, body, timeout)
+        elif self._run == self._subprocess:
+            rc, out, err, timed_out = self._gated(argv, body, timeout, gate)
+        else:                               # an injected runner (tests): the gate guards the call itself
+            if gate.begin() is None:
+                return SendResult(NO_RESPONSE, "cancelled before the request started; nothing was sent")
+            rc, out, err, timed_out = self._run(argv, body, timeout)
+        if timed_out == "cancelled":
+            return SendResult(NO_RESPONSE, "cancelled before the request started; nothing was sent")
         return classify_graphql(rc, out, err, timed_out)
 
     def read_ref(self, repo, ref):
@@ -444,6 +510,10 @@ class LedgerPort:
 
     def stamp(self, obs):
         return self.c.stamp(obs)
+
+    def canary_age(self, canary):
+        """ELIG's e9 age (ahc_clock.Clock.canary_age): this boot's (boot, mono) stamp, else None."""
+        return self.c.clock.canary_age(canary)
 
     def mono(self):
         return float(self.c._mono())
@@ -658,50 +728,67 @@ class Canary:
         except TransportError:
             return None
 
+    def _record(self, repo, state, passed, cases, escalated, error=None):
+        rec = {"repo": str(repo).lower(), "identity": {"login": self.identity.login, "id": self.identity.id},
+               "state": state, "passed": passed, "cases": cases, "boot": self.identity.boot_id,
+               "mono": self.port.mono(), "escalated": escalated}
+        if error:
+            rec["error"] = error
+        self.store.write(rec)
+        return rec
+
+    def _cases(self, repo, branch, cases):
+        """The CHK-CAS cases, filling `cases` as they run (so a later exception keeps what was observed)."""
+        self.t.prepare(repo)
+        tip = self.t.read_ref(repo, "refs/heads/%s" % branch)
+        p = (self.t.commit_parents(repo, tip) or [None])[0]
+        g = (self.t.commit_parents(repo, p) or [None])[0] if p else None
+        cases["ancestors"] = bool(p and g)
+        if not cases["ancestors"]:
+            return
+        runs = self.t.workflow_runs(repo)
+        cur = self._ref(repo)
+        if cur:
+            cases["cleanup"] = self._cas(repo, cur, ZERO_OID).outcome == OK and self._ref(repo) is None
+        r = self._cas(repo, ZERO_OID, g)
+        cases["create"] = r.outcome == OK and self._ref(repo) == g
+        r = self._cas(repo, g, p)
+        cases["fast-forward"] = r.outcome == OK and self._ref(repo) == p
+        r = self._cas(repo, p, g)
+        cases["typed-non-fast-forward"] = r.outcome == P1 and r["kind"] == "non-fast-forward" and \
+            self._ref(repo) == p
+        r = self._cas(repo, g, tip)
+        cases["stale-before"] = r.outcome in (P1, UNTYPED) and self._ref(repo) == p
+        cases["no-workflow"] = self.t.workflow_runs(repo) == runs
+
     def run(self, repo, branch):
+        """F3 (review of PR #270): an attempt first replaces the prior record with an in-progress, not-passed one
+        (durably, before any GitHub call), so an interrupted attempt never leaves an older pass authoritative. Any
+        failed case or exception then persists a failed record and turns the repo's merging off (escalating once)."""
         if not self.identity.fresh():
             return Outcome("waiting-dep", "merge identity unavailable")
-        cases = {}
+        cases, error = {}, None
         with self.lock.shared(SENDER_LOCK_WAIT_SECONDS) as held:
             epoch = self.kill.read() if held else {"on": True}
             if not held or epoch.get("on") is not False:
                 return Outcome("deferred", "kill switch on, unreadable, or a fence holds the lock")
+            prior = self.store.read(repo) or {}
+            self._record(repo, "in-progress", False, {}, bool(prior.get("escalated")) and not prior.get("passed"))
             try:
-                self.t.prepare(repo)
-            except TransportError as error:
-                return Outcome("deferred", "canary not prepared: %s" % error)
-            tip = self.t.read_ref(repo, "refs/heads/%s" % branch)
-            p = (self.t.commit_parents(repo, tip) or [None])[0]
-            g = (self.t.commit_parents(repo, p) or [None])[0] if p else None
-            if not (p and g):
-                return Outcome("refused", "the default branch needs two ancestors for the canary")
-            runs = self.t.workflow_runs(repo)
-            cur = self._ref(repo)
-            if cur:
-                cases["cleanup"] = self._cas(repo, cur, ZERO_OID).outcome == OK and self._ref(repo) is None
-            r = self._cas(repo, ZERO_OID, g)
-            cases["create"] = r.outcome == OK and self._ref(repo) == g
-            r = self._cas(repo, g, p)
-            cases["fast-forward"] = r.outcome == OK and self._ref(repo) == p
-            r = self._cas(repo, p, g)
-            cases["typed-non-fast-forward"] = r.outcome == P1 and r["kind"] == "non-fast-forward" and \
-                self._ref(repo) == p
-            r = self._cas(repo, g, tip)
-            cases["stale-before"] = r.outcome in (P1, UNTYPED) and self._ref(repo) == p
-            cases["no-workflow"] = self.t.workflow_runs(repo) == runs
-        passed = all(cases.values()) and len(cases) >= 5
-        prior = self.store.read(repo) or {}
-        rec = {"repo": str(repo).lower(), "identity": {"login": self.identity.login, "id": self.identity.id},
-               "passed": passed, "cases": cases, "boot": self.identity.boot_id, "mono": self.port.mono(),
-               "escalated": bool(prior.get("escalated")) and not passed}
+                self._cases(repo, branch, cases)
+            except Exception as exc:              # any failure mid-attempt is a failed (inconclusive) canary
+                error = "%s during the canary" % type(exc).__name__
+        passed = error is None and all(cases.values()) and len(cases) >= 6
+        escalated = bool(prior.get("escalated")) and not prior.get("passed") and not passed
         if not passed:
             self.port.set_merging(repo, off=True, cause="CHK-CAS canary failed", actor="ahc-core")
             if not prior.get("escalated") or prior.get("passed"):
                 self.escalations.append("CHK-CAS canary failed for %s: %s" % (
-                    repo, ", ".join(sorted(k for k, v in cases.items() if not v))))
-                rec["escalated"] = True
-        self.store.write(rec)
-        return Outcome("passed" if passed else "failed", "", sent=True, record=rec)
+                    repo, error or ", ".join(sorted(k for k, v in cases.items() if not v))))
+                escalated = True
+        rec = self._record(repo, "passed" if passed else ("inconclusive" if error else "failed"), passed, cases,
+                           escalated, error)
+        return Outcome("passed" if passed else "failed", error or "", sent=True, record=rec)
 
 
 # ---------------------------------------------------------------- E2 and the readbacks
@@ -723,6 +810,7 @@ class Sender:
         self._own_success = set()      # ops whose own CAS response arrived and reported success (this process only)
         self._last_error = {}          # op key -> the error text of its send (this process only)
         self._e13 = {}                 # op key -> the first quiet-window read (this process only)
+        self.workers = []              # send threads (tests join them; a cancelled one can never start a request)
         self._n = 0
 
     def _at(self, point):
@@ -742,17 +830,32 @@ class Sender:
 
     # ------------------------------------------------------------ E2
 
-    def observe(self, row, epoch):
+    def canary_facts(self, repo):
+        """e9 at E2 (F1): {"chk_cas": True, "canary_age": seconds} when the repo's CHK-CAS record passed under this
+        identity and its age, read by the ledger's boot-aware Clock.canary_age (the clock ELIG uses), is at least 0
+        and under CANARY_MAX_SECONDS; otherwise None (a missing, malformed, other-boot or expired stamp fails
+        closed)."""
+        facts = self.cas.local_facts(repo, self.identity)
+        if facts.get("chk_cas") is not True or not isinstance(facts.get("canary"), dict):
+            return None
+        age = self.port.canary_age(facts["canary"])
+        if not isinstance(age, (int, float)) or isinstance(age, bool) or not 0 <= age < CANARY_MAX_SECONDS:
+            return None
+        return {"chk_cas": True, "canary_age": float(age)}
+
+    def observe(self, row, epoch, canary=None):
         """The E2 guard's fresh observation (T2): the tip, the PR, compare B...H and the checks, plus the kill switch
-        and epoch read under the lock."""
+        and epoch read under the lock, and e9's CHK-CAS facts (chk_cas, canary_age) as evidence."""
         self.t.prepare(row["repo"])
         tip = self.t.read_ref(row["repo"], "refs/heads/%s" % self._branch(row))
         pr = self.t.read_pr(row["repo"], row["pr"])
+        canary = canary or {"chk_cas": False, "canary_age": None}
         return self.port.stamp({"repo": row["repo"], "pr": row["pr"], "kill_switch": epoch["on"],
                                 "kill_epoch": epoch["epoch"], "pr_state": pr.get("state"),
                                 "pr_head": pr.get("head"), "draft": pr.get("draft"), "tip": tip,
                                 "compare": self.t.compare(row["repo"], row["base"], row["head"]),
-                                "checks_green": self.checks(row) is True})
+                                "checks_green": self.checks(row) is True,
+                                "chk_cas": canary["chk_cas"], "canary_age": canary["canary_age"]})
 
     def payload(self, row, req, reviewed):
         """The one updateRefs request, built from the committed dispatched row and the reviewed H. force is
@@ -788,6 +891,9 @@ class Sender:
                 return Outcome("refused", "the repo's merging is off")
             if not self.cas.chk_cas(row["repo"], self.identity):     # e9 / NEG-19: no other send path exists
                 return Outcome("refused", "CHK-CAS has not passed for this repo under the merge identity")
+            canary = self.canary_facts(row["repo"])                  # F1: e9's age, at E2, on the boot clock
+            if canary is None:
+                return Outcome("refused", "the CHK-CAS canary is expired, from another boot, or has no valid stamp")
             reviewed = self.port.reviewed_head(row)                  # H from the passed Review row only
             if reviewed is None or reviewed != row["head"]:
                 return Outcome("refused", "the passed adversarial Review row does not name this op's H")
@@ -795,7 +901,7 @@ class Sender:
             if grant is None or grant["kill_epoch"] != epoch["epoch"]:
                 return Outcome("refused", "the grant is missing or from another kill epoch")
             try:
-                obs = self.observe(row, epoch)
+                obs = self.observe(row, epoch, canary)
                 self.port.dispatch(key, obs, expected_version=row["version"], event_id=self._ev(key, "e2"),
                                    lease_ok=lease_ok, mirror_read_back=self.port.mirror_read_back(row),
                                    request_id=rid)
@@ -810,22 +916,27 @@ class Sender:
         return self.record(key, result)
 
     def _send(self, payload):
-        """One request, with the client deadline. On the deadline the request is abandoned locally (the worker thread
-        is left behind) and the caller releases the lock; the result proves nothing."""
+        """One request, with the client deadline, while the caller holds the T9 lock. On the deadline the send is
+        cancelled through its SendGate before this returns (so before the lock is released): a request not yet
+        started never starts, and a started gh process is ended and reaped. The result proves nothing (NO_RESPONSE,
+        even when the gate closed first: ASSUMPTION A-cancel, fail closed rather than claim an absence proof)."""
         box = {}
+        gate = SendGate()
 
         def run():
             try:
                 box["r"] = self.t.update_refs(payload["repo"], payload["ref"], payload["beforeOid"],
-                                              payload["afterOid"], payload["force"], self.send_deadline)
+                                              payload["afterOid"], payload["force"], self.send_deadline, gate=gate)
             except Exception as error:                 # an exception after the call began proves nothing
                 box["r"] = SendResult(UNTYPED, "transport raised %s" % type(error).__name__)
 
         worker = threading.Thread(target=run, name="ahc-merge-send", daemon=True)
+        self.workers.append(worker)
         worker.start()
         worker.join(self.send_deadline)
         if worker.is_alive() or "r" not in box:
-            return SendResult(NO_RESPONSE, "client deadline %.0f s" % self.send_deadline)
+            stopped = gate.cancel()
+            return SendResult(NO_RESPONSE, "client deadline %.0f s; local send %s" % (self.send_deadline, stopped))
         return box["r"]
 
     def record(self, key, result):
