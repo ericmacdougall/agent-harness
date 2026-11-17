@@ -6280,6 +6280,27 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertIn(unit, self.runner.stopped)
         self.assertNotIn(unit, self.runner.live)
 
+    def test_16262_rt19_a_w4_successor_consumes_the_request_at_h_prime_and_its_hold(self):
+        """goodqa#16262 RT-19: W4 takes the owner's request at H' as the successor's packet and deletes it; the
+        request's hold record goes with it (no orphaned `shadow_hold:` key)."""
+        import ahc_shadow  # noqa: PLC0415
+        self.launched()
+        head3 = self.git.commit({"src/d.py": "d\n"}, "third change", parent=self.base)
+        pre = "repos/%s" % SHADOW_REPO
+        self.gh.set(pre + "/pulls/9", TO.pull_json(head3, number=9, repo=SHADOW_REPO, changed=1))
+        self.gh.set(pre + "/commits/%s/check-runs?per_page=100&filter=all" % head3,
+                    TO.page({"total_count": 1, "check_runs": [TO.run("test", head=head3)]}))
+        self.gh.set(pre + "/commits/%s/statuses?per_page=100" % head3, TO.page([]))
+        self.assertEqual(self.submit_pr(9, head3).get("pipeline"), "shadow")
+        c = self.contracts()
+        (key, value), = c.db.execute("SELECT k, v FROM contract_meta WHERE k LIKE ?",
+                                     (ahc_shadow.REQUEST_PREFIX + "%@" + head3,)).fetchall()
+        self.assertTrue(ahc_shadow.write_hold(c, key, value, None, "retryable", "held before the head moved"))
+        c.db.close()
+        self.run_all(self.deps)
+        self.assertEqual(self.ledger_rows("SELECT k FROM contract_meta WHERE k IN (?, ?)",
+                                          (key, ahc_shadow.hold_key(key))), [])
+
     def test_f7_a_policy_b33_of_one_stops_every_launch_and_charge_after_the_first(self):
         """PR 272 F7: policy b33=1 and two queued reviews of one lineage. After the first charge no further
         launch or charge happens, through the integrated tick (scheduler, launcher, launch_intent)."""

@@ -524,9 +524,9 @@ class ShadowTick:
             summary["refused"].append((iid, "%s: %s" % (row, error)))
             return None
         if "successor_packet" in kw:
-            with self.c.tx():
-                self.c.db.execute("DELETE FROM contract_meta WHERE k=?", ("%s%s#%d@%s" % (
-                    REQUEST_PREFIX, item["repo"], item["pr"], obs["pr_head"]),))
+            consumed = "%s%s#%d@%s" % (REQUEST_PREFIX, item["repo"], item["pr"], obs["pr_head"])
+            with self.c.tx():                       # RT-19: the request's hold goes with it
+                self.c.db.execute("DELETE FROM contract_meta WHERE k IN (?, ?)", (consumed, hold_key(consumed)))
         summary["moved"].append((iid, row, moved["state"] if moved else None))
         return row
 
