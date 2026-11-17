@@ -31,7 +31,8 @@ class SchemaError(RuntimeError):
 
 
 class MigrationPending(SchemaError):
-    """A fenced ledger (an interrupted or refused v5 migration) found by a process that does not migrate."""
+    """A ledger only ahc-core can bring current (fenced by an interrupted or refused v5 migration, an older schema,
+    or an interrupted restore), found by a process that does not migrate. The review role waits on it (PR 247 F2)."""
 
 
 class MigrationRefused(SchemaError):

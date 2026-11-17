@@ -777,8 +777,10 @@ ENTRIES.update({
                   SR + "test_ac8_the_daemon_reconciles_before_its_first_tick"],
         "mutations": [
             ("the daemon does not reconcile at start", [
-                ('    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy, role=args.role), default=str))\n',
-                 '')],
+                # anchor follows PR 247 F1: the call sits inside the startup try
+                ('        log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy, role=args.role),\n'
+                 '                                                         default=str))\n',
+                 '        pass\n')],
              RUNNER_PY),
             ("reconciliation findings are not raised", [
                 ('        for text in out["incidents"]:\n            raise_incident(contracts, "reconcile", text)\n', '')],
@@ -1326,6 +1328,54 @@ ENTRIES.update({
             ("a row that cannot be queued is dropped from the tick's report", [
                 ('                summary["refused"].append((rid, "R2 for a later round: %s" % str(error)[:200]))\n',
                  '                pass\n')], SHADOW)]},
+})
+
+
+# PR 247 receipt (25b3125f) F1-F3: each fix reverted must fail its failing-first test.
+INSTALL_PY = "harness/hooks/ahc_install.py"
+UT = "tests.test_ahc_runner.UninstallTests."
+ENTRIES.update({
+    "PR 247 F1 a startup migration failure takes the non-restarting exit": {
+        "tests": [MV + "test_r247_f1_a_migration_failure_in_startup_reconciliation_exits_3_and_runs_no_tick"],
+        "mutations": [
+            ("the startup reconciliation's refusal escapes main", [
+                ('    except SchemaError as error:\n        return refuse(error)\n    return serve(',
+                 '    except ImportError:\n        raise\n    return serve(')], RUNNER_PY)]},
+    "PR 247 F2 the review role waits for core's migration": {
+        "tests": [MV + "test_r247_f2_review_first_on_an_older_ledger_waits_for_core_and_both_run",
+                  MV + "test_r247_f2_core_first_on_an_older_ledger_and_both_run",
+                  MV + "test_r247_f2_an_interrupted_migration_is_rerun_by_core_while_review_waits",
+                  MV + "test_r247_f2_an_older_ledger_is_pending_and_an_unsupported_one_still_refuses"],
+        "mutations": [
+            ("the review role refuses a pending migration (exit 3, never restarted)", [
+                ('            if role != "review":\n                return refuse(error)\n',
+                 '            if True:\n                return refuse(error)\n')], RUNNER_PY),
+            ("an older ledger is a permanent refusal", [
+                ('        raise MigrationPending("ledger schema_version %d is older',
+                 '        raise SchemaError("ledger schema_version %d is older')], RUNNER_PY),
+            ("the waiting review role keeps its lock", [
+                ('    lock.close()\n    while True:\n        sleep(PENDING_WAIT)\n',
+                 '    while True:\n        sleep(PENDING_WAIT)\n')], RUNNER_PY),
+            ("an unsupported schema is waited on", [
+                ('        except MigrationPending as error:\n            if role != "review":\n',
+                 '        except SchemaError as error:\n            if role != "review":\n')], RUNNER_PY)]},
+    "PR 247 F3 a failed uninstall keeps what a retry needs": {
+        "tests": [UT + "test_r247_f3_a_failed_stop_removes_nothing_and_a_retry_finishes",
+                  UT + "test_r247_f3_a_failed_linger_restore_keeps_the_record_and_a_retry_restores_it",
+                  UT + "test_r247_f3_a_failed_daemon_reload_keeps_the_record",
+                  UT + "test_r247_f3_an_is_active_that_cannot_answer_counts_as_running"],
+        "mutations": [
+            ("the stop is not confirmed before removal", [
+                ('        running = [n for n in UNITS if _maybe_running(run, n)]\n', '        running = []\n')],
+             INSTALL_PY),
+            ("the install record is removed after a failed step", [
+                ('    if record is not None and failed:\n', '    if record is not None and False:\n')], INSTALL_PY),
+            ("an is-active that cannot answer counts as stopped", [
+                ('    return (text or "").strip() not in ("inactive", "failed")\n',
+                 '    return (text or "").strip() == "active"\n')], INSTALL_PY),
+            ("a retry disables units whose files are gone", [
+                ('    present = [n for n in UNITS if (unit_dir(home) / ("%s.service" % n)).exists()]\n',
+                 '    present = list(UNITS)\n')], INSTALL_PY)]},
 })
 
 

@@ -2617,6 +2617,57 @@ class UninstallTests(_HostBase):
             self.assertIn(str(path), printed)
         self.assertFalse((self.home / ".local" / "bin" / "ahc").exists())
 
+    def record(self):
+        return self.paths.root / "install.json"
+
+    def test_r247_f3_a_failed_stop_removes_nothing_and_a_retry_finishes(self):
+        host = FakeHost(linger="no")
+        self.install(host)
+        self.assertTrue(self.record().exists())
+        host.fail = {"systemctl --user disable"}               # disable --now fails: both units still run
+        self.assertEqual(self.uninstall(host), 1)
+        self.assertTrue(self.unit("ahc-core").exists() and self.unit("ahc-review").exists(), "unit files kept")
+        self.assertTrue((self.home / ".local" / "bin" / "ahc").exists(), "the wrapper is kept")
+        self.assertTrue(self.record().exists(), "the install record is kept")
+        self.assertEqual(host.linger, "yes", "lingering is not touched while a unit may run")
+        self.assertTrue(any("may still be running" in line for line in self.out), self.out)
+        host.fail = set()
+        self.assertEqual(self.uninstall(host), 0)
+        self.assertEqual((host.active, host.linger, self.record().exists()), (set(), "no", False))
+
+    def test_r247_f3_a_failed_linger_restore_keeps_the_record_and_a_retry_restores_it(self):
+        host = FakeHost(linger="no")
+        self.install(host)
+        host.fail = {"loginctl"}                              # disable-linger fails (show-user too, unused here)
+        self.assertEqual(self.uninstall(host), 1)
+        self.assertFalse(self.unit("ahc-core").exists(), "the stopped units' files are removed")
+        self.assertTrue(self.record().exists(), "the record of lingering before ahc is kept for the retry")
+        self.assertEqual(host.linger, "yes")
+        host.fail = set()
+        self.assertEqual(self.uninstall(host), 0, self.out)
+        self.assertEqual(host.linger, "no", "the retry restores lingering from the kept record")
+        self.assertFalse(self.record().exists())
+        self.assertFalse([c for c in host.calls[-6:] if c[:3] == ["systemctl", "--user", "disable"]],
+                         "the retry does not disable units whose files are gone")
+
+    def test_r247_f3_a_failed_daemon_reload_keeps_the_record(self):
+        host = FakeHost(linger="no")
+        self.install(host)
+        host.fail = {"systemctl --user daemon-reload"}
+        self.assertEqual(self.uninstall(host), 1)
+        self.assertTrue(self.record().exists())
+        host.fail = set()
+        self.assertEqual(self.uninstall(host), 0)
+        self.assertFalse(self.record().exists())
+
+    def test_r247_f3_an_is_active_that_cannot_answer_counts_as_running(self):
+        host = FakeHost(linger="no")
+        self.install(host)
+        host.fail = {"systemctl --user is-active"}
+        host.active = set()
+        self.assertEqual(self.uninstall(host), 1)
+        self.assertTrue(self.unit("ahc-core").exists() and self.record().exists())
+
     def test_uninstall_leaves_linger_on_when_it_was_on(self):
         host = FakeHost(linger="yes")
         self.install(host)
@@ -4715,6 +4766,39 @@ except Exception as error:
 """
 
 
+SERVE_CHILD = r"""
+import os, sys, time, types
+sys.path.insert(0, sys.argv[1])
+import ahc_core, ahc_runner
+paths, role, go = ahc_core.Paths(sys.argv[2]), sys.argv[3], sys.argv[4]
+ahc_runner.Ledger.LOCK_WAIT = 10.0
+ahc_runner.PENDING_WAIT = 0.1
+# the migration's open-file probe sees only this process (as _ProbeRun does in-process)
+ahc_runner.Ledger.PROBE_RUN = staticmethod(
+    lambda argv, timeout: types.SimpleNamespace(returncode=0, stdout="p%d\nf4\n" % os.getpid(), stderr=""))
+lock = ahc_runner.acquire_lock(paths, role)
+print("locked" if lock is not None else "busy", flush=True)
+while not os.path.exists(go):
+    time.sleep(0.02)
+steps = []
+
+
+def step():
+    steps.append(1)
+    ahc_runner.Ledger(paths, migrate=(role == "core")).close()    # the open each role's tick makes
+    return {"role": role}
+
+
+def refuse(error):
+    print("refused %s: %s" % (type(error).__name__, error), flush=True)
+    return 3
+
+
+rc = ahc_runner.serve(paths, role, lock, step, refuse, once=True)
+print("rc %d steps %d" % (rc, len(steps)), flush=True)
+"""
+
+
 def run_old(hooks, home, code):
     """Run `code` in a child process on the old tree (its own ahc_core and ahc_runner) against `home`."""
     import subprocess
@@ -5074,6 +5158,106 @@ class MigrationV5Tests(Base):
         for role, line in lines.items():
             self.assertTrue(line.startswith("ok "), "%s: %s" % (role, line))
             self.assertLess(float(line.split()[1]), 2.0, "%s waited: %s" % (role, line))
+
+    # ---- PR 247 receipt F1 / F2: startup against a ledger that needs core's migration
+
+    def serve_child(self, role, go):
+        proc = subprocess.Popen([sys.executable, "-I", "-B", "-c", SERVE_CHILD, str(HOOKS), str(self.home), role,
+                                 str(go)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: proc.poll() is None and (proc.terminate(), proc.wait()))
+        self.assertEqual(proc.stdout.readline().strip(), "locked", role)
+        return proc
+
+    def start_both(self, first):
+        """Start `first`, let it run alone for a while, then the other role; both must end with rc 0."""
+        second = "core" if first == "review" else "review"
+        procs = {first: self.serve_child(first, self.home / "go-first")}
+        (self.home / "go-first").write_text("go")
+        time.sleep(0.6)
+        procs[second] = self.serve_child(second, self.home / "go-second")
+        (self.home / "go-second").write_text("go")
+        out = {}
+        for role, proc in procs.items():
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:            # a role that never runs is the defect: fail, not error
+                self.fail("%s did not finish within 60 s" % role)
+            out[role] = stdout.strip().splitlines()[-1] if stdout.strip() else "no output: " + stderr[-400:]
+        for role, line in out.items():
+            self.assertTrue(line.startswith("rc 0 "), "%s did not run: %s" % (role, line))
+        self.assertEqual(self.version(), "5")
+        return out
+
+    def old_ledger(self):
+        self.make_old("4d45fe40", PIN_4D45, populate=False)
+        db = self.db()
+        db.execute("UPDATE meta SET v='4' WHERE k='schema_version'")
+        db.close()
+
+    def test_r247_f2_review_first_on_an_older_ledger_waits_for_core_and_both_run(self):
+        self.old_ledger()
+        out = self.start_both("review")
+        self.assertGreater(int(out["review"].split()[-1]), 1, "review waited (more than one step): %s" % out)
+
+    def test_r247_f2_core_first_on_an_older_ledger_and_both_run(self):
+        self.old_ledger()
+        self.start_both("core")
+
+    def test_r247_f2_an_interrupted_migration_is_rerun_by_core_while_review_waits(self):
+        self.make_old("4d45fe40", PIN_4D45)
+        saved = list(runner.MIGRATIONS[5])
+        runner.MIGRATIONS[5] = saved + ["THIS IS NOT SQL"]
+        try:
+            self.expect_refusal(runner.SchemaError, "restored the verified backup")
+        finally:
+            runner.MIGRATIONS[5] = saved
+        self.assertEqual(self.version(), "v5-migrating-from-4", "fenced: an interrupted migration")
+        self.start_both("review")
+
+    def test_r247_f2_an_older_ledger_is_pending_and_an_unsupported_one_still_refuses(self):
+        self.old_ledger()
+        with self.assertRaises(runner.MigrationPending):
+            runner.Ledger(self.paths, migrate=False)
+        db = self.db()
+        db.execute("UPDATE meta SET v='9' WHERE k='schema_version'")
+        db.close()
+        lock = runner.acquire_lock(self.paths, "review")
+        self.addCleanup(lock.close)
+        refused = []
+        rc = runner.serve(self.paths, "review", lock, lambda: runner.Ledger(self.paths, migrate=False).close(),
+                          lambda error: refused.append(error) or runner.SCHEMA_EXIT, once=True,
+                          sleep=lambda s: self.fail("an unsupported schema is not waited on"))
+        self.assertEqual(rc, runner.SCHEMA_EXIT)
+        self.assertEqual([type(e) for e in refused], [runner.SchemaError])
+
+    def test_r247_f1_a_migration_failure_in_startup_reconciliation_exits_3_and_runs_no_tick(self):
+        """The reconciliation core runs before its first tick opens (and may migrate) the ledger; a refusal there
+        is the non-restarting exit 3 with the ahc-schema alert, never an escaping exception (exit 1, restart)."""
+        self.make_old("4d45fe40", PIN_4D45)
+        saved = list(runner.MIGRATIONS[5])
+        runner.MIGRATIONS[5] = saved + ["THIS IS NOT SQL"]
+        self.addCleanup(lambda: runner.MIGRATIONS.__setitem__(5, saved))
+        runner.Ledger.PROBE_RUN = _ProbeRun()
+        import ahc_guard  # noqa: PLC0415
+        alerts, ticks = [], []
+
+        def reconcile(paths, policy, role="all"):
+            runner.Ledger(paths).close()                 # core's reconciliation opens the migrating ledger
+            return {}
+        with mock.patch.object(runner.core, "Paths", lambda *a, **k: self.paths), \
+                mock.patch.object(ahc_guard, "install", lambda policy: policy), \
+                mock.patch.object(runner, "_setup_logging", lambda paths: None), \
+                mock.patch.object(runner, "startup_reconcile", reconcile), \
+                mock.patch.object(runner, "tick", lambda *a, **k: ticks.append(1) or {}), \
+                mock.patch.object(runner.LiveDeps, "ah", lambda deps, argv, timeout: alerts.append(argv)):
+            try:
+                rc = runner.main(["run", "--role", "core", "--once"])
+            except Exception as error:  # noqa: BLE001 - an escape is the defect: fail, not error
+                self.fail("the startup refusal escaped main: %r" % error)
+        self.assertEqual(rc, runner.SCHEMA_EXIT)
+        self.assertEqual(ticks, [], "no tick after a startup refusal")
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn("ahc-schema", alerts[0])
 
     def test_neg27_a_migration_with_another_role_running_still_refuses(self):
         """NEG-27 kept: a ledger that needs the v5 migration is not migrated while another role holds its lock."""

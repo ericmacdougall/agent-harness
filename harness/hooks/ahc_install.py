@@ -223,11 +223,24 @@ def uninstall(paths, home: Path, apply: bool, run=default_run, system=None, out=
         return refused
     verb = "" if apply else "would "
     failed = 0
-    argv = ["systemctl", "--user", "disable", "--now"] + ["%s.service" % n for n in UNITS]
-    out("%srun %s" % (verb, " ".join(argv)))
-    if apply and run(argv)[0] != 0:
-        failed += 1
-        out("  failed; the unit files are still removed below")
+    # PR 247 receipt F3: a retry after a partial uninstall disables only the units whose files are still there
+    present = [n for n in UNITS if (unit_dir(home) / ("%s.service" % n)).exists()]
+    if present:
+        argv = ["systemctl", "--user", "disable", "--now"] + ["%s.service" % n for n in present]
+        out("%srun %s" % (verb, " ".join(argv)))
+        if apply and run(argv)[0] != 0:
+            failed += 1
+            out("  failed")
+    else:
+        out("no ahc unit file is installed; nothing to disable")
+    # PR 247 receipt F3: nothing that manages a service is removed while it may still run
+    out("%scheck that both units are stopped" % verb)
+    if apply:
+        running = [n for n in UNITS if _maybe_running(run, n)]
+        if running:
+            out("ahc: %s may still be running; nothing was removed (the unit files, the wrapper and the install "
+                "record are kept). Stop them, then rerun `ahc uninstall --apply`." % ", ".join(running))
+            return 1
     for name in UNITS:
         target = unit_dir(home) / ("%s.service" % name)
         out("%sremove %s" % (verb, target))
@@ -260,7 +273,11 @@ def uninstall(paths, home: Path, apply: bool, run=default_run, system=None, out=
         out("leave lingering on (it was on before ahc)")
     else:
         out("leave lingering as it is (no record of its state before ahc)")
-    if record is not None:
+    if record is not None and failed:
+        # PR 247 receipt F3: the record (lingering's state before ahc) is what a retry needs to finish the rollback
+        out("keep the install record %s: %d step(s) failed; rerun `ahc uninstall --apply` to finish"
+            % (_record_path(paths), failed))
+    elif record is not None:
         out("%sremove the install record %s" % (verb, _record_path(paths)))
         if apply:
             fs.unlink(paths.root, _record_path(paths))
@@ -268,6 +285,13 @@ def uninstall(paths, home: Path, apply: bool, run=default_run, system=None, out=
     for label, path in kept_paths(paths):
         out("  %s: %s" % (label, path))
     return 1 if failed else 0
+
+
+def _maybe_running(run, name) -> bool:
+    """Whether a unit may still run: anything but a plain "inactive" or "failed" from is-active, including an
+    is-active that cannot answer (fail closed)."""
+    _rc, text = run(["systemctl", "--user", "is-active", "%s.service" % name])
+    return (text or "").strip() not in ("inactive", "failed")
 
 
 def unit_states(run=default_run, system=None) -> dict:

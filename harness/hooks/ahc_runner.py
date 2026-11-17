@@ -518,8 +518,9 @@ class Ledger:
         if migrate:
             self._resume_restore()
         elif self._intent_path().exists():
-            raise SchemaError("the ledger has an interrupted restore; ahc-core completes it at start, this process "
-                              "does not")
+            # PR 247 receipt F2: pending, not a refusal: the review role waits for core instead of stopping
+            raise MigrationPending("the ledger has an interrupted restore; ahc-core completes it at start, this "
+                                   "process does not")
         if migrate and os.path.lexists(str(self.path)):
             self._v5_gate()             # AC-11: migration holds the role locks and the exclusive maint lock
         # every connection holds the maint flock shared for as long as it is open (AC-11)
@@ -565,8 +566,9 @@ class Ledger:
         if version == SCHEMA_VERSION:
             self._check_intent_lifecycle()
             return
-        raise SchemaError("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at start, "
-                          "this process does not" % (version, SCHEMA_VERSION))
+        # PR 247 receipt F2: an older ledger is pending core's migration, not a permanent refusal
+        raise MigrationPending("ledger schema_version %d is older than this ahc (%d); ahc-core migrates it at "
+                               "start, this process does not" % (version, SCHEMA_VERSION))
 
     def _check_intent_lifecycle(self):
         """PR 272 rescue (F1): launch_intents is new in v5 and was never released before its lifecycle had the
@@ -3112,22 +3114,70 @@ def main(argv=None):
     # gh authenticates from its own config under HOME; the unit sets no gh credential variable, so the gh
     # form carries none (ASSUMPTION)
     policy = ahc_guard.install(ahc_guard.Policy(paths.root, repos=config.get("repos", []), home=paths.home))
-    log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy, role=args.role), default=str))
     deps = LiveDeps(paths, config)
+
+    def refuse(error):
+        log.error("schema refusal: %s", error)
+        print("ahc: %s" % error, file=sys.stderr)
+        deps.ah(["ah", "alert", "raise", "--alert-key", "ahc-schema", "--source", "ahc", "--severity", "high",
+                 "--message", "ahc refused to start: " + _short(error)], 60)
+        return SCHEMA_EXIT  # the unit does not restart on it (RestartPreventExitStatus), so no backup loop
+
+    try:
+        # PR 247 receipt F1: core's reconciliation opens (and may migrate) the ledger, so a schema or migration
+        # failure here takes the same non-restarting exit as one in a tick, and no tick runs
+        log.info("startup reconciliation %s", json.dumps(startup_reconcile(paths, policy, role=args.role),
+                                                         default=str))
+    except SchemaError as error:
+        return refuse(error)
+    return serve(paths, args.role, lock, lambda: tick(paths, config, deps, role=args.role), refuse,
+                 once=args.once, interval=args.interval)
+
+
+PENDING_WAIT = 15.0     # seconds the review role waits, its role lock released, for ahc-core's migration (PR 247 F2)
+
+
+def serve(paths, role, lock, step, refuse, once=False, interval=60, sleep=time.sleep):
+    """The daemon loop after startup: `step()` is one tick. A SchemaError is `refuse(error)`'s non-restarting exit.
+    PR 247 receipt F2: the review role never migrates, so a ledger only core can bring current (MigrationPending:
+    older, fenced, or mid-restore) is not a refusal for it. It releases its role lock, which the migration takes,
+    waits PENDING_WAIT, takes the lock back and ticks again, for as long as core needs. Unit restarts would hit
+    StartLimitBurst and stop it for good; exit 3 would never restart it. An unsupported schema still refuses."""
+    waiting = False
     while True:
         try:
-            summary = tick(paths, config, deps, role=args.role)
+            summary = step()
+        except MigrationPending as error:
+            if role != "review":
+                return refuse(error)
+            if not waiting:
+                log.warning("migration pending, waiting for ahc-core: %s", error)
+                waiting = True
+            lock = _release_and_retake(paths, role, lock, sleep)
+            continue
         except SchemaError as error:
-            log.error("schema refusal: %s", error)
-            print("ahc: %s" % error, file=sys.stderr)
-            deps.ah(["ah", "alert", "raise", "--alert-key", "ahc-schema", "--source", "ahc", "--severity", "high",
-                     "--message", "ahc refused to start: " + _short(error)], 60)
-            return SCHEMA_EXIT  # the unit does not restart on it (RestartPreventExitStatus), so no backup loop
+            return refuse(error)
+        if waiting:
+            log.info("the ledger is current; the review role resumes")
+            waiting = False
         log.info("tick %s", json.dumps(summary, default=str))
-        if args.once:
+        if once:
             print(json.dumps(summary, default=str))
             return 0
-        time.sleep(max(10, args.interval))
+        sleep(max(10, interval))
+
+
+def _release_and_retake(paths, role, lock, sleep):
+    """Close this role's lock (so the migrator can take it), wait, and take it again. While core migrates it holds
+    this lock, so a failed take keeps waiting; the returned handle is held for the rest of the process."""
+    if _HELD_ROLES.get((str(paths.root), role)) is lock:
+        del _HELD_ROLES[(str(paths.root), role)]
+    lock.close()
+    while True:
+        sleep(PENDING_WAIT)
+        handle = acquire_lock(paths, role)
+        if handle is not None:
+            return handle
 
 
 if __name__ == "__main__":
