@@ -5621,9 +5621,10 @@ class ShadowTickTests(_ShadowFixture):
 
         def tick():
             producer = FakeProducer(self.c, lambda repo, pr, item: self.facts(repo, pr, item))
-            return self.S.ShadowTick(self.c, producer, lambda repo, head, base: "/clone", self.config, review=Stage(),
-                                     store_packet=lambda p: store.__setitem__(p["sha256"], p["text"].encode()),
-                                     load_packet=store.get).tick()
+            t = self.S.ShadowTick(self.c, producer, lambda repo, head, base: "/clone", self.config, review=Stage(),
+                                  store_packet=lambda p: store.__setitem__(p["sha256"], p["text"].encode()))
+            t.load_packet = store.get          # as the runner wires it (load_r2_packet)
+            return t.tick()
         self.S.queue_request(self.c, {"repo": "o/r", "pr": 5, "head": TC.H1, "base": TC.BASE,
                                       "packet_sha256": TC.PKT, "owner": "agent-x", "ticket": "t"})
         first = tick()
@@ -5651,9 +5652,9 @@ class ShadowTickTests(_ShadowFixture):
         new = [r for (r,) in self.db.execute("SELECT id FROM reviews WHERE item=? AND policy_revision='policy-r2' "
                                              "AND kind IN ('adversarial', 'red-team') ORDER BY id", (iid,))]
         self.assertTrue(new, "W27 made replacement code rows")
-        self.assertEqual(sorted(third["requeued"]), new, third)
-        self.assertEqual(offered, third["scheduled"]["offered"])
         self.assertEqual(len(offered), 1, "the real scheduler offers a W27 replacement row (one slot)")
+        self.assertEqual(offered, third["scheduled"]["offered"])
+        self.assertEqual(sorted(third.get("requeued", [])), new, third)
         self.assertIn(offered[0], new)
         self.assertEqual(self.c._row("reviews", "id", offered[0])["state"], "queued")
 
@@ -6108,12 +6109,12 @@ class ReviewTickTests(ShadowIntegratedTests):
         _a, b, _c = self.extended()
         started = len(self.runner.started)
         tick = self.run_all(self.deps)["shadow"]
-        self.assertEqual(tick["requeued"], [b], tick)
         self.assertEqual(tick["scheduled"]["started"], [b], tick["scheduled"])
+        self.assertEqual(tick.get("requeued"), [b], tick)
         self.assertEqual(len(self.runner.started), started + 1)
         self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (b,)), [("running",)])
         again = self.run_all(self.deps)["shadow"]
-        self.assertEqual(again["requeued"], [], "idempotent: a queued or running row is not queued again")
+        self.assertEqual(again.get("requeued"), [], "idempotent: a queued or running row is not queued again")
 
     def test_r273_f2_an_altered_or_missing_stored_packet_keeps_the_row_required_and_says_so(self):
         """PR 273 receipt F2, negative: the stored packet no longer hashes to the row's sha (or is gone). The row
@@ -6126,7 +6127,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         started = len(self.runner.started)
         for _ in range(2):
             tick = self.run_all(self.deps)["shadow"]
-            self.assertEqual(tick["requeued"], [])
+            self.assertEqual(tick.get("requeued", []), [])
             self.assertTrue(any(r == b and "does not hash" in why for r, why in tick["refused"]), tick["refused"])
         path.unlink()
         tick = self.run_all(self.deps)["shadow"]
@@ -6134,7 +6135,7 @@ class ReviewTickTests(ShadowIntegratedTests):
         self.assertEqual(len(self.runner.started), started)
         self.assertEqual(self.ledger_rows("SELECT state FROM reviews WHERE id=?", (b,)), [("required",)])
         path.write_bytes(good)
-        self.assertEqual(self.run_all(self.deps)["shadow"]["requeued"], [b])
+        self.assertEqual(self.run_all(self.deps)["shadow"].get("requeued"), [b])
 
     def test_f6_w4_head_supersede_stops_the_unit_and_settles_the_row_superseded(self):
         """PR 272 F6: the PR's head moves (W4) while the attempt for H runs. In the same tick the review stage
