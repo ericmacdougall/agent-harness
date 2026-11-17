@@ -6,7 +6,7 @@
   "ahc_core.py": "e078ee019e05953166b3958caa0132b9eccd8d63189b56fba2ae1e4b72a6fee2",
   "ahc_crash.py": "e5615378ffaa1bbef3e8f3e01328c677da260d39f00855fcd9b3605ea3f59070",
   "ahc_fs.py": "cfffa4a962c7286aacd69be1215669bf54c087bc91655af5cf3968a58c5a9a90",
-  "ahc_guard.py": "44c4cf0d2a9fd598449a8586b01d3c798ee095ac91511b69194f99cc4b71725d",
+  "ahc_guard.py": "03c085bfd89fab7fc50fc0c58cb42c189b1a6439c1f88b33805dc32b758eacdb",
   "ahc_install.py": "4c3514f3df7d99a5f22a10fb6f3faace921d1a20b4b31ae51833a505c923f4cd",
   "ahc_migrate.py": "e84130b3128e18e456ddd1cb07e5f40a19c7325fa1489748954bd615bcc61593",
   "ahc_observe.py": "288fa61dcb408679675d487a71f8dc5013c936f6054481ac17bf3b17148eb92e",
@@ -16,5 +16,10 @@
   "ahc_shadow.py": "22ce5ede322a567af0609db245a14189edcad3af0ac2f1f3d6594dc820493837",
   "ahc_w21.py": "04101af2e72ca39ec1d714977d7676d472d17ca4033827734170b856dfdf6b46"
  },
- "note": "v5 entry-point sha256 list; regenerate with scripts/ahc_release_hashes.py"
+ "helpers": {
+  "ah": "e383609a3c6d29b40faa497a672e67e0b0e75e2dfa61e7f7c9e3377bd5c58cdb",
+  "ops_watch": "94d0d1ee5d0f990145e01c70df78ffeef914582073b51ab4a0e87ff0db5f5b6f",
+  "peer_review": "c7763c4c33cfec2c9951c9041eb2418e8506fe1ad121068e21cbf838896e7fbb"
+ },
+ "note": "v5 entry-point and legacy-helper sha256 list; regenerate with scripts/ahc_release_hashes.py"
 }
