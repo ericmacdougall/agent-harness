@@ -156,9 +156,15 @@ DEFAULT_POLICY = {
                            'ignored_ok': ['node_modules', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache'],
                            'ignored_top_ok': ['.venv', 'venv', 'dist', 'build', 'target', '.next', '.gradle']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
-               'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
+               # goodqa#16374 AC-3c: 20 GiB refused real cleanup units; the hash deadline scales with the tree size
+               'max_walk_seconds': 2.0, 'max_hash_bytes': 1 << 40, 'recent_change_seconds': 600,
                'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
 }
+
+# goodqa#16374 AC-3d: basenames a cleanup moves to ~/secret-quarantine by name (never read); the list mac_reclaim used
+SECRET_FILE_NAME = re.compile(r'(^\.env($|\.)|\.env$|\.pem$|\.key$|\.p12$|\.pfx$|^id_(rsa|dsa|ecdsa|ed25519)|'
+                              r'^credentials|\.keychain|^service-account.*\.json$|^\.npmrc$|^\.netrc$|^kubeconfig$|'
+                              r'^\.git-credentials$|^\.pgpass$|token\.json$|^secrets?\.(json|ya?ml|toml)$)', re.I)
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
 BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
@@ -6757,6 +6763,49 @@ class Analyzer:
         return bool(self.LONE_RM.match(raw)) and not re.search(r'[\x00-\x08\x0b-\x1f\x7f]', raw.strip())
 
     _LITERAL = r'[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+'
+
+    # goodqa#16374 AC-3d (goodqa#16362 proposal 3): `mv [-n] [--] /literal/src /literal/dest` and nothing else
+    LONE_MV = re.compile(r'^[ \t]*(?:/bin/)?mv(?:[ \t]+-n)?(?:[ \t]+--)?[ \t]+(' + _LITERAL + r')[ \t]+(' + _LITERAL
+                         + r')[ \t]*$')
+
+    def _quarantine_move(self, src_word, dest_word):
+        """True for a lone literal move of one regular, secret-named file out of a harness work or scratch dir into
+        a new name inside a real ~/secret-quarantine (mode 0700, owned by this user, on the same device). The file is
+        renamed, never read or copied; logs, WALs, kept names, directories and symlinks keep the ordinary refusal."""
+        match = self.LONE_MV.fullmatch(getattr(self.ctx, 'raw_top', '') or '')
+        if not match or match.group(1) != src_word.text or match.group(2) != dest_word.text:
+            return False
+        if any(w.dynamic or w.subs or w.glob for w in (src_word, dest_word)):
+            return False
+        src, dest = src_word.text, dest_word.text
+        if not (os.path.isabs(src) and os.path.isabs(dest)) or os.path.normpath(src) != src \
+                or os.path.normpath(dest) != dest or not SECRET_FILE_NAME.search(posixpath.basename(src)):
+            return False
+        try:
+            st = os.lstat(src)
+            if not stat.S_ISREG(st.st_mode) or os.path.realpath(src) != src:
+                return False
+            if self._work_base(Compiled._segs(src)) is None or self._kept(src) \
+                    or any(rx.search(src.casefold()) for rx in self.c.wal_regexes):
+                return False
+            cls, _path, literal = self.target_class(src_word)
+            if cls != 'root' or not literal:
+                return False
+            parent = os.path.dirname(dest)
+            if os.path.lexists(dest) or os.path.realpath(parent) != parent or not os.path.isdir(parent):
+                return False
+            for home in self.c.homes:
+                root = os.path.join(home, 'secret-quarantine')
+                if not (parent == root or parent.startswith(root + os.sep)):
+                    continue
+                qst = os.lstat(root)
+                if stat.S_ISDIR(qst.st_mode) and os.path.realpath(root) == root \
+                        and stat.S_IMODE(qst.st_mode) == 0o700 and qst.st_uid == os.getuid() \
+                        and os.stat(parent).st_dev == st.st_dev:
+                    return True
+        except OSError:
+            return False
+        return False
     # `git [-C /abs/repo] worktree remove [--] /abs/worktree`: a caller whose working directory is not a repository (a
     # subagent's shell resets to $HOME on every call) names the registry repository with one literal -C
     LONE_WORKTREE_REMOVE = re.compile(
@@ -7029,6 +7078,8 @@ class Analyzer:
                 sources = [a for a in nd if a is not dest]
             elif len(nd) >= 2:
                 dest, sources = nd[-1], nd[:-1]
+            if name == 'mv' and len(sources) == 1 and dest is not None and self._quarantine_move(sources[0], dest):
+                sources = []  # goodqa#16374 AC-3d: a secret-named file moved by name into ~/secret-quarantine
             for w in sources:
                 self.refuse(name + ' (moves it away)', w)
             if dest is not None and not self.state_dest(dest):
@@ -7781,6 +7832,9 @@ def stat_manifest(path, limits, deadline=None):
         kind = 'd' if os.path.isdir(current) and not os.path.islink(current) else ('l' if os.path.islink(current) else 'f')
         h.update(('%s\0%s\0%d\0%d\n' % (rel, kind, st.st_size if kind == 'f' else 0,
                                         st.st_mtime_ns if kind != 'd' else 0)).encode('utf-8', 'surrogateescape'))
+        if kind == 'l':
+            # goodqa#16374 AC-3a: a link re-pointed after approval with its old mtime restored still voids it
+            h.update(('->%s\n' % os.readlink(current)).encode('utf-8', 'surrogateescape'))
         if kind == 'd':
             with os.scandir(current) as it:
                 stack.extend(sorted((e.path for e in it), reverse=True))
@@ -8089,9 +8143,14 @@ class ArchiveVerifier(Verifier):
     member names, a truncated or corrupt stream, a failed download or a decompressor error refuse."""
 
     def __init__(self, sha256_remote, listing_remote, rclone='rclone', zstd=None, opener=None, types=None,
-                 timeout=3600, limit=64 << 30):
+                 timeout=3600, limit=None, policy=None):
         self.sha256_remote, self.listing_remote = sha256_remote, listing_remote
+        if limit is None:
+            # goodqa#16374 AC-3c: the download limit follows the policy's tree cap (never below the old 64 GiB)
+            cap = int(((policy or DEFAULT_POLICY).get('marker') or {}).get('max_hash_bytes', 0) or 0)
+            limit = max(64 << 30, cap)
         self.rclone, self.timeout, self.limit = rclone, timeout, limit
+        self.local_links = None  # {relative path: link target} of the local tree, set by approve_delete
         self.zstd = zstd or _pinned_tool('zstd')
         self.inflate_slack = 256 << 20  # tar headers, padding and AppleDouble companions on top of 2x the tree
         self.max_members = None  # set by verify() from the local manifest
@@ -8197,6 +8256,7 @@ class ArchiveVerifier(Verifier):
             raise ValueError('the archive must be .tar, .tar.gz/.tgz or .tar.zst')
         source = _InflateLimit(source, self.inflate_limit)
         found, self.names, self.appledouble, seen = {}, set(), set(), set()
+        self.links = {}  # symlink members: name -> link target (goodqa#16374 AC-3a)
         deadline = time.monotonic() + self.timeout
         try:
             with tarfile.open(fileobj=source, mode='r|') as tar:
@@ -8217,6 +8277,12 @@ class ArchiveVerifier(Verifier):
                     seen.add(folded)
                     self.names.add(name)
                     if info.isdir():
+                        continue
+                    if info.issym():
+                        # compared as (path, target string) with the local tree's links; never followed or resolved
+                        if '\x00' in info.linkname or '\n' in info.linkname:
+                            raise ValueError('the archive holds a link with an unreadable target (%s)' % name[:120])
+                        self.links[name] = info.linkname
                         continue
                     if not info.isreg():
                         raise ValueError('the archive holds a link or special member (%s); only regular files and '
@@ -8288,8 +8354,23 @@ class ArchiveVerifier(Verifier):
             return VerifyResult(False, error='archive sha256 does not match its .sha256 file')
         if not found:
             return VerifyResult(False, error='the archive holds no regular files')
-        prefix = os.path.basename(os.path.realpath(local_root).rstrip('/'))
-        local = {'%s/%s' % (prefix, rel): (size, sha) for rel, size, sha in manifest}
+        real_root = os.path.realpath(local_root)
+        prefix = os.path.basename(real_root.rstrip('/'))
+        if os.path.isfile(real_root):
+            # goodqa#16374 AC-3b: `tar -C parent -cf - name` stores a single file as the member `name` itself
+            local = {rel: (size, sha) for rel, size, sha in manifest}
+            local_links = {}
+        else:
+            local = {'%s/%s' % (prefix, rel): (size, sha) for rel, size, sha in manifest}
+            local_links = {'%s/%s' % (prefix, rel): target for rel, target in (self.local_links or {}).items()}
+        archive_links = getattr(self, 'links', {})
+        if archive_links != local_links:
+            only_archive = sorted(set(archive_links) - set(local_links))
+            only_local = sorted(set(local_links) - set(archive_links))
+            other = sorted(n for n in set(archive_links) & set(local_links) if archive_links[n] != local_links[n])
+            return VerifyResult(False, len(archive_links), only_local[:20], (only_archive + other)[:20],
+                                error='archive link members differ from the local symlinks (%d missing, %d extra, %d '
+                                      'with another target)' % (len(only_local), len(only_archive), len(other)))
         # macOS bsdtar stores extended attributes as AppleDouble companions `<dir>/._<name>` beside each member; its own
         # `tar -tvf` merges them back and does not list them. Such a companion is metadata, not a file of the tree,
         # when it is not a local file, starts with the AppleDouble magic 00 05 16 07, and its sibling (a file or a
@@ -8339,6 +8420,14 @@ def tree_manifest(path, limits):
                 files.append((os.path.relpath(full, path).replace(os.sep, '/'), full))
                 if len(files) > int(limits['max_walk_entries']):
                     raise ValueError('too many files to approve at once; approve subdirectories')
+    # goodqa#16374 AC-3c: a large unit gets time in proportion to its size (64 MiB/s floor), not a flat budget
+    try:
+        size_hint = sum(os.lstat(full).st_size for _rel, full in files)
+    except OSError:
+        size_hint = 0
+    if size_hint > int(limits['max_hash_bytes']):
+        raise ValueError('tree is larger than the approval limit')
+    deadline = max(deadline, time.monotonic() + size_hint / float(64 << 20))
     for rel, full in files:
         if time.monotonic() > deadline:
             raise ValueError('hashing exceeded its time budget')
@@ -8391,6 +8480,22 @@ def _check_remote(remote, policy, verifier):
         raise ValueError('remote %r is not configured in rclone' % name[:40])
     if kind.casefold() not in allowed:
         raise ValueError('remote %r has backend type %r; approvals need one of %s' % (name[:40], kind[:20], allowed))
+
+
+def tree_symlinks(path, limits=None):
+    """{relative path: link target} of every symlink under `path` (file and directory links), never followed."""
+    found = {}
+    if os.path.islink(path) or not os.path.isdir(path):
+        return found
+    cap = int((limits or {}).get('max_walk_entries', 200000))
+    for root, dirs, names in os.walk(path):
+        for name in sorted(dirs + names):
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                found[os.path.relpath(full, path).replace(os.sep, '/')] = os.readlink(full)
+                if len(found) > cap:
+                    raise ValueError('too many symlinks to approve at once; approve subdirectories')
+    return found
 
 
 def _first_symlink(path):
@@ -8453,15 +8558,14 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
             for extra in archive:
                 _check_remote(extra, policy, verifier)
             if not isinstance(verifier, ArchiveVerifier):
-                verifier = ArchiveVerifier(archive[0], archive[1])
+                verifier = ArchiveVerifier(archive[0], archive[1], policy=policy)
         # PR #120 red-team F1: the delete-time stat check must describe the tree the backup was compared with, so it
         # is taken before hashing and must be unchanged after the (possibly hour-long) verification.
         stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 60)
         if archive is not None:
-            link = _first_symlink(real)
-            if link:
-                raise ValueError('the tree holds a symlink (%s), which the archive comparison does not cover; '
-                                 'refused' % link[:120])
+            # goodqa#16374 AC-3a: symlinks are compared with the archive's link members as (path, target string);
+            # the stat manifest (which hashes each link's target) pins them until the delete
+            verifier.local_links = tree_symlinks(real, limits)
         manifest = tree_manifest(real, limits)
         if not manifest:
             raise ValueError('nothing to approve: the path holds no files')

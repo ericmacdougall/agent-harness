@@ -1156,6 +1156,63 @@ class ApprovalResolution(unittest.TestCase):
 SID_, UID_ = ApprovalResolution.SID, ApprovalResolution.UID
 
 
+class SessionJobs(KillBase):
+    """goodqa#16374 AC-3e: a background job the caller's own session started (its environment carries the caller's
+    CLAUDE_CODE_SESSION_ID and CLAUDE_PID, and it hangs under that live claude process) is stopped without
+    --foreign, audited as session-job with an info notice. Everything else keeps its refusal (NEG-11)."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["CLAUDE_PID"] = "3000"
+        self.addCleanup(os.environ.pop, "CLAUDE_PID", None)
+
+    def job(self, env=("sess-1", 3000), ppid=4100, chain=True, cmd="/usr/bin/python3 archive_push.py --id x"):
+        extra = [proc(1300, ppid, cmd=cmd)]
+        if chain:
+            extra.append(proc(4100, 3000, cmd="/bin/zsh -c run", comm="/bin/zsh"))
+        probe = self.base(*extra)
+        probe.cwds = {1300: "/Users/u/.agent-harness/work/sess-1/mac-cleanup"}
+        probe.claude_env = lambda pid: env if pid == 1300 else (None, None)
+        return probe
+
+    def test_own_session_background_job_is_stopped_without_foreign(self):
+        probe = self.job()
+        out = self.run_kill(probe, [1300], reason="own archive job stuck")
+        self.assertEqual(out["results"][0]["status"], "exited", out)
+        intent = self.audit()[0]
+        self.assertEqual(intent["scope"], "session-job")
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(self.notices[0]["severity"], "info")
+        self.assertEqual(self.notices[0]["key"], "ah-kill:session-job:sess-1")
+
+    def test_other_session_or_other_claude_process_stays_foreign(self):
+        for env in (("sess-2", 3000), ("sess-1", 3999), (None, None), ("sess-1", None)):
+            with self.subTest(env=env):
+                probe = self.job(env=env)
+                out = self.run_kill(probe, [1300])
+                self.assertEqual(out["results"][0]["status"], "refused", out)
+                self.assertIn("--foreign", out["results"][0]["detail"])
+                self.assertEqual(probe.sent, [])
+
+    def test_a_job_outside_the_claude_process_tree_stays_foreign(self):
+        probe = self.job(ppid=1, chain=False)
+        out = self.run_kill(probe, [1300])
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+        self.assertEqual(probe.sent, [])
+
+    def test_without_a_caller_claude_pid_nothing_is_a_session_job(self):
+        os.environ.pop("CLAUDE_PID", None)
+        probe = self.job()
+        out = self.run_kill(probe, [1300])
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+
+    def test_protected_and_daemon_jobs_keep_their_refusal(self):
+        probe = self.job(cmd="rclone sync /a b:")
+        out = self.run_kill(probe, [1300])
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+        self.assertRegex(out["results"][0]["detail"], "daemon|protected")
+
+
 class ApprovedByGuard(unittest.TestCase):
     A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --approved-by wa1b2c3d4e5f"
 

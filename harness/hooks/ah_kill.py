@@ -169,6 +169,25 @@ class Probe:
         m = SESSION_ENV.search(out)
         return m.group(1) if m else None
 
+    def claude_env(self, pid: int):
+        """(CLAUDE_CODE_SESSION_ID, CLAUDE_PID as int) from a process's environment, (None, None) when unreadable.
+        Linux reads /proc/<pid>/environ exactly; macOS reads `ps eww` (own processes only) and takes the LAST
+        occurrence, since the environment follows the arguments."""
+        text = ""
+        try:
+            if sys.platform.startswith("linux"):
+                with open("/proc/%d/environ" % pid, "rb") as handle:
+                    text = "\n".join(handle.read(1 << 20).decode("utf-8", "replace").split("\x00"))
+            else:
+                r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
+                                   timeout=8, env=dict(os.environ, LC_ALL="C"))
+                text = r.stdout
+        except (OSError, subprocess.SubprocessError):
+            return None, None
+        sessions = SESSION_ENV.findall(text)
+        pids = re.findall(r"(?:^|[\s])CLAUDE_PID=([0-9]{1,10})(?=\s|$)", text)
+        return (sessions[-1] if sessions else None), (int(pids[-1]) if pids else None)
+
     def cpu(self, pid: int):
         """Current %CPU as a float, or None."""
         out = self._ps("%cpu", pid=pid).strip()
@@ -415,6 +434,29 @@ def in_own_scope(probe, table, pid, cwd, roots, worktree):
     return bool(worktree and cwd and probe.git_top(cwd) == worktree)
 
 
+def session_job(probe, table, pid, scope):
+    """goodqa#16374 AC-3e: True when `pid` is a background job of the caller's own session: its environment carries
+    the caller's CLAUDE_CODE_SESSION_ID and CLAUDE_PID, and it descends in the process table from that live claude
+    process. The env carries no agent id, so this is session ownership, not per-owner: such stops raise an info
+    notice. The claude process itself and the caller's ancestors are protected before this is reached."""
+    session, claude_pid = scope.get("session"), scope.get("claude_pid")
+    getter = getattr(probe, "claude_env", None)
+    if not session or not claude_pid or getter is None:
+        return False
+    if tuple(getter(pid)) != (session, claude_pid):
+        return False
+    seen, cur = set(), pid
+    for _ in range(64):
+        cur = table.get(cur)
+        if cur == claude_pid:
+            info = probe.info(claude_pid)
+            return bool(info) and is_session_process(info)
+        if not cur or cur <= 1 or cur in seen:
+            return False
+        seen.add(cur)
+    return False
+
+
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 
@@ -584,6 +626,9 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
             probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]) and (
             pid, spawn_start(probe, pid)) in scope["session_spawns"]:
         rec["scope"] = "session-spawn"  # spawned by a worktree in main's session work dir: audited, no notice
+    elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]) \
+            and session_job(probe, table, pid, scope):
+        rec["scope"] = "session-job"  # a background job of the caller's own session: audited, info notice
     elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
         rec["scope"] = "foreign"
         if not scope["foreign"]:
@@ -645,8 +690,10 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     roots = {own_pid}
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
+    claude_pid = os.environ.get("CLAUDE_PID", "")
     scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
-             "session_spawns": session_spawns(home, session_dir) if session_dir else set()}
+             "session_spawns": session_spawns(home, session_dir) if session_dir else set(),
+             "session": session or None, "claude_pid": int(claude_pid) if claude_pid.isdigit() else None}
     if approved_by:
         scope["approval"] = (approval_resolver or resolve_approval)(approved_by, session, home)
         scope["now"] = time.time() if now is None else now
@@ -690,6 +737,23 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
         except Exception as error:  # an approved stop without its notice is not allowed
             audit.row({"event": "aborted", "run": run_id, "why": "ops-watch notice failed: %s" % type(error).__name__})
             raise KillError("notice_failed", "could not raise the ops-watch notice for an approved stop; nothing was signalled", 3)
+    session_live = [r for r in live if r.get("scope") == "session-job"]
+    if session_live:
+        # goodqa#16374 AC-3e: the session's own background job, possibly a sibling owner's: info, one row per session
+        event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info", "check": "ah-kill",
+                 "key": "ah-kill:session-job:" + _who(session, agent),
+                 "message": "ah kill stopped/will stop %d background job(s) of this session outside the caller's tree: "
+                            "%s (reason: %s)" % (len(session_live), ", ".join(str(r["pid"]) for r in session_live),
+                                                 _clip(reason, 120)),
+                 "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "targets": [
+                     {"pid": r["pid"], "cmd": _clip(r["cmd"], 120), "cwd": r["cwd"], "start": r.get("start")}
+                     for r in session_live]}}
+        try:
+            (notify or _ops_notice)(home, event)
+        except Exception as error:  # noqa: BLE001 - a session-job stop without its notice is not allowed
+            audit.row({"event": "aborted", "run": run_id, "why": "ops-watch notice failed: %s" % type(error).__name__})
+            raise KillError("notice_failed", "could not raise the ops-watch notice for a session-job stop; nothing "
+                            "was signalled", 3)
     foreign_live = [r for r in live if r.get("foreign")]
     if foreign_live:
         # Stopping the caller's OWN session's processes outside its tree is info; another owner's stays high. One
