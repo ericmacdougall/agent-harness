@@ -18,11 +18,16 @@ REVIEW = ["tests.test_ahc_contracts.ReviewTests"]
 SM = ["tests.test_ahc_runner.StateMachineTests"]
 TIMEOUT = float(os.environ.get("AHC_VARIANT_TIMEOUT", "900"))   # seconds per variant; a timeout is inconclusive
 V = [
+    # anchors follow c21eb32a (v5): spec_core sits in the binding, the key lookup and the unique key with item and round
     ("Q-A6: spec_core dropped from the row id and the unique key", [
-        ('        if kind == "spec":       # code rows keep their pre-Q-A6 ids\n            binding["spec_core"] = '
-         'spec_core\n', ""),
-        ("  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, spec_core));",
-         "  UNIQUE(kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision));")], CONTRACTS, REVIEW),
+        ('                   "spec_core": spec_core, "round": round}\n', '                   "round": round}\n'),
+        ('"AND packet_sha256=? AND policy_revision=? AND spec_core=? AND round=?",\n',
+         '"AND packet_sha256=? AND policy_revision=? AND round=?",\n'),
+        ("policy_revision,\n                 spec_core, round)).fetchone()",
+         "policy_revision,\n                 round)).fetchone()"),
+        ("  UNIQUE(item, kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, spec_core, round));",
+         "  UNIQUE(item, kind, repo, pr, head, snapshot_base, packet_sha256, policy_revision, round));")],
+     CONTRACTS, REVIEW),
     ("Q-A6: R11 does not compare the attach record's core", [
         ('            want["spec_core"] = row["spec_core"]\n            got["spec_core"] = receipt.get("spec_core")\n',
          "            pass\n")], CONTRACTS, REVIEW),
@@ -46,11 +51,14 @@ V = [
         ('SPEC_CORE_SHA256 = "0130008d', 'SPEC_CORE_SHA256 = "a320dda4')], CONTRACTS, TABLES),
     # WorkItem transition function (StateMachineTests)
     ("T7 dropped: an unsettled Effect does not stop any row", [
-        ("            if unsettled and row_id not in self.T7_ALLOWED:\n", "            if False:\n")],
+        # anchor includes wi_move's raise: since 16c34359 the dry move check repeats the condition
+        ("            if unsettled and row_id not in self.T7_ALLOWED:\n                raise ContractError(\"T7: %s waits while the item's Effect is unsettled\" % row_id)\n",
+         "            if False:\n                raise ContractError(\"T7: %s waits while the item's Effect is unsettled\" % row_id)\n")],
      CONTRACTS, SM),
     ("T7 as a block-list of the rows it names as waiting (lets W15 and W20 through)", [
-        ("            if unsettled and row_id not in self.T7_ALLOWED:\n",
-         '            if unsettled and row_id in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):\n')],
+        ("            if unsettled and row_id not in self.T7_ALLOWED:\n                raise ContractError(\"T7: %s waits while the item's Effect is unsettled\" % row_id)\n",
+         '            if unsettled and row_id in ("W4", "W5", "W13", "W14", "W17", "W18", "W27"):\n'
+         '                raise ContractError("T7: %s waits while the item\'s Effect is unsettled" % row_id)\n')],
      CONTRACTS, SM),
     ("note 8: absent-proven treated as settled", [
         ('    T7_UNSETTLED = ("dispatched", "outcome-unknown", "held", "fenced", "absent-proven")\n',
@@ -127,8 +135,9 @@ V = [
         ("            if row_id == \"W6\" and self.MIRROR_CAUSE in (item[\"cause\"] or \"\").split(\"; \") \\\n",
          "            if row_id == \"W6\" and self.MIRROR_CAUSE == (item[\"cause\"] or \"\") \\\n")], CONTRACTS, SM),
     ("AC-18: W21's authority line keyed per call, so a crash retry writes a second line", [
-        ("                self.authority.append({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",",
-         "                self.authority.append({\"event_id\": event_id + os.urandom(4).hex(), \"item\": iid, \"row\": \"W21\",")],
+        # anchor follows 324fe2ad: _w21_record writes the line with its (item, B, seq) event id
+        ("        self.authority.append({\"event_id\": aev, \"item\": item[\"id\"], \"row\": \"W21\",",
+         "        self.authority.append({\"event_id\": aev + os.urandom(4).hex(), \"item\": item[\"id\"], \"row\": \"W21\",")],
      CONTRACTS, ["tests.test_ahc_crash.CrashPointTests"]),
     ("T6: a replay on another item is accepted as a no-op", [
         ('                if prior[0] == "work_item" and prior[1] == iid and data.get("row") == row_id:\n',
@@ -159,8 +168,8 @@ V = [
         ("        if str(obs.get(\"repo\", \"\")).lower() != item[\"repo\"] or obs.get(\"pr\") != item[\"pr\"]:\n",
          "        if False:\n")], CONTRACTS, SM),
     ("W18: the caller's 'explained' flag is trusted", [
-        ("        elif row_id == \"W18\" and not self.db.execute(\n",
-         "        elif row_id == \"W18\" and not obs.get(\"explained\") and not self.db.execute(\n")], CONTRACTS, SM),
+        ("        if row_id == \"W18\" and not self.db.execute(\n",
+         "        if row_id == \"W18\" and not obs.get(\"explained\") and not self.db.execute(\n")], CONTRACTS, SM),
     ("W4: the old Review rows are left open", [
         ("            self.supersede_reviews(item[\"repo\"], item[\"pr\"], new[\"head\"],\n",
          "            (lambda *a: None)(item[\"repo\"], item[\"pr\"], new[\"head\"],\n")], CONTRACTS, SM),
@@ -234,19 +243,22 @@ V = [
         ("            if iid in observations and not self.elig(item, observations[iid], skip=(\"e10\",)):\n",
          "            if iid in observations and not self.elig(item, observations[iid]):\n")], CONTRACTS, SM),
     ("W21: taken by an item that is not the queue head", [
-        ("            if self.queue_head(item[\"repo\"], queue) != item[\"id\"]:\n", "            if False:\n")],
+        ("        if self.queue_head(item[\"repo\"], queue) != item[\"id\"]:\n", "        if False:\n")],
      CONTRACTS, SM),
     ("W21: a second update at the same B", [
-        ("            if item[\"w21_base\"] == o[\"tip\"]:\n", "            if False:\n")], CONTRACTS, SM),
+        ("            if self.db.execute(\"SELECT 1 FROM w21_sends WHERE item=? AND base=? AND state != 'cancelled'\",\n",
+         "            if False and self.db.execute(\"SELECT 1 FROM w21_sends WHERE item=? AND base=? AND state != 'cancelled'\",\n")],
+     CONTRACTS, SM),
     ("W21: no authority log line first", [
-        ("                self.authority.append({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",",
-         "                (lambda r: None)({\"event_id\": event_id, \"item\": iid, \"row\": \"W21\",")], CONTRACTS, SM),
+        ("        self.authority.append({\"event_id\": aev, \"item\": item[\"id\"], \"row\": \"W21\",",
+         "        (lambda r: None)({\"event_id\": aev, \"item\": item[\"id\"], \"row\": \"W21\",")], CONTRACTS, SM),
     ("T7 precedence: G8 and G9 outrank the WorkItem rows", [
         ('    T7_ORDER = ("W4", "W13", "W14", "W18", "W19", "W17", "G8", "G9")\n',
          '    T7_ORDER = ("G8", "G9", "W4", "W13", "W14", "W18", "W19", "W17")\n')], CONTRACTS, SM),
     # PR 268 v1 receipt findings F1-F4
     ("PR268 F1: e2 ignores the policy revision (old pass counts after W27)", [
-        ('"AND policy_revision=? AND packet_sha256=?",', '"AND ? IS NOT NULL AND packet_sha256=?",')],
+        ('"AND policy_revision=? AND packet_sha256=?" + self.LATEST_ROUND,',
+         '"AND ? IS NOT NULL AND packet_sha256=?" + self.LATEST_ROUND,')],
      CONTRACTS, SM),
     ("PR268 F2: the successor drops red_team", [
         ('red_team=bool(item["red_team"]))', 'red_team=False)')], CONTRACTS, SM),
