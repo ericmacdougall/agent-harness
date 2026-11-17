@@ -36,6 +36,16 @@ class VariantHarnessTests(unittest.TestCase):
                 for dotted in entry["tests"]:
                     self.assertRegex(dotted, r"^tests\.test_ahc\w*\.\w+\.test_\w+$")
 
+    def test_slice1b_the_script_entry_point_runs_after_every_entry_is_registered(self):
+        """An ENTRIES.update placed after `if __name__ == "__main__"` is seen on import (so the anchor test passes)
+        but never by the harness run itself, which exits first: its mutants would be claimed and never run."""
+        import ast  # noqa: PLC0415
+        tree = ast.parse(HARNESS.read_text(encoding="utf-8"))
+        last = tree.body[-1]
+        self.assertIsInstance(last, ast.If, "the script entry point is the module's last statement")
+        self.assertIn("__main__", ast.dump(last.test))
+        self.assertEqual(sum(isinstance(n, ast.If) and "__main__" in ast.dump(n.test) for n in tree.body), 1)
+
     def test_slice1b_every_mutation_anchor_is_in_its_file_exactly_once(self):
         """A stale anchor stops the whole harness run (SystemExit); catch it in the focused suite instead."""
         h = _load()
