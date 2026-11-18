@@ -1438,6 +1438,10 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", "task.register: session id is malformed")
         if not re.fullmatch(r"[A-Za-z0-9]{1,40}|main", args["owner_agent"]):
             raise AhError("bad_request", "task.register: owner_agent must be an agent id or 'main'")
+    elif op == "chat.send":
+        need("client_msg_id", "body_sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", args["body_sha256"]) or bool(args.get("with")) == bool(args.get("conversation")):
+            raise AhError("bad_request", "chat.send: a body hash and exactly one of with or conversation are required")
     elif op == "task.status":
         need("task", "stage", "note")
         if args.get("ticket"):
@@ -1933,6 +1937,8 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         out["wal"] = wid
     elif op == "ticket.comment":
         comment(args["ticket"], args["body"])
+    elif op == "chat.send":
+        pass  # the send already happened (ah_chat.send); this row is its ledger and audit record: ids, hash, length, no text
     elif op in ("alert.raise", "alert.clear"):
         # The ops-watch ring is the one alert channel (goodqa#14591); emit() redacts and fsyncs. host is the short
         # hostname, as ahd.host(), because ahd diffs its desired alerts against this host's ring entries.
@@ -3558,6 +3564,29 @@ def build_parser():
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
     u.add_argument("--recent", type=int)
     u.add_argument("--full", action="store_true")
+    ch = sub.add_parser("chat", help="read (and, with send, post) your own GoodQA chat through the user token (goodqa#16396)")
+    chs = ch.add_subparsers(dest="sub", required=True)
+    for name in ("probe", "history", "files", "send"):
+        c = chs.add_parser(name)
+        c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
+        if name == "probe":
+            continue
+        c.add_argument("--org", help="organization id (default: org in browser-defaults.json)")
+        c.add_argument("--conversation", help="conversation id")
+        if name in ("history", "send"):
+            c.add_argument("--with", dest="with_user", help="user id, or a member's exact name")
+        if name == "history":
+            c.add_argument("--limit", type=int, default=30)
+            c.add_argument("--after")
+            c.add_argument("--before")
+            c.add_argument("--no-text", action="store_true", help="ids, authors and times only; no message text")
+        if name == "files":
+            c.add_argument("--surface", help="file_list surface (see `ah chat probe`)")
+        if name == "send":
+            c.add_argument("--body-file", required=True)
+            c.add_argument("--client-msg-id", help="required: your idempotency id for this message")
+            c.add_argument("--confirm-not-delivered", action="store_true",
+                           help="re-send an attempt whose outcome was unknown, after checking `history` that it did not arrive")
     t = sub.add_parser("ticket")
     ts = t.add_subparsers(dest="sub", required=True)
     g = ts.add_parser("get")
@@ -3775,6 +3804,20 @@ def run(args, home: Path) -> dict:
         return user_msgs(home, s, text=args.search, recent=args.recent, full=args.full)
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
+    if cmd == "chat":
+        import ah_chat  # noqa: PLC0415
+        try:
+            if args.sub == "probe":
+                return ah_chat.probe(args.base)
+            if args.sub == "history":
+                return ah_chat.history(home, args.conversation, args.with_user, args.org, args.limit, args.no_text,
+                                       args.after, args.before, args.base)
+            if args.sub == "files":
+                return ah_chat.files(home, args.conversation, args.org, args.surface, args.base)
+            return ah_chat.send(home, args.with_user, args.org, args.body_file, args.client_msg_id,
+                                args.confirm_not_delivered, args.base, args.conversation)
+        except ah_chat.ChatError as e:
+            raise AhError(e.code, str(e), e.exit_code)
     if cmd == "ticket":
         if args.sub == "create":
             import ah_ticket
