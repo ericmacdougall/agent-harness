@@ -840,9 +840,15 @@ class UploadScale(UploadBase):
 
     def peak(self, root):
         import tracemalloc
+        # tracing makes the stat pass several times slower, so the approve-time headroom rule (checked untraced
+        # below) is relaxed for the memory measurement only
+        relaxed = copy.deepcopy(self.policy)
+        relaxed['marker']['hook_recheck_seconds'] = 600.0
         tracemalloc.start()
         try:
-            entry = self.approve(path=root, remote='dropbox:backups/mac/%s.tar.zst' % root.name)
+            with mock.patch.object(cg, 'RECHECK_SECONDS_PER_ENTRY', 1e-2):
+                entry = cg.approve_delete_upload(str(root), 'dropbox:backups/mac/%s-traced.tar.zst' % root.name,
+                                                 transport=self.transport(), home=str(self.home), policy=relaxed)
             return entry, tracemalloc.get_traced_memory()[1]
         finally:
             tracemalloc.stop()
@@ -860,6 +866,8 @@ class UploadScale(UploadBase):
               % (peak_small / 2 ** 20, peak_large / 2 ** 20, growth / 2 ** 20))
         # an entry list costs about 400 bytes per entry: 80,000 more entries would add about 30 MiB
         self.assertLess(growth, 8 << 20)
+        # untraced, with the real rule: a 100,000-entry tree's stat pass leaves the hook its 2x headroom
+        entry_large = self.approve(path=large, remote='dropbox:backups/mac/%s.tar.zst' % large.name)
         started = time.monotonic()
         self.assertTrue(cg.marker_covers(str(large), home=str(self.home)))
         took = time.monotonic() - started
@@ -955,6 +963,7 @@ class HookRecheckBudget(UploadBase):
             code, message = self.hook('rm -rf %s/%s; ' % (self.alias(), unit.name) + '; '.join(['true'] * 300),
                                       self.small_budget(4.0))
         self.assertEqual(code, 0, message)
+        self.assertNotIn('unanalysable', message)  # charged to the analysis budget, the rest would go unanalysed
 
     def test_approvals_that_do_not_fit_block_and_say_so(self):
         alias = self.alias()

@@ -7918,9 +7918,6 @@ class Approvals:
         self.recheck_spent = 0.0  # goodqa#16374 D1: every re-check of one command shares one budget
         self.recheck_exhausted = False
         self.consulted = False  # an approval matched a path of this command (a timeout then blocks)
-        # one absolute deadline, so no re-check depends on the analyser's alarm (substitute review r4 F1)
-        self.recheck_deadline = time.monotonic() + float(self.limits.get('hook_recheck_seconds',
-                                                                         HOOK_RECHECK_SECONDS))
 
     def __call__(self, path):
         return self.covers(path)
@@ -7959,7 +7956,7 @@ class Approvals:
                     recorded = int(entry.get('stat_entries') or 0)
                     cap = float(self.limits.get('hook_recheck_seconds', HOOK_RECHECK_SECONDS))
                     started = time.monotonic()
-                    budget = min(cap - self.recheck_spent, self.recheck_deadline - started)
+                    budget = cap - self.recheck_spent  # each re-check has its own deadline, never the alarm (r4 F1)
                     own = recheck_seconds(recorded, cap) if recorded else float(self.limits['max_walk_seconds'])
                     if budget <= 0:
                         self.recheck_exhausted = True
