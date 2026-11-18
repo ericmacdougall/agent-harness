@@ -1,4 +1,5 @@
-"""ah chat (goodqa#16396): read and send the user's own GoodQA chat through two separate tokens.
+"""ah chat (goodqa#16396): read the user's own GoodQA chat through two separate tokens. Read only: `send` is deferred to
+goodqa#16399 and must be refused before anything is read or sent.
 
 Every test runs the real `ah.py chat ...` CLI as a subprocess with HOME and AH_HOME in a temporary directory that holds two
 sentinel tokens (the user token and the dedicated dm-read token), against a loopback stub of the GoodQA MCP endpoint. The real
@@ -11,7 +12,6 @@ and a test removes them to prove the client fails loudly instead of answering an
 
 Run: python3 -I -m unittest tests.test_ah_chat   (or python3 -I tests/test_ah_chat.py)
 """
-import hashlib
 import json
 import os
 import subprocess
@@ -22,7 +22,6 @@ import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 AH = HOOKS / "ah.py"
@@ -67,18 +66,6 @@ def ok(data):
 def tool_error(code):
     return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [{"type": "text", "text": json.dumps(
         {"data": {"error": {"code": code, "message": "echo " + USER_SENTINEL}}})}]}}
-
-
-def request_of(base, target, body_text):
-    """The send-file request fingerprint ah_chat computes since r5: the destination, the target and the body's SHA-256. A
-    loopback stub base is already in normal form."""
-    digest = hashlib.sha256(body_text.encode()).hexdigest()
-    return hashlib.sha256(json.dumps({"base": base, "target": target, "body": digest}, sort_keys=True).encode()).hexdigest()
-
-
-def http_error(status, code=None):
-    """An HTTP error answer, with a machine code in the body when one is given (the server's {error: {code, message}})."""
-    return "raw", status, json.dumps({"error": {"code": code, "message": "echo"}} if code else {}).encode()
 
 
 def rpc_error():
@@ -175,8 +162,6 @@ class Base(unittest.TestCase):
             "list_direct_conversation_files": lambda a: ok(FILE_PAGE),
             "list_orgs": lambda a: ok({"orgs": [{"id": ORG, "name": "Org"}]}),
         })
-        self.body = self.home / "body.txt"
-        self.body.write_text("Thanks, I will look at this tomorrow.\n")
 
     def defaults(self, allowed, org=ORG):
         path = self.home / ".config" / "goodqa" / "browser-defaults.json"
@@ -206,7 +191,7 @@ class Base(unittest.TestCase):
                 self.assertNotIn(sentinel, p.stderr)
                 self.assertNotIn(sentinel[5:20], p.stdout + p.stderr)
         for path in self.home.rglob("*"):
-            if path.is_file() and path not in (*self.token_files, self.body):  # the body file is the test's own input
+            if path.is_file() and path not in self.token_files:
                 for sentinel in (USER_SENTINEL, DM_SENTINEL):
                     self.assertNotIn(sentinel, path.read_bytes().decode("latin-1"), str(path))
 
@@ -243,6 +228,15 @@ class ReadTests(Base):
             self.assertEqual((data["ok"], data["code"]), (False, "ambiguous"), paged)
         self.assertEqual(self.stub.sent("get_direct_messages"), [])
         self.assertTrue(self.out("history", "--with", PEER)["ok"])
+
+    def test_flat_member_rows_use_the_user_id_not_the_membership_id(self):
+        # a flat member row carries the membership's own id beside userId; the DM must be read with the user id
+        self.stub.tools["list_org_members"] = lambda a: ok({"members": [
+            {"id": "99999999-9999-4999-8999-999999999999", "userId": PEER, "name": "Una Unique"}]})
+        data = self.out("history", "--with", "Una Unique", "--org", ORG)
+        self.assertTrue(data["ok"])
+        self.assertEqual((data["with"], data["with_name"]), (PEER, "Una Unique"))  # the person sees who the name resolved to
+        self.assertEqual(self.stub.sent("get_direct_messages")[0][1]["userId"], PEER)
 
     def test_history_by_conversation_reads_by_id_with_the_real_conversation_shape(self):
         # B2: the old client looked for a conversationId on a get_direct_messages row; the server's row has none
@@ -454,312 +448,14 @@ class TokenSourceTests(Base):
         self.assertTrue(self.out("history", "--conversation", CONV)["ok"])
         self.assertEqual(self.stub.calls[-1][2], SCHEME + DM_SENTINEL)
 
-    def test_a_send_uses_the_user_token_and_never_the_dm_token(self):
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000001"}})
-        data = self.out("send", "--with", PEER, "--org", ORG, "--body-file", str(self.body), "--client-msg-id", "send-0001-aaaa")
-        self.assertTrue(data["ok"])
-        self.assertEqual({c[2] for c in self.stub.calls}, {SCHEME + USER_SENTINEL})
-        self.assert_no_token()
-
-    def test_a_send_without_a_user_token_is_refused_even_though_a_dm_token_exists(self):
-        self.user_file.unlink()
-        data = self.out("send", "--with", PEER, "--org", ORG, "--body-file", str(self.body), "--client-msg-id", "send-0001-aaaa")
-        self.assertEqual((data["ok"], data["code"]), (False, "refused"))
-        self.assertEqual(self.stub.hits, [])
-
-    def test_a_body_holding_the_dm_token_is_refused(self):
-        # the whole token, then a bare 14-character piece that no secret shape and not the user-token check can recognise
-        for text in ("here: " + DM_SENTINEL, "note " + DM_SENTINEL[8:22] + " end"):
-            self.body.write_text(text)
-            data = self.out("send", "--with", PEER, "--org", ORG, "--body-file", str(self.body), "--client-msg-id", "send-0001-aaaa")
-            self.assertEqual(data["code"], "secret_refused", text)
-        self.assertEqual(self.stub.calls, [])
-        self.assert_no_token()
-
-
-class SendTests(Base):
-    def setUp(self):
-        super().setUp()
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000001"}})
-        self.stub.tools["chat_channel_post"] = lambda a: ok({"message": {"id": "msg-000002"}})
-        self.args = ["send", "--with", PEER, "--org", ORG, "--body-file", str(self.body), "--client-msg-id", "send-0001-aaaa"]
-
-    def ledger(self):
-        path = self.home / ".agent-harness" / "state" / "ah" / "store" / "ledger.jsonl"
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
-
-    def body_args(self, path):
-        args = list(self.args)
-        args[args.index("--body-file") + 1] = path
-        return args
-
-    def with_id(self, args, cid):
-        args = list(args)
-        args[args.index("--client-msg-id") + 1] = cid
-        return args
-
-    # NEG-3
-    def test_send_without_a_client_msg_id_is_refused_and_nothing_is_sent(self):
-        data = self.out("send", "--with", PEER, "--body-file", str(self.body))
-        self.assertEqual((data["ok"], data["code"]), (False, "client_msg_id_required"))
-        self.assertEqual(self.stub.calls, [])
-
-    def test_a_body_with_a_secret_shape_or_the_token_is_refused(self):
-        # built at run time so no secret-shaped literal sits in the repository (the ahc scan reads source text)
-        for text in ("here: " + USER_SENTINEL, "key sk" + "-ant-api03-abcdefghijklmnop", "gh" + "p_" + "a" * 30, SCHEME + "x" * 30,
-                     "-----BEGIN RSA PRIV" + "ATE KEY-----", "bt_" + "kp_" + "z" * 20):
-            self.body.write_text(text)
-            p = self.ah(*self.args)
-            self.assertEqual(json.loads(p.stdout)["code"], "secret_refused", text)
-            self.assert_no_token(p)
-        self.assertEqual(self.stub.sent("send_direct_message"), [])
-
-    def test_a_token_file_itself_cannot_be_the_body(self):
-        copy = self.home / "copy.txt"
-        copy.write_text(USER_SENTINEL)
-        for path, code in ((self.user_file, "bad_request"), (self.dm_file, "bad_request"), (copy, "secret_refused")):
-            data = self.out("send", "--with", PEER, "--org", ORG, "--body-file", str(path), "--client-msg-id", "send-0001-aaaa")
-            self.assertEqual(data["code"], code, str(path))  # a dot directory, then the content check
-        self.assertEqual(self.stub.calls, [])
-
-    def test_dot_files_and_fifos_cannot_be_the_body(self):
-        env_file = self.home / ".env"
-        env_file.write_text("DB_HOST=localhost\n")
-        fifo = self.home / "pipe.txt"
-        os.mkfifo(fifo)
-        for path in (env_file, fifo):
-            self.assertEqual(self.out(*self.body_args(str(path)))["code"], "bad_request", path.name)  # no hang
-        self.assertEqual(self.stub.calls, [])
-
-    def netrc_like_file(self):
-        """A credential file that matches no secret shape: only the path rules can keep it out of a message."""
-        hidden = self.home / ".fakecreds"
-        hidden.mkdir()
-        target = hidden / "netrc"
-        target.write_text("machine example.test login pat password hunter2hunter2\n")
-        return hidden, target
-
-    def test_a_symlinked_directory_cannot_reach_a_dot_directory(self):
-        hidden, target = self.netrc_like_file()
-        work = self.home / ".agent-harness" / "work" / "s"
-        work.mkdir(parents=True)
-        (work / "d").symlink_to(hidden)
-        plain = self.home / "plain"
-        plain.symlink_to(hidden)
-        for path in (work / "d" / "netrc", plain / "netrc"):
-            data = self.out(*self.body_args(str(path)))
-            self.assertEqual((data["ok"], data["code"]), (False, "bad_request"), str(path))  # the path rule, not the content check
-        self.assertEqual(self.stub.calls, [])
-
-    def test_a_hard_link_to_a_credential_file_is_refused(self):
-        hidden, target = self.netrc_like_file()
-        link = self.home / "innocent.txt"
-        os.link(target, link)
-        data = self.out(*self.body_args(str(link)))
-        self.assertEqual((data["ok"], data["code"]), (False, "bad_request"))
-        self.assertIn("hard link", data["message"])
-        self.assertEqual(self.stub.calls, [])
-
-    def test_a_file_swapped_after_the_path_check_is_refused(self):
-        sys.path.insert(0, str(HOOKS))
-        import ah_chat  # noqa: PLC0415
-        real = os.lstat(self.body)
-        swapped = os.stat_result((real.st_mode, real.st_ino + 1, real.st_dev, real.st_nlink, real.st_uid, real.st_gid,
-                                  real.st_size, 0, 0, 0))
-        self.assertTrue(ah_chat._read_body(str(self.body)).startswith("Thanks"))
-        with mock.patch("os.lstat", return_value=swapped):
-            with self.assertRaises(ah_chat.ChatError) as caught:
-                ah_chat._read_body(str(self.body))
-        self.assertIn("changed while it was opened", str(caught.exception))
-
-    def test_a_server_message_id_holding_a_token_is_never_written_or_printed(self):
-        # the id matches the permissive id pattern, so only the credential check before persistence can stop it
-        for sentinel in (USER_SENTINEL, DM_SENTINEL):
-            for conv in (False, True):
-                self.stub.tools["send_direct_message"] = lambda a, s=sentinel: ok({"message": {"id": s}})
-                self.stub.tools["chat_channel_post"] = lambda a, s=sentinel: ok({"message": {"id": s}})
-                cid = "send-echo-%d-%s" % (conv, sentinel[13:17])
-                args = ["send", "--conversation", CONV] if conv else ["send", "--with", PEER, "--org", ORG]
-                p = self.ah(*args, "--body-file", str(self.body), "--client-msg-id", cid)
-                self.assertEqual(json.loads(p.stdout)["code"], "unexpected_response", (sentinel, conv))
-                self.assert_no_token(p)  # stdout, stderr and every file under the home, send file and ledger included
-                rows = (self.home / ".agent-harness" / "state" / "ah" / "chat-send.jsonl").read_text()
-                self.assertIn('"uncertain"', rows)
-                self.assertNotIn('"sent"', rows)
-
-    def test_a_channel_send_without_an_acknowledged_message_id_is_not_sent(self):
-        for n, answer in enumerate(({"status": "approval_required"}, {}, {"message": {}}, {"message": {"id": "bad id!"}})):
-            self.stub.tools["chat_channel_post"] = lambda a, answer=answer: ok(answer)
-            args = ["send", "--conversation", CONV, "--body-file", str(self.body), "--client-msg-id", "send-chan-%04d-x" % n]
-            first = self.out(*args)
-            self.assertEqual((first["ok"], first["code"]), (False, "unexpected_response"), answer)
-            self.assertNotIn("sent", first)
-            again = self.out(*args)  # a retry is allowed for a channel (the server dedupes) but must not claim delivery
-            self.assertEqual(again["ok"], False, answer)
-            self.assertNotEqual(again.get("result"), "duplicate", answer)
-        rows = (self.home / ".agent-harness" / "state" / "ah" / "chat-send.jsonl").read_text()
-        self.assertNotIn('"sent"', rows)
-
-    def test_the_harness_work_directory_is_still_a_valid_place_for_a_body(self):
-        work = self.home / ".agent-harness" / "work" / "s"
-        work.mkdir(parents=True)
-        (work / "msg.txt").write_text("Thanks, noted.\n")
-        self.assertTrue(self.out(*self.body_args(str(work / "msg.txt")))["ok"])
-
-    def test_a_timeout_text_error_may_have_delivered_so_it_is_not_retried_blindly(self):
-        def timed_out(a):
-            return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [
-                {"type": "text", "text": "MCP error -32001: Request timed out"}]}}
-        self.stub.tools["send_direct_message"] = timed_out
-        self.assertEqual(self.out(*self.args)["code"], "tool_error")
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000004"}})
-        self.assertEqual(self.out(*self.args)["code"], "uncertain")
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
-
-    def test_only_a_definite_refusal_lets_the_same_id_post_again(self):
-        """M1 and M3: each failure the first attempt can end in, then the same --client-msg-id again."""
-        cases = [  # (name, first answer, may the same id post again?)
-            ("forbidden", lambda a: tool_error("forbidden"), True),
-            ("bad_request", lambda a: tool_error("bad_request"), True),
-            ("human_approval_required", lambda a: tool_error("human_approval_required"), True),  # the gate fires before the handler
-            ("approval_required", lambda a: tool_error("approval_required"), False),  # not shown to precede delivery: unverified
-            ("http 400", lambda a: ("raw", 400, b"{}"), True),
-            ("http 429", lambda a: ("raw", 429, b"{}"), False),
-            ("http 408", lambda a: ("raw", 408, b"{}"), False),
-            ("http 500", lambda a: ("raw", 500, b"{}"), False),
-            ("http 503", lambda a: ("raw", 503, b"{}"), False),
-            ("rpc error", lambda a: rpc_error(), False),
-            ("no answer", lambda a: "drop", False),
-        ]
-        for n, (name, first, again_ok) in enumerate(cases):
-            cid = "send-case-%02d-xx" % n
-            self.stub.tools["send_direct_message"] = first
-            self.assertFalse(self.out(*self.with_id(self.args, cid))["ok"], name)
-            before = len(self.stub.sent("send_direct_message"))
-            self.stub.tools["send_direct_message"] = lambda a, n=n: ok({"message": {"id": "msg-%06d" % (100 + n)}})
-            second = self.out(*self.with_id(self.args, cid))
-            if again_ok:
-                self.assertEqual((second["ok"], second.get("result")), (True, "sent"), name)
-                self.assertEqual(len(self.stub.sent("send_direct_message")), before + 1, name)
-            else:
-                self.assertEqual((second["ok"], second["code"]), (False, "uncertain"), name)
-                self.assertEqual(len(self.stub.sent("send_direct_message")), before, name)  # nothing was posted again
-        self.assert_no_token()
-
-    def test_a_2xx_that_names_no_message_is_not_sent(self):
-        self.stub.tools["send_direct_message"] = lambda a: ok({"status": "approval_required"})
-        self.assertEqual(self.out(*self.args)["code"], "unexpected_response")
-        self.assertEqual(self.out(*self.args)["code"], "uncertain")
-
-    def test_flat_member_rows_use_the_user_id_not_the_membership_id(self):
-        self.stub.tools["list_org_members"] = lambda a: ok({"members": [
-            {"id": "99999999-9999-4999-8999-999999999999", "userId": PEER, "name": "Una Unique"}]})
-        args = ["send", "--with", "Una Unique", "--org", ORG, "--body-file", str(self.body), "--client-msg-id", "send-0004-dddd"]
-        data = self.out(*args)
-        self.assertTrue(data["ok"])
-        self.assertEqual((data["with"], data["with_name"]), (PEER, "Una Unique"))  # the person sees who the name resolved to
-        self.assertEqual(self.stub.sent("send_direct_message")[0][1]["userId"], PEER)
-
-    def test_a_ledger_row_is_written_again_on_a_duplicate(self):
-        self.out(*self.args)
-        ledger = self.home / ".agent-harness" / "state" / "ah" / "store" / "ledger.jsonl"
-        ledger.unlink()
-        self.assertEqual(self.out(*self.args)["result"], "duplicate")
-        self.assertIn("chat.send", ledger.read_text())
-
-    def test_body_file_must_be_a_regular_non_symlink_small_utf8_file(self):
-        link = self.home / "link.txt"
-        link.symlink_to(self.body)
-        big = self.home / "big.txt"
-        big.write_text("x" * 9000)
-        empty = self.home / "empty.txt"
-        empty.write_text(" \n")
-        for path in (link, big, empty, self.home / "missing.txt"):
-            self.assertEqual(self.out(*self.body_args(str(path)))["code"], "bad_request", path.name)
-        self.assertEqual(self.stub.calls, [])
-
-    def test_send_posts_once_and_records_hash_and_length_not_text(self):
-        data = self.out(*self.args)
-        self.assertEqual((data["ok"], data["result"], data["message_id"]), (True, "sent", "msg-000001"))
-        sent = self.stub.sent("send_direct_message")
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0][1], {"orgId": ORG, "userId": PEER, "body": self.body.read_text()})
-        self.assertEqual(sent[0][2], SCHEME + USER_SENTINEL)
-        row = [r for r in self.ledger() if r.get("op") == "chat.send"][-1]
-        self.assertEqual(row["args"]["body_len"], len(self.body.read_text()))
-        self.assertEqual(len(row["args"]["body_sha256"]), 64)
-        self.assertEqual(row["args"]["with"], PEER)
-        for path in (self.home / ".agent-harness" / "state" / "ah").rglob("*"):
-            if path.is_file():
-                self.assertNotIn("tomorrow", path.read_text(errors="replace"), str(path))
-        audit = (self.home / ".agent-harness" / "state" / "ah" / "store" / "audit.jsonl").read_text()
-        self.assertIn('"op":"chat.send"', audit)
-        self.assert_no_token()
-
-    def test_the_same_client_msg_id_never_sends_twice(self):
-        self.out(*self.args)
-        again = self.out(*self.args)
-        self.assertEqual((again["ok"], again["result"], again["message_id"]), (True, "duplicate", "msg-000001"))
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
-
-    def test_the_same_id_for_a_different_message_is_a_conflict(self):
-        self.out(*self.args)
-        self.body.write_text("something else entirely")
-        self.assertEqual(self.out(*self.args)["code"], "key_conflict")
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
-
-    def test_a_lost_response_is_not_resent_blindly(self):
-        self.stub.tools["send_direct_message"] = lambda a: "drop"
-        first = self.out(*self.args)
-        self.assertEqual((first["ok"], first["code"]), (False, "unreachable"))
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000009"}})
-        second = self.out(*self.args)
-        self.assertEqual(second["code"], "uncertain")
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)  # only the lost attempt reached the stub
-        third = self.out(*self.args, "--confirm-not-delivered")
-        self.assertEqual((third["ok"], third["result"]), (True, "sent"))
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 2)
-
-    def test_a_channel_post_passes_the_client_msg_id_to_the_server(self):
-        data = self.out("send", "--conversation", CONV, "--body-file", str(self.body), "--client-msg-id", "send-0002-bbbb")
-        self.assertEqual((data["ok"], data["message_id"]), (True, "msg-000002"))
-        self.assertEqual(self.stub.sent("chat_channel_post")[0][1]["clientMsgId"], "send-0002-bbbb")
-
-    def test_malformed_client_msg_ids_and_targets_are_refused(self):
-        for cid in ("short", "has space in it", "x" * 121):
-            self.assertFalse(self.out(*self.with_id(self.args, cid))["ok"], cid)
-        self.assertFalse(self.out("send", "--body-file", str(self.body), "--client-msg-id", "send-0003-cccc")["ok"])
-        self.assertEqual(self.stub.calls, [])
-
-    def test_concurrent_sends_with_one_id_post_once(self):
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home),
-               "GQ_BROWSER_TEST_LOOPBACK": "1"}
-        procs = [subprocess.Popen([sys.executable, "-I", str(AH), "chat", *self.args, "--base", self.stub.base], env=env,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
-        results = [json.loads(p.communicate(timeout=60)[0]) for p in procs]
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
-        self.assertEqual(sorted(r["result"] for r in results), ["duplicate"] * 3 + ["sent"])
-
-
 class SweepTests(Base):
-    """PR 277 r4: every value that enters from argv, a file or the server is checked before its first sink (a request, the
-    send file, the ledger, the audit log, stdout, error text). docs/ah-chat.md holds the source-to-sink table; each test here
-    covers a pair that had no check at 9a9f152 and fails against it."""
+    """PR 277 r4, re-run for the read-only build: every value that enters from argv, a file or the server is checked before its
+    first sink (a request, the audit log, stdout, error text). docs/ah-chat.md holds the source-to-sink table."""
 
     def setUp(self):
         super().setUp()
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000001"}})
-        self.stub.tools["chat_channel_post"] = lambda a: ok({"message": {"id": "msg-000002"}})
-        self.state = self.home / ".agent-harness" / "state" / "ah"
         # built at run time so no secret-shaped literal sits in the repository (the ahc scan reads source text)
         self.shapes = ("sk" + "-ant-" + "api03-" + "q" * 12, "AK" + "IA" + "QWERTYUIOPASDFGH")
-
-    def dm(self, cid, with_=PEER, org=ORG):
-        return self.ah("send", "--with", with_, *(("--org", org) if org else ()), "--body-file", str(self.body),
-                       "--client-msg-id", cid)
-
-    def chan(self, cid, conv=CONV):
-        return self.ah("send", "--conversation", conv, "--body-file", str(self.body), "--client-msg-id", cid)
 
     @staticmethod
     def code(p):
@@ -770,52 +466,30 @@ class SweepTests(Base):
             path.write_text(value + "\n")
             path.chmod(0o600)
 
-    def assert_nowhere(self, piece, p, skip=()):
+    def assert_nowhere(self, piece, p):
         """The piece, in any letter case, is in no output and in no file the command wrote (the test's inputs excluded)."""
         low = piece.lower()
         self.assertNotIn(low, (p.stdout + p.stderr).lower())
-        inputs = {*self.token_files, self.body, self.home / ".config" / "goodqa" / "browser-defaults.json", *skip}
+        inputs = {*self.token_files, self.home / ".config" / "goodqa" / "browser-defaults.json"}
         for path in self.home.rglob("*"):
             if path.is_file() and path not in inputs:
                 self.assertNotIn(low, path.read_bytes().decode("latin-1").lower(), str(path))
 
-    # F1: a client id ending in a newline passed CLIENT_ID_RE.match, and _rows never found the earlier attempt
-    def test_a_newline_terminated_client_id_is_refused_before_any_request(self):
-        self.assertTrue(json.loads(self.dm("send-0001-aaaa").stdout)["ok"])
-        hits = len(self.stub.hits)
-        for cid in ("send-0001-aaaa\n", "send-0009-zzzz\n"):
-            for p in (self.dm(cid), self.chan(cid)):
-                self.assertEqual(self.code(p), "bad_request", repr(cid))
-        self.assertEqual(len(self.stub.hits), hits)  # nothing reached the endpoint, tools/list included
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
-        self.assertNotIn("\\n", (self.state / "chat-send.jsonl").read_text())
-
-    def test_send_file_rows_are_matched_after_json_parsing(self):
-        sys.path.insert(0, str(HOOKS))
-        import ah_chat  # noqa: PLC0415
-        path = self.home / "rows.jsonl"
-        for key in ("chat:new\nline-1", 'chat:quote"d-1', "chat:back\\slash-1", "chat:plain-key-1"):
-            ah_chat._put(path, {"key": key, "status": "sent"})
-            self.assertEqual([r["key"] for r in ah_chat._rows(path, key)], [key], repr(key))
-
     def test_newline_terminated_ids_from_argv_the_defaults_file_or_the_server_are_refused(self):
         self.stub.tools["list_org_members"] = lambda a: ok({"members": [{"userId": PEER, "name": "Una Unique"}]})
-        for p in (self.dm("send-nl-0001-a", with_=PEER + "\n"), self.dm("send-nl-0002-a", org=ORG + "\n"),
-                  self.chan("send-nl-0003-a", conv=CONV + "\n"), self.dm("send-nl-0004-a", with_="Una Unique\n"),
-                  self.ah("history", "--with", PEER + "\n"), self.ah("history", "--conversation", CONV + "\n"),
-                  self.ah("history", "--with", PEER, "--org", ORG + "\n"), self.ah("files", "--conversation", CONV + "\n"),
-                  self.ah("conversations", "--org", ORG + "\n")):
+        for p in (self.ah("history", "--with", PEER + "\n"), self.ah("history", "--conversation", CONV + "\n"),
+                  self.ah("history", "--with", "Una Unique\n"), self.ah("history", "--with", PEER, "--org", ORG + "\n"),
+                  self.ah("files", "--conversation", CONV + "\n"), self.ah("conversations", "--org", ORG + "\n")):
             self.assertFalse(json.loads(p.stdout)["ok"], p.args)
         self.assertEqual(self.stub.hits, [])
         self.defaults(allowed=[self.stub.base], org=ORG + "\n")  # browser-defaults.json
-        for p in (self.ah("history", "--with", PEER), self.dm("send-nl-0005-a", org=None), self.ah("conversations")):
+        for p in (self.ah("history", "--with", PEER), self.ah("conversations")):
             self.assertFalse(json.loads(p.stdout)["ok"], p.args)
         self.assertEqual(self.stub.hits, [])
         self.defaults(allowed=[self.stub.base])
         self.stub.tools["list_org_members"] = lambda a: ok({"members": [{"userId": PEER + "\n", "name": "Una Unique"}]})
-        for p in (self.dm("send-nl-0006-a", with_="Una Unique"), self.ah("history", "--with", "Una Unique")):  # the server
-            self.assertEqual(self.code(p), "not_found", p.args)
-        self.assertEqual(self.stub.sent("send_direct_message") + self.stub.sent("get_direct_messages"), [])
+        self.assertEqual(self.code(self.ah("history", "--with", "Una Unique")), "not_found")  # the server's id
+        self.assertEqual(self.stub.sent("get_direct_messages"), [])
 
     def test_no_text_metadata_drops_a_value_with_a_trailing_newline(self):
         evil = dict(MSG, createdAt=MSG["createdAt"] + "\n", senderId=PEER + "\n")
@@ -824,48 +498,6 @@ class SweepTests(Base):
         self.assertEqual(row.get("id"), MSG["id"])
         self.assertNotIn("createdAt", row)
         self.assertNotIn("senderId", row)
-
-    # F2: the client id reached the send file, the ledger and (channel) the request without a credential screen
-    def test_a_client_id_holding_a_token_piece_or_a_secret_shape_is_refused_before_anything(self):
-        pieces = (USER_SENTINEL[4:16], USER_SENTINEL[20:32], DM_SENTINEL[4:16].lower(), "x." + DM_SENTINEL[20:32].upper() + ".y")
-        for cid in pieces + self.shapes:
-            for p in (self.dm(cid), self.chan(cid)):
-                self.assertEqual(self.code(p), "secret_refused", cid)
-                self.assert_nowhere(cid, p)
-                self.assert_no_token(p)
-        self.assertEqual(self.stub.hits, [])
-        self.assertFalse((self.state / "chat-send.jsonl").exists())
-
-    def test_a_client_id_that_is_a_whole_token_is_refused_before_anything(self):
-        for cid in (USER_SENTINEL, DM_SENTINEL):  # the gqu_ sentinels pass the id pattern; both screens catch them
-            for p in (self.dm(cid), self.chan(cid)):
-                self.assertEqual(self.code(p), "secret_refused", cid)
-                self.assert_nowhere(cid, p)
-        # tokens that match no secret shape, so only the token-file screen (gq.holds_credential) can catch them
-        whole = ("SentinelUserWhole.q1w2e3r4t5y6u7i8", "SentinelDmWhole.a9s8d7f6g5h4j3k2")
-        self.use_tokens(*whole)
-        for cid in whole:
-            for p in (self.dm(cid), self.chan(cid)):
-                self.assertEqual(self.code(p), "secret_refused", cid)
-                self.assert_nowhere(cid, p)
-        self.assertEqual(self.stub.hits, [])
-        self.assertFalse((self.state / "chat-send.jsonl").exists())
-
-    def test_a_message_id_replayed_from_the_send_file_is_checked_again(self):
-        # a row written by a build before 9a9f152 stored the server's id unchecked; a duplicate must not relay it
-        request = request_of(self.stub.base, {"org": ORG, "with": PEER}, self.body.read_text())
-        self.state.mkdir(parents=True, exist_ok=True)
-        send_file = self.state / "chat-send.jsonl"
-        for n, stored in enumerate((USER_SENTINEL, DM_SENTINEL[20:32] + "-x") + self.shapes):
-            cid = "send-replay-%02d" % n
-            with open(send_file, "a") as handle:
-                handle.write(json.dumps({"at": 1, "key": "chat:" + cid, "status": "sent", "request": request,
-                                         "base": self.stub.base, "message_id": stored}) + "\n")
-            p = self.dm(cid)
-            data = json.loads(p.stdout)
-            self.assertEqual((data["ok"], data["result"], data["message_id"]), (True, "duplicate", None), stored)
-            self.assert_nowhere(stored, p, skip=(send_file,))  # the test wrote it there; nothing may copy it out
-        self.assertEqual(self.stub.sent("send_direct_message"), [])
 
     def test_error_text_never_repeats_credential_material_from_an_argument(self):
         for piece in (USER_SENTINEL[4:16], DM_SENTINEL[20:32]) + self.shapes:
@@ -878,166 +510,52 @@ class SweepTests(Base):
         hot = "deadbeef" + "cafe"  # a UUID's last group can hold a 12-character piece of a hex token
         self.use_tokens("0123" + "4567" + "89ab" + "cdef" + "0011", hot + "98765432" + "10ff")
         conv, peer, org = CONV[:24] + hot, PEER[:24] + hot, ORG[:24] + hot
-        for p in (self.ah("history", "--conversation", conv), self.ah("files", "--conversation", conv), self.chan("send-hot-0001", conv=conv),
-                  self.ah("history", "--with", peer), self.dm("send-hot-0002", with_=peer), self.ah("conversations", "--org", org),
-                  self.ah("history", "--with", PEER, "--org", org)):
+        for p in (self.ah("history", "--conversation", conv), self.ah("files", "--conversation", conv),
+                  self.ah("files", "--conversation", conv, "--surface", "issue"), self.ah("history", "--with", peer),
+                  self.ah("conversations", "--org", org), self.ah("history", "--with", PEER, "--org", org)):
             self.assertEqual(self.code(p), "secret_refused", p.args)
             self.assert_nowhere(hot, p)
         self.assertEqual(self.stub.hits, [])
         self.stub.tools["list_org_members"] = lambda a: ok({"members": [{"userId": peer, "name": "Una Unique"}]})  # the server
-        for p in (self.dm("send-hot-0003", with_="Una Unique"), self.ah("history", "--with", "Una Unique")):
-            self.assertEqual(self.code(p), "secret_refused", p.args)
-            self.assert_nowhere(hot, p)
-        self.assertEqual(self.stub.sent("send_direct_message") + self.stub.sent("get_direct_messages"), [])
+        p = self.ah("history", "--with", "Una Unique")
+        self.assertEqual(self.code(p), "secret_refused")
+        self.assert_nowhere(hot, p)
+        self.assertEqual(self.stub.sent("get_direct_messages"), [])
 
     def test_a_token_file_that_cannot_be_screened_against_refuses_the_command(self):
-        self.dm_file.chmod(0o644)  # gq.holds_credential skips an unreadable file, so its token would go unscreened
-        self.assertEqual(self.code(self.dm("send-mode-0001")), "refused")
+        # gq.holds_credential skips a file it cannot read, so that token would go unscreened: each read uses the OTHER file
+        self.dm_file.chmod(0o644)
+        self.assertEqual(self.code(self.ah("files", "--conversation", CONV, "--surface", "issue")), "refused")  # user token
         self.dm_file.chmod(0o600)
         self.user_file.chmod(0o644)
-        self.assertEqual(self.code(self.ah("history", "--with", PEER)), "refused")
+        self.assertEqual(self.code(self.ah("history", "--with", PEER)), "refused")  # dm-read token
         self.assertEqual(self.stub.hits, [])
 
 
-def plain_text_error(a):
-    return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [
-        {"type": "text", "text": "MCP error -32001: Request timed out"}]}}
+class SendDeferredTests(Base):
+    """PR 277 ships read only (main's scope decision after five review rounds on send): `ah chat send` is goodqa#16399."""
 
+    def test_send_is_refused_with_the_follow_up_ticket_and_nothing_is_read_or_sent(self):
+        body = self.home / "body.txt"
+        body.write_text("Thanks, noted.\n")
+        for argv in ((), ("--with", PEER, "--org", ORG, "--body-file", str(body), "--client-msg-id", "send-0001-aaaa"),
+                     ("--conversation", CONV, "--body-file", str(body), "--client-msg-id", "send-0002-bbbb",
+                      "--confirm-not-delivered"), ("--help",)):
+            p = self.ah("send", *argv)
+            data = json.loads(p.stdout)
+            self.assertEqual((data["ok"], data["code"]), (False, "not_available"), argv)
+            self.assertIn("goodqa#16399", data["message"])
+            self.assertEqual(p.returncode, 2, argv)
+            self.assert_no_token(p)
+        self.assertEqual(self.stub.hits, [])
+        self.assertEqual([x for x in self.home.rglob("*") if x.is_file() and "agent-harness" in str(x)], [])
 
-def codeless_tool_error(a):
-    return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [{"type": "text", "text": json.dumps(
-        {"data": {}})}]}}
-
-
-# docs/ah-chat.md "How a send attempt is recorded": (row, first answer, may the same id post again as a DM?)
-OUTCOMES = [
-    ("3 tool error, pre-effect code forbidden", lambda a: tool_error("forbidden"), True),
-    ("3 tool error, pre-effect code validation_error", lambda a: tool_error("validation_error"), True),
-    ("4 tool error not_found", lambda a: tool_error("not_found"), True),
-    ("5 tool error approval_required", lambda a: tool_error("approval_required"), False),
-    ("5 tool error, known code that is not pre-effect (conflict)", lambda a: tool_error("conflict"), False),
-    ("5 tool error, unrecognised code", lambda a: tool_error("zz_new_code"), False),
-    ("5 tool error without a code", codeless_tool_error, False),
-    ("6 plain-text tool error", plain_text_error, False),
-    ("7 JSON-RPC error", lambda a: rpc_error(), False),
-    ("8 unexpected 2xx body", lambda a: ("raw", 200, b"not json"), False),
-    ("9 2xx body over the size budget", lambda a: ("raw", 200, b" " * 8_000_001), False),
-    ("10 HTTP 403 with code forbidden", lambda a: http_error(403, "forbidden"), True),
-    ("10 HTTP 409 with code human_approval_required", lambda a: http_error(409, "human_approval_required"), True),
-    ("11 HTTP 409 with code approval_required", lambda a: http_error(409, "approval_required"), False),
-    ("11 HTTP 400 with code conflict", lambda a: http_error(400, "conflict"), False),
-    ("11 HTTP 400 with an unrecognised code", lambda a: http_error(400, "zz_new_code"), False),
-    ("12 HTTP 400, no code", lambda a: http_error(400), True),
-    ("12 HTTP 401, no code", lambda a: http_error(401), True),
-    ("12 HTTP 404, no code", lambda a: http_error(404), True),
-    ("12 HTTP 422, no code", lambda a: http_error(422), True),
-    ("13 HTTP 409, no code", lambda a: http_error(409), False),
-    ("13 HTTP 408, no code", lambda a: http_error(408), False),
-    ("13 HTTP 429, no code", lambda a: http_error(429), False),
-    ("13 HTTP 410, no code", lambda a: http_error(410), False),
-    ("14 HTTP 500 even with code forbidden", lambda a: http_error(500, "forbidden"), False),
-    ("14 HTTP 503, no code", lambda a: http_error(503), False),
-    ("15 redirect", lambda a: ("redirect", "http://127.0.0.1:9/elsewhere"), False),
-    ("16 no answer (connection dropped)", lambda a: "drop", False),
-]
-
-
-class OutcomeTests(Base):
-    """PR 277 r5: every class of the send outcome table, then the same --client-msg-id again. The table in docs/ah-chat.md
-    and this list are kept row for row; tests/mutants_ah_chat.py has a variant per row."""
-
-    def setUp(self):
-        super().setUp()
-        self.send_file = self.home / ".agent-harness" / "state" / "ah" / "chat-send.jsonl"
-
-    def dm_args(self, cid):
-        return ["send", "--with", PEER, "--org", ORG, "--body-file", str(self.body), "--client-msg-id", cid]
-
-    def last_status(self, cid):
-        rows = [json.loads(line) for line in self.send_file.read_text().splitlines()]
-        return [r for r in rows if r.get("key") == "chat:" + cid][-1]["status"]
-
-    def test_every_outcome_class_is_recorded_and_retried_as_the_table_says(self):
-        for n, (row, first, again_ok) in enumerate(OUTCOMES):
-            with self.subTest(row):
-                cid = "send-outcome-%02d" % n
-                self.stub.tools["send_direct_message"] = first
-                answer = self.out(*self.dm_args(cid))
-                self.assertFalse(answer["ok"], row)
-                self.assertEqual(self.last_status(cid), "failed" if again_ok else "uncertain", row)
-                before = len(self.stub.sent("send_direct_message"))
-                self.stub.tools["send_direct_message"] = lambda a, n=n: ok({"message": {"id": "msg-%06d" % (200 + n)}})
-                second = self.out(*self.dm_args(cid))
-                if again_ok:
-                    self.assertEqual((second["ok"], second.get("result")), (True, "sent"), row)
-                    self.assertEqual(len(self.stub.sent("send_direct_message")), before + 1, row)
-                else:
-                    self.assertEqual((second["ok"], second["code"]), (False, "uncertain"), row)
-                    self.assertEqual(len(self.stub.sent("send_direct_message")), before, row)  # no second POST
-        self.assert_no_token()
-
-    # F1 of the 3d071db review, by itself so its failure is plain
-    def test_an_http_409_approval_required_is_uncertain_and_never_posted_again(self):
-        self.stub.tools["send_direct_message"] = lambda a: http_error(409, "approval_required")
-        self.assertEqual(self.out(*self.dm_args("send-r5-f1-0001"))["code"], "http_error")
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000777"}})
-        self.assertEqual(self.out(*self.dm_args("send-r5-f1-0001"))["code"], "uncertain")
-        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
-
-    def test_an_uncertain_channel_post_may_post_again_because_the_server_dedupes(self):
-        self.stub.tools["chat_channel_post"] = lambda a: http_error(409, "approval_required")
-        args = ["send", "--conversation", CONV, "--body-file", str(self.body), "--client-msg-id", "send-chan-r5-01"]
-        self.assertFalse(self.out(*args)["ok"])
-        self.assertEqual(self.last_status("send-chan-r5-01"), "uncertain")
-        self.stub.tools["chat_channel_post"] = lambda a: ok({"message": {"id": "msg-000778"}})
-        again = self.out(*args)
-        self.assertEqual((again["ok"], again["result"]), (True, "sent"))
-        self.assertEqual([c[1]["clientMsgId"] for c in self.stub.sent("chat_channel_post")], ["send-chan-r5-01"] * 2)
-
-    def test_an_attempt_left_pending_is_treated_as_uncertain(self):
-        # row 17: the process died between the pending row and the outcome; nothing says whether the POST went out
-        self.send_file.parent.mkdir(parents=True, exist_ok=True)
-        request = request_of(self.stub.base, {"org": ORG, "with": PEER}, self.body.read_text())
-        self.send_file.write_text(json.dumps({"at": 1, "key": "chat:send-pending-01", "status": "pending",
-                                              "request": request, "base": self.stub.base}) + "\n")
-        self.assertEqual(self.out(*self.dm_args("send-pending-01"))["code"], "uncertain")
-        self.assertEqual(self.stub.sent("send_direct_message"), [])
-
-    # F2 of the 3d071db review
-    def test_the_same_id_at_another_api_base_is_a_conflict_not_a_duplicate(self):
-        other = Stub()
-        self.addCleanup(other.stop)
-        other.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-other-1"}})
-        other.tools["list_org_members"] = lambda a: ok(MEMBERS)
-        self.defaults(allowed=[self.stub.base, other.base])
-        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000001"}})
-        self.assertEqual(self.out(*self.dm_args("send-base-0001"))["result"], "sent")
-        p = self.ah(*self.dm_args("send-base-0001"), base=other.base)
-        data = json.loads(p.stdout)
-        self.assertEqual((data["ok"], data["code"]), (False, "key_conflict"))
-        self.assertNotIn("sent", data)
-        self.assertEqual(other.sent("send_direct_message"), [])  # nothing posted at B, and A's delivery is not claimed
-        self.assertEqual(self.out(*self.dm_args("send-base-0001"))["result"], "duplicate")  # A itself still dedupes
-
-    def test_the_api_base_in_the_send_identity_is_normalised(self):
-        sys.path.insert(0, str(HOOKS))
-        import ah_chat  # noqa: PLC0415
-        for given in ("https://goodqa.app/v1", "HTTPS://GoodQA.App/v1/", "https://goodqa.app:443/v1"):
-            self.assertEqual(ah_chat._destination(given), "https://goodqa.app/v1", given)
-        self.assertEqual(ah_chat._destination("http://127.0.0.1:8080/v1/"), "http://127.0.0.1:8080/v1")
-        self.assertNotEqual(ah_chat._destination("https://staging.goodqa.app/v1"), ah_chat._destination("https://goodqa.app/v1"))
-
-    def test_a_row_recorded_without_an_api_base_is_never_trusted_or_reposted(self):
-        # a row from a build before r5: its destination is unknown, so it proves neither "sent here" nor "safe to post"
-        self.send_file.parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(self.body.read_text().encode()).hexdigest()
-        legacy = hashlib.sha256(json.dumps([{"org": ORG, "with": PEER}, digest], sort_keys=True).encode()).hexdigest()
-        self.send_file.write_text(json.dumps({"at": 1, "key": "chat:send-legacy-01", "status": "sent", "request": legacy,
-                                              "message_id": "msg-old-1"}) + "\n")
-        data = self.out(*self.dm_args("send-legacy-01"))
-        self.assertEqual((data["ok"], data["code"]), (False, "key_conflict"))
-        self.assertIn("without its API base", data["message"])
-        self.assertEqual(self.stub.sent("send_direct_message"), [])
+    def test_send_imports_neither_the_chat_module_nor_the_token_reader(self):
+        code = ("import sys; sys.path.insert(0, %r); import ah; rc = ah.main(['chat', 'send', '--with', %r]); "
+                "print(rc, 'ah_chat' in sys.modules, 'gq_browser' in sys.modules)" % (str(HOOKS), PEER))
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home)}
+        p = subprocess.run([sys.executable, "-I", "-c", code], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.stdout.strip().splitlines()[-1], "2 False False", p.stderr[-300:])
 
 
 if __name__ == "__main__":
