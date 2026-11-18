@@ -1437,6 +1437,28 @@ ENTRIES.update({
             ("an unreadable record counts as no install", [
                 ('            if os.path.lexists(str(record_path)):\n', '            if False:\n')], RUNNER_PY)]},
 })
+UB = "tests.test_ahc_guard.UserBusTests."
+ENTRIES.update({
+    "goodqa#16386 the --user systemd forms get the daemon's own user bus": {
+        "tests": [UB + "test_16386_user_scope_systemd_forms_get_the_uid_derived_bus_not_the_callers",
+                  UB + "test_16386_no_other_form_or_scope_gets_a_bus"],
+        "mutations": [
+            ("the --user systemd forms get no bus", [
+                ('    if name in USER_BUS_FORMS and unit_scope == "--user":\n        base.update(user_bus_env())\n',
+                 '')], GUARD),
+            ("the caller's bus passes through", [
+                ('    runtime = "/run/user/%d" % (os.getuid() if uid is None else uid)\n',
+                 '    runtime = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()\n')], GUARD),
+            ("every form gets the bus", [
+                ('    if name in USER_BUS_FORMS and unit_scope == "--user":\n',
+                 '    if unit_scope == "--user":\n')], GUARD),
+            ("system scope gets the bus", [
+                ('    if name in USER_BUS_FORMS and unit_scope == "--user":\n',
+                 '    if name in USER_BUS_FORMS:\n')], GUARD),
+            ("Policy.env drops the scope", [
+                ("form_env(name, self.trusted, self.home, self.gh_auth, self.unit_scope)",
+                 "form_env(name, self.trusted, self.home, self.gh_auth)")], GUARD)]},
+})
 
 
 if __name__ == "__main__":
