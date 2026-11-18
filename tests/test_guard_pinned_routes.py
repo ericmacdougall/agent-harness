@@ -857,7 +857,7 @@ class TableTests(unittest.TestCase):
              cg.DEV_DECOM_EXPIRES),
             (FAB_REL, '419863b6538f16b6d66c03faf06ecc42f76d8aa765069a447d28f36959f7985f', '/bin/bash -p {path}',
              cg.FABRIC_DO_AUTH_EXPIRES),
-            (DNS_REL, '919caf73658f79cdf4935e300c70010f28ded19d7967cc53b59350791ba8500d', '/usr/bin/python3 -I {path}', cg.TIMBAR_STAGING_DNS_EXPIRES),
+            (DNS_REL, 'bd1252561889d2b8f61c7486e26e89d066dd1dce40bfdd4d05757ef37c9f31ed', '/usr/bin/python3 -I {path}', cg.TIMBAR_STAGING_DNS_EXPIRES),
         ])
 
     def test_the_fabric_pin_is_the_reviewed_script(self):

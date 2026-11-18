@@ -98,7 +98,7 @@ def call(token, method, path, body=None):
         return int(status), {}
     try:
         parsed = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         parsed = {}
     return int(status), parsed if isinstance(parsed, dict) else {}
 
@@ -123,8 +123,8 @@ def run():
     token = read_token()
     status, parsed = call(token, "GET", "/zones?name=" + ZONE)
     zones = [z for z in results(parsed) if z.get("name") == ZONE]
-    if status != 200 or parsed.get("success") is not True or len(zones) != 1:
-        raise Stop(4, "FAILED zone: %s is not visible to this credential (HTTP %d, codes %s)"
+    if status != 200 or parsed.get("success") is not True or len(zones) != 1 or zones[0].get("status") != "active":
+        raise Stop(4, "FAILED zone: %s is not visible and active for this credential (HTTP %d, codes %s)"
                    % (ZONE, status, error_codes(parsed)))
     zone_id = zones[0].get("id")
     if not isinstance(zone_id, str) or not ZONE_ID_RE.fullmatch(zone_id):

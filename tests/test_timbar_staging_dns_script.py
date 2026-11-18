@@ -24,7 +24,7 @@ SCRIPT = Path(os.environ.get('SCRIPT') or HERE / 'fixtures' / 'pinned_routes' / 
 TOKEN = 'cfut_' + 'Ab3_' * 10  # synthetic; has the shape the script accepts
 ZONE_ID = 'ab' * 16
 NAME, IPV4, ZONE = 'timbar-staging.transition2.ai', '159.203.13.118', 'transition2.ai'
-ZONE_OK = (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE}]})
+ZONE_OK = (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE, 'status': 'active'}]})
 RECORD = {'type': 'A', 'name': NAME, 'content': IPV4, 'proxied': False, 'ttl': 300}
 NONE_YET = (200, {'success': True, 'result': []})
 CREATED = (200, {'success': True, 'result': dict(RECORD, id='cd' * 16)})
@@ -135,13 +135,16 @@ class ScriptTests(unittest.TestCase):
     def test_zone_not_visible_stops_before_any_record_call(self):
         rows = {
             'no zone': (200, {'success': True, 'result': []}),
-            'another zone': (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': 'x' + ZONE}]}),
-            'two zones': (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE}] * 2}),
+            'another zone': (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': 'x' + ZONE, 'status': 'active'}]}),
+            'pending zone': (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE, 'status': 'pending'}]}),
+            'no status': (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE}]}),
+            'deeply nested': (200, b'[' * 200000),
+            'two zones': (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE, 'status': 'active'}] * 2}),
             'forbidden': (403, {'success': False, 'errors': [{'code': 9109, 'message': 'no ' + TOKEN}]}),
             'not json': (200, b'<html>' + TOKEN.encode()),
             'a list': (200, [1, 2]),
-            'odd id': (200, {'success': True, 'result': [{'id': '../' + 'a' * 29, 'name': ZONE}]}),
-            'success missing': (200, {'result': [{'id': ZONE_ID, 'name': ZONE}]}),
+            'odd id': (200, {'success': True, 'result': [{'id': '../' + 'a' * 29, 'name': ZONE, 'status': 'active'}]}),
+            'success missing': (200, {'result': [{'id': ZONE_ID, 'name': ZONE, 'status': 'active'}]}),
         }
         for label, answer in rows.items():
             with self.subTest(label):
@@ -230,6 +233,57 @@ class ScriptTests(unittest.TestCase):
         redirects = [h for h in mod._OPENER.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
         self.assertEqual(len(redirects), 1)
         self.assertIsNone(redirects[0].redirect_request(None, None, 302, 'Found', {}, 'https://example.test/'))
+
+    def test_the_real_send_ignores_proxies_refuses_redirects_and_returns_error_bodies(self):
+        # The real send() and opener against listeners on 127.0.0.1 only; the Authorization value is synthetic.
+        import http.server
+        import threading
+        hits = {'proxy': 0, 'target': 0, 'origin': []}
+
+        def server(kind):
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def do_GET(self):
+                    if kind != 'origin':
+                        hits[kind] += 1
+                        self.send_response(200)
+                        self.end_headers()
+                        return
+                    hits['origin'].append(self.path)
+                    if self.path == '/redirect':
+                        self.send_response(302)
+                        self.send_header('Location', 'http://127.0.0.1:%d/stolen' % ports['target'])
+                        self.end_headers()
+                        return
+                    body = b'{"success": false}'
+                    self.send_response(403 if self.path == '/forbidden' else 200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+            httpd = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(httpd.server_close)
+            self.addCleanup(httpd.shutdown)
+            return httpd.server_address[1]
+
+        ports = {}
+        for kind in ('proxy', 'target', 'origin'):
+            ports[kind] = server(kind)
+        proxy = 'http://127.0.0.1:%d' % ports['proxy']
+        with mock.patch.dict(os.environ, {'http_proxy': proxy, 'HTTP_PROXY': proxy, 'all_proxy': proxy, 'no_proxy': ''}):
+            mod = load()
+            answers = []
+            for path in ('/ok', '/forbidden', '/redirect'):
+                request = urllib.request.Request('http://127.0.0.1:%d%s' % (ports['origin'], path),
+                                                 headers={'Authorization': 'Bearer ' + TOKEN})
+                answers.append(mod.send(request))
+        self.assertEqual([a[0] for a in answers], [200, 403, 302])
+        self.assertEqual(answers[1][1], b'{"success": false}')
+        self.assertEqual(hits, {'proxy': 0, 'target': 0, 'origin': ['/ok', '/forbidden', '/redirect']})
 
     def test_the_text_names_one_secret_and_prints_in_one_place(self):
         text = SCRIPT.read_text()
