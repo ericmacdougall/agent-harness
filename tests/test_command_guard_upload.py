@@ -969,7 +969,7 @@ class HookRecheckBudget(UploadBase):
     def test_approvals_that_do_not_fit_block_and_say_so(self):
         alias = self.alias()
         first, second = self.unit('b1'), self.unit('b2')
-        with self.slow_walk(3.0):  # two 3 s re-checks against one 4 s budget
+        with self.slow_walk(2.5):  # two 2.5 s re-checks against one 4 s budget, both inside the 6 s alarm
             code, message = self.hook('rm -rf %s/%s %s/%s' % (alias, first.name, alias, second.name),
                                       self.small_budget(4.0))
         self.assertEqual(code, 2, message)
