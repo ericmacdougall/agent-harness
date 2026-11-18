@@ -558,5 +558,128 @@ class SendDeferredTests(Base):
         self.assertEqual(p.stdout.strip().splitlines()[-1], "2 False False", p.stderr[-300:])
 
 
+class ParseRefusalTests(Base):
+    """PR 277 r7 F1: argparse prints a rejected value to stderr. Every `ah chat` parsing failure is one fixed JSON refusal on
+    stdout instead, with nothing on stderr and no request."""
+
+    def setUp(self):
+        super().setUp()
+        self.pieces = (USER_SENTINEL, DM_SENTINEL, USER_SENTINEL[4:16], DM_SENTINEL[20:32])
+
+    def raw(self, *argv):
+        """ah with exactly these arguments (no `chat` or `--base` added)."""
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home),
+               "GQ_BROWSER_TEST_LOOPBACK": "1", "CLAUDE_CODE_SESSION_ID": "test-session-1"}
+        return subprocess.run([sys.executable, "-I", str(AH), *argv], env=env, capture_output=True, text=True, timeout=60)
+
+    def assert_refused_quietly(self, p, piece, argv):
+        self.assertEqual(p.returncode, 2, argv)
+        self.assertEqual(p.stderr, "", argv)
+        data = json.loads(p.stdout)
+        self.assertEqual((data["ok"], data["code"]), (False, "bad_request"), argv)
+        for shown in (p.stdout, p.stderr):
+            self.assertNotIn(piece.lower(), shown.lower(), argv)
+
+    def test_a_rejected_argument_is_never_echoed_and_nothing_is_requested(self):
+        for piece in self.pieces:
+            cases = (
+                ("history", "--with", PEER, "--limit", piece),             # an invalid integer
+                ("conversations", "--org", ORG, "--limit", piece),
+                ("probe", "--token", piece),                               # an invalid choice
+                ("history", "--with", PEER, "--" + piece),                 # an unknown option
+                ("history", "--with", PEER, "--colour", piece),            # a value for an unknown option
+                ("history", "--with", PEER, "--colour=" + piece),
+                ("files", "--conversation", CONV, piece),                  # an extra positional
+                ("files", "--conversation", CONV, "--org", piece),         # an option the subcommand does not take
+                (piece,),                                                  # an unknown subcommand
+            )
+            for argv in cases:
+                self.assert_refused_quietly(self.ah(*argv), piece, argv)
+            for argv in (("chat", "history", "--limit", piece), ("--text", "chat", "probe", "--token", piece),
+                         ("chat", piece), ("chat",)):
+                self.assert_refused_quietly(self.raw(*argv), piece, argv)
+        self.assertEqual(self.stub.hits, [])
+        self.assert_no_token()
+
+    def test_help_still_works_and_goes_to_stdout(self):
+        for argv in (("chat", "-h"), ("chat", "history", "--help"), ("--text", "chat", "files", "-h")):
+            p = self.raw(*argv)
+            self.assertEqual((p.returncode, p.stderr), (0, ""), argv)
+            self.assertIn("usage: ah chat", p.stdout, argv)
+        self.assertEqual(self.stub.hits, [])
+
+    def test_send_is_refused_when_a_global_option_comes_first(self):
+        p = self.raw("--text", "chat", "send", "--with", PEER)
+        self.assertEqual((p.returncode, json.loads(p.stdout)["code"], p.stderr), (2, "not_available", ""))
+        self.assertEqual(self.stub.hits, [])
+
+
+class AllowListTests(Base):
+    """PR 277 r7 F2: every read output is an allow-list of fields. A link (a signed download URL, an avatar URL, an invite) or
+    a nested object the list does not name never reaches the output, on any file surface."""
+
+    # the query names are built at run time so no credential-shaped literal sits in the repository (the ahc scan reads source)
+    LINKS = ("https://files.example.test/signed?" + "sig" + "=TOPLEVELLINK",
+             "https://cdn.example.test/a?" + "X-Amz-" + "Signature" + "=NESTEDLINK",
+             "/v1/files/f9/download?" + "tok" + "en" + "=RELATIVELINK", "https://evil.example.test/NAMEISALINK")
+
+    def bad_file(self):
+        return {"id": "f2", "name": "x.png", "mime": "image/png", "bytes": 10, "url": self.LINKS[0], "downloadUrl": self.LINKS[0],
+                "links": {"download": self.LINKS[1]}, "variants": [{"href": self.LINKS[1]}], "thumbnail": self.LINKS[2],
+                "fileName": self.LINKS[2], "filename": self.LINKS[3], "sender": {"name": "Pat", "avatarUrl": self.LINKS[1]}}
+
+    def assert_no_link(self, p):
+        for marker in ("TOPLEVELLINK", "NESTEDLINK", "RELATIVELINK", "NAMEISALINK", "AVATARLINK", "INVITELINK", "EXTRALINK"):
+            self.assertNotIn(marker, p.stdout + p.stderr)
+
+    def assert_flat(self, row):
+        for key, value in row.items():
+            self.assertNotIsInstance(value, (dict, list), key)
+
+    def test_every_file_surface_passes_only_the_metadata_allow_list(self):
+        self.stub.tools["file_list"] = lambda a: ok({"files": [self.bad_file()]})
+        self.stub.tools["list_direct_conversation_files"] = lambda a: ok({"attachments": [self.bad_file()]})
+        for surface in ("issue", "personal", "chat"):
+            data = self.out("files", "--conversation", CONV, "--surface", surface)
+            self.assertTrue(data["ok"], surface)
+            row = data["files"][0]
+            self.assertEqual({k: row[k] for k in ("id", "name", "mime", "bytes")},
+                             {"id": "f2", "name": "x.png", "mime": "image/png", "bytes": 10}, surface)
+            self.assertFalse({"url", "downloadUrl", "links", "variants", "thumbnail", "fileName", "filename", "sender"} & set(row),
+                             surface)
+            self.assert_flat(row)
+            self.assert_no_link(self.last)
+
+    def test_messages_pass_only_their_allow_list(self):
+        written = MSG["body"] + " The doc is at https://docs.example.test/plan"  # a link a person wrote stays in the text
+        evil = dict(MSG, body=written, attachments=[self.bad_file()], signedUrl=self.LINKS[0], meta={"link": self.LINKS[1]},
+                    authorLabel={"kind": "person", "label": "Pat Peer", "avatarUrl": "https://x.example.test/AVATARLINK"})
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [evil]})
+        row = self.out("history", "--with", PEER)["messages"][0]
+        self.assertEqual((row["id"], row["senderId"], row["body"]), (MSG["id"], PEER, written))
+        self.assertEqual(row["authorLabel"], {"kind": "person", "label": "Pat Peer"})
+        self.assertEqual(row["attachments"][0]["name"], "x.png")
+        self.assertFalse({"signedUrl", "meta"} & set(row))
+        self.assert_flat(row["attachments"][0])
+        self.assert_no_link(self.last)
+        conv_msg = dict(CONV_MSG, author={"id": PEER, "name": "Pat Peer", "avatarUrl": "https://x.example.test/AVATARLINK"},
+                        reactions=[{"by": PEER, "link": self.LINKS[1]}])
+        self.stub.tools["get_direct_conversation_messages"] = lambda a: ok(dict(CONV_PAGE, messages=[conv_msg]))
+        row = self.out("history", "--conversation", CONV)["messages"][0]
+        self.assertEqual((row["id"], row["seq"], row["author"]), (CONV_MSG["id"], 7, {"id": PEER, "name": "Pat Peer"}))
+        self.assertNotIn("reactions", row)
+        self.assert_no_link(self.last)
+
+    def test_conversations_pass_only_their_allow_list(self):
+        row = dict(CONV_LIST["conversations"][0], inviteLink="https://x.example.test/INVITELINK",
+                   participants=[{"userId": PEER, "avatarUrl": "https://x.example.test/AVATARLINK"}],
+                   lastMessage={"body": "hi", "attachments": [self.bad_file()]}, title="https://x.example.test/EXTRALINK")
+        self.stub.tools["list_direct_conversations"] = lambda a: ok({"conversations": [row]})
+        got = self.out("conversations", "--org", ORG)["conversations"][0]
+        self.assertEqual((got["id"], got["kind"], got["unreadCount"], got["participants"]), (CONV, "dm", 1, [{"userId": PEER}]))
+        self.assertFalse({"inviteLink", "lastMessage", "title"} & set(got))
+        self.assert_no_link(self.last)
+
+
 if __name__ == "__main__":
     unittest.main()

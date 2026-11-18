@@ -32,7 +32,6 @@ MUTANTS = {
         "                self._token = gq.read_token()"),
     "a private read uses the user token": ('    client = Client(base, source="dm")\n    if conversation:\n        _need(client, "get_direct_conversation_messages")',
                                            '    client = Client(base, source="user")\n    if conversation:\n        _need(client, "get_direct_conversation_messages")'),
-    "a file's link is passed on": ("    return {k: _scrub(v) for k, v in row.items() if k in FILE_KEYS", "    return {k: _scrub(v) for k, v in row.items() if k"),
     "an absent conversation tool is not an error": ("    if tool not in _offered(client):", "    if False:"),
     # PR 277 r4 source-to-sink sweep, re-run for the read-only build (r6): one variant per check
     "uuids are prefix-matched": ("UUID_RE.fullmatch(value) is not None", 're.match(UUID_RE.pattern + "$", value) is not None'),
@@ -45,12 +44,35 @@ MUTANTS = {
     "error text is not screened": ("        if _credential_like(message):  # the one choke point", "        if False:  # the one choke point"),
     "an unreadable token file leaves its token unscreened": ("        _screenable()\n", "        pass\n"),
     # PR 277 r6: `ah chat send` is deferred to goodqa#16399; ah.py refuses it before anything is parsed, imported or read
-    "send reaches the parser": ("ah.py", '    if given[:2] == ["chat", "send"]:  # goodqa#16396', '    if False:  # goodqa#16396'),
-    "the send refusal exits zero": ("ah.py", '        sys.stdout.write("\\n")\n        return 2\n    args = build_parser()',
-                                    '        sys.stdout.write("\\n")\n        return 0\n    args = build_parser()'),
+    "send reaches the parser": ("ah.py", '        if _first_word(given[given.index("chat") + 1:]) == "send":', "        if False:"),
+    "the send refusal exits zero": ("ah.py", '    sys.stdout.write("\\n")\n    return 2\n\n\ndef _parse_chat',
+                                    '    sys.stdout.write("\\n")\n    return 0\n\n\ndef _parse_chat'),
     "the send refusal names no follow-up": ("ah.py", "deferred to goodqa#16399, which", "deferred to a follow-up, which"),
-    "send imports the chat module first": ("ah.py", '    if given[:2] == ["chat", "send"]:  # goodqa#16396',
-                                           '    if given[:2] == ["chat", "send"] and __import__("ah_chat"):  # goodqa#16396'),
+    "send imports the chat module first": ("ah.py", '== "send":  # goodqa#16396', '== "send" and __import__("ah_chat"):  # goodqa#16396'),
+    # PR 277 r7 F1: a chat parse failure is one fixed refusal on stdout; nothing reaches stderr
+    "chat parse errors reach stderr": ("ah.py", "        with contextlib.redirect_stderr(io.StringIO()):  # the usage",
+                                       "        if True:  # the usage"),
+    "chat arguments use the plain parser": ("ah.py", '    if _first_word(given) == "chat":', "    if False:"),
+    "a global option before chat skips the chat path": ("ah.py", 'return next((t for t in tokens if not t.startswith("-")), None)',
+                                                        "return tokens[0] if tokens else None"),
+    "help counts as a refusal": ("ah.py", "        if stop.code in (0, None):", "        if False:"),
+    # PR 277 r7 F2: every read output is an allow-list of fields
+    "issue and personal file rows are passed whole": (
+        "    listed = [_file_meta(f) for f in rows[:200]]  # the same",
+        '    listed = [_file_meta(f) if surface == "chat" else f for f in rows[:200]]  # the same'),
+    "a file key outside the list is passed": ("    return _pick(row, FILE_KEYS)", "    return dict(row) if isinstance(row, dict) else {}"),
+    "link-shaped values pass under an allowed key": ("        if key not in TEXT_KEYS and LINKISH.search(value):", "        if False:"),
+    "a relative signed path is not link-shaped": (r"|blob:)|^\s*/\S*[?#]", r"|blob:)"),
+    "message text is treated as a link": ("        if key not in TEXT_KEYS and LINKISH.search(value):",
+                                          "        if LINKISH.search(value):"),
+    "nested values pass under a scalar key": ("    return _DROP  # a dict, a list, a float", "    return value  # a dict, a list, a float"),
+    "message rows are passed whole": ("else [_message(m) for m in rows]", "else [m for m in rows]"),
+    "the author object is passed whole": ('kept["author"] = _pick(row["author"], AUTHOR_KEYS)', 'kept["author"] = row["author"]'),
+    "an author label is passed whole": ('kept["authorLabel"] = _pick(row["authorLabel"], AUTHOR_LABEL_KEYS)',
+                                        'kept["authorLabel"] = row["authorLabel"]'),
+    "message attachments are passed whole": ('[_file_meta(a) for a in row["attachments"][:50]]', 'row["attachments"][:50]'),
+    "conversation rows are passed whole": ("    listed = [_conversation(r) for r in rows]", "    listed = list(rows)"),
+    "participants keep every field": ("[_pick(p, PARTICIPANT_KEYS) for p in", "[p for p in"),
 }
 
 

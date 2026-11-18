@@ -3958,6 +3958,35 @@ def run(args, home: Path) -> dict:
 CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "
                       "deferred to goodqa#16399, which needs a server delivery contract and server-side DM dedupe first. "
                       "Nothing was read or sent.")
+CHAT_PARSE_REFUSED = ("ah chat: the arguments were not accepted. The rejected value is not shown, because it may hold a "
+                      "credential. Run `ah chat <subcommand> -h` for the accepted options. Nothing was read or sent.")
+
+
+def _first_word(tokens):
+    """The first token that is not an option. ah's only top-level option (--text) takes no value, so before the subcommand
+    this is the subcommand itself."""
+    return next((t for t in tokens if not t.startswith("-")), None)
+
+
+def _refuse_chat(code, message) -> int:
+    json.dump({"ok": False, "code": code, "message": message}, sys.stdout)
+    sys.stdout.write("\n")
+    return 2
+
+
+def _parse_chat(given):
+    """PR 277 r7 F1: argparse writes a rejected value (a bad --limit, a --token choice, an unknown option, an extra word) to
+    stderr, outside every credential screen. For the whole `ah chat` subtree a parse failure is one fixed refusal on stdout
+    that repeats nothing; help (-h) still prints to stdout. Returns (args, None) or (None, exit code)."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):  # the usage and error text argparse writes are dropped unread
+            return build_parser().parse_args(given), None
+    except SystemExit as stop:
+        if stop.code in (0, None):
+            return None, 0  # -h or --help: argparse printed the help to stdout
+        return None, _refuse_chat("bad_request", CHAT_PARSE_REFUSED)
 
 
 def main(argv=None) -> int:
@@ -3974,11 +4003,14 @@ def main(argv=None) -> int:
             sys.stdout.write("\n")
             return 4
         return guard_selftest.cli_main(given[1:])
-    if given[:2] == ["chat", "send"]:  # goodqa#16396 ships read only: nothing is parsed, imported, read or sent
-        json.dump({"ok": False, "code": "not_available", "message": CHAT_SEND_DEFERRED}, sys.stdout)
-        sys.stdout.write("\n")
-        return 2
-    args = build_parser().parse_args(argv)
+    if _first_word(given) == "chat":
+        if _first_word(given[given.index("chat") + 1:]) == "send":  # goodqa#16396 ships read only: nothing is parsed,
+            return _refuse_chat("not_available", CHAT_SEND_DEFERRED)  # imported, read or sent
+        args, stopped = _parse_chat(given)
+        if args is None:
+            return stopped
+    else:
+        args = build_parser().parse_args(argv)
     try:
         data = run(args, home_dir())
     except AhError as e:

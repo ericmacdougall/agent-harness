@@ -15,8 +15,9 @@ token in ~/.config/goodqa/user-token. A missing or unusable file is an error tha
 token to the other. The token is read in-process by gq_browser and sent only as the Authorization header of one HTTPS request
 to the GoodQA MCP endpoint (<allowedBase>/mcp). It is never printed, logged, put on a command line, written to the audit log or
 kept anywhere. Only the API bases in ~/.config/goodqa/browser-defaults.json (allowedBases) are used; redirects and environment
-proxies are never followed (gq_browser._OPENER). Every byte this command returns passes gq_browser.holds_credential() for BOTH
-token files: output holding either, whole or in a 12-character piece, is withheld. Server error bodies are never shown, only
+proxies are never followed (gq_browser._OPENER). Every output is an allow-list of fields (FILE_KEYS, MESSAGE_KEYS,
+CONVERSATION_KEYS): no nested object it does not name and no link-shaped value, on every file surface. Every byte this
+command returns passes gq_browser.holds_credential() for BOTH token files: output holding either, whole or in a 12-character piece, is withheld. Server error bodies are never shown, only
 an allow-listed machine code and an HTTP status.
 
 `history --conversation`, `conversations` and `files --surface chat` need the server tools get_direct_conversation_messages,
@@ -220,17 +221,72 @@ class Client:
 
 # ------------------------------------------------------------------ helpers
 
-def _scrub(value, depth=0):
-    """Cap string fields and nesting so one message cannot flood the output."""
-    if depth > 8:
-        return None
+# PR 277 r7 F2: every read output is an ALLOW-LIST of fields, never "everything but". A server row can carry a link (a signed
+# download URL, an avatar URL, an invite) under any key, at any depth; a link is a capability and is never passed on. Only the
+# keys below are kept, each must hold a plain value (a nested object is dropped unless a sub-list below names its fields), and a
+# string that is shaped like a link is dropped even under an allowed key. Message text (`body`) is the one exception: it is
+# what a person wrote, shown as written and marked untrusted.
+FILE_KEYS = ("id", "shareId", "filename", "fileName", "name", "mime", "contentType", "bytes", "size", "sizeBytes", "sender",
+             "sentAt", "createdAt", "seq", "messageId", "threadRootId")  # one list for every file surface: chat, issue, personal
+MESSAGE_KEYS = ("id", "conversationId", "seq", "senderId", "recipientId", "body", "createdAt", "editedAt", "updatedAt",
+                "deletedAt", "threadRootId", "authorBlocked", "kind")
+AUTHOR_KEYS = ("id", "name")
+AUTHOR_LABEL_KEYS = ("kind", "label")
+CONVERSATION_KEYS = ("id", "kind", "title", "name", "orgId", "lastSeq", "lastReadSeq", "unreadCount", "createdAt", "updatedAt")
+PARTICIPANT_KEYS = ("userId", "name", "role")
+TEXT_KEYS = ("body",)
+LINKISH = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,30}://|^\s*(?:www\.|data:|mailto:|javascript:|blob:)|^\s*/\S*[?#]", re.I)
+_DROP = object()
+
+
+def _plain(key, value):
+    """An allowed field's value, or _DROP: None, a bool, an int, or a string that is not shaped like a link (cut to size)."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value if abs(value) < 10**15 else _DROP
     if isinstance(value, str):
+        if key not in TEXT_KEYS and LINKISH.search(value):
+            return _DROP
         return value if len(value) <= MAX_TEXT_FIELD else value[:MAX_TEXT_FIELD] + " [cut]"
-    if isinstance(value, list):
-        return [_scrub(v, depth + 1) for v in value[:1000]]
-    if isinstance(value, dict):
-        return {str(k)[:80]: _scrub(v, depth + 1) for k, v in list(value.items())[:100]}
-    return value
+    return _DROP  # a dict, a list, a float: never passed on under a scalar key
+
+
+def _pick(row, keys):
+    if not isinstance(row, dict):
+        return {}
+    kept = {}
+    for key in keys:
+        if key in row:
+            value = _plain(key, row[key])
+            if value is not _DROP:
+                kept[key] = value
+    return kept
+
+
+def _file_meta(row):
+    """A file row as metadata only, on every surface. The server's attachment rows carry a `url` (possibly a signed link); a
+    link is a capability, so it is never passed on: a file is fetched through the product, not from this output."""
+    return _pick(row, FILE_KEYS)
+
+
+def _message(row):
+    kept = _pick(row, MESSAGE_KEYS)
+    if isinstance(row, dict):
+        if isinstance(row.get("author"), dict):
+            kept["author"] = _pick(row["author"], AUTHOR_KEYS)
+        if isinstance(row.get("authorLabel"), dict):
+            kept["authorLabel"] = _pick(row["authorLabel"], AUTHOR_LABEL_KEYS)
+        if isinstance(row.get("attachments"), list):
+            kept["attachments"] = [_file_meta(a) for a in row["attachments"][:50]]
+    return kept
+
+
+def _conversation(row):
+    kept = _pick(row, CONVERSATION_KEYS)
+    if isinstance(row, dict) and isinstance(row.get("participants"), list):
+        kept["participants"] = [_pick(p, PARTICIPANT_KEYS) for p in row["participants"][:100]]
+    return kept
 
 
 def _checked(result):
@@ -377,7 +433,7 @@ def conversations(home, org=None, limit=30, base=None):
     org = _org(client, org)
     _need(client, "list_direct_conversations")
     rows = _messages(client.tool("list_direct_conversations", {"orgId": org, "limit": limit}))[:limit]
-    listed = [_scrub(r) for r in rows]
+    listed = [_conversation(r) for r in rows]
     _audit(home, {"op": "chat.list", "result": "read", "count": len(listed), "org": org})
     return _checked({"ok": True, "untrusted": True, "notice": NOTICE, "source": "goodqa", "org": org,
                      "count": len(listed), "conversations": listed})
@@ -412,21 +468,13 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         if name:
             target["with_name"] = name
     rows = _messages(data)[:limit]
-    messages = [_metadata_only(m) for m in rows] if no_text else [_scrub(m) for m in rows]
+    messages = [_metadata_only(m) for m in rows] if no_text else [_message(m) for m in rows]
     _audit(home, {"op": "chat.read", "result": "read", "count": len(messages), "text": not no_text,
                   **{k: v for k, v in target.items() if k != "with_name"}})
     return _checked({"ok": True, "untrusted": True, "notice": NOTICE, "source": "goodqa", **target,
                      "count": len(messages), "messages": messages})
 
 
-FILE_KEYS = ("id", "shareId", "filename", "fileName", "name", "mime", "bytes", "sizeBytes", "sender", "sentAt", "seq", "messageId",
-             "threadRootId")
-
-
-def _file_meta(row):
-    """A DM file row as metadata only. The server's attachment rows carry a `url` (possibly a signed link); a link is a
-    capability, so it is never passed on: a file is fetched through the product, not from this output."""
-    return {k: _scrub(v) for k, v in row.items() if k in FILE_KEYS and not isinstance(v, (dict, list))} if isinstance(row, dict) else {}
 
 
 def files(home, conversation=None, surface=None, base=None):
@@ -452,7 +500,7 @@ def files(home, conversation=None, surface=None, base=None):
         rows = next((data[k] for k in ("files", "attachments") + MESSAGE_LISTS if isinstance(data.get(k), list)), None)
     if rows is None:
         raise ChatError("unexpected_response", "GoodQA returned files in an unknown shape", 3)
-    listed = [_file_meta(f) for f in rows[:200]] if surface == "chat" else [_scrub(f) for f in rows[:200]]
+    listed = [_file_meta(f) for f in rows[:200]]  # the same allow-list on every surface (PR 277 r7 F2)
     _audit(home, {"op": "chat.files", "result": "read", "count": len(listed), "conversation": conversation, "surface": surface})
     more = data.get("nextOffset") if isinstance(data, dict) else None
     paging = {"next_offset": more} if isinstance(more, int) and not isinstance(more, bool) and 0 <= more < 10**9 else {}
