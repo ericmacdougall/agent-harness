@@ -586,7 +586,14 @@ def send(home, with_=None, org=None, body_file=None, client_msg_id=None, confirm
             message = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else data
             mid = message.get("id") if isinstance(message, dict) else None
             mid = mid if isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,80}", mid) else None
-            if mid is None and not conversation:  # a 2xx that names no message (for example a pending approval) is not "sent"
+            if mid is not None:  # a server-supplied id is checked BEFORE it is written anywhere (send file, ledger, output)
+                try:
+                    gq._refuse_secret_text(mid, client._token)
+                    if gq.holds_credential(mid):
+                        raise gq.Refused("credential")
+                except gq.Refused:
+                    mid = None  # the value is dropped, never recorded
+            if mid is None:  # a 2xx with no usable message id (a pending approval, {}, a credential echo) is not "sent", DM or channel
                 _put(path, {"at": time.time(), "key": key, "status": "uncertain", "request": request_sha, "why": "no_message"})
                 raise ChatError("unexpected_response", "GoodQA answered without naming the sent message; check `ah chat history` "
                                                        "before retrying (then use --confirm-not-delivered)", 3)

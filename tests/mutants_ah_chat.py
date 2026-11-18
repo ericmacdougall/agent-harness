@@ -51,6 +51,8 @@ MUTANTS = {
     "a private read uses the user token": ('    client = Client(base, source="dm")\n    if conversation:\n        _need(client, "get_direct_conversation_messages")',
                                            '    client = Client(base, source="user")\n    if conversation:\n        _need(client, "get_direct_conversation_messages")'),
     "a file's link is passed on": ("    return {k: _scrub(v) for k, v in row.items() if k in FILE_KEYS", "    return {k: _scrub(v) for k, v in row.items() if k"),
+    "a server message id is not checked before it is stored": ("            if mid is not None:  # a server-supplied id is checked", "            if False:  # a server-supplied id is checked"),
+    "a channel send without a message id counts as sent": ("            if mid is None:  # a 2xx with no usable", "            if mid is None and not conversation:  # a 2xx with no usable"),
     "an absent conversation tool is not an error": ("    if tool not in _offered(client):", "    if False:"),
 }
 

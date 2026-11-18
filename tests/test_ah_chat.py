@@ -559,6 +559,34 @@ class SendTests(Base):
                 ah_chat._read_body(str(self.body))
         self.assertIn("changed while it was opened", str(caught.exception))
 
+    def test_a_server_message_id_holding_a_token_is_never_written_or_printed(self):
+        # the id matches the permissive id pattern, so only the credential check before persistence can stop it
+        for sentinel in (USER_SENTINEL, DM_SENTINEL):
+            for conv in (False, True):
+                self.stub.tools["send_direct_message"] = lambda a, s=sentinel: ok({"message": {"id": s}})
+                self.stub.tools["chat_channel_post"] = lambda a, s=sentinel: ok({"message": {"id": s}})
+                cid = "send-echo-%d-%s" % (conv, sentinel[13:17])
+                args = ["send", "--conversation", CONV] if conv else ["send", "--with", PEER, "--org", ORG]
+                p = self.ah(*args, "--body-file", str(self.body), "--client-msg-id", cid)
+                self.assertEqual(json.loads(p.stdout)["code"], "unexpected_response", (sentinel, conv))
+                self.assert_no_token(p)  # stdout, stderr and every file under the home, send file and ledger included
+                rows = (self.home / ".agent-harness" / "state" / "ah" / "chat-send.jsonl").read_text()
+                self.assertIn('"uncertain"', rows)
+                self.assertNotIn('"sent"', rows)
+
+    def test_a_channel_send_without_an_acknowledged_message_id_is_not_sent(self):
+        for n, answer in enumerate(({"status": "approval_required"}, {}, {"message": {}}, {"message": {"id": "bad id!"}})):
+            self.stub.tools["chat_channel_post"] = lambda a, answer=answer: ok(answer)
+            args = ["send", "--conversation", CONV, "--body-file", str(self.body), "--client-msg-id", "send-chan-%04d-x" % n]
+            first = self.out(*args)
+            self.assertEqual((first["ok"], first["code"]), (False, "unexpected_response"), answer)
+            self.assertNotIn("sent", first)
+            again = self.out(*args)  # a retry is allowed for a channel (the server dedupes) but must not claim delivery
+            self.assertEqual(again["ok"], False, answer)
+            self.assertNotEqual(again.get("result"), "duplicate", answer)
+        rows = (self.home / ".agent-harness" / "state" / "ah" / "chat-send.jsonl").read_text()
+        self.assertNotIn('"sent"', rows)
+
     def test_the_harness_work_directory_is_still_a_valid_place_for_a_body(self):
         work = self.home / ".agent-harness" / "work" / "s"
         work.mkdir(parents=True)
