@@ -977,6 +977,7 @@ class HookRecheckBudget(UploadBase):
         with mock.patch.object(cg, 'stat_manifest', interrupted):
             code, message = self.hook('rm -rf %s/%s' % (self.alias(), unit.name), self.policy)
         self.assertEqual(code, 2, message)
+        self.assertIn('delete one approved path per command', message)
         self.assertTrue(cg.marker_covers(str(unit), home=str(self.home)))
         self.assertIs(cg.stat_manifest, real)
 
