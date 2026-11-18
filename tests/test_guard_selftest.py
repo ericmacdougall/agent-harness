@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -121,7 +122,10 @@ class RunsTheFixedTable(Base):
     def test_an_analyser_that_hangs_fails_every_case_by_the_tools_own_timeout(self):
         self.edit("command_guard.py", "if __name__ == '__main__':\n    sys.exit(main())", "if __name__ == '__main__':\n    import time\n    time.sleep(60)")
         launcher = self.hooks / "command_guard_hook.py"
-        launcher.write_text(launcher.read_text().replace("CHILD_TIMEOUT = 10.0", "CHILD_TIMEOUT = 600.0"))  # the launcher's own watchdog is "broken"
+        text = launcher.read_text()
+        broken = re.sub(r"(?m)^CHILD_TIMEOUT = [0-9.]+$", "CHILD_TIMEOUT = 600.0", text)  # the launcher's own watchdog is "broken"
+        self.assertNotEqual(broken, text)
+        launcher.write_text(broken)
         with mock.patch.object(gs, "TIMEOUT", 3):
             result = self.run_it()
         self.assertEqual(result["exit_code"], 1)

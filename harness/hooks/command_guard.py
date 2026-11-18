@@ -161,9 +161,11 @@ DEFAULT_POLICY = {
                'max_walk_seconds': 2.0, 'max_hash_bytes': 1 << 40, 'recent_change_seconds': 600,
                # goodqa#16374 D1: the --upload route walks and hashes streaming, so its entry cap is 2,000,000; the
                # --archive and --remote routes hold a comparison map in memory and keep their lower caps. The hook
-               # re-checks approvals within one shared budget, and an approval whose own stat pass took longer than
-               # approve_stat_max_seconds is never written (the hook could not re-check it in time).
-               'max_upload_entries': 2000000, 'hook_recheck_seconds': 20.0, 'approve_stat_max_seconds': 15.0,
+               # re-checks a command's approvals within one shared hook_recheck_seconds budget, which the analyser's
+               # alarm and the launcher's child timeout are sized around (hook_alarm_seconds), and an approval whose
+               # own stat pass took more than 1/recheck_margin of its hook-time re-check is never written, so every
+               # written approval can be used (substitute review r4 F1).
+               'max_upload_entries': 2000000, 'hook_recheck_seconds': 12.0, 'recheck_margin': 2.0,
                'upload_min_bytes_per_second': 2 << 20,
                'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
 }
@@ -6745,8 +6747,14 @@ class Analyzer:
                 and path.casefold() not in ctx.created and not self._foreign_home(path) \
                 and not self.c.is_guard_file(path):
             return False  # creating a new file is not destructive
-        if literal and cls in ('log', 'root') and ctx.marker is not None and ctx.marker(path):
-            return False
+        if literal and cls in ('log', 'root') and ctx.marker is not None:
+            started = time.monotonic()
+            try:
+                covered = ctx.marker(path)
+            finally:
+                ctx.budget.deadline += time.monotonic() - started  # the re-check has its own budget (r4 F1)
+            if covered:
+                return False
         if literal and cls == 'root' and what in RM_CMDS and self._reproducible_clone(path):
             return False
         label = {'log': 'a protected log, WAL or approval-state location', 'root': 'a protected harness directory',
@@ -7657,6 +7665,11 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         already = [f for f in getattr(error, 'findings', []) if modes.get(f.category) == 'enforce']
         if already:
             return 'block', format_block(already[0], more=len(already) - 1)
+        if isinstance(error, TimeoutError) and (getattr(marker, 'consulted', False) or getattr(marker, 'used', None)):
+            # the alarm fired while a delete approval was being re-checked (goodqa#16374 substitute review r4 F1)
+            return 'block', format_block(Finding(LOG_DELETE, 'approval-recheck-timeout', 'the delete approvals could '
+                                                 'not be re-checked inside the hook\'s time budget',
+                                                 'delete one approved path per command'))
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']
@@ -7860,22 +7873,35 @@ def stat_manifest(path, limits, deadline=None, max_entries=None, counted=False):
 
 
 def _approval_stat(real, limits, max_entries=None):
-    """The stat digest an approval records, with its entry count; refuses when the pass took longer than the hook
-    could spend re-checking it (goodqa#16374 D1)."""
-    cutoff = float(limits.get('approve_stat_max_seconds', 15.0))
+    """The stat digest an approval records, with its entry count; refuses when the pass took more than
+    1/recheck_margin of the time the hook will grant its re-check, so a written approval can always be used
+    (goodqa#16374 D1, substitute review r4 F1)."""
+    margin = max(1.0, float(limits.get('recheck_margin', 2.0)))
+    cap = float(limits.get('hook_recheck_seconds', HOOK_RECHECK_SECONDS))
     started = time.monotonic()
-    digest, count = stat_manifest(real, limits, deadline=started + max(60.0, cutoff), max_entries=max_entries,
-                                  counted=True)
+    digest, count = stat_manifest(real, limits, deadline=started + 60.0, max_entries=max_entries, counted=True)
     took = time.monotonic() - started
-    if took > cutoff:
-        raise ValueError('checking the tree took %.1f s, longer than the %.0f s the delete hook may spend '
-                         're-checking it; approve smaller subtrees' % (took, cutoff))
+    allowed = recheck_seconds(count, cap)
+    if took * margin > allowed:
+        raise ValueError('checking the tree took %.1f s; the delete hook may spend %.1f s re-checking it, and an '
+                         'approval needs %.0fx headroom; approve smaller subtrees' % (took, allowed, margin))
     return digest, count
 
 
-def recheck_seconds(entries):
+HOOK_RECHECK_SECONDS = 12.0
+RECHECK_SECONDS_PER_ENTRY = 3e-5  # about twice the 15.5 us per entry measured on t2-dev at 200k and 600k entries
+
+
+def recheck_seconds(entries, cap=HOOK_RECHECK_SECONDS):
     """Hook-time re-check deadline for an approval that recorded `entries` stat entries (D1)."""
-    return min(20.0, 2.0 + 1e-5 * max(0, int(entries or 0)))
+    return min(float(cap), 2.0 + RECHECK_SECONDS_PER_ENTRY * max(0, int(entries or 0)))
+
+
+def hook_alarm_seconds(policy):
+    """The analyser's wall-clock alarm: the analysis allowance plus the shared re-check budget. The launcher's
+    CHILD_TIMEOUT sits above it and the host's hook timeout above that (tests pin the order)."""
+    analysis = int(float(policy['limits']['max_seconds']) * 2) + 1
+    return analysis + int(-(-float(policy['marker'].get('hook_recheck_seconds', HOOK_RECHECK_SECONDS)) // 1))
 
 
 class Approvals:
@@ -7891,6 +7917,10 @@ class Approvals:
         self.no_backup = set()  # real paths covered by a no-backup entry: decide() then requires a sole delete
         self.recheck_spent = 0.0  # goodqa#16374 D1: every re-check of one command shares one budget
         self.recheck_exhausted = False
+        self.consulted = False  # an approval matched a path of this command (a timeout then blocks)
+        # one absolute deadline, so no re-check depends on the analyser's alarm (substitute review r4 F1)
+        self.recheck_deadline = time.monotonic() + float(self.limits.get('hook_recheck_seconds',
+                                                                         HOOK_RECHECK_SECONDS))
 
     def __call__(self, path):
         return self.covers(path)
@@ -7917,6 +7947,7 @@ class Approvals:
                 continue
             if os.path.normpath(str(entry.get('path'))) != real:
                 continue
+            self.consulted = True
             try:
                 if list(_identity(real)) != list(entry.get('identity') or []):
                     continue
@@ -7926,12 +7957,13 @@ class Approvals:
                         continue
                 else:
                     recorded = int(entry.get('stat_entries') or 0)
-                    budget = float(self.limits.get('hook_recheck_seconds', 20.0)) - self.recheck_spent
-                    own = recheck_seconds(recorded) if recorded else float(self.limits['max_walk_seconds'])
+                    cap = float(self.limits.get('hook_recheck_seconds', HOOK_RECHECK_SECONDS))
+                    started = time.monotonic()
+                    budget = min(cap - self.recheck_spent, self.recheck_deadline - started)
+                    own = recheck_seconds(recorded, cap) if recorded else float(self.limits['max_walk_seconds'])
                     if budget <= 0:
                         self.recheck_exhausted = True
                         continue
-                    started = time.monotonic()
                     try:
                         digest = stat_manifest(real, self.limits, deadline=started + min(own, budget),
                                                max_entries=max(recorded, int(self.limits.get('max_approve_files',
@@ -7944,6 +7976,9 @@ class Approvals:
                         self.recheck_spent += time.monotonic() - started
                     if digest != entry.get('stat_sha256'):
                         continue
+            except TimeoutError:
+                self.recheck_exhausted = True  # the analyser's alarm: the hook is out of time, and it blocks
+                raise
             except (OSError, ValueError):
                 continue
             if entry.get('kind') == NO_BACKUP_KIND:
@@ -8830,6 +8865,18 @@ def _upload_iter_fd(real, limits, deadline, known):
             return fd
         return opener
 
+    def link_reader(dfd, name, st):
+        def read_link():
+            # relative to the pinned parent, so a directory swapped for a symlink cannot supply an outside target
+            # (substitute review r4 F3); the link itself must still be the one the check saw
+            target = os.readlink(name, dir_fd=dfd)
+            after = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if not stat.S_ISLNK(after.st_mode) or (after.st_dev, after.st_ino) != (st.st_dev, st.st_ino):
+                raise ValueError('a link changed while being read: %s' % name)
+            seen(after)
+            return target
+        return read_link
+
     if stat.S_ISREG(root_st.st_mode):
         seen(root_st)
         yield base, real, root_st, opener_for(None, base, root_st, real)
@@ -8858,7 +8905,7 @@ def _upload_iter_fd(real, limits, deadline, known):
             st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
             seen(st)
             if stat.S_ISLNK(st.st_mode):
-                yield child_member, child_full, st, None
+                yield child_member, child_full, st, link_reader(dfd, name, st)
             elif stat.S_ISREG(st.st_mode):
                 yield child_member, child_full, st, opener_for(dfd, name, st, child_full)
             elif stat.S_ISDIR(st.st_mode):
@@ -9274,7 +9321,8 @@ def _stream_upload(real, entries, transport, remote, zstd, deadline, pinned=None
                     info.type = tarfile.DIRTYPE
                     tar.addfile(info)
                 elif stat.S_ISLNK(st.st_mode):
-                    info.type, info.linkname = tarfile.SYMTYPE, os.readlink(full)
+                    info.type = tarfile.SYMTYPE
+                    info.linkname = opener() if opener is not None else os.readlink(full)
                     tar.addfile(info)
                 else:
                     rel = member.split('/', 1)[1] if '/' in member else member
@@ -9535,6 +9583,7 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
                       'verified': 'Dropbox content hash and size of the stored object matched the bytes sent',
                       'dropbox_hash': dbx, 'stat_sha256': stat_digest, 'host': host, 'kind': UPLOAD_KIND},
                      home=home)
+        audit('approved', entry, home=home, wal=wal, strict=True)  # before the approval exists (r4 F4)
         _store_entry(entry, real, now, home)
     except (OSError, ValueError) as error:
         audit('refused', {'path': real, 'remote': remote, 'kind': UPLOAD_KIND,
@@ -9542,7 +9591,6 @@ def approve_delete_upload(path, remote, transport=None, ttl=None, home=None, pol
               home=home, wal=wal)
         raise ValueError('the backup %s is stored but its records could not be written (%s); nothing was approved'
                          % (remote, str(error)[:120]))
-    audit('approved', entry, home=home, wal=wal)
     return entry
 
 
@@ -10310,9 +10358,11 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         def _timeout(_s, _f):
             raise TimeoutError('command_guard wall-clock limit')
         signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(int(float(limits['max_seconds']) * 2) + 1)
+        signal.alarm(hook_alarm_seconds({'limits': limits, 'marker': (compiled.policy['marker'] if compiled
+                                                                       else DEFAULT_POLICY['marker'])}))
         alarm = True
     raw_text = ''
+    approvals = None
     try:
         import safe_input
         try:
@@ -10353,13 +10403,18 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         if verdict == 'block' and approvals is not None and approvals.recheck_exhausted:
             message += ('\nThe delete approvals could not all be re-checked inside the hook\'s %.0f s budget; '
                         'delete one approved path per command.' % float(c.policy['marker'].get('hook_recheck_seconds',
-                                                                                              20.0)))
+                                                                                              HOOK_RECHECK_SECONDS)))
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
                                                              'already used or changed', 'approve again after a fresh '
                                                              'verified backup'))
         return emit(verdict, message, fmt)
     except TimeoutError:
+        if approvals is not None and (approvals.consulted or approvals.used):
+            # a delete approval was being re-checked: allowing would delete with the check unfinished (r4 F1)
+            return emit('block', format_block(Finding(LOG_DELETE, 'approval-recheck-timeout', 'the delete approvals '
+                                                      'could not be re-checked inside the hook\'s time budget',
+                                                      'delete one approved path per command')), fmt)
         verdict = 'block' if raw_sensitive(raw_text) else 'warn'
         return emit(verdict, format_block(Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',
                                                   'analysis exceeded its wall-clock limit', 'split it into smaller '

@@ -18,7 +18,9 @@ import re
 import subprocess
 import sys
 
-CHILD_TIMEOUT = 10.0
+# Above the analyser's alarm (command_guard.hook_alarm_seconds: analysis 7 s plus the 12 s approval re-check budget)
+# and below the host's 30 s hook timeout; tests/test_command_guard_upload.py pins the order (goodqa#16374 r4 F1).
+CHILD_TIMEOUT = 24.0
 MAX_STDIN = 8 * 1024 * 1024
 GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'command_guard.py')
 GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',
@@ -94,8 +96,13 @@ def sensitive(text, cwd=None):
     return False
 
 
-def fallback(raw, why):
+def fallback(raw, why, timed_out=False):
     guarded, text = guarded_text(raw)
+    if guarded and timed_out and DESTROY_TEXT.search(text[:4_000_000]):
+        # the analyser may have been re-checking a delete approval when it ran out of time (goodqa#16374 r4 F1)
+        sys.stderr.write('command_guard BLOCKED [guard_failure]: the analyser timed out on a command with a '
+                         'destructive verb. Safe alternative: delete one path per command, or retry.\n')
+        return 2
     if guarded and sensitive(text, payload_cwd(raw)):
         sys.stderr.write('command_guard BLOCKED [guard_failure]: the analyser %s and the command names a protected '
                          'harness location, a credential location, a secret source or a code-execution step with a '
@@ -139,7 +146,7 @@ def main():
         child = subprocess.run([sys.executable, '-I', GUARD, 'hook'], input=data, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, timeout=CHILD_TIMEOUT, check=False)
     except subprocess.TimeoutExpired:
-        return fallback(raw, 'timed out')
+        return fallback(raw, 'timed out', timed_out=True)
     except Exception as error:  # noqa: BLE001
         return fallback(raw, 'could not start (%s)' % type(error).__name__)
     if child.returncode in (0, 2):

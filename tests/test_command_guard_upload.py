@@ -552,6 +552,38 @@ class UploadApproval(UploadBase):
             path.unlink()
         self.assert_never_uploaded()
 
+    def test_a_link_target_is_read_through_the_pinned_directory(self):
+        # substitute review r4 F3: a directory swapped for a symlink mid-stream cannot put an outside link target in
+        # the archive; the target is read relative to the directory descriptor the walk holds
+        os.symlink('inside-target', str(self.target / 'sub/L'))
+        outside = self.home / ('outside-%d' % time.monotonic_ns())
+        outside.mkdir()
+        os.symlink('OUTSIDETARGET', str(outside / 'L'))
+        age(self.target)
+        held = self.target / 'sub.held'
+
+        def swap():
+            os.rename(str(self.target / 'sub'), str(held))
+            os.symlink(str(outside), str(self.target / 'sub'))
+        try:
+            with self.swap_in_stream('/sub/L', swap):
+                self.approve(zstd=self.plain_zstd())
+        except ValueError:
+            pass  # refused after the stream is fine; what matters is what reached rcat
+        self.assertFalse(b'OUTSIDETARGET' in self.received(), 'an outside link target reached rcat')
+
+    def test_no_approval_without_its_audit_row(self):
+        # substitute review r4 F4: the audit row is written strictly, before the approval is stored
+        real_audit = cg.audit
+
+        def failing(event, fields, *a, **kw):
+            if event == 'approved':
+                raise ValueError('audit log is read-only')
+            return real_audit(event, fields, *a, **kw)
+        with mock.patch.object(cg, 'audit', failing):
+            self.refused('records could not be written')
+        self.assertFalse(cg.marker_covers(str(self.target), home=str(self.home)))
+
     def test_no_approval_without_its_records(self):
         # red-team E3: a failed index write leaves no usable approval
         with mock.patch.object(cg, 'index_record', side_effect=OSError('read-only file system')):
@@ -642,10 +674,15 @@ class UploadRefusals(UploadBase):
         self.assert_never_uploaded()
 
     def test_a_slow_approval_stat_pass_is_refused(self):
-        # D1: an approval the hook could not re-check in time is never written
-        self.policy = copy.deepcopy(self.policy)
-        self.policy['marker']['approve_stat_max_seconds'] = 0.0
-        self.refused('re-checking it')
+        # D1, substitute review r4 F1: an approval is written only when its stat pass took at most 1/recheck_margin of
+        # the time the hook will grant its re-check, so a written approval can always be used
+        real = cg.stat_manifest
+
+        def slow(path, limits, deadline=None, max_entries=None, counted=False):
+            time.sleep(1.3)  # the 6-entry tree gets about 2 s at hook time; 1.3 s x margin 2 does not fit
+            return real(path, limits, deadline=deadline, max_entries=max_entries, counted=counted)
+        with mock.patch.object(cg, 'stat_manifest', slow):
+            self.refused('re-checking it')
 
     def test_the_upload_walk_streams(self):
         import inspect
@@ -657,8 +694,8 @@ class UploadRefusals(UploadBase):
     def test_the_hook_recheck_shares_one_budget(self):
         entry = self.approve()
         self.assertTrue(cg.marker_covers(str(self.target), home=str(self.home)))
-        self.assertAlmostEqual(cg.recheck_seconds(entry['stat_entries']), 2.0 + 6e-5)
-        self.assertEqual(cg.recheck_seconds(10 ** 7), 20.0)
+        self.assertAlmostEqual(cg.recheck_seconds(entry['stat_entries']), 2.0 + 6 * cg.RECHECK_SECONDS_PER_ENTRY)
+        self.assertEqual(cg.recheck_seconds(10 ** 7), cg.DEFAULT_POLICY['marker']['hook_recheck_seconds'])
         tight = cg.Compiled(dict(self.policy, marker=dict(self.policy['marker'], hook_recheck_seconds=0.0)),
                             home=str(self.home))
         approvals = cg.Approvals(home=str(self.home), compiled=tight)
@@ -842,6 +879,143 @@ class UploadCli(UploadBase):
                                 '--wal', str(wal)] + extra)
                 self.assertEqual(code, 2)
         self.assert_never_uploaded()
+
+
+
+class HookRecheckBudget(UploadBase):
+    """Substitute review r4 F1: the hook-time re-check fits inside the analyser's alarm, the alarm inside the launcher's
+    child timeout and that inside the host's hook timeout; a re-check that runs out of time blocks, never allows."""
+
+    def craft(self, target, entries):
+        # re-MAC the stored approval with a larger recorded entry count (the fixture's own key): models a big tree
+        sd = cg.state_dir(str(self.home))
+        data = json.loads((sd / cg.MARKER_NAME).read_text())
+        key = (sd / cg.KEY_NAME).read_bytes()
+        for e in data['entries']:
+            if e['path'] == os.path.realpath(str(target)):
+                e['stat_entries'] = entries
+                e.pop('mac', None)
+                e['mac'] = cg._mac(key, e)
+        (sd / cg.MARKER_NAME).write_text(json.dumps(data))
+
+    def unit(self, name, entries=10 ** 6):
+        unit = self.target.parent / ('%s-%d' % (name, time.monotonic_ns()))
+        (unit / 'sub').mkdir(parents=True)
+        (unit / 'sub/f.txt').write_text('x\n')
+        age(unit)
+        self.approve(path=unit, remote='dropbox:backups/mac/%s.tar.zst' % unit.name)
+        self.craft(unit, entries)
+        return unit
+
+    def slow_walk(self, seconds):
+        """Each hook re-check takes `seconds`, the way a real walk does: it honours its deadline and raises at it."""
+        real = cg.stat_manifest
+
+        def walk(path, limits, deadline=None, max_entries=None, counted=False):
+            wait = seconds if deadline is None else min(seconds, max(0.0, deadline - time.monotonic()))
+            time.sleep(wait)
+            if wait < seconds:
+                raise ValueError('walking the tree exceeded its time budget')
+            return real(path, limits, deadline=deadline, max_entries=max_entries, counted=counted)
+        return mock.patch.object(cg, 'stat_manifest', walk)
+
+    def hook(self, command, policy):
+        cwd = str(self.home)
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}, 'cwd': cwd}).encode()
+        compiled = cg.Compiled(policy, home=str(self.home), cwd=cwd)
+        err, out = io.StringIO(), io.StringIO()
+        import contextlib
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            code = cg.hook_main(fmt='exit2', stdin_bytes=payload, compiled=compiled)
+        return code, err.getvalue() + out.getvalue()
+
+    def small_budget(self, recheck):
+        policy = copy.deepcopy(self.policy)
+        policy['limits']['max_seconds'] = 0.5  # analyser alarm part: int(2 x 0.5) + 1 = 2 s
+        policy['marker']['hook_recheck_seconds'] = recheck
+        return policy
+
+    def alias(self):
+        # a path whose text names no protected location, so the launcher's raw-text probe sees nothing sensitive
+        link = Path(tempfile.mkdtemp(prefix='w')) / 'w'
+        os.symlink(str(self.target.parent), str(link))
+        self.addCleanup(shutil.rmtree, str(link.parent), True)
+        return link
+
+    def test_a_recheck_longer_than_the_analysis_alarm_still_completes(self):
+        unit = self.unit('one')
+        with self.slow_walk(3.0):  # longer than the 2 s analysis part, inside the 4 s re-check budget
+            code, message = self.hook('rm -rf %s/%s' % (self.alias(), unit.name), self.small_budget(4.0))
+        self.assertEqual(code, 0, message)
+        self.assertFalse(cg.marker_covers(str(unit), home=str(self.home)))  # used, so consumed
+
+    def test_a_long_recheck_is_not_charged_to_the_analysis_budget(self):
+        unit = self.unit('compound')
+        with self.slow_walk(1.5):  # three times the 0.5 s analysis budget; more segments are analysed afterwards
+            code, message = self.hook('rm -rf %s/%s; ' % (self.alias(), unit.name) + '; '.join(['true'] * 300),
+                                      self.small_budget(4.0))
+        self.assertEqual(code, 0, message)
+
+    def test_approvals_that_do_not_fit_block_and_say_so(self):
+        alias = self.alias()
+        first, second = self.unit('b1'), self.unit('b2')
+        with self.slow_walk(3.0):  # two 3 s re-checks against one 4 s budget
+            code, message = self.hook('rm -rf %s/%s %s/%s' % (alias, first.name, alias, second.name),
+                                      self.small_budget(4.0))
+        self.assertEqual(code, 2, message)
+        self.assertIn('delete one approved path per command', message)
+        self.assertTrue(cg.marker_covers(str(first), home=str(self.home)))
+        self.assertTrue(cg.marker_covers(str(second), home=str(self.home)))
+
+    def test_an_alarm_during_a_recheck_blocks(self):
+        # the alarm is only a backstop; if it fires while approvals are in use the verdict is a block, not a warning
+        unit = self.unit('alarm')
+        real = cg.stat_manifest
+
+        def interrupted(*a, **kw):
+            raise TimeoutError('command_guard wall-clock limit')
+        with mock.patch.object(cg, 'stat_manifest', interrupted):
+            code, message = self.hook('rm -rf %s/%s' % (self.alias(), unit.name), self.policy)
+        self.assertEqual(code, 2, message)
+        self.assertTrue(cg.marker_covers(str(unit), home=str(self.home)))
+        self.assertIs(cg.stat_manifest, real)
+
+    def test_the_budgets_nest_inside_the_host_timeout(self):
+        import ast
+        hooks = Path(cg.__file__).resolve().parent
+        tree = ast.parse((hooks / 'command_guard_hook.py').read_text())
+        child = [n.value.value for n in tree.body if isinstance(n, ast.Assign)
+                 and getattr(n.targets[0], 'id', '') == 'CHILD_TIMEOUT'][0]
+        install = (hooks.parent.parent / 'install.py').read_text()
+        host = min(int(x) for x in re.findall(r'command_guard_hook[^\n]*\n?[^\n]*?"timeout": (\d+)', install)
+                   or re.findall(r'"timeout": (\d+), "onFailure": "block"', install))
+        for policy in (cg.DEFAULT_POLICY, self.policy):
+            alarm = cg.hook_alarm_seconds(policy)
+            analysis = int(float(policy['limits']['max_seconds']) * 2) + 1
+            self.assertGreaterEqual(alarm, analysis + float(policy['marker']['hook_recheck_seconds']))
+            self.assertLessEqual(alarm + 4, child, 'the analyser must finish before the launcher kills it')
+            self.assertLessEqual(child + 4, host, 'the launcher must answer before the host times out')
+
+    def test_the_launcher_blocks_a_delete_when_the_analyser_times_out(self):
+        import subprocess as sp
+        hooks = Path(cg.__file__).resolve().parent
+        d = Path(tempfile.mkdtemp(prefix='cg-launcher-'))
+        self.addCleanup(shutil.rmtree, str(d), True)
+        text = (hooks / 'command_guard_hook.py').read_text()
+        patched = re.sub(r'(?m)^CHILD_TIMEOUT = [0-9.]+$', 'CHILD_TIMEOUT = 1.0', text)
+        self.assertNotEqual(patched, text)
+        (d / 'command_guard_hook.py').write_text(patched)
+        (d / 'command_guard.py').write_text('import time\ntime.sleep(30)\n')
+        alias = self.alias()
+
+        def run(command):
+            payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}).encode()
+            done = sp.run([sys.executable, str(d / 'command_guard_hook.py')], input=payload, stdout=sp.PIPE,
+                          stderr=sp.PIPE, env={'PATH': '/usr/bin:/bin', 'HOME': str(d)}, timeout=60, check=False)
+            return done.returncode, done.stderr.decode()
+        code, err = run('rm -rf %s/e1 %s/e2' % (alias, alias))
+        self.assertEqual(code, 2, err)
+        self.assertEqual(run('ls -la')[0], 0)
 
 
 if __name__ == '__main__':
