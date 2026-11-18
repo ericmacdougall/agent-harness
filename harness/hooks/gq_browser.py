@@ -125,10 +125,11 @@ def _remember(value):
 
 
 def _credential_secrets():
-    try:
-        read_token()
-    except (Refused, OSError):
-        pass
+    for reader in (read_token, read_dm_token):  # both files are secrets, whichever one this command uses
+        try:
+            reader()
+        except (Refused, OSError):
+            pass
     return set(_SECRETS)
 
 
@@ -198,20 +199,32 @@ def _private_file(path, what, fix, allow_missing=False):
     return st
 
 
-def read_token():
-    path = token_path()
+def dm_token_path():
+    """The DEDICATED token that holds [read, chat.dm.read] (goodqa#16396). A separate file, never a fallback for or from user-token."""
+    return os.path.join(home(), ".config", "goodqa", "dm-read-token")
+
+
+def _read_secret_file(path, what):
     fix = "Create it with mode 0600 (chmod 600 %s); never paste the token into chat." % path
-    st = _private_file(path, "The GoodQA user-token file", fix)
+    st = _private_file(path, what, fix)
     if st.st_mode & 0o077:
-        raise Refused("The GoodQA user-token file %s is readable by group or others. Fix: chmod 600 %s" % (path, path))
+        raise Refused("%s %s is readable by group or others. Fix: chmod 600 %s" % (what, path, path))
     try:
         with open(path, "r", encoding="utf-8") as f:
             value = f.read().strip()
     except OSError:
-        raise Refused("The GoodQA user-token file %s is unreadable. %s" % (path, fix))
+        raise Refused("%s %s is unreadable. %s" % (what, path, fix))
     if not value or len(value) > 4096 or any(c.isspace() for c in value):
-        raise Refused("The GoodQA user-token file %s does not hold one token. %s" % (path, fix))
+        raise Refused("%s %s does not hold one token. %s" % (what, path, fix))
     return _remember(value)
+
+
+def read_token():
+    return _read_secret_file(token_path(), "The GoodQA user-token file")
+
+
+def read_dm_token():
+    return _read_secret_file(dm_token_path(), "The GoodQA DM-read token file")
 
 
 def load_defaults():

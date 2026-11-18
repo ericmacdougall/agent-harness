@@ -3564,21 +3564,27 @@ def build_parser():
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
     u.add_argument("--recent", type=int)
     u.add_argument("--full", action="store_true")
-    ch = sub.add_parser("chat", help="read (and, with send, post) your own GoodQA chat through the user token (goodqa#16396)")
+    ch = sub.add_parser("chat", help="read (dm-read token) and, with send, post (user token) your own GoodQA chat (goodqa#16396)")
     chs = ch.add_subparsers(dest="sub", required=True)
-    for name in ("probe", "history", "files", "send"):
+    for name in ("probe", "conversations", "history", "files", "send"):
         c = chs.add_parser(name)
         c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
         if name == "probe":
+            c.add_argument("--token", choices=("user", "dm"), default="user",
+                           help="which credential file to probe with (never both): the user token or the dedicated dm-read token")
             continue
-        c.add_argument("--org", help="organization id (default: org in browser-defaults.json)")
+        if name != "files":  # files takes only the conversation id
+            c.add_argument("--org", help="organization id (default: org in browser-defaults.json; not with history --conversation)")
+        if name == "conversations":
+            c.add_argument("--limit", type=int, default=30)
+            continue
         c.add_argument("--conversation", help="conversation id")
         if name in ("history", "send"):
             c.add_argument("--with", dest="with_user", help="user id, or a member's exact name")
         if name == "history":
             c.add_argument("--limit", type=int, default=30)
-            c.add_argument("--after")
-            c.add_argument("--before")
+            c.add_argument("--after", help="not offered")
+            c.add_argument("--before", help="message sequence number to page back from (with --conversation only)")
             c.add_argument("--no-text", action="store_true", help="ids, authors and times only; no message text")
         if name == "files":
             c.add_argument("--surface", help="file_list surface (see `ah chat probe`)")
@@ -3808,12 +3814,14 @@ def run(args, home: Path) -> dict:
         import ah_chat  # noqa: PLC0415
         try:
             if args.sub == "probe":
-                return ah_chat.probe(args.base)
+                return ah_chat.probe(args.base, args.token)
+            if args.sub == "conversations":
+                return ah_chat.conversations(home, args.org, args.limit, args.base)
             if args.sub == "history":
                 return ah_chat.history(home, args.conversation, args.with_user, args.org, args.limit, args.no_text,
                                        args.after, args.before, args.base)
             if args.sub == "files":
-                return ah_chat.files(home, args.conversation, args.org, args.surface, args.base)
+                return ah_chat.files(home, args.conversation, args.surface, args.base)
             return ah_chat.send(home, args.with_user, args.org, args.body_file, args.client_msg_id,
                                 args.confirm_not_delivered, args.base, args.conversation)
         except ah_chat.ChatError as e:
