@@ -11,6 +11,7 @@ and a test removes them to prove the client fails loudly instead of answering an
 
 Run: python3 -I -m unittest tests.test_ah_chat   (or python3 -I tests/test_ah_chat.py)
 """
+import hashlib
 import json
 import os
 import subprocess
@@ -170,10 +171,10 @@ class Base(unittest.TestCase):
         path.write_text(json.dumps({"allowedBases": allowed, "org": org}))
         path.chmod(0o600)
 
-    def ah(self, *argv):
+    def ah(self, *argv, base=None):
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home),
                "GQ_BROWSER_TEST_LOOPBACK": "1", "CLAUDE_CODE_SESSION_ID": "test-session-1"}
-        p = subprocess.run([sys.executable, "-I", str(AH), "chat", *argv, "--base", self.stub.base], env=env,
+        p = subprocess.run([sys.executable, "-I", str(AH), "chat", *argv, "--base", base or self.stub.base], env=env,
                            capture_output=True, text=True, timeout=60)
         self.last = p
         return p
@@ -726,6 +727,165 @@ class SendTests(Base):
         results = [json.loads(p.communicate(timeout=60)[0]) for p in procs]
         self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
         self.assertEqual(sorted(r["result"] for r in results), ["duplicate"] * 3 + ["sent"])
+
+
+class SweepTests(Base):
+    """PR 277 r4: every value that enters from argv, a file or the server is checked before its first sink (a request, the
+    send file, the ledger, the audit log, stdout, error text). docs/ah-chat.md holds the source-to-sink table; each test here
+    covers a pair that had no check at 9a9f152 and fails against it."""
+
+    def setUp(self):
+        super().setUp()
+        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000001"}})
+        self.stub.tools["chat_channel_post"] = lambda a: ok({"message": {"id": "msg-000002"}})
+        self.state = self.home / ".agent-harness" / "state" / "ah"
+        # built at run time so no secret-shaped literal sits in the repository (the ahc scan reads source text)
+        self.shapes = ("sk" + "-ant-" + "api03-" + "q" * 12, "AK" + "IA" + "QWERTYUIOPASDFGH")
+
+    def dm(self, cid, with_=PEER, org=ORG):
+        return self.ah("send", "--with", with_, *(("--org", org) if org else ()), "--body-file", str(self.body),
+                       "--client-msg-id", cid)
+
+    def chan(self, cid, conv=CONV):
+        return self.ah("send", "--conversation", conv, "--body-file", str(self.body), "--client-msg-id", cid)
+
+    @staticmethod
+    def code(p):
+        return json.loads(p.stdout).get("code")
+
+    def use_tokens(self, user, dm):
+        for path, value in ((self.user_file, user), (self.dm_file, dm)):
+            path.write_text(value + "\n")
+            path.chmod(0o600)
+
+    def assert_nowhere(self, piece, p, skip=()):
+        """The piece, in any letter case, is in no output and in no file the command wrote (the test's inputs excluded)."""
+        low = piece.lower()
+        self.assertNotIn(low, (p.stdout + p.stderr).lower())
+        inputs = {*self.token_files, self.body, self.home / ".config" / "goodqa" / "browser-defaults.json", *skip}
+        for path in self.home.rglob("*"):
+            if path.is_file() and path not in inputs:
+                self.assertNotIn(low, path.read_bytes().decode("latin-1").lower(), str(path))
+
+    # F1: a client id ending in a newline passed CLIENT_ID_RE.match, and _rows never found the earlier attempt
+    def test_a_newline_terminated_client_id_is_refused_before_any_request(self):
+        self.assertTrue(json.loads(self.dm("send-0001-aaaa").stdout)["ok"])
+        hits = len(self.stub.hits)
+        for cid in ("send-0001-aaaa\n", "send-0009-zzzz\n"):
+            for p in (self.dm(cid), self.chan(cid)):
+                self.assertEqual(self.code(p), "bad_request", repr(cid))
+        self.assertEqual(len(self.stub.hits), hits)  # nothing reached the endpoint, tools/list included
+        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
+        self.assertNotIn("\\n", (self.state / "chat-send.jsonl").read_text())
+
+    def test_send_file_rows_are_matched_after_json_parsing(self):
+        sys.path.insert(0, str(HOOKS))
+        import ah_chat  # noqa: PLC0415
+        path = self.home / "rows.jsonl"
+        for key in ("chat:new\nline-1", 'chat:quote"d-1', "chat:back\\slash-1", "chat:plain-key-1"):
+            ah_chat._put(path, {"key": key, "status": "sent"})
+            self.assertEqual([r["key"] for r in ah_chat._rows(path, key)], [key], repr(key))
+
+    def test_newline_terminated_ids_from_argv_the_defaults_file_or_the_server_are_refused(self):
+        self.stub.tools["list_org_members"] = lambda a: ok({"members": [{"userId": PEER, "name": "Una Unique"}]})
+        for p in (self.dm("send-nl-0001-a", with_=PEER + "\n"), self.dm("send-nl-0002-a", org=ORG + "\n"),
+                  self.chan("send-nl-0003-a", conv=CONV + "\n"), self.dm("send-nl-0004-a", with_="Una Unique\n"),
+                  self.ah("history", "--with", PEER + "\n"), self.ah("history", "--conversation", CONV + "\n"),
+                  self.ah("history", "--with", PEER, "--org", ORG + "\n"), self.ah("files", "--conversation", CONV + "\n"),
+                  self.ah("conversations", "--org", ORG + "\n")):
+            self.assertFalse(json.loads(p.stdout)["ok"], p.args)
+        self.assertEqual(self.stub.hits, [])
+        self.defaults(allowed=[self.stub.base], org=ORG + "\n")  # browser-defaults.json
+        for p in (self.ah("history", "--with", PEER), self.dm("send-nl-0005-a", org=None), self.ah("conversations")):
+            self.assertFalse(json.loads(p.stdout)["ok"], p.args)
+        self.assertEqual(self.stub.hits, [])
+        self.defaults(allowed=[self.stub.base])
+        self.stub.tools["list_org_members"] = lambda a: ok({"members": [{"userId": PEER + "\n", "name": "Una Unique"}]})
+        for p in (self.dm("send-nl-0006-a", with_="Una Unique"), self.ah("history", "--with", "Una Unique")):  # the server
+            self.assertEqual(self.code(p), "not_found", p.args)
+        self.assertEqual(self.stub.sent("send_direct_message") + self.stub.sent("get_direct_messages"), [])
+
+    def test_no_text_metadata_drops_a_value_with_a_trailing_newline(self):
+        evil = dict(MSG, createdAt=MSG["createdAt"] + "\n", senderId=PEER + "\n")
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [evil]})
+        row = self.out("history", "--with", PEER, "--no-text")["messages"][0]
+        self.assertEqual(row.get("id"), MSG["id"])
+        self.assertNotIn("createdAt", row)
+        self.assertNotIn("senderId", row)
+
+    # F2: the client id reached the send file, the ledger and (channel) the request without a credential screen
+    def test_a_client_id_holding_a_token_piece_or_a_secret_shape_is_refused_before_anything(self):
+        pieces = (USER_SENTINEL[4:16], USER_SENTINEL[20:32], DM_SENTINEL[4:16].lower(), "x." + DM_SENTINEL[20:32].upper() + ".y")
+        for cid in pieces + self.shapes:
+            for p in (self.dm(cid), self.chan(cid)):
+                self.assertEqual(self.code(p), "secret_refused", cid)
+                self.assert_nowhere(cid, p)
+                self.assert_no_token(p)
+        self.assertEqual(self.stub.hits, [])
+        self.assertFalse((self.state / "chat-send.jsonl").exists())
+
+    def test_a_client_id_that_is_a_whole_token_is_refused_before_anything(self):
+        for cid in (USER_SENTINEL, DM_SENTINEL):  # the gqu_ sentinels pass the id pattern; both screens catch them
+            for p in (self.dm(cid), self.chan(cid)):
+                self.assertEqual(self.code(p), "secret_refused", cid)
+                self.assert_nowhere(cid, p)
+        # tokens that match no secret shape, so only the token-file screen (gq.holds_credential) can catch them
+        whole = ("SentinelUserWhole.q1w2e3r4t5y6u7i8", "SentinelDmWhole.a9s8d7f6g5h4j3k2")
+        self.use_tokens(*whole)
+        for cid in whole:
+            for p in (self.dm(cid), self.chan(cid)):
+                self.assertEqual(self.code(p), "secret_refused", cid)
+                self.assert_nowhere(cid, p)
+        self.assertEqual(self.stub.hits, [])
+        self.assertFalse((self.state / "chat-send.jsonl").exists())
+
+    def test_a_message_id_replayed_from_the_send_file_is_checked_again(self):
+        # a row written by a build before 9a9f152 stored the server's id unchecked; a duplicate must not relay it
+        digest = hashlib.sha256(self.body.read_text().encode()).hexdigest()
+        request = hashlib.sha256(json.dumps([{"org": ORG, "with": PEER}, digest], sort_keys=True).encode()).hexdigest()
+        self.state.mkdir(parents=True, exist_ok=True)
+        send_file = self.state / "chat-send.jsonl"
+        for n, stored in enumerate((USER_SENTINEL, DM_SENTINEL[20:32] + "-x") + self.shapes):
+            cid = "send-replay-%02d" % n
+            with open(send_file, "a") as handle:
+                handle.write(json.dumps({"at": 1, "key": "chat:" + cid, "status": "sent", "request": request,
+                                         "message_id": stored}) + "\n")
+            p = self.dm(cid)
+            data = json.loads(p.stdout)
+            self.assertEqual((data["ok"], data["result"], data["message_id"]), (True, "duplicate", None), stored)
+            self.assert_nowhere(stored, p, skip=(send_file,))  # the test wrote it there; nothing may copy it out
+        self.assertEqual(self.stub.sent("send_direct_message"), [])
+
+    def test_error_text_never_repeats_credential_material_from_an_argument(self):
+        for piece in (USER_SENTINEL[4:16], DM_SENTINEL[20:32]) + self.shapes:
+            p = self.ah("history", "--with", PEER, base="https://evil.example.test/" + piece)
+            self.assertEqual(self.code(p), "refused", piece)
+            self.assert_nowhere(piece, p)
+        self.assertEqual(self.stub.hits, [])
+
+    def test_an_id_holding_a_token_piece_is_refused_before_any_request_or_audit_row(self):
+        hot = "deadbeef" + "cafe"  # a UUID's last group can hold a 12-character piece of a hex token
+        self.use_tokens("0123" + "4567" + "89ab" + "cdef" + "0011", hot + "98765432" + "10ff")
+        conv, peer, org = CONV[:24] + hot, PEER[:24] + hot, ORG[:24] + hot
+        for p in (self.ah("history", "--conversation", conv), self.ah("files", "--conversation", conv), self.chan("send-hot-0001", conv=conv),
+                  self.ah("history", "--with", peer), self.dm("send-hot-0002", with_=peer), self.ah("conversations", "--org", org),
+                  self.ah("history", "--with", PEER, "--org", org)):
+            self.assertEqual(self.code(p), "secret_refused", p.args)
+            self.assert_nowhere(hot, p)
+        self.assertEqual(self.stub.hits, [])
+        self.stub.tools["list_org_members"] = lambda a: ok({"members": [{"userId": peer, "name": "Una Unique"}]})  # the server
+        for p in (self.dm("send-hot-0003", with_="Una Unique"), self.ah("history", "--with", "Una Unique")):
+            self.assertEqual(self.code(p), "secret_refused", p.args)
+            self.assert_nowhere(hot, p)
+        self.assertEqual(self.stub.sent("send_direct_message") + self.stub.sent("get_direct_messages"), [])
+
+    def test_a_token_file_that_cannot_be_screened_against_refuses_the_command(self):
+        self.dm_file.chmod(0o644)  # gq.holds_credential skips an unreadable file, so its token would go unscreened
+        self.assertEqual(self.code(self.dm("send-mode-0001")), "refused")
+        self.dm_file.chmod(0o600)
+        self.user_file.chmod(0o644)
+        self.assertEqual(self.code(self.ah("history", "--with", PEER)), "refused")
+        self.assertEqual(self.stub.hits, [])
 
 
 if __name__ == "__main__":

@@ -40,6 +40,32 @@ The server half (GoodQA tools `list_direct_conversations`, `get_direct_conversat
 - **A body file is checked, but the content check is the control.** `--body-file` must be a regular file of at most 8000 bytes with one hard link, not a symlink, whose real path (symlinked directories resolved) is not a dot file and not under a dot directory (`.env`, `.aws`, `.ssh`, `.config`, `.claude`), except `~/.agent-harness/work` and `~/.agent-harness/scratch`. That keeps the obvious credential files out. It does **not** stop a credential file that was copied to a plain name: a secret that matches no known shape (a netrc, a pgpass, a docker or kube config) is sent if you point `--body-file` at such a copy. What stops a secret is the content check (the tokens, and the secret shapes), and your own care about which file you name.
 - **A conversation you are not in is a clean refusal** (`not_found`, exit 3), never a traceback.
 
+## Where each input goes, and what is checked first
+
+Sinks: **N** the request to `<allowedBase>/mcp`, **S** the send file `chat-send.jsonl`, **L** the ah ledger and its audit row (`ah.write`), **A** a read's audit row, **O** the printed result, **E** error text (printed as `{"ok": false, "message": ...}`). `ah chat` writes nothing to stderr. Every **O** passes `_checked` (either token, whole, encoded or a 12-character piece). Every **E** passes the `ChatError` screen (the same check plus the secret shapes), so a refusal never repeats credential material it was given. A "screen" below means both token files (`gq.holds_credential`) and `gq.SECRET_SHAPES`, run before the first sink. Every validating pattern uses `fullmatch`: a value ending in a newline is refused, never accepted with its newline. The only `re.match` calls left extract a numeric prefix from local or server text (`MCP error -N`, `GoodQA HTTP NNN`). They validate nothing.
+
+| Source | Value | Sinks | Checked before the first sink | Test (`tests/test_ah_chat.py`) |
+| --- | --- | --- | --- | --- |
+| argv | `--client-msg-id` | S, L, N (channel `clientMsgId`), O | id pattern (fullmatch), then the screen. Both run first in `send`, before the body is read or a token is used | `SweepTests`: newline id; token pieces and shapes; whole tokens |
+| argv, defaults file | `--org`, `org` | N, S (hashed), L, A, O | UUID (fullmatch), screen (`_org`) | `SweepTests`: newline (argv and file); hex-token piece |
+| argv | `--conversation` | N, S (hashed), L, A, O | UUID (fullmatch), screen | `SweepTests`: newline; hex-token piece |
+| argv | `--with` as an id | N, S (hashed), L, A, O | UUID (fullmatch), screen (`_user`) | `SweepTests`: newline; hex-token piece |
+| argv | `--with` as a name | none (compared locally) | name pattern (fullmatch) | `SweepTests`: newline name |
+| argv | `--limit`, `--before`, `--surface`, `--token`, `--after` | N, A | int 1 to 100; `\d{1,12}` fullmatch with `--conversation` only; fixed set; argparse choices; refused | `ReadTests` |
+| argv | `--base` | N (URL), E | exact `allowedBases` match; error text screened | `SweepTests`: credential piece in `--base`; `ReadTests` |
+| argv | `--body-file` path | none (opened only) | not a dot path, no symlink, one hard link, unchanged between check and read | `SendTests` |
+| file | body text | N; its SHA-256 and length to S, L, O | user-token pieces and shapes, then both token files | `SendTests`, `TokenSourceTests` |
+| file | `user-token`, `dm-read-token` | the Authorization header only | read in-process; a file that exists but cannot be read safely refuses the command, because its token could not be screened | `TokenSourceTests`; `SweepTests`: unscreenable file |
+| file | send-file rows | S (decisions), L, O (`message_id`) | key compared after JSON parsing; `request` must match; a stored `message_id` is checked again | `SweepTests`: escaped keys; replayed id |
+| server | send `message.id` | S, L, O | id pattern (fullmatch), then the screen; otherwise dropped and the attempt is `uncertain` | `SendTests` |
+| server | member `userId` | N, S (hashed), L, O | UUID (fullmatch), screen | `SweepTests`: newline; hex-token piece |
+| server | member name | O (`with_name`) | control characters removed, at most 80 characters | `ReadTests`, `SendTests` |
+| server | message, file and conversation rows | O; A (count only) | `_scrub`; `--no-text` keys and values (fullmatch); file rows drop links | `ReadTests`; `SweepTests`: metadata newline |
+| server | tool list and schemas | O (`probe`) | names fullmatch `[a-z_]{1,60}`; bounded enums and types | `ReadTests` |
+| server | error code, HTTP status, JSON-RPC code | E; S (`why` holds a local code) | allow-listed code; status 0 to 999; integer below 10^7 | `ReadTests`, `SendTests` |
+
+Not covered here: `ah.py`'s own `KEY_RE` (the ledger key pattern) still uses `match` with `$`. It is unreachable from `ah chat`, because the client id is checked with fullmatch first, and other `ah` commands are outside this change.
+
 ## Tests
 
 `python3 -I tests/test_ah_chat.py` (loopback stub of the MCP endpoint answering with the server's real row shapes, two sentinel tokens, every output and file scanned), `python3 -I tests/test_command_guard_ah_chat.py`, and the failing-first check `python3 -B tests/mutants_ah_chat.py` (each broken variant must fail the tests). The command guard needed one minimal change for the second file: the credential path rule for `~/.config/goodqa/user-token` also names `dm-read-token`.
