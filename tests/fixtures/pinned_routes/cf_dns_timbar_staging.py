@@ -8,10 +8,12 @@ from GCP Secret Manager into memory, sent only to api.cloudflare.com in the Auth
 logged, written to disk, placed in argv or exported. All output is built from fixed text, numbers and the constants below.
 
 Idempotent: when the record already exists exactly as wanted it reports that and exits 0. When any other record holds
-the name it changes nothing and exits 4. Python 3.9, standard library only.
+the name it changes nothing and exits 4. Cloudflare has no conditional create, so after creating it lists the name
+again: if another record appeared in between, it removes the one record this run created (by the id the create call
+returned, and nothing else) and exits 4. Python 3.9, standard library only.
 
 Exit codes: 0 created or already present; 2 arguments given; 3 secret unreadable or malformed; 4 zone not visible or a
-conflicting record; 5 the create call failed or its result could not be confirmed; 70 unexpected error.
+conflicting record; 5 the create call failed, or its result could not be confirmed or undone; 70 unexpected error.
 """
 import json
 import os
@@ -55,7 +57,9 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedire
 
 
 def read_token():
-    env = {"HOME": pwd.getpwuid(os.getuid()).pw_dir, "PATH": GCLOUD_PATH, "CLOUDSDK_CORE_DISABLE_PROMPTS": "1"}
+    # The two logging overrides beat any persisted gcloud setting, so the answer cannot reach a gcloud log file.
+    env = {"HOME": pwd.getpwuid(os.getuid()).pw_dir, "PATH": GCLOUD_PATH, "CLOUDSDK_CORE_DISABLE_PROMPTS": "1",
+           "CLOUDSDK_CORE_LOG_HTTP": "false", "CLOUDSDK_CORE_DISABLE_FILE_LOGGING": "true"}
     try:
         done = subprocess.run(
             [GCLOUD, "secrets", "versions", "access", "latest", "--secret", SECRET, "--project", PROJECT],
@@ -119,6 +123,15 @@ def wanted(record):
             and record.get("proxied") is False)
 
 
+def listed(token, records_path):
+    """The records that hold NAME, or None when the list could not be read."""
+    status, parsed = call(token, "GET", records_path + "?name=" + NAME)
+    rows = parsed.get("result")
+    if status != 200 or parsed.get("success") is not True or not isinstance(rows, list) or len(results(parsed)) != len(rows):
+        return None, status, error_codes(parsed)
+    return rows, status, []
+
+
 def run():
     token = read_token()
     status, parsed = call(token, "GET", "/zones?name=" + ZONE)
@@ -130,24 +143,39 @@ def run():
     if not isinstance(zone_id, str) or not ZONE_ID_RE.fullmatch(zone_id):
         raise Stop(4, "FAILED zone: the zone id has an unexpected form")
     records_path = "/zones/%s/dns_records" % zone_id
-    status, parsed = call(token, "GET", records_path + "?name=" + NAME)
-    if status != 200 or parsed.get("success") is not True or not isinstance(parsed.get("result"), list):
+    existing, status, codes = listed(token, records_path)
+    if existing is None:
         raise Stop(4, "FAILED lookup: could not list records for %s (HTTP %d, codes %s); nothing was changed"
-                   % (NAME, status, error_codes(parsed)))
-    existing = results(parsed)
-    if len(existing) != len(parsed["result"]):
-        raise Stop(4, "FAILED lookup: the record list has an unexpected form; nothing was changed")
+                   % (NAME, status, codes))
     if len(existing) == 1 and wanted(existing[0]):
         return "OK already present: A %s -> %s, DNS only" % (NAME, IPV4)
     if existing:
-        raise Stop(4, "CONFLICT: %d other record(s) already hold %s; nothing was changed" % (len(existing), NAME))
+        raise Stop(4, "CONFLICT: %d record(s) hold %s and they are not exactly the one wanted; nothing was changed"
+                   % (len(existing), NAME))
     status, parsed = call(token, "POST", records_path,
                           {"type": "A", "name": NAME, "content": IPV4, "ttl": TTL, "proxied": False, "comment": COMMENT})
     created = parsed.get("result")
-    if status == 200 and parsed.get("success") is True and isinstance(created, dict) and wanted(created):
-        return "OK created: A %s -> %s, DNS only, TTL %d" % (NAME, IPV4, TTL)
-    raise Stop(5, "FAILED create: HTTP %d, codes %s; run again to see whether the record exists"
-               % (status, error_codes(parsed)))
+    created_id = created.get("id") if isinstance(created, dict) else None
+    if not (status == 200 and parsed.get("success") is True and isinstance(created, dict) and wanted(created)
+            and isinstance(created_id, str) and ZONE_ID_RE.fullmatch(created_id)):
+        raise Stop(5, "FAILED create: HTTP %d, codes %s; run again to see whether the record exists"
+                   % (status, error_codes(parsed)))
+    # Nothing binds the create to the empty list seen above, so look again and undo this run's record on a conflict.
+    now, status, codes = listed(token, records_path)
+    if now is None:
+        raise Stop(5, "FAILED confirm: the record was created but the name could not be listed again (HTTP %d, codes %s); "
+                      "run again to check it" % (status, codes))
+    if all(row.get("id") == created_id for row in now):  # no other record holds the name
+        if len(now) == 1 and wanted(now[0]):
+            return "OK created: A %s -> %s, DNS only, TTL %d" % (NAME, IPV4, TTL)
+        raise Stop(5, "FAILED confirm: the record was created but the list of the name does not show it as wanted; "
+                      "run again to check it")
+    status, parsed = call(token, "DELETE", records_path + "/" + created_id)
+    if status == 200 and parsed.get("success") is True:
+        raise Stop(4, "CONFLICT: another record took %s while this one was being created; the record this run created "
+                      "was removed" % NAME)
+    raise Stop(5, "FAILED undo: another record took %s during the create and the record this run created could not be "
+                  "removed (HTTP %d, codes %s); remove A %s -> %s by hand" % (NAME, status, error_codes(parsed), NAME, IPV4))
 
 
 def main(argv):

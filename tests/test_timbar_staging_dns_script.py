@@ -27,7 +27,10 @@ NAME, IPV4, ZONE = 'timbar-staging.transition2.ai', '159.203.13.118', 'transitio
 ZONE_OK = (200, {'success': True, 'result': [{'id': ZONE_ID, 'name': ZONE, 'status': 'active'}]})
 RECORD = {'type': 'A', 'name': NAME, 'content': IPV4, 'proxied': False, 'ttl': 300}
 NONE_YET = (200, {'success': True, 'result': []})
-CREATED = (200, {'success': True, 'result': dict(RECORD, id='cd' * 16)})
+NEW_ID = 'cd' * 16
+CREATED = (200, {'success': True, 'result': dict(RECORD, id=NEW_ID)})
+CONFIRMED = (200, {'success': True, 'result': [dict(RECORD, id=NEW_ID)]})
+RECORDS_URL = 'https://api.cloudflare.com/client/v4/zones/%s/dns_records' % ZONE_ID
 
 
 def load():
@@ -76,14 +79,15 @@ class ScriptTests(unittest.TestCase):
             self.assertNotIn(value, run.out + run.err)
 
     def test_creates_the_one_record(self):
-        run = Run([ZONE_OK, NONE_YET, CREATED])
+        run = Run([ZONE_OK, NONE_YET, CREATED, CONFIRMED])
         self.assertEqual((run.code, run.err), (0, ''))
         self.assertEqual(run.out, 'OK created: A %s -> %s, DNS only, TTL 300\n' % (NAME, IPV4))
-        self.assertEqual(run.methods, ['GET', 'GET', 'POST'])
+        self.assertEqual(run.methods, ['GET', 'GET', 'POST', 'GET'])
+        self.assertEqual(run.left, [])
         self.assertEqual([r.full_url for r in run.requests], [
             'https://api.cloudflare.com/client/v4/zones?name=' + ZONE,
             'https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s' % (ZONE_ID, NAME),
-            'https://api.cloudflare.com/client/v4/zones/%s/dns_records' % ZONE_ID])
+            RECORDS_URL, RECORDS_URL + '?name=' + NAME])
         self.assertEqual(json.loads(run.requests[2].data), {
             'type': 'A', 'name': NAME, 'content': IPV4, 'ttl': 300, 'proxied': False,
             'comment': 'TIMBAR staging (IP-restricted at nginx)'})
@@ -93,12 +97,16 @@ class ScriptTests(unittest.TestCase):
         self.assertNoSecret(run)
 
     def test_reads_one_secret_with_a_fixed_command_and_environment(self):
-        run = Run([ZONE_OK, NONE_YET, CREATED])
+        run = Run([ZONE_OK, NONE_YET, CREATED, CONFIRMED])
         self.assertEqual(len(run.tool_calls), 1)
         args, kwargs = run.tool_calls[0]
         self.assertEqual(args, ['/opt/homebrew/bin/gcloud', 'secrets', 'versions', 'access', 'latest', '--secret',
                                 'GOODQA_CLOUDFLARE_API_TOKEN', '--project', 'goodqa-28dd3'])
-        self.assertEqual(sorted(kwargs['env']), ['CLOUDSDK_CORE_DISABLE_PROMPTS', 'HOME', 'PATH'])
+        self.assertEqual(sorted(kwargs['env']), ['CLOUDSDK_CORE_DISABLE_FILE_LOGGING', 'CLOUDSDK_CORE_DISABLE_PROMPTS',
+                                                 'CLOUDSDK_CORE_LOG_HTTP', 'HOME', 'PATH'])
+        # These two beat a persisted log_http / file-logging setting (checked against a throwaway gcloud config).
+        self.assertEqual((kwargs['env']['CLOUDSDK_CORE_LOG_HTTP'], kwargs['env']['CLOUDSDK_CORE_DISABLE_FILE_LOGGING']),
+                         ('false', 'true'))
         self.assertEqual(kwargs['env']['PATH'], '/opt/homebrew/bin:/usr/bin:/bin')
         self.assertEqual((kwargs['stdin'], kwargs['stderr']), (subprocess.DEVNULL, subprocess.DEVNULL))
         self.assertNotIn('shell', kwargs)
@@ -106,7 +114,7 @@ class ScriptTests(unittest.TestCase):
 
     def test_home_for_the_secret_tool_ignores_the_environment(self):
         with mock.patch.dict(os.environ, {'HOME': '/nonexistent/planted'}):
-            run = Run([ZONE_OK, NONE_YET, CREATED])
+            run = Run([ZONE_OK, NONE_YET, CREATED, CONFIRMED])
         self.assertNotEqual(run.tool_calls[0][1]['env']['HOME'], '/nonexistent/planted')
 
     def test_already_present_is_success_without_a_write(self):
@@ -176,11 +184,61 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(run.err, 'FAILED create: HTTP 400, codes [81057]; run again to see whether the record exists\n')
 
     def test_a_create_answer_that_is_not_the_wanted_record_is_not_success(self):
-        for label, result in (('other content', dict(RECORD, content='192.0.2.9')), ('proxied', dict(RECORD, proxied=True)),
-                              ('missing', None)):
+        for label, result in (('other content', dict(RECORD, content='192.0.2.9', id=NEW_ID)),
+                              ('proxied', dict(RECORD, proxied=True, id=NEW_ID)), ('missing', None),
+                              ('no id', RECORD), ('odd id', dict(RECORD, id='../' + 'a' * 29)), ('id not text', dict(RECORD, id=7))):
             with self.subTest(label):
                 run = Run([ZONE_OK, NONE_YET, (200, {'success': True, 'result': result})])
+                self.assertEqual((run.code, run.out, run.methods), (5, '', ['GET', 'GET', 'POST']))
+
+    def test_a_record_that_appears_during_the_create_undoes_this_runs_record_only(self):
+        mine, other = dict(RECORD, id=NEW_ID), dict(RECORD, content='192.0.2.9', id='ef' * 16)
+        rows = {
+            'another address beside it': [mine, other],
+            'a cname beside it': [mine, {'type': 'CNAME', 'name': NAME, 'content': 'elsewhere.example', 'id': 'ef' * 16}],
+            'only the other one': [other],
+            'the same record under another id': [dict(RECORD, id='ef' * 16)],
+        }
+        for label, now in rows.items():
+            with self.subTest(label):
+                run = Run([ZONE_OK, NONE_YET, CREATED, (200, {'success': True, 'result': now}),
+                           (200, {'success': True, 'result': {'id': NEW_ID}})])
+                self.assertEqual((run.code, run.out, run.left), (4, '', []))
+                self.assertEqual(run.methods, ['GET', 'GET', 'POST', 'GET', 'DELETE'])
+                self.assertEqual(run.requests[4].full_url, RECORDS_URL + '/' + NEW_ID)
+                self.assertIsNone(run.requests[4].data)
+                self.assertIn('the record this run created was removed', run.err)
+                self.assertNotIn('192.0.2.9', run.err)
+
+    def test_a_failed_undo_says_what_is_left(self):
+        other = dict(RECORD, content='192.0.2.9', id='ef' * 16)
+        for label, answer in (('server error', (500, {'success': False, 'errors': [{'code': 1000, 'message': TOKEN}]})),
+                              ('not success', (200, {'success': False})), ('no answer', (200, b''))):
+            with self.subTest(label):
+                run = Run([ZONE_OK, NONE_YET, CREATED, (200, {'success': True, 'result': [dict(RECORD, id=NEW_ID), other]}),
+                           answer])
                 self.assertEqual((run.code, run.out), (5, ''))
+                self.assertIn('FAILED undo', run.err)
+                self.assertIn('remove A %s -> %s by hand' % (NAME, IPV4), run.err)
+                self.assertNoSecret(run)
+
+    def test_an_unreadable_confirmation_deletes_nothing(self):
+        for label, answer in (('server error', (500, {})), ('not a list', (200, {'success': True, 'result': None})),
+                              ('odd rows', (200, {'success': True, 'result': ['x']})),
+                              ('not listed yet', (200, {'success': True, 'result': []})),
+                              ('listed but changed', (200, {'success': True, 'result': [dict(RECORD, proxied=True, id=NEW_ID)]})),
+                              ('listed twice', (200, {'success': True, 'result': [dict(RECORD, id=NEW_ID)] * 2}))):
+            with self.subTest(label):
+                run = Run([ZONE_OK, NONE_YET, CREATED, answer])
+                self.assertEqual((run.code, run.out, run.methods), (5, '', ['GET', 'GET', 'POST', 'GET']))
+                self.assertIn('FAILED confirm', run.err)
+
+    def test_delete_is_never_sent_on_any_other_path(self):
+        for answers in ([ZONE_OK, NONE_YET, CREATED, CONFIRMED], [ZONE_OK, (200, {'success': True, 'result': [RECORD]})],
+                        [ZONE_OK, (200, {'success': True, 'result': [dict(RECORD, content='192.0.2.9')]})],
+                        [ZONE_OK, NONE_YET, (400, {'success': False})], [(403, {})]):
+            run = Run(answers)
+            self.assertNotIn('DELETE', run.methods)
 
     def test_secret_failures_stop_before_any_request(self):
         rows = {
@@ -290,7 +348,7 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(text.count('print('), 2)
         self.assertEqual(sorted(set(__import__('re').findall(r'\b[A-Z][A-Z0-9_]*(?:TOKEN|SECRET_KEY|API_KEY)\b', text))),
                          ['GOODQA_CLOUDFLARE_API_TOKEN'])
-        for word in ('getenv', 'os.environ', 'open(', 'argparse', 'logging', 'shell=True', 'eval(', 'exec('):
+        for word in ('getenv', 'os.environ', 'open(', 'argparse', 'import logging', 'shell=True', 'eval(', 'exec('):
             self.assertNotIn(word, text.replace('_OPENER.open(', ''))
 
     def test_the_real_file_refuses_an_argument_under_isolated_python(self):
