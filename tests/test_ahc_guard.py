@@ -485,6 +485,54 @@ class GuardPolicyUnitTests(unittest.TestCase):
         self.assertEqual(p.git_prefix(), ahc_clone.SAFE)
 
 
+class UserBusTests(unittest.TestCase):
+    """goodqa#16386: a guarded `systemctl --user` / `systemd-run --user` needs the daemon's own user bus. It is derived
+    from the running uid, never passed through from the caller, and no other form or scope gets it."""
+
+    CALLER = {"XDG_RUNTIME_DIR": "/tmp/caller-runtime", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/caller-runtime/bus"}
+
+    def policy(self, scope):
+        return guard.Policy.for_test("/nonexistent-root", {}, trusted_dirs=("/usr/bin", "/bin"), unit_scope=scope)
+
+    def test_16386_user_scope_systemd_forms_get_the_uid_derived_bus_not_the_callers(self):
+        runtime = "/run/user/%d" % os.getuid()
+        with mock.patch.dict(os.environ, self.CALLER):
+            p = self.policy("--user")
+            for name in ("systemctl", "systemd-run"):
+                with self.subTest(form=name):
+                    self.assertEqual(p.env(name), {"PATH": "/usr/bin:/bin", "HOME": p.home, "LC_ALL": "C",
+                                                   "XDG_RUNTIME_DIR": runtime,
+                                                   "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s/bus" % runtime})
+
+    def test_16386_no_other_form_or_scope_gets_a_bus(self):
+        with mock.patch.dict(os.environ, self.CALLER):
+            user, system = self.policy("--user"), self.policy("")
+            cases = [(user, n) for n in guard.EXECUTABLES if n not in ("systemctl", "systemd-run")]
+            cases += [(system, "systemctl"), (system, "systemd-run")]
+            for p, name in cases:
+                with self.subTest(form=name, scope=p.unit_scope):
+                    env = p.env(name)
+                    self.assertNotIn("XDG_RUNTIME_DIR", env)
+                    self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", env)
+            self.assertEqual(guard.form_env("git", ["/usr/bin"], "/h").keys() & {"XDG_RUNTIME_DIR"}, set())
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and os.path.exists("/run/user/%d/bus" % os.getuid()),
+                         "needs a Linux host with this user's systemd user manager (t2-dev)")
+    def test_16386_guarded_user_list_units_reaches_the_user_bus_on_a_real_host(self):
+        """The real form, as startup reconciliation runs it: before the fix it exits 1 with "Failed to connect to
+        bus: No medium found". A bogus caller bus must not matter, because the form's env is fixed."""
+        import ahc_review  # noqa: PLC0415
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = guard.Policy(tmp.name, repos=[])
+        self.assertIn("systemctl", p.exe, "systemctl must resolve from the trusted directories")
+        with mock.patch.dict(os.environ, self.CALLER):
+            rc, out, err = ahc_review.SystemdRunner(p).ctl("list-units", "--plain", "--no-legend", "--all",
+                                                          "ahc-review-*")
+        self.assertNotIn("No medium found", err)
+        self.assertEqual(rc, 0, err)
+
+
 
 class MigrateProbeTests(_GuardFixture):
     """AC-11 steps 2 and 4 under the installed guard: the open-file probe launches through the policy's lsof form
