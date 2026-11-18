@@ -46,6 +46,9 @@ MAX_RESPONSE = 8_000_000
 MAX_BODY_FILE = 8_000
 MAX_LIMIT = 200
 MAX_PEERS = 100
+# tool error codes that mean the server refused before acting: a send that got one may be retried without confirmation
+PRE_EFFECT = frozenset({"bad_request", "validation_error", "validation_failed", "forbidden", "unauthorized", "approval_required",
+                        "policy_denied", "not_found", "human_approval_required", "user_token_expired", "user_token_ability_missing"})
 MAX_TEXT_FIELD = 20_000
 TOOLS = ("get_direct_messages", "list_messages", "agent_chat_history", "file_list", "send_direct_message", "chat_channel_list",
          "chat_channel_post", "list_orgs", "list_org_members", "get_attachment")
@@ -56,6 +59,8 @@ META_VALUE = re.compile(r"^(?:[0-9a-fA-F-]{36}|\d{4}-\d\d-\d\dT[0-9:.]{8,16}(?:Z
 
 class ChatError(Exception):
     """code and message are local text only; nothing from a server body reaches them except an allow-listed code."""
+
+    server_code = None  # the allow-listed machine code a tool error carried, when it carried one
 
     def __init__(self, code, message, exit_code=2):
         super().__init__(message)
@@ -140,7 +145,7 @@ class Client:
         if isinstance(err, dict):
             number = err.get("code")
             raise ChatError("rpc_error", "GoodQA refused the request (JSON-RPC %s)" % (
-                number if isinstance(number, int) and not isinstance(number, bool) else "error"), 3)
+                number if isinstance(number, int) and not isinstance(number, bool) and abs(number) < 10**7 else "error"), 3)
         if not isinstance(doc.get("result"), dict):
             raise ChatError("unexpected_response", "GoodQA returned an unexpected shape", 3)
         return doc["result"]
@@ -164,7 +169,9 @@ class Client:
             code = err.get("code") if isinstance(err, dict) else None
             if code == "not_found":
                 raise ChatError("not_found", "GoodQA says not_found: no such conversation or user, or you are not a party to it", 3)
-            raise ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
+            refused = ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
+            refused.server_code = code if isinstance(code, str) and code in gq.KNOWN_CODES else None
+            raise refused
         return inner
 
 
@@ -197,8 +204,7 @@ def _messages(data):
         for key in MESSAGE_LISTS:
             if isinstance(data.get(key), list):
                 return data[key]
-    names = sorted(k for k in data if isinstance(k, str) and re.fullmatch(r"[A-Za-z_]{1,40}", k)) if isinstance(data, dict) else []
-    raise ChatError("unexpected_response", "GoodQA returned messages in an unknown shape (keys: %s)" % ", ".join(names[:12]), 3)
+    raise ChatError("unexpected_response", "GoodQA returned messages in an unknown shape", 3)
 
 
 def _metadata_only(message):
@@ -228,6 +234,8 @@ def _user(client, org, who):
     if not NAME_RE.match(who or ""):
         raise ChatError("bad_request", "--with is a user id or a member's exact name")
     data = client.tool("list_org_members", {"orgId": org})
+    if isinstance(data, dict) and (data.get("nextCursor") or data.get("hasMore")):
+        raise ChatError("ambiguous", "the org has more members than one page; use the user id instead of a name", 3)
     rows = _messages(data) if not isinstance(data, dict) or not isinstance(data.get("members"), list) else data["members"]
     want = who.strip().casefold()
     hits = []
@@ -235,7 +243,7 @@ def _user(client, org, who):
         if not isinstance(row, dict):
             continue
         user = row.get("user") if isinstance(row.get("user"), dict) else row
-        uid = user.get("id") or user.get("userId") or row.get("userId")
+        uid = row.get("userId") or user.get("userId") or (user.get("id") if user is not row else None)
         labels = {str(user.get(k)).strip().casefold() for k in ("name", "displayName", "email") if user.get(k)}
         if want in labels and isinstance(uid, str) and UUID_RE.match(uid):
             hits.append(uid)
@@ -357,9 +365,25 @@ def files(home, conversation=None, org=None, surface=None, base=None):
 
 # ------------------------------------------------------------------ send
 
+def _plain_path(path):
+    """A body file must not sit under a dot directory or be a dot file (.env, .aws, .ssh, .config, .claude): `send` is a way
+    to put a file's text in front of another person, so files that hold credentials are out of reach. The harness work and
+    scratch directories (~/.agent-harness/work, ~/.agent-harness/scratch) are the exception."""
+    parts = Path(os.path.abspath(os.path.expanduser(path))).parts
+    for i, part in enumerate(parts):
+        if part.startswith(".") and part not in (".", ".."):
+            if part == ".agent-harness" and i + 1 < len(parts) and parts[i + 1] in ("work", "scratch"):
+                continue
+            return False
+    return True
+
+
 def _read_body(path):
+    if not isinstance(path, str) or not _plain_path(path):
+        raise ChatError("bad_request", "--body-file may not be a dot file or sit in a dot directory (write the message "
+                                       "to a plain file, for example in your work directory)")
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except (OSError, TypeError):
         raise ChatError("bad_request", "--body-file cannot be opened (a regular file, not a symlink)") from None
     try:
@@ -442,30 +466,40 @@ def send(home, with_=None, org=None, body_file=None, client_msg_id=None, confirm
         if rows and rows[0].get("request") != request_sha:
             raise ChatError("key_conflict", "that --client-msg-id was used for a different message or target", 3)
         sent = [r for r in rows if r.get("status") == "sent"]
-        if sent:
-            return _checked({"ok": True, "result": "duplicate", "sent": True, "client_msg_id": client_msg_id, **target,
-                             "message_id": sent[-1].get("message_id")})
-        if rows and rows[-1].get("status") in ("pending", "uncertain") and not conversation and not confirm_not_delivered:
+        result = "sent"
+        mid = None
+        if sent:  # no second post; the ledger row is written again below (idempotent) in case the first write failed
+            result, mid = "duplicate", sent[-1].get("message_id")
+        elif rows and rows[-1].get("status") in ("pending", "uncertain") and not conversation and not confirm_not_delivered:
             raise ChatError("uncertain", "an earlier attempt with this --client-msg-id has an unknown outcome and a direct "
                                          "message has no server-side duplicate check: read `ah chat history --with ...` to see "
                                          "whether it arrived; if it did not, retry with --confirm-not-delivered", 3)
-        _put(path, {"at": time.time(), "key": key, "status": "pending", "request": request_sha})
-        try:
-            if conversation:
-                data = client.tool("chat_channel_post", {"conversationId": conversation, "body": body,
-                                                         "clientMsgId": client_msg_id})
-            else:
-                data = client.tool("send_direct_message", {"orgId": target["org"], "userId": target["with"], "body": body})
-        except ChatError as error:
-            definite = error.code in ("tool_error", "not_found", "rpc_error") or (
-                error.code == "http_error" and re.match(r"GoodQA HTTP 4\d\d", str(error)) is not None)
-            _put(path, {"at": time.time(), "key": key, "status": "failed" if definite else "uncertain",
-                        "request": request_sha, "why": error.code})
-            raise
-        message = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else data
-        mid = message.get("id") if isinstance(message, dict) else None
-        mid = mid if isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,80}", mid) else None
-        _put(path, {"at": time.time(), "key": key, "status": "sent", "request": request_sha, "message_id": mid})
+        if result == "sent":
+            _put(path, {"at": time.time(), "key": key, "status": "pending", "request": request_sha})
+            try:
+                if conversation:
+                    data = client.tool("chat_channel_post", {"conversationId": conversation, "body": body,
+                                                             "clientMsgId": client_msg_id})
+                else:
+                    data = client.tool("send_direct_message", {"orgId": target["org"], "userId": target["with"], "body": body})
+            except ChatError as error:
+                # "failed" (safe to retry) only when the server refused before acting; anything else, such as a timeout
+                # message or a 5xx, may have delivered the message and stays "uncertain"
+                status = re.match(r"GoodQA HTTP (\d{3})", str(error))
+                definite = error.code == "not_found" or (error.code == "tool_error" and getattr(error, "server_code", None) in PRE_EFFECT) \
+                    or (error.code == "http_error" and status is not None and status.group(1)[0] == "4"
+                        and status.group(1) not in ("408", "429"))
+                _put(path, {"at": time.time(), "key": key, "status": "failed" if definite else "uncertain",
+                            "request": request_sha, "why": error.code})
+                raise
+            message = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else data
+            mid = message.get("id") if isinstance(message, dict) else None
+            mid = mid if isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,80}", mid) else None
+            if mid is None and not conversation:  # a 2xx that names no message (for example a pending approval) is not "sent"
+                _put(path, {"at": time.time(), "key": key, "status": "uncertain", "request": request_sha, "why": "no_message"})
+                raise ChatError("unexpected_response", "GoodQA answered without naming the sent message; check `ah chat history` "
+                                                       "before retrying (then use --confirm-not-delivered)", 3)
+            _put(path, {"at": time.time(), "key": key, "status": "sent", "request": request_sha, "message_id": mid})
     finally:
         os.close(lock)
     ledger = "recorded"
@@ -475,5 +509,5 @@ def send(home, with_=None, org=None, body_file=None, client_msg_id=None, confirm
                                               message_id=mid), ah.env_session(), key=key)
     except Exception:  # noqa: BLE001 - the message is sent; the local send file above already holds it
         ledger = "failed"
-    return _checked({"ok": True, "result": "sent", "sent": True, "client_msg_id": client_msg_id, **target,
+    return _checked({"ok": True, "result": result, "sent": True, "client_msg_id": client_msg_id, **target,
                      "message_id": mid, "body_sha256": digest, "ledger": ledger})

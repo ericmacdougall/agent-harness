@@ -314,9 +314,52 @@ class SendTests(Base):
         self.assertEqual(self.stub.sent("send_direct_message"), [])
 
     def test_the_token_file_itself_cannot_be_the_body(self):
-        data = self.out("send", "--with", PEER, "--org", ORG, "--body-file", str(self.token_file), "--client-msg-id", "send-0001-aaaa")
-        self.assertEqual(data["code"], "secret_refused")
+        copy = self.home / "copy.txt"
+        copy.write_text(TOKEN)
+        for path, code in ((self.token_file, "bad_request"), (copy, "secret_refused")):  # a dot directory, then the content check
+            data = self.out("send", "--with", PEER, "--org", ORG, "--body-file", str(path), "--client-msg-id", "send-0001-aaaa")
+            self.assertEqual(data["code"], code)
         self.assertEqual(self.stub.calls, [])
+
+    def test_dot_files_and_fifos_cannot_be_the_body(self):
+        env_file = self.home / ".env"
+        env_file.write_text("DB_HOST=localhost\n")
+        fifo = self.home / "pipe.txt"
+        os.mkfifo(fifo)
+        for path in (env_file, fifo):
+            args = list(self.args)
+            args[args.index("--body-file") + 1] = str(path)
+            self.assertEqual(self.out(*args)["code"], "bad_request", path.name)  # a fifo must not hang either
+        self.assertEqual(self.stub.calls, [])
+
+    def test_a_timeout_text_error_may_have_delivered_so_it_is_not_retried_blindly(self):
+        def timed_out(a):
+            return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [
+                {"type": "text", "text": "MCP error -32001: Request timed out"}]}}
+        self.stub.tools["send_direct_message"] = timed_out
+        self.assertEqual(self.out(*self.args)["code"], "tool_error")
+        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000004"}})
+        self.assertEqual(self.out(*self.args)["code"], "uncertain")
+        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
+
+    def test_a_2xx_that_names_no_message_is_not_sent(self):
+        self.stub.tools["send_direct_message"] = lambda a: ok({"status": "approval_required"})
+        self.assertEqual(self.out(*self.args)["code"], "unexpected_response")
+        self.assertEqual(self.out(*self.args)["code"], "uncertain")
+
+    def test_flat_member_rows_use_the_user_id_not_the_membership_id(self):
+        self.stub.tools["list_org_members"] = lambda a: ok({"members": [
+            {"id": "99999999-9999-4999-8999-999999999999", "userId": PEER, "name": "Una Unique"}]})
+        args = ["send", "--with", "Una Unique", "--org", ORG, "--body-file", str(self.body), "--client-msg-id", "send-0004-dddd"]
+        self.assertTrue(self.out(*args)["ok"])
+        self.assertEqual(self.stub.sent("send_direct_message")[0][1]["userId"], PEER)
+
+    def test_a_ledger_row_is_written_again_on_a_duplicate(self):
+        self.out(*self.args)
+        ledger = self.home / ".agent-harness" / "state" / "ah" / "store" / "ledger.jsonl"
+        ledger.unlink()
+        self.assertEqual(self.out(*self.args)["result"], "duplicate")
+        self.assertIn("chat.send", ledger.read_text())
 
     def test_body_file_must_be_a_regular_non_symlink_small_utf8_file(self):
         link = self.home / "link.txt"
