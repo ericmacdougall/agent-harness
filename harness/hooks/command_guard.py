@@ -352,6 +352,7 @@ def _pw_home():
 # Entry: (path relative to HOME, sha256, exact command shape with {path}, expiry as a UNIX time).
 DEV_DECOM_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host the pve evacuation routes served shut down
 FABRIC_DO_AUTH_EXPIRES = 1795219200  # 2026-11-21T00:00:00Z, seven days after the user approved it
+TIMBAR_STAGING_DNS_EXPIRES = 1795305600  # 2026-11-22T00:00:00Z, under four days after the user approved it
 PINNED_ROUTES = (
     # The pve evacuation (GoodQA goodqa#14518).
     ('.agent-harness/work/dev-decom/unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
@@ -373,6 +374,16 @@ PINNED_ROUTES = (
      '419863b6538f16b6d66c03faf06ecc42f76d8aa765069a447d28f36959f7985f',
      r'/bin/bash -p {path}',
      FABRIC_DO_AUTH_EXPIRES),
+    # TIMBAR staging (GoodQA goodqa#16393): create the one record A timbar-staging.transition2.ai -> 159.203.13.118 (DNS
+    # only) with the Cloudflare token read from GCP Secret Manager into memory. No arguments: the zone, name, address and
+    # secret name are constants in the file, which prints fixed text only and writes nothing when the name is taken.
+    # Source: user:3410ce93-bee1-4ffb-b94b-1e852bc94483/d65a6c83-177c-4959-8e8e-f08fc483160b "you do it, get the
+    # secret/key from gcloud and set it" and, after the guard refused the first draft,
+    # user:3410ce93-bee1-4ffb-b94b-1e852bc94483/86b906f7-44bb-4d30-9a5e-ed10a45e60c1 "fix the command guard".
+    ('.agent-harness/work/3410ce93-bee1-4ffb-b94b-1e852bc94483/cf_dns.py',
+     '3fc503e96c61aa8ffb4705a858f8ded2515ae0ecd563142ce25d6c7c30f26420',
+     r'/usr/bin/python3 -I {path}',
+     TIMBAR_STAGING_DNS_EXPIRES),
 )
 # Existing scripts keep only log deletion and the credential-read rules (SCRIPT_CREDENTIAL_RULES); other printing rules
 # inside them still pass (goodqa#14993 follow-up). This also refuses
