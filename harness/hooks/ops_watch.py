@@ -2394,6 +2394,32 @@ def queue_events(cfg: dict, state: dict, news: list, now: float) -> None:
             sent[e["key"]] = now
 
 
+DELIVERED_MAX = 500  # deadman delivery receipts kept (oldest evicted)
+
+
+def record_delivered(state: dict, key, now: float) -> None:
+    """The deadman delivery receipt (goodqa#16034 D19): written only after send_deadman returned success, so it is the
+    one piece of state that means "handed to the mail command". deadman_sent stays the queue and rate-limit marker
+    and is set before any send, so it is never evidence of delivery."""
+    if not key:
+        return
+    got = state.setdefault("deadman_delivered", {})
+    got.pop(key, None)
+    got[key] = now
+    while len(got) > DELIVERED_MAX:
+        got.pop(min(got, key=got.get))
+
+
+def delivered_at(home: Path, key: str):
+    """Read-only query for other tools (ahc): the key's delivery time, or None. Unreadable or malformed state is
+    None, never a receipt."""
+    got = load_state(home).get("deadman_delivered")
+    if not isinstance(got, dict):
+        return None
+    value = got.get(key)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 FWD_KEYS_MAX = 200  # keys remembered as forwarded-raised (a bounded state slot)
 
 
@@ -2619,6 +2645,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
         if tries < 3 and time.monotonic() < deadline:
             tries += 1
             if send_deadman(cfg, runner, e):
+                record_delivered(state, e.get("key"), now)  # saved with this run's state, after the send succeeded
                 continue
         still.append(e)
     state["pending_deadman"] = still
@@ -2837,6 +2864,8 @@ def capabilities() -> list:
     caps = ["emit"]
     if callable(globals().get("forward_foreign")) and callable(globals().get("queue_events")):
         caps.append("forward-foreign-critical")  # critical raise and clear rows of a foreign ring source reach the digest and the deadman queue
+    if callable(globals().get("record_delivered")) and callable(globals().get("delivered_at")):
+        caps.append("deadman-delivered")  # a durable delivery receipt and the read-only `delivered --key K --json` query
     return caps
 
 
@@ -2856,6 +2885,9 @@ def main(argv=None) -> int:
     sub.add_parser("config")
     sub.add_parser("capabilities", help="print one capability per line (an installer can grep -qx for one)")
     sub.add_parser("relay-comment", help="post stdin as one comment on the ops-watch alerts ticket (peer relay)")
+    d = sub.add_parser("delivered", help="read-only: when a deadman alert key was handed to the mail command, or null")
+    d.add_argument("--key", required=True)
+    d.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     cmd = args.cmd or "run"
     if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)
@@ -2863,6 +2895,9 @@ def main(argv=None) -> int:
         return 0
     home = Path.home()
     try:
+        if cmd == "delivered":  # read-only; never writes state
+            print(json.dumps({"key": args.key, "delivered_at": delivered_at(home, args.key)}))
+            return 0
         if cmd == "emit":
             print(emit(json.loads(args.json), home=home))
             return 0

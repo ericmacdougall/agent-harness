@@ -1250,6 +1250,126 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         self.assertFalse(capture.exists())
         self.assertTrue(self.output.is_dir())
 
+    # PR 247 F4 (goodqa#16049): agent-harness runs no GitHub CI, so the PR review is the merge gate for the ahc
+    # release list. These run the real `pr` entry point on a fixture repository shaped like agent-harness.
+    RELEASE_HELPERS = ('ah', 'ops_watch', 'peer_review')
+
+    def release_commit(self, message, *, files=None, manifest='current', install_names=('ahc_core.py',),
+                       helpers=None, install_text=None):
+        """HEAD declares its shipped modules in install.py HOOKS and its helpers in ahc_guard.HELPER_SCRIPTS, as
+        agent-harness does; 'current' writes the list ahc_release_hashes.py --write would."""
+        hooks = self.repo / 'harness' / 'hooks'
+        hooks.mkdir(parents=True, exist_ok=True)
+        for name, text in (files or {}).items():
+            (hooks / name).write_text(text)
+        helpers = helpers if helpers is not None else {n: n + '.py' for n in self.RELEASE_HELPERS}
+        (self.repo / 'install.py').write_text(install_text or (
+            'HOOKS = (' + ', '.join('"%s"' % n for n in (*install_names, 'ah.py')) + ',)\n'))
+        (hooks / 'ahc_guard.py').write_text('import re\nHELPER_SCRIPTS = %r\n' % (helpers,))
+        if manifest == 'current':
+            sha = lambda name: hashlib.sha256((hooks / name).read_bytes()).hexdigest()  # noqa: E731
+            manifest = {'files': {n: sha(n) for n in install_names},
+                        'helpers': {n: sha(f) for n, f in helpers.items()}}
+        if manifest is not None:
+            (hooks / 'ahc_release.json').write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+        subprocess.run(['git', '-C', str(self.repo), 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', message], check=True)
+
+    def release_base(self):
+        self.release_commit('ahc release base', files={'ahc_core.py': 'core = 1\n', 'ah.py': 'ah = 1\n',
+                                                        'ops_watch.py': 'watch = 1\n', 'peer_review.py': 'review = 1\n'})
+
+    def assert_release_refused(self, *fragments):
+        launches = self.root / 'release-launches'
+        result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        for fragment in ('Review refused: harness/hooks/ahc_release.json', *fragments):
+            self.assertIn(fragment, result.stderr)
+        self.assertFalse(launches.exists(), 'a stale release list must refuse before any provider launch')
+        self.assertFalse(self.output.exists(), 'a refused review writes no report, so no merge authorization')
+        usage = self.root / 'usage-state'
+        runs = [p for p in usage.rglob('*') if p.is_file() and b'peer-review-pr' in p.read_bytes()] if usage.exists() else []
+        self.assertEqual(runs, [], 'no PR review run (so no PASS evidence) may be recorded')
+        return result
+
+    def test_r247_f4_a_drifted_helper_refuses_the_pr_review_before_any_provider(self):
+        self.release_base()
+        self.release_commit('change a helper without regenerating', files={'ah.py': 'ah = 2\n'}, manifest=None)
+        result = self.assert_release_refused('helpers ah (sha256 differs)', 'scripts/ahc_release_hashes.py --write')
+        self.assertNotIn('ops_watch', result.stderr)
+
+    def test_r247_f4_a_drifted_ahc_module_refuses_the_pr_review(self):
+        self.release_base()
+        self.release_commit('change a module without regenerating', files={'ahc_core.py': 'core = 2\n'}, manifest=None)
+        self.assert_release_refused('files ahc_core.py (sha256 differs)')
+
+    def test_r247_f4_dropping_a_listed_helper_refuses_the_pr_review(self):
+        self.release_base()
+        hooks = self.repo / 'harness' / 'hooks'
+        manifest = json.loads((hooks / 'ahc_release.json').read_text())
+        del manifest['helpers']['ah']
+        self.release_commit('drop a helper from the list', files={'ah.py': 'ah = 2\n'}, manifest=manifest)
+        self.assert_release_refused('helpers ah (declared by ahc_guard.HELPER_SCRIPTS, not listed)')
+
+    def test_r247_f4_a_newly_declared_helper_that_is_not_listed_refuses(self):
+        self.release_base()
+        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
+        self.release_commit('declare a helper without listing it', files={'extra.py': 'extra = 1\n'}, manifest=manifest,
+                            helpers={**{n: n + '.py' for n in self.RELEASE_HELPERS}, 'extra': 'extra.py'})
+        self.assert_release_refused('helpers extra (declared by ahc_guard.HELPER_SCRIPTS, not listed)')
+
+    def test_r247_f4_a_listed_helper_nothing_declares_refuses(self):
+        self.release_base()
+        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
+        manifest['helpers']['ghost'] = 'f' * 64
+        self.release_commit('list a helper nothing declares', manifest=manifest)
+        self.assert_release_refused('helpers ghost (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)')
+
+    def test_r247_f4_a_module_no_longer_shipped_leaves_the_list_and_passes(self):
+        # what --check requires: ahc_core.py stays on disk (as ahc_scan.py does) but install.py no longer ships it
+        self.release_base()
+        self.release_commit('stop shipping a module', install_names=())
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_r247_f4_a_listed_name_nothing_declares_refuses(self):
+        self.release_base()
+        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
+        self.release_commit('stop shipping a module but keep listing it', install_names=(), manifest=manifest)
+        self.assert_release_refused('files ahc_core.py (listed, but install.py does not ship it)')
+
+    def test_r247_f4_a_declaration_that_is_not_a_literal_refuses(self):
+        self.release_base()
+        self.release_commit('compute HOOKS', install_text='NAMES = ["ahc_core.py"]\nHOOKS = tuple(NAMES)\n')
+        self.assert_release_refused('install.py HOOKS is not a literal')
+
+    def test_r247_f4_an_unlisted_shipped_module_refuses_the_pr_review(self):
+        self.release_base()
+        hooks = self.repo / 'harness' / 'hooks'
+        manifest = json.loads((hooks / 'ahc_release.json').read_text())
+        self.release_commit('ship a new module without listing it', files={'ahc_new.py': 'new = 1\n'},
+                            manifest=manifest, install_names=('ahc_core.py', 'ahc_new.py'))
+        self.assert_release_refused('files ahc_new.py (shipped by install.py, not listed)')
+
+    def test_r247_f4_a_malformed_or_deleted_list_refuses_the_pr_review(self):
+        for label, manifest in (('not json', '{'), ('bad digest', {'files': {'ahc_core.py': 'x'}, 'helpers': {}}),
+                                ('deleted', None)):
+            with self.subTest(label):
+                self.release_base()
+                if manifest is None:
+                    (self.repo / 'harness' / 'hooks' / 'ahc_release.json').unlink()
+                self.release_commit('break the list: ' + label, manifest=manifest)
+                self.assert_release_refused()
+
+    def test_r247_f4_a_regenerated_list_passes_and_the_report_names_it(self):
+        self.release_base()
+        self.release_commit('change a helper and regenerate', files={'ah.py': 'ah = 2\n'})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        listed = (self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_bytes()
+        self.assertIn('ahc release list: current at this HEAD (harness/hooks/ahc_release.json SHA-256 '
+                      + hashlib.sha256(listed).hexdigest() + ')', self.output.read_text())
+
 
 class ProviderEnvelopeTests(unittest.TestCase):
     @classmethod

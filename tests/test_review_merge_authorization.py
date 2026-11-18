@@ -165,13 +165,14 @@ class AuthorizationTests(unittest.TestCase):
         self.counter = 0
         self.default_evidence = None
 
-    def evidence(self, review_changes=None, *, result="CHECK_OK", reason="NONE", settle=True, typed=True):
+    def evidence(self, review_changes=None, *, result="CHECK_OK", reason="NONE", settle=True, typed=True,
+                 subject_head=HEAD, subject_tree="f" * 40):
         self.counter += 1
         root = self.root / ("evidence-" + str(self.counter))
         repo = root / "repo"
         repo.mkdir(parents=True)
         store = guard.UsageStore(root / "usage")
-        subject = guard.Subject(schema=1, fingerprint="e" * 64, reusable=True, head=HEAD, tree="f" * 40)
+        subject = guard.Subject(schema=1, fingerprint="e" * 64, reusable=True, head=subject_head, tree=subject_tree)
         subject.repo, subject.manifest = repo, {}
         subject.probe = lambda: subject
         invocation = guard.invocation_identity(
@@ -276,6 +277,210 @@ class AuthorizationTests(unittest.TestCase):
                           "main:fixture")
 
 
+class PrPassEvidenceTests(AuthorizationTests):
+    """merge_gate.pr_pass_evidence: the pure predicate add_review_waiver and the ahc daemon share (goodqa#16049
+    M-1). It classifies evidence only; it never writes a waiver or any other state."""
+
+    def inspected(self, **changes):
+        store, reference = self.evidence(**changes)
+        return store.inspect(reference)
+
+    def test_settled_independent_pass_returns_its_binding(self):
+        self.assertEqual(mg.pr_pass_evidence(self.inspected()), ("o/r", 5, HEAD, REPORT_SHA))
+
+    def test_each_guard_clause_refuses(self):
+        good = self.inspected()
+        mutations = {
+            "unsettled": lambda e: e.update(review_finalization="PENDING"),
+            "not completed": lambda e: e.update(execution="TIMEOUT"),
+            "not CHECK_OK": lambda e: e.update(result="CHECK_FAILED"),
+            "reason set": lambda e: e.update(reason="ADVISORY"),
+            "wrong purpose": lambda e: e["invocation"].update(purpose="peer-review-code-inspection"),
+            "stage": lambda e: e["review"].update(stage="CODE_INSPECTION"),
+            "verdict": lambda e: e["review"].update(verdict="BLOCK"),
+            "findings": lambda e: e["review"].update(findings=["F1"]),
+            "ticketed": lambda e: e["review"].update(ticketed=True),
+            "missing report sha": lambda e: e["review"].pop("report_sha256"),
+            "subject head differs": lambda e: e["subject"].update(head=OTHER),
+            "author unknown": lambda e: e["review"].update(author_harness="unknown"),
+            "reviewer unknown": lambda e: e["review"].update(reviewer_harness="kimi"),
+            "same harness": lambda e: e["review"].update(reviewer_harness="claude", reviewer="Claude fixture"),
+            "prefix mismatch": lambda e: e["review"].update(reviewer="Claude fixture"),
+            "no provider launch": lambda e: e["usage"].update(provider_launches=0),
+            "launches not int": lambda e: e["usage"].update(provider_launches="1"),
+            "no review": lambda e: e.pop("review"),
+            "invocation not a mapping": lambda e: e.update(invocation="peer-review-pr"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name):
+                evidence = json.loads(json.dumps(good))
+                mutate(evidence)
+                with self.assertRaises((ValueError, guard.GuardError)):
+                    mg.pr_pass_evidence(evidence)
+        with self.assertRaises(ValueError):
+            mg.pr_pass_evidence(None)
+
+    def test_predicate_writes_nothing(self):
+        evidence = self.inspected()
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        mg.pr_pass_evidence(evidence)
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+        self.assertFalse(self.state.exists(), "classifying evidence never creates merge_gate state")
+
+    def test_add_review_waiver_decides_through_the_predicate(self):
+        store, reference = self.evidence()
+        with mock.patch.object(mg, "pr_pass_evidence", side_effect=ValueError("refused by predicate")):
+            with self.assertRaisesRegex(ValueError, "refused by predicate"):
+                mg.add_review_waiver(self.state, reference, store=store)
+        self.assertEqual(mg._read_waivers(self.state) if self.state.exists() else [], [])
+
+
+class BoundPassTests(AuthorizationTests):
+    """merge_gate.ahc_bound_pass (spec ahc-m1-v2g2 R4/E2, v2g6 scope: cross-vendor only): the PASS must be for the
+    reviewed head H, carry B_r, and B_r must be the current default-branch tip B or an ancestor of it. It replaces
+    the withdrawn candidate-M binding. BOUNDARY: main merges this and the security review reads it."""
+
+    H, B, BR, B2, H2 = "2" * 40, "1" * 40, "7" * 40, "8" * 40, "3" * 40
+
+    def final(self, head=None, snapshot_base=None, **review):
+        review.setdefault("head", head or self.H)
+        if snapshot_base is not False:
+            review["snapshot_base"] = snapshot_base or self.BR
+        store, reference = self.evidence(review, subject_head=review["head"])
+        return store.inspect(reference)
+
+    @staticmethod
+    def cmp(base, head, status="ahead"):
+        return {"base": base, "head": head, "status": status}
+
+    def binding(self, br=None, base_status="ahead", head_status="ahead", **changes):
+        b = {"repo": "o/r", "pr": 5, "head": self.H, "base": self.B, "pr_head": self.H,
+             "base_compare": self.cmp(br or self.BR, self.B, base_status),
+             "head_compare": self.cmp(self.B, self.H, head_status)}
+        b.update(changes)
+        return b
+
+    def test_pass_for_h_with_b_r_an_ancestor_of_b_or_equal_binds(self):
+        self.assertEqual(mg.ahc_bound_pass(self.final(), self.binding()), ("o/r", 5, self.H, self.BR, REPORT_SHA))
+        same = self.final(snapshot_base=self.B)
+        self.assertEqual(mg.ahc_bound_pass(same, self.binding(br=self.B, base_status="identical"))[3], self.B)
+        self.assertEqual(mg.ahc_bound_pass(self.final(), self.binding(repo="O/R"))[0], "o/r")
+
+    def test_each_binding_condition_refuses(self):
+        final = self.final()
+        bad = {
+            "legacy receipt without B_r": (self.final(snapshot_base=False), self.binding()),
+            "other repo": (final, self.binding(repo="o/other")),
+            "lookalike repo": (final, self.binding(repo="o/r\u0435")),
+            "other PR": (final, self.binding(pr=6)),
+            "PR as a string": (final, self.binding(pr="5")),
+            "Reviewed HEAD is not H": (self.final(head=self.H2), self.binding()),
+            "PR head read back moved": (final, self.binding(pr_head=self.H2)),
+            "PR head unread": (final, self.binding(pr_head=None)),
+            "B_r diverged from B": (final, self.binding(base_status="diverged")),
+            "B_r ahead of B": (final, self.binding(base_status="behind")),
+            "compare unread": (final, self.binding(base_compare=None)),
+            "compare a bare status": (final, self.binding(base_compare="ahead")),
+            "identical but B_r is not B": (final, self.binding(base_status="identical")),
+            "ahead but B_r is B": (self.final(snapshot_base=self.B), self.binding(br=self.B)),
+            "compare base is not B_r": (final, self.binding(br=self.B2)),
+            "compare head is not B": (final, self.binding(base_compare=self.cmp(self.BR, self.B2))),
+            "compare pair swapped": (final, self.binding(base_compare=self.cmp(self.B, self.BR))),
+            "compare sha short": (final, self.binding(base_compare=self.cmp(self.BR[:12], self.B))),
+            "compare status missing": (final, self.binding(base_compare={"base": self.BR, "head": self.B})),
+            "H not ahead of B": (final, self.binding(head_status="diverged")),
+            "H behind B": (final, self.binding(head_status="behind")),
+            "H identical to B by compare": (final, self.binding(head_status="identical")),
+            "B...H unread": (final, self.binding(head_compare=None)),
+            "B...H base is not B": (final, self.binding(head_compare=self.cmp(self.B2, self.H))),
+            "B...H head is not H": (final, self.binding(head_compare=self.cmp(self.B, self.H2))),
+            "B...H pair swapped": (final, self.binding(head_compare=self.cmp(self.H, self.B))),
+            "malformed H": (final, self.binding(head="xyz")),
+            "malformed B": (final, self.binding(base="B" * 40)),
+            "H equals B": (final, self.binding(base=self.H, head_compare=self.cmp(self.H, self.H),
+                                               base_compare=self.cmp(self.BR, self.H))),
+            "not a mapping": (final, None),
+        }
+        for name, (evidence, binding) in bad.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                mg.ahc_bound_pass(evidence, binding)
+
+    def test_cross_vendor_only_and_the_author_harness_must_be_known(self):
+        """v2g6 AC-17 scope: no same-vendor fallback in this change; an unknown author harness fails closed."""
+        for name, review in {"same vendor": {"reviewer_harness": "claude", "reviewer": "Claude x"},
+                             "author unknown": {"author_harness": "unknown"},
+                             "reviewer unknown": {"reviewer_harness": "kimi"}}.items():
+            with self.subTest(name), self.assertRaises((ValueError, guard.GuardError)):
+                mg.ahc_bound_pass(self.final(**review), self.binding())
+        with self.assertRaises((ValueError, guard.GuardError)):
+            mg.ahc_bound_pass(self.final(verdict="BLOCK"), self.binding())
+        self.assertNotIn("same_vendor", mg.ahc_bound_pass.__code__.co_varnames, "no fallback argument yet")
+
+    def test_mains_predicate_still_refuses_a_same_vendor_final(self):
+        """v2g6 AC-17: main's path, pr_pass_evidence, refuses a same-vendor FINAL, with and without B_r."""
+        for with_base in (False, True):
+            with self.subTest(with_base=with_base), self.assertRaises((ValueError, guard.GuardError)):
+                mg.pr_pass_evidence(self.final(reviewer_harness="claude", reviewer="Claude x"), with_base=with_base)
+
+    def test_binding_writes_nothing(self):
+        evidence = self.final()
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        mg.ahc_bound_pass(evidence, self.binding())
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+
+    def test_the_withdrawn_candidate_binding_is_gone(self):
+        self.assertFalse(hasattr(mg, "ahc_candidate_pass"), "v2g withdrew the candidate-M binding")
+
+
+class SnapshotBaseTests(AuthorizationTests):
+    """B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling option a): the PR FINAL may carry the reviewer's snapshot
+    base; usage_guard validates it and pr_pass_evidence exposes it. BOUNDARY: main merges this."""
+
+    BR = "9" * 40
+
+    def meta(self, **changes):
+        m = {"stage": "PR", "verdict": "ACCEPT", "findings": [], "repo": "o/r", "pr": 5, "head": HEAD,
+             "report_sha256": REPORT_SHA, "reviewer": "Codex fixture", "reviewer_harness": "openai",
+             "author_harness": "claude", "snapshot_base": self.BR}
+        m.update(changes)
+        return m
+
+    def test_metadata_accepts_a_full_snapshot_base_and_legacy_receipts_without_one(self):
+        guard.validate_review_metadata(self.meta(), result="CHECK_OK")
+        legacy = self.meta()
+        legacy.pop("snapshot_base")
+        guard.validate_review_metadata(legacy, result="CHECK_OK")
+
+    def test_metadata_refuses_a_malformed_snapshot_base(self):
+        for name, changes in {"short": {"snapshot_base": "9" * 12}, "upper": {"snapshot_base": "A" * 40},
+                              "not a string": {"snapshot_base": 9}, "equals head": {"snapshot_base": HEAD},
+                              "length differs from head": {"snapshot_base": "9" * 64},
+                              "no head": {"head": None}, "plan stage": {"stage": "PLAN"}}.items():
+            with self.subTest(name):
+                m = self.meta(**changes)
+                if m.get("head") is None:
+                    m.pop("head")
+                if m["stage"] != "PR":
+                    for k in ("repo", "pr", "reviewer", "reviewer_harness", "author_harness"):
+                        m.pop(k)
+                with self.assertRaises(guard.GuardError):
+                    guard.validate_review_metadata(m, result="CHECK_OK")
+
+    def test_pr_pass_evidence_exposes_the_base_only_when_asked(self):
+        store, reference = self.evidence({"snapshot_base": self.BR})
+        evidence = store.inspect(reference)
+        self.assertEqual(mg.pr_pass_evidence(evidence), ("o/r", 5, HEAD, REPORT_SHA), "default shape unchanged")
+        self.assertEqual(mg.pr_pass_evidence(evidence, with_base=True), ("o/r", 5, HEAD, REPORT_SHA, self.BR))
+
+    def test_with_base_refuses_a_legacy_receipt_without_a_snapshot_base(self):
+        # main's ruling: absence is legacy, never "same as the merge-base"; the 4-tuple path still accepts it
+        store, reference = self.evidence()
+        legacy = store.inspect(reference)
+        self.assertEqual(mg.pr_pass_evidence(legacy), ("o/r", 5, HEAD, REPORT_SHA))
+        with self.assertRaisesRegex(ValueError, "LEGACY_NO_SNAPSHOT_BASE"):
+            mg.pr_pass_evidence(legacy, with_base=True)
+
+
 class EndToEndTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -290,6 +495,7 @@ class EndToEndTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.repo), "add", "app.txt"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "baseline"], check=True)
         subprocess.run(["git", "-C", str(self.repo), "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+        self.baseline = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
         (self.repo / "app.txt").write_text("change\n")
         subprocess.run(["git", "-C", str(self.repo), "commit", "-qam", "feat: change\n\nRefs: none (fixture)\n\n"
                         "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
@@ -351,6 +557,118 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(code, 2, text)
         finally:
             fixture.HEAD = original_head
+
+    def test_no_main_stamp_leaves_mains_stamp_and_mints_nothing(self):
+        # goodqa#16049: the ahc daemon's bound run on a host where main has a stamp for this exact repo and PR
+        import caller_identity
+        caller_identity.put_stamp("review-auth", ["o/r", 5], home=self.root)
+        folder = caller_identity.stamp_dir(self.root)
+        before = sorted(p.name for p in folder.iterdir())
+        output = self.root / "daemon.md"
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", "--snapshot-base", self.baseline],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Merge authorization:", result.stdout)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), before, "main's stamp is neither taken nor burnt")
+        state = self.root / ".agent-harness" / "state"
+        self.assertEqual([r for r in mg._read_waivers(state) if r.get("event") == "waive"], [])
+        self.assertIn("Reviewed PR: 5", output.read_text(), "the run still binds to the PR")
+        self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=self.root),
+                             "main can still use its stamp afterwards")
+        # the daemon's own settled FINAL is still merge-eligible evidence for the shared predicate (M-1 C6 needs it)
+        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
+        reference = json.loads(line[len("Usage receipt: "):])
+        evidence = guard.UsageStore(self.root / "usage").inspect(reference)
+        self.assertEqual(mg.pr_pass_evidence(evidence)[:3], ("o/r", 5, self.head))
+        self.assertEqual(evidence["review"]["author_harness"], "claude", "derived from the trailers")
+        merge_base = subprocess.check_output(["git", "-C", str(self.repo), "merge-base", self.head,
+                                              "refs/remotes/origin/main"], text=True).strip()
+        self.assertEqual(merge_base, self.baseline, "fixture: the explicit base IS the merge-base")
+        self.assertEqual(mg.pr_pass_evidence(evidence, with_base=True)[4], self.baseline,
+                         "explicit base == merge-base still records the key (v2g, main's ruling)")
+
+    def reviewed_two_commit_pr(self, *extra):
+        # a second PR commit, so the merge-base (baseline) differs from head^1 (self.head)
+        (self.repo / "app.txt").write_text("second\n")
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qam", "feat: second\n\nRefs: none (fixture)\n\n"
+                        "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
+        head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
+                               "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
+        value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
+        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        output = self.root / "two.md"
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", head,
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", *extra],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
+        evidence = guard.UsageStore(self.root / "usage").inspect(json.loads(line[len("Usage receipt: "):]))
+        return head, mg.pr_pass_evidence(evidence, with_base=True)
+
+    def test_explicit_base_off_the_merge_base_is_recorded_not_inferred(self):
+        head, binding = self.reviewed_two_commit_pr("--snapshot-base", self.head)
+        self.assertEqual(binding[2], head)
+        self.assertEqual(binding[4], self.head, "B_r is the base the reviewer diffed against, not the merge-base")
+
+    def test_default_base_is_recorded_as_reviewed_not_the_merge_base(self):
+        head, binding = self.reviewed_two_commit_pr()
+        self.assertEqual(binding[4], self.head, "no flag: the head^1 snapshot base, never an inferred merge-base")
+
+    def reviewed_evidence(self, repo, head, *extra):
+        """Run the bound daemon-style PR review of `head` in `repo`; return its settled FINAL evidence."""
+        self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
+                               "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
+        value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
+        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        output = self.root / ("review-%s.md" % head[:12])
+        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
+                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
+                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
+        result = subprocess.run([
+            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(repo),
+            "--packet", str(self.packet), "--output", str(output), "--expected-head", head,
+            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", *extra],
+            text=True, capture_output=True, env=env, timeout=45)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
+        return guard.UsageStore(self.root / "usage").inspect(json.loads(line[len("Usage receipt: "):]))
+
+    def assert_no_base_and_refused(self, evidence, head):
+        self.assertNotIn("snapshot_base", evidence["review"], "no base: the key is absent, never defaulted")
+        self.assertEqual(mg.pr_pass_evidence(evidence)[2], head, "the legacy 4-tuple path still accepts it")
+        with self.assertRaisesRegex(ValueError, "LEGACY_NO_SNAPSHOT_BASE"):
+            mg.pr_pass_evidence(evidence, with_base=True)
+
+    def test_root_commit_pr_without_a_flag_has_no_base_and_is_refused_with_base(self):
+        root = self.root / "rootrepo"
+        root.mkdir()
+        for args in (["init", "-q", "-b", "main"], ["config", "user.name", "Fixture"],
+                     ["config", "user.email", "fixture@example.invalid"]):
+            subprocess.run(["git", "-C", str(root)] + args, check=True)
+        (root / "app.txt").write_text("only\n")
+        subprocess.run(["git", "-C", str(root), "add", "app.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "commit", "-qm", "feat: root\n\nRefs: none (fixture)\n\n"
+                        "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"], check=True)
+        head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", head + "^1"],
+                                        capture_output=True).returncode, 1, "fixture: a parentless commit")
+        self.assert_no_base_and_refused(self.reviewed_evidence(root, head), head)
+
+    def test_explicit_base_equal_to_head_is_omitted_and_refused_with_base(self):
+        evidence = self.reviewed_evidence(self.repo, self.head, "--snapshot-base", self.head)
+        self.assert_no_base_and_refused(evidence, self.head)
 
     def test_unstamped_review_mints_nothing(self):
         # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp

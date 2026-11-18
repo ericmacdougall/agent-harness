@@ -108,6 +108,28 @@ class Base(unittest.TestCase):
         self.addCleanup(p.stop)
 
 
+class BookkeepingCommentAgeTests(unittest.TestCase):
+    """goodqa#16034 AC-30: an ahc D24 bookkeeping note is never an owner checkpoint, so the ticket comment age that
+    `ah owners --comments` reports skips it and reads the newest real comment."""
+
+    def age(self, comments, now=2_000_000_000.0):
+        adapter = mock.Mock()
+        adapter.call.return_value = {"comments": comments}
+        with mock.patch.object(ah, "load_adapter", return_value=(adapter, None)), \
+                mock.patch.object(ah, "ticket_ref", return_value=("goodqa", 1)), \
+                mock.patch.object(ah, "ticket_issue", return_value=mock.Mock(id="i")):
+            return ah.comment_age("GoodQA goodqa#1", now)
+
+    def test_note_is_skipped_and_the_owner_comment_counts(self):
+        now = 2_000_000_000.0
+        owner_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 7200))
+        note_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+        comments = [{"body": "coordinator bookkeeping (ahc): receipt bookkeeping posted by ahc.", "createdAt": note_at},
+                    {"body": "Owner checkpoint: plan", "createdAt": owner_at}]
+        self.assertEqual(self.age(comments, now), 7200)
+        self.assertIsNone(self.age(comments[:1], now), "only a note: no owner comment at all")
+
+
 class LivenessTests(unittest.TestCase):
     def c(self, wal_age, tr_age=None, stopped=False, outcome=None, note="", typ="task-owner"):
         return liveness.classify(NOW, NOW - wal_age, NOW - tr_age if tr_age is not None else 0.0, stopped, outcome, note, typ)["state"]
