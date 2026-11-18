@@ -381,7 +381,7 @@ PINNED_ROUTES = (
     # secret/key from gcloud and set it" and, after the guard refused the first draft,
     # user:3410ce93-bee1-4ffb-b94b-1e852bc94483/86b906f7-44bb-4d30-9a5e-ed10a45e60c1 "fix the command guard".
     ('.agent-harness/work/3410ce93-bee1-4ffb-b94b-1e852bc94483/cf_dns.py',
-     '083e27060da9ed53db09ac4e5852ecaf14addf99cecb735f1196bd5c9df41d25',
+     '3fc503e96c61aa8ffb4705a858f8ded2515ae0ecd563142ce25d6c7c30f26420',
      r'/usr/bin/python3 -I {path}',
      TIMBAR_STAGING_DNS_EXPIRES),
 )

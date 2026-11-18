@@ -227,7 +227,19 @@ class ScriptTests(unittest.TestCase):
                               ('odd rows', (200, {'success': True, 'result': ['x']})),
                               ('not listed yet', (200, {'success': True, 'result': []})),
                               ('listed but changed', (200, {'success': True, 'result': [dict(RECORD, proxied=True, id=NEW_ID)]})),
-                              ('listed twice', (200, {'success': True, 'result': [dict(RECORD, id=NEW_ID)] * 2}))):
+                              ('listed twice', (200, {'success': True, 'result': [dict(RECORD, id=NEW_ID)] * 2})),
+                              ('empty row', (200, {'success': True, 'result': [{}]})),
+                              ('row without id', (200, {'success': True, 'result': [RECORD]})),
+                              ('row with odd id', (200, {'success': True, 'result': [dict(RECORD, id='../' + 'a' * 29)]})),
+                              ('row with id not text', (200, {'success': True, 'result': [dict(RECORD, id=7)]})),
+                              ('row for another name', (200, {'success': True, 'result': [
+                                  dict(RECORD, id='ef' * 16, name='x.' + ZONE, content='192.0.2.9')]})),
+                              ('row without type or content', (200, {'success': True, 'result': [
+                                  {'id': 'ef' * 16, 'name': NAME}]})),
+                              ('mine beside a malformed row', (200, {'success': True, 'result': [
+                                  dict(RECORD, id=NEW_ID), {}]})),
+                              ('mine beside a row for another name', (200, {'success': True, 'result': [
+                                  dict(RECORD, id=NEW_ID), dict(RECORD, id='ef' * 16, name='x.' + ZONE)]}))):
             with self.subTest(label):
                 run = Run([ZONE_OK, NONE_YET, CREATED, answer])
                 self.assertEqual((run.code, run.out, run.methods), (5, '', ['GET', 'GET', 'POST', 'GET']))

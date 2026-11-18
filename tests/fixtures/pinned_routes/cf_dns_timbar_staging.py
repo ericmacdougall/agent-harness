@@ -165,7 +165,12 @@ def run():
     if now is None:
         raise Stop(5, "FAILED confirm: the record was created but the name could not be listed again (HTTP %d, codes %s); "
                       "run again to check it" % (status, codes))
-    if all(row.get("id") == created_id for row in now):  # no other record holds the name
+    for row in now:  # a row that is not clearly a record on this name proves no conflict, so it is never undone
+        if not (isinstance(row.get("id"), str) and ZONE_ID_RE.fullmatch(row["id"]) and row.get("name") == NAME
+                and isinstance(row.get("type"), str) and isinstance(row.get("content"), str)):
+            raise Stop(5, "FAILED confirm: the record was created but the list of the name has an unexpected form; "
+                          "nothing was removed; run again to check it")
+    if all(row["id"] == created_id for row in now):  # no other record holds the name
         if len(now) == 1 and wanted(now[0]):
             return "OK created: A %s -> %s, DNS only, TTL %d" % (NAME, IPV4, TTL)
         raise Stop(5, "FAILED confirm: the record was created but the list of the name does not show it as wanted; "
