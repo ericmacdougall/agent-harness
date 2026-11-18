@@ -69,6 +69,18 @@ def tool_error(code):
         {"data": {"error": {"code": code, "message": "echo " + USER_SENTINEL}}})}]}}
 
 
+def request_of(base, target, body_text):
+    """The send-file request fingerprint ah_chat computes since r5: the destination, the target and the body's SHA-256. A
+    loopback stub base is already in normal form."""
+    digest = hashlib.sha256(body_text.encode()).hexdigest()
+    return hashlib.sha256(json.dumps({"base": base, "target": target, "body": digest}, sort_keys=True).encode()).hexdigest()
+
+
+def http_error(status, code=None):
+    """An HTTP error answer, with a machine code in the body when one is given (the server's {error: {code, message}})."""
+    return "raw", status, json.dumps({"error": {"code": code, "message": "echo"}} if code else {}).encode()
+
+
 def rpc_error():
     return 200, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "internal"}}
 
@@ -841,15 +853,14 @@ class SweepTests(Base):
 
     def test_a_message_id_replayed_from_the_send_file_is_checked_again(self):
         # a row written by a build before 9a9f152 stored the server's id unchecked; a duplicate must not relay it
-        digest = hashlib.sha256(self.body.read_text().encode()).hexdigest()
-        request = hashlib.sha256(json.dumps([{"org": ORG, "with": PEER}, digest], sort_keys=True).encode()).hexdigest()
+        request = request_of(self.stub.base, {"org": ORG, "with": PEER}, self.body.read_text())
         self.state.mkdir(parents=True, exist_ok=True)
         send_file = self.state / "chat-send.jsonl"
         for n, stored in enumerate((USER_SENTINEL, DM_SENTINEL[20:32] + "-x") + self.shapes):
             cid = "send-replay-%02d" % n
             with open(send_file, "a") as handle:
                 handle.write(json.dumps({"at": 1, "key": "chat:" + cid, "status": "sent", "request": request,
-                                         "message_id": stored}) + "\n")
+                                         "base": self.stub.base, "message_id": stored}) + "\n")
             p = self.dm(cid)
             data = json.loads(p.stdout)
             self.assertEqual((data["ok"], data["result"], data["message_id"]), (True, "duplicate", None), stored)
@@ -886,6 +897,147 @@ class SweepTests(Base):
         self.user_file.chmod(0o644)
         self.assertEqual(self.code(self.ah("history", "--with", PEER)), "refused")
         self.assertEqual(self.stub.hits, [])
+
+
+def plain_text_error(a):
+    return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [
+        {"type": "text", "text": "MCP error -32001: Request timed out"}]}}
+
+
+def codeless_tool_error(a):
+    return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [{"type": "text", "text": json.dumps(
+        {"data": {}})}]}}
+
+
+# docs/ah-chat.md "How a send attempt is recorded": (row, first answer, may the same id post again as a DM?)
+OUTCOMES = [
+    ("3 tool error, pre-effect code forbidden", lambda a: tool_error("forbidden"), True),
+    ("3 tool error, pre-effect code validation_error", lambda a: tool_error("validation_error"), True),
+    ("4 tool error not_found", lambda a: tool_error("not_found"), True),
+    ("5 tool error approval_required", lambda a: tool_error("approval_required"), False),
+    ("5 tool error, known code that is not pre-effect (conflict)", lambda a: tool_error("conflict"), False),
+    ("5 tool error, unrecognised code", lambda a: tool_error("zz_new_code"), False),
+    ("5 tool error without a code", codeless_tool_error, False),
+    ("6 plain-text tool error", plain_text_error, False),
+    ("7 JSON-RPC error", lambda a: rpc_error(), False),
+    ("8 unexpected 2xx body", lambda a: ("raw", 200, b"not json"), False),
+    ("9 2xx body over the size budget", lambda a: ("raw", 200, b" " * 8_000_001), False),
+    ("10 HTTP 403 with code forbidden", lambda a: http_error(403, "forbidden"), True),
+    ("10 HTTP 409 with code human_approval_required", lambda a: http_error(409, "human_approval_required"), True),
+    ("11 HTTP 409 with code approval_required", lambda a: http_error(409, "approval_required"), False),
+    ("11 HTTP 400 with code conflict", lambda a: http_error(400, "conflict"), False),
+    ("11 HTTP 400 with an unrecognised code", lambda a: http_error(400, "zz_new_code"), False),
+    ("12 HTTP 400, no code", lambda a: http_error(400), True),
+    ("12 HTTP 401, no code", lambda a: http_error(401), True),
+    ("12 HTTP 404, no code", lambda a: http_error(404), True),
+    ("12 HTTP 422, no code", lambda a: http_error(422), True),
+    ("13 HTTP 409, no code", lambda a: http_error(409), False),
+    ("13 HTTP 408, no code", lambda a: http_error(408), False),
+    ("13 HTTP 429, no code", lambda a: http_error(429), False),
+    ("13 HTTP 410, no code", lambda a: http_error(410), False),
+    ("14 HTTP 500 even with code forbidden", lambda a: http_error(500, "forbidden"), False),
+    ("14 HTTP 503, no code", lambda a: http_error(503), False),
+    ("15 redirect", lambda a: ("redirect", "http://127.0.0.1:9/elsewhere"), False),
+    ("16 no answer (connection dropped)", lambda a: "drop", False),
+]
+
+
+class OutcomeTests(Base):
+    """PR 277 r5: every class of the send outcome table, then the same --client-msg-id again. The table in docs/ah-chat.md
+    and this list are kept row for row; tests/mutants_ah_chat.py has a variant per row."""
+
+    def setUp(self):
+        super().setUp()
+        self.send_file = self.home / ".agent-harness" / "state" / "ah" / "chat-send.jsonl"
+
+    def dm_args(self, cid):
+        return ["send", "--with", PEER, "--org", ORG, "--body-file", str(self.body), "--client-msg-id", cid]
+
+    def last_status(self, cid):
+        rows = [json.loads(line) for line in self.send_file.read_text().splitlines()]
+        return [r for r in rows if r.get("key") == "chat:" + cid][-1]["status"]
+
+    def test_every_outcome_class_is_recorded_and_retried_as_the_table_says(self):
+        for n, (row, first, again_ok) in enumerate(OUTCOMES):
+            with self.subTest(row):
+                cid = "send-outcome-%02d" % n
+                self.stub.tools["send_direct_message"] = first
+                answer = self.out(*self.dm_args(cid))
+                self.assertFalse(answer["ok"], row)
+                self.assertEqual(self.last_status(cid), "failed" if again_ok else "uncertain", row)
+                before = len(self.stub.sent("send_direct_message"))
+                self.stub.tools["send_direct_message"] = lambda a, n=n: ok({"message": {"id": "msg-%06d" % (200 + n)}})
+                second = self.out(*self.dm_args(cid))
+                if again_ok:
+                    self.assertEqual((second["ok"], second.get("result")), (True, "sent"), row)
+                    self.assertEqual(len(self.stub.sent("send_direct_message")), before + 1, row)
+                else:
+                    self.assertEqual((second["ok"], second["code"]), (False, "uncertain"), row)
+                    self.assertEqual(len(self.stub.sent("send_direct_message")), before, row)  # no second POST
+        self.assert_no_token()
+
+    # F1 of the 3d071db review, by itself so its failure is plain
+    def test_an_http_409_approval_required_is_uncertain_and_never_posted_again(self):
+        self.stub.tools["send_direct_message"] = lambda a: http_error(409, "approval_required")
+        self.assertEqual(self.out(*self.dm_args("send-r5-f1-0001"))["code"], "http_error")
+        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000777"}})
+        self.assertEqual(self.out(*self.dm_args("send-r5-f1-0001"))["code"], "uncertain")
+        self.assertEqual(len(self.stub.sent("send_direct_message")), 1)
+
+    def test_an_uncertain_channel_post_may_post_again_because_the_server_dedupes(self):
+        self.stub.tools["chat_channel_post"] = lambda a: http_error(409, "approval_required")
+        args = ["send", "--conversation", CONV, "--body-file", str(self.body), "--client-msg-id", "send-chan-r5-01"]
+        self.assertFalse(self.out(*args)["ok"])
+        self.assertEqual(self.last_status("send-chan-r5-01"), "uncertain")
+        self.stub.tools["chat_channel_post"] = lambda a: ok({"message": {"id": "msg-000778"}})
+        again = self.out(*args)
+        self.assertEqual((again["ok"], again["result"]), (True, "sent"))
+        self.assertEqual([c[1]["clientMsgId"] for c in self.stub.sent("chat_channel_post")], ["send-chan-r5-01"] * 2)
+
+    def test_an_attempt_left_pending_is_treated_as_uncertain(self):
+        # row 17: the process died between the pending row and the outcome; nothing says whether the POST went out
+        self.send_file.parent.mkdir(parents=True, exist_ok=True)
+        request = request_of(self.stub.base, {"org": ORG, "with": PEER}, self.body.read_text())
+        self.send_file.write_text(json.dumps({"at": 1, "key": "chat:send-pending-01", "status": "pending",
+                                              "request": request, "base": self.stub.base}) + "\n")
+        self.assertEqual(self.out(*self.dm_args("send-pending-01"))["code"], "uncertain")
+        self.assertEqual(self.stub.sent("send_direct_message"), [])
+
+    # F2 of the 3d071db review
+    def test_the_same_id_at_another_api_base_is_a_conflict_not_a_duplicate(self):
+        other = Stub()
+        self.addCleanup(other.stop)
+        other.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-other-1"}})
+        other.tools["list_org_members"] = lambda a: ok(MEMBERS)
+        self.defaults(allowed=[self.stub.base, other.base])
+        self.stub.tools["send_direct_message"] = lambda a: ok({"message": {"id": "msg-000001"}})
+        self.assertEqual(self.out(*self.dm_args("send-base-0001"))["result"], "sent")
+        p = self.ah(*self.dm_args("send-base-0001"), base=other.base)
+        data = json.loads(p.stdout)
+        self.assertEqual((data["ok"], data["code"]), (False, "key_conflict"))
+        self.assertNotIn("sent", data)
+        self.assertEqual(other.sent("send_direct_message"), [])  # nothing posted at B, and A's delivery is not claimed
+        self.assertEqual(self.out(*self.dm_args("send-base-0001"))["result"], "duplicate")  # A itself still dedupes
+
+    def test_the_api_base_in_the_send_identity_is_normalised(self):
+        sys.path.insert(0, str(HOOKS))
+        import ah_chat  # noqa: PLC0415
+        for given in ("https://goodqa.app/v1", "HTTPS://GoodQA.App/v1/", "https://goodqa.app:443/v1"):
+            self.assertEqual(ah_chat._destination(given), "https://goodqa.app/v1", given)
+        self.assertEqual(ah_chat._destination("http://127.0.0.1:8080/v1/"), "http://127.0.0.1:8080/v1")
+        self.assertNotEqual(ah_chat._destination("https://staging.goodqa.app/v1"), ah_chat._destination("https://goodqa.app/v1"))
+
+    def test_a_row_recorded_without_an_api_base_is_never_trusted_or_reposted(self):
+        # a row from a build before r5: its destination is unknown, so it proves neither "sent here" nor "safe to post"
+        self.send_file.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(self.body.read_text().encode()).hexdigest()
+        legacy = hashlib.sha256(json.dumps([{"org": ORG, "with": PEER}, digest], sort_keys=True).encode()).hexdigest()
+        self.send_file.write_text(json.dumps({"at": 1, "key": "chat:send-legacy-01", "status": "sent", "request": legacy,
+                                              "message_id": "msg-old-1"}) + "\n")
+        data = self.out(*self.dm_args("send-legacy-01"))
+        self.assertEqual((data["ok"], data["code"]), (False, "key_conflict"))
+        self.assertIn("without its API base", data["message"])
+        self.assertEqual(self.stub.sent("send_direct_message"), [])
 
 
 if __name__ == "__main__":

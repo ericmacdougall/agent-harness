@@ -39,6 +39,7 @@ import socket
 import stat
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -56,13 +57,21 @@ MESSAGE_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,80}")
 MAX_RESPONSE = 8_000_000
 MAX_BODY_FILE = 8_000
 MAX_LIMIT = 100  # get_direct_messages takes at most 100; the other read tools' maxima are not readable here, so the same cap
-# tool error codes that mean the server refused before acting: a send that got one may be retried without confirmation
+# Server codes that mean the server refused before acting: a send that got one (in an MCP tool error OR in an HTTP 4xx body)
+# is "failed" and the same id may post again. Any other code, recognised or not, is "uncertain" whatever the HTTP status says
+# (PR 277 r5 F1: a code decides before a status). The outcome table in docs/ah-chat.md lists every class.
 # `human_approval_required` is the user-token gate's 409 (bugtracker ag.ts, the "mustAsk" branch): it throws BEFORE the route
 # handler runs and the request is not queued; the message goes out only if the same request is repeated with the approval id,
 # which this command never sends. `approval_required` is deliberately NOT listed: no server source readable here shows it is
 # raised before the message is persisted, so a send that got it stays "uncertain" (UNVERIFIED: see docs/ah-chat.md).
 PRE_EFFECT = frozenset({"bad_request", "validation_error", "validation_failed", "forbidden", "unauthorized",
                         "policy_denied", "not_found", "human_approval_required", "user_token_expired", "user_token_ability_missing"})
+# An HTTP 4xx that carries NO machine code counts as "failed" only for these statuses: each is produced by a check that runs
+# before a route handler can store anything (authentication 401, authorisation 403, no such route 404 or method 405, a body
+# the framework cannot accept 400, 411, 413, 414, 415, schema validation 422). Every other 4xx without a code (409 above all:
+# a conflict can be an earlier delivery) and every 1xx, 3xx and 5xx is "uncertain". UNVERIFIED against the server source in
+# this pass (not readable here): this is HTTP semantics, not an observed contract.
+PRE_EFFECT_STATUS = frozenset({400, 401, 403, 404, 405, 411, 413, 414, 415, 422})
 MAX_TEXT_FIELD = 20_000
 DM_CONVERSATION_TOOLS = ("list_direct_conversations", "get_direct_conversation_messages", "list_direct_conversation_files")
 TOOLS = ("get_direct_messages", "list_messages", "agent_chat_history", "file_list", "send_direct_message", "chat_channel_list",
@@ -79,7 +88,8 @@ WITHHELD_ERROR = "error text withheld: it held credential material (a GoodQA tok
 class ChatError(Exception):
     """code and message are local text only; nothing from a server body reaches them except an allow-listed code."""
 
-    server_code = None  # the allow-listed machine code a tool error carried, when it carried one
+    server_code = None  # the machine code a tool error or an HTTP error body carried: allow-listed, "unrecognized_error" or None
+    http_status = None  # the HTTP status of an http_error or redirect_refused (an int), else None
 
     def __init__(self, code, message, exit_code=2):
         if _credential_like(message):  # the one choke point for exception text, which ah prints to stdout unscanned
@@ -126,6 +136,14 @@ def _screenable():
 def _code_text(code):
     shown = gq.shown_code(code) if isinstance(code, str) else None
     return shown or "unrecognized_error"
+
+
+def _known_or_unrecognized(code):
+    """The structured form of a server code: itself when allow-listed, "unrecognized_error" for any other value that was
+    there, None when there was none. Never the raw value (it may be a token echoed back)."""
+    if code is None:
+        return None
+    return code if isinstance(code, str) and code in gq.KNOWN_CODES else "unrecognized_error"
 
 
 def _error_code_of(raw):
@@ -181,8 +199,13 @@ class Client:
             status = gq.shown_status(error.code)
             note = " (%s)" % _code_text(code) if code else ""
             if error.code in (301, 302, 303, 307, 308):
-                raise ChatError("redirect_refused", "GoodQA answered with a redirect (HTTP %s); redirects are never followed" % status, 3) from None
-            raise ChatError("http_error", "GoodQA HTTP %s%s" % (status, note), 3) from None
+                refused = ChatError("redirect_refused", "GoodQA answered with a redirect (HTTP %s); redirects are never followed" % status, 3)
+            else:
+                refused = ChatError("http_error", "GoodQA HTTP %s%s" % (status, note), 3)
+            # kept as data, not only as display text (PR 277 r5 F1): the send outcome is classified from these two fields
+            refused.http_status = error.code if isinstance(error.code, int) and not isinstance(error.code, bool) else None
+            refused.server_code = _known_or_unrecognized(code)
+            raise refused from None
         except (urllib.error.URLError, socket.timeout, ConnectionError, OSError):
             raise ChatError("unreachable", "GoodQA did not answer (connection failed or timed out)", 3) from None
         if len(raw) > MAX_RESPONSE:
@@ -229,9 +252,10 @@ class Client:
             err = inner.get("error") if isinstance(inner, dict) else None
             code = err.get("code") if isinstance(err, dict) else None
             if code == "not_found":
-                raise ChatError("not_found", "GoodQA says not_found: no such conversation or user, or you are not a party to it", 3)
-            refused = ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
-            refused.server_code = code if isinstance(code, str) and code in gq.KNOWN_CODES else None
+                refused = ChatError("not_found", "GoodQA says not_found: no such conversation or user, or you are not a party to it", 3)
+            else:
+                refused = ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
+            refused.server_code = _known_or_unrecognized(code)
             raise refused
         return inner
 
@@ -533,6 +557,36 @@ def _read_body(path):
     return text
 
 
+def _outcome(error):
+    """How a send that raised `error` is recorded: "failed" (the server refused before acting, so the same id may post again)
+    or "uncertain" (it may have been delivered). docs/ah-chat.md has the table; every row has a test and a mutant.
+
+    1. A machine code decides first, from an MCP tool error (HTTP 200) or from an HTTP 4xx body: PRE_EFFECT is "failed",
+       any other code ("approval_required", "conflict", an unrecognised one) is "uncertain".
+    2. An HTTP 4xx with no code: "failed" only for PRE_EFFECT_STATUS.
+    3. Everything else is "uncertain": a 5xx, a redirect, a JSON-RPC error, a plain-text tool error, an unexpected or
+       oversized 2xx body, no answer at all."""
+    code = getattr(error, "server_code", None)
+    status = getattr(error, "http_status", None)
+    if error.code in ("tool_error", "not_found"):
+        return "failed" if code in PRE_EFFECT else "uncertain"
+    if error.code == "http_error" and isinstance(status, int) and 400 <= status <= 499:
+        if code is not None:
+            return "failed" if code in PRE_EFFECT else "uncertain"
+        return "failed" if status in PRE_EFFECT_STATUS else "uncertain"
+    return "uncertain"
+
+
+def _destination(base):
+    """The API base as part of a send's identity (PR 277 r5 F2): scheme and host lower-cased, a default port dropped, no
+    trailing slash. The same id, target and body sent to another base is a different request."""
+    u = urllib.parse.urlsplit(base)
+    host = (u.hostname or "").lower()
+    port = u.port
+    netloc = host if port is None or (u.scheme.lower(), port) in (("https", 443), ("http", 80)) else "%s:%d" % (host, port)
+    return urllib.parse.urlunsplit((u.scheme.lower(), netloc, u.path.rstrip("/"), "", ""))
+
+
 def _send_file(home):
     d = Path(home) / ".agent-harness" / "state" / "ah"
     d.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -608,15 +662,22 @@ def send(home, with_=None, org=None, body_file=None, client_msg_id=None, confirm
         uid, name = _user(client, org, with_)
         target = {"org": org, "with": uid}
     digest = hashlib.sha256(body.encode()).hexdigest()
-    request_sha = hashlib.sha256(json.dumps([target, digest], sort_keys=True).encode()).hexdigest()
+    destination = _destination(client.base)
+    request_sha = hashlib.sha256(json.dumps({"base": destination, "target": target, "body": digest},
+                                            sort_keys=True).encode()).hexdigest()
     key = "chat:" + client_msg_id
     path = _send_file(home)
     lock = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
         rows = _rows(path, key)
+        if rows and not isinstance(rows[0].get("base"), str):
+            # a row from a build before r5 recorded no destination: it may have gone to this base or another one, so it can
+            # prove neither "already sent here" nor "safe to post": refused, nothing posted, a new id is the way on
+            raise ChatError("key_conflict", "that --client-msg-id was recorded by an earlier build without its API base, so "
+                                            "where it went is unknown; check `ah chat history` and use a new --client-msg-id", 3)
         if rows and rows[0].get("request") != request_sha:
-            raise ChatError("key_conflict", "that --client-msg-id was used for a different message or target", 3)
+            raise ChatError("key_conflict", "that --client-msg-id was used for a different message, target or API base", 3)
         sent = [r for r in rows if r.get("status") == "sent"]
         result = "sent"
         mid = None
@@ -628,7 +689,7 @@ def send(home, with_=None, org=None, body_file=None, client_msg_id=None, confirm
                                          "message has no server-side duplicate check: read `ah chat history --with ...` to see "
                                          "whether it arrived; if it did not, retry with --confirm-not-delivered", 3)
         if result == "sent":
-            _put(path, {"at": time.time(), "key": key, "status": "pending", "request": request_sha})
+            _put(path, {"at": time.time(), "key": key, "status": "pending", "request": request_sha, "base": destination})
             try:
                 if conversation:
                     data = client.tool("chat_channel_post", {"conversationId": conversation, "body": body,
@@ -636,30 +697,28 @@ def send(home, with_=None, org=None, body_file=None, client_msg_id=None, confirm
                 else:
                     data = client.tool("send_direct_message", {"orgId": target["org"], "userId": target["with"], "body": body})
             except ChatError as error:
-                # "failed" (safe to retry) only when the server refused before acting; anything else, such as a timeout
-                # message or a 5xx, may have delivered the message and stays "uncertain"
-                status = re.match(r"GoodQA HTTP (\d{3})", str(error))
-                definite = error.code == "not_found" or (error.code == "tool_error" and getattr(error, "server_code", None) in PRE_EFFECT) \
-                    or (error.code == "http_error" and status is not None and status.group(1)[0] == "4"
-                        and status.group(1) not in ("408", "429"))
-                _put(path, {"at": time.time(), "key": key, "status": "failed" if definite else "uncertain",
-                            "request": request_sha, "why": error.code})
+                # "failed" (safe to retry) only when the server refused before acting (_outcome); anything else may have
+                # delivered the message and stays "uncertain"
+                _put(path, {"at": time.time(), "key": key, "status": _outcome(error), "request": request_sha,
+                            "base": destination, "why": error.code})
                 raise
             message = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else data
             # a server-supplied id is checked BEFORE it is written anywhere (send file, ledger, output)
             mid = _usable_message_id(message.get("id") if isinstance(message, dict) else None)
             if mid is None:  # a 2xx with no usable message id (a pending approval, {}, a credential echo) is not "sent", DM or channel
-                _put(path, {"at": time.time(), "key": key, "status": "uncertain", "request": request_sha, "why": "no_message"})
+                _put(path, {"at": time.time(), "key": key, "status": "uncertain", "request": request_sha, "base": destination,
+                            "why": "no_message"})
                 raise ChatError("unexpected_response", "GoodQA answered without naming the sent message; check `ah chat history` "
                                                        "before retrying (then use --confirm-not-delivered)", 3)
-            _put(path, {"at": time.time(), "key": key, "status": "sent", "request": request_sha, "message_id": mid})
+            _put(path, {"at": time.time(), "key": key, "status": "sent", "request": request_sha, "base": destination,
+                        "message_id": mid})
     finally:
         os.close(lock)
     ledger = "recorded"
     try:
         import ah  # noqa: PLC0415
         ah.write(Path(home), "chat.send", dict(target, client_msg_id=client_msg_id, body_sha256=digest, body_len=len(body),
-                                              message_id=mid), ah.env_session(), key=key)
+                                              message_id=mid, base=destination), ah.env_session(), key=key)
     except Exception:  # noqa: BLE001 - the message is sent; the local send file above already holds it
         ledger = "failed"
     shown = {"with_name": name} if name else {}  # who a name resolved to (server text, bounded), next to the id
