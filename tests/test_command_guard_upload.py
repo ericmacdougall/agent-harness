@@ -527,8 +527,9 @@ class UploadApproval(UploadBase):
         self.approve()
 
     def test_only_a_real_gitdir_skips_the_loose_name_list(self):
-        # red-team E1: a plain directory named .git carries no exemption; tier 1 counts inside a real gitdir
-        fake = self.target / 'vendor/.git'
+        # red-team E1: a plain directory named .git carries no exemption, not even under its objects/ (where a real
+        # gitdir skips the loose name list); tier 1 counts inside a real gitdir
+        fake = self.target / 'vendor/.git/objects'
         fake.mkdir(parents=True)
         (fake / 'secrets.json').write_text('{}\n')
         age(self.target)
