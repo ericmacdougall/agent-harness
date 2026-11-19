@@ -3571,6 +3571,7 @@ def build_parser():
             c.add_argument("--org", help="organization id (default: org in browser-defaults.json; not with history --conversation)")
         if name == "conversations":
             c.add_argument("--limit", type=int, default=30)
+            c.add_argument("--cursor", help="next_cursor of the previous page (one page per call; nothing is followed)")
             continue
         c.add_argument("--conversation", help="conversation id")
         if name == "history":
@@ -3581,6 +3582,7 @@ def build_parser():
             c.add_argument("--no-text", action="store_true", help="ids, authors and times only; no message text")
         if name == "files":
             c.add_argument("--surface", help="file_list surface (see `ah chat probe`)")
+            c.add_argument("--offset", type=int, help="next_offset of the previous page (--surface chat only; one page per call)")
     t = sub.add_parser("ticket")
     ts = t.add_subparsers(dest="sub", required=True)
     g = ts.add_parser("get")
@@ -3804,11 +3806,11 @@ def run(args, home: Path) -> dict:
             if args.sub == "probe":
                 return ah_chat.probe(args.base, args.token)
             if args.sub == "conversations":
-                return ah_chat.conversations(home, args.org, args.limit, args.base)
+                return ah_chat.conversations(home, args.org, args.limit, args.base, args.cursor)
             if args.sub == "history":
                 return ah_chat.history(home, args.conversation, args.with_user, args.org, args.limit, args.no_text,
                                        args.after, args.before, args.base)
-            return ah_chat.files(home, args.conversation, args.surface, args.base)
+            return ah_chat.files(home, args.conversation, args.surface, args.base, args.offset)
         except ah_chat.ChatError as e:
             raise AhError(e.code, str(e), e.exit_code)
     if cmd == "ticket":

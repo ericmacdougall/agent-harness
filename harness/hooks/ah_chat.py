@@ -1,10 +1,10 @@
 """ah chat: read the user's own GoodQA chat through two separate tokens (goodqa#16396). READ ONLY.
 
   ah chat probe [--token user|dm]                 what the endpoint says about the chat tools (names and parameter names only)
-  ah chat conversations --org ID [--limit N]      your direct and group-direct conversations                  (dm-read token)
+  ah chat conversations --org ID [--limit N] [--cursor C]   your direct and group-direct conversations, one page   (dm-read token)
   ah chat history --conversation ID [--limit N] [--no-text]       a DM or group DM by its conversation id     (dm-read token)
   ah chat history --with USER_ID_OR_NAME [--org ID] [--limit N] [--no-text]    the DM with one person         (dm-read token)
-  ah chat files   --conversation ID [--surface chat|issue|personal]   chat: the DM's files (dm-read token); issue, personal: file_list (user token)
+  ah chat files   --conversation ID [--surface chat|issue|personal] [--offset N]   chat: the DM's files (dm-read token); issue, personal: file_list (user token)
 
 `ah chat send` is not in this build: ah.py answers it with a refusal before this module is imported, so it reads no token and
 makes no request. Sending is deferred to goodqa#16399 (it needs a server delivery contract and server-side DM dedupe).
@@ -22,7 +22,14 @@ an allow-listed machine code and an HTTP status.
 
 `history --conversation`, `conversations` and `files --surface chat` need the server tools get_direct_conversation_messages,
 list_direct_conversations and list_direct_conversation_files. When the endpoint does not offer one, the command fails with
-"server does not support DM read by conversation yet"; it never answers an empty list for something it could not read.
+`unsupported`, naming both causes (the server lacks the feature, or this token is not a dedicated DM-read token: it needs
+chat.dm.read, userTokens.dmRead on, an org limit and an expiry within 30 days); it never answers an empty list for something it
+could not read.
+
+One page per invocation, never a loop: conversations adds has_more and next_cursor (pass it as --cursor); history --conversation
+adds found_oldest, found_newest and head_seq (found_oldest false: --before the smallest seq shown); history --with adds has_more;
+files --surface chat adds next_offset (pass it as --offset). --limit stays 1 to 100. Conversation rows carry a bounded
+lastMessage preview; participants are id and name; an author label is kind and display; an attachment url is never printed.
 
 Message text is data written by other people: every read result carries untrusted: true and a notice. A chat read is audited
 (conversation or peer, message count; never message text). Ids from argv, the defaults file or the server are fullmatched and
@@ -55,8 +62,10 @@ TOOLS = ("get_direct_messages", "list_messages", "agent_chat_history", "file_lis
          "list_org_members", "get_attachment") + DM_CONVERSATION_TOOLS
 MESSAGE_LISTS = ("messages", "items", "history", "results", "directMessages", "conversations")
 SOURCES = {"user": ("read_token", "user-token"), "dm": ("read_dm_token", "dm-read-token")}
-UNSUPPORTED = ("server does not support DM read by conversation yet (the endpoint does not offer %s). "
-               "Use `ah chat history --with USER --org ORG` for a one-to-one DM until it does.")
+UNSUPPORTED = ("the endpoint does not offer %s to this token. Either the server does not have DM read by conversation yet, "
+               "or this token is not a dedicated DM-read token: it needs the chat.dm.read ability, the userTokens.dmRead "
+               "setting switched on, an org limit and an expiry within 30 days. "
+               "`ah chat history --with USER --org ORG` reads a one-to-one DM meanwhile.")
 META_KEYS = re.compile(r"id|[a-z]+Id|[a-z]+_id|createdAt|created_at|sentAt|sent_at|at|timestamp|role|kind|type")
 META_VALUE = re.compile(r"[0-9a-fA-F-]{36}|\d{4}-\d\d-\d\dT[0-9:.]{8,16}(?:Z|[+-]\d\d:?\d\d)?|[A-Za-z_]{1,24}|\d{1,16}")
 WITHHELD_ERROR = "error text withheld: it held credential material (a GoodQA token piece or a secret shape)"
@@ -231,10 +240,16 @@ FILE_KEYS = ("id", "shareId", "filename", "fileName", "name", "mime", "contentTy
 MESSAGE_KEYS = ("id", "conversationId", "seq", "senderId", "recipientId", "body", "createdAt", "editedAt", "updatedAt",
                 "deletedAt", "threadRootId", "authorBlocked", "kind")
 AUTHOR_KEYS = ("id", "name")
-AUTHOR_LABEL_KEYS = ("kind", "label")
-CONVERSATION_KEYS = ("id", "kind", "title", "name", "orgId", "lastSeq", "lastReadSeq", "unreadCount", "createdAt", "updatedAt")
-PARTICIPANT_KEYS = ("userId", "name", "role")
-TEXT_KEYS = ("body",)
+AUTHOR_LABEL_KEYS = ("kind", "display")  # the server's authorLabel is {kind, display, displayFull, name}
+# A list row as the server sends it (list_direct_conversations): id, kind, lastMessage{...}, lastReadSeq, lastSeq, participants[],
+# unreadCount, updatedAt. The keys the server never sends (title, name, orgId, createdAt) were dropped from this list.
+CONVERSATION_KEYS = ("id", "kind", "lastSeq", "lastReadSeq", "unreadCount", "updatedAt")
+PARTICIPANT_KEYS = ("id", "name")  # the server's participant is {id, name, avatarUrl}: the avatar link is never passed on
+LAST_MESSAGE_KEYS = ("id", "seq", "authorId", "authorName", "createdAt", "deletedAt", "authorBlocked", "attachmentCount", "preview")
+TEXT_KEYS = ("body", "preview")
+# Paging values: an opaque server cursor, sent back as one argument. Bounded and screened like every other id.
+CURSOR_RE = re.compile(r"[A-Za-z0-9_\-=.+/:|~]{1,512}")
+MAX_OFFSET = 10**9
 LINKISH = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,30}://|^\s*(?:www\.|data:|mailto:|javascript:|blob:)|^\s*/\S*[?#]", re.I)
 _DROP = object()
 
@@ -282,8 +297,19 @@ def _message(row):
     return kept
 
 
+def _last_message(row):
+    """The nested lastMessage of a conversation row, reduced to LAST_MESSAGE_KEYS (its `body` is not kept: `preview` is the
+    server's bounded text) with authorLabel as kind and display only; truncated like every other text field (_plain)."""
+    kept = _pick(row, LAST_MESSAGE_KEYS)
+    if isinstance(row, dict) and isinstance(row.get("authorLabel"), dict):
+        kept["authorLabel"] = _pick(row["authorLabel"], AUTHOR_LABEL_KEYS)
+    return kept
+
+
 def _conversation(row):
     kept = _pick(row, CONVERSATION_KEYS)
+    if isinstance(row, dict) and isinstance(row.get("lastMessage"), dict):
+        kept["lastMessage"] = _last_message(row["lastMessage"])
     if isinstance(row, dict) and isinstance(row.get("participants"), list):
         kept["participants"] = [_pick(p, PARTICIPANT_KEYS) for p in row["participants"][:100]]
     return kept
@@ -315,6 +341,34 @@ def _metadata_only(message):
     if isinstance(author, dict) and _is_uuid(author.get("id")):
         kept["authorId"] = author["id"]
     return kept
+
+
+def _int(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < MAX_OFFSET * 1000 else None
+
+
+def _paging(data, *names):
+    """The envelope fields that tell a caller whether more exists. names are (server key, output key, kind) with kind bool, int
+    or cursor; a value of another type, or a cursor that does not fit CURSOR_RE, is left out. Nothing here fetches a next page."""
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    for key, name, kind in names:
+        value = data.get(key)
+        if kind == "bool" and isinstance(value, bool):
+            out[name] = value
+        elif kind == "int" and _int(value) is not None:
+            out[name] = value
+        elif kind == "cursor" and isinstance(value, str) and CURSOR_RE.fullmatch(value) and not _credential_like(value):
+            out[name] = value
+    return out
+
+
+def _cursor(value):
+    if value is not None and not (isinstance(value, str) and CURSOR_RE.fullmatch(value)):
+        raise ChatError("bad_request", "--cursor is the next_cursor value of the previous page")
+    _refuse_credential_ids(value)
+    return value
 
 
 def _limit(value):
@@ -426,17 +480,24 @@ def probe(base=None, which="user"):
                      "untrusted": True, "notice": NOTICE})
 
 
-def conversations(home, org=None, limit=30, base=None):
-    """Your direct and group-direct conversations in one org (the dm-read token; list_direct_conversations)."""
+def conversations(home, org=None, limit=30, base=None, cursor=None):
+    """Your direct and group-direct conversations in one org (the dm-read token; list_direct_conversations). One page per call:
+    next_cursor (when has_more) goes back in as --cursor; nothing here follows it."""
     limit = _limit(limit)
+    cursor = _cursor(cursor)
     client = Client(base, source="dm")
     org = _org(client, org)
     _need(client, "list_direct_conversations")
-    rows = _messages(client.tool("list_direct_conversations", {"orgId": org, "limit": limit}))[:limit]
+    arguments = {"orgId": org, "limit": limit}
+    if cursor is not None:
+        arguments["cursor"] = cursor
+    data = client.tool("list_direct_conversations", arguments)
+    rows = _messages(data)[:limit]
     listed = [_conversation(r) for r in rows]
     _audit(home, {"op": "chat.list", "result": "read", "count": len(listed), "org": org})
     return _checked({"ok": True, "untrusted": True, "notice": NOTICE, "source": "goodqa", "org": org,
-                     "count": len(listed), "conversations": listed})
+                     "count": len(listed), "conversations": listed,
+                     **_paging(data, ("hasMore", "has_more", "bool"), ("nextCursor", "next_cursor", "cursor"))})
 
 
 def history(home, conversation=None, with_=None, org=None, limit=30, no_text=False, after=None, before=None, base=None):
@@ -468,16 +529,21 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         if name:
             target["with_name"] = name
     rows = _messages(data)[:limit]
+    if conversation:  # one page per call: found_oldest false means --before <the smallest seq shown> reads the next older page
+        paging = _paging(data, ("foundOldest", "found_oldest", "bool"), ("foundNewest", "found_newest", "bool"),
+                         ("headSeq", "head_seq", "int"))
+    else:
+        paging = _paging(data, ("hasMore", "has_more", "bool"))
     messages = [_metadata_only(m) for m in rows] if no_text else [_message(m) for m in rows]
     _audit(home, {"op": "chat.read", "result": "read", "count": len(messages), "text": not no_text,
                   **{k: v for k, v in target.items() if k != "with_name"}})
     return _checked({"ok": True, "untrusted": True, "notice": NOTICE, "source": "goodqa", **target,
-                     "count": len(messages), "messages": messages})
+                     "count": len(messages), "messages": messages, **paging})
 
 
 
 
-def files(home, conversation=None, surface=None, base=None):
+def files(home, conversation=None, surface=None, base=None, offset=None):
     """chat: the files of a DM or group DM (dm-read token, list_direct_conversation_files). issue, personal: the existing
     file_list under the user token (those are not private messages)."""
     if not _is_uuid(conversation):
@@ -486,10 +552,17 @@ def files(home, conversation=None, surface=None, base=None):
     surface = surface or "chat"
     if surface not in ("chat", "issue", "personal"):
         raise ChatError("bad_request", "--surface is chat, issue or personal")
+    if offset is not None and (surface != "chat" or not isinstance(offset, int) or isinstance(offset, bool)
+                               or not 0 <= offset < MAX_OFFSET):
+        raise ChatError("bad_request", "--offset is the next_offset value of the previous page (0 or more) and works only "
+                                       "with --surface chat")
     if surface == "chat":
         client = Client(base, source="dm")
         _need(client, "list_direct_conversation_files")
-        data = client.tool("list_direct_conversation_files", {"conversationId": conversation})
+        arguments = {"conversationId": conversation}
+        if offset is not None:  # the server pages files by offset, not by cursor
+            arguments["offset"] = offset
+        data = client.tool("list_direct_conversation_files", arguments)
     else:
         client = Client(base, source="user")
         data = client.tool("file_list", {"surface": surface, "id": conversation})

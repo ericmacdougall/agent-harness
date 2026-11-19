@@ -6,10 +6,10 @@
 
 ```
 ah chat probe [--token user|dm]                 what the endpoint offers (tool and parameter names only)
-ah chat conversations --org ID [--limit N]      your direct and group-direct conversations          (dm-read token)
+ah chat conversations --org ID [--limit N] [--cursor C]   your direct and group-direct conversations, one page  (dm-read token)
 ah chat history --conversation ID [--limit N] [--before SEQ] [--no-text]   a DM or group DM by its id  (dm-read token)
 ah chat history --with USER_ID_OR_NAME [--org ID] [--limit N] [--no-text]   the DM with one person    (dm-read token)
-ah chat files   --conversation ID [--surface chat|issue|personal]   chat: a DM's files (dm-read token); issue, personal: file_list (user token)
+ah chat files   --conversation ID [--surface chat|issue|personal] [--offset N]   chat: a DM's files (dm-read token); issue, personal: file_list (user token)
 ```
 
 ## Two tokens, two files, no fallback
@@ -25,7 +25,7 @@ A missing or unusable file is an error that names the file. A private read never
 
 The server half (GoodQA tools `list_direct_conversations`, `get_direct_conversation_messages`, `list_direct_conversation_files`, and the `chat.dm.read` ability) is specified and not yet built or deployed. Until it is:
 
-- `history --conversation`, `conversations` and `files --surface chat` fail with `server does not support DM read by conversation yet` (they check `tools/list` first), never with an empty result.
+- `history --conversation`, `conversations` and `files --surface chat` fail with code `unsupported` (they check `tools/list` first), never with an empty result. The message names both causes: the server lacks the feature, or this token is not a dedicated DM-read token (it needs the `chat.dm.read` ability, the `userTokens.dmRead` setting on, an org limit and an expiry within 30 days).
 - `history --with USER --org ORG` calls the existing `get_direct_messages`. Whether the dm-read token returns your DM rows through it depends on the same server change. **Not verified live: AC-1 of goodqa#16396 (reading conversation 0d4e18ae) is open until a live run on the deployed server.**
 
 ## What it guarantees
@@ -35,8 +35,9 @@ The server half (GoodQA tools `list_direct_conversations`, `get_direct_conversat
 - **Shapes.** The stubs and parsers follow the server routes that the new tools will call (read from the bugtracker source, `messaging/routes.ts` and `dms.ts`): conversation messages `{conversation, messages, headSeq, foundOldest, foundNewest}`, conversation list `{conversations, hasMore, nextCursor}`, files `{attachments, nextOffset}`. The tool wrappers themselves are not built yet, so their exact argument names (`before` as a sequence number, limits up to 100) are the spec's, not observed. File rows are reduced to metadata: the server's rows carry a `url` that may be a signed link, and a link is never printed.
 - **Every output is an allow-list of fields.** A server row can carry a link (a signed download URL, an avatar URL, an invite) under any key, at any depth, and a link is a capability. So each output keeps only named fields, and only plain values under them (text, a number, true or false). A nested object is dropped unless a sub-list names its fields. A string shaped like a link (`scheme://`, `www.`, `data:`, `mailto:`, `javascript:`, `blob:`, or a path with a query) is dropped even under an allowed field.
   - Files, on every surface (`chat`, `issue` and `personal` alike): `id`, `shareId`, `filename`, `fileName`, `name`, `mime`, `contentType`, `bytes`, `size`, `sizeBytes`, `sender`, `sentAt`, `createdAt`, `seq`, `messageId`, `threadRootId`.
-  - Messages: `id`, `conversationId`, `seq`, `senderId`, `recipientId`, `body`, `createdAt`, `editedAt`, `updatedAt`, `deletedAt`, `threadRootId`, `authorBlocked`, `kind`. Sub-lists: `author` (`id`, `name`), `authorLabel` (`kind`, `label`), and `attachments` (the file list above). Message text (`body`) is shown as written, links included, because it is what a person wrote; it is marked untrusted.
-  - Conversations: `id`, `kind`, `title`, `name`, `orgId`, `lastSeq`, `lastReadSeq`, `unreadCount`, `createdAt`, `updatedAt`. Sub-list: `participants` (`userId`, `name`, `role`).
+  - Messages: `id`, `conversationId`, `seq`, `senderId`, `recipientId`, `body`, `createdAt`, `editedAt`, `updatedAt`, `deletedAt`, `threadRootId`, `authorBlocked`, `kind`. Sub-lists: `author` (`id`, `name`), `authorLabel` (`kind`, `display`), and `attachments` (the file list above). Message text (`body`) is shown as written, links included, because it is what a person wrote; it is marked untrusted.
+  - Conversations: `id`, `kind`, `lastSeq`, `lastReadSeq`, `unreadCount`, `updatedAt`. Sub-lists: `participants` (`id`, `name`; the avatar link is dropped) and `lastMessage` (`id`, `seq`, `authorId`, `authorName`, `createdAt`, `deletedAt`, `authorBlocked`, `attachmentCount`, `preview`, and `authorLabel` as `kind`, `display`; the full `body` is not repeated). Attachment `url` values are dropped everywhere.
+  - Paging, one page per invocation (nothing follows a next page for you): `conversations` adds `has_more` and `next_cursor` (pass it back as `--cursor`); `history --conversation` adds `found_oldest`, `found_newest` and `head_seq` (`found_oldest` false: read the next older page with `--before` set to the smallest `seq` shown); `history --with` adds `has_more`; `files --surface chat` adds `next_offset` (pass it back as `--offset`; the server pages files by offset, not by cursor). `--limit` stays 1 to 100.
   - `--no-text` messages: keys matching an id, time, role or kind pattern, each value an id, a timestamp, a short word or a number.
   - `probe`: tool names, required-parameter names, parameter names and bounded types or enums, built field by field.
   - A name lookup: only the resolved user id and the matched display name (`with`, `with_name`).
