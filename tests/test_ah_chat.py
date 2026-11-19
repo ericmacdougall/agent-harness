@@ -20,6 +20,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -324,13 +325,15 @@ class ReadTests(Base):
         self.assertEqual(self.stub.calls, [])
 
     def test_probe_reports_tool_names_and_which_token_was_accepted(self):
-        data = self.out("probe")
+        data = self.out("probe", "--token", "user")
         self.assertEqual((data["ok"], data["probed_with"], data["accepted"]), (True, "user", True))
         self.assertIn("get_direct_messages", data["tools"])
         self.assertIn("agent_chat_history", data["missing"])
         self.assertTrue(data["dm_read_by_conversation"])
         self.assertEqual(self.stub.hits[0][2], SCHEME + USER_SENTINEL)
         data = self.out("probe", "--token", "dm")
+        self.assertEqual((data["probed_with"], self.stub.hits[-1][2]), ("dm", SCHEME + DM_SENTINEL))
+        data = self.out("probe")  # PR 277 r8 m3: a chat probe does not default to the general user token
         self.assertEqual((data["probed_with"], self.stub.hits[-1][2]), ("dm", SCHEME + DM_SENTINEL))
         self.stub.offered = [t for t in ALL_TOOLS if t not in NEW_TOOLS]
         self.assertIs(self.out("probe", "--token", "dm")["dm_read_by_conversation"], False)
@@ -411,12 +414,6 @@ class ReadTests(Base):
         p = self.ah("history", "--with", PEER)
         self.assertIn("forbidden", p.stdout)
         self.assert_no_token(p)
-
-    def test_a_base_outside_allowed_bases_is_refused_and_nothing_is_sent(self):
-        self.defaults(allowed=["https://goodqa.app/v1"])
-        p = self.ah("history", "--with", PEER)
-        self.assertEqual(json.loads(p.stdout)["code"], "refused")
-        self.assertEqual(self.stub.hits, [])
 
     def test_reads_are_audited_without_message_text(self):
         self.out("history", "--with", PEER)
@@ -529,14 +526,14 @@ class SweepTests(Base):
         self.assert_nowhere(hot, p)
         self.assertEqual(self.stub.sent("get_direct_messages"), [])
 
-    def test_a_token_file_that_cannot_be_screened_against_refuses_the_command(self):
-        # gq.holds_credential skips a file it cannot read, so that token would go unscreened: each read uses the OTHER file
-        self.dm_file.chmod(0o644)
-        self.assertEqual(self.code(self.ah("files", "--conversation", CONV, "--surface", "issue")), "refused")  # user token
-        self.dm_file.chmod(0o600)
+    def test_a_bad_mode_on_the_other_token_file_does_not_block_a_read(self):
+        # PR 277 r8 m3: a read opens only the file it uses. The general user token is not a gate for a DM read.
         self.user_file.chmod(0o644)
-        self.assertEqual(self.code(self.ah("history", "--with", PEER)), "refused")  # dm-read token
-        self.assertEqual(self.stub.hits, [])
+        self.assertTrue(self.out("history", "--conversation", CONV)["ok"])
+        self.assertTrue(self.out("conversations", "--org", ORG)["ok"])
+        self.user_file.chmod(0o600)
+        self.dm_file.chmod(0o644)
+        self.assertEqual(self.code(self.ah("history", "--conversation", CONV)), "refused")  # its own file still must be private
 
 
 class SendDeferredTests(Base):
@@ -765,6 +762,68 @@ class ContractTests(Base):
         self.assertEqual((got["id"], got["filename"], got["sizeBytes"]), ("a1", "plan.pdf", 5))
         self.assertNotIn("url", got)
         self.assertNotIn("MSGATTACHLINK", self.last.stdout + self.last.stderr)
+
+
+class BasePinTests(Base):
+    """PR 277 r8 M3: ah chat sends a token only to https://goodqa.app/v1. --base, browser-defaults.json base and allowedBases
+    cannot move it; the one exception is the loopback test switch, and then never with a token from the real token path."""
+
+    EVIL = "https://evil.example.test/v1"
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(HOOKS))
+        self.addCleanup(sys.path.remove, str(HOOKS))
+        import ah_chat  # noqa: PLC0415
+        import gq_browser  # noqa: PLC0415
+        self.chat, self.gq = ah_chat, gq_browser
+
+    def env(self, **extra):
+        env = {"HOME": str(self.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}
+        env.update(extra)
+        return mock.patch.dict(os.environ, env)
+
+    def test_another_base_is_refused_before_any_request_and_before_the_token_is_read(self):
+        self.defaults(allowed=[self.EVIL, self.stub.base])  # even a base the user's own file lists
+        self.dm_file.chmod(0o644)  # a token read would refuse with the file-mode text: the base refusal must come first
+        for argv in (("history", "--with", PEER), ("conversations", "--org", ORG), ("probe", "--token", "dm"),
+                     ("files", "--conversation", CONV)):
+            p = self.ah(*argv, base=self.EVIL)
+            data = json.loads(p.stdout)
+            self.assertEqual((data["ok"], data["code"]), (False, "refused"), argv)
+            self.assertNotIn("group or others", data["message"], argv)
+            self.assertNotIn("evil.example", p.stdout + p.stderr)  # the rejected value is not repeated
+        self.assertEqual((self.stub.hits, self.stub.calls), ([], []))
+
+    def test_a_base_in_browser_defaults_is_ignored(self):
+        path = self.home / ".config" / "goodqa" / "browser-defaults.json"
+        path.write_text(json.dumps({"base": self.EVIL, "allowedBases": [self.EVIL, self.stub.base], "org": ORG}))
+        path.chmod(0o600)
+        with self.env():
+            client = self.chat.Client(None, source="dm")
+        self.assertEqual(client.base, self.gq.DEFAULT_BASE)
+        self.assertEqual(client.url, "https://goodqa.app/v1/mcp")
+
+    def test_loopback_needs_the_test_switch_and_a_loopback_address(self):
+        with self.env(GQ_BROWSER_TEST_LOOPBACK="0"), self.assertRaises(self.chat.ChatError):
+            self.chat.Client(self.stub.base, source="dm")
+        with self.env(), self.assertRaises(self.chat.ChatError):
+            self.chat.Client("http://192.0.2.1:9/v1", source="dm")
+        with self.env():
+            self.assertEqual(self.chat.Client(self.stub.base, source="dm").base, self.stub.base)
+
+    def test_test_mode_never_sends_a_token_read_from_the_real_token_path(self):
+        with self.env(), mock.patch.object(self.chat, "_real_home", return_value=str(self.home)):
+            with self.assertRaises(self.chat.ChatError) as raised:
+                self.chat.Client(self.stub.base, source="dm")
+        self.assertEqual(raised.exception.code, "refused")
+        self.assertIn("real token path", str(raised.exception))
+        self.assertEqual(self.stub.hits, [])
+
+    def test_the_real_base_is_accepted_with_or_without_a_trailing_slash(self):
+        with self.env():
+            for base in (None, self.gq.DEFAULT_BASE, self.gq.DEFAULT_BASE + "/"):
+                self.assertEqual(self.chat.Client(base, source="dm").base, self.gq.DEFAULT_BASE)
 
 
 class WithGateTests(Base):

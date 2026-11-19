@@ -39,10 +39,12 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import gq_browser as gq
@@ -61,7 +63,7 @@ DM_CONVERSATION_TOOLS = ("list_direct_conversations", "get_direct_conversation_m
 TOOLS = ("get_direct_messages", "list_messages", "agent_chat_history", "file_list", "chat_channel_list", "list_orgs",
          "list_org_members", "get_attachment") + DM_CONVERSATION_TOOLS
 MESSAGE_LISTS = ("messages", "items", "history", "results", "directMessages", "conversations")
-SOURCES = {"user": ("read_token", "user-token"), "dm": ("read_dm_token", "dm-read-token")}
+SOURCES = {"user": ("read_token", "user-token", "token_path"), "dm": ("read_dm_token", "dm-read-token", "dm_token_path")}
 UNSUPPORTED = ("the endpoint does not offer %s to this token. Either the server does not have DM read by conversation yet, "
                "or this token is not a dedicated DM-read token: it needs the chat.dm.read ability, the userTokens.dmRead "
                "setting switched on, an org limit and an expiry within 30 days.")
@@ -102,16 +104,34 @@ def _is_uuid(value):
     return isinstance(value, str) and UUID_RE.fullmatch(value) is not None
 
 
-def _screenable():
-    """Every byte is screened against BOTH token files, but gq.holds_credential skips a file it cannot read. A token file that
-    exists and cannot be read safely (wrong mode, owner or type) would leave its token unscreened, so it is refused here."""
-    for reader, path in ((gq.read_token, gq.token_path()), (gq.read_dm_token, gq.dm_token_path())):
+def _real_home():
+    """The account's real home directory from the password database, not from $HOME (which a caller can set)."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return None
+
+
+def _pinned_base(base):
+    """PR 277 r8 M3: the only host a token goes to is gq.DEFAULT_BASE. browser-defaults.json (base, allowedBases) and --base cannot
+    move it: the user's agent can write that file. The one exception is a loopback base under the explicit test switch, and
+    Client then refuses it for a token read from the real token path. The refusal never repeats the rejected value."""
+    if base is None:
+        return gq.DEFAULT_BASE
+    if isinstance(base, str):
+        want = base.rstrip("/")
+        if want == gq.DEFAULT_BASE:
+            return want
         try:
-            reader()
-        except gq.Refused as error:
-            if os.path.lexists(path):
-                raise ChatError("refused", str(error) + " (output and arguments are screened against this file, so it "
-                                                        "must be readable as a private file)") from None
+            u = urllib.parse.urlsplit(want)
+            loopback = (u.hostname in ("127.0.0.1", "localhost", "::1") and u.scheme in ("http", "https")
+                        and not (u.username or u.password or u.query or u.fragment))
+        except ValueError:
+            loopback = False
+        if loopback and os.environ.get("GQ_BROWSER_TEST_LOOPBACK") == "1":
+            return want
+    raise ChatError("refused", "ah chat sends a token only to %s (a loopback base is allowed only with the test switch); "
+                               "the base given was not used, and no token was read" % gq.DEFAULT_BASE)
 
 
 # ------------------------------------------------------------------ transport
@@ -143,16 +163,18 @@ class Client:
         if source not in SOURCES:
             raise ChatError("bad_request", "internal: unknown token source")
         self.source = source
+        self.base = _pinned_base(base)  # before anything is read: a refused base never touches a token file
+        if self.base != gq.DEFAULT_BASE:  # test mode: a test token only, never the one at the real token path
+            home = _real_home()
+            real = os.path.realpath(os.path.join(home, ".config", "goodqa")) if home else None
+            if real is None or os.path.realpath(os.path.dirname(getattr(gq, SOURCES[source][2])())) == real:
+                raise ChatError("refused", "a loopback test base never takes a token from the real token path")
         try:
-            self.defaults = gq.load_defaults()
-            allowed = self.defaults.get("allowedBases")
-            first = allowed[0] if isinstance(allowed, list) and allowed and isinstance(allowed[0], str) else gq.DEFAULT_BASE
-            self.base = gq.check_base(base or self.defaults.get("base") or first, self.defaults)
+            self.defaults = gq.load_defaults()  # only for the default org; its base and allowedBases are ignored
             self._token = getattr(gq, SOURCES[source][0])()
         except gq.Refused as error:
             note = " (reading private messages needs this dedicated file; the user token is never used for it)" if source == "dm" else ""
             raise ChatError("refused", str(error) + note) from None
-        _screenable()
         self.url = self.base + "/mcp"
         self.timeout = timeout
 
@@ -457,7 +479,7 @@ def _param_shape(spec):
     return kind if isinstance(kind, str) and re.fullmatch(r"[a-z]{1,20}", kind) else None
 
 
-def probe(base=None, which="user"):
+def probe(base=None, which="dm"):
     client = Client(base, source=which)
     result = client.rpc("tools/list")
     tools = result.get("tools") if isinstance(result.get("tools"), list) else []
@@ -524,6 +546,10 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         org = _org(client, org)
         # get_direct_messages answers an EMPTY 200 to a token the DM gate did not admit (PR 277 r8 M2), so it is read only when
         # the gated tools are offered: that proves the gate is in force for this token.
+        if not (_is_uuid(with_) or (isinstance(with_, str) and NAME_RE.fullmatch(with_))):  # checked before the first request
+            raise ChatError("bad_request", "--with is a user id or a member's exact name")
+        if _is_uuid(with_):
+            _refuse_credential_ids(with_)  # an id is screened before the first request, the tools/list below included
         _need(client, "get_direct_conversation_messages")
         peer, name = _user(client, org, with_)
         data = client.tool("get_direct_messages", {"orgId": org, "userId": peer, "limit": limit})

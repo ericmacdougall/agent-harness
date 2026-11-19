@@ -3564,7 +3564,7 @@ def build_parser():
         c = chs.add_parser(name)
         c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
         if name == "probe":
-            c.add_argument("--token", choices=("user", "dm"), default="user",
+            c.add_argument("--token", choices=("user", "dm"), default="dm",
                            help="which credential file to probe with (never both): the user token or the dedicated dm-read token")
             continue
         if name != "files":  # files takes only the conversation id
