@@ -847,6 +847,33 @@ class TicketVerification(Fixture):
         self.assertEqual([(w["kind"], w["subject"]) for w in report["waivers"]], [("tickets", self.head)])
         self.assertEqual(self.check()["status"], "PASS", "the full SHA form keeps working")
 
+    def test_head_moving_during_the_check_cannot_borrow_another_commits_waiver(self):
+        # Review F1 on goodqa#16442: the range and the waiver subject must be the same commit even when HEAD moves
+        # between the two reads. HEAD moves to a waived commit right after the range has been collected.
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.addCleanup(os.environ.__setitem__, "HOME", old)
+        cp.LEDGER = self.home / ".agent-harness" / "commit-policy" / "waivers.jsonl"
+        self.addCleanup(setattr, cp, "LEDGER", Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl")
+        self.wal.parent.mkdir(parents=True, exist_ok=True)
+        self.fake.fail = "reset"
+        reason = "ticket project is not visible to this credential; approved by the owner in GoodQA #16442"
+        real, seen = cp.range_commits, []
+
+        def moving(repo, base, head, exclude=()):
+            commits = real(repo, base, head, exclude)
+            seen.append(head)
+            git("commit", "--allow-empty", "-q", "-m", "chore(test): move head", cwd=self.repo, env=self.env)
+            moved = git("rev-parse", "HEAD", cwd=self.repo, env=self.env)
+            self.assertNotEqual(moved, self.head)
+            cp.record_waiver(self.wal, "tickets", moved, reason, POLICY)
+            return commits
+        cp.range_commits = moving
+        self.addCleanup(setattr, cp, "range_commits", real)
+        report = cp.check_range(str(self.repo), self.base, "HEAD", self.policy, verify_tickets=True)
+        self.assertEqual(seen, [self.head], "the range is read for the commit resolved before it")
+        self.assertEqual((report["status"], report["head"], report["waivers"]), ("UNVERIFIED", self.head, []))
+
     def test_branch_comment_must_be_newer_than_commit(self):
         self.fake.comment(self.issue, "work continues on claude/x-1", datetime.now(timezone.utc) - timedelta(hours=3))
         self.assertEqual(self.check(branch="claude/x-1")["status"], "BLOCKED")

@@ -1778,13 +1778,15 @@ def check_range(repo, base, head, policy, *, branch=None, pr=None, verify_ticket
     if policy.get("enforcement") == "off":
         return {"base": base, "head": head, "exclude": list(exclude), "commits": [], "tickets": [],
                 "waivers": [], "status": "PASS", "enforcement": "off"}
-    commits = range_commits(repo, base, head, exclude)
     # A tickets waiver names a full commit SHA (`waive` refuses anything else), while callers may pass a symbolic
-    # head (peer_review passes "HEAD"). Look the waiver up under the commit the name resolves to, so a waiver for
-    # this commit is found and a waiver for any other commit is not (goodqa#16442).
+    # head (peer_review passes "HEAD"). Resolve the name ONCE, before the range is read, and use that commit for
+    # the range, the waiver lookup and the report: a ref that moves during the check can then never pair one
+    # commit's waiver with another commit's range (goodqa#16442). A name that does not resolve is left as given
+    # and fails in range_commits as before.
     resolved = git(repo, "rev-parse", "-q", "--verify", f"{head}^{{commit}}", check=False).strip()
     if re.fullmatch(r"[0-9a-f]{40}", resolved):
         head = resolved
+    commits = range_commits(repo, base, head, exclude)
     ticket_context = repo_ticket_context(repo, policy, push_url=push_url)
     previous = git(repo, "log", "-1", "--format=%B", base, check=False) or None
 
