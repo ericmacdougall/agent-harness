@@ -825,6 +825,28 @@ class TicketVerification(Fixture):
         fresh = self.check()
         self.assertEqual((fresh["status"], fresh["tickets"][0]["status"]), ("PASS", "UPDATED"))
 
+    def test_tickets_waiver_for_the_head_commit_covers_a_symbolic_head(self):
+        # goodqa#16442: peer_review passes the literal "HEAD" while a waiver can only name a full commit SHA.
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.addCleanup(os.environ.__setitem__, "HOME", old)
+        cp.LEDGER = self.home / ".agent-harness" / "commit-policy" / "waivers.jsonl"
+        self.addCleanup(setattr, cp, "LEDGER", Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl")
+        self.wal.parent.mkdir(parents=True, exist_ok=True)
+        self.fake.fail = "reset"
+        reason = "ticket project is not visible to this credential; approved by the owner in GoodQA #16442"
+
+        def by_name():
+            return cp.check_range(str(self.repo), self.base, "HEAD", self.policy, verify_tickets=True)
+        self.assertEqual(by_name()["status"], "UNVERIFIED")
+        cp.record_waiver(self.wal, "tickets", self.base, reason, POLICY)
+        self.assertEqual(by_name()["status"], "UNVERIFIED", "a waiver for another commit must not cover this head")
+        cp.record_waiver(self.wal, "tickets", self.head, reason, POLICY)
+        report = by_name()
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual([(w["kind"], w["subject"]) for w in report["waivers"]], [("tickets", self.head)])
+        self.assertEqual(self.check()["status"], "PASS", "the full SHA form keeps working")
+
     def test_branch_comment_must_be_newer_than_commit(self):
         self.fake.comment(self.issue, "work continues on claude/x-1", datetime.now(timezone.utc) - timedelta(hours=3))
         self.assertEqual(self.check(branch="claude/x-1")["status"], "BLOCKED")
