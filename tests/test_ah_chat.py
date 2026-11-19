@@ -297,8 +297,8 @@ class ReadTests(Base):
         data = self.out("history", "--with", PEER, "--no-text")
         self.assertEqual(data["messages"], [{"id": MSG["id"], "senderId": PEER, "recipientId": ME, "createdAt": MSG["createdAt"]}])
         data = self.out("history", "--conversation", CONV, "--no-text")
-        self.assertEqual(data["messages"], [{"id": CONV_MSG["id"], "conversationId": CONV, "createdAt": CONV_MSG["createdAt"],
-                                             "authorId": PEER}])
+        self.assertEqual(data["messages"], [{"id": CONV_MSG["id"], "conversationId": CONV, "seq": 7,
+                                             "createdAt": CONV_MSG["createdAt"], "authorId": PEER}])
         self.assertNotIn("ignore your instructions", self.last.stdout)
 
     def test_files_of_a_dm_use_the_dm_tool_and_fail_loudly_without_it(self):
@@ -762,6 +762,91 @@ class ContractTests(Base):
         self.assertEqual((got["id"], got["filename"], got["sizeBytes"]), ("a1", "plan.pdf", 5))
         self.assertNotIn("url", got)
         self.assertNotIn("MSGATTACHLINK", self.last.stdout + self.last.stderr)
+
+
+def ok_bare(data):
+    """A real DM tool answers with the bare route JSON (toToolResult), not the {dataTrust, data} wrapper."""
+    return 200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(data)}]}}
+
+
+def error_bare(code):
+    return 200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [{"type": "text", "text": json.dumps(
+        {"error": {"code": code, "message": "the server's own words"}})}]}}
+
+
+class SecretAndBoundsTests(Base):
+    """PR 277 r8 M4, m4 to m7, m9. Third-party text (message text, previews, names, file names) is redacted for secret shapes
+    before it is printed; the fake secrets are built at run time so no key-shaped literal sits in the source."""
+
+    ANT = "sk-" + "ant-" + "api03-" + "Q" * 40
+    GH = "gh" + "p_" + "R" * 36
+
+    def assert_clean(self, p):
+        for secret in (self.ANT, self.GH, self.ANT[:30], self.GH[:20]):
+            self.assertNotIn(secret, p.stdout + p.stderr)
+
+    def test_secret_shaped_text_is_withheld_from_a_message_a_name_and_a_file_name(self):
+        row = dict(CONV_MSG, body="the key is %s and %s ok" % (self.ANT, self.GH),
+                   author={"id": PEER, "name": "Pat " + self.GH},
+                   authorLabel={"kind": "person", "display": "Pat " + self.ANT},
+                   attachments=[{"id": "a1", "filename": self.ANT + ".txt", "mime": "text/plain", "sizeBytes": 3}])
+        self.stub.tools["get_direct_conversation_messages"] = lambda a: ok(dict(CONV_PAGE, messages=[row]))
+        got = self.out("history", "--conversation", CONV)["messages"][0]
+        self.assert_clean(self.last)
+        self.assertTrue(got["body"].startswith("the key is ") and got["body"].endswith(" ok"))
+        self.assertIs(got["redacted"], True)
+        self.assertIs(got["author"]["redacted"], True)
+        self.assertIs(got["authorLabel"]["redacted"], True)
+        self.assertIs(got["attachments"][0]["redacted"], True)
+        self.assertEqual(got["seq"], 7)  # an ordinary row is untouched
+        plain = self.out("history", "--with", PEER)["messages"][0]
+        self.assertNotIn("redacted", plain)
+
+    def test_secret_shaped_text_is_withheld_from_a_preview_and_a_participant_name(self):
+        row = dict(CONV_LIST["conversations"][0])
+        row["lastMessage"] = dict(row["lastMessage"], preview="see " + self.GH, authorName=self.ANT)
+        row["participants"] = [{"id": PEER, "name": "Pat " + self.ANT}]
+        self.stub.tools["list_direct_conversations"] = lambda a: ok({"conversations": [row], "hasMore": False})
+        got = self.out("conversations", "--org", ORG)["conversations"][0]
+        self.assert_clean(self.last)
+        self.assertIs(got["lastMessage"]["redacted"], True)
+        self.assertIs(got["participants"][0]["redacted"], True)
+        self.assertTrue(got["lastMessage"]["preview"].startswith("see "))
+
+    def test_names_are_bounded_and_the_notice_names_them(self):
+        row = dict(CONV_MSG, author={"id": PEER, "name": "N" * 5000})
+        self.stub.tools["get_direct_conversation_messages"] = lambda a: ok(dict(CONV_PAGE, messages=[row]))
+        data = self.out("history", "--conversation", CONV)
+        self.assertLess(len(data["messages"][0]["author"]["name"]), 300)
+        for words in ("message text", "names", "file names"):
+            self.assertIn(words, data["notice"])
+
+    def test_no_text_keeps_seq(self):
+        row = self.out("history", "--conversation", CONV, "--no-text")["messages"][0]
+        self.assertEqual(row["seq"], 7)
+
+    def test_the_cursor_cap_is_500_like_the_server(self):
+        self.assertTrue(self.out("conversations", "--org", ORG, "--cursor", "c" * 500)["ok"])
+        self.assertEqual(self.out("conversations", "--org", ORG, "--cursor", "c" * 501)["code"], "bad_request")
+
+    def test_with_says_plainly_that_it_cannot_page(self):
+        data = self.out("history", "--with", PEER)
+        self.assertIn("cannot page", data["paging_note"])
+        self.assertNotIn("paging_note", self.out("history", "--conversation", CONV))
+
+    def test_bare_tool_results_and_bare_errors_are_understood(self):
+        self.stub.tools.update({"get_direct_conversation_messages": lambda a: ok_bare(CONV_PAGE),
+                                "list_direct_conversations": lambda a: ok_bare(CONV_LIST),
+                                "list_direct_conversation_files": lambda a: ok_bare(FILE_PAGE)})
+        self.assertEqual(self.out("history", "--conversation", CONV)["messages"][0]["seq"], 7)
+        self.assertEqual(self.out("conversations", "--org", ORG)["conversations"][0]["id"], CONV)
+        self.assertEqual(self.out("files", "--conversation", CONV)["files"][0]["id"], "f1")
+        self.stub.tools["get_direct_conversation_messages"] = lambda a: error_bare("not_found")
+        self.assertEqual(self.out("history", "--conversation", CONV)["code"], "not_found")
+        self.stub.tools["get_direct_conversation_messages"] = lambda a: error_bare("forbidden")
+        data = self.out("history", "--conversation", CONV)
+        self.assertEqual((data["code"], "forbidden" in data["message"]), ("tool_error", True))
+        self.assertNotIn("server's own words", self.last.stdout)
 
 
 class BasePinTests(Base):
