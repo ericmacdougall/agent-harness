@@ -83,8 +83,10 @@ class ChatError(Exception):
     """code and message are local text only; nothing from a server body reaches them except an allow-listed code."""
 
 
-    def __init__(self, code, message, exit_code=2):
-        if _credential_like(message):  # the one choke point for exception text, which ah prints to stdout unscanned
+    def __init__(self, code, message, exit_code=2, fixed=False):
+        # PR 277 r11 F2: fixed=True marks a literal local refusal that holds no third-party text and is raised before the client
+        # has any reason to read a token. It skips the screen, because screening lazily opens the dm-read token file.
+        if not fixed and _credential_like(message):  # the one choke point for exception text, which ah prints to stdout unscanned
             message = WITHHELD_ERROR
         super().__init__(message)
         self.code, self.exit_code = code, exit_code
@@ -193,7 +195,7 @@ def _pinned_base(base):
         if loopback and os.environ.get("GQ_BROWSER_TEST_LOOPBACK") == "1":
             return want
     raise ChatError("refused", "ah chat sends a token only to %s (a loopback base is allowed only with the test switch); "
-                               "the base given was not used, and no token was read" % gq.DEFAULT_BASE)
+                               "the base given was not used, and no token was read" % gq.DEFAULT_BASE, fixed=True)
 
 
 # ------------------------------------------------------------------ transport
@@ -223,14 +225,14 @@ class Client:
         """source "dm" reads the dedicated dm-read token, "user" the user token. Exactly one file is read: a missing or unusable
         file is an error, never a reason to try the other one."""
         if source not in SOURCES:
-            raise ChatError("bad_request", "internal: unknown token source")
+            raise ChatError("bad_request", "internal: unknown token source", fixed=True)
         self.source = source
         self.base = _pinned_base(base)  # before anything is read: a refused base never touches a token file
         if self.base != gq.DEFAULT_BASE:  # test mode: a test token only, never the one at the real token path
             home = _real_home()
             real = os.path.realpath(os.path.join(home, ".config", "goodqa")) if home else None
             if real is None or os.path.realpath(os.path.dirname(getattr(gq, SOURCES[source][2])())) == real:
-                raise ChatError("refused", "a loopback test base never takes a token from the real token path")
+                raise ChatError("refused", "a loopback test base never takes a token from the real token path", fixed=True)
         try:
             self.defaults = gq.load_defaults()  # only for the default org; its base and allowedBases are ignored
             self._token = getattr(gq, SOURCES[source][0])()
@@ -464,14 +466,14 @@ def _paging(data, *names):
 
 def _cursor(value):
     if value is not None and not (isinstance(value, str) and CURSOR_RE.fullmatch(value)):
-        raise ChatError("bad_request", "--cursor is the next_cursor value of the previous page")
+        raise ChatError("bad_request", "--cursor is the next_cursor value of the previous page", fixed=True)
     _refuse_credential_ids(value)
     return value
 
 
 def _limit(value):
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_LIMIT:
-        raise ChatError("bad_request", "--limit must be 1 to %d" % MAX_LIMIT)
+        raise ChatError("bad_request", "--limit must be 1 to %d" % MAX_LIMIT, fixed=True)
     return value
 
 
@@ -588,6 +590,7 @@ def probe(base=None, which="dm"):
 def conversations(home, org=None, limit=30, base=None, cursor=None):
     """Your direct and group-direct conversations in one org (the dm-read token; list_direct_conversations). One page per call:
     next_cursor (when has_more) goes back in as --cursor; nothing here follows it."""
+    _pinned_base(base)  # PR 277 r11 F2: a refused base is the first refusal; the id screens below read the DM token
     limit = _limit(limit)
     cursor = _cursor(cursor)
     client = Client(base, source="dm")
@@ -606,18 +609,19 @@ def conversations(home, org=None, limit=30, base=None, cursor=None):
 
 
 def history(home, conversation=None, with_=None, org=None, limit=30, no_text=False, after=None, before=None, base=None):
+    _pinned_base(base)  # PR 277 r11 F2: first, before any id screen can read the DM token
     if bool(conversation) == bool(with_):
-        raise ChatError("bad_request", "give exactly one of --conversation or --with")
+        raise ChatError("bad_request", "give exactly one of --conversation or --with", fixed=True)
     limit = _limit(limit)
     if after:
-        raise ChatError("bad_request", "--after is not offered (the chat read tools page backwards with --before)")
+        raise ChatError("bad_request", "--after is not offered (the chat read tools page backwards with --before)", fixed=True)
     if before is not None and not (conversation and re.fullmatch(r"\d{1,12}", str(before))):
-        raise ChatError("bad_request", "--before is a message sequence number and works only with --conversation")
+        raise ChatError("bad_request", "--before is a message sequence number and works only with --conversation", fixed=True)
     if conversation is not None and not _is_uuid(conversation):
-        raise ChatError("bad_request", "--conversation is a conversation id (a UUID)")
-    _refuse_credential_ids(conversation)
+        raise ChatError("bad_request", "--conversation is a conversation id (a UUID)", fixed=True)
     if conversation and org:
-        raise ChatError("bad_request", "--org is not used with --conversation (the conversation id names the conversation)")
+        raise ChatError("bad_request", "--org is not used with --conversation (the conversation id names the conversation)", fixed=True)
+    _refuse_credential_ids(conversation)
     client = Client(base, source="dm")
     if conversation:
         _need(client, "get_direct_conversation_messages")
@@ -662,16 +666,17 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
 def files(home, conversation=None, surface=None, base=None, offset=None):
     """chat: the files of a DM or group DM (dm-read token, list_direct_conversation_files). issue, personal: the existing
     file_list under the user token (those are not private messages)."""
+    _pinned_base(base)  # PR 277 r11 F2: first, before the id screen can read the DM token
     if not _is_uuid(conversation):
-        raise ChatError("bad_request", "--conversation is a conversation id (a UUID)")
-    _refuse_credential_ids(conversation)
+        raise ChatError("bad_request", "--conversation is a conversation id (a UUID)", fixed=True)
     surface = surface or "chat"
     if surface not in ("chat", "issue", "personal"):
-        raise ChatError("bad_request", "--surface is chat, issue or personal")
+        raise ChatError("bad_request", "--surface is chat, issue or personal", fixed=True)
     if offset is not None and (surface != "chat" or not isinstance(offset, int) or isinstance(offset, bool)
                                or not 0 <= offset < MAX_OFFSET):
         raise ChatError("bad_request", "--offset is the next_offset value of the previous page (0 or more) and works only "
-                                       "with --surface chat")
+                                       "with --surface chat", fixed=True)
+    _refuse_credential_ids(conversation)  # after the literal argument checks: this screen reads the DM token
     if surface == "chat":
         client = Client(base, source="dm")
         _need(client, "list_direct_conversation_files")

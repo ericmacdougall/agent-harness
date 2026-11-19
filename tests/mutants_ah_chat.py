@@ -40,7 +40,11 @@ MUTANTS = {
     "the secret-shape screen is off for ids and error text": ("or bool(_secret_spans(value)))", "or False)"),
     "target ids are not screened": ("        if _credential_like(value):\n            raise ChatError(\"secret_refused\", \"an id",
                                     "        if False:\n            raise ChatError(\"secret_refused\", \"an id"),
-    "error text is not screened": ("        if _credential_like(message):  # the one choke point", "        if False:  # the one choke point"),
+    "error text is not screened": ("        if not fixed and _credential_like(message):  # the one choke point", "        if False:  # the one choke point"),
+    # PR 277 r11 F2: a fixed pre-credential refusal must not lazily open the DM token file
+    "a fixed refusal is screened (reads the DM token)": ("        if not fixed and _credential_like(message):", "        if _credential_like(message):"),
+    "history screens its ids before the base": (
+        "    _pinned_base(base)  # PR 277 r11 F2: first, before any id screen can read the DM token\n", ""),
     # PR 277 r6: `ah chat send` is deferred to goodqa#16399; ah.py refuses it before anything is parsed, imported or read
     "send reaches the parser": ("ah.py", '        if _first_word(given[given.index("chat") + 1:]) == "send":', "        if False:"),
     "the send refusal exits zero": ("ah.py", '    sys.stdout.write("\\n")\n    return 2\n\n\ndef _parse_chat',

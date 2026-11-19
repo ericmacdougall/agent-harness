@@ -1115,6 +1115,60 @@ class BasePinTests(Base):
             self.assertNotIn("evil.example", p.stdout + p.stderr)  # the rejected value is not repeated
         self.assertEqual((self.stub.hits, self.stub.calls), ([], []))
 
+    def _spied_fresh_run(self, call, switch):
+        """PR 277 r11 F2: run call() in a fresh state (the lazy screening latch not yet set) with every token reader a spy; returns
+        (the ChatError raised, the reader calls). The spies return nothing a caller could use, so a read shows only as a call."""
+        calls = []
+        def spy(name):
+            def reader(*a, **k):
+                calls.append(name)
+                raise self.gq.Refused("spy")
+            return reader
+        env = {"HOME": str(self.home)}
+        if switch:
+            env["GQ_BROWSER_TEST_LOOPBACK"] = "1"
+        with mock.patch.dict(os.environ, env), mock.patch.object(self.chat, "_SCREEN_LOADED", []), \
+                mock.patch.object(self.gq, "read_dm_token", spy("read_dm_token")), \
+                mock.patch.object(self.gq, "read_token", spy("read_token")), \
+                mock.patch.object(self.gq, "_read_secret_file", spy("_read_secret_file")):
+            os.environ.pop("GQ_BROWSER_TEST_LOOPBACK", None) if not switch else None
+            with self.assertRaises(self.chat.ChatError) as raised:
+                call()
+        return raised.exception, calls
+
+    def test_a_rejected_base_opens_no_token_reader_at_all(self):
+        h = str(self.home)
+        for label, switch, base in (("other host", True, self.EVIL), ("other host, no switch", False, self.EVIL),
+                                    ("loopback without the test switch", False, "http://127.0.0.1:9/v1")):
+            for name, call in (("probe", lambda: self.chat.probe(base, "dm")), ("probe user", lambda: self.chat.probe(base, "user")),
+                               ("conversations", lambda: self.chat.conversations(h, ORG, base=base)),
+                               ("history", lambda: self.chat.history(h, conversation=CONV, base=base)),
+                               ("files", lambda: self.chat.files(h, conversation=CONV, base=base)),
+                               ("files issue", lambda: self.chat.files(h, conversation=CONV, surface="issue", base=base))):
+                error, calls = self._spied_fresh_run(call, switch)
+                self.assertEqual(error.code, "refused", (label, name))
+                self.assertEqual(calls, [], (label, name))  # no token file was opened to refuse a base
+                self.assertIn("ah chat sends a token only to", str(error), (label, name))
+
+    def test_a_fixed_argument_refusal_opens_no_token_reader(self):
+        h = str(self.home)
+        for name, call in (("limit", lambda: self.chat.conversations(h, ORG, limit=0)),
+                           ("cursor", lambda: self.chat.conversations(h, ORG, cursor="not a cursor!")),
+                           ("both targets", lambda: self.chat.history(h, conversation=CONV, with_=PEER)),
+                           ("neither target", lambda: self.chat.history(h)),
+                           ("bad conversation", lambda: self.chat.history(h, conversation="nope")),
+                           ("files bad surface", lambda: self.chat.files(h, conversation=CONV, surface="x")),
+                           ("files bad conversation", lambda: self.chat.files(h, conversation="nope"))):
+            error, calls = self._spied_fresh_run(call, True)
+            self.assertEqual(error.code, "bad_request", name)
+            self.assertEqual(calls, [], name)
+
+    def test_an_unfixed_error_is_still_screened_and_loads_the_token_to_do_it(self):
+        error, calls = self._spied_fresh_run(lambda: (_ for _ in ()).throw(
+            self.chat.ChatError("tool_error", "echo " + DM_SENTINEL)), True)
+        self.assertEqual(calls, ["read_dm_token"])  # the choke point still reads the DM token, once, on the first error it screens
+        self.assertEqual(str(error), self.chat.WITHHELD_ERROR)
+
     def test_a_base_in_browser_defaults_is_ignored(self):
         path = self.home / ".config" / "goodqa" / "browser-defaults.json"
         path.write_text(json.dumps({"base": self.EVIL, "allowedBases": [self.EVIL, self.stub.base], "org": ORG}))
