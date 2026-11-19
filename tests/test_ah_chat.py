@@ -911,6 +911,60 @@ class BasePinTests(Base):
                 self.assertEqual(self.chat.Client(base, source="dm").base, self.gq.DEFAULT_BASE)
 
 
+class TokenFileReadTests(Base):
+    """PR 277 r8 m1, m2: a token file is opened with O_NOFOLLOW and read at most 4097 bytes, so a huge or swapped file is refused
+    without being slurped or followed."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(HOOKS))
+        self.addCleanup(sys.path.remove, str(HOOKS))
+        import gq_browser  # noqa: PLC0415
+        self.gq = gq_browser
+
+    def env(self):
+        return mock.patch.dict(os.environ, {"HOME": str(self.home)})
+
+    def spy(self):
+        calls = {"open": [], "read": []}
+        real_open, real_read = os.open, os.read
+
+        def spy_open(path, flags, *a, **k):
+            calls["open"].append((str(path), flags))
+            return real_open(path, flags, *a, **k)
+
+        def spy_read(fd, n):
+            calls["read"].append(n)
+            return real_read(fd, n)
+        return calls, mock.patch.object(os, "open", spy_open), mock.patch.object(os, "read", spy_read)
+
+    def test_a_token_file_is_opened_without_following_symlinks_and_read_with_a_bound(self):
+        calls, o, r = self.spy()
+        with self.env(), o, r:
+            self.assertEqual(self.gq.read_dm_token(), DM_SENTINEL)
+        mine = [flags for path, flags in calls["open"] if path.endswith("dm-read-token")]
+        self.assertEqual(len(mine), 1)
+        self.assertTrue(mine[0] & os.O_NOFOLLOW)
+        self.assertTrue(calls["read"] and max(calls["read"]) <= 4097)
+
+    def test_an_oversized_token_file_is_refused_after_a_bounded_read(self):
+        self.dm_file.write_text("x" * 3_000_000)
+        self.dm_file.chmod(0o600)
+        calls, o, r = self.spy()
+        with self.env(), o, r, self.assertRaises(self.gq.Refused):
+            self.gq.read_dm_token()
+        self.assertTrue(calls["read"] and max(calls["read"]) <= 4097)
+
+    def test_a_symlinked_token_file_is_refused(self):
+        target = self.home / "elsewhere"
+        target.write_text(DM_SENTINEL + "\n")
+        target.chmod(0o600)
+        self.dm_file.unlink()
+        self.dm_file.symlink_to(target)
+        with self.env(), self.assertRaises(self.gq.Refused):
+            self.gq.read_dm_token()
+
+
 class WithGateTests(Base):
     """PR 277 r8 M2: `history --with` calls get_direct_messages, which the server answers with an EMPTY 200 for a token the DM
     gate did not admit. So the DM-read tools must be offered first, or the empty list would read as "no messages"."""

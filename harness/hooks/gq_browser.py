@@ -206,14 +206,31 @@ def dm_token_path():
 
 def _read_secret_file(path, what):
     fix = "Create it with mode 0600 (chmod 600 %s); never paste the token into chat." % path
-    st = _private_file(path, what, fix)
-    if st.st_mode & 0o077:
-        raise Refused("%s %s is readable by group or others. Fix: chmod 600 %s" % (what, path, path))
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            value = f.read().strip()
+    _private_file(path, what, fix)
+    try:  # PR 277 r8 m1, m2: no symlink is followed, the checks run on the opened descriptor, and at most 4097 bytes are read
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         raise Refused("%s %s is unreadable. %s" % (what, path, fix))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise Refused("%s %s must be a regular file owned by you. %s" % (what, path, fix))
+        if st.st_mode & 0o077:
+            raise Refused("%s %s is readable by group or others. Fix: chmod 600 %s" % (what, path, path))
+        raw = b""
+        while len(raw) < 4097:
+            chunk = os.read(fd, 4097 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        raise Refused("%s %s is unreadable. %s" % (what, path, fix))
+    finally:
+        os.close(fd)
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        value = ""
     if not value or len(value) > 4096 or any(c.isspace() for c in value):
         raise Refused("%s %s does not hold one token. %s" % (what, path, fix))
     return _remember(value)
