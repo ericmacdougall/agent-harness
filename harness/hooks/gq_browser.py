@@ -124,8 +124,10 @@ def _remember(value):
     return value
 
 
-def _credential_secrets():
-    for reader in (read_token, read_dm_token):  # both files are secrets, whichever one this command uses
+def _credential_secrets(readers=None):
+    """Every secret this process holds, after trying `readers` (default: both token files, whichever one this command uses).
+    readers=() reads no file and checks only the secrets already read in this process (PR 277 r9: ah chat's DM commands)."""
+    for reader in ((read_token, read_dm_token) if readers is None else readers):
         try:
             reader()
         except (Refused, OSError):
@@ -133,11 +135,11 @@ def _credential_secrets():
     return set(_SECRETS)
 
 
-def holds_credential(text):
+def holds_credential(text, readers=None):
     if isinstance(text, bytes):
         text = text.decode("latin-1")
     low = text.lower()
-    for s in _credential_secrets():
+    for s in _credential_secrets(readers):
         sl = s.lower()
         if any(sl[i:i + 12] in low for i in range(len(sl) - 11)):
             return True
@@ -207,8 +209,10 @@ def dm_token_path():
 def _read_secret_file(path, what):
     fix = "Create it with mode 0600 (chmod 600 %s); never paste the token into chat." % path
     _private_file(path, what, fix)
-    try:  # PR 277 r8 m1, m2: no symlink is followed, the checks run on the opened descriptor, and at most 4097 bytes are read
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    # PR 277 r8 m1, m2: no symlink is followed, the checks run on the opened descriptor, and at most 4097 bytes are read.
+    # r9 r3: O_NONBLOCK, so a FIFO swapped in after the precheck opens at once (and fstat refuses it) instead of hanging.
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError:
         raise Refused("%s %s is unreadable. %s" % (what, path, fix))
     try:

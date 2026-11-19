@@ -16,7 +16,7 @@ FILE = "ah_chat.py"
 
 MUTANTS = {
     "redirects are followed": ("gq._OPENER.open(req, timeout=self.timeout)", "urllib.request.urlopen(req, timeout=self.timeout)"),
-    "the credential backstop is off": ("    if gq.holds_credential(json.dumps(result, ensure_ascii=False)):", "    if False:"),
+    "the credential backstop is off": ("    if _holds_token(json.dumps(result, ensure_ascii=False)):", "    if False:"),
     "server error codes are printed raw": ('    shown = gq.shown_code(code) if isinstance(code, str) else None\n    return shown or "unrecognized_error"',
                                            "    return str(code)"),
     "not_found is a traceback": ('raise ChatError("not_found", "GoodQA says not_found', 'raise KeyError("not_found", "GoodQA says not_found'),
@@ -33,10 +33,11 @@ MUTANTS = {
     "an absent conversation tool is not an error": ("    if tool not in _offered(client):", "    if False:"),
     # PR 277 r4 source-to-sink sweep, re-run for the read-only build (r6): one variant per check
     "uuids are prefix-matched": ("UUID_RE.fullmatch(value) is not None", 're.match(UUID_RE.pattern + "$", value) is not None'),
-    "names are prefix-matched": ("NAME_RE.fullmatch(who)", 're.match(NAME_RE.pattern + "$", who)'),
+    # r9: one --with name check (history), so this is no longer an equivalent mutant dominated by a second check in _user
+    "names are prefix-matched": ("NAME_RE.fullmatch(with_)", 're.match(NAME_RE.pattern + "$", with_)'),
     "metadata values are prefix-matched": ("META_VALUE.fullmatch(str(v))", 're.match("(?:" + META_VALUE.pattern + ")$", str(v))'),
-    "the token-file screen is off for ids and error text": ("(gq.holds_credential(value) or any(", "(False or any("),
-    "the secret-shape screen is off for ids and error text": ("or any(p.search(value) for p in gq.SECRET_SHAPES))", "or False)"),
+    "the token-file screen is off for ids and error text": ("(_holds_token(value) or bool(_secret_spans(value)))", "(False or bool(_secret_spans(value)))"),
+    "the secret-shape screen is off for ids and error text": ("or bool(_secret_spans(value)))", "or False)"),
     "target ids are not screened": ("        if _credential_like(value):\n            raise ChatError(\"secret_refused\", \"an id",
                                     "        if False:\n            raise ChatError(\"secret_refused\", \"an id"),
     "error text is not screened": ("        if _credential_like(message):  # the one choke point", "        if False:  # the one choke point"),
@@ -71,8 +72,8 @@ MUTANTS = {
     "conversation rows are passed whole": ("    listed = [_conversation(r) for r in rows]", "    listed = list(rows)"),
     "participants keep every field": ("[_pick(p, PARTICIPANT_KEYS) for p in", "[p for p in"),
     # PR 277 r8 (the findings of the 9d0706a review): one mutant per new control
-    "M2: --with skips the tools-offered check": ('        _need(client, "get_direct_conversation_messages")\n        peer, name = _user(client, org, with_)',
-                                                 '        peer, name = _user(client, org, with_)'),
+    "M2: --with skips the tools-offered check": ('        _need(client, "get_direct_conversation_messages")\n        peer, name, name_redacted = _user(client, org, with_)',
+                                                 '        peer, name, name_redacted = _user(client, org, with_)'),
     "M3: a base other than goodqa.app is accepted": ('    raise ChatError("refused", "ah chat sends a token only to', '    return base\n    raise ChatError("refused", "ah chat sends a token only to'),
     "M3: browser-defaults.json base is trusted": ("self.base = _pinned_base(base)  # before", "self.base = _pinned_base(base or gq.load_defaults().get('base'))  # before"),
     "M3: loopback needs no test switch": ('        if loopback and os.environ.get("GQ_BROWSER_TEST_LOOPBACK") == "1":', "        if loopback:"),
@@ -80,8 +81,7 @@ MUTANTS = {
     "M3: test mode takes the real token path": ("            if real is None or os.path.realpath(os.path.dirname(getattr(gq, SOURCES[source][2])())) == real:", "            if False:"),
     "M3: the token is read before the base is checked": ("self.base = _pinned_base(base)  # before", "self.base = _pinned_base(base) if getattr(gq, SOURCES[source][0])() else None  # before"),
     "m3: probe defaults to the user token": ("ah.py", 'c.add_argument("--token", choices=("user", "dm"), default="dm",', 'c.add_argument("--token", choices=("user", "dm"), default="user",'),
-    "M4: text is not redacted": ("                raw = redact.redact(scanned) + raw[MAX_SCAN:]", "                raw = scanned + raw[MAX_SCAN:]"),
-    "M4: the redacted flag is not set": ('                    kept["redacted"] = True', "                    pass"),
+    "M4: text is not redacted": ("                raw, hit = _screen(raw[:MAX_SCAN])", "                raw, hit = raw[:MAX_SCAN], False"),
     "m7: names are not bounded": ("        cap = MAX_TEXT_FIELD if key in TEXT_KEYS else MAX_NAME_FIELD", "        cap = MAX_TEXT_FIELD"),
     "m7: the notice omits the names": ("previews, participant and author names and file names are untrusted", "file names are untrusted"),
     "paging: conversations drop the cursor argument": ('        arguments["cursor"] = cursor', "        pass"),
@@ -99,8 +99,28 @@ MUTANTS = {
     "m4: --no-text drops seq": ('META_KEYS = re.compile(r"id|seq|', 'META_KEYS = re.compile(r"id|'),
     "m6: --with does not say it cannot page": ('        paging["paging_note"] = (', '        paging["x"] = ('),
     "m9: a bare tool result is not understood": ('inner = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data', 'inner = data.get("data")'),
-    "m1: a token file is opened following symlinks": ("gq_browser.py", '        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))', "        fd = os.open(path, os.O_RDONLY)"),
+    "m1: a token file is opened following symlinks": ("gq_browser.py", 'os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))',
+                                                      'os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))'),
     "m1: a token file is read without a bound": ("gq_browser.py", "chunk = os.read(fd, 4097 - len(raw))", "chunk = os.read(fd, 1 << 26)"),
+    # PR 277 r9 (the delta review of d7ab4a8): B1 one screen, the union of redact.py and gq_browser.SECRET_SHAPES
+    "B1: the GoodQA user-token shape is not screened": ("gq_browser.py", r'r"gq[a-z]{1,4}_[A-Za-z0-9_-]{16,}", ', ""),
+    "B1: the GoodQA key shape is not screened": ("gq_browser.py", r'r"bt_k[a-z]_[A-Za-z0-9_-]{16,}", ', ""),
+    "B1: the DigitalOcean shape is not screened": ("gq_browser.py", r'r"\bdop_v1_[A-Za-z0-9]{20,}", ', ""),
+    "B1: SECRET_SHAPES are left out of the screen": ("    for pattern in gq.SECRET_SHAPES:", "    for pattern in ():"),
+    "B1: redact.py shapes are left out of the screen": ("    spans = [(start, end) for _kind, start, end in redact.find(text)]", "    spans = []"),
+    "B1: a prefix-only shape keeps its tail": ("spans.append((m.start(), _TOKEN_RUN.match(text, m.end()).end()))", "spans.append((m.start(), m.end()))"),
+    "B1: the redacted flag is not set": ('                    kept["redacted"] = True', "                    pass"),
+    "B1: our own token echoed is redacted, not withheld": ('    if _holds_token(text):\n        raise ChatError("withheld", gq.WITHHELD, 3)\n    merged = []',
+                                                           "    merged = []"),
+    "B1: with_name is not screened": (r'hits.append((uid, _screen(re.sub(r"[\x00-\x1f\x7f]", " ", shown)[:MAX_SCAN])))',
+                                      r'hits.append((uid, (re.sub(r"[\x00-\x1f\x7f]", " ", shown), False)))'),
+    "B1: with_name is cut before it is screened": (r'" ", shown)[:MAX_SCAN])))', r'" ", shown)[:80])))'),
+    "B1: the with_name redacted flag is not set": ('            target["redacted"] = True', "            pass"),
+    "B1: probe strings are not screened": ("    text, hit = _screen(value[:MAX_SCAN])", "    text, hit = value, False"),
+    "B1: --no-text values are not screened": ("    for key in [k for k, v in kept.items() if isinstance(v, str) and _screen(v)[1]]:", "    for key in []:"),
+    "r4: a DM screen opens the user-token file": ("gq.holds_credential(text, readers=())", "gq.holds_credential(text)"),
+    "r1: test mode takes a real-shaped token": ("        if self.base != gq.DEFAULT_BASE and self._token.startswith(REAL_TOKEN_PREFIX):", "        if False:"),
+    "r3: a token file is opened without O_NONBLOCK": ("gq_browser.py", 'getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))', 'getattr(os, "O_NOFOLLOW", 0))'),
 }
 
 
@@ -123,8 +143,12 @@ def one(job):
         if text.count(old) != 1:
             return name, "BROKEN MUTANT: pattern found %d times" % text.count(old), True
         path.write_text(text.replace(old, new))
-    failed = run(tree).returncode != 0
+    proc = run(tree)
+    failed = proc.returncode != 0
     shutil.rmtree(tree, ignore_errors=True)  # the disk is tight: one copy of the hooks at a time per worker
+    if failed and change is None:  # r9: a failing real file invalidates the whole run, so say why (test names only)
+        tail = [line for line in proc.stderr.splitlines() if line.startswith(("FAIL:", "ERROR:", "Ran ", "FAILED"))]
+        return name, "tests FAIL (RUN INVALID): %s" % " | ".join(tail[:6]), True
     return name, "tests FAIL (killed)" if failed else "tests PASS", failed != (change is not None)
 
 

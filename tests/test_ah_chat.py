@@ -384,12 +384,25 @@ class ReadTests(Base):
         self.assert_no_token(p)
 
     def test_a_success_body_that_holds_either_token_is_withheld(self):
-        for sentinel in (DM_SENTINEL, USER_SENTINEL):  # the read uses one token; the output backstop covers both files
-            evil = dict(MSG, body="debug: " + sentinel)
-            self.stub.tools["get_direct_messages"] = lambda a, evil=evil: ok({"messages": [evil]})
-            p = self.ah("history", "--with", PEER)
-            self.assertEqual(json.loads(p.stdout)["code"], "withheld", sentinel)
-            self.assert_no_token(p)
+        # The token this command reads (dm-read) echoed back withholds the whole result. A DM read does not open the general
+        # user-token file (PR 277 r9 r4), so that token, pasted whole, is caught by its shape instead: replaced, never printed.
+        evil = dict(MSG, body="debug: " + DM_SENTINEL)
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [evil]})
+        p = self.ah("history", "--with", PEER)
+        self.assertEqual(json.loads(p.stdout)["code"], "withheld")
+        self.assert_no_token(p)
+        user = "gqu_" + "Uz7Vb3Nk" * 4  # shares no 12-character piece with DM_SENTINEL (the sentinels share "gqu_SENTINEL")
+        self.user_file.write_text(user + "\n")
+        evil = dict(MSG, body="debug: " + user)
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [evil]})
+        p = self.ah("history", "--with", PEER)
+        self.assertIs(json.loads(p.stdout)["messages"][0]["redacted"], True)
+        self.assertNotIn(user[4:16], p.stdout + p.stderr)
+        # a command that reads the user token withholds a result that echoes it
+        self.stub.tools["file_list"] = lambda a: ok({"files": [{"id": "f2", "name": "x " + user}]})
+        p = self.ah("files", "--conversation", CONV, "--surface", "issue")
+        self.assertEqual(json.loads(p.stdout)["code"], "withheld")
+        self.assertNotIn(user[4:16], p.stdout + p.stderr)
         evil = dict(MSG, body="piece: " + DM_SENTINEL[4:24].upper())  # a 12-character piece, other case
         self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [evil]})
         p = self.ah("history", "--with", PEER)
@@ -503,10 +516,25 @@ class SweepTests(Base):
         self.assertNotIn("createdAt", row)
         self.assertNotIn("senderId", row)
 
-    def test_error_text_never_repeats_credential_material_from_an_argument(self):
-        for piece in (USER_SENTINEL[4:16], DM_SENTINEL[20:32]) + self.shapes:
-            p = self.ah("history", "--with", PEER, base="https://evil.example.test/" + piece)
+    def test_error_text_never_repeats_credential_material_from_the_environment(self):
+        # PR 277 r9: the refusal for a missing token file names the file's path, which is built from HOME. A HOME whose name
+        # holds a secret shape must reach the output only through the ChatError screen, which withholds that text.
+        for piece in self.shapes + ("gq" + "ut_" + "Hm4" * 7,):
+            home = self.home / ("h-" + piece)
+            (home / ".config" / "goodqa").mkdir(parents=True, mode=0o700)  # no dm-read-token in it
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home), "AH_HOME": str(home),
+                   "GQ_BROWSER_TEST_LOOPBACK": "1", "CLAUDE_CODE_SESSION_ID": "test-session-1"}
+            p = subprocess.run([sys.executable, "-I", str(AH), "chat", "history", "--conversation", CONV, "--base",
+                                self.stub.base], env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(self.code(p), "refused", piece)
+            self.assertIn("withheld", json.loads(p.stdout)["message"], piece)
+            self.assert_nowhere(piece, p)
+        self.assertEqual(self.stub.hits, [])
+
+    def test_a_cursor_holding_a_secret_shape_is_refused_before_any_request(self):
+        for piece in (self.shapes[0], "gq" + "ut_" + "Hm4" * 7, "bt_k" + "s_" + "Hm4" * 7):
+            p = self.ah("conversations", "--org", ORG, "--cursor", piece)
+            self.assertEqual(self.code(p), "secret_refused", piece)
             self.assert_nowhere(piece, p)
         self.assertEqual(self.stub.hits, [])
 
@@ -854,6 +882,187 @@ class SecretAndBoundsTests(Base):
         self.assertNotIn("server's own words", self.last.stdout)
 
 
+class ShapeScreenTests(Base):
+    """PR 277 r9 B1: every third-party string that reaches stdout is screened by ONE function, the union of redact.py's shapes
+    and gq_browser.SECRET_SHAPES. redact.py has no GoodQA user-token (gqut_), GoodQA key (bt_k?_) or DigitalOcean (dop_v1_)
+    shape, so before r9 those were printed. Fakes are built at run time and placed after neutral words (a word such as
+    "token:" before them would let redact.py's named-credential shape hide the gap)."""
+
+    def setUp(self):
+        super().setUp()
+        # the three shapes only SECRET_SHAPES has, and one only redact.py has (Hugging Face), so the screen is the union
+        self.fakes = ("gq" + "ut_" + "Zx9Kp2" * 4, "bt_k" + "s_" + "Mn4Rt7" * 4, "do" + "p_v1_" + "a1B2c3D4" * 4,
+                      "h" + "f_" + "Hx5Yt2" * 4)
+        self.tail = "Tq8Wv3"  # after a prefix-only shape (SECRET_SHAPES matches "sk-ant-" alone): the tail must go too
+        self.short_ant = "sk-" + "ant-" + self.tail
+
+    def text(self, fake):
+        return "see here %s thanks" % fake
+
+    def assert_hidden(self, p, fake):
+        shown = p.stdout + p.stderr
+        self.assertNotIn(fake, shown)
+        self.assertNotIn(fake[-12:], shown)  # no tail survives a partial match
+        self.assertNotIn(fake[:14], shown)   # nor the head
+
+    def conv_msg(self, **fields):
+        self.stub.tools["get_direct_conversation_messages"] = lambda a: ok(dict(CONV_PAGE, messages=[dict(CONV_MSG, **fields)]))
+        return self.out("history", "--conversation", CONV)["messages"][0]
+
+    def conv_row(self, **fields):
+        row = dict(CONV_LIST["conversations"][0], **fields)
+        self.stub.tools["list_direct_conversations"] = lambda a: ok({"conversations": [row], "hasMore": False})
+        return self.out("conversations", "--org", ORG)["conversations"][0]
+
+    def test_a_body(self):
+        for fake in self.fakes:
+            got = self.conv_msg(body=self.text(fake))
+            self.assert_hidden(self.last, fake)
+            self.assertIs(got["redacted"], True, fake)
+            self.assertTrue(got["body"].startswith("see here ") and got["body"].endswith(" thanks"), fake)
+
+    def test_a_preview(self):
+        for fake in self.fakes:
+            last = dict(CONV_LIST["conversations"][0]["lastMessage"], preview=self.text(fake))
+            got = self.conv_row(lastMessage=last)["lastMessage"]
+            self.assert_hidden(self.last, fake)
+            self.assertIs(got["redacted"], True, fake)
+
+    def test_an_author_name(self):
+        for fake in self.fakes:
+            got = self.conv_msg(author={"id": PEER, "name": "Pat " + fake})
+            self.assert_hidden(self.last, fake)
+            self.assertIs(got["author"]["redacted"], True, fake)
+
+    def test_an_author_label_display(self):
+        for fake in self.fakes:
+            got = self.conv_msg(authorLabel={"kind": "person", "display": "Pat " + fake})
+            self.assert_hidden(self.last, fake)
+            self.assertIs(got["authorLabel"]["redacted"], True, fake)
+
+    def test_a_participant_name(self):
+        for fake in self.fakes:
+            got = self.conv_row(participants=[{"id": PEER, "name": "Pat " + fake}])
+            self.assert_hidden(self.last, fake)
+            self.assertIs(got["participants"][0]["redacted"], True, fake)
+
+    def test_a_filename(self):
+        for fake in self.fakes:
+            self.stub.tools["list_direct_conversation_files"] = lambda a, fake=fake: ok(
+                {"attachments": [{"id": "f1", "filename": "plan " + fake + ".pdf", "mime": "application/pdf"}]})
+            got = self.out("files", "--conversation", CONV)["files"][0]
+            self.assert_hidden(self.last, fake)
+            self.assertIs(got["redacted"], True, fake)
+
+    def test_with_name(self):
+        for fake in self.fakes:
+            self.stub.tools["list_org_members"] = lambda a, fake=fake: ok(
+                {"members": [{"userId": PEER, "name": "Pat " + fake, "email": "pat@example.test"}]})
+            data = self.out("history", "--with", "pat@example.test", "--org", ORG)
+            self.assertEqual((data["ok"], data["with"]), (True, PEER), fake)
+            self.assert_hidden(self.last, fake)
+            self.assertTrue(data["with_name"].startswith("Pat "), fake)
+            self.assertIs(data["redacted"], True, fake)
+        # the name is cut at 80 characters: screened first, so a cut that splits the secret leaves no 14-character head
+        fake = self.fakes[0]
+        self.stub.tools["list_org_members"] = lambda a: ok(
+            {"members": [{"userId": PEER, "name": "P" * 66 + fake, "email": "pat@example.test"}]})
+        data = self.out("history", "--with", "pat@example.test", "--org", ORG)
+        self.assertNotIn(fake[:14], self.last.stdout)
+        self.assertIs(data["redacted"], True)
+
+    def test_a_prefix_only_shape_takes_its_tail_with_it(self):
+        got = self.conv_msg(body=self.text(self.short_ant))
+        self.assertNotIn(self.tail, self.last.stdout)
+        self.assertIs(got["redacted"], True)
+
+    def test_probe_strings_from_the_server_are_screened(self):
+        fake = "gq" + "ut_" + "abcdefghijklmnopq"  # lower-case letters only: it also fits the tool-name pattern
+        self.stub.schemas["get_direct_messages"] = {"type": "object", "required": ["x" + fake],
+                                                    "properties": {"y" + fake: {"enum": ["e " + fake]}}}
+        self.stub.offered = ALL_TOOLS + ["chat_" + fake]
+        data = self.out("probe")
+        self.assertNotIn(fake[5:], self.last.stdout)
+        self.assertIs(data["redacted"], True)
+
+    def test_no_text_values_are_screened(self):
+        fake = "gq" + "ut_" + "abcdefghijklmnopq"  # fits META_VALUE's 24-letter word
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [dict(MSG, kind=fake)]})
+        row = self.out("history", "--with", PEER, "--no-text")["messages"][0]
+        self.assertNotIn(fake[5:], self.last.stdout)
+        self.assertNotIn("kind", row)
+        self.assertIs(row["redacted"], True)
+
+    def test_an_unreadable_user_token_file_still_leaves_that_token_unprinted(self):
+        # the reviewer's lost protection: a user-token file with a bad mode is not screened against, so the owner's own user
+        # token pasted in a DM must still be withheld, by its shape
+        real_shaped = "gq" + "ut_" + "Own5Tok" * 4
+        self.user_file.write_text(real_shaped + "\n")
+        self.user_file.chmod(0o644)
+        got = self.conv_msg(body=self.text(real_shaped))
+        self.assert_hidden(self.last, real_shaped)
+        self.assertIs(got["redacted"], True)
+
+
+class UserTokenNotOpenedTests(Base):
+    """PR 277 r9 r4: a DM command screens by shape plus the dm-read token it reads anyway; it never opens the general user-token
+    file. The user token is opened only by the two commands that send it (files --surface issue|personal, probe --token user)."""
+
+    def setUp(self):
+        super().setUp()
+        sys.path.insert(0, str(HOOKS))
+        self.addCleanup(sys.path.remove, str(HOOKS))
+        import ah_chat  # noqa: PLC0415
+        import gq_browser  # noqa: PLC0415
+        self.chat, self.gq = ah_chat, gq_browser
+
+    def test_dm_commands_never_open_the_user_token_file(self):
+        opened, calls = [], []
+        real_open = os.open
+
+        def spy_open(path, flags, *a, **k):
+            opened.append(str(path))
+            return real_open(path, flags, *a, **k)
+
+        def spy_read_token():
+            calls.append("read_token")
+            raise self.gq.Refused("spy")
+        env = {"HOME": str(self.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(os, "open", spy_open), \
+                mock.patch.object(self.gq, "read_token", spy_read_token):
+            self.chat.history(self.home, conversation=CONV, base=self.stub.base)
+            self.chat.history(self.home, with_=PEER, org=ORG, base=self.stub.base)
+            self.chat.conversations(self.home, org=ORG, base=self.stub.base)
+            self.chat.files(self.home, conversation=CONV, base=self.stub.base)
+            self.chat.probe(self.stub.base, "dm")
+        self.assertEqual(calls, [])
+        self.assertEqual([p for p in opened if p.endswith("user-token")], [])
+        self.assertTrue([p for p in opened if p.endswith("dm-read-token")])  # the spy saw the reads it should see
+
+
+class TestModeTokenTests(Base):
+    """PR 277 r9 r1: under the loopback test switch a token shaped like a real GoodQA user token (gqut_) is refused, so a hard
+    link or copy of the real file into a test HOME cannot be sent to a loopback listener. Test tokens are gqu_."""
+
+    def test_a_real_shaped_token_is_refused_in_test_mode(self):
+        real_shaped = "gq" + "ut_" + "Lnk8Cp" * 4
+        self.dm_file.write_text(real_shaped + "\n")
+        self.dm_file.chmod(0o600)
+        for argv in (("history", "--conversation", CONV), ("conversations", "--org", ORG), ("probe",)):
+            p = self.ah(*argv)
+            data = json.loads(p.stdout)
+            self.assertEqual((data["ok"], data["code"]), (False, "refused"), argv)
+            self.assertIn("test", data["message"], argv)
+            self.assertNotIn(real_shaped[5:], p.stdout + p.stderr)
+        self.assertEqual(self.stub.hits, [])
+        self.use_sentinel()
+        self.assertTrue(self.out("history", "--conversation", CONV)["ok"])
+
+    def use_sentinel(self):
+        self.dm_file.write_text(DM_SENTINEL + "\n")
+        self.dm_file.chmod(0o600)
+
+
 class BasePinTests(Base):
     """PR 277 r8 M3: ah chat sends a token only to https://goodqa.app/v1. --base, browser-defaults.json base and allowedBases
     cannot move it; the one exception is the loopback test switch, and then never with a token from the real token path."""
@@ -950,7 +1159,23 @@ class TokenFileReadTests(Base):
         mine = [flags for path, flags in calls["open"] if path.endswith("dm-read-token")]
         self.assertEqual(len(mine), 1)
         self.assertTrue(mine[0] & os.O_NOFOLLOW)
+        self.assertTrue(mine[0] & os.O_NONBLOCK)  # PR 277 r9 r3
         self.assertTrue(calls["read"] and max(calls["read"]) <= 4097)
+
+    def test_a_fifo_swapped_in_after_the_precheck_is_refused_without_hanging(self):
+        # PR 277 r9 r3: the lstat precheck refuses a FIFO that is already there, so the race is simulated by switching the
+        # precheck off. Without O_NONBLOCK, open() of a FIFO with no writer blocks forever; it runs in a child with a timeout.
+        self.dm_file.unlink()
+        os.mkfifo(str(self.dm_file), 0o600)
+        code = ("import sys; sys.path.insert(0, %r); import gq_browser as gq\n"
+                "gq._private_file = lambda *a, **k: None\n"
+                "try:\n    gq.read_dm_token(); print('read')\nexcept gq.Refused:\n    print('refused')\n" % str(HOOKS))
+        try:
+            p = subprocess.run([sys.executable, "-I", "-c", code], env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "")},
+                               capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("reading a FIFO token file hung (no O_NONBLOCK)")
+        self.assertEqual(p.stdout.strip(), "refused", p.stderr[-300:])
 
     def test_an_oversized_token_file_is_refused_after_a_bounded_read(self):
         self.dm_file.write_text("x" * 3_000_000)
