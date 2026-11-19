@@ -1,6 +1,6 @@
 """ah chat: read the user's own GoodQA chat through two separate tokens (goodqa#16396). READ ONLY.
 
-  ah chat probe [--token user|dm]                 what the endpoint says about the chat tools (names and parameter names only)
+  ah chat probe [--token dm|user]                 what the endpoint says about the chat tools (names and parameter names only)
   ah chat conversations --org ID [--limit N] [--cursor C]   your direct and group-direct conversations, one page   (dm-read token)
   ah chat history --conversation ID [--limit N] [--no-text]       a DM or group DM by its conversation id     (dm-read token)
   ah chat history --with USER_ID_OR_NAME [--org ID] [--limit N] [--no-text]    the DM with one person         (dm-read token)
@@ -10,11 +10,11 @@
 makes no request. Sending is deferred to goodqa#16399 (it needs a server delivery contract and server-side DM dedupe).
 
 Two credentials, never mixed. Reading private messages needs the DEDICATED token in ~/.config/goodqa/dm-read-token (mode 0600;
-abilities read + chat.dm.read; minted by you in the GoodQA web app). `probe` and a file_list of a non-DM surface use the user
+abilities read + chat.dm.read; minted by you in the GoodQA web app). a file_list of a non-DM surface and an explicit `probe --token user` use the user
 token in ~/.config/goodqa/user-token. A missing or unusable file is an error that names the file: there is no fallback from one
 token to the other. The token is read in-process by gq_browser and sent only as the Authorization header of one HTTPS request
-to the GoodQA MCP endpoint (<allowedBase>/mcp). It is never printed, logged, put on a command line, written to the audit log or
-kept anywhere. Only the API bases in ~/.config/goodqa/browser-defaults.json (allowedBases) are used; redirects and environment
+to https://goodqa.app/v1/mcp (the host is fixed; --base and browser-defaults.json cannot move it). It is never printed, logged, put on a command line, written to the audit log or
+kept anywhere. Third-party text is redacted for secret shapes (redacted: true on the row); redirects and environment
 proxies are never followed (gq_browser._OPENER). Every output is an allow-list of fields (FILE_KEYS, MESSAGE_KEYS,
 CONVERSATION_KEYS): no nested object it does not name and no link-shaped value, on every file surface. Every byte this
 command returns passes gq_browser.holds_credential() for BOTH token files: output holding either, whole or in a 12-character piece, is withheld. Server error bodies are never shown, only

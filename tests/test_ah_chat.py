@@ -818,7 +818,7 @@ class SecretAndBoundsTests(Base):
         self.stub.tools["get_direct_conversation_messages"] = lambda a: ok(dict(CONV_PAGE, messages=[row]))
         data = self.out("history", "--conversation", CONV)
         self.assertLess(len(data["messages"][0]["author"]["name"]), 300)
-        for words in ("message text", "names", "file names"):
+        for words in ("message text", "previews", "participant and author names", "file names"):
             self.assertIn(words, data["notice"])
 
     def test_no_text_keeps_seq(self):
@@ -828,6 +828,11 @@ class SecretAndBoundsTests(Base):
     def test_the_cursor_cap_is_500_like_the_server(self):
         self.assertTrue(self.out("conversations", "--org", ORG, "--cursor", "c" * 500)["ok"])
         self.assertEqual(self.out("conversations", "--org", ORG, "--cursor", "c" * 501)["code"], "bad_request")
+
+    def test_a_cursor_holding_token_material_is_refused_before_any_request(self):
+        before = len(self.stub.calls)
+        self.assertEqual(json.loads(self.ah("conversations", "--org", ORG, "--cursor", DM_SENTINEL[4:30]).stdout)["code"], "secret_refused")
+        self.assertEqual(len(self.stub.calls), before)
 
     def test_with_says_plainly_that_it_cannot_page(self):
         data = self.out("history", "--with", PEER)
