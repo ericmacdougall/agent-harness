@@ -985,6 +985,27 @@ class ShapeScreenTests(Base):
         self.assertNotIn(fake[5:], self.last.stdout)
         self.assertIs(data["redacted"], True)
 
+    def test_the_whole_result_backstop_withholds_a_token_in_a_metadata_key_name(self):
+        # --no-text keeps a key that matches META_KEYS ([a-z]+Id, [a-z]+_id) with a plain value. Only VALUES are screened
+        # per field, so a token piece in a key NAME reaches stdout unless _checked refuses the whole result (goodqa#16396 r10).
+        piece = DM_SENTINEL[4:18].lower()  # 14 letters of the dm-read token; held in any letter case (gq.holds_credential)
+        harmless = "otherwordsId"
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [dict(MSG, **{harmless: 5})]})
+        row = self.out("history", "--with", PEER, "--no-text")["messages"][0]
+        self.assertEqual(row[harmless], 5)  # the key path prints, so the refusals below are the backstop and not a dropped key
+        for key in (piece + "Id", piece + "_id"):
+            self.stub.tools["get_direct_messages"] = lambda a, key=key: ok({"messages": [dict(MSG, **{key: 5})]})
+            self.stub.tools["get_direct_conversation_messages"] = lambda a, key=key: ok(dict(
+                CONV_PAGE, messages=[dict(CONV_MSG, **{key: 5})]))
+            for argv in (("history", "--with", PEER, "--no-text"), ("history", "--conversation", CONV, "--no-text")):
+                p = self.ah(*argv)
+                data = json.loads(p.stdout)
+                self.assertEqual((data.get("ok"), data.get("code")), (False, "withheld"), (key, argv))
+                self.assertNotEqual(p.returncode, 0)
+                self.assertNotIn("messages", data)
+                self.assertNotIn(piece, p.stdout.lower() + p.stderr.lower())
+                self.assert_no_token(p)
+
     def test_no_text_values_are_screened(self):
         fake = "gq" + "ut_" + "abcdefghijklmnopq"  # fits META_VALUE's 24-letter word
         self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [dict(MSG, kind=fake)]})
