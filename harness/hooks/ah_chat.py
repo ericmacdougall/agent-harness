@@ -64,8 +64,7 @@ MESSAGE_LISTS = ("messages", "items", "history", "results", "directMessages", "c
 SOURCES = {"user": ("read_token", "user-token"), "dm": ("read_dm_token", "dm-read-token")}
 UNSUPPORTED = ("the endpoint does not offer %s to this token. Either the server does not have DM read by conversation yet, "
                "or this token is not a dedicated DM-read token: it needs the chat.dm.read ability, the userTokens.dmRead "
-               "setting switched on, an org limit and an expiry within 30 days. "
-               "`ah chat history --with USER --org ORG` reads a one-to-one DM meanwhile.")
+               "setting switched on, an org limit and an expiry within 30 days.")
 META_KEYS = re.compile(r"id|[a-z]+Id|[a-z]+_id|createdAt|created_at|sentAt|sent_at|at|timestamp|role|kind|type")
 META_VALUE = re.compile(r"[0-9a-fA-F-]{36}|\d{4}-\d\d-\d\dT[0-9:.]{8,16}(?:Z|[+-]\d\d:?\d\d)?|[A-Za-z_]{1,24}|\d{1,16}")
 WITHHELD_ERROR = "error text withheld: it held credential material (a GoodQA token piece or a secret shape)"
@@ -523,6 +522,9 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         target = {"conversation": conversation}
     else:
         org = _org(client, org)
+        # get_direct_messages answers an EMPTY 200 to a token the DM gate did not admit (PR 277 r8 M2), so it is read only when
+        # the gated tools are offered: that proves the gate is in force for this token.
+        _need(client, "get_direct_conversation_messages")
         peer, name = _user(client, org, with_)
         data = client.tool("get_direct_messages", {"orgId": org, "userId": peer, "limit": limit})
         target = {"org": org, "with": peer}

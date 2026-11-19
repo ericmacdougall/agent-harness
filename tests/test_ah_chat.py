@@ -767,5 +767,22 @@ class ContractTests(Base):
         self.assertNotIn("MSGATTACHLINK", self.last.stdout + self.last.stderr)
 
 
+class WithGateTests(Base):
+    """PR 277 r8 M2: `history --with` calls get_direct_messages, which the server answers with an EMPTY 200 for a token the DM
+    gate did not admit. So the DM-read tools must be offered first, or the empty list would read as "no messages"."""
+
+    def test_with_reports_unsupported_not_an_empty_read_when_the_dm_tools_are_not_offered(self):
+        self.stub.offered = ["get_direct_messages", "list_orgs", "list_org_members", "file_list"]
+        self.stub.tools["get_direct_messages"] = lambda a: ok({"messages": [], "hasMore": False, "nextCursor": None})
+        data = self.out("history", "--with", PEER, "--org", ORG)
+        self.assertEqual((data["ok"], data["code"]), (False, "unsupported"))
+        self.assertNotIn("count", data)
+        self.assertEqual(self.stub.sent("get_direct_messages"), [])
+        self.assertNotIn("--with", data["message"])  # the hint that sent people down this path is gone
+
+    def test_with_still_reads_when_the_dm_tools_are_offered(self):
+        self.assertEqual(self.out("history", "--with", PEER, "--org", ORG)["count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
