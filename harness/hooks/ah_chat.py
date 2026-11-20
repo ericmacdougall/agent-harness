@@ -477,10 +477,22 @@ def _limit(value):
     return value
 
 
+def _with_syntax(with_):
+    """The literal --with check (a user id or an exact member name). It holds no server text, so it is a fixed refusal."""
+    if not (_is_uuid(with_) or (isinstance(with_, str) and NAME_RE.fullmatch(with_))):
+        raise ChatError("bad_request", "--with is a user id or a member's exact name", fixed=True)
+
+
+def _org_syntax(org):
+    """A given --org must be a UUID; an absent one is resolved from the defaults after the client exists (see _org)."""
+    if org and not _is_uuid(org):
+        raise ChatError("bad_request", "give --org ID (or set org in browser-defaults.json)", fixed=True)
+
+
 def _org(client, org):
     org = org or client.defaults.get("org")
     if not _is_uuid(org):
-        raise ChatError("bad_request", "give --org ID (or set org in browser-defaults.json)")
+        raise ChatError("bad_request", "give --org ID (or set org in browser-defaults.json)", fixed=True)
     _refuse_credential_ids(org)
     return org
 
@@ -593,6 +605,7 @@ def conversations(home, org=None, limit=30, base=None, cursor=None):
     _pinned_base(base)  # PR 277 r11 F2: a refused base is the first refusal; the id screens below read the DM token
     limit = _limit(limit)
     cursor = _cursor(cursor)
+    _org_syntax(org)
     client = Client(base, source="dm")
     org = _org(client, org)
     _need(client, "list_direct_conversations")
@@ -621,6 +634,9 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         raise ChatError("bad_request", "--conversation is a conversation id (a UUID)", fixed=True)
     if conversation and org:
         raise ChatError("bad_request", "--org is not used with --conversation (the conversation id names the conversation)", fixed=True)
+    if with_:
+        _with_syntax(with_)  # PR 277 r12 F2: the one --with syntax check, before the client (which reads the DM token) exists
+    _org_syntax(org)
     _refuse_credential_ids(conversation)
     client = Client(base, source="dm")
     if conversation:
@@ -634,8 +650,6 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         org = _org(client, org)
         # get_direct_messages answers an EMPTY 200 to a token the DM gate did not admit (PR 277 r8 M2), so it is read only when
         # the gated tools are offered: that proves the gate is in force for this token.
-        if not (_is_uuid(with_) or (isinstance(with_, str) and NAME_RE.fullmatch(with_))):  # the one check, before the first
-            raise ChatError("bad_request", "--with is a user id or a member's exact name")   # request (_user does not repeat it)
         if _is_uuid(with_):
             _refuse_credential_ids(with_)  # an id is screened before the first request, the tools/list below included
         _need(client, "get_direct_conversation_messages")

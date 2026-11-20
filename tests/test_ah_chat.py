@@ -1158,7 +1158,14 @@ class BasePinTests(Base):
                            ("neither target", lambda: self.chat.history(h)),
                            ("bad conversation", lambda: self.chat.history(h, conversation="nope")),
                            ("files bad surface", lambda: self.chat.files(h, conversation=CONV, surface="x")),
-                           ("files bad conversation", lambda: self.chat.files(h, conversation="nope"))):
+                           ("files bad conversation", lambda: self.chat.files(h, conversation="nope")),
+                           # PR 277 r12 F2: a malformed --with or --org is refused before the client reads the DM token
+                           ("with newline", lambda: self.chat.history(h, org=ORG, with_="ab\ncd")),
+                           ("with control character", lambda: self.chat.history(h, org=ORG, with_="ab\x07cd")),
+                           ("with over-long", lambda: self.chat.history(h, org=ORG, with_="a" * 121)),
+                           ("with empty", lambda: self.chat.history(h, org=ORG, with_="")),
+                           ("history bad org", lambda: self.chat.history(h, org="nope", with_=PEER)),
+                           ("conversations bad org", lambda: self.chat.conversations(h, "nope"))):
             error, calls = self._spied_fresh_run(call, True)
             self.assertEqual(error.code, "bad_request", name)
             self.assertEqual(calls, [], name)

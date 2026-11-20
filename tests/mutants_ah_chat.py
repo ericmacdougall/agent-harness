@@ -58,6 +58,10 @@ MUTANTS = {
     "a global option before chat skips the chat path": ("ah.py", 'return next((t for t in tokens if not t.startswith("-")), None)',
                                                         "return tokens[0] if tokens else None"),
     "help counts as a refusal": ("ah.py", "        if stop.code in (0, None):", "        if False:"),
+    # PR 277 r12 F2: the --with syntax check precedes the client (which reads the DM token)
+    "history builds the client before the --with syntax check": (
+        "        _with_syntax(with_)  # PR 277 r12 F2",
+        '        Client(base, source="dm"); _with_syntax(with_)  # PR 277 r12 F2'),
     # PR 277 r7 F2: every read output is an allow-list of fields
     "issue and personal file rows are passed whole": (
         "    listed = [_file_meta(f) for f in rows[:200]]  # the same",
