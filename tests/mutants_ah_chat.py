@@ -62,6 +62,11 @@ MUTANTS = {
     "history builds the client before the --with syntax check": (
         "        _with_syntax(with_)  # PR 277 r12 F2",
         '        Client(base, source="dm"); _with_syntax(with_)  # PR 277 r12 F2'),
+    # PR 277 r13 F2: every literal check precedes every credential screen (a screen lazily reads the DM token)
+    "a credential screen runs before a literal check": (
+        "    _org_syntax(org)  # every literal check above this line; the credential screens (which read the DM token) below it\n"
+        "    _refuse_credential_ids(cursor, org)\n",
+        "    _refuse_credential_ids(cursor)\n    _org_syntax(org)\n"),
     # PR 277 r7 F2: every read output is an allow-list of fields
     "issue and personal file rows are passed whole": (
         "    listed = [_file_meta(f) for f in rows[:200]]  # the same",

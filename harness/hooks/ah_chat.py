@@ -467,8 +467,7 @@ def _paging(data, *names):
 def _cursor(value):
     if value is not None and not (isinstance(value, str) and CURSOR_RE.fullmatch(value)):
         raise ChatError("bad_request", "--cursor is the next_cursor value of the previous page", fixed=True)
-    _refuse_credential_ids(value)
-    return value
+    return value  # PR 277 r13 F2: syntax only; the credential screen of the cursor runs after every literal check
 
 
 def _limit(value):
@@ -605,7 +604,8 @@ def conversations(home, org=None, limit=30, base=None, cursor=None):
     _pinned_base(base)  # PR 277 r11 F2: a refused base is the first refusal; the id screens below read the DM token
     limit = _limit(limit)
     cursor = _cursor(cursor)
-    _org_syntax(org)
+    _org_syntax(org)  # every literal check above this line; the credential screens (which read the DM token) below it
+    _refuse_credential_ids(cursor, org)
     client = Client(base, source="dm")
     org = _org(client, org)
     _need(client, "list_direct_conversations")
@@ -636,8 +636,8 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         raise ChatError("bad_request", "--org is not used with --conversation (the conversation id names the conversation)", fixed=True)
     if with_:
         _with_syntax(with_)  # PR 277 r12 F2: the one --with syntax check, before the client (which reads the DM token) exists
-    _org_syntax(org)
-    _refuse_credential_ids(conversation)
+    _org_syntax(org)  # every literal check above this line; the credential screens (which read the DM token) below it
+    _refuse_credential_ids(conversation, org, with_ if _is_uuid(with_) else None)
     client = Client(base, source="dm")
     if conversation:
         _need(client, "get_direct_conversation_messages")
@@ -650,8 +650,6 @@ def history(home, conversation=None, with_=None, org=None, limit=30, no_text=Fal
         org = _org(client, org)
         # get_direct_messages answers an EMPTY 200 to a token the DM gate did not admit (PR 277 r8 M2), so it is read only when
         # the gated tools are offered: that proves the gate is in force for this token.
-        if _is_uuid(with_):
-            _refuse_credential_ids(with_)  # an id is screened before the first request, the tools/list below included
         _need(client, "get_direct_conversation_messages")
         peer, name, name_redacted = _user(client, org, with_)
         data = client.tool("get_direct_messages", {"orgId": org, "userId": peer, "limit": limit})

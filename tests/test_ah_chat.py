@@ -1152,6 +1152,7 @@ class BasePinTests(Base):
 
     def test_a_fixed_argument_refusal_opens_no_token_reader(self):
         h = str(self.home)
+        all_failures = []
         for name, call in (("limit", lambda: self.chat.conversations(h, ORG, limit=0)),
                            ("cursor", lambda: self.chat.conversations(h, ORG, cursor="not a cursor!")),
                            ("both targets", lambda: self.chat.history(h, conversation=CONV, with_=PEER)),
@@ -1165,10 +1166,32 @@ class BasePinTests(Base):
                            ("with over-long", lambda: self.chat.history(h, org=ORG, with_="a" * 121)),
                            ("with empty", lambda: self.chat.history(h, org=ORG, with_="")),
                            ("history bad org", lambda: self.chat.history(h, org="nope", with_=PEER)),
-                           ("conversations bad org", lambda: self.chat.conversations(h, "nope"))):
-            error, calls = self._spied_fresh_run(call, True)
-            self.assertEqual(error.code, "bad_request", name)
-            self.assertEqual(calls, [], name)
+                           ("conversations bad org", lambda: self.chat.conversations(h, "nope")),
+                           # PR 277 r13 F2: every literal check runs before any credential screen, so a VALID argument that
+                           # is screened (a cursor, an id) beside a malformed one still opens no token reader
+                           ("valid cursor, malformed org", lambda: self.chat.conversations(h, "nope", cursor="ABC")),
+                           ("valid cursor, malformed limit", lambda: self.chat.conversations(h, ORG, limit=0, cursor="ABC")),
+                           ("valid conversation, malformed before", lambda: self.chat.history(h, conversation=CONV, before="x1")),
+                           ("valid conversation, malformed limit", lambda: self.chat.history(h, conversation=CONV, limit=0)),
+                           ("valid conversation, org given", lambda: self.chat.history(h, conversation=CONV, org=ORG)),
+                           ("valid with id, malformed org", lambda: self.chat.history(h, with_=PEER, org="nope")),
+                           ("valid with id, malformed limit", lambda: self.chat.history(h, with_=PEER, org=ORG, limit=0)),
+                           ("valid with name, malformed org", lambda: self.chat.history(h, with_="Pat Peer", org="nope")),
+                           ("valid files conversation, malformed offset", lambda: self.chat.files(h, conversation=CONV, offset=-1)),
+                           ("valid files conversation, offset off chat", lambda: self.chat.files(h, conversation=CONV, surface="issue", offset=1)),
+                           ("valid files conversation, malformed surface", lambda: self.chat.files(h, conversation=CONV, surface="x", offset=0))):
+            failures = []  # collected, then asserted once, so a red run shows every failing case
+            try:
+                error, calls = self._spied_fresh_run(call, True)
+            except AssertionError as caught:  # nothing was refused at all
+                failures.append("%s: no ChatError (%s)" % (name, caught))
+            else:
+                if error.code != "bad_request":
+                    failures.append("%s: code %s" % (name, error.code))
+                if calls:
+                    failures.append("%s: token readers called %s" % (name, calls))
+            all_failures.extend(failures)
+        self.assertEqual(all_failures, [])
 
     def test_an_unfixed_error_is_still_screened_and_loads_the_token_to_do_it(self):
         error, calls = self._spied_fresh_run(lambda: (_ for _ in ()).throw(
