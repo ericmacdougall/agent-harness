@@ -36,6 +36,14 @@
 #   LOG_BACKUP_LANE_POLL_SECONDS  how often a lane copy checks for a tier-1 run (default 2, 1-60)
 #   LOG_BACKUP_LANE_BUDGET_SECONDS  wall time of one lane run (default 10800); the next scheduled run starts another
 #   LOG_BACKUP_TIER         internal: bulk marks the lane run itself; nothing else may set it
+#   LOG_BACKUP_RECON_SECONDS  reconcile time per tier-1 run (default 420; 0 turns the reconcile off) (goodqa#15532)
+#   LOG_BACKUP_RECON_CHUNK_DIRS  session folders per remote listing (default 100) and LOG_BACKUP_RECON_MAX_CHUNKS (0 = no limit)
+#   LOG_BACKUP_AUDIT_EVERY_SECONDS  how often a finished reconcile repeats (default 604800; 0 = every run)
+#   LOG_BACKUP_SEED_MARGIN_SECONDS  files this much older than the old last-ok are seeded, unproven (default 7200)
+# Tier 1 folder sources (.claude/wals, .claude/projects, .codex/sessions) go through a ledger of files known to be on the
+# remote: only files it lacks are sent (--files-from-raw --no-traverse), and last-ok also needs every ledger line proven
+# (see "Tier 1" below the bulk checkpoint code and docs/operations.md). Dropbox lists one folder per request, so the old
+# full copy of 7000 folders never fitted the budget.
 # Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
 # atomically with the run START time only after every tier-1 source copied cleanly and a primary source
 # (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
@@ -97,6 +105,16 @@ if [ -n "$budget_share" ]; then
 fi
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
+# Tier-1 incremental send and reconcile (goodqa#15532). Read-only listing of the remote is rate limited like a write.
+RECON_SECONDS=${LOG_BACKUP_RECON_SECONDS:-420}          # reconcile time per run (0 turns it off)
+RECON_CHUNK=${LOG_BACKUP_RECON_CHUNK_DIRS:-100}         # session folders listed per remote request batch
+AUDIT_SECONDS=${LOG_BACKUP_AUDIT_EVERY_SECONDS:-604800} # a finished reconcile is repeated this often (0: every run)
+SEED_MARGIN=${LOG_BACKUP_SEED_MARGIN_SECONDS:-7200}     # files this much older than the old last-ok are seeded
+RECON_MAX_CHUNKS=${LOG_BACKUP_RECON_MAX_CHUNKS:-0}      # 0: no limit; a test and operator knob
+for numeric in RECON_SECONDS RECON_CHUNK AUDIT_SECONDS SEED_MARGIN RECON_MAX_CHUNKS; do
+  printf '%s' "${!numeric}" | grep -Eq '^(0|[1-9][0-9]{0,6})$' || { echo "log-backup: $numeric must be a whole number of at most 7 digits without leading zeros" >&2; exit 2; }
+done
+[ "$RECON_CHUNK" -ge 1 ] || { echo "log-backup: LOG_BACKUP_RECON_CHUNK_DIRS must be at least 1" >&2; exit 2; }
 for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
@@ -205,7 +223,10 @@ acquire_lock() { # acquire_lock [LOCK-DIR]: the run lock by default
   holder=$(cat "$lockd/pid" 2>/dev/null)
   age=$(file_age "$lockd")
   if [ -n "$holder" ]; then
-    holder_alive "$holder" && [ "$age" -lt $STALE_LOCK_SECONDS ] && return 1
+    # The run lock of a live log-backup process is never taken over, whatever its age: a displaced run that was only
+    # paused could wake and write the tier-1 ledger beside its replacement (goodqa#15532 plan review). A dead holder,
+    # or a lane lock past its limit, is taken over as before.
+    holder_alive "$holder" && { [ "$age" -lt $STALE_LOCK_SECONDS ] || [ "$lockd" = "$LOCKD" ]; } && return 1
   elif [ "$age" -lt $STALE_LOCK_SECONDS ]; then
     # No pid file: the owner has not written it yet, or the lock belongs to the older hand-installed script (same
     # lock.d directory, no pid). Never take that over while it is young; its owner stops it, or it ages out.
@@ -318,9 +339,16 @@ case "$BASE" in
     fi ;;
 esac
 R="$BASE/$HOST"
+# The tier-1 ledger proves files by content hash (plan review F1): only a backend that returns one qualifies. A crypt
+# overlay hashes nothing common with the local files, so there tier 1 fails closed instead of trusting size.
+T1_HASH_OK=0
+case "$BASE" in
+  /*) T1_HASH_OK=1 ;;   # a local directory (tests only)
+  *) [ "$(printf '%s\n' "$remotes" | awk -v n="${BASE%%:*}:" '$1==n {print $2}')" = dropbox ] && T1_HASH_OK=1 ;;
+esac
 [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ] || say "WARNING: versions disabled; a truncated local file would overwrite its remote copy"
 
-ok=0 found=0 primary=0 throttled=0 throttle_src=
+ok=0 found=0 primary=0 throttled=0 throttle_src= hard_fail=0 budget_hit=0
 STAGE=${LOG_BACKUP_STAGE:-$HOME/.agent-harness/backup-stage}
 # Live sources (transcripts and WALs grow while uploaded, so Dropbox's hash check would fail) are snapshotted into a
 # local stage first and uploaded from there. Static sources upload in place, skipping files younger than 2 minutes.
@@ -654,6 +682,297 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   return 0
 }
 
+# Tier 1 (goodqa#15532). Dropbox lists one folder per request (measured: 87 requests in 45 s at 2/s; --fast-list does not
+# help), so a full `rclone copy` of the 7000 session folders in .claude/wals and .claude/projects needs about an hour of
+# listing and never finished inside its 13 minutes. Each tier-1 directory source now keeps a ledger of the files known to be
+# on the remote, and a run sends only what the ledger lacks (--files-from-raw --no-traverse, newest first):
+#   ledger  header "#log-backup-t1 1 <destination>", then one line per file: FLAG US path US size US mtime (US is 0x1f).
+#           V = sent by a chunk that exited 0 and still matched in the stage, or found on the remote by the reconcile.
+#           S = seeded from the old last-ok, NOT proven. last-ok needs zero S lines.
+#   recon/  a reconcile in progress: the stage listing it compares, the folders, a cursor. Read-only: one remote listing per
+#           chunk of folders (rclone lsf -R --include-from), compared by path and size. Missing or short files lose their
+#           ledger line (so they are sent); matching S lines become V. The ledger is written before the cursor moves.
+# Lines are compared byte for byte and never parsed; the listing runs with TZ=UTC so a time zone change resends nothing.
+US=$'\x1f'
+T1_STATE="$LOGDIR/log-backup.t1.d"
+T1_SRCS=()
+bounded() { # bounded LIMIT-SECONDS OUT-FILE CMD...: run CMD (stdout to OUT-FILE) under a TERM then KILL watchdog; rc in bounded_rc
+  local limit=$1 out=$2 dog
+  shift 2
+  [ "$limit" -ge 1 ] || limit=1
+  "$@" </dev/null > "$out" 2>> "$LOG" &
+  copy_pid=$!
+  ( nap=
+    trap 'kill ${nap:+"$nap"} 2>/dev/null; exit 0' TERM
+    sleep "$limit" & nap=$!
+    wait "$nap" || exit 0
+    kill -TERM "$copy_pid" 2>/dev/null || exit 0
+    sleep 5 & nap=$!
+    wait "$nap" || exit 0
+    kill -KILL "$copy_pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  dog=$!
+  wait "$copy_pid"; bounded_rc=$?
+  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null
+  copy_pid=
+  return 0
+}
+iso_epoch() { # an ISO UTC stamp (2026-11-13T19:02:11Z) as epoch seconds; empty when it cannot be read
+  local e
+  if [ "$(uname)" = Darwin ]; then e=$(date -j -u -f %Y-%m-%dT%H:%M:%SZ "$1" +%s 2>/dev/null); else e=$(date -u -d "$1" +%s 2>/dev/null); fi
+  case "$e" in ''|*[!0-9]*) return 0 ;; esac
+  echo "$e"
+}
+epoch_utc() { # epoch seconds as "YYYY-MM-DD HH:MM:SS" in UTC, the form rclone lsf prints under TZ=UTC
+  if [ "$(uname)" = Darwin ]; then date -u -r "$1" '+%Y-%m-%d %H:%M:%S'; else date -u -d "@$1" '+%Y-%m-%d %H:%M:%S'; fi
+}
+t1_seed_cutoff() { # the mtime before which files are seeded: the old last-ok stamp less the margin; empty when none is usable
+  local lo stamp rem e now
+  lo=$(head -n 1 "$LOGDIR/log-backup.last-ok" 2>/dev/null)
+  stamp=${lo%% *}
+  case "$lo" in *"remote="*) rem=${lo##*remote=} ;; *) return 0 ;; esac
+  [ "$rem" = "${R%%:*}" ] || return 0               # another remote: nothing it says about the old backup applies
+  e=$(iso_epoch "$stamp"); [ -n "$e" ] || return 0
+  now=$(date +%s)
+  [ "$e" -le $(( now + 300 )) ] || return 0         # a stamp from the future is not evidence of anything
+  [ "$e" -gt "$SEED_MARGIN" ] || return 0
+  epoch_utc $(( e - SEED_MARGIN ))
+}
+t1_count_s() { LC_ALL=C awk -F "$US" '$1 == "S" && NF == 4 {n++} END {print n + 0}' "$1/ledger" 2>/dev/null; }
+t1_set() { # t1_set STATE-DIR NAME VALUE: a small state file, written whole
+  printf '%s\n' "$3" > "$1/$2.tmp.$$" && mv "$1/$2.tmp.$$" "$1/$2"
+}
+t1_ledger_swap() { # t1_ledger_swap STATE-DIR: the ledger.new file (header already in it) replaces the ledger
+  mv "$1/ledger.new" "$1/ledger"
+}
+
+t1_pass() { # t1_pass SRC-REL: send what the ledger lacks for one tier-1 directory source; 0 when nothing is left
+  local rel="$1" st root hdr n size fit seed_cut rc found0 primary0 pre_hard pre_ok singles_failed=0 key
+  st="$T1_STATE/$(bulk_key "$rel")" root="$STAGE/$rel"
+  found0=$found primary0=$primary
+  case " ${T1_SRCS[*]-} " in *" $rel "*) ;; *) T1_SRCS+=("$rel") ;; esac
+  mkdir -p "$st" && chmod 700 "$T1_STATE" "$st" || { say "cannot create tier-1 state for $rel"; ok=1; return 1; }
+  # Last run's verdict and listing must not survive a failed write of this run's (a full disk): remove them first, and the
+  # gate accepts only a verdict stamped with this run's start.
+  if [ "$T1_HASH_OK" != 1 ]; then
+    say "$rel: this destination returns no content hash, so files cannot be proven by their bytes; tier 1 is withheld (use a dropbox remote, or ask for a hash-capable proof)"
+    ok=1; return 1
+  fi
+  rm -f "$st/run.state" "$st/listing" "$st/pending" "$st/stuck"
+  { [ ! -e "$st/run.state" ] && [ ! -e "$st/listing" ]; } || { say "cannot reset tier-1 state for $rel"; ok=1; return 1; }
+  hdr="#log-backup-t1 1 $R"
+  if [ -f "$st/ledger" ] && [ "$(head -n 1 "$st/ledger")" != "$hdr" ]; then
+    say "$rel: the ledger belongs to another destination or format; starting an empty one (nothing is trusted from it)"
+    { printf '%s\n' "$hdr"; } > "$st/ledger.new" && t1_ledger_swap "$st"
+    rm -rf "$st/recon" "$st/recon.last"
+  fi
+  # 1. List the stage (local, TZ=UTC, same credential excludes). Fields: path US size US mtime.
+  bounded 300 "$st/listing.raw" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator "$US" \
+    --exclude-from "$EXCLUDES" --ignore-case -- "$root"
+  if [ "$bounded_rc" -ne 0 ]; then say "listing the stage for $rel failed (rclone exit $bounded_rc)"; ok=1; hard_fail=1; return 1; fi
+  # rclone escapes control characters in the names it lists (a newline prints as U+240A and maps back when the file is
+  # read or copied; measured), so such names are listed and sent like any other. A line that still has the wrong field
+  # count would be a name this script cannot track: it is counted and keeps last-ok back instead of vanishing.
+  LC_ALL=C awk -F "$US" 'NF != 3 {n++} END {print n + 0}' "$st/listing.raw" > "$st/odd"
+  # Names Dropbox would store as one file (case folded, Unicode NFC) are a silent overwrite: they keep last-ok back.
+  # perl's core Unicode::Normalize does the folding; without perl the check cannot be made, so it fails closed.
+  perl -MEncode -MUnicode::Normalize -ne 'chomp; my @f = split(/\x1f/, $_, -1); next unless @f == 3; my $k = lc(NFC(Encode::decode("UTF-8", $f[0]))); if (exists $s{$k} && $s{$k} ne $f[0]) { $c++ } $s{$k} = $f[0]; END { print $c + 0, "\n" }' \
+    "$st/listing.raw" > "$st/collide.tmp" 2>/dev/null || { say "$rel: cannot check names for collisions (perl missing?); last-ok is withheld"; echo 1 > "$st/collide.tmp"; }
+  mv "$st/collide.tmp" "$st/collide"
+  # Refused names (goodqa#16123) never become part of the listing; they are counted, not failures.
+  RE="$REFUSED_RE" LC_ALL=C awk -F "$US" -v OFS="$US" -v refused="$st/refused.n" '
+    NF != 3 {next}
+    tolower($1) ~ ENVIRON["RE"] {r++; next}
+    {print}
+    END {print r + 0 > refused}' "$st/listing.raw" > "$st/listing" || { say "cannot filter the $rel listing"; ok=1; hard_fail=1; return 1; }
+  [ "$(cat "$st/refused.n")" = 0 ] || note_refused "$rel" "$(cat "$st/refused.n")" "left out of the listing, refused"
+  [ "$(cat "$st/odd")" = 0 ] || say "$rel: $(cat "$st/odd") listed lines hold a newline or the field separator in a name; last-ok is withheld until they are renamed"
+  [ "$(cat "$st/collide")" = 0 ] || say "$rel: $(cat "$st/collide") names collide under case and Unicode folding; Dropbox treats them as one file, so last-ok is withheld"
+  # 2. First run on this host: seed the ledger from the old last-ok. Header and S lines are written in ONE rename, and every
+  #    seeded line carries the S flag, so a crash anywhere can only leave an unproven ledger that the gate refuses.
+  if [ ! -f "$st/ledger" ]; then
+    seed_cut=$(t1_seed_cutoff)
+    { printf '%s\n' "$hdr"
+      [ -z "$seed_cut" ] || LC_ALL=C awk -F "$US" -v OFS="$US" -v cut="$seed_cut" '$3 < cut {print "S", $1, $2, $3}' "$st/listing"
+    } > "$st/ledger.new" || { say "cannot seed the $rel ledger"; ok=1; hard_fail=1; return 1; }
+    t1_ledger_swap "$st" || { say "cannot seed the $rel ledger"; ok=1; hard_fail=1; return 1; }
+    rm -rf "$st/recon" "$st/recon.last"
+    if [ -n "$seed_cut" ]; then say "$rel: new ledger seeded from the last good backup (files older than $seed_cut UTC are assumed present until the reconcile proves them)"
+    else say "$rel: new ledger, no usable earlier backup: every file is sent"; fi
+  fi
+  # 3. Cut the ledger back to files still in the listing, and list what it lacks, newest first.
+  : > "$st/pending.unsorted"; : > "$st/ledger.body"
+  LC_ALL=C awk -F "$US" -v OFS="$US" -v keep="$st/ledger.body" -v pend="$st/pending.unsorted" '
+    FNR == NR {if (FNR > 1 && NF == 4) {k = $2 OFS $3 OFS $4; line[k] = $0}; next}
+    {k = $1 OFS $2 OFS $3; if (k in line) print line[k] > keep; else print $0 > pend}' "$st/ledger" "$st/listing" \
+    && { head -n 1 "$st/ledger"; cat "$st/ledger.body"; } > "$st/ledger.new" && t1_ledger_swap "$st" \
+    && LC_ALL=C sort -t "$US" -k3,3r "$st/pending.unsorted" > "$st/pending" \
+    || { say "cannot work out what $rel still needs"; ok=1; hard_fail=1; return 1; }
+  : > "$st/stuck"
+  t1_set "$st" total "$(wc -l < "$st/listing" | tr -d ' ')"
+  # 4. Send the rest in chunks. A chunk that exits 0 is re-checked against the stage before it is recorded.
+  while [ -s "$st/pending" ]; do
+    size=$BULK_CHUNK fit=$(( ($(time_left) - ${RESERVE:-0}) * TPSLIMIT / 2 ))
+    [ "$fit" -ge "$size" ] || size=$fit
+    [ "$size" -ge 1 ] || size=1
+    head -n "$size" "$st/pending" > "$st/chunk" || { say "cannot read the $rel chunk"; ok=1; hard_fail=1; break; }
+    n=$(wc -l < "$st/chunk" | tr -d ' ')
+    cut -d "$US" -f1 "$st/chunk" > "$st/chunk.paths"
+    copied=0 yielded=0 pre_hard=$hard_fail pre_ok=$ok
+    upload "$root" "$rel" --files-from-raw "$st/chunk.paths" --no-traverse
+    if [ "$copied" -eq 1 ]; then
+      t1_record "$st" "$root" "$st/chunk" "$st/chunk.paths"
+    elif [ "$hard_fail" != "$pre_hard" ]; then
+      # The chunk failed for a reason other than the budget or a throttle. One bad file must not hold back the others:
+      # send them one by one; a file that still fails is stuck (blocks last-ok, never the rest).
+      hard_fail=$pre_hard ok=$pre_ok
+      say "$rel: a chunk of $n files failed; sending its files one at a time"
+      while IFS= read -r key; do
+        [ "$throttled" = 0 ] && [ "$(time_left)" -ge "$MIN_SLICE" ] || { ok=1; break 2; }
+        printf '%s\n' "${key%%"$US"*}" > "$st/one.paths"
+        printf '%s\n' "$key" > "$st/one"
+        copied=0 yielded=0
+        upload "$root" "$rel" --files-from-raw "$st/one.paths" --no-traverse
+        if [ "$copied" -eq 1 ]; then
+          t1_record "$st" "$root" "$st/one" "$st/one.paths"
+        elif [ "$hard_fail" != "$pre_hard" ]; then
+          hard_fail=$pre_hard ok=$pre_ok
+          printf '%s\n' "${key%%"$US"*}" >> "$st/stuck"
+          say "$rel: stuck, could not send: ${key%%"$US"*}"
+          singles_failed=$((singles_failed + 1))
+          [ $singles_failed -lt 5 ] || { say "$rel: five files failed in a row of sends; stopping this source for the run"; ok=1; break 2; }
+        else
+          ok=1; break 2   # budget, throttle or yield mid-way: the rest waits for the next run
+        fi
+      done < "$st/chunk"
+    else
+      ok=1; break          # budget, throttle or yield: the next run continues from the ledger
+    fi
+    tail -n +$(( n + 1 )) "$st/pending" > "$st/pending.tmp" && mv "$st/pending.tmp" "$st/pending" || { ok=1; break; }
+  done
+  found=$found0 primary=$primary0   # counted once, by the gate
+  if [ -s "$st/pending" ] || [ -s "$st/stuck" ]; then
+    say "$rel: $(wc -l < "$st/pending" | tr -d ' ') of $(cat "$st/total") files still to send; the next run continues"
+    return 1
+  fi
+  t1_set "$st" run.state "complete $STARTED"
+  return 0
+}
+t1_record() { # t1_record ST ROOT CHUNK-KEYS CHUNK-PATHS: after a copy that exited 0, mark V the files still as listed in the stage
+  # rclone exits 0 for a listed path that vanished (measured), so what the stage holds now is read again first (red-team C4).
+  local st=$1 root=$2 keys=$3 paths=$4
+  bounded 120 "$st/now" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator "$US" --files-from-raw "$paths" -- "$root"
+  [ "$bounded_rc" -eq 0 ] || { say "could not re-check a chunk against the stage; it is sent again next run"; return 0; }
+  { head -n 1 "$st/ledger"; tail -n +2 "$st/ledger"
+    LC_ALL=C awk -F "$US" -v OFS="$US" 'FNR == NR {now[$1 OFS $2 OFS $3] = 1; next} ($1 OFS $2 OFS $3) in now {print "V", $1, $2, $3}' "$st/now" "$keys"
+  } > "$st/ledger.new" && t1_ledger_swap "$st"
+}
+
+t1_recon() { # t1_recon SRC-REL: prove what the ledger claims by reading the remote (read-only), within this run's slice
+  local rel="$1" st rdir s last age cur total n left fit mark inc d rc fails chunk_n changed=0 chunks=0 prev
+  st="$T1_STATE/$(bulk_key "$rel")" rdir="$st/recon"
+  [ -f "$st/ledger" ] || return 0
+  if [ ! -d "$rdir" ]; then
+    s=$(t1_count_s "$st")
+    last=$(cat "$st/recon.last" 2>/dev/null)
+    if [ "$s" -eq 0 ]; then
+      # Nothing unproven. A host that never seeded has only V lines (each sent and checked): note the time, audit later.
+      printf '%s' "$last" | grep -Eq '^[0-9]+$' || { date +%s > "$st/recon.last"; return 0; }
+      age=$(( $(date +%s) - last ))
+      [ "$age" -ge "$AUDIT_SECONDS" ] || return 0
+    fi
+    mkdir -p "$rdir.tmp" && cp "$st/listing" "$rdir.tmp/listing" \
+      && LC_ALL=C awk -F "$US" '{i = index($1, "/"); d = (i ? substr($1, 1, i - 1) : "."); if (!(d in s)) {s[d] = 1; print d}}' "$st/listing" | LC_ALL=C sort > "$rdir.tmp/dirs" \
+      && echo 0 > "$rdir.tmp/cursor" && rm -rf "$rdir" && mv "$rdir.tmp" "$rdir" \
+      || { say "cannot start the $rel reconcile"; rm -rf "$rdir.tmp"; return 0; }
+    say "$rel: reconcile started ($(wc -l < "$rdir/dirs" | tr -d ' ') folders, $s unproven files)"
+  fi
+  total=$(wc -l < "$rdir/dirs" | tr -d ' ')
+  while :; do
+    cur=$(cat "$rdir/cursor" 2>/dev/null); printf '%s' "$cur" | grep -Eq '^(0|[1-9][0-9]*)$' || cur=0
+    [ "$cur" -lt "$total" ] || break
+    [ "$throttled" = 0 ] || return 0
+    [ "$RECON_MAX_CHUNKS" -eq 0 ] || [ "$chunks" -lt "$RECON_MAX_CHUNKS" ] || return 0
+    left=$(( RECON_END - $(date +%s) )); prev=$(time_left); [ "$prev" -ge "$left" ] || left=$prev
+    [ "$left" -ge 15 ] || { say "$rel: reconcile paused at $cur of $total folders (this run's slice is used)"; return 0; }
+    chunk_n=$(cat "$rdir/chunk" 2>/dev/null); printf '%s' "$chunk_n" | grep -Eq '^[1-9][0-9]{0,4}$' || chunk_n=$RECON_CHUNK
+    n=$chunk_n fit=$(( left * TPSLIMIT - 6 ))
+    [ "$fit" -ge "$n" ] || n=$fit
+    [ "$n" -ge 1 ] || n=1
+    sed -n "$((cur + 1)),$((cur + n))p;$((cur + n))q" "$rdir/dirs" > "$rdir/cdirs"
+    n=$(wc -l < "$rdir/cdirs" | tr -d ' ')
+    # include patterns are globs: escape every metacharacter so a folder name matches only itself
+    LC_ALL=C awk '{d = $0; if (d == ".") {print "/*"; next} gsub(/[][\\*?{}]/, "\\\\&", d); print "/" d "/**"}' "$rdir/cdirs" > "$rdir/include"
+    mark=$(wc -c < "$LOG" 2>/dev/null | tr -d ' '); mark=${mark:-0}
+    # Content hashes, not sizes: Dropbox returns its content_hash in the listing at no extra request, and rclone computes the
+    # same hash of the stage files locally, so a file is proven by its bytes (plan review F1).
+    bounded "$left" "$rdir/remote" "$RCLONE" lsf -R --files-only --format ph --hash dropbox --separator "$US" --include-from "$rdir/include" \
+      --tpslimit "$TPSLIMIT" --contimeout 60s --timeout 300s --low-level-retries 20 --log-file "$LOG" --log-level NOTICE -- "$R/$rel"
+    rc=$bounded_rc
+    if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+      LC_ALL=C awk -F "$US" 'FNR == NR {dset[$0] = 1; next} {i = index($1, "/"); d = (i ? substr($1, 1, i - 1) : "."); if (d in dset) print $1}' \
+        "$rdir/cdirs" "$rdir/listing" > "$rdir/lpaths" || rc=1
+      bounded "$left" "$rdir/local" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format ph --hash dropbox --separator "$US" \
+        --files-from-raw "$rdir/lpaths" -- "$STAGE/$rel"
+      [ "$bounded_rc" -eq 0 ] || rc=$bounded_rc
+    fi
+    if [ "$rc" -eq 3 ]; then : > "$rdir/remote"; rc=0; fi   # the remote folder does not exist yet: nothing is there
+    if [ "$rc" -eq 0 ] && LC_ALL=C awk -F "$US" 'NF < 2 || $2 == "" {bad = 1} END {exit !bad}' "$rdir/remote"; then
+      # Fail closed (plan review F1): without a content hash a file cannot be proven by its bytes, and a checksum copy would
+      # fall back to size. Nothing is promoted; last-ok stays withheld while files are unproven.
+      say "$rel: the remote returns no content hash for some files (a crypt overlay?); they cannot be proven by bytes, so nothing is promoted"
+      return 0
+    fi
+    if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then t1_set "$rdir" chunk $(( chunk_n / 2 > 0 ? chunk_n / 2 : 1 )); fi   # timed out: smaller chunks next
+    if [ "$rc" -ne 0 ]; then
+      if tail -c +"$(( mark + 1 ))" "$LOG" 2>/dev/null | grep -Eqi 'too_many_requests|too many requests|429'; then
+        t1_set "$rdir" chunk $(( chunk_n / 2 > 0 ? chunk_n / 2 : 1 ))
+        say "$rel: reconcile stopped on the Dropbox read rate limit; the next run lists smaller chunks"
+        return 0
+      fi
+      fails=$(cat "$rdir/fails" 2>/dev/null); printf '%s' "$fails" | grep -Eq '^[0-9]+$' || fails=0
+      fails=$((fails + 1)); echo "$fails" > "$rdir/fails"
+      if [ "$fails" -lt 3 ]; then say "$rel: reconcile listing failed (rclone exit $rc); it is tried again"; return 0; fi
+      # Three failures: stop depending on the listing. These folders lose their ledger lines, so the copy path proves them.
+      say "$rel: reconcile listing of $n folders failed $fails times; their files are sent again instead of proven"
+      LC_ALL=C awk -F "$US" -v OFS="$US" 'FNR == NR {bad[$0] = 1; next} FNR == 1 {print; next}
+        {i = index($2, "/"); d = (i ? substr($2, 1, i - 1) : "."); if (!(d in bad)) print}' "$rdir/cdirs" "$st/ledger" > "$st/ledger.new" \
+        && t1_ledger_swap "$st" || return 0
+      changed=1
+      echo 0 > "$rdir/fails"
+    else
+      # Compare the remote listing with the stage listing taken when this reconcile started, for these folders only.
+      LC_ALL=C awk -F "$US" -v OFS="$US" -v prov="$rdir/prov" -v miss="$rdir/miss" '
+        FILENAME == ARGV[1] {dset[$0] = 1; next}
+        FILENAME == ARGV[2] {rhash[$1] = $2; next}
+        FILENAME == ARGV[3] {lhash[$1] = $2; next}
+        {i = index($1, "/"); d = (i ? substr($1, 1, i - 1) : "."); if (!(d in dset)) next
+         k = $1 OFS $2 OFS $3
+         if (($1 in rhash) && ($1 in lhash) && rhash[$1] != "" && rhash[$1] == lhash[$1]) print k > prov; else print k > miss}' \
+        "$rdir/cdirs" "$rdir/remote" "$rdir/local" "$rdir/listing" || { say "$rel: reconcile could not compare a chunk"; return 0; }
+      [ -e "$rdir/prov" ] || : > "$rdir/prov"; [ -e "$rdir/miss" ] || : > "$rdir/miss"
+      [ ! -s "$rdir/miss" ] || changed=1
+      # Ledger first, cursor second: a crash between the two repeats the chunk and never skips it.
+      LC_ALL=C awk -F "$US" -v OFS="$US" '
+        FILENAME == ARGV[1] {miss[$0] = 1; next}
+        FILENAME == ARGV[2] {prov[$0] = 1; next}
+        FNR == 1 {print; next}
+        {k = $2 OFS $3 OFS $4
+         if (k in miss) next
+         if ($1 == "S" && (k in prov)) {print "V", $2, $3, $4; next}
+         print}' "$rdir/miss" "$rdir/prov" "$st/ledger" > "$st/ledger.new" && t1_ledger_swap "$st" \
+        || { say "$rel: reconcile could not update the ledger"; return 0; }
+      rm -f "$rdir/prov" "$rdir/miss" "$rdir/fails"
+    fi
+    cur=$((cur + n)); chunks=$((chunks + 1))
+    echo "$cur" > "$rdir/cursor.tmp" && mv "$rdir/cursor.tmp" "$rdir/cursor"
+  done
+  rm -rf "$rdir"
+  date +%s > "$st/recon.last"
+  say "$rel: reconcile complete"
+  [ "$changed" -eq 0 ] || t1_pass "$rel"   # files the remote lacked go out now, in what is left of the run
+  return 0
+}
+
 bulk_try="$LOGDIR/log-backup.bulk-last-try"
 bulk_due() { # the hourly gap has passed (or a pass stopped on the budget cleared it)
   local a
@@ -711,6 +1030,27 @@ elif [ "$TIER" = live ] && bulk_due; then
   fi
 fi
 transcripts_ok=0
+# Orphan fence (plan review F2): an rclone writing under this destination whose parent is not a live log-backup run was left
+# by a killed run or a taken-over lock. Its late commit could land behind a ledger line written for newer content, so while it
+# lives this run copies and reconciles nothing and says why; the next run looks again.
+orphan_uploader() {
+  ps -axo pid=,ppid=,command= 2>/dev/null | awk -v dest="$R" '$3 ~ /(^|\/)rclone$/ {for (i = 4; i <= NF; i++) if (index($i, dest) == 1) {print $1, $2; break}}' \
+    | { while read -r opid oppid; do
+          [ "$opid" != "$$" ] || continue
+          # Only the bulk lane's own copy (its parent is the live holder of the lane lock) may write beside this run. A
+          # displaced run's uploader keeps a live parent too, so a live parent alone is no exemption (plan review F2).
+          [ "$oppid" = "$(cat "$LANE_LOCKD/pid" 2>/dev/null)" ] && holder_alive "$oppid" && continue
+          echo "$opid"; break
+        done; }
+}
+orphan=
+if [ "$TIER" != bulk ]; then
+  orphan=$(orphan_uploader)
+  if [ -n "$orphan" ]; then
+    say "an rclone copy to $R (pid $orphan) outlived the run that started it; this run copies nothing until it ends, so its late commit cannot land behind a newer backup"
+    ok=1; LIVE=()
+  fi
+fi
 if [ "$TIER" != bulk ]; then
 later=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
@@ -740,8 +1080,36 @@ for src in "${LIVE[@]}"; do
   else
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
-  upload "$snap" "$src"
+  if [ -d "$HOME/$src" ]; then t1_pass "$src"; else upload "$snap" "$src"; fi   # a folder tree goes through its ledger (goodqa#15532)
 done
+# The reconcile reads the remote (read-only) with what is left of its slice, after every upload, so fresh data is never starved.
+RECON_END=$(( $(date +%s) + RECON_SECONDS ))
+if [ "$RECON_SECONDS" -gt 0 ] && [ "$throttled" = 0 ]; then
+  for src in "${T1_SRCS[@]+"${T1_SRCS[@]}"}"; do t1_recon "$src"; done
+fi
+# The gate for the directory sources: nothing left to send, nothing unproven (S), nothing stuck, no name that cannot be
+# listed, no case collision. Each of those keeps last-ok back; none is hidden.
+progress="$LOGDIR/log-backup.t1.progress.tmp.$$"; : > "$progress"
+for src in "${T1_SRCS[@]+"${T1_SRCS[@]}"}"; do
+  st="$T1_STATE/$(bulk_key "$src")"
+  s_n=$(t1_count_s "$st"); odd_n=$(cat "$st/odd" 2>/dev/null || echo 0); col_n=$(cat "$st/collide" 2>/dev/null || echo 0)
+  stuck_n=$(wc -l < "$st/stuck" 2>/dev/null | tr -d ' '); stuck_n=${stuck_n:-0}
+  pend_n=$(LC_ALL=C awk -F "$US" 'FNR == NR {if (FNR > 1 && NF == 4) have[$2 FS $3 FS $4] = 1; next} !(($1 FS $2 FS $3) in have) {n++} END {print n + 0}' "$st/ledger" "$st/listing" 2>/dev/null || echo 1)
+  rec=
+  [ ! -d "$st/recon" ] || rec=" reconcile=$(cat "$st/recon/cursor" 2>/dev/null)/$(wc -l < "$st/recon/dirs" 2>/dev/null | tr -d ' ')"
+  printf '%s unproven=%s pending=%s stuck=%s unlistable=%s collisions=%s last_audit=%s%s\n' "$src" "$s_n" "$pend_n" "$stuck_n" "$odd_n" "$col_n" "$(cat "$st/recon.last" 2>/dev/null || echo never)" "$rec" >> "$progress"
+  if [ "$(cat "$st/run.state" 2>/dev/null)" = "complete $STARTED" ] && [ "$pend_n" -eq 0 ] && [ "$stuck_n" -eq 0 ] && [ "$s_n" -eq 0 ] && [ "$odd_n" -eq 0 ] && [ "$col_n" -eq 0 ]; then
+    found=$((found + 1))
+    case "$src" in .claude/projects|.codex/sessions)
+      # An empty primary tree is not evidence of a backup (judged on the live tree).
+      if [ -n "$(find "$HOME/$src" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
+    esac
+  else
+    [ "$s_n" -eq 0 ] || say "$src: $s_n files are assumed on the remote but not yet proven (reconcile pending); last-ok is withheld"
+    ok=1
+  fi
+done
+mv "$progress" "$LOGDIR/log-backup.t1.progress" 2>/dev/null
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
 say "transcripts exit=$ok sources=$found remote=${R%%:*}"
@@ -768,6 +1136,7 @@ if [ $bulk_ran -eq 1 ] && [ ${#sources_bulk[@]} -gt 0 ] && [ "$(time_left)" -lt 
   bulk_ran=0 sources_bulk=()
   say "bulk tier deferred: no run time left after tier 1; the next run with time left tries it"
 fi
+if [ -n "$orphan" ] && [ $bulk_ran -eq 1 ]; then bulk_ran=0 sources_bulk=(); fi   # the fence covers tier 2 as well
 # One writer per bulk checkpoint: a run with the lane off still takes the lane lock, so it never shares the
 # checkpoint with a lane run that is still going (the lane run took it at its start).
 if [ "$TIER" = all ] && [ $bulk_ran -eq 1 ] && ! acquire_lock "$LANE_LOCKD"; then

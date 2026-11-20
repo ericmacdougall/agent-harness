@@ -35,6 +35,7 @@ LAST_SKIP = "log-backup.last-skip"
 LAST_RUN = "log-backup.last-run"
 THROTTLED = "log-backup.throttled"   # a run that stopped early on the Dropbox rate limit (goodqa#15218)
 BULK_OK = "log-backup.bulk-last-ok"
+T1_PROGRESS = "log-backup.t1.progress"   # per tier-1 source: unproven, pending, stuck, collisions, reconcile cursor, last audit
 FIRST_RUN = "log-backup.first-run"
 BULK_MAX_AGE_SECONDS = 6 * 3600
 LOCK_DIR = "log-backup.lock.d"
@@ -280,6 +281,8 @@ def cmd_status(args) -> int:
     print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
     print(f"throttled    : {printable(read_small(logs / THROTTLED) or 'never')} (a run that stopped early on the Dropbox rate limit)")
     print(f"lock         : {lock_holder(args.home)}")
+    for line in (read_small(logs / T1_PROGRESS) or "").splitlines()[:8]:   # goodqa#15532: why last-ok is or is not back
+        print(f"tier 1       : {printable(line)}")
     print(f"bulk lane    : {lock_holder(args.home, LANE_LOCK_DIR)}; last lane run {printable(read_small(logs / LANE_LAST_RUN) or 'never')}")
     return 0 if result["state"] == "fresh" else 1
 
