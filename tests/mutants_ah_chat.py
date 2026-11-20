@@ -103,7 +103,7 @@ MUTANTS = {
     "paging: files drop the offset argument": ('            arguments["offset"] = offset', "            pass"),
     "paging: an offset is accepted off the chat surface": ('    if offset is not None and (surface != "chat" or not isinstance(offset, int)', '    if offset is not None and (False or not isinstance(offset, int)'),
     "cursor: a malformed cursor is sent": ("    if value is not None and not (isinstance(value, str) and CURSOR_RE.fullmatch(value)):", "    if False:"),
-    "cursor: a cursor holding a token piece is sent": ("    _refuse_credential_ids(value)\n    return value", "    return value"),
+    "cursor: a cursor holding a token piece is sent": ("    _refuse_credential_ids(cursor, org)\n", "    _refuse_credential_ids(org)\n"),
     "cursor: the cap is 512": ("{1,500}", "{1,512}"),
     "last message: the full body is kept": ('"attachmentCount", "preview")', '"attachmentCount", "preview", "body")'),
     "last message: the author label is passed whole": ('    kept = _pick(row, LAST_MESSAGE_KEYS)\n    if isinstance(row, dict) and isinstance(row.get("authorLabel"), dict):\n        kept["authorLabel"] = _pick(row["authorLabel"], AUTHOR_LABEL_KEYS)', '    kept = _pick(row, LAST_MESSAGE_KEYS)\n    if isinstance(row, dict) and isinstance(row.get("authorLabel"), dict):\n        kept["authorLabel"] = row["authorLabel"]'),
