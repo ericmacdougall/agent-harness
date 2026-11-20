@@ -3558,6 +3558,31 @@ def build_parser():
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
     u.add_argument("--recent", type=int)
     u.add_argument("--full", action="store_true")
+    ch = sub.add_parser("chat", help="read your own GoodQA chat (goodqa#16396); read only: `send` is deferred to goodqa#16399")
+    chs = ch.add_subparsers(dest="sub", required=True)
+    for name in ("probe", "conversations", "history", "files"):
+        c = chs.add_parser(name)
+        c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
+        if name == "probe":
+            c.add_argument("--token", choices=("user", "dm"), default="dm",
+                           help="which credential file to probe with (never both): the user token or the dedicated dm-read token")
+            continue
+        if name != "files":  # files takes only the conversation id
+            c.add_argument("--org", help="organization id (default: org in browser-defaults.json; not with history --conversation)")
+        if name == "conversations":
+            c.add_argument("--limit", type=int, default=30)
+            c.add_argument("--cursor", help="next_cursor of the previous page (one page per call; nothing is followed)")
+            continue
+        c.add_argument("--conversation", help="conversation id")
+        if name == "history":
+            c.add_argument("--with", dest="with_user", help="user id, or a member's exact name")
+            c.add_argument("--limit", type=int, default=30)
+            c.add_argument("--after", help="not offered")
+            c.add_argument("--before", help="message sequence number to page back from (with --conversation only)")
+            c.add_argument("--no-text", action="store_true", help="ids, authors and times only; no message text")
+        if name == "files":
+            c.add_argument("--surface", help="file_list surface (see `ah chat probe`)")
+            c.add_argument("--offset", type=int, help="next_offset of the previous page (--surface chat only; one page per call)")
     t = sub.add_parser("ticket")
     ts = t.add_subparsers(dest="sub", required=True)
     g = ts.add_parser("get")
@@ -3775,6 +3800,19 @@ def run(args, home: Path) -> dict:
         return user_msgs(home, s, text=args.search, recent=args.recent, full=args.full)
     if cmd == "disk":
         return disk(args.host, args.root, args.count, args.budget, not args.no_top)
+    if cmd == "chat":
+        import ah_chat  # noqa: PLC0415
+        try:
+            if args.sub == "probe":
+                return ah_chat.probe(args.base, args.token)
+            if args.sub == "conversations":
+                return ah_chat.conversations(home, args.org, args.limit, args.base, args.cursor)
+            if args.sub == "history":
+                return ah_chat.history(home, args.conversation, args.with_user, args.org, args.limit, args.no_text,
+                                       args.after, args.before, args.base)
+            return ah_chat.files(home, args.conversation, args.surface, args.base, args.offset)
+        except ah_chat.ChatError as e:
+            raise AhError(e.code, str(e), e.exit_code)
     if cmd == "ticket":
         if args.sub == "create":
             import ah_ticket
@@ -3919,6 +3957,40 @@ def run(args, home: Path) -> dict:
     raise AhError("unknown_command", cmd)
 
 
+CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "
+                      "deferred to goodqa#16399, which needs a server delivery contract and server-side DM dedupe first. "
+                      "Nothing was read or sent.")
+CHAT_PARSE_REFUSED = ("ah chat: the arguments were not accepted. The rejected value is not shown, because it may hold a "
+                      "credential. Run `ah chat <subcommand> -h` for the accepted options. Nothing was read or sent.")
+
+
+def _first_word(tokens):
+    """The first token that is not an option. ah's only top-level option (--text) takes no value, so before the subcommand
+    this is the subcommand itself."""
+    return next((t for t in tokens if not t.startswith("-")), None)
+
+
+def _refuse_chat(code, message) -> int:
+    json.dump({"ok": False, "code": code, "message": message}, sys.stdout)
+    sys.stdout.write("\n")
+    return 2
+
+
+def _parse_chat(given):
+    """PR 277 r7 F1: argparse writes a rejected value (a bad --limit, a --token choice, an unknown option, an extra word) to
+    stderr, outside every credential screen. For the whole `ah chat` subtree a parse failure is one fixed refusal on stdout
+    that repeats nothing; help (-h) still prints to stdout. Returns (args, None) or (None, exit code)."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):  # the usage and error text argparse writes are dropped unread
+            return build_parser().parse_args(given), None
+    except SystemExit as stop:
+        if stop.code in (0, None):
+            return None, 0  # -h or --help: argparse printed the help to stdout
+        return None, _refuse_chat("bad_request", CHAT_PARSE_REFUSED)
+
+
 def main(argv=None) -> int:
     given = list(sys.argv[1:] if argv is None else argv)
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
@@ -3933,7 +4005,14 @@ def main(argv=None) -> int:
             sys.stdout.write("\n")
             return 4
         return guard_selftest.cli_main(given[1:])
-    args = build_parser().parse_args(argv)
+    if _first_word(given) == "chat":
+        if _first_word(given[given.index("chat") + 1:]) == "send":  # goodqa#16396 ships read only: nothing is parsed,
+            return _refuse_chat("not_available", CHAT_SEND_DEFERRED)  # imported, read or sent
+        args, stopped = _parse_chat(given)
+        if args is None:
+            return stopped
+    else:
+        args = build_parser().parse_args(argv)
     try:
         data = run(args, home_dir())
     except AhError as e:

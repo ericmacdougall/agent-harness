@@ -124,19 +124,22 @@ def _remember(value):
     return value
 
 
-def _credential_secrets():
-    try:
-        read_token()
-    except (Refused, OSError):
-        pass
+def _credential_secrets(readers=None):
+    """Every secret this process holds, after trying `readers` (default: both token files, whichever one this command uses).
+    readers=() reads no file and checks only the secrets already read in this process (PR 277 r9: ah chat's DM commands)."""
+    for reader in ((read_token, read_dm_token) if readers is None else readers):
+        try:
+            reader()
+        except (Refused, OSError):
+            pass
     return set(_SECRETS)
 
 
-def holds_credential(text):
+def holds_credential(text, readers=None):
     if isinstance(text, bytes):
         text = text.decode("latin-1")
     low = text.lower()
-    for s in _credential_secrets():
+    for s in _credential_secrets(readers):
         sl = s.lower()
         if any(sl[i:i + 12] in low for i in range(len(sl) - 11)):
             return True
@@ -198,20 +201,51 @@ def _private_file(path, what, fix, allow_missing=False):
     return st
 
 
-def read_token():
-    path = token_path()
+def dm_token_path():
+    """The DEDICATED token that holds [read, chat.dm.read] (goodqa#16396). A separate file, never a fallback for or from user-token."""
+    return os.path.join(home(), ".config", "goodqa", "dm-read-token")
+
+
+def _read_secret_file(path, what):
     fix = "Create it with mode 0600 (chmod 600 %s); never paste the token into chat." % path
-    st = _private_file(path, "The GoodQA user-token file", fix)
-    if st.st_mode & 0o077:
-        raise Refused("The GoodQA user-token file %s is readable by group or others. Fix: chmod 600 %s" % (path, path))
+    _private_file(path, what, fix)
+    # PR 277 r8 m1, m2: no symlink is followed, the checks run on the opened descriptor, and at most 4097 bytes are read.
+    # r9 r3: O_NONBLOCK, so a FIFO swapped in after the precheck opens at once (and fstat refuses it) instead of hanging.
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            value = f.read().strip()
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError:
-        raise Refused("The GoodQA user-token file %s is unreadable. %s" % (path, fix))
+        raise Refused("%s %s is unreadable. %s" % (what, path, fix))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            raise Refused("%s %s must be a regular file owned by you. %s" % (what, path, fix))
+        if st.st_mode & 0o077:
+            raise Refused("%s %s is readable by group or others. Fix: chmod 600 %s" % (what, path, path))
+        raw = b""
+        while len(raw) < 4097:
+            chunk = os.read(fd, 4097 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    except OSError:
+        raise Refused("%s %s is unreadable. %s" % (what, path, fix))
+    finally:
+        os.close(fd)
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        value = ""
     if not value or len(value) > 4096 or any(c.isspace() for c in value):
-        raise Refused("The GoodQA user-token file %s does not hold one token. %s" % (path, fix))
+        raise Refused("%s %s does not hold one token. %s" % (what, path, fix))
     return _remember(value)
+
+
+def read_token():
+    return _read_secret_file(token_path(), "The GoodQA user-token file")
+
+
+def read_dm_token():
+    return _read_secret_file(dm_token_path(), "The GoodQA DM-read token file")
 
 
 def load_defaults():
