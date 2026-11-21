@@ -170,8 +170,8 @@ func (a *app) scheduleInputs(id string) {
 	s.scheduled = false
 	continueQueue := false
 	if wake := binding.workspaceWake; wake != nil && s.workspaceWake == wake {
-		// Only an unchanged, completed origin proves the wake never acquired
-		// a native send intent. Keep its debit, but let a later FIFO head run.
+		// Keep the debit. The completed origin is still current only before
+		// intent or after durable settlement of a definite no-write refusal.
 		continueQueue = err != nil && a.workspaceWakeIdentityLocked(s, wake) && workspaceOriginCompleted(s, wake) &&
 			s.Status == "idle" && s.task.State == "active" && s.Supervision.State == "active" && firstPendingInput(s) != nil
 		s.workspaceWake = nil

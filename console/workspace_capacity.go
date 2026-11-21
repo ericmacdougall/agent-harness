@@ -18,6 +18,17 @@ const (
 const maxWorkspaceMinimumBytes uint64 = 1<<53 - 1 // Native checkpoint JSON is decoded through float64.
 const capacityResumePrompt = "The console observed local workspace free space meet your recorded threshold after being below it. Continue the existing objective from its last authorized checkpoint. Recheck workspace identity and applicable resource, review, and deployment gates before acting."
 
+// Only the native write-admission callback can return this refusal. The input
+// writer returns it to the caller without calling Write on the provider stream.
+var errWorkspaceWakeQueued = refused("accepted user input superseded the workspace wake before native write")
+
+type workspaceWakeUnwritten struct {
+	binding *codexTurnBinding
+}
+
+func (*workspaceWakeUnwritten) Error() string { return errWorkspaceWakeQueued.Error() }
+func (*workspaceWakeUnwritten) Unwrap() error { return errWorkspaceWakeQueued }
+
 // Durable metadata is for inspection only. A restored session does not regain
 // the live provider binding or the ability to poll or spend this receipt.
 type workspaceWakeReceipt struct {
@@ -191,13 +202,67 @@ func (a *app) claimWorkspaceWakeLocked(s *session) (*workspaceWake, error) {
 	return w, nil
 }
 
-func (a *app) workspaceWakeSendLocked(s *session, w *workspaceWake, request string) bool {
+func (a *app) workspaceWakeSendIdentityLocked(s *session, w *workspaceWake, request string) bool {
 	return request == w.receipt.ID && w.receipt.State == "spent" &&
-		a.workspaceWakeOwnerLocked(s, w) && s.scheduled &&
+		a.workspaceWakeIdentityLocked(s, w) && s.scheduled &&
 		s.task.State == "active" && s.Supervision.State == "active" &&
 		w.origin.turnID == w.receipt.OriginTurn && w.origin.requestID == w.receipt.OriginRequest &&
-		w.origin.finalStatus == "completed" && s.requests[w.origin.requestID] == "final" &&
-		a.workspaceWakeFresh(w, time.Now())
+		w.origin.finalStatus == "completed" && s.requests[w.origin.requestID] == "final"
+}
+
+func (a *app) workspaceWakeSendLocked(s *session, w *workspaceWake, request string) bool {
+	return a.workspaceWakeSendIdentityLocked(s, w, request) && !activeQueue(s) && a.workspaceWakeFresh(w, time.Now())
+}
+
+func (a *app) admitWorkspaceWakeLocked(s *session, w *workspaceWake, request string) error {
+	binding := s.codexTurn
+	if !a.workspaceWakeSendIdentityLocked(s, w, request) || !a.workspaceWakeFresh(w, time.Now()) ||
+		binding == nil || binding.client != w.origin.client || binding.requestID != request || binding.turnID != "" ||
+		s.requests[request] != "intent" {
+		return refused("workspace wake authority changed before native write")
+	}
+	if head := firstPendingInput(s); head != nil && head.Status == "queued" {
+		return &workspaceWakeUnwritten{binding: binding}
+	}
+	if activeQueue(s) {
+		return refused("workspace wake cannot supersede retained or held user input")
+	}
+	return nil
+}
+
+// Call only with the exact refusal emitted before the writer called Write.
+// Store the rejected wake before making the previous final available again.
+func (a *app) settleUnwrittenWorkspaceWake(s *session, w *workspaceWake, request string, binding *codexTurnBinding) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	head := firstPendingInput(s)
+	if w == nil || !a.workspaceWakeSendIdentityLocked(s, w, request) || s.Status != "running" ||
+		s.lastRequest != request || s.requests[request] != "intent" || s.providerFinal ||
+		binding == nil || s.codexTurn != binding || binding.client != w.origin.client || binding.requestID != request || binding.turnID != "" ||
+		head == nil || head.Status != "queued" {
+		return false
+	}
+	if err := a.record(s, request, "rejected"); err != nil {
+		a.quarantineCodexLocked(s, request, "Could not persist the unwritten workspace wake outcome; no replay")
+		return true
+	}
+	a.transitionRequestLocked(s, request, "rejected")
+	s.lastRequest = w.origin.requestID
+	s.codexTurn = w.origin
+	s.providerFinal = true
+	s.Status = "idle"
+	if s.Cascade != nil {
+		s.Cascade.RequestID = w.origin.requestID
+	}
+	s.Supervision.Reason = "Accepted user input takes priority over the workspace wake"
+	for i, message := range s.Messages {
+		if message.ID == request {
+			s.Messages = append(s.Messages[:i], s.Messages[i+1:]...)
+			break
+		}
+	}
+	a.changedLocked()
+	return true
 }
 
 // One serial worker owns all probes. Filesystem calls have no portable context

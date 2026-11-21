@@ -289,6 +289,134 @@ func TestWorkspaceCapacityWakeLateUserQueueWinsBeforeIntent(t *testing.T) {
 	}
 }
 
+func TestWorkspaceCapacityWakeLateUserQueueWinsBeforeNativeWrite(t *testing.T) {
+	checkWorkspaceWakeLateNativeQueue(t, "")
+}
+
+func TestWorkspaceCapacityWakeLateQueueStaysFencedOnUnknownOutcome(t *testing.T) {
+	for _, failure := range []string{"unclassified-write", "rejection-journal"} {
+		t.Run(failure, func(t *testing.T) {
+			checkWorkspaceWakeLateNativeQueue(t, failure)
+		})
+	}
+}
+
+func checkWorkspaceWakeLateNativeQueue(t *testing.T, failure string) {
+	t.Helper()
+	a, s := workspaceNativeFixture(t, true)
+	armNativeWorkspaceFixture(t, a, s, "fixture-turn", true)
+	finishNativeQueueTurn(a, s)
+	setWorkspaceBytes(a, s, 0, "volume-A")
+	a.pollWorkspaceCapacity()
+	setWorkspaceBytes(a, s, 2<<20, "volume-A")
+
+	entered, proceed, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(proceed)
+		}
+	}()
+	a.mu.Lock()
+	request := s.workspaceWake.receipt.ID
+	s.codex.authAdmit = func() (func(), error) {
+		a.mu.Lock()
+		beforeWakeWrite := s.lastRequest == request && s.requests[request] == "intent"
+		a.mu.Unlock()
+		if beforeWakeWrite {
+			close(entered)
+			<-proceed
+			if failure == "unclassified-write" {
+				return nil, errors.New("controlled uncertain provider write outcome")
+			}
+		}
+		return nil, nil
+	}
+	a.mu.Unlock()
+	go func() { a.pollWorkspaceCapacity(); close(done) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wake did not reach native write admission")
+	}
+	if _, err := a.enqueueInput(s.ID, "late-native-follow-up", "Take priority before a native write", nil); err != nil {
+		t.Fatal(err)
+	}
+	if failure == "rejection-journal" {
+		a.mu.Lock()
+		a.journalSync = func() error { return errors.New("controlled rejection receipt sync failure") }
+		a.mu.Unlock()
+	}
+	a.scheduleInputs(s.ID)
+	close(proceed)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("native wake refusal did not settle")
+	}
+	if failure != "" {
+		a.scheduleInputs(s.ID)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if s.requests[request] != "unknown" || s.requests["late-native-follow-up"] != "" ||
+			s.task.workspaceWakeReceipt.State != "spent" || s.Supervision.RemainingBursts != 2 {
+			t.Fatalf("%s was allowed to restore FIFO authority or refund the wake: requests=%v", failure, s.requests)
+		}
+		return
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		a.mu.Lock()
+		accepted := s.lastRequest == "late-native-follow-up" && s.requests["late-native-follow-up"] == "accepted"
+		spent := s.task.workspaceWakeReceipt.State == "spent" && s.Supervision.RemainingBursts == 2
+		wakeOutcome, state := s.requests[request], s.Status
+		a.mu.Unlock()
+		if accepted {
+			if !spent || wakeOutcome != "rejected" {
+				t.Fatal("late follow-up retried or refunded the one-use wake")
+			}
+			verifyWakeRejectionPrecedesQueueIntent(t, a, s, request)
+			return
+		}
+		if state == "error" || state == "unknown" || time.Now().After(deadline) {
+			t.Fatalf("definite no-write wake refusal stranded the late user input: status=%s wake=%s", state, wakeOutcome)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func verifyWakeRejectionPrecedesQueueIntent(t *testing.T, a *app, s *session, request string) {
+	t.Helper()
+	journal, err := os.Open(a.journal.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+	rejected := false
+	scan := bufio.NewScanner(journal)
+	for scan.Scan() {
+		var r journalRecord
+		if err := json.Unmarshal(scan.Bytes(), &r); err != nil {
+			t.Fatal(err)
+		}
+		if r.SessionID != s.ID {
+			continue
+		}
+		if r.RequestID == request && r.State == "rejected" && r.Checkpoint != nil &&
+			r.Checkpoint.WorkspaceWake != nil && r.Checkpoint.WorkspaceWake.State == "spent" {
+			rejected = true
+		}
+		if r.RequestID == "late-native-follow-up" && r.State == "intent" {
+			if !rejected {
+				t.Fatal("late follow-up acquired native intent before rejection became durable")
+			}
+			return
+		}
+	}
+	t.Fatalf("missing late follow-up intent in journal: %v", scan.Err())
+}
+
 func TestWorkspaceCapacityWakeRejectsCapacityLossDuringSendAdmission(t *testing.T) {
 	a, s := workspaceNativeFixture(t, true)
 	armNativeWorkspaceFixture(t, a, s, "fixture-turn", true)
@@ -339,8 +467,8 @@ func TestWorkspaceCapacityWakeRechecksAuthorityAtNativeWrite(t *testing.T) {
 			s.lastRequest = w.receipt.ID
 			s.requests[s.lastRequest] = "intent"
 			s.codexTurn = &codexTurnBinding{client: s.codex, requestID: s.lastRequest}
-			admit := a.turnAdmissionGuarded(s, w.epoch, s.lastRequest, func(current *session) bool {
-				return a.workspaceWakeSendLocked(current, w, w.receipt.ID)
+			admit := a.turnAdmissionGuarded(s, w.epoch, s.lastRequest, func(current *session) error {
+				return a.admitWorkspaceWakeLocked(current, w, w.receipt.ID)
 			})
 			switch changed {
 			case "revision":

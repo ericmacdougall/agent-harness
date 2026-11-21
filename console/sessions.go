@@ -302,11 +302,15 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if metadataTask != nil {
 		params["additionalContext"] = map[string]any{"consoleTask": map[string]any{"kind": "application", "value": checkpointMetadata(metadataTask)}}
 	}
-	var extraAdmission func(*session) bool
+	var extraAdmission func(*session) error
 	if wake != nil {
-		extraAdmission = func(s *session) bool { return a.workspaceWakeSendLocked(s, wake, requestID) }
+		extraAdmission = func(s *session) error { return a.admitWorkspaceWakeLocked(s, wake, requestID) }
 	}
 	err := a.startCodexTurn(ctx, current, client, requestID, params, a.turnAdmissionGuarded(current, epoch, requestID, extraAdmission))
+	var unwritten *workspaceWakeUnwritten
+	if errors.As(err, &unwritten) && a.settleUnwrittenWorkspaceWake(current, wake, requestID, unwritten.binding) {
+		return err
+	}
 	if err != nil {
 		a.unknownSend(current, requestID, err)
 	}
