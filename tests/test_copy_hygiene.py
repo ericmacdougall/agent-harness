@@ -29,8 +29,12 @@ def sh(*args, cwd=None):
 
 
 class Base(unittest.TestCase):
+    # Subclasses may set _tempdir_parent to keep the fixture off /tmp (see Protected).
+    _tempdir_parent = None
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = (tempfile.TemporaryDirectory(dir=self._tempdir_parent)
+                    if self._tempdir_parent else tempfile.TemporaryDirectory())
         self.home = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {"HARNESS_COPY_HYGIENE_HOME": str(self.home),
                                                 "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
@@ -434,8 +438,20 @@ class Reap(OldCopies, Base):
         self.assertEqual(marks, {"tester-0": True, "tester-1": False, "tester-2": False})
 
 
+def _tempdir_outside_tmp():
+    """Parent for Protected fixtures. tempfile.TemporaryDirectory() is /tmp on Linux, so a command
+    like `rm -f $(find /tmp -name '*.tmp')` would correctly refuse the fixture itself. Keep the
+    fixture outside that scanned root so the allow-case still tests an unrelated find."""
+    real = os.path.realpath(tempfile.gettempdir())
+    if (real == "/tmp" or real.startswith("/tmp" + os.sep)) and os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK):
+        return "/var/tmp"
+    return None
+
+
 class Protected(OldCopies, Base):
     """2026-11-21: cleanups deleted claude-rc's WorkingDirectory and the pp gate's runner and caches on t2-dev."""
+
+    _tempdir_parent = _tempdir_outside_tmp()
 
     def unit(self, name, body, sub=""):
         d = self.units / sub if sub else self.units
@@ -644,6 +660,83 @@ class Protected(OldCopies, Base):
                         "find ~/coordinator-v2/rc/agent-harness -name '*.pyc' -not -path '*/node_modules/*' -delete",
                         'TMPDIR=$(mktemp -d); rm -rf "$TMPDIR"'):
                 self.allow(cmd)
+
+    def test_nested_defaults_recursive_detection_and_find_alternatives(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ('rm -rf "${X:-${HOME}/pp-ci/nm}"', 'rm -rf "${X:-${HOME}/pp-ci}/nm"',
+                        "D=${X:-${HOME}/pp-ci}; rm -rf $D/nm", "rm -rf ${X:-~/pp-ci}/nm",
+                        "rm -f ~/pp-ci/runner/$d/gate.sh", "rm -f ~/pp-ci/$sub/runner/gate.sh",
+                        "rm ~/pp-ci/nm/$d -rf", "OPTS=-rf; rm $OPTS ~/pp-ci/nm/$d", "rm $OPTS ~/pp-ci/nm/$d",
+                        "rm -${R}f ~/pp-ci/nm/$d", "find ~/pp-ci/nm -name .git -prune -o -type f -delete",
+                        "find ~/pp-ci/nm -name '*.keep' -o -delete", "rm -rf ~/pp-ci/nm # cleanup",
+                        'D=~/pp-ci/nm/a/b; rm -rf "${D%%/b*}"'):
+                self.deny(cmd)
+            for cmd in ('rm -rf "$dir/$name"', 'rm -f "$tmp/$f"', 'rm -rf "$BUILD/$target/"',
+                        "rm -rf ~/pp-ci/nm/x$", "rm -rf ~/coordinator-v2/rc/agent-harness/build/x$"):
+                self.allow(cmd)
+
+    def test_prune_cleanups_allowed_and_alternatives_and_positional_forms_denied(self):
+        self.setup_services()
+        h = str(self.home)
+        # From the service checkout itself. From an ancestor that contains protected paths a selective find is
+        # refused by design (the name filter could match inside them).
+        for cmd in ("find . -name __pycache__ -prune -exec rm -rf {} +",
+                    "find . -type d -name node_modules -prune -exec rm -rf {} +"):
+            self.allow(cmd, self.rc)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("find ~/pp-ci/nm \\( -name '*.keep' -o -delete \\)",
+                        "find ~/pp-ci/nm -name .git -prune -o \\( -type f -delete \\)",
+                        "find ~/pp-ci/nm -newer x -o -delete", 'D=${D:-$HOME/pp-ci}; rm -rf "$D/nm"',
+                        "rm -rf ~/pp-ci/nm/$1", "rm -rf ~/pp-ci/nm/$@", "rm -rf ~/pp-ci/nm/${a[0]}",
+                        "rm -rf ~/pp-ci/nm/$(cat f)", 'args=(-rf); rm "${args[@]}" ~/pp-ci/nm/$d'):
+                self.deny(cmd)
+            self.allow('D=%s/x/build/; rm -rf "${D%%/}"' % h)
+
+    def test_find_grammar_per_action_selectivity(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("find ~/pp-ci/nm -exec chmod u+w {} + \\( -name '*.keep' -o -delete \\)",
+                        "find ~/pp-ci/nm -exec echo {} \\; \\( -name '*.keep' -o -delete \\)",
+                        "find ~/pp-ci/nm -name .git -prune -o -print0 | xargs -0 rm -rf",
+                        "find ~/pp-ci/nm -name '*.keep' -o -print | xargs rm -rf",
+                        "rm -rf $(find ~/pp-ci/nm -name .git -prune -o -print)",
+                        "find ~/pp-ci/nm -prune -exec rm -rf {} +",
+                        "find ~/pp-ci/nm -exec grep -o x {} \\; -o -delete",
+                        "find ~/pp-ci/nm -exec sh -c 'echo )' \\; -delete"):
+                self.deny(cmd)
+        for cmd in ("find . -name .git -prune -o -name '*.pyc' -delete",
+                    "find . -path ./node_modules -prune -o -name '*.orig' -exec rm {} +",
+                    "find . -name '*.pyc' -delete -o -name __pycache__ -exec rm -rf {} +",
+                    "find . \\( -name a -o -name b \\) \\( -type f -delete \\)",
+                    "find . -name '*.log' -print | xargs rm -f", "rm -f $(find . -name '*.tmp')",
+                    "find . -empty -name '*.lock' -delete"):
+            self.allow(cmd, self.rc)
+
+    def test_find_output_through_several_substitutions_and_loops(self):
+        self.setup_services()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            for cmd in ("rm -rf $(find ~/pp-ci/nm -mindepth 1 -maxdepth 1) $(find . -name '*.tmp')",
+                        'rm -rf $(find ~/pp-ci/nm -maxdepth 1 -type d) "$(pwd)/build"',
+                        "rm -rf $(find ~/pp-ci/nm -maxdepth 1) $(cat extra.txt)",
+                        'for d in $(find ~/pp-ci/nm -mindepth 1 -maxdepth 1); do rm -rf "$d"; done',
+                        'find ~/pp-ci/nm -mindepth 1 -maxdepth 1 | while read -r d; do rm -rf "$d"; done',
+                        "find ~/pp-ci/nm -mtime +7 | xargs rm -rf", "rm -rf $(find ~/pp-ci/nm -mtime +7)",
+                        "find ~/pp-ci/nm -nouser -delete"):
+                self.deny(cmd)
+            for cmd in ("rm -f $(find /tmp -name '*.tmp')", "for f in $(find /tmp -name x); do rm $f; done"):
+                self.allow(cmd)
+
+    def test_find_stored_in_a_variable_or_fed_by_process_substitution(self):
+        # Fable round 13: B1 (assignment / for-in of a find-valued var) and B3 (`done < <(find)`).
+        self.setup_services()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            for cmd in ('old=$(find ~/pp-ci/nm -mindepth 1 -maxdepth 1); rm -rf $old',
+                        'old=$(find ~/pp-ci/nm -mindepth 1 -maxdepth 1); for d in $old; do rm -rf "$d"; done',
+                        'while read -r d; do rm -rf "$d"; done < <(find ~/pp-ci/nm -mindepth 1 -maxdepth 1)'):
+                self.deny(cmd)
 
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
