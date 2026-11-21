@@ -39,6 +39,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "copy_hygiene.py",  # one test copy per PR/lane, disk-low and /dev/shm guard, report-only reaper (t2-dev disk full 2026-11-21)
+         "workspace_janitor.py",  # shared mirrors, session-end release, TTL sweep, container memory caps (2026-11-21)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
@@ -101,7 +102,8 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
+                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
+                         "workspace_janitor.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -288,6 +290,15 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
                "timeout": 20}
     managed.setdefault("Stop", []).append({"hooks": [hygiene]})
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(hygiene)]})
+    # Workspace janitor (t2-dev disk full 2026-11-21): when a session ends, remove its verified-recoverable checkouts
+    # (clean, every commit on what the remote advertises, not in use, not referenced by a service); never blocks.
+    managed.setdefault("SessionEnd", []).append({"hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "workspace_janitor.py"), "session-end"],
+        "timeout": 60}]})
+    # ... and refuse uncapped containers (`docker run` without --memory; Elasticsearch without a heap cap). Fails open.
+    managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "workspace_janitor.py"), "pretool"],
+        "timeout": 5}]})
     # The caller's identity for acknowledgements comes from the hook payload (review round 3, B1).
     managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "pretool"],
