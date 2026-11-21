@@ -1157,16 +1157,18 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
     lies strictly inside its root; "" means the path itself (and everything inside it) goes."""
     bases = [cwd if str(cwd).startswith("/") else None]
     stack, pending_old, vars_ = [], [], {}
-    out, find_ctx, subst_find = [], None, None
+    out, find_ctx, subst_finds, var_finds = [], None, [], {}
     for words, sep in _cmd_lines(cmd):
         if words == [_PUSH]:
             stack.append((list(bases), list(pending_old), dict(vars_), find_ctx))
+            find_ctx = None
             continue
         if words == [_POP]:
             inner = find_ctx
             if stack:
                 bases, pending_old, vars_, find_ctx = stack.pop()
-            subst_find = inner if inner is not None else subst_find
+            if inner is not None:
+                subst_finds.append(inner)            # every substituted find feeding the next outer command
             continue
         if sep != "&&" and pending_old:
             bases = list(dict.fromkeys(bases + pending_old))
@@ -1175,8 +1177,25 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
             find_ctx = None
         words = [x for w in words for x in _expand_braces(w)]
         name = os.path.basename(words[0])
-        if name not in DELETE_VERBS:
-            subst_find = None if name != "find" else subst_find
+        # find output bound to a loop variable: `for d in $(find R); do rm -rf "$d"` / `find R | while read d`
+        if name == "for" and len(words) >= 3 and words[2] == "in" and subst_finds and any("__SUBST__" in w for w in words):
+            var_finds[words[1]] = list(subst_finds)
+        if name == "read" and sep == "|" and find_ctx is not None:
+            rpos = [w for w in words[1:] if not w.startswith("-")]
+            if rpos:
+                var_finds[rpos[-1]] = [find_ctx]
+        if name in DELETE_VERBS:
+            feeds = list(subst_finds) if any("__SUBST__" in w for w in words) else []
+            for w in words[1:]:
+                for m in _VAR.finditer(w):
+                    vn = m.group(2) or re.match(r"^\w*", m.group(1) or "").group(0)
+                    feeds.extend(var_finds.get(vn, []))
+            for roots_, fp_, fb_ in feeds:           # the find's output is the target list
+                for r in roots_:
+                    for p, k, kind in _resolve(r, fb_, vars_):
+                        out.append((p, k, kind or fp_["print_mode"]))
+        if not stack and name not in ("find",):
+            subst_finds = []
         if name in ("export", "local", "declare", "readonly", "typeset") and len(words) > 1:
             words = [w for w in words[1:] if not w.startswith("-")] or words
         if words and all(ASSIGN.match(w) for w in words):
@@ -1197,11 +1216,6 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
             bases = new[:1] if len(new) == 1 or (new and len(set(new)) == 1) else [None]
             continue
         raw, gbases, mode, recursive = [], bases, "", True
-        if name in DELETE_VERBS and subst_find is not None and any("__SUBST__" in w for w in words):
-            roots, fp, fb = subst_find               # rm -rf $(find ROOT ...): the find's output is the target list
-            for r in roots:
-                for p, k, kind in _resolve(r, fb, vars_):
-                    out.append((p, k, kind or fp["print_mode"]))
         if name in DELETE_VERBS:
             raw = pos
             # Recursive unless every option is a literal flag without r/R: `rm $OPTS x` and `rm -${R}f x` may be.

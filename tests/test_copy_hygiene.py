@@ -648,6 +648,20 @@ class Protected(OldCopies, Base):
                     "find . -empty -name '*.lock' -delete"):
             self.allow(cmd, self.rc)
 
+    def test_find_output_through_several_substitutions_and_loops(self):
+        self.setup_services()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            for cmd in ("rm -rf $(find ~/pp-ci/nm -mindepth 1 -maxdepth 1) $(find . -name '*.tmp')",
+                        'rm -rf $(find ~/pp-ci/nm -maxdepth 1 -type d) "$(pwd)/build"',
+                        "rm -rf $(find ~/pp-ci/nm -maxdepth 1) $(cat extra.txt)",
+                        'for d in $(find ~/pp-ci/nm -mindepth 1 -maxdepth 1); do rm -rf "$d"; done',
+                        'find ~/pp-ci/nm -mindepth 1 -maxdepth 1 | while read -r d; do rm -rf "$d"; done',
+                        "find ~/pp-ci/nm -mtime +7 | xargs rm -rf", "rm -rf $(find ~/pp-ci/nm -mtime +7)",
+                        "find ~/pp-ci/nm -nouser -delete"):
+                self.deny(cmd)
+            for cmd in ("rm -f $(find /tmp -name '*.tmp')", "for f in $(find /tmp -name x); do rm $f; done"):
+                self.allow(cmd)
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()
