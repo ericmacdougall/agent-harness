@@ -193,8 +193,8 @@ def low_disk_message(path: str, free_gb: float, fl: float) -> str:
     return (f"DISK LOW: {free_gb:.1f} GB free on the volume holding {path} (floor {fl:.1f} GB). The harness refuses to "
             "create another copy. Reuse your PR's test copy with `python3 ~/.claude/hooks/copy_hygiene.py acquire "
             "--repo <checkout> --key pr-<N>`, and run `python3 ~/.claude/hooks/copy_hygiene.py reap` to list idle "
-            "copies (removing them needs the owner's OK). The floor is min_free_gb / min_free_pct in "
-            "~/.agent-harness/state/copy-hygiene.json (or HARNESS_COPY_HYGIENE_MIN_FREE_GB).")
+            "copies (removing them needs the owner's OK). Only the owner changes the floor (min_free_gb / min_free_pct in "
+            "~/.agent-harness/state/copy-hygiene.json); do not lower it to get around this.")
 
 
 # ---------------------------------------------------------------- git helpers
