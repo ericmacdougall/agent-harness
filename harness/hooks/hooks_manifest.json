@@ -462,6 +462,60 @@
    ]
   },
   {
+   "id": "copy_hygiene:pretool",
+   "script": "copy_hygiene.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      },
+      "cwd": "/"
+     },
+     "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "mkdir -p /dev/shm/doctor-canary"
+      },
+      "cwd": "/"
+     },
+     "expect": "deny"
+    }
+   ]
+  },
+  {
+   "id": "copy_hygiene:session-start",
+   "script": "copy_hygiene.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
+   ]
+  },
+  {
    "id": "prod_delete_guard:hook",
    "script": "prod_delete_guard.py",
    "arg": null,

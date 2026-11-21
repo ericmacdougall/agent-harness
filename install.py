@@ -38,6 +38,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
+         "copy_hygiene.py",  # one test copy per PR/lane, disk-low and /dev/shm guard, report-only reaper (t2-dev disk full 2026-11-21)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
@@ -100,7 +101,7 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py")}
+                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -214,6 +215,13 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "matcher": "Bash",
             "hooks": [heavy_guard],
         }, {
+            # Copy hygiene: below the free-space floor, denies commands that create another copy (clone, worktree
+            # add, cp -r, rsync -a, ditto); always denies writing scratch into /dev/shm (RAM). Silent otherwise; fails
+            # open, so no onFailure.
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "python3",
+                       "args": [str(claude / "hooks" / "copy_hygiene.py"), "pretool"], "timeout": 5}],
+        }, {
             "matcher": PROD_DELETE_MATCHER,
             "hooks": [prod_delete],
         }, {
@@ -230,6 +238,11 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
+    # Copy hygiene report (t2-dev disk full 2026-11-21): one line when idle test copies pile up, and a detached
+    # report-only reap at most every 6 h. Never deletes; fails open.
+    managed["SessionStart"].append({"hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "copy_hygiene.py"), "session-start"],
+        "timeout": 5}]})
     if log_backup:
         # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered
         # where the backup is opted in (--log-backup, or already installed), so a host without it gets no alert.
