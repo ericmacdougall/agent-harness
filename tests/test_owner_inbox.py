@@ -171,7 +171,49 @@ class Inject(Base):
         self.assertNotIn("secret-looking", result.stdout)
 
 
+    def test_subagent_event_does_not_consume_the_note(self):
+        self.write_decision(body="for the main session only\n")
+        self.assertIsNone(self.hook(self.event(name="PostToolUse", agent_id="a1b2c3")))
+        self.assertIsNone(self.hook(self.event(agent_type="task-owner")))
+        text = self.context(self.event())
+        self.assertIn("for the main session only", text)
+
+    def test_stop_hook_active_does_not_block_again(self):
+        self.write_decision(body="do not loop\n")
+        self.assertIsNone(self.hook(self.event(name="Stop", stop_hook_active=True)))
+        out = self.hook(self.event(name="Stop"))
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("do not loop", out["reason"])
+
+    def test_failed_mark_does_not_stop_loop_or_eat_posttool(self):
+        self.write_decision(body="still unread if mark fails\n")
+        os.chmod(self.work, 0o500)
+        try:
+            self.assertIsNone(self.hook(self.event(name="Stop")))
+            self.assertIsNone(self.hook(self.event(name="PostToolUse")))
+            text = self.context(self.event())  # UserPromptSubmit still surfaces it
+            self.assertIn("still unread if mark fails", text)
+        finally:
+            os.chmod(self.work, 0o700)
+        text = self.context(self.event())
+        self.assertIn("still unread if mark fails", text)
+        self.assertIsNone(self.hook(self.event()))
+
+    def test_unreadable_file_is_skipped_not_fatal(self):
+        bad = self.write_decision(name="OWNER-DECISION-bad.md", body="cannot read me\n")
+        self.write_decision(name="OWNER-DECISION-good.md", body="visible note\n")
+        os.chmod(bad, 0o000)
+        try:
+            text = self.context(self.event())
+            self.assertIn("visible note", text)
+            self.assertNotIn("cannot read me", text)
+        finally:
+            os.chmod(bad, 0o600)
+
+
+
 class Install(unittest.TestCase):
+
     def test_installer_ships_and_wires_the_inbox(self):
         import install  # noqa: E402
         import install_codex  # noqa: E402

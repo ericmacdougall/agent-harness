@@ -93,8 +93,8 @@ func executeCLILaunch(ticket cliLaunchTicket, binary string, env []string, in io
 		return errors.New("launch working directory changed or was redirected")
 	}
 	command := exec.Command(binary)
-	if wrap, tmuxBin, session := cliTmuxWrap(env, stdinIsTerminal(in), exec.LookPath); wrap {
-		command = exec.Command(tmuxBin, tmuxLaunchArgs(session, binary)...)
+	if wrap, tmuxBin, session := cliTmuxWrap(env, stdinIsTerminal(in) && stdoutIsTerminal(out), exec.LookPath); wrap {
+		command = exec.Command(tmuxBin, tmuxLaunchArgs(session, actualCWD, binary)...)
 	}
 	command.Dir = ticket.CWD
 	command.Env = env
@@ -123,14 +123,18 @@ func envOrProcess(env []string, key string) string {
 
 func stdinIsTerminal(in io.Reader) bool {
 	file, ok := in.(*os.File)
-	if !ok {
+	if !ok || file == nil {
 		return false
 	}
-	info, err := file.Stat()
-	if err != nil {
+	return fdIsTerminal(int(file.Fd()))
+}
+
+func stdoutIsTerminal(out io.Writer) bool {
+	file, ok := out.(*os.File)
+	if !ok || file == nil {
 		return false
 	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return fdIsTerminal(int(file.Fd()))
 }
 
 // cliTmuxWrap reports whether a console CLI launch should run inside tmux, and if so the
@@ -179,8 +183,11 @@ func tmuxSessionNameOK(name string) bool {
 	return true
 }
 
-func tmuxLaunchArgs(session, binary string, args ...string) []string {
-	out := []string{"new-session", "-s", session, "--", binary}
+func tmuxLaunchArgs(session, cwd, binary string, args ...string) []string {
+	// A private socket (-L) starts a dedicated server that inherits this process's
+	// environment (command.Env), so API keys are not put on a command line with -e,
+	// and the caller's env is not written into the user's default tmux server.
+	out := []string{"-u", "-L", session, "new-session", "-c", cwd, "-s", session, "--", binary}
 	return append(out, args...)
 }
 func loadCLILaunchTicket(path, digest string) (cliLaunchTicket, error) {

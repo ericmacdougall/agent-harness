@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 from datetime import datetime, timezone
@@ -32,7 +33,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wal import safe_id  # noqa: E402
 
 STATE_NAME = ".owner-inbox-read.json"
-STATE_TMP = ".owner-inbox-read.json.tmp"
 INBOX_DIR = "inbox"
 DECISION_NAME = re.compile(r"^OWNER-DECISION-[A-Za-z0-9._-]{1,200}\.md$")
 INBOX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.(md|txt)$")
@@ -112,17 +112,21 @@ def _load_state(dirfd: int) -> dict:
 
 def _write_state(dirfd: int, state: dict) -> None:
     payload = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    tmp = f".owner-inbox-read.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
     try:
-        os.unlink(STATE_TMP, dir_fd=dirfd)
-    except FileNotFoundError:
-        pass
-    fd = os.open(STATE_TMP, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
-    try:
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.rename(STATE_TMP, STATE_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, STATE_NAME, src_dir_fd=dirfd, dst_dir_fd=dirfd)
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dirfd)
+        except OSError:
+            pass
+        raise
 
 
 def _candidates(session_fd: int) -> list[tuple[str, int, int]]:
@@ -194,7 +198,10 @@ def collect_unread(session_id: str) -> list[dict]:
             info = _regular_file(dirfd, name)
             if info is None:
                 continue
-            data = _read_file(dirfd, name, info.st_size)
+            try:
+                data = _read_file(dirfd, name, info.st_size)
+            except OSError:
+                continue
             digest = _digest(data)
             previous = read.get(relpath)
             if isinstance(previous, dict) and previous.get("sha256") == digest:
@@ -263,16 +270,30 @@ def hook_output(event: dict) -> dict | None:
     session = event.get("session_id")
     if name not in HOOK_EVENTS or not isinstance(session, str) or not session.strip():
         return None
+    # Subagent and SDK events share the parent's session_id; do not consume the note there.
+    if event.get("agent_id") or event.get("agent_type"):
+        return None
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        return None
     items = collect_unread(session)
     if not items:
         return None
+    # A repeated Stop must not consume or re-block the same note.
+    if name == STOP_EVENT and event.get("stop_hook_active"):
+        return None
     text = format_items(items)
+    marked = False
     try:
         mark_read(session, items)
+        marked = True
     except OSError:
-        pass  # still surface the text; a later turn may re-inject
+        marked = False
     if name == STOP_EVENT:
+        if not marked:
+            return None
         return {"decision": "block", "reason": text}
+    if not marked and name == "PostToolUse":
+        return None  # a failed mark would otherwise re-inject after every tool
     return {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
 
 
