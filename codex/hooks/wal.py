@@ -189,6 +189,8 @@ def append(path: Path, record: dict) -> None:
 
 
 WORK_STATES = {"active", "blocked", "handoff", "complete", "paused"}
+MAX_CONTINUATIONS = 4
+MAX_ASSISTANT_MESSAGE = 65_536
 STATE_FILE = "continuation.json"
 INTERRUPT_FILE = "continuation.interrupt"
 CONTINUE_REASON = (
@@ -199,6 +201,10 @@ CONTINUE_REASON = (
 )
 UNFINISHED = "The session has unfinished tracked work. Its continuation allowance has been used or cannot be applied."
 UNAVAILABLE = "The continuation checkpoint could not be read or updated. Check its status before claiming completion."
+
+
+class ContinuationBudgetError(ValueError):
+    pass
 
 
 def state_file(directory: int, name: str, flags: int) -> int:
@@ -232,20 +238,88 @@ def read_interrupt(directory: int) -> str | None:
     return marker.decode("ascii")
 
 
+def checkpoint_fields(pairs: list[tuple[str, object]]) -> dict:
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("duplicate continuation field")
+    return fields
+
+
+def valid_digest(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
 def read_checkpoint(directory: int) -> dict | None:
-    data = read_private(directory, STATE_FILE, 512)
+    data = read_private(directory, STATE_FILE, 1024)
     if data is None:
         return None
-    state = json.loads(data)
-    if (not isinstance(state, dict) or set(state) != {"state", "used", "interrupt"}
+    try:
+        state = json.loads(data, object_pairs_hook=checkpoint_fields)
+    except RecursionError as error:
+        raise ValueError("invalid continuation checkpoint") from error
+    if (not isinstance(state, dict) or not {"state", "interrupt"} <= state.keys()
             or not isinstance(state["state"], str) or state["state"] not in WORK_STATES
-            or not isinstance(state["used"], bool)
             or (state["interrupt"] is not None and (
                 not isinstance(state["interrupt"], str)
                 or not re.fullmatch(r"[0-9a-f]{32}", state["interrupt"])
             ))):
         raise ValueError("invalid continuation checkpoint")
-    return state
+    if set(state) == {"state", "interrupt", "used"} and isinstance(state["used"], bool):
+        return state
+    if set(state) == {"state", "interrupt", "limit", "claims", "repeat_open"}:
+        limit = state["limit"]
+        claims = state["claims"]
+        repeat_open = state["repeat_open"]
+        if (type(limit) is int and 1 <= limit <= MAX_CONTINUATIONS
+                and isinstance(claims, list) and len(claims) <= limit
+                and all(isinstance(claim, list) and len(claim) == 2 and valid_digest(claim[0])
+                        and (claim[1] is None or valid_digest(claim[1])) for claim in claims)
+                and len({tuple(claim) for claim in claims}) == len(claims)
+                and isinstance(repeat_open, bool)
+                and (not repeat_open or (claims and claims[-1][1] is not None))):
+            return state
+    raise ValueError("invalid continuation checkpoint")
+
+
+def continuation_budget(state: dict | None) -> tuple[int, int]:
+    if state is None:
+        return 0, 0
+    if "limit" in state:
+        return state["limit"], len(state["claims"])
+    return 1, int(state["used"])
+
+
+def output_digest(message: object) -> str | None:
+    if not isinstance(message, str) or len(message) > MAX_ASSISTANT_MESSAGE:
+        return None
+    normalized = message.strip()
+    if not normalized:
+        return None
+    try:
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return None
+
+
+def spend_continuation(
+    state: dict, turn_digest: str, assistant_digest: str | None, repeated_stop: bool,
+) -> dict | None:
+    limit, spent = continuation_budget(state)
+    if spent >= limit:
+        return None
+    if "limit" not in state:
+        return None if repeated_stop else {**state, "used": True}
+    claims = state["claims"]
+    claim = [turn_digest, assistant_digest]
+    if repeated_stop:
+        # Codex can invoke several Stop hooks. A repeated Stop only belongs to
+        # this checkpoint after our own latest claim for the same native turn.
+        if (not state["repeat_open"] or claims[-1][0] != turn_digest
+                or assistant_digest is None or claim in claims):
+            return None
+    elif any(claimed_turn == turn_digest for claimed_turn, _ in claims):
+        return None
+    return {**state, "claims": [*claims, claim], "repeat_open": assistant_digest is not None}
 
 
 def replace_private(directory: int, current_directory, name: str, data: bytes) -> None:
@@ -273,7 +347,15 @@ def visible_checkpoint(state: dict | None, marker: str | None) -> dict | None:
     return state
 
 
-def checkpoint(session: str, action: str) -> tuple[dict | None, bool]:
+def checkpoint(
+    session: str,
+    action: str,
+    *,
+    turn_digest: str | None = None,
+    assistant_digest: str | None = None,
+    repeated_stop: bool = False,
+    max_continuations: int | None = None,
+) -> tuple[dict | None, bool]:
     with session_directory(session) as (directory, current_directory):
         if not current_directory():
             raise ValueError("continuation directory changed")
@@ -295,13 +377,28 @@ def checkpoint(session: str, action: str) -> tuple[dict | None, bool]:
                 raise ValueError("continuation lock or directory changed")
             marker = read_interrupt(directory)
             state = visible_checkpoint(read_checkpoint(directory), marker)
-            used = state["used"] if state is not None else False
             if action == "claim":
-                if state is None or state["state"] != "active" or used:
+                if state is None or state["state"] != "active" or not turn_digest:
                     return state, False
-                state = {**state, "used": True}
+                claimed_state = spend_continuation(state, turn_digest, assistant_digest, repeated_stop)
+                if claimed_state is None:
+                    return state, False
+                state = claimed_state
             else:
-                state = {"state": action, "used": used, "interrupt": marker}
+                state = state if state is not None else {"used": False}
+                if max_continuations is not None:
+                    if "limit" in state:
+                        if state["limit"] != max_continuations:
+                            raise ContinuationBudgetError("cannot change the configured continuation budget")
+                    elif state["used"]:
+                        raise ContinuationBudgetError("cannot change the continuation budget after its first pass")
+                    else:
+                        state = {"limit": max_continuations, "claims": [], "repeat_open": False}
+                if "limit" in state and (action != "active" or state.get("state") != "active"):
+                    # Resuming authorized work cannot revive callbacks from a
+                    # native turn that was already interrupted or put on hold.
+                    state = {**state, "repeat_open": False}
+                state = {**state, "state": action, "interrupt": marker}
             replace_private(directory, current_directory, STATE_FILE, json.dumps(state).encode())
             visible = visible_checkpoint(state, read_interrupt(directory))
             return visible, action == "claim" and visible["state"] == "active"
@@ -311,11 +408,17 @@ def checkpoint(session: str, action: str) -> tuple[dict | None, bool]:
 
 def lifecycle_hook(data: dict, session: str) -> None:
     interrupt = data["hook_event_name"] == "Interrupt"
-    may_claim = (isinstance(data.get("turn_id"), str) and bool(data["turn_id"])
-                 and data.get("stop_hook_active") is False)
+    turn_id = data.get("turn_id")
+    repeated_stop = data.get("stop_hook_active")
+    may_claim = (not interrupt and isinstance(repeated_stop, bool)
+                 and data.get("agent_id") is None and data.get("agent_type") is None
+                 and isinstance(turn_id, str) and re.fullmatch(r"[!-~]{1,256}", turn_id))
     action = "interrupt" if interrupt else "claim" if may_claim else "status"
+    turn_digest = hashlib.sha256(turn_id.encode("ascii")).hexdigest() if may_claim else None
+    assistant_digest = output_digest(data.get("last_assistant_message")) if may_claim else None
     try:
-        state, claimed = checkpoint(session, action)
+        state, claimed = checkpoint(session, action, turn_digest=turn_digest,
+                                    assistant_digest=assistant_digest, repeated_stop=repeated_stop is True)
     except (OSError, ValueError):
         result = {"systemMessage": UNAVAILABLE}
     else:
@@ -440,6 +543,8 @@ def main() -> None:
     continuation = subcommands.add_parser('continuation')
     continuation.add_argument('--wal', type=Path, required=True)
     continuation.add_argument('state', choices=sorted(WORK_STATES | {'status'}))
+    continuation.add_argument('--max-continuations', type=int, choices=range(1, MAX_CONTINUATIONS + 1),
+                              help='set an explicit per-session budget with active before the first pass')
     args = parser.parse_args()
     if args.command == 'hook':
         hook()
@@ -451,12 +556,17 @@ def main() -> None:
         path = args.wal.expanduser().absolute()
         if path.name != 'main.jsonl' or path.parent.parent != wal_root():
             parser.error('continuation requires a main session WAL path')
+        if args.max_continuations is not None and args.state != 'active':
+            parser.error('--max-continuations requires active')
         try:
-            state, _ = checkpoint(path.parent.name, args.state)
+            state, _ = checkpoint(path.parent.name, args.state, max_continuations=args.max_continuations)
+        except ContinuationBudgetError as error:
+            parser.error(str(error))
         except (OSError, ValueError):
             parser.error(UNAVAILABLE)
-        print(json.dumps({'state': state['state'], 'used': state['used']} if state else
-                         {'state': 'untracked', 'used': False}))
+        limit, spent = continuation_budget(state)
+        print(json.dumps({'state': state['state'] if state else 'untracked', 'used': spent > 0,
+                          'limit': limit, 'remaining': limit - spent}))
     else:
         note(args.wal, args.event, args.note)
 

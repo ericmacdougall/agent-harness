@@ -43,7 +43,7 @@ python3 ~/.codex/agent-harness/wal.py continuation --wal "$session_wal" active
 python3 ~/.codex/agent-harness/wal.py continuation --wal "$session_wal" status
 ```
 
-With trusted hooks, Stop can request one automatic continuation per session when the checkpoint is active. It keeps the checkpoint visible after that allowance is spent. This helps catch an early final reply while a test or worker is still running. It requires explicit tracking and does not supervise detached jobs. See [checkpoint and handoff rules](codex/skills/agent-harness/references/delivery.md).
+With trusted hooks, Stop can request one automatic continuation per session by default when the checkpoint is active. For authorized autonomous work, add `--max-continuations 4` to the `active` command before the first pass. The checkpoint remains visible after its passes run out. This helps catch an early final reply while a test or worker is still running. An idle chat requires a separate wake. [Checkpoint and handoff rules](codex/skills/agent-harness/references/delivery.md)
 
 ## Capabilities by edition
 
