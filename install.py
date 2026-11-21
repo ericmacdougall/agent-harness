@@ -42,6 +42,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
+         "owner_inbox.py",  # stall-watcher answer inbox: OWNER-DECISION-*.md and inbox/ notes
          "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
          "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
          "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
@@ -101,7 +102,7 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
+                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -311,6 +312,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     inbox = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "mc_inbox.py"), "hook"], "timeout": 5}
     for event in ("Stop", "UserPromptSubmit"):
         managed.setdefault(event, []).append({"hooks": [dict(inbox)]})
+    # Stall-watcher / owner decision inbox: inject unread OWNER-DECISION-*.md and inbox/ notes
+    # as additionalContext (or a one-time Stop block), then mark them read. Fails open, so no onFailure.
+    owner_inbox = {"type": "command", "command": "python3",
+                   "args": [str(claude / "hooks" / "owner_inbox.py"), "hook"], "timeout": 5}
+    for event in ("UserPromptSubmit", "SessionStart", "Stop", "PostToolUse"):
+        managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
     return managed
 
 
