@@ -174,9 +174,10 @@ class Inject(Base):
     def test_subagent_event_does_not_consume_the_note(self):
         self.write_decision(body="for the main session only\n")
         self.assertIsNone(self.hook(self.event(name="PostToolUse", agent_id="a1b2c3")))
-        self.assertIsNone(self.hook(self.event(agent_type="task-owner")))
-        text = self.context(self.event())
+        # A main session started with --agent has agent_type but no agent_id; it must still receive the note.
+        text = self.context(self.event(agent_type="task-owner"))
         self.assertIn("for the main session only", text)
+        self.assertIsNone(self.hook(self.event()))
 
     def test_stop_hook_active_does_not_block_again(self):
         self.write_decision(body="do not loop\n")

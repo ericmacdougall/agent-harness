@@ -270,10 +270,9 @@ def hook_output(event: dict) -> dict | None:
     session = event.get("session_id")
     if name not in HOOK_EVENTS or not isinstance(session, str) or not session.strip():
         return None
-    # Subagent and SDK events share the parent's session_id; do not consume the note there.
-    if event.get("agent_id") or event.get("agent_type"):
-        return None
-    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+    # A subagent event carries agent_id and shares the parent's session_id; do not consume the note there.
+    # agent_type alone is not enough: a main session started with --agent also has agent_type.
+    if event.get("agent_id"):
         return None
     items = collect_unread(session)
     if not items:
@@ -294,6 +293,11 @@ def hook_output(event: dict) -> dict | None:
         return {"decision": "block", "reason": text}
     if not marked and name == "PostToolUse":
         return None  # a failed mark would otherwise re-inject after every tool
+    if not marked:
+        text = text.replace(
+            "They are now marked read and will not be re-injected unless the file contents change.",
+            "They could not be marked read this turn and may be offered again.",
+        )
     return {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
 
 
