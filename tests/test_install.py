@@ -236,7 +236,7 @@ class InstallerTests(unittest.TestCase):
         foreign = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(foreign))
         install(self.home, apply=True)
-        expected = [("PreToolUse", "AskUserQuestion", "ask-gate"), ("PostToolUse", "AskUserQuestion", "ask-close"),
+        expected = [("PostToolUse", "AskUserQuestion", "ask-close"), ("PreToolUse", "AskUserQuestion", "ask-gate"),
                     ("Stop", None, "stop-lint"), ("UserPromptSubmit", None, "prompt")]
         self.assertEqual(self.provenance_entries(), expected)
         install(self.home, apply=True)
@@ -283,7 +283,7 @@ class InstallerTests(unittest.TestCase):
 
     def test_no_provenance_hooks_flag_unregisters_and_default_restores(self):
         install(self.home, apply=True)
-        self.assertEqual(len(self.provenance_entries()), 3)
+        self.assertEqual(len(self.provenance_entries()), 4)
         install(self.home, apply=True, provenance=False)
         self.assertEqual(self.provenance_entries(), [])
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
@@ -291,7 +291,7 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(any("wal.py" in str(h.get("args")) for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
         self.assertTrue((self.claude / "hooks" / "provenance_hooks.py").is_file())  # files stay installed
         install(self.home, apply=True)
-        self.assertEqual(len(self.provenance_entries()), 3)
+        self.assertEqual(len(self.provenance_entries()), 4)
 
     def test_tolerates_user_hook_with_empty_args(self):
         (self.claude / "settings.json").write_text(json.dumps(
