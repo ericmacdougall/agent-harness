@@ -26,20 +26,44 @@ WHAT.
                 local commits missing from its remotes, no ignored files except regenerable build output, and no
                 process inside it. Linked worktrees go through plain `git worktree remove` (no --force).
 
+  protected     Paths a live service depends on are NEVER deleted (2026-11-21: cleanups on t2-dev removed
+                ~/coordinator-v2/rc/agent-harness, claude-rc's WorkingDirectory, plus ~/pp-ci/runner and the ~/pp-ci/nm
+                caches the pp gate runs from). Protected: every absolute path named anywhere in a systemd unit
+                (system, --user, runtime, transient and generated units and drop-ins; WorkingDirectory=, Exec*=,
+                Environment=, paths inside `bash -c '...'` strings; %h/~ expanded, a path cut at an unresolved
+                specifier such as %i), every path in a launchd plist, the source of a `systemctl link`ed unit, and
+                the config's protected_paths. Deleting a protected path or any directory containing one, or emptying
+                one with `<dir>/*`, is refused; single files or build output inside it stay allowed. The pretool hook
+                checks rm / rmdir / unlink / shred / trash / gio remove / mv (sources) / find -delete or -exec rm /
+                find | xargs rm / git [-C dir] worktree remove, follows `cd`, `bash -c`, sudo/env/timeout wrappers,
+                $HOME/$PWD and {a,b}; a relative target under an unknown directory is matched by path tail. It fails
+                OPEN on an internal error (with an alert). The reaper fails CLOSED: if any unit file can't be read it
+                deletes nothing. `copy_hygiene.py protected [--check <path>]` lists or explains (exit 1 = protected),
+                the one choke point other cleaners should call. Known gap: commands run on another host over ssh are
+                checked only by that host's own hook.
+  scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
+                directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
+                `export TMPDIR=$(python3 ~/.claude/hooks/copy_hygiene.py scratch)`. Refused below the disk floor; its
+                size is shown in the reap report (scratch is never reaped).
+
 Config (~/.agent-harness/state/copy-hygiene.json; every key optional):
   min_free_gb (25), min_free_pct (10; the floor is the smaller of the two), max_age_hours (24), max_total_gb (60),
   reaper_delete_enabled (false), roots ([~/.agent-harness/work]), name_patterns (["tester-*", "test-copy-*",
-  "click-test-*"]).
-Env: HARNESS_COPY_HYGIENE_MIN_FREE_GB overrides min_free_gb; HARNESS_COPY_HYGIENE_HOME relocates the state (tests).
+  "click-test-*"]), protected_paths ([]).
+Env: HARNESS_COPY_HYGIENE_MIN_FREE_GB overrides min_free_gb; HARNESS_COPY_HYGIENE_HOME relocates the state (tests);
+HARNESS_COPY_HYGIENE_UNIT_DIRS (os.pathsep list) replaces the systemd/launchd directories scanned (tests).
 """
 from __future__ import annotations
 
 import argparse
 import fcntl
 import fnmatch
+import glob
 import hashlib
 import json
 import os
+import plistlib
+import pwd
 import re
 import shlex
 import shutil
@@ -57,6 +81,7 @@ DEFAULTS = {
     "reaper_delete_enabled": False,
     "roots": None,                     # None = [<home>/.agent-harness/work]
     "name_patterns": ["tester-*", "test-copy-*", "click-test-*"],
+    "protected_paths": [],
 }
 GIT_TIMEOUT = 60
 REPORT_EVERY_S = 6 * 3600
@@ -112,6 +137,10 @@ def normalize(cfg: dict) -> dict:
         pats = [pats]
     pats = [str(p) for p in pats if str(p).strip("*")] if isinstance(pats, list) else []
     out["name_patterns"] = pats or list(DEFAULTS["name_patterns"])
+    prot = out.get("protected_paths")
+    if isinstance(prot, str):
+        prot = [prot]
+    out["protected_paths"] = [os.path.expanduser(str(x)) for x in prot if str(x).strip()] if isinstance(prot, list) else []
     return out
 
 
@@ -306,6 +335,291 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -
         return {"ok": True, "path": path, "commit": sha, "reused": False, "moved": True}
 
 
+# ---------------------------------------------------------------- protected paths (live services)
+# Unit and job directories scanned. Duplicates through symlinks (merged /usr) are scanned once.
+SYSTEM_UNIT_DIRS = ("/etc/systemd/system", "/etc/systemd/system.control", "/run/systemd/system",
+                    "/run/systemd/system.control", "/run/systemd/transient", "/run/systemd/generator",
+                    "/run/systemd/generator.early", "/run/systemd/generator.late", "/usr/local/lib/systemd/system",
+                    "/lib/systemd/system", "/usr/lib/systemd/system")
+USER_UNIT_DIRS_GLOBAL = ("/etc/systemd/user", "/usr/local/lib/systemd/user", "/usr/lib/systemd/user")
+USER_UNIT_DIRS_HOME = (".config/systemd/user", ".config/systemd/user.control", ".local/share/systemd/user")
+LAUNCHD_DIRS_GLOBAL = ("/Library/LaunchAgents", "/Library/LaunchDaemons")
+UNIT_SUFFIXES = (".service", ".socket", ".mount", ".automount", ".path", ".timer", ".swap", ".conf")
+# Keys whose values never name a path the unit depends on.
+UNIT_SKIP_KEYS = frozenset(("Description", "Documentation", "After", "Before", "Wants", "Requires", "WantedBy",
+                            "RequiredBy", "Alias", "Also", "Conflicts", "PartOf", "BindsTo", "Requisite"))
+_PATH_TOKEN = re.compile(r"(%h|~|/)[^\s;&|'\"`()<>,:]*")
+_SPEC = re.compile(r"%[A-Za-z%]")
+PROTECTED_CACHE_TTL_S = 60
+
+
+def _unit_dirs() -> "list[tuple[str, str]]":
+    """(directory, 'user' | 'system')."""
+    env = os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS")
+    if env is not None:
+        return [(d, "user") for d in env.split(os.pathsep) if d]
+    h = home()
+    out = [(d, "system") for d in SYSTEM_UNIT_DIRS + LAUNCHD_DIRS_GLOBAL]
+    out += [(d, "user") for d in USER_UNIT_DIRS_GLOBAL]
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        out.append((os.path.join(xdg, "systemd", "user"), "user"))
+    out += [(os.path.join(h, d), "user") for d in USER_UNIT_DIRS_HOME]
+    try:
+        run = f"/run/user/{os.getuid()}/systemd"
+        out += [(os.path.join(run, d), "user") for d in ("user", "transient", "generator", "user.control")]
+    except AttributeError:
+        pass
+    out.append((os.path.join(h, "Library", "LaunchAgents"), "user"))
+    return out
+
+
+def _user_home(user: str) -> str:
+    try:
+        return pwd.getpwuid(int(user)).pw_dir if str(user).isdigit() else pwd.getpwnam(user).pw_dir
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
+def _expand_one(tok: str, homes: "list[str]") -> "list[str]":
+    if tok.startswith("~") and not (tok == "~" or tok.startswith("~/")):
+        return []                                      # ~user forms: not resolved
+    outs = []
+    for h in homes or [""]:
+        t = tok
+        if t == "~" or t.startswith("~/"):
+            if not h:
+                continue
+            t = h + t[1:]
+        if "%h" in t:
+            if not h:
+                continue
+            t = t.replace("%h", h)
+        m = _SPEC.search(t)                           # unresolved specifier (%i, %t, ...): protect the prefix
+        if m:
+            t = t[:m.start()]
+            t = t if t.endswith("/") else os.path.dirname(t)
+        if t.startswith("/"):
+            outs.append(os.path.normpath(t))
+    return outs
+
+
+def _paths_in(value: str, homes: "list[str]") -> "list[str]":
+    """Every absolute path named in a value: plain words, Exec prefixes (-/@/+/!), K=/path, --opt=/path, -C/path,
+    file:/path, PATH-like lists, and paths inside shell strings such as `bash -lc 'cd %h/x && ./run'`."""
+    out = []
+    for m in _PATH_TOKEN.finditer(value):
+        i = m.start()
+        prev = value[i - 1] if i else " "
+        if prev.isalnum() or prev in "._$}%~/":
+            if not (i >= 2 and value[i - 2] == "-" and prev.isalpha()):      # allow -C/path, -I/path
+                continue
+        tok = m.group(0).rstrip(".")
+        if tok in ("~", "%h") or len(tok) > 1 or tok == "/":
+            out.extend(_expand_one(tok, homes))
+    try:                                          # quoted words with spaces: WorkingDirectory="/a b", "/x y/run"
+        for w in shlex.split(value):
+            w = w.lstrip("-@+!:|")
+            if " " in w and w.startswith(("/", "~/", "%h")):
+                out.extend(_expand_one(w, homes))
+    except ValueError:
+        pass
+    return out
+
+
+def _unit_text(path: str) -> str:
+    with open(path, errors="replace") as f:
+        return re.sub(r"\\\n", " ", f.read(1 << 20))
+
+
+def _unit_user(text: str) -> str:
+    m = None
+    for m in re.finditer(r"^\s*User\s*=\s*(\S*)", text, re.M):
+        pass
+    return m.group(1) if m else ""
+
+
+def _parse_unit(text: str, homes: "list[str]") -> "list[str]":
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;[" or "=" not in line:
+            continue
+        key, val = (x.strip() for x in line.split("=", 1))
+        if key in UNIT_SKIP_KEYS:
+            continue
+        if key == "WorkingDirectory" and val.lstrip("-").strip('"') == "~":
+            out.extend(h for h in homes if h)
+            continue
+        out.extend(_paths_in(val, homes))
+    return out
+
+
+def _parse_plist(path: str, homes: "list[str]") -> "list[str]":
+    with open(path, "rb") as f:
+        d = plistlib.load(f)
+    if not isinstance(d, dict):
+        return []
+    vals = [str(d.get(k) or "") for k in ("WorkingDirectory", "Program", "StandardOutPath", "StandardErrorPath",
+                                            "StandardInPath", "RootDirectory")]
+    for k in ("ProgramArguments", "WatchPaths", "QueueDirectories"):
+        vals += [str(x) for x in (d.get(k) or []) if isinstance(x, (str, int))]
+    env = d.get("EnvironmentVariables")
+    if isinstance(env, dict):
+        vals += [str(v) for v in env.values()]
+    out = []
+    for v in vals:
+        out.extend(_paths_in(v, homes))
+    return out
+
+
+def _scan_files(dirs) -> "tuple[list, int, list]":
+    """([(file, scope)], errors, signature) with duplicate directories (symlinks) removed."""
+    seen, files, errors, sig = set(), [], 0, []
+    for d, scope in dirs:
+        try:
+            st = os.stat(d)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            errors += 1
+            continue
+        if not os.path.isdir(d):
+            continue
+        rd = os.path.realpath(d)
+        if rd in seen:
+            continue
+        seen.add(rd)
+        sig.append((rd, st.st_mtime_ns))
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            errors += 1
+            continue
+        for n in names:
+            f = os.path.join(d, n)
+            if n.endswith(".d") and os.path.isdir(f):
+                try:
+                    sig.append((f, os.stat(f).st_mtime_ns))
+                    files += [(os.path.join(f, c), scope) for c in sorted(os.listdir(f)) if c.endswith(".conf")]
+                except OSError:
+                    errors += 1
+            elif n.endswith(UNIT_SUFFIXES) or n.endswith(".plist"):
+                files.append((f, scope))
+    return files, errors, sig
+
+
+def _scan_units() -> "tuple[dict, int]":
+    files, errors, _sig = _scan_files(_unit_dirs())
+    users = {}                                      # unit name -> User= (drop-ins inherit the parent's)
+    texts = {}
+    for f, scope in files:
+        if f.endswith(".plist") or scope != "system":
+            continue
+        try:
+            texts[f] = _unit_text(f)
+        except OSError:
+            continue
+        u = _unit_user(texts[f])
+        if u:
+            unit = os.path.basename(os.path.dirname(f))[:-2] if f.endswith(".conf") else os.path.basename(f)
+            users[unit] = u
+    out = {}
+    def add(p, src):
+        for q in {os.path.normpath(p), os.path.realpath(p)}:
+            out.setdefault(_k(q), (q, src))
+    for f, scope in files:
+        try:
+            if scope == "user":
+                homes = [home()]
+            else:
+                unit = os.path.basename(os.path.dirname(f))[:-2] if f.endswith(".conf") else os.path.basename(f)
+                homes = sorted({"/root", _user_home(users.get(unit, ""))} - {""})
+            if f.endswith(".plist"):
+                names = _parse_plist(f, homes if scope == "user" else homes + [home()])
+            else:
+                names = _parse_unit(texts[f] if f in texts else _unit_text(f), homes)
+            if os.path.islink(f):                   # `systemctl link` from a checkout: keep the unit's source
+                names.append(os.path.realpath(f))
+        except Exception:      # noqa: BLE001 -- unreadable unit: counted, so callers can fail closed
+            if os.path.exists(f):
+                errors += 1
+            continue
+        for p in names:
+            add(p, f)
+    return out, errors
+
+
+def _k(p: str) -> str:
+    """Comparison key: APFS/HFS+ are case-insensitive by default."""
+    return p.lower() if sys.platform == "darwin" else p
+
+
+def protected_scan(cfg: "dict | None" = None) -> "tuple[dict, int]":
+    """({key: (path, where it is named)}, unreadable-unit count). Cached for 60 s keyed on the directory mtimes."""
+    cfg = normalize(cfg) if cfg is not None else load_config()
+    _f, _e, sig = _scan_files(_unit_dirs())
+    cache = os.path.join(state_dir(), "copy-hygiene-protected.json")
+    key = hashlib.sha256(json.dumps([sig, os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS"), home()]).encode()).hexdigest()
+    prot, errors = None, 0
+    try:
+        with open(cache) as f:
+            c = json.load(f)
+        if c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
+            prot = {k: tuple(v) for k, v in c["prot"].items()}
+            errors = int(c.get("errors", 0))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        prot = None
+    if prot is None:
+        prot, errors = _scan_units()
+        try:
+            _atomic_write(cache, json.dumps({"key": key, "ts": time.time(), "prot": prot, "errors": errors}))
+        except OSError:
+            pass
+    prot = dict(prot)
+    for p in cfg.get("protected_paths") or []:
+        p = os.path.normpath(os.path.expanduser(p))
+        for q in {p, os.path.realpath(p)}:
+            prot.setdefault(_k(q), (q, "config protected_paths"))
+    return prot, errors
+
+
+def protected_paths(cfg: "dict | None" = None) -> "dict[str, str]":
+    """{path: where it is named} for every path a systemd unit or launchd job (or the config) names."""
+    prot, _errors = protected_scan(cfg)
+    return {v[0]: v[1] for v in prot.values()}
+
+
+def protecting(path: str, prot: dict) -> "tuple[str, str] | None":
+    """(protected path, source) when deleting `path` would delete a protected path: it is one or contains one.
+    `prot` is protected_paths() output or protected_scan()[0]. The target's parent is resolved (symlinked parents
+    are followed) but a symlink target itself is not: removing a link does not remove what it points to."""
+    p = os.path.normpath(path)
+    cands = {p, os.path.join(os.path.realpath(os.path.dirname(p)), os.path.basename(p)) if p != "/" else "/"}
+    items = [(_k(k), v if isinstance(v, tuple) else (k, v)) for k, v in prot.items()]
+    for c in cands:
+        ck = _k(c)
+        pre = ck.rstrip("/") + "/"
+        for kk, (orig, src) in items:
+            if kk == ck or kk.startswith(pre):
+                return orig, src
+    return None
+
+
+def protecting_tail(rel: str, prot: dict) -> "tuple[str, str] | None":
+    """For a relative target whose base directory is unknown (`cd $X && rm -rf runner`): match by path tail."""
+    rel = os.path.normpath(rel).lstrip("./") if rel not in (".", "..") else ""
+    if not rel or rel.startswith(".."):
+        return None
+    tail = "/" + _k(rel)
+    for k, v in prot.items():
+        orig, src = v if isinstance(v, tuple) else (k, v)
+        kk = _k(orig)
+        if kk.endswith(tail) or (tail + "/") in kk:
+            return orig, src
+    return None
+
+
 # ---------------------------------------------------------------- command analysis
 def simple_commands(cmd: str) -> list:
     """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises)."""
@@ -396,6 +710,231 @@ def _dest(words: list) -> "list[str]":
     return out
 
 
+DELETE_VERBS = frozenset(("rm", "rmdir", "unlink", "shred", "trash", "trash-put", "srm"))
+FIND_SELECTORS = frozenset(("-name", "-iname", "-path", "-ipath", "-wholename", "-regex", "-iregex", "-newer",
+                            "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size", "-empty", "-user",
+                            "-perm", "-links", "-samefile", "-inum", "-lname"))
+FIND_EXEC_DELETERS = frozenset(("rm", "rmdir", "shred", "unlink", "trash", "trash-put", "srm", "mv"))
+SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh"))
+_VAR = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+
+
+def _expand_braces(s: str) -> "list[str]":
+    m = re.search(r"\{([^{}]*,[^{}]*)\}", s)
+    if not m:
+        return [s]
+    out = []
+    for alt in m.group(1).split(","):
+        out.extend(_expand_braces(s[:m.start()] + alt + s[m.end():]))
+    return out[:256]
+
+
+def _expand_vars(s: str, cwd: "str | None") -> str:
+    env = {"HOME": os.path.expanduser("~"), "PWD": cwd or "", "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+           "USER": os.environ.get("USER", "")}
+    return _VAR.sub(lambda m: env.get(m.group(1) or m.group(2)) or m.group(0), s)
+
+
+def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
+    """[(argv, separator before it)] for each simple command, keeping `|` so `find ... | xargs rm` is seen.
+    `bash -c '<line>'` and `sh -c` bodies are analysed as lines of their own."""
+    out = []
+    sep = ";"
+    for seg, nsep in _split_line(cmd):
+        cur_sep, sep = sep, nsep
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            words = shlex.split(seg, comments=True)
+        except ValueError:
+            words = [w.strip("'\"") for w in seg.split()]
+        words = _unwrap(words)
+        if not words:
+            continue
+        if os.path.basename(words[0]) in SHELLS:
+            j = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", w)), 0)
+            if j and j + 1 < len(words):
+                out.extend(_cmd_lines(words[j + 1]))
+                continue
+        out.append((words, cur_sep))
+    return out
+
+
+def _split_line(cmd: str) -> "list[tuple[str, str]]":
+    """[(segment, separator after it)], splitting on ; & && || | newline ( ) $( ` outside quotes only."""
+    out, buf, q, i = [], [], "", 0
+    while i < len(cmd):
+        c = cmd[i]
+        if q:
+            buf.append(c)
+            if c == "\\" and q == '"' and i + 1 < len(cmd):
+                buf.append(cmd[i + 1]); i += 2; continue
+            if c == q:
+                q = ""
+            i += 1; continue
+        if c in "'\"":
+            q = c; buf.append(c); i += 1; continue
+        if c == "\\" and i + 1 < len(cmd):
+            buf.append(cmd[i:i + 2]); i += 2; continue
+        two = cmd[i:i + 2]
+        if two in ("&&", "||", "$("):
+            out.append(("".join(buf), two)); buf = []; i += 2; continue
+        if c in ";|&\n()`":
+            out.append(("".join(buf), c)); buf = []; i += 1; continue
+        buf.append(c); i += 1
+    out.append(("".join(buf), ";"))
+    return out
+
+
+def _unwrap(words: list) -> list:
+    """Drop VAR=val, sudo/env/nohup/nice/timeout/... and their options (sudo -u x, timeout 5, nice -n 5)."""
+    takes_value = {"sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"}, "env": {"-u", "-C", "-S"},
+                   "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "timeout": {"-s", "-k", "--signal", "--kill-after"}}
+    while words and (ASSIGN.match(words[0]) or os.path.basename(words[0]) in PREFIXES):
+        name = os.path.basename(words[0])
+        words = words[1:]
+        while words and words[0].startswith("-") and words[0] != "-":
+            w = words.pop(0)
+            if w in takes_value.get(name, ()) and words:
+                words.pop(0)
+        if name == "timeout" and words and re.match(r"^\d+(\.\d+)?[smhd]?$", words[0]):
+            words = words[1:]
+    return words
+
+
+def _resolve(raw: str, cwd: "str | None") -> "list[tuple[str, bool]]":
+    """[(path, known)]: absolute paths, or (relative path, False) when the base directory is unknown."""
+    out = []
+    for r in _expand_braces(_expand_vars(raw, cwd)):
+        r = os.path.expanduser(r)
+        if "$" in r:                                # unresolved variable: keep the literal suffix as a tail
+            tail = re.split(r"\$(?:\{\w+\}|\w+)/?", r)[-1]
+            if tail:
+                out.append((tail, False))
+            continue
+        if not r.startswith("/"):
+            if not cwd:
+                out.append((r, False))
+                continue
+            r = os.path.join(cwd, r)
+        base = os.path.basename(r.rstrip("/"))
+        if base in ("*", ".*", ".[!.]*", "..?*"):   # emptying a directory counts as deleting it
+            out.append((os.path.normpath(os.path.dirname(r.rstrip("/"))), True))
+        hits = glob.glob(r) if any(ch in r for ch in "*?[") else [r]
+        out.extend((os.path.normpath(h), True) for h in hits)
+    return out
+
+
+def _find_roots(words: list) -> list:
+    i, roots = 1, []
+    while i < len(words) and words[i] in ("-H", "-L", "-P", "-D", "-O") or (i < len(words) and re.match(r"^-O\d$", words[i])):
+        i += 2 if words[i] in ("-D", "-O") else 1
+    while i < len(words) and not words[i].startswith("-") and words[i] not in ("(", "!", ")"):
+        roots.append(words[i]); i += 1
+    return roots or ["."]
+
+
+def _find_deletes(words: list) -> bool:
+    if "-delete" in words:
+        return True
+    for i, w in enumerate(words):
+        if w in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(words):
+            rest = _unwrap(words[i + 1:])
+            if rest and os.path.basename(rest[0]) in FIND_EXEC_DELETERS:
+                return True
+    return False
+
+
+def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
+    """[(path, known, mode)] a command line would delete or move away, tracking `cd` and `find | xargs rm`.
+    mode "below": a find with name/path/time filters deletes only some entries under the path, so it is refused
+    only when a protected path lies strictly inside it (it may match there); otherwise the path itself goes."""
+    cur = cwd if str(cwd).startswith("/") else None
+    out, prev_find_roots = [], None
+    for words, sep in _cmd_lines(cmd):
+        name = os.path.basename(words[0])
+        flags, pos = _opts(words)
+        raw = []
+        if name == "cd":
+            t = pos[0] if pos else "~"
+            res = _resolve(t, cur)
+            cur = res[0][0] if len(res) == 1 and res[0][1] and os.path.isabs(res[0][0]) else None
+            prev_find_roots = None
+            continue
+        if name == "pushd" and pos:
+            res = _resolve(pos[0], cur)
+            cur = res[0][0] if len(res) == 1 and res[0][1] else None
+            continue
+        base = cur
+        if name in DELETE_VERBS:
+            raw = pos
+        elif name == "gio" and pos[:1] in (["remove"], ["trash"]):
+            raw = pos[1:]
+        elif name == "mv":
+            tdir = any(w in ("-t", "--target-directory") or w.startswith("--target-directory=") for w in words)
+            raw = pos if tdir else pos[:-1]
+            if tdir:                                  # the -t value is the destination, not a source
+                for i, w in enumerate(words):
+                    if w in ("-t", "--target-directory") and i + 1 < len(words) and words[i + 1] in raw:
+                        raw.remove(words[i + 1])
+        elif name == "find":
+            roots = _find_roots(words)
+            selective = any(w in FIND_SELECTORS for w in words)
+            if _find_deletes(words):
+                out.extend((p, k, "below" if selective else "") for r in roots for p, k in _resolve(r, base))
+            prev_find_roots = (roots, selective, base)
+            continue
+        elif name == "xargs" and sep == "|" and prev_find_roots is not None:
+            rest = _unwrap([w for w in words[1:] if not w.startswith("-")])
+            if rest and os.path.basename(rest[0]) in FIND_EXEC_DELETERS:
+                roots, selective, fbase = prev_find_roots
+                out.extend((p, k, "below" if selective else "") for r in roots for p, k in _resolve(r, fbase))
+                prev_find_roots = None
+                continue
+        elif name == "git":
+            i, args, gdir = 1, [], cur
+            while i < len(words):
+                if words[i] == "-C" and i + 1 < len(words):
+                    r = _resolve(words[i + 1], gdir)
+                    gdir = r[0][0] if len(r) == 1 and r[0][1] else None
+                    i += 2; continue
+                if words[i] in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
+                    i += 2; continue
+                if not words[i].startswith("-"):
+                    args.append(words[i])
+                i += 1
+            if len(args) >= 3 and args[0] == "worktree" and args[1] == "remove":
+                raw, base = [args[-1]], gdir
+        prev_find_roots = None
+        out.extend((p, k, "") for r in raw for p, k in _resolve(r, base))
+    return out
+
+
+def delete_targets(words: list, cwd: str) -> "list[str]":
+    """Known absolute targets of one argv (kept for callers; the hook uses delete_targets_line)."""
+    return [p for p, known, _m in delete_targets_line(shlex.join(words), cwd) if known]
+
+
+def protected_delete(cmd: str, cwd: str, cfg: "dict | None" = None) -> "tuple[str, str, str] | None":
+    """(target, protected path, source) for the first deletion that would remove a protected path."""
+    targets = delete_targets_line(cmd, cwd)
+    if not targets:
+        return None
+    prot, errors = protected_scan(cfg)
+    if errors:
+        alert("protected-units-unreadable", {"errors": errors})
+    for t, known, mode in targets:
+        if mode == "below" and known:
+            pre = _k(os.path.normpath(t)).rstrip("/") + "/"
+            hit = next(((o, src) for kk, (o, src) in ((_k(v[0]), v) for v in prot.values()) if kk.startswith(pre)),
+                       None)
+        else:
+            hit = protecting(t, prot) if known else protecting_tail(t, prot)
+        if hit:
+            return t, hit[0], hit[1]
+    return None
+
 def writes_into_shm(cmd: str, cwd: str = "") -> bool:
     if SHM_ENV.search(cmd) or SHM_REDIRECT.search(cmd):
         return True
@@ -419,12 +958,29 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
         if len(cmd) > 256 * 1024:
             return 0, ""
         cwd = str(event.get("cwd") or "")
+        if re.search(r"\b(rm|rmdir|unlink|shred|trash|trash-put|gio|srm|find|worktree|mv|xargs)\b", cmd):
+            if os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS") is not None:
+                alert("test-override-active", {"var": "HARNESS_COPY_HYGIENE_UNIT_DIRS"})
+            try:
+                hit = protected_delete(cmd, cwd, cfg)
+            except Exception as e:  # noqa: BLE001 -- documented choice: fail OPEN (a broken check must not block
+                hit = None          # every rm in every session) but leave an alert for the owner
+                alert("protected-check-error", {"error": f"{type(e).__name__}: {str(e)[:160]}"})
+            if hit:
+                alert("protected-delete-denied", {"target": hit[0][:200], "protected": hit[1][:200],
+                                                  "source": hit[2][:200]})
+                return 2, (f"PROTECTED PATH: deleting or moving {hit[0]} would remove {hit[1]}, which a service "
+                           f"depends on (named in {hit[2]}). On 2026-11-21 cleanups deleted claude-rc's working folder "
+                           "and the pp gate's runner and caches this way. Leave it. Deleting single files or build "
+                           "output inside it is fine; emptying it is not. If the service is truly retired, the owner "
+                           "removes its unit file first. `python3 ~/.claude/hooks/copy_hygiene.py protected --check "
+                           "<path>` explains any path.\n")
         if SHM in cmd or cwd.startswith(SHM):
             if writes_into_shm(cmd, cwd):
                 alert("shm-write-denied", {"cwd": cwd[:200]})
                 return 2, ("SCRATCH IN RAM REFUSED: /dev/shm is memory, not disk (2026-11-21: sessions filled 50 of "
-                           "t2-dev's 56 GB). Write scratch under your session's work directory in ~/.agent-harness/work/ "
-                           "instead. Reading, copying out of and removing files in /dev/shm stay allowed.\n")
+                           "t2-dev's 56 GB). Use disk-backed scratch instead: `export TMPDIR=$(python3 "
+                           "~/.claude/hooks/copy_hygiene.py scratch)` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
         copying = [w for w in simple_commands(cmd) if is_copy_command(w)]
         if not copying:
             return 0, ""
@@ -553,8 +1109,15 @@ def deletable(path: str) -> "tuple[bool, str]":
     return True, "clean and pushed"
 
 
-def remove_copy(path: str) -> "tuple[bool, str]":
+def remove_copy(path: str, prot: "dict | None" = None) -> "tuple[bool, str]":
     try:
+        if prot is None:
+            prot, errors = protected_scan()
+            if errors:
+                return False, "could not read service units"
+        hit = protecting(path, prot)
+        if hit:
+            return False, f"protected: a service uses {hit[0]}"
         dotgit = os.path.join(path, ".git")
         if os.path.isfile(dotgit):   # linked worktree
             rc, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -592,7 +1155,17 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
         r["reap"] = bool(reasons)
         r["why"] = "; ".join(reasons)
     deleting = bool(apply and cfg["reaper_delete_enabled"])
+    try:
+        prot, errors = protected_scan(cfg)
+    except Exception:          # noqa: BLE001 -- cannot tell what services use: delete nothing
+        prot, errors = None, 1
     for r in rows:
+        hit = protecting(r["path"], prot) if prot else None
+        if r["reap"] and (hit or errors):
+            r["reap"] = False
+            r["action"] = (f"kept: protected, a service uses {hit[0]} ({hit[1]})" if hit
+                           else "kept: could not read service units")
+            continue
         if not r["reap"]:
             r["action"] = "keep"
         elif not deleting:
@@ -602,11 +1175,14 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
             if not ok:
                 r["action"] = f"kept: {why}"
             else:
-                done, msg = remove_copy(r["path"])
+                done, msg = remove_copy(r["path"], prot)
                 r["action"] = "removed" if done else f"remove failed: {msg}"
     res = {"mode": "delete" if deleting else "report-only", "delete_enabled": cfg["reaper_delete_enabled"],
            "total_gb": round(total / GB, 2), "cap_gb": cfg["max_total_gb"], "max_age_hours": cfg["max_age_hours"],
            "size_unknown": sum(not r["size_known"] for r in rows), "copies": rows, "ts": int(now)}
+    if os.path.isdir(scratch_root()):           # scratch is reported, never reaped: it may hold a session's work
+        sz = dir_size(scratch_root())
+        res["scratch_gb"] = round((sz or 0) / GB, 2)
     if apply and not cfg["reaper_delete_enabled"]:
         res["note"] = ("--apply ignored: deletion needs \"reaper_delete_enabled\": true in " + config_path() +
                        " (the owner's OK first)")
@@ -649,6 +1225,25 @@ def session_start() -> str:
     return msg
 
 
+def scratch_root() -> str:
+    return os.path.join(home(), ".agent-harness", "scratch")
+
+
+def scratch(key: str = "") -> "str | None":
+    """A private disk-backed scratch directory (the replacement for /dev/shm), one per session. Returns None (and
+    alerts) when the disk is below the copy floor, so scratch can't fill the disk the way it filled /dev/shm."""
+    key = key or os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID") or \
+        f"{time.strftime('%Y%m%d')}-{os.getppid()}"
+    d = os.path.join(scratch_root(), safe_key(key))
+    cfg = load_config()
+    low, gb, fl = disk_low(home(), cfg)
+    if low:
+        alert("disk-low-refused-scratch", {"free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
+        return None
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="copy_hygiene.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -659,7 +1254,35 @@ def main(argv=None) -> int:
     sub.add_parser("pretool")
     sub.add_parser("session-start")
     sub.add_parser("check-disk")
+    sc = sub.add_parser("scratch"); sc.add_argument("--key", default="")
+    pr = sub.add_parser("protected", help="list protected paths, or --check <path> (exit 1 when protected)")
+    pr.add_argument("--check", default="")
     args = ap.parse_args(argv)
+    if args.cmd == "scratch":
+        d = scratch(args.key)
+        if not d:
+            sys.stderr.write(low_disk_message(home(), *disk_low(home(), load_config())[1:]) + "\n")
+            return 3
+        print(d)
+        return 0
+    if args.cmd == "protected":
+        prot, errors = protected_scan()
+        if args.check:
+            path = os.path.abspath(os.path.expanduser(args.check))
+            hit = protecting(path, prot)
+            if hit:
+                print(f"PROTECTED: deleting {path} would remove {hit[0]} (named in {hit[1]})")
+                return 1
+            if errors:
+                print(f"UNKNOWN: {errors} service unit file(s) could not be read; treat {path} as protected")
+                return 1
+            print(f"not protected: {path}")
+            return 0
+        for _k2, (path, src) in sorted(prot.items()):
+            print(f"{path}\t{src}")
+        if errors:
+            print(f"# {errors} unit file(s) could not be read", file=sys.stderr)
+        return 0
     if args.cmd == "pretool":
         try:
             raw = sys.stdin.read(1 << 20) if not sys.stdin.isatty() else ""
