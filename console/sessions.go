@@ -9,8 +9,9 @@ import (
 )
 
 type sendBinding struct {
-	taskID string
-	epoch  uint64
+	taskID        string
+	epoch         uint64
+	workspaceWake *workspaceWake
 }
 
 func (a *app) send(sessionID, requestID, text string, attachments []string, automatic bool, bindings ...sendBinding) error {
@@ -39,6 +40,15 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if automatic && (len(bindings) != 1 || current.task == nil || current.task.ID != bindings[0].taskID || current.controlEpoch != bindings[0].epoch) {
 		a.mu.Unlock()
 		return refused("automatic continuation belongs to an older task or control epoch")
+	}
+	var wake *workspaceWake
+	if automatic {
+		wake = bindings[0].workspaceWake
+	}
+	if wake != nil && (!a.workspaceWakeSendLocked(current, wake, requestID) ||
+		!workspaceOriginCompleted(current, wake) || current.Status != "idle") {
+		a.mu.Unlock()
+		return refused("workspace wake lost its exact finalized request or task")
 	}
 	if !automatic && queueEntry(current, requestID) != nil {
 		a.mu.Unlock()
@@ -70,6 +80,7 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	epoch := current.controlEpoch
 	runtimeCWD := current.CWD
 	admittedTask := current.task
+	capacityProbe := a.workspaceProbe
 	var selection *cascadeSelection
 	if current.Cascade != nil {
 		copy := *current.Cascade
@@ -102,6 +113,17 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 			}
 		}
 	}
+	var workspaceStillReady bool
+	if wake != nil && policyErr == nil && runtimeErr == nil {
+		// Refresh the read-only measurement before send admission. Keep all
+		// filesystem I/O out of the app lock and provider write authority lock.
+		if capacityProbe == nil {
+			capacityProbe = probeWorkspaceCapacity
+		}
+		sample, err := capacityProbe(wake.cwd)
+		workspaceStillReady = err == nil && workspaceSampleMatches(wake, sample) &&
+			sample.available >= wake.receipt.MinimumAvailableBytes
+	}
 	a.mu.Lock()
 	if current.controlEpoch != epoch || automatic && (current.Supervision.State != "active" || current.task != admittedTask) {
 		a.mu.Unlock()
@@ -118,6 +140,12 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if policyErr != nil {
 		a.mu.Unlock()
 		return policyErr
+	}
+	if wake != nil && (!a.workspaceWakeSendLocked(current, wake, requestID) ||
+		!workspaceOriginCompleted(current, wake) || current.Status != "idle" ||
+		policyHash(policy) != wake.policyHash || fingerprint != wake.runtimeHash || !workspaceStillReady) {
+		a.mu.Unlock()
+		return refused("workspace wake task, policy or runtime changed during send admission")
 	}
 	if (policy.Provider != "" && policy.Provider != current.Provider) || (policy.ProfileID != "" && policy.ProfileID != current.ProfileID) {
 		a.mu.Unlock()
@@ -274,7 +302,11 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if metadataTask != nil {
 		params["additionalContext"] = map[string]any{"consoleTask": map[string]any{"kind": "application", "value": checkpointMetadata(metadataTask)}}
 	}
-	err := a.startCodexTurn(ctx, current, client, requestID, params, a.turnAdmission(current, epoch, requestID))
+	var extraAdmission func(*session) bool
+	if wake != nil {
+		extraAdmission = func(s *session) bool { return a.workspaceWakeSendLocked(s, wake, requestID) }
+	}
+	err := a.startCodexTurn(ctx, current, client, requestID, params, a.turnAdmissionGuarded(current, epoch, requestID, extraAdmission))
 	if err != nil {
 		a.unknownSend(current, requestID, err)
 	}
@@ -434,6 +466,9 @@ func (a *app) control(sessionID, action, agentID string) error {
 	}
 	current.controlEpoch++
 	current.resumeRequested = false
+	cancelIdleWorkspaceWake := current.workspaceWake != nil && current.Status == "idle" &&
+		current.providerFinal && current.requests[current.lastRequest] == "final"
+	wakeErr := a.revokeWorkspaceWakeLocked(current, "User canceled the workspace capacity wait", "active")
 	a.holdInputsLocked(current, "User paused; explicit Resume required")
 	// Pause is a UI state, not an outcome, so it cannot replace unknown.
 	if current.Status != "unknown" && current.requests[current.lastRequest] != "unknown" {
@@ -455,6 +490,11 @@ func (a *app) control(sessionID, action, agentID string) error {
 	a.mu.Unlock()
 	release()
 	go a.cancelParentReviews(current)
+	if cancelIdleWorkspaceWake {
+		// This control revoked local waiting authority. The prior native turn
+		// already has a final receipt; never guess an interrupt target for it.
+		return wakeErr
+	}
 	if provider == "claude" {
 		if run == nil {
 			return errors.New("no Claude turn is running")
@@ -503,7 +543,7 @@ func (a *app) control(sessionID, action, agentID string) error {
 	return nil
 }
 func (a *app) changeCWD(id, path string) error {
-	cwd, err := validCWD(path)
+	cwd, info, err := canonicalCWD(path)
 	if err != nil {
 		return err
 	}
@@ -526,7 +566,11 @@ func (a *app) changeCWD(id, path string) error {
 		return errors.New("queued or retained inputs bind this cwd; cancel or discard them first")
 	}
 	current.controlEpoch++
+	if err = a.revokeWorkspaceWakeLocked(current, "Working directory changed during the workspace capacity wait", "blocked"); err != nil {
+		return err
+	}
 	current.CWD = cwd
+	current.cwdInfo = info
 	if err = a.record(current, "", "cwd"); err != nil {
 		return err
 	}

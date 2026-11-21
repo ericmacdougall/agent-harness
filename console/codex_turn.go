@@ -14,6 +14,7 @@ type codexTurnBinding struct {
 	requestID     string
 	client        *rpcClient
 	turnID        string
+	finalStatus   string // Written only after the exact correlated final receipt is durable.
 	pending       []codexCompletion
 	frames        []codexPendingFrame
 	frameBytes    int
@@ -207,6 +208,9 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 		current.Supervision.State = "paused"
 		current.Supervision.Reason = "User or provider interrupted this turn"
 	}
+	if status != "completed" && current.task != nil && current.task.State == waitingForCapacity && current.workspaceWake != nil {
+		retireWorkspaceWakeLocked(current, "blocked")
+	}
 	// Persist before publishing: a final that was never saved is unknown, and unknown
 	// cannot later become final.
 	if err := a.record(current, requestID, "final"); err != nil {
@@ -220,6 +224,7 @@ func (a *app) codexCompletionLocked(current *session, client *rpcClient, complet
 		a.inputOutcomeLocked(current, requestID, "unknown", "Provider completed but final receipt durability is unknown; no replay")
 		return
 	}
+	binding.finalStatus = status
 	a.transitionRequestLocked(current, requestID, "final")
 	a.inputOutcomeLocked(current, requestID, "retained", "Main turn final; files retained for possible owner/tool readers until explicit discard")
 	if current.queueUncertain {

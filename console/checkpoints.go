@@ -25,6 +25,8 @@ type trackedTask struct {
 	lastBlocked   string
 	capability    string
 	reviewPolicy  resolvedPolicy
+
+	workspaceWakeReceipt *workspaceWakeReceipt
 }
 type checkpointInput struct {
 	InputRevision uint64   `json:"inputRevision"`
@@ -38,10 +40,21 @@ type checkpointInput struct {
 	Head          string   `json:"head"`
 	Evidence      []string `json:"evidence"`
 	Scope         string   `json:"scope"`
+
+	MinimumAvailableBytes uint64 `json:"minimumAvailableBytes,omitempty"`
 }
 
-func checkpointTool() map[string]any {
-	return map[string]any{"type": "function", "name": "harness_console_checkpoint", "description": "Track substantive work, request independent review and verified completion. Use the taskId/generation/inputRevision/objectiveHash from application context. Casual questions need no checkpoint. Review requires bounded real evidence. End your turn after needs_review; the console dispatches an independent reviewer.", "inputSchema": map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{"subjectRoot": map[string]any{"type": "string", "description": "Current cwd or a registered feature worktree of the same Git repository; leave empty for current cwd"}, "taskId": map[string]any{"type": "string"}, "generation": map[string]any{"type": "integer"}, "inputRevision": map[string]any{"type": "integer"}, "objectiveHash": map[string]any{"type": "string"}, "state": map[string]any{"type": "string", "enum": []string{"active", "needs_review", "complete", "blocked", "handoff"}}, "stage": map[string]any{"type": "string", "enum": []string{"plan_review", "code_review", "final_review"}}, "kind": map[string]any{"type": "string", "enum": []string{"code", "artifact"}}, "head": map[string]any{"type": "string"}, "evidence": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "scope": map[string]any{"type": "string"}}, "required": []string{"taskId", "generation", "inputRevision", "objectiveHash", "state", "stage", "kind", "head", "evidence", "scope"}}}
+func checkpointTool(capacityWake bool) map[string]any {
+	states := []string{"active", "needs_review", "complete", "blocked", "handoff"}
+	description := "Track substantive work, request independent review and verified completion. Use the taskId/generation/inputRevision/objectiveHash from application context. Casual questions need no checkpoint. Review requires bounded real evidence. End your turn after needs_review; the console dispatches an independent reviewer."
+	properties := map[string]any{"subjectRoot": map[string]any{"type": "string", "description": "Current cwd or a registered feature worktree of the same Git repository; leave empty for current cwd"}, "taskId": map[string]any{"type": "string"}, "generation": map[string]any{"type": "integer"}, "inputRevision": map[string]any{"type": "integer"}, "objectiveHash": map[string]any{"type": "string"}, "stage": map[string]any{"type": "string", "enum": []string{"plan_review", "code_review", "final_review"}}, "kind": map[string]any{"type": "string", "enum": []string{"code", "artifact"}}, "head": map[string]any{"type": "string"}, "evidence": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}, "scope": map[string]any{"type": "string"}}
+	if capacityWake {
+		states = append(states, waitWorkspaceCapacity)
+		properties["minimumAvailableBytes"] = map[string]any{"type": "integer", "minimum": 1, "maximum": maxWorkspaceMinimumBytes, "description": "Positive local workspace free-byte threshold; use only for wait_workspace_capacity and end the native turn"}
+		description += " For an active task blocked solely on local workspace capacity, use wait_workspace_capacity with minimumAvailableBytes, then end the turn. Recheck the actual gate on continuation."
+	}
+	properties["state"] = map[string]any{"type": "string", "enum": states}
+	return map[string]any{"type": "function", "name": "harness_console_checkpoint", "description": description, "inputSchema": map[string]any{"type": "object", "additionalProperties": false, "properties": properties, "required": []string{"taskId", "generation", "inputRevision", "objectiveHash", "state", "stage", "kind", "head", "evidence", "scope"}}}
 }
 func (a *app) checkpointUpdate(id string, input checkpointInput) error {
 	return a.checkpointUpdateGuarded(id, input, nil)
@@ -75,6 +88,25 @@ func (a *app) checkpointUpdateGuarded(id string, input checkpointInput, guard fu
 	if len(input.Scope) > 2000 {
 		a.mu.Unlock()
 		return errors.New("scope exceeds checkpoint bound")
+	}
+	if input.State == waitWorkspaceCapacity {
+		err := a.armWorkspaceWakeLocked(current, input.MinimumAvailableBytes, guard != nil)
+		a.mu.Unlock()
+		return err
+	}
+	if input.MinimumAvailableBytes != 0 {
+		a.mu.Unlock()
+		return errors.New("minimumAvailableBytes is only valid for a workspace capacity wait")
+	}
+	if task.State == waitingForCapacity {
+		if !oneOf(input.State, "active", "blocked", "handoff") {
+			a.mu.Unlock()
+			return errors.New("resolve the workspace capacity wait before review or completion")
+		}
+		task.scope = input.Scope
+		err := a.revokeWorkspaceWakeLocked(current, "Workspace capacity wait canceled by the admitted turn", input.State)
+		a.mu.Unlock()
+		return err
 	}
 	cwd := current.CWD
 	provider, profile := current.Provider, current.ProfileID
