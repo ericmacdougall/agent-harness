@@ -737,6 +737,12 @@ t1_seed_cutoff() { # the mtime before which files are seeded: the old last-ok st
   [ "$e" -gt "$SEED_MARGIN" ] || return 0
   epoch_utc $(( e - SEED_MARGIN ))
 }
+t1_cap() { # t1_cap LIMIT: LIMIT seconds, or the run's time left when that is less (never under 5): every step is inside the deadline
+  local l
+  l=$(time_left); [ "$l" -lt "$1" ] || l=$1
+  [ "$l" -ge 5 ] || l=5
+  echo "$l"
+}
 t1_count_s() { LC_ALL=C awk -F "$US" '$1 == "S" && NF == 4 {n++} END {print n + 0}' "$1/ledger" 2>/dev/null; }
 t1_set() { # t1_set STATE-DIR NAME VALUE: a small state file, written whole
   printf '%s\n' "$3" > "$1/$2.tmp.$$" && mv "$1/$2.tmp.$$" "$1/$2"
@@ -766,7 +772,7 @@ t1_pass() { # t1_pass SRC-REL: send what the ledger lacks for one tier-1 directo
     rm -rf "$st/recon" "$st/recon.last"
   fi
   # 1. List the stage (local, TZ=UTC, same credential excludes). Fields: path US size US mtime.
-  bounded 300 "$st/listing.raw" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator "$US" \
+  bounded "$(t1_cap 300)" "$st/listing.raw" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator "$US" \
     --exclude-from "$EXCLUDES" --ignore-case -- "$root"
   if [ "$bounded_rc" -ne 0 ]; then say "listing the stage for $rel failed (rclone exit $bounded_rc)"; ok=1; hard_fail=1; return 1; fi
   # rclone escapes control characters in the names it lists (a newline prints as U+240A and maps back when the file is
@@ -860,7 +866,7 @@ t1_pass() { # t1_pass SRC-REL: send what the ledger lacks for one tier-1 directo
 t1_record() { # t1_record ST ROOT CHUNK-KEYS CHUNK-PATHS: after a copy that exited 0, mark V the files still as listed in the stage
   # rclone exits 0 for a listed path that vanished (measured), so what the stage holds now is read again first (red-team C4).
   local st=$1 root=$2 keys=$3 paths=$4
-  bounded 120 "$st/now" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator "$US" --files-from-raw "$paths" -- "$root"
+  bounded "$(t1_cap 120)" "$st/now" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator "$US" --files-from-raw "$paths" -- "$root"
   [ "$bounded_rc" -eq 0 ] || { say "could not re-check a chunk against the stage; it is sent again next run"; return 0; }
   { head -n 1 "$st/ledger"; tail -n +2 "$st/ledger"
     LC_ALL=C awk -F "$US" -v OFS="$US" 'FNR == NR {now[$1 OFS $2 OFS $3] = 1; next} ($1 OFS $2 OFS $3) in now {print "V", $1, $2, $3}' "$st/now" "$keys"
@@ -893,7 +899,7 @@ t1_recon() { # t1_recon SRC-REL: prove what the ledger claims by reading the rem
     [ "$throttled" = 0 ] || return 0
     [ "$RECON_MAX_CHUNKS" -eq 0 ] || [ "$chunks" -lt "$RECON_MAX_CHUNKS" ] || return 0
     left=$(( RECON_END - $(date +%s) )); prev=$(time_left); [ "$prev" -ge "$left" ] || left=$prev
-    [ "$left" -ge 15 ] || { say "$rel: reconcile paused at $cur of $total folders (this run's slice is used)"; return 0; }
+    [ "$left" -ge $(( RECON_SECONDS / 2 < 15 ? RECON_SECONDS / 2 : 15 )) ] || { say "$rel: reconcile paused at $cur of $total folders (this run's slice is used)"; return 0; }
     chunk_n=$(cat "$rdir/chunk" 2>/dev/null); printf '%s' "$chunk_n" | grep -Eq '^[1-9][0-9]{0,4}$' || chunk_n=$RECON_CHUNK
     n=$chunk_n fit=$(( left * TPSLIMIT - 6 ))
     [ "$fit" -ge "$n" ] || n=$fit
@@ -1052,6 +1058,21 @@ if [ "$TIER" != bulk ]; then
   fi
 fi
 if [ "$TIER" != bulk ]; then
+# Fairness (plan review round 4): while any ledger holds an unproven S line, or a reconcile is mid-way, the uploads end
+# RECON_SECONDS (at most half the budget) before the run deadline, so a stream of changed files cannot starve the proof
+# that last-ok needs. With nothing unproven the uploads get the whole budget.
+WALL_END_FULL=$WALL_END
+if [ "$RECON_SECONDS" -gt 0 ]; then
+  for src in "${LIVE[@]}"; do
+    st="$T1_STATE/$(bulk_key "$src")"
+    # unproven lines now, a reconcile mid-way, or a first run that is about to seed its ledger from the old last-ok
+    if [ -d "$st/recon" ] || [ "$(t1_count_s "$st")" -gt 0 ] || { [ -d "$HOME/$src" ] && [ ! -f "$st/ledger" ] && [ -n "$(t1_seed_cutoff)" ]; }; then
+      hold=$(( RECON_SECONDS + DEADLINE_GRACE + KILL_GRACE )); [ "$hold" -le $(( BUDGET_SECONDS / 2 )) ] || hold=$(( BUDGET_SECONDS / 2 ))
+      WALL_END=$(( WALL_END - hold ))
+      break
+    fi
+  done
+fi
 later=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
 for src in "${LIVE[@]}"; do
@@ -1083,6 +1104,7 @@ for src in "${LIVE[@]}"; do
   if [ -d "$HOME/$src" ]; then t1_pass "$src"; else upload "$snap" "$src"; fi   # a folder tree goes through its ledger (goodqa#15532)
 done
 # The reconcile reads the remote (read-only) with what is left of its slice, after every upload, so fresh data is never starved.
+WALL_END=$WALL_END_FULL
 RECON_END=$(( $(date +%s) + RECON_SECONDS ))
 if [ "$RECON_SECONDS" -gt 0 ] && [ "$throttled" = 0 ]; then
   for src in "${T1_SRCS[@]+"${T1_SRCS[@]}"}"; do t1_recon "$src"; done

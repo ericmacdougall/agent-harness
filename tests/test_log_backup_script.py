@@ -31,6 +31,21 @@ if argv and argv[0] == "lsf":  # the bulk checkpoint lists a local source once p
     if os.environ.get("FAKE_DELEGATE"):
         os.execv(os.environ["FAKE_DELEGATE"], [os.environ["FAKE_DELEGATE"]] + argv)
     root = argv[-1]
+    if "--separator" in argv and "\\x1f" in argv[argv.index("--separator") + 1]:  # tier 1: unit separator, UTC times, re-check from a list
+        sep = argv[argv.index("--separator") + 1]
+        fmt = argv[argv.index("--format") + 1] if "--format" in argv else "p"
+        if "--files-from-raw" in argv:
+            rels = [l for l in open(argv[argv.index("--files-from-raw") + 1]).read().split("\\n") if l]
+        else:
+            rels = sorted(os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(root) for f in fs)
+        for rel in rels:
+            full = os.path.join(root, rel)
+            if not os.path.isfile(full):
+                continue
+            st = os.stat(full)
+            cols = {"p": rel, "s": str(st.st_size), "t": time.strftime("%%Y-%%m-%%d %%H:%%M:%%S", time.gmtime(st.st_mtime)), "h": "0" * 64}
+            print(sep.join(cols[c] for c in fmt))
+        sys.exit(0)
     for d, _, fs in sorted(os.walk(root)):
         for f in sorted(fs):
             full = os.path.join(d, f)
@@ -181,6 +196,11 @@ class Case(unittest.TestCase):
         for rel, data in ORDINARY.items():
             self.put(rel, data)
         self.logs = self.home / ".agent-harness" / "logs"
+
+    def bulk_copies(self):
+        """The checkpointed bulk-tier chunk copies. Tier-1 folder sources also send file lists since goodqa#15532."""
+        tier1 = (".claude/wals", ".claude/projects", ".codex/sessions")
+        return [c for c in self.copies() if "--files-from-raw" in c and not c[-1].endswith(tier1)]
 
     def put(self, rel, data):
         path = self.home / rel
@@ -532,14 +552,16 @@ class Locking(Case):
         self.assertEqual(self.run_script().returncode, 0)
         self.assertTrue(self.last_ok().exists())
 
-    def test_lock_older_than_a_day_is_taken_over_even_if_pid_looks_live(self):
+    def test_a_run_lock_older_than_a_day_is_not_taken_from_a_live_holder(self):
+        # goodqa#15532 plan review: a paused displaced run could wake and write the tier-1 ledger beside its replacement.
         proc = self.holder()
         time.sleep(0.3)
         lock = self.lock(proc.pid)
         old = time.time() - 90000
         os.utime(lock, (old, old))
         self.assertEqual(self.run_script().returncode, 0)
-        self.assertTrue(self.last_ok().exists())
+        self.assertFalse(self.last_ok().exists(), "the live holder keeps its lock whatever its age")
+        self.assertIn("holds the lock", (self.logs / "log-backup.log").read_text())
 
     def test_spoofed_command_line_with_script_name_as_later_argument_is_not_a_holder(self):
         other = subprocess.Popen(["/bin/sh", "-c", "sleep 60", "log-backup.sh"])  # script name only as argv[2]
@@ -692,8 +714,7 @@ class DisallowedNames(Case):
             self.assertIn(rel, files)
         self.assertFalse([f for f in files if f.lower().rsplit("/", 1)[-1] in REFUSED])
         plain, chunk = self.offered("plain"), self.offered("chunk")
-        self.assertTrue(plain, "the plain copy path ran")
-        self.assertTrue(chunk, "the files-from path ran")
+        self.assertTrue(chunk, "the files-from path ran (tier-1 folders and the bulk tier both use it since goodqa#15532)")
         self.assertFalse([n for n in plain + chunk if n.lower().rsplit("/", 1)[-1] in REFUSED], plain + chunk)
 
     def test_a_stale_checkpoint_list_that_still_names_a_refused_file_is_filtered_before_the_copy(self):
@@ -712,9 +733,9 @@ class DisallowedNames(Case):
         done = self.run_refusing(LOG_BACKUP_EXCLUDES=str(self.excludes_without_names()))
         self.assertEqual(done.returncode, 0, done.stderr.decode() + self.log_tail())
         self.assertTrue(self.last_ok().exists())
-        self.assertTrue([n for n in self.offered("plain") if n.lower().rsplit("/", 1)[-1] in REFUSED],
-                        "the stub really offered refused names on the plain path")
-        self.assertIn("refused by the remote by name", (self.logs / "log-backup.log").read_text())
+        # Tier 1 lists its folders itself (goodqa#15532): a refused name never reaches a copy, and is counted and reported.
+        self.assertFalse([n for n in self.offered("plain") + self.offered("chunk") if n.lower().rsplit("/", 1)[-1] in REFUSED])
+        self.assertIn("refused", (self.logs / "log-backup.log").read_text())
         self.assertRegex((self.logs / "log-backup.refused").read_text(), r"refused=[1-9]")
 
     def test_a_genuinely_failing_file_beside_a_refused_name_still_fails_the_run(self):
@@ -937,8 +958,12 @@ class Failure(Case):
         for argv in self.copies():
             live = argv[-2].startswith(str(stage))
             self.assertNotIn("--min-age", argv)  # live sources are snapshots; a bulk chunk carries no filter flags
-            self.assertEqual("--files-from-raw" in argv, not live, argv)
-        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
+            if live and argv[-1].endswith((".claude/wals", ".claude/projects", ".codex/sessions")):
+                self.assertIn("--files-from-raw", argv)   # tier-1 folders send a ledger's file list (goodqa#15532)
+                self.assertIn("--no-traverse", argv)
+            else:
+                self.assertEqual("--files-from-raw" in argv, not live, argv)
+        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf" and not c["argv"][-1].startswith(str(stage))]
         self.assertTrue(lists)
         for argv in lists:
             self.assertIn("--min-age", argv)  # static sources skip young files when their pass is listed
@@ -1094,7 +1119,7 @@ class Failure(Case):
             self.assertEqual(len({tuple(c[-2:]) for c in self.copies()}), n_sources)  # one attempt per source, no retry
 
     def test_bulk_only_budget_exit_withholds_only_the_bulk_marker(self):
-        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="--files-from-raw")
+        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="lessons-dropbox:Backups/agent-logs/testhost/.agent-harness/work")
         self.assertNotEqual(done.returncode, 0)
         self.assertTrue(self.last_ok().exists())     # transcripts completed
         self.assertFalse(self.bulk_ok().exists())    # the bulk gap is not hidden
@@ -1178,13 +1203,14 @@ class Failure(Case):
         for p in (self.last_ok(), self.bulk_ok()):
             os.unlink(p)
         self.put(".agent-harness/work/t1/more.md", b"more")  # the finished pass sends only new files: give it one
-        done = self.run_script(FAKE_FAIL_MATCH="--files-from-raw", LOG_BACKUP_RETRIES="0")  # only bulk copies
+        done = self.run_script(FAKE_FAIL_MATCH=".agent-harness_work/chunk", LOG_BACKUP_RETRIES="0")  # only the bulk work tree
         self.assertNotEqual(done.returncode, 0)
         self.assertTrue(self.last_ok().exists())            # transcripts are safe and say so
         self.assertFalse(self.bulk_ok().exists())           # the gap in the bulk tier is not hidden
         for p in (self.last_ok(), self.bulk_ok()):
             if p.exists():
                 os.unlink(p)
+        self.put(".claude/wals/s1/main.jsonl", b"wal line, changed\n")  # tier 1 sends only what changed
         done = self.run_script(FAKE_FAIL_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0")  # transcripts tier fails
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.last_ok().exists())
@@ -1368,6 +1394,8 @@ class Contention(Case):
                       LOG_BACKUP_DEADLINE_GRACE_SECONDS="2", LOG_BACKUP_KILL_GRACE_SECONDS="1",
                       LOG_BACKUP_SLICE_RESERVE_SECONDS="5"))
         for extra in cases:
+            for rel, data in ORDINARY.items():  # the tier-1 ledger sends only what changed: change every source each time
+                self.put(rel, data + repr(sorted(extra)).encode())
             open(self.calls, "w").close()
             for name in ("log-backup.throttled", "log-backup.log"):
                 if (self.logs / name).exists():
@@ -1423,11 +1451,18 @@ class Contention(Case):
         # NEG-1: rclone logs the rate limit but its own retries succeed: every source is copied, last-ok is written and
         # no throttled marker appears.
         self.assertEqual(self.run_script().returncode, 0)  # the first run also finishes the bulk passes
+
+        def change_everything(tag):  # tier-1 folders send only what changed: give every source something new
+            for rel in ORDINARY:
+                self.put(rel, ORDINARY[rel] + tag)
+
+        change_everything(b"1")
         open(self.calls, "w").close()
         healthy = self.run_script()
         self.assertEqual(healthy.returncode, 0, healthy.stderr)
         expected = len(self.copies())
         self.assertGreater(expected, 1)
+        change_everything(b"2")
         open(self.calls, "w").close()
         self.last_ok().unlink()
         done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : Attempt 1/3 failed: too_many_write_operations")
@@ -1516,9 +1551,6 @@ class BulkTier(Case):
 
     def bulk_try(self):
         return self.logs / "log-backup.bulk-last-try"
-
-    def bulk_copies(self):
-        return [c for c in self.copies() if "--files-from-raw" in c]
 
     def test_bulk_tier_with_no_time_left_is_deferred_not_spent(self):
         done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="30",
@@ -1639,7 +1671,7 @@ class BulkLane(Case):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("bulk=lane", (self.logs / "log-backup.last-run").read_text())
         self.assertIn("exit=0 bulk=0", self.wait_for_lane())
-        bulk = [c for c in self.copies() if "--files-from-raw" in c]
+        bulk = self.bulk_copies()
         live = [c for c in self.copies() if "--files-from-raw" not in c]
         self.assertTrue(bulk and live, self.copies())
         self.assertEqual({self.tps(c) for c in live}, {"3"}, "tier 1 copies at the full TPSLIMIT")
@@ -1667,7 +1699,7 @@ class BulkLane(Case):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertNotIn("bulk lane started", (self.logs / "log-backup.log").read_text())
         self.assertEqual({self.tps(c) for c in self.copies()}, {"2"})
-        self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [])
+        self.assertEqual(self.bulk_copies(), [])
 
     def test_a_lane_stopped_by_sigterm_exits_only_after_its_copy_has_stopped(self):
         # PR #124 delta review N2: the lane released its lock while its copy was still committing a batch, and the
@@ -1679,7 +1711,7 @@ class BulkLane(Case):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
         end = time.time() + 20
-        while time.time() < end and not [c for c in self.copies() if "--files-from-raw" in c]:
+        while time.time() < end and not self.bulk_copies():
             time.sleep(0.1)
         self.assertTrue(self.copies(), "the lane started a copy")
         time.sleep(0.5)
@@ -1720,7 +1752,7 @@ class BulkLane(Case):
             done = self.run_script(LOG_BACKUP_TPSLIMIT="2", **extra)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual({self.tps(c) for c in self.copies()}, {"1"}, extra)
-            self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [], "no second bulk writer")
+            self.assertEqual(self.bulk_copies(), [], "no second bulk writer")
         self.assertNotIn("bulk lane started", (self.logs / "log-backup.log").read_text(), "no second lane")
 
     def test_a_lane_run_exits_when_another_run_holds_the_checkpoint(self):
@@ -1735,7 +1767,7 @@ class BulkLane(Case):
         proc = self.hold_lane_lock()
         done = self.run_script()
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [], "no second bulk writer")
+        self.assertEqual(self.bulk_copies(), [], "no second bulk writer")
         self.assertIn("bulk tier skipped: a bulk lane run holds the bulk checkpoint",
                       (self.logs / "log-backup.log").read_text())
         self.assertEqual((self.lane_lock() / "pid").read_text(), str(proc.pid), "the lane's lock is left alone")
@@ -1804,9 +1836,6 @@ class LaneYield(BulkLane):
 
     def run_lock(self):
         return self.logs / "log-backup.lock.d"
-
-    def bulk_copies(self):
-        return [c for c in self.copies() if "--files-from-raw" in c]
 
     def test_ac1_with_tier_1_active_the_lane_makes_no_copy_requests(self):
         self.logs.mkdir(parents=True, exist_ok=True)

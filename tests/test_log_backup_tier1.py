@@ -64,6 +64,9 @@ if argv and argv[0] == "copy" and sep >= 0:
     vanish = os.environ.get("FAKE_VANISH")
     if vanish and vanish in names and os.path.exists(os.path.join(src, vanish)):
         os.unlink(os.path.join(src, vanish))
+    if os.environ.get("FAKE_COPY_DELAY") and "--files-from-raw" in argv:
+        import time
+        time.sleep(float(os.environ["FAKE_COPY_DELAY"]))  # a slow upload: time pressure on the run budget
     if "--no-traverse" in argv and "--files-from-raw" in argv:
         charge(len(names), 10)
     elif os.path.isfile(src):
@@ -270,7 +273,20 @@ class TierOneIncremental(TierOne):
             self.skipTest("case-insensitive file system")
         self.go()
         self.assertFalse(self.last_ok().exists())
-        self.assertIn("letter case", self.log_text())
+        self.assertIn("collide", self.log_text())
+
+    def test_names_with_control_characters_arrive_under_their_own_names(self):
+        # rclone escapes control characters in what it lists and maps them back on copy: a newline, a tab, the unit
+        # separator used by this script's lists, and a literal backslash sequence must all be sent and keep their bytes.
+        self.sessions(2)
+        names = ["a\nb.jsonl", "c\td.jsonl", "e\x1ff.jsonl", "g\\nh.jsonl"]
+        for i, name in enumerate(names):
+            self.put(f".claude/wals/s0/{name}", b"content %d" % i)
+        done = self.go()
+        self.assertTrue(self.last_ok().exists(), self.log_text()[:2500] + done.stderr.decode())
+        remote = {p.name: p.read_bytes() for p in (self.remote / "testhost/.claude/wals/s0").iterdir()}
+        for i, name in enumerate(names):
+            self.assertEqual(remote.get(name), b"content %d" % i, (name, sorted(remote)))
 
     def test_a_permanent_failure_sticks_one_file_and_not_the_rest(self):
         self.sessions(5)
@@ -332,6 +348,33 @@ class TierOneBootstrap(TierOne):
         self.assertGreater(runs, 3, "a reconcile of several chunks cannot finish in one run")
         self.assertLess(runs, 39, self.log_text()[-1500:])
         self.assertEqual(sum(1 for i in range(8) if self.remote_has(f".claude/wals/o{i}/main.jsonl")), 8)
+
+    def test_changing_files_do_not_starve_the_reconcile(self):
+        # Uploads are slow (1 s a chunk of one file) against a 40 s run, and 15 more files change before each of the first three
+        # runs. The reconcile still gets its reserved slice each run, so the seeded files are proven and last-ok returns
+        # once the changes stop.
+        self.old_tree(6)
+        stamp = self.old_last_ok()
+        env = dict(FAKE_COPY_DELAY="1", LOG_BACKUP_BULK_CHUNK="1", LOG_BACKUP_BUDGET_SECONDS="40", LOG_BACKUP_RECON_SECONDS="16",
+                   LOG_BACKUP_RECON_CHUNK_DIRS="10", LOG_BACKUP_DEADLINE_GRACE_SECONDS="1", LOG_BACKUP_KILL_GRACE_SECONDS="1",
+                   LOG_BACKUP_SLICE_RESERVE_SECONDS="1", LOG_BACKUP_PERIOD_SECONDS="900")
+        s_counts, cursors = [], []
+        for run in range(1, 11):
+            if run <= 3:
+                for i in range(15):
+                    rel = f".claude/wals/new{run}_{i}/main.jsonl"
+                    self.put(rel, b"new %d %d" % (run, i))
+                    os.utime(self.home / rel, (time.time() - 5, time.time() - 5))
+            self.go(**env)
+            s_counts.append(sum(1 for l in self.ledger_lines() if l.startswith("S" + US)))
+            cursor = self.ledger_dir / ".claude_wals" / "recon" / "cursor"
+            cursors.append(int(cursor.read_text()) if cursor.exists() else 10 ** 6)  # no checkpoint left: it finished
+            if (self.logs / "log-backup.last-ok").read_text().split()[0] != stamp:
+                break
+        self.assertEqual(s_counts[-1], 0, s_counts)
+        # files changed before runs 1 to 3: without the reserved slice the uploads use every run and the reconcile waits
+        self.assertEqual(cursors[2], 10 ** 6, ("the reconcile finished while files were still changing", cursors))
+        self.assertTrue(self.remote_has(".claude/wals/o0/main.jsonl"))
 
     def test_kill_points_around_the_seed_never_write_last_ok(self):
         self.old_tree(3)
