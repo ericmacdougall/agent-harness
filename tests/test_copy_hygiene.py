@@ -469,7 +469,7 @@ class Protected(OldCopies, Base):
     def allow(self, cmd, cwd=None):
         self.assertEqual(tc.pretool(self.ev(cmd, cwd), self.cfg())[0], 0, cmd)
 
-    def test_fable_r4_bypasses_are_denied(self):
+    def test_cd_variables_braces_wildcards_and_wrappers_cannot_slip_past(self):
         self.setup_services()
         h = str(self.home)
         with mock.patch.dict(os.environ, {"HOME": h}):
@@ -485,6 +485,42 @@ class Protected(OldCopies, Base):
                         "bash -lc 'cd %s/pp-ci && rm -rf runner'" % h, "timeout 5 rm -rf %s" % self.nm,
                         "sudo -u eric rm -rf %s" % self.nm, "env -u X nohup rm -r %s" % self.nm):
                 self.deny(cmd)
+
+    def test_unresolved_variables_assignments_loops_and_brace_moves_are_denied(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf ~/pp-ci/$d", 'D=~/pp-ci/runner; rm -rf "$D"',
+                        'for d in ~/pp-ci/runner ~/pp-ci/nm; do rm -rf "$d"; done', "mv ~/pp-ci/runner{,.bak}",
+                        "cd $X && rm -rf pp-ci/runner/*", "rm -rf $X/pp-ci/nm/*",
+                        "if [ -d %s ]; then rm -rf %s; fi" % (self.nm, self.nm), "{ rm -rf %s; }" % self.nm,
+                        "! rm -rf %s" % self.nm, "time rm -rf %s" % self.nm,
+                        "find %s -print0 | xargs -0 -I {} rm -rf {}" % self.nm, "find %s | xargs -n 1 rm" % self.nm,
+                        "find %s | grep -v keep | xargs rm -rf" % self.nm,
+                        "find %s -name '*' -delete" % self.nm, "find %s -mtime +1 -delete" % self.nm,
+                        "find %s -exec sh -c 'rm -rf \"$1\"' _ {} \\;" % self.nm, "rm -rf %s/**" % self.nm,
+                        "rm -rf %s/[!.]*" % self.nm):
+                self.deny(cmd)
+
+    def test_cd_scope_does_not_leak_or_hide_the_real_directory(self):
+        self.setup_services()
+        pp = self.home / "pp-ci"
+        for cmd in ("(cd /tmp && true); rm -rf runner", "bash -c 'cd /tmp'; rm -rf runner",
+                    "pushd /tmp; popd; rm -rf runner", "cd /tmp && cd - && rm -rf runner",
+                    "cd missing-dir; rm -rf runner"):
+            self.deny(cmd, cwd=pp)
+
+    def test_emptying_through_a_symlink_is_denied(self):
+        self.setup_services()
+        link = self.home / "nm-link"
+        link.symlink_to(self.nm)
+        (self.nm / "pkg").mkdir()
+        self.deny("rm -rf %s/*" % link)
+        self.deny("find -L %s -delete" % link)
+
+    def test_unknown_cd_does_not_block_system_named_dirs(self):
+        self.unit("sys.service", "[Service]\nExecStart=/usr/lib/thing/bin/run\n")
+        self.allow("cd $X && rm -rf bin")
 
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()

@@ -39,8 +39,10 @@ WHAT.
                 $HOME/$PWD and {a,b}; a relative target under an unknown directory is matched by path tail. It fails
                 OPEN on an internal error (with an alert). The reaper fails CLOSED: if any unit file can't be read it
                 deletes nothing. `copy_hygiene.py protected [--check <path>]` lists or explains (exit 1 = protected),
-                the one choke point other cleaners should call. Known gap: commands run on another host over ssh are
-                checked only by that host's own hook.
+                the one choke point other cleaners should call: exit 0 is the only go-ahead, and checking children one
+                by one does not cover emptying a directory (check the directory). Known gap: a command sent with
+                `ssh host '...'` is not checked by any hook (the remote host's hook only sees agent sessions running
+                there). `rsync --delete` into a service directory and `git clean` are not treated as deletes.
   scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
                 directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
                 `export TMPDIR=$(python3 ~/.claude/hooks/copy_hygiene.py scratch)`. Refused below the disk floor; its
@@ -408,6 +410,7 @@ def _paths_in(value: str, homes: "list[str]") -> "list[str]":
     """Every absolute path named in a value: plain words, Exec prefixes (-/@/+/!), K=/path, --opt=/path, -C/path,
     file:/path, PATH-like lists, and paths inside shell strings such as `bash -lc 'cd %h/x && ./run'`."""
     out = []
+    value = re.sub(r"\$\{?HOME\}?", "%h", value)
     for m in _PATH_TOKEN.finditer(value):
         i = m.start()
         prev = value[i - 1] if i else " "
@@ -521,7 +524,7 @@ def _scan_units() -> "tuple[dict, int]":
         except OSError:
             continue
         u = _unit_user(texts[f])
-        if u:
+        if u and not (f.endswith(".conf") and not os.path.dirname(f).endswith(".d")):
             unit = os.path.basename(os.path.dirname(f))[:-2] if f.endswith(".conf") else os.path.basename(f)
             users[unit] = u
     out = {}
@@ -607,14 +610,21 @@ def protecting(path: str, prot: dict) -> "tuple[str, str] | None":
 
 
 def protecting_tail(rel: str, prot: dict) -> "tuple[str, str] | None":
-    """For a relative target whose base directory is unknown (`cd $X && rm -rf runner`): match by path tail."""
-    rel = os.path.normpath(rel).lstrip("./") if rel not in (".", "..") else ""
-    if not rel or rel.startswith(".."):
+    """For a relative target whose base directory is unknown (`cd $X && rm -rf runner`): match by path tail.
+    Only protected paths under the home directory or from the config are tail-matched, so `rm -rf bin` after an
+    unknown cd is not refused because some system unit names /usr/bin/..."""
+    rel = os.path.normpath(rel)
+    while rel.startswith("./"):
+        rel = rel[2:]
+    if not rel or rel in (".", "..") or rel.startswith("../"):
         return None
     tail = "/" + _k(rel)
+    hk = _k(home().rstrip("/")) + "/"
     for k, v in prot.items():
         orig, src = v if isinstance(v, tuple) else (k, v)
         kk = _k(orig)
+        if not (kk.startswith(hk) or src == "config protected_paths"):
+            continue
         if kk.endswith(tail) or (tail + "/") in kk:
             return orig, src
     return None
@@ -711,12 +721,17 @@ def _dest(words: list) -> "list[str]":
 
 
 DELETE_VERBS = frozenset(("rm", "rmdir", "unlink", "shred", "trash", "trash-put", "srm"))
-FIND_SELECTORS = frozenset(("-name", "-iname", "-path", "-ipath", "-wholename", "-regex", "-iregex", "-newer",
-                            "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size", "-empty", "-user",
-                            "-perm", "-links", "-samefile", "-inum", "-lname"))
+# Name filters narrow what find deletes; time/size filters alone do not when the root itself is a service directory.
+FIND_NAME_SELECTORS = frozenset(("-name", "-iname", "-path", "-ipath", "-wholename", "-regex", "-iregex", "-lname",
+                                 "-samefile", "-inum"))
+FIND_SELECTORS = FIND_NAME_SELECTORS | frozenset(("-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin",
+                                                  "-size", "-empty", "-user", "-perm", "-links"))
 FIND_EXEC_DELETERS = frozenset(("rm", "rmdir", "shred", "unlink", "trash", "trash-put", "srm", "mv"))
 SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh"))
+KEYWORDS = frozenset(("then", "do", "else", "elif", "if", "while", "until", "{", "!", "}"))
 _VAR = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+_EMPTYING = re.compile(r"^[*?.\[\]!^]*[*?][*?.\[\]!^]*$")       # *, .*, **, ?*, [!.]*, .[!.]*, ..?*
+_PUSH, _POP = "\0push", "\0pop"
 
 
 def _expand_braces(s: str) -> "list[str]":
@@ -729,35 +744,57 @@ def _expand_braces(s: str) -> "list[str]":
     return out[:256]
 
 
-def _expand_vars(s: str, cwd: "str | None") -> str:
-    env = {"HOME": os.path.expanduser("~"), "PWD": cwd or "", "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-           "USER": os.environ.get("USER", "")}
-    return _VAR.sub(lambda m: env.get(m.group(1) or m.group(2)) or m.group(0), s)
+def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "list[str]":
+    """Every expansion of $VAR / ${VAR}: HOME, PWD, TMPDIR, USER and same-line assignments / for-lists."""
+    env = {"HOME": [os.path.expanduser("~")], "TMPDIR": [os.environ.get("TMPDIR", "/tmp")],
+           "USER": [os.environ.get("USER", "")]}
+    if cwd:
+        env["PWD"] = [cwd]
+    env.update(vars_ or {})
+    outs = [s]
+    for _ in range(4):
+        nxt = []
+        for o in outs:
+            m = _VAR.search(o)
+            vals = env.get(m.group(1) or m.group(2)) if m else None
+            if not m or not vals:
+                nxt.append(o)
+                continue
+            nxt.extend(o[:m.start()] + v + o[m.end():] for v in vals)
+        outs = nxt[:256]
+    return outs
 
 
 def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
     """[(argv, separator before it)] for each simple command, keeping `|` so `find ... | xargs rm` is seen.
-    `bash -c '<line>'` and `sh -c` bodies are analysed as lines of their own."""
-    out = []
+    `( ... )` subshells and `bash -c '<line>'` bodies are bracketed by _PUSH/_POP so a `cd` inside them does not
+    leak out."""
+    out, in_bt = [], False
     sep = ";"
     for seg, nsep in _split_line(cmd):
         cur_sep, sep = sep, nsep
         seg = seg.strip()
-        if not seg:
-            continue
-        try:
-            words = shlex.split(seg, comments=True)
-        except ValueError:
-            words = [w.strip("'\"") for w in seg.split()]
-        words = _unwrap(words)
-        if not words:
-            continue
-        if os.path.basename(words[0]) in SHELLS:
-            j = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", w)), 0)
-            if j and j + 1 < len(words):
-                out.extend(_cmd_lines(words[j + 1]))
-                continue
-        out.append((words, cur_sep))
+        if seg:
+            try:
+                words = shlex.split(seg, comments=True)
+            except ValueError:
+                words = [w.strip("'\"") for w in seg.split()]
+            words = _unwrap(words)
+            if words and os.path.basename(words[0]) in SHELLS:
+                j = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", w)), 0)
+                if j and j + 1 < len(words):
+                    out.append(([_PUSH], cur_sep))
+                    out.extend(_cmd_lines(words[j + 1]))
+                    out.append(([_POP], ";"))
+                    words = []
+            if words:
+                out.append((words, cur_sep))
+        if nsep in ("(", "$(") or (nsep == "`" and not in_bt):
+            out.append(([_PUSH], nsep))
+        elif nsep == ")" or (nsep == "`" and in_bt):
+            out.append(([_POP], nsep))
+        if nsep == "`":
+            in_bt = not in_bt
     return out
 
 
@@ -788,12 +825,16 @@ def _split_line(cmd: str) -> "list[tuple[str, str]]":
 
 
 def _unwrap(words: list) -> list:
-    """Drop VAR=val, sudo/env/nohup/nice/timeout/... and their options (sudo -u x, timeout 5, nice -n 5)."""
+    """Drop shell keywords (then, do, if, !, {), VAR=val prefixes, sudo/env/nohup/nice/timeout/time/command/exec
+    and their options (sudo -u x, timeout 5, nice -n 5)."""
     takes_value = {"sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"}, "env": {"-u", "-C", "-S"},
                    "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "timeout": {"-s", "-k", "--signal", "--kill-after"}}
-    while words and (ASSIGN.match(words[0]) or os.path.basename(words[0]) in PREFIXES):
+    while words and (words[0] in KEYWORDS or (ASSIGN.match(words[0]) and len(words) > 1)
+                     or os.path.basename(words[0]) in PREFIXES):
         name = os.path.basename(words[0])
         words = words[1:]
+        if name in KEYWORDS or "=" in name:
+            continue
         while words and words[0].startswith("-") and words[0] != "-":
             w = words.pop(0)
             if w in takes_value.get(name, ()) and words:
@@ -803,33 +844,52 @@ def _unwrap(words: list) -> list:
     return words
 
 
-def _resolve(raw: str, cwd: "str | None") -> "list[tuple[str, bool]]":
-    """[(path, known)]: absolute paths, or (relative path, False) when the base directory is unknown."""
+def _resolve(raw: str, bases: list, vars_: "dict | None" = None) -> "list[tuple[str, bool]]":
+    """[(path, known)] for a raw argument. `bases` are the possible current directories (None = unknown).
+    known=False means a relative path under an unknown directory (matched by tail). A wildcard that empties a
+    directory (`dir/*`, `dir/.*`, `dir/**`) also yields the directory itself, resolved through symlinks. A path
+    with an unresolved variable yields its literal prefix as an emptied directory (`~/pp-ci/$d` -> `~/pp-ci`)."""
     out = []
-    for r in _expand_braces(_expand_vars(raw, cwd)):
-        r = os.path.expanduser(r)
-        if "$" in r:                                # unresolved variable: keep the literal suffix as a tail
-            tail = re.split(r"\$(?:\{\w+\}|\w+)/?", r)[-1]
-            if tail:
-                out.append((tail, False))
-            continue
-        if not r.startswith("/"):
-            if not cwd:
-                out.append((r, False))
-                continue
-            r = os.path.join(cwd, r)
-        base = os.path.basename(r.rstrip("/"))
-        if base in ("*", ".*", ".[!.]*", "..?*"):   # emptying a directory counts as deleting it
-            out.append((os.path.normpath(os.path.dirname(r.rstrip("/"))), True))
-        hits = glob.glob(r) if any(ch in r for ch in "*?[") else [r]
-        out.extend((os.path.normpath(h), True) for h in hits)
+    for b in bases or [None]:
+        for r in (x for e in _expand_vars(raw, b, vars_) for x in _expand_braces(e)):
+            r = os.path.expanduser(r)
+            if "$" in r:
+                prefix = r[:r.index("$")]
+                rest = re.split(r"\$(?:\{\w+\}|\w+)/?", r)[-1]
+                prefix = prefix if prefix.endswith("/") or not prefix else os.path.dirname(prefix) + "/"
+                if prefix:
+                    r = prefix + "*"                       # anything at or below the known prefix
+                elif rest:
+                    out.extend(_resolve_unknown(rest))
+                    continue
+                else:
+                    continue                               # whole target is an unknown variable
+            if not r.startswith("/"):
+                if b is None:
+                    out.extend(_resolve_unknown(r))
+                    continue
+                r = os.path.join(b, r)
+            base = os.path.basename(r.rstrip("/"))
+            if _EMPTYING.match(base):
+                parent = os.path.normpath(os.path.dirname(r.rstrip("/")))
+                out.append((parent, True))
+                out.append((os.path.realpath(parent), True))
+            hits = glob.glob(r) if any(ch in r for ch in "*?[") else [r]
+            out.extend((os.path.normpath(h), True) for h in hits)
     return out
+
+
+def _resolve_unknown(rel: str) -> "list[tuple[str, bool]]":
+    rel = rel.rstrip("/")
+    while rel and _EMPTYING.match(os.path.basename(rel)):
+        rel = os.path.dirname(rel)
+    return [(rel, False)] if rel and not any(ch in rel for ch in "*?[") else []
 
 
 def _find_roots(words: list) -> list:
     i, roots = 1, []
-    while i < len(words) and words[i] in ("-H", "-L", "-P", "-D", "-O") or (i < len(words) and re.match(r"^-O\d$", words[i])):
-        i += 2 if words[i] in ("-D", "-O") else 1
+    while i < len(words) and (words[i] in ("-H", "-L", "-P", "-D") or re.match(r"^-O\d?$", words[i])):
+        i += 2 if words[i] == "-D" else 1
     while i < len(words) and not words[i].startswith("-") and words[i] not in ("(", "!", ")"):
         roots.append(words[i]); i += 1
     return roots or ["."]
@@ -843,61 +903,93 @@ def _find_deletes(words: list) -> bool:
             rest = _unwrap(words[i + 1:])
             if rest and os.path.basename(rest[0]) in FIND_EXEC_DELETERS:
                 return True
+            if rest and os.path.basename(rest[0]) in SHELLS:
+                j = next((k for k, x in enumerate(rest[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", x)), 0)
+                body = rest[j + 1] if j and j + 1 < len(rest) else ""
+                if any(t and os.path.basename(t[0]) in FIND_EXEC_DELETERS for t, _s in _cmd_lines(body)):
+                    return True
     return False
 
 
+def _find_selective(words: list) -> "tuple[bool, bool]":
+    """(any selector, a real name selector). `-name '*'` is not a name selector."""
+    sel = name_sel = False
+    for i, w in enumerate(words):
+        if w in FIND_SELECTORS:
+            sel = True
+            if w in FIND_NAME_SELECTORS and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1])):
+                name_sel = True
+    return sel, name_sel
+
+
 def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
-    """[(path, known, mode)] a command line would delete or move away, tracking `cd` and `find | xargs rm`.
-    mode "below": a find with name/path/time filters deletes only some entries under the path, so it is refused
-    only when a protected path lies strictly inside it (it may match there); otherwise the path itself goes."""
-    cur = cwd if str(cwd).startswith("/") else None
-    out, prev_find_roots = [], None
+    """[(path, known, mode)] a command line would delete or move away.
+    Tracks `cd` / `pushd` (an unresolvable one, `cd -` or `popd` makes the directory unknown; after a cd that is not
+    joined by `&&` both the old and new directory are checked, since the cd may have failed), `( )` and `bash -c`
+    scopes, same-line `NAME=value` and `for x in ...` lists, and `find ... | ... | xargs rm` through a pipeline.
+    mode "below": a find with name filters deletes only some entries, so it is refused only when a protected path
+    lies strictly inside its root; "" means the path itself (and everything inside it) goes."""
+    bases = [cwd if str(cwd).startswith("/") else None]
+    stack, pending_old, vars_ = [], [], {}
+    out, find_ctx = [], None
     for words, sep in _cmd_lines(cmd):
+        if words == [_PUSH]:
+            stack.append((list(bases), list(pending_old), dict(vars_)))
+            continue
+        if words == [_POP]:
+            if stack:
+                bases, pending_old, vars_ = stack.pop()
+            continue
+        if sep != "&&" and pending_old:
+            bases = list(dict.fromkeys(bases + pending_old))
+            pending_old = []
+        if sep != "|":
+            find_ctx = None
+        words = [x for w in words for x in _expand_braces(w)]
         name = os.path.basename(words[0])
+        if all(ASSIGN.match(w) for w in words):
+            for w in words:
+                k, v = w.split("=", 1)
+                vals = [x for b in bases for x in _expand_vars(v, b, vars_)]
+                vars_[k] = [os.path.expanduser(x) for x in vals]
+            continue
+        if name == "for" and len(words) >= 3 and words[2] == "in":
+            vars_[words[1]] = [os.path.expanduser(x) for w in words[3:] for x in _expand_vars(w, bases[0], vars_)]
+            continue
         flags, pos = _opts(words)
-        raw = []
-        if name == "cd":
-            t = pos[0] if pos else "~"
-            res = _resolve(t, cur)
-            cur = res[0][0] if len(res) == 1 and res[0][1] and os.path.isabs(res[0][0]) else None
-            prev_find_roots = None
+        if name in ("cd", "pushd", "popd"):
+            t = pos[0] if pos else ("~" if name == "cd" else None)
+            res = _resolve(t, bases, vars_) if t and t != "-" and name != "popd" else []
+            new = [p for p, k in res if k and os.path.isabs(p)]
+            pending_old = list(bases) if name != "popd" else []
+            bases = new[:1] if len(new) == 1 or (new and len(set(new)) == 1) else [None]
             continue
-        if name == "pushd" and pos:
-            res = _resolve(pos[0], cur)
-            cur = res[0][0] if len(res) == 1 and res[0][1] else None
-            continue
-        base = cur
+        raw, gbases, mode = [], bases, ""
         if name in DELETE_VERBS:
             raw = pos
         elif name == "gio" and pos[:1] in (["remove"], ["trash"]):
             raw = pos[1:]
         elif name == "mv":
             tdir = any(w in ("-t", "--target-directory") or w.startswith("--target-directory=") for w in words)
-            raw = pos if tdir else pos[:-1]
-            if tdir:                                  # the -t value is the destination, not a source
+            raw = list(pos) if tdir else pos[:-1]
+            if tdir:
                 for i, w in enumerate(words):
                     if w in ("-t", "--target-directory") and i + 1 < len(words) and words[i + 1] in raw:
                         raw.remove(words[i + 1])
         elif name == "find":
             roots = _find_roots(words)
-            selective = any(w in FIND_SELECTORS for w in words)
-            if _find_deletes(words):
-                out.extend((p, k, "below" if selective else "") for r in roots for p, k in _resolve(r, base))
-            prev_find_roots = (roots, selective, base)
-            continue
-        elif name == "xargs" and sep == "|" and prev_find_roots is not None:
-            rest = _unwrap([w for w in words[1:] if not w.startswith("-")])
-            if rest and os.path.basename(rest[0]) in FIND_EXEC_DELETERS:
-                roots, selective, fbase = prev_find_roots
-                out.extend((p, k, "below" if selective else "") for r in roots for p, k in _resolve(r, fbase))
-                prev_find_roots = None
+            find_ctx = (roots, _find_selective(words), list(bases))
+            if not _find_deletes(words):
+                continue
+        elif name == "xargs" and find_ctx is not None:
+            if not any(os.path.basename(w) in FIND_EXEC_DELETERS for w in words[1:]):
                 continue
         elif name == "git":
-            i, args, gdir = 1, [], cur
+            i, args, gb = 1, [], bases
             while i < len(words):
                 if words[i] == "-C" and i + 1 < len(words):
-                    r = _resolve(words[i + 1], gdir)
-                    gdir = r[0][0] if len(r) == 1 and r[0][1] else None
+                    r = [p for p, k in _resolve(words[i + 1], gb, vars_) if k]
+                    gb = r[:1] if r else [None]
                     i += 2; continue
                 if words[i] in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
                     i += 2; continue
@@ -905,11 +997,18 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
                     args.append(words[i])
                 i += 1
             if len(args) >= 3 and args[0] == "worktree" and args[1] == "remove":
-                raw, base = [args[-1]], gdir
-        prev_find_roots = None
-        out.extend((p, k, "") for r in raw for p, k in _resolve(r, base))
+                raw, gbases = [args[-1]], gb
+        if name in ("find", "xargs") and find_ctx is not None:
+            roots, (sel, name_sel), fb = find_ctx
+            for r in roots:
+                for p, k in _resolve(r, fb, vars_):
+                    out.append((p, k, "below" if name_sel else ("root-selective" if sel else "")))
+                    if k:
+                        out.append((os.path.realpath(p), k, "below" if name_sel else ("root-selective" if sel else "")))
+            find_ctx = None if name == "xargs" else find_ctx
+            continue
+        out.extend((p, k, mode) for r in raw for p, k in _resolve(r, gbases, vars_))
     return out
-
 
 def delete_targets(words: list, cwd: str) -> "list[str]":
     """Known absolute targets of one argv (kept for callers; the hook uses delete_targets_line)."""
@@ -925,10 +1024,14 @@ def protected_delete(cmd: str, cwd: str, cfg: "dict | None" = None) -> "tuple[st
     if errors:
         alert("protected-units-unreadable", {"errors": errors})
     for t, known, mode in targets:
-        if mode == "below" and known:
+        if known and mode in ("below", "root-selective"):
             pre = _k(os.path.normpath(t)).rstrip("/") + "/"
             hit = next(((o, src) for kk, (o, src) in ((_k(v[0]), v) for v in prot.values()) if kk.startswith(pre)),
                        None)
+            if not hit and mode == "root-selective":     # time/size filters only: emptying the service dir itself
+                exact = _k(os.path.normpath(t))
+                hit = next(((o, src) for kk, (o, src) in ((_k(v[0]), v) for v in prot.values()) if kk == exact),
+                           None)
         else:
             hit = protecting(t, prot) if known else protecting_tail(t, prot)
         if hit:
@@ -980,7 +1083,8 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                 alert("shm-write-denied", {"cwd": cwd[:200]})
                 return 2, ("SCRATCH IN RAM REFUSED: /dev/shm is memory, not disk (2026-11-21: sessions filled 50 of "
                            "t2-dev's 56 GB). Use disk-backed scratch instead: `export TMPDIR=$(python3 "
-                           "~/.claude/hooks/copy_hygiene.py scratch)` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
+                           "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
+                           ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
         copying = [w for w in simple_commands(cmd) if is_copy_command(w)]
         if not copying:
             return 0, ""
