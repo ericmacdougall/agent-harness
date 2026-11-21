@@ -28,8 +28,12 @@ def sh(*args, cwd=None):
 
 
 class Base(unittest.TestCase):
+    # Subclasses may set _tempdir_parent to keep the fixture off /tmp (see Protected).
+    _tempdir_parent = None
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = (tempfile.TemporaryDirectory(dir=self._tempdir_parent)
+                    if self._tempdir_parent else tempfile.TemporaryDirectory())
         self.home = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {"HARNESS_COPY_HYGIENE_HOME": str(self.home),
                                                 "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
@@ -383,8 +387,20 @@ class Reap(OldCopies, Base):
         self.assertEqual(marks, {"tester-0": True, "tester-1": False, "tester-2": False})
 
 
+def _tempdir_outside_tmp():
+    """Parent for Protected fixtures. tempfile.TemporaryDirectory() is /tmp on Linux, so a command
+    like `rm -f $(find /tmp -name '*.tmp')` would correctly refuse the fixture itself. Keep the
+    fixture outside that scanned root so the allow-case still tests an unrelated find."""
+    real = os.path.realpath(tempfile.gettempdir())
+    if (real == "/tmp" or real.startswith("/tmp" + os.sep)) and os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK):
+        return "/var/tmp"
+    return None
+
+
 class Protected(OldCopies, Base):
     """2026-11-21: cleanups deleted claude-rc's WorkingDirectory and the pp gate's runner and caches on t2-dev."""
+
+    _tempdir_parent = _tempdir_outside_tmp()
 
     def unit(self, name, body, sub=""):
         d = self.units / sub if sub else self.units
@@ -661,6 +677,15 @@ class Protected(OldCopies, Base):
                 self.deny(cmd)
             for cmd in ("rm -f $(find /tmp -name '*.tmp')", "for f in $(find /tmp -name x); do rm $f; done"):
                 self.allow(cmd)
+
+    def test_find_stored_in_a_variable_or_fed_by_process_substitution(self):
+        # Fable round 13: B1 (assignment / for-in of a find-valued var) and B3 (`done < <(find)`).
+        self.setup_services()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            for cmd in ('old=$(find ~/pp-ci/nm -mindepth 1 -maxdepth 1); rm -rf $old',
+                        'old=$(find ~/pp-ci/nm -mindepth 1 -maxdepth 1); for d in $old; do rm -rf "$d"; done',
+                        'while read -r d; do rm -rf "$d"; done < <(find ~/pp-ci/nm -mindepth 1 -maxdepth 1)'):
+                self.deny(cmd)
 
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()

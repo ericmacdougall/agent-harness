@@ -826,8 +826,8 @@ def _expand_vars_once(s: str, cwd: "str | None", vars_: "dict | None" = None) ->
 
 def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
     """[(argv, separator before it)] for each simple command, keeping `|` so `find ... | xargs rm` is seen.
-    `( ... )` subshells, `$( ... )` / backtick bodies and `bash -c '<line>'` bodies are bracketed by _PUSH/_POP so
-    a `cd` inside them does not leak out."""
+    `( ... )` subshells, `$( ... )` / backtick / `<( ... )` / `>( ... )` bodies and `bash -c '<line>'` bodies are
+    bracketed by _PUSH/_POP so a `cd` inside them does not leak out."""
     out = []
     sep = ";"
     for seg, nsep, bodies in _split_line(cmd):
@@ -878,9 +878,9 @@ SUBST = "${__SUBST__}"        # placeholder for a command substitution: an unres
 
 
 def _split_line(cmd: str) -> "list[tuple[str, str, list]]":
-    """[(segment, separator after it, substitution bodies)], splitting on ; & && || | newline ( ) outside quotes. `$( ... )` and
-    backtick substitutions stay inside their word as SUBST (so `rm -rf $(pwd)/x` and `D=$(mktemp -d)` keep their
-    shape); their bodies are returned for separate analysis."""
+    """[(segment, separator after it, substitution bodies)], splitting on ; & && || | newline ( ) outside quotes. `$( ... )`,
+    backticks and process substitutions (`<( ... )`, `>( ... )`) stay inside their word as SUBST (so `rm -rf $(pwd)/x`,
+    `D=$(mktemp -d)` and `done < <(find R)` keep their shape); their bodies are returned for separate analysis."""
     out, buf, q, i, bodies = [], [], "", 0, []
     while i < len(cmd):
         c = cmd[i]
@@ -923,6 +923,26 @@ def _split_line(cmd: str) -> "list[tuple[str, str, list]]":
             i += 1; continue
         if c in "'\"":
             q = c; buf.append(c); i += 1; continue
+        if c in "<>" and i + 1 < len(cmd) and cmd[i + 1] == "(":
+            depth, j, qq = 1, i + 2, ""
+            while j < len(cmd) and depth:
+                ch = cmd[j]
+                if qq:
+                    if ch == "\\" and qq == '"':
+                        j += 2; continue
+                    if ch == qq:
+                        qq = ""
+                elif ch == "\\":
+                    j += 2; continue
+                elif ch in "'\"":
+                    qq = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                j += 1
+            bodies.append(cmd[i + 2:j - 1] if depth == 0 else cmd[i + 2:])
+            buf.append(SUBST); i = j; continue
         two = cmd[i:i + 2]
         if two in ("&&", "||"):
             out.append(("".join(buf), two, bodies)); buf, bodies = [], []; i += 2; continue
@@ -1148,122 +1168,159 @@ def _find_parse(words: list) -> "dict":
             "print_mode": mode("print") if mode("print") is not None else ""}
 
 
+def _read_var(words: list):
+    """The destination of `read [opts] var` / `read -r d < ...`, skipping flags and redirections."""
+    rpos = [w for w in words[1:] if not w.startswith("-") and w not in ("<", ">", ">>", "<>", "<&", ">&")
+            and "__SUBST__" not in w]
+    return rpos[-1] if rpos else None
+
+
+def _inherit_finds(words: list, subst_finds: list, var_finds: dict) -> list:
+    """Find contexts reaching a word list via `$(find)` / `<(find)` or `$var` that already holds one."""
+    feeds = list(subst_finds) if any("__SUBST__" in w for w in words) else []
+    for w in words:
+        for m in _VAR.finditer(w):
+            vn = m.group(2) or re.match(r"^\w*", m.group(1) or "").group(0)
+            feeds.extend(var_finds.get(vn, []))
+    return feeds
+
+
 def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
     """[(path, known, mode)] a command line would delete or move away.
     Tracks `cd` / `pushd` (an unresolvable one, `cd -` or `popd` makes the directory unknown; after a cd that is not
     joined by `&&` both the old and new directory are checked, since the cd may have failed), `( )` and `bash -c`
     scopes, same-line `NAME=value` and `for x in ...` lists, and `find ... | ... | xargs rm` through a pipeline.
+    Find output stored in a variable (`old=$(find R); rm -rf $old` / `for d in $old`) or fed to a `read` loop
+    (`find R | while read d` / `while read d; do ...; done < <(find R)`) is treated as the delete target list.
+    Two passes so a process substitution after `done` still binds the preceding `read`.
     mode "below": a find with name filters deletes only some entries, so it is refused only when a protected path
     lies strictly inside its root; "" means the path itself (and everything inside it) goes."""
-    bases = [cwd if str(cwd).startswith("/") else None]
-    stack, pending_old, vars_ = [], [], {}
-    out, find_ctx, subst_finds, var_finds = [], None, [], {}
-    for words, sep in _cmd_lines(cmd):
-        if words == [_PUSH]:
-            stack.append((list(bases), list(pending_old), dict(vars_), find_ctx))
-            find_ctx = None
-            continue
-        if words == [_POP]:
-            inner = find_ctx
-            if stack:
-                bases, pending_old, vars_, find_ctx = stack.pop()
-            if inner is not None:
-                subst_finds.append(inner)            # every substituted find feeding the next outer command
-            continue
-        if sep != "&&" and pending_old:
-            bases = list(dict.fromkeys(bases + pending_old))
-            pending_old = []
-        if sep != "|":
-            find_ctx = None
-        words = [x for w in words for x in _expand_braces(w)]
-        name = os.path.basename(words[0])
-        # find output bound to a loop variable: `for d in $(find R); do rm -rf "$d"` / `find R | while read d`
-        if name == "for" and len(words) >= 3 and words[2] == "in" and subst_finds and any("__SUBST__" in w for w in words):
-            var_finds[words[1]] = list(subst_finds)
-        if name == "read" and sep == "|" and find_ctx is not None:
-            rpos = [w for w in words[1:] if not w.startswith("-")]
-            if rpos:
-                var_finds[rpos[-1]] = [find_ctx]
-        if name in DELETE_VERBS:
-            feeds = list(subst_finds) if any("__SUBST__" in w for w in words) else []
-            for w in words[1:]:
-                for m in _VAR.finditer(w):
-                    vn = m.group(2) or re.match(r"^\w*", m.group(1) or "").group(0)
-                    feeds.extend(var_finds.get(vn, []))
-            for roots_, fp_, fb_ in feeds:           # the find's output is the target list
-                for r in roots_:
-                    for p, k, kind in _resolve(r, fb_, vars_):
-                        out.append((p, k, kind or fp_["print_mode"]))
-        if not stack and name not in ("find",):
-            subst_finds = []
-        if name in ("export", "local", "declare", "readonly", "typeset") and len(words) > 1:
-            words = [w for w in words[1:] if not w.startswith("-")] or words
-        if words and all(ASSIGN.match(w) for w in words):
-            for w in words:
-                k, v = w.split("=", 1)
-                vals = [x for b in bases for x in _expand_vars(v, b, vars_)]
-                vars_[k] = [os.path.expanduser(x) for x in vals]
-            continue
-        if name == "for" and len(words) >= 3 and words[2] == "in":
-            vars_[words[1]] = [os.path.expanduser(x) for w in words[3:] for x in _expand_vars(w, bases[0], vars_)]
-            continue
-        flags, pos = _opts(words)
-        if name in ("cd", "pushd", "popd"):
-            t = pos[0] if pos else ("~" if name == "cd" else None)
-            res = _resolve(t, bases, vars_) if t and t != "-" and name != "popd" else []
-            new = [p for p, k, kind in res if k and not kind and os.path.isabs(p)]
-            pending_old = list(dict.fromkeys(pending_old + bases))      # every directory the line may still be in
-            bases = new[:1] if len(new) == 1 or (new and len(set(new)) == 1) else [None]
-            continue
-        raw, gbases, mode, recursive = [], bases, "", True
-        if name in DELETE_VERBS:
-            raw = pos
-            # Recursive unless every option is a literal flag without r/R: `rm $OPTS x` and `rm -${R}f x` may be.
-            recursive = (name in ("trash", "trash-put") or bool(flags & {"r", "R", "--recursive"})
-                         or any(_VAR.fullmatch(w) or (w.startswith("-") and "$" in w) for w in words[1:]))
-        elif name == "gio" and pos[:1] in (["remove"], ["trash"]):
-            raw = pos[1:]
-        elif name == "mv":
-            tdir = any(w in ("-t", "--target-directory") or w.startswith("--target-directory=") for w in words)
-            raw = list(pos) if tdir else pos[:-1]
-            if tdir:
-                for i, w in enumerate(words):
-                    if w in ("-t", "--target-directory") and i + 1 < len(words) and words[i + 1] in raw:
-                        raw.remove(words[i + 1])
-        elif name == "find":
-            roots = _find_roots(words)
-            fp = _find_parse(words)
-            find_ctx = (roots, fp, list(bases))
-            if not fp["deletes"]:
+    var_finds, out = {}, []
+    parsed = _cmd_lines(cmd)
+    for bind_only in (True, False):
+        bases = [cwd if str(cwd).startswith("/") else None]
+        stack, pending_old, vars_ = [], [], {}
+        find_ctx, subst_finds, last_read = None, [], None
+        if not bind_only:
+            out = []
+        for words, sep in parsed:
+            if words == [_PUSH]:
+                stack.append((list(bases), list(pending_old), dict(vars_), find_ctx))
+                find_ctx = None
                 continue
-        elif name == "xargs" and find_ctx is not None:
-            if not any(os.path.basename(w) in FIND_EXEC_DELETERS for w in words[1:]):
+            if words == [_POP]:
+                inner = find_ctx
+                if stack:
+                    bases, pending_old, vars_, find_ctx = stack.pop()
+                if inner is not None:
+                    subst_finds.append(inner)            # every substituted find feeding the next outer command
                 continue
-        elif name == "git":
-            i, args, gb = 1, [], bases
-            while i < len(words):
-                if words[i] == "-C" and i + 1 < len(words):
-                    r = [p for p, k, kind in _resolve(words[i + 1], gb, vars_) if k and not kind]
-                    gb = r[:1] if r else [None]
-                    i += 2; continue
-                if words[i] in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
-                    i += 2; continue
-                if not words[i].startswith("-"):
-                    args.append(words[i])
-                i += 1
-            if len(args) >= 3 and args[0] == "worktree" and args[1] == "remove":
-                raw, gbases = [args[-1]], gb
-        if name in ("find", "xargs") and find_ctx is not None:
-            roots, fp, fb = find_ctx
-            fmode = fp["delete_mode"] if name == "find" else fp["print_mode"]
-            for r in roots:
-                for p, k, kind in _resolve(r, fb, vars_):
-                    out.append((p, k, kind or fmode))
-                    if k and not kind:
-                        out.append((os.path.realpath(p), k, fmode))
-            find_ctx = None if name == "xargs" else find_ctx
-            continue
-        out.extend((p, k, kind or mode) for r in raw for p, k, kind in _resolve(r, gbases, vars_, recursive))
+            if sep != "&&" and pending_old:
+                bases = list(dict.fromkeys(bases + pending_old))
+                pending_old = []
+            if sep != "|":
+                find_ctx = None
+            words = [x for w in words for x in _expand_braces(w)]
+            name = os.path.basename(words[0])
+            # find output bound to a loop variable: `for d in $(find R); do rm -rf "$d"` / `for d in $old`
+            if name == "for" and len(words) >= 3 and words[2] == "in":
+                inherited = _inherit_finds(words[3:], subst_finds, var_finds)
+                if inherited:
+                    var_finds[words[1]] = inherited
+            if name == "read":
+                rv = _read_var(words)
+                if rv:
+                    if sep == "|" and find_ctx is not None:
+                        var_finds[rv] = [find_ctx]
+                    elif subst_finds:
+                        var_finds[rv] = list(subst_finds)
+                    last_read = rv
+            # `while read d; do rm ...; done < <(find R)`: the substitution sits on `done`, after the loop body
+            if last_read and subst_finds and any("__SUBST__" in w for w in words) and (
+                    name == "done" or name.startswith("done<") or any(w == "<" or w.startswith("<") for w in words)):
+                var_finds[last_read] = list(subst_finds)
+            if not bind_only and name in DELETE_VERBS:
+                feeds = _inherit_finds(words, subst_finds, var_finds)
+                for roots_, fp_, fb_ in feeds:           # the find's output is the target list
+                    for r in roots_:
+                        for p, k, kind in _resolve(r, fb_, vars_):
+                            out.append((p, k, kind or fp_["print_mode"]))
+            if name in ("export", "local", "declare", "readonly", "typeset") and len(words) > 1:
+                words = [w for w in words[1:] if not w.startswith("-")] or words
+            if words and all(ASSIGN.match(w) for w in words):
+                for w in words:
+                    k, v = w.split("=", 1)
+                    vals = [x for b in bases for x in _expand_vars(v, b, vars_)]
+                    vars_[k] = [os.path.expanduser(x) for x in vals]
+                    if subst_finds and "__SUBST__" in v:
+                        var_finds[k] = list(subst_finds)
+                if not stack:
+                    subst_finds = []
+                continue
+            if name == "for" and len(words) >= 3 and words[2] == "in":
+                vars_[words[1]] = [os.path.expanduser(x) for w in words[3:] for x in _expand_vars(w, bases[0], vars_)]
+                if not stack:
+                    subst_finds = []
+                continue
+            if not stack and name not in ("find",):
+                subst_finds = []
+            flags, pos = _opts(words)
+            if name in ("cd", "pushd", "popd"):
+                t = pos[0] if pos else ("~" if name == "cd" else None)
+                res = _resolve(t, bases, vars_) if t and t != "-" and name != "popd" else []
+                new = [p for p, k, kind in res if k and not kind and os.path.isabs(p)]
+                pending_old = list(dict.fromkeys(pending_old + bases))      # every directory the line may still be in
+                bases = new[:1] if len(new) == 1 or (new and len(set(new)) == 1) else [None]
+                continue
+            raw, gbases, mode, recursive = [], bases, "", True
+            if name in DELETE_VERBS:
+                raw = pos
+                # Recursive unless every option is a literal flag without r/R: `rm $OPTS x` and `rm -${R}f x` may be.
+                recursive = (name in ("trash", "trash-put") or bool(flags & {"r", "R", "--recursive"})
+                             or any(_VAR.fullmatch(w) or (w.startswith("-") and "$" in w) for w in words[1:]))
+            elif name == "gio" and pos[:1] in (["remove"], ["trash"]):
+                raw = pos[1:]
+            elif name == "mv":
+                tdir = any(w in ("-t", "--target-directory") or w.startswith("--target-directory=") for w in words)
+                raw = list(pos) if tdir else pos[:-1]
+                if tdir:
+                    for i, w in enumerate(words):
+                        if w in ("-t", "--target-directory") and i + 1 < len(words) and words[i + 1] in raw:
+                            raw.remove(words[i + 1])
+            elif name == "find":
+                roots = _find_roots(words)
+                fp = _find_parse(words)
+                find_ctx = (roots, fp, list(bases))
+                if not fp["deletes"]:
+                    continue
+            elif name == "xargs" and find_ctx is not None:
+                if not any(os.path.basename(w) in FIND_EXEC_DELETERS for w in words[1:]):
+                    continue
+            elif name == "git":
+                i, args, gb = 1, [], bases
+                while i < len(words):
+                    if words[i] == "-C" and i + 1 < len(words):
+                        r = [p for p, k, kind in _resolve(words[i + 1], gb, vars_) if k and not kind]
+                        gb = r[:1] if r else [None]
+                        i += 2; continue
+                    if words[i] in ("-c", "--git-dir", "--work-tree") and i + 1 < len(words):
+                        i += 2; continue
+                    if not words[i].startswith("-"):
+                        args.append(words[i])
+                    i += 1
+                if len(args) >= 3 and args[0] == "worktree" and args[1] == "remove":
+                    raw, gbases = [args[-1]], gb
+            if name in ("find", "xargs") and find_ctx is not None:
+                roots, fp, fb = find_ctx
+                fmode = fp["delete_mode"] if name == "find" else fp["print_mode"]
+                for r in roots:
+                    for p, k, kind in _resolve(r, fb, vars_):
+                        out.append((p, k, kind or fmode))
+                        if k and not kind:
+                            out.append((os.path.realpath(p), k, fmode))
+                find_ctx = None if name == "xargs" else find_ctx
+                continue
+            out.extend((p, k, kind or mode) for r in raw for p, k, kind in _resolve(r, gbases, vars_, recursive))
     return out
 
 
