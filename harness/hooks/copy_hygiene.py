@@ -355,7 +355,7 @@ def resolve_ref(m: str, ref: str, source: "str | None") -> "str | None":
 
 def resolved_note(ref: str, source: "str | None", sha: str) -> dict:
     """{} or the warning when a branch name resolved to the remote's commit although the source checkout's branch of
-    the same name is somewhere else (it may be ahead: its commits are NOT in the copy)."""
+    the same name is somewhere else (ahead: its commits are NOT in the copy; behind: the remote is newer)."""
     if not source or not ref or ref == "HEAD" or re.fullmatch(r"[0-9a-f]{40}", ref):
         return {}
     rc, out, _ = S.git(source, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
@@ -363,8 +363,8 @@ def resolved_note(ref: str, source: "str | None", sha: str) -> dict:
     if rc != 0 or not local or local == sha:
         return {}
     return {"resolved_from": "remote", "source_commit": local,
-            "warning": "%r resolved to the remote's commit %s, but your checkout's %r is at %s; push it or pass the "
-                       "commit id to use yours" % (ref, sha[:12], ref, local[:12])}
+            "warning": "%r resolved to the remote's commit %s, but your checkout's %r is at %s (ahead: push it; "
+                       "behind: pull it); or pass the commit id to use yours" % (ref, sha[:12], ref, local[:12])}
 
 
 def _leave_ok(path: str, cur: str, source: "str | None") -> bool:
@@ -1624,7 +1624,7 @@ def candidates(cfg: dict) -> list:
                         add(os.path.join(rd, k))
     for root in cfg["roots"]:
         if not S.within_allowed(root, strictly_inside=False):
-            alert("root-ignored", {"root": root, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
+            S.alert_daily("root-ignored", root, {"root": root, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
             continue
         if not os.path.isdir(root):
             continue
@@ -1670,7 +1670,8 @@ def safe_remove(path: str, kind: str = "checkout", cfg: "dict | None" = None) ->
     any removal it re-reads the service units WITHOUT the cache and refuses a path a service uses (or contains one),
     a configured protect_names match, and anything it cannot check (fails closed). kind: "checkout" (git worktree
     remove, or a clone), "tree" (a mirror or other folder), "empty-tree" (only empty folders, removed bottom-up with
-    rmdir; stops at the first one that is not empty, so a file written meanwhile survives)."""
+    rmdir; stops at the first one that is not empty, so a file written meanwhile survives; folders emptied before it
+    stopped stay removed, so a False result can still have removed empty sibling folders)."""
     try:
         cfg = normalize(cfg) if cfg is not None else load_config()
         prot, errors = protected_scan(cfg, fresh=True)

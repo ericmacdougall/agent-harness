@@ -53,9 +53,10 @@ import hygiene_safety as S
 GB = S.GB
 SHM_DIR = "/dev/shm"
 PROC = "/proc"
-# Never removed by name: semaphores, PostgreSQL segments, Podman's lock segment and browser segments. (An allow-list of
+# Never removed by name: semaphores, PostgreSQL segments and Podman's lock segment (browser scratch is not exempt: the
+# in-use scan keeps a live one, and crashed-browser leftovers are the thing to reclaim). (An allow-list of
 # session-scratch prefixes would be safer still, but nobody has enumerated them; the in-use scan runs inside shm_sweep.)
-SHM_SKIP = ("sem.", "PostgreSQL.", "libpod", ".org.chromium.", ".com.google.Chrome.", "playwright", "pulse-shm")
+SHM_SKIP = ("sem.", "PostgreSQL.", "libpod")
 COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 
 
@@ -295,7 +296,7 @@ def _mirror_worktree_entries(m: str) -> "list | None":
 
 
 def _mirror_unpushed(m: str) -> str:
-    """'' when every commit in the mirror (all refs, HEAD) is on what its origin advertises RIGHT NOW (fresh ls-remote),
+    """'' when every commit in the mirror (branches, tags, HEAD; not remote-tracking refs) is on what its origin advertises RIGHT NOW (fresh ls-remote),
     else why not. Any failure answers with a reason: the mirror is kept."""
     rc, remotes, _ = S.git(m, "remote")
     names = remotes.split()
@@ -310,11 +311,24 @@ def _mirror_unpushed(m: str) -> str:
         if rc != 0:
             return "ls-remote failed (cannot prove its commits are on the remote)"
         advertised |= {l.split()[0] for l in adv.splitlines() if l.strip()}
-    rc, present, _ = S.git(m, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)))
+    # offline: the mirror is a partial clone, and checking must not download what it is about to delete
+    rc, present, _ = S.git(m, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)),
+                           offline=True)
     have = "".join("^%s\n" % l.split()[0] for l in present.splitlines() if l.endswith(" commit"))
-    rc, n, _ = S.git(m, "rev-list", "--count", "--stdin", "--all", inp=have, t=600)
+    # local work only: branches, tags and HEAD. Remote-tracking refs are copies of what the remote had (a branch
+    # deleted upstream after a squash-merge must not pin the mirror for ever).
+    # HEAD goes in as a commit id and only when it resolves: with an unborn HEAD (the usual state of a mirror) git 2.43
+    # answers `rev-list --count --branches HEAD` with 0 and rc 0, which would read as "nothing unpushed".
+    rc, head, _ = S.git(m, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    extra = [head.strip()] if rc == 0 and head.strip() else []
+    rc, n, _ = S.git(m, "rev-list", "--count", "--stdin", "--branches", "--tags", *extra, inp=have, t=600, offline=True)
     if rc != 0 or n.strip() != "0":
         return "it holds commits that are on no remote ref"
+    rc, tags, _ = S.git(m, "for-each-ref", "--format=%(objectname) %(objecttype)", "refs/tags")
+    if rc != 0:
+        return "cannot list tags"
+    if any(l.endswith(" tag") and l.split()[0] not in advertised for l in tags.splitlines()):
+        return "it holds an annotated tag that is on no remote ref"
     return ""
 
 
@@ -405,14 +419,16 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
         if S.within_allowed(r, strictly_inside=False):
             roots.append(r)
         else:
-            audit("root-ignored", {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
+            S.alert_daily("root-ignored", r, {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
     for root in roots:
         names = [e for e in sorted(S._ls(root)) if os.path.isdir(os.path.join(root, e)) and not os.path.islink(os.path.join(root, e))]
         alive = live_sessions(names, ttl, now)
         for e in names:
             p = os.path.join(root, e)
             if e in alive:
-                res["released"].append({"path": p, "removed": [], "freed_bytes": 0, "kept": [{"path": p, "why": "session is alive or recent"}]})
+                res["released"].append({"path": p, "mode": "apply" if deleting else "report-only", "removed": [], "freed_bytes": 0,
+                                        "would_remove": [], "would_free_bytes": 0,
+                                        "kept": [{"path": p, "why": "session is alive or recent"}]})
             elif now - S.newest_activity(p) >= ttl:
                 res["released"].append(release(p, apply, used, refs, cfg, min_idle_s=ttl, now=now))
     co = S.ah("checkouts")

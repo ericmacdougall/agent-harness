@@ -104,11 +104,42 @@ def alert(kind: str, detail: dict) -> None:
         pass
 
 
-def git(cwd: str, *args: str, t: int = 120, inp: "str | None" = None) -> "tuple[int, str, str]":
-    """(rc, stdout, stderr); rc -1 on timeout or a missing git."""
+# A partial-clone mirror must not download while it is only being inspected: GIT_NO_LAZY_FETCH is honoured by newer
+# git; git 2.43 ignores it, so also allow no transport at all (a missing object then just reads as absent).
+NO_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "none-allowed"}
+
+
+def alert_daily(kind: str, key: str, detail: dict) -> None:
+    """alert(), but at most once per UTC day per (kind, key): a standing condition must not add rows every run."""
+    try:
+        os.makedirs(state_dir(), exist_ok=True)
+        path = os.path.join(state_dir(), "alert-daily.json")
+        try:
+            with open(path) as f:
+                seen = json.load(f)
+            if not isinstance(seen, dict):
+                seen = {}
+        except (OSError, ValueError):
+            seen = {}
+        day, k = time.strftime("%Y-%m-%d", time.gmtime()), kind + ":" + key
+        if seen.get(k) == day:
+            return
+        seen = {a: b for a, b in seen.items() if b == day}
+        seen[k] = day
+        tmp = path + ".tmp%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(seen, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    alert(kind, detail)
+
+
+def git(cwd: str, *args: str, t: int = 120, inp: "str | None" = None, offline: bool = False) -> "tuple[int, str, str]":
+    """(rc, stdout, stderr); rc -1 on timeout or a missing git. offline=True: never lazy-fetch a missing object."""
     try:
         r = subprocess.run(["git", "-C", cwd] + GSAFE + list(args), capture_output=True, text=True, timeout=t,
-                           env=GENV, errors="replace", input=inp)
+                           env=dict(GENV, **NO_FETCH_ENV) if offline else GENV, errors="replace", input=inp)
         return r.returncode, r.stdout, r.stderr
     except Exception as e:  # noqa: BLE001
         return -1, "", str(e)
@@ -470,13 +501,14 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
         if rc2 != 0:
             return False, "ls-remote failed (cannot prove the commits are on the remote)"
         advertised |= {l.split()[0] for l in adv.splitlines() if l.strip()}
-    rc, present, _ = git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)), t=120)
+    rc, present, _ = git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)), t=120,
+                      offline=True)
     have = "".join("^%s\n" % l.split()[0] for l in present.splitlines() if l.endswith(" commit"))
-    rc, n, _ = git(repo, "rev-list", "--count", "--stdin", "HEAD", inp=have, t=300)
+    rc, n, _ = git(repo, "rev-list", "--count", "--stdin", "HEAD", inp=have, t=300, offline=True)
     if rc != 0 or n.strip() != "0":
         return False, "HEAD is on no remote ref"
     if not linked:
-        rc, n, _ = git(repo, "rev-list", "--count", "--stdin", "--branches", "--tags", inp=have, t=300)
+        rc, n, _ = git(repo, "rev-list", "--count", "--stdin", "--branches", "--tags", inp=have, t=300, offline=True)
         if rc != 0 or n.strip() != "0":
             return False, "a local branch has commits on no remote"
     return True, ""

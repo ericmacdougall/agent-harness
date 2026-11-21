@@ -438,9 +438,15 @@ class Release(Base):
         with mock.patch.object(wj, "uncapped_containers", return_value=[]), mock.patch.object(wj, "shm_sweep", return_value=[]):
             wj.sweep(apply=False, now=time.time())
             C.candidates(C.load_config())
-        log = Path(self.home, ".agent-harness", "state", "copy-hygiene-alerts.jsonl").read_text()
-        self.assertIn("janitor-root-ignored", log)
-        self.assertIn('"kind": "root-ignored"', log)
+        self.assertEqual(Path(self.home, ".agent-harness", "state", "copy-hygiene-alerts.jsonl").read_text().count("root-ignored"), 1)     # once a day, not per call and per module
+        with mock.patch.object(wj, "uncapped_containers", return_value=[]), mock.patch.object(wj, "shm_sweep", return_value=[]):
+            wj.sweep(apply=False, now=time.time())
+        self.assertEqual(Path(self.home, ".agent-harness", "state", "copy-hygiene-alerts.jsonl").read_text().count("root-ignored"), 1)
+        other = os.path.join(self.home, "projects3")
+        os.makedirs(other)
+        self.write_config(reaper_delete_enabled=True, roots=[other])  # a different root is a different condition
+        C.candidates(C.load_config())
+        self.assertEqual(Path(self.home, ".agent-harness", "state", "copy-hygiene-alerts.jsonl").read_text().count("root-ignored"), 2)
 
     def test_unwrap_takes_the_value_of_stdbuf_and_doas_options(self):
         self.assertEqual(C._unwrap(["stdbuf", "-o", "L", "rm", "-rf", "x"]), ["rm", "-rf", "x"])
@@ -452,6 +458,8 @@ class Release(Base):
         remote_sha = subprocess.run(["git", "-C", src, "rev-parse", "origin/main"], capture_output=True, text=True).stdout.strip()
         note = C.resolved_note("main", src, remote_sha)
         self.assertEqual(note["resolved_from"], "remote")
+        self.assertIn("ahead: push it", note["warning"])
+        self.assertIn("behind: pull it", note["warning"])
         self.assertIn("main", note["warning"])
         self.assertEqual(C.resolved_note("main", src, subprocess.run(["git", "-C", src, "rev-parse", "main"], capture_output=True,
                                                                      text=True).stdout.strip()), {})
@@ -497,7 +505,9 @@ class Sweep(Base):
                 mock.patch.object(wj, "live_sessions", return_value={sid}):
             r = wj.sweep(apply=True)
         self.assertTrue(os.path.exists(c))
-        self.assertEqual(r["released"][0]["kept"][0]["why"], "session is alive or recent")
+        row = r["released"][0]
+        self.assertEqual(row["kept"][0]["why"], "session is alive or recent")
+        self.assertEqual((row["mode"], row["would_remove"], row["would_free_bytes"]), ("apply", [], 0))
 
     def test_live_sessions_reads_command_lines_and_the_wal(self):
         sid = "11111111-2222-4333-8444-555555555555"
@@ -630,6 +640,45 @@ class MirrorSweep(Base):
         sh("git", "branch", "-q", "-D", "fix", cwd=self.mirror)           # control: nothing unpushed -> removable
         self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
 
+    def origin_commit(self, branch="main"):
+        seed = os.path.join(self.t, "seed")
+        sh("git", "commit", "-q", "--allow-empty", "-m", "upstream " + branch, cwd=seed)
+        sh("git", "push", "-q", self.origin, "HEAD:refs/heads/" + branch, cwd=seed)
+        return subprocess.run(["git", "-C", seed, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+
+    def has_object(self, sha):
+        env = dict(os.environ, GIT_ALLOW_PROTOCOL="none-allowed", GIT_NO_LAZY_FETCH="1")
+        return subprocess.run(["git", "-C", self.mirror, "cat-file", "-e", sha], capture_output=True, env=env).returncode == 0
+
+    def test_n2_a_branch_gone_from_the_remote_does_not_pin_an_idle_mirror(self):
+        self.origin_commit("pr")
+        sh("git", "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*", cwd=self.mirror)
+        sh("git", "rev-parse", "--verify", "refs/remotes/origin/pr", cwd=self.mirror)
+        sh("git", "push", "-q", self.origin, ":refs/heads/pr", cwd=os.path.join(self.t, "seed"))   # squash-merge-and-delete
+        self.drop_copy_folder()
+        self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
+
+    def test_n3_the_unpushed_check_does_not_download_new_upstream_commits(self):
+        self.drop_copy_folder()
+        new = self.origin_commit("main")
+        self.assertFalse(self.has_object(new))
+        self.assertEqual(wj._mirror_unpushed(self.mirror), "")
+        self.assertFalse(self.has_object(new), "the check downloaded an upstream commit into the mirror")
+
+    def test_n3_recoverable_does_not_download_new_upstream_commits_either(self):
+        new = self.origin_commit("other")      # main keeps advertising what the copy holds
+        self.assertEqual(S.recoverable(self.copy), (True, ""))
+        self.assertFalse(self.has_object(new))
+
+    def test_a_local_only_annotated_tag_on_a_pushed_commit_keeps_the_mirror(self):
+        self.drop_copy_folder()
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "tag", "-a", "-m", "mine", "local-note", "refs/remotes/origin/main", cwd=self.mirror)
+        row = wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]
+        self.assertTrue(row["action"].startswith("kept"), row)
+        self.assertIn("annotated tag", row["action"])
+        sh("git", "tag", "-d", "local-note", cwd=self.mirror)
+        self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
+
     def test_b1_an_unreachable_origin_keeps_the_mirror(self):
         self.drop_copy_folder()
         moved = self.origin + ".moved"
@@ -744,12 +793,20 @@ class ShmSweep(Base):
         self.assertEqual(rows[0]["action"], "would remove")
 
 
-    def test_s6_podman_lock_and_browser_segments_are_never_removed(self):
-        keep = [self.make(n) for n in ("libpod_rootless_lock_1000", ".org.chromium.Chromium.abc", "playwright_x")]
+    def test_s6_podman_lock_semaphores_and_postgres_segments_are_never_removed(self):
+        keep = [self.make(n) for n in ("libpod_rootless_lock_1000", "sem.mp-abc", "PostgreSQL.123")]
         gone = self.make("scratch2.bin")
         self.sweep_with_ctime_old()
         self.assertTrue(all(os.path.exists(k) for k in keep))
         self.assertFalse(os.path.exists(gone))
+
+    def test_idle_unmapped_browser_scratch_is_reclaimed_but_a_mapped_one_is_kept(self):
+        crashed = self.make(".org.chromium.Chromium.abc")
+        live = self.make("playwright_live")
+        with mock.patch.object(S, "in_use_paths", return_value={live}):
+            self.sweep_with_ctime_old()
+        self.assertFalse(os.path.exists(crashed))
+        self.assertTrue(os.path.exists(live))
 
     def test_s6_the_process_scan_is_taken_inside_the_shm_sweep_and_a_failed_scan_keeps_everything(self):
         f = self.make("held.bin")
@@ -860,6 +917,9 @@ class InstallTimer(unittest.TestCase):
         import install
         self.install = install
         self.home = Path(os.path.realpath(tempfile.mkdtemp()))
+        # janitor_timer_status looks for systemctl even when `run` is injected: pretend it is there (macOS has none)
+        mock.patch("shutil.which", side_effect=lambda n, *a, **k: "/usr/bin/" + n if n == "systemctl" else None).start()
+        self.addCleanup(mock.patch.stopall)
 
     def fake(self, linger="no", fail=None):
         calls = []
