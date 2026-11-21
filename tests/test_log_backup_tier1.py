@@ -73,6 +73,9 @@ if argv and argv[0] == "copy" and sep >= 0:
         charge(1, 10)  # one file: one lookup
     else:
         charge(dirs_under(dst) + 1, 10)  # a copy that walks the remote: one request per folder
+if os.environ.get("FAKE_HASH_LSF_DELAY") and argv and argv[0] == "lsf" and "--hash" in argv:
+    import time
+    time.sleep(float(os.environ["FAKE_HASH_LSF_DELAY"]))  # a slow remote listing or slow local hashing
 if argv and argv[0] == "lsf" and sep >= 0 and remote_root and argv[-1].startswith(remote_root):
     target = argv[-1]
     if "--include-from" in argv:
@@ -462,6 +465,16 @@ class TierOneReconcile(TierOne):
             self.go(LOG_BACKUP_AUDIT_EVERY_SECONDS="86400", LOG_BACKUP_RECON_CHUNK_DIRS="2", LOG_BACKUP_RECON_MAX_CHUNKS="1")
         self.assertTrue(self.remote_has(".claude/wals/s0/main.jsonl"))
         self.assertTrue(self.last_ok().exists(), self.log_text()[-1500:])
+
+    def test_a_slow_remote_listing_leaves_no_time_for_hashing_and_the_cursor_stays(self):
+        # The slice is 10 s and the remote listing takes 6 s: the local hashing must not get a second full slice (code review F2).
+        self.sessions(4)
+        self.go()
+        self.go(LOG_BACKUP_AUDIT_EVERY_SECONDS="0", LOG_BACKUP_RECON_SECONDS="10", FAKE_HASH_LSF_DELAY="6")
+        state = self.ledger_dir / ".claude_wals" / "recon"
+        self.assertTrue(state.exists(), self.log_text()[-1500:])
+        self.assertEqual((state / "cursor").read_text().strip(), "0")
+        self.assertIn("the slice ended during the remote listing", self.log_text())
 
     def test_a_failing_listing_does_not_advance_the_cursor(self):
         self.sessions(6)

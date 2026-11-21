@@ -915,6 +915,10 @@ t1_recon() { # t1_recon SRC-REL: prove what the ledger claims by reading the rem
       --tpslimit "$TPSLIMIT" --contimeout 60s --timeout 300s --low-level-retries 20 --log-file "$LOG" --log-level NOTICE -- "$R/$rel"
     rc=$bounded_rc
     if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+      # The remote listing used part of the slice: the local hashing gets only what is really left, against both the
+      # reconcile slice and the run deadline (code review F2). Out of time: the cursor stays, the chunk is listed again.
+      left=$(( RECON_END - $(date +%s) )); prev=$(time_left); [ "$prev" -ge "$left" ] || left=$prev
+      if [ "$left" -lt 5 ]; then say "$rel: reconcile paused at $cur of $total folders (the slice ended during the remote listing)"; return 0; fi
       LC_ALL=C awk -F "$US" 'FNR == NR {dset[$0] = 1; next} {i = index($1, "/"); d = (i ? substr($1, 1, i - 1) : "."); if (d in dset) print $1}' \
         "$rdir/cdirs" "$rdir/listing" > "$rdir/lpaths" || rc=1
       bounded "$left" "$rdir/local" /usr/bin/env TZ=UTC "$RCLONE" lsf -R --files-only --format ph --hash dropbox --separator "$US" \
