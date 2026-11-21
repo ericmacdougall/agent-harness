@@ -311,23 +311,37 @@ def _mirror_unpushed(m: str) -> str:
         if rc != 0:
             return "ls-remote failed (cannot prove its commits are on the remote)"
         advertised |= {l.split()[0] for l in adv.splitlines() if l.strip()}
-    # offline: the mirror is a partial clone, and checking must not download what it is about to delete
-    rc, present, _ = S.git(m, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)),
-                           offline=True)
-    have = "".join("^%s\n" % l.split()[0] for l in present.splitlines() if l.endswith(" commit"))
-    # local work only: branches, tags and HEAD. Remote-tracking refs are copies of what the remote had (a branch
-    # deleted upstream after a squash-merge must not pin the mirror for ever).
+    # Offline throughout: the mirror is a partial clone, and checking must not download what it is about to delete.
+    # Local work = branches and HEAD. Remote-tracking refs are copies of what the remote had (a branch deleted upstream
+    # after a squash-merge must not pin the mirror for ever), and neither is a tag that is not annotated: a
+    # lightweight tag the mirror fetched and the remote later deleted is not work. An ANNOTATED tag that no remote ref
+    # carries is local-only and keeps the mirror (below).
     # HEAD goes in as a commit id and only when it resolves: with an unborn HEAD (the usual state of a mirror) git 2.43
     # answers `rev-list --count --branches HEAD` with 0 and rc 0, which would read as "nothing unpushed".
     rc, head, _ = S.git(m, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-    extra = [head.strip()] if rc == 0 and head.strip() else []
-    rc, n, _ = S.git(m, "rev-list", "--count", "--stdin", "--branches", "--tags", *extra, inp=have, t=600, offline=True)
-    if rc != 0 or n.strip() != "0":
-        return "it holds commits that are on no remote ref"
-    rc, tags, _ = S.git(m, "for-each-ref", "--format=%(objectname) %(objecttype)", "refs/tags")
-    if rc != 0:
-        return "cannot list tags"
-    if any(l.endswith(" tag") and l.split()[0] not in advertised for l in tags.splitlines()):
+    tips = S.refs_ids(m, "refs/heads")
+    rc2, tagrefs, _ = S.git(m, "for-each-ref", "--format=%(objectname)", "refs/tags")
+    if tips is None or rc2 != 0:
+        return "cannot list branches or tags"
+    if rc == 0 and head.strip():
+        tips.append(head.strip())
+    try:
+        with S.offline_view(m) as v:
+            ty = v.types(advertised)
+            if ty is None:
+                return "object check failed or timed out (kept)"
+            have = {i for i, k in ty.items() if k == "commit"}
+            n = v.unpushed(tips, have)
+            if n is None:
+                return "object check failed or timed out (kept)"
+            if n != 0:
+                return "it holds commits that are on no remote ref"
+            tty = v.types(tagrefs.split())
+            if tty is None:
+                return "tag check failed or timed out (kept)"
+    except S.ProbeError as e:
+        return "offline check unavailable (%s)" % e
+    if any(k == "tag" and i not in advertised for i, k in tty.items()):
         return "it holds an annotated tag that is on no remote ref"
     return ""
 
@@ -419,7 +433,7 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
         if S.within_allowed(r, strictly_inside=False):
             roots.append(r)
         else:
-            S.alert_daily("root-ignored", r, {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
+            S.alert_daily("janitor-root-ignored", r, {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"}, dedupe="root-ignored")
     for root in roots:
         names = [e for e in sorted(S._ls(root)) if os.path.isdir(os.path.join(root, e)) and not os.path.islink(os.path.join(root, e))]
         alive = live_sessions(names, ttl, now)

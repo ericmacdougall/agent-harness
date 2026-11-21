@@ -77,4 +77,13 @@ The service has `TimeoutStartSec=1800` and `MemoryMax=1G`. By hand: copy `harnes
 
 Config: `~/.agent-harness/state/copy-hygiene.json` (`max_age_hours`, `shm_ttl_hours`, `mirror_ttl_days`, `roots`, `protect_names`,
 `default_memory`, `reaper_delete_enabled`, plus the disk-floor keys). Roots outside `~/.agent-harness/{work,checkouts,
-test-copies}` are ignored (one alert row each). Without `/proc` (macOS) session liveness reads `ps -axo command=`; with no process list at all every session counts as alive. Audit and alert log: `~/.agent-harness/state/copy-hygiene-alerts.jsonl`.
+test-copies}` are ignored: one alert row per root per UTC day, across the janitor and the reaper (`janitor-root-ignored` from the janitor, `root-ignored` from the reaper, deduped through `state/alert-daily.json`, which is flock-protected). Without `/proc` (macOS) session liveness reads `ps -axo command=`; with no process list at all every session counts as alive. Audit and alert log: `~/.agent-harness/state/copy-hygiene-alerts.jsonl`.
+
+Mirror safety checks are offline. Whether a mirror or a test copy holds commits the remote lacks is answered from a throwaway bare
+repository that borrows the object directory (alternates) and has no promisor remote, so a missing id fails at once and nothing is
+downloaded (git 2.43 has no `GIT_NO_LAZY_FETCH` and otherwise spins a failed lazy fetch per missing id). A `cat-file` or `rev-list`
+failure or timeout always keeps the folder. The one exception is `recoverable`: when HEAD is not on what the remote advertises
+and the copy lacks advertised commits (its own branch advanced upstream), it makes ONE time-limited commit-only fetch
+(`--filter=tree:0` on a partial clone) and re-checks offline; a failed fetch keeps the copy. For mirrors, only branches and HEAD count
+as local work; a lightweight tag removed on the remote does not pin a mirror, while an annotated tag that no remote ref carries
+is local-only and keeps it.

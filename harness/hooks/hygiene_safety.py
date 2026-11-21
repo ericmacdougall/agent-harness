@@ -16,6 +16,7 @@ ONE place for every question "may this folder be deleted?" so the two tools cann
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import glob
 import json
@@ -25,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 GB = 1024 ** 3
@@ -109,30 +111,34 @@ def alert(kind: str, detail: dict) -> None:
 NO_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "none-allowed"}
 
 
-def alert_daily(kind: str, key: str, detail: dict) -> None:
-    """alert(), but at most once per UTC day per (kind, key): a standing condition must not add rows every run."""
+def alert_daily(kind: str, key: str, detail: dict, dedupe: "str | None" = None) -> None:
+    """alert(), but at most once per UTC day per (kind, key): a standing condition must not add rows every run.
+    `dedupe` names the shared marker when two callers write different kinds for one condition (default: kind).
+    The read-modify-write of state/alert-daily.json runs under an exclusive flock, so concurrent runs add one row."""
     try:
         os.makedirs(state_dir(), exist_ok=True)
         path = os.path.join(state_dir(), "alert-daily.json")
-        try:
-            with open(path) as f:
-                seen = json.load(f)
-            if not isinstance(seen, dict):
+        with open(path + ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                with open(path) as f:
+                    seen = json.load(f)
+                if not isinstance(seen, dict):
+                    seen = {}
+            except (OSError, ValueError):
                 seen = {}
-        except (OSError, ValueError):
-            seen = {}
-        day, k = time.strftime("%Y-%m-%d", time.gmtime()), kind + ":" + key
-        if seen.get(k) == day:
-            return
-        seen = {a: b for a, b in seen.items() if b == day}
-        seen[k] = day
-        tmp = path + ".tmp%d" % os.getpid()
-        with open(tmp, "w") as f:
-            json.dump(seen, f)
-        os.replace(tmp, path)
+            day, k = time.strftime("%Y-%m-%d", time.gmtime()), (dedupe or kind) + ":" + key
+            if seen.get(k) == day:
+                return
+            seen = {a: b for a, b in seen.items() if b == day}
+            seen[k] = day
+            tmp = path + ".tmp%d" % os.getpid()
+            with open(tmp, "w") as f:
+                json.dump(seen, f)
+            os.replace(tmp, path)
+            alert(kind, detail)                   # inside the lock: the marker and the row go together
     except OSError:
-        pass
-    alert(kind, detail)
+        alert(kind, detail)
 
 
 def git(cwd: str, *args: str, t: int = 120, inp: "str | None" = None, offline: bool = False) -> "tuple[int, str, str]":
@@ -425,6 +431,80 @@ def busy(path: str, used: set, refs: set) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- offline object view
+class OfflineView:
+    """Answers 'which of these commits exist here, and what is not on the remote' WITHOUT ever fetching.
+
+    Asking a partial clone directly is not safe: git 2.43 has no GIT_NO_LAZY_FETCH, and `cat-file --batch-check` of a
+    missing id then spins a failed lazy fetch (100% CPU, 90+ s per id on a 38M-object repo). The view is a throwaway bare
+    repository whose objects/info/alternates points at the repository's object directory and which has no promisor
+    remote, so a missing id fails at once."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def _git(self, *args, inp=None, t=300):
+        return git(self.path, *args, inp=inp, t=t, offline=True)
+
+    def types(self, ids) -> "dict | None":
+        """{id: object type or 'missing'}; None when git failed or timed out (callers keep everything)."""
+        ids = sorted(set(ids))
+        if not ids:
+            return {}
+        rc, out, _ = self._git("cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(ids) + "\n", t=120)
+        if rc != 0:
+            return None
+        got = {}
+        for l in out.splitlines():
+            parts = l.split()
+            if len(parts) >= 2:
+                got[parts[0]] = parts[-1]
+        return got if all(i in got for i in ids) else None
+
+    def commits(self, ids) -> "set | None":
+        ty = self.types(ids)
+        return None if ty is None else {i for i, k in ty.items() if k == "commit"}
+
+    def unpushed(self, tips, have) -> "int | None":
+        """Number of commits reachable from tips and from none of `have`; None on any failure."""
+        stdin = "".join(t + "\n" for t in tips) + "".join("^%s\n" % h for h in sorted(have))
+        rc, n, _ = self._git("rev-list", "--count", "--stdin", inp=stdin, t=600)
+        try:
+            return int(n.strip()) if rc == 0 else None
+        except ValueError:
+            return None
+
+
+@contextlib.contextmanager
+def offline_view(repo: str):
+    """Yield an OfflineView of repo's objects; the throwaway repository is removed afterwards. ProbeError when it cannot be built."""
+    rc, objs, _ = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+    objs = objs.strip()
+    if rc != 0 or not objs or not os.path.isdir(objs):
+        raise ProbeError("cannot find the object directory")
+    tmp = tempfile.mkdtemp(prefix="hygiene-view-")
+    try:
+        rc, _, err = git(tmp, "init", "-q", "--bare", ".")
+        if rc != 0:
+            raise ProbeError("cannot create the offline view: " + err.strip()[-120:])
+        with open(os.path.join(tmp, "objects", "info", "alternates"), "w") as f:
+            f.write(objs + "\n")
+        rc, shallow, _ = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "shallow")
+        if rc == 0 and os.path.isfile(shallow.strip()):
+            shutil.copyfile(shallow.strip(), os.path.join(tmp, "shallow"))
+        yield OfflineView(tmp)
+    except OSError as e:
+        raise ProbeError("offline view failed: %s" % e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def refs_ids(repo: str, *patterns: str) -> "list | None":
+    """Object ids of the refs under patterns (names only, no object reads); None when git failed."""
+    rc, out, _ = git(repo, "for-each-ref", "--format=%(objectname)", *patterns)
+    return None if rc != 0 else [l.strip() for l in out.splitlines() if l.strip()]
+
+
 # ---------------------------------------------------------------- recoverability
 def _has_nested_repo(path: str) -> bool:
     for dp, dn, fn in os.walk(path):
@@ -494,24 +574,61 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
     names = remotes.split()
     if rc != 0 or not names:
         return False, "no remote"
-    advertised = set()
+    per_remote = {}
     for name in names:
         rc, url, _ = git(repo, "remote", "get-url", name)
         rc2, adv, _ = git(repo, "ls-remote", url.strip(), t=left()) if rc == 0 and url.strip() else (1, "", "")
         if rc2 != 0:
             return False, "ls-remote failed (cannot prove the commits are on the remote)"
-        advertised |= {l.split()[0] for l in adv.splitlines() if l.strip()}
-    rc, present, _ = git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)), t=120,
-                      offline=True)
-    have = "".join("^%s\n" % l.split()[0] for l in present.splitlines() if l.endswith(" commit"))
-    rc, n, _ = git(repo, "rev-list", "--count", "--stdin", "HEAD", inp=have, t=300, offline=True)
-    if rc != 0 or n.strip() != "0":
-        return False, "HEAD is on no remote ref"
-    if not linked:
-        rc, n, _ = git(repo, "rev-list", "--count", "--stdin", "--branches", "--tags", inp=have, t=300, offline=True)
-        if rc != 0 or n.strip() != "0":
-            return False, "a local branch has commits on no remote"
-    return True, ""
+        per_remote[name] = {l.split()[0] for l in adv.splitlines() if l.strip()}
+    advertised = set().union(*per_remote.values())
+    rc, head, _ = git(repo, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    tips = refs_ids(repo, "refs/heads", "refs/tags") if not linked else []
+    if rc != 0 or not head.strip() or tips is None:
+        return False, "cannot read HEAD or the local refs"
+    head = head.strip()
+
+    def check() -> "tuple[bool, str, set | None]":
+        """(ok, why, advertised ids missing here); everything offline."""
+        try:
+            with offline_view(repo) as v:
+                ty = v.types(advertised)
+                if ty is None:
+                    return False, "object check failed or timed out", None
+                have = {i for i, k in ty.items() if k == "commit"}
+                missing = {i for i, k in ty.items() if k == "missing"}
+                n = v.unpushed([head], have)
+                if n is None:
+                    return False, "object check failed or timed out", None
+                if n != 0:
+                    return False, "HEAD is on no remote ref", missing
+                if tips:
+                    n = v.unpushed(tips, have)
+                    if n is None:
+                        return False, "object check failed or timed out", None
+                    if n != 0:
+                        return False, "a local branch has commits on no remote", missing
+        except ProbeError as e:
+            return False, "offline check unavailable (%s)" % e, None
+        return True, "", missing
+
+    ok, why, missing = check()
+    if ok or not missing or why.startswith(("object check", "offline check")):
+        return ok, why
+    # The remote may simply have moved on (the copy's own branch advanced upstream): ONE explicit, time-limited fetch of
+    # the commits it advertises and the copy lacks, then the same offline check. A failed fetch keeps the copy.
+    rc, pc, _ = git(repo, "config", "--get", "extensions.partialclone")
+    flt = ["--filter=tree:0"] if rc == 0 else []         # a full clone cannot filter; it takes the commits and their trees
+    for name, ids in sorted(per_remote.items()):
+        want = sorted(ids & missing)
+        if not want:
+            continue
+        rc, _, err = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", *flt, name, *want,
+                         t=left())
+        if rc != 0:
+            return False, "fetch of the remote's new commits failed (cannot prove HEAD is on the remote)"
+    ok, why, _ = check()
+    return ok, why
 
 
 def find_repos(root: str) -> list:

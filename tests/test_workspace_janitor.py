@@ -18,6 +18,7 @@ import copy_hygiene as C  # noqa: E402
 import hygiene_safety as S  # noqa: E402
 import workspace_janitor as wj  # noqa: E402
 
+REAL_IN_USE = S.in_use_paths        # Base stubs the probe; the /proc test below needs the real one
 OLD = time.time() - 3 * 86400
 ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t",
            GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
@@ -45,6 +46,7 @@ class Base(unittest.TestCase):
         self.patch_env = mock.patch.dict(os.environ, {"HARNESS_JANITOR_HOME": self.home, "GIT_CONFIG_GLOBAL": "/dev/null",
                                                       "GIT_CONFIG_NOSYSTEM": "1", "HARNESS_COPY_HYGIENE_UNIT_DIRS": units})
         self.patch_env.start()
+        mock.patch.object(S, "in_use_paths", return_value=set()).start()      # the real probe is slow (lsof on macOS); tests that need it patch it again
         os.environ.pop("HARNESS_COPY_HYGIENE_HOME", None)
         os.environ.pop("HARNESS_JANITOR", None)
         self.origin = os.path.join(self.t, "origin.git")
@@ -670,6 +672,65 @@ class MirrorSweep(Base):
         self.assertEqual(S.recoverable(self.copy), (True, ""))
         self.assertFalse(self.has_object(new))
 
+    def test_b1_recoverable_fetches_once_when_the_copys_branch_advanced_upstream(self):
+        new = self.origin_commit("main")                  # the copy's own branch moved on the remote
+        self.assertFalse(self.has_object(new))
+        self.assertEqual(S.recoverable(self.copy), (True, ""))
+        self.assertTrue(self.has_object(new))             # the one explicit commit-only fetch
+
+    def test_b1_recoverable_keeps_the_copy_when_that_fetch_fails_and_never_fetches_when_not_needed(self):
+        self.origin_commit("main")
+        calls = []
+        real = S.git
+
+        def no_fetch(cwd, *a, **kw):
+            if "fetch" in a:
+                calls.append(a)
+                return 1, "", "boom"
+            return real(cwd, *a, **kw)
+        with mock.patch.object(S, "git", side_effect=no_fetch):
+            ok, why = S.recoverable(self.copy)
+        self.assertFalse(ok)
+        self.assertIn("fetch", why)
+        self.assertEqual(len(calls), 1)
+        calls.clear()
+        self.drop_copy_folder()
+        with mock.patch.object(S, "git", side_effect=no_fetch):
+            self.assertEqual(wj._mirror_unpushed(self.mirror), "")      # the mirror check stays offline
+        self.assertEqual(calls, [])
+
+    def test_b1_the_offline_view_reports_missing_ids_without_spawning_a_fetch(self):
+        new = self.origin_commit("main")
+        trace = os.path.join(self.t, "trace.txt")
+        with mock.patch.object(S, "GENV", dict(S.GENV, GIT_TRACE=trace)), S.offline_view(self.mirror) as v:
+            self.assertEqual(v.types([new]), {new: "missing"})
+            self.assertEqual(v.commits([new]), set())
+            self.assertNotIn("fetch", Path(trace).read_text())
+            cfg = subprocess.run(["git", "-C", v.path, "config", "--list"], capture_output=True, text=True, env=ENV).stdout
+            self.assertNotIn("promisor", cfg)
+            vp = v.path
+        self.assertFalse(os.path.exists(vp), "the throwaway view must be removed")
+
+    def test_b1_a_failing_object_check_keeps_the_mirror_explicitly(self):
+        self.drop_copy_folder()
+        real = S.git
+
+        def fail(cwd, *a, **kw):
+            return (-1, "", "timeout") if "cat-file" in a else real(cwd, *a, **kw)
+        with mock.patch.object(S, "git", side_effect=fail):
+            self.assertIn("timed out", wj._mirror_unpushed(self.mirror))
+
+    def test_a_lightweight_tag_deleted_upstream_does_not_pin_the_mirror(self):
+        self.drop_copy_folder()
+        seed = os.path.join(self.t, "seed")
+        sh("git", "commit", "-q", "--allow-empty", "-m", "tagged", cwd=seed)
+        sh("git", "tag", "v-gone", cwd=seed)
+        sh("git", "push", "-q", self.origin, "HEAD:refs/heads/main", "refs/tags/v-gone", cwd=seed)
+        sh("git", "fetch", "-q", "--tags", "origin", cwd=self.mirror)
+        sh("git", "push", "-q", self.origin, ":refs/tags/v-gone", cwd=seed)
+        self.origin_commit("main")
+        self.assertEqual(wj._mirror_unpushed(self.mirror), "")
+
     def test_a_local_only_annotated_tag_on_a_pushed_commit_keeps_the_mirror(self):
         self.drop_copy_folder()
         sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "tag", "-a", "-m", "mine", "local-note", "refs/remotes/origin/main", cwd=self.mirror)
@@ -759,6 +820,7 @@ class ShmSweep(Base):
                 "l.mmap.restype=ctypes.c_void_p\nl.mmap.argtypes=[ctypes.c_void_p,ctypes.c_size_t,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_long]\n"
                 "a=l.mmap(None,8192,3,1,fd,0)\nassert a not in (None,2**64-1)\nos.close(fd)\n"
                 "print('ready',flush=True)\ntime.sleep(60)\n")
+        mock.patch.object(S, "in_use_paths", REAL_IN_USE).start()
         p = subprocess.Popen([sys.executable, "-c", code, f], stdout=subprocess.PIPE, text=True)
         try:
             self.assertEqual(p.stdout.readline().strip(), "ready")

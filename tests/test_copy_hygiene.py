@@ -42,6 +42,8 @@ class Base(unittest.TestCase):
         # the service probe reads the real host's systemd/cron/docker; stub-based tests of it live in test_hygiene_safety
         self.sr = mock.patch.object(S, "service_refs", return_value=set())
         self.sr.start()
+        self.iu = mock.patch.object(S, "in_use_paths", return_value=set())     # the real probe is slow (lsof on macOS)
+        self.iu.start()
         os.environ.pop("HARNESS_COPY_HYGIENE_MIN_FREE_GB", None)
         self.units = self.home / "units"
         self.units.mkdir()
@@ -57,6 +59,7 @@ class Base(unittest.TestCase):
         sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.repo)
 
     def tearDown(self):
+        self.iu.stop()
         self.sr.stop()
         self.env.stop()
         self.tmp.cleanup()
