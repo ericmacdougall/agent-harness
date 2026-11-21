@@ -279,6 +279,19 @@ class Status(Base):
             self.assertIn(needle, text)
 
 
+class Tier1Progress(Base):
+    def test_status_names_the_tier_1_progress_and_keeps_its_exit_code(self):
+        self.last_ok(stamp(time.time() - 60) + " sources=6\n")
+        (self.logs / "log-backup.t1.progress").write_text(
+            ".claude/wals unproven=120 pending=3 stuck=0 unlistable=0 collisions=0 last_audit=never reconcile=200/4752\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = lb.main(["--home", str(self.home), "status"])
+        self.assertEqual(code, 0)
+        self.assertIn("tier 1       : .claude/wals unproven=120 pending=3", out.getvalue())
+        self.assertNotIn("tier1", lb.status_json(self.home), "the status --json schema is stable")
+
+
 @unittest.skipUnless(REAL_RCLONE, "rclone not installed")
 class Restore(Base):
     def setUp(self):
