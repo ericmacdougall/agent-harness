@@ -522,6 +522,47 @@ class Protected(OldCopies, Base):
         self.unit("sys.service", "[Service]\nExecStart=/usr/lib/thing/bin/run\n")
         self.allow("cd $X && rm -rf bin")
 
+    def test_everyday_variable_and_substitution_commands_stay_allowed(self):
+        self.setup_services()
+        for cwd in ("/tmp", self.home, self.home / "pp-ci"):
+            for cmd in ("rm -f out_$n.log", "mv x.tmp.$$ x", "rm -rf build-$V", 'D=""; rm -rf "$D"',
+                        'D=$(mktemp -d); rm -rf "$D"', "rm -rf `mktemp -d`", "rm %s/log-$d" % self.runner):
+                self.allow(cmd, cwd=cwd)
+
+    def test_substitutions_and_scopes_cannot_hide_a_delete(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd, cwd in (("rm -rf $(pwd)/runner", self.home / "pp-ci"),
+                             ("find ~/pp-ci/nm -mtime +$(echo 1) -delete", None),
+                             ("cd ~/pp-ci && (cd /tmp && true) && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && x=$(cd /tmp && pwd) && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && x=`cd /tmp && pwd` && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && bash -c 'cd /tmp' && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && pushd /tmp && popd && rm -rf runner", "/tmp"),
+                             ("cd /nonexistent && cd /tmp; rm -rf runner", self.home / "pp-ci"),
+                             ("rm -rf %s/" % (self.home / "nm-link"), None),
+                             ("find ~/pp-ci/nm \\( -name a -o -name b \\) -mtime +1 -delete", None),
+                             ('export D=~/pp-ci/runner; rm -rf "$D"', None), ('local D=~/pp-ci/runner; rm -rf "$D"', None),
+                             ('declare D=~/pp-ci/runner; rm -rf "$D"', None), ("A=1 D=~/pp-ci/nm; rm -rf $D", None),
+                             ("rm -rf ~/pp-ci/*/*", None), ("find ~/pp-ci/nm ! -name keep -delete", None)):
+                if "nm-link" in cmd and not (self.home / "nm-link").exists():
+                    (self.home / "nm-link").symlink_to(self.nm)
+                if "\\(" in cmd:
+                    # name selectors: the root itself may stay, but nm is protected exactly and the find is selective,
+                    # so this is allowed; the case only checks that escaped parentheses are not split as subshells.
+                    self.assertEqual(tc.delete_targets_line(cmd, "/tmp")[0][2], "below", cmd)
+                    continue
+                self.deny(cmd, cwd)
+
+    def test_scope_handling_is_what_catches_and_joined_forms(self):
+        # Failing-first guard: with the PUSH/POP scoping removed these would resolve `runner` against /tmp.
+        self.setup_services()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            targets = tc.delete_targets_line("cd ~/pp-ci && (cd /tmp && true) && rm -rf runner", "/tmp")
+        self.assertIn(str(self.runner), [p for p, _k, _m in targets])
+        self.assertNotIn("/tmp/runner", [p for p, _k, _m in targets])
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()
