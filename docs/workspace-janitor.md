@@ -38,7 +38,7 @@ clean and its HEAD commit is on a remote or still in your checkout; otherwise `a
 |---|---|
 | `SessionEnd` hook (`session-end`) | When deletion is on, starts a detached `release --session <id> --apply --budget 600` and returns at once (the probes and per-repo `ls-remote` can take minutes). |
 | `release --session ID / --path DIR [--apply] [--budget S]` | For `~/.agent-harness/work/<id>` or one folder inside `~/.agent-harness/{work,checkouts,test-copies}` (nothing else is accepted): removes each checkout that is verified recoverable. Removes the session folder when no file is left. Dry run without `--apply`. Call it at the end of every runner job. |
-| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its Claude process is alive (session id on a command line, or a WAL newer than the TTL); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*` and `PostgreSQL.*` are never touched); lists running docker/podman containers with no memory limit. A failed probe keeps everything and exits 0. |
+| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its Claude process is alive (session id on a command line, or a WAL newer than the TTL); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*` and `PostgreSQL.*` are never touched); reports the count and size of `~/.agent-harness/mirrors` and removes a mirror idle longer than `mirror_ttl_days` (14) only when no registered worktree of it exists, nothing uses or references it and deletion is on (report-only otherwise); lists running docker/podman containers with no memory limit. Every removal re-reads idle time under the lock and repeats the process and service probes first. A failed probe keeps everything and exits 0. |
 | `pretool` hook | Denies `docker\|podman run\|create` and `compose up\|run` without a memory cap, and Elasticsearch/OpenSearch without a heap cap (also via `--env-file`). Handles `sudo/env/timeout/nice/command`, `docker container run`, `$(...)`, pipes and `bash -c`; stops reading flags at the image name. Fails open. |
 
 Testcontainers-style tests start containers through the Docker API and never reach the hook; the sweep lists them as
@@ -70,6 +70,6 @@ The service has `TimeoutStartSec=1800` and `MemoryMax=1G`. By hand: copy `harnes
 `~/.config/systemd/user/` and `systemctl --user enable --now agent-harness-janitor.timer`. To let it delete, set
 `"reaper_delete_enabled": true` in `copy-hygiene.json` after reading a report-only run (`sweep --json`).
 
-Config: `~/.agent-harness/state/copy-hygiene.json` (`max_age_hours`, `shm_ttl_hours`, `roots`, `protect_names`,
+Config: `~/.agent-harness/state/copy-hygiene.json` (`max_age_hours`, `shm_ttl_hours`, `mirror_ttl_days`, `roots`, `protect_names`,
 `default_memory`, `reaper_delete_enabled`, plus the disk-floor keys). Roots outside `~/.agent-harness/{work,checkouts,
 test-copies}` are ignored. Audit and alert log: `~/.agent-harness/state/copy-hygiene-alerts.jsonl`.

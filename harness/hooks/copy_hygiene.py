@@ -68,6 +68,7 @@ DEFAULTS = {
     "name_patterns": ["tester-*", "test-copy-*", "click-test-*"],
     # workspace_janitor.py reads the same file (one config, one deletion switch):
     "shm_ttl_hours": 6.0,
+    "mirror_ttl_days": 14.0,           # shared bare mirrors with no worktree left are removed after this many idle days
     "protect_names": ["yates", "optinrouter"],
     "default_memory": "4g",
 }
@@ -98,6 +99,11 @@ def copies_root() -> str:
     return os.path.join(home(), ".agent-harness", "test-copies")
 
 
+def under_copies(path: str) -> bool:
+    """True for a path inside test-copies, compared by realpath on BOTH sides (a symlinked home must not skip the lock)."""
+    return os.path.realpath(path).startswith(os.path.realpath(copies_root()) + os.sep)
+
+
 def _num(v, default: float) -> float:
     try:
         f = float(v)
@@ -109,7 +115,7 @@ def _num(v, default: float) -> float:
 def normalize(cfg: dict) -> dict:
     out = dict(DEFAULTS)
     out.update({k: v for k, v in (cfg or {}).items() if k in DEFAULTS})
-    for k in ("min_free_gb", "min_free_pct", "max_age_hours", "max_total_gb", "shm_ttl_hours"):
+    for k in ("min_free_gb", "min_free_pct", "max_age_hours", "max_total_gb", "shm_ttl_hours", "mirror_ttl_days"):
         out[k] = _num(out[k], DEFAULTS[k])
     out["reaper_delete_enabled"] = out.get("reaper_delete_enabled") is True    # only a literal true enables deletion
     roots = out.get("roots")
@@ -657,6 +663,32 @@ def remove_copy(path: str) -> "tuple[bool, str]":
     return ok, (msg or "removed")
 
 
+def _reap_one(r: dict, now: float) -> str:
+    """Decide on one copy with the key lock HELD and nothing carried over from the scan: an acquire that only touched the
+    index (the worktree's HEAD lives in the mirror) must stop the removal, so the idle time is re-read from the index
+    and the process and service probes are run again right before the removal."""
+    path = r["path"]
+    lk = S.lock_nonblocking(path + ".lock") if under_copies(path) else None
+    if under_copies(path) and lk is None:
+        return "kept: locked by a running acquire"
+    try:
+        idle = (now - last_activity(path, load_index())) / 3600
+        if idle < r["min_idle_hours"]:
+            return f"kept: used since the scan (idle {round(idle, 1)}h)"
+        try:
+            used, refs = S.in_use_paths(), S.service_refs()
+        except S.ProbeError as e:               # a failed probe keeps everything
+            return f"kept: liveness probe failed: {e}"
+        ok, why = deletable(path, used, refs)
+        if not ok:
+            return f"kept: {why}"
+        done, msg = remove_copy(path)
+        return "removed" if done else f"remove failed: {msg}"
+    finally:
+        if lk:
+            lk.close()
+
+
 def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = None) -> dict:
     cfg = normalize(cfg) if cfg is not None else load_config()
     now = now or time.time()
@@ -680,35 +712,16 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
         r["reap"] = bool(reasons)
         r["why"] = "; ".join(reasons)
     deleting = bool(apply and deletion_enabled(cfg))
-    used = refs = None
-    probe_err = ""
-    if deleting and any(r["reap"] for r in rows):
-        try:
-            used, refs = S.in_use_paths(), S.service_refs()
-        except S.ProbeError as e:               # a failed probe keeps everything
-            probe_err = str(e)
+    for r in rows:
+        if r["reap"]:
+            r["min_idle_hours"] = cfg["max_age_hours"] if r["idle_hours"] >= cfg["max_age_hours"] else 1
     for r in rows:
         if not r["reap"]:
             r["action"] = "keep"
         elif not deleting:
             r["action"] = "would-remove (report-only)"
-        elif probe_err:
-            r["action"] = f"kept: liveness probe failed: {probe_err}"
         else:
-            lk = S.lock_nonblocking(r["path"] + ".lock") if r["path"].startswith(copies_root() + os.sep) else None
-            if r["path"].startswith(copies_root() + os.sep) and lk is None:
-                r["action"] = "kept: locked by a running acquire"
-                continue
-            try:
-                ok, why = deletable(r["path"], used, refs)
-                if not ok:
-                    r["action"] = f"kept: {why}"
-                else:
-                    done, msg = remove_copy(r["path"])
-                    r["action"] = "removed" if done else f"remove failed: {msg}"
-            finally:
-                if lk:
-                    lk.close()
+            r["action"] = _reap_one(r, now)
     res = {"mode": "delete" if deleting else "report-only", "delete_enabled": deletion_enabled(cfg),
            "total_gb": round(total / GB, 2), "cap_gb": cfg["max_total_gb"], "max_age_hours": cfg["max_age_hours"],
            "size_unknown": sum(not r["size_known"] for r in rows), "copies": rows, "ts": int(now)}

@@ -264,6 +264,52 @@ class Reap(Base):
         self.assertFalse(old.exists())
         self.assertTrue(dirty.exists() and keep.exists())
 
+    def test_acquire_touching_the_index_after_the_scan_prevents_removal(self):
+        # N1: the acquire only touches the index (HEAD lives in the mirror); the reaper holds a stale idle reading.
+        p = Path(tc.acquire(str(self.repo), "pr-9", cfg=self.cfg(min_free_gb=0))["path"])
+        self.write_config(reaper_delete_enabled=True, max_age_hours=24)
+        real_lock = S.lock_nonblocking
+        t0 = time.time()
+
+        def lock_after_acquire_touched(path):
+            tc.touch_index(str(p))                  # the runner's acquire lands between the scan and the removal
+            return real_lock(path)
+        old = time.time() - 72 * 3600
+        with mock.patch.object(tc, "last_activity", side_effect=lambda q, idx: max(old, float((idx.get(q) or {}).get("last_used") or 0)
+                                                                if float((idx.get(q) or {}).get("last_used") or 0) > t0 else 0)), \
+                mock.patch.object(S, "in_use_paths", return_value=set()), \
+                mock.patch.object(S, "lock_nonblocking", side_effect=lock_after_acquire_touched):
+            res = tc.reap(apply=True)
+        self.assertTrue(p.exists(), res)
+        self.assertIn("used since the scan", [c for c in res["copies"] if c["path"] == str(p)][0]["action"])
+
+    def test_probes_are_repeated_after_the_lock(self):
+        p = Path(tc.acquire(str(self.repo), "pr-10", cfg=self.cfg(min_free_gb=0))["path"])
+        self.write_config(reaper_delete_enabled=True, max_age_hours=0)
+        calls = []
+        with mock.patch.object(S, "in_use_paths", side_effect=lambda: calls.append(1) or set()):
+            tc.reap(apply=True, now=time.time() + 100)
+        self.assertEqual(len(calls), 1)             # one fresh probe for the one removal, taken under the lock
+        self.assertFalse(p.exists())
+
+    def test_symlinked_home_still_takes_the_acquire_lock(self):
+        link = self.home.parent / (self.home.name + "-link")
+        os.symlink(self.home, link)
+        self.addCleanup(os.unlink, link)
+        with mock.patch.dict(os.environ, {"HARNESS_COPY_HYGIENE_HOME": str(link)}):
+            p = Path(tc.acquire(str(self.repo), "pr-11", cfg=self.cfg(min_free_gb=0))["path"])
+            self.write_config(reaper_delete_enabled=True, max_age_hours=0)
+            self.assertTrue(tc.under_copies(str(p.resolve())))      # realpath side vs symlinked copies_root
+            lk = S.lock_nonblocking(str(p) + ".lock")
+            try:
+                with mock.patch.object(S, "in_use_paths", return_value=set()):
+                    res = tc.reap(apply=True, now=time.time() + 100)
+            finally:
+                lk.close()
+        self.assertTrue(p.exists(), res)
+        self.assertEqual([c for c in res["copies"] if c["path"].endswith("pr-11")][0]["action"],
+                         "kept: locked by a running acquire")
+
     def test_in_use_copy_is_kept(self):
         old, _, _ = self.make_old_copies()
         self.write_config(reaper_delete_enabled=True)

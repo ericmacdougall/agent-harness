@@ -65,6 +65,11 @@ class Base(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         Path(d, "copy-hygiene.json").write_text(json.dumps(kw))
 
+    def write_config_at(self, home, **kw):
+        d = os.path.join(home, ".agent-harness", "state")
+        os.makedirs(d, exist_ok=True)
+        Path(d, "copy-hygiene.json").write_text(json.dumps(kw))
+
     def clone(self, rel):
         p = os.path.join(self.work, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -237,6 +242,51 @@ class Release(Base):
         wj.release(os.path.dirname(res["path"]), apply=True)
         self.assertFalse(os.path.exists(res["path"]))
 
+    def test_release_realpath_session_path_takes_the_lock_under_a_symlinked_home(self):
+        real_home = os.path.join(self.t, "real-home")
+        os.makedirs(real_home)
+        link = os.path.join(self.t, "home-link")
+        os.symlink(real_home, link)
+        with mock.patch.dict(os.environ, {"HARNESS_JANITOR_HOME": link}):
+            res = C.acquire("", "pr-8", url=self.origin, cfg=C.normalize({"min_free_gb": 0, "min_free_pct": 0}))
+            self.assertTrue(res["ok"], res)
+            real_dir = os.path.realpath(os.path.dirname(res["path"]))      # what the CLI passes (--path is realpath'd)
+            self.write_config_at(link, reaper_delete_enabled=True)
+            lk = S.lock_nonblocking(res["path"] + ".lock")
+            try:
+                r = wj.release(real_dir, apply=True)
+            finally:
+                lk.close()
+        self.assertTrue(os.path.exists(res["path"]), r)
+        self.assertEqual(r["kept"][0]["why"], "locked by a running acquire")
+
+    def test_acquire_between_snapshot_and_removal_prevents_release_deletion(self):
+        res = C.acquire("", "pr-12", url=self.origin, cfg=C.normalize({"min_free_gb": 0, "min_free_pct": 0}))
+        self.assertTrue(res["ok"], res)
+        p = res["path"]
+        real_lock = S.lock_nonblocking
+
+        def lock_after_acquire(path):
+            C.touch_index(p)
+            return real_lock(path)
+        with mock.patch.object(S, "lock_nonblocking", side_effect=lock_after_acquire):
+            r = wj.release(os.path.dirname(p), apply=True, min_idle_s=3600, now=time.time() - 1)
+        self.assertTrue(os.path.exists(p), r)
+        self.assertEqual(r["kept"][0]["why"], "used since the sweep started")
+
+    def test_release_probes_again_right_before_removal(self):
+        c = self.clone("s14/c")
+        seen = []
+        states = iter([{c}])             # the caller's snapshot is empty; the fresh probe sees a process in c
+
+        def fresh():
+            seen.append(1)
+            return next(states)
+        with mock.patch.object(S, "in_use_paths", side_effect=fresh):
+            r = wj.release(os.path.join(self.work, "s14"), apply=True, used=set(), refs=set())
+        self.assertTrue(os.path.exists(c), r)
+        self.assertEqual(len(seen), 1)
+
     # ---- restricted roots
     def test_release_path_is_restricted_to_the_agent_harness_trees(self):
         proj = os.path.join(self.home, "projects", "real")
@@ -326,6 +376,66 @@ class Sweep(Base):
             with mock.patch("sys.stdout"):
                 self.assertEqual(wj.main(["sweep", "--apply"]), 0)
         self.assertTrue(os.path.exists(c))
+
+
+class MirrorSweep(Base):
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(S, "in_use_paths", return_value=set()).start()
+        mock.patch.object(S, "service_refs", return_value=set()).start()
+        mock.patch.object(wj, "uncapped_containers", return_value=[]).start()
+        mock.patch.object(wj, "shm_sweep", return_value=[]).start()
+        self.cfg_ = C.normalize({"reaper_delete_enabled": True, "mirror_ttl_days": 14})
+        res = C.acquire("", "pr-1", url=self.origin, cfg=C.normalize({"min_free_gb": 0, "min_free_pct": 0}))
+        self.assertTrue(res["ok"], res)
+        self.copy = res["path"]
+        self.mirror = C.mirror_path(self.origin)
+        self.later = time.time() + 30 * 86400
+
+    def drop_copy_folder(self):
+        import shutil
+        shutil.rmtree(self.copy)                # folder gone; git still lists the worktree as prunable
+
+    def test_sweep_reports_count_and_size_and_keeps_a_young_mirror(self):
+        r = wj.sweep(apply=True, cfg=self.cfg_)
+        self.assertEqual(r["mirrors"]["count"], 1)
+        self.assertGreater(r["mirrors"]["bytes"], 0)
+        self.assertEqual(r["mirrors"]["rows"][0]["action"], "keep")
+        self.assertTrue(os.path.isdir(self.mirror))
+
+    def test_mirror_with_a_registered_worktree_is_kept_even_when_old(self):
+        r = wj.mirror_sweep(True, self.cfg_, self.later)
+        self.assertIn("registered worktree", r["rows"][0]["action"])
+        self.assertTrue(os.path.isdir(self.mirror))
+
+    def test_old_mirror_without_worktrees_is_removed_only_when_deletion_is_on(self):
+        self.drop_copy_folder()
+        off = C.normalize({"mirror_ttl_days": 14})
+        self.assertEqual(wj.mirror_sweep(True, off, self.later)["rows"][0]["action"], "would remove (report-only)")
+        self.assertEqual(wj.mirror_sweep(False, self.cfg_, self.later)["rows"][0]["action"], "would remove (report-only)")
+        self.assertTrue(os.path.isdir(self.mirror))
+        self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
+        self.assertFalse(os.path.exists(self.mirror))
+
+    def test_in_use_service_referenced_probe_failed_and_locked_mirrors_are_kept(self):
+        self.drop_copy_folder()
+        with mock.patch.object(S, "in_use_paths", return_value={self.mirror}):
+            self.assertIn("process", wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"])
+        with mock.patch.object(S, "service_refs", return_value={self.mirror + "/HEAD"}):
+            self.assertIn("referenced", wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"])
+        with mock.patch.object(S, "service_refs", side_effect=S.ProbeError("x")):
+            self.assertIn("probe failed", wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"])
+        lk = S.lock_nonblocking(self.mirror + ".lock")
+        try:
+            self.assertIn("locked", wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"])
+        finally:
+            lk.close()
+        self.assertTrue(os.path.isdir(self.mirror))
+
+    def test_mirror_ttl_days_is_configurable_and_sanitised(self):
+        self.assertEqual(C.normalize({})["mirror_ttl_days"], 14.0)
+        self.assertEqual(C.normalize({"mirror_ttl_days": "bad"})["mirror_ttl_days"], 14.0)
+        self.assertEqual(C.normalize({"mirror_ttl_days": 3})["mirror_ttl_days"], 3.0)
 
 
 class ShmSweep(Base):

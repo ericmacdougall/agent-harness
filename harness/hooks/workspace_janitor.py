@@ -70,7 +70,18 @@ def _remaining_files(path: str, removed: list) -> bool:
     return False
 
 
-def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "float | None" = None) -> dict:
+def _idle_s(repo: str, now: float) -> float:
+    """Seconds since the newest of: file activity in the checkout and its last acquire (index), read fresh."""
+    idx = C.load_index()
+    used_at = max(float((idx.get(k) or {}).get("last_used") or 0) for k in {repo, os.path.realpath(repo)})
+    return now - max(S.newest_activity(repo), used_at)
+
+
+def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "float | None" = None,
+            min_idle_s: "float | None" = None, now: "float | None" = None) -> dict:
+    """min_idle_s is the sweep's TTL: it is re-checked per checkout with the lock held (an acquire may have touched the
+    checkout since the sweep looked). The in-use and service probes are repeated right before every removal."""
+    now = now or time.time()
     cfg = cfg or C.load_config()
     res = {"path": path, "removed": [], "kept": [], "freed_bytes": 0}
     if not S.within_allowed(path):
@@ -90,7 +101,6 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
     if why:
         res["kept"].append({"path": path, "why": why})
         return res
-    copies = C.copies_root() + os.sep
     kept_paths = []
     for repo in S.find_repos(path):
         if deadline is not None and time.time() > deadline:
@@ -98,9 +108,10 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
             kept_paths.append(repo)
             continue
         inner = [k for k in kept_paths if k.startswith(repo.rstrip("/") + "/")]
-        lk = S.lock_nonblocking(repo + ".lock") if repo.startswith(copies) else None   # shared with acquire
+        in_copies = C.under_copies(repo)
+        lk = S.lock_nonblocking(repo + ".lock") if in_copies else None   # shared with acquire
         try:
-            if repo.startswith(copies) and lk is None:
+            if in_copies and lk is None:
                 why = "locked by a running acquire"
             elif inner:
                 why = "holds a kept checkout (%s)" % inner[0]
@@ -109,6 +120,15 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
                 if not why:
                     ok, why = S.recoverable(repo, deadline)
                     why = "" if ok else why
+            if not why and min_idle_s is not None and _idle_s(repo, now) < min_idle_s:
+                why = "used since the sweep started"
+            if not why and deleting:
+                try:
+                    used, refs = S.in_use_paths(), S.service_refs()      # fresh, right before the removal
+                except S.ProbeError as e:
+                    why = "liveness probe failed: %s" % e
+                else:
+                    why = S.busy(repo, used, refs)
             if why:
                 res["kept"].append({"path": repo, "why": why})
                 kept_paths.append(repo)
@@ -219,13 +239,78 @@ def uncapped_containers() -> list:
     return out
 
 
+def _mirror_worktrees(m: str) -> "list | None":
+    """Registered worktrees of a bare mirror whose folder still exists; None when git cannot say."""
+    rc, out, _ = S.git(m, "worktree", "list", "--porcelain")
+    if rc != 0:
+        return None
+    paths = [l[9:] for l in out.splitlines() if l.startswith("worktree ")]
+    return [p for p in paths[1:] if os.path.exists(p)]          # the first entry is the mirror itself
+
+
+def mirror_sweep(apply: bool, cfg: dict, now: float) -> dict:
+    """Count and size of ~/.agent-harness/mirrors; a mirror is removed after mirror_ttl_days idle only when no worktree
+    registered in it exists, nothing uses it, no service references it and deletion is on (the shared switch)."""
+    root = os.path.realpath(S.ah("mirrors"))
+    deleting = bool(apply and C.deletion_enabled(cfg))
+    ttl = cfg["mirror_ttl_days"] * 86400
+    out = {"count": 0, "bytes": 0, "ttl_days": cfg["mirror_ttl_days"], "rows": []}
+    for host in sorted(S._ls(root)):
+        hd = os.path.join(root, host)
+        if os.path.islink(hd) or not os.path.isdir(hd):
+            continue
+        for e in sorted(S._ls(hd)):
+            m = os.path.join(hd, e)
+            if not e.endswith(".git") or os.path.islink(m) or not os.path.isdir(m):
+                continue
+            size = S.du(m)
+            row = {"path": m, "bytes": size, "idle_days": round((now - S.newest_activity(m)) / 86400, 1), "action": "keep"}
+            out["count"] += 1
+            out["bytes"] += size
+            out["rows"].append(row)
+            if now - S.newest_activity(m) < ttl:
+                continue
+            row["action"] = _drop_mirror(m, row, deleting, ttl, now)
+    return out
+
+
+def _drop_mirror(m: str, row: dict, deleting: bool, ttl: float, now: float) -> str:
+    lk = S.lock_nonblocking(m + ".lock")                  # the lock acquire holds while it fetches or adds a worktree
+    if lk is None:
+        return "kept: locked by a running acquire"
+    try:
+        if now - S.newest_activity(m) < ttl:
+            return "kept: used since the sweep started"
+        wts = _mirror_worktrees(m)
+        if wts is None:
+            return "kept: cannot list its worktrees"
+        if wts:
+            return "kept: %d registered worktree(s) exist" % len(wts)
+        try:
+            used, refs = S.in_use_paths(), S.service_refs()
+        except S.ProbeError as e:
+            return "kept: liveness probe failed: %s" % e
+        why = S.busy(m, used, refs)
+        if why:
+            return "kept: " + why
+        if not deleting:
+            return "would remove (report-only)"
+        done, err = S.remove_tree(m)
+        if not done:
+            return "kept: remove failed: " + err
+        audit("remove-mirror", {"path": m, "bytes": row["bytes"]})
+        return "removed"
+    finally:
+        lk.close()
+
+
 def sweep(apply: bool, cfg=None, now=None) -> dict:
     cfg = cfg or C.load_config()
     now = now or time.time()
     deleting = bool(apply and C.deletion_enabled(cfg))
     ttl = cfg["max_age_hours"] * 3600
     res = {"mode": "apply" if deleting else "report-only", "delete_enabled": C.deletion_enabled(cfg), "released": [],
-           "copies": [], "shm": [], "freed_gb": 0.0, "uncapped_containers": [], "probe_error": ""}
+           "copies": [], "shm": [], "mirrors": {"count": 0, "bytes": 0, "rows": []}, "freed_gb": 0.0, "uncapped_containers": [], "probe_error": ""}
     if apply and not deleting:
         res["note"] = ("deletion is OFF: report-only. The owner enables it with \"reaper_delete_enabled\": true in "
                        + C.config_path())
@@ -245,14 +330,15 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
             if e in alive:
                 res["released"].append({"path": p, "removed": [], "freed_bytes": 0, "kept": [{"path": p, "why": "session is alive or recent"}]})
             elif now - S.newest_activity(p) >= ttl:
-                res["released"].append(release(p, apply, used, refs, cfg))
+                res["released"].append(release(p, apply, used, refs, cfg, min_idle_s=ttl, now=now))
     co = S.ah("checkouts")
     for e in sorted(S._ls(co)):
         for k in sorted(S._ls(os.path.join(co, e))):
             p = os.path.join(co, e, k)
             if os.path.isdir(p) and not os.path.islink(p) and now - S.newest_activity(p) >= ttl:
-                res["released"].append(release(p, apply, used, refs, cfg))
+                res["released"].append(release(p, apply, used, refs, cfg, min_idle_s=ttl, now=now))
     res["copies"] = C.reap(apply=apply, cfg=cfg, now=now)["copies"]
+    res["mirrors"] = mirror_sweep(apply, cfg, now)
     res["shm"] = shm_sweep(apply, used, cfg, now)
     res["uncapped_containers"] = uncapped_containers()
     res["freed_gb"] = round(sum(r["freed_bytes"] for r in res["released"]) / GB, 2)
@@ -450,8 +536,9 @@ def main(argv=None) -> int:
         if a.json:
             print(json.dumps(r, indent=1))
         else:
-            print("sweep (%s): freed %.2f GB, %d folders checked, %d test copies, %d shm entries, %d uncapped containers%s" % (
-                r["mode"], r["freed_gb"], len(r["released"]), len(r["copies"]), len(r["shm"]), len(r["uncapped_containers"]),
+            print("sweep (%s): freed %.2f GB, %d folders checked, %d test copies, %d shm entries, %d mirrors (%.2f GB), %d uncapped containers%s" % (
+                r["mode"], r["freed_gb"], len(r["released"]), len(r["copies"]), len(r["shm"]),
+                r["mirrors"]["count"], r["mirrors"]["bytes"] / GB, len(r["uncapped_containers"]),
                 "; kept everything, probe failed: " + r["probe_error"] if r["probe_error"] else ""))
             if r.get("note"):
                 print(r["note"])
