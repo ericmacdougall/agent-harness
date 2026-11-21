@@ -19,13 +19,18 @@ func inputLifecycleBlocked(s *session) bool {
 }
 
 func (a *app) turnAdmission(s *session, epoch uint64, request string) inputAdmission {
+	return a.turnAdmissionGuarded(s, epoch, request, nil)
+}
+
+func (a *app) turnAdmissionGuarded(s *session, epoch uint64, request string, guard func(*session) bool) inputAdmission {
 	if s.reviewParent != "" {
 		return a.managedReviewAdmission(s)
 	}
 	return func() (func(), error) {
 		s.dispatchMu.Lock()
 		a.mu.Lock()
-		valid := s.controlEpoch == epoch && s.Status == "running" && s.lastRequest == request && !inputLifecycleBlocked(s)
+		valid := s.controlEpoch == epoch && s.Status == "running" && s.lastRequest == request && !inputLifecycleBlocked(s) &&
+			(guard == nil || guard(s))
 		if valid {
 			if err := a.commitDeliveryLocked(s, request); err != nil {
 				a.mu.Unlock()

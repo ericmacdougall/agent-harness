@@ -68,22 +68,26 @@ func defaultRuntime(provider, profile string) (string, []string, error) {
 	return binary, os.Environ(), err
 }
 func validCWD(path string) (string, error) {
+	resolved, _, err := canonicalCWD(path)
+	return resolved, err
+}
+func canonicalCWD(path string) (string, os.FileInfo, error) {
 	if path == "" {
 		path = "."
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	resolved, err := filepath.EvalSymlinks(absolute)
 	if err != nil {
-		return "", errors.New("working directory does not exist")
+		return "", nil, errors.New("working directory does not exist")
 	}
 	info, err := os.Stat(resolved)
 	if err != nil || !info.IsDir() {
-		return "", errors.New("working directory must be a directory")
+		return "", nil, errors.New("working directory must be a directory")
 	}
-	return resolved, nil
+	return resolved, info, nil
 }
 func (a *app) codexClient(profile string, cwds ...string) (*rpcClient, error) {
 	policy, err := a.policyFor("codex", profile, "main")
@@ -157,7 +161,7 @@ func (a *app) publishCodexClient(key, profile string, generation uint64, existin
 	return client, nil
 }
 func (a *app) createSession(provider, cwd, profile string) (*session, error) {
-	cwd, err := validCWD(cwd)
+	cwd, cwdInfo, err := canonicalCWD(cwd)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +175,7 @@ func (a *app) createSession(provider, cwd, profile string) (*session, error) {
 		return nil, errors.New("choose Codex or Claude")
 	}
 	current := emptySession(provider, cwd, profile)
+	current.cwdInfo = cwdInfo
 	current.Cascade = selection
 	current.policy = policy
 	current.PolicyRevision = policy.Revision
@@ -219,7 +224,10 @@ func (a *app) createSession(provider, cwd, profile string) (*session, error) {
 				Effort string `json:"reasoningEffort"`
 			} `json:"thread"`
 		}
-		params := map[string]any{"cwd": cwd, "dynamicTools": []any{checkpointTool()}}
+		a.mu.Lock()
+		capacityWake := a.workspaceWakeEnabled && workspaceCapacitySupported()
+		a.mu.Unlock()
+		params := map[string]any{"cwd": cwd, "dynamicTools": []any{checkpointTool(capacityWake)}}
 		applyThreadPolicy(params, policy)
 		e = client.call(ctx, "thread/start", params, &result)
 		if e != nil {

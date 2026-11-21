@@ -120,7 +120,9 @@ func TestRepairAutomaticSendCannotOutrunPause(t *testing.T) {
 	}
 	a.runtime = func(string, string) (string, []string, error) { return "/trusted/cli", nil, nil }
 	done := make(chan error, 1)
-	go func() { done <- a.send(s.ID, "auto", "continue", nil, true, sendBinding{s.task.ID, s.controlEpoch}) }()
+	go func() {
+		done <- a.send(s.ID, "auto", "continue", nil, true, sendBinding{taskID: s.task.ID, epoch: s.controlEpoch})
+	}()
 	<-entered
 	_ = a.control(s.ID, "pause", "")
 	close(release)

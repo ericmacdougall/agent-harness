@@ -79,7 +79,7 @@ func (a *app) scheduleInputs(id string) {
 		return
 	}
 	var text, request string
-	binding := sendBinding{task.ID, s.controlEpoch}
+	binding := sendBinding{taskID: task.ID, epoch: s.controlEpoch}
 	if head != nil {
 		if !s.providerFinal {
 			head.Status = "held"
@@ -89,6 +89,12 @@ func (a *app) scheduleInputs(id string) {
 			a.mu.Unlock()
 			return
 		}
+		if task.State == waitingForCapacity {
+			if err := a.revokeWorkspaceWakeLocked(s, "User follow-up superseded the workspace capacity wait", "active"); err != nil {
+				a.mu.Unlock()
+				return
+			}
+		}
 		text = head.Text
 		request = head.RequestID
 		if s.pendingReviewResult != "" {
@@ -97,6 +103,14 @@ func (a *app) scheduleInputs(id string) {
 		head.Status = "dispatching"
 		head.Reason = "Preparing next-turn delivery"
 		s.Supervision.State = "active"
+	} else if task.State == waitingForCapacity {
+		wake, err := a.claimWorkspaceWakeLocked(s)
+		if err != nil || wake == nil {
+			a.mu.Unlock()
+			return
+		}
+		binding.workspaceWake = wake
+		text, request = capacityResumePrompt, wake.receipt.ID
 	} else {
 		if s.Supervision.State != "active" {
 			a.mu.Unlock()
@@ -150,6 +164,16 @@ func (a *app) scheduleInputs(id string) {
 	err := a.sendInput(id, request, text, nil, true, head, binding)
 	a.mu.Lock()
 	s.scheduled = false
+	if wake := binding.workspaceWake; wake != nil && s.workspaceWake == wake {
+		s.workspaceWake = nil
+		if err != nil && s.task == wake.task && s.controlEpoch == wake.epoch && s.Status == "idle" && s.lastRequest == wake.origin.requestID {
+			s.task.State = "blocked"
+			s.Supervision.State = "blocked"
+			s.Supervision.Reason = "Workspace wake could not be admitted; reconcile without replay"
+			_ = a.recordCheckpoint(s)
+			a.changedLocked()
+		}
+	}
 	if err == nil {
 		s.resumeRequested = false
 		if s.pendingReviewResult == reviewResult {
