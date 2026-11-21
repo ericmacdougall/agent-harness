@@ -1,0 +1,8 @@
+[Unit]
+Description=agent-harness workspace janitor (TTL sweep of idle session checkouts and /dev/shm scratch)
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/python3 %h/.claude/hooks/workspace_janitor.py sweep --apply
