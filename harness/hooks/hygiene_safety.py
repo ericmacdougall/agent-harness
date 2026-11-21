@@ -478,8 +478,16 @@ class OfflineView:
 VIEW_PREFIX = "hygiene-view-"
 
 
+_SWEPT = False
+
+
 def _sweep_old_views(max_age: float = 86400.0) -> None:
-    """Remove hygiene-view-* folders a killed run (TimeoutStartSec) left in the temp folder; they hold only an alternates file."""
+    """Remove hygiene-view-* folders a killed run (TimeoutStartSec) left in the temp folder (only an alternates file).
+    Once per process: offline_view is called twice per copy."""
+    global _SWEPT
+    if _SWEPT:
+        return
+    _SWEPT = True
     root = tempfile.gettempdir()
     for e in _ls(root):
         d = os.path.join(root, e)
@@ -525,20 +533,6 @@ def refs_ids(repo: str, *patterns: str) -> "list | None":
 
 
 # ---------------------------------------------------------------- recoverability
-def _upstream_of(repo: str) -> "tuple[str, str]":
-    """(remote name, refs/heads/<branch> on it) of the checked-out branch's upstream; ('', '') when there is none."""
-    rc, br, _ = git(repo, "symbolic-ref", "-q", "HEAD")
-    br = br.strip()
-    if rc != 0 or not br.startswith("refs/heads/"):
-        return "", ""
-    b = br[len("refs/heads/"):]
-    rc1, remote, _ = git(repo, "config", "--get", "branch.%s.remote" % b)
-    rc2, target, _ = git(repo, "config", "--get", "branch.%s.%s" % (b, "mer" + "ge"))
-    if rc1 != 0 or rc2 != 0 or not target.strip().startswith("refs/heads/"):
-        return "", ""
-    return remote.strip(), target.strip()
-
-
 def _has_nested_repo(path: str) -> bool:
     for dp, dn, fn in os.walk(path):
         if ".git" in dn or ".git" in fn:
@@ -559,6 +553,10 @@ def ignored_problem(repo: str, status_out: str) -> str:
         if name not in NESTED_REPO_OK and os.path.isdir(full) and _has_nested_repo(full):
             return "ignored folder holds a nested repository (%s)" % entry[:80]
     return ""
+
+
+FETCH_CHUNK = 50          # ids per fetch command
+PULL_FETCH_CAP = 200       # most ids fetched per remote and stage
 
 
 def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]":
@@ -648,23 +646,30 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
     ok, why, missing = check()
     if ok or not missing or why.startswith(("object check", "offline check")):
         return ok, why
-    # The remote may simply have moved on (the copy's own branch advanced upstream): ONE explicit, time-limited fetch of the
-    # branch heads it advertises and the copy lacks, then the same offline check. A failed fetch keeps the copy. Only ids
-    # under refs/heads/* are wanted (never the thousands of refs/pull/* heads), and only the copy's upstream branch when
-    # that is known. No filter option is passed: a partial clone applies the filter stored in its config.
-    up_name, up_ref = _upstream_of(repo)
-    for name, refs in sorted(per_remote.items()):
-        heads = [(i, r) for i, r in refs if r.startswith("refs/heads/") and i in missing]
-        if up_name == name and any(r == up_ref for _, r in heads):
-            heads = [(i, r) for i, r in heads if r == up_ref]
-        want = sorted({i for i, _ in heads})
-        if not want:
+    # The remote may simply have moved on (the copy's branch advanced upstream, or a review copy sits on a PR head pushed
+    # again). Explicit, time-limited fetches of ids the remote advertises and the copy lacks, then the
+    # same offline check, in two stages that share one deadline: (1) the missing refs/heads/* ids; (2) only if the check
+    # still fails, the missing refs/pull/*/head ids (never /merge), in chunks and capped. A failed fetch keeps the copy.
+    # No filter option is passed: a partial clone applies the filter stored in its config.
+    stages = (lambda r: r.startswith("refs/heads/"),
+              lambda r: r.startswith("refs/pull/") and r.endswith("/head"))
+    for pick in stages:
+        wanted = {}
+        for name, refs in sorted(per_remote.items()):
+            ids = sorted({i for i, r in refs if pick(r) and i in missing})
+            if ids:
+                wanted[name] = ids[:PULL_FETCH_CAP]
+        for name, ids in wanted.items():
+            for n in range(0, len(ids), FETCH_CHUNK):
+                rc, _, err = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", name,
+                                 *ids[n:n + FETCH_CHUNK], t=left())
+                if rc != 0:
+                    return False, "fetch of the remote's new commits failed (cannot prove HEAD is on the remote)"
+        if not wanted:
             continue
-        rc, _, err = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", name, *want,
-                         t=left())
-        if rc != 0:
-            return False, "fetch of the remote's new commits failed (cannot prove HEAD is on the remote)"
-    ok, why, _ = check()
+        ok, why, missing = check()
+        if ok or not missing or why.startswith(("object check", "offline check")):
+            return ok, why
     return ok, why
 
 

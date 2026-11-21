@@ -83,9 +83,11 @@ Mirror safety checks are offline. Whether a mirror or a test copy holds commits 
 repository that borrows the object directory (alternates) and has no promisor remote, so a missing id fails at once and nothing is
 downloaded (git 2.43 has no `GIT_NO_LAZY_FETCH` and otherwise spins a failed lazy fetch per missing id). A `cat-file` or `rev-list`
 failure or timeout always keeps the folder. The one exception is `recoverable`: when HEAD is not on what the remote advertises
-and the copy lacks advertised commits (its own branch advanced upstream), it makes ONE time-limited fetch of the missing
-`refs/heads/*` heads (only the copy's upstream branch when it has one; never `refs/pull/*`), using the filter a partial clone
-has stored, and re-checks offline; a failed fetch keeps the copy. For mirrors, every ref except `refs/remotes/*` (branches, tags,
-notes, `refs/backup/*`, anything) and HEAD count as local work, so a commit parked under a tag or a custom ref keeps the mirror;
+and the copy lacks advertised commits (its own branch advanced upstream, or a review copy sits on a pull-request head that was
+pushed again), it fetches in two stages within one deadline: the missing `refs/heads/*` heads, re-check offline; then, only if
+that still fails, the missing `refs/pull/*/head` ids (never `/merge`; chunked and capped), and one more re-check. It uses the
+filter a partial clone has stored; a failed fetch keeps the copy. For mirrors, every ref except `refs/remotes/*` (branches, tags,
+notes, `refs/backup/*`, anything) and HEAD count as local work, so a commit parked under a tag or a custom ref keeps the mirror,
+and so does a bare blob or tree under any such ref;
 a lightweight tag removed on the remote pins it only when its commit is on no advertised ref, and an annotated tag that no
 remote ref carries is local-only and keeps it.

@@ -4,6 +4,7 @@ Every test runs under a temporary HARNESS_JANITOR_HOME with real git repositorie
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -770,15 +771,71 @@ class MirrorSweep(Base):
         self.assertEqual(ids, [new])
         self.assertNotIn("--filter=tree:0", calls[0])
 
+    def test_b1_a_copy_on_a_pr_head_is_recoverable_after_the_pr_head_moves(self):
+        seed = os.path.join(self.t, "seed")
+        sh("git", "commit", "-q", "--allow-empty", "-m", "pr work", cwd=seed)
+        x = subprocess.run(["git", "-C", seed, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        sh("git", "push", "-q", self.origin, "HEAD:refs/pull/7/head", cwd=seed)  # X lives only on the PR head
+        res = C.acquire(seed, "pr-7", ref=x, url=self.origin, cfg=C.normalize({"min_free_gb": 0, "min_free_pct": 0}))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(S.recoverable(res["path"]), (True, ""))
+        sh("git", "commit", "-q", "--allow-empty", "-m", "pr pushed again", cwd=seed)
+        y = subprocess.run(["git", "-C", seed, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        sh("git", "push", "-q", self.origin, "HEAD:refs/pull/7/head", cwd=seed)  # the PR head moves to Y (X is below it)
+        sh("git", "push", "-q", self.origin, "HEAD:refs/pull/7/merge", cwd=seed)
+        self.assertFalse(self.has_object(y))
+        calls = []
+        real = S.git
+
+        def spy(cwd, *a, **kw):
+            if "fetch" in a:
+                calls.append(a)
+            return real(cwd, *a, **kw)
+        with mock.patch.object(S, "git", side_effect=spy):
+            self.assertEqual(S.recoverable(res["path"]), (True, ""))
+        self.assertEqual([[i for i in c if len(i) == 40] for c in calls], [[y]])       # the head id once, in stage 2
+
+    def test_s1_a_blob_or_tree_under_a_non_remote_ref_keeps_the_mirror(self):
+        self.drop_copy_folder()
+        blob = subprocess.run(["git", "-C", self.mirror, "hash-object", "-w", "--stdin"], input="parked", text=True,
+                              capture_output=True, env=ENV).stdout.strip()
+        tree = subprocess.run(["git", "-C", self.mirror, "mktree"], input="100644 blob %s\tf\n" % blob, text=True,
+                              capture_output=True, env=ENV).stdout.strip()
+        for ref, obj in (("refs/backup/blob", blob), ("refs/backup/tree", tree)):
+            with self.subTest(ref):
+                sh("git", "update-ref", ref, obj, cwd=self.mirror)
+                self.assertIn("non-commit", wj._mirror_unpushed(self.mirror))
+                sh("git", "update-ref", "-d", ref, cwd=self.mirror)           # control: removable once the ref is gone
+                self.assertEqual(wj._mirror_unpushed(self.mirror), "")
+
     def test_nit_the_offline_view_uses_the_repos_object_format_and_old_views_are_cleaned(self):
-        old = os.path.join(tempfile.gettempdir(), S.VIEW_PREFIX + "leftover-test")
-        os.makedirs(old, exist_ok=True)
+        old = os.path.join(tempfile.gettempdir(), "%sleftover-%d-%d" % (S.VIEW_PREFIX, os.getpid(), time.time_ns()))
+        os.makedirs(old)
         os.utime(old, (1, 1))
-        with S.offline_view(self.mirror) as v:
-            fmt = subprocess.run(["git", "-C", v.path, "rev-parse", "--show-object-format"], capture_output=True, text=True,
-                                 env=ENV).stdout.strip()
-            self.assertEqual(fmt, "sha1")
-        self.assertFalse(os.path.exists(old))
+        self.addCleanup(shutil.rmtree, old, True)
+        with mock.patch.object(S, "_SWEPT", False):
+            with S.offline_view(self.mirror) as v:
+                fmt = subprocess.run(["git", "-C", v.path, "rev-parse", "--show-object-format"], capture_output=True,
+                                     text=True, env=ENV).stdout.strip()
+                self.assertEqual(fmt, "sha1")
+            self.assertFalse(os.path.exists(old))
+            os.makedirs(old)
+            os.utime(old, (1, 1))
+            with S.offline_view(self.mirror):
+                pass
+            self.assertTrue(os.path.exists(old), "the sweep runs once per process")
+
+    def test_nit_a_sha256_repository_gets_a_sha256_view(self):
+        r = subprocess.run(["git", "init", "-q", "--object-format=sha256", os.path.join(self.t, "s256")],
+                           capture_output=True, text=True, env=ENV)
+        if r.returncode != 0:
+            self.skipTest("this git has no sha256 support")
+        repo = os.path.join(self.t, "s256")
+        sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x", cwd=repo)
+        with S.offline_view(repo) as v:
+            fmt = subprocess.run(["git", "-C", v.path, "rev-parse", "--show-object-format"], capture_output=True,
+                                 text=True, env=ENV).stdout.strip()
+            self.assertEqual(fmt, "sha256")
 
     def test_a_local_only_annotated_tag_on_a_pushed_commit_keeps_the_mirror(self):
         self.drop_copy_folder()

@@ -339,13 +339,16 @@ def _mirror_unpushed(m: str) -> str:
                 return "object check failed or timed out (kept)"
             if n != 0:
                 return "it holds commits that are on no remote ref"
-            tty = v.types(tagrefs.split())
+            tty = v.types(set(tagrefs.split()) | set(tips))
             if tty is None:
                 return "tag check failed or timed out (kept)"
     except S.ProbeError as e:
         return "offline check unavailable (%s)" % e
     if any(k == "tag" and i not in advertised for i, k in tty.items()):
         return "it holds an annotated tag that is on no remote ref"
+    # rev-list skips a ref pointing straight at a blob or a tree, so such a ref (parked by hand) keeps the mirror too.
+    if any(k not in ("commit", "tag") for i, k in tty.items() if i in set(tips) and i not in advertised):
+        return "it holds a non-commit object under a local ref"
     return ""
 
 
