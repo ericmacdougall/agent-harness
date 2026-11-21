@@ -41,6 +41,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ahd_peek as peek  # noqa: E402
+import ask_state  # noqa: E402
 import liveness  # noqa: E402
 
 SOURCE = "ahd"
@@ -387,15 +388,10 @@ def wal_asks(policy: dict, sessions: list) -> list:
             lines, stats = peek.read_tail_lines(str(p), cap, 1 << 20)
         except OSError:
             continue
-        asks, resolved = {}, set()
-        for ev in peek.parse_lines(lines, stats):
-            if ev.get("event") == "ask" and isinstance(ev.get("id"), str):
-                note = ev.get("note")
-                asks[ev["id"]] = {"id": ev["id"], "session": s[:8], "at": parse_ts(ev.get("at")),
-                                  "text": "[excluded]" if peek.text_excluded(note, policy) else peek.scrub(note, 140)}
-            elif ev.get("event") == "ask_resolved" and isinstance(ev.get("ref"), str):
-                resolved.add(ev["ref"])
-        out.extend(a for k, a in asks.items() if k not in resolved)
+        for k, ev in ask_state.open_asks(list(peek.parse_lines(lines, stats))).items():
+            note = ev.get("note")
+            out.append({"id": k, "session": s[:8], "at": parse_ts(ev.get("at")),
+                        "text": "[excluded]" if peek.text_excluded(note, policy) else peek.scrub(note, 140)})
     return out
 
 

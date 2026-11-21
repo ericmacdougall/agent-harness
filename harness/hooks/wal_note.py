@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from wal import append
+import ask_state
 
 
 EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff', 'result',
@@ -80,46 +81,24 @@ def provenance_check(event, source, allow_mc=False):
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
 
 
-def ask_entry(path, ref: str):
-    """The last `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
+def _tail_records(path):
+    """Parsed records of the last 4 MiB of this WAL, or None when it cannot be read."""
     try:
         import safe_input  # noqa: PLC0415
-        tail = safe_input.read_tail(path, 4 << 20)
+        return list(ask_state.parse_lines(safe_input.read_tail(path, 4 << 20).splitlines()))
     except Exception:  # noqa: BLE001
         return None
-    found = None
-    for raw in tail.splitlines():
-        if ref.encode() not in raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and rec.get('event') == 'ask' and rec.get('id') == ref:
-            found = rec
-    return found
+
+
+def ask_entry(path, ref: str):
+    """The `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
+    return (ask_state.fold(_tail_records(path) or []).get(ref) or {}).get('ask')
 
 
 def open_ask_exists(path, ref: str) -> bool:
-    """True when `ref` is an `ask` entry of this WAL with no later `ask_resolved` naming it (bounded tail read)."""
-    try:
-        import safe_input  # noqa: PLC0415
-        tail = safe_input.read_tail(path, 4 << 20)
-    except Exception:  # noqa: BLE001 - a WAL that cannot be read cannot hold an open ask
-        return False
-    seen, resolved = False, False
-    for raw in tail.splitlines():
-        try:
-            rec = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(rec, dict):
-            continue
-        if rec.get('event') == 'ask' and rec.get('id') == ref:
-            seen, resolved = True, False
-        elif rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
-            resolved = True
-    return seen and not resolved
+    """True when `ref` is an `ask` entry of this WAL that nothing closed (bounded tail read; the rule is ask_state.fold)."""
+    row = ask_state.fold(_tail_records(path) or []).get(ref)  # a WAL that cannot be read cannot hold an open ask
+    return bool(row) and row['resolved'] is None
 
 
 def sibling_ask_wal(path, ref: str):

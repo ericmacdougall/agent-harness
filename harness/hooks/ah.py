@@ -2138,19 +2138,10 @@ def ask_states(main_wal: Path, tally: "ReadTally | None" = None) -> dict:
     states = {}
     try:
         with open(main_wal, "rb") as handle:
-            for raw in handle:
-                if b'"ask' not in raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if _prov().wal_record_problem(rec):
-                    continue
-                if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")):
-                    states.setdefault(rec["id"], "open")
-                elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
-                    states[rec["ref"]] = "resolved"
+            import ask_state  # noqa: PLC0415 - the one rule for open and resolved asks
+            lines = (raw for raw in handle if b'"ask' in raw)
+            for ident, row in ask_state.fold(ask_state.parse_lines(lines)).items():
+                states[ident] = "open" if row["resolved"] is None else "resolved"
     except OSError as error:
         if tally is not None:   # which asks are open is unknown: never an empty "every wait is on a missing ask" read
             tally.missed("main WAL (ask states)", error if not isinstance(error, FileNotFoundError) else "file-missing")

@@ -1074,21 +1074,16 @@ def ask_states(home: Path, session: str) -> dict:
         fd = safe_input.open_regular_file(path, max_bytes=512 << 20)
     except safe_input.InputRejected:
         return {}
+    import ask_state  # noqa: PLC0415 - the one rule for open and resolved asks
     with os.fdopen(fd, "rb") as handle:
-        for raw in handle:
-            if b'"ask' not in raw:
-                continue
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if not isinstance(rec, dict):
-                continue
-            if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")):
-                text = " ".join(str(rec.get(k) or "") for k in ("note", "question", "ref", "ticket"))
-                out.setdefault(rec["id"], {"state": "open", "note": text[:600]})
-            elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
-                out.setdefault(rec["ref"], {"note": ""})["state"] = "resolved"
+        records = list(ask_state.parse_lines(raw for raw in handle if b'"ask' in raw))
+        for ref in ask_state.resolved_refs(records):   # a resolution whose ask lives in an owner WAL still reads resolved
+            out.setdefault(ref, {"note": ""})["state"] = "resolved"
+        for ident, row in ask_state.fold(records).items():
+            rec = row["ask"]
+            text = " ".join(str(rec.get(k) or "") for k in ("note", "question", "ref", "ticket"))
+            out[ident] = {"state": "open" if row["resolved"] is None else "resolved",
+                          "note": text[:600]}
     return out
 
 

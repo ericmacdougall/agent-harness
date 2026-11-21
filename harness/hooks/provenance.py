@@ -1569,7 +1569,7 @@ def ledger(session: str, home=None) -> list:
 def ledger_read(session: str, home=None) -> tuple:
     """(records, read): the ledger, and what was actually read for it (read_block). One unreadable WAL does not hide
     the other WALs' asks, but it is named in `read`, so a reader never takes the rest for the whole ledger."""
-    asks, closed = {}, {}
+    collected = []   # ask and ask_resolved rows of every WAL of the session; ask_state.fold applies the one open/closed rule
     paths, unread = session_wals_read(session, home)
     read_ok, skipped, limited = 0, 0, False
     for path in paths:
@@ -1596,14 +1596,13 @@ def ledger_read(session: str, home=None) -> tuple:
                     event = record.get("event")
                     if event == "ask" and needle == b'"ask"':
                         if isinstance(record.get("id"), str):
-                            record["at"] = str(record.get("at") or "")
                             record["_wal"] = path
-                            asks[record["id"]] = record
+                            collected.append(record)
                         else:
                             skipped += 1  # an ask with no id cannot be listed
                     elif event == "ask_resolved" and needle == b'"ask_resolved"':
                         if isinstance(record.get("ref"), str):
-                            closed[record["ref"]] = record
+                            collected.append(record)
                         else:
                             skipped += 1  # a resolution with no ref closes nothing we can name
             except Problem as problem:  # one unreadable WAL must not hide every other ask; it is reported as unread
@@ -1615,8 +1614,12 @@ def ledger_read(session: str, home=None) -> tuple:
             unread.append({"source": path.name, "reason": failed})
         else:
             read_ok += 1
-    for ident, record in asks.items():
-        record["_closed"] = closed.get(ident)
+    import ask_state  # noqa: PLC0415 - installed beside this module
+    asks = {}
+    for ident, row in ask_state.fold(collected).items():
+        asks[ident] = row["ask"]
+        row["ask"]["at"] = str(row["ask"].get("at") or "")   # after the fold: a null `at` is a valid undated ask
+        row["ask"]["_closed"] = row["resolved"]
     if any(u["source"] in ("main.jsonl", "session WAL folder") for u in unread):
         read_ok = 0  # without the main WAL the session's ledger was not read
     return sorted(asks.values(), key=lambda r: r["at"]), read_block(read_ok, unread, skipped, limited)
