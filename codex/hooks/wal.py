@@ -229,13 +229,14 @@ def read_private(directory: int, name: str, limit: int) -> bytes | None:
     return data
 
 
-def read_interrupt(directory: int) -> str | None:
-    marker = read_private(directory, INTERRUPT_FILE, 32)
+def read_interrupt(directory: int) -> tuple[str | None, str | None]:
+    marker = read_private(directory, INTERRUPT_FILE, 97)
     if marker is None:
-        return None
-    if not re.fullmatch(rb"[0-9a-f]{32}", marker):
+        return None, None
+    match = re.fullmatch(r"([0-9a-f]{32})(?::([0-9a-f]{64}))?", marker.decode("ascii"))
+    if match is None:
         raise ValueError("invalid interrupt generation")
-    return marker.decode("ascii")
+    return match[1], match[2]
 
 
 def checkpoint_fields(pairs: list[tuple[str, object]]) -> dict:
@@ -361,12 +362,16 @@ def checkpoint(
             raise ValueError("continuation directory changed")
         if action == "interrupt":
             # Independent of the claim lock: an interrupt must not be lost to
-            # contention. A later explicit resume acknowledges this generation.
-            marker = secrets.token_hex(16).encode("ascii")
-            replace_private(directory, current_directory, INTERRUPT_FILE, marker)
+            # contention. Bind the latest generation and interrupted turn in
+            # one write so resume cannot admit a late first Stop from that turn.
+            marker = secrets.token_hex(16)
+            if turn_digest is not None:
+                marker = f"{marker}:{turn_digest}"
+            replace_private(directory, current_directory, INTERRUPT_FILE, marker.encode("ascii"))
             return None, False
         if action in {"claim", "status"}:
-            state = visible_checkpoint(read_checkpoint(directory), read_interrupt(directory))
+            marker, _ = read_interrupt(directory)
+            state = visible_checkpoint(read_checkpoint(directory), marker)
             if action == "status" or state is None or state["state"] != "active":
                 return state, False
         lock = state_file(directory, "continuation.lock", os.O_RDWR | os.O_CREAT)
@@ -375,10 +380,11 @@ def checkpoint(
             named = os.stat("continuation.lock", dir_fd=directory, follow_symlinks=False)
             if not os.path.samestat(named, os.fstat(lock)) or not current_directory():
                 raise ValueError("continuation lock or directory changed")
-            marker = read_interrupt(directory)
+            marker, interrupted_turn = read_interrupt(directory)
             state = visible_checkpoint(read_checkpoint(directory), marker)
             if action == "claim":
-                if state is None or state["state"] != "active" or not turn_digest:
+                if (state is None or state["state"] != "active" or not turn_digest
+                        or turn_digest == interrupted_turn):
                     return state, False
                 claimed_state = spend_continuation(state, turn_digest, assistant_digest, repeated_stop)
                 if claimed_state is None:
@@ -400,7 +406,8 @@ def checkpoint(
                     state = {**state, "repeat_open": False}
                 state = {**state, "state": action, "interrupt": marker}
             replace_private(directory, current_directory, STATE_FILE, json.dumps(state).encode())
-            visible = visible_checkpoint(state, read_interrupt(directory))
+            latest_marker, _ = read_interrupt(directory)
+            visible = visible_checkpoint(state, latest_marker)
             return visible, action == "claim" and visible["state"] == "active"
         finally:
             os.close(lock)
@@ -409,12 +416,12 @@ def checkpoint(
 def lifecycle_hook(data: dict, session: str) -> None:
     interrupt = data["hook_event_name"] == "Interrupt"
     turn_id = data.get("turn_id")
+    has_turn = isinstance(turn_id, str) and re.fullmatch(r"[!-~]{1,256}", turn_id)
     repeated_stop = data.get("stop_hook_active")
-    may_claim = (not interrupt and isinstance(repeated_stop, bool)
-                 and data.get("agent_id") is None and data.get("agent_type") is None
-                 and isinstance(turn_id, str) and re.fullmatch(r"[!-~]{1,256}", turn_id))
+    may_claim = (not interrupt and has_turn and isinstance(repeated_stop, bool)
+                 and data.get("agent_id") is None and data.get("agent_type") is None)
     action = "interrupt" if interrupt else "claim" if may_claim else "status"
-    turn_digest = hashlib.sha256(turn_id.encode("ascii")).hexdigest() if may_claim else None
+    turn_digest = hashlib.sha256(turn_id.encode("ascii")).hexdigest() if has_turn and (interrupt or may_claim) else None
     assistant_digest = output_digest(data.get("last_assistant_message")) if may_claim else None
     try:
         state, claimed = checkpoint(session, action, turn_digest=turn_digest,

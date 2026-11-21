@@ -203,6 +203,38 @@ class ContinuationTests(unittest.TestCase):
         self.state('complete')
         self.assertEqual(self.event('Stop', turn_id='reopen', stop_hook_active=False), {})
 
+    def test_delayed_first_stop_cannot_claim_after_interrupt_and_resume(self):
+        self.state('active', 2)
+        self.event('Interrupt', turn_id='interrupted-turn')
+        self.assertEqual(self.state('status')['state'], 'paused')
+        self.assertEqual(self.state('active')['remaining'], 2)
+        self.assertNotIn('decision', self.stop('interrupted-turn', last_assistant_message='late response'))
+        self.assertEqual(self.state('status')['remaining'], 2)
+        marker = self.wal.with_name('continuation.interrupt').read_text()
+        self.assertRegex(marker, r'^[0-9a-f]{32}:[0-9a-f]{64}$')
+        self.assertNotIn('interrupted-turn', marker)
+        self.assertEqual(self.stop('fresh-turn', last_assistant_message='fresh response')['decision'], 'block')
+        self.assertEqual(self.state('status')['remaining'], 1)
+
+    def test_legacy_interrupt_marker_pauses_and_can_be_acknowledged(self):
+        self.state('active', 2)
+        path = self.wal.with_name('continuation.interrupt')
+        path.write_bytes(b'a' * 32)
+        path.chmod(0o600)
+        self.assertEqual(self.state('status')['state'], 'paused')
+        self.assertEqual(self.stop('pending-turn'), {})
+        self.assertEqual(self.state('active')['remaining'], 2)
+        self.assertEqual(self.stop('fresh-turn')['decision'], 'block')
+
+    def test_interrupt_without_valid_turn_still_rotates_generation(self):
+        self.state('active', 3)
+        for turn_id in (None, '', {'id': 'malformed'}, 'x' * 257):
+            self.event('Interrupt', turn_id=turn_id)
+            self.assertEqual(self.state('status')['state'], 'paused')
+            marker = self.wal.with_name('continuation.interrupt').read_text()
+            self.assertRegex(marker, r'^[0-9a-f]{32}$')
+            self.assertEqual(self.state('active')['remaining'], 3)
+
     def test_other_session_and_missing_protocol_fields_do_not_continue(self):
         self.state('active')
         self.assertEqual(self.invoke('hook', payload={
