@@ -353,6 +353,20 @@ def resolve_ref(m: str, ref: str, source: "str | None") -> "str | None":
     return out.strip() if rc == 0 and out.strip() else None
 
 
+def resolved_note(ref: str, source: "str | None", sha: str) -> dict:
+    """{} or the warning when a branch name resolved to the remote's commit although the source checkout's branch of
+    the same name is somewhere else (it may be ahead: its commits are NOT in the copy)."""
+    if not source or not ref or ref == "HEAD" or re.fullmatch(r"[0-9a-f]{40}", ref):
+        return {}
+    rc, out, _ = S.git(source, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+    local = out.strip()
+    if rc != 0 or not local or local == sha:
+        return {}
+    return {"resolved_from": "remote", "source_commit": local,
+            "warning": "%r resolved to the remote's commit %s, but your checkout's %r is at %s; push it or pass the "
+                       "commit id to use yours" % (ref, sha[:12], ref, local[:12])}
+
+
 def _leave_ok(path: str, cur: str, source: "str | None") -> bool:
     """The copy's HEAD commit loses nothing when the copy moves: on the remote, or still held by the source checkout."""
     rc, local = git(path, "rev-list", "-1", cur, "--not", "--remotes")
@@ -434,7 +448,8 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None, u
                 if rc != 0:
                     return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha, "error": out[-300:]}
             touch_index(path, repo=source or url, key=key)
-            return {"ok": True, "path": path, "commit": sha, "reused": True, "moved": cur != sha}
+            return {"ok": True, "path": path, "commit": sha, "reused": True, "moved": cur != sha,
+                    **resolved_note(ref, source, sha)}
         low, gb, fl = disk_low(path, cfg)
         if low:
             alert("disk-low-refused-acquire", {"path": path, "free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
@@ -445,7 +460,8 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None, u
             git(m, "worktree", "prune")
             return {"ok": False, "error": out[-300:]}
         touch_index(path, repo=source or url, key=key)
-        return {"ok": True, "path": path, "commit": sha, "reused": False, "moved": True}
+        return {"ok": True, "path": path, "commit": sha, "reused": False, "moved": True,
+                **resolved_note(ref, source, sha)}
 
 
 def index_path() -> str:
@@ -697,8 +713,9 @@ def _k(p: str) -> str:
     return p.lower() if sys.platform == "darwin" else p
 
 
-def protected_scan(cfg: "dict | None" = None) -> "tuple[dict, int]":
-    """({key: (path, where it is named)}, unreadable-unit count). Cached for 60 s keyed on the directory mtimes."""
+def protected_scan(cfg: "dict | None" = None, fresh: bool = False) -> "tuple[dict, int]":
+    """({key: (path, where it is named)}, unreadable-unit count). Cached for 60 s keyed on the directory mtimes;
+    fresh=True ignores the cache (every removal uses it: the cache can be a minute old)."""
     cfg = normalize(cfg) if cfg is not None else load_config()
     _f, _e, sig = _scan_files(_unit_dirs())
     cache = os.path.join(state_dir(), "copy-hygiene-protected.json")
@@ -707,7 +724,7 @@ def protected_scan(cfg: "dict | None" = None) -> "tuple[dict, int]":
     try:
         with open(cache) as f:
             c = json.load(f)
-        if c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
+        if not fresh and c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
             prot = {k: tuple(v) for k, v in c["prot"].items()}
             errors = int(c.get("errors", 0))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -1037,7 +1054,8 @@ def _unwrap(words: list) -> list:
     """Drop shell keywords (then, do, if, !, {), VAR=val prefixes, sudo/env/nohup/nice/timeout/time/command/exec
     and their options (sudo -u x, timeout 5, nice -n 5)."""
     takes_value = {"sudo": {"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U"}, "env": {"-u", "-C", "-S"},
-                   "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "timeout": {"-s", "-k", "--signal", "--kill-after"}}
+                   "nice": {"-n"}, "ionice": {"-c", "-n", "-p"}, "timeout": {"-s", "-k", "--signal", "--kill-after"},
+                   "stdbuf": {"-i", "-o", "-e"}, "doas": {"-u", "-C"}}
     while words and (words[0] in KEYWORDS or (ASSIGN.match(words[0]) and not all(ASSIGN.match(w) for w in words))
                      or (not ASSIGN.match(words[0]) and os.path.basename(words[0]) in PREFIXES)):
         name = words[0] if ASSIGN.match(words[0]) else os.path.basename(words[0])
@@ -1411,7 +1429,10 @@ def candidates(cfg: dict) -> list:
                     if not k.endswith(".lock"):
                         add(os.path.join(rd, k))
     for root in cfg["roots"]:
-        if not os.path.isdir(root) or not S.within_allowed(root, strictly_inside=False):
+        if not S.within_allowed(root, strictly_inside=False):
+            alert("root-ignored", {"root": root, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
+            continue
+        if not os.path.isdir(root):
             continue
         for sess in sorted(os.listdir(root)):
             sd = os.path.join(root, sess)
@@ -1450,20 +1471,43 @@ def deletable(path: str, used: "set | None" = None, refs: "set | None" = None) -
     return True, "clean and pushed"
 
 
-def remove_copy(path: str, prot: "dict | None" = None) -> "tuple[bool, str]":
-    """Remove one checkout (shared safety module does the removal); first refuse anything a service uses."""
+def safe_remove(path: str, kind: str = "checkout", cfg: "dict | None" = None) -> "tuple[bool, str]":
+    """THE removal choke point (copies, session folders, mirrors; PR #284's rule for every deletion). Immediately before
+    any removal it re-reads the service units WITHOUT the cache and refuses a path a service uses (or contains one),
+    a configured protect_names match, and anything it cannot check (fails closed). kind: "checkout" (git worktree
+    remove, or a clone), "tree" (a mirror or other folder), "empty-tree" (only empty folders, removed bottom-up with
+    rmdir; stops at the first one that is not empty, so a file written meanwhile survives)."""
     try:
-        if prot is None:
-            prot, errors = protected_scan()
-            if errors:
-                return False, "could not read service units"
+        cfg = normalize(cfg) if cfg is not None else load_config()
+        prot, errors = protected_scan(cfg, fresh=True)
+        if errors:
+            return False, "could not read service units"
         hit = protecting(path, prot)
         if hit:
             return False, f"protected: a service uses {hit[0]}"
+        why = S.protected_name(path, cfg)
+        if why:
+            return False, why
     except Exception as e:      # noqa: BLE001 -- cannot tell what services use: delete nothing
         return False, f"protection check failed: {type(e).__name__}"
-    ok, msg = S.remove_checkout(path)
+    if kind == "empty-tree":
+        if S.mounts_under(path):
+            return False, "mount point inside"
+        try:
+            for dp, _dn, fn in os.walk(path, topdown=False):
+                if fn:
+                    return False, "a file is present: " + os.path.join(dp, fn[0])[:120]
+                os.rmdir(dp)                     # ENOTEMPTY (or a symlink) stops here
+        except OSError as e:
+            return False, "not empty (%s)" % type(e).__name__
+        return True, "removed"
+    ok, msg = S.remove_checkout(path) if kind == "checkout" else S.remove_tree(path)
     return ok, (msg or "removed")
+
+
+def remove_copy(path: str, cfg: "dict | None" = None) -> "tuple[bool, str]":
+    """Remove one checkout through safe_remove."""
+    return safe_remove(path, "checkout", cfg)
 
 
 def _reap_one(r: dict, now: float, cfg: "dict | None" = None) -> str:
@@ -1491,10 +1535,13 @@ def _reap_one(r: dict, now: float, cfg: "dict | None" = None) -> str:
         hit = protecting(path, prot)
         if hit:
             return f"kept: protected, a service uses {hit[0]} ({hit[1]})"
+        why = S.protected_name(path, normalize(cfg) if cfg is not None else load_config())
+        if why:
+            return f"kept: {why}"
         ok, why = deletable(path, used, refs)
         if not ok:
             return f"kept: {why}"
-        done, msg = remove_copy(path, prot)
+        done, msg = remove_copy(path, cfg)
         return "removed" if done else f"remove failed: {msg}"
     finally:
         if lk:
@@ -1533,6 +1580,11 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
             r["min_idle_hours"] = cfg["max_age_hours"] if r["idle_hours"] >= cfg["max_age_hours"] else 1
     for r in rows:
         hit = protecting(r["path"], prot) if prot else None
+        pn = S.protected_name(r["path"], cfg) if r["reap"] else ""
+        if r["reap"] and pn:
+            r["reap"] = False
+            r["action"] = "kept: " + pn
+            continue
         if r["reap"] and (hit or errors):
             r["reap"] = False
             r["action"] = (f"kept: protected, a service uses {hit[0]} ({hit[1]})" if hit

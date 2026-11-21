@@ -31,7 +31,7 @@ class FakeTools(unittest.TestCase):
     """A bin/ directory of fake programs first on PATH; each logs its arguments to $FAKE_LOG."""
 
     def setUp(self):
-        self.t = tempfile.mkdtemp()
+        self.t = os.path.realpath(tempfile.mkdtemp())
         self.home = os.path.join(self.t, "home")
         os.makedirs(os.path.join(self.home, ".agent-harness", "work", "svc"))
         os.makedirs(os.path.join(self.home, ".config", "systemd", "user"))
@@ -89,6 +89,18 @@ class ServiceRefs(FakeTools):
         for sub in ("svc", "dollar/bin", "brace", "tilde", "mnt", "cronjob", "dockermount", "podmanmount"):
             self.assertTrue(any(r == os.path.join(w, sub) or r.startswith(os.path.join(w, sub) + "/") for r in refs), (sub, sorted(refs)[:12]))
         self.assertIn("/compose/dir", refs)
+
+    def test_unit_scan_import_failure_is_a_probe_error_not_a_crash(self):
+        with mock.patch.dict(sys.modules, {"copy_hygiene": None}):           # `import copy_hygiene` raises ImportError
+            with self.assertRaises(S.ProbeError):
+                S.service_refs()
+
+    def test_test_results_and_playwright_report_are_evidence_not_regenerable(self):
+        for name in ("test-results", "playwright-report"):
+            self.assertNotIn(name, S.REGENERABLE_IGNORED)
+            self.assertTrue(S.ignored_problem("/x", "!! %s/\n" % name))
+        for name in (".cache", "target"):
+            self.assertNotIn(name, S.NESTED_REPO_OK)
 
     def test_templates_are_skipped_and_dash_units_come_after_double_dash(self):
         S.service_refs()
@@ -176,9 +188,10 @@ class ServiceRefs(FakeTools):
         self.assertNotIn("/", refs)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc: the macOS probe is lsof and is not mapped-file aware")
 class InUse(unittest.TestCase):
     def setUp(self):
-        self.t = tempfile.mkdtemp()
+        self.t = os.path.realpath(tempfile.mkdtemp())
         self.procs = []
 
     def tearDown(self):
@@ -273,7 +286,7 @@ class Removal(unittest.TestCase):
 
 class RepoFixture(unittest.TestCase):
     def setUp(self):
-        self.t = tempfile.mkdtemp()
+        self.t = os.path.realpath(tempfile.mkdtemp())
         self.home = os.path.join(self.t, "home")
         os.makedirs(self.home)
         self.env = mock.patch.dict(os.environ, {"HARNESS_JANITOR_HOME": self.home, "GIT_CONFIG_GLOBAL": "/dev/null",

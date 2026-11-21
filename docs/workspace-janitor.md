@@ -38,7 +38,7 @@ clean and its HEAD commit is on a remote or still in your checkout; otherwise `a
 |---|---|
 | `SessionEnd` hook (`session-end`) | When deletion is on, starts a detached `release --session <id> --apply --budget 600` and returns at once (the probes and per-repo `ls-remote` can take minutes). |
 | `release --session ID / --path DIR [--apply] [--budget S]` | For `~/.agent-harness/work/<id>` or one folder inside `~/.agent-harness/{work,checkouts,test-copies}` (nothing else is accepted): removes each checkout that is verified recoverable. Removes the session folder when no file is left. Dry run without `--apply`. Call it at the end of every runner job. |
-| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its Claude process is alive (session id on a command line, or a WAL newer than the TTL); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*` and `PostgreSQL.*` are never touched); reports the count and size of `~/.agent-harness/mirrors` and removes a mirror idle longer than `mirror_ttl_days` (14) only when no registered worktree of it exists, nothing uses or references it and deletion is on (report-only otherwise); lists running docker/podman containers with no memory limit. Every removal re-reads idle time under the lock and repeats the process and service probes first. A failed probe keeps everything and exits 0. |
+| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its Claude process is alive (session id on a command line, or a WAL newer than the TTL); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*`, `PostgreSQL.*`, `libpod*` and browser segments are never touched; the process scan is taken inside the `/dev/shm` step and a failed scan keeps everything); reports the count and size of `~/.agent-harness/mirrors` and removes a mirror idle longer than `mirror_ttl_days` (14) only when it has no `worktrees/<k>` admin entry at all (even for a folder that is missing), a fresh `ls-remote` of its origin succeeds and every commit in it (all refs, so a branch that exists only in the mirror) is on what the origin advertises, nothing uses or references it and deletion is on (report-only otherwise); lists running docker/podman containers with no memory limit. Every removal re-reads idle time under the lock and repeats the process and service probes first. A failed probe keeps everything and exits 0. |
 | `pretool` hook | Denies `docker\|podman run\|create` and `compose up\|run` without a memory cap, and Elasticsearch/OpenSearch without a heap cap (also via `--env-file`). Handles `sudo/env/timeout/nice/command`, `docker container run`, `$(...)`, pipes and `bash -c`; stops reading flags at the image name. Fails open. |
 
 Testcontainers-style tests start containers through the Docker API and never reach the hook; the sweep lists them as
@@ -57,7 +57,12 @@ Never removed: anything a process uses (cwd, root, **exe, open files and `/proc/
 `list-units --all` for `systemd-run` units; template units are skipped), crontab, docker or podman container, or
 launchd plist names (`~`, `$HOME`, `${HOME}`, `%h` expanded; symlinks in `~/bin`, `~/.local/bin` followed; compared by
 `realpath`), anything with a mount inside (removal never crosses a mount), names in `protect_names`
-(yates, optinrouter). Every probe fails closed: an error or timeout keeps everything.
+(yates, optinrouter), matched against every checkout's path AND its remote URLs (release, reap and mirror removal alike),
+ignored `test-results/` and `playwright-report/` folders (click-test evidence, not regenerable). Every probe fails closed:
+an error or timeout keeps everything. Every removal (checkout, session folder, mirror) goes through one function that
+re-reads the service units without the 60-second cache right before deleting; a session folder is removed bottom-up with
+`rmdir` only, so a file written meanwhile survives. With deletion off, `release` and `sweep` report `would_remove` /
+`would_free_bytes` (`mode: report-only`) and never `removed` / `freed`.
 
 ## Install the timer (Linux, opt-in)
 
@@ -72,4 +77,4 @@ The service has `TimeoutStartSec=1800` and `MemoryMax=1G`. By hand: copy `harnes
 
 Config: `~/.agent-harness/state/copy-hygiene.json` (`max_age_hours`, `shm_ttl_hours`, `mirror_ttl_days`, `roots`, `protect_names`,
 `default_memory`, `reaper_delete_enabled`, plus the disk-floor keys). Roots outside `~/.agent-harness/{work,checkouts,
-test-copies}` are ignored. Audit and alert log: `~/.agent-harness/state/copy-hygiene-alerts.jsonl`.
+test-copies}` are ignored (one alert row each). Without `/proc` (macOS) session liveness reads `ps -axo command=`; with no process list at all every session counts as alive. Audit and alert log: `~/.agent-harness/state/copy-hygiene-alerts.jsonl`.

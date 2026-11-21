@@ -52,7 +52,10 @@ import hygiene_safety as S
 
 GB = S.GB
 SHM_DIR = "/dev/shm"
-SHM_SKIP = ("sem.", "PostgreSQL.")        # semaphores and PostgreSQL segments: never removed by name
+PROC = "/proc"
+# Never removed by name: semaphores, PostgreSQL segments, Podman's lock segment and browser segments. (An allow-list of
+# session-scratch prefixes would be safer still, but nobody has enumerated them; the in-use scan runs inside shm_sweep.)
+SHM_SKIP = ("sem.", "PostgreSQL.", "libpod", ".org.chromium.", ".com.google.Chrome.", "playwright", "pulse-shm")
 COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
 
 
@@ -80,10 +83,19 @@ def _idle_s(repo: str, now: float) -> float:
 def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "float | None" = None,
             min_idle_s: "float | None" = None, now: "float | None" = None) -> dict:
     """min_idle_s is the sweep's TTL: it is re-checked per checkout with the lock held (an acquire may have touched the
-    checkout since the sweep looked). The in-use and service probes are repeated right before every removal."""
+    checkout since the sweep looked). The in-use and service probes are repeated right before every removal.
+    With deletion off nothing is removed: the result says mode "report-only" and lists `would_remove` /
+    `would_free_bytes`; `removed` and `freed_bytes` stay empty/0 so nobody reports space that was not freed."""
     now = now or time.time()
     cfg = cfg or C.load_config()
-    res = {"path": path, "removed": [], "kept": [], "freed_bytes": 0}
+    deleting = bool(apply and C.deletion_enabled(cfg))
+    res = {"path": path, "mode": "apply" if deleting else "report-only", "removed": [], "kept": [], "freed_bytes": 0,
+           "would_remove": [], "would_free_bytes": 0}
+    gone, gone_bytes = [], 0
+    def finish() -> dict:
+        key = ("removed", "freed_bytes") if deleting else ("would_remove", "would_free_bytes")
+        res[key[0]], res[key[1]] = gone, gone_bytes
+        return res
     if not S.within_allowed(path):
         res["kept"].append({"path": path, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
         return res
@@ -93,9 +105,9 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
     except S.ProbeError as e:
         res["kept"].append({"path": path, "why": "liveness probe failed: %s" % e})
         return res
-    deleting = bool(apply and C.deletion_enabled(cfg))
-    if any(n in path.lower() for n in cfg["protect_names"]):
-        res["kept"].append({"path": path, "why": "protected name"})
+    why = S.protected_name(path, cfg)
+    if why:
+        res["kept"].append({"path": path, "why": why})
         return res
     why = S.busy(path, used, refs) or ("mount point inside" if S.mounts_under(path) else "")
     if why:
@@ -116,7 +128,7 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
             elif inner:
                 why = "holds a kept checkout (%s)" % inner[0]
             else:
-                why = S.busy(repo, used, refs)
+                why = S.protected_name(repo, cfg) or S.busy(repo, used, refs)    # per repo, incl. its remote URL
                 if not why:
                     ok, why = S.recoverable(repo, deadline)
                     why = "" if ok else why
@@ -135,41 +147,66 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
                 continue
             size = S.du(repo)
             if deleting:
-                done, err = S.remove_checkout(repo)
+                done, err = C.safe_remove(repo, "checkout", cfg)         # fresh unit scan + protect_names, fail closed
                 if not done:
                     res["kept"].append({"path": repo, "why": "remove failed: " + err})
                     kept_paths.append(repo)
                     continue
                 audit("remove-checkout", {"path": repo, "bytes": size})
-            res["removed"].append(repo)
-            res["freed_bytes"] += size
+            gone.append(repo)
+            gone_bytes += size
         finally:
             if lk:
                 lk.close()
-    if os.path.isdir(path) and not kept_paths and not _remaining_files(path, res["removed"]) and not S.busy(path, used, refs):
+    if os.path.isdir(path) and not kept_paths and not _remaining_files(path, gone) and not S.busy(path, used, refs):
         size = S.du(path)
         if deleting:
-            done, err = S.remove_tree(path)
+            # Only empty folders should remain. Probe again, then remove bottom-up with rmdir (never rmtree): a file
+            # written since the checks above (this is the durable work directory) stops the removal.
+            try:
+                used, refs = S.in_use_paths(), S.service_refs()
+            except S.ProbeError as e:
+                res["kept"].append({"path": path, "why": "liveness probe failed: %s" % e})
+                return finish()
+            why = S.busy(path, used, refs) or ("a file appeared in it" if _remaining_files(path, gone) else "")
+            if why:
+                res["kept"].append({"path": path, "why": why})
+                return finish()
+            done, err = C.safe_remove(path, "empty-tree", cfg)
             if not done:
                 res["kept"].append({"path": path, "why": "remove failed: " + err})
-                return res
+                return finish()
             audit("remove-session-folder", {"path": path, "bytes": size})
-        res["removed"].append(path)
-        res["freed_bytes"] += size
-    return res
+        gone.append(path)
+        gone_bytes += size
+    return finish()
 
 
 # ------------------------------------------------------------------ sweep
-def live_sessions(names: list, ttl_s: float, now: float) -> set:
-    """Session folders whose Claude process is alive (the id is on a command line) or whose WAL is newer than the TTL."""
-    blob = ""
-    for p in os.listdir("/proc") if os.path.isdir("/proc") else []:
+def _process_blob() -> "str | None":
+    """Every process command line, one per line. /proc on Linux; `ps -axo command=` where /proc has no processes
+    (macOS). None when neither lists any process: the caller must then treat every session as alive."""
+    blob, seen = [], False
+    for p in os.listdir(PROC) if os.path.isdir(PROC) else []:
         if p.isdigit():
             try:
-                with open("/proc/%s/cmdline" % p, "rb") as f:
-                    blob += f.read(8192).replace(b"\0", b" ").decode("utf-8", "replace") + "\n"
+                with open("%s/%s/cmdline" % (PROC, p), "rb") as f:
+                    blob.append(f.read(8192).replace(b"\0", b" ").decode("utf-8", "replace"))
+                seen = True
             except OSError:
                 pass
+    if seen:
+        return "\n".join(blob)
+    rc, out, _ = S.probe(["ps", "-axo", "command="], 30)
+    return out if rc == 0 and out.strip() else None
+
+
+def live_sessions(names: list, ttl_s: float, now: float) -> set:
+    """Session folders whose Claude process is alive (the id is on a command line) or whose WAL is newer than the TTL.
+    Without any process list at all, every session counts as alive (nothing is released on a guess)."""
+    blob = _process_blob()
+    if blob is None:
+        return set(names)
     live = set()
     for n in names:
         if len(n) >= 8 and n in blob:
@@ -184,7 +221,9 @@ def live_sessions(names: list, ttl_s: float, now: float) -> set:
     return live
 
 
-def shm_sweep(apply: bool, used: set, cfg: dict, now: float) -> list:
+def shm_sweep(apply: bool, cfg: dict, now: float) -> list:
+    """The process scan is taken HERE (this runs last in a sweep, minutes after its start): a segment a process opened
+    or mapped meanwhile is kept, and a failed scan keeps everything."""
     rows = []
     uid = os.getuid()
     deleting = bool(apply and C.deletion_enabled(cfg))
@@ -192,6 +231,10 @@ def shm_sweep(apply: bool, used: set, cfg: dict, now: float) -> list:
         names = os.listdir(SHM_DIR)
     except OSError:
         return rows
+    try:
+        used = S.in_use_paths()
+    except S.ProbeError as e:
+        return [{"path": SHM_DIR, "action": "kept: liveness probe failed: %s" % e}]
     for e in names:
         p = os.path.join(SHM_DIR, e)
         try:
@@ -239,18 +282,46 @@ def uncapped_containers() -> list:
     return out
 
 
-def _mirror_worktrees(m: str) -> "list | None":
-    """Registered worktrees of a bare mirror whose folder still exists; None when git cannot say."""
-    rc, out, _ = S.git(m, "worktree", "list", "--porcelain")
-    if rc != 0:
+def _mirror_worktree_entries(m: str) -> "list | None":
+    """Names under <mirror>/worktrees (git's admin entries); None when they cannot be listed. An entry exists until
+    `git worktree remove` or prune drops it, so a worktree whose folder is merely unmounted or moved still counts."""
+    d = os.path.join(m, "worktrees")
+    try:
+        return sorted(os.listdir(d))
+    except FileNotFoundError:
+        return []
+    except OSError:
         return None
-    paths = [l[9:] for l in out.splitlines() if l.startswith("worktree ")]
-    return [p for p in paths[1:] if os.path.exists(p)]          # the first entry is the mirror itself
+
+
+def _mirror_unpushed(m: str) -> str:
+    """'' when every commit in the mirror (all refs, HEAD) is on what its origin advertises RIGHT NOW (fresh ls-remote),
+    else why not. Any failure answers with a reason: the mirror is kept."""
+    rc, remotes, _ = S.git(m, "remote")
+    names = remotes.split()
+    if rc != 0 or not names:
+        return "no remote to compare with"
+    advertised = set()
+    for name in names:
+        rc, url, _ = S.git(m, "remote", "get-url", name)
+        if rc != 0 or not url.strip():
+            return "cannot read the remote URL"
+        rc, adv, _ = S.git(m, "ls-remote", url.strip(), t=300)
+        if rc != 0:
+            return "ls-remote failed (cannot prove its commits are on the remote)"
+        advertised |= {l.split()[0] for l in adv.splitlines() if l.strip()}
+    rc, present, _ = S.git(m, "cat-file", "--batch-check=%(objectname) %(objecttype)", inp="\n".join(sorted(advertised)))
+    have = "".join("^%s\n" % l.split()[0] for l in present.splitlines() if l.endswith(" commit"))
+    rc, n, _ = S.git(m, "rev-list", "--count", "--stdin", "--all", inp=have, t=600)
+    if rc != 0 or n.strip() != "0":
+        return "it holds commits that are on no remote ref"
+    return ""
 
 
 def mirror_sweep(apply: bool, cfg: dict, now: float) -> dict:
-    """Count and size of ~/.agent-harness/mirrors; a mirror is removed after mirror_ttl_days idle only when no worktree
-    registered in it exists, nothing uses it, no service references it and deletion is on (the shared switch)."""
+    """Count and size of ~/.agent-harness/mirrors; a mirror is removed after mirror_ttl_days idle only when it has no
+    worktree admin entry at all, every commit in it is on its origin (fresh ls-remote), nothing uses it, no service
+    references it and deletion is on (the shared switch)."""
     root = os.path.realpath(S.ah("mirrors"))
     deleting = bool(apply and C.deletion_enabled(cfg))
     ttl = cfg["mirror_ttl_days"] * 86400
@@ -270,22 +341,29 @@ def mirror_sweep(apply: bool, cfg: dict, now: float) -> dict:
             out["rows"].append(row)
             if now - S.newest_activity(m) < ttl:
                 continue
-            row["action"] = _drop_mirror(m, row, deleting, ttl, now)
+            row["action"] = _drop_mirror(m, row, deleting, ttl, now, cfg)
     return out
 
 
-def _drop_mirror(m: str, row: dict, deleting: bool, ttl: float, now: float) -> str:
+def _drop_mirror(m: str, row: dict, deleting: bool, ttl: float, now: float, cfg: dict) -> str:
     lk = S.lock_nonblocking(m + ".lock")                  # the lock acquire holds while it fetches or adds a worktree
     if lk is None:
         return "kept: locked by a running acquire"
     try:
         if now - S.newest_activity(m) < ttl:
             return "kept: used since the sweep started"
-        wts = _mirror_worktrees(m)
-        if wts is None:
+        why = S.protected_name(m, cfg)
+        if why:
+            return "kept: " + why
+        entries = _mirror_worktree_entries(m)
+        if entries is None:
             return "kept: cannot list its worktrees"
-        if wts:
-            return "kept: %d registered worktree(s) exist" % len(wts)
+        if entries:
+            # Any admin entry keeps it (so each worktrees/<k>/HEAD is covered too): a copy's commits live only here.
+            return "kept: %d registered worktree(s) exist" % len(entries)
+        why = _mirror_unpushed(m)
+        if why:
+            return "kept: " + why
         try:
             used, refs = S.in_use_paths(), S.service_refs()
         except S.ProbeError as e:
@@ -295,7 +373,7 @@ def _drop_mirror(m: str, row: dict, deleting: bool, ttl: float, now: float) -> s
             return "kept: " + why
         if not deleting:
             return "would remove (report-only)"
-        done, err = S.remove_tree(m)
+        done, err = C.safe_remove(m, "tree", cfg)
         if not done:
             return "kept: remove failed: " + err
         audit("remove-mirror", {"path": m, "bytes": row["bytes"]})
@@ -310,7 +388,8 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
     deleting = bool(apply and C.deletion_enabled(cfg))
     ttl = cfg["max_age_hours"] * 3600
     res = {"mode": "apply" if deleting else "report-only", "delete_enabled": C.deletion_enabled(cfg), "released": [],
-           "copies": [], "shm": [], "mirrors": {"count": 0, "bytes": 0, "rows": []}, "freed_gb": 0.0, "uncapped_containers": [], "probe_error": ""}
+           "copies": [], "shm": [], "mirrors": {"count": 0, "bytes": 0, "rows": []}, "freed_gb": 0.0,
+           "would_free_gb": 0.0, "uncapped_containers": [], "probe_error": ""}
     if apply and not deleting:
         res["note"] = ("deletion is OFF: report-only. The owner enables it with \"reaper_delete_enabled\": true in "
                        + C.config_path())
@@ -321,7 +400,12 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
         res["uncapped_containers"] = uncapped_containers()
         audit("sweep", {"mode": "probe-failed", "error": str(e)[:200]})
         return res
-    roots = [r for r in cfg["roots"] if S.within_allowed(r, strictly_inside=False)]
+    roots = []
+    for r in cfg["roots"]:
+        if S.within_allowed(r, strictly_inside=False):
+            roots.append(r)
+        else:
+            audit("root-ignored", {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"})
     for root in roots:
         names = [e for e in sorted(S._ls(root)) if os.path.isdir(os.path.join(root, e)) and not os.path.islink(os.path.join(root, e))]
         alive = live_sessions(names, ttl, now)
@@ -339,10 +423,12 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
                 res["released"].append(release(p, apply, used, refs, cfg, min_idle_s=ttl, now=now))
     res["copies"] = C.reap(apply=apply, cfg=cfg, now=now)["copies"]
     res["mirrors"] = mirror_sweep(apply, cfg, now)
-    res["shm"] = shm_sweep(apply, used, cfg, now)
+    res["shm"] = shm_sweep(apply, cfg, now)
     res["uncapped_containers"] = uncapped_containers()
     res["freed_gb"] = round(sum(r["freed_bytes"] for r in res["released"]) / GB, 2)
-    audit("sweep", {"mode": res["mode"], "freed_gb": res["freed_gb"], "uncapped": len(res["uncapped_containers"])})
+    res["would_free_gb"] = round(sum(r.get("would_free_bytes", 0) for r in res["released"]) / GB, 2)
+    audit("sweep", {"mode": res["mode"], "freed_gb": res["freed_gb"], "would_free_gb": res["would_free_gb"],
+                    "uncapped": len(res["uncapped_containers"])})
     return res
 
 
@@ -536,8 +622,9 @@ def main(argv=None) -> int:
         if a.json:
             print(json.dumps(r, indent=1))
         else:
-            print("sweep (%s): freed %.2f GB, %d folders checked, %d test copies, %d shm entries, %d mirrors (%.2f GB), %d uncapped containers%s" % (
-                r["mode"], r["freed_gb"], len(r["released"]), len(r["copies"]), len(r["shm"]),
+            print("sweep (%s): " % r["mode"] + ("freed %.2f GB" % r["freed_gb"] if r["mode"] == "apply"
+                  else "nothing removed, would free %.2f GB" % r["would_free_gb"]) + ", %d folders checked, %d test copies, %d shm entries, %d mirrors (%.2f GB), %d uncapped containers%s" % (
+                len(r["released"]), len(r["copies"]), len(r["shm"]),
                 r["mirrors"]["count"], r["mirrors"]["bytes"] / GB, len(r["uncapped_containers"]),
                 "; kept everything, probe failed: " + r["probe_error"] if r["probe_error"] else ""))
             if r.get("note"):

@@ -7,9 +7,10 @@ ONE place for every question "may this folder be deleted?" so the two tools cann
                   LFS or submodule, no ignored file except the one regenerable list below, no kept path inside it, and
                   every local commit is on what the remote advertises RIGHT NOW (fresh ls-remote, not stale tracking refs).
   in_use_paths()  every path a process uses: cwd, root, exe, open files and memory maps (/proc/*/maps).
-  service_refs()  every path a systemd unit or launchd plist names (via copy_hygiene.protected_scan, the one unit parser), plus cron,
-                  docker or podman container, or launchd plist names, resolved with realpath. Every probe fails CLOSED:
+  service_refs()  every path a systemd unit or launchd plist names (via copy_hygiene.protected_scan, the one unit parser), plus
+                  cron entries and docker or podman containers, resolved with realpath. Every probe fails CLOSED:
                   a probe that errors or times out raises ProbeError and the caller keeps everything.
+  protected_name()  the one "protect_names" rule: matches the path AND the checkout's remote URLs.
   remove_tree()   removal that never crosses a mount point.
   simple_commands()  the one shell-command splitter used by the PreToolUse hooks.
 """
@@ -27,13 +28,14 @@ import sys
 import time
 
 GB = 1024 ** 3
-# THE regenerable list: ignored paths with one of these names may be deleted with their checkout.
+# THE regenerable list: ignored paths with one of these names may be deleted with their checkout. test-results and
+# playwright-report are NOT here: click-test evidence lives there (an owner may add them in config if wanted).
 REGENERABLE_IGNORED = ("node_modules", ".next", "dist", "build", "target", ".venv", "venv", "__pycache__",
                        ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage", ".turbo", ".cache", ".parcel-cache",
-                       ".gradle", "DerivedData", ".nuxt", ".svelte-kit", "out", "test-results", "playwright-report")
+                       ".gradle", "DerivedData", ".nuxt", ".svelte-kit", "out")
 # Dependency folders that may legitimately hold nested .git folders (git dependencies); any other ignored folder with a
 # repository inside is kept because the repository may hold work.
-NESTED_REPO_OK = frozenset(("node_modules", ".venv", "venv", "target", "__pycache__", ".gradle", "DerivedData", ".cache"))
+NESTED_REPO_OK = frozenset(("node_modules", ".venv", "venv"))
 GENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
             GIT_SSH_COMMAND="ssh -o BatchMode=yes -o ConnectTimeout=15")
 GSAFE = ["-c", "core.fsmonitor=false", "-c", "gc.auto=0", "-c", "maintenance.auto=false"]
@@ -319,8 +321,8 @@ def service_refs() -> set:
     # systemd units and launchd plists: ONE parser, copy_hygiene's protected-path scan (it carries the bypass fixes:
     # %h/~ expansion, User= homes, drop-ins, EnvironmentFile, symlinked units). Imported here because copy_hygiene
     # imports this module. An unreadable unit fails closed like every other probe.
-    import copy_hygiene
     try:
+        import copy_hygiene
         prot, unit_errors = copy_hygiene.protected_scan()
     except Exception as e:      # noqa: BLE001
         raise ProbeError("service unit scan failed: %s" % type(e).__name__)
@@ -351,6 +353,28 @@ def service_refs() -> set:
     refs.discard(os.path.realpath(h))
     refs.discard("/")
     return refs
+
+
+def protected_name(path: str, cfg: dict) -> str:
+    """'' or why `path` is protected by a configured name (cfg["protect_names"], lower case). Matches the path (and its
+    realpath) and, for a checkout or bare mirror, every remote URL, because a clone can be named anything. A repository
+    whose URLs cannot be read counts as protected (fail closed)."""
+    names = [n for n in (cfg.get("protect_names") or []) if n]
+    if not names:
+        return ""
+    for text in {path.lower(), os.path.realpath(path).lower()}:
+        for n in names:
+            if n in text:
+                return "protected name %r" % n
+    if os.path.exists(os.path.join(path, ".git")) or os.path.isfile(os.path.join(path, "HEAD")):
+        rc, out, _ = git(path, "config", "--get-regexp", r"^remote\..*url$")
+        if rc not in (0, 1):                      # 1 = no remote configured
+            return "protected: cannot read the remote URLs to check protect_names"
+        low = out.lower()
+        for n in names:
+            if n in low:
+                return "protected name %r in a remote URL" % n
+    return ""
 
 
 def referenced(path: str, refs: set) -> bool:

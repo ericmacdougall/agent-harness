@@ -37,11 +37,13 @@ class Base(unittest.TestCase):
     delete = True
 
     def setUp(self):
-        self.t = tempfile.mkdtemp()
+        self.t = os.path.realpath(tempfile.mkdtemp())            # macOS: /var -> /private/var
         self.home = os.path.join(self.t, "home")
         os.makedirs(self.home)
+        units = os.path.join(self.t, "units")                   # hermetic: never read the real systemd/launchd folders
+        os.makedirs(units)
         self.patch_env = mock.patch.dict(os.environ, {"HARNESS_JANITOR_HOME": self.home, "GIT_CONFIG_GLOBAL": "/dev/null",
-                                                      "GIT_CONFIG_NOSYSTEM": "1"})
+                                                      "GIT_CONFIG_NOSYSTEM": "1", "HARNESS_COPY_HYGIENE_UNIT_DIRS": units})
         self.patch_env.start()
         os.environ.pop("HARNESS_COPY_HYGIENE_HOME", None)
         os.environ.pop("HARNESS_JANITOR", None)
@@ -203,7 +205,8 @@ class Release(Base):
         os.remove(os.path.join(self.home, ".agent-harness", "state", "copy-hygiene.json"))
         r = wj.release(os.path.join(self.work, "sw"), apply=True)
         self.assertTrue(os.path.exists(c))
-        self.assertEqual(r["removed"][0], c)                       # reported only
+        self.assertEqual(r["would_remove"][0], c)                  # reported only
+        self.assertEqual((r["removed"], r["freed_bytes"], r["mode"]), ([], 0, "report-only"))
         self.write_config(reaper_delete_enabled=True)
         with mock.patch.dict(os.environ, {"HARNESS_JANITOR": "off"}):
             wj.release(os.path.join(self.work, "sw"), apply=True)
@@ -218,7 +221,8 @@ class Release(Base):
     def test_dry_run_reports_the_session_folder_it_would_remove(self):
         self.clone("dry/c")
         r = wj.release(os.path.join(self.work, "dry"), apply=False)
-        self.assertIn(os.path.join(self.work, "dry"), r["removed"])
+        self.assertIn(os.path.join(self.work, "dry"), r["would_remove"])
+        self.assertEqual(r["removed"], [])
         self.assertTrue(os.path.exists(os.path.join(self.work, "dry", "c")))
 
     def test_session_folder_with_loose_files_is_never_removed(self):
@@ -310,6 +314,149 @@ class Release(Base):
         self.assertTrue(os.path.exists(c))
 
 
+    # ---- Fable review: S1 protect_names per repo and by remote URL
+    def test_protected_name_inside_a_session_folder_keeps_the_clone_and_the_folder(self):
+        c = self.clone("sess-1/yates")
+        r = wj.release(os.path.join(self.work, "sess-1"), apply=True)
+        self.assertTrue(os.path.exists(c), r)
+        self.assertTrue(os.path.exists(os.path.join(self.work, "sess-1")))
+        self.assertIn("protected name", r["kept"][0]["why"])
+
+    def test_protect_names_also_matches_the_remote_url(self):
+        self.write_config(reaper_delete_enabled=True, protect_names=["origin.git"])      # the clone's URL, not its name
+        c = self.clone("sess-2/innocent")
+        r = wj.release(os.path.join(self.work, "sess-2"), apply=True)
+        self.assertTrue(os.path.exists(c), r)
+        self.assertIn("remote URL", r["kept"][0]["why"])
+
+    def test_reap_never_removes_a_protected_name_or_url(self):
+        cp = os.path.join(self.home, ".agent-harness", "test-copies")
+        named = os.path.join(cp, "yates-x", "k")
+        os.makedirs(os.path.dirname(named))
+        sh("git", "clone", "-q", self.origin, named)
+        cfg = C.normalize({"reaper_delete_enabled": True, "max_age_hours": 0})
+        self.assertIn("protected name", C._reap_one({"path": named, "min_idle_hours": 0}, time.time() + 9, cfg))
+        self.assertTrue(os.path.exists(named))
+        rows = C.reap(apply=True, cfg=cfg, now=time.time() + 9)["copies"]
+        self.assertTrue(os.path.exists(named), rows)
+        self.assertTrue(all("protected" in r["action"] for r in rows if r["path"] == named), rows)
+        byurl = os.path.join(cp, "plain", "k")
+        os.makedirs(os.path.dirname(byurl))
+        sh("git", "clone", "-q", self.origin, byurl)
+        cfg = C.normalize({"reaper_delete_enabled": True, "max_age_hours": 0, "protect_names": ["origin.git"]})
+        self.assertIn("remote URL", C._reap_one({"path": byurl, "min_idle_hours": 0}, time.time() + 9, cfg))
+        self.assertTrue(os.path.exists(byurl))
+
+    # ---- S2 report-only wording
+    def test_report_only_release_says_would_remove_never_removed(self):
+        self.clone("ro/c")
+        os.remove(os.path.join(self.home, ".agent-harness", "state", "copy-hygiene.json"))
+        r = wj.release(os.path.join(self.work, "ro"), apply=True)
+        self.assertEqual(r["mode"], "report-only")
+        self.assertEqual((r["removed"], r["freed_bytes"]), ([], 0))
+        self.assertTrue(r["would_remove"] and r["would_free_bytes"] > 0)
+        self.write_config(reaper_delete_enabled=True)
+        r = wj.release(os.path.join(self.work, "ro"), apply=True)
+        self.assertEqual(r["mode"], "apply")
+        self.assertTrue(r["removed"] and r["freed_bytes"] > 0 and r["would_remove"] == [])
+
+    # ---- S3 one fresh, fail-closed removal function
+    def test_every_removal_re_reads_the_service_units_without_the_cache(self):
+        self.clone("fr/c")
+        with mock.patch.object(C, "protected_scan", wraps=C.protected_scan) as ps:
+            wj.release(os.path.join(self.work, "fr"), apply=True)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "fr")))
+        calls = [c for c in ps.call_args_list]
+        self.assertGreaterEqual(len(calls), 2)                               # the checkout and the session folder
+        self.assertTrue(all(c.kwargs.get("fresh") is True for c in calls), calls)
+
+    def test_removal_fails_closed_when_the_unit_scan_fails_and_honours_a_unit_that_names_it(self):
+        c = self.clone("fc/c")
+        with mock.patch.object(C, "protected_scan", side_effect=OSError("boom")):
+            r = wj.release(os.path.join(self.work, "fc"), apply=True)
+        self.assertTrue(os.path.exists(c), r)
+        self.assertIn("protection check failed", r["kept"][0]["why"])
+        units = os.environ["HARNESS_COPY_HYGIENE_UNIT_DIRS"]
+        Path(units, "svc.service").write_text("[Service]\nWorkingDirectory=%s\nExecStart=/bin/true\n" % c)
+        r = wj.release(os.path.join(self.work, "fc"), apply=True)           # S.service_refs is mocked empty here
+        self.assertTrue(os.path.exists(c), r)
+        self.assertIn("protected", r["kept"][0]["why"])
+
+    # ---- S4 session folder: no rmtree of a stale check
+    def test_a_file_written_before_the_session_folder_removal_survives(self):
+        self.clone("late/c")
+        sess = os.path.join(self.work, "late")
+        real = S.du
+
+        def du(path):
+            n = real(path)
+            if path == sess:
+                Path(sess, "job-state.json").write_text("{}")             # written after the last scan
+            return n
+        with mock.patch.object(S, "du", side_effect=du):
+            wj.release(sess, apply=True)
+        self.assertTrue(os.path.exists(os.path.join(sess, "job-state.json")))
+
+    def test_safe_remove_empty_tree_stops_at_the_first_file_and_never_uses_rmtree(self):
+        d = os.path.join(self.work, "et")
+        os.makedirs(os.path.join(d, "a", "b"))
+        os.makedirs(os.path.join(d, "z"))
+        Path(d, "a", "keep.txt").write_text("x")
+        with mock.patch("shutil.rmtree", side_effect=AssertionError("rmtree")):
+            ok, why = C.safe_remove(d, "empty-tree")
+        self.assertFalse(ok)
+        self.assertTrue(os.path.exists(os.path.join(d, "a", "keep.txt")))
+        os.remove(os.path.join(d, "a", "keep.txt"))
+        ok, why = C.safe_remove(d, "empty-tree")
+        self.assertTrue(ok, why)
+        self.assertFalse(os.path.exists(d))
+
+    # ---- S5 evidence folders, nested repos
+    def test_test_results_and_playwright_report_are_kept_as_evidence(self):
+        for name in ("test-results", "playwright-report"):
+            c = self.clone("ev-%s/c" % name)
+            self.exclude(c, name + "/")
+            os.makedirs(os.path.join(c, name))
+            Path(c, name, "shot.png").write_text("evidence")
+            r = wj.release(os.path.join(self.work, "ev-" + name), apply=True)
+            self.assertTrue(os.path.exists(os.path.join(c, name, "shot.png")), r)
+            self.assertIn("may be evidence", r["kept"][0]["why"])
+
+    def test_a_clone_under_an_ignored_dot_cache_is_checked_not_deleted_blind(self):
+        c = self.clone("dc/proj")
+        self.exclude(c, ".cache/")
+        sh("git", "init", "-q", os.path.join(c, ".cache", "keep"))
+        r = wj.release(os.path.join(self.work, "dc"), apply=True)
+        self.assertTrue(os.path.exists(c), r)
+        self.assertIn("nested repository", r["kept"][0]["why"])
+
+    # ---- nits
+    def test_a_root_outside_the_trees_leaves_an_alert_row(self):
+        outside = os.path.join(self.home, "projects2")
+        os.makedirs(outside)
+        self.write_config(reaper_delete_enabled=True, roots=[outside])
+        with mock.patch.object(wj, "uncapped_containers", return_value=[]), mock.patch.object(wj, "shm_sweep", return_value=[]):
+            wj.sweep(apply=False, now=time.time())
+            C.candidates(C.load_config())
+        log = Path(self.home, ".agent-harness", "state", "copy-hygiene-alerts.jsonl").read_text()
+        self.assertIn("janitor-root-ignored", log)
+        self.assertIn('"kind": "root-ignored"', log)
+
+    def test_unwrap_takes_the_value_of_stdbuf_and_doas_options(self):
+        self.assertEqual(C._unwrap(["stdbuf", "-o", "L", "rm", "-rf", "x"]), ["rm", "-rf", "x"])
+        self.assertEqual(C._unwrap(["doas", "-u", "bob", "rm", "x"]), ["rm", "x"])
+
+    def test_acquire_by_branch_warns_when_the_source_branch_is_ahead_of_the_remote(self):
+        src = self.clone("srcwarn/src")
+        sh("git", "commit", "-q", "--allow-empty", "-m", "ahead", cwd=src)
+        remote_sha = subprocess.run(["git", "-C", src, "rev-parse", "origin/main"], capture_output=True, text=True).stdout.strip()
+        note = C.resolved_note("main", src, remote_sha)
+        self.assertEqual(note["resolved_from"], "remote")
+        self.assertIn("main", note["warning"])
+        self.assertEqual(C.resolved_note("main", src, subprocess.run(["git", "-C", src, "rev-parse", "main"], capture_output=True,
+                                                                     text=True).stdout.strip()), {})
+
+
 class Sweep(Base):
     def setUp(self):
         super().setUp()
@@ -378,6 +525,34 @@ class Sweep(Base):
         self.assertTrue(os.path.exists(c))
 
 
+    def test_report_only_sweep_says_would_free_and_never_freed(self):
+        os.remove(os.path.join(self.home, ".agent-harness", "state", "copy-hygiene.json"))
+        self.clone("wd/c")
+        with mock.patch.object(S, "newest_activity", return_value=OLD):
+            r = wj.sweep(apply=True)
+            self.assertEqual(r["freed_gb"], 0)
+            self.assertEqual(r["released"][0]["removed"], [])
+            self.assertTrue(r["released"][0]["would_remove"])
+            self.assertIn("would_free_gb", r)
+            with mock.patch("sys.stdout") as out:
+                wj.main(["sweep", "--apply"])
+        text = "".join(c.args[0] for c in out.write.call_args_list)
+        self.assertIn("would free", text)
+        self.assertNotIn("freed", text.replace("would free", ""))
+
+    def test_live_sessions_without_proc_uses_ps_and_without_any_process_list_everything_is_alive(self):
+        sid = "33333333-4444-4555-8666-777777777777"
+        other = "44444444-5555-4666-8777-888888888888"
+        with mock.patch.object(wj, "PROC", os.path.join(self.t, "no-proc")):
+            with mock.patch.object(S, "probe", return_value=(0, "/usr/bin/claude --session-id %s\n/bin/zsh\n" % sid, "")) as pr:
+                self.assertEqual(wj.live_sessions([sid, other], 3600, time.time()), {sid})
+            self.assertEqual(pr.call_args.args[0][:2], ["ps", "-axo"])
+            with mock.patch.object(S, "probe", return_value=(127, "", "not installed")):
+                self.assertEqual(wj.live_sessions([sid, other], 3600, time.time()), {sid, other})
+            with mock.patch.object(S, "probe", return_value=(0, "  \n", "")):
+                self.assertEqual(wj.live_sessions([sid, other], 3600, time.time()), {sid, other})
+
+
 class MirrorSweep(Base):
     def setUp(self):
         super().setUp()
@@ -393,8 +568,8 @@ class MirrorSweep(Base):
         self.later = time.time() + 30 * 86400
 
     def drop_copy_folder(self):
-        import shutil
-        shutil.rmtree(self.copy)                # folder gone; git still lists the worktree as prunable
+        """The copy is removed the way release does it: `git worktree remove` (its admin entry goes too)."""
+        sh("git", "worktree", "remove", "--force", self.copy, cwd=self.mirror)
 
     def test_sweep_reports_count_and_size_and_keeps_a_young_mirror(self):
         r = wj.sweep(apply=True, cfg=self.cfg_)
@@ -438,6 +613,58 @@ class MirrorSweep(Base):
         self.assertEqual(C.normalize({"mirror_ttl_days": 3})["mirror_ttl_days"], 3.0)
 
 
+    # ---- Fable review B1: a mirror may hold the only copy of a branch
+    def test_b1_a_branch_that_exists_only_in_the_mirror_keeps_it(self):
+        sh("git", "checkout", "-q", "-b", "fix", cwd=self.copy)
+        sh("git", "commit", "-q", "--allow-empty", "-m", "unpushed work", cwd=self.copy)
+        sh("git", "checkout", "-q", "--detach", "origin/main", cwd=self.copy)
+        self.assertEqual(S.recoverable(self.copy), (True, ""))            # a linked worktree skips the branch check
+        r = wj.release(self.copy, apply=True)
+        self.assertFalse(os.path.exists(self.copy), r)                    # the copy goes; the commit lives in the mirror
+        self.assertEqual(subprocess.run(["git", "-C", self.mirror, "rev-parse", "--verify", "refs/heads/fix"],
+                                        capture_output=True).returncode, 0)
+        row = wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]
+        self.assertTrue(row["action"].startswith("kept"), row)
+        self.assertIn("no remote ref", row["action"])
+        self.assertTrue(os.path.isdir(self.mirror))
+        sh("git", "branch", "-q", "-D", "fix", cwd=self.mirror)           # control: nothing unpushed -> removable
+        self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
+
+    def test_b1_an_unreachable_origin_keeps_the_mirror(self):
+        self.drop_copy_folder()
+        moved = self.origin + ".moved"
+        os.rename(self.origin, moved)
+        try:
+            row = wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]
+            self.assertIn("ls-remote failed", row["action"])
+            self.assertTrue(os.path.isdir(self.mirror))
+        finally:
+            os.rename(moved, self.origin)
+        self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
+
+    def test_b1_a_worktree_admin_entry_keeps_the_mirror_even_when_its_folder_is_gone(self):
+        import shutil
+        shutil.rmtree(self.copy)                       # unmounted or moved: git still has the entry, os.path.exists says no
+        self.assertTrue(os.listdir(os.path.join(self.mirror, "worktrees")))
+        row = wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]
+        self.assertIn("registered worktree", row["action"])
+        self.assertTrue(os.path.isdir(self.mirror))
+
+    def test_protect_names_covers_a_mirror_by_name_and_by_url(self):
+        self.drop_copy_folder()
+        for names in (["origin-"], ["origin.git"]):
+            cfg = C.normalize({"reaper_delete_enabled": True, "mirror_ttl_days": 14, "protect_names": names})
+            row = wj.mirror_sweep(True, cfg, self.later)["rows"][0]
+            self.assertIn("protected name", row["action"], names)
+            self.assertTrue(os.path.isdir(self.mirror))
+
+    def test_mirror_removal_goes_through_the_fresh_removal_function(self):
+        self.drop_copy_folder()
+        with mock.patch.object(C, "protected_scan", wraps=C.protected_scan) as ps:
+            self.assertEqual(wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]["action"], "removed")
+        self.assertTrue(ps.call_args_list and all(c.kwargs.get("fresh") is True for c in ps.call_args_list))
+
+
 class ShmSweep(Base):
     delete = True
 
@@ -460,9 +687,9 @@ class ShmSweep(Base):
             os.utime(os.path.join(p, "f"), (OLD, OLD))
         return p
 
-    def sweep_with_ctime_old(self, apply=True, used=None):
+    def sweep_with_ctime_old(self, apply=True):
         later = time.time() + 3 * 86400            # ctime cannot be backdated, so move "now" forward instead
-        return wj.shm_sweep(apply, S.in_use_paths() if used is None else used, self.cfg, later)
+        return wj.shm_sweep(apply, self.cfg, later)
 
     def test_idle_entries_are_removed_and_semaphores_postgres_segments_are_not(self):
         f = self.make("scratch.bin")
@@ -475,6 +702,7 @@ class ShmSweep(Base):
         self.assertTrue(os.path.exists(sem) and os.path.exists(pg))
         self.assertEqual(sorted(r["action"] for r in rows), ["removed", "removed"])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
     def test_a_file_a_process_mapped_and_closed_is_kept(self):
         f = self.make("dsm.segment", data=b"\0" * 8192)
         # libc mmap, then close the descriptor: Python's own mmap module keeps a dup'd descriptor open
@@ -514,6 +742,28 @@ class ShmSweep(Base):
         rows = self.sweep_with_ctime_old(apply=False)
         self.assertTrue(os.path.exists(f))
         self.assertEqual(rows[0]["action"], "would remove")
+
+
+    def test_s6_podman_lock_and_browser_segments_are_never_removed(self):
+        keep = [self.make(n) for n in ("libpod_rootless_lock_1000", ".org.chromium.Chromium.abc", "playwright_x")]
+        gone = self.make("scratch2.bin")
+        self.sweep_with_ctime_old()
+        self.assertTrue(all(os.path.exists(k) for k in keep))
+        self.assertFalse(os.path.exists(gone))
+
+    def test_s6_the_process_scan_is_taken_inside_the_shm_sweep_and_a_failed_scan_keeps_everything(self):
+        f = self.make("held.bin")
+        g = self.make("other.bin")
+        with mock.patch.object(S, "in_use_paths", return_value={f}) as scan:
+            rows = self.sweep_with_ctime_old()
+        self.assertEqual(scan.call_count, 1)
+        self.assertTrue(os.path.exists(f))
+        self.assertFalse(os.path.exists(g))
+        h = self.make("third.bin")
+        with mock.patch.object(S, "in_use_paths", side_effect=S.ProbeError("scan failed")):
+            rows = self.sweep_with_ctime_old()
+        self.assertTrue(os.path.exists(h), rows)
+        self.assertIn("probe failed", rows[0]["action"])
 
 
 class Pretool(unittest.TestCase):
@@ -609,7 +859,7 @@ class InstallTimer(unittest.TestCase):
         sys.path.insert(0, str(HOOKS.parents[1]))
         import install
         self.install = install
-        self.home = Path(tempfile.mkdtemp())
+        self.home = Path(os.path.realpath(tempfile.mkdtemp()))
 
     def fake(self, linger="no", fail=None):
         calls = []
