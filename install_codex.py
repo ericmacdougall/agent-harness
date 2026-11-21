@@ -51,6 +51,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # goals_view imports mission_coverage at load; spec_flow and others import these lazily
                     # (tests/test_ah_export.py walks the chain).
                     'mission_coverage.py', 'resource_budget.py', 'workdir.py',
+                    'ask_state.py',  # the one open-ask rule: ah, mission_coverage, provenance and wal_note import it (goodqa#16599)
                     'shellwords.py',  # dropped_gate's pretool path imports it (PR 208 red-team)
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',

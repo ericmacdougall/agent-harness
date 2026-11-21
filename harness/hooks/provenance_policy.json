@@ -3,6 +3,7 @@
   "spec": "enforce",
   "plan_packet": "warn",
   "ask_user_question": "enforce",
+  "ask_close": "enforce",
   "stop_lint": "warn",
   "status_lint": "warn",
   "ask_presence": "enforce",

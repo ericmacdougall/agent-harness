@@ -6,6 +6,10 @@
   provenance_hooks.py stop-lint   Stop: the final assistant message's "need from you" items each carry
                                   `[ask:<id>]` or an inline `[src: <source>]` that resolves
   provenance_hooks.py prompt      UserPromptSubmit: hand the agent a reminder left by a warn-mode stop-lint
+  provenance_hooks.py ask-close   PostToolUse on AskUserQuestion: an ask named `[ask:<id>]` in a question the user answered is
+                                  closed (ask_resolved with the answer: source) at answer time, so a session that stops
+                                  right after the answer leaves no open ask (goodqa#16599); stop-lint repeats it for an
+                                  answer the transcript had not flushed yet. Policy key `ask_close`.
   provenance_hooks.py calibrate   measure the stop-lint detector on a transcript (no hook payload)
 
 Modes come from provenance_policy.json (`ask_user_question`, `stop_lint`: off | warn | enforce). Every hook
@@ -25,7 +29,9 @@ from pathlib import Path
 import provenance as prov
 import safe_input
 
-ASK_ID = re.compile(r"\[ask:\s*([A-Za-z0-9_-]{4,40})\s*\]")
+import ask_state  # noqa: E402
+
+ASK_ID = ask_state.ASK_TAG   # one definition of how a question names its ask
 TAIL_BYTES = 4 * 1024 * 1024
 
 # A heading or label line that introduces a list of things the agent wants from the user. A bare
@@ -385,6 +391,11 @@ def cmd_stop_lint(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
+    if prov.load_policy().get("ask_close", "enforce") != "off":
+        try:  # an answer the PostToolUse hook could not see yet; never blocks the lint
+            reconcile_open_asks(session)
+        except Exception:  # noqa: BLE001
+            pass
     quarantine = quarantine_block(session, payload)  # its own policy key, independent of stop_lint (review minor)
     if quarantine.get("decision") == "block":
         return quarantine
@@ -420,6 +431,11 @@ def cmd_prompt(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
+    if prov.load_policy().get("ask_close", "enforce") != "off":
+        try:  # a card answered while the closer was not running (a restart): close what it names before the turn starts
+            reconcile_open_asks(session)
+        except Exception:  # noqa: BLE001
+            pass
     path = reminder_path(session)
     claimed = path.with_name(f"{path.name}.{os.getpid()}")
     try:
@@ -557,6 +573,188 @@ def cmd_ask_gate(payload: dict) -> dict:
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "(warn mode) " + reason}}
 
 
+# --------------------------------------------------------------------------- ask-close (goodqa#16599)
+
+ASK_CLOSE_WAIT_S = 120.0    # the detached closer waits this long for the transcript to hold the answer record
+ASK_CLOSE_RECENT = 5        # the sweep looks at the newest answers that name an open ask, no more
+
+
+def card_excerpt(card: dict, question: str):
+    """A quote of the user's answer that provenance accepts: the whole answer text when it fits, else the answer to this
+    question when it is long enough to quote; None when neither can be quoted."""
+    whole = prov.norm(card["text"])
+    if whole and len(whole) <= prov.EXCERPT_MAX:
+        return whole
+    for asked, answer in card["pairs"]:
+        if asked == question:
+            quote = prov.norm(answer)[:prov.EXCERPT_MAX].strip()
+            if len(quote) >= prov.EXCERPT_MIN:
+                return quote
+    return None
+
+
+def close_from_card(session: str, uid: str, home=None) -> dict:
+    """Close every open ask of this session that a question the user answered names as [ask:<id>], through
+    wal_note.close_ask (the one writer: the same checks as a typed ask_resolved). The row goes to the session's MAIN WAL, with
+    `ask_wal` when an owner WAL holds the ask, so an owner's WAL is never written to (liveness reads those). Returns
+    {"closed": [ids], "skipped": [(id, why)]}. A question left empty, dismissed or answered "Other" with no text names
+    nothing (answer_card drops it). The decision field is never set: only a typed resolution may say approved or declined
+    (escalation.py reads that field as an approval), and wal_note lets one such resolution follow this row."""
+    import wal_note  # noqa: PLC0415
+    result = {"closed": [], "skipped": []}
+    card = prov.answer_card(session, uid, home)
+    wals = prov.session_wals(session, home)
+    main = next((w for w in wals if w.name == "main.jsonl"), None)
+    if main is None:
+        return result
+    open_ids = ask_state.session_open(wals)
+    for question, _answer in card["pairs"]:
+        for ask_id in ask_state.tagged_ids(question):
+            if ask_id in result["closed"] or ask_id not in open_ids:
+                continue  # not an open ask of this session: another session's id, a closed or unknown one
+            quote = card_excerpt(card, question)
+            if quote is None:
+                result["skipped"].append((ask_id, "the answer is too short or too long to quote"))
+                continue
+            source = f'answer:{session}/{uid} "{quote.replace(chr(34), chr(92) + chr(34))}"'
+            note = f"Answered on its question card (answer {uid[:8]}); closed by the ask-close hook, not by an agent."
+            record, refusal = wal_note.close_ask(main, ask_id, source, note, by=ask_state.AUTO_CLOSER)
+            if refusal:
+                if not str(refusal.get("problem")).startswith("no open ask"):
+                    result["skipped"].append((ask_id, str(refusal.get("problem"))[:120]))
+            else:
+                result["closed"].append(ask_id)
+    return result
+
+
+def answer_uid_for_use(session: str, use_id: str, home=None):
+    """uuid of the transcript record that answers AskUserQuestion tool_use `use_id`, or None when it is not written yet."""
+    try:
+        path = prov.find_transcript(session, home)
+        for line in prov._lines_containing(path, use_id.encode()):
+            if line is None:
+                continue
+            try:
+                record = prov.loads_line(line)
+            except ValueError:
+                continue
+            blocks = (record.get("message") or {}).get("content") if isinstance(record, dict) else None
+            if (isinstance(record, dict) and record.get("type") == "user" and "toolUseResult" in record
+                    and isinstance(blocks, list) and blocks and isinstance(blocks[0], dict)
+                    and blocks[0].get("tool_use_id") == use_id and isinstance(record.get("uuid"), str)):
+                return record["uuid"]
+    except prov.Problem:
+        pass
+    return None
+
+
+def ask_close_message(outcome: dict) -> str:
+    parts = []
+    if outcome["closed"]:
+        parts.append("closed " + ", ".join(f"[ask:{i}]" for i in outcome["closed"]) + " from the answered question card "
+                     "(ask_resolved written with the answer: source; no decision field is set: if the answer is an approval "
+                     "or a decline that escalation or ah kill reads, record it once with wal_note --event ask_resolved "
+                     "--decision approved|declined citing the same answer)")
+    if outcome["skipped"]:
+        parts.append("could not close " + "; ".join(f"[ask:{i}] ({why})" for i, why in outcome["skipped"]) +
+                     ": close it with wal_note --event ask_resolved --ref <id> --source answer:<id>")
+    return "Provenance ask-close: " + "; ".join(parts) if parts else ""
+
+
+def spawn_closer(session: str, use_id: str) -> bool:
+    """Start the detached closer: PostToolUse runs before Claude Code writes the answer record, and the closing must not
+    need the session to be alive (a usage limit can end it right after the answer). Short-lived: it exits when it closes
+    or after ASK_CLOSE_WAIT_S. Best effort."""
+    import subprocess  # noqa: PLC0415
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "ask-close-wait", session, use_id],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, close_fds=True)
+        return True
+    except OSError:
+        return False
+
+
+def ask_close_wait_seconds() -> float:
+    try:
+        return max(1.0, min(float(os.environ.get("HARNESS_ASK_CLOSE_WAIT", ASK_CLOSE_WAIT_S)), 600.0))
+    except ValueError:
+        return ASK_CLOSE_WAIT_S
+
+
+def cmd_ask_close(payload: dict) -> dict:
+    if prov.load_policy().get("ask_close", "enforce") == "off" or payload.get("tool_name") != "AskUserQuestion":
+        return {}
+    session, use_id = str(payload.get("session_id") or ""), payload.get("tool_use_id")
+    if not valid_session(session) or not isinstance(use_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", use_id):
+        return {}
+    uid = answer_uid_for_use(session, use_id)
+    if not uid:
+        spawn_closer(session, use_id)  # the record is written after this hook returns; the stop-lint sweep is the second net
+        return {}
+    text = ask_close_message(close_from_card(session, uid))
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}} if text else {}
+
+
+def run_ask_close_wait(session: str, use_id: str, wait=None, interval: float = 0.5) -> dict:
+    """The detached closer's body: wait for the answer record of `use_id`, then close what its questions name."""
+    deadline = time.monotonic() + (ask_close_wait_seconds() if wait is None else wait)
+    seen_size = -1
+    while True:
+        try:  # scan the transcript only when it grew: a long transcript costs a few tens of ms per scan
+            size = os.stat(prov.find_transcript(session)).st_size
+        except (OSError, prov.Problem):
+            size = -1
+        if size != seen_size:
+            seen_size = size
+            uid = answer_uid_for_use(session, use_id)
+            if uid:
+                return close_from_card(session, uid)
+        if time.monotonic() >= deadline:
+            return {"closed": [], "skipped": []}
+        time.sleep(interval)
+
+
+def reconcile_open_asks(session: str, home=None) -> dict:
+    """The sweep (stop-lint and prompt): when this session has open asks, close those that a recent answered card names.
+    Bounded: one transcript scan, and only when an open ask exists."""
+    outcome = {"closed": [], "skipped": []}
+    open_ids = set(ask_state.session_open(prov.session_wals(session, home)))
+    if not open_ids:
+        return outcome
+    transcript = prov.find_transcript(session, home)
+    stamp = f"{os.stat(transcript).st_size}:{','.join(sorted(open_ids))}"
+    marker = Path.home() / ".agent-harness" / "state" / "ask-close" / session
+    try:  # a 600 MB transcript costs about a second to scan: skip when neither it nor the open asks changed since the last sweep
+        if marker.read_text(encoding="utf-8") == stamp:
+            return outcome
+    except OSError:
+        pass
+    answers = []
+    for line in prov._lines_containing(transcript, b'"answers"', prov.LEDGER_MAX_HITS):   # not the 200-line lookup cap: the newest answers come last
+        if line is None or not any(i.encode() in line for i in open_ids):
+            continue
+        try:
+            record = prov.loads_line(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("type") == "user" and "toolUseResult" in record and isinstance(record.get("uuid"), str):
+            answers.append(record["uuid"])
+    for uid in answers[-ASK_CLOSE_RECENT:]:
+        try:
+            one = close_from_card(session, uid, home)
+        except prov.Problem:
+            continue
+        outcome["closed"] += one["closed"]
+        outcome["skipped"] += one["skipped"]
+    try:
+        marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker.write_text(stamp, encoding="utf-8")
+    except OSError:
+        pass
+    return outcome
+
+
 # --------------------------------------------------------------------------- calibration
 
 def assistant_messages(path: str) -> list:
@@ -589,14 +787,14 @@ def peak_rss_bytes() -> int:
     return peak if sys.platform == "darwin" else peak * 1024  # macOS reports bytes, Linux kilobytes
 
 
-def install_limits(rss_limit=RSS_LIMIT_BYTES, wall_limit=WALL_LIMIT_SECONDS):
+def install_limits(rss_limit=RSS_LIMIT_BYTES, wall_limit=WALL_LIMIT_SECONDS, cpu_limit=CPU_LIMIT_SECONDS):
     """Backstop against a runaway read or loop: exit 0 (fail open) instead of eating the machine.
     RLIMIT_AS and RLIMIT_DATA are not enforced on macOS, so a watchdog thread polls the peak RSS and the wall
     clock; RLIMIT_CPU is the last resort for a thread that never yields."""
     import threading
     try:
         import resource
-        resource.setrlimit(resource.RLIMIT_CPU, (CPU_LIMIT_SECONDS, CPU_LIMIT_SECONDS + 5))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 5))
     except (ImportError, ValueError, OSError):
         pass
     started = time.monotonic()
@@ -624,7 +822,7 @@ def install_limits(rss_limit=RSS_LIMIT_BYTES, wall_limit=WALL_LIMIT_SECONDS):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("ask-gate", "stop-lint", "prompt", "calibrate", "show-message"):
+    if not argv or argv[0] not in ("ask-gate", "stop-lint", "prompt", "ask-close", "ask-close-wait", "calibrate", "show-message"):
         print(__doc__, file=sys.stderr)
         return 3
     command = argv[0]
@@ -645,10 +843,19 @@ def main(argv=None) -> int:
             hits = detect(message["text"])
             print(json.dumps({"uuid": message["uuid"], "items": len(hits), "chars": len(message["text"])}))
         return 0
+    if command == "ask-close-wait":   # the detached closer: ask-close-wait <session> <tool_use_id>; no stdin, own deadline
+        if len(argv) < 3 or not valid_session(argv[1]) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", argv[2]):
+            return 3
+        install_limits(wall_limit=ask_close_wait_seconds() + 20, cpu_limit=60)
+        try:
+            run_ask_close_wait(argv[1], argv[2])
+        except Exception as error:  # noqa: BLE001 - best effort; the stop-lint sweep is the second net
+            print(f"provenance_hooks ask-close-wait: skipped ({type(error).__name__})", file=sys.stderr)
+        return 0
     install_limits()
     try:
         payload = read_payload()
-        handler = {"ask-gate": cmd_ask_gate, "stop-lint": cmd_stop_lint, "prompt": cmd_prompt}[command]
+        handler = {"ask-gate": cmd_ask_gate, "stop-lint": cmd_stop_lint, "prompt": cmd_prompt, "ask-close": cmd_ask_close}[command]
         result = handler(payload)
     except Exception as error:  # fail open: a lint bug must not trap the agent
         print(f"provenance_hooks {command}: skipped ({type(error).__name__})", file=sys.stderr)

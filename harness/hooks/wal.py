@@ -183,6 +183,30 @@ def tmp_advisory_output(data: dict) -> tuple:
 OWNER_AGENT_TYPES = {"task-owner", "fixer", "red-team", "click-tester", "general-purpose", "claude"}
 
 
+def open_ask_context(root: Path, main_wal: Path) -> str:
+    """goodqa#16599 AC-3: the asks of THIS session that nothing closed (a resume or compaction keeps the session id), each with
+    the command that closes it once the user has answered. Never raises. A different session that continued this work has no
+    machine-readable link to this one (SessionStart carries only session_id, source and cwd), so its asks are not guessed."""
+    try:
+        import ask_state  # noqa: PLC0415
+        paths = [w for w in sorted(root.glob("*.jsonl"))
+                 if not w.is_symlink() and (w.name == "main.jsonl" or w.name.startswith("agent-"))]
+        pending = ask_state.session_open(paths)   # one fold over the session: an owner's ask that main closed is closed
+        lines, shown = [], 0
+        for ident, (_wal, ask) in pending.items():
+            shown += 1
+            if shown <= 4:
+                note = " ".join(str(ask.get("note") or "").split())[:80]
+                lines.append(f"[ask:{ident}] {note}: python3 ~/.claude/hooks/wal_note.py --wal {main_wal} --event ask_resolved "
+                             f"--ref {ident} --source '<answer: or user: source from `ah user-msg`>' --note answered")
+        if not shown:
+            return ""
+        return (f" OPEN ASKS of this session ({shown}; nobody has closed them, so reminders continue). If the user already "
+                "answered one, close it with its command: " + " || ".join(lines) + (" || ..." if shown > 4 else "") + ".")
+    except Exception:  # noqa: BLE001 - a missing line must never block session start
+        return ""
+
+
 def main() -> None:
     event = sys.argv[1]
     data = json.load(sys.stdin)
@@ -198,7 +222,7 @@ def main() -> None:
     if event == "session":
         record["source"] = data.get("source", "")
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data) + ops_alert_context(event, session_id)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data) + open_ask_context(root, main_wal) + ops_alert_context(event, session_id)}}))
     elif event == "prompt":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)

@@ -236,8 +236,8 @@ class InstallerTests(unittest.TestCase):
         foreign = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(foreign))
         install(self.home, apply=True)
-        expected = [("PreToolUse", "AskUserQuestion", "ask-gate"), ("Stop", None, "stop-lint"),
-                    ("UserPromptSubmit", None, "prompt")]
+        expected = [("PreToolUse", "AskUserQuestion", "ask-gate"), ("PostToolUse", "AskUserQuestion", "ask-close"),
+                    ("Stop", None, "stop-lint"), ("UserPromptSubmit", None, "prompt")]
         self.assertEqual(self.provenance_entries(), expected)
         install(self.home, apply=True)
         install(self.home, apply=True)

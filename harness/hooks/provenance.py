@@ -226,7 +226,7 @@ EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
-    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce", "status_lint": "warn",
+    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "ask_close": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce", "status_lint": "warn",
     "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"},
 }
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
@@ -284,7 +284,7 @@ def read_text_arg(path, limit: int = 4 * SMALL_FILE) -> str:
 
 
 MODE_RANK = {"off": 0, "warn": 1, "enforce": 2}
-POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup", "status_lint")
+POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "ask_close", "stop_lint", "ticket_lookup", "status_lint")
 
 
 def stricter(current, wanted):
@@ -883,7 +883,10 @@ def askuser_bound(path: Path, use_id) -> set:
     return ids & {use_id}
 
 
-def answer_turn(session: str, uid: str, home=None) -> dict:
+def answer_card(session: str, uid: str, home=None) -> dict:
+    """The AskUserQuestion answer record `uid` as {"text", "timestamp", "uuid", "session", "pairs"}, or Problem. `pairs` is
+    [(question text, answer)] for the questions the user actually answered: a question left empty, dismissed or answered
+    "Other" with no text is not in it (the answer record carries only the user's selections, never the agent's prose)."""
     path = find_transcript(session, home)
     record = load_record(path, "uuid", uid)
     if record == "malformed":
@@ -902,7 +905,34 @@ def answer_turn(session: str, uid: str, home=None) -> dict:
     text = answer_text(record, ids)
     if text is None:
         raise Problem("not-user-authored", "record is not an AskUserQuestion answer bound to an AskUserQuestion tool_use")
-    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session}
+    answers = record["toolUseResult"]["answers"]
+    pairs = [(q, a.strip()) for q, a in answers.items() if isinstance(q, str) and isinstance(a, str) and a.strip()]
+    return {"text": text, "timestamp": record.get("timestamp"), "uuid": uid, "session": session, "pairs": pairs}
+
+
+def answer_turn(session: str, uid: str, home=None) -> dict:
+    card = answer_card(session, uid, home)
+    return {k: card[k] for k in ("text", "timestamp", "uuid", "session")}
+
+
+def answer_names_ask(source: str, ref: str, home=None, session=None):
+    """None when `source` is an answer: source whose answered question names ask `ref` ([ask:<ref>] in a question the
+    user answered), else why not (GoodQA goodqa#16599, like mc_bind for dashboard approvals). With `session` (the session
+    whose WAL holds the ask) the card must be that session's: ask ids repeat across sessions."""
+    try:
+        parsed = parse_source(source)
+        if parsed.get("kind") != "user" or parsed.get("variant") != "answer":
+            return "not an answer: source"
+        if session and parsed["session"] != session:
+            return f"that answer card belongs to session {parsed['session'][:8]}, not to the session whose WAL holds the ask"
+        card = answer_card(parsed["session"], parsed["ident"], home)
+    except Problem as problem:
+        return problem.message
+    import ask_state  # noqa: PLC0415
+    for question, _answer in card["pairs"]:
+        if ref in ask_state.tagged_ids(question):
+            return None
+    return f"the answered question card does not name [ask:{ref}]"
 
 
 def _has_human_turn(path: Path) -> bool:

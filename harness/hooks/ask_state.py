@@ -11,9 +11,20 @@ Pure: no I/O besides `read_records`. Stdlib only.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
+ASK_TAG = re.compile(r"\[ask:\s*([A-Za-z0-9_-]{4,40})\s*\]")   # how a question card names the ask it asks
 MAX_ID = 64   # wal_note writes w + 11 hex; older and hand-written rows use shorter ids, all are asks
+
+
+def tagged_ids(text) -> list:
+    """The ask ids a question text names as [ask:<id>], in order, without repeats."""
+    seen = []
+    for match in ASK_TAG.finditer(str(text or "")):
+        if match.group(1) not in seen:
+            seen.append(match.group(1))
+    return seen
 
 
 def record_ok(rec) -> bool:
@@ -54,6 +65,27 @@ def resolved_refs(records) -> set:
 def open_asks(records) -> dict:
     """{ask id: ask row} for the asks of one WAL that nothing closed."""
     return {k: v["ask"] for k, v in fold(records).items() if v["resolved"] is None}
+
+
+AUTO_CLOSER = "ask-close"   # `by` of a resolution the ask-close hook wrote from an answered card
+
+
+def auto_closed(resolved) -> bool:
+    """True for a resolution written by the ask-close hook. It carries the user's answer but never an approve or decline
+    (no decision field), so approval consumers (escalation, ah kill) refuse it until an agent records the decision."""
+    return isinstance(resolved, dict) and resolved.get("by") == AUTO_CLOSER
+
+
+def session_open(wal_paths, tail_bytes=4 << 20) -> dict:
+    """{ask id: (WAL path, ask row)} over ALL WALs of one session: an ask in an owner WAL that main closed with `ask_wal`
+    is closed, as the provenance ledger reads it. Every session-wide reader (SessionStart, the ask-close sweep) uses this."""
+    asks, closed = {}, set()
+    for path in wal_paths:
+        records = read_records(path, tail_bytes=tail_bytes)
+        for ident, row in fold(records).items():
+            asks[ident] = (path, row["ask"])
+        closed |= resolved_refs(records)
+    return {k: v for k, v in asks.items() if k not in closed}
 
 
 def parse_lines(lines):

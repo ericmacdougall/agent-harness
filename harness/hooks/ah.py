@@ -2139,8 +2139,10 @@ def ask_states(main_wal: Path, tally: "ReadTally | None" = None) -> dict:
     try:
         with open(main_wal, "rb") as handle:
             import ask_state  # noqa: PLC0415 - the one rule for open and resolved asks
-            lines = (raw for raw in handle if b'"ask' in raw)
-            for ident, row in ask_state.fold(ask_state.parse_lines(lines)).items():
+            records = list(ask_state.parse_lines(raw for raw in handle if b'"ask' in raw))
+            for ref in ask_state.resolved_refs(records):   # main closed an owner WAL's ask (ask_wal): still resolved here
+                states[ref] = "resolved"
+            for ident, row in ask_state.fold(records).items():
                 states[ident] = "open" if row["resolved"] is None else "resolved"
     except OSError as error:
         if tally is not None:   # which asks are open is unknown: never an empty "every wait is on a missing ask" read
@@ -3250,7 +3252,7 @@ def note_cmd(home: Path, args) -> dict:
 def doctor() -> dict:
     """Partial installs are the common failure: import every module ah needs and hash the files."""
     checks = []
-    for name in ("liveness", "provenance", "safe_input", "redact", "wal", "wal_note", "ticket_adapters"):
+    for name in ("liveness", "provenance", "safe_input", "redact", "wal", "wal_note", "ticket_adapters", "ask_state"):
         try:
             __import__(name)
             checks.append({"check": f"import {name}", "ok": True})

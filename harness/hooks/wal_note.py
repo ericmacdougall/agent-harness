@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -133,6 +134,144 @@ def sibling_ask_wal(path, ref: str):
     return holders[0].stem
 
 
+UNBOUND_MIN = 20
+
+
+def last_resolution(path, ref: str):
+    """The last `ask_resolved` row naming `ref` in this WAL (bounded tail read), whether or not the ask row is here."""
+    found = None
+    for rec in _tail_records(path) or []:
+        if ask_state.record_ok(rec) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
+            found = rec
+    return found
+
+
+def ask_resolved_fields(path, ref, source, decision=None, unbound_reason=None):
+    """(fields, None) for an ask_resolved row closing ask `ref`, or (None, refusal) with nothing to write. This is the one
+    path that closes an ask: wal_note and the ask-close hook (provenance_hooks.py) both call it, so a hook-written
+    resolution passes exactly the checks a typed one does (goodqa#16599). Fields: ref, source, and when they apply
+    ask_wal, decision, assumption, answer_unbound."""
+    ask_wal = None
+    supersedes = None
+    if not open_ask_exists(path, ref):
+        ask_wal = sibling_ask_wal(path, ref)
+    if not open_ask_exists(path, ref) and ask_wal is None:
+        # The ask-close hook closed it from an answered card and cannot tell approve from decline. One typed
+        # resolution WITH a decision may follow it (escalation.py and ah kill read the decision, never the hook's row).
+        last = last_resolution(path, ref)
+        if last is not None and ask_state.auto_closed(last) and decision:
+            supersedes = last.get('id')
+            ask_wal = last.get('ask_wal')
+        elif last is not None and ask_state.auto_closed(last):
+            return None, {'problem': f'ask {ref} was closed from its answered card by the ask-close hook, which records no decision',
+                          'hint': 'to record the outcome repeat with --decision approved|declined and the answer: or user: source; '
+                                  'escalation and ah kill read that field'}
+        else:
+            return None, {'problem': f'no open ask {ref} in this WAL',
+                          'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}
+    if not source or not source.strip():
+        return None, {'problem': 'ask_resolved needs --source',
+                      'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}
+    source = source.strip()
+    if not re.match(r'^(user:|uuid:|answer:|queue:|mc:|ticket:)', source):
+        return None, {'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
+                      'hint': 'an ask cannot be closed on an inferred: or file: source'}
+    mode, problem, assumption = provenance_check('ask', source, allow_mc=True)  # the answer is sourced like an ask (M1)
+    if problem:
+        return None, {'problem': problem[:300], 'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}
+    unbound = None
+    if source.lower().startswith('mc:'):
+        import provenance as _prov  # noqa: PLC0415
+        # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
+        # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).
+        bound = _prov.mc_bind(source, ref, decision, ask=ask_entry(path, ref),
+                              session=path.parent.name, wal=path.stem if ask_wal is None else ask_wal)
+        if bound:
+            return None, {'problem': bound[:300], 'hint': 'an mc: source closes only the ask it names, with its own decision'}
+    elif source.lower().startswith('answer:'):
+        import provenance as _prov  # noqa: PLC0415
+        # AC-4: an answer card closes the ask its question names; anything else needs a stated reason (audited on the row)
+        not_named = _prov.answer_names_ask(source, ref, session=path.parent.name)
+        if not_named:
+            reason = (unbound_reason or '').strip()
+            if len(reason) < UNBOUND_MIN:
+                return None, {'problem': not_named[:300],
+                              'hint': f'an answer: source must come from the card that asks [ask:{ref}]. If the user answered it '
+                                      f'in free text on another card, repeat the command with --unbound-reason "<why, '
+                                      f'{UNBOUND_MIN}+ characters>" (recorded on the row); a typed reply can be cited as user:'}
+            unbound = reason[:300]
+    fields = {'ref': ref}
+    if ask_wal:
+        fields['ask_wal'] = ask_wal
+    fields['source'] = source[:2000]
+    if decision:
+        fields['decision'] = decision
+    if assumption:
+        fields['assumption'] = True
+    if unbound:
+        fields['answer_unbound'] = unbound
+    if supersedes:
+        fields['supersedes'] = supersedes
+    return fields, None
+
+
+def close_ask(path, ref, source, note, by=None, decision=None):
+    """Close ask `ref` through ask_resolved_fields and append the row; (record, None) or (None, refusal). Used by the
+    ask-close hook, which passes no decision (only a typed or approval-card resolution may say approved or declined)."""
+    fields, refusal = ask_resolved_fields(path, ref, source, decision)
+    if refusal:
+        return None, refusal
+    record = {'at': datetime.now(timezone.utc).isoformat(), 'event': 'ask_resolved', 'note': note.strip()[:4000],
+              'id': 'w' + uuid.uuid4().hex[:11], **fields}
+    if by:
+        record['by'] = by
+    append(path, record)
+    return record, None
+
+
+ANSWER_SOURCE_RE = re.compile(r'^(?:answer|user|uuid|queue):', re.I)
+SOURCE_SESSION_RE = re.compile(r'^(?:answer|user|uuid|queue):\s*([0-9a-fA-F]{8}-[0-9a-fA-F-]{27})/')
+
+
+def ask_holder_wal(path, ident, source):
+    """The main WAL command target for closing `ident`: this WAL when it (or one of this session's owner WALs) holds the
+    open ask; else the main WAL of the session the answer's source names (a successor cites its predecessor's answer, and the
+    ask lives in the predecessor's WAL). None when no open ask is found. Reads only; closes nothing."""
+    if open_ask_exists(path, ident) or sibling_ask_wal(path, ident):
+        return path
+    found = SOURCE_SESSION_RE.match((source or '').strip())
+    if found and found.group(1).lower() != path.parent.name:
+        other = path.parent.parent / found.group(1).lower() / 'main.jsonl'
+        if other.is_file() and not other.is_symlink() and (open_ask_exists(other, ident) or sibling_ask_wal(other, ident)):
+            return other
+    return None
+BARE_ASK_ID_RE = re.compile(r'\bw[0-9a-f]{11}\b')
+
+
+def unclosed_ask_hint(path, event, source, *texts):
+    """GoodQA goodqa#16599: a row backed by the user's words (answer:, user:, queue:) that names an ask still open in this
+    WAL (or an owner WAL of this session) is usually that ask's answer; say how to close it. Never closes anything: a
+    mention in note text is not an answer to the question. None when nothing applies."""
+    if event in ('ask', 'ask_resolved') or not source or not ANSWER_SOURCE_RE.match(source.strip()):
+        return None
+    named = []
+    for text in texts:
+        for ident in ask_state.tagged_ids(text) + BARE_ASK_ID_RE.findall(text or ''):
+            if ident not in named:
+                named.append(ident)
+    commands = []
+    for ident in named[:5]:
+        holder = ask_holder_wal(path, ident, source)
+        if holder:
+            commands.append(f"python3 ~/.claude/hooks/wal_note.py --wal {shlex.quote(str(holder))} --event ask_resolved "
+                            f"--ref {ident} --source {shlex.quote(source.strip())} --note 'answered'")
+    if not commands:
+        return None
+    return ('this row names an ask that is still open; the row does not close it (a mention is not an answer), so the '
+            'reminders continue. If the user answered it, close it with: ' + ' ; '.join(commands) +
+            ' (an answer: source must come from the card that names the ask, or add --unbound-reason "<why>")')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wal', type=Path, required=True)
@@ -144,6 +283,8 @@ def main():
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
     parser.add_argument('--decision', choices=('approved', 'declined'),
                         help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
+    parser.add_argument('--unbound-reason', help='ask_resolved with an answer: source only: why the answered card does not name the ask '
+                                                 '(a free-text answer to another question); recorded on the row as answer_unbound')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     parser.add_argument('--goal', help='mission goal id this row is evidence for (ah goals lists it as a tag candidate)')
@@ -195,49 +336,17 @@ def main():
     if args.event == 'ask_resolved':
         if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
             parser.error('ask_resolved needs --ref <ask id>')
-        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
-        ask_wal = None
-        if not open_ask_exists(path, args.ref):
-            ask_wal = sibling_ask_wal(path, args.ref)
-        if not open_ask_exists(path, args.ref) and ask_wal is None:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
-                              'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
-                  file=sys.stderr)
+        if args.unbound_reason is not None and SECRET_PATTERN.search(args.unbound_reason):
+            parser.error('--unbound-reason appears to contain a credential; redact it first')
+        fields, refusal = ask_resolved_fields(path, args.ref, args.source, args.decision, args.unbound_reason)
+        if refusal:
+            print(json.dumps(dict(refusal, status='REFUSED', event='ask_resolved')), file=sys.stderr)
             return 2
-        if not args.source or not args.source.strip():
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved needs --source',
-                              'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
-                  file=sys.stderr)
-            return 2
-        if not re.match(r'^(user:|uuid:|answer:|queue:|mc:|ticket:)', args.source.strip()):
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
-                              'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
-            return 2
-        mode, problem, assumption = provenance_check('ask', args.source, allow_mc=True)  # the answer is sourced like an ask (M1)
-        if problem:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
-                              'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
-            return 2
-        if args.source.strip().lower().startswith('mc:'):
-            import provenance as _prov  # noqa: PLC0415
-            # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
-            # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).
-            bound = _prov.mc_bind(args.source.strip(), args.ref, args.decision, ask=ask_entry(path, args.ref),
-                                  session=path.parent.name, wal=path.stem if ask_wal is None else ask_wal)
-            if bound:
-                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': bound[:300],
-                                  'hint': 'an mc: source closes only the ask it names, with its own decision'}), file=sys.stderr)
-                return 2
-        record['ref'] = args.ref
-        if ask_wal:
-            record['ask_wal'] = ask_wal
-        record['source'] = args.source.strip()[:2000]
-        if args.decision:
-            record['decision'] = args.decision
-        if assumption:
-            record['assumption'] = True
+        record.update(fields)
     elif args.decision:
         parser.error('--decision applies to ask_resolved only')
+    elif args.unbound_reason is not None:
+        parser.error('--unbound-reason applies to ask_resolved only')
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
         if problem and args.source and caller_error(problem):
@@ -271,8 +380,9 @@ def main():
     append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
+    hint = unclosed_ask_hint(path, args.event, args.source, note, args.reason)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'id': record['id'], 'wal': str(path),
-                      **({'warnings': warnings} if warnings else {})}))
+                      **({'warnings': warnings} if warnings else {}), **({'hint': hint} if hint else {})}))
 
 
 if __name__ == '__main__':

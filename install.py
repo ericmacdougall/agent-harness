@@ -37,6 +37,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
+         "ask_state.py",  # the one open/closed rule for asks, shared by every reader (goodqa#16599)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
@@ -122,6 +123,8 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
     return {
         "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-gate")]}],
+        # Closes the asks a question names once the user answers (goodqa#16599); silent and fail-open
+        "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-close")]}],
         "Stop": [{"hooks": [hook("stop-lint")]}],
         "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
     }

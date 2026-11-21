@@ -323,6 +323,13 @@ def resolve_approval(ask_id, session, home, now=None, prov=None):
     closed = ask.get("_closed") or {}
     if not closed.get("source"):
         raise KillError("approval_invalid", "ask %s has no ask_resolved entry citing the user's answer" % ask_id)
+    import ask_state  # noqa: PLC0415 - installed beside this module
+    if ask_state.auto_closed(closed):  # goodqa#16599: the ask-close hook records that a card was answered, never what it said
+        raise KillError("approval_invalid", "ask %s was closed by the ask-close hook from an answered card, which cannot tell "
+                        "approve from decline: record wal_note --event ask_resolved --ref %s --decision approved (or declined) "
+                        "citing that answer first" % (ask_id, ask_id))
+    if closed.get("decision") == "declined":
+        raise KillError("approval_invalid", "ask %s was resolved as declined" % ask_id)
     result = prov.resolve(closed["source"], {"home": claude, "want_text": True})
     node = next((n for n in result.get("chain", []) if n.get("kind") == "user"), None)
     if not result.get("ok") or result.get("origin") != "user" or result.get("assumption") or result.get("weak") \
