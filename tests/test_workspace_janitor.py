@@ -35,6 +35,8 @@ def age(p):
 
 
 class Base(unittest.TestCase):
+    """Hermetic janitor fixture: a temp home, a bare origin and a seed repo. setUp stubs S.in_use_paths for the whole suite
+    (the real probe is slow); only the /proc test uses the real one."""
     delete = True
 
     def setUp(self):
@@ -728,8 +730,55 @@ class MirrorSweep(Base):
         sh("git", "push", "-q", self.origin, "HEAD:refs/heads/main", "refs/tags/v-gone", cwd=seed)
         sh("git", "fetch", "-q", "--tags", "origin", cwd=self.mirror)
         sh("git", "push", "-q", self.origin, ":refs/tags/v-gone", cwd=seed)
-        self.origin_commit("main")
-        self.assertEqual(wj._mirror_unpushed(self.mirror), "")
+        self.assertEqual(wj._mirror_unpushed(self.mirror), "")      # its commit is still on an advertised branch
+        sh("git", "push", "-q", "-f", self.origin, "HEAD~1:refs/heads/main", cwd=seed)   # ...and now on none: the safe side keeps it
+        self.assertIn("no remote ref", wj._mirror_unpushed(self.mirror))
+
+    def test_n1_a_commit_parked_under_any_non_remote_ref_keeps_the_mirror(self):
+        self.drop_copy_folder()
+        for kind in ("backup", "tag", "note"):
+            with self.subTest(kind):
+                sha = subprocess.run(["git", "-C", self.mirror, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree",
+                                      "-m", "wip-" + kind, "refs/remotes/origin/main^{tree}"], capture_output=True,
+                                     text=True, env=ENV).stdout.strip()
+                ref = {"backup": "refs/backup/x", "tag": "refs/tags/wip-save", "note": "refs/notes/commits"}[kind]
+                sh("git", "update-ref", ref, sha, cwd=self.mirror)
+                row = wj.mirror_sweep(True, self.cfg_, self.later)["rows"][0]
+                self.assertTrue(row["action"].startswith("kept"), (kind, row))
+                self.assertIn("no remote ref", row["action"])
+                self.assertTrue(os.path.isdir(self.mirror))
+                sh("git", "update-ref", "-d", ref, cwd=self.mirror)      # control: without it the mirror is removable
+                self.assertEqual(wj._mirror_unpushed(self.mirror), "")
+
+    def test_s2_the_fetch_wants_only_branch_heads_not_pull_refs(self):
+        new = self.origin_commit("main")
+        seed = os.path.join(self.t, "seed")
+        for n in range(30):
+            sh("git", "commit", "-q", "--allow-empty", "-m", "pr%d" % n, cwd=seed)
+            sh("git", "push", "-q", self.origin, "HEAD:refs/pull/%d/head" % n, cwd=seed)
+        calls = []
+        real = S.git
+
+        def spy(cwd, *a, **kw):
+            if "fetch" in a:
+                calls.append(a)
+            return real(cwd, *a, **kw)
+        with mock.patch.object(S, "git", side_effect=spy):
+            self.assertEqual(S.recoverable(self.copy), (True, ""))
+        self.assertEqual(len(calls), 1)
+        ids = [x for x in calls[0] if len(x) == 40]
+        self.assertEqual(ids, [new])
+        self.assertNotIn("--filter=tree:0", calls[0])
+
+    def test_nit_the_offline_view_uses_the_repos_object_format_and_old_views_are_cleaned(self):
+        old = os.path.join(tempfile.gettempdir(), S.VIEW_PREFIX + "leftover-test")
+        os.makedirs(old, exist_ok=True)
+        os.utime(old, (1, 1))
+        with S.offline_view(self.mirror) as v:
+            fmt = subprocess.run(["git", "-C", v.path, "rev-parse", "--show-object-format"], capture_output=True, text=True,
+                                 env=ENV).stdout.strip()
+            self.assertEqual(fmt, "sha1")
+        self.assertFalse(os.path.exists(old))
 
     def test_a_local_only_annotated_tag_on_a_pushed_commit_keeps_the_mirror(self):
         self.drop_copy_folder()

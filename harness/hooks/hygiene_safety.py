@@ -475,16 +475,35 @@ class OfflineView:
             return None
 
 
+VIEW_PREFIX = "hygiene-view-"
+
+
+def _sweep_old_views(max_age: float = 86400.0) -> None:
+    """Remove hygiene-view-* folders a killed run (TimeoutStartSec) left in the temp folder; they hold only an alternates file."""
+    root = tempfile.gettempdir()
+    for e in _ls(root):
+        d = os.path.join(root, e)
+        try:
+            if e.startswith(VIEW_PREFIX) and not os.path.islink(d) and time.time() - os.lstat(d).st_mtime > max_age:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+
 @contextlib.contextmanager
 def offline_view(repo: str):
-    """Yield an OfflineView of repo's objects; the throwaway repository is removed afterwards. ProbeError when it cannot be built."""
+    """Yield an OfflineView of repo's objects; the throwaway repository is removed afterwards.
+    ProbeError when it cannot be built."""
     rc, objs, _ = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "objects")
     objs = objs.strip()
     if rc != 0 or not objs or not os.path.isdir(objs):
         raise ProbeError("cannot find the object directory")
-    tmp = tempfile.mkdtemp(prefix="hygiene-view-")
+    _sweep_old_views()
+    rc, fmt, _ = git(repo, "rev-parse", "--show-object-format")      # a sha256 repository needs a sha256 view
+    fmt = fmt.strip() if rc == 0 and fmt.strip() in ("sha1", "sha256") else "sha1"
+    tmp = tempfile.mkdtemp(prefix=VIEW_PREFIX)
     try:
-        rc, _, err = git(tmp, "init", "-q", "--bare", ".")
+        rc, _, err = git(tmp, "init", "-q", "--bare", "--object-format=" + fmt, ".")
         if rc != 0:
             raise ProbeError("cannot create the offline view: " + err.strip()[-120:])
         with open(os.path.join(tmp, "objects", "info", "alternates"), "w") as f:
@@ -506,6 +525,20 @@ def refs_ids(repo: str, *patterns: str) -> "list | None":
 
 
 # ---------------------------------------------------------------- recoverability
+def _upstream_of(repo: str) -> "tuple[str, str]":
+    """(remote name, refs/heads/<branch> on it) of the checked-out branch's upstream; ('', '') when there is none."""
+    rc, br, _ = git(repo, "symbolic-ref", "-q", "HEAD")
+    br = br.strip()
+    if rc != 0 or not br.startswith("refs/heads/"):
+        return "", ""
+    b = br[len("refs/heads/"):]
+    rc1, remote, _ = git(repo, "config", "--get", "branch.%s.remote" % b)
+    rc2, target, _ = git(repo, "config", "--get", "branch.%s.%s" % (b, "mer" + "ge"))
+    if rc1 != 0 or rc2 != 0 or not target.strip().startswith("refs/heads/"):
+        return "", ""
+    return remote.strip(), target.strip()
+
+
 def _has_nested_repo(path: str) -> bool:
     for dp, dn, fn in os.walk(path):
         if ".git" in dn or ".git" in fn:
@@ -580,8 +613,8 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
         rc2, adv, _ = git(repo, "ls-remote", url.strip(), t=left()) if rc == 0 and url.strip() else (1, "", "")
         if rc2 != 0:
             return False, "ls-remote failed (cannot prove the commits are on the remote)"
-        per_remote[name] = {l.split()[0] for l in adv.splitlines() if l.strip()}
-    advertised = set().union(*per_remote.values())
+        per_remote[name] = [tuple(l.split()[:2]) for l in adv.splitlines() if len(l.split()) >= 2]
+    advertised = {i for refs in per_remote.values() for i, _ in refs}
     rc, head, _ = git(repo, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     tips = refs_ids(repo, "refs/heads", "refs/tags") if not linked else []
     if rc != 0 or not head.strip() or tips is None:
@@ -615,15 +648,19 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
     ok, why, missing = check()
     if ok or not missing or why.startswith(("object check", "offline check")):
         return ok, why
-    # The remote may simply have moved on (the copy's own branch advanced upstream): ONE explicit, time-limited fetch of
-    # the commits it advertises and the copy lacks, then the same offline check. A failed fetch keeps the copy.
-    rc, pc, _ = git(repo, "config", "--get", "extensions.partialclone")
-    flt = ["--filter=tree:0"] if rc == 0 else []         # a full clone cannot filter; it takes the commits and their trees
-    for name, ids in sorted(per_remote.items()):
-        want = sorted(ids & missing)
+    # The remote may simply have moved on (the copy's own branch advanced upstream): ONE explicit, time-limited fetch of the
+    # branch heads it advertises and the copy lacks, then the same offline check. A failed fetch keeps the copy. Only ids
+    # under refs/heads/* are wanted (never the thousands of refs/pull/* heads), and only the copy's upstream branch when
+    # that is known. No filter option is passed: a partial clone applies the filter stored in its config.
+    up_name, up_ref = _upstream_of(repo)
+    for name, refs in sorted(per_remote.items()):
+        heads = [(i, r) for i, r in refs if r.startswith("refs/heads/") and i in missing]
+        if up_name == name and any(r == up_ref for _, r in heads):
+            heads = [(i, r) for i, r in heads if r == up_ref]
+        want = sorted({i for i, _ in heads})
         if not want:
             continue
-        rc, _, err = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", *flt, name, *want,
+        rc, _, err = git(repo, "fetch", "--no-tags", "--no-write-fetch-head", "--no-recurse-submodules", name, *want,
                          t=left())
         if rc != 0:
             return False, "fetch of the remote's new commits failed (cannot prove HEAD is on the remote)"

@@ -296,8 +296,9 @@ def _mirror_worktree_entries(m: str) -> "list | None":
 
 
 def _mirror_unpushed(m: str) -> str:
-    """'' when every commit in the mirror (branches, tags, HEAD; not remote-tracking refs) is on what its origin advertises RIGHT NOW (fresh ls-remote),
-    else why not. Any failure answers with a reason: the mirror is kept."""
+    """'' when every commit reachable from any local ref of the mirror (all refs except refs/remotes/*: heads, tags,
+    notes, refs/backup/*, anything) or from HEAD is on what its origin advertises RIGHT NOW (fresh ls-remote), else why
+    not. Any failure answers with a reason: the mirror is kept."""
     rc, remotes, _ = S.git(m, "remote")
     names = remotes.split()
     if rc != 0 or not names:
@@ -312,17 +313,19 @@ def _mirror_unpushed(m: str) -> str:
             return "ls-remote failed (cannot prove its commits are on the remote)"
         advertised |= {l.split()[0] for l in adv.splitlines() if l.strip()}
     # Offline throughout: the mirror is a partial clone, and checking must not download what it is about to delete.
-    # Local work = branches and HEAD. Remote-tracking refs are copies of what the remote had (a branch deleted upstream
-    # after a squash-merge must not pin the mirror for ever), and neither is a tag that is not annotated: a
-    # lightweight tag the mirror fetched and the remote later deleted is not work. An ANNOTATED tag that no remote ref
-    # carries is local-only and keeps the mirror (below).
+    # Local work = every ref except refs/remotes/* (those are copies of what the remote had: a branch deleted upstream
+    # after a squash-merge must not pin the mirror for ever), plus HEAD. A ref outside heads/tags (refs/backup/*, notes)
+    # or a lightweight tag is how work is parked, so each counts; a lightweight tag deleted upstream pins the mirror only
+    # when its commit is on no advertised ref, which errs on the safe side. An ANNOTATED tag that no remote ref carries
+    # is local-only too (below).
     # HEAD goes in as a commit id and only when it resolves: with an unborn HEAD (the usual state of a mirror) git 2.43
     # answers `rev-list --count --branches HEAD` with 0 and rc 0, which would read as "nothing unpushed".
     rc, head, _ = S.git(m, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-    tips = S.refs_ids(m, "refs/heads")
+    rc3, allrefs, _ = S.git(m, "for-each-ref", "--format=%(refname) %(objectname)")
     rc2, tagrefs, _ = S.git(m, "for-each-ref", "--format=%(objectname)", "refs/tags")
-    if tips is None or rc2 != 0:
-        return "cannot list branches or tags"
+    if rc3 != 0 or rc2 != 0:
+        return "cannot list the refs"
+    tips = [l.split()[-1] for l in allrefs.splitlines() if l.strip() and not l.startswith("refs/remotes/")]
     if rc == 0 and head.strip():
         tips.append(head.strip())
     try:
@@ -348,8 +351,8 @@ def _mirror_unpushed(m: str) -> str:
 
 def mirror_sweep(apply: bool, cfg: dict, now: float) -> dict:
     """Count and size of ~/.agent-harness/mirrors; a mirror is removed after mirror_ttl_days idle only when it has no
-    worktree admin entry at all, every commit in it is on its origin (fresh ls-remote), nothing uses it, no service
-    references it and deletion is on (the shared switch)."""
+    worktree admin entry at all, every commit reachable from any of its refs (all but refs/remotes/*) or HEAD is on its
+    origin (fresh ls-remote), nothing uses it, no service references it and deletion is on (the shared switch)."""
     root = os.path.realpath(S.ah("mirrors"))
     deleting = bool(apply and C.deletion_enabled(cfg))
     ttl = cfg["mirror_ttl_days"] * 86400
@@ -433,7 +436,9 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
         if S.within_allowed(r, strictly_inside=False):
             roots.append(r)
         else:
-            S.alert_daily("janitor-root-ignored", r, {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"}, dedupe="root-ignored")
+            S.alert_daily("janitor-root-ignored", r,
+                          {"root": r, "why": "outside ~/.agent-harness/{work,checkouts,test-copies}"},
+                          dedupe="root-ignored")
     for root in roots:
         names = [e for e in sorted(S._ls(root)) if os.path.isdir(os.path.join(root, e)) and not os.path.islink(os.path.join(root, e))]
         alive = live_sessions(names, ttl, now)
