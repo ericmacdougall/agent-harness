@@ -43,6 +43,16 @@ func (a *app) followupSnapshotsLocked(s *session, entry *queuedInput, policy res
 	}
 	return a.selectedAttachments(holder, paths)
 }
+
+func firstPendingInput(s *session) *queuedInput {
+	for _, entry := range s.inputs {
+		if pendingInput(entry) {
+			return entry
+		}
+	}
+	return nil
+}
+
 func (a *app) scheduleInputs(id string) {
 	a.mu.Lock()
 	s := a.findLocked(id)
@@ -66,13 +76,7 @@ func (a *app) scheduleInputs(id string) {
 		a.runReviews(s)
 		return
 	}
-	var head *queuedInput
-	for _, entry := range s.inputs {
-		if pendingInput(entry) {
-			head = entry
-			break
-		}
-	}
+	head := firstPendingInput(s)
 	if head != nil && head.Status != "queued" {
 		a.changedLocked()
 		a.mu.Unlock()
@@ -164,9 +168,14 @@ func (a *app) scheduleInputs(id string) {
 	err := a.sendInput(id, request, text, nil, true, head, binding)
 	a.mu.Lock()
 	s.scheduled = false
+	continueQueue := false
 	if wake := binding.workspaceWake; wake != nil && s.workspaceWake == wake {
+		// Only an unchanged, completed origin proves the wake never acquired
+		// a native send intent. Keep its debit, but let a later FIFO head run.
+		continueQueue = err != nil && a.workspaceWakeIdentityLocked(s, wake) && workspaceOriginCompleted(s, wake) &&
+			s.Status == "idle" && s.task.State == "active" && s.Supervision.State == "active" && firstPendingInput(s) != nil
 		s.workspaceWake = nil
-		if err != nil && s.task == wake.task && s.controlEpoch == wake.epoch && s.Status == "idle" && s.lastRequest == wake.origin.requestID {
+		if !continueQueue && err != nil && s.task == wake.task && s.controlEpoch == wake.epoch && s.Status == "idle" && s.lastRequest == wake.origin.requestID {
 			s.task.State = "blocked"
 			s.Supervision.State = "blocked"
 			s.Supervision.Reason = "Workspace wake could not be admitted; reconcile without replay"
@@ -191,7 +200,7 @@ func (a *app) scheduleInputs(id string) {
 		_ = a.saveInputsLocked(s)
 		a.changedLocked()
 	}
-	again := err == nil && s.Status == "idle"
+	again := err == nil && s.Status == "idle" || continueQueue
 	a.mu.Unlock()
 	if again {
 		go a.advance(id)

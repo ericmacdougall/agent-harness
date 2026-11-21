@@ -45,8 +45,8 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 	if automatic {
 		wake = bindings[0].workspaceWake
 	}
-	if wake != nil && (!a.workspaceWakeSendLocked(current, wake, requestID) || current.codexTurn != wake.origin ||
-		!current.providerFinal || current.lastRequest != wake.origin.requestID || current.Status != "idle") {
+	if wake != nil && (!a.workspaceWakeSendLocked(current, wake, requestID) ||
+		!workspaceOriginCompleted(current, wake) || current.Status != "idle") {
 		a.mu.Unlock()
 		return refused("workspace wake lost its exact finalized request or task")
 	}
@@ -141,8 +141,8 @@ func (a *app) sendInput(sessionID, requestID, text string, attachments []string,
 		a.mu.Unlock()
 		return policyErr
 	}
-	if wake != nil && (!a.workspaceWakeSendLocked(current, wake, requestID) || current.codexTurn != wake.origin ||
-		!current.providerFinal || current.lastRequest != wake.origin.requestID || current.Status != "idle" ||
+	if wake != nil && (!a.workspaceWakeSendLocked(current, wake, requestID) ||
+		!workspaceOriginCompleted(current, wake) || current.Status != "idle" ||
 		policyHash(policy) != wake.policyHash || fingerprint != wake.runtimeHash || !workspaceStillReady) {
 		a.mu.Unlock()
 		return refused("workspace wake task, policy or runtime changed during send admission")

@@ -219,6 +219,76 @@ func TestWorkspaceCapacityWakeNeverOvertakesQueuedInput(t *testing.T) {
 	}
 }
 
+func TestWorkspaceCapacityWakeLateUserQueueWinsBeforeIntent(t *testing.T) {
+	a, s := workspaceNativeFixture(t, true)
+	armNativeWorkspaceFixture(t, a, s, "fixture-turn", true)
+	finishNativeQueueTurn(a, s)
+	setWorkspaceBytes(a, s, 0, "volume-A")
+	a.pollWorkspaceCapacity()
+
+	entered, proceed, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(proceed)
+		}
+	}()
+	a.mu.Lock()
+	info, calls := s.cwdInfo, 0
+	a.workspaceProbe = func(string) (workspaceCapacitySample, error) {
+		calls++
+		if calls == 2 {
+			close(entered)
+			<-proceed
+		}
+		return workspaceCapacitySample{directory: info, filesystem: "volume-A", available: 2 << 20}, nil
+	}
+	a.mu.Unlock()
+	go func() { a.pollWorkspaceCapacity(); close(done) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wake did not reach its pre-intent sample")
+	}
+	a.mu.Lock()
+	safeOrigin := s.task.workspaceWakeReceipt.State == "spent" && s.lastRequest == "original" &&
+		s.providerFinal && s.requests["original"] == "final"
+	a.mu.Unlock()
+	if !safeOrigin {
+		t.Fatal("fixture did not pause after durable spend and before the native intent")
+	}
+	if _, err := a.enqueueInput(s.ID, "late-follow-up", "Take priority over the waiting wake", nil); err != nil {
+		t.Fatal(err)
+	}
+	a.scheduleInputs(s.ID)
+	close(proceed)
+	released = true
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("pre-intent wake attempt did not settle")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		a.mu.Lock()
+		accepted := s.lastRequest == "late-follow-up" && s.requests["late-follow-up"] == "accepted"
+		spent := s.task.workspaceWakeReceipt.State == "spent" && s.Supervision.RemainingBursts == 2
+		_, wakeSent := s.requests[s.task.workspaceWakeReceipt.ID]
+		state := s.task.State
+		a.mu.Unlock()
+		if accepted {
+			if !spent || wakeSent {
+				t.Fatal("late user input retried or refunded the one-use wake")
+			}
+			return
+		}
+		if state == "blocked" || time.Now().After(deadline) {
+			t.Fatalf("definite pre-intent wake refusal stranded the late user input: task=%s", state)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestWorkspaceCapacityWakeRejectsCapacityLossDuringSendAdmission(t *testing.T) {
 	a, s := workspaceNativeFixture(t, true)
 	armNativeWorkspaceFixture(t, a, s, "fixture-turn", true)

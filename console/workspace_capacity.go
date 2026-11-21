@@ -107,7 +107,7 @@ func (a *app) armWorkspaceWakeLocked(s *session, minimum uint64, guarded bool) e
 	return err
 }
 
-func (a *app) workspaceWakeOwnerLocked(s *session, w *workspaceWake) bool {
+func (a *app) workspaceWakeIdentityLocked(s *session, w *workspaceWake) bool {
 	return a.workspaceWakeEnabled && a.findLocked(s.ID) == s && !inputLifecycleBlocked(s) &&
 		s.workspaceWake == w && s.task == w.task && s.task.workspaceWakeReceipt == w.receipt &&
 		s.task.Generation == w.generation && s.task.InputRevision == w.inputRevision &&
@@ -115,17 +115,24 @@ func (a *app) workspaceWakeOwnerLocked(s *session, w *workspaceWake) bool {
 		s.Provider == "codex" && s.codex == w.origin.client && !s.codex.disconnected.Load() &&
 		s.ProviderID == w.providerID && s.codex.runtimeHash == w.runtimeHash &&
 		s.CWD == w.cwd && s.cwdInfo != nil && os.SameFile(w.cwdInfo, s.cwdInfo) &&
-		policyHash(s.policy) == w.policyHash && !activeQueue(s) &&
+		policyHash(s.policy) == w.policyHash &&
 		!s.task.reviewing && oneOf(s.task.ReviewStatus, "", "passed") &&
 		s.pendingReviewResult == "" && !s.resumeRequested && len(s.PendingQuestions) == 0
+}
+
+func (a *app) workspaceWakeOwnerLocked(s *session, w *workspaceWake) bool {
+	return a.workspaceWakeIdentityLocked(s, w) && !activeQueue(s)
+}
+
+func workspaceOriginCompleted(s *session, w *workspaceWake) bool {
+	return s.lastRequest == w.origin.requestID && s.codexTurn == w.origin &&
+		s.providerFinal && w.origin.finalStatus == "completed" && s.requests[w.origin.requestID] == "final"
 }
 
 func (a *app) workspaceWakeIdleLocked(s *session, w *workspaceWake) bool {
 	return a.workspaceWakeOwnerLocked(s, w) && s.Status == "idle" &&
 		s.task.State == waitingForCapacity && s.Supervision.State == waitingForCapacity &&
-		s.Supervision.RemainingBursts > 0 && s.lastRequest == w.origin.requestID &&
-		s.codexTurn == w.origin && s.providerFinal && w.origin.finalStatus == "completed" &&
-		s.requests[w.origin.requestID] == "final" && !s.scheduled
+		s.Supervision.RemainingBursts > 0 && workspaceOriginCompleted(s, w) && !s.scheduled
 }
 
 func retireWorkspaceWakeLocked(s *session, nextState string) {
