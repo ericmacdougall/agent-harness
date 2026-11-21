@@ -358,6 +358,18 @@ class OpenTest(Base):
         self.assertEqual(len(self.api.calls("DELETE", "/api-keys/" + KEY_ID)), 1)
         self.assertIn("key_deleted", p.stdout + p.stderr)
 
+    def test_browser_worker_unavailable_reports_known_code_and_cleans_up(self):
+        endpoint = ("POST", "/agent-browsers/sessions")
+        for code, expected in (("agent_browser_no_worker", "agent_browser_no_worker"),
+                               ("unknown_backend_marker", "unrecognized_error")):
+            with self.subTest(code=code):
+                self.api.override[endpoint] = (503, {"error": {"code": code}})
+                failure = self.open(check=1)
+                self.assertIn("HTTP 503 " + expected, failure.stderr)
+                self.assertNotIn("unknown_backend_marker", failure.stderr)
+                self.assertIn("grant_revoked", failure.stderr)
+                self.assertIn("key_deleted", failure.stderr)
+
     def test_ac7_lost_session_response_deletes_key(self):
         self.api.drop.add(("POST", "/agent-browsers/sessions"))
         p = self.open(check=None)
