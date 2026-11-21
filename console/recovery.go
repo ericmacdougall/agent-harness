@@ -19,6 +19,8 @@ type checkpointRecord struct {
 	Attempts      map[string]int    `json:"attempts"`
 	Passes        map[string]string `json:"passes"`
 	Bursts        int               `json:"bursts"`
+
+	WorkspaceWake *workspaceWakeReceipt `json:"workspaceWake,omitempty"`
 }
 
 func checkpointSnapshot(s *session) *checkpointRecord {
@@ -28,7 +30,7 @@ func checkpointSnapshot(s *session) *checkpointRecord {
 	}
 	subject := t.Subject
 	subject.Files = nil
-	return &checkpointRecord{InputRevision: t.InputRevision, ObjectiveHash: t.ObjectiveHash, ID: t.ID, Generation: t.Generation, State: t.State, Stage: t.Stage, ScopeHash: objectiveHash(t.scope), Subject: subject, ReviewStatus: t.ReviewStatus, Attempts: t.attempts, Passes: t.passes, Bursts: s.Supervision.RemainingBursts}
+	return &checkpointRecord{InputRevision: t.InputRevision, ObjectiveHash: t.ObjectiveHash, ID: t.ID, Generation: t.Generation, State: t.State, Stage: t.Stage, ScopeHash: objectiveHash(t.scope), Subject: subject, ReviewStatus: t.ReviewStatus, Attempts: t.attempts, Passes: t.passes, Bursts: s.Supervision.RemainingBursts, WorkspaceWake: t.workspaceWakeReceipt}
 }
 func restoreCheckpoint(s *session, r journalRecord) {
 	checkpoint := r.Checkpoint
@@ -38,7 +40,7 @@ func restoreCheckpoint(s *session, r journalRecord) {
 	if checkpoint == nil {
 		return
 	}
-	s.task = &trackedTask{InputRevision: checkpoint.InputRevision, ObjectiveHash: checkpoint.ObjectiveHash, ID: checkpoint.ID, Generation: checkpoint.Generation, State: checkpoint.State, Stage: checkpoint.Stage, Subject: checkpoint.Subject, ReviewStatus: "unknown", passes: checkpoint.Passes, attempts: checkpoint.Attempts}
+	s.task = &trackedTask{InputRevision: checkpoint.InputRevision, ObjectiveHash: checkpoint.ObjectiveHash, ID: checkpoint.ID, Generation: checkpoint.Generation, State: checkpoint.State, Stage: checkpoint.Stage, Subject: checkpoint.Subject, ReviewStatus: "unknown", passes: checkpoint.Passes, attempts: checkpoint.Attempts, workspaceWakeReceipt: checkpoint.WorkspaceWake}
 	s.Work = s.task
 	s.Supervision.RemainingBursts = checkpoint.Bursts
 }

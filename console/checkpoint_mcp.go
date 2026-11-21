@@ -39,7 +39,7 @@ func runCheckpointMCP(input io.Reader, output io.Writer) error {
 		case "ping":
 			result = map[string]any{}
 		case "tools/list":
-			tool := checkpointTool()
+			tool := checkpointTool(false)
 			result = map[string]any{"tools": []any{map[string]any{"name": tool["name"], "description": tool["description"], "inputSchema": tool["inputSchema"]}}}
 		case "tools/call":
 			params := object(packet.Params)

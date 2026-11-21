@@ -561,7 +561,7 @@ function render() {
   $('#composer-hint').hidden = !$('#composer-hint').textContent;
   $('#stop-session').hidden = !current || current.restored || !(running(current.status) || current.canStop);
   $('#discard-turn').hidden = !current?.canDiscard;
-  $('#pause-session').hidden = !current || current.restored || !running(current.status);
+  $('#pause-session').hidden = !current || current.restored || (!running(current.status) && current.supervision?.state !== 'waiting_capacity');
   const resumable = current && (['paused', 'disconnected'].includes(current.status) || current.status === 'idle' && current.supervision?.state === 'waiting' && current.messages?.some(message => message.role === 'user'));
   $('#resume-session').hidden = !!current?.restored || !resumable || !current.providerId;
   $('#attach-button').disabled = !current || !!current.restored;
