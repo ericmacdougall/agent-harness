@@ -1064,13 +1064,19 @@ def _find_selective(words: list) -> "tuple[bool, bool]":
             if (w in FIND_NAME_SELECTORS and not prev_neg and not neg_depth
                     and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1]))):
                 name_sel = True
-    # A top-level alternative (`-name x -o -delete`) or -prune means a name filter no longer narrows the delete;
-    # `\( -name a -o -name b \)` inside a group still does.
-    d = 0
+    # An alternative (-o / -or / ,) at a depth no deeper than the delete action means the action can run without
+    # the name filter (`-name x -o -delete`, `\( -name k -o -delete \)`, `-prune -o \( -type f -delete \)`): the
+    # filters no longer narrow it. `\( -name a -o -name b \) -delete` and `-name x -prune -exec rm` still narrow.
+    d, act_depth, depths = 0, None, []
     for w in words:
-        d += 1 if w == "(" else -1 if w == ")" else 0
-        if w == "-prune" or (d == 0 and w in ("-o", "-or", ",")):
-            name_sel = False
+        d += 1 if w == "(" else 0
+        if w in ("-o", "-or", ","):
+            depths.append(d)
+        if act_depth is None and (w == "-delete" or w in ("-exec", "-execdir", "-ok", "-okdir")):
+            act_depth = d
+        d -= 1 if w == ")" else 0
+    if act_depth is not None and any(x <= act_depth for x in depths):
+        sel = name_sel = False
     return sel, name_sel
 
 

@@ -610,6 +610,23 @@ class Protected(OldCopies, Base):
                         "rm -rf ~/pp-ci/nm/x$", "rm -rf ~/coordinator-v2/rc/agent-harness/build/x$"):
                 self.allow(cmd)
 
+    def test_prune_cleanups_allowed_and_alternatives_and_positional_forms_denied(self):
+        self.setup_services()
+        h = str(self.home)
+        # From the service checkout itself. From an ancestor that contains protected paths a selective find is
+        # refused by design (the name filter could match inside them).
+        for cmd in ("find . -name __pycache__ -prune -exec rm -rf {} +",
+                    "find . -type d -name node_modules -prune -exec rm -rf {} +"):
+            self.allow(cmd, self.rc)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("find ~/pp-ci/nm \\( -name '*.keep' -o -delete \\)",
+                        "find ~/pp-ci/nm -name .git -prune -o \\( -type f -delete \\)",
+                        "find ~/pp-ci/nm -newer x -o -delete", 'D=${D:-$HOME/pp-ci}; rm -rf "$D/nm"',
+                        "rm -rf ~/pp-ci/nm/$1", "rm -rf ~/pp-ci/nm/$@", "rm -rf ~/pp-ci/nm/${a[0]}",
+                        "rm -rf ~/pp-ci/nm/$(cat f)", 'args=(-rf); rm "${args[@]}" ~/pp-ci/nm/$d'):
+                self.deny(cmd)
+            self.allow('D=%s/x/build/; rm -rf "${D%%/}"' % h)
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()
