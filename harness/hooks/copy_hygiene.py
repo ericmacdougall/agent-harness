@@ -733,6 +733,7 @@ KEYWORDS = frozenset(("then", "do", "else", "elif", "if", "while", "until", "{",
 _VAR = re.compile(r"\$(?:\{([^{}]*)\}|(\w+)|[@*#?$!0-9-])")
 _EMPTYING = re.compile(r"^[*?.\[\]!^]*[*?][*?.\[\]!^]*$")       # *, .*, **, ?*, [!.]*, .[!.]*, ..?*
 _PUSH, _POP = "\0push", "\0pop"
+_DEFAULT = "\0default:"     # marks a ${X:-default} value so its own variables are expanded too
 
 
 def _expand_braces(s: str) -> "list[str]":
@@ -754,11 +755,18 @@ def _var_value(m, env: dict) -> "list[str] | None":
     nm = re.match(r"^\w+", body)
     if not nm:
         return None
-    vals = env.get(nm.group(0))
-    if vals:
+    name, op = nm.group(0), body[nm.end():]
+    vals = env.get(name)
+    if vals and (op == "" or op.startswith(("?", ":?")) or op == "%/"):
+        return vals                                 # value unchanged (or only a trailing slash trimmed)
+    d = re.match(r"^:?[-=](.*)$", op)
+    if d and not vals:
+        return [_DEFAULT + d.group(1)]
+    if d and vals:
         return vals
-    d = re.match(r"^\w+:?[-=](.*)$", body)
-    return [d.group(1)] if d else None
+    if vals and op.startswith("%") and "/" in op:    # ${D%/*}: usually D's parent; check D and its parent
+        return [x for v in vals for x in (v, os.path.dirname(v.rstrip("/")) or "/")]
+    return None                                     # ${D%/*}, ${D:+x}, ${D/a/b}, ${D:0:3}, ${D#..}: unknown
 
 
 def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "list[str]":
@@ -768,7 +776,7 @@ def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "lis
            "USER": [os.environ.get("USER", "")]}
     if cwd:
         env["PWD"] = [cwd]
-    env.update({k: v for k, v in (vars_ or {}).items() if v is not None})
+    env.update(vars_ or {})                         # a same-line reassignment shadows HOME/TMPDIR/...
     outs = [("", s)]
     done = []
     for _ in range(64):
@@ -784,10 +792,15 @@ def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "lis
             if vals is None:
                 nxt.append((head + rest[:m.end()], rest[m.end():]))
             else:
-                nxt.extend((head + rest[:m.start()] + v, rest[m.end():]) for v in vals)
+                for v in vals:
+                    if v.startswith(_DEFAULT):          # rescan a default value: ${X:-$HOME/pp-ci}
+                        nxt.append((head + rest[:m.start()], v[len(_DEFAULT):] + rest[m.end():]))
+                    else:
+                        nxt.append((head + rest[:m.start()] + v, rest[m.end():]))
         outs = nxt[:256]
     done.extend(h + r for h, r in outs)
     return done[:256]
+
 
 def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
     """[(argv, separator before it)] for each simple command, keeping `|` so `find ... | xargs rm` is seen.
@@ -803,8 +816,9 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
                 out.append(([_PUSH], ";"))
                 out.extend(_cmd_lines(body))
                 out.append(([_POP], ";"))
+            seg = _strip_comment(seg)
             try:
-                words = shlex.split(seg, comments=True)
+                words = shlex.split(seg)                # not comments=True: it cuts `${f##*/}` mid-word
             except ValueError:
                 words = [w.strip("'\"") for w in seg.split()]
             words = _unwrap(words)
@@ -822,6 +836,20 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
         elif nsep == ")":
             out.append(([_POP], nsep))
     return out
+
+def _strip_comment(seg: str) -> str:
+    """Drop a shell comment: `#` outside quotes at the start of a word."""
+    q = ""
+    for i, c in enumerate(seg):
+        if q:
+            if c == q:
+                q = ""
+        elif c in "'\"":
+            q = c
+        elif c == "#" and (i == 0 or seg[i - 1].isspace()):
+            return seg[:i]
+    return seg
+
 
 SUBST = "${__SUBST__}"        # placeholder for a command substitution: an unresolved variable to _resolve
 
@@ -901,7 +929,8 @@ def _unwrap(words: list) -> list:
     return words
 
 
-def _resolve(raw: str, bases: list, vars_: "dict | None" = None) -> "list[tuple[str, bool, str]]":
+def _resolve(raw: str, bases: list, vars_: "dict | None" = None,
+             recursive: bool = True) -> "list[tuple[str, bool, str]]":
     """[(path, known, kind)] for a raw argument. `bases` are the possible current directories (None = unknown).
     known=False: a relative path under an unknown directory (matched by tail). kind "pattern": the path holds `*`
     where an unresolved variable or command substitution stood; it is refused only when a protected path or one
@@ -918,20 +947,23 @@ def _resolve(raw: str, bases: list, vars_: "dict | None" = None) -> "list[tuple[
             if "$" in r:
                 m = _VAR.match(r)
                 if m:                                       # starts with an unknown variable: unknown base
-                    rest = r[m.end():]
-                    if rest.startswith("/") and "$" not in rest:
+                    rest = _VAR.sub("", r[m.end():])        # later unknown variables taken as empty
+                    if rest.startswith("/"):
                         out.extend((p, k, "") for p, k in _resolve_unknown(rest.lstrip("/")))
                     continue
-                # A variable that is a whole path component may be empty (unset in a fresh shell): check that too.
-                comps = r.split("/")
-                if any(c and _VAR.fullmatch(c) for c in comps):
-                    empty = "/".join("" if (c and _VAR.fullmatch(c)) else c for c in comps)
-                    if "$" not in empty and empty.strip("/"):
-                        out.extend(_resolve(empty + ("/" if r.endswith("/") else ""), [b], None))
-                # Literal emptying components (`/*`, `/.*`, `/**`, trailing `/`) widen to their directory.
-                while comps and (comps[-1] == "" or (_EMPTYING.match(comps[-1]) and "$" not in comps[-1])):
+                z = _VAR.sub("\0", r)                      # slash-free sentinel per unknown variable
+                comps = z.split("/")
+                # Unset variables are empty in a fresh shell: check the target with every one of them empty. For
+                # a recursive delete an emptied component turns into `dir/` or `dir/*`, i.e. the directory itself.
+                if recursive:
+                    empty = z.replace("\0", "")
+                    if empty.strip("/"):
+                        out.extend(_resolve(empty, [b], None))
+                # Trailing components made only of variables and wildcards widen to their directory.
+                while recursive and comps and (comps[-1].replace("\0", "") == ""
+                                               or _EMPTYING.match(comps[-1].replace("\0", "*"))):
                     comps.pop()
-                r = _VAR.sub("*", "/".join(comps) or "/")
+                r = "/".join(comps).replace("\0", "*") or "/"
                 kind = "pattern"
             if not r.startswith("/"):
                 if b is None:
@@ -985,16 +1017,26 @@ def _find_deletes(words: list) -> bool:
 
 
 def _find_selective(words: list) -> "tuple[bool, bool]":
-    """(any selector, a real name selector). `-name '*'` is not a name selector."""
+    """(any selector, a positive name selector). `-name '*'` is not a name selector; a selector right after `!` /
+    `-not`, or inside a negated `\( ... \)` group, is negative and does not narrow what is deleted."""
     sel = name_sel = False
+    neg_depth, depth = [], 0
     for i, w in enumerate(words):
-        if w in FIND_SELECTORS:
+        prev_neg = i > 0 and words[i - 1] in ("!", "-not")
+        if w == "(":
+            depth += 1
+            if prev_neg:
+                neg_depth.append(depth)
+        elif w == ")":
+            if neg_depth and neg_depth[-1] == depth:
+                neg_depth.pop()
+            depth -= 1
+        elif w in FIND_SELECTORS:
             sel = True
-            negated = "!" in words or "-not" in words
-            if w in FIND_NAME_SELECTORS and not negated and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1])):
+            if (w in FIND_NAME_SELECTORS and not prev_neg and not neg_depth
+                    and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1]))):
                 name_sel = True
     return sel, name_sel
-
 
 def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
     """[(path, known, mode)] a command line would delete or move away.
@@ -1040,9 +1082,10 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
             pending_old = list(dict.fromkeys(pending_old + bases))      # every directory the line may still be in
             bases = new[:1] if len(new) == 1 or (new and len(set(new)) == 1) else [None]
             continue
-        raw, gbases, mode = [], bases, ""
+        raw, gbases, mode, recursive = [], bases, "", True
         if name in DELETE_VERBS:
             raw = pos
+            recursive = name in ("trash", "trash-put") or bool(flags & {"r", "R", "--recursive"})
         elif name == "gio" and pos[:1] in (["remove"], ["trash"]):
             raw = pos[1:]
         elif name == "mv":
@@ -1084,7 +1127,7 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
                         out.append((os.path.realpath(p), k, fmode))
             find_ctx = None if name == "xargs" else find_ctx
             continue
-        out.extend((p, k, kind or mode) for r in raw for p, k, kind in _resolve(r, gbases, vars_))
+        out.extend((p, k, kind or mode) for r in raw for p, k, kind in _resolve(r, gbases, vars_, recursive))
     return out
 
 def delete_targets(words: list, cwd: str) -> "list[str]":

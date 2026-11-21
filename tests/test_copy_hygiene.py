@@ -579,6 +579,21 @@ class Protected(OldCopies, Base):
                              ("rm -rf ~/pp-ci/runner/log-$d", None), ("echo $((1+2)); rm -f /tmp/x", None)):
                 self.allow(cmd, cwd)
 
+    def test_variables_inside_components_and_defaults(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf ~/pp-ci/nm/${f##*/}", "rm -rf ~/pp-ci/nm/${d%/}", "rm -rf ~/pp-ci/nm/$prefix*",
+                        "rm -rf ~/pp-ci/nm/${d}*", "rm -rf ~/pp-ci/nm/$a$b", "find ~/pp-ci/nm/$d* -delete",
+                        "D=$HOME/pp-ci; rm -rf $D/nm", 'rm -rf "${X:-$HOME/pp-ci}/nm"',
+                        'D=~/pp-ci/nm/cache; rm -rf "${D%/*}"', "rm -rf $ROOT/pp-ci/$d",
+                        "rm -f ~/pp-ci/runner/$f"):             # non-recursive, but $f may be the named gate.sh
+                self.deny(cmd)
+            for cmd in ("rm -rf ~/pp-ci/runner/log-$d*", "rm -f ~/coordinator-v2/rc/agent-harness/$f",
+                        "find ~/coordinator-v2/rc/agent-harness -name '*.pyc' -not -path '*/node_modules/*' -delete",
+                        'TMPDIR=$(mktemp -d); rm -rf "$TMPDIR"'):
+                self.allow(cmd)
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()
