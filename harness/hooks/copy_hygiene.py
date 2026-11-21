@@ -729,7 +729,8 @@ FIND_SELECTORS = FIND_NAME_SELECTORS | frozenset(("-newer", "-mtime", "-mmin", "
 FIND_EXEC_DELETERS = frozenset(("rm", "rmdir", "shred", "unlink", "trash", "trash-put", "srm", "mv"))
 SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh"))
 KEYWORDS = frozenset(("then", "do", "else", "elif", "if", "while", "until", "{", "!", "}"))
-_VAR = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+# $name, ${name}, ${name<op>...} (:? :- := % # / ...), ${arr[@]}, and specials ($$ $1 $@ ...).
+_VAR = re.compile(r"\$(?:\{([^{}]*)\}|(\w+)|[@*#?$!0-9-])")
 _EMPTYING = re.compile(r"^[*?.\[\]!^]*[*?][*?.\[\]!^]*$")       # *, .*, **, ?*, [!.]*, .[!.]*, ..?*
 _PUSH, _POP = "\0push", "\0pop"
 
@@ -744,26 +745,49 @@ def _expand_braces(s: str) -> "list[str]":
     return out[:256]
 
 
+def _var_value(m, env: dict) -> "list[str] | None":
+    """Values for one _VAR match, or None when unknown. ${D:?}, ${D%/} and the like use D's value (the suffix
+    operators only trim); an unknown ${D:-x} / ${D:=x} / ${D-x} uses its default text."""
+    body = m.group(1)
+    if body is None:
+        return env.get(m.group(2)) if m.group(2) else None
+    nm = re.match(r"^\w+", body)
+    if not nm:
+        return None
+    vals = env.get(nm.group(0))
+    if vals:
+        return vals
+    d = re.match(r"^\w+:?[-=](.*)$", body)
+    return [d.group(1)] if d else None
+
+
 def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "list[str]":
-    """Every expansion of $VAR / ${VAR}: HOME, PWD, TMPDIR, USER and same-line assignments / for-lists."""
+    """Every expansion of the known variables in s (HOME, PWD, TMPDIR, USER, same-line assignments and for-lists);
+    unknown ones are left in place for _resolve."""
     env = {"HOME": [os.path.expanduser("~")], "TMPDIR": [os.environ.get("TMPDIR", "/tmp")],
            "USER": [os.environ.get("USER", "")]}
     if cwd:
         env["PWD"] = [cwd]
-    env.update(vars_ or {})
-    outs = [s]
-    for _ in range(4):
+    env.update({k: v for k, v in (vars_ or {}).items() if v is not None})
+    outs = [("", s)]
+    done = []
+    for _ in range(64):
+        if not outs:
+            break
         nxt = []
-        for o in outs:
-            m = _VAR.search(o)
-            vals = env.get(m.group(1) or m.group(2)) if m else None
-            if not m or not vals:
-                nxt.append(o)
+        for head, rest in outs:
+            m = _VAR.search(rest)
+            if not m:
+                done.append(head + rest)
                 continue
-            nxt.extend(o[:m.start()] + v + o[m.end():] for v in vals)
+            vals = _var_value(m, env)
+            if vals is None:
+                nxt.append((head + rest[:m.end()], rest[m.end():]))
+            else:
+                nxt.extend((head + rest[:m.start()] + v, rest[m.end():]) for v in vals)
         outs = nxt[:256]
-    return outs
-
+    done.extend(h + r for h, r in outs)
+    return done[:256]
 
 def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
     """[(argv, separator before it)] for each simple command, keeping `|` so `find ... | xargs rm` is seen.
@@ -799,7 +823,7 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
             out.append(([_POP], nsep))
     return out
 
-SUBST = "$__SUBST__"        # placeholder for a command substitution: an unresolved variable to _resolve
+SUBST = "${__SUBST__}"        # placeholder for a command substitution: an unresolved variable to _resolve
 
 
 def _split_line(cmd: str) -> "list[tuple[str, str, list]]":
@@ -816,12 +840,25 @@ def _split_line(cmd: str) -> "list[tuple[str, str, list]]":
             i += 1; continue
         if c == "\\" and i + 1 < len(cmd):
             buf.append(cmd[i:i + 2]); i += 2; continue
-        if cmd.startswith("$(", i) and not cmd.startswith("$((", i):
-            depth, j = 1, i + 2
+        if cmd.startswith("$(", i):
+            depth, j, qq = 1, i + 2, ""
             while j < len(cmd) and depth:
-                depth += {"(": 1, ")": -1}.get(cmd[j], 0)
+                ch = cmd[j]
+                if qq:
+                    if ch == "\\" and qq == '"':
+                        j += 2; continue
+                    if ch == qq:
+                        qq = ""
+                elif ch == "\\":
+                    j += 2; continue
+                elif ch in "'\"":
+                    qq = ch
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
                 j += 1
-            bodies.append(cmd[i + 2:j - 1])
+            bodies.append(cmd[i + 2:j - 1] if depth == 0 else cmd[i + 2:])
             buf.append(SUBST); i = j; continue
         if c == "`":
             j = cmd.find("`", i + 1)
@@ -879,13 +916,22 @@ def _resolve(raw: str, bases: list, vars_: "dict | None" = None) -> "list[tuple[
             r = os.path.expanduser(r)
             kind = ""
             if "$" in r:
-                m = re.match(r"^\$(?:\{\w+\}|\w+)", r)
+                m = _VAR.match(r)
                 if m:                                       # starts with an unknown variable: unknown base
                     rest = r[m.end():]
                     if rest.startswith("/") and "$" not in rest:
                         out.extend((p, k, "") for p, k in _resolve_unknown(rest.lstrip("/")))
                     continue
-                r = _VAR.sub("*", r)
+                # A variable that is a whole path component may be empty (unset in a fresh shell): check that too.
+                comps = r.split("/")
+                if any(c and _VAR.fullmatch(c) for c in comps):
+                    empty = "/".join("" if (c and _VAR.fullmatch(c)) else c for c in comps)
+                    if "$" not in empty and empty.strip("/"):
+                        out.extend(_resolve(empty + ("/" if r.endswith("/") else ""), [b], None))
+                # Literal emptying components (`/*`, `/.*`, `/**`, trailing `/`) widen to their directory.
+                while comps and (comps[-1] == "" or (_EMPTYING.match(comps[-1]) and "$" not in comps[-1])):
+                    comps.pop()
+                r = _VAR.sub("*", "/".join(comps) or "/")
                 kind = "pattern"
             if not r.startswith("/"):
                 if b is None:
@@ -944,7 +990,7 @@ def _find_selective(words: list) -> "tuple[bool, bool]":
     for i, w in enumerate(words):
         if w in FIND_SELECTORS:
             sel = True
-            negated = i > 0 and words[i - 1] in ("!", "-not")
+            negated = "!" in words or "-not" in words
             if w in FIND_NAME_SELECTORS and not negated and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1])):
                 name_sel = True
     return sel, name_sel
@@ -962,11 +1008,11 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
     out, find_ctx = [], None
     for words, sep in _cmd_lines(cmd):
         if words == [_PUSH]:
-            stack.append((list(bases), list(pending_old), dict(vars_)))
+            stack.append((list(bases), list(pending_old), dict(vars_), find_ctx))
             continue
         if words == [_POP]:
             if stack:
-                bases, pending_old, vars_ = stack.pop()
+                bases, pending_old, vars_, find_ctx = stack.pop()
             continue
         if sep != "&&" and pending_old:
             bases = list(dict.fromkeys(bases + pending_old))
@@ -1057,8 +1103,8 @@ def protected_delete(cmd: str, cwd: str, cfg: "dict | None" = None) -> "tuple[st
     for t, known, mode in targets:
         if known and mode == "pattern":
             hit = None
-            for v in prot.values():
-                o, src = v if isinstance(v, tuple) else (v, "")
+            for key, v in prot.items():
+                o, src = v if isinstance(v, tuple) else (key, v)
                 anc = o
                 while anc and anc != "/":
                     if fnmatch.fnmatchcase(_k(anc), _k(t)):

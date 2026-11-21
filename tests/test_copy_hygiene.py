@@ -563,6 +563,22 @@ class Protected(OldCopies, Base):
         self.assertIn(str(self.runner), [p for p, _k, _m in targets])
         self.assertNotIn("/tmp/runner", [p for p, _k, _m in targets])
 
+    def test_variable_components_parameter_forms_and_quoted_parens(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf ~/pp-ci/nm/$d", "rm -rf ~/pp-ci/runner/$(cat f)", "find ~/pp-ci/nm/$d -delete",
+                        "rm -rf ~/pp-ci/$d/*", "rm -rf ~/pp-ci/$d/", "rm -rf ~/pp-ci/$d/.*",
+                        "x=$(echo \"$l\" | cut -d'(' -f1); rm -rf ~/pp-ci/nm",
+                        'n=$(grep -c ")" f); rm -rf ~/pp-ci/nm',
+                        "rm -rf ~/pp-ci/${T:-nm}", 'D=~/pp-ci; rm -rf "${D:?}/nm"', 'D=~/pp-ci/nm; rm -rf "${D%/}"',
+                        "find ~/pp-ci/nm -type f | xargs -P $(nproc) rm -rf", "find ~/pp-ci/nm | xargs -n$(nproc) rm",
+                        "find ~/pp-ci/nm ! \\( -name a -o -name b \\) -delete"):
+                self.deny(cmd)
+            for cmd, cwd in (("cd /tmp/build && rm -rf runner", self.home / "pp-ci"),
+                             ("rm -rf ~/pp-ci/runner/log-$d", None), ("echo $((1+2)); rm -f /tmp/x", None)):
+                self.allow(cmd, cwd)
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()
