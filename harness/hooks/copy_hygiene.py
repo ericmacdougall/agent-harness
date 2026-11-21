@@ -67,7 +67,7 @@ PREFIXES = frozenset(("sudo", "command", "time", "env", "nice", "nohup", "exec",
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SHM = "/dev/shm"
 SHM_ENV = re.compile(r"\b(?:TMPDIR|TMP|TEMP|CLAUDE_CODE_TMPDIR|XDG_CACHE_HOME|XDG_RUNTIME_DIR)=[\"']?/dev/shm(?:/|\b|$)")
-SHM_REDIRECT = re.compile(r"(?:^|[^<0-9&])\d?>>?\|?\s*[\"']?/dev/shm(?:/|\s|$|[\"'])")
+SHM_REDIRECT = re.compile(r"(?:^|[^<0-9])(?:&|\d)?>>?\|?\s*[\"']?/dev/shm(?:/|\s|$|[\"'])")
 
 
 # ---------------------------------------------------------------- config and state
@@ -193,7 +193,8 @@ def low_disk_message(path: str, free_gb: float, fl: float) -> str:
     return (f"DISK LOW: {free_gb:.1f} GB free on the volume holding {path} (floor {fl:.1f} GB). The harness refuses to "
             "create another copy. Reuse your PR's test copy with `python3 ~/.claude/hooks/copy_hygiene.py acquire "
             "--repo <checkout> --key pr-<N>`, and run `python3 ~/.claude/hooks/copy_hygiene.py reap` to list idle "
-            "copies (removing them needs the owner's OK).")
+            "copies (removing them needs the owner's OK). The floor is min_free_gb / min_free_pct in "
+            "~/.agent-harness/state/copy-hygiene.json (or HARNESS_COPY_HYGIENE_MIN_FREE_GB).")
 
 
 # ---------------------------------------------------------------- git helpers
@@ -539,7 +540,7 @@ def deletable(path: str) -> "tuple[bool, str]":
     rc, local = git(path, "log", "--oneline", "-1", "--branches", "--not", "--remotes")
     if rc != 0 or local:
         return False, "a local branch has commits on no remote"
-    rc, ign = git(path, "status", "--porcelain", "--ignored")
+    rc, ign = git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal")
     if rc != 0:
         return False, "git status --ignored failed"
     for line in ign.splitlines():

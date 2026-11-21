@@ -187,7 +187,7 @@ class Shm(Base):
             for cmd in ("mkdir -p /dev/shm/run1", "cp -R build /dev/shm/x", "python3 gen.py > /dev/shm/out.bin",
                         "TMPDIR=/dev/shm npm test", "git clone a /dev/shm/repo", "cd x && tar -xf a.tar -C /dev/shm/t",
                         "mv out.bin /dev/shm/", "dd if=/dev/zero of=/dev/shm/big bs=1M count=10",
-                        "cp -t /dev/shm/ a b", "echo hi >> /dev/shm/log"):
+                        "cp -t /dev/shm/ a b", "echo hi >> /dev/shm/log", "make &> /dev/shm/build.log"):
                 code, err = tc.pretool(self.ev(cmd), self.cfg())
                 self.assertEqual(code, 2, cmd)
                 self.assertIn("/dev/shm is memory", err)
@@ -388,10 +388,12 @@ class Install(unittest.TestCase):
         ids = {h["id"]: h for h in manifest["hooks"]}
         self.assertEqual(ids["copy_hygiene:pretool"]["status"], "installed")
         self.assertEqual(ids["copy_hygiene:session-start"]["status"], "installed")
-        for c in ids["copy_hygiene:pretool"]["canaries"]:
-            p = subprocess.run([sys.executable, str(HOOKS / "copy_hygiene.py"), "pretool"], input=json.dumps(c["payload"]),
-                               capture_output=True, text=True)
-            self.assertEqual(p.returncode, 2 if c["expect"] == "deny" else 0, c)
+        with tempfile.TemporaryDirectory() as h:
+            for c in ids["copy_hygiene:pretool"]["canaries"]:
+                p = subprocess.run([sys.executable, str(HOOKS / "copy_hygiene.py"), "pretool"],
+                                   input=json.dumps(c["payload"]), capture_output=True, text=True,
+                                   env=dict(os.environ, HARNESS_COPY_HYGIENE_HOME=h))
+                self.assertEqual(p.returncode, 2 if c["expect"] == "deny" else 0, c)
 
     def test_click_tester_brief_uses_acquire(self):
         brief = (ROOT / "harness" / "agents" / "click-tester.md").read_text()
