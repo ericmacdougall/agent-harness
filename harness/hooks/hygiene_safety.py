@@ -7,7 +7,7 @@ ONE place for every question "may this folder be deleted?" so the two tools cann
                   LFS or submodule, no ignored file except the one regenerable list below, no kept path inside it, and
                   every local commit is on what the remote advertises RIGHT NOW (fresh ls-remote, not stale tracking refs).
   in_use_paths()  every path a process uses: cwd, root, exe, open files and memory maps (/proc/*/maps).
-  service_refs()  every path a systemd unit (system and user: WorkingDirectory, ExecStart*, Environment*, ...), cron job,
+  service_refs()  every path a systemd unit or launchd plist names (via copy_hygiene.protected_scan, the one unit parser), plus cron,
                   docker or podman container, or launchd plist names, resolved with realpath. Every probe fails CLOSED:
                   a probe that errors or times out raises ProbeError and the caller keeps everything.
   remove_tree()   removal that never crosses a mount point.
@@ -292,11 +292,9 @@ def service_refs() -> set:
         raise ProbeError("crontab -l failed")
     texts.append(cron)
     texts += _systemd_texts()
-    for g in [h + "/.config/systemd/user/**", "/etc/systemd/system/**", "/etc/systemd/user/**", "/run/systemd/transient/*",
-              "/run/user/%d/systemd/transient/*" % os.getuid(), "/etc/cron*/*", "/etc/crontab", "/var/spool/cron/crontabs/*",
+    for g in ["/etc/cron*/*", "/etc/crontab", "/var/spool/cron/crontabs/*",
               h + "/.config/environment.d/*", h + "/.config/containers/systemd/**", "/etc/containers/systemd/**",
-              h + "/.profile", h + "/.bashrc", h + "/.zshrc", h + "/Library/LaunchAgents/*.plist",
-              "/Library/LaunchAgents/*.plist", "/Library/LaunchDaemons/*.plist"]:
+              h + "/.profile", h + "/.bashrc", h + "/.zshrc"]:
         for f in glob.glob(g, recursive=True):
             try:
                 if os.path.isfile(f):
@@ -318,6 +316,21 @@ def service_refs() -> set:
                 raise ProbeError("%s inspect failed" % tool)
             texts.append(o)
     refs = set()
+    # systemd units and launchd plists: ONE parser, copy_hygiene's protected-path scan (it carries the bypass fixes:
+    # %h/~ expansion, User= homes, drop-ins, EnvironmentFile, symlinked units). Imported here because copy_hygiene
+    # imports this module. An unreadable unit fails closed like every other probe.
+    import copy_hygiene
+    try:
+        prot, unit_errors = copy_hygiene.protected_scan()
+    except Exception as e:      # noqa: BLE001
+        raise ProbeError("service unit scan failed: %s" % type(e).__name__)
+    if unit_errors:
+        raise ProbeError("%d service unit file(s) could not be read" % unit_errors)
+    for _k_, (orig, _src) in prot.items():
+        for x in {orig, os.path.realpath(orig)}:
+            refs.add(x)
+            if os.path.isfile(x):
+                refs.add(os.path.dirname(x))
     for t in texts:
         t = t.replace("${HOME}", h).replace("$HOME", h).replace("%h", h).replace("~/", h + "/")
         for m in ABS_PATH.findall(t):

@@ -39,6 +39,9 @@ class Base(unittest.TestCase):
         self.sr = mock.patch.object(S, "service_refs", return_value=set())
         self.sr.start()
         os.environ.pop("HARNESS_COPY_HYGIENE_MIN_FREE_GB", None)
+        self.units = self.home / "units"
+        self.units.mkdir()
+        os.environ["HARNESS_COPY_HYGIENE_UNIT_DIRS"] = str(self.units)   # never read the host's real units
         # origin (bare) + a checkout of it
         self.origin = self.home / "origin.git"
         sh("git", "init", "-q", "--bare", "-b", "main", str(self.origin))
@@ -211,7 +214,9 @@ class Shm(Base):
         self.assertEqual(tc.pretool(ev, self.cfg())[0], 2)
 
 
-class Reap(Base):
+class OldCopies:
+    """Helpers for reaper tests (mixed into Base subclasses)."""
+
     def make_old_copies(self):
         return self.make_old_copies_named("sess1")
 
@@ -233,6 +238,14 @@ class Reap(Base):
             os.utime(p, (past, past))
         return old, dirty, keep
 
+    def enabled_reap(self):
+        self.write_config(reaper_delete_enabled=True, max_age_hours=24)
+        with mock.patch.object(tc, "in_use", return_value=False), \
+                mock.patch.object(tc, "last_activity", side_effect=lambda p, idx: time.time() - 72 * 3600):
+            return {r["path"]: r["action"] for r in tc.reap(apply=True)["copies"]}
+
+
+class Reap(OldCopies, Base):
     def test_default_is_report_only_even_with_apply(self):
         old, dirty, keep = self.make_old_copies()
         with mock.patch.object(tc, "last_activity", side_effect=lambda p, idx: time.time() - 72 * 3600):
@@ -346,12 +359,6 @@ class Reap(Base):
                 os.utime(os.path.join(root, n), (past, past), follow_symlinks=False)
         os.utime(p, (past, past))
 
-    def enabled_reap(self):
-        self.write_config(reaper_delete_enabled=True, max_age_hours=24)
-        with mock.patch.object(tc, "in_use", return_value=False), \
-                mock.patch.object(tc, "last_activity", side_effect=lambda p, idx: time.time() - 72 * 3600):
-            return {r["path"]: r["action"] for r in tc.reap(apply=True)["copies"]}
-
     def test_unpushed_local_branch_is_kept(self):
         old, _, _ = self.make_old_copies()
         sh("git", "checkout", "-q", "-b", "side", cwd=old)
@@ -425,6 +432,334 @@ class Reap(Base):
             res = tc.reap(cfg=self.cfg(max_age_hours=48, max_total_gb=60))
         marks = {Path(r["path"]).name: r["reap"] for r in res["copies"]}
         self.assertEqual(marks, {"tester-0": True, "tester-1": False, "tester-2": False})
+
+
+class Protected(OldCopies, Base):
+    """2026-11-21: cleanups deleted claude-rc's WorkingDirectory and the pp gate's runner and caches on t2-dev."""
+
+    def unit(self, name, body, sub=""):
+        d = self.units / sub if sub else self.units
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(body)
+
+    def ev(self, command, cwd=None):
+        return {"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(cwd or self.home)}
+
+    def setup_services(self):
+        self.rc = self.home / "coordinator-v2" / "rc" / "agent-harness"
+        self.runner = self.home / "pp-ci" / "runner"
+        self.nm = self.home / "pp-ci" / "nm"
+        for d in (self.rc, self.runner, self.nm):
+            d.mkdir(parents=True)
+        self.unit("claude-rc.service", "[Service]\nWorkingDirectory=%s\nExecStart=/usr/bin/claude rc\n" % self.rc)
+        self.unit("pp-gate.service", "[Service]\nExecStart=-/bin/bash \\\n  %h/pp-ci/runner/gate.sh --x\n"
+                                     "Environment=NODE_PATH=%h/pp-ci/nm\n")
+
+    def test_units_name_working_directory_exec_and_env_paths(self):
+        self.setup_services()
+        self.unit("10-extra.conf", "[Service]\nExecStartPre=+%h/pre/hook.sh\n", sub="pp-gate.service.d")
+        prot = tc.protected_paths(self.cfg(protected_paths=["~/keepme"]))
+        for p in (self.rc, self.runner / "gate.sh", self.nm, self.home / "pre" / "hook.sh",
+                  Path(os.path.expanduser("~/keepme"))):
+            self.assertIn(os.path.normpath(str(p)), prot, p)
+        self.assertNotIn(str(self.home / "pp-ci"), prot)     # the parent is not itself named
+
+    def test_launchd_plist_paths_are_protected(self):
+        import plistlib
+        job = self.home / "svc"
+        job.mkdir()
+        with open(self.units / "com.eric.svc.plist", "wb") as f:
+            plistlib.dump({"Label": "x", "WorkingDirectory": str(job), "ProgramArguments": ["/bin/sh", str(job / "run")]}, f)
+        prot = tc.protected_paths(self.cfg())
+        self.assertIn(str(job), prot)
+        self.assertIsNotNone(tc.protecting(str(self.home), prot))
+
+    def test_pretool_denies_deleting_service_paths_and_their_parents(self):
+        self.setup_services()
+        for cmd, cwd in (("rm -rf ~/coordinator-v2/rc/agent-harness".replace("~", str(self.home)), None),
+                         ("rm -rf %s" % (self.home / "pp-ci"), None),
+                         ("rm -rf runner", self.home / "pp-ci"),
+                         ("sudo rm -r %s/*" % (self.home / "pp-ci"), None),
+                         ("find %s -mindepth 1 -delete" % self.nm, None),
+                         ("find %s -name x -exec rm -rf {} +" % (self.home / "pp-ci"), None),
+                         ("cd /tmp && rmdir %s" % self.nm, None),
+                         ("git worktree remove %s" % self.rc, None)):
+            code, err = tc.pretool(self.ev(cmd, cwd), self.cfg())
+            self.assertEqual(code, 2, cmd)
+            self.assertIn("PROTECTED PATH", err)
+        alerts = (self.home / ".agent-harness" / "state").rglob("*")
+        self.assertTrue(any("protected-delete-denied" in p.read_text(errors="ignore") for p in alerts if p.is_file()))
+
+    def test_pretool_allows_unrelated_deletes_and_reads(self):
+        self.setup_services()
+        other = self.home / "pp-ci" / "old-logs"
+        other.mkdir()
+        for cmd in ("rm -rf %s" % other, "ls %s" % self.runner, "cat %s/gate.sh" % self.runner,
+                    "rm -rf %s/node_modules/.cache" % self.home, "find %s -name '*.log'" % self.home):
+            self.assertEqual(tc.pretool(self.ev(cmd), self.cfg())[0], 0, cmd)
+
+    def test_reaper_keeps_a_copy_a_service_runs_from_even_when_enabled(self):
+        old, _, _ = self.make_old_copies()
+        self.unit("tester.service", "[Service]\nWorkingDirectory=%s\nExecStart=/usr/bin/true\n" % old)
+        acts = self.enabled_reap()
+        self.assertIn("kept: protected", acts[str(old)])
+        self.assertTrue(old.exists())
+
+    def test_reaper_deletes_nothing_when_units_cannot_be_read(self):
+        old, _, _ = self.make_old_copies()
+        with mock.patch.object(tc, "protected_scan", side_effect=RuntimeError("boom")):
+            acts = self.enabled_reap()
+        self.assertEqual(acts[str(old)], "kept: could not read service units")
+        self.assertTrue(old.exists())
+
+    def deny(self, cmd, cwd=None):
+        code, err = tc.pretool(self.ev(cmd, cwd), self.cfg())
+        self.assertEqual(code, 2, cmd)
+        self.assertIn("PROTECTED PATH", err)
+
+    def allow(self, cmd, cwd=None):
+        self.assertEqual(tc.pretool(self.ev(cmd, cwd), self.cfg())[0], 0, cmd)
+
+    def test_cd_variables_braces_wildcards_and_wrappers_cannot_slip_past(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("cd %s/pp-ci && rm -rf runner nm" % h,             # relative target after cd
+                        "cd $SOMEWHERE && rm -rf pp-ci/runner",              # unknown base: matched by tail
+                        "rm -rf $HOME/pp-ci/runner", 'rm -rf "${HOME}/pp-ci"', "rm -rf ~/pp-ci/{runner,nm}",
+                        "rm -rf $UNSET_VAR/pp-ci/nm",
+                        "rm -rf %s/*" % self.rc, "rm -rf ~/pp-ci/nm/*",        # emptying a protected directory
+                        "find -L %s -delete" % self.nm, "find %s -exec sudo rm -rf {} +" % self.nm,
+                        "find %s -type d | xargs rm -rf" % self.nm, "find %s -exec mv {} /tmp \\;" % self.nm,
+                        "git -C %s worktree remove agent-harness" % self.rc.parent,
+                        "mv %s /tmp/old-runner" % self.runner, "mv -t /tmp %s" % self.nm,
+                        "bash -lc 'cd %s/pp-ci && rm -rf runner'" % h, "timeout 5 rm -rf %s" % self.nm,
+                        "sudo -u eric rm -rf %s" % self.nm, "env -u X nohup rm -r %s" % self.nm):
+                self.deny(cmd)
+
+    def test_unresolved_variables_assignments_loops_and_brace_moves_are_denied(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf ~/pp-ci/$d", 'D=~/pp-ci/runner; rm -rf "$D"',
+                        'for d in ~/pp-ci/runner ~/pp-ci/nm; do rm -rf "$d"; done', "mv ~/pp-ci/runner{,.bak}",
+                        "cd $X && rm -rf pp-ci/runner/*", "rm -rf $X/pp-ci/nm/*",
+                        "if [ -d %s ]; then rm -rf %s; fi" % (self.nm, self.nm), "{ rm -rf %s; }" % self.nm,
+                        "! rm -rf %s" % self.nm, "time rm -rf %s" % self.nm,
+                        "find %s -print0 | xargs -0 -I {} rm -rf {}" % self.nm, "find %s | xargs -n 1 rm" % self.nm,
+                        "find %s | grep -v keep | xargs rm -rf" % self.nm,
+                        "find %s -name '*' -delete" % self.nm, "find %s -mtime +1 -delete" % self.nm,
+                        "find %s -exec sh -c 'rm -rf \"$1\"' _ {} \\;" % self.nm, "rm -rf %s/**" % self.nm,
+                        "rm -rf %s/[!.]*" % self.nm):
+                self.deny(cmd)
+
+    def test_cd_scope_does_not_leak_or_hide_the_real_directory(self):
+        self.setup_services()
+        pp = self.home / "pp-ci"
+        for cmd in ("(cd /tmp && true); rm -rf runner", "bash -c 'cd /tmp'; rm -rf runner",
+                    "pushd /tmp; popd; rm -rf runner", "cd /tmp && cd - && rm -rf runner",
+                    "cd missing-dir; rm -rf runner"):
+            self.deny(cmd, cwd=pp)
+
+    def test_emptying_through_a_symlink_is_denied(self):
+        self.setup_services()
+        link = self.home / "nm-link"
+        link.symlink_to(self.nm)
+        (self.nm / "pkg").mkdir()
+        self.deny("rm -rf %s/*" % link)
+        self.deny("find -L %s -delete" % link)
+
+    def test_unknown_cd_does_not_block_system_named_dirs(self):
+        self.unit("sys.service", "[Service]\nExecStart=/usr/lib/thing/bin/run\n")
+        self.allow("cd $X && rm -rf bin")
+
+    def test_everyday_variable_and_substitution_commands_stay_allowed(self):
+        self.setup_services()
+        for cwd in ("/tmp", self.home, self.home / "pp-ci"):
+            for cmd in ("rm -f out_$n.log", "mv x.tmp.$$ x", "rm -rf build-$V", 'D=""; rm -rf "$D"',
+                        'D=$(mktemp -d); rm -rf "$D"', "rm -rf `mktemp -d`", "rm %s/log-$d" % self.runner):
+                self.allow(cmd, cwd=cwd)
+
+    def test_substitutions_and_scopes_cannot_hide_a_delete(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd, cwd in (("rm -rf $(pwd)/runner", self.home / "pp-ci"),
+                             ("find ~/pp-ci/nm -mtime +$(echo 1) -delete", None),
+                             ("cd ~/pp-ci && (cd /tmp && true) && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && x=$(cd /tmp && pwd) && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && x=`cd /tmp && pwd` && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && bash -c 'cd /tmp' && rm -rf runner", "/tmp"),
+                             ("cd ~/pp-ci && pushd /tmp && popd && rm -rf runner", "/tmp"),
+                             ("cd /nonexistent && cd /tmp; rm -rf runner", self.home / "pp-ci"),
+                             ("rm -rf %s/" % (self.home / "nm-link"), None),
+                             ("find ~/pp-ci/nm \\( -name a -o -name b \\) -mtime +1 -delete", None),
+                             ('export D=~/pp-ci/runner; rm -rf "$D"', None), ('local D=~/pp-ci/runner; rm -rf "$D"', None),
+                             ('declare D=~/pp-ci/runner; rm -rf "$D"', None), ("A=1 D=~/pp-ci/nm; rm -rf $D", None),
+                             ("rm -rf ~/pp-ci/*/*", None), ("find ~/pp-ci/nm ! -name keep -delete", None)):
+                if "nm-link" in cmd and not (self.home / "nm-link").exists():
+                    (self.home / "nm-link").symlink_to(self.nm)
+                if "\\(" in cmd:
+                    # name selectors: the root itself may stay, but nm is protected exactly and the find is selective,
+                    # so this is allowed; the case only checks that escaped parentheses are not split as subshells.
+                    self.assertEqual(tc.delete_targets_line(cmd, "/tmp")[0][2], "below", cmd)
+                    continue
+                self.deny(cmd, cwd)
+
+    def test_scope_handling_is_what_catches_and_joined_forms(self):
+        # Failing-first guard: with the PUSH/POP scoping removed these would resolve `runner` against /tmp.
+        self.setup_services()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}):
+            targets = tc.delete_targets_line("cd ~/pp-ci && (cd /tmp && true) && rm -rf runner", "/tmp")
+        self.assertIn(str(self.runner), [p for p, _k, _m in targets])
+        self.assertNotIn("/tmp/runner", [p for p, _k, _m in targets])
+
+    def test_variable_components_parameter_forms_and_quoted_parens(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf ~/pp-ci/nm/$d", "rm -rf ~/pp-ci/runner/$(cat f)", "find ~/pp-ci/nm/$d -delete",
+                        "rm -rf ~/pp-ci/$d/*", "rm -rf ~/pp-ci/$d/", "rm -rf ~/pp-ci/$d/.*",
+                        "x=$(echo \"$l\" | cut -d'(' -f1); rm -rf ~/pp-ci/nm",
+                        'n=$(grep -c ")" f); rm -rf ~/pp-ci/nm',
+                        "rm -rf ~/pp-ci/${T:-nm}", 'D=~/pp-ci; rm -rf "${D:?}/nm"', 'D=~/pp-ci/nm; rm -rf "${D%/}"',
+                        "find ~/pp-ci/nm -type f | xargs -P $(nproc) rm -rf", "find ~/pp-ci/nm | xargs -n$(nproc) rm",
+                        "find ~/pp-ci/nm ! \\( -name a -o -name b \\) -delete"):
+                self.deny(cmd)
+            for cmd, cwd in (("cd /tmp/build && rm -rf runner", self.home / "pp-ci"),
+                             ("rm -rf ~/pp-ci/runner/log-$d", None), ("echo $((1+2)); rm -f /tmp/x", None)):
+                self.allow(cmd, cwd)
+
+    def test_variables_inside_components_and_defaults(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf ~/pp-ci/nm/${f##*/}", "rm -rf ~/pp-ci/nm/${d%/}", "rm -rf ~/pp-ci/nm/$prefix*",
+                        "rm -rf ~/pp-ci/nm/${d}*", "rm -rf ~/pp-ci/nm/$a$b", "find ~/pp-ci/nm/$d* -delete",
+                        "D=$HOME/pp-ci; rm -rf $D/nm", 'rm -rf "${X:-$HOME/pp-ci}/nm"',
+                        'D=~/pp-ci/nm/cache; rm -rf "${D%/*}"', "rm -rf $ROOT/pp-ci/$d",
+                        "rm -f ~/pp-ci/runner/$f"):             # non-recursive, but $f may be the named gate.sh
+                self.deny(cmd)
+            for cmd in ("rm -rf ~/pp-ci/runner/log-$d*", "rm -f ~/coordinator-v2/rc/agent-harness/$f",
+                        "find ~/coordinator-v2/rc/agent-harness -name '*.pyc' -not -path '*/node_modules/*' -delete",
+                        'TMPDIR=$(mktemp -d); rm -rf "$TMPDIR"'):
+                self.allow(cmd)
+
+    def test_single_children_and_unrelated_paths_stay_allowed(self):
+        self.setup_services()
+        (self.rc / "build").mkdir()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("rm -rf %s/build" % self.rc, "rm %s/gate.log" % self.runner, "mv %s/a %s/b" % (self.nm, self.nm),
+                        "cd %s && rm -rf build" % self.rc, "find %s -name '*.log' -delete" % self.rc,
+                        "rm -rf $HOME/other", "mv a.txt b.txt", "find %s -name x" % self.nm):
+                self.allow(cmd)
+
+    def test_find_from_an_ancestor_with_delete_is_denied_by_design(self):
+        # `find . -delete` from ~ could reach a service directory; the deny is deliberate (message explains).
+        self.setup_services()
+        self.deny("find . -name __pycache__ -delete", cwd=self.home)
+
+    def test_removing_a_symlink_to_a_service_dir_is_allowed(self):
+        self.setup_services()
+        link = self.home / "rc-link"
+        link.symlink_to(self.rc)
+        self.allow("rm %s" % link)
+
+    def test_paths_inside_shell_strings_specifiers_and_attached_options(self):
+        self.unit("gate.service", "[Service]\nExecStart=/bin/bash -lc 'cd %h/pp-ci/runner && exec ./gate.sh'\n"
+                                  "WorkingDirectory=%h/runners/%i\nExecStartPost=/usr/bin/tool -C/opt/tooldir\n"
+                                  "StandardOutput=append:/var/log/gate/out.log\n"
+                                  "Environment=PATH=%h/pp-ci/nm/.bin:/usr/bin\n")
+        prot = tc.protected_paths(self.cfg())
+        for p in (self.home / "pp-ci" / "runner", self.home / "runners", Path("/opt/tooldir"),
+                  Path("/var/log/gate/out.log"), self.home / "pp-ci" / "nm" / ".bin"):
+            self.assertIn(str(p), prot, p)
+
+    def test_quoted_and_tilde_working_directory_and_dropin_override(self):
+        self.unit("a.service", '[Service]\nWorkingDirectory="%s"\n' % (self.home / "wd a"))
+        self.unit("b.service", "[Service]\nWorkingDirectory=~\n")
+        self.unit("10-x.conf", "[Service]\nExecStart=%h/b2/run\n", sub="b.service.d")
+        (self.units / "b.service.d" / "20-more.conf").write_text("[Service]\nExecStart=\nExecStart=%h/b3/run\n")
+        prot = tc.protected_paths(self.cfg())
+        for p in (self.home / "wd a", self.home, self.home / "b2" / "run", self.home / "b3" / "run"):
+            self.assertIn(str(p), prot, p)
+
+    def test_system_units_use_root_and_user_homes(self):
+        sysd = self.home / "sys"
+        sysd.mkdir()
+        (sysd / "svc.service").write_text("[Service]\nUser=nosuchuser-xyz\nWorkingDirectory=%h/svcdir\n")
+        (sysd / "svc.service.d").mkdir()
+        (sysd / "svc.service.d" / "x.conf").write_text("[Service]\nExecStart=~/svc2/run\n")
+        with mock.patch.object(tc, "_unit_dirs", return_value=[(str(sysd), "system")]), \
+                mock.patch.object(tc, "_user_home", side_effect=lambda u: "/home/svcuser" if u == "nosuchuser-xyz" else ""):
+            prot = tc.protected_paths(self.cfg())
+        for p in ("/root/svcdir", "/home/svcuser/svcdir", "/home/svcuser/svc2/run"):
+            self.assertIn(p, prot, p)
+
+    def test_linked_unit_source_is_protected(self):
+        src = self.home / "checkout" / "units"
+        src.mkdir(parents=True)
+        (src / "x.service").write_text("[Service]\nExecStart=/usr/bin/true\n")
+        (self.units / "x.service").symlink_to(src / "x.service")
+        self.assertIn(str((src / "x.service").resolve()), tc.protected_paths(self.cfg()))
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads mode-000 files")
+    def test_unreadable_unit_makes_the_reaper_keep_everything(self):
+        old, _, _ = self.make_old_copies()
+        bad = self.units / "secret.service"
+        bad.write_text("[Service]\nWorkingDirectory=/x\n")
+        bad.chmod(0)
+        try:
+            self.assertGreater(tc.protected_scan(self.cfg())[1], 0)
+            acts = self.enabled_reap()
+        finally:
+            bad.chmod(0o644)
+        self.assertEqual(acts[str(old)], "kept: could not read service units")
+        self.assertTrue(old.exists())
+        self.assertEqual(tc.main(["protected", "--check", str(self.home / "anything")]), 1)
+
+    def test_pretool_fails_open_with_an_alert_when_the_check_breaks(self):
+        with mock.patch.object(tc, "protected_delete", side_effect=RuntimeError("boom")):
+            self.assertEqual(tc.pretool(self.ev("rm -rf /tmp/x"), self.cfg())[0], 0)
+        log = self.home / ".agent-harness" / "state" / "copy-hygiene-alerts.jsonl"
+        self.assertIn("protected-check-error", log.read_text())
+
+    def test_check_cli(self):
+        self.setup_services()
+        self.assertEqual(tc.main(["protected", "--check", str(self.home / "pp-ci")]), 1)
+        self.assertEqual(tc.main(["protected", "--check", str(self.home / "elsewhere")]), 0)
+
+    def test_cache_notices_new_units(self):
+        self.setup_services()
+        self.assertNotIn(str(self.home / "new"), tc.protected_paths(self.cfg()))
+        time.sleep(0.01)
+        self.unit("new.service", "[Service]\nWorkingDirectory=%h/new\n")
+        self.assertIn(str(self.home / "new"), tc.protected_paths(self.cfg()))
+
+    def test_remove_copy_refuses_protected_path(self):
+        self.setup_services()
+        ok, why = tc.remove_copy(str(self.home / "pp-ci"))
+        self.assertFalse(ok)
+        self.assertIn("protected", why)
+        self.assertTrue(self.runner.exists())
+
+
+class Scratch(Base):
+    def test_scratch_is_disk_backed_and_shm_message_points_to_it(self):
+        with mock.patch.object(tc, "free_bytes", return_value=100 * GB):
+            d = tc.scratch("pr-12")
+            esc = tc.scratch("../../etc")
+        self.assertTrue(os.path.isdir(d))
+        self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+        self.assertTrue(esc.startswith(str(self.home / ".agent-harness" / "scratch") + "/"))
+        with mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+            self.assertIsNone(tc.scratch("pr-13"))
+        self.assertTrue(d.startswith(str(self.home / ".agent-harness" / "scratch")))
+        code, err = tc.pretool({"tool_name": "Bash", "tool_input": {"command": "TMPDIR=/dev/shm/x make"}, "cwd": "/"},
+                               self.cfg())
+        self.assertEqual(code, 2)
+        self.assertIn("copy_hygiene.py scratch", err)
 
 
 class Install(unittest.TestCase):
