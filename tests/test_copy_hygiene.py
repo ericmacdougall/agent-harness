@@ -594,6 +594,22 @@ class Protected(OldCopies, Base):
                         'TMPDIR=$(mktemp -d); rm -rf "$TMPDIR"'):
                 self.allow(cmd)
 
+    def test_nested_defaults_recursive_detection_and_find_alternatives(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ('rm -rf "${X:-${HOME}/pp-ci/nm}"', 'rm -rf "${X:-${HOME}/pp-ci}/nm"',
+                        "D=${X:-${HOME}/pp-ci}; rm -rf $D/nm", "rm -rf ${X:-~/pp-ci}/nm",
+                        "rm -f ~/pp-ci/runner/$d/gate.sh", "rm -f ~/pp-ci/$sub/runner/gate.sh",
+                        "rm ~/pp-ci/nm/$d -rf", "OPTS=-rf; rm $OPTS ~/pp-ci/nm/$d", "rm $OPTS ~/pp-ci/nm/$d",
+                        "rm -${R}f ~/pp-ci/nm/$d", "find ~/pp-ci/nm -name .git -prune -o -type f -delete",
+                        "find ~/pp-ci/nm -name '*.keep' -o -delete", "rm -rf ~/pp-ci/nm # cleanup",
+                        'D=~/pp-ci/nm/a/b; rm -rf "${D%%/b*}"'):
+                self.deny(cmd)
+            for cmd in ('rm -rf "$dir/$name"', 'rm -f "$tmp/$f"', 'rm -rf "$BUILD/$target/"',
+                        "rm -rf ~/pp-ci/nm/x$", "rm -rf ~/coordinator-v2/rc/agent-harness/build/x$"):
+                self.allow(cmd)
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()

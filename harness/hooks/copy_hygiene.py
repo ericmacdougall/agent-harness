@@ -74,6 +74,7 @@ import sys
 import tempfile
 import time
 
+
 GB = 1024 ** 3
 DEFAULTS = {
     "min_free_gb": 25.0,
@@ -764,12 +765,33 @@ def _var_value(m, env: dict) -> "list[str] | None":
         return [_DEFAULT + d.group(1)]
     if d and vals:
         return vals
-    if vals and op.startswith("%") and "/" in op:    # ${D%/*}: usually D's parent; check D and its parent
+    if vals and op == "%/*":                        # ${D%/*}: D's parent
         return [x for v in vals for x in (v, os.path.dirname(v.rstrip("/")) or "/")]
+    if vals and op.startswith("%") and "/" in op:    # ${D%%/*}, ${D%/*/*}: some ancestor of D
+        out = []
+        for v in vals:
+            a = v.rstrip("/") or "/"
+            while True:
+                out.append(a)
+                if a in ("/", ""):
+                    break
+                a = os.path.dirname(a)
+        return out
     return None                                     # ${D%/*}, ${D:+x}, ${D/a/b}, ${D:0:3}, ${D#..}: unknown
 
 
 def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "list[str]":
+    """Expand to a fixpoint, so nested forms such as ${X:-${HOME}/pp-ci} resolve (inner first, then outer)."""
+    outs = [s]
+    for _ in range(6):
+        nxt = list(dict.fromkeys(x for o in outs for x in _expand_vars_once(o, cwd, vars_)))[:256]
+        if nxt == outs:
+            break
+        outs = nxt
+    return outs
+
+
+def _expand_vars_once(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "list[str]":
     """Every expansion of the known variables in s (HOME, PWD, TMPDIR, USER, same-line assignments and for-lists);
     unknown ones are left in place for _resolve."""
     env = {"HOME": [os.path.expanduser("~")], "TMPDIR": [os.environ.get("TMPDIR", "/tmp")],
@@ -836,6 +858,7 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
         elif nsep == ")":
             out.append(([_POP], nsep))
     return out
+
 
 def _strip_comment(seg: str) -> str:
     """Drop a shell comment: `#` outside quotes at the start of a word."""
@@ -909,6 +932,7 @@ def _split_line(cmd: str) -> "list[tuple[str, str, list]]":
     out.append(("".join(buf), ";", bodies))
     return out
 
+
 def _unwrap(words: list) -> list:
     """Drop shell keywords (then, do, if, !, {), VAR=val prefixes, sudo/env/nohup/nice/timeout/time/command/exec
     and their options (sudo -u x, timeout 5, nice -n 5)."""
@@ -944,7 +968,7 @@ def _resolve(raw: str, bases: list, vars_: "dict | None" = None,
                 continue
             r = os.path.expanduser(r)
             kind = ""
-            if "$" in r:
+            if "$" in r and _VAR.search(r):
                 m = _VAR.match(r)
                 if m:                                       # starts with an unknown variable: unknown base
                     rest = _VAR.sub("", r[m.end():])        # later unknown variables taken as empty
@@ -955,10 +979,13 @@ def _resolve(raw: str, bases: list, vars_: "dict | None" = None,
                 comps = z.split("/")
                 # Unset variables are empty in a fresh shell: check the target with every one of them empty. For
                 # a recursive delete an emptied component turns into `dir/` or `dir/*`, i.e. the directory itself.
-                if recursive:
+                # A non-recursive delete can't remove the directory a trailing empty variable leaves, but an
+                # empty middle component (`runner/$d/gate.sh`) still names a real file.
+                last = comps[-1].replace("\0", "") if comps else ""
+                if recursive or last:
                     empty = z.replace("\0", "")
-                    if empty.strip("/"):
-                        out.extend(_resolve(empty, [b], None))
+                    if "$" not in empty and empty.strip("/") and empty != r:
+                        out.extend(_resolve(empty, [b], None, recursive))
                 # Trailing components made only of variables and wildcards widen to their directory.
                 while recursive and comps and (comps[-1].replace("\0", "") == ""
                                                or _EMPTYING.match(comps[-1].replace("\0", "*"))):
@@ -983,6 +1010,7 @@ def _resolve(raw: str, bases: list, vars_: "dict | None" = None,
             hits = glob.glob(r) if any(ch in r for ch in "*?[") else [r]
             out.extend((os.path.normpath(h), True, "") for h in hits)
     return out
+
 
 def _resolve_unknown(rel: str) -> "list[tuple[str, bool]]":
     rel = rel.rstrip("/")
@@ -1036,7 +1064,15 @@ def _find_selective(words: list) -> "tuple[bool, bool]":
             if (w in FIND_NAME_SELECTORS and not prev_neg and not neg_depth
                     and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1]))):
                 name_sel = True
+    # A top-level alternative (`-name x -o -delete`) or -prune means a name filter no longer narrows the delete;
+    # `\( -name a -o -name b \)` inside a group still does.
+    d = 0
+    for w in words:
+        d += 1 if w == "(" else -1 if w == ")" else 0
+        if w == "-prune" or (d == 0 and w in ("-o", "-or", ",")):
+            name_sel = False
     return sel, name_sel
+
 
 def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
     """[(path, known, mode)] a command line would delete or move away.
@@ -1085,7 +1121,9 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
         raw, gbases, mode, recursive = [], bases, "", True
         if name in DELETE_VERBS:
             raw = pos
-            recursive = name in ("trash", "trash-put") or bool(flags & {"r", "R", "--recursive"})
+            # Recursive unless every option is a literal flag without r/R: `rm $OPTS x` and `rm -${R}f x` may be.
+            recursive = (name in ("trash", "trash-put") or bool(flags & {"r", "R", "--recursive"})
+                         or any(_VAR.fullmatch(w) or (w.startswith("-") and "$" in w) for w in words[1:]))
         elif name == "gio" and pos[:1] in (["remove"], ["trash"]):
             raw = pos[1:]
         elif name == "mv":
@@ -1130,6 +1168,7 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
         out.extend((p, k, kind or mode) for r in raw for p, k, kind in _resolve(r, gbases, vars_, recursive))
     return out
 
+
 def delete_targets(words: list, cwd: str) -> "list[str]":
     """Known absolute targets of one argv (kept for callers; the hook uses delete_targets_line)."""
     return [p for p, known, _m in delete_targets_line(shlex.join(words), cwd) if known]
@@ -1169,6 +1208,7 @@ def protected_delete(cmd: str, cwd: str, cfg: "dict | None" = None) -> "tuple[st
         if hit:
             return t, hit[0], hit[1]
     return None
+
 
 def writes_into_shm(cmd: str, cwd: str = "") -> bool:
     if SHM_ENV.search(cmd) or SHM_REDIRECT.search(cmd):
@@ -1479,6 +1519,7 @@ def scratch(key: str = "") -> "str | None":
     os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(d, 0o700)
     return d
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="copy_hygiene.py")
