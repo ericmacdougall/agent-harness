@@ -38,6 +38,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
+         "test_copies.py",  # one test copy per PR/lane, disk-low guard, report-only reaper (t2-dev disk full 2026-11-21)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
@@ -213,6 +214,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
             "matcher": "Bash",
             "hooks": [heavy_guard],
+        }, {
+            # Disk-low guard for test copies: silent above the free-space floor; below it, denies commands that
+            # create another copy (worktree add, clone, cp -R, rsync -a, ditto). Fails open.
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "python3",
+                       "args": [str(claude / "hooks" / "test_copies.py"), "pretool"], "timeout": 5}],
         }, {
             "matcher": PROD_DELETE_MATCHER,
             "hooks": [prod_delete],

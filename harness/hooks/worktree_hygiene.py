@@ -1400,6 +1400,11 @@ def run(ev: dict, budget: Budget) -> "tuple[int, str, str]":
 
 
 def main() -> int:
+    # `worktree_hygiene.py copies <acquire|reap|check-disk> ...`: the test-copy tools (test_copies.py) under the
+    # hygiene entry point, so one place answers "where do test copies come from and who removes them".
+    if len(sys.argv) > 1 and sys.argv[1] == "copies":
+        import test_copies
+        return test_copies.main(sys.argv[2:])
     budget = Budget(budget_seconds())
     try:
         raw = safe_input.read_stdin_bounded().decode("utf-8", "replace") if not sys.stdin.isatty() else ""

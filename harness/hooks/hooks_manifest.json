@@ -462,6 +462,35 @@
    ]
   },
   {
+   "id": "test_copies:pretool",
+   "script": "test_copies.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      },
+      "cwd": "/"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
    "id": "prod_delete_guard:hook",
    "script": "prod_delete_guard.py",
    "arg": null,
