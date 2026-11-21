@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import copy_hygiene as tc  # noqa: E402
+import hygiene_safety as S  # noqa: E402
 
 GB = 1024 ** 3
 
@@ -34,6 +35,9 @@ class Base(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {"HARNESS_COPY_HYGIENE_HOME": str(self.home),
                                                 "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
         self.env.start()
+        # the service probe reads the real host's systemd/cron/docker; stub-based tests of it live in test_hygiene_safety
+        self.sr = mock.patch.object(S, "service_refs", return_value=set())
+        self.sr.start()
         os.environ.pop("HARNESS_COPY_HYGIENE_MIN_FREE_GB", None)
         # origin (bare) + a checkout of it
         self.origin = self.home / "origin.git"
@@ -46,6 +50,7 @@ class Base(unittest.TestCase):
         sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.repo)
 
     def tearDown(self):
+        self.sr.stop()
         self.env.stop()
         self.tmp.cleanup()
 

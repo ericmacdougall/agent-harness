@@ -8,10 +8,14 @@ full copy and nothing removed the old ones. Sessions also held 50 of the host's 
 
 WHAT.
   acquire       `copy_hygiene.py acquire --repo <checkout> --key <pr-1408|lane> [--ref <ref>]` returns ONE stable path
-                (~/.agent-harness/test-copies/<repo>-<id>/<key>) per repository and PR/lane. The first call makes a
-                detached linked worktree; later calls reuse it and check out the requested commit. It refuses (exit 4)
-                when tracked changes would have to be discarded, so a round never silently tests an older commit. It
-                refuses to create a copy below the free-space floor (exit 3) and writes an alert.
+                (~/.agent-harness/test-copies/<repo>-<id>/<key>) per repository and PR/lane, backed by ONE shared bare
+                mirror per repository (~/.agent-harness/mirrors/<host>/<repo>-<id>.git, temp clone + rename, a lock per
+                mirror and per key). `--url <remote> --key K` works without a checkout. The first call makes a detached
+                linked worktree; later calls reuse it and check out the requested commit; a branch name resolves
+                through refs/remotes/origin/<ref> in the freshly fetched mirror. It refuses (exit 4) when tracked
+                changes, or a commit that is on no remote and not in your checkout, would be lost, so a round never
+                silently tests an older commit. It refuses to create a mirror or copy below the free-space floor
+                (exit 3) and writes an alert. Every refusal exits nonzero.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
                 add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. It always denies writing scratch INTO
                 /dev/shm (RAM); reading, copying out of and removing from /dev/shm stay allowed. Silent otherwise.
@@ -23,8 +27,11 @@ WHAT.
                 "reaper_delete_enabled": true (a literal JSON true) is set in ~/.agent-harness/state/copy-hygiene.json
                 AND --apply is passed. The installer never sets it, so installing or a first run deletes nothing.
                 Even when enabled it removes only a git checkout with no tracked or untracked changes, no stash, no
-                local commits missing from its remotes, no ignored files except regenerable build output, and no
-                process inside it. Linked worktrees go through plain `git worktree remove` (no --force).
+                local commits missing from what the remote advertises (fresh ls-remote), no ignored files except the
+                one regenerable list (hygiene_safety.REGENERABLE_IGNORED), no process using it (cwd, exe, open files,
+                memory maps), and nothing a systemd unit, cron job, container or launchd plist references. Linked
+                worktrees go through plain `git worktree remove` (no --force). The same rule and the same switch serve
+                workspace_janitor.py (session-end release, hourly TTL sweep); see hygiene_safety.py.
 
 Config (~/.agent-harness/state/copy-hygiene.json; every key optional):
   min_free_gb (25), min_free_pct (10; the floor is the smaller of the two), max_age_hours (24), max_total_gb (60),
@@ -48,7 +55,9 @@ import sys
 import tempfile
 import time
 
-GB = 1024 ** 3
+import hygiene_safety as S
+
+GB = S.GB
 DEFAULTS = {
     "min_free_gb": 25.0,
     "min_free_pct": 10.0,
@@ -57,14 +66,16 @@ DEFAULTS = {
     "reaper_delete_enabled": False,
     "roots": None,                     # None = [<home>/.agent-harness/work]
     "name_patterns": ["tester-*", "test-copy-*", "click-test-*"],
+    # workspace_janitor.py reads the same file (one config, one deletion switch):
+    "shm_ttl_hours": 6.0,
+    "protect_names": ["yates", "optinrouter"],
+    "default_memory": "4g",
 }
 GIT_TIMEOUT = 60
 REPORT_EVERY_S = 6 * 3600
-REGENERABLE_IGNORED = ("node_modules", ".next", "dist", "build", "target", ".venv", "venv", "__pycache__",
-                       ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage", ".turbo", ".cache", ".parcel-cache",
-                       ".gradle", "DerivedData", ".nuxt", ".svelte-kit", "out")
-PREFIXES = frozenset(("sudo", "command", "time", "env", "nice", "nohup", "exec", "builtin", "ionice", "timeout"))
-ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+REGENERABLE_IGNORED = S.REGENERABLE_IGNORED      # the ONE regenerable list lives in hygiene_safety
+PREFIXES = S.PREFIXES
+ASSIGN = S.ASSIGN
 SHM = "/dev/shm"
 SHM_ENV = re.compile(r"\b(?:TMPDIR|TMP|TEMP|CLAUDE_CODE_TMPDIR|XDG_CACHE_HOME|XDG_RUNTIME_DIR)=[\"']?/dev/shm(?:/|\b|$)")
 SHM_REDIRECT = re.compile(r"(?:^|[^<0-9])(?:&|\d)?>>?\|?\s*[\"']?/dev/shm(?:/|\s|$|[\"'])")
@@ -72,11 +83,11 @@ SHM_REDIRECT = re.compile(r"(?:^|[^<0-9])(?:&|\d)?>>?\|?\s*[\"']?/dev/shm(?:/|\s
 
 # ---------------------------------------------------------------- config and state
 def home() -> str:
-    return os.environ.get("HARNESS_COPY_HYGIENE_HOME") or os.path.expanduser("~")
+    return S.home()
 
 
 def state_dir() -> str:
-    return os.path.join(home(), ".agent-harness", "state")
+    return S.state_dir()
 
 
 def config_path() -> str:
@@ -98,7 +109,7 @@ def _num(v, default: float) -> float:
 def normalize(cfg: dict) -> dict:
     out = dict(DEFAULTS)
     out.update({k: v for k, v in (cfg or {}).items() if k in DEFAULTS})
-    for k in ("min_free_gb", "min_free_pct", "max_age_hours", "max_total_gb"):
+    for k in ("min_free_gb", "min_free_pct", "max_age_hours", "max_total_gb", "shm_ttl_hours"):
         out[k] = _num(out[k], DEFAULTS[k])
     out["reaper_delete_enabled"] = out.get("reaper_delete_enabled") is True    # only a literal true enables deletion
     roots = out.get("roots")
@@ -112,7 +123,15 @@ def normalize(cfg: dict) -> dict:
         pats = [pats]
     pats = [str(p) for p in pats if str(p).strip("*")] if isinstance(pats, list) else []
     out["name_patterns"] = pats or list(DEFAULTS["name_patterns"])
+    pn = out.get("protect_names")
+    out["protect_names"] = [str(x).lower() for x in pn if str(x).strip()] if isinstance(pn, list) else list(DEFAULTS["protect_names"])
+    out["default_memory"] = str(out.get("default_memory") or DEFAULTS["default_memory"])
     return out
+
+
+def deletion_enabled(cfg: dict) -> bool:
+    """THE one deletion switch, shared with workspace_janitor: the owner's config AND no HARNESS_JANITOR=off kill switch."""
+    return bool(cfg.get("reaper_delete_enabled")) and os.environ.get("HARNESS_JANITOR", "").lower() != "off"
 
 
 def load_config() -> dict:
@@ -146,15 +165,8 @@ def _atomic_write(path: str, text: str) -> None:
 
 
 def alert(kind: str, detail: dict) -> None:
-    """Append one row to the alert log; never raises."""
-    try:
-        os.makedirs(state_dir(), exist_ok=True)
-        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
-        row.update(detail)
-        with open(os.path.join(state_dir(), "copy-hygiene-alerts.jsonl"), "a") as f:
-            f.write(json.dumps(row) + "\n")
-    except OSError:
-        pass
+    """Append one row to the single alert/audit record; never raises."""
+    S.alert(kind, detail)
 
 
 # ---------------------------------------------------------------- disk floor
@@ -199,28 +211,204 @@ def low_disk_message(path: str, free_gb: float, fl: float) -> str:
 
 # ---------------------------------------------------------------- git helpers
 def git(cwd: str, *args: str) -> "tuple[int, str]":
+    rc, out, err = S.git(cwd, *args, t=GIT_TIMEOUT)
+    return (99 if rc == -1 else rc), (out + err).strip()
+
+
+safe_key = S.safe_key
+
+
+def parse_url(url: str) -> "tuple[str, str]":
+    """(host, repo path) of a remote URL or a local repository path; the same repo over https and ssh gives one pair."""
+    if url.startswith("/") or url.startswith("file://"):
+        p = url[7:] if url.startswith("file://") else url
+        return "local", re.sub(r"\.git$", "", p.strip("/"))
+    m = re.match(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^@/]+@)?([^/:]+)(?::\d+(?=/))?[:/]+(.+?)(?:\.git)?/?$", url)
+    if not m or ".." in m.group(2).split("/"):
+        raise ValueError("cannot parse repo url: %s" % re.sub(r"://[^@/]+@", "://", url))
+    return m.group(1).lower(), m.group(2)
+
+
+def mirror_id(url: str) -> "tuple[str, str, str]":
+    """(<name>-<10 hex of host/path>, host dir, name): one shared id for a repository, whoever asks."""
+    host, path = parse_url(url)
+    name = safe_key(path.split("/")[-1] or "repo")
+    return "%s-%s" % (name, hashlib.sha256(("%s/%s" % (host, path)).encode()).hexdigest()[:10]), safe_key(host), name
+
+
+def mirror_path(url: str) -> str:
+    rid, host, _ = mirror_id(url)
+    return os.path.join(home(), ".agent-harness", "mirrors", host, rid + ".git")
+
+
+def source_url(top: str) -> str:
+    """The origin URL of a checkout (a relative remote path made absolute); the checkout itself when it has no origin."""
+    rc, out, _ = S.git(top, "remote", "get-url", "origin")
+    url = out.strip()
+    if rc != 0 or not url:
+        return os.path.realpath(top)
+    if "://" not in url and not re.match(r"^[^/]+@[^/]+:", url) and not url.startswith("/"):
+        cand = os.path.realpath(os.path.join(top, os.path.expanduser(url)))
+        if os.path.exists(cand):
+            return cand
+    return url
+
+
+def ensure_mirror(url: str, cfg: dict) -> "tuple[str, dict | None]":
+    """(mirror path, None) once the shared bare mirror exists and is freshly fetched; (path, error result) otherwise.
+    Call with the mirror lock held. The first clone goes to a temp folder and is renamed into place, so a half-finished
+    clone is never reused. Branch copies under refs/heads are deleted after the clone: only refs/remotes/origin/* is
+    maintained, so a branch name can never resolve to a commit from the day the mirror was made."""
+    m = mirror_path(url)
+    if not os.path.isdir(m):
+        low, gb, fl = disk_low(os.path.dirname(m), cfg)
+        if low:
+            alert("disk-low-refused-acquire", {"path": m, "free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
+            return m, {"ok": False, "refused": "disk-low", "free_gb": round(gb, 2), "error": low_disk_message(m, gb, fl)}
+        tmp = "%s.tmp-%d" % (m, os.getpid())
+        shutil.rmtree(tmp, ignore_errors=True)
+
+        def fail(msg: str) -> "tuple[str, dict]":
+            shutil.rmtree(tmp, ignore_errors=True)
+            return m, {"ok": False, "error": "mirror clone failed: " + msg[-300:]}
+        rc, _, err = S.git(os.path.dirname(m), "clone", "--bare", "--quiet", "--filter=blob:none", url, tmp, t=3600)
+        if rc != 0:
+            return fail(err)
+        rc, refs, err = S.git(tmp, "for-each-ref", "--format=%(refname)", "refs/heads")
+        if rc != 0:
+            return fail(err)
+        for ref in refs.split():
+            rc, _, err = S.git(tmp, "update-ref", "-d", ref)
+            if rc != 0:
+                return fail(err)
+        rc, _, err = S.git(tmp, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")
+        if rc != 0:
+            return fail(err)
+        rc, _, err = S.git(tmp, "fetch", "--prune", "--quiet", "origin", t=3600)
+        if rc != 0:
+            return fail(err)
+        rc, _, err = S.git(tmp, "remote", "set-head", "origin", "-a")
+        if rc != 0:
+            return fail(err)
+        os.rename(tmp, m)
+        return m, None
+    rc, _, err = S.git(m, "fetch", "--prune", "--quiet", "origin", t=1800)
+    if rc != 0:
+        return m, {"ok": False, "error": "mirror fetch failed (nothing was changed): " + err.strip()[-300:]}
+    if S.git(m, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/HEAD")[0] != 0:
+        S.git(m, "remote", "set-head", "origin", "-a")             # best effort; a missing HEAD is reported at resolve time
+    return m, None
+
+
+def resolve_ref(m: str, ref: str, source: "str | None") -> "str | None":
+    """Commit for ref. A branch name resolves through refs/remotes/origin/<ref> in the freshly fetched mirror FIRST."""
+    ref = ref or "HEAD"
+    if re.fullmatch(r"[0-9a-f]{40}", ref):
+        return ref
+    plain = ref != "HEAD" and not re.search(r"[~^@:{}\s]|\.\.", ref)
+    if plain:
+        for cand in ("refs/remotes/origin/" + ref, "refs/remotes/" + ref, "refs/tags/" + ref):
+            rc, out, _ = S.git(m, "rev-parse", "--verify", "--quiet", cand + "^{commit}")
+            if rc == 0 and out.strip():
+                return out.strip()
+    where, target = (source, ref) if source else (m, "refs/remotes/origin/HEAD" if ref == "HEAD" else ref)
+    rc, out, _ = S.git(where, "rev-parse", "--verify", "--quiet", target + "^{commit}")
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def _leave_ok(path: str, cur: str, source: "str | None") -> bool:
+    """The copy's HEAD commit loses nothing when the copy moves: on the remote, or still held by the source checkout."""
+    rc, local = git(path, "rev-list", "-1", cur, "--not", "--remotes")
+    if rc == 0 and not local:
+        return True
+    if not source:
+        return False
+    if S.git(source, "cat-file", "-e", cur + "^{commit}")[0] != 0:
+        return False
+    if S.git(source, "merge-base", "--is-ancestor", cur, "HEAD")[0] == 0:
+        return True
+    rc, out, _ = S.git(source, "for-each-ref", "--contains", cur, "--count=1", "--format=%(refname)")
+    return rc == 0 and bool(out.strip())
+
+
+def lock_path(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a")
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    return fh
+
+
+# ---------------------------------------------------------------- acquire
+def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None, url: str = "") -> dict:
+    """THE reuse API: one stable detached worktree per (repository, key) at ~/.agent-harness/test-copies/<id>/<key>,
+    backed by one shared bare mirror per repository. `repo` is any checkout of the repository (its origin URL picks the
+    mirror); with `url` and no `repo` the URL does. A lock per key and per mirror serialises runners."""
+    cfg = normalize(cfg) if cfg is not None else load_config()
     try:
-        p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
-                           env=dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0"))
-        return p.returncode, (p.stdout + p.stderr).strip()
-    except (OSError, subprocess.TimeoutExpired) as e:
-        return 99, str(e)
-
-
-def safe_key(key: str) -> str:
-    k = re.sub(r"[^A-Za-z0-9._-]+", "-", str(key)).strip("-.")
-    if not k or set(k) <= {"."}:
-        raise ValueError(f"unusable key: {key!r}")
-    return k[:80]
-
-
-def repo_identity(top: str) -> "tuple[str, str]":
-    """(<repo name>-<8 hex>, common dir): one id for every worktree of a repository, distinct for same-named repos."""
-    rc, common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    common = os.path.realpath(common.splitlines()[-1].strip()) if rc == 0 and common else os.path.realpath(top)
-    base = os.path.basename(os.path.dirname(common)) if os.path.basename(common) == ".git" else os.path.basename(common)
-    base = re.sub(r"\.git$", "", base) or "repo"
-    return f"{safe_key(base)}-{hashlib.sha256(common.encode()).hexdigest()[:8]}", common
+        k = safe_key(key)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    source = None
+    if repo:
+        repo = os.path.abspath(repo)
+        rc, top = git(repo, "rev-parse", "--show-toplevel")
+        if rc != 0:
+            return {"ok": False, "error": f"not a git checkout: {repo}"}
+        source = top.splitlines()[-1].strip()
+        url = url or source_url(source)
+    if not url:
+        return {"ok": False, "error": "need --repo <checkout> or --url <remote>"}
+    try:
+        rid, _, _ = mirror_id(url)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    m = mirror_path(url)
+    path = os.path.join(copies_root(), rid, k)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with lock_path(path + ".lock"), lock_path(m + ".lock"):
+        m, err = ensure_mirror(url, cfg)
+        if err:
+            return err
+        sha = resolve_ref(m, ref, source)
+        if not sha:
+            return {"ok": False, "error": f"unknown ref {ref!r} in {source or url}"}
+        if S.git(m, "cat-file", "-e", sha + "^{commit}")[0] != 0:
+            if not source or S.git(m, "fetch", "--quiet", "--no-tags", source, sha, t=600)[0] != 0 \
+                    or S.git(m, "cat-file", "-e", sha + "^{commit}")[0] != 0:
+                return {"ok": False, "error": f"commit {sha[:12]} is not on the remote and could not be fetched; push it first"}
+        if os.path.isdir(path):
+            rc, cur = git(path, "rev-parse", "HEAD")
+            if rc != 0:
+                return {"ok": False, "path": path, "error": f"existing copy is not a usable checkout: {path}; "
+                        "move it aside by hand (nothing was changed)"}
+            cur = cur.strip()
+            if cur != sha:
+                rc, dirty = git(path, "status", "--porcelain", "--untracked-files=no")
+                if rc != 0 or dirty:
+                    touch_index(path, repo=source or url, key=key)
+                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
+                            "error": "the copy has uncommitted tracked changes and is still at an older commit; "
+                                     "commit or remove them, then acquire again (nothing was discarded)"}
+                if not _leave_ok(path, cur, source):
+                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
+                            "error": "the copy's HEAD holds a commit that is on no remote and not in your checkout; "
+                                     "push it or save it on a branch first (nothing was discarded)"}
+                rc, out = git(path, "checkout", "--detach", "--quiet", sha)
+                if rc != 0:
+                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha, "error": out[-300:]}
+            touch_index(path, repo=source or url, key=key)
+            return {"ok": True, "path": path, "commit": sha, "reused": True, "moved": cur != sha}
+        low, gb, fl = disk_low(path, cfg)
+        if low:
+            alert("disk-low-refused-acquire", {"path": path, "free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
+            return {"ok": False, "refused": "disk-low", "free_gb": round(gb, 2), "error": low_disk_message(path, gb, fl)}
+        rc, out = git(m, "worktree", "add", "--detach", path, sha)
+        if rc != 0:
+            shutil.rmtree(path, ignore_errors=True)
+            git(m, "worktree", "prune")
+            return {"ok": False, "error": out[-300:]}
+        touch_index(path, repo=source or url, key=key)
+        return {"ok": True, "path": path, "commit": sha, "reused": False, "moved": True}
 
 
 def index_path() -> str:
@@ -251,78 +439,8 @@ def touch_index(path: str, **extra) -> None:
         pass
 
 
-# ---------------------------------------------------------------- acquire
-def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -> dict:
-    cfg = normalize(cfg) if cfg is not None else load_config()
-    try:
-        k = safe_key(key)
-    except ValueError as e:
-        return {"ok": False, "error": str(e)}
-    repo = os.path.abspath(repo)
-    rc, top = git(repo, "rev-parse", "--show-toplevel")
-    if rc != 0:
-        return {"ok": False, "error": f"not a git checkout: {repo}"}
-    top = top.splitlines()[-1].strip()
-    # Resolve the ref in the SOURCE checkout: "HEAD" inside the copy would mean the copy's own commit.
-    rc, sha = git(top, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
-    if rc != 0 or not sha:
-        return {"ok": False, "error": f"unknown ref in {top}: {ref}"}
-    sha = sha.splitlines()[-1].strip()
-    rid, common = repo_identity(top)
-    path = os.path.join(copies_root(), rid, k)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".lock", "w") as lk:            # one acquire per copy at a time
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        if os.path.isdir(path):
-            rc, cur = git(path, "rev-parse", "HEAD")
-            if rc != 0:
-                return {"ok": False, "path": path, "error": f"existing copy is not a usable checkout: {path}; "
-                        "move it aside by hand (nothing was changed)"}
-            cur = cur.strip()
-            if cur != sha:
-                rc, dirty = git(path, "status", "--porcelain", "--untracked-files=no")
-                if rc != 0 or dirty:
-                    touch_index(path, repo=top, key=key)
-                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
-                            "error": "the copy has uncommitted tracked changes and is still at an older commit; "
-                                     "commit or remove them, then acquire again (nothing was discarded)"}
-                rc, local = git(path, "log", "--oneline", "-1", "HEAD", "--not", "--remotes", "--branches")
-                if rc == 0 and local:
-                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
-                            "error": "the copy's HEAD holds a commit on no branch or remote; save it on a branch first"}
-                rc, out = git(path, "checkout", "--detach", "--quiet", sha)
-                if rc != 0:
-                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha, "error": out[-300:]}
-            touch_index(path, repo=top, key=key)
-            return {"ok": True, "path": path, "commit": sha, "reused": True, "moved": cur != sha}
-        low, gb, fl = disk_low(path, cfg)
-        if low:
-            alert("disk-low-refused-acquire", {"path": path, "free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
-            return {"ok": False, "refused": "disk-low", "free_gb": round(gb, 2), "error": low_disk_message(path, gb, fl)}
-        rc, out = git(common if os.path.isdir(common) else top, "worktree", "add", "--detach", path, sha)
-        if rc != 0:
-            return {"ok": False, "error": out[-300:]}
-        touch_index(path, repo=top, key=key)
-        return {"ok": True, "path": path, "commit": sha, "reused": False, "moved": True}
-
-
 # ---------------------------------------------------------------- command analysis
-def simple_commands(cmd: str) -> list:
-    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises)."""
-    out = []
-    for seg in re.split(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)", cmd):
-        seg = seg.strip()
-        if not seg:
-            continue
-        try:
-            words = shlex.split(seg, comments=True)
-        except ValueError:
-            words = seg.split()
-        while words and (ASSIGN.match(words[0]) or os.path.basename(words[0]) in PREFIXES):
-            words = words[1:]
-        if words:
-            out.append(words)
-    return out
+simple_commands = S.simple_commands
 
 
 def _opts(words: list) -> "tuple[set, list]":
@@ -495,7 +613,7 @@ def candidates(cfg: dict) -> list:
                     if not k.endswith(".lock"):
                         add(os.path.join(rd, k))
     for root in cfg["roots"]:
-        if not os.path.isdir(root):
+        if not os.path.isdir(root) or not S.within_allowed(root, strictly_inside=False):
             continue
         for sess in sorted(os.listdir(root)):
             sd = os.path.join(root, sess)
@@ -512,61 +630,31 @@ def candidates(cfg: dict) -> list:
     return out
 
 
-def in_use(path: str) -> bool:
-    """True when a process has its cwd or an open file under path (lsof; unknown counts as in use)."""
-    if not shutil.which("lsof"):
-        return True
+def in_use(path: str, used: "set | None" = None) -> bool:
+    """True when a process uses path (cwd, root, exe, open file or memory map); unknown counts as in use."""
     try:
-        p = subprocess.run(["lsof", "-t", "+D", path], capture_output=True, text=True, timeout=300)
-        return bool(p.stdout.strip())
-    except (OSError, subprocess.TimeoutExpired):
+        return S.is_used(path, S.in_use_paths() if used is None else used)
+    except S.ProbeError:
         return True
 
 
-def deletable(path: str) -> "tuple[bool, str]":
+def deletable(path: str, used: "set | None" = None, refs: "set | None" = None) -> "tuple[bool, str]":
+    """The ONE rule (hygiene_safety.recoverable) plus in-use and service references."""
     if not os.path.exists(os.path.join(path, ".git")):
         return False, "not a git checkout (kept; check by hand)"
-    rc, dirty = git(path, "status", "--porcelain", "--untracked-files=all")
-    if rc != 0:
-        return False, "git status failed"
-    if dirty:
-        return False, "uncommitted or untracked changes"
-    rc, stash = git(path, "stash", "list")
-    if rc != 0 or stash:
-        return False, "has a stash"
-    rc, remote = git(path, "branch", "-r", "--contains", "HEAD")
-    if rc != 0 or not remote.strip():
-        return False, "HEAD is on no remote ref"
-    rc, local = git(path, "log", "--oneline", "-1", "--branches", "--not", "--remotes")
-    if rc != 0 or local:
-        return False, "a local branch has commits on no remote"
-    rc, ign = git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal")
-    if rc != 0:
-        return False, "git status --ignored failed"
-    for line in ign.splitlines():
-        if line.startswith("!! "):
-            first = line[3:].strip().strip('"').rstrip("/").split("/")
-            if not any(part in REGENERABLE_IGNORED for part in first):
-                return False, f"ignored files that may be evidence ({line[3:].strip()[:80]})"
-    if in_use(path):
+    ok, why = S.recoverable(path)
+    if not ok:
+        return False, why
+    if in_use(path, used):
         return False, "a process is working in it"
+    if refs is not None and S.referenced(path, refs):
+        return False, "referenced by a systemd unit, cron job, container or launchd plist"
     return True, "clean and pushed"
 
 
 def remove_copy(path: str) -> "tuple[bool, str]":
-    try:
-        dotgit = os.path.join(path, ".git")
-        if os.path.isfile(dotgit):   # linked worktree
-            rc, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-            if rc != 0:
-                return False, "cannot find the main repository"
-            main = os.path.dirname(common.strip()) if os.path.basename(common.strip()) == ".git" else common.strip()
-            rc, out = git(main, "worktree", "remove", path)
-            return rc == 0, (out[-200:] if rc else "git worktree remove")
-        shutil.rmtree(path)
-        return True, "removed standalone clone"
-    except OSError as e:
-        return False, f"{type(e).__name__}: {str(e)[:160]}"
+    ok, msg = S.remove_checkout(path)
+    return ok, (msg or "removed")
 
 
 def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = None) -> dict:
@@ -591,23 +679,40 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
             over -= r["bytes"]
         r["reap"] = bool(reasons)
         r["why"] = "; ".join(reasons)
-    deleting = bool(apply and cfg["reaper_delete_enabled"])
+    deleting = bool(apply and deletion_enabled(cfg))
+    used = refs = None
+    probe_err = ""
+    if deleting and any(r["reap"] for r in rows):
+        try:
+            used, refs = S.in_use_paths(), S.service_refs()
+        except S.ProbeError as e:               # a failed probe keeps everything
+            probe_err = str(e)
     for r in rows:
         if not r["reap"]:
             r["action"] = "keep"
         elif not deleting:
             r["action"] = "would-remove (report-only)"
+        elif probe_err:
+            r["action"] = f"kept: liveness probe failed: {probe_err}"
         else:
-            ok, why = deletable(r["path"])
-            if not ok:
-                r["action"] = f"kept: {why}"
-            else:
-                done, msg = remove_copy(r["path"])
-                r["action"] = "removed" if done else f"remove failed: {msg}"
-    res = {"mode": "delete" if deleting else "report-only", "delete_enabled": cfg["reaper_delete_enabled"],
+            lk = S.lock_nonblocking(r["path"] + ".lock") if r["path"].startswith(copies_root() + os.sep) else None
+            if r["path"].startswith(copies_root() + os.sep) and lk is None:
+                r["action"] = "kept: locked by a running acquire"
+                continue
+            try:
+                ok, why = deletable(r["path"], used, refs)
+                if not ok:
+                    r["action"] = f"kept: {why}"
+                else:
+                    done, msg = remove_copy(r["path"])
+                    r["action"] = "removed" if done else f"remove failed: {msg}"
+            finally:
+                if lk:
+                    lk.close()
+    res = {"mode": "delete" if deleting else "report-only", "delete_enabled": deletion_enabled(cfg),
            "total_gb": round(total / GB, 2), "cap_gb": cfg["max_total_gb"], "max_age_hours": cfg["max_age_hours"],
            "size_unknown": sum(not r["size_known"] for r in rows), "copies": rows, "ts": int(now)}
-    if apply and not cfg["reaper_delete_enabled"]:
+    if apply and not deletion_enabled(cfg):
         res["note"] = ("--apply ignored: deletion needs \"reaper_delete_enabled\": true in " + config_path() +
                        " (the owner's OK first)")
     if any(r["reap"] for r in rows):
@@ -629,9 +734,13 @@ def session_start() -> str:
         n = sum(1 for c in rep.get("copies", []) if c.get("reap"))
         gb = sum(c.get("bytes", 0) for c in rep.get("copies", []) if c.get("reap")) / GB
         if n:
+            tail = ("The janitor removes the ones that are verified recoverable (clean, pushed, not in use)."
+                    if deletion_enabled(load_config()) else
+                    "Cleanup is report-only until the owner sets \"reaper_delete_enabled\": true in "
+                    "~/.agent-harness/state/copy-hygiene.json; removing them needs the owner's OK.")
             msg = (f"Test copies: {n} idle copies hold {gb:.1f} GB (all copies {rep.get('total_gb')} GB, cap "
                    f"{rep.get('cap_gb')} GB). Reuse one copy per PR (`copy_hygiene.py acquire`); "
-                   "`copy_hygiene.py reap` lists them. Removing them needs the owner's OK.")
+                   f"`copy_hygiene.py reap` lists them. {tail}")
         age = time.time() - float(rep.get("ts") or 0)
     except (OSError, ValueError, TypeError):
         age = REPORT_EVERY_S + 1
@@ -652,8 +761,8 @@ def session_start() -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="copy_hygiene.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("acquire"); a.add_argument("--repo", required=True); a.add_argument("--key", required=True)
-    a.add_argument("--ref", default="HEAD")
+    a = sub.add_parser("acquire"); a.add_argument("--repo", default=""); a.add_argument("--url", default="")
+    a.add_argument("--key", required=True); a.add_argument("--ref", default="HEAD")
     r = sub.add_parser("reap"); r.add_argument("--apply", action="store_true"); r.add_argument("--json", action="store_true")
     r.add_argument("--write-report", action="store_true", help="store the report for the SessionStart line")
     sub.add_parser("pretool")
@@ -681,8 +790,10 @@ def main(argv=None) -> int:
             print(json.dumps({"systemMessage": msg}))
         return 0
     if args.cmd == "acquire":
-        res = acquire(args.repo, args.key, args.ref)
+        res = acquire(args.repo, args.key, args.ref, url=args.url)
         print(json.dumps(res))
+        if not res.get("ok"):
+            sys.stderr.write("acquire refused: %s\n" % res.get("error", ""))
         return 0 if res.get("ok") else (3 if res.get("refused") else 4 if res.get("stale") else 1)
     if args.cmd == "check-disk":
         cfg = load_config()

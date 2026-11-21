@@ -4,6 +4,7 @@ Description=Run the agent-harness workspace janitor hourly
 [Timer]
 OnBootSec=15min
 OnUnitActiveSec=1h
+RandomizedDelaySec=120
 Persistent=true
 
 [Install]

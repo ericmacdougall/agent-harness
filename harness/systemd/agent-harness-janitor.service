@@ -1,8 +1,11 @@
 [Unit]
-Description=agent-harness workspace janitor (TTL sweep of idle session checkouts and /dev/shm scratch)
+Description=agent-harness workspace janitor (TTL sweep of idle session checkouts and /dev/shm scratch; report-only until reaper_delete_enabled is set)
 
 [Service]
 Type=oneshot
 Nice=10
 IOSchedulingClass=idle
+# A hung git, docker or systemctl probe must not pile up hourly runs, and the janitor must stay small.
+TimeoutStartSec=1800
+MemoryMax=1G
 ExecStart=/usr/bin/python3 %h/.claude/hooks/workspace_janitor.py sweep --apply

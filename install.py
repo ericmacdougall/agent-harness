@@ -39,7 +39,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "copy_hygiene.py",  # one test copy per PR/lane, disk-low and /dev/shm guard, report-only reaper (t2-dev disk full 2026-11-21)
-         "workspace_janitor.py",  # shared mirrors, session-end release, TTL sweep, container memory caps (2026-11-21)
+         "hygiene_safety.py", "workspace_janitor.py",  # shared safety rules; session-end release, TTL sweep, container memory caps (2026-11-21)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
@@ -103,7 +103,7 @@ def managed_scripts(claude: Path) -> set[str]:
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
                          "mc_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
-                         "workspace_janitor.py")}
+                         "hygiene_safety.py", "workspace_janitor.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -1150,8 +1150,48 @@ def log_backup_status(home: Path, apply: bool, flag=None) -> str:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"
 
 
+JANITOR_UNITS = ("agent-harness-janitor.service", "agent-harness-janitor.timer")
+
+
+def janitor_timer_status(home: Path, apply: bool, flag: bool, run=None) -> str:
+    """Opt-in (--janitor-timer): install the hourly workspace-janitor user timer. The janitor deletes nothing until the
+    owner turns the deletion switch on in ~/.agent-harness/state/copy-hygiene.json (it only reports until then; see docs/workspace-janitor.md).
+    Never fails the harness install. A user timer only runs while the user is logged in unless linger is enabled."""
+    if not flag:
+        return "janitor timer: not installed (opt in with --janitor-timer)"
+    import shutil
+    import subprocess
+    run = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=60))
+    target = home.expanduser().resolve() / ".config" / "systemd" / "user"
+    if not apply:
+        return f"janitor timer: would install {', '.join(JANITOR_UNITS)} in {target} and enable the timer"
+    try:
+        if any(p.is_symlink() for p in (target, target.parent, target.parent.parent)):
+            return "janitor timer: skipped (a symlinked systemd user directory; inspect it first)"
+        target.mkdir(parents=True, exist_ok=True)
+        for name in JANITOR_UNITS:
+            (target / name).write_text((ROOT / "harness" / "systemd" / name).read_text())
+        if shutil.which("systemctl") is None:
+            return f"janitor timer: unit files written to {target}; systemctl not found, enable them by hand"
+        for argv in (["systemctl", "--user", "daemon-reload"],
+                     ["systemctl", "--user", "enable", "--now", "agent-harness-janitor.timer"]):
+            result = run(argv)
+            if result.returncode != 0:
+                return f"janitor timer: unit files written but `{' '.join(argv)}` failed: {(result.stderr or '').strip()[-120:]}"
+        note = ""
+        linger = run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"])
+        if linger.returncode == 0 and linger.stdout.strip() != "yes":
+            note = "; run `loginctl enable-linger $USER` so it also runs while you are signed out"
+        return f"janitor timer: installed and enabled (report-only until the owner enables deletion){note}"
+    except Exception as error:  # noqa: BLE001
+        return f"janitor timer: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--janitor-timer", action="store_true",
+                        help="also install and enable the hourly workspace-janitor systemd user timer (report-only "
+                             "until the owner enables deletion; see docs/workspace-janitor.md)")
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
     parser.add_argument("--services", action="store_true",
                         help="also register the host services (the ahd launchd/systemd job) after the files are installed")
@@ -1224,6 +1264,7 @@ def main() -> None:
     print(f"  {command_guard_status(args.command_guard)}")
     print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
     print(f"  {mission_control_status(args.home, args.apply, args.mission_control)}")
+    print(f"  {janitor_timer_status(args.home, args.apply, args.janitor_timer)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 

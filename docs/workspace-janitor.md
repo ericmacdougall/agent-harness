@@ -2,27 +2,74 @@
 
 `harness/hooks/workspace_janitor.py` keeps agent and runner checkouts from piling up (t2-dev reached 0 bytes free on
 2026-11-21 with 117 GB of per-session copies, 50 GB of scratch in /dev/shm and ~895k OOM kills from uncapped test
-containers). It complements `copy_hygiene.py` from PR #284 (one test copy per PR, disk floor, /dev/shm deny, report-only reaper).
+containers). It is built on two modules:
+
+- `hygiene_safety.py`: the one set of safety rules (recoverability, in-use, service references, removal, regenerable
+  list, command splitter).
+- `copy_hygiene.py` (PR #284): the single reuse API (`acquire`), the disk floor, the `/dev/shm` deny, the reaper, and
+  the one config file and deletion switch.
+
+## Deletion is off until the owner turns it on
+
+Everything that removes files (`release`, `sweep --apply`, `session-end`, `copy_hygiene.py reap --apply`) checks one
+switch: `"reaper_delete_enabled": true` (a literal JSON `true`) in `~/.agent-harness/state/copy-hygiene.json`.
+`HARNESS_JANITOR=off` is a kill switch on top. The installer never sets it. Until then the hourly timer, `release` and
+the SessionEnd hook only report, and `session-end` starts nothing.
+
+## Reuse: one checkout per repository and PR/lane
+
+```
+python3 ~/.claude/hooks/copy_hygiene.py acquire --repo <checkout> --key pr-1408 [--ref <branch|tag|sha>]
+python3 ~/.claude/hooks/copy_hygiene.py acquire --url <remote> --key pr-1408      # no checkout needed
+```
+
+One bare mirror per repository (`~/.agent-harness/mirrors/<host>/<name>-<id>.git`; the id hashes host and path, so
+`a__b/c` and `a/b__c`, or one repo on two hosts, never collide) and one detached worktree per (repository, key) under
+`~/.agent-harness/test-copies/<name>-<id>/<key>`. First clone goes to a temp folder and is renamed into place; a lock per
+mirror and per key serialises runners; the free-space floor is checked before cloning and before `worktree add`. A branch
+name resolves through `refs/remotes/origin/<ref>` after a fresh fetch (the clone's `refs/heads/*` copies are deleted, and
+`origin/HEAD` is set with `remote set-head -a`, so a default branch of `master` works). The copy moves only when it is
+clean and its HEAD commit is on a remote or still in your checkout; otherwise `acquire` exits nonzero (3 disk floor,
+4 stale/refused, 1 other) and changes nothing. Use a PR number or lane as the key, never a per-round name.
+
+## Cleanup
 
 | Piece | What it does |
 |---|---|
-| `checkout --url U --key K [--ref R]` | One bare partial mirror per repo under `~/.agent-harness/mirrors/`, one linked worktree per (repo, key) under `~/.agent-harness/checkouts/`. Reused on the next call; moved to R only when clean. Use a PR number or lane as the key. |
-| `SessionEnd` hook (`session-end`) | Releases `~/.agent-harness/work/<session_id>`: removes each checkout that is clean, has no untracked files, no stash, every commit on a remote ref, no other linked worktrees, nothing open, and no service reference. The folder goes when only rebuildable folders remain. Never blocks. |
-| `release --session ID / --path DIR [--apply]` | The same for a runner job's folder; call it at the end of every job. Dry run without `--apply`. |
-| `sweep --apply` (hourly timer) | `release` for every work folder and checkout idle longer than `ttl_hours` (24); removes the user's own `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open; lists running containers with no memory limit. |
-| `pretool` hook | Refuses `docker run/create` without `--memory`/`-m`, and Elasticsearch/OpenSearch without `ES_JAVA_OPTS`/`OPENSEARCH_JAVA_OPTS`. Fails open. |
+| `SessionEnd` hook (`session-end`) | When deletion is on, starts a detached `release --session <id> --apply --budget 600` and returns at once (the probes and per-repo `ls-remote` can take minutes). |
+| `release --session ID / --path DIR [--apply] [--budget S]` | For `~/.agent-harness/work/<id>` or one folder inside `~/.agent-harness/{work,checkouts,test-copies}` (nothing else is accepted): removes each checkout that is verified recoverable. Removes the session folder when no file is left. Dry run without `--apply`. Call it at the end of every runner job. |
+| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its Claude process is alive (session id on a command line, or a WAL newer than the TTL); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*` and `PostgreSQL.*` are never touched); lists running docker/podman containers with no memory limit. A failed probe keeps everything and exits 0. |
+| `pretool` hook | Denies `docker\|podman run\|create` and `compose up\|run` without a memory cap, and Elasticsearch/OpenSearch without a heap cap (also via `--env-file`). Handles `sudo/env/timeout/nice/command`, `docker container run`, `$(...)`, pipes and `bash -c`; stops reading flags at the image name. Fails open. |
 
-Protected always: anything a process has open or works in; paths named by systemd units (system and user), crontabs,
-docker mounts/compose dirs and launchd plists (earlier cleanups removed folders that live services ran from); names in
-`protect_names` (yates, optinrouter). `HARNESS_JANITOR=off` turns every removal into a report.
+Testcontainers-style tests start containers through the Docker API and never reach the hook; the sweep lists them as
+uncapped. Cap them in the test setup or run the daemon with a default cgroup-parent slice that has `MemoryMax`.
 
-Install the timer on Linux hosts:
+## What counts as safe to delete (`hygiene_safety.recoverable`)
+
+Clean tree; no skip-worktree/assume-unchanged files; no stash, LFS or submodule; no rebase/merge in progress; no other
+linked worktree of a standalone clone; **ignored files only when each is on the one regenerable list**
+(`REGENERABLE_IGNORED`: `node_modules`, `.venv`, `target`, `dist`, `build`, `coverage`, `.cache`, ...), and an ignored
+`build/`-style folder holding a nested repository is kept; every commit reachable from what each remote advertises right
+now (`ls-remote`, not stale tracking refs). A kept path keeps every ancestor.
+
+Never removed: anything a process uses (cwd, root, **exe, open files and `/proc/*/maps`**), anything a systemd unit
+(system and user: `WorkingDirectory`, `ExecStart*`, `Environment*`, ... via `systemctl show -- <units>`, including
+`list-units --all` for `systemd-run` units; template units are skipped), crontab, docker or podman container, or
+launchd plist names (`~`, `$HOME`, `${HOME}`, `%h` expanded; symlinks in `~/bin`, `~/.local/bin` followed; compared by
+`realpath`), anything with a mount inside (removal never crosses a mount), names in `protect_names`
+(yates, optinrouter). Every probe fails closed: an error or timeout keeps everything.
+
+## Install the timer (Linux, opt-in)
 
 ```
-mkdir -p ~/.config/systemd/user
-cp harness/systemd/agent-harness-janitor.* ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now agent-harness-janitor.timer
+python3 install.py --apply --janitor-timer
+loginctl enable-linger "$USER"        # without linger a user timer runs only while you are logged in
 ```
 
-Config: `~/.agent-harness/state/workspace-janitor.json` (`ttl_hours`, `shm_ttl_hours`, `work_roots`, `protect_names`,
-`default_memory`). Audit log: `~/.agent-harness/state/workspace-janitor.jsonl`.
+The service has `TimeoutStartSec=1800` and `MemoryMax=1G`. By hand: copy `harness/systemd/agent-harness-janitor.*` to
+`~/.config/systemd/user/` and `systemctl --user enable --now agent-harness-janitor.timer`. To let it delete, set
+`"reaper_delete_enabled": true` in `copy-hygiene.json` after reading a report-only run (`sweep --json`).
+
+Config: `~/.agent-harness/state/copy-hygiene.json` (`max_age_hours`, `shm_ttl_hours`, `roots`, `protect_names`,
+`default_memory`, `reaper_delete_enabled`, plus the disk-floor keys). Roots outside `~/.agent-harness/{work,checkouts,
+test-copies}` are ignored. Audit and alert log: `~/.agent-harness/state/copy-hygiene-alerts.jsonl`.
