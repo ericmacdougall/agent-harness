@@ -60,7 +60,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'installer_scan.py',
                     # Mission Control chat by hand from a Codex main session: wait, read, reply --from codex (goodqa#15585).
                     # No Codex Stop hook: Codex keys hook trust by position and the dashboard's Codex chat uses codex exec.
-                    'mc_chat.py', 'mc_inbox.py')
+                    'mc_chat.py', 'mc_inbox.py',
+                    # Stall-watcher answer inbox (UserPromptSubmit + SessionStart only; appended so trust positions stay).
+                    'owner_inbox.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -106,6 +108,10 @@ def heavy_guard_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'heavy_job_guard.py'))
 
 
+def owner_inbox_command(codex_home: Path) -> str:
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'owner_inbox.py')) + ' hook'
+
+
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
@@ -119,6 +125,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     kill_guard = kill_guard_command(codex_home)
     heavy_guard = heavy_guard_command(codex_home)
     gate = gate_command(codex_home)
+    owner_inbox = owner_inbox_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -133,7 +140,8 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, ''), gate, kill_guard, heavy_guard))]
+                                                               guard_command(codex_home, ''), gate, kill_guard,
+                                                               heavy_guard, owner_inbox))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
@@ -159,6 +167,9 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             # It fails open on its own errors and denies with exit 2 only for heavy work on the Mac. Codex trust for
             # this hook needs the user to review it in /hooks; until then Codex skips it (ops-watch codex:trust).
             preserved.append({'hooks': [{'type': 'command', 'command': heavy_guard, 'timeout': 30}]})
+        # Appended last so existing Codex hook-trust positions do not move. No Stop hook for Codex.
+        if event in {'SessionStart', 'UserPromptSubmit'}:
+            preserved.append({'hooks': [{'type': 'command', 'command': owner_inbox, 'timeout': 5}]})
         hooks[event] = preserved
     return result
 

@@ -923,6 +923,65 @@
    ],
    "status": "installed",
    "rules": []
+  },
+  {
+   "id": "owner_inbox:prompt",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "UserPromptSubmit",
+      "session_id": "doctor-canary"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "owner_inbox:session-start",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "owner_inbox:stop",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "owner_inbox:posttool",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "PostToolUse",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }
