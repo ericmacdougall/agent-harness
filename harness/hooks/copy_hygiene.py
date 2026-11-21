@@ -1028,56 +1028,124 @@ def _find_roots(words: list) -> list:
     return roots or ["."]
 
 
-def _find_deletes(words: list) -> bool:
-    if "-delete" in words:
+FIND_ACTIONS_PRINT = frozenset(("-print", "-print0", "-printf", "-fprint", "-fprint0", "-ls", "-fls"))
+FIND_EXEC = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+# Tests and options that take one argument (so the argument is never read as an operator).
+FIND_ONE_ARG = (FIND_SELECTORS - {"-empty"}) | frozenset(("-type", "-xtype", "-maxdepth", "-mindepth", "-group", "-uid", "-gid",
+                                           "-fstype", "-printf", "-fprint", "-fprint0", "-fls", "-used", "-anewer",
+                                           "-cnewer", "-context", "-files0-from"))
+
+
+def _exec_deletes(args: list) -> bool:
+    rest = _unwrap(list(args))
+    if not rest:
+        return False
+    if os.path.basename(rest[0]) in FIND_EXEC_DELETERS:
         return True
-    for i, w in enumerate(words):
-        if w in ("-exec", "-execdir", "-ok", "-okdir") and i + 1 < len(words):
-            rest = _unwrap(words[i + 1:])
-            if rest and os.path.basename(rest[0]) in FIND_EXEC_DELETERS:
-                return True
-            if rest and os.path.basename(rest[0]) in SHELLS:
-                j = next((k for k, x in enumerate(rest[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", x)), 0)
-                body = rest[j + 1] if j and j + 1 < len(rest) else ""
-                if any(t and os.path.basename(t[0]) in FIND_EXEC_DELETERS for t, _s in _cmd_lines(body)):
-                    return True
+    if os.path.basename(rest[0]) in SHELLS:
+        j = next((k for k, x in enumerate(rest[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", x)), 0)
+        body = rest[j + 1] if j and j + 1 < len(rest) else ""
+        return any(t and os.path.basename(t[0]) in FIND_EXEC_DELETERS for t, _s in _cmd_lines(body))
     return False
 
 
-def _find_selective(words: list) -> "tuple[bool, bool]":
-    """(any selector, a positive name selector). `-name '*'` is not a name selector; a selector right after `!` /
-    `-not`, or inside a negated `\( ... \)` group, is negative and does not narrow what is deleted."""
-    sel = name_sel = False
-    neg_depth, depth = [], 0
-    for i, w in enumerate(words):
-        prev_neg = i > 0 and words[i - 1] in ("!", "-not")
-        if w == "(":
-            depth += 1
-            if prev_neg:
-                neg_depth.append(depth)
-        elif w == ")":
-            if neg_depth and neg_depth[-1] == depth:
-                neg_depth.pop()
-            depth -= 1
-        elif w in FIND_SELECTORS:
-            sel = True
-            if (w in FIND_NAME_SELECTORS and not prev_neg and not neg_depth
-                    and not (i + 1 < len(words) and _EMPTYING.match(words[i + 1]))):
-                name_sel = True
-    # An alternative (-o / -or / ,) at a depth no deeper than the delete action means the action can run without
-    # the name filter (`-name x -o -delete`, `\( -name k -o -delete \)`, `-prune -o \( -type f -delete \)`): the
-    # filters no longer narrow it. `\( -name a -o -name b \) -delete` and `-name x -prune -exec rm` still narrow.
-    d, act_depth, depths = 0, None, []
-    for w in words:
-        d += 1 if w == "(" else 0
-        if w in ("-o", "-or", ","):
-            depths.append(d)
-        if act_depth is None and (w == "-delete" or w in ("-exec", "-execdir", "-ok", "-okdir")):
-            act_depth = d
-        d -= 1 if w == ")" else 0
-    if act_depth is not None and any(x <= act_depth for x in depths):
-        sel = name_sel = False
-    return sel, name_sel
+def _find_parse(words: list) -> "dict":
+    """Parse a find expression (the words after the roots) by find's grammar: OR of AND-chains, ! / -not, groups,
+    and -exec ... ; / + arguments skipped as a unit. For every action the selectors ANDed before it on its own path
+    decide whether it is narrowed. Returns {"deletes": bool, "delete_mode": m, "print_mode": m}, where m is
+    "below" (every such action is narrowed by a positive name test), "root-selective" (narrowed only by time/size
+    tests) or "" (some action runs on everything)."""
+    i = 1
+    while i < len(words) and (words[i] in ("-H", "-L", "-P", "-D") or re.match(r"^-O\d?$", words[i])):
+        i += 2 if words[i] == "-D" else 1
+    while i < len(words) and not words[i].startswith("-") and words[i] not in ("(", "!", ")"):
+        i += 1
+    toks = words[i:]
+    pos = [0]
+    acts = []                                   # (kind, name_narrowed, sel_narrowed)
+
+    def peek():
+        return toks[pos[0]] if pos[0] < len(toks) else None
+
+    def or_expr(ctx):
+        n, s_ = and_expr(ctx)
+        allnarrow = [(n, s_)]
+        while peek() in ("-o", "-or", ","):
+            pos[0] += 1
+            allnarrow.append(and_expr(ctx))
+        return all(a for a, _b in allnarrow), all(b for _a, b in allnarrow)
+
+    def and_expr(ctx):
+        name_n, sel_n = ctx
+        while peek() is not None and peek() not in ("-o", "-or", ",", ")"):
+            if peek() in ("-a", "-and"):
+                pos[0] += 1
+                continue
+            n, s_ = unary((name_n, sel_n))
+            name_n, sel_n = name_n or n, sel_n or s_
+        return name_n, sel_n
+
+    def unary(ctx):
+        t = peek()
+        if t in ("!", "-not"):
+            pos[0] += 1
+            unary(ctx)                          # actions inside still count; a negated test narrows nothing
+            return False, False
+        if t == "(":
+            pos[0] += 1
+            r = or_expr(ctx)
+            if peek() == ")":
+                pos[0] += 1
+            return r
+        pos[0] += 1
+        if t in FIND_EXEC:
+            j = pos[0]
+            while j < len(toks) and toks[j] not in (";", "+"):
+                j += 1
+            args = toks[pos[0]:j]
+            pos[0] = j + 1
+            acts.append(("delete" if _exec_deletes(args) else "other", ctx[0], ctx[1]))
+            return False, False
+        if t == "-delete":
+            acts.append(("delete", ctx[0], ctx[1]))
+            return False, False
+        if t in FIND_ACTIONS_PRINT:
+            if t in FIND_ONE_ARG:
+                pos[0] += 1
+            acts.append(("print", ctx[0], ctx[1]))
+            return False, False
+        if t in FIND_ONE_ARG:
+            arg = peek()
+            pos[0] += 1
+            if t in FIND_NAME_SELECTORS:
+                return (not (arg is not None and _EMPTYING.match(arg))), True
+            return False, t in FIND_SELECTORS
+        if t == "-empty":
+            return False, True
+        return False, False                     # -prune, -true, -xdev, -depth, ...
+
+    try:
+        whole = (False, False)
+        while pos[0] < len(toks):
+            whole = or_expr((False, False))
+            if peek() == ")":                   # unbalanced: skip and keep parsing
+                pos[0] += 1
+    except Exception:                           # noqa: BLE001 -- unparseable: assume it deletes everything
+        return {"deletes": True, "delete_mode": "", "print_mode": ""}
+    if not any(k in ("print", "delete", "other") for k, _n, _s in acts):
+        acts.append(("print", whole[0], whole[1]))          # implicit -print of the whole expression
+
+    def mode(kind):
+        sel = [(n, s_) for k, n, s_ in acts if k == kind]
+        if not sel:
+            return None
+        if all(n for n, _s in sel):
+            return "below"
+        if all(n or s_ for n, s_ in sel):
+            return "root-selective"
+        return ""
+    return {"deletes": any(k == "delete" for k, _n, _s in acts), "delete_mode": mode("delete") or "",
+            "print_mode": mode("print") if mode("print") is not None else ""}
 
 
 def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
@@ -1089,14 +1157,16 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
     lies strictly inside its root; "" means the path itself (and everything inside it) goes."""
     bases = [cwd if str(cwd).startswith("/") else None]
     stack, pending_old, vars_ = [], [], {}
-    out, find_ctx = [], None
+    out, find_ctx, subst_find = [], None, None
     for words, sep in _cmd_lines(cmd):
         if words == [_PUSH]:
             stack.append((list(bases), list(pending_old), dict(vars_), find_ctx))
             continue
         if words == [_POP]:
+            inner = find_ctx
             if stack:
                 bases, pending_old, vars_, find_ctx = stack.pop()
+            subst_find = inner if inner is not None else subst_find
             continue
         if sep != "&&" and pending_old:
             bases = list(dict.fromkeys(bases + pending_old))
@@ -1105,6 +1175,8 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
             find_ctx = None
         words = [x for w in words for x in _expand_braces(w)]
         name = os.path.basename(words[0])
+        if name not in DELETE_VERBS:
+            subst_find = None if name != "find" else subst_find
         if name in ("export", "local", "declare", "readonly", "typeset") and len(words) > 1:
             words = [w for w in words[1:] if not w.startswith("-")] or words
         if words and all(ASSIGN.match(w) for w in words):
@@ -1125,6 +1197,11 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
             bases = new[:1] if len(new) == 1 or (new and len(set(new)) == 1) else [None]
             continue
         raw, gbases, mode, recursive = [], bases, "", True
+        if name in DELETE_VERBS and subst_find is not None and any("__SUBST__" in w for w in words):
+            roots, fp, fb = subst_find               # rm -rf $(find ROOT ...): the find's output is the target list
+            for r in roots:
+                for p, k, kind in _resolve(r, fb, vars_):
+                    out.append((p, k, kind or fp["print_mode"]))
         if name in DELETE_VERBS:
             raw = pos
             # Recursive unless every option is a literal flag without r/R: `rm $OPTS x` and `rm -${R}f x` may be.
@@ -1141,8 +1218,9 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
                         raw.remove(words[i + 1])
         elif name == "find":
             roots = _find_roots(words)
-            find_ctx = (roots, _find_selective(words), list(bases))
-            if not _find_deletes(words):
+            fp = _find_parse(words)
+            find_ctx = (roots, fp, list(bases))
+            if not fp["deletes"]:
                 continue
         elif name == "xargs" and find_ctx is not None:
             if not any(os.path.basename(w) in FIND_EXEC_DELETERS for w in words[1:]):
@@ -1162,9 +1240,9 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
             if len(args) >= 3 and args[0] == "worktree" and args[1] == "remove":
                 raw, gbases = [args[-1]], gb
         if name in ("find", "xargs") and find_ctx is not None:
-            roots, (sel, name_sel), fb = find_ctx
+            roots, fp, fb = find_ctx
+            fmode = fp["delete_mode"] if name == "find" else fp["print_mode"]
             for r in roots:
-                fmode = "below" if name_sel else ("root-selective" if sel else "")
                 for p, k, kind in _resolve(r, fb, vars_):
                     out.append((p, k, kind or fmode))
                     if k and not kind:

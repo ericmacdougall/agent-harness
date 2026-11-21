@@ -627,6 +627,27 @@ class Protected(OldCopies, Base):
                 self.deny(cmd)
             self.allow('D=%s/x/build/; rm -rf "${D%%/}"' % h)
 
+    def test_find_grammar_per_action_selectivity(self):
+        self.setup_services()
+        h = str(self.home)
+        with mock.patch.dict(os.environ, {"HOME": h}):
+            for cmd in ("find ~/pp-ci/nm -exec chmod u+w {} + \\( -name '*.keep' -o -delete \\)",
+                        "find ~/pp-ci/nm -exec echo {} \\; \\( -name '*.keep' -o -delete \\)",
+                        "find ~/pp-ci/nm -name .git -prune -o -print0 | xargs -0 rm -rf",
+                        "find ~/pp-ci/nm -name '*.keep' -o -print | xargs rm -rf",
+                        "rm -rf $(find ~/pp-ci/nm -name .git -prune -o -print)",
+                        "find ~/pp-ci/nm -prune -exec rm -rf {} +",
+                        "find ~/pp-ci/nm -exec grep -o x {} \\; -o -delete",
+                        "find ~/pp-ci/nm -exec sh -c 'echo )' \\; -delete"):
+                self.deny(cmd)
+        for cmd in ("find . -name .git -prune -o -name '*.pyc' -delete",
+                    "find . -path ./node_modules -prune -o -name '*.orig' -exec rm {} +",
+                    "find . -name '*.pyc' -delete -o -name __pycache__ -exec rm -rf {} +",
+                    "find . \\( -name a -o -name b \\) \\( -type f -delete \\)",
+                    "find . -name '*.log' -print | xargs rm -f", "rm -f $(find . -name '*.tmp')",
+                    "find . -empty -name '*.lock' -delete"):
+            self.allow(cmd, self.rc)
+
     def test_single_children_and_unrelated_paths_stay_allowed(self):
         self.setup_services()
         (self.rc / "build").mkdir()
