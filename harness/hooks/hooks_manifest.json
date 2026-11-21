@@ -462,8 +462,8 @@
    ]
   },
   {
-   "id": "test_copies:pretool",
-   "script": "test_copies.py",
+   "id": "copy_hygiene:pretool",
+   "script": "copy_hygiene.py",
    "arg": "pretool",
    "event": "PreToolUse",
    "tools": [
@@ -487,7 +487,32 @@
       "cwd": "/"
      },
      "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "mkdir -p /dev/shm/doctor-canary"
+      },
+      "cwd": "/"
+     },
+     "expect": "deny"
     }
+   ]
+  },
+  {
+   "id": "copy_hygiene:session-start",
+   "script": "copy_hygiene.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
    ]
   },
   {
