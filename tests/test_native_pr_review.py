@@ -318,7 +318,13 @@ class NativeReviewContracts(TestCase):
         client = mock.Mock()
         pull = {"number": 3, "state": "open", "base": {"sha": BASE, "ref": "main", "repo": {"full_name": "fixture/project"}},
                 "head": {"sha": HEAD, "ref": "codex/reviewed", "repo": {"full_name": "fixture/project"}}}
-        client.json.return_value = pull
+        routes = {
+            "repos/fixture/project/pulls/3": pull,
+            "repos/fixture/project/git/ref/heads/main": {"ref": "refs/heads/main", "object": {"type": "commit", "sha": BASE}},
+            "repos/fixture/project/git/ref/heads/codex/reviewed": {
+                "ref": "refs/heads/codex/reviewed", "object": {"type": "commit", "sha": HEAD}},
+        }
+        client.json.side_effect = lambda arguments, _: routes[arguments[1]]
         valid = {"slug": "fixture/project", "number": 3, "head": HEAD, "no_ci": True, "unsettled": []}
         with mock.patch("merge_gate.evaluate_pr", return_value=(valid, [])):
             self.assertEqual(n._remote(client, "fixture/project", 3, HEAD, BASE), ("main", "codex/reviewed", True))
@@ -338,6 +344,25 @@ class NativeReviewContracts(TestCase):
             with self.assertRaisesRegex(ValueError, "CI is not eligible"):
                 n._remote(client, "fixture/project", 3, HEAD, BASE)
 
+    def test_cached_pr_projection_cannot_override_authoritative_refs(self):
+        pull = {"number": 3, "state": "open", "mergeable": False,
+                "base": {"sha": BASE, "ref": "main", "repo": {"full_name": "fixture/project"}},
+                "head": {"sha": HEAD, "ref": "codex/reviewed", "repo": {"full_name": "fixture/project"}}}
+        details = {"slug": "fixture/project", "number": 3, "head": HEAD, "no_ci": True, "unsettled": []}
+        live_base = {"ref": "refs/heads/main", "object": {"type": "commit", "sha": BASE}}
+        live_head = {"ref": "refs/heads/codex/reviewed", "object": {"type": "commit", "sha": HEAD}}
+        for base, head in (
+            ({**live_base, "object": {"type": "commit", "sha": "e" * 40}}, live_head),
+            (live_base, {**live_head, "object": {"type": "commit", "sha": "e" * 40}}),
+            (live_base, {**live_head, "ref": "refs/tags/codex/reviewed"}),
+            (live_base, {**live_head, "object": {"type": "tag", "sha": HEAD}}),
+        ):
+            client = mock.Mock()
+            client.json.side_effect = [pull, base, head]
+            with mock.patch("merge_gate.evaluate_pr", return_value=(details, [])):
+                with self.assertRaisesRegex(ValueError, "authoritative GitHub"):
+                    n._remote(client, "fixture/project", 3, HEAD, BASE)
+
     def test_three_roles_and_complete_native_commit_proof_required(self):
         bundle = self.repo / "bundle.json"
         proof = lambda agent, report: {"agent": agent, "report": str(report), "started": "2026-11-22T19:00:00Z",
@@ -346,6 +371,7 @@ class NativeReviewContracts(TestCase):
             "owner": proof(OWNER, self.owner_report), "acceptance": proof(ACCEPTANCE, self.report),
             "adversarial": proof(ADVERSARIAL, self.report),
         }}
+        receipts["proofs"]["acceptance"]["started"] = "2026-11-22T18:59:59Z"
         bundle.write_text(json.dumps(receipts))
         now = n.spec_flow._native_stamp("2026-11-22T19:01:00Z").timestamp()
         finished = n.spec_flow._native_stamp("2026-11-22T19:00:11Z")
@@ -359,6 +385,10 @@ class NativeReviewContracts(TestCase):
             result = n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now,
                                      expected_digest=n.digest(bundle.read_bytes()))
             self.assertEqual(set(result["proofs"]), set(n.ROLES))
+            oldest = n.spec_flow._native_stamp(receipts["proofs"]["acceptance"]["started"]).timestamp()
+            self.assertEqual(result["not_after"], oldest + n.MAX_AGE)
+            with self.assertRaisesRegex(ValueError, "witness is stale"):
+                n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=result["not_after"])
             with self.assertRaisesRegex(ValueError, "bundle digest changed"):
                 n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now,
                                 expected_digest="f" * 64)
@@ -417,8 +447,9 @@ class NativeReviewContracts(TestCase):
             people.append(("contributor", WORKER, path_report))
         for role, agent, report in people:
             typed = "worker" if role == "contributor" else n.ROLES[role]
-            line = n.witness_line(context(), role, agent, start, end, report.read_bytes())
-            prior = n.witness_line(dict(context(), pr=9), role, agent, start, end, report.read_bytes())
+            role_start = "2026-11-22T18:59:58Z" if role == "contributor" else start
+            line = n.witness_line(context(), role, agent, role_start, end, report.read_bytes())
+            prior = n.witness_line(dict(context(), pr=9), role, agent, role_start, end, report.read_bytes())
             relative_agent = f"/root/{role}"
             source = {"subagent": {"thread_spawn": {"parent_thread_id": ROOT_ID, "depth": 1,
                                                      "agent_path": relative_agent, "agent_role": typed}}}
@@ -448,7 +479,7 @@ class NativeReviewContracts(TestCase):
                                                        "status": "completed", "content": [{"type": "output_text", "text": prior + "\n" + line}]},
                                      "2026-11-22T19:00:12Z"))
             put(rollout, rows)
-            proofs[role] = {"agent": agent, "report": str(report), "started": start, "ended": end}
+            proofs[role] = {"agent": agent, "report": str(report), "started": role_start, "ended": end}
         store.commit()
         put(base / "main.jsonl", initial_rows)
         bundle = self.repo / "native.json"
@@ -466,6 +497,8 @@ class NativeReviewContracts(TestCase):
             self.assertEqual(passed["context_sha256"], n.context_digest(context()))
             if with_contributor:
                 self.assertIn(f"contributor:{WORKER}", passed["proofs"])
+                started_by_worker = n.spec_flow._native_stamp(worker_proof["started"]).timestamp()
+                self.assertEqual(passed["not_after"], started_by_worker + n.MAX_AGE)
                 document.pop("contributors")
                 bundle.write_text(json.dumps(document))
                 with self.assertRaisesRegex(ValueError, "exactly match the author's declaration"):

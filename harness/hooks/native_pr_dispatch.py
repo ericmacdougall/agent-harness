@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -142,7 +143,16 @@ def _binding(args, client, root):
     return {"context": context, "proof": proof, "root": root, "no_ci": no_ci}
 
 
-def send_merge(client, context, *, require_live):
+def _require_current_refs(client, context):
+    review.require_current_refs(client, context["repo"], context["base_ref"], context["base"],
+                                context["head_ref"], context["head"])
+
+
+def _unexpired(deadline, now):
+    return (type(deadline) is int or (type(deadline) is float and math.isfinite(deadline))) and deadline > now
+
+
+def send_merge(client, context, *, require_live, before_send):
     """Use the protected PR operation with a server-side expected-head check.
 
     GitHub supplies no expected-base parameter. Base freshness is checked
@@ -150,14 +160,21 @@ def send_merge(client, context, *, require_live):
     is detected after the irreversible operation and stays uncertain.
     """
     pull = client.json(["api", f"repos/{context['repo']}/pulls/{context['pr']}"], "merge readiness")
-    if (pull.get("state") != "open" or pull.get("draft") is not False or pull.get("mergeable") is not True
-            or (pull.get("base") or {}).get("sha") != context["base"]
-            or (pull.get("base") or {}).get("ref") != context["base_ref"]
-            or (pull.get("head") or {}).get("sha") != context["head"]
-            or (pull.get("head") or {}).get("ref") != context["head_ref"]
-            or ((pull.get("head") or {}).get("repo") or {}).get("full_name", "").lower() != context["repo"]):
+    base = pull.get("base") if isinstance(pull, dict) else None
+    head = pull.get("head") if isinstance(pull, dict) else None
+    if (not isinstance(base, dict) or not isinstance(head, dict)
+            or pull.get("number") != context["pr"] or pull.get("state") != "open"
+            or pull.get("draft") is not False or pull.get("mergeable") is not True
+            or base.get("sha") != context["base"] or base.get("ref") != context["base_ref"]
+            or head.get("sha") != context["head"] or head.get("ref") != context["head_ref"]):
         raise ValueError("the PR is not ready at the reviewed base and head")
+    for branch in (base, head):
+        repository = branch.get("repo")
+        if not isinstance(repository, dict) or merge_gate.repo_key(repository.get("full_name")) != context["repo"]:
+            raise ValueError("the PR is not ready at the reviewed base and head")
+    _require_current_refs(client, context)
     body = {"sha": context["head"], "merge_method": "merge"}
+    before_send()
     require_live()
     result = subprocess.run(["/opt/homebrew/bin/gh", "api", "--hostname", "github.com", "--method", "PUT",
                              f"repos/{context['repo']}/pulls/{context['pr']}/merge", "--input", "-"], input=review.canonical(body),
@@ -201,19 +218,41 @@ def execute(args, client, root, *, clock=time.time, send=send_merge):
             raise ValueError("release was submitted already; retain and reconcile its journal")
         binding = _binding(args, client, root)
         if args.action == "authorize":
+            _require_current_refs(client, binding["context"])
             require_live()
-            save(path, {"phase": "AUTHORIZED", "binding": binding, "expires_at": clock() + 1800})
+            authorized_at = clock()
+            proof_deadline = binding["proof"].get("not_after")
+            if not _unexpired(proof_deadline, authorized_at):
+                raise ValueError("native authorization proof expired")
+            expires_at = min(authorized_at + 1800, proof_deadline)
+            save(path, {"phase": "AUTHORIZED", "binding": binding, "expires_at": expires_at})
             return {"status": "AUTHORIZED", "context_sha256": args.context_sha256}
         if (not prior or prior.get("phase") != "AUTHORIZED" or prior.get("binding") != binding
-                or type(prior.get("expires_at")) not in (int, float) or prior["expires_at"] < clock()):
+                or not _unexpired(prior.get("expires_at"), clock())):
             raise ValueError("a fresh main-authorized matching native grant is required")
         # One final context/proof read before recording the irreversible send intent.
         if _binding(args, client, root) != binding:
             raise ValueError("release changed at consumption")
-        pending = {**prior, "phase": "PENDING", "submitted_at": clock()}
-        save(path, pending)
-        require_live()
-        send(client, binding["context"], require_live=require_live)
+        pending = None
+
+        def require_send_authority():
+            require_live()
+            now = clock()
+            if not _unexpired(prior["expires_at"], now):
+                raise ValueError("native release grant expired before send")
+            return now
+
+        def before_send():
+            nonlocal pending
+            if pending is not None:
+                raise ValueError("release send intent was already recorded")
+            candidate_pending = {**prior, "phase": "PENDING", "submitted_at": require_send_authority()}
+            save(path, candidate_pending)
+            pending = candidate_pending
+
+        send(client, binding["context"], require_live=require_send_authority, before_send=before_send)
+        if pending is None:
+            raise ValueError("release sender returned without recording send intent")
         _confirm_remote(args, client, binding["context"])
         save(path, {**pending, "phase": "COMPLETE", "completed_at": clock()})
         return {"status": "MERGED", "head": args.head, "pr": args.pr, "repo": args.github_repo}

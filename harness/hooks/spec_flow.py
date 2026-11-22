@@ -766,7 +766,8 @@ def _native_review_rows(home, uid, agent, parent, *, rollout=False):
 
 
 def _native_review_source(path, agent, role):
-    expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer"}.get(role)
+    expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer",
+                "click-test": NATIVE_CLICK_ROLE}.get(role)
     identity = _native_agent_source(path, agent, expected, purpose="review")
     if identity is None:
         return None
@@ -852,6 +853,8 @@ def _native_agent_source(path, agent, expected, *, purpose):
 
 NATIVE_CLICK_PREFIX = "CLICK_TEST_WITNESS_V1 "
 NATIVE_CLICK_SOURCE = "codex-native-click-witness-v1"
+_NATIVE_REPORT_SOURCE = "report+codex-tester-final-sha256"
+_NATIVE_REPORT_UPGRADE = "historical native report-only evidence needs a current context-bound native click witness"
 NATIVE_CLICK_ROLE = "harness_click_tester"
 NATIVE_ROLLOUT_LIMIT = 16_000_000
 _NATIVE_PR_ROLLOUT_LIMIT = 64_000_000
@@ -1148,8 +1151,16 @@ def _native_click_claim(record):
         tester = {}
     ident = tester.get("identity")
     return (record.get("v") == 2 or tester.get("family") == "codex"
-            or tester.get("agent_type") == NATIVE_CLICK_ROLE or record.get("pass_source") == NATIVE_CLICK_SOURCE
+            or tester.get("agent_type") == NATIVE_CLICK_ROLE
+            or record.get("pass_source") in (NATIVE_CLICK_SOURCE, _NATIVE_REPORT_SOURCE)
             or (isinstance(ident, str) and re.fullmatch(UUID, ident) is not None))
+
+
+def _historical_native_report(record):
+    tester = record.get("tester")
+    return (record.get("v") == 1 and isinstance(tester, dict) and tester.get("family") == "codex"
+            and tester.get("agent_type") == NATIVE_CLICK_ROLE
+            and record.get("pass_source") in (_NATIVE_REPORT_SOURCE, None))
 
 
 def _native_click_record_line(record, attachments):
@@ -1182,6 +1193,80 @@ def _native_click_record_proof(record, attachments, cache):
     _native_click_proof(identity, tester["identity"], line, tester["started_at"], tester["ended_at"])
     if cache is not None:
         cache[line] = True
+
+
+def _native_click_tester(wal_dir, agent, report_sha):
+    """Check historical report authorship only. This is not current click evidence."""
+    native = _native_review_source(wal_dir / "main.jsonl", agent, "click-test")
+    if native is None:
+        return None
+    if not report_sha:
+        raise SpecError("native click-test requires a report bound by SHA-256", EXIT_USAGE)
+    import pwd
+    import sqlite3
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    uid = os.getuid()
+    try:
+        before = _native_database_binding(home, uid)
+        connection = sqlite3.connect((home / ".codex/state_5.sqlite").as_uri() + "?mode=ro", timeout=.05, uri=True)
+        try:
+            connection.execute("PRAGMA trusted_schema=OFF")
+            connection.execute("PRAGMA query_only=ON")
+            row = connection.execute("SELECT rollout_path FROM threads WHERE id=?", (agent,)).fetchone()
+        finally:
+            connection.close()
+        if not row or len(row) != 1 or type(row[0]) is not str:
+            raise ValueError("native rollout unavailable")
+        path = Path(row[0])
+        sessions = home / ".codex/sessions"
+        if not path.is_absolute() or path != path.resolve() or not path.is_relative_to(sessions):
+            raise ValueError("native rollout outside session store")
+        # Validate every absolute directory from the owned session root.
+        chain = [sessions]
+        for part in path.relative_to(sessions).parts[:-1]:
+            chain.append(chain[-1] / part)
+        bindings = tuple(_native_path(item, uid, directory=True) for item in chain)
+        binding = _native_path(path, uid, maximum=64_000_000)
+        snapshot = (path.stat().st_size, path.stat().st_mtime_ns)
+        raw = _native_read(path, {"home": home, "uid": uid}, 64_000_000, binding=binding)
+        marker = "REPORT_SHA256 " + report_sha
+        found, session_id = None, None
+        completed = set()
+        for line in raw.splitlines():
+            event = _native_json(line, 2_000_000)
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if isinstance(event, dict) and event.get("type") == "session_meta" and isinstance(payload, dict):
+                if session_id is None and payload.get("id") == agent:
+                    session_id = agent
+                elif session_id != agent or payload.get("id") != wal_dir.name:
+                    raise ValueError("native rollout identity conflicts")
+            if (isinstance(event, dict) and event.get("type") == "event_msg" and isinstance(payload, dict)
+                    and payload.get("type") == "item_completed" and payload.get("thread_id") == agent):
+                item = payload.get("item")
+                if (isinstance(item, dict) and item.get("type") == "AgentMessage"
+                        and item.get("phase") == "final_answer" and isinstance(item.get("id"), str)):
+                    completed.add(item["id"])
+            if (not isinstance(event, dict) or event.get("type") != "response_item" or not isinstance(payload, dict)
+                    or payload.get("type") != "message" or payload.get("role") != "assistant"
+                    or not (payload.get("channel") == "final" or payload.get("phase") == "final_answer")
+                    or payload.get("id") not in completed):
+                continue
+            content = payload.get("content")
+            text = "\n".join(item.get("text", "") for item in content
+                             if isinstance(item, dict) and isinstance(item.get("text"), str)) if isinstance(content, list) else ""
+            if marker in text.splitlines():
+                found = event.get("timestamp")
+        if session_id != agent or not isinstance(found, str) or not found:
+            raise ValueError("tester final does not bind report digest")
+        if (_native_database_binding(home, uid) != before or
+                tuple(_native_path(item, uid, directory=True) for item in chain) != bindings or
+                _native_path(path, uid, maximum=64_000_000) != binding or
+                (path.stat().st_size, path.stat().st_mtime_ns) != snapshot):
+            raise ValueError("native rollout changed")
+        return {"kind": "agent", "identity": agent, "agent_type": "harness_click_tester",
+                "family": "codex", "started_at": found, "ended_at": found, "last_activity_at": found}
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
+        raise SpecError("native click-test report provenance unavailable or conflicting", EXIT_USAGE) from None
 
 
 def wal_entries(path: Path):
@@ -1413,7 +1498,9 @@ def kind_problems(record: dict, *, native_cache=None) -> list:
     elif record["kind"] == "click_test":
         if not (roles.get("log") or roles.get("report")):
             problems.append("the click-test record has no log or report attached")
-        if _native_click_claim(record):
+        if _historical_native_report(record):
+            problems.append(_NATIVE_REPORT_UPGRADE)
+        elif _native_click_claim(record):
             try:
                 _native_click_record_proof(record, attachments, native_cache)
             except (SpecError, OSError, ValueError, TypeError, KeyError):
@@ -1552,6 +1639,8 @@ def _latest_click_result(records, index, spec, label, notes):
         notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
     observations = {_native_click_record_line(r, r["attachments"]): r for r in good}
     unknown = [r for r in native if r not in good]
+    if not observations and all(_historical_native_report(record) for record in native):
+        return None, True, _NATIVE_REPORT_UPGRADE
     if not observations:
         return None, True, "the latest native result does not verify for this ticket on this host"
     last_end = max(_native_stamp(r["tester"]["ended_at"]) for r in observations.values())
@@ -2335,6 +2424,10 @@ def cmd_click_test(args, spec_policy):
         files.append(("screenshot", Path(path).name, mime, data))
     if not any(role in ("log", "report") for role, *_ in files):
         raise SpecError("a click-test needs its logs: give --log and/or --report from the click-tester", EXIT_USAGE)
+    if (native and report_sha and not args.started and not args.ended
+            and not args.print_native_witness and not args.verify_native_witness):
+        _native_click_tester(wal_dir, args.agent_id, report_sha)
+        raise SpecError(f"report authorship verified; {_NATIVE_REPORT_UPGRADE}", EXIT_USAGE)
     # "On deploy": bind the click-test to the deployed commit, which must contain every evidence commit so far.
     repo = Path(args.repo or ".")
     deployed = git_commit(repo, args.deployed_commit, None)

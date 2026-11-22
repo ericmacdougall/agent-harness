@@ -313,6 +313,19 @@ def _branch_ref(value):
     return all(part and not part.startswith(".") and not part.endswith((".", ".lock")) for part in value.split("/"))
 
 
+def require_current_refs(client, repository, base_ref, base, head_ref, head):
+    if not _branch_ref(base_ref) or not _branch_ref(head_ref) or base_ref == head_ref:
+        raise ValueError("the GitHub base and source refs must be valid and distinct")
+    for label, branch, expected in (("base", base_ref, base), ("source", head_ref, head)):
+        if not _matches(OID, expected):
+            raise ValueError("the reviewed GitHub ref identity is invalid")
+        row = client.json(["api", f"repos/{repository}/git/ref/heads/{branch}"], f"the authoritative {label} ref")
+        target = row.get("object") if isinstance(row, dict) else None
+        if (not isinstance(target, dict) or row.get("ref") != f"refs/heads/{branch}"
+                or target.get("type") != "commit" or target.get("sha") != expected):
+            raise ValueError(f"the authoritative GitHub {label} ref changed or did not verify")
+
+
 def _remote(client, repository, pr, head, base):
     import merge_gate
 
@@ -337,6 +350,7 @@ def _remote(client, repository, pr, head, base):
     no_ci = details.get("no_ci")
     if type(no_ci) is not bool:
         raise ValueError("the GitHub workflow classification is unavailable")
+    require_current_refs(client, repository, base_ref, base, head_ref, head)
     return base_ref, head_ref, no_ci
 
 
@@ -792,6 +806,7 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     main = home / ".agent-harness/codex-wals" / parent / "main.jsonl"
     hashes = {}
+    not_after = None
     reviewed_context_sha = context_digest(expected_context)
     witness_scope = _witness_scope(reviewed_context_sha)
     subjects = {sha: _git(repo, "show", "-s", "--format=%s", sha) for sha in expected_context["commits"]}
@@ -829,10 +844,15 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected
         if role == "owner" and created != set(subjects):
             raise ValueError("the owner history does not prove creation of every candidate commit")
         current = time.time() if now is None else now
-        if not current - MAX_AGE <= spec_flow._native_stamp(proof["started"]).timestamp() <= observed.timestamp() <= current:
+        began = spec_flow._native_stamp(proof["started"]).timestamp()
+        expires = began + MAX_AGE
+        if not began <= observed.timestamp() <= current < expires:
             raise ValueError("native PR witness is stale or has a future timestamp")
+        not_after = expires if not_after is None else min(not_after, expires)
         hashes[role if role != "contributor" else f"contributor:{proof['agent']}"] = digest(line.encode())
-    return {"context_sha256": reviewed_context_sha, "proofs": hashes}
+    if not_after is None or (time.time() if now is None else now) >= not_after:
+        raise ValueError("native PR witness expired during verification")
+    return {"context_sha256": reviewed_context_sha, "proofs": hashes, "not_after": not_after}
 
 
 def add_context_args(parser):

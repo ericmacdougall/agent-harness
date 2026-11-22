@@ -604,6 +604,8 @@ The agent may approve a delete itself, but only after a backup that the approval
 python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
 ```
 
+For a clean, published linked worktree retired through `ah worktree-remove`, register a backup approval on the executing host for each otherwise-blocking ignored file. A collapsed ignored subtree qualifies only when every regular file has its own valid approval. The delegated verifier rejects mounted subtrees, special files, links, nested repositories, open backed files and any unfamiliar or changed path. Preview leaves approvals available. During removal, it verifies content, then rebuilds Git status, index flags and the complete ignored coverage under the approval lock after activity checks. Bounded directory identities and membership include the root and ignored-path ancestors, so a new sibling during activity checking or lock waiting refuses without spending any grant. The same full grant set is consumed once before non-forced Git removal. Observed quiescence remains required; this does not make an uncontrolled external writer atomic with Git removal. A removal that fails or is unconfirmed after consumption requires fresh backup verification and approval. Raw `git worktree remove` keeps its own guard.
+
 `approve-delete` refuses in these cases:
 
 - a glob or variable path;
@@ -1051,6 +1053,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
     - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
     - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
     - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
+    - A Codex native `harness_click_tester` supplies its UUID and parent session directory. The helper checks its typed role and parent in the owned native database. Its report digest must appear as a complete `REPORT_SHA256 <digest>` line in its own assistant final response. The database-bound session rollout must identify the same child. The recorded observation time is the final response timestamp.
   - **Human click-tests** are self-attested.
 - **Sign-off:**
   - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.

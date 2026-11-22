@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 from types import SimpleNamespace
+import unittest
 from unittest import mock
 
 from test_spec_flow import ISSUE, SPEC, SpecFlowCase, git_repo, setUpModule, sf, tearDownModule  # noqa: F401
@@ -484,6 +485,26 @@ class NativeClick(SpecFlowCase):
             _, _, problem = self.latest(records, index, spec)
             self.assertIn("does not verify", problem)
 
+    def test_historical_native_report_never_supplies_current_pass(self):
+        records, index, spec = self.order_fixture([
+            (TESTER, END, "pass", "2026-11-05T10:10:00Z"),
+            (UNRELATED, END, "pass", "2026-11-05T10:11:00Z"),
+        ])
+        historical = records[1]
+        historical.update(v=1, pass_source=sf._NATIVE_REPORT_SOURCE)
+        latest, _, problem = self.latest([historical], index, spec)
+        self.assertIsNone(latest)
+        self.assertIn("report-only", problem)
+        self.assertTrue(sf._native_click_claim(dict(historical, tester={})))
+        with mock.patch.object(sf, "_native_click_record_proof"):
+            latest, _, problem = self.latest(records, index, spec)
+            self.assertIsNone(latest, "a newer unbound receipt must not reveal an older PASS")
+            self.assertIn("does not verify", problem)
+            historical["_at"] = "2026-11-05T10:05:00Z"
+            latest, _, problem = self.latest(records, index, spec)
+            self.assertIs(latest, records[0])
+            self.assertIsNone(problem)
+
     def test_candidate_limit_stops_before_native_history_reads(self):
         records, index, spec = self.order_fixture(
             [(TESTER, END, "pass", FINAL)] * (sf.MAX_NATIVE_CLICK_CANDIDATES + 1))
@@ -512,3 +533,104 @@ class NativeClick(SpecFlowCase):
             latest, _, problem = self.latest(records, index, spec)
             self.assertIsNone(problem)
             self.assertIs(latest, records[0])
+
+import test_spec_flow_native_review as fixtures
+
+REVIEWER, OTHER = fixtures.REVIEWER, fixtures.OTHER
+
+class HistoricalNativeClick(unittest.TestCase):
+    setUp = fixtures.NativeSpecReview.setUp
+    child = fixtures.NativeSpecReview.child
+
+    def fixture(self):
+        self.child(REVIEWER, 'harness_click_tester')
+        self.db.execute('ALTER TABLE threads ADD COLUMN rollout_path TEXT')
+        self.db.execute('ALTER TABLE threads ADD COLUMN model_provider TEXT')
+        self.rollout = self.home / '.codex/sessions/2026/11/22/tester.jsonl'
+        self.rollout.parent.mkdir(parents=True)
+        for path in (self.home / '.codex/sessions', *list(self.rollout.parents)[:3]):
+            path.chmod(0o700)
+        self.sha = hashlib.sha256(self.report.read_bytes()).hexdigest()
+        self.final = {'timestamp':'2026-11-22T19:00:00Z','type':'response_item',
+                      'payload':{'type':'message','id':'owned-final','role':'assistant','channel':'final',
+                                 'content':[{'type':'output_text','text':'REPORT_SHA256 '+self.sha}]}}
+        self.write_final()
+        self.db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(self.rollout), REVIEWER))
+        self.db.commit()
+
+    def write_final(self):
+        self.rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':REVIEWER}})+'\n'+json.dumps({'type':'event_msg','payload':{'type':'item_completed','thread_id':REVIEWER,'item':{'type':'AgentMessage','phase':'final_answer','id':'owned-final'}}})+'\n'+json.dumps(self.final)+'\n')
+        self.rollout.chmod(0o600)
+
+    def get(self, sha=None):
+        return sf._native_click_tester(self.wal.parent, REVIEWER, sha or self.sha)
+
+    def test_native_report_digest_bound_to_tester_final(self):
+        self.fixture()
+        tester = self.get()
+        self.assertEqual(tester['agent_type'], 'harness_click_tester')
+        self.assertEqual(tester['family'], 'codex')
+        self.assertEqual(tester['identity'], REVIEWER)
+
+    def test_report_only_cli_verifies_authorship_but_never_posts_current_pass(self):
+        self.report.write_text('CLICK_TEST_RESULT: PASS\nOwned sandbox observation.\n')
+        self.fixture()
+        session = SimpleNamespace(ticket=SimpleNamespace(label='GoodQA harness#1'), post=mock.Mock())
+        args = SimpleNamespace(log=[],report=str(self.report),result='pass',screenshot=[],repo=str(self.root),
+                               deployed_commit='a'*40,agent_id=REVIEWER,wal_dir=str(self.wal.parent),
+                               human=None, actor='agent:main', url='http://owned.test', really_tested=None,
+                               started=None, ended=None, print_native_witness=False, verify_native_witness=False)
+        for changes in ({}, {'deployed_commit': 'c' * 40}, {'url': 'http://other.test'}):
+            with self.subTest(changes=changes), \
+                 mock.patch.object(sf, '_actor_and_spec', return_value=(session, [], {}, {'spec_core_sha': 'b' * 64})):
+                with self.assertRaisesRegex(sf.SpecError, "report authorship verified.*context-bound"):
+                    sf.cmd_click_test(SimpleNamespace(**{**vars(args), **changes}), {})
+                session.post.assert_not_called()
+
+    def test_actual_forked_rollout_final_phase_binds_only_own_completion(self):
+        self.fixture()
+        self.final['payload'].pop('channel')
+        self.final['payload']['phase'] = 'final_answer'
+        self.write_final()
+        lines = self.rollout.read_text().splitlines()
+        lines.insert(1, json.dumps({'type':'session_meta','payload':{'id':fixtures.PARENT}}))
+        self.rollout.write_text('\n'.join(lines)+'\n')
+        self.assertEqual(self.get()['identity'], REVIEWER)
+        event = json.loads(lines[2]);event['payload']['thread_id'] = fixtures.PARENT
+        lines[2] = json.dumps(event)
+        self.rollout.write_text('\n'.join(lines)+'\n')
+        with self.assertRaises(sf.SpecError):
+            self.get()
+
+    def test_wrong_role_parent_and_digest_refuse(self):
+        self.fixture()
+        with self.assertRaises(sf.SpecError):
+            self.get('a'*64)
+        self.db.execute('UPDATE threads SET agent_role=? WHERE id=?', ('harness_owner', REVIEWER));self.db.commit()
+        with self.assertRaises(sf.SpecError):
+            self.get()
+        self.db.execute('UPDATE threads SET agent_role=?,attached_thread_parent_id=? WHERE id=?',
+                        ('harness_click_tester', OTHER, REVIEWER));self.db.commit()
+        with self.assertRaises(sf.SpecError):
+            self.get()
+
+    def test_tool_user_and_nonfinal_text_cannot_bind_report(self):
+        self.fixture()
+        for role, channel in (('user','final'), ('tool','final'), ('assistant','commentary')):
+            self.final['payload']['role'], self.final['payload']['channel'] = role,channel
+            self.write_final()
+            with self.assertRaises(sf.SpecError):
+                self.get()
+
+    def test_unowned_shape_symlink_and_foreign_path_refuse(self):
+        self.fixture()
+        original = self.rollout.read_bytes()
+        self.rollout.chmod(0o666)
+        with self.assertRaises(sf.SpecError):
+            self.get()
+        self.rollout.chmod(0o600)
+        elsewhere = self.root / 'foreign.jsonl'
+        elsewhere.write_bytes(original);elsewhere.chmod(0o600)
+        self.rollout.unlink();self.rollout.symlink_to(elsewhere)
+        with self.assertRaises(sf.SpecError):
+            self.get()
