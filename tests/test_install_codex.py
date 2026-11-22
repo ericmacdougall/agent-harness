@@ -12,8 +12,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex.hooks import wal
+from harness.hooks.ops_watch import codex_expected_trust
 from install_codex import (AGENTS, CONFIG_END, CONFIG_START, DELIVERY_HELPERS, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
-                           managed_command, merge_config, merge_marked, tomllib)
+                           gate_command, managed_command, merge_config, merge_hooks, merge_marked, tomllib)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -300,6 +301,74 @@ class CodexInstallerTests(unittest.TestCase):
                     install(home, apply=True)
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
                 self.assertFalse((codex_home / 'agent-harness').exists())
+
+    def test_prefixed_merge_gate_reinstall_restores_prior_positional_approvals(self):
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate), tempfile.TemporaryDirectory(suffix=' with spaces') as temporary:
+                home = Path(temporary).resolve()
+                codex_home = home / '.codex'
+                codex_home.mkdir()
+                hooks_path = codex_home / 'hooks.json'
+                config_path = codex_home / 'config.toml'
+                approved = merge_hooks({'hooks': {'ProjectEvent': [{'hooks': [
+                    {'type': 'command', 'command': 'printf foreign'}]}]}}, codex_home)
+                pretool = approved['hooks']['PreToolUse']
+                plain_gate = pretool[2]
+                self.assertEqual(plain_gate, {'hooks': [{
+                    'type': 'command', 'command': gate_command(codex_home), 'timeout': 60}]})
+                prefixed_gate = {'hooks': [{**plain_gate['hooks'][0],
+                    'command': 'PATH="${PATH:+$PATH:}/opt/homebrew/bin" ' + gate_command(codex_home)}]}
+                pretool[2] = prefixed_gate
+                self.assertEqual(len(pretool), 6)
+                hooks_path.write_text(json.dumps(approved))
+                approvals = codex_expected_trust(hooks_path)
+                config_path.write_text(''.join(
+                    f'[hooks.state.{json.dumps(key)}]\ntrusted_hash = {json.dumps(value)}\n\n'
+                    for key, value in approvals.items()
+                ))
+                if duplicate:
+                    # The old installer preserved the prefixed gate as the first custom group.
+                    current = {'hooks': {**approved['hooks'], 'PreToolUse': [
+                        prefixed_gate, *pretool[:2], plain_gate, *pretool[3:]]}}
+                    hooks_path.write_text(json.dumps(current))
+
+                for _ in range(2):
+                    install(home, apply=True)
+                    self.assertEqual(json.loads(hooks_path.read_text()), approved)
+                    self.assertEqual(codex_expected_trust(hooks_path), approvals)
+                    self.assertEqual(tomllib.loads(config_path.read_text())['hooks']['state'],
+                                     {key: {'trusted_hash': value} for key, value in approvals.items()})
+
+    def test_plain_merge_gate_installation_stays_idempotent(self):
+        codex_home = Path('/synthetic home/.codex')
+        clean = merge_hooks({}, codex_home)
+        gates = clean['hooks']['PreToolUse']
+        self.assertEqual(len(gates), 6)
+        self.assertEqual(gates[2], {'hooks': [{
+            'type': 'command', 'command': gate_command(codex_home), 'timeout': 60}]})
+        self.assertEqual(merge_hooks(clean, codex_home), clean)
+
+    def test_custom_merge_gate_groups_stay_intact(self):
+        codex_home = Path('/synthetic home/.codex')
+        plain = {'type': 'command', 'command': gate_command(codex_home), 'timeout': 60}
+        prefixed = {**plain, 'command': 'PATH="${PATH:+$PATH:}/opt/homebrew/bin" ' + plain['command']}
+        custom = [
+            {'hooks': [{**plain, 'command': plain['command'] + ' && printf other'}]},
+            {'hooks': [{**prefixed, 'command': prefixed['command'].replace('/opt/homebrew/bin', '/other/bin')}]},
+            {'hooks': [{**prefixed, 'command': prefixed['command'].replace('merge_gate.py', 'another_gate.py')}]},
+            {'matcher': 'Bash', 'hooks': [plain]},
+            {'hooks': [{**plain, 'timeout': 25}]},
+            {'hooks': [{**plain, 'timeout': 60.0}]},
+            {'hooks': [{**prefixed, 'statusMessage': 'Operator customization'}]},
+            {'hooks': [plain], 'operator_setting': 'preserve'},
+            {'hooks': [plain, prefixed,
+                       {'type': 'command', 'command': managed_command(codex_home), 'timeout': 10}]},
+        ]
+        base = merge_hooks({}, codex_home)
+        supplied = {'hooks': {'PreToolUse': custom}}
+        first = merge_hooks(supplied, codex_home)
+        self.assertEqual(first['hooks']['PreToolUse'], custom + base['hooks']['PreToolUse'])
+        self.assertEqual(merge_hooks(first, codex_home), first)
 
     def test_preview_apply_idempotence_and_foreign_settings(self):
         with tempfile.TemporaryDirectory() as temporary:

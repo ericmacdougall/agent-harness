@@ -126,8 +126,15 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     heavy_guard = heavy_guard_command(codex_home)
     gate = gate_command(codex_home)
     owner_inbox = owner_inbox_command(codex_home)
+    prefixed_gate = 'PATH="${PATH:+$PATH:}/opt/homebrew/bin" ' + gate
+    gate_group = {'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]}
+    prefixed_gate_group = {'hooks': [{'type': 'command', 'command': prefixed_gate, 'timeout': 60}]}
+    managed_commands = (command, policy, guard, guard_command(codex_home, ''), kill_guard, heavy_guard, owner_inbox)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
+        pretool = event == 'PreToolUse'
+        other_managed = managed_commands if pretool else (*managed_commands, gate)
+        selected_gate = gate_group
         managed = {'hooks': [{'type': 'command', 'command': command,
                               'timeout': 1 if event == 'Interrupt' else 10}]}
         groups = hooks.setdefault(event, [])
@@ -137,22 +144,32 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
         for group in groups:
             if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
+            if pretool:
+                if group in (gate_group, prefixed_gate_group) and type(group['hooks'][0]['timeout']) is int:
+                    # Codex keys approvals by position. Keep the existing supported command at the
+                    # managed position, including when an older reinstall appended a plain duplicate.
+                    if group == prefixed_gate_group:
+                        selected_gate = prefixed_gate_group
+                    continue
+                if any(isinstance(handler, dict) and handler.get('command') in (gate, prefixed_gate)
+                       for handler in group['hooks']):
+                    # A customized or mixed merge group belongs to the operator.
+                    preserved.append(group)
+                    continue
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, ''), gate, kill_guard,
-                                                               heavy_guard, owner_inbox))]
+                                and handler.get('command') in other_managed)]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
         preserved.append(managed)
-        if event == 'PreToolUse':
+        if pretool:
             # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
-            preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
-        if event == 'PreToolUse' and command_guard:
+            preserved.append(selected_gate)
+        if pretool and command_guard:
             # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
             # write_stdin text typed into a running shell is never checked again by the host. Appended last:
             # Codex keys hook trust by position (hooks.state "<file>:pre_tool_use:<group>:<handler>"), so adding
@@ -162,7 +179,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             # Kill guard after the command guard, so main's trusted positions above it do not move (GoodQA #14590,
             # GoodQA #14506). --no-command-guard leaves out both.
             preserved.append({'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})
-        if event == 'PreToolUse':
+        if pretool:
             # Heavy-job guard last, so every trusted position above keeps its hash; independent of --no-command-guard.
             # It fails open on its own errors and denies with exit 2 only for heavy work on the Mac. Codex trust for
             # this hook needs the user to review it in /hooks; until then Codex skips it (ops-watch codex:trust).
