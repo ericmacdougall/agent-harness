@@ -1148,7 +1148,7 @@ def _native_owner_proof(main_wal, owner):
                     raise ValueError("duplicate owner event key")
                 value[key] = item
             return value
-        candidate = None
+        candidate, start = None, None
         for line in data.splitlines():
             if not line.strip():
                 continue
@@ -1157,15 +1157,24 @@ def _native_owner_proof(main_wal, owner):
                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid owner number")))
             if not isinstance(item, dict):
                 raise ValueError("invalid owner event")
+            if item.get("event") == "SubagentStart":
+                timestamp = item.get("at")
+                if (start is not None or item.get("agent_id") != agent or item.get("agent_type") != "harness_owner"
+                        or not isinstance(timestamp, str) or len(timestamp) > 64
+                        or datetime.fromisoformat(timestamp).tzinfo is None):
+                    raise ValueError("owner start is unavailable or conflicting")
+                start = {"started_at": timestamp, "start_event_sha256": sha256_bytes(line)}
             if item.get("event") in {"handoff", "result"} and isinstance(item.get("note"), str) and item["note"].strip():
                 timestamp = item.get("at")
                 if not isinstance(timestamp, str) or len(timestamp) > 64 or datetime.fromisoformat(timestamp).tzinfo is None:
                     raise ValueError("invalid owner attestation timestamp")
+                if start is None or datetime.fromisoformat(timestamp) < datetime.fromisoformat(start["started_at"]):
+                    raise ValueError("owner attestation predates the matching start")
                 candidate = {"attestation_event": item["event"], "attestation_at": timestamp,
                              "event_sha256": sha256_bytes(line)}
         if candidate is None or _native_agent_source(Path(main_wal), agent, "harness_owner", purpose="owner") != native:
             raise ValueError("owner attestation or stable assignment unavailable")
-        return {"owner": owner, "parent": native["parent"], "family": "codex", "agent_type": "harness_owner",
+        return {"owner": owner, "parent": native["parent"], "family": "codex", "agent_type": "harness_owner", **start,
                 "native_binding_sha256": native["native_binding_sha256"], "wal_sha256": sha256_bytes(data), **candidate}
     except (OSError, ValueError, TypeError, UnicodeError, RuntimeError):
         raise SpecError("Owner-recorded handoff/result evidence unavailable or changed", EXIT_USAGE) from None
@@ -1302,7 +1311,7 @@ def explicit_record_owners(record):
     if not _OWNERSHIP_FIELDS.intersection(record) and record.get("v") != 2:
         return None
     fields = {"owner", "parent", "family", "agent_type", "attestation_event", "attestation_at",
-              "wal_sha256", "event_sha256", "native_binding_sha256"}
+              "started_at", "start_event_sha256", "wal_sha256", "event_sha256", "native_binding_sha256"}
     try:
         owners, proofs, core = record["owners"], record["owner_proofs"], record["owners_core_sha"]
         if (record.get("v") != 2 or type(owners) is not list or not 1 <= len(owners) <= 8 or len(set(owners)) != len(owners)
@@ -1320,8 +1329,11 @@ def explicit_record_owners(record):
                     or proof["parent"] != proof["parent"].lower() or owner == "agent:" + proof["parent"]
                     or type(proof["attestation_at"]) is not str or len(proof["attestation_at"]) > 64
                     or datetime.fromisoformat(proof["attestation_at"]).tzinfo is None
+                    or type(proof["started_at"]) is not str or len(proof["started_at"]) > 64
+                    or datetime.fromisoformat(proof["started_at"]).tzinfo is None
+                    or datetime.fromisoformat(proof["attestation_at"]) < datetime.fromisoformat(proof["started_at"])
                     or any(type(proof[key]) is not str or re.fullmatch(r"[0-9a-f]{64}", proof[key]) is None
-                           for key in ("wal_sha256", "event_sha256", "native_binding_sha256"))):
+                           for key in ("wal_sha256", "event_sha256", "native_binding_sha256", "start_event_sha256"))):
                 raise ValueError
         if (len({proof["parent"] for proof in proofs}) != 1
                 or record["owner_proof_sha256"] != sha256_bytes(ownership_payload(record))):
@@ -1474,31 +1486,81 @@ def verified(records: list, index: dict, kind: str, *, native_cache=None):
     return [record for record, _ in good], bad
 
 
-def broken_current_ownership(records, index):
-    """A real attached explicit spec with torn metadata cannot select an older spec."""
-    payloads = []
+def current_artifact_spec(records, index, label=None):
+    """Select from checked server attachment bytes, never mutable comment role/version."""
+    sources, errors = [], []
+    for row in index.values():
+        if not isinstance(row, dict) or row.get("mime") != "text/markdown" or not row.get("commentId"):
+            continue
+        timestamp = row.get("_comment_at")
+        try:
+            order = (_native_stamp(timestamp), row["commentId"])
+        except (ValueError, TypeError, KeyError):
+            raise SpecError("Attached markdown lacks a verified comment timestamp") from None
+        data = row.get("_spec_bytes")
+        if (row.get("completionState") != "completed" or row.get("deletedAt") or row.get("archivedAt")
+                or row.get("_spec_error") or not isinstance(data, bytes)
+                or len(data) > 1_000_000 or sha256_bytes(data) != row.get("sha256")):
+            errors.append(order)
+            continue
+        try:
+            text = data.decode("utf-8")
+            parsed = parse_spec(text)
+            header = parsed["header"]
+            looks_spec = text.lstrip().startswith("# Spec:") or ("Ticket" in header and "Author" in header)
+            if not looks_spec:
+                continue
+            if label and norm_identity(header.get("Ticket")) != norm_identity(label):
+                continue
+            author = parse_author(header.get("Author", ""))
+            owners = declared_owners(parsed)
+            sources.append({"order": order, "comment": row["commentId"], "at": timestamp,
+                            "author": author, "owners": owners, "core": core_sha(text),
+                            "sha": row["sha256"], "id": row["id"], "ticket": header.get("Ticket")})
+        except (UnicodeError, ValueError, SpecError):
+            errors.append(order)
+    if not sources:
+        if errors or any(r["kind"] == "spec" for r in records):
+            raise SpecError("No verified spec: attached specification source bytes cannot be verified")
+        return None
+    newest = max(source["order"] for source in sources)
     for record in records:
-        if record["kind"] != "spec":
-            continue
-        roles = {a.get("role"): a for a in record.get("attachments") or []}
-        core_files = [a for a in record.get("attachments") or [] if a.get("role") in ("spec", "reviews")]
-        if attachment_problems(dict(record, attachments=core_files), index):
-            continue
-        if ((roles.get("spec") or {}).get("sha256") == record.get("spec_file_sha")
-                and record.get("spec_file_sha") and "reviews" in roles):
-            payloads.append(record)
-    if payloads:
-        latest = payloads[-1]
-        if latest.get("v") == 2 or _OWNERSHIP_FIELDS.intersection(latest):
-            if attachment_problems(latest, index):
-                return "current explicit spec attachment or owner provenance verification failed"
+        if record["kind"] == "spec":
             try:
-                explicit_record_owners(latest)
-                proof = next((a for a in latest["attachments"] if a.get("role") == "owner-provenance"), {})
-                if proof.get("sha256") != latest.get("owner_proof_sha256"):
-                    return "current explicit spec has no matching owner provenance attachment"
-            except SpecError as error:
-                return str(error)
+                if (_native_stamp(record["_at"]), record["_comment"]) > newest:
+                    raise SpecError("A newer specification record has no verified attached source; older specs cannot substitute")
+            except (KeyError, TypeError, ValueError):
+                raise SpecError("Specification record timestamp cannot be verified") from None
+    if errors and max(errors) >= newest:
+        raise SpecError("Current attached specification source is unavailable or corrupt; older specs cannot substitute")
+    current = [source for source in sources if source["order"] == newest]
+    bindings = {(r["core"], r["author"], None if r["owners"] is None else tuple(r["owners"])) for r in current}
+    if len(bindings) != 1:
+        raise SpecError("Conflicting specification artifacts are attached to the current comment")
+    matches = [r for r in records if r["kind"] == "spec" and r["_comment"] == current[0]["comment"]]
+    if len(matches) != 1:
+        raise SpecError("Current attached specification has missing or ambiguous record metadata")
+    record = matches[0]
+    source = next((r for r in current if r["sha"] == record.get("spec_file_sha")), None)
+    if (source is None or record.get("author") != source["author"] or record.get("spec_core_sha") != source["core"]
+            or norm_identity(record.get("ticket")) != norm_identity(source["ticket"])):
+        raise SpecError("Specification record author/core differs from the verified attached source")
+    if source["owners"] is not None:
+        if record.get("owners") != source["owners"] or explicit_record_owners(record) != set(source["owners"]):
+            raise SpecError("Explicit ownership metadata differs from the verified attached specification")
+    elif _OWNERSHIP_FIELDS.intersection(record) or record.get("v") == 2:
+        raise SpecError("Ownership metadata is not declared by the attached specification")
+    problems = attachment_problems(record, index) + kind_problems(record)
+    if problems:
+        raise SpecError("Current specification verification failed: " + "; ".join(problems))
+    return record
+
+
+def broken_current_ownership(records, index):
+    try:
+        current_artifact_spec(records, index)
+    except SpecError as error:
+        return str(error)
     return None
 
 
@@ -1532,12 +1594,10 @@ class Session:
         return records, ignored, index
 
     def latest_spec(self, records, index):
-        if problem := broken_current_ownership(records, index):
-            raise SpecError(problem)
-        good, _ = verified(records, index, "spec")
-        if not good:
+        current = current_artifact_spec(records, index, self.ticket.label)
+        if current is None:
             raise SpecError(f"no verified spec is attached to {self.ticket.label}; run spec_flow.py attach first")
-        return good[-1]
+        return current
 
     def post(self, kind: str, summary: str, record: dict, files, records):
         """files: [(role, name, mime, bytes)]. Idempotent on the record key."""
@@ -1578,15 +1638,17 @@ class Session:
         comment = self.adapter.comment_with_files(self.ticket.id, record_body(summary, record),
                                                   op_id(self.ticket.id, op_key),
                                                   [item["id"] for item in attachments])
-        if comment.get("id") in rejected:
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, str) or not comment_id:
+            raise SpecError("GoodQA did not return a comment identifier", EXIT_TRACKER)
+        if comment_id in rejected:
             raise SpecError("GoodQA replayed an earlier rejected comment instead of recording this one", EXIT_TRACKER)
         bound = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
-        unbound = [item["name"] for item in attachments if (bound.get(item["id"]) or {}).get("commentId") != comment.get("id")]
-        if unbound:
-            raise SpecError(f"GoodQA did not bind {', '.join(unbound)} to the new comment; the record will not "
-                            "verify", EXIT_TRACKER)
+        problems = attachment_problems(dict(record, _comment=comment_id), bound)
+        if problems:
+            raise SpecError("GoodQA attachment verification failed: " + "; ".join(problems), EXIT_TRACKER)
         print(json.dumps({"status": "RECORDED", "kind": kind, "ticket": self.ticket.label,
-                          "comment": comment["id"], "attachments": len(attachments)}))
+                          "comment": comment_id, "attachments": len(attachments)}))
         return comment
 
 
@@ -1671,20 +1733,22 @@ def _latest_click_result(records, index, spec, label, notes):
 def evaluate(records: list, index: dict, issue: dict, ignored=()):
     """Return {"ready", "missing", "self_attested", "notes"} for one ticket."""
     missing, attested, notes = [], [], list(ignored)
-    if problem := broken_current_ownership(records, index):
-        return {"ready": False, "missing": [problem], "self_attested": [], "notes": notes}
     label = issue.get("_label") or issue.get("id")
+    try:
+        current = current_artifact_spec(records, index, label)
+    except SpecError as error:
+        return {"ready": False, "missing": [str(error)], "self_attested": [], "notes": notes}
     specs, bad_specs = verified(records, index, "spec")
     for record, problems in bad_specs:
         notes.append(f"spec record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
-    if not specs:
+    if current is None:
         missing.append("No verified spec is attached. Fix: spec_flow.py new --ticket '<ref>' --out spec.md; "
                        "get adversarial + acceptance reviews (spec_flow.py review); spec_flow.py attach spec.md")
         return {"ready": False, "missing": missing, "self_attested": attested, "notes": notes}
-    spec = specs[-1]
+    spec = current
     core = spec.get("spec_core_sha")
-    attested.append("spec core sha, criteria and review verdicts are read from the spec record; the attached spec "
-                    "file is checked by sha256 but the core is not re-derived from it")
+    attested.append("spec author, Owners and core are derived from checksum-verified attachment bytes; criteria and "
+                    "review verdict metadata retain their existing declared-record trust limits")
     author = spec.get("author")
     review_policy = spec.get("review_policy")
     required_roles = required_review_roles(review_policy)

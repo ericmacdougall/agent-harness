@@ -1054,6 +1054,25 @@ explicit metadata refuses instead of choosing older legacy ownership data.
 Update participating helpers before using this record version; older helpers
 do not enforce explicit-owner semantics.
 
+Owner attestations must follow the matching native `SubagentStart` event; both
+timestamps and event digests are retained. The gate derives Author, Owners and
+the core from actual checksum-verified attached specification bytes, selected
+by server comment binding rather than mutable JSON roles/version. Stripping
+record fields, downgrading a record or remirroring a smaller owner list cannot
+turn an explicit artifact into legacy ownership. An unavailable current source
+refuses rather than selecting an older specification.
+
+Artifact reads use the existing authenticated API read-target route. A separate
+empty HTTP client fetches approved storage without API credentials, cookies,
+environment proxies or redirects, after checking the actual public peer. The
+production default permits only `https://goodqa-uploads.tor1.digitaloceanspaces.com`
+for the production `https://goodqa.app` API; development is not implicitly
+allowed. Custom deployments need an explicit trusted `artifact_download_origins`
+list. Reads have command deadlines, a 64 KiB target-JSON limit, a 1 MB source
+limit, 64 markdown candidates and an 8 MB aggregate source budget. Download
+capabilities and headers are never logged. Access failures remain verification
+failures, not permission changes.
+
 In explicit mode, a coordinator can transport someone else's spec, evidence or
 tester report without becoming an inferred owner. Author, declared owners,
 current spec reviewers and all historical attachment-verified actual testers

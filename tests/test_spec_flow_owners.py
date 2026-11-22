@@ -28,6 +28,7 @@ def tearDownModule():
 def proof(owner):
     return {'owner': owner, 'parent': PARENT, 'family': 'codex', 'agent_type': 'harness_owner',
             'attestation_event': 'handoff', 'attestation_at': '2026-11-22T01:00:00+00:00',
+            'started_at': '2026-11-22T00:00:00+00:00', 'start_event_sha256': 'd' * 64,
             'wal_sha256': 'a' * 64, 'event_sha256': 'b' * 64, 'native_binding_sha256': 'c' * 64}
 
 
@@ -63,6 +64,76 @@ class ExplicitOwners(unittest.TestCase):
         self.assertEqual(self.record()['owners_core_sha'], sf.core_sha(TEXT))
         result = self.case.evaluate()
         self.assertFalse(any(x.startswith('sign-off:') for x in result['missing']), result['missing'])
+
+    def test_attached_owners_survive_full_metadata_downgrade(self):
+        self.complete()
+        self.assertNotEqual(self.sign(B)[0], 0)
+        comment = next(c for c in self.case.fake.comments[base.ISSUE]
+                       if json.loads(sf.RECORD_BLOCK.search(c['body']).group(1))['kind'] == 'spec')
+        record = json.loads(sf.RECORD_BLOCK.search(comment['body']).group(1))
+        record['v'] = 1
+        for key in sf._OWNERSHIP_FIELDS:
+            record.pop(key, None)
+        for drop_roles in (False, True):
+            changed = copy.deepcopy(record)
+            if drop_roles:
+                for item in changed['attachments']:
+                    if item['role'] in ('spec', 'owner-provenance'):
+                        item['role'] = 'log'
+            comment['body'] = sf.record_body('downgraded mutable metadata only', changed)
+            self.assertNotEqual(self.sign(B)[0], 0, 'immutable attached Owners must still exclude B')
+            self.assertFalse(self.case.evaluate()['ready'])
+
+    def test_recomputed_smaller_owner_proof_cannot_change_attached_spec(self):
+        self.complete()
+        self.assertNotEqual(self.sign(B)[0], 0)
+        original = self.record()
+        changed = copy.deepcopy(original)
+        changed['owners'] = [OWNERS[0]]
+        changed['owner_proofs'] = [changed['owner_proofs'][0]]
+        changed['owner_proof_sha256'] = sf.sha256_bytes(sf.ownership_payload(changed))
+        adapter = sf.make_adapter(self.case.config, self.case.spec_policy, 'harness', sf.time.monotonic() + 30)
+        attachments = []
+        for item in original['attachments']:
+            source = self.case.fake.attachments[item['id']]
+            data = sf.ownership_payload(changed) if item['role'] == 'owner-provenance' else source['bytes']
+            digest = sf.sha256_bytes(data)
+            aid = adapter.upload(base.PROJECT, item['name'], source['mime'], data, digest)
+            attachments.append(dict(item, id=aid, sha256=digest))
+        changed['attachments'] = attachments
+        changed['key'] = 'spec:recomputed-owner-record'
+        adapter.comment_with_files(base.ISSUE, sf.record_body('new forged smaller owner list', changed),
+                                   'owner-mirror-negative', [a['id'] for a in attachments])
+        self.assertNotEqual(self.sign(B)[0], 0, 'actual spec still includes B despite coherent smaller mirror')
+        self.assertFalse(self.case.evaluate()['ready'])
+
+    def test_new_v1_comment_with_same_source_cannot_recast_owners(self):
+        self.complete()
+        original = self.record()
+        changed = {k:v for k,v in original.items() if k not in sf._OWNERSHIP_FIELDS}
+        changed['v'] = 1
+        adapter = sf.make_adapter(self.case.config, self.case.spec_policy, 'harness', sf.time.monotonic() + 30)
+        attachments = []
+        for item in original['attachments']:
+            source = self.case.fake.attachments[item['id']]
+            aid = adapter.upload(base.PROJECT, item['name'], source['mime'], source['bytes'], item['sha256'])
+            attachments.append(dict(item, id=aid))
+        changed['attachments'] = attachments
+        adapter.comment_with_files(base.ISSUE, sf.record_body('new v1 same immutable source', changed),
+                                   'owner-v1-copy-negative', [a['id'] for a in attachments])
+        self.assertNotEqual(self.sign(B)[0], 0)
+        self.assertFalse(self.case.evaluate()['ready'])
+
+    def test_torn_author_or_core_cannot_expose_older_legacy_spec(self):
+        self.case.attached()
+        self.attach()
+        comment = self.case.fake.comments[base.ISSUE][-1]
+        original = json.loads(sf.RECORD_BLOCK.search(comment['body']).group(1))
+        for key, value in [('author', []), ('spec_core_sha', []), ('author', 'agent:main1'), ('spec_core_sha', 'f' * 64)]:
+            changed = dict(original, **{key:value})
+            comment['body'] = sf.record_body('torn current mutable source claim', changed)
+            self.assertNotEqual(self.sign(B)[0], 0)
+            self.assertFalse(self.case.evaluate()['ready'])
 
     def test_missing_native_provenance_refuses_attachment_before_post(self):
         spec = self.case.reviewed_spec(TEXT)
@@ -180,7 +251,9 @@ class NativeOwnerProvenance(unittest.TestCase):
         self.addCleanup(self.native.doCleanups)
         self.native.child(A, 'harness_owner')
         self.owner_wal = self.native.wal.parent / ('agent-' + A + '.jsonl')
-        self.line = json.dumps({'at': '2026-11-22T02:00:00+00:00', 'event': 'handoff',
+        self.start = json.dumps({'at': '2026-11-22T01:00:00+00:00', 'event': 'SubagentStart',
+                                 'agent_id': A, 'agent_type': 'harness_owner'}) + '\n'
+        self.line = self.start + json.dumps({'at': '2026-11-22T02:00:00+00:00', 'event': 'handoff',
                                 'note': 'private owner-recorded work handoff; never upload this note'}) + '\n'
         self.owner_wal.write_text(self.line)
         self.owner_wal.chmod(0o600)
@@ -217,6 +290,13 @@ class NativeOwnerProvenance(unittest.TestCase):
                 with self.assertRaises(sf.SpecError):
                     self.get()
 
+    def test_attestation_before_matching_native_start_is_refused(self):
+        start = {'at': '2026-11-22T03:00:00+00:00', 'event': 'SubagentStart',
+                 'agent_id': A, 'agent_type': 'harness_owner'}
+        self.owner_wal.write_text(json.dumps(start) + '\n' + self.line[len(self.start):])
+        with self.assertRaises(sf.SpecError):
+            self.get()
+
     def test_owner_wal_alias_or_changed_snapshot_refuses(self):
         target = self.owner_wal.with_suffix('.saved')
         self.owner_wal.rename(target)
@@ -251,8 +331,10 @@ class NativeOwnersAndClickWitness(unittest.TestCase):
                 (ident, json.dumps(source), 'subagent', 'Codex Desktop', '/root/owner_' + ident[:4],
                  'harness_owner', None, 0, None, 'fixture-provider'))
             wal = self.fixture.native_dir / ('agent-' + ident + '.jsonl')
-            wal.write_text(json.dumps({'event': 'handoff', 'at': '2026-11-05T09:59:00+00:00',
-                                      'note': 'owner-recorded fixture handoff'}) + '\n')
+            wal.write_text(json.dumps({'event': 'SubagentStart', 'at': '2026-11-05T09:58:00+00:00',
+                                       'agent_id': ident, 'agent_type': 'harness_owner'}) + '\n' +
+                           json.dumps({'event': 'handoff', 'at': '2026-11-05T09:59:00+00:00',
+                                       'note': 'owner-recorded fixture handoff'}) + '\n')
             wal.chmod(0o600)
         self.fixture.db.commit()
         self.text = base.SPEC.replace('Author: agent:owner1 (claude-opus-5-5)',

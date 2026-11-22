@@ -134,6 +134,7 @@ class FakeGoodQA:
         self.issues = {ISSUE: {"id": ISSUE, "number": 168, "title": "Spec flow", "status": "in_progress",
                                "projectId": PROJECT, "description": "", "closedAt": None}}
         self.comments, self.attachments, self.calls = {ISSUE: []}, {}, []
+        self.artifact_gets, self.artifact_mode = [], None
         self.delay, self.refuse_done, self.clock = 0, False, 0
         self.forbidden = set()  # issue ids whose reads are refused, as for a revoked key
         self.lost_projects = set()  # project ids the key can no longer read (lost membership answers not_found)
@@ -148,7 +149,10 @@ class FakeGoodQA:
                 self.send_header("content-type", ctype)
                 self.send_header("content-length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                try:
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # The bounded-reader negatives intentionally close early.
 
             def do_PUT(self):
                 data = self.rfile.read(int(self.headers["content-length"]))
@@ -157,6 +161,61 @@ class FakeGoodQA:
                     return self._send(403)
                 attachment["bytes"] = data
                 self._send(200)
+
+            def do_GET(self):
+                outer.artifact_gets.append({"path": self.path.split("?", 1)[0],
+                                           "authorization": bool(self.headers.get("Authorization")),
+                                           "cookie": bool(self.headers.get("Cookie"))})
+                parts = self.path.split("?", 1)[0].split("/")
+                if self.path.startswith("/v1/uploads/") and self.path.endswith("/content/read-target"):
+                    if self.headers.get("Authorization") != "Bearer test-key":
+                        return self._send(401)
+                    aid = parts[3]
+                    if aid not in outer.attachments:
+                        return self._send(404)
+                    if outer.artifact_mode == "target-redirect":
+                        self.send_response(302)
+                        self.send_header("Location", outer.base + "/forbidden-sink")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if outer.artifact_mode == "target-oversize":
+                        return self._send(200, b"x" * 65537, "application/json")
+                    target = outer.base + "/download/" + aid
+                    if outer.artifact_mode == "off-origin":
+                        target = "https://forbidden.example.invalid/source"
+                    if outer.artifact_mode == "metadata":
+                        target = "http://169.254.169.254/latest/credentials"
+                    response = {"url": target, "mime": outer.attachments[aid]["mime"], "expiresAt": None}
+                    if outer.artifact_mode == "target-headers":
+                        response["headers"] = {"Authorization": "must-not-forward"}
+                    return self._send(200, json.dumps(response).encode(), "application/json")
+                if self.path.startswith("/download/"):
+                    if self.headers.get("Authorization") or self.headers.get("Cookie"):
+                        return self._send(403)
+                    if outer.artifact_mode == "redirect":
+                        self.send_response(302)
+                        self.send_header("Location", outer.base + "/forbidden-sink")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    row = outer.attachments.get(parts[2])
+                    if (row is None or outer.artifact_mode == "missing"
+                            or parts[2] in getattr(outer, "unavailable_artifact_ids", ())):
+                        return self._send(404)
+                    payload = row.get("bytes", b"")
+                    if outer.artifact_mode == "corrupt":
+                        payload += b"changed"
+                    if outer.artifact_mode == "oversize":
+                        payload = b"x" * 1_000_001
+                    if outer.artifact_mode == "stream-oversize":
+                        self.send_response(200)
+                        self.send_header("Content-Type", row["mime"])
+                        self.end_headers()
+                        self.wfile.write(b"x" * 1_000_001)
+                        return
+                    return self._send(200, payload, row["mime"])
+                return self._send(404)
 
             def do_POST(self):
                 request = json.loads(self.rfile.read(int(self.headers["content-length"])))
