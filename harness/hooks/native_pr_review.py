@@ -79,6 +79,33 @@ def _github_origin(repo):
     return match[1].lower()
 
 
+def github_runner(args, timeout, cwd=None, *, run=None):
+    """Pin the native read-only runner to GitHub.com without changing legacy CLI behavior."""
+    import merge_gate
+
+    args = list(args)
+    if len(args) == 2 and args[0] == "api" and args[1].startswith("repos/"):
+        args[1:1] = ["--hostname", "github.com"]
+    elif (len(args) >= 5 and args[:2] in (["pr", "view"], ["pr", "checks"])
+          and args.count("-R") == 1 and not any(arg.startswith("--repo") for arg in args)):
+        index = args.index("-R") + 1
+        if index >= len(args):
+            raise ValueError("native GitHub PR read has no repository")
+        repository = merge_gate.repo_key(args[index])
+        if not repository or "/" not in args[index] or args[index].lower() != repository:
+            raise ValueError("native GitHub PR read needs a canonical repository")
+        args[index] = "github.com/" + repository
+    else:
+        raise ValueError("unsupported native GitHub read")
+    return (run or merge_gate.SubprocessGh())(args, timeout, cwd)
+
+
+def github_client(deadline, cwd=None):
+    import merge_gate
+
+    return merge_gate.Client(github_runner, deadline, cwd)
+
+
 def _branch_ref(value):
     if not _matches(re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._/-]{0,127}"), value) or value.startswith("-") or ".." in value:
         return False
@@ -527,7 +554,7 @@ def main(argv=None):
                                 spec_flow.read_regular(args.report, MAX_FILE))
             print(line)
         else:
-            client = merge_gate.Client(merge_gate.SubprocessGh(), time.monotonic() + 20)
+            client = github_client(time.monotonic() + 20)
             context, _ = cli_context(args, client)
             print(canonical(context if args.action == "context" else verify_bundle(args.bundle, context, args.repo)))
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, StopIteration, subprocess.SubprocessError,

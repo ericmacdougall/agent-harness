@@ -98,6 +98,24 @@ class NativeReviewContracts(TestCase):
             self.assertNotEqual(line, n.witness_line(dict(values, **{field: replacement}), "acceptance", *args))
         self.assertNotEqual(line, n.witness_line(values, "adversarial", *args))
 
+    def test_native_runner_pins_both_github_lookup_routes(self):
+        import os
+
+        run = mock.Mock(return_value=(0, "{}", ""))
+        with mock.patch.dict(os.environ, {"GH_HOST": "enterprise.example.invalid"}):
+            n.github_runner(["api", "repos/fixture/project/pulls/3"], 4, run=run)
+            run.assert_called_once_with(["api", "--hostname", "github.com", "repos/fixture/project/pulls/3"], 4, None)
+            run.reset_mock()
+            n.github_runner(["pr", "checks", "3", "-R", "fixture/project", "--required"], 7, str(self.repo), run=run)
+            run.assert_called_once_with(["pr", "checks", "3", "-R", "github.com/fixture/project", "--required"],
+                                        7, str(self.repo))
+            run.reset_mock()
+            with self.assertRaisesRegex(ValueError, "unsupported native GitHub read"):
+                n.github_runner(["api", "--hostname", "enterprise.example.invalid", "repos/fixture/project"], 4, run=run)
+            with self.assertRaisesRegex(ValueError, "canonical repository"):
+                n.github_runner(["pr", "view", "3", "-R", "enterprise.example.invalid/fixture/project"], 4, run=run)
+            run.assert_not_called()
+
     def test_fresh_remote_ref_and_ci_proof(self):
         client = mock.Mock()
         pull = {"number": 3, "state": "open", "base": {"sha": BASE, "ref": "main", "repo": {"full_name": "fixture/project"}},
