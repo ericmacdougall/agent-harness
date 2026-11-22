@@ -1,5 +1,15 @@
 # Operations and safety boundaries
 
+## Sparse native delivery
+
+Native delivery supports expanded Git indexes in canonical cone sparse checkouts, and a bounded positive anchored non-cone subset: literal files, trailing-slash directories, and final-component `*.extension` selections. Other non-cone syntax, sparse-directory indexes, malformed settings, unsupported Git `sparse-checkout check-rules` capability, and unverifiable state refuse before publication. This does not change separate review snapshot isolation rules.
+
+Uppercase skip-worktree flags are admitted only after native NUL-delimited rule matching exactly partitions every indexed path into included and excluded sets, frozen rule matching agrees, and every skipped path is physically absent. Descriptor-based nofollow traversal refuses symlinks, unreadable ancestors and present skipped content. Index, rules and effective settings are rechecked under bounded metadata/time budgets. Assume-unchanged flags, submodules, executable local filters and existing routing/conflict refusals remain blocked. No sparse rules/index changes, materialization or automatic checkout expansion are performed.
+
+Every new delivery generation uses journal schema 2, with required source and original layout evidence including explicit ordinary state. A valid rule change, sparse-to-ordinary transition, missing evidence or malformed evidence blocks reuse at the same HEAD. Prepare a new reviewed generation only when existing settled-phase rules allow it; unresolved publication/recovery state must first be reconciled through its existing workflow. Schema-1 ordinary generations remain supported, while schema-1 sparse generations cannot resume without a settled fresh prepare. Never remove recovery state to obtain this path.
+
+Normal protected pinned fast-forward preserves the supported layout and ignored-data protection. Delivered checks still run against the actual sparse checkout; a check needing omitted files fails normally. The checks assume a cooperative local account: they detect inspected changes and repeat at delivery boundaries, but do not atomically exclude a malicious concurrent writer.
+
 ## Components
 
 | Component | Role |
