@@ -4,9 +4,30 @@ The macOS signer creates a fresh approval for one named T2Scan audit. The approv
 
 ## Provisioning boundary
 
-Provision this route with an independently protected operator and verifier. The Mac operator must run a reviewed, stable-identity build from a protected installation. Keep the Secure Enclave key handle under operator custody and inaccessible to agents. Install the public key and target audience in the verifier through a separate authenticated administrator. The verifier requires the exact configured issuer and the audience derived from the provisioned SSH host key and executor UID. Authenticate those values out of band before enrollment.
+The Mac operator runs the signer built from the reviewed, pinned release and keeps the Secure Enclave key handle in the private operator stage. The verifier pins the hardware key's public part and the audience derived from the independently verified SSH host key and executor UID. Check the target host identity before enrollment.
 
-An ECDSA signature establishes possession of the enrolled key. The enrollment ceremony establishes that the key came from the reviewed Secure Enclave signer with a Touch ID policy. An agent with administrative control of the verifier host can replace local trust policy and replay state. Deploy the verifier across an independent administrative boundary or remove that privilege from the executor before enabling this route. Keep the broker service inactive pending verified provisioning.
+An ECDSA signature establishes possession of the enrolled key. The operator observes that the reviewed enrollment program creates a Secure Enclave key gated by Touch ID. Use the existing cooperating-agent trust model on the owned t2-dev host. Root ownership protects the verifier during ordinary application operation. A deliberate host administrator could replace its pin or replay state, and the workflow does not establish resistance to that administrator. Keep the broker inactive until reviewed operator enrollment succeeds.
+
+## First-time setup and one named audit
+
+Run this command from the exact reviewed Agent Harness release after it is merged. Use the Ed25519 fingerprint independently verified for the existing t2-dev entry in your macOS SSH known-hosts file. Pass a manifest of exactly the intended three retained audit assignments, with digests computed from their actual packets. The tool uses the existing pinned SSH account and its operator-authorized sudo on t2-dev.
+
+```sh
+python3 scripts/provision_t2scan_consent.py \
+  --ref REVIEWED_MERGED_COMMIT --issuer OPERATOR_LABEL \
+  --fingerprint T2_DEV_ED25519_SHA256_FINGERPRINT \
+  --project PROJECT_ID --run AUDIT_RUN_ID --manifest EXACT_THREE_ASSIGNMENTS.json --apply
+```
+
+Omit `--apply` for an inspection that leaves broker files and state untouched. Apply requires a local interactive operator terminal. The command checks the release, target and manifest before enrollment. The first Touch ID prompt enrolls the signer. The command then pins the emitted public key, creates the broker and checks access as the exact execution account. A separate scope window displays the precise three assignments before a fresh Touch ID signature. Cancelling that scope leaves the separately enrolled broker without an audit grant.
+
+The printed private `portable-consent` directory holds one capsule per signed task. Hand the capsules to the scoped native adapter through the protected application provisioning route. Refresh any long-running launcher that predates its new client-group membership. A capsule expires within 15 minutes. The installer will refuse pre-existing issuer, service or replay paths. Preserve a partial install for reconciliation.
+
+To disable the broker, use the same command with the same `--ref`, `--issuer` and `--fingerprint`, replacing audit and apply flags with `--rollback`. It disables the socket and stops the service while retaining the issuer, replay ledger and release record. Runs already accepted stay subject to normal receipt reconciliation.
+
+## Separate signer enrollment
+
+If you used first-time setup, keep the signer and enrollment from its private operator directory for subsequent audits. Use the following standalone commands only if you are provisioning the signer and broker separately.
 
 The signer supports macOS 14 or later on a Mac with Secure Enclave and enrolled Touch ID. Use the installed Apple Swift SDK to build the staged helper.
 
