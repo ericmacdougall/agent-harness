@@ -125,6 +125,133 @@ class NativeClick(SpecFlowCase):
         self.wal(self.rollout, *history)
         return line
 
+    def pr_owner_history(self):
+        role = "harness_owner"
+        marker = "NATIVE_PR_WITNESS_V1 "
+        line = marker + "{}"
+        meta = json.loads(self.rollout.read_text())
+        source = meta["payload"]["source"]
+        source["subagent"]["thread_spawn"]["agent_role"] = role
+        self.db.execute("UPDATE threads SET agent_role=?, source=? WHERE id=?", (role, json.dumps(source), TESTER))
+        self.db.commit()
+        meta["payload"].update(agent_role=role, subagent_history_start_ordinal=2)
+        root = {"timestamp": meta["timestamp"], "type": "session_meta", "payload": {
+            "id": PARENT, "session_id": PARENT, "source": "vscode", "thread_source": "user",
+            "originator": "Codex Desktop", "model_provider": "fixture-provider",
+        }}
+        settings = {"timestamp": meta["timestamp"], "type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_id": TESTER,
+        }}
+        for path in (self.main, self.child):
+            event = json.loads(path.read_text())
+            path.write_text("")
+            self.wal(path, {**event, "agent_type": role})
+        self.wal(self.child, {"at": NOTE, "event": "check", "note": line})
+        self.rollout.write_text("")
+        self.wal(self.rollout, meta, root, settings)
+        identity = sf._native_agent_source(self.main, TESTER, role, purpose="pr-review")
+        return identity, role, marker, line
+
+    def test_authenticated_pr_owner_witness_beyond_click_history_limit(self):
+        identity, role, marker, line = self.pr_owner_history()
+        with self.rollout.open("ab") as stream:
+            row = b'{"type":"fixture","payload":"' + b"x" * 3_300_000 + b'"}\n'
+            for _ in range(5):
+                stream.write(row)
+        self.message(line)
+        self.assertGreater(self.rollout.stat().st_size, sf.NATIVE_ROLLOUT_LIMIT)
+        observed = sf._native_authored_witness(identity, TESTER, role, marker, line, START, END,
+                                               require_fork_boundary=True)
+        self.assertEqual(observed, sf._native_stamp(FINAL))
+
+    def test_click_history_has_unchanged_exact_cap_and_cannot_select_pr_scope(self):
+        identity = sf._native_agent_source(self.main, TESTER, ROLE, purpose="click-test")
+        row = b"x" * 999_999 + b"\n"
+        with self.rollout.open("wb") as stream:
+            for _ in range(16):
+                stream.write(row)
+        self.assertEqual(self.rollout.stat().st_size, sf.NATIVE_ROLLOUT_LIMIT)
+        with sf._native_witness_entries(self.rollout, identity, ROLE, require_fork_boundary=False) as records:
+            self.assertEqual(sum(len(record) + 1 for record in records), sf.NATIVE_ROLLOUT_LIMIT)
+        with self.rollout.open("ab") as stream:
+            stream.write(b"\n")
+        with self.assertRaisesRegex(ValueError, "unqualified native metadata path"):
+            with sf._native_witness_entries(self.rollout, identity, ROLE, require_fork_boundary=False):
+                self.fail("click history larger than its cap was admitted")
+        with self.assertRaises(sf.SpecError):
+            sf._native_agent_source(self.main, TESTER, ROLE, purpose="pr-review")
+        forged = dict(identity, witness_purpose="pr-review", witness_role="harness_owner")
+        with self.assertRaisesRegex(ValueError, "authenticated scope"):
+            with sf._native_witness_entries(self.rollout, forged, "harness_owner", require_fork_boundary=True):
+                self.fail("unverified purpose received the PR history budget")
+
+    def test_pr_history_exact_cap_and_sparse_overflow(self):
+        identity, role, _, _ = self.pr_owner_history()
+        row = b"x" * 999_999 + b"\n"
+        with self.rollout.open("wb") as stream:
+            for _ in range(64):
+                stream.write(row)
+        self.assertEqual(self.rollout.stat().st_size, sf._NATIVE_PR_ROLLOUT_LIMIT)
+        with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as records:
+            self.assertEqual(sum(len(record) + 1 for record in records), sf._NATIVE_PR_ROLLOUT_LIMIT)
+        for mode in ("ab", "wb"):
+            with self.rollout.open(mode) as stream:
+                stream.truncate(sf._NATIVE_PR_ROLLOUT_LIMIT + 1)
+            with self.assertRaisesRegex(ValueError, "unqualified native metadata path"):
+                with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True):
+                    self.fail("PR history larger than the logical byte cap was admitted")
+
+    def test_pr_history_requires_fork_work_bounds_and_complete_consumption(self):
+        identity, role, _, _ = self.pr_owner_history()
+        with self.assertRaisesRegex(ValueError, "verified fork boundary"):
+            with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=False):
+                self.fail("PR history without the fork requirement was admitted")
+        with self.assertRaisesRegex(ValueError, "through EOF"):
+            with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                self.assertIn(b"session_meta", next(rows))
+        for key, limit in (("_NATIVE_PR_SCAN_SECONDS", 0), ("_NATIVE_PR_ROW_LIMIT", 1)):
+            with self.subTest(limit=key), mock.patch.object(sf, key, limit):
+                with self.assertRaisesRegex(ValueError, "work limit exceeded"):
+                    with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                        list(rows)
+
+    def test_pr_history_enforces_per_record_ceiling_and_refuses_malformed_tail(self):
+        identity, role, marker, line = self.pr_owner_history()
+        good = self.rollout.read_bytes()
+        with self.rollout.open("wb") as stream:
+            stream.write(b"x" * sf._NATIVE_PR_RECORD_LIMIT + b"\r\n")
+        with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+            self.assertEqual([len(row) for row in rows], [sf._NATIVE_PR_RECORD_LIMIT])
+        with self.rollout.open("wb") as stream:
+            stream.write(b"x" * (sf._NATIVE_PR_RECORD_LIMIT + 1) + b"\n")
+        with self.assertRaisesRegex(ValueError, "record limit"):
+            with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                list(rows)
+        self.rollout.write_bytes(good)
+        self.message(line)
+        with self.rollout.open("ab") as stream:
+            stream.write(b"{")
+        with self.assertRaises(ValueError):
+            sf._native_authored_witness(identity, TESTER, role, marker, line, START, END, require_fork_boundary=True)
+
+    def test_pr_history_snapshot_rejects_replacement_and_shrink(self):
+        identity, role, _, _ = self.pr_owner_history()
+        good = self.rollout.read_bytes()
+        for change in ("shrink", "replace"):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, "native file changed"):
+                    with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                        self.assertIn(b"session_meta", next(rows))
+                        if change == "shrink":
+                            with self.rollout.open("wb"):
+                                pass
+                        else:
+                            self.rollout.rename(self.rollout.with_suffix(".retained"))
+                            self.rollout.write_bytes(good)
+                            self.rollout.chmod(0o600)
+                        list(rows)
+                self.rollout.write_bytes(good)
+
     def test_real_shape_inherited_root_prologue_and_child_boundary_verify(self):
         line = self.inherited_prologue(inherited_witness=True)
         code, out, error = self.click("--verify-native-witness")

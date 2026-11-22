@@ -25,6 +25,7 @@ import time
 import unicodedata
 import urllib.parse
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -807,8 +808,9 @@ def _native_agent_source(path, agent, expected, *, purpose):
         directories = (home, home / ".agent-harness", root, raw.parent)
         before = tuple(_native_path(item, uid, directory=True) for item in directories)
         wal_binding = _native_path(raw, uid, maximum=64_000_000)
-        if rollout_proof and (parent != parent.lower() or agent != agent.lower()):
-            raise ValueError("noncanonical child identity")
+        if rollout_proof and (parent != parent.lower() or agent != agent.lower()
+                              or expected not in _NATIVE_WITNESS_ROLES[purpose]):
+            raise ValueError("noncanonical child identity or witness role")
         rows = _native_review_rows(home, uid, agent, parent, rollout=True) if rollout_proof else _native_review_rows(home, uid, agent, parent)
         parent_row, child = rows[parent], rows[agent]
         if (parent_row[1:4] != ("vscode", "user", "Codex Desktop") or any(parent_row[i] is not None for i in (4, 5, 6))
@@ -840,7 +842,9 @@ def _native_agent_source(path, agent, expected, *, purpose):
         return {"home": home, "uid": uid, "parent": parent, "agent_path": child[4],
                 "main": raw, "main_binding": wal_binding, "rollout": child[8] if rollout_proof else None,
                 "archived": bool(child[7]), "child_source": source,
-                "child_provider": child[9] if rollout_proof else None, "parent_provider": parent_row[9] if rollout_proof else None}
+                "child_provider": child[9] if rollout_proof else None, "parent_provider": parent_row[9] if rollout_proof else None,
+                "witness_purpose": purpose if rollout_proof else None, "witness_role": expected if rollout_proof else None,
+                "history_scope": _NATIVE_PR_HISTORY_SCOPE if purpose == "pr-review" else None}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
         label = "click-tester" if purpose == "click-test" else "reviewer"
         raise SpecError(f"native {label} metadata unavailable or conflicting", EXIT_USAGE) from None
@@ -850,12 +854,22 @@ NATIVE_CLICK_PREFIX = "CLICK_TEST_WITNESS_V1 "
 NATIVE_CLICK_SOURCE = "codex-native-click-witness-v1"
 NATIVE_CLICK_ROLE = "harness_click_tester"
 NATIVE_ROLLOUT_LIMIT = 16_000_000
+_NATIVE_PR_ROLLOUT_LIMIT = 64_000_000
+_NATIVE_PR_RECORD_LIMIT = 4_000_000
+_NATIVE_PR_ROW_LIMIT = 128_000
+_NATIVE_PR_SCAN_SECONDS = 15
+_NATIVE_PR_HISTORY_SCOPE = object()
+_NATIVE_WITNESS_ROLES = {
+    "click-test": frozenset({NATIVE_CLICK_ROLE}),
+    "pr-review": frozenset({"harness_owner", "harness_reviewer", "harness_red_team", "worker"}),
+}
 NATIVE_CLICK_WAL_LIMIT = 4_000_000
 MAX_NATIVE_CLICK_CANDIDATES = 16
 
 
-def _native_read(path, identity, limit, *, binding=None):
-    """Bound one local file and its ancestors throughout the read."""
+@contextmanager
+def _native_file_snapshot(path, identity, limit, *, binding=None):
+    """Open a bounded local file and verify the descriptor and path on successful exit."""
     home, uid = identity["home"], identity["uid"]
     parents = [home, *(p for p in reversed(path.parents) if p != home and p.is_relative_to(home))]
     directories = [_native_path(p, uid, directory=True) for p in parents]
@@ -865,19 +879,65 @@ def _native_read(path, identity, limit, *, binding=None):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         first = os.fstat(fd)
-        if (first.st_dev, first.st_ino, first.st_uid, first.st_mode) != before:
+        if (first.st_dev, first.st_ino, first.st_uid, first.st_mode) != before or first.st_size > limit:
             raise ValueError("native file changed")
         with os.fdopen(fd, "rb", closefd=False) as stream:
-            raw = stream.read(limit + 1)
+            yield stream, first.st_size
         last = os.fstat(fd)
         if ((first.st_size, first.st_mtime_ns, first.st_ctime_ns) !=
-                (last.st_size, last.st_mtime_ns, last.st_ctime_ns) or len(raw) != first.st_size or len(raw) > limit
+                (last.st_size, last.st_mtime_ns, last.st_ctime_ns)
                 or _native_path(path, uid, maximum=limit) != before
                 or [_native_path(p, uid, directory=True) for p in parents] != directories):
             raise ValueError("native file changed")
-        return raw
     finally:
         os.close(fd)
+
+
+def _native_read(path, identity, limit, *, binding=None):
+    with _native_file_snapshot(path, identity, limit, binding=binding) as (stream, size):
+        raw = stream.read(limit + 1)
+        if len(raw) != size:
+            raise ValueError("native file changed")
+    return raw
+
+
+def _native_pr_records(stream, size, deadline):
+    total = 0
+    rows = 0
+    while total < size:
+        if rows >= _NATIVE_PR_ROW_LIMIT or time.monotonic() >= deadline:
+            raise ValueError("native PR history work limit exceeded")
+        raw = stream.readline(min(_NATIVE_PR_RECORD_LIMIT + 2, size - total + 1))
+        total += len(raw)
+        if not raw or total > size:
+            raise ValueError("native file changed")
+        record = raw.removesuffix(b"\n").removesuffix(b"\r")
+        if len(record) > _NATIVE_PR_RECORD_LIMIT or (not raw.endswith(b"\n") and total < size):
+            raise ValueError("native PR history record limit exceeded")
+        rows += 1
+        yield record
+    if stream.read(1):
+        raise ValueError("native file changed")
+    if time.monotonic() >= deadline:
+        raise ValueError("native PR history work limit exceeded")
+
+
+@contextmanager
+def _native_witness_entries(rollout, identity, role, *, require_fork_boundary):
+    purpose = identity.get("witness_purpose")
+    if identity.get("witness_role") != role or role not in _NATIVE_WITNESS_ROLES.get(purpose, ()):
+        raise ValueError("native witness purpose or role unavailable")
+    if purpose == "click-test":
+        yield iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
+        return
+    if identity.get("history_scope") is not _NATIVE_PR_HISTORY_SCOPE or not require_fork_boundary:
+        raise ValueError("native PR history needs authenticated scope and a verified fork boundary")
+    deadline = time.monotonic() + _NATIVE_PR_SCAN_SECONDS
+    with _native_file_snapshot(rollout, identity, _NATIVE_PR_ROLLOUT_LIMIT) as (stream, size):
+        records = _native_pr_records(stream, size, deadline)
+        yield records
+        if next(records, None) is not None:
+            raise ValueError("native PR history was not verified through EOF")
 
 
 def _native_json(raw, limit):
@@ -951,7 +1011,6 @@ def _native_authored_witness(identity, agent, role, marker, line, started, ended
     start, end = _native_stamp(started), _native_stamp(ended)
     if start > end:
         raise ValueError("native observed time order invalid")
-    parent = identity["parent"]
     agent_wal = identity["main"].with_name(f"agent-{agent}.jsonl")
     main_data = _native_read(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
     main_rows = [_native_json(raw, 4_000_000) for raw in main_data.splitlines()]
@@ -963,7 +1022,14 @@ def _native_authored_witness(identity, agent, role, marker, line, started, ended
             or len(notes) != 1 or notes[0].get("event") != "check" or notes[0].get("note") != line
             or not _native_stamp(starts[0].get("at")) <= start <= end <= _native_stamp(notes[0].get("at"))):
         raise ValueError("native WAL witness missing or mismatched")
-    entries = iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
+    with _native_witness_entries(rollout, identity, role, require_fork_boundary=require_fork_boundary) as entries:
+        return _native_rollout_result(entries, identity, agent, role, line, start, _native_stamp(notes[0].get("at")),
+                                      in_scope, require_fork_boundary=require_fork_boundary, observe=observe)
+
+
+def _native_rollout_result(entries, identity, agent, role, line, start, noted, in_scope,
+                           *, require_fork_boundary, observe):
+    parent = identity["parent"]
     first = _native_json(next(entries), 4_000_000)
     meta = first.get("payload")
     first_at = _native_stamp(first.get("timestamp"))
@@ -981,7 +1047,7 @@ def _native_authored_witness(identity, agent, role, marker, line, started, ended
                 or meta.get("model_provider") != identity["child_provider"]
                 or meta.get("source") != identity["child_source"]):
             raise ValueError("native fork history boundary unavailable")
-    matches = []
+    matched = None
     for ordinal, raw in enumerate(entries, start=1):
         entry = _native_json(raw, 4_000_000)
         if cutoff is not None and ordinal == 1:
@@ -1012,10 +1078,12 @@ def _native_authored_witness(identity, agent, role, marker, line, started, ended
                 raise ValueError("native rollout message unavailable")
             for text in item["text"].splitlines():
                 if in_scope(text):
-                    matches.append((text, _native_stamp(entry.get("timestamp"))))
-    if len(matches) != 1 or matches[0][0] != line or matches[0][1] < _native_stamp(notes[0].get("at")):
+                    if matched is not None or text != line:
+                        raise ValueError("native assistant witness missing, mismatched or replayed")
+                    matched = _native_stamp(entry.get("timestamp"))
+    if matched is None or matched < noted:
         raise ValueError("native assistant witness missing, mismatched or replayed")
-    return matches[0][1]
+    return matched
 
 
 def _native_click_origin(repo):
