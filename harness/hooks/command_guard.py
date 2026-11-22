@@ -1728,7 +1728,264 @@ def reproducible_clone_refusal(path, policy=None, now=None):
         return 'could not verify (%s)' % type(error).__name__
 
 
-def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
+
+MAX_BACKED_IGNORED_ENTRIES = 512
+BACKED_CHECK_SECONDS = 12
+
+
+def _worktree_mount_clear(path):
+    """Mounted descendants, including same-device Linux bind mounts, are outside the backup route."""
+    if sys.platform == 'linux':
+        with open('/proc/self/mountinfo', encoding='utf-8', errors='surrogateescape') as source:
+            data = source.read((2 << 20) + 1)
+        if len(data) > 2 << 20:
+            return False
+        mounts = []
+        for line in data.splitlines():
+            fields = line.split()
+            if len(fields) < 10 or '-' not in fields[6:] or not fields[4].startswith('/'):
+                return False
+            mounts.append(re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4]))
+    elif sys.platform == 'darwin':
+        done = subprocess.run(['/sbin/mount'], capture_output=True, text=True, timeout=5,
+                              env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}, check=True)
+        mounts = [line.rsplit(' (', 1)[0].partition(' on ')[2] for line in done.stdout.splitlines()]
+        if any(not mount.startswith('/') for mount in mounts):
+            return False
+    else:
+        return False
+    return bool(mounts) and not any(mount == path or mount.startswith(path + os.sep) for mount in mounts)
+
+
+def _backed_stat(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _private_backup_state(home):
+    directory = state_dir(home)
+    try:
+        for folder in (directory.parent, directory):
+            info = folder.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                return False
+        for name in (MARKER_NAME, KEY_NAME):
+            info = (directory / name).lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o077):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _read_backed_leaf(path, expected, deadline, max_bytes):
+    """Re-hash only exact already-approved regular files, using pinned parent descriptors."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent = os.open(os.sep, flags)
+    try:
+        for part in os.path.dirname(path).split(os.sep)[1:]:
+            child = os.open(part, flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, 'rb') as source:
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or _backed_stat(os.fstat(fd)) != expected:
+                return None
+            size = expected[4]
+            if size > max_bytes:
+                return None
+            content = hashlib.sha256()
+            remaining = size
+            while remaining:
+                if time.monotonic() > deadline:
+                    return None
+                data = source.read(min(remaining, 1 << 20))
+                if not data:
+                    return None
+                remaining -= len(data)
+                content.update(data)
+            if source.read(1) or _backed_stat(os.fstat(fd)) != expected:
+                return None
+            return manifest_digest([(os.path.basename(path), size, content.hexdigest())])
+    finally:
+        os.close(parent)
+
+
+class _IgnoredBackups:
+    """Local signed leaf backups for the delegated worktree command, never the ordinary Git hook."""
+
+    def __init__(self, path, policy):
+        self.path = path
+        self.policy = policy
+        self.approvals = None
+        self.snapshot = {}
+        self.memberships = {}
+        self.leaves = {}
+        self.head = None
+
+    def remember_directory(self, path, deadline):
+        if time.monotonic() > deadline or os.path.realpath(path) != path:
+            return None
+        info = os.lstat(path)
+        identity = _backed_stat(info)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_dev != os.lstat(self.path).st_dev
+                or (path in self.snapshot and self.snapshot[path] != identity)):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if _backed_stat(os.fstat(fd)) != identity:
+                return None
+            names = []
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    names.append(entry.name)
+                    if (time.monotonic() > deadline or sum(map(len, self.memberships.values()))
+                            - len(self.memberships.get(path, ())) + len(names) > MAX_BACKED_IGNORED_ENTRIES):
+                        return None
+            if _backed_stat(os.fstat(fd)) != identity or _backed_stat(os.lstat(path)) != identity:
+                return None
+        finally:
+            os.close(fd)
+        names = tuple(sorted(names))
+        if path in self.memberships and self.memberships[path] != names:
+            return None
+        self.snapshot[path], self.memberships[path] = identity, names
+        return names
+
+    def cover(self, relative, seconds):
+        name = relative.rstrip('/')
+        path = os.path.join(self.path, name)
+        if not name or not path.startswith(self.path + os.sep) or os.path.realpath(path) != path:
+            return False
+        if self.approvals is None:
+            home = _pinned_home()
+            if (os.path.realpath(os.path.expanduser('~')) != home or not _worktree_mount_clear(self.path)
+                    or not _private_backup_state(home)):
+                return False
+            self.approvals = Approvals(home=home, compiled=Compiled(self.policy, home=home))
+        if not self.approvals.entries:
+            return False
+        device = os.lstat(self.path).st_dev
+        deadline = time.monotonic() + seconds
+        ancestor = os.path.dirname(path)
+        while True:
+            if self.remember_directory(ancestor, deadline) is None:
+                return False
+            if ancestor == self.path:
+                break
+            ancestor = os.path.dirname(ancestor)
+        pending = [path]
+        count = 0
+        while pending:
+            candidate = pending.pop()
+            if time.monotonic() > deadline or len(self.snapshot) >= MAX_BACKED_IGNORED_ENTRIES:
+                return False
+            info = os.lstat(candidate)
+            identity = _backed_stat(info)
+            if (info.st_dev != device or os.path.realpath(candidate) != candidate
+                    or os.path.basename(candidate).casefold() == '.git'):
+                return False
+            if stat.S_ISDIR(info.st_mode):
+                names = self.remember_directory(candidate, deadline)
+                if names is None or len(self.snapshot) + len(pending) + len(names) > MAX_BACKED_IGNORED_ENTRIES:
+                    return False
+                if 'HEAD' in names and 'objects' in names:
+                    return False  # bare repository
+                pending.extend(os.path.join(candidate, name) for name in names)
+            else:
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or not self.approvals.covers(candidate, backup_only=True)):
+                    return False
+                self.snapshot[candidate] = identity
+                self.leaves[candidate] = identity
+                count += 1
+        return count > 0
+
+    def idle(self):
+        exe = next((exe for exe in ('/usr/bin/lsof', '/usr/sbin/lsof')
+                    if os.path.realpath(exe) == exe and os.path.isfile(exe)), None)
+        if exe is None:
+            return False
+        deadline = time.monotonic() + BACKED_CHECK_SECONDS
+        paths = sorted(self.leaves)
+        for start in range(0, len(paths), 32):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            result = subprocess.run([exe, '-nP', '-t', '--', *paths[start:start + 32]],
+                                    env={'PATH': '/usr/bin:/usr/sbin:/bin', 'LC_ALL': 'C'},
+                                    capture_output=True, timeout=remaining)
+            if result.returncode != 1 or result.stdout or result.stderr:
+                return False
+        return True
+
+    def files_match_backup(self, deadline):
+        limit = int(self.approvals.limits['max_hash_bytes'])
+        remaining = limit
+        for path, identity in self.leaves.items():
+            if identity[4] > remaining:
+                return False
+            if _read_backed_leaf(path, identity, deadline, remaining) != self.approvals.backup_records[path][2]:
+                return False
+            remaining -= identity[4]
+        return True
+
+    def consume(self):
+        return self.approvals.consume(backup_leaves=self.leaves, backup_root=self.path, backup_scope=self)
+
+    def locked_scope_matches(self):
+        """Rebuild the full removal scope after activity checks and the approval-lock wait."""
+        deadline = time.monotonic() + BACKED_CHECK_SECONDS
+        cfg = dict(DEFAULT_POLICY['reproducible_clone'], **delegated_policy(self.policy)['reproducible_clone'])
+
+        def step(seconds):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError('locked removal scope check timed out')
+            return min(remaining, seconds * cfg['scale'])
+
+        try:
+            fresh = _IgnoredBackups(self.path, self.policy)
+            if (_git_out(self.path, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip() != self.head
+                    or any(entry and entry[0] != 'H' for entry in
+                           _git_out(self.path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'))
+                    or _linked_status_refusal(self.path, cfg, step, fresh)
+                    or fresh.snapshot != self.snapshot or fresh.memberships != self.memberships
+                    or fresh.leaves != self.leaves or fresh.approvals is None
+                    or fresh.approvals.backup_records != self.approvals.backup_records):
+                return False
+            # The final Git/status calls must not leave an unchecked membership change.
+            for path, names in tuple(fresh.memberships.items()):
+                if fresh.remember_directory(path, deadline) != names:
+                    return False
+            return fresh.snapshot == self.snapshot
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+
+
+def _linked_status_refusal(path, cfg, step, backups):
+    ignored_ok, ignored_top_ok = set(cfg['ignored_ok']), set(cfg['ignored_top_ok'])
+    status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignored=traditional',
+                             '--no-renames'], step(3.0))
+    for entry in filter(None, status.split('\x00')):
+        if not entry.startswith('!! '):
+            return 'the working tree is not clean (modified, staged or untracked files)'
+        name = entry[3:]
+        leaf = name.rstrip('/').rsplit('/', 1)[-1]
+        top_ignored = '/' not in name.rstrip('/')
+        if not (name.endswith('/') and (leaf in ignored_ok or (top_ignored and leaf in ignored_top_ok))):
+            if backups is not None and backups.cover(name, step(1.0)):
+                continue
+            return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
+        found = _nested_repo(os.path.join(path, name), limit=int(250000 * cfg.get('scale', 1.0)),
+                             deep=leaf not in ignored_ok, seconds=step(1.5))
+        if found == 'large':
+            return 'an ignored build directory is too large to check for nested repositories in time'
+        if found:
+            return 'an ignored build directory holds a nested repository'
+    return None
+
+def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, backups=None):
     """None only for a clean, registered linked worktree whose exact HEAD is live on an allowlisted remote.
 
     This deliberately does not call reproducible_clone_refusal(): a linked worktree has a .git file, shares its
@@ -1836,27 +2093,14 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None):
         for entry in _git_out(path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'):
             if entry and entry[0] != 'H':
                 return 'a tracked file is marked assume-unchanged, skip-worktree or otherwise hidden from git status'
-        ignored_ok, ignored_top_ok = set(cfg['ignored_ok']), set(cfg['ignored_top_ok'])
-        status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignored=traditional',
-                                 '--no-renames'], step(3.0))
-        for entry in filter(None, status.split('\x00')):
-            if entry.startswith('!! '):
-                name = entry[3:]
-                leaf = name.rstrip('/').rsplit('/', 1)[-1]
-                top_ignored = '/' not in name.rstrip('/')
-                if not (name.endswith('/') and (leaf in ignored_ok or (top_ignored and leaf in ignored_top_ok))):
-                    return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
-                found = _nested_repo(os.path.join(path, name), limit=int(250000 * scale), deep=leaf not in ignored_ok,
-                                     seconds=max(0.2, min(left(), 1.5 * scale)))  # inside the budget that is left
-                if found == 'large':
-                    return 'an ignored build directory is too large to check for nested repositories in time'
-                if found:
-                    return 'an ignored build directory holds a nested repository'
-            else:
-                return 'the working tree is not clean (modified, staged or untracked files)'
+        reason = _linked_status_refusal(path, cfg, step, backups)
+        if reason:
+            return reason
         head = _git_out(path, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip()
         if not re.fullmatch(r'[0-9a-f]{40,64}', head):
             return 'the worktree has no exact commit HEAD'
+        if backups is not None:
+            backups.head = head
         refs = {}
         for line in _git_out(path, ['for-each-ref', '--format=%(refname)%09%(objectname)'],
                              step(2.0)).splitlines():
@@ -2245,16 +2489,18 @@ def delegated_policy(base=None):
     return dict(base, reproducible_clone=merged)
 
 
-def verify_worktree(path, authenticated=False, policy=None):
+def verify_worktree(path, authenticated=False, policy=None, *, _backups=None):
     """Read-only verdict as a dict {removable, reason, head, repo, urls, verifier}. `authenticated` reads the remote with
     this host's own credentials (authenticated_remote_refs) instead of the guard's anonymous ls-remote."""
     report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'repo': None, 'urls': {},
               'verifier': VERIFIER_VERSION}
     reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
+    backups = _backups or _IgnoredBackups(path, policy or DEFAULT_POLICY)
     if reason is None:
         effective = delegated_policy(policy)
         reason = linked_worktree_remove_refusal(path, os.sep, effective,
-                                                remote_ls=authenticated_remote_refs if authenticated else None)
+                                                remote_ls=authenticated_remote_refs if authenticated else None,
+                                                backups=backups)
         try:
             report['head'] = _git_out(path, ['rev-parse', '--verify', 'HEAD'], 2.0).strip()
             report['repo'], report['urls'] = _primary_and_urls(path)
@@ -2277,6 +2523,14 @@ def verify_worktree(path, authenticated=False, policy=None):
             reason = ('could not check for processes using the worktree: %d process(es) of this user cannot be inspected '
                       'and may be using it (%s%s); let them end, then retry' % (len(scan['unreadable']), named,
                                                                               ' and %d more' % more if more > 0 else ''))
+    if reason is None and backups.leaves:
+        try:
+            if report['head'] != backups.head or not backups.idle():
+                reason = 'the backed ignored paths or the verified HEAD may be in use or changed'
+            else:
+                report['approved_ignored_count'] = len(backups.leaves)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            reason = 'the backed ignored paths could not be checked for open files'
     report['reason'] = reason
     report['removable'] = reason is None and bool(report['repo']) and bool(report['head'])
     return report
@@ -2298,6 +2552,42 @@ def _worktree_audit(record):
         pass
 
 
+def _consume_worktree_backups(path, previous, policy, directory):
+    """Check the same scope as late as possible; no partial consumption."""
+    fresh = _IgnoredBackups(path, policy or DEFAULT_POLICY)
+    fresh.head = previous.head
+    cfg = delegated_policy(policy)['reproducible_clone']
+    cfg = dict(DEFAULT_POLICY['reproducible_clone'], **cfg)
+    deadline = time.monotonic() + BACKED_CHECK_SECONDS
+
+    def step(seconds):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError('backed ignored recheck timed out')
+        return min(remaining, seconds * cfg['scale'])
+
+    try:
+        if (not previous.files_match_backup(deadline)
+                or _git_out(path, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip() != previous.head
+                or any(entry and entry[0] != 'H' for entry in
+                       _git_out(path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'))
+                or _linked_status_refusal(path, cfg, step, fresh)
+                or fresh.snapshot != previous.snapshot or fresh.approvals is None
+                or fresh.approvals.backup_records != previous.approvals.backup_records
+                or not fresh.idle()
+                or not _same_worktree_directory(path, directory)
+                or not fresh.consume()):
+            return False
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def _same_worktree_directory(path, expected):
+    current = os.lstat(path)
+    return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == expected
+
+
 def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
     compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
@@ -2307,7 +2597,8 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
     except OSError as error:
         return {'path': path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION,
                 'reason': 'cannot stat the path (%s)' % type(error).__name__}
-    report = verify_worktree(path, authenticated, policy)
+    backups = _IgnoredBackups(path, policy or DEFAULT_POLICY)
+    report = verify_worktree(path, authenticated, policy, _backups=backups)
     report['removed'] = False
     if not report['removable']:
         return report
@@ -2326,6 +2617,9 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
         free_before = shutil.disk_usage(home).free
     except OSError:
         free_before = None
+    if backups.leaves and not _consume_worktree_backups(path, backups, policy, (before.st_dev, before.st_ino)):
+        report.update(removable=False, reason='backed ignored paths changed, could not be checked, or lost approval')
+        return report
     _worktree_audit({'event': 'remove', 'path': path, 'head': report['head'], 'repo': report['repo']})
     problem = None
     try:
@@ -7916,6 +8210,7 @@ class Approvals:
         self.used = {}
         self.used_archive = {}  # path -> archive URL, for the delete receipt (goodqa#15068)
         self.no_backup = set()  # real paths covered by a no-backup entry: decide() then requires a sole delete
+        self.backup_records = {}
 
     def __call__(self, path):
         return self.covers(path)
@@ -7930,7 +8225,7 @@ class Approvals:
         except (KeyError, TypeError, ValueError):
             return False
 
-    def covers(self, path):
+    def covers(self, path, *, backup_only=False):
         if not self.entries:
             return False
         try:
@@ -7938,9 +8233,16 @@ class Approvals:
         except (OSError, ValueError):
             return False
         for entry in self.entries:
-            if not isinstance(entry, dict) or not self._valid(entry):
+            if not isinstance(entry, dict):
                 continue
             if os.path.normpath(str(entry.get('path'))) != real:
+                continue
+            if not self._valid(entry):
+                continue
+            if backup_only and (entry.get('path') != path or real != path or entry.get('kind') not in (None, ARCHIVE_KIND)
+                                or not re.fullmatch(r'[a-f0-9]{16}', str(entry.get('nonce', '')))
+                                or not re.fullmatch(r'[a-f0-9]{64}', str(entry.get('manifest_sha256', '')))
+                                or not isinstance(entry.get('remote'), str) or ':' not in entry['remote']):
                 continue
             try:
                 if list(_identity(real)) != list(entry.get('identity') or []):
@@ -7958,10 +8260,12 @@ class Approvals:
             self.used[real] = entry.get('nonce')
             if entry.get('archive'):
                 self.used_archive[real] = entry.get('archive')
+            if backup_only:
+                self.backup_records[real] = (entry['nonce'], entry['mac'], entry['manifest_sha256'])
             return True
         return False
 
-    def consume(self):
+    def consume(self, *, backup_leaves=None, backup_root=None, backup_scope=None):
         """Remove every used entry under an exclusive lock. True when all of them were still present."""
         if not self.used:
             return True
@@ -7971,12 +8275,26 @@ class Approvals:
         except ImportError:  # pragma: no cover - non-POSIX: refuse rather than allow a reusable approval
             return False
         try:
-            fd = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT, 0o600)
+            nofollow = os.O_NOFOLLOW if backup_leaves is not None else 0
+            fd = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT | nofollow, 0o600)
         except OSError:
             return False
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             entries, key = load_marker(self.home)
+            if backup_leaves is not None:
+                lock_info = os.fstat(fd)
+                if (not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid()
+                        or lock_info.st_nlink != 1 or lock_info.st_mode & 0o077
+                        or not _private_backup_state(self.home)
+                        or not self._recheck_backups(entries, key, backup_leaves)
+                        or not backup_root or not _worktree_mount_clear(backup_root)
+                        or not isinstance(backup_scope, _IgnoredBackups) or backup_scope.path != backup_root
+                        or backup_scope.leaves != backup_leaves or backup_scope.approvals is not self
+                        or not backup_scope.locked_scope_matches()
+                        or load_marker(self.home) != (entries, key)
+                        or not self._recheck_backups(entries, key, backup_leaves)):
+                    return False
             wanted = set(self.used.values())
             remaining = [e for e in entries if not (isinstance(e, dict) and e.get('nonce') in wanted)]
             if len(entries) - len(remaining) != len(wanted):
@@ -8003,9 +8321,43 @@ class Approvals:
         return True
 
 
+    def _recheck_backups(self, entries, key, leaves):
+        if leaves.keys() != self.used.keys() or len(set(self.used.values())) != len(leaves):
+            return False
+        fresh = Approvals(home=self.home)
+        fresh.entries, fresh.key, fresh.limits = entries, key, self.limits
+        for path, identity in leaves.items():
+            if not fresh.covers(path, backup_only=True) or _backed_stat(os.lstat(path)) != identity:
+                return False
+        if fresh.backup_records != self.backup_records:
+            return False
+        # A long read or an expiry boundary does not make stale authority available.
+        fresh.now = time.time()
+        used = set(self.used.values())
+        return all(fresh._valid(entry) for entry in entries if isinstance(entry, dict) and entry.get('nonce') in used)
+
+
 def marker_covers(path, home=None, now=None, compiled=None):
     """Read-only check (used by `check`): does a valid approval cover exactly this path?"""
     return Approvals(home=home, compiled=compiled, now=now).covers(path)
+
+
+def revoke_delete(home=None):
+    """Serialize revocation with the issuer and every consumer of a backup marker."""
+    import fcntl
+    sd = state_dir(home)
+    if not sd.is_dir():
+        return
+    fd = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            os.unlink(str(sd / MARKER_NAME))
+        except FileNotFoundError:
+            pass
+        audit('revoked', {}, home=home)
+    finally:
+        os.close(fd)
 
 
 class VerifyResult:
@@ -9777,10 +10129,10 @@ def main(argv=None):
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':
         try:
-            os.unlink(str(state_dir() / MARKER_NAME))
-        except FileNotFoundError:
-            pass
-        audit('revoked', {})
+            revoke_delete()
+        except (OSError, ImportError):
+            print('revoke-delete refused: the approval lock is unavailable', file=sys.stderr)
+            return 2
         print('{"status": "REVOKED"}')
         return 0
     if args.cmd == 'scan-wal':
