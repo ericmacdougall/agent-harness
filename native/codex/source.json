@@ -2,7 +2,7 @@
   "upstreamRepository": "https://github.com/openai/codex.git",
   "upstreamTag": "rust-v0.169.0",
   "upstreamCommit": "d32063f96c2dff1dc96af839b3952abb6acfeda4",
-  "patchSha256": "a903ab736d0a06a5460fcdbfbbf75f8274228a00246cc39f7991c8b5f872b8eb",
+  "patchSha256": "90141e64b41ec86c31c5a320535c4cb9300aab29894117544a44a746386d9c1f",
   "toolchain": "1.95.0",
   "target": "x86_64-unknown-linux-gnu",
   "receiptProtocol": "codex-response-model-observation-v1"

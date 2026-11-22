@@ -150,7 +150,7 @@ index b4872ba..73fa5d2 100644
 -pub(crate) use responses::process_responses_event;
  pub use responses::spawn_response_stream;
 diff --git a/codex-rs/codex-api/src/sse/responses.rs b/codex-rs/codex-api/src/sse/responses.rs
-index 9c12aae..502c557 100644
+index 9c12aae..f9620e5 100644
 --- a/codex-rs/codex-api/src/sse/responses.rs
 +++ b/codex-rs/codex-api/src/sse/responses.rs
 @@ -15,12 +15,19 @@ use codex_protocol::ResponseUsageMetadata;
@@ -193,7 +193,7 @@ index 9c12aae..502c557 100644
          )
          .await;
      });
-@@ -296,6 +309,223 @@ impl ResponsesStreamEvent {
+@@ -296,6 +309,224 @@ impl ResponsesStreamEvent {
      }
  }
  
@@ -312,6 +312,9 @@ index 9c12aae..502c557 100644
 +    fn bind_id(&mut self, id: &str) -> bool {
 +        if id.is_empty()
 +            || id.len() > 128
++            || !id
++                .bytes()
++                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.:".contains(&byte))
 +            || self.response_id.as_deref().is_some_and(|known| known != id)
 +        {
 +            self.invalid = true;
@@ -326,7 +329,10 @@ index 9c12aae..502c557 100644
 +    fn observe_event(&mut self, kind: &str, raw: &str) {
 +        if !matches!(
 +            kind,
-+            "response.created" | "response.metadata" | "response.completed"
++            "response.created"
++                | "response.metadata"
++                | "codex.response.metadata"
++                | "response.completed"
 +        ) {
 +            return;
 +        }
@@ -351,12 +357,7 @@ index 9c12aae..502c557 100644
 +        }
 +        let id = body_id_text.as_deref().or(wire_id_text.as_deref());
 +        match kind {
-+            "response.created" => {
-+                if let Some(id) = id {
-+                    self.bind_id(id);
-+                }
-+            }
-+            "response.metadata" => {
++            "response.created" | "response.metadata" | "codex.response.metadata" => {
 +                // Metadata without a response ID can belong to a prior request on the same socket.
 +                if id.is_some_and(|id| self.bind_id(id)) {
 +                    self.observe_headers(event.headers.as_ref());
@@ -417,7 +418,7 @@ index 9c12aae..502c557 100644
  fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
      let headers = value.as_object()?;
      headers.iter().find_map(|(name, value)| {
-@@ -505,6 +735,7 @@ pub fn process_responses_event(
+@@ -505,6 +736,7 @@ pub fn process_responses_event(
                              response_id: resp.id,
                              token_usage: resp.usage.map(Into::into),
                              usage_metadata: resp.usage_metadata,
@@ -425,7 +426,7 @@ index 9c12aae..502c557 100644
                              end_turn: if interrupted {
                                  Some(false)
                              } else {
-@@ -575,6 +806,7 @@ pub async fn process_sse(
+@@ -575,6 +807,7 @@ pub async fn process_sse(
          idle_timeout,
          telemetry,
          SafetyBufferingTreatment::default(),
@@ -433,7 +434,7 @@ index 9c12aae..502c557 100644
      )
      .await;
  }
-@@ -585,6 +817,7 @@ async fn process_sse_with_treatment(
+@@ -585,6 +818,7 @@ async fn process_sse_with_treatment(
      idle_timeout: Duration,
      telemetry: Option<Arc<dyn SseTelemetry>>,
      safety_buffering_treatment: SafetyBufferingTreatment,
@@ -441,7 +442,7 @@ index 9c12aae..502c557 100644
  ) {
      let mut stream = stream.eventsource();
      let mut response_error: Option<ApiError> = None;
-@@ -633,6 +866,7 @@ async fn process_sse_with_treatment(
+@@ -633,6 +867,7 @@ async fn process_sse_with_treatment(
          let event: ResponsesStreamEvent = match serde_json::from_str(&sse.data) {
              Ok(event) => event,
              Err(e) => {
@@ -449,7 +450,7 @@ index 9c12aae..502c557 100644
                  debug!(
                      error_category = ?e.classify(),
                      error_line = e.line(),
-@@ -664,7 +898,7 @@ async fn process_sse_with_treatment(
+@@ -664,7 +899,7 @@ async fn process_sse_with_treatment(
              }
          }
  
@@ -458,7 +459,7 @@ index 9c12aae..502c557 100644
              Ok(Some(event)) => {
                  let is_completed = matches!(event, ResponseEvent::Completed { .. });
                  if tx_event.send(Ok(event)).await.is_err() {
-@@ -778,6 +1012,113 @@ mod tests {
+@@ -778,6 +1013,148 @@ mod tests {
          out
      }
  
@@ -466,6 +467,10 @@ index 9c12aae..502c557 100644
 +    fn response_model_observation_requires_bound_unambiguous_provider_metadata() {
 +        let terminal = r#"{"type":"response.completed","response":{"id":"resp-1"}}"#;
 +        let bound = r#"{"type":"response.metadata","response_id":"resp-1","headers":{"X-OpenAI-Model":"gpt-6-astra"}}"#;
++        let bound_codex = r#"{"type":"codex.response.metadata","response_id":"resp-1","headers":{"OpenAI-Model":"gpt-6-astra"}}"#;
++        let created = r#"{"type":"response.created","response":{"id":"resp-1","headers":{"openai-model":"gpt-6-astra"}}}"#;
++        let other_created = r#"{"type":"response.created","response":{"id":"resp-1","headers":{"openai-model":"gpt-6-sol"}}}"#;
++        let other_codex = r#"{"type":"codex.response.metadata","response_id":"resp-1","headers":{"OpenAI-Model":"gpt-6-sol"}}"#;
 +        let matching_aliases = r#"{"type":"response.completed","response":{"id":"resp-1","headers":{"openai-model":"gpt-6-astra","x-openai-model":"gpt-6-astra"}}}"#;
 +        let body =
 +            r#"{"type":"response.completed","response":{"id":"resp-1","model":"gpt-6-astra"}}"#;
@@ -477,6 +482,18 @@ index 9c12aae..502c557 100644
 +                Some(ResponseModelSource::ResponseHeader),
 +            ),
 +            (
++                Some(bound_codex),
++                terminal,
++                Some(ResponseModelSource::ResponseHeader),
++            ),
++            (
++                Some(created),
++                terminal,
++                Some(ResponseModelSource::ResponseHeader),
++            ),
++            (Some(other_created), matching_aliases, None),
++            (Some(other_codex), matching_aliases, None),
++            (
 +                None,
 +                matching_aliases,
 +                Some(ResponseModelSource::ResponseHeader),
@@ -485,6 +502,25 @@ index 9c12aae..502c557 100644
 +            (
 +                Some(bound),
 +                r#"{"type":"response.completed","response":{"id":"resp-2"}}"#,
++                None,
++            ),
++            (
++                Some(
++                    r#"{"type":"codex.response.metadata","headers":{"openai-model":"gpt-6-astra"}}"#,
++                ),
++                terminal,
++                None,
++            ),
++            (
++                Some(
++                    r#"{"type":"response.created","response_id":"resp-2","response":{"id":"resp-1"}}"#,
++                ),
++                matching_aliases,
++                None,
++            ),
++            (
++                None,
++                r#"{"type":"response.completed","response":{"id":"resp/1","headers":{"openai-model":"gpt-6-astra"}}}"#,
 +                None,
 +            ),
 +            (
@@ -572,7 +608,7 @@ index 9c12aae..502c557 100644
      fn idle_timeout() -> Duration {
          Duration::from_millis(1000)
      }
-@@ -882,6 +1223,7 @@ mod tests {
+@@ -882,6 +1259,7 @@ mod tests {
                  token_usage,
                  usage_metadata,
                  end_turn,
@@ -580,7 +616,7 @@ index 9c12aae..502c557 100644
              }) => {
                  assert_eq!(response_id, "resp1");
                  assert!(token_usage.is_none());
-@@ -1080,6 +1422,7 @@ mod tests {
+@@ -1080,6 +1458,7 @@ mod tests {
                  token_usage,
                  usage_metadata,
                  end_turn,
@@ -588,7 +624,7 @@ index 9c12aae..502c557 100644
              }) => {
                  assert_eq!(response_id, "resp1");
                  assert!(token_usage.is_none());
-@@ -1676,6 +2019,7 @@ mod tests {
+@@ -1676,6 +2055,7 @@ mod tests {
                  token_usage: None,
                  usage_metadata: None,
                  end_turn: None,
@@ -596,7 +632,7 @@ index 9c12aae..502c557 100644
              } if response_id == "resp-1"
          );
      }
-@@ -1717,6 +2061,7 @@ mod tests {
+@@ -1717,6 +2097,7 @@ mod tests {
                  token_usage: None,
                  usage_metadata: None,
                  end_turn: None,
@@ -604,7 +640,7 @@ index 9c12aae..502c557 100644
              } if response_id == "resp-1"
          );
      }
-@@ -1753,6 +2098,7 @@ mod tests {
+@@ -1753,6 +2134,7 @@ mod tests {
                  token_usage: None,
                  usage_metadata: None,
                  end_turn: None,
@@ -612,7 +648,7 @@ index 9c12aae..502c557 100644
              } if response_id == "resp-1"
          );
      }
-@@ -1789,6 +2135,7 @@ mod tests {
+@@ -1789,6 +2171,7 @@ mod tests {
                  token_usage: None,
                  usage_metadata: None,
                  end_turn: None,
@@ -789,7 +825,7 @@ index 4aa7e07..d0cc16c 100644
                  .await;
                  sess.update_token_usage_info(
 diff --git a/codex-rs/core/src/compact_remote_v2.rs b/codex-rs/core/src/compact_remote_v2.rs
-index 5656fb4..1b49f24 100644
+index 5656fb4..2dea07b 100644
 --- a/codex-rs/core/src/compact_remote_v2.rs
 +++ b/codex-rs/core/src/compact_remote_v2.rs
 @@ -442,6 +442,7 @@ async fn collect_compaction_output(
@@ -816,6 +852,14 @@ index 5656fb4..1b49f24 100644
              end_turn: Some(true),
          })]);
          let result = collect_compaction_output(
+@@ -1485,6 +1488,7 @@ mod tests {
+                     amount: Some("0.125".to_string()),
+                     metadata: Some(serde_json::json!({ "extra": { "label": "example" } })),
+                 }),
++                model_observation: None,
+                 end_turn: Some(true),
+             }),
+         ]);
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
 index ce93060..0088966 100644
 --- a/codex-rs/core/src/session/mod.rs
