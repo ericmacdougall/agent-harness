@@ -5,6 +5,7 @@ read or written.
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,18 @@ class Acquire(Base):
         self.assertEqual((p / "ignored.txt").read_text(), "local evidence")
         self.assertEqual(tc.git(str(p), "rev-parse", "HEAD")[1], first["commit"])
 
+    def test_ref_advance_preserves_tracked_wal(self):
+        (self.repo / "WAL.md").write_text("original evidence")
+        sh("git", "add", "WAL.md", cwd=self.repo)
+        sh("git", "commit", "-qm", "track WAL", cwd=self.repo)
+        first = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))
+        (self.repo / "WAL.md").write_text("different evidence")
+        sh("git", "commit", "-qam", "change WAL", cwd=self.repo)
+        r = self.run_acquire("--require-reuse")
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertIn("tracked protected logs or WAL evidence", r.stdout)
+        self.assertEqual((Path(first["path"]) / "WAL.md").read_text(), "original evidence")
+
     def test_reuse_refuses_an_unregistered_managed_path(self):
         first = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))
         idx = Path(tc.index_path())
@@ -220,6 +233,43 @@ class Acquire(Base):
         r = subprocess.run([sys.executable, str(HOOKS / "copy_hygiene.py"), "acquire", "--repo", str(self.repo),
                             "--key", "pr-3"], capture_output=True, text=True, env=dict(os.environ, HARNESS_COPY_HYGIENE_MIN_FREE_GB="0"))
         self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+
+    def test_group_interrupt_keeps_lease_when_payload_ignores_signal(self):
+        path = Path(tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))["path"])
+        ready, release = self.home / "group-ready", self.home / "group-release"
+        code = (
+            "import signal,sys,time; from pathlib import Path; "
+            "signal.signal(signal.SIGINT,signal.SIG_IGN); "
+            "Path(sys.argv[1]).touch(); deadline=time.monotonic()+10; "
+            "exec('while not Path(sys.argv[2]).exists() and time.monotonic()<deadline: time.sleep(.01)')"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, str(HOOKS / "copy_hygiene.py"), "acquire", "--repo", str(self.repo), "--key", "leased",
+             "--require-reuse", "--run", sys.executable, "-c", code, str(ready), str(release)],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, HARNESS_COPY_HYGIENE_MIN_FREE_GB="0"))
+        try:
+            deadline = time.monotonic() + 4
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists())
+            os.killpg(proc.pid, signal.SIGINT)  # Only the isolated process group above.
+            self.assertIn(proc.wait(timeout=4), (130, -signal.SIGINT))
+            deadline = time.monotonic() + 0.8
+            while time.monotonic() < deadline:
+                r = self.run_acquire("--require-reuse")
+                self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertTrue(path.exists())
+        finally:
+            release.touch()
+            if proc.poll() is None:
+                proc.wait(timeout=12)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            r = self.run_acquire("--require-reuse")
+            if r.returncode == 0:
+                break
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_two_worktrees_of_one_repo_share_the_copy_and_bad_keys_are_refused(self):
         wt = self.home / "repos" / "proj-wt"
@@ -453,6 +503,51 @@ class Reap(OldCopies, Base):
             item.write_text("local content")
             self.assertEqual(self.enabled_reap()[str(path)], "kept: tracked, untracked or ignored changes")
             self.assertEqual(item.read_text(), "local content")
+
+    def test_pushed_tracked_wal_is_kept(self):
+        wal = self.repo / "evidence" / "WAL.md"
+        wal.parent.mkdir()
+        wal.write_text("important tracked evidence")
+        sh("git", "add", ".", cwd=self.repo)
+        sh("git", "commit", "-qm", "track evidence", cwd=self.repo)
+        sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.repo)
+        path = Path(tc.acquire(str(self.repo), "pr-wal", cfg=self.cfg(min_free_gb=0))["path"])
+        self.assertEqual(self.enabled_reap()[str(path)], "kept: tracked protected logs or WAL evidence")
+        self.assertEqual((path / "evidence" / "WAL.md").read_text(), "important tracked evidence")
+
+    def test_reaper_refuses_head_advanced_during_service_scan(self):
+        path = Path(tc.acquire(str(self.repo), "pr-race", cfg=self.cfg(min_free_gb=0))["path"])
+        original_scan = tc.protected_scan
+
+        def later_scan(*args, **kwargs):
+            if kwargs.get("fresh"):
+                (path / "new.txt").write_text("unpublished")
+                sh("git", "add", "new.txt", cwd=path)
+                sh("git", "commit", "-qm", "private commit", cwd=path)
+            return original_scan(*args, **kwargs)
+
+        with mock.patch.object(tc, "remove_copy") as remove, \
+                mock.patch.object(tc, "protected_scan", side_effect=later_scan):
+            report = self.enabled_reap()
+        remove.assert_not_called()
+        self.assertIn("changed", report[str(path)])
+        self.assertEqual((path / "new.txt").read_text(), "unpublished")
+
+    def test_reaper_refuses_index_changed_during_service_scan(self):
+        path = Path(tc.acquire(str(self.repo), "pr-index", cfg=self.cfg(min_free_gb=0))["path"])
+        original_scan = tc.protected_scan
+
+        def later_scan(*args, **kwargs):
+            if kwargs.get("fresh"):
+                sh("git", "update-index", "--assume-unchanged", "a.txt", cwd=path)
+            return original_scan(*args, **kwargs)
+
+        with mock.patch.object(tc, "remove_copy") as remove, \
+                mock.patch.object(tc, "protected_scan", side_effect=later_scan):
+            report = self.enabled_reap()
+        remove.assert_not_called()
+        self.assertIn("identity or activity changed", report[str(path)])
+        self.assertTrue(path.exists())
 
     def test_fresh_copy_with_preserved_mtimes_is_not_idle(self):
         work = self.home / ".agent-harness" / "work" / "s3"

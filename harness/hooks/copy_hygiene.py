@@ -70,6 +70,7 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -375,6 +376,10 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None, *
                 if cur != sha:
                     if changes := copy_changes(path):
                         return dict(stale, commit=cur, error=f"{changes}; checkout left at its previous commit")
+                    rc, changed = git(path, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+                                      "--no-textconv", "--diff-filter=DMRT", cur, sha, "--")
+                    if rc or any(protected_git_path(p) for p in changed.rstrip("\0").split("\0") if p):
+                        return dict(stale, commit=cur, error="tracked protected logs or WAL evidence may change")
                     rc, local = git(path, "log", "--oneline", "-1", "HEAD", "--not", "--remotes", "--branches")
                     if rc or local:
                         return dict(stale, commit=cur, error="could not prove previous HEAD is saved on a branch")
@@ -1582,15 +1587,33 @@ def in_use(path: str) -> bool:
         return True
 
 
-def deletable(path: str) -> "tuple[bool, str]":
+def protected_git_path(path: str) -> bool:
+    parts = path.casefold().split("/")
+    if any(p in {"wal", "wals", "codex-wals"} or p.startswith(("wal-", "wal_", "wal."))
+           or p.endswith(".wal.jsonl") for p in parts):
+        return True
+    if parts[-1] == "main.jsonl":
+        return True
+    if any(p in {".claude", ".codex"} for p in parts[:-1]):
+        return any(p in {"projects", "sessions", "transcripts", "archived_sessions", "file-history", "logs"}
+                   or p.startswith("history") for p in parts[1:])
+    return parts[-1].startswith(("claude-", "codex-")) and parts[-1].endswith((".log", ".jsonl"))
+
+
+def deletable(path: str, head: str = "HEAD") -> "tuple[bool, str]":
     if not os.path.exists(os.path.join(path, ".git")):
         return False, "not a git checkout (kept; check by hand)"
     if changes := copy_changes(path):
         return False, changes
+    rc, tracked = git(path, "ls-files", "-z")
+    if rc:
+        return False, "could not check tracked protection"
+    if any(protected_git_path(p) for p in tracked.rstrip("\0").split("\0") if p):
+        return False, "tracked protected logs or WAL evidence"
     rc, stash = git(path, "stash", "list")
     if rc != 0 or stash:
         return False, "has a stash"
-    rc, remote = git(path, "branch", "-r", "--contains", "HEAD")
+    rc, remote = git(path, "branch", "-r", "--contains", head)
     if rc != 0 or not remote.strip():
         return False, "HEAD is on no remote ref"
     rc, local = git(path, "log", "--oneline", "-1", "--branches", "--not", "--remotes")
@@ -1601,7 +1624,42 @@ def deletable(path: str) -> "tuple[bool, str]":
     return True, "clean and pushed"
 
 
-def remove_copy(path: str, prot: "dict | None" = None) -> "tuple[bool, str]":
+def copy_snapshot(path: str):
+    """Bind retirement to the verified physical directory, registration, HEAD, tree and index."""
+    rec = load_index().get(path)
+    if not isinstance(rec, dict) or not isinstance(rec.get("repo"), str):
+        return None
+    rc, common = git(rec["repo"], "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc:
+        return None
+    common = os.path.realpath(common)
+    head = managed_head(path, os.path.basename(path), common)
+    if head is None:
+        return None
+    rc, tree = git(path, "rev-parse", "--verify", head + "^{tree}")
+    if rc or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", tree):
+        return None
+    rc, index = git(path, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    if (rc or os.path.dirname(os.path.dirname(index)) != os.path.join(common, "worktrees")
+            or os.path.realpath(index) != index):
+        return None
+    source = os.lstat(path)
+    digest = hashlib.sha256()
+    fd = os.open(index, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        for data in iter(lambda: f.read(1 << 20), b""):
+            digest.update(data)
+        current = os.lstat(index)
+        index_identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if index_identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns):
+            return None
+    return (common, head, tree, source.st_dev, source.st_ino, index, index_identity, digest.digest())
+
+
+def remove_copy(path: str, prot: "dict | None" = None, *, expected=None) -> "tuple[bool, str]":
     try:
         if prot is None:
             prot, errors = protected_scan()
@@ -1610,13 +1668,9 @@ def remove_copy(path: str, prot: "dict | None" = None) -> "tuple[bool, str]":
         hit = protecting(path, prot)
         if hit:
             return False, f"protected: a service uses {hit[0]}"
-        rec = load_index().get(path)
-        if not isinstance(rec, dict) or not isinstance(rec.get("repo"), str):
-            return False, "managed registration unknown"
-        rc, common = git(rec["repo"], "rev-parse", "--path-format=absolute", "--git-common-dir")
-        if rc or managed_head(path, os.path.basename(path), os.path.realpath(common)) is None:
-            return False, "managed registration changed"
-        rc, out = git(common, "worktree", "remove", path)
+        if expected is None or copy_snapshot(path) != expected:
+            return False, "managed checkout identity changed or is unverified"
+        rc, out = git(expected[0], "worktree", "remove", path)
         return rc == 0, (out[-200:] if rc else "git worktree remove")
     except OSError as e:
         return False, f"{type(e).__name__}: {str(e)[:160]}"
@@ -1627,25 +1681,26 @@ def retire_copy(path: str, cfg: dict, planned_activity: float) -> str:
         return "kept: legacy or unmanaged copy; report only"
     try:
         with copy_lock(path):
-            before = os.lstat(path)
             if last_activity(path, load_index()) > planned_activity:
                 return "kept: copy was used after planning"
-            rec = load_index().get(path)
-            if not isinstance(rec, dict) or not isinstance(rec.get("repo"), str):
-                return "kept: managed registration unknown"
-            rc, common = git(rec["repo"], "rev-parse", "--path-format=absolute", "--git-common-dir")
-            if rc or managed_head(path, os.path.basename(path), os.path.realpath(common)) is None:
-                return "kept: managed registration changed"
-            ok, why = deletable(path)
+            expected = copy_snapshot(path)
+            if expected is None:
+                return "kept: managed checkout identity unverified"
+            head = expected[1]
+            ok, why = deletable(path, head)
             if not ok:
                 return f"kept: {why}"
             prot, errors = protected_scan(cfg, fresh=True)
             if errors or protecting(path, prot):
                 return "kept: service protection changed or is unknown"
-            after = os.lstat(path)
-            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
-                return "kept: managed directory identity changed"
-            done, why = remove_copy(path, prot)
+            if copy_snapshot(path) != expected or last_activity(path, load_index()) > planned_activity:
+                return "kept: managed checkout identity or activity changed"
+            ok, why = deletable(path, head)
+            if not ok:
+                return f"kept: {why}"
+            if last_activity(path, load_index()) > planned_activity:
+                return "kept: copy was used after planning"
+            done, why = remove_copy(path, prot, expected=expected)
             return "removed" if done else f"remove failed: {why}"
     except BlockingIOError:
         return "kept: managed copy lease is currently held"
@@ -1789,6 +1844,10 @@ def supervise_acquire(args) -> int:
     """
     pid = os.fork()
     if pid == 0:
+        # Caught handlers reset on exec, so a normally behaved payload still gets the
+        # foreground signal. The supervisor keeps waiting if the payload handles it.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, lambda *_: None)
         try:
             code = acquire_cli(args)
         except KeyboardInterrupt:
@@ -1797,7 +1856,10 @@ def supervise_acquire(args) -> int:
             print("leased acquire failed", file=sys.stderr, flush=True)
             code = 1
         os._exit(code)
-    _, status = os.waitpid(pid, 0)
+    try:
+        _, status = os.waitpid(pid, 0)
+    except KeyboardInterrupt:
+        return 130
     code = os.waitstatus_to_exitcode(status)
     return code if code >= 0 else 128 - code
 
