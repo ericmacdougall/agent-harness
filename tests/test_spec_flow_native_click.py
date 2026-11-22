@@ -24,14 +24,14 @@ class NativeClick(unittest.TestCase):
             path.chmod(0o700)
         self.sha = hashlib.sha256(self.report.read_bytes()).hexdigest()
         self.final = {'timestamp':'2026-11-22T19:00:00Z','type':'response_item',
-                      'payload':{'type':'message','role':'assistant','channel':'final',
+                      'payload':{'type':'message','id':'owned-final','role':'assistant','channel':'final',
                                  'content':[{'type':'output_text','text':'REPORT_SHA256 '+self.sha}]}}
         self.write_final()
         self.db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(self.rollout), REVIEWER))
         self.db.commit()
 
     def write_final(self):
-        self.rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':REVIEWER}})+'\n'+json.dumps(self.final)+'\n')
+        self.rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':REVIEWER}})+'\n'+json.dumps({'type':'event_msg','payload':{'type':'item_completed','thread_id':REVIEWER,'item':{'type':'AgentMessage','phase':'final_answer','id':'owned-final'}}})+'\n'+json.dumps(self.final)+'\n')
         self.rollout.chmod(0o600)
 
     def get(self, sha=None):
@@ -57,6 +57,21 @@ class NativeClick(unittest.TestCase):
         record = session.post.call_args.args[2]
         self.assertEqual(record['tester']['family'],'codex')
         self.assertEqual(record['pass_source'],'report+codex-tester-final-sha256')
+
+    def test_actual_forked_rollout_final_phase_binds_only_own_completion(self):
+        self.fixture()
+        self.final['payload'].pop('channel')
+        self.final['payload']['phase'] = 'final_answer'
+        self.write_final()
+        lines = self.rollout.read_text().splitlines()
+        lines.insert(1, json.dumps({'type':'session_meta','payload':{'id':fixtures.PARENT}}))
+        self.rollout.write_text('\n'.join(lines)+'\n')
+        self.assertEqual(self.get()['identity'], REVIEWER)
+        event = json.loads(lines[2]);event['payload']['thread_id'] = fixtures.PARENT
+        lines[2] = json.dumps(event)
+        self.rollout.write_text('\n'.join(lines)+'\n')
+        with self.assertRaises(sf.SpecError):
+            self.get()
 
     def test_wrong_role_parent_and_digest_refuse(self):
         self.fixture()

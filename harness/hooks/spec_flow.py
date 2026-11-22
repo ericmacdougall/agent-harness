@@ -857,16 +857,25 @@ def _native_click_tester(wal_dir, agent, report_sha):
         raw = read_regular(path, 64_000_000)
         marker = "REPORT_SHA256 " + report_sha
         found, session_id = None, None
+        completed = set()
         for line in raw.splitlines():
             event = safe_input.safe_json_loads(line, max_depth=48, max_bytes=2_000_000)
             payload = event.get("payload") if isinstance(event, dict) else None
             if isinstance(event, dict) and event.get("type") == "session_meta" and isinstance(payload, dict):
-                if session_id is not None or payload.get("id") != agent:
+                if session_id is None and payload.get("id") == agent:
+                    session_id = agent
+                elif session_id != agent or payload.get("id") != wal_dir.name:
                     raise ValueError("native rollout identity conflicts")
-                session_id = payload["id"]
+            if (isinstance(event, dict) and event.get("type") == "event_msg" and isinstance(payload, dict)
+                    and payload.get("type") == "item_completed" and payload.get("thread_id") == agent):
+                item = payload.get("item")
+                if (isinstance(item, dict) and item.get("type") == "AgentMessage"
+                        and item.get("phase") == "final_answer" and isinstance(item.get("id"), str)):
+                    completed.add(item["id"])
             if (not isinstance(event, dict) or event.get("type") != "response_item" or not isinstance(payload, dict)
                     or payload.get("type") != "message" or payload.get("role") != "assistant"
-                    or payload.get("channel") != "final"):
+                    or not (payload.get("channel") == "final" or payload.get("phase") == "final_answer")
+                    or payload.get("id") not in completed):
                 continue
             content = payload.get("content")
             text = "\n".join(item.get("text", "") for item in content
