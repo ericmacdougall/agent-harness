@@ -4,9 +4,9 @@ Description=Agent Harness T2Scan direct Astra consent socket
 [Socket]
 ListenStream=/run/agent-harness/t2scan-astra-consent.sock
 DirectoryMode=0755
-SocketMode=0666
+SocketMode=0660
 SocketUser=root
-SocketGroup=root
+SocketGroup=agent-harness-consent-client
 RemoveOnStop=true
 
 [Install]
