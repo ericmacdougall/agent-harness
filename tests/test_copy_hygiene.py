@@ -124,6 +124,40 @@ class Acquire(Base):
             self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
             self.assertFalse((self.home / ".agent-harness" / "test-copies").exists())
 
+    def test_pending_or_malformed_retirement_fences_leased_cli_before_payload(self):
+        path = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))["path"]
+        lock = Path(path + ".lock")
+        marker = self.home / "payload-started"
+        index_before = Path(tc.index_path()).read_bytes()
+        for fence in (b"retiring " + b"1" * 32 + b"\n", b"incomplete write"):
+            with self.subTest(fence=fence):
+                lock.write_bytes(fence)
+                result = self.run_acquire("--require-reuse", "--run", sys.executable, "-c",
+                                          "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                                          str(marker))
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)["refused"], "retirement-unconfirmed")
+                self.assertFalse(marker.exists())
+                self.assertEqual(lock.read_bytes(), fence)
+                self.assertEqual(Path(tc.index_path()).read_bytes(), index_before)
+
+    def test_same_head_leased_cli_rotates_generation_before_payload(self):
+        first = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))
+        lock = Path(first["path"] + ".lock")
+        old_generation = b"1" * 32 + b"\n"
+        lock.write_bytes(old_generation)
+        marker = self.home / "observed-generation"
+        result = self.run_acquire("--require-reuse", "--run", sys.executable, "-c",
+                                  "from pathlib import Path; import sys; "
+                                  "Path(sys.argv[1]).write_bytes(Path(sys.argv[2]).read_bytes())",
+                                  str(marker), str(lock))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["commit"], first["commit"])
+        generation = marker.read_bytes()
+        self.assertRegex(generation, rb"^[0-9a-f]{32}\n$")
+        self.assertNotEqual(generation, old_generation)
+        self.assertEqual(generation, lock.read_bytes())
+
     def test_ignored_destination_file_survives_ref_advance(self):
         (self.repo / ".gitignore").write_text("ignored.txt\n")
         sh("git", "add", ".gitignore", cwd=self.repo)

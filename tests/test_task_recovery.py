@@ -53,13 +53,14 @@ if sys.argv[3]=="complete": (root/"done").write_text("verified")
         self.manifest = self.root / "input.json"
         self.task = self.root / "task"
 
-    def enroll(self, delay="0", mode="complete", attempts=2, timeout=5):
-        value = {"schema": "native-recovery-v1", "task_id": "test-recovery", "cwd": str(self.root),
+    def enroll(self, delay="0", mode="complete", attempts=2, timeout=5, cwd=None):
+        value = {"schema": "native-recovery-v1", "task_id": "test-recovery", "cwd": str(cwd or self.root),
                  "agent_argv": [str(self.agent), str(self.root), delay, mode],
                  "prompt_file": str(self.prompt),
                  "prompt_sha256": hashlib.sha256(self.prompt.read_bytes()).hexdigest(),
                  "verify_argv": [sys.executable, "-c",
-                                 "from pathlib import Path; raise SystemExit(0 if Path('done').read_text()=='verified' else 1)"],
+                                 "from pathlib import Path; import sys; raise SystemExit(0 if "
+                                 "Path(sys.argv[1]).read_text()=='verified' else 1)", str(self.root / "done")],
                  "max_attempts": attempts, "attempt_timeout": timeout, "task_timeout": 30}
         self.manifest.write_text(json.dumps(value))
         self.manifest.chmod(0o600)
@@ -89,6 +90,19 @@ if sys.argv[3]=="complete": (root/"done").write_text("verified")
         self.assertEqual(self.command("run").returncode, 0)
         self.assertEqual((self.root / "calls").read_text(), "call\n")
         self.assertEqual(json.loads((self.task / "state.json").read_text())["status"], "complete")
+
+    def test_completed_checkout_can_be_retired_without_losing_status_or_respawning(self):
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        self.enroll(cwd=checkout)
+        self.assertEqual(self.command("run").returncode, 0)
+        self.assertEqual((self.root / "calls").read_text(), "call\n")
+        checkout.rmdir()
+        status = self.command("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(json.loads(status.stdout)["status"], "complete")
+        self.assertEqual(self.command("run").returncode, 0)
+        self.assertEqual((self.root / "calls").read_text(), "call\n")
 
     def test_zero_agent_exit_does_not_establish_completion(self):
         self.enroll(mode="fail")

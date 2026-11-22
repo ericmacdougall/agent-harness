@@ -67,14 +67,14 @@ def argv(value):
     return value
 
 
-def validate(m):
+def validate(m, *, require_cwd=True):
     required = {"schema", "task_id", "cwd", "agent_argv", "prompt_file", "prompt_sha256",
                 "verify_argv", "max_attempts", "attempt_timeout", "task_timeout"}
     if set(m) != required or m["schema"] != "native-recovery-v1":
         raise ValueError("invalid manifest schema")
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,47}", m["task_id"]):
         raise ValueError("invalid task id")
-    if not Path(m["cwd"]).is_absolute() or not Path(m["cwd"]).is_dir():
+    if not Path(m["cwd"]).is_absolute() or (require_cwd and not Path(m["cwd"]).is_dir()):
         raise ValueError("cwd must be an existing absolute directory")
     argv(m["agent_argv"])
     argv(m["verify_argv"])
@@ -88,13 +88,21 @@ def validate(m):
     return m
 
 
+def completion_time(state):
+    value = state.get("verified_at")
+    return value if state.get("status") == "complete" and type(value) in (int, float) and 0 < value <= time.time() else None
+
+
 def load(root):
     private(root, True)
     raw = read(root / "manifest.json")
-    manifest = validate(json.loads(raw))
     state = json.loads(read(root / "state.json"))
     if state["manifest_sha256"] != digest(raw):
         raise ValueError("enrolled manifest changed")
+    verified = completion_time(state)
+    if state.get("status") == "complete" and verified is None:
+        raise ValueError("missing verified completion time")
+    manifest = validate(json.loads(raw), require_cwd=verified is None)
     return manifest, state
 
 
@@ -103,6 +111,23 @@ def lock(root):
     private(root / "lock")
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     return fd
+
+
+def enrolled_copy_generation(cwd):
+    configured = os.environ.get("HARNESS_COPY_HYGIENE_HOME")
+    copies = ((Path(configured) if configured else Path.home()) / ".agent-harness/test-copies").resolve()
+    path = Path(cwd).resolve(strict=True)
+    if copies not in path.parents or len(path.relative_to(copies).parts) != 2:
+        return None
+    if not Path(str(path) + ".lock").is_file():
+        return None
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import copy_hygiene
+    finally:
+        sys.path.pop(0)
+    with copy_hygiene.copy_lock(str(path), create=False, wait=False) as descriptor:
+        return copy_hygiene.copy_generation(descriptor)
 
 
 def enroll(root, source):
@@ -119,9 +144,13 @@ def enroll(root, source):
             return
         if (root / "state.json").exists():
             raise ValueError("orphan state requires reconciliation")
+        generation = enrolled_copy_generation(manifest["cwd"])
         atomic(root / "manifest.json", manifest)
-        atomic(root / "state.json", {"manifest_sha256": digest(raw), "attempts": 0,
-                                    "deadline": time.time() + manifest["task_timeout"], "status": "enrolled"})
+        state = {"manifest_sha256": digest(raw), "attempts": 0,
+                 "deadline": time.time() + manifest["task_timeout"], "status": "enrolled"}
+        if generation is not None:
+            state["copy_generation"] = generation
+        atomic(root / "state.json", state)
     finally:
         os.close(fd)
 

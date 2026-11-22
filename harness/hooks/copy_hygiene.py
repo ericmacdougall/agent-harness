@@ -59,6 +59,7 @@ HARNESS_COPY_HYGIENE_UNIT_DIRS (os.pathsep list) replaces the systemd/launchd di
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import fnmatch
 import glob
@@ -253,9 +254,9 @@ def safe_key(key: str) -> str:
     return k[:80]
 
 
-def repo_identity(top: str) -> "tuple[str, str]":
+def repo_identity(top: str, read_git=None) -> "tuple[str, str]":
     """(<repo name>-<8 hex>, common dir): one id for every worktree of a repository, distinct for same-named repos."""
-    rc, common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    rc, common = (read_git or git)(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
     common = os.path.realpath(common.splitlines()[-1].strip()) if rc == 0 and common else os.path.realpath(top)
     base = os.path.basename(os.path.dirname(common)) if os.path.basename(common) == ".git" else os.path.basename(common)
     base = re.sub(r"\.git$", "", base) or "repo"
@@ -291,21 +292,62 @@ def touch_index(path: str, **extra) -> None:
 
 
 # ---------------------------------------------------------------- acquire
-def copy_lock(path: str):
-    """The permanent sibling lock is never moved or unlinked while recycling a copy."""
+@contextmanager
+def copy_lock(path: str, *, create: bool = True, wait: bool = False):
+    """Hold the permanent sibling lease and expose its verified descriptor."""
     if os.path.realpath(os.path.dirname(path)) != os.path.dirname(path):
         raise ValueError("copy lock parent is redirected")
-    fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    lk = os.fdopen(fd, "rb")
+    lock_path = path + ".lock"
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0)
+    descriptor = os.open(lock_path, flags, 0o600)
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
-            raise ValueError("copy lease is not an owned regular file")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BaseException:
-        lk.close()
-        raise
-    return lk
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1 or opened.st_mode & 0o022):
+            raise ValueError("Unsafe reusable-copy lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        named = os.lstat(lock_path)
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("Reusable-copy lock changed")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+COPY_GENERATION = re.compile(rb"[0-9a-f]{32}\n")
+
+
+def copy_lock_record(descriptor):
+    return os.pread(descriptor, 43, 0)
+
+
+def copy_retirement_unconfirmed(descriptor):
+    record = copy_lock_record(descriptor)
+    return bool(record and not COPY_GENERATION.fullmatch(record))
+
+
+def copy_generation(descriptor):
+    value = copy_lock_record(descriptor)
+    return value[:-1].decode("ascii") if COPY_GENERATION.fullmatch(value) else None
+
+
+def write_copy_lock_record(descriptor, value):
+    if os.pwrite(descriptor, value, 0) != len(value):
+        raise OSError("Could not record reusable-copy state")
+    os.ftruncate(descriptor, len(value))
+    os.fsync(descriptor)
+
+
+def set_copy_retirement(descriptor, generation, *, pending):
+    active = generation.encode("ascii") + b"\n"
+    if not COPY_GENERATION.fullmatch(active):
+        raise ValueError("Invalid reusable-copy generation")
+    retiring = b"retiring " + active
+    expected, replacement = (active, retiring) if pending else (retiring, active)
+    if copy_lock_record(descriptor) != expected:
+        raise ValueError("Reusable-copy retirement state changed")
+    write_copy_lock_record(descriptor, replacement)
+
 
 
 def managed_head(path: str, key: str, common: str) -> "str | None":
@@ -366,7 +408,12 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None, *
         if os.path.realpath(os.path.dirname(path)) != os.path.dirname(path):
             return dict(stale, error="managed copy parent is redirected")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with copy_lock(path):
+        with copy_lock(path) as descriptor:
+            if copy_retirement_unconfirmed(descriptor):
+                return {"ok": False, "refused": "retirement-unconfirmed", "path": path,
+                        "error": "Reusable-copy retirement is unconfirmed. Inspect the enrolled task's cleanup receipt."}
+            # Renew the generation even at the same HEAD before another use can start.
+            write_copy_lock_record(descriptor, os.urandom(16).hex().encode("ascii") + b"\n")
             reused = os.path.lexists(path)
             cur = None
             if reused:
@@ -635,27 +682,32 @@ def _k(p: str) -> str:
     return p.lower() if sys.platform == "darwin" else p
 
 
-def protected_scan(cfg: "dict | None" = None, *, fresh=False) -> "tuple[dict, int]":
-    """({key: (path, where it is named)}, unreadable-unit count). Cached for 60 s keyed on the directory mtimes."""
+def protected_scan(cfg: "dict | None" = None, *, fresh: bool = False) -> "tuple[dict, int]":
+    """Service dependencies and unreadable-unit count. Destructive callers can bypass the advisory cache."""
     cfg = normalize(cfg) if cfg is not None else load_config()
-    _f, _e, sig = _scan_files(_unit_dirs())
-    cache = os.path.join(state_dir(), "copy-hygiene-protected.json")
-    key = hashlib.sha256(json.dumps([sig, os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS"), home()]).encode()).hexdigest()
-    prot, errors = None, 0
-    try:
-        with open(cache) as f:
-            c = json.load(f)
-        if not fresh and c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
-            prot = {k: tuple(v) for k, v in c["prot"].items()}
-            errors = int(c.get("errors", 0))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        prot = None
-    if prot is None:
+    if fresh:
         prot, errors = _scan_units()
+    else:
+        _f, _e, sig = _scan_files(_unit_dirs())
+        cache = os.path.join(state_dir(), "copy-hygiene-protected.json")
+        key = hashlib.sha256(
+            json.dumps([sig, os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS"), home()]).encode()
+        ).hexdigest()
+        prot, errors = None, 0
         try:
-            _atomic_write(cache, json.dumps({"key": key, "ts": time.time(), "prot": prot, "errors": errors}))
-        except OSError:
-            pass
+            with open(cache) as f:
+                c = json.load(f)
+            if c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
+                prot = {k: tuple(v) for k, v in c["prot"].items()}
+                errors = int(c.get("errors", 0))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            prot = None
+        if prot is None:
+            prot, errors = _scan_units()
+            try:
+                _atomic_write(cache, json.dumps({"key": key, "ts": time.time(), "prot": prot, "errors": errors}))
+            except OSError:
+                pass
     prot = dict(prot)
     for p in cfg.get("protected_paths") or []:
         p = os.path.normpath(os.path.expanduser(p))
@@ -1680,7 +1732,9 @@ def retire_copy(path: str, cfg: dict, planned_activity: float) -> str:
     if os.path.dirname(os.path.dirname(path)) != copies_root():
         return "kept: legacy or unmanaged copy; report only"
     try:
-        with copy_lock(path):
+        with copy_lock(path) as descriptor:
+            if copy_retirement_unconfirmed(descriptor):
+                return "kept: reusable-copy retirement is unconfirmed"
             if last_activity(path, load_index()) > planned_activity:
                 return "kept: copy was used after planning"
             expected = copy_snapshot(path)
@@ -1879,7 +1933,23 @@ def main(argv=None) -> int:
     sc = sub.add_parser("scratch"); sc.add_argument("--key", default="")
     pr = sub.add_parser("protected", help="list protected paths, or --check <path> (exit 1 when protected)")
     pr.add_argument("--check", default="")
+    finish = sub.add_parser("finish", help="verify and optionally retire one completed task's indexed copy")
+    finish.add_argument("--repo", required=True)
+    finish.add_argument("--key", required=True)
+    finish.add_argument("--expect-head", required=True)
+    archive = sub.add_parser("archive-artifact", help="verify and optionally retire one completed task artifact to B2")
+    archive.add_argument("--name", required=True)
+    archive.add_argument("--b2-remote")
+    archive.add_argument("--max-bytes", type=int, help="explicit artifact limit, up to 4 GiB (defaults to 256 MiB)")
+    for scoped in (finish, archive):
+        scoped.add_argument("--task-dir", required=True)
+        scoped.add_argument("--apply", action="store_true")
     args = ap.parse_args(argv)
+    if args.cmd in ("finish", "archive-artifact"):
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import lifecycle_cleanup
+
+        return lifecycle_cleanup.run(args)
     if args.cmd == "acquire" and args.run == []:
         ap.error("--run requires a command")
     if args.cmd == "scratch":

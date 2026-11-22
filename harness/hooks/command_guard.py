@@ -2187,7 +2187,7 @@ VERIFIER_VERSION = 2  # `ah worktree-remove` refuses a verifier that does not re
 GITHUB_REMOTE = re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
 
 
-def worktree_scope_refusal(path):
+def worktree_scope_refusal(path, *, _managed_copy=None):
     """Where `ah worktree-remove` may act: strictly under the caller's home, never the home itself, never the harness
     or credential state, and under ~/.agent-harness only inside work/. Names are compared case-folded (APFS is case
     insensitive)."""
@@ -2198,6 +2198,11 @@ def worktree_scope_refusal(path):
     if parts[0].casefold() in WORKTREE_HOME_DENY:
         return 'the path is inside protected state (%s)' % parts[0][:30]
     if parts[0].casefold() == '.agent-harness' and (len(parts) < 3 or parts[1].casefold() != 'work'):
+        # Only the isolated lifecycle worker supplies this internal exact scope after acquiring both named
+        # locks and validating the completed task, allocation, repository and generation.
+        if (_managed_copy == path and len(parts) == 4 and parts[:2] == ['.agent-harness', 'test-copies']
+                and all(re.fullmatch(r'[A-Za-z0-9._-]+', part) and part not in ('.', '..') for part in parts[2:])):
+            return None
         return 'under ~/.agent-harness only a worktree inside work/ is removable'
     return None
 
@@ -2489,12 +2494,13 @@ def delegated_policy(base=None):
     return dict(base, reproducible_clone=merged)
 
 
-def verify_worktree(path, authenticated=False, policy=None, *, _backups=None):
+def verify_worktree(path, authenticated=False, policy=None, *, _managed_copy=None, _backups=None):
     """Read-only verdict as a dict {removable, reason, head, repo, urls, verifier}. `authenticated` reads the remote with
     this host's own credentials (authenticated_remote_refs) instead of the guard's anonymous ls-remote."""
     report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'repo': None, 'urls': {},
               'verifier': VERIFIER_VERSION}
-    reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
+    reason = (worktree_scope_refusal(path, _managed_copy=_managed_copy)
+              if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path')
     backups = _backups or _IgnoredBackups(path, policy or DEFAULT_POLICY)
     if reason is None:
         effective = delegated_policy(policy)
@@ -2588,7 +2594,8 @@ def _same_worktree_directory(path, expected):
     return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == expected
 
 
-def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
+def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
+                    _managed_copy=None, _before_remove=None, _managed_lock_fds=()):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
     compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
     removal is audited on this host (the audit of `ah` lives on the caller's host)."""
@@ -2598,7 +2605,7 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
         return {'path': path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION,
                 'reason': 'cannot stat the path (%s)' % type(error).__name__}
     backups = _IgnoredBackups(path, policy or DEFAULT_POLICY)
-    report = verify_worktree(path, authenticated, policy, _backups=backups)
+    report = verify_worktree(path, authenticated, policy, _managed_copy=_managed_copy, _backups=backups)
     report['removed'] = False
     if not report['removable']:
         return report
@@ -2617,15 +2624,27 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
         free_before = shutil.disk_usage(home).free
     except OSError:
         free_before = None
+    locking = {}
+    if _managed_copy == path:
+        if len(_managed_lock_fds) != 2 or len(set(_managed_lock_fds)) != 2:
+            report.update(removable=False, reason='the managed-copy removal requires both held lock descriptors')
+            return report
+        locking['pass_fds'] = _managed_lock_fds
     if backups.leaves and not _consume_worktree_backups(path, backups, policy, (before.st_dev, before.st_ino)):
         report.update(removable=False, reason='backed ignored paths changed, could not be checked, or lost approval')
         return report
+    if _managed_copy == path:
+        # Service/copy checks and the retirement fence stay immediately before the actual writer.
+        reason = _before_remove() if _before_remove else 'the managed-copy final check was not supplied'
+        if reason:
+            report.update(removable=False, reason=reason)
+            return report
     _worktree_audit({'event': 'remove', 'path': path, 'head': report['head'], 'repo': report['repo']})
     problem = None
     try:
         done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', report['repo'],
                                'worktree', 'remove', '--', path],
-                              capture_output=True, text=True, timeout=REMOVE_SECONDS, env=_clone_env())
+                              capture_output=True, text=True, timeout=REMOVE_SECONDS, env=_clone_env(), **locking)
         returned, stderr = done.returncode, (done.stderr or '').strip()[:200]
     except (subprocess.SubprocessError, OSError, ValueError) as error:
         # git may have been killed partway through deleting: the report must say what is left, never nothing
