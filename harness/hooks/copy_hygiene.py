@@ -305,9 +305,39 @@ def copy_lock(path, *, create, wait):
         os.close(descriptor)
 
 
+COPY_GENERATION = re.compile(rb"[0-9a-f]{32}\n")
+
+
+def copy_lock_record(descriptor):
+    return os.pread(descriptor, 43, 0)
+
+
+def copy_retirement_unconfirmed(descriptor):
+    record = copy_lock_record(descriptor)
+    return bool(record and not COPY_GENERATION.fullmatch(record))
+
+
 def copy_generation(descriptor):
-    value = os.pread(descriptor, 34, 0)
-    return value[:-1].decode("ascii") if re.fullmatch(rb"[0-9a-f]{32}\n", value) else None
+    value = copy_lock_record(descriptor)
+    return value[:-1].decode("ascii") if COPY_GENERATION.fullmatch(value) else None
+
+
+def write_copy_lock_record(descriptor, value):
+    if os.pwrite(descriptor, value, 0) != len(value):
+        raise OSError("Could not record reusable-copy state")
+    os.ftruncate(descriptor, len(value))
+    os.fsync(descriptor)
+
+
+def set_copy_retirement(descriptor, generation, *, pending):
+    active = generation.encode("ascii") + b"\n"
+    if not COPY_GENERATION.fullmatch(active):
+        raise ValueError("Invalid reusable-copy generation")
+    retiring = b"retiring " + active
+    expected, replacement = (active, retiring) if pending else (retiring, active)
+    if copy_lock_record(descriptor) != expected:
+        raise ValueError("Reusable-copy retirement state changed")
+    write_copy_lock_record(descriptor, replacement)
 
 
 def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -> dict:
@@ -330,12 +360,12 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -
     path = os.path.join(copies_root(), rid, k)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with copy_lock(path, create=True, wait=True) as descriptor:
+        if copy_retirement_unconfirmed(descriptor):
+            return {"ok": False, "refused": "retirement-unconfirmed", "path": path,
+                    "error": "Reusable-copy retirement is unconfirmed. Inspect the enrolled task's cleanup receipt."}
         # Record a new use even at identical HEAD and regardless of the wall clock.
         generation = os.urandom(16).hex().encode("ascii") + b"\n"
-        if os.pwrite(descriptor, generation, 0) != len(generation):
-            raise OSError("Could not record the reusable-copy generation")
-        os.ftruncate(descriptor, len(generation))
-        os.fsync(descriptor)
+        write_copy_lock_record(descriptor, generation)
         if os.path.isdir(path):
             rc, cur = git(path, "rev-parse", "HEAD")
             if rc != 0:
@@ -1638,12 +1668,20 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
         elif not deleting:
             r["action"] = "would-remove (report-only)"
         else:
-            ok, why = deletable(r["path"])
-            if not ok:
-                r["action"] = f"kept: {why}"
-            else:
-                done, msg = remove_copy(r["path"], prot)
-                r["action"] = "removed" if done else f"remove failed: {msg}"
+            path = r["path"]
+            try:
+                with copy_lock(path, create=True, wait=False) as descriptor:
+                    if copy_retirement_unconfirmed(descriptor):
+                        r["action"] = "kept: reusable-copy retirement is unconfirmed"
+                        continue
+                    ok, why = deletable(path)
+                    if not ok:
+                        r["action"] = f"kept: {why}"
+                    else:
+                        done, msg = remove_copy(path, prot)
+                        r["action"] = "removed" if done else f"remove failed: {msg}"
+            except (OSError, ValueError):
+                r["action"] = "kept: reusable-copy lock is busy or uncertain"
     res = {"mode": "delete" if deleting else "report-only", "delete_enabled": cfg["reaper_delete_enabled"],
            "total_gb": round(total / GB, 2), "cap_gb": cfg["max_total_gb"], "max_age_hours": cfg["max_age_hours"],
            "size_unknown": sum(not r["size_known"] for r in rows), "copies": rows, "ts": int(now)}

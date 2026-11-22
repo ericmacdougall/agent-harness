@@ -1,15 +1,20 @@
 """Scoped lifecycle controls. All destructive controls use disposable fixtures."""
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 import io
 import json
+import multiprocessing
 import os
 import subprocess
 import tarfile
 import sys
 import tempfile
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "harness" / "hooks"))
@@ -222,6 +227,31 @@ class CopyLifecycle(CopyFixture):
         manifest = {"task_id": "fixture", "cwd": path, "prompt_file": str(task / "prompt")}
         return task, manifest, repo, path, head
 
+    def test_persisted_retirement_blocks_reacquire_without_a_worker(self):
+        _, _, repo, path, _ = self.fixture()
+        generation = cleanup.task_recovery.enrolled_copy_generation(path)
+        record = f"retiring {generation}\n"
+        Path(path + ".lock").write_text(record)
+        result = cleanup.copy_hygiene.acquire(repo, "pr-1", cfg=self.cfg(min_free_gb=0))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["refused"], "retirement-unconfirmed")
+        self.assertEqual(Path(path + ".lock").read_text(), record)
+        self.assertTrue(Path(path).is_dir())
+
+    def test_enabled_legacy_reaper_preserves_fenced_copy(self):
+        _, _, _, path, _ = self.fixture()
+        generation = cleanup.task_recovery.enrolled_copy_generation(path)
+        cfg = self.cfg(reaper_delete_enabled=True, max_age_hours=0)
+        with patch.object(cleanup.copy_hygiene, "deletable") as eligible:
+            with cleanup.copy_hygiene.copy_lock(path, create=False, wait=True) as lock:
+                cleanup.copy_hygiene.set_copy_retirement(lock, generation, pending=True)
+                busy = cleanup.copy_hygiene.reap(apply=True, cfg=cfg)["copies"][0]
+                self.assertIn("lock is busy", busy["action"])
+            pending = cleanup.copy_hygiene.reap(apply=True, cfg=cfg)["copies"][0]
+            self.assertIn("retirement is unconfirmed", pending["action"])
+            eligible.assert_not_called()
+        self.assertTrue(Path(path).is_dir())
+
     def test_fresh_same_head_reuse_invalidates_earlier_completion(self):
         task, manifest, repo, path, head = self.fixture()
         os.utime(path + ".lock", (1, 1))
@@ -254,8 +284,8 @@ class CopyLifecycle(CopyFixture):
             guard.assert_not_called()
         self.assertTrue(Path(path).is_dir())
 
-    def test_managed_copy_passes_real_guard_and_ordinary_entry_refuses(self):
-        task, manifest, repo, path, head = self.fixture()
+    def completed_fixture(self):
+        task, _, repo, path, head = self.fixture()
         task.rmdir()
         work = self.home.resolve() / ".agent-harness/work"
         work.mkdir()
@@ -273,6 +303,11 @@ class CopyLifecycle(CopyFixture):
         proposal.chmod(0o600)
         cleanup.task_recovery.enroll(task, proposal)
         self.assertEqual(cleanup.task_recovery.run(task), 0)
+        self.enterContext(patch.object(cleanup.workdir, "work_root", return_value=work))
+        return task, repo, path, head
+
+    def test_managed_copy_passes_real_guard_and_ordinary_entry_refuses(self):
+        task, repo, path, head = self.completed_fixture()
         # Keep the real guard, Git worktree, index and removal. Replace only its remote transport with the
         # fixture's actually advertised Git ref so the test remains offline.
         live_git_output = subprocess.check_output(["/usr/bin/git", "ls-remote", str(self.origin)], text=True)
@@ -280,17 +315,110 @@ class CopyLifecycle(CopyFixture):
         cleanup.safe_git(repo, "remote", "set-url", "origin", "https://github.com/fixture/project.git")
         with patch.dict(os.environ, {"HOME": str(self.home.resolve())}), patch.object(
             cleanup.command_guard, "authenticated_remote_refs", return_value=live
-        ), patch.object(cleanup.workdir, "work_root", return_value=work):
+        ):
             self.assertIn("only a worktree inside work/",
                           cleanup.command_guard.verify_worktree(path, authenticated=True)["reason"])
-            with cleanup.completed_task(task) as (manifest, state):
+            with cleanup.completed_task(task) as (manifest, state, task_lock):
                 self.assertTrue(state["copy_generation"])
                 preview = cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, False)
                 self.assertEqual(preview["status"], "preview")
-                result = cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, True)
+                result = cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, True,
+                                             task_lock=task_lock)
                 self.assertEqual(result["status"], "removed")
         self.assertFalse(Path(path).exists())
         self.assertEqual(cleanup.task_recovery.load(task)[1]["status"], "complete")
+        self.assertTrue(cleanup.copy_hygiene.acquire(repo, "pr-1", cfg=self.cfg(min_free_gb=0))["ok"])
+
+    def test_final_guard_refusal_releases_retirement_fence(self):
+        task, repo, path, head = self.completed_fixture()
+        with cleanup.completed_task(task) as (manifest, state, task_lock), patch.object(
+            cleanup, "guard", return_value={"removable": False}
+        ):
+            result = cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, True,
+                                         task_lock=task_lock)
+        self.assertEqual(result["status"], "retained")
+        self.assertTrue(cleanup.copy_hygiene.acquire(repo, "pr-1", cfg=self.cfg(min_free_gb=0))["ok"])
+
+    def test_lost_worker_leaves_actual_removal_child_holding_both_locks(self):
+        task, repo, path, head = self.completed_fixture()
+        ready, release, exited = (task / name for name in ("writer-ready", "writer-release", "writer-exited"))
+        real_spawn = subprocess.Popen
+
+        def guarded_spawn(argv, *args, **kwargs):
+            if ["worktree", "remove", "--", path] != argv[-4:]:
+                return real_spawn(argv, *args, **kwargs)
+            # Preserve the production Popen options. Replace only the destructive argv with a bounded writer.
+            argv = [sys.executable, "-I", "-c", """
+from pathlib import Path
+import sys
+import time
+ready, release, exited = map(Path, sys.argv[1:])
+ready.touch()
+for unused in range(700):
+    if release.exists():
+        break
+    time.sleep(0.01)
+exited.touch()
+""", str(ready), str(release), str(exited)]
+            writer = real_spawn(argv, *args, **kwargs)
+            deadline = time.monotonic() + 3
+            while not ready.exists() and writer.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            # Exit this disposable worker at the process-creation boundary without running its cleanup handlers.
+            os._exit(71 if ready.exists() and writer.poll() is None else 72)
+
+        def worker_entry():
+            with cleanup.completed_task(task) as (manifest, state, task_lock), patch.object(
+                cleanup.command_guard, "verify_worktree", return_value={"removable": True, "head": head, "repo": repo}
+            ), patch.object(cleanup.command_guard.subprocess, "Popen", side_effect=guarded_spawn):
+                cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, True,
+                                    task_lock=task_lock)
+
+        worker = multiprocessing.get_context("fork").Process(target=worker_entry)
+        worker.start()
+        reaching_lock = threading.Event()
+        copy_lock = cleanup.copy_hygiene.copy_lock
+
+        def observe_lock(*args, **kwargs):
+            reaching_lock.set()
+            return copy_lock(*args, **kwargs)
+
+        with ThreadPoolExecutor(max_workers=1) as contender:
+            try:
+                worker.join(timeout=5)
+                self.assertEqual(worker.exitcode, 71, "the guarded removal worker did not exit at the intended boundary")
+                self.assertTrue(ready.exists())
+                self.assertFalse(exited.exists())
+                with self.assertRaises(BlockingIOError), cleanup.completed_task(task):
+                    self.fail("task lock released while the removal child is still running")
+                with patch.object(cleanup.copy_hygiene, "copy_lock", side_effect=observe_lock):
+                    acquisition = contender.submit(cleanup.copy_hygiene.acquire, repo, "pr-1",
+                                                   cfg=self.cfg(min_free_gb=0))
+                    self.assertTrue(reaching_lock.wait(timeout=3))
+                    with self.assertRaises(TimeoutError):
+                        acquisition.result(timeout=0.1)
+                    release.touch()
+                    refused = acquisition.result(timeout=3)
+            finally:
+                release.touch()
+                worker.join(timeout=3)
+        self.assertTrue(exited.exists())
+        self.assertEqual(refused.get("refused"), "retirement-unconfirmed")
+        self.assertEqual(json.loads(cleanup.audit_path(task, Path(path)).read_text())["status"], "removing")
+        self.assertTrue(Path(path).is_dir())
+
+    def test_controller_timeout_or_interrupt_does_not_stop_owned_worker(self):
+        args = SimpleNamespace(cmd="finish", task_dir="/fixture/task", repo="/fixture/source", key="pr-1",
+                               expect_head="1" * 40, apply=True)
+        for error in (subprocess.TimeoutExpired("worker", 1), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                worker = Mock()
+                worker.wait.side_effect = error
+                with patch.object(cleanup.subprocess, "Popen", return_value=worker) as spawn, redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(cleanup.run(args), 2)
+                self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+                self.assertIn("may still be running", json.loads(out.getvalue())["reason"])
+                self.assertEqual(worker.mock_calls, [call.wait(timeout=cleanup.COPY_WORKER_WAIT_SECONDS)])
 
     def test_uncertain_or_incomplete_recovery_state_never_admits_cleanup(self):
         task, manifest, repo, path, head = self.fixture()

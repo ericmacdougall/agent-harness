@@ -35,6 +35,7 @@ DEFAULT_BYTES = 256 * 1024 * 1024
 MAX_BYTES = 4 * 1024 * 1024 * 1024
 ARCHIVE_OVERHEAD = 32 * 1024 * 1024
 MAX_ENTRIES = 4096
+COPY_WORKER_WAIT_SECONDS = 1200
 TOOL_DIRS = ("/usr/sbin", "/usr/bin", "/sbin", "/bin", "/usr/local/bin", "/opt/homebrew/bin")
 
 
@@ -78,7 +79,7 @@ def safe_git(repo, *args):
     return result.returncode, result.stdout.strip()
 
 
-def guard(path, action, head=None):
+def guard(path, action, head=None, *, lock_fds=()):
     # This runs inside the locked lifecycle worker, whose process has the trusted system Git environment.
     def recheck():
         try:
@@ -92,7 +93,8 @@ def guard(path, action, head=None):
     if action == "verify-worktree":
         return command_guard.verify_worktree(path_text, authenticated=True, policy=policy, _managed_copy=path_text)
     return command_guard.remove_worktree(path_text, authenticated=True, expect_head=head, policy=policy,
-                                        _managed_copy=path_text, _before_remove=recheck)
+                                        _managed_copy=path_text, _before_remove=recheck,
+                                        _managed_lock_fds=lock_fds)
 
 
 @contextmanager
@@ -109,7 +111,7 @@ def completed_task(root):
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         manifest, state = task_recovery.load(root)
         require(task_recovery.completion_time(state), "Authoritative task completion is missing or uncertain.")
-        yield manifest, state
+        yield manifest, state, descriptor
     finally:
         os.close(descriptor)
 
@@ -138,7 +140,7 @@ def check_previous(audit):
                 "A prior removal was not reconciled. Retain the candidate.")
 
 
-def retire_copy(task, manifest, generation, repo, key, head, apply):
+def retire_copy(task, manifest, generation, repo, key, head, apply, *, task_lock=None):
     require(GIT_HEAD.fullmatch(head), "Expected the exact 40-hex checkout commit.")
     code, source = safe_git(repo, "rev-parse", "--show-toplevel")
     require(code == 0 and source.strip(), "Source checkout could not be resolved.")
@@ -164,14 +166,18 @@ def retire_copy(task, manifest, generation, repo, key, head, apply):
             require(result.get("removable") and result.get("head") == head,
                     "Exact Git origin verification refused; keep the checkout.")
             return {"status": "preview", "task": manifest["task_id"], "path": str(path), "head": head}
+        require(task_lock is not None, "The managed-copy worker does not hold the task lock.")
         context = {"task": manifest["task_id"], "path": str(path), "head": head, "reason": "verified origin"}
         task_recovery.atomic(audit, dict(context, status="removing"))
-        result = guard(path, "remove-worktree", head)
+        copy_hygiene.set_copy_retirement(lock, generation, pending=True)
+        result = guard(path, "remove-worktree", head, lock_fds=(task_lock, lock))
         state = "removed" if result.get("removed") is True else (
             "retained" if result.get("removable") is False else "uncertain"
         )
         answer = dict(context, status=state)
         task_recovery.atomic(audit, answer)
+        if state != "uncertain":
+            copy_hygiene.set_copy_retirement(lock, generation, pending=False)
         return answer
 
 
@@ -404,10 +410,10 @@ def retire_artifact(task, manifest, name, target, apply, max_bytes=DEFAULT_BYTES
 def run_locked(args):
     try:
         task = Path(args.task_dir)
-        with completed_task(task) as (manifest, state):
+        with completed_task(task) as (manifest, state, task_lock):
             if args.cmd == "finish":
                 result = retire_copy(task, manifest, state.get("copy_generation"), args.repo, args.key,
-                                     args.expect_head, args.apply)
+                                     args.expect_head, args.apply, task_lock=task_lock)
             else:
                 limit = DEFAULT_BYTES if args.max_bytes is None else args.max_bytes
                 result = retire_artifact(task, manifest, args.name, args.b2_remote, args.apply, limit)
@@ -433,10 +439,14 @@ def run(args):
     argv = [sys.executable, "-I", str(Path(__file__).resolve()), "--", args.task_dir, args.repo, args.key,
             args.expect_head, "apply" if args.apply else "check"]
     try:
-        return subprocess.run(argv, env=finish_environment(), timeout=1200).returncode
-    except (OSError, subprocess.SubprocessError):
-        print(json.dumps({"status": "retained-or-uncertain", "reason": "Managed-copy worker outcome is unavailable."}))
-        return 2
+        worker = subprocess.Popen(argv, env=finish_environment(), start_new_session=True)
+        return worker.wait(timeout=COPY_WORKER_WAIT_SECONDS)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        reason = "Managed-copy worker may still be running. Inspect the enrolled task's cleanup receipt."
+    except OSError:
+        reason = "Managed-copy worker outcome is unavailable."
+    print(json.dumps({"status": "retained-or-uncertain", "reason": reason}))
+    return 2
 
 
 if __name__ == "__main__":

@@ -2301,7 +2301,7 @@ def _worktree_audit(record):
 
 
 def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
-                    _managed_copy=None, _before_remove=None):
+                    _managed_copy=None, _before_remove=None, _managed_lock_fds=()):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
     compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
     removal is audited on this host (the audit of `ah` lives on the caller's host)."""
@@ -2329,7 +2329,12 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
         free_before = shutil.disk_usage(home).free
     except OSError:
         free_before = None
+    locking = {}
     if _managed_copy == path:
+        if len(_managed_lock_fds) != 2 or len(set(_managed_lock_fds)) != 2:
+            report.update(removable=False, reason='the managed-copy removal requires both held lock descriptors')
+            return report
+        locking['pass_fds'] = _managed_lock_fds
         reason = _before_remove() if _before_remove else 'the managed-copy final check was not supplied'
         if reason:
             report.update(removable=False, reason=reason)
@@ -2339,7 +2344,7 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
     try:
         done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', report['repo'],
                                'worktree', 'remove', '--', path],
-                              capture_output=True, text=True, timeout=REMOVE_SECONDS, env=_clone_env())
+                              capture_output=True, text=True, timeout=REMOVE_SECONDS, env=_clone_env(), **locking)
         returned, stderr = done.returncode, (done.stderr or '').strip()[:200]
     except (subprocess.SubprocessError, OSError, ValueError) as error:
         # git may have been killed partway through deleting: the report must say what is left, never nothing

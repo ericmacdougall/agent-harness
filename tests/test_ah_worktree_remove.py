@@ -149,8 +149,8 @@ class Verifier(Repo):
     def test_a_path_swapped_between_verification_and_removal_is_refused(self):
         real = cg.verify_worktree
 
-        def swapping(path, authenticated=False, policy=None):
-            report = real(path, authenticated, policy)
+        def swapping(path, authenticated=False, policy=None, **kwargs):
+            report = real(path, authenticated, policy, **kwargs)
             os.rename(path, path + ".old")
             os.mkdir(path)
             return report

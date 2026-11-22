@@ -12,6 +12,8 @@ python3 /path/to/copy_hygiene.py finish \
 
 Add `--apply` to retire the same checkout after reviewing the preview. The copy must still match the enrolled task's working directory and exact commit, belong to the reused key, and have no later acquisition. The isolated lifecycle worker holds the task and copy locks throughout guard verification and removal. The guarded remover checks live Git origin, uncommitted work, the worktree registry, open processes, and current protected service paths. It uses ordinary Git worktree removal. Keep a checkout that fails these checks.
 
+The removal process inherits both locks. If its controller times out or is interrupted, the worker may still finish and write the receipt. An unconfirmed removal leaves a persistent fence that refuses reacquisition of that copy key even after the processes exit. Inspect the task's cleanup receipt and any running removal before reconciliation. The command never clears an uncertain fence or retries the removal automatically.
+
 For an explicitly selected, non-secret build or report artifact, put the regular file or subtree under the enrolled task's private `artifacts` directory. Use only data authorized to be archived to the configured private bucket. The operation refuses the enrolled prompt, hidden paths, links, foreign filesystems, logs, WALs, credentials by common names or extensions, and recognized durable harness state. These name checks cannot classify arbitrary artifact content. Keep sensitive files outside this directory.
 
 ```sh
