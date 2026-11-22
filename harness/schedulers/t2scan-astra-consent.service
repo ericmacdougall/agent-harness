@@ -1,0 +1,24 @@
+[Unit]
+Description=Agent Harness T2Scan direct Astra consent broker
+Requires=t2scan-astra-consent.socket
+After=t2scan-astra-consent.socket
+
+[Service]
+Type=simple
+User=agent-harness-consent
+Group=agent-harness-consent
+ExecStart=/usr/bin/python3 -I /usr/lib/agent-harness/t2scan_consent.py serve
+StateDirectory=agent-harness-t2scan-astra-consent
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
