@@ -38,11 +38,195 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
 import unicodedata
 from pathlib import Path
+
+# Reviewed native append-only implementation; changing it requires updating the binding and tests.
+CODEX_WAL_NOTE_SHA256 = 'eebaeda8cc22ca056632041a2e3f1a5128ac6cbf24d814b909be7c3002e56f3c'
+CODEX_WAL_EVENTS = frozenset(('intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker',
+                              'status', 'handoff', 'result'))
+
+
+def _owned_path(path, root, private=False, digest=None):
+    """Observe a canonical owned file without following links. Not atomic execution binding.
+
+    A same-account writer can change an installed script after this observation; this is an
+    installed-account trust boundary, not isolation from a hostile process with the same uid.
+    """
+    try:
+        path, root = Path(path), Path(root)
+        if not path.is_absolute() or path != Path(os.path.normpath(path)) or root.resolve() != root:
+            return False
+        relative = path.relative_to(root)
+        if not relative.parts:
+            return False
+        current = root
+        for part in (None,) + relative.parts:
+            if part is not None:
+                current = current / part
+            info = current.lstat()
+            last = current == path
+            if info.st_uid != os.getuid() or stat.S_ISLNK(info.st_mode):
+                return False
+            if last:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    return False
+            elif not stat.S_ISDIR(info.st_mode):
+                return False
+            # The root home need not itself be private; the WAL subtree must be.
+            forbidden = 0o077 if private and current != root else 0o022
+            if info.st_mode & forbidden:
+                return False
+        if digest:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) or opened.st_size > 200000:
+                    return False
+                with os.fdopen(fd, 'rb', closefd=False) as stream:
+                    data = stream.read(200001)
+                after = os.fstat(fd)
+                identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                          value.st_mtime_ns, value.st_ctime_ns, value.st_mode, value.st_uid)
+                if identity(after) != identity(opened) or hashlib.sha256(data).hexdigest() != digest:
+                    return False
+            finally:
+                os.close(fd)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _trusted_cellar_directory(path, info):
+    """One observed Homebrew admin-managed directory, never an arbitrary writable ancestor."""
+    if (sys.platform != 'darwin' or str(path) != '/opt/homebrew/Cellar'
+            or not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
+            or info.st_gid != 80 or info.st_mode & 0o002):
+        return False
+    try:
+        import grp  # only available on Unix; the exception is Darwin-only
+        if grp.getgrgid(80).gr_name != 'admin':
+            return False
+        # Darwin exposes extended ACL presence as '+' in the ls mode field. Unknown or
+        # extended ACLs are refused rather than inferring their effective permissions.
+        result = subprocess.run(['/bin/ls', '-lde', '/opt/homebrew/Cellar'], capture_output=True,
+                                text=True, timeout=2, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        mode = result.stdout.split()[0] if result.stdout.split() else ''
+        return result.returncode == 0 and bool(re.fullmatch(r'd[rwxstST-]{9}', mode))
+    except (KeyError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _trusted_python_chain(path):
+    """Inspect original aliases and each intermediate target, not just the resolved leaf."""
+    pending, current, links = list(Path(path).parts[1:]), Path('/'), 0
+    root = current.lstat()
+    if root.st_uid not in (0, os.getuid()) or not stat.S_ISDIR(root.st_mode) or root.st_mode & 0o022:
+        return None
+    while pending:
+        part = pending.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            current = current.parent
+            continue
+        candidate = current / part
+        info = candidate.lstat()
+        if info.st_uid not in (0, os.getuid()):
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            # Symlink modes are conventionally 0777; replacement is controlled by the
+            # already-inspected parent. The link owner and every target ancestor matter.
+            links += 1
+            if links > 40:
+                return None
+            target = os.readlink(candidate)
+            if target.startswith('/'):
+                current = Path('/')
+            pending = list(Path(target).parts[1:] if target.startswith('/') else Path(target).parts) + pending
+            continue
+        if info.st_mode & 0o022 and not _trusted_cellar_directory(candidate, info):
+            return None
+        if pending:
+            if not stat.S_ISDIR(info.st_mode):
+                return None
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_mode & 0o111:
+            return None
+        current = candidate
+    return current
+
+
+def _trusted_note_python(word):
+    """Literal trusted system/Homebrew installation; no arbitrary basename or relocated alias."""
+    text = word.text
+    if word.raw != text or not re.fullmatch(
+            r'(?:/usr/bin/python3(?:\.[0-9]+)?|/opt/homebrew/(?:bin/python3(?:\.[0-9]+)?|'
+            r'opt/python@3\.[0-9]+/bin/python3\.[0-9]+|Cellar/python@3\.[0-9]+/[0-9][0-9A-Za-z_.-]*/'
+            r'(?:Frameworks/Python\.framework/Versions/3\.[0-9]+/bin/|bin/)python3(?:\.[0-9]+)?))', text):
+        return False
+    try:
+        resolved = _trusted_python_chain(text)
+        if '/Cellar/' in text and resolved != Path(text):
+            return False  # the canonical versioned entry must itself be physical, not a second alias
+        if resolved is None or not (str(resolved).startswith('/usr/bin/') or re.fullmatch(
+                r'/opt/homebrew/Cellar/python@3\.[0-9]+/[^/]+/(?:Frameworks/Python\.framework/Versions/'
+                r'3\.[0-9]+/bin/)?(?:bin/)?python3(?:\.[0-9]+)?', str(resolved))):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _literal_wrapper_tail(name, args):
+    """Return the proven inner argv boundary for a deliberately finite wrapper grammar."""
+    if any(a.dynamic or a.subs or a.vars or a.glob for a in args):
+        return None
+    texts = [a.text for a in args]
+    if name == 'env':
+        if texts[:1] != ['-i']:
+            return None
+        i, seen = 1, set()
+        while i < len(texts) and '=' in texts[i]:
+            key, _, value = texts[i].partition('=')
+            if key in seen or key not in ('PATH', 'LC_ALL'):
+                return None
+            if key == 'PATH' and value != '/usr/bin:/bin' or key == 'LC_ALL' and value != 'C':
+                return None
+            seen.add(key)
+            i += 1
+        return i if seen == {'PATH', 'LC_ALL'} and i < len(texts) and not texts[i].startswith('-') else None
+    if name == 'sudo':
+        return 1 if len(texts) > 1 and texts[0] == '-n' and not texts[1].startswith('-') else None
+    if name != 'timeout':
+        return None
+    def duration(value):
+        match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)([smhd]?)', value)
+        return bool(match and 0 < float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[match[2]] <= 86400)
+    i, seen = 0, set()
+    while i < len(texts) and texts[i].startswith('-'):
+        key, equal, value = texts[i].partition('=')
+        if key not in ('--signal', '--kill-after', '-s', '-k'):
+            return None
+        key = {'-s': '--signal', '-k': '--kill-after'}.get(key, key)
+        if key in seen:
+            return None
+        if not equal:
+            i += 1
+            if i >= len(texts):
+                return None
+            value = texts[i]
+        if key == '--signal' and value not in ('TERM', 'KILL', 'INT', 'HUP', '15', '9', '2', '1'):
+            return None
+        if key == '--kill-after' and not duration(value):
+            return None
+        seen.add(key)
+        i += 1
+    return i + 1 if i + 1 < len(texts) and duration(texts[i]) and not texts[i + 1].startswith('-') else None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -1461,12 +1645,13 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
+                if not self.is_codex_note(words, cmd, depth, pl) and not self.is_ah_kill(name, args, cmd, depth) \
+                        and not self.is_harness_cli(name, args, cmd, depth):
                     self.check_interpreter(name, texts, cmd, args)
             self.check_spawn(name, args, texts, depth, pl, idx)
-            self.check_text_runners(name, args, texts, cmd, depth)
+            self.check_text_runners(name, args, texts, cmd, depth, pl, idx)
 
-        def check_text_runners(self, name, args, texts, cmd, depth):
+        def check_text_runners(self, name, args, texts, cmd, depth, pl, idx):
             """Commands that run a text argument or here-string as shell code, which the base does not follow."""
             runs_stdin = name in cg.SHELLS or name in ('at', 'batch') or (
                 (name in WRAPPER_NAMES or name in REMOTE_WRAPPERS or name in REMOTE_EXEC) and any(
@@ -1487,7 +1672,20 @@ def make_analyzer_class(cg):
                 finally:
                     self.remote -= 1 if remote else 0
             if (name in WRAPPER_NAMES) and any(INTERPRETER_NAME.fullmatch(cg.norm_name(a.text)) for a in args):
-                self.check_interpreter(name, texts, cmd)  # uv run python - <<EOF
+                # Rebuilt inner argv does not carry the original input redirections or pipeline.
+                # Keep the old full scan in those contexts rather than losing stdin code.
+                head = (getattr(cmd, 'words', None) or [None])[0]
+                trusted_wrapper = head is not None and head.raw == '/usr/bin/' + name
+                boundary = (None if not trusted_wrapper or getattr(cmd, 'redirs', [])
+                            or (pl is not None and len(pl.cmds) != 1)
+                            else _literal_wrapper_tail(name, args))
+                if boundary is None:
+                    self.check_interpreter(name, texts, cmd)  # uncertain wrapper: retain conservative scan
+                else:
+                    # Prove the actual inner boundary by analyzing that argv, not by exempting a whole
+                    # wrapper. Base wrapper recursion and scan_tail still run independently. Original
+                    # redirections above remain checked; inner Python/shell code is never omitted.
+                    self.inner_words(args[boundary:], depth, pl, idx)
             if name in ('at', 'batch'):
                 for i, t in enumerate(texts):
                     if t == '-f' and i + 1 < len(args):
@@ -1565,6 +1763,59 @@ def make_analyzer_class(cg):
                 if not rest or rest[0] not in AH_SUBCOMMANDS:
                     return False
             return True
+
+        def is_codex_note(self, words, cmd, depth, pl):
+            """Only reviewed installed append data, isolated from Python startup and shell expansion."""
+            if self.remote or depth or self.ctx.ps or self.home_moved() or getattr(cmd, 'redirs', []):
+                return False
+            if pl is not None and len(pl.cmds) != 1:
+                return False
+            if not words or any(w.dynamic or w.subs or w.vars or w.glob for w in words):
+                return False
+            original = getattr(cmd, 'words', None) or []
+            if not original or original[0].raw != words[0].raw:
+                return False  # assignment prefixes may have been removed from the execution words
+            if not _trusted_note_python(words[0]):
+                return False
+            args = words[1:]
+            texts = [a.text for a in args]
+            if texts[:2] != ['-I', '-S']:
+                return False
+            i = 2
+            seen_flags = set()
+            while i < len(texts) and texts[i] in ('-B', '-u'):
+                if texts[i] in seen_flags:
+                    return False
+                seen_flags.add(texts[i])
+                i += 1
+            home = Path.home()
+            script = home / '.codex/agent-harness/wal.py'
+            if i >= len(texts) or texts[i] != str(script) or args[i].raw != str(script):
+                return False
+            if not _owned_path(script, home, digest=CODEX_WAL_NOTE_SHA256):
+                return False
+            rest = texts[i + 1:]
+            if len(rest) != 7 or rest[0] != 'note':
+                return False
+            values = {}
+            for j in (1, 3, 5):
+                key, value = rest[j:j + 2]
+                if key not in ('--wal', '--event', '--note') or key in values:
+                    return False
+                values[key] = value
+            if values.get('--event') not in CODEX_WAL_EVENTS or not 1 <= len(values['--note'].strip()) <= 4000:
+                return False
+            wal = Path(values['--wal'])
+            root = home / '.agent-harness/codex-wals'
+            try:
+                parts = wal.relative_to(root).parts
+            except ValueError:
+                return False
+            if len(parts) != 2 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', parts[0]):
+                return False
+            if parts[1] != 'main.jsonl' and not re.fullmatch(r'agent-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.jsonl', parts[1]):
+                return False
+            return _owned_path(wal, home, private=True)
 
         def is_ah_kill(self, name, args, cmd, depth):
             """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R

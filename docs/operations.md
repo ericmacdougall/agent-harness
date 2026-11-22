@@ -29,6 +29,20 @@ No background process is installed. Claude Code runs hooks, and the main agent i
 
 Before replacing a managed file, both installers also compare its current bytes and permission mode with the original snapshot. If either differs, they refuse the write and leave that path untouched. Rollback acts only on files this run published and refuses to replace or remove one whose published bytes or mode were edited in place. The backup contains the preflight snapshot, not a later external edit. A noncooperating editor can still write in the narrow interval between the final comparison and atomic replacement; filesystem rename has no portable compare-and-swap guard for file contents. Coordinate installers and editors if that race matters.
 
+## Literal Codex WAL notes
+
+The process guard recognizes a bounded append-data operation: a trusted absolute system or Homebrew Python entry, separate `-I -S` flags (optional `-B` and `-u` afterwards), the absolute installed `.codex/agent-harness/wal.py`, and `note` with exactly one each of `--wal`, `--event`, and `--note`. Use the existing absolute private native WAL supplied by the session hook. For Homebrew, prefer the fully resolved, versioned Cellar executable; alias directories such as `bin` or `opt` are refused when writable. Every original alias and intermediate target is checked, not only the final resolved binary. The reviewed writer bytes are pinned; source changes require updating the binding and its test. Symlinked, hardlinked, changed or uncertain writer/WAL paths retain ordinary interpreter analysis.
+
+For example, substitute the verified absolute paths on the executing host:
+
+```sh
+<trusted-absolute-python> -I -S <absolute-home>/.codex/agent-harness/wal.py note --wal <absolute-home>/.agent-harness/codex-wals/SESSION_ID/main.jsonl --event intent --note 'Scoped intent without private values'
+```
+
+Quoted literal prose is data, including signalling vocabulary. Active expansions, substitutions, redirects, wrappers, inline Python and unknown arguments receive ordinary checks. Other command segments are checked independently. Legacy note calls without isolated flags can still be conservatively refused; this recognition does not exempt arbitrary Python or grant authority over processes or another agent's WAL. Filesystem checks observe identity and content before execution; they do not isolate execution from a hostile concurrent writer with the same installed-account authority. System/Homebrew installation owners and OS administrators are trusted. The sole writable-ancestor exception is Darwin's physical `/opt/homebrew/Cellar` owned by root or the caller, group 80 resolving to `admin`, with no world write or extended ACL; other writable ancestors and writable interpreter files are refused. Administrators can already modify this toolchain; these checks do not establish a root-owned or code-signed binary.
+
+Known edit operations are classified before commit-message analysis, including raw patch data under a `command` key. Shell, orchestration, missing and unknown operation names retain command checks. A narrow system `env`/`sudo`/`timeout` grammar avoids scanning supervision options as Python code while retaining inner-command, substitution, redirection and stdin analysis; uncertain wrappers retain conservative scanning.
+
 ## Managed test checkouts
 
 Use one copy per repository and PR or lane. Run the test under the lease.
