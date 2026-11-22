@@ -29,6 +29,19 @@ No background process is installed. Claude Code runs hooks, and the main agent i
 
 Before replacing a managed file, both installers also compare its current bytes and permission mode with the original snapshot. If either differs, they refuse the write and leave that path untouched. Rollback acts only on files this run published and refuses to replace or remove one whose published bytes or mode were edited in place. The backup contains the preflight snapshot, not a later external edit. A noncooperating editor can still write in the narrow interval between the final comparison and atomic replacement; filesystem rename has no portable compare-and-swap guard for file contents. Coordinate installers and editors if that race matters.
 
+## Managed test checkouts
+
+Use one copy per repository and PR or lane. Run the test under the lease.
+
+```sh
+python3 ~/.claude/hooks/copy_hygiene.py acquire --repo "$owner_checkout" --key "pr-$pr" \
+  --ref "$reviewed_commit" --require-reuse --run your-test-command
+```
+
+Omit `--require-reuse` only for an authorized first checkout. Without `--run`, acquisition reports the path and releases its lease immediately. With `--run`, the first output line records the verified path and commit, and the command runs in that checkout with its exit status propagated. The lease survives the CLI controller exiting while the command runs. The command must wait for workers it starts before it exits. The lease is held by the supervisor and ends when the foreground command returns. It does not protect a background worker after that point.
+
+An existing checkout can be reused at the disk floor. An advance to a different commit requires a clean, registered copy with no tracked, untracked or ignored changes. At the same commit a leased command requires clean tracked files and can use existing local byproducts. A busy lease, absent copy under `--require-reuse`, or uncertain checkout fails acquisition without opening a fallback checkout. Reaping reports by default. If enabled explicitly, it rechecks the managed registration, lease, local changes, liveness and service protection before using Git's non-forced worktree removal. Legacy or unmanaged copies are reported for separate disposition.
+
 ## Installer scan (installer_scan.py)
 
 `installer_scan.py <dir-or-file> [--json]` statically scans third-party shell and Python installers (`*.sh`, `*.py`, `install*`, `setup*`, `Makefile`) before anyone runs them. It never executes or imports the target and reads each file with a 2 MB cap (larger files are listed as skipped). Findings carry a category and `file:line`: `mcp` (agent CLI `mcp add`, `[mcp_servers.`, `mcpServers`), `agent-rules` (CLAUDE.md, AGENTS.md, settings files, config.toml, permission grants), `launchd` (launchctl, LaunchAgents, systemctl, crontab, schtasks), `shell-rc` (rc files, `PATH=`), `network-exec` (`curl | sh`, wget, pip/npm -g/brew install), `credentials` (keychain, keyring, `~/.ssh`, `~/.aws`, `~/.kimi-code`) and `privileged` (sudo, setuid, writes under `/usr/local`, `/etc`, `/Library`). Exit 0 means at least one file was scanned with no findings and nothing was left unscanned. Exit 1 means findings, a skipped file (oversize or unreadable), an executable-looking file the scan does not parse (`.js`, `.mjs`, `package.json`, `.plist`, `.ps1`, `.rb`, an executable or `#!` file, listed as skipped), no file scanned, or the 5,000-file limit reached. Exit 2 means bad usage. The rule is scan, then read. A clean scan is not a safety proof: it is regex matching on source text, so obfuscated or generated commands are missed. Review the installer anyway; the scan only makes the known side effects (for example the GoodQA MCP registration in the secure-login installer) visible first.
