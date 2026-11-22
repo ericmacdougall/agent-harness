@@ -1,5 +1,6 @@
 """Real subprocess controls for explicitly enrolled detached task recovery."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,24 @@ HELPER = Path(__file__).resolve().parents[1] / "harness/hooks/task_recovery.py"
 
 
 class Recovery(unittest.TestCase):
+    def test_timeout_does_not_release_a_surviving_writer(self):
+        spec = importlib.util.spec_from_file_location("task_recovery_control", HELPER)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        writer = self.root / "orphan-wrote"
+        program = (
+            "import os,signal,time,pathlib; "
+            "pid=os.fork(); "
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN) if pid==0 else None; "
+            "time.sleep(1) if pid==0 else time.sleep(20); "
+            "pathlib.Path(" + repr(str(writer)) + ").write_text('unsafe') if pid==0 else None"
+        )
+        result = module.execute([sys.executable, "-c", program], str(self.root),
+                                self.root / "descendant.log", .2)
+        self.assertEqual(result, 124)
+        time.sleep(1.1)
+        self.assertFalse(writer.exists(), "descendant wrote after the command was declared terminated")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

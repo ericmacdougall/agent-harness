@@ -126,6 +126,49 @@ def enroll(root, source):
         os.close(fd)
 
 
+class ProcessUncertain(RuntimeError):
+    """An owned process group may still contain a live writer."""
+
+
+def group_live(pgid):
+    try:
+        result = subprocess.run(["/bin/ps", "-axo", "pgid=,stat="], capture_output=True, timeout=2)
+        rows = result.stdout.decode("ascii", "strict").splitlines()
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise ProcessUncertain("process observation unavailable") from error
+    if result.returncode:
+        raise ProcessUncertain("process observation unavailable")
+    for line in rows:
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            raise ProcessUncertain("process observation malformed")
+        if int(fields[0]) == pgid and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
+def quiesce(child):
+    """Observe descendants independently from the command leader."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not group_live(child.pid):
+            child.wait(timeout=2)
+            return
+        try:
+            os.killpg(child.pid, sig)
+        except ProcessLookupError:
+            pass
+        end = time.monotonic() + .2
+        while time.monotonic() < end:
+            child.poll()
+            if not group_live(child.pid):
+                child.wait(timeout=2)
+                return
+            time.sleep(.02)
+    child.poll()
+    if group_live(child.pid):
+        raise ProcessUncertain("owned group remains active")
+
+
 def execute(command, cwd, log, timeout, prompt=None):
     """Only signal the new child session created by this invocation."""
     with log.open("ab", buffering=0) as output:
@@ -133,20 +176,10 @@ def execute(command, cwd, log, timeout, prompt=None):
                                  stdout=output, stderr=output, start_new_session=True, close_fds=True)
         try:
             child.communicate(input=prompt, timeout=max(.01, timeout))
+            quiesce(child)
             return child.returncode
         except (subprocess.TimeoutExpired, BaseException) as error:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                child.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(child.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                child.wait()
+            quiesce(child)
             if isinstance(error, subprocess.TimeoutExpired):
                 return 124
             raise
@@ -165,13 +198,16 @@ def attempt(root, number, inherited_fd):
         % (number, manifest["max_attempts"])
     ).encode()
     remaining = min(manifest["attempt_timeout"], state["deadline"] - time.time())
-    code = 125
+    code, quiescent = 125, True
     try:
         if remaining > 0 and not (root / "paused.json").exists():
             code = execute(manifest["agent_argv"], manifest["cwd"], root / ("attempt-%d.log" % number),
                            remaining, prompt + directive)
+    except ProcessUncertain:
+        quiescent = False
     finally:
         atomic(root / ("attempt-%d.json" % number), {"attempt": number, "exit": code,
+                                                    "quiescent": quiescent,
                                                     "manifest_sha256": state["manifest_sha256"],
                                                     "finished_at": time.time()})
     return 0
@@ -186,7 +222,7 @@ def run(root):
         # A missing receipt may hide a surviving native writer. Preserve ambiguity.
         if state["status"] == "running" and state["attempts"] > 0:
             previous = root / ("attempt-%d.json" % state["attempts"])
-            if not previous.exists():
+            if not previous.exists() or json.loads(read(previous)).get("quiescent") is not True:
                 state["status"] = "recovery_uncertain"
                 atomic(root / "state.json", state)
                 return 0
@@ -199,8 +235,13 @@ def run(root):
                 state["status"] = "deadline_exhausted"
                 atomic(root / "state.json", state)
                 return 0
-            verified = execute(manifest["verify_argv"], manifest["cwd"], root / "verification.log",
-                               min(60, remaining))
+            try:
+                verified = execute(manifest["verify_argv"], manifest["cwd"], root / "verification.log",
+                                   min(60, remaining))
+            except ProcessUncertain:
+                state["status"] = "recovery_uncertain"
+                atomic(root / "state.json", state)
+                return 0
             if verified == 0:
                 state["status"], state["verified_at"] = "complete", time.time()
                 atomic(root / "state.json", state)
@@ -225,6 +266,10 @@ def run(root):
                 receipt = json.loads(read(path))
                 if receipt["attempt"] != number or receipt["manifest_sha256"] != state["manifest_sha256"]:
                     raise ValueError("attempt receipt does not match task")
+                if receipt.get("quiescent") is not True:
+                    state["status"] = "recovery_uncertain"
+                    atomic(root / "state.json", state)
+                    return 0
             else:
                 state["status"] = "recovery_uncertain"
                 atomic(root / "state.json", state)
