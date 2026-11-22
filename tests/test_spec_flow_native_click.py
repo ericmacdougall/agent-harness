@@ -40,23 +40,24 @@ class NativeClick(SpecFlowCase):
         self.rollout = (self.native_home / ".codex/sessions/2026/11/05" /
                         f"rollout-2026-11-05T10-01-00-{TESTER}.jsonl")
         self.rollout.parent.mkdir(parents=True)
+        source = {"subagent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1,
+                  "agent_path": AGENT_PATH, "agent_role": ROLE}}}
         self.wal(self.rollout, {"timestamp": "2026-11-05T10:01:02Z", "type": "session_meta", "payload": {
             "id": TESTER, "session_id": PARENT, "parent_thread_id": PARENT, "originator": "Codex Desktop",
             "thread_source": "subagent", "agent_role": ROLE, "agent_path": AGENT_PATH,
+            "source": source, "model_provider": "fixture-provider",
         }})
         self.rollout.chmod(0o600)
         self.db = sqlite3.connect(self.native_home / ".codex/state_5.sqlite")
         self.addCleanup(self.db.close)
         self.db.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, source TEXT, thread_source TEXT, "
                         "originator TEXT, agent_path TEXT, agent_role TEXT, attached_thread_parent_id TEXT, "
-                        "archived INTEGER, rollout_path TEXT)")
-        self.db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)",
-                        (PARENT, "vscode", "user", "Codex Desktop", None, None, None, 0, None))
-        source = {"subagent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1,
-                  "agent_path": AGENT_PATH, "agent_role": ROLE}}}
-        self.db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)",
+                        "archived INTEGER, rollout_path TEXT, model_provider TEXT)")
+        self.db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (PARENT, "vscode", "user", "Codex Desktop", None, None, None, 0, None, "fixture-provider"))
+        self.db.execute("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (TESTER, json.dumps(source), "subagent", "Codex Desktop", AGENT_PATH, ROLE, None, 0,
-                         str(self.rollout)))
+                         str(self.rollout), "fixture-provider"))
         self.db.commit()
         self.repo = self.tmp / "fixture-repo"
         self.commits = git_repo(self.repo, "first", "deployed", "after")
@@ -97,6 +98,62 @@ class NativeClick(SpecFlowCase):
         code, _, _ = self.click(*extra, **kwargs)
         self.assertNotEqual(code, 0)
         self.assertEqual((len(self.fake.comments[ISSUE]), len(self.fake.attachments)), before)
+
+    def inherited_prologue(self, *, inherited_witness=False, authored_witness=True, root_changes=None,
+                           extra_header=False, bad_boundary=False, bad_clock=False):
+        line = self.witness()
+        meta, message = map(json.loads, self.rollout.read_text().splitlines())
+        root = {"timestamp": meta["timestamp"], "type": "session_meta", "payload": {
+            "id": PARENT, "session_id": PARENT, "source": "vscode", "thread_source": "user",
+            "originator": "Codex Desktop", "model_provider": "fixture-provider",
+        }}
+        root["payload"].update(root_changes or {})
+        if bad_clock:
+            root["timestamp"] = "2026-11-05T10:01:01Z"
+        history = [meta, root]
+        if inherited_witness:
+            history.append(message)
+        meta["payload"]["subagent_history_start_ordinal"] = len(history)
+        history.append({"timestamp": meta["timestamp"], "type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_id": UNRELATED if bad_boundary else TESTER,
+        }})
+        if authored_witness:
+            history.append(message)
+        if extra_header:
+            history.append(root)
+        self.rollout.write_text("")
+        self.wal(self.rollout, *history)
+        return line
+
+    def test_real_shape_inherited_root_prologue_and_child_boundary_verify(self):
+        line = self.inherited_prologue(inherited_witness=True)
+        code, out, error = self.click("--verify-native-witness")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(json.loads(out)["sha256"], hashlib.sha256(line.encode()).hexdigest())
+
+    def test_inherited_parent_witness_cannot_replace_child_witness(self):
+        self.inherited_prologue(inherited_witness=True, authored_witness=False)
+        self.no_write("--verify-native-witness")
+
+    def test_foreign_root_prologue_refuses(self):
+        self.inherited_prologue(root_changes={"id": UNRELATED})
+        self.no_write("--verify-native-witness")
+
+    def test_conflicting_root_provider_refuses(self):
+        self.inherited_prologue(root_changes={"model_provider": "foreign-provider"})
+        self.no_write("--verify-native-witness")
+
+    def test_nonmonotonic_root_header_refuses(self):
+        self.inherited_prologue(bad_clock=True)
+        self.no_write("--verify-native-witness")
+
+    def test_conflicting_child_history_boundary_refuses(self):
+        self.inherited_prologue(bad_boundary=True)
+        self.no_write("--verify-native-witness")
+
+    def test_extra_late_prologue_header_refuses(self):
+        self.inherited_prologue(extra_header=True)
+        self.no_write("--verify-native-witness")
 
     def test_native_record_preflights_posts_and_revalidates_without_role_grant(self):
         line = self.witness()

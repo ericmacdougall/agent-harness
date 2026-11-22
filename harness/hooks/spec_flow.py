@@ -737,7 +737,7 @@ def _native_review_rows(home, uid, agent, parent, *, rollout=False):
         tables = connection.execute("PRAGMA main.table_list('threads')").fetchmany(2)
         if len(tables) != 1 or tables[0][:3] != ("main", "threads", "table"):
             raise ValueError("native identity table unavailable")
-        columns = (*_NATIVE_REVIEW_COLUMNS, "archived", *(("rollout_path",) if rollout else ()))
+        columns = (*_NATIVE_REVIEW_COLUMNS, "archived", *(("rollout_path", "model_provider") if rollout else ()))
         slots = ",".join("?" for _ in columns)
         count = connection.execute(
             f"SELECT count(*) FROM pragma_table_xinfo('threads','main') WHERE name IN ({slots}) AND hidden=0",
@@ -747,7 +747,9 @@ def _native_review_rows(home, uid, agent, parent, *, rollout=False):
         query = _NATIVE_REVIEW_QUERY
         if rollout:
             query = query.replace(" FROM main.threads", ", CASE WHEN typeof(rollout_path)='text' AND "
-                                  "length(CAST(rollout_path AS BLOB))<=1024 THEN rollout_path END FROM main.threads")
+                                  "length(CAST(rollout_path AS BLOB))<=1024 THEN rollout_path END, "
+                                  "CASE WHEN typeof(model_provider)='text' AND length(CAST(model_provider AS BLOB))<=128 "
+                                  "THEN model_provider END FROM main.threads")
         rows = connection.execute(query, (agent, parent)).fetchmany(3)
     finally:
         connection.close()
@@ -837,7 +839,8 @@ def _native_agent_source(path, agent, expected, *, purpose):
             raise ValueError("native review WAL binding changed")
         return {"home": home, "uid": uid, "parent": parent, "agent_path": child[4],
                 "main": raw, "main_binding": wal_binding, "rollout": child[8] if click else None,
-                "archived": bool(child[7])}
+                "archived": bool(child[7]), "child_source": source,
+                "child_provider": child[9] if click else None, "parent_provider": parent_row[9] if click else None}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
         label = "click-tester" if click else "reviewer"
         raise SpecError(f"native {label} metadata unavailable or conflicting", EXIT_USAGE) from None
@@ -903,6 +906,21 @@ def _native_stamp(value):
     return stamp
 
 
+def _check_native_inherited_header(entry, identity, first_at, observed_start):
+    """Accept the one Desktop fork prologue, which belongs to the already-bound parent."""
+    payload = entry.get("payload")
+    parent = identity["parent"]
+    if (entry.get("type") != "session_meta" or not isinstance(payload, dict)
+            or payload.get("id") != parent or payload.get("session_id") != parent
+            or payload.get("source") != "vscode" or payload.get("thread_source") != "user"
+            or payload.get("originator") != "Codex Desktop" or not identity["parent_provider"]
+            or payload.get("model_provider") != identity["parent_provider"]
+            or any(payload.get(key) is not None for key in ("parent_thread_id", "forked_from_id", "agent_path",
+                                                           "agent_role", "agent_nickname", "subagent_history_start_ordinal"))
+            or not first_at <= _native_stamp(entry.get("timestamp")) <= observed_start):
+        raise ValueError("native inherited rollout header mismatched")
+
+
 def _native_click_proof(identity, agent, line, started, ended):
     """Require the same statement in the child's native final answer and own WAL."""
     try:
@@ -935,18 +953,36 @@ def _native_click_proof(identity, agent, line, started, ended):
         entries = iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
         first = _native_json(next(entries), 4_000_000)
         meta = first.get("payload")
+        first_at = _native_stamp(first.get("timestamp"))
         if (first.get("type") != "session_meta" or not isinstance(meta, dict) or meta.get("id") != agent
                 or meta.get("session_id") != parent or meta.get("parent_thread_id") != parent
                 or meta.get("originator") != "Codex Desktop" or meta.get("thread_source") != "subagent"
                 or meta.get("agent_role") != NATIVE_CLICK_ROLE or meta.get("agent_path") != identity["agent_path"]
-                or _native_stamp(first.get("timestamp")) > start):
+                or first_at > start):
             raise ValueError("native rollout metadata mismatched")
+        cutoff = meta.get("subagent_history_start_ordinal")
+        if cutoff is not None:
+            if (type(cutoff) is not int or cutoff < 2 or not identity["child_provider"]
+                    or meta.get("model_provider") != identity["child_provider"]
+                    or meta.get("source") != identity["child_source"]):
+                raise ValueError("native fork history boundary unavailable")
         matches = []
-        for raw in entries:
+        for ordinal, raw in enumerate(entries, start=1):
             entry = _native_json(raw, 4_000_000)
+            if cutoff is not None and ordinal == 1:
+                _check_native_inherited_header(entry, identity, first_at, start)
+                continue
             if entry.get("type") == "session_meta":
-                raise ValueError("duplicate native rollout header")
+                raise ValueError("unexpected native rollout header")
+            if cutoff is not None and ordinal < cutoff:
+                continue
             payload = entry.get("payload")
+            settings = (entry.get("type") == "event_msg" and isinstance(payload, dict)
+                        and payload.get("type") == "thread_settings_applied")
+            if ordinal == cutoff and (not settings or _native_stamp(entry.get("timestamp")) > start):
+                raise ValueError("native fork history boundary unavailable")
+            if settings and payload.get("thread_id") != agent:
+                raise ValueError("native rollout settings name another thread")
             if (entry.get("type") != "response_item" or not isinstance(payload, dict)
                     or payload.get("type") != "message" or payload.get("role") != "assistant"
                     or payload.get("phase") != "final_answer" or payload.get("status") != "completed"):
