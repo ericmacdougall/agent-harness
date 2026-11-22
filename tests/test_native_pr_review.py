@@ -21,7 +21,7 @@ HEAD, BASE = "a" * 40, "b" * 40
 
 def context():
     return {"version": 1, "repo": "fixture/project", "pr": 3, "head": HEAD, "base": BASE, "base_ref": "main",
-            "commits": [HEAD], "packet_sha256": "c" * 64, "tests_sha256": "d" * 64, "no_ci": True, "evidence_authors": [],
+            "head_ref": "codex/reviewed", "commits": [HEAD], "packet_sha256": "c" * 64, "tests_sha256": "d" * 64, "no_ci": True, "evidence_authors": [],
             "tickets": [{"ticket": "GoodQA fixture#3", "state": "in_review", "spec_core_sha": "2" * 64,
                          "review_sha256": "3" * 64, "evidence_sha256": "4" * 64, "release_records_sha256": "5" * 64, "missing": ["live proof pending"], "premerge_missing": []}]}
 
@@ -92,7 +92,7 @@ class NativeReviewContracts(TestCase):
         values = context()
         args = (ACCEPTANCE, "2026-11-22T18:55:00Z", "2026-11-22T19:00:00Z", self.report.read_bytes())
         line = n.witness_line(values, "acceptance", *args)
-        for field, replacement in (("base_ref", "feature"), ("base", "f" * 40), ("pr", 10),
+        for field, replacement in (("base_ref", "feature"), ("head_ref", "codex/other"), ("base", "f" * 40), ("pr", 10),
                                    ("packet_sha256", "e" * 64), ("tests_sha256", "e" * 64), ("no_ci", False),
                                    ("commits", [BASE, HEAD])):
             self.assertNotEqual(line, n.witness_line(dict(values, **{field: replacement}), "acceptance", *args))
@@ -100,14 +100,24 @@ class NativeReviewContracts(TestCase):
 
     def test_fresh_remote_ref_and_ci_proof(self):
         client = mock.Mock()
-        pull = {"number": 3, "state": "open", "base": {"sha": BASE, "ref": "main"}, "head": {"sha": HEAD}}
+        pull = {"number": 3, "state": "open", "base": {"sha": BASE, "ref": "main", "repo": {"full_name": "fixture/project"}},
+                "head": {"sha": HEAD, "ref": "codex/reviewed", "repo": {"full_name": "fixture/project"}}}
         client.json.return_value = pull
         valid = {"slug": "fixture/project", "number": 3, "head": HEAD, "no_ci": True, "unsettled": []}
         with mock.patch("merge_gate.evaluate_pr", return_value=(valid, [])):
-            self.assertEqual(n._remote(client, "fixture/project", 3, HEAD, BASE), ("main", True))
+            self.assertEqual(n._remote(client, "fixture/project", 3, HEAD, BASE), ("main", "codex/reviewed", True))
             pull["base"]["sha"] = HEAD
             with self.assertRaisesRegex(ValueError, "base or head changed"):
                 n._remote(client, "fixture/project", 3, HEAD, BASE)
+            pull["base"]["sha"] = BASE
+            pull["head"]["repo"]["full_name"] = "fork/project"
+            with self.assertRaisesRegex(ValueError, "same GitHub repository"):
+                n._remote(client, "fixture/project", 3, HEAD, BASE)
+            pull["head"]["repo"]["full_name"] = "fixture/project"
+            for invalid_ref in ("main", "refs//broken", "refs/../main", "codex/test.lock"):
+                with self.subTest(ref=invalid_ref), self.assertRaisesRegex(ValueError, "valid and distinct"):
+                    pull["head"]["ref"] = invalid_ref
+                    n._remote(client, "fixture/project", 3, HEAD, BASE)
         with mock.patch("merge_gate.evaluate_pr", return_value=(valid, ["a check failed"])):
             with self.assertRaisesRegex(ValueError, "CI is not eligible"):
                 n._remote(client, "fixture/project", 3, HEAD, BASE)

@@ -25,7 +25,7 @@ IDENT = re.compile(spec_flow.UUID.lower())
 MAX_FILE = 2_000_000
 MAX_COMMITS = 128
 MAX_AGE = 3600
-CONTEXT_FIELDS = {"version", "repo", "pr", "head", "base", "base_ref", "commits", "packet_sha256", "tests_sha256",
+CONTEXT_FIELDS = {"version", "repo", "pr", "head", "base", "base_ref", "head_ref", "commits", "packet_sha256", "tests_sha256",
                   "no_ci", "tickets", "evidence_authors"}
 MAX_TICKETS = 8
 PROOF_FIELDS = {"agent", "started", "ended", "report"}
@@ -79,6 +79,12 @@ def _github_origin(repo):
     return match[1].lower()
 
 
+def _branch_ref(value):
+    if not _matches(re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._/-]{0,127}"), value) or value.startswith("-") or ".." in value:
+        return False
+    return all(part and not part.startswith(".") and not part.endswith((".", ".lock")) for part in value.split("/"))
+
+
 def _remote(client, repository, pr, head, base):
     import merge_gate
 
@@ -87,16 +93,23 @@ def _remote(client, repository, pr, head, base):
             or problems or details.get("unsettled")):
         raise ValueError("current GitHub head or CI is not eligible for independent native review")
     row = client.json(["api", f"repos/{repository}/pulls/{pr}"], "the reviewed base and head")
-    if (not isinstance(row, dict) or row.get("number") != pr or row.get("state") != "open"
-            or (row.get("base") or {}).get("sha") != base or (row.get("head") or {}).get("sha") != head):
+    if not isinstance(row, dict) or row.get("number") != pr or row.get("state") != "open":
+        raise ValueError("the reviewed GitHub PR is no longer open")
+    base_branch, head_branch = row.get("base"), row.get("head")
+    if (not isinstance(base_branch, dict) or not isinstance(head_branch, dict)
+            or base_branch.get("sha") != base or head_branch.get("sha") != head):
         raise ValueError("the GitHub PR base or head changed")
-    ref = (row.get("base") or {}).get("ref")
-    if not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,128}", ref) or ref.startswith("-"):
-        raise ValueError("the GitHub base branch is invalid")
+    for branch in (base_branch, head_branch):
+        origin = branch.get("repo")
+        if not isinstance(origin, dict) or merge_gate.repo_key(origin.get("full_name")) != repository:
+            raise ValueError("native review requires base and head in the same GitHub repository")
+    base_ref, head_ref = base_branch.get("ref"), head_branch.get("ref")
+    if not _branch_ref(base_ref) or not _branch_ref(head_ref) or base_ref == head_ref:
+        raise ValueError("the GitHub base and source refs must be valid and distinct")
     no_ci = details.get("no_ci")
     if type(no_ci) is not bool:
         raise ValueError("the GitHub workflow classification is unavailable")
-    return ref, no_ci
+    return base_ref, head_ref, no_ci
 
 
 def _is_ancestor(repo, older, newer):
@@ -168,7 +181,8 @@ def _validate_context(context):
             or not isinstance(context["repo"], str) or merge_gate.repo_key(context["repo"]) != context["repo"]
             or type(context["pr"]) is not int or context["pr"] <= 0
             or not all(_matches(OID, context[k]) for k in ("head", "base")) or context["head"] == context["base"]
-            or not _matches(re.compile(r"[A-Za-z0-9._/-]{1,128}"), context["base_ref"]) or context["base_ref"].startswith("-")
+            or not all(_branch_ref(context[key]) for key in ("base_ref", "head_ref"))
+            or context["base_ref"] == context["head_ref"]
             or not all(_matches(DIGEST, context[k]) for k in ("packet_sha256", "tests_sha256"))
             or type(context["no_ci"]) is not bool or not isinstance(context["tickets"], list)
             or not 1 <= len(context["tickets"]) <= MAX_TICKETS
@@ -209,12 +223,12 @@ def build_context(repo, repository, pr, head, base, packet, tests, client):
     tests_bytes = spec_flow.read_regular(Path(tests), MAX_FILE)
     if not packet_bytes.strip() or not tests_bytes.strip():
         raise ValueError("review packet and test evidence must both be nonempty")
-    base_ref, no_ci = _remote(client, repository, pr, head, base)
+    base_ref, head_ref, no_ci = _remote(client, repository, pr, head, base)
     if not 1 <= len(commits) <= MAX_COMMITS:
         raise ValueError("candidate commit set is invalid")
     tickets, evidence_authors = _tracker_claims(repo, repository, commits, head)
-    context = {"version": 1, "repo": repository, "pr": pr, "head": head, "base": base, "base_ref": base_ref,
-               "commits": commits, "packet_sha256": digest(packet_bytes), "tests_sha256": digest(tests_bytes), "no_ci": no_ci,
+    context = {"version": 1, "repo": repository, "pr": pr, "head": head, "base": base,
+               "base_ref": base_ref, "head_ref": head_ref, "commits": commits, "packet_sha256": digest(packet_bytes), "tests_sha256": digest(tests_bytes), "no_ci": no_ci,
                "tickets": tickets, "evidence_authors": evidence_authors}
     _validate_context(context)
     return context, no_ci
