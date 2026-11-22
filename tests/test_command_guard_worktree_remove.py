@@ -347,6 +347,35 @@ class WorktreeRemoveCase(unittest.TestCase):
     def test_late_membership_root_during_lock_wait_preserves_files_and_grants(self):
         self.late_membership('lock', 'root')
 
+    def test_grants_expiring_during_locked_scope_check_spend_nothing(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        original, _ = cg.load_marker(self.home)
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        real_scope = cg._IgnoredBackups.locked_scope_matches
+        clock = mock.patch.object(cg.time, 'time', return_value=max(row['expires_at'] for row in original) + 1)
+        advanced = []
+
+        def slow_scope(backups):
+            self.assertTrue(real_scope(backups), 'valid unchanged scope must reach the final expiry boundary')
+            advanced.append(True)
+            clock.start()
+            return True
+
+        try:
+            with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                    mock.patch.object(cg, 'busy_scan', return_value=idle), \
+                    mock.patch.object(cg._IgnoredBackups, 'locked_scope_matches', slow_scope), \
+                    mock.patch.object(cg, '_worktree_audit') as audit:
+                result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+                self.assertFalse(audit.called, 'expired authority must not reach Git intent')
+        finally:
+            if advanced:
+                clock.stop()
+        self.assertEqual(advanced, [True])
+        self.assertFalse(result['removed'], result)
+        self.assertTrue(all(path.exists() for path in paths))
+        self.assertEqual(cg.load_marker(self.home)[0], original)
+
     def late_membership(self, boundary, location):
         import fcntl
         folder, paths, policy = self.backed_ignored_fixture()

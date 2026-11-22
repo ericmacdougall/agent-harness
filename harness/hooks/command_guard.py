@@ -8186,7 +8186,8 @@ class Approvals:
                         or not isinstance(backup_scope, _IgnoredBackups) or backup_scope.path != backup_root
                         or backup_scope.leaves != backup_leaves or backup_scope.approvals is not self
                         or not backup_scope.locked_scope_matches()
-                        or load_marker(self.home) != (entries, key)):
+                        or load_marker(self.home) != (entries, key)
+                        or not self._recheck_backups(entries, key, backup_leaves)):
                     return False
             wanted = set(self.used.values())
             remaining = [e for e in entries if not (isinstance(e, dict) and e.get('nonce') in wanted)]
