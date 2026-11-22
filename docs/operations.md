@@ -1053,6 +1053,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
     - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
     - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
     - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
+    - A Codex native `harness_click_tester` supplies its UUID and parent session directory. The helper checks its typed role and parent in the owned native database. Its report digest must appear as a complete `REPORT_SHA256 <digest>` line in its own assistant final response. The database-bound session rollout must identify the same child. The recorded observation time is the final response timestamp.
   - **Human click-tests** are self-attested.
 - **Sign-off:**
   - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.
