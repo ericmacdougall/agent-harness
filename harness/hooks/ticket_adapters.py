@@ -10,6 +10,9 @@ Credentials are read from a private file and never printed or logged.
 from __future__ import annotations
 
 import json
+import hashlib
+import http.client
+import ipaddress
 import os
 import re
 import socket
@@ -21,6 +24,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+from safe_input import safe_json_loads
 
 
 class TicketSystemUnavailable(Exception):
@@ -127,6 +131,9 @@ class GoodQAAdapter:
         self._key = None
         self._read_only = False
         self._org = config.get("org_id")
+        self._comment_times = {}
+        self._artifact_cache = {}
+        self._listed_attachments = {}
 
     def _load_key(self):
         """The private key file wins; without it, a configured Secret Manager key is read-only."""
@@ -309,6 +316,7 @@ class GoodQAAdapter:
                     raise TicketSystemUnavailable("GoodQA returned a malformed comment")
                 if not item.get("archivedAt"):
                     found.append(item)
+                    self._comment_times[item["id"]] = item.get("createdAt")
             cursor = data.get("nextCursor")
             if not data.get("hasMore") or not cursor:
                 return found
@@ -319,7 +327,156 @@ class GoodQAAdapter:
         data = self.call("issue_attachments_list", {"issueId": issue_id})
         if "__error__" in data or not isinstance(data.get("attachments"), list):
             raise TicketSystemUnavailable("GoodQA attachments could not be listed")
-        return [item for item in data["attachments"] if isinstance(item, dict)]
+        rows = [dict(item) for item in data["attachments"] if isinstance(item, dict)]
+        self._listed_attachments = {row.get("id"): row for row in rows if isinstance(row.get("id"), str)}
+        candidates = [row for row in rows if row.get("mime") == "text/markdown" and row.get("commentId")]
+        if len(candidates) > 64:
+            raise TicketSystemUnavailable("Spec attachment candidate budget exceeded")
+        consumed = 0
+        for row in candidates:
+            # These internal bytes can only come from a checked HTTP response,
+            # never from a JSON comment or a server-supplied cache field.
+            row.pop("_spec_bytes", None)
+            row.pop("_spec_error", None)
+            row["_comment_at"] = self._comment_times.get(row["commentId"])
+            try:
+                if consumed >= 8_000_000:
+                    raise TicketSystemUnavailable("Spec attachment aggregate budget exceeded")
+                payload = self.read_attachment(row, limit=min(1_000_000, 8_000_000 - consumed))
+                consumed += len(payload)
+                if consumed > 8_000_000:
+                    raise TicketSystemUnavailable("Spec attachment aggregate budget exceeded")
+                row["_spec_bytes"] = payload
+            except TicketSystemUnavailable:
+                row["_spec_error"] = "Attached markdown source could not be verified"
+        return rows
+
+    @staticmethod
+    def _artifact_origin(url):
+        if not isinstance(url, str) or len(url) > 16384 or not url.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in url):
+            raise TicketSystemUnavailable("Invalid attachment target")
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.username or parsed.password or parsed.fragment or not parsed.hostname:
+                raise ValueError
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if parsed.scheme not in ("https", "http"):
+                raise ValueError
+            return parsed, (parsed.scheme, parsed.hostname.lower(), port)
+        except ValueError:
+            raise TicketSystemUnavailable("Invalid attachment target") from None
+
+    def _artifact_get(self, origin, path, limit, *, api=False, fixture=False):
+        scheme, host, port = origin
+        if scheme != "https" and not fixture:
+            raise TicketSystemUnavailable("Attachment transport requires HTTPS")
+        headers = {"Accept": "application/json" if api else "application/octet-stream", "Accept-Encoding": "identity"}
+        if api:
+            if self._key is None:
+                self._load_key()
+            headers["Authorization"] = "Bearer " + self._key
+        # http.client has no redirect handler, cookie jar, netrc or environment
+        # proxy authentication. Each hop gets a new empty connection.
+        connection = None
+        try:
+            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+            connection = cls(host, port, timeout=self._remaining())
+            connection.connect()
+            wire = connection.sock
+            peer = ipaddress.ip_address(wire.getpeername()[0])
+            if not peer.is_global and not (fixture and peer.is_loopback):
+                raise TicketSystemUnavailable("Attachment peer is not public")
+            wire.settimeout(self._remaining())
+            connection.request("GET", path, headers=headers)
+            wire.settimeout(self._remaining())
+            response = connection.getresponse()
+            if response.status != 200:
+                raise TicketSystemUnavailable(f"Attachment read refused (HTTP {response.status})")
+            length = response.getheader("Content-Length")
+            if length is not None and (not length.isdigit() or int(length) > limit):
+                raise TicketSystemUnavailable("Attachment response exceeds its byte budget")
+            if response.getheader("Content-Encoding", "identity").lower() != "identity":
+                raise TicketSystemUnavailable("Unexpected attachment content encoding")
+            chunks, size = [], 0
+            while True:
+                wire.settimeout(self._remaining())
+                chunk = response.read(min(65536, limit + 1 - size))
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > limit:
+                    raise TicketSystemUnavailable("Attachment response exceeds its byte budget")
+                chunks.append(chunk)
+                if response.isclosed():
+                    break
+            return b"".join(chunks)
+        except (OSError, ValueError, http.client.HTTPException):
+            # Exceptions may include a signed URL: never retain or echo repr.
+            raise TicketSystemUnavailable("Attachment transport unavailable") from None
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def read_attachment(self, row, *, limit=1_000_000):
+        aid, expected = row.get("id"), row.get("sha256")
+        listed = self._listed_attachments.get(aid) if isinstance(aid, str) else None
+        if (not isinstance(aid, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,80}", aid) is None or listed is None
+                or listed.get("sha256") != expected or listed.get("commentId") != row.get("commentId")
+                or row.get("completionState") != "completed" or row.get("deletedAt") or row.get("archivedAt")
+                or not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None):
+            raise TicketSystemUnavailable("Attachment is not a completed listed source")
+        cache_key = (aid, expected)
+        cached = self._artifact_cache.get(cache_key)
+        if isinstance(cached, bytes) and len(cached) <= limit and hashlib.sha256(cached).hexdigest() == expected:
+            return cached
+        parsed, api_origin = self._artifact_origin(self.endpoint)
+        prefix = parsed.path.rstrip("/")
+        if parsed.query or not prefix.endswith("/mcp"):
+            raise TicketSystemUnavailable("Unsupported attachment API endpoint")
+        prefix = prefix[:-4]
+        fixture = api_origin[0] == "http" and api_origin[1] in ("127.0.0.1", "localhost")
+        if not fixture and (api_origin[0] != "https" or api_origin[2] != 443):
+            raise TicketSystemUnavailable("Unsupported attachment API origin")
+        raw = self._artifact_get(api_origin, prefix + "/uploads/" + aid + "/content/read-target", 65536,
+                                 api=True, fixture=fixture)
+        try:
+            def unique(items):
+                value = {}
+                for key, item in items:
+                    if key in value:
+                        raise ValueError
+                    value[key] = item
+                return value
+            safe_json_loads(raw, max_depth=8, max_bytes=65536)
+            target = json.loads(raw, object_pairs_hook=unique)
+            target = target.get("download", target)
+            if not isinstance(target, dict) or target.get("headers") or target.get("method", "GET") != "GET":
+                raise ValueError
+            storage, origin = self._artifact_origin(target["url"])
+        except (ValueError, KeyError, TypeError, AttributeError, RecursionError):
+            raise TicketSystemUnavailable("Invalid attachment read target") from None
+        approved = self.config.get("artifact_download_origins")
+        if approved is None:
+            approved = (["https://goodqa-uploads.tor1.digitaloceanspaces.com"]
+                        if api_origin == ("https", "goodqa.app", 443) else [])
+        if not isinstance(approved, list) or len(approved) > 8:
+            raise TicketSystemUnavailable("Invalid attachment origin policy")
+        allow = set()
+        for value in approved:
+            endpoint, item = self._artifact_origin(value)
+            if item[0] != "https" or item[2] != 443 or endpoint.path not in ("", "/") or endpoint.query:
+                raise TicketSystemUnavailable("Invalid attachment origin policy")
+            allow.add(item)
+        if origin not in allow and not (fixture and origin == api_origin):
+            raise TicketSystemUnavailable("Attachment storage origin is not approved")
+        path = storage.path or "/"
+        if storage.query:
+            path += "?" + storage.query
+        payload = self._artifact_get(origin, path, limit, fixture=fixture and origin == api_origin)
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise TicketSystemUnavailable("Attachment content checksum mismatch")
+        self._artifact_cache[cache_key] = payload
+        return payload
 
     def upload(self, project_id: str, filename: str, mime: str, payload: bytes, sha256: str) -> str:
         """Project-surface upload: start, PUT to the presigned URL, complete with the sha256."""
@@ -373,6 +530,7 @@ class GoodQAAdapter:
         comment = data.get("comment", data)
         if not isinstance(comment, dict) or not isinstance(comment.get("id"), str):
             raise TicketSystemUnavailable("GoodQA comment returned an unexpected shape")
+        self._comment_times[comment["id"]] = comment.get("createdAt")
         return comment
 
     def close_done(self, issue_id: str, note: str):
