@@ -1,6 +1,9 @@
 """Controlled broken variants of ah_install.py and the guard rule (goodqa#15742): each must make a named test fail.
 
-Run: python3 -B tests/mutants_install_files.py   (copies the hooks and the tests into a temporary tree; changes nothing here)."""
+Run: python3 -B tests/mutants_install_files.py [--component guard|installer]
+The runner copies the hooks and fixtures into temporary isolated trees."""
+import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -12,6 +15,10 @@ INST = "ah_install.py"
 GUARD = "command_guard.py"
 T = "tests.test_ah_install."
 G = "tests.test_command_guard_install_files."
+POSITIVE = {
+    INST: T + "Install.test_the_remote_command_string_reaches_python_unchanged_through_a_shell",
+    GUARD: G + "NativeInstallAuthority.test_proven_desktop_main_passes_the_actual_install_hook",
+}
 
 # name -> (file, old text or list, new text or list, tests that must fail)
 MUTANTS = {
@@ -78,40 +85,129 @@ MUTANTS = {
                                   [G + "Forms.test_everyday_evasions_are_refused_for_a_sub_agent_and_the_real_form_with_redirects_passes_for_main"]),
     "guard rule splits inside quotes": (GUARD, "        if '\\n' in text:\n            raise ValueError('multi-line text')", "        if True:\n            raise ValueError('multi-line text')",
                                         [G + "Forms.test_everyday_evasions_are_refused_for_a_sub_agent_and_the_real_form_with_redirects_passes_for_main"]),
-    "guard rule lets a sub-agent in": (GUARD, "        if not is_main:\n            return 'ah install-files: only the main agent", "        if False:\n            return 'ah install-files: only the main agent",
+    "guard rule lets a sub-agent in": (GUARD, "    if proven_main is not True:\n        return 'ah install-files: only the main agent",
+                                       "    if False:\n        return 'ah install-files: only the main agent",
                                        [G + "Forms.test_a_sub_agent_is_refused_even_in_the_literal_form"]),
     "guard rule accepts a worktree copy": (GUARD, "if len(rest) != 1 or rest[0] not in literal:", "if False:",
                                            [G + "Forms.test_the_installed_literal_form_passes_for_main_and_every_other_form_is_refused"]),
-    "guard rule ignores flags": (GUARD, "if flag not in INSTALL_FILES_FLAGS:", "if False:",
+    "guard rule ignores flags": (GUARD, "if flag not in INSTALL_FILES_FLAGS:\n                # a redirection target",
+                                 "if flag not in INSTALL_FILES_FLAGS:\n                i += 1\n                continue\n                # a redirection target",
                                  [G + "Forms.test_the_installed_literal_form_passes_for_main_and_every_other_form_is_refused"]),
 }
 
 
-def main():
+CASES_RUNNER = """
+import json
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.getcwd())
+
+class Result(unittest.TextTestResult):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cases = {}
+        self.assertions = []
+
+    def startTest(self, test):
+        self.cases.setdefault(test.id(), []).append([])
+        super().startTest(test)
+
+    def addFailure(self, test, err):
+        if issubclass(err[0], AssertionError):
+            self.assertions.append(test.id())
+        super().addFailure(test, err)
+
+    def addSubTest(self, test, subtest, err):
+        self.cases[test.id()][-1].append(subtest.id())
+        if err and issubclass(err[0], AssertionError):
+            self.assertions.append(test.id())
+        super().addSubTest(test, subtest, err)
+
+loader = unittest.TestLoader()
+suite = loader.loadTestsFromNames(sys.argv[1:])
+result = unittest.TextTestRunner(resultclass=Result, buffer=True).run(suite)
+print(json.dumps({
+    "cases": result.cases, "assertions": result.assertions, "failures": len(result.failures),
+    "invalid": (len(loader.errors) + len(result.errors) + len(result.skipped)
+                + len(result.expectedFailures) + len(result.unexpectedSuccesses)),
+}))
+"""
+
+
+def isolate(folder):
+    shutil.copytree(ROOT / "harness" / "hooks", folder / "harness" / "hooks",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    tests = folder / "tests"
+    tests.mkdir()
+    (tests / "__init__.py").touch()
+    for name in ("test_ah_install.py", "test_command_guard_install_files.py", "test_native_main.py"):
+        shutil.copy(ROOT / "tests" / name, tests)
+    for name in ("install.py", "install_codex.py"):
+        shutil.copy(ROOT / name, folder)
+
+
+def run_cases(folder, tests):
+    try:
+        done = subprocess.run([sys.executable, "-I", "-B", "-c", CASES_RUNNER, *tests],
+                              cwd=folder, capture_output=True, text=True, timeout=90)
+        result = json.loads(done.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0 or result["invalid"] or result["failures"] != len(result["assertions"]):
+        return None
+    if set(result["cases"]) != set(tests) or any(len(runs) != 1 for runs in result["cases"].values()):
+        return None
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--component", choices=("all", "guard", "installer"), default="all")
+    component = parser.parse_args(argv).component
+    target_file = {"guard": GUARD, "installer": INST}.get(component)
+    selected = {name: data for name, data in MUTANTS.items() if target_file in (None, data[0])}
+    if not selected:
+        parser.error("No mutations selected")
     failures = 0
-    for name, (target, old, new, tests) in MUTANTS.items():
-        with tempfile.TemporaryDirectory(prefix="mutant-") as tmp:
-            tmp = Path(tmp)
-            shutil.copytree(ROOT / "harness" / "hooks", tmp / "harness" / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
-            (tmp / "tests").mkdir()
-            for extra in ("test_ah_install.py", "test_command_guard_install_files.py"):
-                shutil.copy(ROOT / "tests" / extra, tmp / "tests")
-            for extra in ("install.py", "install_codex.py"):
-                shutil.copy(ROOT / extra, tmp / extra)
-            path = tmp / "harness" / "hooks" / target
-            text = path.read_text()
-            olds, news = (old, new) if isinstance(old, list) else ([old], [new])
-            if any(o not in text for o in olds):
-                print("MUTANT NOT APPLIED:", name)
+    for name, (target, old, new, negatives) in selected.items():
+        tests = [*negatives, POSITIVE[target]]
+        with tempfile.TemporaryDirectory(prefix="mutant-") as directory:
+            folder = Path(directory)
+            isolate(folder)
+            baseline = run_cases(folder, tests)
+            if baseline is None or baseline["assertions"]:
+                print("BASELINE FAILED:", name, flush=True)
+                return 1
+            subtests = sum(len(runs[0]) for runs in baseline["cases"].values())
+            print(f"BASELINE PASS: {name} ({len(tests)} cases, {subtests} subtests)", flush=True)
+
+            path = folder / "harness" / "hooks" / target
+            source = path.read_text()
+            pairs = list(zip(old, new, strict=True)) if isinstance(old, list) else [(old, new)]
+            if any(source.count(before) != 1 for before, _ in pairs):
+                print("MUTANT NOT APPLIED EXACTLY ONCE:", name, flush=True)
                 failures += 1
                 continue
-            for o, n in zip(olds, news):
-                text = text.replace(o, n, 1)
-            path.write_text(text)
-            done = subprocess.run([sys.executable, "-B", "-m", "unittest", *tests], cwd=str(tmp), capture_output=True, text=True)
-            killed = done.returncode != 0
-            print("%-36s %s" % (name, "KILLED" if killed else "SURVIVED (test is vacuous)"))
-            failures += 0 if killed else 1
+            for before, after in pairs:
+                source = source.replace(before, after, 1)
+            path.write_text(source)
+
+            result = run_cases(folder, tests)
+            if result is None or result["cases"] != baseline["cases"]:
+                verdict = "INVALID RESULT (test errors or changed coverage)"
+            elif not result["assertions"]:
+                verdict = "SURVIVED"
+            elif not set(result["assertions"]).issubset(negatives):
+                verdict = "INVALID RESULT (positive control failed)"
+            else:
+                count = len(result["assertions"])
+                print(f"KILLED: {name} ({len(tests)} cases, {subtests} subtests, {count} expected assertion failures)",
+                      flush=True)
+                continue
+            print(f"{verdict}: {name}", flush=True)
+            failures += 1
     return 1 if failures else 0
 
 

@@ -301,8 +301,13 @@ class Hardening(Base):
                 return {"unexpected": "shape"}  # a KeyError for done["live"]
             return out
         with mock.patch.object(ai.Remote, "call", boom):
-            with self.assertRaises(ai.InstallError) as caught:
-                self.install()
+            try:
+                with self.assertRaises(ai.InstallError) as caught:
+                    self.install()
+            except KeyError as error:
+                if error.args != ("live",):
+                    raise
+                self.fail("Installer let the injected commit-reply error escape instead of reporting uncertainty")
         self.assertEqual(caught.exception.exit_code, 5)
         self.assertEqual(caught.exception.data["result"], "unknown")
         self.assertIn("check t2-dev", str(caught.exception.data["reason"]))
@@ -433,7 +438,9 @@ class Install(Base):
             self.assertEqual(self.live(n), plan["new_sha"])
             self.assertNotEqual(plan["new_sha"], old[n])
             self.assertEqual(sha((self.hooks / ".ah-install" / "backups" / out["run"] / n).read_bytes()), old[n])
-            self.assertEqual(sha((self.mac / ".agent-harness" / "install-backups" / out["run"] / n).read_bytes()), old[n])
+            local_backup = self.mac / ".agent-harness" / "install-backups" / out["run"] / n
+            self.assertTrue(local_backup.is_file(), f"Missing local backup for {n}")
+            self.assertEqual(sha(local_backup.read_bytes()), old[n])
             self.assertFalse((self.hooks / ("." + n + ".ah-install-tmp")).exists())
         self.assertEqual(oct((self.hooks / ".ah-install" / "backups").stat().st_mode & 0o777), "0o700")
         self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
@@ -771,7 +778,12 @@ class Lock(Base):
         self.assertTrue(lock.exists())
         old = __import__("time").time() - 4000
         os.utime(lock, (old, old))
-        out = self.install()
+        try:
+            out = self.install()
+        except ai.InstallError as error:
+            if error.exit_code != 2 or "locked by another run" not in str(error):
+                raise
+            self.fail("The installer refused to take over the verified stale lock")
         self.assertEqual(out["result"], "installed")
         self.assertFalse([p for p in (self.hooks / ".ah-install").iterdir() if p.name.startswith("lock.stale-")])  # pruned after the run
         self.assertFalse(lock.exists())

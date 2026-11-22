@@ -78,7 +78,8 @@ class Forms(unittest.TestCase):
                 self.assertIsNotNone(cg.install_files_refusal(text, False), text)
                 self.assertEqual(hook(text, False)[0], 2, text)
         worktree_in_bash = "bash -c 'python3 harness/hooks/ah.py install-files --host t2-dev'"
-        self.assertIsNotNone(cg.install_files_refusal(worktree_in_bash, True))  # not even main, from a worktree copy
+        with self.subTest("worktree path in nested shell"):
+            self.assertIsNotNone(cg.install_files_refusal(worktree_in_bash, True))
         for text in (GOOD + " > out.json", GOOD + " > out.json 2>&1", GOOD + " 2>&1 | tee out.txt", GOOD + " --allow-older"):
             with self.subTest(text[-30:]):
                 self.assertIsNone(cg.install_files_refusal(text, True), text)
@@ -89,7 +90,9 @@ class Forms(unittest.TestCase):
                 self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
 
     def test_a_sub_agent_is_refused_even_in_the_literal_form(self):  # AC-9, NEG-11
-        self.assertIn("only the main agent", cg.install_files_refusal(GOOD, False))
+        refusal = cg.install_files_refusal(GOOD, False)
+        self.assertIsNotNone(refusal)
+        self.assertIn("only the main agent", refusal)
         code, message = hook(GOOD, False)
         self.assertEqual(code, 2)
         self.assertIn("main agent", message)
