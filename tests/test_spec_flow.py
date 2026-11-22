@@ -669,6 +669,30 @@ class Evidence(SpecFlowCase):
         self.spec_policy["max_log_bytes"] = len(body) + 10
         self.assertEqual(self.ev("--ac", "AC-1", "--log", str(cut))[0], 2)
 
+    def test_post_requires_server_verified_attachment_after_comment_binding(self):
+        handle = self.fake.handle
+        for change, problem in (
+            ({"sha256": "a" * 64}, "sha256 differs"),
+            ({"completionState": "uploading"}, "not a completed upload"),
+            ({"archivedAt": "2026-11-04T06:00:00Z"}, "not a completed upload"),
+        ):
+            with self.subTest(problem=problem, change=change):
+                log = self.tmp / "proof.log"
+                log.write_text(f"verified run {len(self.fake.comments[ISSUE])}\n")
+
+                def mutate_after_comment(name, args):
+                    result, error = handle(name, args)
+                    if name == "comment_on_issue" and error is None:
+                        for aid in args["attachmentIds"]:
+                            self.fake.attachments[aid].update(change)
+                    return result, error
+
+                with mock.patch.object(self.fake, "handle", side_effect=mutate_after_comment):
+                    code, out, err = self.ev("--ac", "AC-1", "--log", str(log))
+                self.assertEqual(code, sf.EXIT_TRACKER)
+                self.assertNotIn("RECORDED", out)
+                self.assertIn(problem, err)
+
     def test_retry_after_a_rejected_record_posts_again(self):
         log = self.tmp / "retry.log"
         log.write_text("Ran 3 tests\nOK\n")
