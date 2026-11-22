@@ -15,6 +15,7 @@ OWNER = "11111111-1111-4111-8111-111111111111"
 ROOT_ID = "22222222-2222-4222-8222-222222222222"
 ACCEPTANCE = "33333333-3333-4333-8333-333333333333"
 ADVERSARIAL = "44444444-4444-4444-8444-444444444444"
+WORKER = "55555555-5555-4555-8555-555555555555"
 HEAD, BASE = "a" * 40, "b" * 40
 
 
@@ -150,6 +151,12 @@ class NativeReviewContracts(TestCase):
                 n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
 
     def test_real_fixture_binds_owner_and_two_native_final_reports(self):
+        self.exercise_native_bundle()
+
+    def test_real_fixture_authenticates_typed_worker_and_checks_declared_membership(self):
+        self.exercise_native_bundle(with_contributor=True)
+
+    def exercise_native_bundle(self, *, with_contributor=False):
         import os
         import sqlite3
         from types import SimpleNamespace
@@ -175,9 +182,15 @@ class NativeReviewContracts(TestCase):
             path.write_text("".join(json.dumps(row) + "\n" for row in rows))
             path.chmod(0o600)
 
-        for role, agent, report in (("owner", OWNER, self.owner_report), ("acceptance", ACCEPTANCE, self.report),
-                                    ("adversarial", ADVERSARIAL, self.report)):
-            typed = n.ROLES[role]
+        people = [("owner", OWNER, self.owner_report), ("acceptance", ACCEPTANCE, self.report),
+                  ("adversarial", ADVERSARIAL, self.report)]
+        path_report = self.repo / "contribution.json"
+        if with_contributor:
+            self.owner_report.write_text(json.dumps({"owner": OWNER, "authors": {HEAD: [OWNER, WORKER]}}))
+            path_report.write_text(json.dumps({"contributor": WORKER, "commits": {HEAD: ["worker.py"]}}))
+            people.append(("contributor", WORKER, path_report))
+        for role, agent, report in people:
+            typed = "worker" if role == "contributor" else n.ROLES[role]
             line = n.witness_line(context(), role, agent, start, end, report.read_bytes())
             prior = n.witness_line(dict(context(), pr=9), role, agent, start, end, report.read_bytes())
             relative_agent = f"/root/{role}"
@@ -213,13 +226,49 @@ class NativeReviewContracts(TestCase):
         store.commit()
         put(base / "main.jsonl", initial_rows)
         bundle = self.repo / "native.json"
-        bundle.write_text(json.dumps({"root": ROOT_ID, "context": context(), "proofs": proofs}))
+        document = {"root": ROOT_ID, "context": context(), "proofs": proofs}
+        if with_contributor:
+            worker_proof = proofs.pop("contributor")
+            document["contributors"] = [worker_proof]
+        bundle.write_text(json.dumps(document))
         self.assertEqual(os.stat(home / ".codex/state_5.sqlite").st_uid, os.getuid())
         now = n.spec_flow._native_stamp("2026-11-22T19:01:00Z").timestamp()
         with mock.patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(home))), \
-             mock.patch.object(n, "_git", return_value="fixture subject"):
+             mock.patch.object(n, "_git", return_value="fixture subject"), \
+             mock.patch.object(n, "_changed_paths", return_value={"worker.py", "another-changed.py"}):
             passed = n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
             self.assertEqual(passed["context_sha256"], n.context_digest(context()))
+            if with_contributor:
+                self.assertIn(f"contributor:{WORKER}", passed["proofs"])
+                document.pop("contributors")
+                bundle.write_text(json.dumps(document))
+                with self.assertRaisesRegex(ValueError, "exactly match the author's declaration"):
+                    n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+                document["contributors"] = [dict(worker_proof, agent=ACCEPTANCE)]
+                bundle.write_text(json.dumps(document))
+                with self.assertRaisesRegex(ValueError, "distinct identities"):
+                    n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+                document["contributors"] = [worker_proof]
+                bundle.write_text(json.dumps(document))
+                store.execute("UPDATE threads SET agent_role=? WHERE id=?", (n.ROLES["acceptance"], WORKER))
+                store.commit()
+                with self.assertRaisesRegex(n.spec_flow.SpecError, "metadata unavailable or conflicting"):
+                    n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+                store.execute("UPDATE threads SET agent_role=? WHERE id=?", ("worker", WORKER))
+                store.commit()
+                old_report = path_report.read_text()
+                path_report.write_text(json.dumps({"contributor": WORKER, "commits": {BASE: ["worker.py"]}}))
+                with self.assertRaisesRegex(ValueError, "commit membership differs"):
+                    n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+                path_report.write_text(json.dumps({"contributor": WORKER, "commits": {HEAD: ["unchanged.py"]}}))
+                with self.assertRaisesRegex(ValueError, "path outside"):
+                    n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+                path_report.write_text(json.dumps({"contributor": WORKER, "commits": {HEAD: ["another-changed.py"]}}))
+                with self.assertRaisesRegex(ValueError, "WAL witness missing or mismatched"):
+                    n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+                path_report.write_text(old_report)
+            else:
+                self.assertEqual(set(passed["proofs"]), set(n.ROLES))
             acceptance_wal = base / f"agent-{ACCEPTANCE}.jsonl"
             old_wal = acceptance_wal.read_text()
             with acceptance_wal.open("a") as append:
@@ -327,3 +376,19 @@ class NativeReviewContracts(TestCase):
                 "commits: no current structured evidence names the exact candidate",
                 "commits: current evidence includes a commit outside the exact candidate ancestry",
             ])
+
+
+    def test_declared_contribution_paths_are_real_git_changes(self):
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        (self.repo / "bootstrap.sh").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "bootstrap.sh"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Fixture", "-c", "user.email=f@example.invalid",
+                        "commit", "-q", "-m", "fixture contribution"], check=True)
+        commit = n._git(self.repo, "rev-parse", "HEAD")
+        members = {commit}
+        as_report = lambda path: json.dumps({"contributor": WORKER, "commits": {commit: [path]}}).encode()
+        n._contributor_report(as_report("bootstrap.sh"), WORKER, members, self.repo, {})
+        with self.assertRaisesRegex(ValueError, "path outside"):
+            n._contributor_report(as_report("another.sh"), WORKER, members, self.repo, {})
+        with self.assertRaisesRegex(ValueError, "distinct changed paths"):
+            n._contributor_report(as_report("../bootstrap.sh"), WORKER, members, self.repo, {})

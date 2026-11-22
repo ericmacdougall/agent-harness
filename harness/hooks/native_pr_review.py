@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shlex
 import subprocess
@@ -29,6 +29,9 @@ CONTEXT_FIELDS = {"version", "repo", "pr", "head", "base", "base_ref", "commits"
                   "no_ci", "tickets", "evidence_authors"}
 MAX_TICKETS = 8
 PROOF_FIELDS = {"agent", "started", "ended", "report"}
+CONTRIBUTOR_ROLE = "worker"
+MAX_CONTRIBUTORS = 8
+MAX_CONTRIBUTED_PATHS = 256
 
 
 def canonical(value):
@@ -219,22 +222,63 @@ def build_context(repo, repository, pr, head, base, packet, tests, client):
 
 def witness_line(context, role, agent, started, ended, report_bytes):
     _validate_context(context)
-    if role not in ROLES or not _identifier(agent) or spec_flow._native_stamp(started) > spec_flow._native_stamp(ended):
+    if role not in (*ROLES, "contributor") or not _identifier(agent) or spec_flow._native_stamp(started) > spec_flow._native_stamp(ended):
         raise ValueError("invalid role, identity or review interval")
     return PREFIX + canonical({"agent": agent, "role": role, "context_sha256": context_digest(context),
                                "report_sha256": digest(report_bytes), "started": started, "ended": ended})
 
 
 def _authors(report, owner, parent, commits):
-    """Require a complete owner declaration; the observed Git events prove commit production only."""
+    """The owner declares authors; the observed Git events prove commit production only."""
     value = spec_flow._native_json(report, MAX_FILE)
     if set(value) != {"owner", "authors"} or value["owner"] != owner or not isinstance(value["authors"], dict):
         raise ValueError("owner declaration is invalid")
     if set(value["authors"]) != set(commits):
         raise ValueError("owner declaration does not cover the complete candidate")
-    for identities in value["authors"].values():
-        if (not isinstance(identities, list) or identities not in ([owner], sorted([owner, parent]))):
-            raise ValueError("native review v1 requires one declared owner with only optional main contribution")
+    declared = {}
+    for commit, identities in value["authors"].items():
+        if (not isinstance(identities, list) or not 1 <= len(identities) <= MAX_CONTRIBUTORS + 2
+                or not all(_identifier(agent) for agent in identities)
+                or len(set(identities)) != len(identities) or owner not in identities):
+            raise ValueError("candidate authors must identify the owner and any distinct contributors")
+        for agent in identities:
+            if agent not in (owner, parent):
+                declared.setdefault(agent, set()).add(commit)
+    if len(declared) > MAX_CONTRIBUTORS:
+        raise ValueError("too many candidate contributors")
+    return declared
+
+
+def _contribution_path(path):
+    if not isinstance(path, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,1024}", path):
+        return False
+    parsed = PurePosixPath(path)
+    return not parsed.is_absolute() and str(parsed) == path and all(part != ".." for part in parsed.parts) and path != "."
+
+
+def _changed_paths(repo, commit):
+    paths = _git(repo, "diff-tree", "--root", "-m", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z",
+                 commit).split("\0")
+    return {path for path in paths if path}
+
+
+def _contributor_report(report, agent, expected_commits, repo, changed_paths):
+    claim = spec_flow._native_json(report, MAX_FILE)
+    if (set(claim) != {"contributor", "commits"} or claim["contributor"] != agent
+            or not isinstance(claim["commits"], dict) or set(claim["commits"]) != expected_commits):
+        raise ValueError("contributor commit membership differs from the owner's declaration")
+    count = 0
+    for commit, paths in claim["commits"].items():
+        if (not isinstance(paths, list) or not paths or not all(_contribution_path(path) for path in paths)
+                or len(set(paths)) != len(paths)):
+            raise ValueError("contributor must identify distinct changed paths")
+        count += len(paths)
+        if count > MAX_CONTRIBUTED_PATHS:
+            raise ValueError("too many contributor paths")
+        if commit not in changed_paths:
+            changed_paths[commit] = _changed_paths(repo, commit)
+        if not set(paths) <= changed_paths[commit]:
+            raise ValueError("contribution names a path outside the declared commit's changes")
 
 
 def _shell_commit_directory(command, cwd, home):
@@ -367,18 +411,22 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected
     if expected_digest is not None and (not _matches(DIGEST, expected_digest) or digest(raw) != expected_digest):
         raise ValueError("native review bundle digest changed")
     bundle = spec_flow._native_json(raw, MAX_FILE)
-    if set(bundle) != {"root", "context", "proofs"} or bundle["context"] != expected_context:
+    keys = {"root", "context", "proofs"}
+    if set(bundle) not in (keys, keys | {"contributors"}) or bundle["context"] != expected_context:
         raise ValueError("native review bundle does not bind the fresh candidate context")
     parent, proofs = bundle["root"], bundle["proofs"]
+    contributors = bundle.get("contributors", [])
+    if not isinstance(contributors, list) or len(contributors) > MAX_CONTRIBUTORS:
+        raise ValueError("contributor proof set is invalid")
     if (not _identifier(parent) or (root is not None and root != parent)
             or not isinstance(proofs, dict) or set(proofs) != set(ROLES)):
         raise ValueError("bundle root or proof set is invalid")
     if any(not isinstance(p, dict) or set(p) != PROOF_FIELDS or not _identifier(p["agent"])
-           or not isinstance(p["report"], str) for p in proofs.values()):
+           or not isinstance(p["report"], str) for p in [*proofs.values(), *contributors]):
         raise ValueError("bundle proof inputs are incomplete")
-    agents = {p["agent"] for p in proofs.values()}
-    if len(agents | {parent}) != 4:
-        raise ValueError("owner, main and the two reviewers must have distinct identities")
+    agents = {p["agent"] for p in [*proofs.values(), *contributors]}
+    if len(agents | {parent}) != 4 + len(contributors):
+        raise ValueError("owner, main, contributors and the two reviewers must have distinct identities")
     if set(expected_context["evidence_authors"]) & {proofs[name]["agent"] for name in ("acceptance", "adversarial")}:
         raise ValueError("an independent reviewer is a ticket author or evidence producer")
     import pwd
@@ -388,15 +436,23 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected
     reviewed_context_sha = context_digest(expected_context)
     witness_scope = _witness_scope(reviewed_context_sha)
     subjects = {sha: _git(repo, "show", "-s", "--format=%s", sha) for sha in expected_context["commits"]}
-    for role in ROLES:
-        proof = proofs[role]
+    supplied_contributors = {p["agent"] for p in contributors}
+    declared = {}
+    changed_paths = {}
+    checks = [(role, proof) for role, proof in proofs.items() if role != "owner"]
+    checks = [("owner", proofs["owner"]), *checks, *(("contributor", proof) for proof in contributors)]
+    for role, proof in checks:
         report = spec_flow.read_regular(Path(proof["report"]), MAX_FILE)
         if role == "owner":
-            _authors(report, proof["agent"], parent, expected_context["commits"])
+            declared = _authors(report, proof["agent"], parent, expected_context["commits"])
+            if set(declared) != supplied_contributors:
+                raise ValueError("the verified contributors must exactly match the author's declaration")
+        elif role == "contributor":
+            _contributor_report(report, proof["agent"], declared[proof["agent"]], repo, changed_paths)
         else:
             _pure_review(report)
         line = witness_line(expected_context, role, proof["agent"], proof["started"], proof["ended"], report)
-        typed_role = ROLES[role]
+        typed_role = CONTRIBUTOR_ROLE if role == "contributor" else ROLES[role]
         identity = spec_flow._native_agent_source(main, proof["agent"], typed_role, purpose="pr-review")
         if identity is None:
             raise ValueError("native reviewer identity not available on this account")
@@ -416,7 +472,7 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected
         current = time.time() if now is None else now
         if not current - MAX_AGE <= spec_flow._native_stamp(proof["started"]).timestamp() <= observed.timestamp() <= current:
             raise ValueError("native PR witness is stale or has a future timestamp")
-        hashes[role] = digest(line.encode())
+        hashes[role if role != "contributor" else f"contributor:{proof['agent']}"] = digest(line.encode())
     return {"context_sha256": reviewed_context_sha, "proofs": hashes}
 
 
@@ -445,7 +501,7 @@ def main(argv=None):
     proof.add_argument("--bundle", required=True, type=Path)
     witness = actions.add_parser("witness", allow_abbrev=False)
     witness.add_argument("--context", required=True, type=Path)
-    witness.add_argument("--role", choices=list(ROLES), required=True)
+    witness.add_argument("--role", choices=[*ROLES, "contributor"], required=True)
     witness.add_argument("--agent", required=True)
     witness.add_argument("--started", required=True)
     witness.add_argument("--ended", required=True)
