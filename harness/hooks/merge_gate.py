@@ -567,6 +567,16 @@ def _literal_args(args):
     return True
 
 
+def _inert_merge_arguments(words):
+    """Only existing literal inert heads, never gh/git/python authority forms."""
+    if any(re.fullmatch(r"[;&|()<>]+", word) for word in words):
+        return False  # shlex can group `);`: a later command remains in this segment
+    i = 0
+    while i < len(words) and (words[i] in KEYWORDS or ANY_ASSIGN.match(words[i])):
+        i += 1
+    return (i < len(words) and words[i] in FREE_TEXT_COMMANDS and _free_text(words))
+
+
 def _unquoted_expansion(text):
     """True when the raw command has a $, glob or brace character outside quotes: its expansion is split into words
     that the hook cannot see (delta review N1; main's closure check: {--output=/f,--oneline} is brace expansion)."""
@@ -850,6 +860,7 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
     n = len(tokens)
     base = [os.path.basename(t) for t in tokens]
     assigns = _literal_assignments(tokens)
+    risky_environment = any(ENV_RISKY.match(t) for t in tokens)
     if any(b in ("cd", "pushd", "popd", "chdir", "ssh", "docker", "podman", "kubectl", "su", "tmux", "-C", "--chdir")
            for b in base) or any(t.startswith(("GH_REPO=", "GH_HOST=", "--chdir=")) for t in tokens):
         ctx["implicit_ok"] = False
@@ -866,7 +877,21 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
     for index, (a, b, sep) in enumerate(segments):
         seg = tokens[a:b]
         handled, seen_xargs = False, False
-        for i in range(a, b):
+        inert = not risky_environment and _inert_merge_arguments(seg)
+        if inert:
+            # A path operand named gh is not an executable. Substitutions still
+            # execute before the inert command, and executor pipelines keep the
+            # existing raw-text analysis below.
+            for token in seg:
+                for inner in _substitutions(token):
+                    found.extend(find_merges(inner, cwd, _depth + 1, ctx))
+            nxt = words[index + 1] if index + 1 < len(segments) else ""
+            next_seg = tokens[segments[index + 1][0]:segments[index + 1][1]] if index + 1 < len(segments) else []
+            consumer = nxt in EXEC_CONSUMERS or bool(INTERPRETERS.match(nxt)) or (
+                nxt == "xargs" and any(os.path.basename(t) in SHELLS or t in ("eval", "gh") for t in next_seg))
+            if not (sep in ("|", "|&") and consumer):
+                continue
+        for i in (() if inert else range(a, b)):
             name = base[i]
             if name == "xargs":
                 seen_xargs = True

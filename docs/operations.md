@@ -988,7 +988,7 @@ Run `python3 -m unittest tests.test_worktree_hygiene`. This runs Hawkeye's 108-c
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
 
-The ticket is the record of truth. Each step posts one comment containing a readable summary and a fenced `harness-spec-record` JSON block, with its files attached. Attaching costs four calls: `file_upload_start` (project surface), a presigned `PUT`, `file_upload_complete` with the sha256, then `comment_on_issue` with `attachmentIds`. The done gate trusts a file only when `issue_attachments_list` shows it completed, on that comment, with the server-computed sha256 that the record names. Retries are idempotent: a record whose content key is already on the ticket is reported `ALREADY_RECORDED`, and the comment `operationId` is derived from that key.
+The ticket is the record of truth. Each step posts one comment containing a readable summary and a fenced `harness-spec-record` JSON block, with its files attached. Attaching costs four calls: `file_upload_start` (project surface), a presigned `PUT`, `file_upload_complete` with the sha256, then `comment_on_issue` with `attachmentIds`. The posting command returns `RECORDED` only after `issue_attachments_list` confirms each file is completed, active, bound to the returned comment, and has the expected server-computed SHA-256. The done gate uses the same attachment verification. An already verified content key returns `ALREADY_RECORDED`, and the comment `operationId` is derived from that key.
 
 ```sh
 S=~/.claude/hooks/spec_flow.py
@@ -1227,6 +1227,8 @@ python3 ~/.claude/hooks/bg_job.py wait --name suite --timeout 3600 --dir /abs/ta
 - `wait` exit codes: 0 the status file says exit 0; 1 the job ran and failed (`EXIT_STATUS=n`); 2 no trustworthy status (missing, garbled, belongs to another job, or the process is gone without a status, including a reused PID); 3 timeout while still running. PID liveness is proven by the wrapper nonce in the process command line, never by `kill -0` alone, and the status file is written atomically by the wrapper. Never use the last command of a loop, or a systemd unit `Result` alone, as the outcome.
 - Per-stage pipeline status: use `set -o pipefail`, or read `PIPESTATUS` immediately after the pipeline itself (not after `X=$(...)`), or write each stage's status to its own file.
 - `bg_lint.py` is an advisory PreToolUse hook (Claude Code only; Codex ships `bg_job.py` as a helper but has no lint hook). It warns, never blocks, and names `bg_job.py` for: a success echo after `;` or `&`; a wait/poll loop whose last command is `ls`, `cat` or `tail`; `PIPESTATUS` after a command-substitution assignment; a while/until loop polling `pgrep -f PATTERN` or `ps | grep PATTERN` (without `grep -v grep`) where the pattern also occurs in the loop's own shell command line, so it never exits (one ran 12 h on dev2 on 2026-11-06; use `pgrep -f "[t]sc ..."`, a PID wait or an exit file). It is a heuristic over a shell string, so it can miss wrapped or generated commands; the helper itself is opt-in.
+
+For unattended evidence delivery, launch a single, predeclared task script that runs the bounded job, validates its exact versioned evidence, posts it to the named ticket, and exits with the verified posting result. Keep its inputs, log, and receipt under the private task directory. Record the job name and receipt path in the WAL before handing off. `STARTED` confirms launch. A successful terminal receipt confirms the script completed its requested checks. Reconcile an interrupted or uncertain external write by checking GoodQA before restarting a script.
 
 ## Test watcher
 
@@ -1589,7 +1591,12 @@ An approval recorded on one host (for example `approve-delete` on the Mac) is a 
 names the session, the approving host, the exact canonical path list, the pre-delete tree hash, an expiry (24 h) and a
 one-use nonce, and it is signed with a key the agent cannot invoke (the user's SSH agent or Secure Enclave key). The
 remote guard verifies the signature against the main host's public key, consumes the nonce atomically, and refuses a
-record whose path list or tree hash differs from what it sees. Not implemented; #139 added the remote delete route this builds on.
+record whose path list or tree hash differs from what it sees. Not implemented for remote delete. PR #139 added the
+existing remote delete route.
+
+The dedicated [T2Scan direct Astra broker](t2scan-portable-consent.md) implements signed portable consent for
+that operation with a separate issuer, short-lived exact scope, replay state and protected provisioning.
+The [macOS operator signer](t2scan-operator-signing.md) prepares and signs that consent.
 
 ### Audited Windows stop route (B3.10)
 
