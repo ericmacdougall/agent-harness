@@ -40,7 +40,7 @@ class DataOperations(unittest.TestCase):
             return kg.decide(command, cwd=str(self.home), home=str(self.home))[0]
 
     def note(self, text='will kill nothing'):
-        return (f'{sys.executable} -I -S {self.script} note --wal {self.wal} '
+        return (f'{Path(sys.executable).resolve()} -I -S {self.script} note --wal {self.wal} '
                 f'--event intent --note {shlex.quote(text)}')
 
     def test_edit_payloads_are_data_before_both_entry_points(self):
@@ -68,7 +68,7 @@ class DataOperations(unittest.TestCase):
         bad = [base.replace(' -I -S ', ' '), base.replace(' -I -S ', ' -I '),
                base.replace('--event intent', '--event madeup'), base + ' --event risk',
                base + ' --other kill', base.replace("'will kill nothing'", '"$(kill 12345)"'),
-               base + ' > out', base + ' ; kill 12345', base.replace(sys.executable, '/tmp/python3'),
+               base + ' > out', base + ' ; kill 12345', base.replace(str(Path(sys.executable).resolve()), '/tmp/python3'),
                base.replace('--note', '--note=kill --note'), base.replace('note --wal', 'hook --wal'),
                self.note('kill ' + 'x' * 4000), base.replace('--note', '--notefake'),
                base.replace(str(self.wal), str(self.wal.parent / '../session/main.jsonl')),
@@ -137,6 +137,32 @@ class DataOperations(unittest.TestCase):
                 return result
             with mock.patch.object(Path, 'lstat', changed):
                 self.assertEqual(self.decide(self.note()), 'block')
+
+    @unittest.skipUnless(sys.executable.startswith('/opt/homebrew/opt/'), 'actual Homebrew alias layout control')
+    def test_trusted_python_checks_original_alias_chain(self):
+        original = Path.lstat
+        alias = Path(sys.executable)
+        for target, change in ((alias.parents[2], 'writable'), (alias.parents[1], 'foreign')):
+            seen = []
+            def changed(path):
+                result = original(path)
+                seen.append(path)
+                if change == 'foreign' and path == alias.parents[2]:
+                    data = list(result)
+                    data[0] &= ~0o022  # isolate the later symlink-owner rejection from the earlier directory
+                    return os.stat_result(data)
+                if path == target:
+                    data = list(result)
+                    if change == 'writable':
+                        data[0] |= 0o022
+                    else:
+                        data[4] = os.getuid() + 10000
+                    return os.stat_result(data)
+                return result
+            command = self.note().replace(str(Path(sys.executable).resolve()), str(alias))
+            with self.subTest(target=target, change=change), mock.patch.object(Path, 'lstat', changed):
+                self.assertEqual(self.decide(command), 'block')
+                self.assertIn(target, seen)
 
     def test_supervised_observer_argv(self):
         command = ('/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/sudo -n '

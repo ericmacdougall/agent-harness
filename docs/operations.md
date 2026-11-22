@@ -31,7 +31,7 @@ Before replacing a managed file, both installers also compare its current bytes 
 
 ## Literal Codex WAL notes
 
-The process guard recognizes a bounded append-data operation: a trusted absolute system or Homebrew Python entry, separate `-I -S` flags (optional `-B` and `-u` afterwards), the absolute installed `.codex/agent-harness/wal.py`, and `note` with exactly one each of `--wal`, `--event`, and `--note`. Use the existing absolute private native WAL supplied by the session hook. The reviewed writer bytes are pinned; source changes require updating the binding and its test. Symlinked, hardlinked, changed or uncertain writer/WAL paths retain ordinary interpreter analysis.
+The process guard recognizes a bounded append-data operation: a trusted absolute system or Homebrew Python entry, separate `-I -S` flags (optional `-B` and `-u` afterwards), the absolute installed `.codex/agent-harness/wal.py`, and `note` with exactly one each of `--wal`, `--event`, and `--note`. Use the existing absolute private native WAL supplied by the session hook. For Homebrew, prefer the fully resolved, versioned Cellar executable; alias directories such as `bin` or `opt` are refused when writable. Every original alias and intermediate target is checked, not only the final resolved binary. The reviewed writer bytes are pinned; source changes require updating the binding and its test. Symlinked, hardlinked, changed or uncertain writer/WAL paths retain ordinary interpreter analysis.
 
 For example, substitute the verified absolute paths on the executing host:
 

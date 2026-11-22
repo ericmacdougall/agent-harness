@@ -122,30 +122,58 @@ def _trusted_cellar_directory(path, info):
         return False
 
 
+def _trusted_python_chain(path):
+    """Inspect original aliases and each intermediate target, not just the resolved leaf."""
+    pending, current, links = list(Path(path).parts[1:]), Path('/'), 0
+    while pending:
+        part = pending.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            current = current.parent
+            continue
+        candidate = current / part
+        info = candidate.lstat()
+        if info.st_uid not in (0, os.getuid()):
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            # Symlink modes are conventionally 0777; replacement is controlled by the
+            # already-inspected parent. The link owner and every target ancestor matter.
+            links += 1
+            if links > 40:
+                return None
+            target = os.readlink(candidate)
+            if target.startswith('/'):
+                current = Path('/')
+            pending = list(Path(target).parts[1:] if target.startswith('/') else Path(target).parts) + pending
+            continue
+        if info.st_mode & 0o022 and not _trusted_cellar_directory(candidate, info):
+            return None
+        if pending:
+            if not stat.S_ISDIR(info.st_mode):
+                return None
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_mode & 0o111:
+            return None
+        current = candidate
+    return current
+
+
 def _trusted_note_python(word):
     """Literal trusted system/Homebrew installation; no arbitrary basename or relocated alias."""
     text = word.text
     if word.raw != text or not re.fullmatch(
             r'(?:/usr/bin/python3(?:\.[0-9]+)?|/opt/homebrew/(?:bin/python3(?:\.[0-9]+)?|'
-            r'opt/python@3\.[0-9]+/bin/python3\.[0-9]+))', text):
+            r'opt/python@3\.[0-9]+/bin/python3\.[0-9]+|Cellar/python@3\.[0-9]+/[0-9][0-9A-Za-z_.-]*/'
+            r'(?:Frameworks/Python\.framework/Versions/3\.[0-9]+/bin/|bin/)python3(?:\.[0-9]+)?))', text):
         return False
     try:
-        resolved = Path(text).resolve(strict=True)
-        if not (str(resolved).startswith('/usr/bin/') or re.fullmatch(
+        resolved = _trusted_python_chain(text)
+        if '/Cellar/' in text and resolved != Path(text):
+            return False  # the canonical versioned entry must itself be physical, not a second alias
+        if resolved is None or not (str(resolved).startswith('/usr/bin/') or re.fullmatch(
                 r'/opt/homebrew/Cellar/python@3\.[0-9]+/[^/]+/(?:Frameworks/Python\.framework/Versions/'
                 r'3\.[0-9]+/bin/)?(?:bin/)?python3(?:\.[0-9]+)?', str(resolved))):
             return False
-        for path in (resolved,) + tuple(resolved.parents):
-            info = path.lstat()
-            if info.st_uid not in (0, os.getuid()):
-                return False
-            if info.st_mode & 0o022 and not _trusted_cellar_directory(path, info):
-                return False
-            if path == resolved:
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_mode & 0o111:
-                    return False
-            elif not stat.S_ISDIR(info.st_mode):
-                return False
         return True
     except OSError:
         return False
