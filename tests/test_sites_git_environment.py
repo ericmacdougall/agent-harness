@@ -13,6 +13,7 @@ sys.path.insert(0, str(HOOKS))
 import git_safety as safety
 import integrate_local as integrate
 import publish_feature as publish
+import deliver
 
 SCOPES = ('https://chatgpt.com/backend-api/codex/sites/git/',
           'https://chatgpt-staging.com/backend-api/codex/sites/git/')
@@ -111,6 +112,16 @@ class SitesEnvironment(unittest.TestCase):
                            env=inherited, cwd=root, capture_output=True, timeout=10)
             self.assertTrue(sentinel.exists(), 'credential leak control did not exercise the helper')
             sentinel.unlink()
+            request_script = root / 'credential-request.py'
+            request_script.write_text('import subprocess\nsubprocess.run(["git", "credential", "fill"], '
+                                      'input=' + repr(request) + ', text=True, capture_output=True, timeout=10)\n')
+            alias = 'alias.sites-probe=!' + shlex.quote(sys.executable) + ' ' + shlex.quote(str(request_script))
+            # An actual Git alias lets the no-stdin delivery dispatcher exercise
+            # credential lookup without contacting a network service.
+            subprocess.run(['git', '-c', alias, 'sites-probe'], env=inherited,
+                           cwd=root, capture_output=True, timeout=10)
+            self.assertTrue(sentinel.exists(), 'delivery dispatch leak control did not exercise the helper')
+            sentinel.unlink()
             with patch.dict(os.environ, inherited, clear=True):
                 self.assertFalse(unsupported(NoValueReads(injected)))
                 result = publish.run_git(root, 'credential', 'fill', input=request, timeout=10)
@@ -119,3 +130,6 @@ class SitesEnvironment(unittest.TestCase):
                 config = integrate.run_git_nohooks(root, 'config', '--get-regexp', r'^(credential|http)\.', timeout=10)
                 self.assertEqual(config.returncode, 1)
                 self.assertEqual(config.stdout, '')
+                code, _ = deliver.git(root, '-c', alias, 'sites-probe', timeout=10)
+                self.assertEqual(code, 0)
+                self.assertFalse(sentinel.exists())

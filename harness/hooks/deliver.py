@@ -27,7 +27,7 @@ import time
 from urllib.parse import quote
 
 from github_identity import github_repository, repository_name
-from git_safety import git_environment, require_safe_source
+from git_safety import git_environment, require_safe_source, unsupported_git_environment
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
                              OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
                              require_check_interpreters,
@@ -1991,7 +1991,7 @@ def parse_args():
 def main():
     args = parse_args()
     try:
-        if any(name.startswith("GIT_") and name not in ALLOWED_GIT_ENV for name in os.environ):
+        if unsupported_git_environment(os.environ, ALLOWED_GIT_ENV):
             raise DeliveryError("BLOCKED_POLICY", "Unsupported Git routing environment", code=2)
         return prepare(args) if args.phase == "prepare" else finish(args)
     except DeliveryError as error:
