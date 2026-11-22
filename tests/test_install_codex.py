@@ -21,6 +21,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(tomllib is not None, 'Codex installer requires Python 3.11+')
 class CodexInstallerTests(unittest.TestCase):
+    def test_task_recovery_survives_reinstall(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            for _ in range(2):
+                install(home, apply=True)
+                helper = home / ".codex/agent-harness/task_recovery.py"
+                self.assertEqual(helper.read_bytes(), (ROOT / "harness/hooks/task_recovery.py").read_bytes())
+                result = subprocess.run([sys.executable, str(helper), "--help"], cwd=home,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("enroll", result.stdout)
+
     def test_inline_marker_text_is_preserved(self):
         original = 'Keep <!-- agent-harness-codex:start --> this example <!-- agent-harness-codex:end --> intact.\n'
         merged = merge_marked(original, 'Managed.')

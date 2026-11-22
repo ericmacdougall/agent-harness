@@ -14,6 +14,16 @@ from install import (END, START, ROOT, durable_tmp_choice, install, merged_instr
 
 
 class InstallerTests(unittest.TestCase):
+    def test_task_recovery_survives_reinstall(self):
+        for _ in range(2):
+            install(self.home, apply=True)
+            helper = self.claude / "hooks/task_recovery.py"
+            self.assertEqual(helper.read_bytes(), (ROOT / "harness/hooks/task_recovery.py").read_bytes())
+            result = subprocess.run([sys.executable, str(helper), "--help"], cwd=self.home,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("enroll", result.stdout)
+
     def setUp(self):
         # Sessions started after install export CLAUDE_CODE_TMPDIR; tests must not depend on the host.
         isolate = patch.dict(os.environ)
