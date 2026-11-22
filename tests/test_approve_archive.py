@@ -211,22 +211,21 @@ class ArchiveApproval(Fixture):
                 self.put(build_members(self.name, FILES, specials), listing_for(self.name, FILES))
                 self.refused('twice')
 
-    def test_link_and_special_members_are_refused(self):
-        # F2/F6: the comparison covers regular files only, so a link member is never trusted.
-        for specials in ([('extra-link', tarfile.SYMTYPE, 'b.txt')],
-                         [('extra-hard', tarfile.LNKTYPE, '%s/b.txt' % self.name)],
+    def test_hardlink_and_special_members_are_refused(self):
+        # Hardlinks and special nodes cannot represent an independently compared file.
+        for specials in ([('extra-hard', tarfile.LNKTYPE, '%s/b.txt' % self.name)],
                          [('fifo', tarfile.FIFOTYPE, None)]):
             with self.subTest(specials=specials):
                 self.put(build_members(self.name, FILES, specials), listing_for(self.name, FILES))
                 self.refused('link or special')
 
-    def test_a_local_symlink_is_refused(self):
-        # F6: a symlink in the tree would be deleted but is not part of the compared regular-file set.
+    def test_an_unbacked_local_symlink_is_refused(self):
+        # The archive must preserve every local link as an exact typed member.
         os.symlink('b.txt', str(self.target / 'alias'))
         past = time.time() - 3600
         os.utime(str(self.target / 'alias'), (past, past), follow_symlinks=False)
         os.utime(str(self.target), (past, past))
-        self.refused('symlink')
+        self.refused('local files missing')
 
     def test_a_second_gzip_member_is_read_like_bsdtar_reads_it(self):
         # F3: Python r|gz stops after the first gzip member; bsdtar restores the second one too.

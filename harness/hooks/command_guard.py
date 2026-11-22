@@ -8084,9 +8084,12 @@ def stat_manifest(path, limits, deadline=None):
         if count > max_entries + 1 or time.monotonic() > deadline:
             raise ValueError('tree is too large to check inside the time budget; approve a smaller subtree')
         rel = os.path.relpath(current, root)
-        kind = 'd' if os.path.isdir(current) and not os.path.islink(current) else ('l' if os.path.islink(current) else 'f')
+        kind = 'd' if stat.S_ISDIR(st.st_mode) else ('l' if stat.S_ISLNK(st.st_mode) else 'f')
         h.update(('%s\0%s\0%d\0%d\n' % (rel, kind, st.st_size if kind == 'f' else 0,
                                         st.st_mtime_ns if kind != 'd' else 0)).encode('utf-8', 'surrogateescape'))
+        if kind == 'l':
+            # Literal link metadata is part of the delete-time identity. Never follow its target.
+            h.update(hashlib.sha256(os.fsencode(os.readlink(current))).digest())
         if kind == 'd':
             with os.scandir(current) as it:
                 stack.extend(sorted((e.path for e in it), reverse=True))
@@ -8352,6 +8355,13 @@ _SHA_LINE = re.compile(r'^([0-9a-fA-F]{64})(?:\s+\*?(\S.*))?$')
 # bsdtar / GNU tar `tar -tvf` regular-file line: mode, links or owner/group, size, date, path.
 _TVF_BSD = re.compile(r'^-[rwxsStT-]{9}[@+.]?\s+\d+\s+\S+\s+\S+\s+(\d+)\s+\w{3}\s+\d{1,2}\s+(?:\d{1,2}:\d{2}|\d{4})\s(.+)$')
 _TVF_GNU = re.compile(r'^-[rwxsStT-]{9}[@+.]?\s+\S+/\S+\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s(.+)$')
+_TVF_LINK_BSD = re.compile(_TVF_BSD.pattern.replace('^-', '^l'))
+_TVF_LINK_GNU = re.compile(_TVF_GNU.pattern.replace('^-', '^l'))
+
+
+def _link_digest(target):
+    return hashlib.sha256(os.fsencode(target)).hexdigest()
+
 
 
 def _safe_member(name):
@@ -8505,21 +8515,31 @@ class ArchiveVerifier(Verifier):
         return m.group(1).lower()
 
     def listing(self):
-        """{member path: size} of the regular files in a `tar -tvf` listing (bsdtar or GNU style)."""
+        """Regular sizes and typed link-target hashes from an exact GNU/BSD listing."""
         found = {}
-        for line in self._small(self.listing_remote, 256 << 20, 'archive listing').decode('utf-8', 'replace').splitlines():
-            if not line.startswith('-'):
-                continue  # directories, links and blank lines
-            m = _TVF_BSD.match(line) or _TVF_GNU.match(line)
-            name = _safe_member(m.group(2)) if m else None
+        for line in self._small(self.listing_remote, 256 << 20, 'archive listing').decode('utf-8', 'surrogateescape').splitlines():
+            if not line.startswith(('-', 'l')):
+                continue
+            is_link = line.startswith('l')
+            patterns = (_TVF_LINK_BSD, _TVF_LINK_GNU) if is_link else (_TVF_BSD, _TVF_GNU)
+            match = patterns[0].match(line) or patterns[1].match(line)
+            name = match.group(2) if match else None
+            value = int(match.group(1)) if match else None
+            if is_link:
+                if not name or name.count(' -> ') != 1 or any(c in name for c in "\\'\""):
+                    raise ValueError('the archive listing has an ambiguous symlink line')
+                name, target = name.split(' -> ')
+                if not target or '\x00' in target:
+                    raise ValueError('the archive listing has an unreadable symlink target')
+                value = (-1, _link_digest(target))
+            name = _safe_member(name) if name else None
             if not name:
-                raise ValueError('the archive listing has a regular-file line it cannot read')
+                raise ValueError('the archive listing has a file line it cannot read')
             if name in found:
                 raise ValueError('the archive listing names one file twice')
-            found[name] = int(m.group(1))
+            found[name] = value
         if not found:
-            # a failed listing step leaves a 0-byte or directory-only listing (pp407 review-full, 2026-11-07)
-            raise ValueError('the archive listing names no regular files')
+            raise ValueError('the archive listing names no regular files or symlinks')
         return found
 
     def members(self, archive):
@@ -8560,7 +8580,7 @@ class ArchiveVerifier(Verifier):
             wait()
             raise ValueError('the archive must be .tar, .tar.gz/.tgz or .tar.zst')
         source = _InflateLimit(source, self.inflate_limit)
-        found, self.names, self.appledouble, seen = {}, set(), set(), set()
+        found, self.names, self.appledouble, seen, links = {}, set(), set(), set(), set()
         deadline = time.monotonic() + self.timeout
         try:
             with tarfile.open(fileobj=source, mode='r|') as tar:
@@ -8575,16 +8595,22 @@ class ArchiveVerifier(Verifier):
                         raise ValueError('the archive holds an unsafe member name')
                     # red-team F2: a later member of ANY type with the same name (or one that is the same file on a
                     # case-insensitive or normalising disk) replaces the verified file on restore.
-                    folded = unicodedata.normalize('NFC', name).casefold()
+                    folded = unicodedata.normalize('NFC', posixpath.normpath(name)).casefold()
                     if folded in seen:
                         raise ValueError('the archive names one path twice (%s)' % name[:120])
                     seen.add(folded)
                     self.names.add(name)
                     if info.isdir():
                         continue
+                    if info.issym():
+                        if not info.linkname or info.size != 0:
+                            raise ValueError('the archive has invalid symlink metadata')
+                        links.add(folded)
+                        found[name] = (-1, _link_digest(info.linkname))
+                        continue
                     if not info.isreg():
                         raise ValueError('the archive holds a link or special member (%s); only regular files and '
-                                         'directories can be compared' % name[:120])
+                                         'directories or symlinks can be compared' % name[:120])
                     member = tar.extractfile(info)
                     h, size, head = hashlib.sha256(), 0, b''
                     while True:
@@ -8600,6 +8626,12 @@ class ArchiveVerifier(Verifier):
                     if head == APPLEDOUBLE_MAGIC:
                         self.appledouble.add(name)
                     found[name] = (size, h.hexdigest())
+                # A restored member must never be written through a link, in either archive order.
+                canonical = {unicodedata.normalize('NFC', posixpath.normpath(n)).casefold() for n in self.names}
+                for name in canonical:
+                    parents = name.split('/')[:-1]
+                    if any('/'.join(parents[:i]) in links for i in range(1, len(parents) + 1)):
+                        raise ValueError('an archive member would descend through a symlink')
                 # red-team F3: nothing but zero padding may follow the end-of-archive block.
                 while True:
                     rest = tar.fileobj.read(1 << 20)
@@ -8641,7 +8673,7 @@ class ArchiveVerifier(Verifier):
     def verify(self, local_root, manifest, remote):
         if self.max_members is None:
             self.max_members = 4 * len(manifest) + 1000  # files, their AppleDouble companions and directories
-        self.inflate_limit = 2 * sum(size for _rel, size, _sha in manifest) + self.inflate_slack
+        self.inflate_limit = 2 * sum(max(0, size) for _rel, size, _sha in manifest) + self.inflate_slack
         try:
             expected = self.expected_sha256(remote)
             listed = self.listing()
@@ -8674,7 +8706,7 @@ class ArchiveVerifier(Verifier):
                                       % (len(missing), len(extra)))
         if differs:
             return VerifyResult(False, len(found), [], differs[:20], error='archive content differs from the local files')
-        if listed != {n: s for n, (s, _h) in found.items()}:
+        if listed != {n: (s if s >= 0 else (s, h)) for n, (s, h) in found.items()}:
             return VerifyResult(False, len(found), error='archive listing does not match the archive members')
         self.verified_sha256 = actual
         return VerifyResult(bool(found), len(found))
@@ -8685,7 +8717,7 @@ def zlib_error():
     return zlib.error
 
 
-def tree_manifest(path, limits):
+def tree_manifest(path, limits, *, include_links=False):
     """[(relative path, size, sha256)] for a file or directory, bounded; raises ValueError over budget."""
     path = os.path.realpath(path)
     entries, total = [], 0
@@ -8696,9 +8728,10 @@ def tree_manifest(path, limits):
     else:
         for root, dirs, names in os.walk(path):
             dirs.sort()
-            for name in sorted(names):
+            candidates = names + ([name for name in dirs if os.path.islink(os.path.join(root, name))] if include_links else [])
+            for name in sorted(candidates):
                 full = os.path.join(root, name)
-                if os.path.islink(full):
+                if os.path.islink(full) and not include_links:
                     continue
                 files.append((os.path.relpath(full, path).replace(os.sep, '/'), full))
                 if len(files) > int(limits['max_walk_entries']):
@@ -8706,9 +8739,27 @@ def tree_manifest(path, limits):
     for rel, full in files:
         if time.monotonic() > deadline:
             raise ValueError('hashing exceeded its time budget')
+        if include_links and os.path.islink(full):
+            before = os.lstat(full)
+            target = os.readlink(full)
+            after = os.lstat(full)
+            identity = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            if identity(before) != identity(after) or not stat.S_ISLNK(after.st_mode):
+                raise ValueError('a symlink changed while its metadata was being read')
+            entries.append((rel, -1, _link_digest(target)))
+            continue
         h = hashlib.sha256()
         size = 0
-        with open(full, 'rb') as handle:
+        if include_links:
+            if not hasattr(os, 'O_NOFOLLOW'):
+                raise ValueError('archive verification needs no-follow file opens on this platform')
+            fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            handle = os.fdopen(fd, 'rb')
+        else:
+            handle = open(full, 'rb')
+        with handle:
+            if include_links and not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                raise ValueError('the local tree holds a special file')
             while True:
                 block = handle.read(1 << 20)
                 if not block:
@@ -8755,17 +8806,6 @@ def _check_remote(remote, policy, verifier):
         raise ValueError('remote %r is not configured in rclone' % name[:40])
     if kind.casefold() not in allowed:
         raise ValueError('remote %r has backend type %r; approvals need one of %s' % (name[:40], kind[:20], allowed))
-
-
-def _first_symlink(path):
-    """Relative path of the first symlink under `path` (or `path` itself), else None."""
-    if os.path.islink(path):
-        return '.'
-    for root, dirs, names in os.walk(path):
-        for name in sorted(dirs + names):
-            if os.path.islink(os.path.join(root, name)):
-                return os.path.relpath(os.path.join(root, name), path)
-    return None
 
 
 def _recent_change(path, seconds, now, limits):
@@ -8821,12 +8861,7 @@ def approve_delete(path, remote, verifier=None, pinned_digest=None, ttl=None, ho
         # PR #120 red-team F1: the delete-time stat check must describe the tree the backup was compared with, so it
         # is taken before hashing and must be unchanged after the (possibly hour-long) verification.
         stat_before = stat_manifest(real, limits, deadline=time.monotonic() + 60)
-        if archive is not None:
-            link = _first_symlink(real)
-            if link:
-                raise ValueError('the tree holds a symlink (%s), which the archive comparison does not cover; '
-                                 'refused' % link[:120])
-        manifest = tree_manifest(real, limits)
+        manifest = tree_manifest(real, limits, include_links=archive is not None)
         if not manifest:
             raise ValueError('nothing to approve: the path holds no files')
         if len(manifest) > int(limits.get('max_approve_files', 20000)):
