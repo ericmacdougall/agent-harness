@@ -141,9 +141,9 @@ class ExplicitOwners(unittest.TestCase):
                 comment['body'] = sf.record_body('historical verified tester', record)
         self.assertNotEqual(self.sign('ct1')[0], 0)
 
-    def test_actual_declared_owner_cannot_be_click_tester(self):
+    def test_native_owner_uuid_cannot_fall_back_to_legacy_tester(self):
         self.complete()
-        with self.assertRaisesRegex(AssertionError, 'declared owner'):
+        with self.assertRaisesRegex(AssertionError, 'native UUID tester must use its native Codex WAL'):
             self.case.click(A, 'https://app.goodqa.example')
         self.assertEqual(len([c for c in self.case.fake.comments[base.ISSUE]
             if json.loads(sf.RECORD_BLOCK.search(c['body']).group(1))['kind'] == 'click_test']), 1)
@@ -234,6 +234,58 @@ class NativeOwnerProvenance(unittest.TestCase):
             return data
         with mock.patch.object(sf, 'read_regular', side_effect=changed), self.assertRaises(sf.SpecError):
             self.get()
+
+
+class NativeOwnersAndClickWitness(unittest.TestCase):
+    def setUp(self):
+        import test_spec_flow_native_click as native
+        self.fixture = native.NativeClick()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.addCleanup(self.fixture.tearDown)
+        self.ids = [B, '55555555-5555-4555-8555-555555555555']
+        for ident in self.ids:
+            source = {'subagent': {'thread_spawn': {'parent_thread_id': PARENT, 'depth': 1,
+                      'agent_path': '/root/owner_' + ident[:4], 'agent_role': 'harness_owner'}}}
+            self.fixture.db.execute('INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?)',
+                (ident, json.dumps(source), 'subagent', 'Codex Desktop', '/root/owner_' + ident[:4],
+                 'harness_owner', None, 0, None, 'fixture-provider'))
+            wal = self.fixture.native_dir / ('agent-' + ident + '.jsonl')
+            wal.write_text(json.dumps({'event': 'handoff', 'at': '2026-11-05T09:59:00+00:00',
+                                      'note': 'owner-recorded fixture handoff'}) + '\n')
+            wal.chmod(0o600)
+        self.fixture.db.commit()
+        self.text = base.SPEC.replace('Author: agent:owner1 (claude-opus-5-5)',
+            'Author: agent:' + self.ids[0] + '\nOwners: ' + ', '.join('agent:' + x for x in self.ids))
+        spec = self.fixture.reviewed_spec(self.text)
+        code, _, error = self.fixture.run_cli('attach', str(spec), '--actor', 'agent:main1',
+                                             '--owners-wal', str(self.fixture.main))
+        self.assertEqual(code, 0, error)
+
+    def test_real_native_owner_proof_and_click_witness_coexist(self):
+        self.fixture.witness()
+        code, _, error = self.fixture.click()
+        self.assertEqual(code, 0, error)
+        for signer, expected in [('main1', 0), (self.ids[0], 2), ('22222222-2222-4222-8222-222222222222', 2)]:
+            code, _, error = self.fixture.run_cli('signoff', '--ticket', 'GoodQA harness#168', '--actor', 'agent:main1',
+                                                 '--by', signer, '--kind', 'agent', '--source', 'fixture main review')
+            self.assertEqual(code, expected, error)
+        result = self.fixture.evaluate()
+        self.assertFalse(any(m.startswith('click-test:') or m.startswith('sign-off:') for m in result['missing']), result)
+
+    def test_declared_owner_exclusion_survives_a_changed_native_role(self):
+        ident = self.ids[0]
+        source = {'subagent': {'thread_spawn': {'parent_thread_id': PARENT, 'depth': 1,
+                  'agent_path': '/root/owner_' + ident[:4], 'agent_role': 'harness_click_tester'}}}
+        self.fixture.db.execute('UPDATE threads SET source=?,agent_role=?,rollout_path=? WHERE id=?',
+            (json.dumps(source), 'harness_click_tester', str(self.fixture.rollout), ident))
+        self.fixture.db.commit()
+        before = len(self.fixture.fake.comments[base.ISSUE])
+        code, _, error = self.fixture.click('--print-native-witness', tester=ident)
+        self.assertNotEqual(code, 0)
+        self.assertIn('independent', error)
+        self.assertEqual(len(self.fixture.fake.comments[base.ISSUE]), before)
+
 
 
 if __name__ == '__main__':
