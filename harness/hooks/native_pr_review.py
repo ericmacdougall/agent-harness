@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ import shlex
 import subprocess
 import sys
 import time
+from urllib.parse import unquote, urlsplit
 
 import git_safety
 import spec_flow
@@ -521,65 +523,182 @@ def _contributor_report(report, agent, expected_commits, repo, changed_paths):
             raise ValueError("contribution names a path outside the declared commit's changes")
 
 
+def _native_command_cwd(value):
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    desktop_uri = value.startswith("file:")
+    try:
+        if desktop_uri:
+            uri = urlsplit(value)
+            if uri.netloc or uri.query or uri.fragment:
+                return None
+            path = unquote(uri.path, errors="strict")
+        else:
+            path = value
+        if (not path.startswith("/") or path.startswith("//") or "\\" in path
+                or any(ord(char) < 32 or ord(char) == 127 for char in path)):
+            return None
+        current = Path(path)
+        if ".." in current.parts or (desktop_uri and ("%" in path or current.as_uri() != value)):
+            return None
+        return current
+    except ValueError:
+        return None
+
+
+def _literal_git_paths(paths):
+    return (1 <= len(paths) <= 128 and len(set(paths)) == len(paths)
+            and all(not path.startswith("-") and _contribution_path(path) for path in paths))
+
+
+def _message_path(word, base):
+    if re.fullmatch(r"[A-Za-z0-9_./][A-Za-z0-9_./-]*", word):
+        return word
+    if base is not None and re.fullmatch(r"\$base/[A-Za-z0-9_./-]+", word):
+        return f'"{word}"'
+    return None
+
+
+def _native_commit_message(line, words, base):
+    amend = words[2:4] == ["--amend", "-F"]
+    message_at = 4 if amend else 3
+    if len(words) <= message_at or words[message_at - 1] != "-F":
+        return None
+    message = _message_path(words[message_at], base)
+    scope = words[message_at + 1:]
+    if message is None or line != " ".join([*words[:message_at], message, *scope]):
+        return None
+    if scope and (amend or scope[:2] != ["--only", "--"] or not _literal_git_paths(scope[2:])):
+        return None
+    return message
+
+
+def _literal_message_edit(body):
+    """Recognize the retained literal message edit without evaluating it."""
+    expected = """
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text().replace("", "").replace("", "")
+p.write_text(s)
+"""
+    try:
+        tree = ast.parse("\n".join(body))
+    except (SyntaxError, ValueError, RecursionError):
+        return False
+    for index, node in enumerate(ast.walk(tree)):
+        if index == 64:
+            return False
+        if isinstance(node, ast.Constant) and type(node.value) is str:
+            node.value = ""
+    return ast.dump(tree) == ast.dump(ast.parse(expected))
+
+
+def _native_message_setup(line, words, lines, base, current, home):
+    if len(words) != 4 or words[:2] not in (["cat", ">"], ["python3", "-"]):
+        return None
+    name = re.fullmatch(r"\$base/(commit-message-[A-Za-z0-9_-]+\.txt)", words[2])
+    if not name or base is None or base != current.parent:
+        return None
+    try:
+        relative = base.relative_to(home / ".agent-harness/work")
+        if len(relative.parts) < 2 or not _identifier(relative.parts[0]):
+            return None
+        _, _, _, base_mode = spec_flow._native_path(base, os.getuid(), directory=True)
+        _, _, _, file_mode = spec_flow._native_path(base / name[1], os.getuid(), maximum=MAX_FILE)
+        if (base_mode | file_mode) & 0o077:
+            return None
+    except (OSError, ValueError):
+        return None
+    message = _message_path(words[2], base)
+    terminator = re.fullmatch(r"<<([A-Za-z_][A-Za-z0-9_]*)", words[3])
+    if message is None or not terminator:
+        return None
+    delimiter = terminator[1]
+    if line != f"{words[0]} {words[1]} {message} <<'{delimiter}'":
+        return None
+    body = []
+    for raw in lines:
+        if raw == delimiter:
+            return message if words[0] == "cat" or _literal_message_edit(body) else None
+        body.append(raw)
+    return None
+
+
+def _native_git_preparation(line, words):
+    if line in ("umask 077", "git diff --check"):
+        return True
+    if words[:2] == ["git", "add"] and line == " ".join(words):
+        return _literal_git_paths(words[3:] if words[2:3] == ["--"] else words[2:])
+    if re.fullmatch(r'test "\$\(git rev-parse HEAD\)" = [0-9a-f]{40}', line):
+        return True
+    remote = re.fullmatch(r'test -z "\$\(git ls-remote --heads origin ([A-Za-z0-9._/-]+)\)"', line)
+    return bool(remote and _branch_ref(remote[1]))
+
+
 def _shell_commit_directory(command, cwd, home):
     """Recognize the finite commit/readback command shape without executing any input."""
     if (not isinstance(command, list) or len(command) != 3 or not all(isinstance(word, str) for word in command)
-            or Path(command[0]).name not in ("bash", "zsh", "sh") or command[1] not in ("-c", "-lc")
-            or not isinstance(cwd, str) or len(command[2]) > 16_000):
+            or command[0] not in ("/bin/bash", "/usr/bin/bash", "/bin/zsh", "/bin/sh")
+            or command[1] not in ("-c", "-lc")
+            or len(command[2]) > 16_000):
         return None
-    current = Path(cwd)
-    variables = {}
+    current = _native_command_cwd(cwd)
+    if current is None:
+        return None
+    base = None
+    changed_dir = False
+    prepared_message = None
     directory = None
     readback = False
-    heredoc = None
-    for line in command[2].splitlines():
-        if heredoc is not None:
-            if line == heredoc:
-                heredoc = None
-            continue
-        stripped = line.strip()
+    lines = iter(command[2].split("\n"))
+    if next(lines).strip(" \t") not in ("set -e", "set -eu"):
+        return None
+    for line in lines:
+        stripped = line.strip(" \t")
         if not stripped or stripped.startswith("#"):
             continue
-        words = shlex.split(stripped)
+        try:
+            words = shlex.split(stripped)
+        except ValueError:
+            return None
         if not words:
             continue
         if readback:
-            if words not in (["git", "status", "--short"], ["git", "status", "-sb"], ["git", "diff", "--check"],
-                             ["git", "diff", "--check", "HEAD^", "HEAD"], ["git", "diff", "--stat", "HEAD^", "HEAD"]):
+            if stripped != " ".join(words) or words not in (
+                             ["git", "status", "--short"], ["git", "status", "-sb"], ["git", "diff", "--check"],
+                             ["git", "diff", "--check", "HEAD^", "HEAD"], ["git", "diff", "--stat", "HEAD^", "HEAD"],
+                             ["git", "show", "--check", "--oneline", "HEAD"]):
                 return None
             continue
-        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(~/[A-Za-z0-9_./-]+|/[A-Za-z0-9_./-]+)", words[0])
-        if assignment and len(words) == 1 and directory is None:
-            name, path = assignment.groups()
-            if name in variables:
+        assignment = re.fullmatch(r"base=(~?/[A-Za-z0-9_./-]+)", stripped)
+        change = re.fullmatch(r'cd (?:"\$base(/[A-Za-z0-9_./-]+)"|(/[A-Za-z0-9_./-]+))', stripped)
+        if assignment and base is None and not changed_dir and directory is None and prepared_message is None:
+            path = assignment[1]
+            base = _native_command_cwd(str(home / path[2:]) if path.startswith("~/") else path)
+            if base is None:
                 return None
-            variables[name] = str(home / path[2:]) if path.startswith("~/") else path
-        elif words[0] == "cd" and len(words) == 2 and directory is None:
-            target = re.fullmatch(r"\$([A-Za-z_][A-Za-z0-9_]*)(/[A-Za-z0-9_./-]+)", words[1])
-            if target and target[1] in variables:
-                current = Path(variables[target[1]] + target[2])
-            elif re.fullmatch(r"/[A-Za-z0-9_./-]+", words[1]):
-                current = Path(words[1])
-            else:
+        elif change and not changed_dir and directory is None and prepared_message is None:
+            relative, absolute = change.groups()
+            current = _native_command_cwd(absolute or (str(base) + relative if base is not None else None))
+            if current is None:
                 return None
+            changed_dir = True
         elif words[:2] == ["git", "commit"]:
-            flags = words[2:-1]
-            if (directory is not None or flags not in (["-F"], ["--amend", "-F"])
-                    or not re.fullmatch(r"(?:[$][A-Za-z_][A-Za-z0-9_]*/)?[A-Za-z0-9_./-]+", words[-1])
-                    or words[-1].startswith("-")):
+            message = _native_commit_message(stripped, words, base)
+            if directory is not None or message is None or (prepared_message and message != prepared_message):
                 return None
             directory = current.resolve()
         elif words == ["git", "rev-parse", "HEAD"]:
-            if directory is None or directory != current.resolve():
+            if directory is None or stripped != " ".join(words):
                 return None
             readback = True
-        elif words[0] in ("set", "umask", "test") or words[:2] in (["git", "diff"], ["git", "add"]):
+        elif directory is None and prepared_message is None and _native_git_preparation(stripped, words):
             continue
-        elif words[0] in ("cat", "python3") and directory is None:
-            delim = re.search(r"""<<['"]([A-Za-z_][A-Za-z0-9_]*)['"]$""", stripped)
-            if delim is None:
+        elif words[0] in ("cat", "python3") and directory is None and prepared_message is None:
+            prepared_message = _native_message_setup(stripped, words, lines, base, current, home)
+            if prepared_message is None:
                 return None
-            heredoc = delim[1]
         else:
             return None
     return directory if readback else None

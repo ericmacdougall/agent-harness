@@ -145,6 +145,58 @@ class NativeReviewContracts(TestCase):
         self.assertIsNone(match(self.event(command=["/bin/sh", "-c",
                                                      "git commit -F message\ngit rev-parse HEAD\necho fixture"])))
 
+    def test_native_authorship_accepts_desktop_local_file_uri(self):
+        subjects = {HEAD: "fixture subject"}
+        self.assertEqual(n._commit_from_event(self.event(cwd=self.repo.as_uri()), OWNER,
+                                               self.repo, self.repo, subjects), HEAD)
+
+    def test_native_authorship_accepts_scoped_commit_and_readback(self):
+        command = [
+            "/bin/zsh", "-lc",
+            "set -eu\ngit commit -F ../message.txt --only -- hooks/review.py tests/test_review.py\n"
+            "git rev-parse HEAD\ngit show --check --oneline HEAD\ngit status --short",
+        ]
+        subjects = {HEAD: "fixture subject"}
+        self.assertEqual(n._commit_from_event(self.event(command=command), OWNER,
+                                               self.repo, self.repo, subjects), HEAD)
+
+    def test_native_authorship_refuses_ambiguous_cwd_and_commit_shapes(self):
+        subjects = {HEAD: "fixture subject"}
+        local = self.repo.as_uri()
+        invalid_cwds = [
+            "file://wrong.invalid" + self.repo.as_posix(), local + "?view=other", local + "#other",
+            "file://localhost" + self.repo.as_posix(), local.rsplit("/", 1)[0] + "%2F" + self.repo.name,
+            local + "/../" + self.repo.name, local + "%5C", local + "%252f",
+            local + "%00", local + "?", local + "#",
+            local.replace("file:///", "file:/", 1), self.repo.name,
+        ]
+        for cwd in invalid_cwds:
+            with self.subTest(cwd=cwd):
+                self.assertIsNone(n._commit_from_event(self.event(cwd=cwd), OWNER, self.repo, self.repo, subjects))
+        invalid_shells = [
+            "git commit -F message --only --",
+            "git commit -F message --only -- ../outside.py",
+            "git commit -F message --only -- /outside.py",
+            "git commit -F message --only -- ':(glob)*'",
+            "git commit -F message --only -- -outside.py",
+            "git commit -F message --only --no-verify -- tracked.py",
+            "git commit -F message --only -- tracked.py tracked.py",
+            "git commit -F message --only -- " + " ".join(f"tracked{num}.py" for num in range(129)),
+            "env git commit -F message --only -- tracked.py",
+            "git -c user.name=Other commit -F message --only -- tracked.py",
+            "git commit -F message --only -- tracked.py && echo fixture",
+            "git commit -F message --only -- tracked.py; echo fixture",
+            "set +e\ngit commit -F message --only -- tracked.py",
+        ]
+        for shell in invalid_shells:
+            with self.subTest(shell=shell):
+                command = ["/bin/zsh", "-lc",
+                           "set -eu\n" + shell + "\ngit rev-parse HEAD\ngit show --check --oneline HEAD"]
+                self.assertIsNone(n._commit_from_event(self.event(command=command), OWNER,
+                                                      self.repo, self.repo, subjects))
+        command = ["/bin/zsh", "-lc", "git commit -F message --only -- tracked.py\ngit rev-parse HEAD"]
+        self.assertIsNone(n._commit_from_event(self.event(command=command), OWNER, self.repo, self.repo, subjects))
+
     def test_authored_sibling_worktree_binds_same_repository(self):
         actual_repo = self.repo / "primary"
         sibling = self.repo / "sibling"
@@ -158,7 +210,65 @@ class NativeReviewContracts(TestCase):
         subprocess.run(["git", "-C", str(actual_repo), "worktree", "add", "-q", "--detach", str(sibling)], check=True)
         subjects = {HEAD: "fixture subject"}
         self.assertEqual(n._commit_from_event(self.event(cwd=sibling), OWNER, actual_repo, self.repo, subjects), HEAD)
+        self.assertEqual(n._commit_from_event(self.event(cwd=sibling.as_uri()), OWNER,
+                                              actual_repo, self.repo, subjects), HEAD)
         self.assertIsNone(n._commit_from_event(self.event(cwd=foreign), OWNER, actual_repo, self.repo, subjects))
+        self.assertIsNone(n._commit_from_event(self.event(cwd=foreign.as_uri()), OWNER, actual_repo,
+                                              self.repo, subjects))
+
+    def _message_scratch(self):
+        scratch = self.repo / ".agent-harness/work" / ROOT_ID / "message-scratch"
+        scratch.mkdir(parents=True, mode=0o700)
+        checkout = scratch / "checkout"
+        checkout.mkdir()
+        for name in ("main", "other"):
+            path = scratch / f"commit-message-{name}.txt"
+            path.touch(mode=0o600)
+        (scratch / "commit-message-alias.txt").symlink_to(scratch / "commit-message-main.txt")
+        return scratch, checkout
+
+    def test_native_authorship_rejects_unparsed_setup_and_message_operations(self):
+        subjects = {HEAD: "fixture subject"}
+        scratch, checkout = self._message_scratch()
+        main_message = '"$base/commit-message-main.txt"'
+        blocks = [
+            "umask 077; true",
+            "test -n fixture && true",
+            "git add tracked.py && true",
+            "git diff --check; true",
+            f"GIT_DIR={self.repo}",
+            f"python3 - {main_message} <<'PY'\nprint('fixture')\nPY",
+            f"cat > {main_message} && true <<'EOF'\nfixture\nEOF",
+            "cat > \"$base/commit-message-other.txt\" <<'EOF'\nfixture\nEOF",
+        ]
+        cases = [(setup, main_message) for setup in blocks] + [
+            ("cat > \"$base/commit-message-alias.txt\" <<'EOF'\nfixture\nEOF", '"$base/commit-message-alias.txt"'),
+            ("cat > .git/config <<'EOF'\nfixture\nEOF", ".git/config"),
+            ("cat > ../commit-message-main.txt <<'EOF'\nfixture\nEOF", "../commit-message-main.txt"),
+        ]
+        for setup, message in cases:
+            with self.subTest(setup=setup):
+                command = ["/bin/zsh", "-lc",
+                           f"set -eu\nbase={scratch}\n{setup}\ngit commit -F {message}\ngit rev-parse HEAD"]
+                self.assertIsNone(n._commit_from_event(self.event(cwd=checkout, command=command), OWNER,
+                                                      checkout, self.repo, subjects))
+
+    def test_native_authorship_accepts_exact_historical_message_writers(self):
+        subjects = {HEAD: "fixture subject"}
+        scratch, checkout = self._message_scratch()
+        message = '"$base/commit-message-main.txt"'
+        writer_blocks = [
+            f"cat > {message} <<'EOF'\nA literal commit message.\nEOF",
+            f"python3 - {message} <<'PY'\nfrom pathlib import Path\nimport sys\n"
+            "p = Path(sys.argv[1])\ns = p.read_text().replace('a', 'b').replace('c', 'd')\n"
+            "p.write_text(s)\nPY",
+        ]
+        for writer in writer_blocks:
+            with self.subTest(writer=writer):
+                script = (f"set -eu\nbase={scratch}\ngit diff --check\ngit add tracked.py\n{writer}\n"
+                          f"git commit -F {message}\ngit rev-parse HEAD")
+                event = self.event(cwd=checkout, command=["/bin/zsh", "-lc", script])
+                self.assertEqual(n._commit_from_event(event, OWNER, checkout, self.repo, subjects), HEAD)
 
     def test_complete_owner_declaration_and_pure_pass(self):
         n._authors(self.owner_report.read_bytes(), OWNER, ROOT_ID, [HEAD])
