@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# One public-source Linux build. GitHub credentials are not inherited by this process.
+set -Eeuo pipefail
+umask 077
+
+readonly harness_root="$PWD"
+readonly upstream="$harness_root/codex-upstream"
+readonly capsule="$harness_root/codex-receipt-capsule"
+readonly manifest="$capsule/native/codex/source.json"
+readonly patch="$capsule/native/codex/model-receipt.patch"
+readonly run_root="${1:?expected runner temp directory}/codex-receipt-work"
+readonly output="${1:?expected runner temp directory}/codex-receipt-output"
+readonly upstream_commit=d32063f96c2dff1dc96af839b3952abb6acfeda4
+readonly capsule_commit=8d688c1c9a548f14de0a1c4b9475ef42e607684b
+readonly patch_sha=90141e64b41ec86c31c5a320535c4cb9300aab29894117544a44a746386d9c1f
+readonly toolchain=1.95.0
+readonly target=x86_64-unknown-linux-gnu
+
+[[ "$(uname -m)" == x86_64 ]]
+test "$(git -C "$upstream" rev-parse --verify HEAD)" = "$upstream_commit"
+test "$(git -C "$capsule" rev-parse --verify HEAD)" = "$capsule_commit"
+test -z "$(git -C "$upstream" status --porcelain=v1)"
+test -z "$(git -C "$capsule" status --porcelain=v1)"
+printf '%s  %s\n' "$patch_sha" "$patch" | sha256sum --check --strict -
+python3 - "$manifest" "$upstream_commit" "$patch_sha" "$toolchain" "$target" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+doc = json.loads(Path(sys.argv[1]).read_bytes())
+assert doc == {
+    "upstreamRepository": "https://github.com/openai/codex.git",
+    "upstreamTag": "rust-v0.169.0",
+    "upstreamCommit": sys.argv[2],
+    "patchSha256": sys.argv[3],
+    "toolchain": sys.argv[4],
+    "target": sys.argv[5],
+    "receiptProtocol": "codex-response-model-observation-v1",
+}
+PY
+mkdir -m 700 "$run_root" "$output"
+git -C "$upstream" apply --check --index --whitespace=error "$patch"
+git -C "$upstream" apply --index --whitespace=error "$patch"
+readonly patched_tree="$(git -C "$upstream" write-tree)"
+readonly harness_commit="$(git -C "$harness_root" rev-parse --verify HEAD)"
+
+rustup toolchain install "$toolchain" --profile minimal --target "$target"
+rustup run "$toolchain" rustc --version --verbose > "$run_root/rustc.txt"
+grep -Fx "host: $target" "$run_root/rustc.txt"
+
+# The pinned upstream checkout provides the trust anchor for these prebuilt GNU V8 files.
+readonly v8_version=152.2.0
+test "$(python3 "$upstream/.github/scripts/rusty_v8_bazel.py" resolved-v8-crate-version)" = "$v8_version"
+readonly v8_profile="ptrcomp_sandbox_release_$target"
+readonly v8_manifest="rusty_v8_$v8_profile.sha256"
+readonly v8_archive="librusty_v8_$v8_profile.a.gz"
+readonly v8_binding="src_binding_$v8_profile.rs"
+readonly v8_dir="$run_root/v8"
+mkdir -m 700 "$v8_dir"
+for item in "$v8_manifest" "$v8_archive" "$v8_binding"; do
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 180 \
+    "https://github.com/openai/codex/releases/download/rusty-v8-v$v8_version/$item" \
+    --output "$v8_dir/$item"
+done
+(
+  cd "$v8_dir"
+  awk -v file="$v8_manifest" '$2 == file { print }' \
+    "$upstream/third_party/v8/rusty_v8_152_2_0_release_manifests.sha256" | sha256sum --check --strict -
+  test "$(wc -l < "$v8_manifest")" -eq 2
+  tr -d '\r' < "$v8_manifest" | sha256sum --check --strict -
+)
+export RUSTY_V8_ARCHIVE="$v8_dir/$v8_archive"
+export RUSTY_V8_SRC_BINDING_PATH="$v8_dir/$v8_binding"
+
+# Use one compatible profile for both the narrow fixtures and the proof binary.
+export CARGO_TARGET_DIR="$run_root/target"
+export CARGO_BUILD_JOBS=3 CARGO_INCREMENTAL=0
+export CARGO_PROFILE_RELEASE_OPT_LEVEL=1 CARGO_PROFILE_RELEASE_LTO=false
+export CARGO_PROFILE_RELEASE_DEBUG=0 CARGO_PROFILE_RELEASE_STRIP=symbols
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+export STABLE_GIT_COMMIT="$capsule_commit"
+cd "$upstream/codex-rs"
+
+df -h "$run_root"
+readonly -a cargo_cmd=(rustup run "$toolchain" cargo)
+run_focused() {
+  local label="$1"
+  shift
+  "${cargo_cmd[@]}" test --locked --release --target "$target" "$@" 2>&1 | tee -a "$run_root/$label.log"
+  grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$run_root/$label.log"
+}
+run_focused tracker -p codex-api --lib response_model_observation
+run_focused sse -p codex-api --test sse_end_to_end responses_sse_binds_http_model_header_to_its_one_response
+run_focused websocket -p codex-core --test all responses_websocket_model_observation_does_not_cross_response_boundaries
+run_focused compaction -p codex-core --lib collect_compaction_output_accepts_additional_output_items
+run_focused app-server -p codex-app-server --test all turn_start_emits_raw_response_completed_with_upstream_usage
+for kind in 0 1; do
+  CODEX_APP_SERVER_SCHEMA_ROOT="$PWD/app-server-protocol/schema" CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL="$kind" \
+    run_focused "schema-export-$kind" -p codex-app-server-protocol --lib \
+      schema_fixtures_tests::write_schema_fixtures_from_env -- --exact --ignored
+done
+run_focused schema-verify -p codex-app-server-protocol --lib schema_fixtures_tests
+
+"${cargo_cmd[@]}" build --locked --release --target "$target" -p codex-cli --bin codex
+readonly binary="$CARGO_TARGET_DIR/$target/release/codex"
+test -x "$binary"
+test "$("$binary" --version)" = "codex-cli 0.169.0"
+install -m 0755 "$binary" "$run_root/codex"
+(
+  cd "$run_root"
+  sha256sum codex > "$output/binary.sha256"
+  gzip -n -1 -c codex > "$output/codex-linux-x64.gz"
+)
+cp "$manifest" "$output/source.json"
+cp "$run_root/rustc.txt" "$output/rustc.txt"
+cp app-server-protocol/schema/precomputed/app-server-exports-stable.json.zst "$output/"
+cp app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst "$output/"
+printf 'harness_commit=%s\ncapsule_commit=%s\npatched_tree=%s\nprofile=release-opt1-no-lto\n' \
+  "$harness_commit" "$capsule_commit" "$patched_tree" > "$output/build-provenance.txt"
+(
+  cd "$output"
+  sha256sum binary.sha256 codex-linux-x64.gz source.json rustc.txt build-provenance.txt \
+    app-server-exports-stable.json.zst app-server-exports-experimental.json.zst > artifacts.sha256
+  test "$(du --apparent-size --bytes --summarize . | cut -f1)" -le 134217728
+)
+df -h "$run_root"
