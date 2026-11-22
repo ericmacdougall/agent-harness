@@ -1068,7 +1068,12 @@ environment proxies or redirects, after checking the actual public peer. The
 production default permits only `https://goodqa-uploads.tor1.digitaloceanspaces.com`
 for the production `https://goodqa.app` API; development is not implicitly
 allowed. Custom deployments need an explicit trusted `artifact_download_origins`
-list. Reads have command deadlines, a 64 KiB target-JSON limit, a 1 MB source
+list. Header and body receives enforce the absolute verification deadline at
+each socket read, including final completion; slow byte streams cannot extend
+it by resetting an idle timeout. OS DNS resolution and multi-address connection
+setup are not hard wall-clock bounded: connection/TLS timeouts and post-connect
+deadline checks remain, so this is not a whole-command cancellation guarantee.
+Reads have a 64 KiB target-JSON limit, a 1 MB source
 limit, 64 markdown candidates and an 8 MB aggregate source budget. Download
 capabilities and headers are never logged. Access failures remain verification
 failures, not permission changes.

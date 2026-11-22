@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import hashlib
 import http.client
+import io
 import ipaddress
 import os
 import re
@@ -29,6 +30,41 @@ from safe_input import safe_json_loads
 
 class TicketSystemUnavailable(Exception):
     """The ticket system could not be reached or answered unexpectedly."""
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    """Recompute the absolute budget at every receive hidden by HTTP buffering."""
+
+    def __init__(self, wire, remaining):
+        super().__init__()
+        self.wire, self.remaining = wire, remaining
+        # Retain a native socket-file reference across HTTP/1.0 connection.close.
+        self.raw = wire.makefile("rb", buffering=0)
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.wire.settimeout(self.remaining())
+        size = self.raw.readinto(buffer)
+        self.remaining()
+        return size
+
+    def close(self):
+        try:
+            self.raw.close()
+        finally:
+            super().close()
+
+
+class _DeadlineResponseSocket:
+    def __init__(self, wire, remaining):
+        self.wire, self.remaining = wire, remaining
+
+    def makefile(self, mode):
+        if mode != "rb":
+            raise ValueError("Unsupported attachment stream mode")
+        return io.BufferedReader(_DeadlineSocketReader(self.wire, self.remaining))
 
 
 class TicketOutOfScope(Exception):
@@ -378,10 +414,12 @@ class GoodQAAdapter:
         # http.client has no redirect handler, cookie jar, netrc or environment
         # proxy authentication. Each hop gets a new empty connection.
         connection = None
+        response = None
         try:
             cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
             connection = cls(host, port, timeout=self._remaining())
             connection.connect()
+            self._remaining()
             wire = connection.sock
             peer = ipaddress.ip_address(wire.getpeername()[0])
             if not peer.is_global and not (fixture and peer.is_loopback):
@@ -389,7 +427,10 @@ class GoodQAAdapter:
             wire.settimeout(self._remaining())
             connection.request("GET", path, headers=headers)
             wire.settimeout(self._remaining())
+            connection.response_class = lambda sock, **kwargs: http.client.HTTPResponse(
+                _DeadlineResponseSocket(sock, self._remaining), **kwargs)
             response = connection.getresponse()
+            self._remaining()
             if response.status != 200:
                 raise TicketSystemUnavailable(f"Attachment read refused (HTTP {response.status})")
             length = response.getheader("Content-Length")
@@ -409,11 +450,14 @@ class GoodQAAdapter:
                 chunks.append(chunk)
                 if response.isclosed():
                     break
+            self._remaining()
             return b"".join(chunks)
         except (OSError, ValueError, http.client.HTTPException):
             # Exceptions may include a signed URL: never retain or echo repr.
             raise TicketSystemUnavailable("Attachment transport unavailable") from None
         finally:
+            if response is not None:
+                response.close()
             if connection is not None:
                 connection.close()
 
