@@ -9,3 +9,5 @@ The job uses a standard public Ubuntu runner and stops after 60 minutes. It chec
 This artifact is for side-by-side testing. Live validation needs a separately reviewed consumer and authorization for a scoped native run.
 
 Run `python3 -B native/codex/test_verify_focused.py` to check the proof parser against independent literal logs. [Fixture sources](FOCUSED_FIXTURES.md) identifies the pinned Rust declarations and macro case names.
+
+Run `python3 -B native/codex/test_build_proof.py` to verify that source and provenance failures stop the driver before the Rust toolchain step. The test exercises the real driver with local stand-ins and an explicit build sentinel.

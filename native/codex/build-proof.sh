@@ -17,10 +17,15 @@ readonly toolchain=1.95.0
 readonly target=x86_64-unknown-linux-gnu
 
 [[ "$(uname -m)" == x86_64 ]]
-test "$(git -C "$upstream" rev-parse --verify HEAD)" = "$upstream_commit"
-test "$(git -C "$capsule" rev-parse --verify HEAD)" = "$capsule_commit"
-test -z "$(git -C "$upstream" status --porcelain=v1)"
-test -z "$(git -C "$capsule" status --porcelain=v1)"
+actual_upstream="$(git -C "$upstream" rev-parse --verify HEAD)"
+actual_capsule="$(git -C "$capsule" rev-parse --verify HEAD)"
+upstream_status="$(git -C "$upstream" status --porcelain=v1)"
+capsule_status="$(git -C "$capsule" status --porcelain=v1)"
+if [[ "$actual_upstream" != "$upstream_commit" || "$actual_capsule" != "$capsule_commit" ||
+      -n "$upstream_status" || -n "$capsule_status" ]]; then
+  printf '%s\n' "The pinned source checkouts could not be verified." >&2
+  exit 1
+fi
 printf '%s  %s\n' "$patch_sha" "$patch" | sha256sum --check --strict -
 python3 - "$manifest" "$upstream_commit" "$patch_sha" "$toolchain" "$target" <<'PY'
 import json
@@ -41,8 +46,13 @@ PY
 mkdir -m 700 "$run_root" "$output"
 git -C "$upstream" apply --check --index --whitespace=error "$patch"
 git -C "$upstream" apply --index --whitespace=error "$patch"
-readonly patched_tree="$(git -C "$upstream" write-tree)"
-readonly harness_commit="$(git -C "$harness_root" rev-parse --verify HEAD)"
+patched_tree="$(git -C "$upstream" write-tree)"
+harness_commit="$(git -C "$harness_root" rev-parse --verify HEAD)"
+if ! [[ "$patched_tree" =~ ^[0-9a-f]{40}$ && "$harness_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  printf '%s\n' "Complete source provenance identifiers are required." >&2
+  exit 1
+fi
+readonly patched_tree harness_commit
 
 rustup toolchain install "$toolchain" --profile minimal --target "$target"
 rustup run "$toolchain" rustc --version --verbose > "$run_root/rustc.txt"
