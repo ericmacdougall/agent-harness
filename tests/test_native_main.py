@@ -165,6 +165,100 @@ class DesktopReviewRole(unittest.TestCase):
         backend.assert_not_called()
 
 
+HELPER = ("/Applications/Fixture.app/Contents/Frameworks/Codex Framework.framework/"
+          "Versions/158.0.8127.37/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)")
+
+
+class HelperDesktop(FakeDesktop):
+    def __init__(self):
+        super().__init__()
+        self.processes[20] = ProcessIdentity(20, 25, 501, 3, CLI)
+        self.processes[25] = ProcessIdentity(25, 30, 501, 3, HELPER)
+        self.helper_code = CodeIdentity("com.openai.codex.helper", OPENAI_TEAM, "d" * 40, HELPER)
+        self.helper_calls = 0
+        self.on_helper = lambda: None
+
+    def helper_signature(self, pid):
+        self.helper_calls += 1
+        self.on_helper()
+        return self.helper_code if pid == 25 else None
+
+
+@unittest.skipUnless(ADAPTER_PRESENT, "native root adapter absent")
+class DesktopHelperRole(unittest.TestCase):
+    def setUp(self):
+        self.backend = HelperDesktop()
+
+    def admit(self, envelope=None, reader=None):
+        return nm._is_desktop_root(envelope or payload(), 10, self.backend,
+                                   reader or (lambda _ident: (ROOT_ROW, ("fixture binding",))))
+
+    def test_official_single_helper_topology_qualifies(self):
+        self.assertTrue(self.admit())
+        self.assertEqual(self.backend.helper_calls, 2)
+
+    def test_helper_uses_fixed_running_code_requirement(self):
+        backend = object.__new__(nm._DesktopBackend)
+        with patch.object(backend, '_signature', return_value=self.backend.helper_code) as check:
+            self.assertEqual(backend.helper_signature(25), self.backend.helper_code)
+        check.assert_called_once_with(25, (nm._HELPER_REQUIREMENT,))
+        self.assertIn('identifier "com.openai.codex.helper"', nm._HELPER_REQUIREMENT)
+        self.assertIn('anchor apple generic', nm._HELPER_REQUIREMENT)
+        self.assertIn(OPENAI_TEAM, nm._HELPER_REQUIREMENT)
+
+    def test_cross_package_and_unbounded_or_fake_framework_paths_deny(self):
+        for path in (HELPER.replace('Fixture.app', 'Other.app'),
+                     HELPER.replace('158.0.8127.37', '../158.0.8127.37'),
+                     HELPER.replace('158.0.8127.37', 'Current'),
+                     HELPER.replace('158.0.8127.37', '1' * 50),
+                     HELPER.replace('Codex (Aperitif)', 'Other Helper')):
+            with self.subTest(path=path):
+                self.backend = HelperDesktop()
+                self.backend.processes[25] = ProcessIdentity(25, 30, 501, 3, path)
+                self.backend.helper_code = CodeIdentity('com.openai.codex.helper', OPENAI_TEAM, 'd' * 40, path)
+                self.assertFalse(self.admit())
+
+    def test_helper_signature_is_required_and_bound_to_kernel_path(self):
+        for code in (None, CodeIdentity('other', OPENAI_TEAM, 'd' * 40, HELPER),
+                     CodeIdentity('com.openai.codex.helper', 'OTHERTEAM', 'd' * 40, HELPER),
+                     CodeIdentity('com.openai.codex.helper', OPENAI_TEAM, '', HELPER),
+                     CodeIdentity('com.openai.codex.helper', OPENAI_TEAM, 'd' * 40, HELPER.replace('8127', '8126'))):
+            with self.subTest(code=code):
+                self.backend.helper_code = code
+                self.assertFalse(self.admit())
+
+    def test_additional_intermediary_and_foreign_uid_deny(self):
+        for process in (ProcessIdentity(25, 40, 501, 3, HELPER),
+                        ProcessIdentity(25, 30, 502, 3, HELPER)):
+            self.backend = HelperDesktop()
+            self.backend.processes[25] = process
+            self.backend.processes[40] = ProcessIdentity(40, 30, 501, 3, HELPER)
+            self.assertFalse(self.admit())
+
+    def test_helper_process_and_code_replacement_deny(self):
+        for replacement in (ProcessIdentity(25, 30, 501, 4, HELPER),
+                            ProcessIdentity(25, 40, 501, 3, HELPER),
+                            ProcessIdentity(25, 30, 502, 3, HELPER)):
+            self.backend = HelperDesktop()
+            self.backend.on_helper = lambda: self.backend.processes.__setitem__(25, replacement)
+            self.assertFalse(self.admit())
+        self.backend = HelperDesktop()
+        def replace_code():
+            if self.backend.helper_calls == 2:
+                self.backend.helper_code = CodeIdentity('com.openai.codex.helper', OPENAI_TEAM, 'e' * 40, HELPER)
+        self.backend.on_helper = replace_code
+        self.assertFalse(self.admit())
+
+    def test_signature_exception_and_child_identity_fail_closed(self):
+        with patch.object(self.backend, 'helper_signature', side_effect=OSError('unavailable')):
+            self.assertFalse(self.admit())
+        self.assertFalse(self.admit(payload(agent_id=CHILD_ID)))
+        for index, value in ((4, '/root/child'), (5, 'worker'), (6, ROOT_ID)):
+            row = list(ROOT_ROW)
+            row[index] = value
+            self.assertFalse(self.admit(reader=lambda _ident: (tuple(row), ("fixture binding",))))
+
+
 @unittest.skipUnless(ADAPTER_PRESENT, "new reader is absent on the unchanged baseline")
 class FixedMetadataReader(unittest.TestCase):
     def setUp(self):
