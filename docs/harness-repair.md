@@ -15,4 +15,6 @@ Progress and diagnostics remain in private work directories. An error after appl
 
 The tool repairs installation drift. Codex hook review uses the native `/hooks` command or Settings > Hooks. An audit's model approval still requires its supported consent source, and a verified model result still requires provider execution evidence. Keep application-specific approvals, deployment gates, and enabled or disabled integrations in their established configuration.
 
+For a release that updates the remote hook-file deployment guard itself, use this normal repair flow with the reviewed merged commit. After the refreshed guard is active, the installed `ah.py install-files` command accepts a proven Claude Code main or Codex Desktop root. It checks the existing command form and applies the same remote host, merged source, allowlist, backup, and audit requirements. A Desktop root qualifies through the actual signed runtime and supported GUI ancestry plus the current root metadata. Children and standalone CLI sessions do not inherit that authority.
+
 Git versions below 2.54 cannot activate the installer's global commit-msg backstop. The host's installer reports that limitation. Review it alongside the other install results.

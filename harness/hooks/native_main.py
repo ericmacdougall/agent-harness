@@ -1,4 +1,4 @@
-"""Recognize the supported Desktop review root at the existing review hook seam."""
+"""Recognize the supported Desktop root for explicitly scoped hooks."""
 from __future__ import annotations
 
 import ctypes as ct
@@ -23,6 +23,11 @@ _CHILD_FIELDS = (
     "attached_thread_parent_id", "attachedThreadParentId",
 )
 _DESKTOP_IDENTIFIER = "com.openai.codex"
+_HELPER_IDENTIFIER = "com.openai.codex.helper"
+_HELPER_REQUIREMENT = (
+    f'anchor apple generic and identifier "{_HELPER_IDENTIFIER}" '
+    f'and certificate leaf[subject.OU] = "{OPENAI_TEAM}"'
+)
 _DESKTOP_REQUIREMENT = (
     f'anchor apple generic and identifier "{_DESKTOP_IDENTIFIER}" '
     f'and certificate leaf[subject.OU] = "{OPENAI_TEAM}"'
@@ -148,6 +153,10 @@ def _read_thread(home, uid, ident):
 
 
 class _DesktopBackend(DarwinBackend):
+    def helper_signature(self, pid):
+        """Verify this running helper, never just a similarly named disk file."""
+        return self._signature(pid, (_HELPER_REQUIREMENT,))
+
     def desktop_signature(self, pid):
         """Check the running GUI guest with the GUI-specific fixed requirement."""
         owned = []
@@ -230,6 +239,25 @@ def _same_package(runtime, gui):
     return bundle.suffix == ".app" and runtime.executable == str(bundle / _APP_RUNTIME)
 
 
+def _same_helper_package(runtime, helper, gui):
+    if not _same_package(runtime, gui):
+        return False
+    bundle = Path(gui.executable).parents[2]
+    # One observed first-party helper layout only. The framework build can
+    # change; this does not attest the entire installed app's resource seal.
+    prefix = str(bundle / "Contents/Frameworks/Codex Framework.framework/Versions")
+    return re.fullmatch(
+        re.escape(prefix) + r"/[0-9]{1,6}(?:\.[0-9]{1,6}){1,4}/Helpers/"
+        r"Codex \(Aperitif\)\.app/Contents/MacOS/Codex \(Aperitif\)", helper.executable
+    ) is not None
+
+
+def _qualified_code(code, identifier, process):
+    return (isinstance(code, CodeIdentity) and code.identifier == identifier
+            and code.team == OPENAI_TEAM and code.executable == process.executable
+            and isinstance(code.cdhash, str) and _CDHASH.fullmatch(code.cdhash) is not None)
+
+
 def _is_desktop_root(payload, pid, backend, read_thread):
     session = _current_session(payload)
     if session is None:
@@ -248,18 +276,29 @@ def _is_desktop_root(payload, pid, backend, read_thread):
         if runtime.parent <= 1:
             return False
         gui = snapshot.process(runtime.parent)
+        helper, helper_code = None, None
+        if not _same_package(runtime, gui):
+            helper = gui
+            if helper.parent <= 1:
+                return False
+            gui = snapshot.process(helper.parent)
+            if not _same_helper_package(runtime, helper, gui) or helper.uid != runtime.uid:
+                return False
+            helper_code = backend.helper_signature(helper.pid)
+            if not _qualified_code(helper_code, _HELPER_IDENTIFIER, helper):
+                return False
         caller = snapshot.observed[pid]
         if not (caller.uid == runtime.uid == gui.uid and _same_package(runtime, gui)):
             return False
         gui_code = backend.desktop_signature(gui.pid)
-        if (not isinstance(gui_code, CodeIdentity) or gui_code.identifier != _DESKTOP_IDENTIFIER
-                or gui_code.team != OPENAI_TEAM or gui_code.executable != gui.executable
-                or not isinstance(gui_code.cdhash, str) or not _CDHASH.fullmatch(gui_code.cdhash)):
+        if not _qualified_code(gui_code, _DESKTOP_IDENTIFIER, gui):
             return False
         if read_thread(session) != first_row:
             return False
         snapshot.recheck()
         if backend.desktop_signature(gui.pid) != gui_code or backend.signature(runtime.pid) != origin.code:
+            return False
+        if helper is not None and backend.helper_signature(helper.pid) != helper_code:
             return False
         snapshot.recheck()
         return True
@@ -268,9 +307,12 @@ def _is_desktop_root(payload, pid, backend, read_thread):
 
 
 def is_desktop_review_root(payload):
-    """The user-driven Codex Desktop root session. Callers: the review stamp and, by the user's decision (answer
-    b6714826, goodqa#15565: a Codex Desktop root may record merge waivers), merge_gate._may_record_waiver. The caller
-    owns command and receipt policy; a spawned child, standalone CLI or unqualified row is never a root."""
+    """Prove the user-driven Codex Desktop root for an explicitly authorized operation.
+
+    The review stamp, audited merge waivers (GoodQA #15565), and the installed hook-file deploy guard
+    each own their command and receipt policy. A spawned child, standalone CLI, or unqualified row is
+    never a root. This identifies the calling session and does not attest a human approval event.
+    """
     if sys.platform != "darwin" or _current_session(payload) is None:
         return False
     try:
