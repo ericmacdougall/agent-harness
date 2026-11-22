@@ -72,6 +72,25 @@ class OperatorProtocolTest(unittest.TestCase):
     def test_golden_scope(self):
         self.check(canonical(golden()), expected=0)
 
+    def test_proposal_generator_matches_real_signer_parser(self):
+        good = golden()
+        manifest = self.directory / "manifest.json"
+        output = self.directory / "generated.json"
+        fields = ("assignment", "work_item_id", "packet_sha256")
+        manifest.write_bytes(canonical({"assignments": [{key: row[key] for key in fields}
+                                                         for row in reversed(good["assignments"])]}))
+        prepare = SIGNER.with_name("t2scan_astra_challenge.py")
+        command = [sys.executable, prepare, "--issuer", ISSUER, "--audience", AUDIENCE,
+                   "--project", good["project_id"], "--run", good["run_id"], "--manifest", manifest, "--out", output]
+        first = subprocess.run(command, capture_output=True, timeout=5, check=False)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        original = output.read_bytes()
+        self.check(original, expected=0)
+        self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+        repeated = subprocess.run(command, capture_output=True, timeout=5, check=False)
+        self.assertEqual(repeated.returncode, 2)
+        self.assertEqual(output.read_bytes(), original)
+
     def test_rejects_unpinned_identity(self):
         self.check(canonical(golden()), issuer="another-operator")
         self.check(canonical(golden()), audience="another-host")

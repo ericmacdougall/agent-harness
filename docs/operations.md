@@ -1589,10 +1589,12 @@ An approval recorded on one host (for example `approve-delete` on the Mac) is a 
 names the session, the approving host, the exact canonical path list, the pre-delete tree hash, an expiry (24 h) and a
 one-use nonce, and it is signed with a key the agent cannot invoke (the user's SSH agent or Secure Enclave key). The
 remote guard verifies the signature against the main host's public key, consumes the nonce atomically, and refuses a
-record whose path list or tree hash differs from what it sees. Remote delete retains its existing path from #139.
+record whose path list or tree hash differs from what it sees. Not implemented for remote delete. PR #139 added the
+existing remote delete route.
 
 The dedicated [T2Scan direct Astra broker](t2scan-portable-consent.md) implements signed portable consent for
 that operation with a separate issuer, short-lived exact scope, replay state and protected provisioning.
+The [macOS operator signer](t2scan-operator-signing.md) prepares and signs that consent.
 
 ### Audited Windows stop route (B3.10)
 
