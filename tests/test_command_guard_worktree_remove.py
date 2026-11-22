@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -214,6 +215,125 @@ class WorktreeRemoveCase(unittest.TestCase):
                 self.assertFalse(result['removed'])
                 self.assertTrue(all(path.exists() for path in paths))
                 self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
+
+    def test_late_consumed_leaf_preserves_other_grant_under_backed_lock(self):
+        self.late_backed_invalidation('consume')
+
+    def test_late_replaced_leaf_preserves_both_grants_under_backed_lock(self):
+        self.late_backed_invalidation('replace')
+
+    def test_late_revocation_refuses_backed_consumption_and_git_removal(self):
+        self.late_backed_invalidation('revoke')
+
+    def late_backed_invalidation(self, mutation):
+        folder, paths, policy = self.backed_ignored_fixture()
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        real_consume = cg._IgnoredBackups.consume
+        real_recheck = cg.Approvals._recheck_backups
+        rechecks, calls = [], []
+        original, _ = cg.load_marker(self.home)
+
+        def late(backups):
+            self.assertEqual(set(backups.approvals.backup_records), set(map(str, paths)))
+            calls.append(mutation)
+            if mutation == 'consume':
+                other = cg.Approvals(home=str(self.home), compiled=cg.Compiled(policy, home=str(self.home)))
+                self.assertTrue(other.covers(str(paths[1]), backup_only=True))
+                self.assertTrue(other.consume())
+            elif mutation == 'replace':
+                entry = next(row for row in original if row['path'] == str(paths[1]))
+                # Same nonce: a generic nonce-count check cannot detect this changed signed grant.
+                replacement = dict(entry, remote='dropbox:fixture/replaced-grant')
+                cg._store_entry(replacement, str(paths[1]), time.time(), str(self.home))
+            else:
+                cg.revoke_delete(home=self.home)
+            return real_consume(backups)
+
+        def checked(approvals, *args):
+            rechecks.append(True)
+            return real_recheck(approvals, *args)
+
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', return_value=idle), \
+                mock.patch.object(cg._IgnoredBackups, 'consume', late), \
+                mock.patch.object(cg.Approvals, '_recheck_backups', checked), \
+                mock.patch.object(cg, '_worktree_audit') as audit:
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+        self.assertEqual(calls, [mutation])
+        self.assertFalse(result['removed'], result)
+        self.assertTrue(all(path.exists() for path in paths))
+        self.assertFalse(audit.called, 'refusal must precede the Git removal intent')
+        remaining, _ = cg.load_marker(self.home)
+        if mutation == 'revoke':
+            self.assertEqual(remaining, [])
+        else:
+            self.assertEqual(rechecks, [True], 'must reach the actual locked backed recheck')
+            first = next(row for row in original if row['path'] == str(paths[0]))
+            self.assertIn(first, remaining, 'unaffected grant must remain intact')
+            self.assertEqual(len(remaining), 1 if mutation == 'consume' else 2)
+
+    def test_two_backed_removers_race_and_only_one_consumes_or_removes(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        rendezvous = threading.Barrier(2, timeout=15)
+        real_consume, real_run = cg._IgnoredBackups.consume, subprocess.run
+        results, errors, git_removals = [], [], []
+
+        def synchronized(backups):
+            self.assertEqual(len(backups.approvals.backup_records), 2)
+            rendezvous.wait()
+            return real_consume(backups)
+
+        def spy(argv, *args, **kwargs):
+            if 'worktree' in argv and 'remove' in argv:
+                git_removals.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        def remove():
+            try:
+                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', return_value=idle), \
+                mock.patch.object(cg._IgnoredBackups, 'consume', synchronized), \
+                mock.patch.object(cg.subprocess, 'run', spy):
+            workers = [threading.Thread(target=remove, daemon=True) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=25)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(row['removed'] for row in results), [False, True], results)
+        self.assertEqual(len(git_removals), 1)
+        self.assertNotIn('--force', git_removals[0])
+        self.assertEqual(cg.load_marker(self.home)[0], [])
+        self.assertFalse(self.linked.exists())
+
+    def test_failed_git_removal_spends_backed_grants_and_retry_cannot_reuse_them(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        real_run, git_removals = subprocess.run, []
+
+        def fail_remove(argv, *args, **kwargs):
+            if 'worktree' in argv and 'remove' in argv:
+                git_removals.append(list(argv))
+                return subprocess.CompletedProcess(argv, 1, '', 'injected Git removal failure')
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', return_value=idle), \
+                mock.patch.object(cg.subprocess, 'run', fail_remove):
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            self.assertFalse(result['removed'], result)
+            self.assertIn('injected Git removal failure', result['reason'])
+            self.assertEqual(cg.load_marker(self.home)[0], [])
+            retry = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+        self.assertFalse(retry['removed'], retry)
+        self.assertEqual(len(git_removals), 1, 'retry must not reach Git with spent approvals')
+        self.assertTrue(all(path.exists() for path in paths))
 
     def test_unpushed_commit_and_remote_without_exact_head_block(self):
         (self.linked / 'local.txt').write_text('local\n')
