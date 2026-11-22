@@ -127,7 +127,7 @@ class DataOperations(unittest.TestCase):
     def test_trusted_python_rejects_writable_binary_and_other_ancestor(self):
         original = Path.lstat
         binary = Path(sys.executable).resolve()
-        for target in (binary, binary.parent):
+        for target in (Path('/'), binary, binary.parent):
             def changed(path):
                 result = original(path)
                 if path == target:
@@ -138,10 +138,13 @@ class DataOperations(unittest.TestCase):
             with mock.patch.object(Path, 'lstat', changed):
                 self.assertEqual(self.decide(self.note()), 'block')
 
-    @unittest.skipUnless(sys.executable.startswith('/opt/homebrew/opt/'), 'actual Homebrew alias layout control')
+    @unittest.skipUnless(sys.platform == 'darwin', 'actual Homebrew alias layout control')
     def test_trusted_python_checks_original_alias_chain(self):
         original = Path.lstat
-        alias = Path(sys.executable)
+        version = f'{sys.version_info.major}.{sys.version_info.minor}'
+        alias = Path(f'/opt/homebrew/opt/python@{version}/bin/python{version}')
+        if not alias.exists():
+            self.skipTest('matching Homebrew opt entry is not installed')
         for target, change in ((alias.parents[2], 'writable'), (alias.parents[1], 'foreign')):
             seen = []
             def changed(path):

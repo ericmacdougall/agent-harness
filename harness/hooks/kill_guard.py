@@ -125,6 +125,9 @@ def _trusted_cellar_directory(path, info):
 def _trusted_python_chain(path):
     """Inspect original aliases and each intermediate target, not just the resolved leaf."""
     pending, current, links = list(Path(path).parts[1:]), Path('/'), 0
+    root = current.lstat()
+    if root.st_uid not in (0, os.getuid()) or not stat.S_ISDIR(root.st_mode) or root.st_mode & 0o022:
+        return None
     while pending:
         part = pending.pop(0)
         if part in ('', '.'):
