@@ -11,33 +11,43 @@ import sys
 NAMES = ('takeover_patch.py', 'takeover-native-manifest.json', 'broker_patch_transaction.py', 'broker-takeover-bundle.json')
 
 REMOTE = r'''
-import base64,hashlib,json,os,pathlib,stat,subprocess,sys,tempfile
+import base64,fcntl,hashlib,json,os,pathlib,re,stat,subprocess,sys,tempfile
 p=json.loads(sys.stdin.read())
+if not re.fullmatch('[a-f0-9]{64}',p['release']):
+    raise SystemExit('Invalid release identity')
 root=pathlib.Path.home()/'.agent-harness'/'work'/('goodqa-takeover-release-'+p['release'])
 for parent in (pathlib.Path.home()/'.agent-harness',pathlib.Path.home()/'.agent-harness/work',root):
     parent.mkdir(mode=0o700,exist_ok=True)
     info=parent.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o022:
         raise SystemExit('Unsafe remote release directory')
+lock=os.open(root/'upload.lock',os.O_CREAT|os.O_NOFOLLOW|os.O_RDWR,0o600)
+info=os.fstat(lock)
+if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1 or info.st_mode&0o022:
+    raise SystemExit('Unsafe upload lock')
+fcntl.flock(lock,fcntl.LOCK_EX)
 for name in ('broker_patch_transaction.py','broker-takeover-bundle.json'):
     item=p['files'][name]
     data=base64.b64decode(item['content'],validate=True)
     if hashlib.sha256(data).hexdigest()!=item['sha256']:
         raise SystemExit('Remote payload digest mismatch')
     path=root/name
-    if not path.exists():
+    if not os.path.lexists(path):
         fd,scratch=tempfile.mkstemp(prefix=name+'.incoming-',dir=root)
         try:
             with os.fdopen(fd,'wb') as f:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
+            os.replace(scratch,path)
+            directory=os.open(root,os.O_RDONLY)
             try:
-                os.link(scratch,path,follow_symlinks=False)
-            except FileExistsError:
-                pass
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
-            os.unlink(scratch)
+            if os.path.exists(scratch):
+                os.unlink(scratch)
     info=path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_nlink!=1 or info.st_mode&0o022 or path.read_bytes()!=data:
         raise SystemExit('Remote release path differs')

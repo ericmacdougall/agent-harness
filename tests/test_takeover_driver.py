@@ -1,4 +1,6 @@
+import base64
 import hashlib
+import os
 import importlib.util
 import json
 from pathlib import Path
@@ -45,6 +47,21 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(run.call_count,4)
             self.assertIn('--apply',run.call_args_list[2].args[0])
             self.assertTrue(json.loads(run.call_args_list[3].kwargs['input'])['apply'])
+
+    def test_actual_remote_protocol_recovers_process_exit_after_rename(self):
+        code = b'import sys; print("SYNTHETIC_BROKER", "--apply" in sys.argv)\n'
+        payload = {'release':'a'*64, 'apply':True, 'files':{}}
+        for name, content in [('broker_patch_transaction.py',code),('broker-takeover-bundle.json',b'{}')]:
+            payload['files'][name]={'sha256':hashlib.sha256(content).hexdigest(),'content':base64.b64encode(content).decode()}
+        environment = dict(os.environ, HOME=str(self.root))
+        broken = driver.REMOTE.replace('            os.replace(scratch,path)', '            os.replace(scratch,path)\n            os._exit(71)')
+        first = subprocess.run([sys.executable,'-B','-c',broken],input=json.dumps(payload).encode(),capture_output=True,env=environment)
+        self.assertEqual(first.returncode,71,first.stderr)
+        result = subprocess.run([sys.executable,'-B','-c',driver.REMOTE],input=json.dumps(payload).encode(),capture_output=True,env=environment)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertIn(b'SYNTHETIC_BROKER True',result.stdout)
+        result = subprocess.run([sys.executable,'-B','-c',driver.REMOTE],input=json.dumps(payload).encode(),capture_output=True,env=environment)
+        self.assertEqual(result.returncode,0,result.stderr)
 
     def test_bad_bundle_or_manifest_never_executes(self):
         (self.root/driver.NAMES[0]).write_text('changed')
