@@ -3,6 +3,7 @@ from pathlib import Path
 import io
 import json
 import os
+import subprocess
 import tarfile
 import sys
 import tempfile
@@ -26,6 +27,7 @@ class ArtifactLifecycle(unittest.TestCase):
         self.candidate.mkdir(mode=0o700)
         self.report = self.candidate / "dashboard.html"
         self.report.write_bytes(b"rendered fixture")
+        self.manifest = {"task_id": "fixture", "prompt_file": str(self.task / "prompt")}
 
     def test_artifact_scope_refuses_logs_and_symlinks(self):
         self.assertTrue(cleanup.inventory(self.candidate))
@@ -41,18 +43,86 @@ class ArtifactLifecycle(unittest.TestCase):
         def backup(*args):
             self.report.write_bytes(b"later bytes")
             return "fixture-cold:bucket/artifact.tar", "1" * 64
-        task = {"task_id": "fixture"}
         with patch.object(cleanup, "idle"), patch.object(cleanup, "store_archive", side_effect=backup):
             with self.assertRaisesRegex(cleanup.Retention, "changed"):
-                cleanup.retire_artifact(self.task, task, "reports", "fixture-cold:bucket", True)
+                cleanup.retire_artifact(self.task, self.manifest, "reports", "fixture-cold:bucket", True)
         self.assertEqual(self.report.read_bytes(), b"later bytes")
+
+    def test_enrolled_prompt_in_artifact_preserves_completed_task(self):
+        prompt = self.candidate / "prompt"
+        prompt.write_bytes(b"synthetic enrolled task")
+        prompt.chmod(0o600)
+        proposal = self.task / "manifest-input.json"
+        proposal.write_text(json.dumps({
+            "schema": "native-recovery-v1", "task_id": "fixture", "cwd": str(self.task),
+            "agent_argv": ["/fixture/codex"], "verify_argv": ["/usr/bin/true"],
+            "prompt_file": str(prompt), "prompt_sha256": cleanup.task_recovery.digest(prompt.read_bytes()),
+            "max_attempts": 1, "attempt_timeout": 1, "task_timeout": 10,
+        }))
+        proposal.chmod(0o600)
+        cleanup.task_recovery.enroll(self.task, proposal)
+        self.assertEqual(cleanup.task_recovery.run(self.task), 0)
+        manifest, state = cleanup.task_recovery.load(self.task)
+        self.assertEqual(state["status"], "complete")
+        with patch.object(cleanup, "idle"), patch.object(
+            cleanup, "store_archive", return_value=("fixture-cold:bucket/archive.tar", "a" * 64)
+        ) as backup:
+            with self.assertRaisesRegex(cleanup.Retention, "task prompt"):
+                cleanup.retire_artifact(self.task, manifest, "reports", "fixture-cold:bucket", True)
+            backup.assert_not_called()
+        self.assertEqual(prompt.read_bytes(), b"synthetic enrolled task")
+        self.assertEqual(cleanup.task_recovery.load(self.task)[1]["status"], "complete")
+
+    def test_uncached_service_scan_stops_retirement_after_in_place_unit_edit(self):
+        units = self.task / "user-units"
+        units.mkdir()
+        unit = units / "fixture.service"
+        unit.write_text("[Service]\nWorkingDirectory=/fixture/unrelated\n")
+        before = units.stat().st_mtime_ns
+
+        def backup(*args):
+            unit.write_text(f"[Service]\nWorkingDirectory={self.candidate}\n")
+            self.assertEqual(units.stat().st_mtime_ns, before)
+            return "fixture-cold:bucket/archive.tar", "b" * 64
+
+        with patch.object(cleanup.copy_hygiene, "_unit_dirs", return_value=[(str(units), "user")]), \
+                patch.object(cleanup.copy_hygiene, "state_dir", return_value=str(self.task / "scanner-state")), \
+                patch.object(cleanup, "store_archive", side_effect=backup):
+            self.assertEqual(cleanup.copy_hygiene.protected_scan()[1], 0)
+            with self.assertRaisesRegex(cleanup.Retention, "service uses"):
+                cleanup.retire_artifact(self.task,
+                                        {"task_id": "fixture", "prompt_file": str(self.task / "prompt")},
+                                        "reports", "fixture-cold:bucket", True)
+        self.assertTrue(self.report.is_file())
+
+    def test_new_service_dependency_on_original_name_preserves_quarantined_bytes(self):
+        units = self.task / "user-units"
+        units.mkdir()
+        unit = units / "fixture.service"
+        unit.write_text("[Service]\nWorkingDirectory=/fixture/unrelated\n")
+        original_inventory = cleanup.inventory
+
+        def inventory(path, max_bytes):
+            found = original_inventory(path, max_bytes)
+            if path.parent.name.startswith("cleanup-quarantine-"):
+                unit.write_text(f"[Service]\nWorkingDirectory={self.candidate}\n")
+            return found
+
+        with patch.object(cleanup.copy_hygiene, "_unit_dirs", return_value=[(str(units), "user")]), \
+                patch.object(cleanup, "inventory", side_effect=inventory), \
+                patch.object(cleanup, "store_archive", return_value=("fixture:archive", "e" * 64)):
+            with self.assertRaisesRegex(cleanup.Retention, "service uses"):
+                cleanup.retire_artifact(self.task, self.manifest, "reports", "fixture:archive", True)
+        record = json.loads(cleanup.audit_path(self.task, self.candidate).read_text())
+        self.assertEqual(record["status"], "uncertain")
+        self.assertEqual((Path(record["quarantine"]) / self.report.name).read_bytes(), b"rendered fixture")
 
     def test_explicit_archive_limit_refuses_before_transfer(self):
         with patch.object(cleanup, "idle"), patch.object(cleanup, "store_archive") as archive:
             with self.assertRaisesRegex(cleanup.Retention, "limit exceeded"):
-                cleanup.retire_artifact(self.task, {"task_id": "fixture"}, "reports", "fixture:bucket", True, 1)
+                cleanup.retire_artifact(self.task, self.manifest, "reports", "fixture:bucket", True, 1)
             with self.assertRaisesRegex(cleanup.Retention, "4 GiB"):
-                cleanup.retire_artifact(self.task, {"task_id": "fixture"}, "reports", "fixture:bucket", True,
+                cleanup.retire_artifact(self.task, self.manifest, "reports", "fixture:bucket", True,
                                         cleanup.MAX_BYTES + 1)
             archive.assert_not_called()
         self.assertTrue(self.report.is_file())
@@ -80,12 +150,11 @@ class ArtifactLifecycle(unittest.TestCase):
             self.assertEqual(saved[f"{args[-1]}/{filename}"], (Path(args[-2]) / filename).read_bytes())
             return b""
 
-        task = {"task_id": "fixture"}
         name = "fixture-cold:bucket"
         with patch.object(cleanup, "idle"), patch.object(cleanup, "trusted_tool", side_effect=tool), \
                 patch.object(cleanup, "rclone", side_effect=transport):
             with self.assertRaisesRegex(cleanup.Retention, "download verification"):
-                cleanup.retire_artifact(self.task, task, "reports", name, True)
+                cleanup.retire_artifact(self.task, self.manifest, "reports", name, True)
         self.assertTrue(self.report.is_file())
         self.assertEqual(json.loads(cleanup.audit_path(self.task, self.candidate).read_text())["status"], "retained")
 
@@ -98,7 +167,7 @@ class ArtifactLifecycle(unittest.TestCase):
 
         with patch.object(cleanup, "idle"), patch.object(cleanup, "trusted_tool", side_effect=tool), \
                 patch.object(cleanup, "rclone", side_effect=verified):
-            result = cleanup.retire_artifact(self.task, task, "reports", name, True)
+            result = cleanup.retire_artifact(self.task, self.manifest, "reports", name, True)
         self.assertEqual(result["status"], "removed")
         self.assertFalse(self.candidate.exists())
         self.assertEqual(result["sha256"] + ".tar", result["archive"].rsplit("/", 1)[1])
@@ -114,12 +183,11 @@ class ArtifactLifecycle(unittest.TestCase):
                 cleanup.idle(self.candidate)
 
     def test_quarantine_is_preserved_and_retry_refused_if_final_process_check_is_uncertain(self):
-        task = {"task_id": "fixture"}
         with patch.object(
             cleanup, "idle", side_effect=[None, None, cleanup.Retention("open file after move")]
         ), patch.object(cleanup, "store_archive", return_value=("fixture:archive", "c" * 64)):
             with self.assertRaisesRegex(cleanup.Retention, "open file"):
-                cleanup.retire_artifact(self.task, task, "reports", "fixture:archive", True)
+                cleanup.retire_artifact(self.task, self.manifest, "reports", "fixture:archive", True)
         record = json.loads(cleanup.audit_path(self.task, self.candidate).read_text())
         self.assertEqual(record["status"], "uncertain")
         self.assertEqual((Path(record["quarantine"]) / "dashboard.html").read_bytes(), b"rendered fixture")
@@ -185,6 +253,44 @@ class CopyLifecycle(CopyFixture):
                                     generation, repo, "pr-1", head, True)
             guard.assert_not_called()
         self.assertTrue(Path(path).is_dir())
+
+    def test_managed_copy_passes_real_guard_and_ordinary_entry_refuses(self):
+        task, manifest, repo, path, head = self.fixture()
+        task.rmdir()
+        work = self.home.resolve() / ".agent-harness/work"
+        work.mkdir()
+        task = work / "enrolled"
+        prompt = work / "prompt"
+        prompt.write_bytes(b"synthetic task")
+        prompt.chmod(0o600)
+        proposal = work / "manifest-input.json"
+        proposal.write_text(json.dumps({
+            "schema": "native-recovery-v1", "task_id": "fixture", "cwd": path,
+            "agent_argv": ["/fixture/codex"], "verify_argv": ["/usr/bin/true"],
+            "prompt_file": str(prompt), "prompt_sha256": cleanup.task_recovery.digest(prompt.read_bytes()),
+            "max_attempts": 1, "attempt_timeout": 1, "task_timeout": 10,
+        }))
+        proposal.chmod(0o600)
+        cleanup.task_recovery.enroll(task, proposal)
+        self.assertEqual(cleanup.task_recovery.run(task), 0)
+        # Keep the real guard, Git worktree, index and removal. Replace only its remote transport with the
+        # fixture's actually advertised Git ref so the test remains offline.
+        live_git_output = subprocess.check_output(["/usr/bin/git", "ls-remote", str(self.origin)], text=True)
+        live = {ref: sha for sha, ref in (line.split() for line in live_git_output.splitlines())}
+        cleanup.safe_git(repo, "remote", "set-url", "origin", "https://github.com/fixture/project.git")
+        with patch.dict(os.environ, {"HOME": str(self.home.resolve())}), patch.object(
+            cleanup.command_guard, "authenticated_remote_refs", return_value=live
+        ), patch.object(cleanup.workdir, "work_root", return_value=work):
+            self.assertIn("only a worktree inside work/",
+                          cleanup.command_guard.verify_worktree(path, authenticated=True)["reason"])
+            with cleanup.completed_task(task) as (manifest, state):
+                self.assertTrue(state["copy_generation"])
+                preview = cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, False)
+                self.assertEqual(preview["status"], "preview")
+                result = cleanup.retire_copy(task, manifest, state["copy_generation"], repo, "pr-1", head, True)
+                self.assertEqual(result["status"], "removed")
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(cleanup.task_recovery.load(task)[1]["status"], "complete")
 
     def test_uncertain_or_incomplete_recovery_state_never_admits_cleanup(self):
         task, manifest, repo, path, head = self.fixture()

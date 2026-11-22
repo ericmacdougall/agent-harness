@@ -1,6 +1,7 @@
 """Opt-in retirement of one copy or explicit artifact from a verified completed task."""
 
 from contextlib import contextmanager
+import argparse
 import fcntl
 import hashlib
 import json
@@ -14,6 +15,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import command_guard
 import copy_hygiene
@@ -75,16 +79,20 @@ def safe_git(repo, *args):
 
 
 def guard(path, action, head=None):
-    # Run the existing authoritative Git guard with only the trusted system tool directories.
-    script = Path(command_guard.__file__).resolve(strict=True)
-    argv = [sys.executable, "-I", str(script), action, "--path", str(path), "--remote-auth"]
-    if head:
-        argv.extend(("--expect-head", head))
-    result = subprocess.run(argv, env=tool_env(git_auth=True), capture_output=True, timeout=1100)
-    evidence = json.loads(result.stdout)
-    require(type(evidence) is dict and evidence.get("verifier") == command_guard.VERIFIER_VERSION,
-            "The Git guard outcome was not verified.")
-    return evidence
+    # This runs inside the locked lifecycle worker, whose process has the trusted system Git environment.
+    def recheck():
+        try:
+            idle(path)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return "Fresh service or process checks refused managed-copy removal."
+        return None
+
+    path_text = str(path)
+    policy = command_guard.load_policy()
+    if action == "verify-worktree":
+        return command_guard.verify_worktree(path_text, authenticated=True, policy=policy, _managed_copy=path_text)
+    return command_guard.remove_worktree(path_text, authenticated=True, expect_head=head, policy=policy,
+                                        _managed_copy=path_text, _before_remove=recheck)
 
 
 @contextmanager
@@ -106,16 +114,17 @@ def completed_task(root):
         os.close(descriptor)
 
 
-def idle(path):
+def idle(path, *, original=None):
     require("HARNESS_COPY_HYGIENE_UNIT_DIRS" not in os.environ, "Service scan test override is active.")
-    protected, errors = copy_hygiene.protected_scan()
-    require(not errors and not copy_hygiene.protecting(str(path), protected),
-            "A service uses this path or its dependencies could not be confirmed.")
     tool = trusted_tool("lsof")
     args = [tool, "-nP", "-t", "+D", str(path)] if path.is_dir() else [tool, "-nP", "-t", "--", str(path)]
     result = subprocess.run(args, env=tool_env(), capture_output=True, timeout=40)
     require(result.returncode == 1 and not result.stdout and not result.stderr,
             "A process is using the path or observations are uncertain.")
+    protected, errors = copy_hygiene.protected_scan(fresh=True)
+    service_paths = (path,) if original is None else (path, original)
+    require(not errors and all(not copy_hygiene.protecting(str(name), protected) for name in service_paths),
+            "A service uses this path or its dependencies could not be confirmed.")
 
 
 def audit_path(task, path):
@@ -134,7 +143,7 @@ def retire_copy(task, manifest, generation, repo, key, head, apply):
     code, source = safe_git(repo, "rev-parse", "--show-toplevel")
     require(code == 0 and source.strip(), "Source checkout could not be resolved.")
     source = source.strip()
-    ident, _ = copy_hygiene.repo_identity(source, safe_git)
+    ident, common = copy_hygiene.repo_identity(source, safe_git)
     path = Path(copy_hygiene.copies_root()) / ident / copy_hygiene.safe_key(key)
     require(path.resolve(strict=True) == path and Path(manifest["cwd"]).resolve(strict=True) == path,
             "Completed task does not own the exact reusable copy.")
@@ -145,6 +154,8 @@ def retire_copy(task, manifest, generation, repo, key, head, apply):
                 "Copy generation is unavailable or was reacquired after task enrollment.")
         row = copy_hygiene.load_index().get(str(path), {})
         require(row.get("repo") == source and row.get("key") == key, "The copy was not indexed for this key and source.")
+        code, copy_common = safe_git(str(path), "rev-parse", "--path-format=absolute", "--git-common-dir")
+        require(code == 0 and os.path.realpath(copy_common) == common, "The managed copy belongs to another repository.")
         audit = audit_path(task, path)
         check_previous(audit)
         idle(path)
@@ -346,6 +357,8 @@ def retire_artifact(task, manifest, name, target, apply, max_bytes=DEFAULT_BYTES
     task_recovery.private(base, True)
     path = base / name
     require(path.resolve(strict=True) == path, "Artifact path is not a regular unredirected subtree.")
+    prompt = Path(manifest["prompt_file"]).resolve()
+    require(prompt != path and path not in prompt.parents, "The enrolled task prompt is inside the artifact.")
     audit = audit_path(task, path)
     check_previous(audit)
     idle(path)
@@ -373,7 +386,7 @@ def retire_artifact(task, manifest, name, target, apply, max_bytes=DEFAULT_BYTES
                     "Artifact identity changed before quarantine.")
             os.rename(path.name, quarantine.name, src_dir_fd=source, dst_dir_fd=target)
         require(inventory(quarantine, max_bytes) == before, "Artifact changed while being retired. Keep its quarantine.")
-        idle(quarantine)
+        idle(quarantine, original=path)
         require(not mounted_subtree(quarantine), "A mount appeared before retirement. Keep its quarantine.")
         if quarantine.is_dir():
             shutil.rmtree(quarantine)
@@ -388,7 +401,7 @@ def retire_artifact(task, manifest, name, target, apply, max_bytes=DEFAULT_BYTES
     return result
 
 
-def run(args):
+def run_locked(args):
     try:
         task = Path(args.task_dir)
         with completed_task(task) as (manifest, state):
@@ -403,3 +416,40 @@ def run(args):
         result = {"status": "retained-or-uncertain", "reason": reason}
     print(json.dumps(result))
     return 0 if result["status"] in ("preview", "removed") else 2
+
+
+def finish_environment():
+    environment = tool_env(git_auth=True)
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    if os.path.isabs(xdg):
+        environment["XDG_CONFIG_HOME"] = xdg
+    return environment
+
+
+def run(args):
+    if args.cmd != "finish":
+        return run_locked(args)
+    # Isolate the entire validation and mutation, so the process that owns both locks also calls the Git guard.
+    argv = [sys.executable, "-I", str(Path(__file__).resolve()), "--", args.task_dir, args.repo, args.key,
+            args.expect_head, "apply" if args.apply else "check"]
+    try:
+        return subprocess.run(argv, env=finish_environment(), timeout=1200).returncode
+    except (OSError, subprocess.SubprocessError):
+        print(json.dumps({"status": "retained-or-uncertain", "reason": "Managed-copy worker outcome is unavailable."}))
+        return 2
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Isolated internal managed-copy finish worker")
+    if not sys.flags.isolated:
+        parser.error("Managed-copy finish requires an isolated Python interpreter.")
+    for name in ("task_dir", "repo", "key", "expect_head"):
+        parser.add_argument(name)
+    parser.add_argument("mode", choices=("check", "apply"))
+    options = parser.parse_args()
+    options.cmd = "finish"
+    options.apply = options.mode == "apply"
+    environment = finish_environment()
+    os.environ.clear()
+    os.environ.update(environment)
+    raise SystemExit(run_locked(options))

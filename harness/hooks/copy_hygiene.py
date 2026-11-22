@@ -590,27 +590,32 @@ def _k(p: str) -> str:
     return p.lower() if sys.platform == "darwin" else p
 
 
-def protected_scan(cfg: "dict | None" = None) -> "tuple[dict, int]":
-    """({key: (path, where it is named)}, unreadable-unit count). Cached for 60 s keyed on the directory mtimes."""
+def protected_scan(cfg: "dict | None" = None, *, fresh: bool = False) -> "tuple[dict, int]":
+    """Service dependencies and unreadable-unit count. Destructive callers can bypass the advisory cache."""
     cfg = normalize(cfg) if cfg is not None else load_config()
-    _f, _e, sig = _scan_files(_unit_dirs())
-    cache = os.path.join(state_dir(), "copy-hygiene-protected.json")
-    key = hashlib.sha256(json.dumps([sig, os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS"), home()]).encode()).hexdigest()
-    prot, errors = None, 0
-    try:
-        with open(cache) as f:
-            c = json.load(f)
-        if c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
-            prot = {k: tuple(v) for k, v in c["prot"].items()}
-            errors = int(c.get("errors", 0))
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        prot = None
-    if prot is None:
+    if fresh:
         prot, errors = _scan_units()
+    else:
+        _f, _e, sig = _scan_files(_unit_dirs())
+        cache = os.path.join(state_dir(), "copy-hygiene-protected.json")
+        key = hashlib.sha256(
+            json.dumps([sig, os.environ.get("HARNESS_COPY_HYGIENE_UNIT_DIRS"), home()]).encode()
+        ).hexdigest()
+        prot, errors = None, 0
         try:
-            _atomic_write(cache, json.dumps({"key": key, "ts": time.time(), "prot": prot, "errors": errors}))
-        except OSError:
-            pass
+            with open(cache) as f:
+                c = json.load(f)
+            if c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
+                prot = {k: tuple(v) for k, v in c["prot"].items()}
+                errors = int(c.get("errors", 0))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            prot = None
+        if prot is None:
+            prot, errors = _scan_units()
+            try:
+                _atomic_write(cache, json.dumps({"key": key, "ts": time.time(), "prot": prot, "errors": errors}))
+            except OSError:
+                pass
     prot = dict(prot)
     for p in cfg.get("protected_paths") or []:
         p = os.path.normpath(os.path.expanduser(p))

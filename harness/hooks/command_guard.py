@@ -1939,7 +1939,7 @@ VERIFIER_VERSION = 2  # `ah worktree-remove` refuses a verifier that does not re
 GITHUB_REMOTE = re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
 
 
-def worktree_scope_refusal(path):
+def worktree_scope_refusal(path, *, _managed_copy=None):
     """Where `ah worktree-remove` may act: strictly under the caller's home, never the home itself, never the harness
     or credential state, and under ~/.agent-harness only inside work/. Names are compared case-folded (APFS is case
     insensitive)."""
@@ -1950,6 +1950,11 @@ def worktree_scope_refusal(path):
     if parts[0].casefold() in WORKTREE_HOME_DENY:
         return 'the path is inside protected state (%s)' % parts[0][:30]
     if parts[0].casefold() == '.agent-harness' and (len(parts) < 3 or parts[1].casefold() != 'work'):
+        # Only the isolated lifecycle worker supplies this internal exact scope after acquiring both named
+        # locks and validating the completed task, allocation, repository and generation.
+        if (_managed_copy == path and len(parts) == 4 and parts[:2] == ['.agent-harness', 'test-copies']
+                and all(re.fullmatch(r'[A-Za-z0-9._-]+', part) and part not in ('.', '..') for part in parts[2:])):
+            return None
         return 'under ~/.agent-harness only a worktree inside work/ is removable'
     return None
 
@@ -2241,12 +2246,13 @@ def delegated_policy(base=None):
     return dict(base, reproducible_clone=merged)
 
 
-def verify_worktree(path, authenticated=False, policy=None):
+def verify_worktree(path, authenticated=False, policy=None, *, _managed_copy=None):
     """Read-only verdict as a dict {removable, reason, head, repo, urls, verifier}. `authenticated` reads the remote with
     this host's own credentials (authenticated_remote_refs) instead of the guard's anonymous ls-remote."""
     report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'repo': None, 'urls': {},
               'verifier': VERIFIER_VERSION}
-    reason = worktree_scope_refusal(path) if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path'
+    reason = (worktree_scope_refusal(path, _managed_copy=_managed_copy)
+              if isinstance(path, str) and os.path.isabs(path) else 'not a literal absolute path')
     if reason is None:
         effective = delegated_policy(policy)
         reason = linked_worktree_remove_refusal(path, os.sep, effective,
@@ -2294,7 +2300,8 @@ def _worktree_audit(record):
         pass
 
 
-def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
+def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
+                    _managed_copy=None, _before_remove=None):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
     compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
     removal is audited on this host (the audit of `ah` lives on the caller's host)."""
@@ -2303,7 +2310,7 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
     except OSError as error:
         return {'path': path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION,
                 'reason': 'cannot stat the path (%s)' % type(error).__name__}
-    report = verify_worktree(path, authenticated, policy)
+    report = verify_worktree(path, authenticated, policy, _managed_copy=_managed_copy)
     report['removed'] = False
     if not report['removable']:
         return report
@@ -2322,6 +2329,11 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None):
         free_before = shutil.disk_usage(home).free
     except OSError:
         free_before = None
+    if _managed_copy == path:
+        reason = _before_remove() if _before_remove else 'the managed-copy final check was not supplied'
+        if reason:
+            report.update(removable=False, reason=reason)
+            return report
     _worktree_audit({'event': 'remove', 'path': path, 'head': report['head'], 'repo': report['repo']})
     problem = None
     try:
