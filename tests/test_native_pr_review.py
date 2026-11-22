@@ -1,6 +1,7 @@
 """Native PR context and authorship controls against disposable local fixtures."""
 import json
 from pathlib import Path
+import shutil
 import sys
 import subprocess
 from tempfile import TemporaryDirectory
@@ -24,6 +25,55 @@ def context():
             "head_ref": "codex/reviewed", "commits": [HEAD], "packet_sha256": "c" * 64, "tests_sha256": "d" * 64, "no_ci": True, "evidence_authors": [],
             "tickets": [{"ticket": "GoodQA fixture#3", "state": "in_review", "spec_core_sha": "2" * 64,
                          "review_sha256": "3" * 64, "evidence_sha256": "4" * 64, "release_records_sha256": "5" * 64, "missing": ["live proof pending"], "premerge_missing": []}]}
+
+
+class NativeReportPayload(TestCase):
+    def test_native_finding_recognition_matches_peer_review(self):
+        from peer_review import finding_ids
+
+        for text in ("F1 finding", "R12-a.2 finding", "  ### Finding F2 note", "* R3 heading",
+                     "Finding F1_under", "ran F1 fixture", "f1 lowercase", "#R7 without space", "ordinary check"):
+            with self.subTest(text=text):
+                body = f"VERDICT: PASS\n{text}\n"
+                if finding_ids(body.strip()) == ["UNSPECIFIED"]:
+                    n._pure_review(body.encode())
+                else:
+                    with self.assertRaisesRegex(ValueError, "pure PASS"):
+                        n._pure_review(body.encode())
+
+    def test_pure_review_in_isolated_codex_payload_without_peer_review(self):
+        with TemporaryDirectory() as temporary:
+            payload = Path(temporary).resolve()
+            for name in ("native_pr_review", "git_safety", "process", "spec_flow", "safe_input", "ticket_adapters"):
+                shutil.copyfile(ROOT / "harness/hooks" / f"{name}.py", payload / f"{name}.py")
+            code = """
+from importlib.util import find_spec
+from pathlib import Path
+import sys
+
+payload = Path(sys.argv[1])
+sys.path.insert(0, str(payload))
+assert find_spec("peer_review") is None
+import native_pr_review as review
+assert Path(review.__file__).resolve().parent == payload
+review._pure_review(b"VERDICT: PASS\\nChecked the reviewed candidate.\\n")
+for report in (
+    b"VERDICT: PASS\\n### Finding R27-a.2 Fixed path\\n",
+    b"VERDICT: PASS\\n- F1 Fixture finding\\n",
+    b"VERDICT: PASS\\n  verdict: BLOCK\\n",
+    b"VERDICT: PASS\\nTicketed: Example\\n",
+    b"VERDICT: PASS-WITH-TICKETS\\n",
+    b"VERDICT: PASS\\n\\xff",
+):
+    try:
+        review._pure_review(report)
+    except ValueError:
+        continue
+    raise AssertionError("invalid report passed")
+"""
+            result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(payload)],
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class NativeCallLiveness(TestCase):

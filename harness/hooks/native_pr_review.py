@@ -759,10 +759,11 @@ def _commit_from_event(entry, agent, repo, home, subjects):
 
 
 def _pure_review(report):
-    from peer_review import finding_ids
-
     body = report.decode("utf-8", "strict").strip()
-    if (not body or body.splitlines()[0] != "VERDICT: PASS" or finding_ids(body) != ["UNSPECIFIED"]
+    # Match peer_review.finding_ids without requiring the Claude-only review helper.
+    finding = re.search(r"(?m)^\s*(?:#{1,6}\s+|[-*]\s+)?(?:Finding\s+)?"
+                        r"(?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*\b", body)
+    if (not body or body.splitlines()[0] != "VERDICT: PASS" or finding
             or len(re.findall(r"(?mi)^\s*VERDICT:", body)) != 1 or "TICKETED:" in body.upper()):
         raise ValueError("native reviewer did not record a pure PASS")
 
