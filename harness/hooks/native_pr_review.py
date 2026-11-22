@@ -399,8 +399,14 @@ def _tracker_claims(repo, repository, commits, head):
             missing.append("commits: too many current evidence commits for bounded ancestry verification")
         elif any(not _is_ancestor(repo, sha, head) for sha in evidence_commits):
             missing.append("commits: current evidence includes a commit outside the exact candidate ancestry")
-        authors = {r.get("actor") for r in current} | {spec.get("author")}
-        writers.update(value.partition(":")[2] for value in authors
+        explicit = spec_flow.explicit_record_owners(spec)
+        review_sources = spec.get("reviews") or []
+        reviewer_exclusions = {r.get("actor") for r in current} | {spec.get("author")}
+        if explicit is not None:
+            reviewer_exclusions.update(explicit)
+            review_sources = {"reviews": review_sources, "owners": sorted(explicit),
+                              "owner_proof_sha256": spec["owner_proof_sha256"]}
+        writers.update(value.partition(":")[2] for value in reviewer_exclusions
                        if isinstance(value, str) and value.startswith("agent:") and _identifier(value.partition(":")[2]))
         gates = [r for r in records if r.get("spec_core_sha") == spec["spec_core_sha"]
                  and r["kind"] in ("click_test", "signoff")]
@@ -409,7 +415,7 @@ def _tracker_claims(repo, repository, commits, head):
         gate_index = {ident: index.get(ident) for ident in attachment_ids}
         claims.append({"ticket": ticket.ticket.label, "state": issue["status"],
                        "spec_core_sha": spec["spec_core_sha"],
-                       "review_sha256": digest(canonical(spec.get("reviews") or []).encode()),
+                       "review_sha256": digest(canonical(review_sources).encode()),
                        "evidence_sha256": digest(canonical(current).encode()),
                        "release_records_sha256": digest(canonical([gates, gate_index]).encode()),
                        "missing": result["missing"], "premerge_missing": missing})

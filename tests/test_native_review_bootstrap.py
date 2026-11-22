@@ -83,6 +83,96 @@ class BootstrapTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return bootstrap.transact(self.manifest, self.payloads, mode, runner or self.agent)
 
+    def five_generation(self):
+        # Extracted read-only using ast.literal_eval from the real committed
+        # 7f2c954951a0d977ba40f1283b20ff86c19ad820 AGENT_SOURCE. The test
+        # requires no Git executable or repository history at runtime.
+        source = bootstrap.AGENT_SOURCE.replace(', "ticket_adapters.py")', ')')
+        self.assertEqual(bootstrap.sha(source.encode()),
+                         "ed318f23fd02612ceb6c939290721bbe936a6f5c4ec319bc1589e666954c583a")
+        manifest = json.loads(json.dumps(self.manifest))
+        del manifest["payloads"]["ticket_adapters.py"]
+        for host in bootstrap.HOSTS:
+            for edition in bootstrap.EDITIONS:
+                del manifest["hosts"][host][edition]["ticket_adapters.py"]
+        transaction = bootstrap.sha(json.dumps(manifest, sort_keys=True).encode())
+        def request(host, phase):
+            return {"phase": phase, "transaction": transaction,
+                    "expected": manifest["hosts"][host],
+                    "payloads": {name: value for name, value in self.payloads.items()
+                                 if name != "ticket_adapters.py"}}
+        return source, request
+
+    def test_five_prepared_reservation_blocks_six_and_wrong_generation_rollback(self):
+        source, old_request = self.five_generation()
+        before = self.snapshot()
+        with mock.patch.object(bootstrap, "AGENT_SOURCE", source):
+            for host in bootstrap.HOSTS:
+                self.agent(host, old_request(host, "prepare"))
+        for host in bootstrap.HOSTS:
+            for phase in ("check", "prepare", "rollback-check", "rollback"):
+                with self.subTest(host=host, phase=phase), self.assertRaisesRegex(RuntimeError, "another target transaction"):
+                    self.run_phase(host, phase)
+        self.assertEqual(before, self.snapshot())
+
+    def test_six_prepared_reservation_blocks_old_five_rollback(self):
+        source, old_request = self.five_generation()
+        before = self.snapshot()
+        for host in bootstrap.HOSTS:
+            self.run_phase(host, "prepare")
+        with mock.patch.object(bootstrap, "AGENT_SOURCE", source):
+            for host in bootstrap.HOSTS:
+                for phase in ("prepare", "rollback-check", "rollback"):
+                    with self.subTest(host=host, phase=phase), self.assertRaisesRegex(RuntimeError, "another target transaction"):
+                        self.agent(host, old_request(host, phase))
+        self.assertEqual(before, self.snapshot())
+
+    def test_old_five_crash_lock_blocks_new_six_even_without_active_record(self):
+        source, old_request = self.five_generation()
+        with mock.patch.object(bootstrap, "AGENT_SOURCE", source):
+            self.agent("local", old_request("local", "prepare"))
+        root = self.state("local").parent
+        (root / "active.json").unlink()
+        (root / "target-lock").mkdir()
+        before = self.snapshot()
+        with self.assertRaises(RuntimeError):
+            self.run_phase("local", "prepare")
+        self.assertEqual(before, self.snapshot())
+
+    def test_old_five_recovery_then_six_transaction_restores_all_bytes_and_modes(self):
+        source, old_request = self.five_generation()
+        before = self.snapshot()
+        with mock.patch.object(bootstrap, "AGENT_SOURCE", source):
+            for phase in ("prepare", "apply-check", "apply", "verify", "finalize",
+                          "rollback-check", "rollback-prepare", "rollback", "rollback-verify", "rollback-finalize"):
+                for host in bootstrap.HOSTS:
+                    self.agent(host, old_request(host, phase))
+        self.assertEqual(before, self.snapshot())
+        self.transaction_run("apply")
+        for home in self.homes.values():
+            for edition in bootstrap.EDITIONS:
+                self.assertEqual((home / edition / "ticket_adapters.py").read_bytes(),
+                                 base64.b64decode(self.payloads["ticket_adapters.py"]))
+        self.transaction_run("rollback")
+        self.assertEqual(before, self.snapshot())
+
+    def test_cross_generation_reservation_mutant_accepts_forbidden_overlap(self):
+        source, old_request = self.five_generation()
+        with mock.patch.object(bootstrap, "AGENT_SOURCE", source):
+            self.agent("local", old_request("local", "prepare"))
+        with self.assertRaisesRegex(RuntimeError, "another target transaction"):
+            self.run_phase("local", "prepare")
+        # This controlled mutant removes both common active-record guards.
+        # Its unsafe prepare proves the preceding refusal is non-vacuous.
+        guard = 'active["transaction"] != transaction and active["state"] not in ("verified", "rolled-back")'
+        self.assertEqual(bootstrap.AGENT_SOURCE.count(guard), 2)
+        mutant = bootstrap.AGENT_SOURCE.replace(guard, "False")
+        before = self.snapshot()
+        with mock.patch.object(bootstrap, "AGENT_SOURCE", mutant):
+            accepted = self.run_phase("local", "prepare")
+        self.assertEqual(accepted["phase"], "prepared")
+        self.assertEqual(before, self.snapshot())
+
     def test_check_is_read_only_and_both_hosts(self):
         before = self.snapshot()
         self.transaction_run("check")
@@ -424,6 +514,17 @@ class BootstrapTests(unittest.TestCase):
         request = self.request("local", "check")
         request["payloads"] = dict(request["payloads"])
         del request["payloads"]["caller_identity.py"]
+        with self.assertRaisesRegex(RuntimeError, "closed payload set"):
+            self.agent("local", request)
+
+    def test_ticket_adapter_required_by_release_and_fixed_host_agent(self):
+        manifest = json.loads(json.dumps(self.manifest))
+        del manifest["payloads"]["ticket_adapters.py"]
+        with self.assertRaisesRegex(ValueError, "closed release payload"):
+            bootstrap.validate_manifest(json.dumps(manifest), SCRIPT.read_bytes())
+        request = self.request("local", "check")
+        request["payloads"] = dict(request["payloads"])
+        del request["payloads"]["ticket_adapters.py"]
         with self.assertRaisesRegex(RuntimeError, "closed payload set"):
             self.agent("local", request)
 

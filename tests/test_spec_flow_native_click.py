@@ -416,9 +416,11 @@ class NativeClick(SpecFlowCase):
 
     def test_unverifiable_new_result_blocks_an_older_pass(self):
         core = sf.core_sha(SPEC)
-        spec = {"v": 1, "kind": "spec", "_comment": "s", "_at": "1", "spec_core_sha": core,
-                "spec_file_sha": "spec", "ac": ["AC-1"], "author": "agent:owner",
-                "attachments": [{"id": "s", "role": "spec", "sha256": "spec"},
+        source = SPEC.encode()
+        source_sha = hashlib.sha256(source).hexdigest()
+        spec = {"v": 1, "kind": "spec", "_comment": "s", "_at": "2026-11-04T04:00:00Z", "spec_core_sha": core,
+                "ticket": "GoodQA harness#168", "spec_file_sha": source_sha, "ac": ["AC-1"], "author": "agent:owner1",
+                "attachments": [{"id": "s", "role": "spec", "sha256": source_sha},
                                 {"id": "r", "role": "reviews", "sha256": "rev"}]}
         base = {"v": 1, "kind": "click_test", "_comment": "c", "_at": "2", "spec_core_sha": core,
                 "tester": {"kind": "agent", "identity": "legacy"}, "url": URL, "result": "pass",
@@ -426,6 +428,7 @@ class NativeClick(SpecFlowCase):
         current = {**base, "v": 2, "_comment": "new", "_at": "3", "tester": {"kind": "agent", "identity": TESTER}}
         index = {item["id"]: {"commentId": rec["_comment"], "completionState": "completed", "sha256": item["sha256"]}
                  for rec in (spec, base) for item in rec["attachments"]}
+        index["s"].update(id="s", mime="text/markdown", _comment_at=spec["_at"], _spec_bytes=source)
         self.assertFalse(any(m.startswith("click-test:") for m in sf.evaluate([spec, base], index, {})["missing"]))
         self.assertIn("click-test: the latest native result does not verify for this ticket on this host",
                       sf.evaluate([spec, base, current], index, {})["missing"])

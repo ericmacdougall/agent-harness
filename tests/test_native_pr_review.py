@@ -539,16 +539,22 @@ class NativeReviewContracts(TestCase):
             with self.assertRaisesRegex(ValueError, "WAL witness missing or mismatched"):
                 n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
 
-    def staged_acceptance(self):
-        core = "7" * 64
+    def staged_acceptance(self, *, author="agent:author", owners=None):
         ticket = "GoodQA fixture#3"
+        source = f"# Spec: staged fixture\n\nTicket: {ticket}\nAuthor: {author}\n"
+        if owners:
+            source += f"Owners: {', '.join(owners)}\n"
+        source += "\n## Outcome\n\nIndependent staged acceptance.\n"
+        core = n.spec_flow.core_sha(source)
+        source_bytes = source.encode()
+        file_sha = n.digest(source_bytes)
         records = [
             {"v": 1, "kind": "spec", "ticket": ticket, "_comment": "spec", "_at": "2026-11-22T18:50:00Z",
-             "author": "agent:author", "actor": "agent:author", "ac": ["AC-1"], "spec_core_sha": core,
-             "spec_file_sha": "a" * 64, "click_test": {"required": True},
+             "author": author, "actor": author, "ac": ["AC-1"], "spec_core_sha": core,
+             "spec_file_sha": file_sha, "click_test": {"required": True},
              "reviews": [{"role": role, "verdict": "ACCEPT", "core_sha": core, "key": "agent:" + role}
                          for role in ("adversarial", "acceptance")],
-             "attachments": [{"id": "spec-file", "role": "spec", "sha256": "a" * 64},
+             "attachments": [{"id": "spec-file", "role": "spec", "sha256": file_sha},
                              {"id": "spec-reviews", "role": "reviews", "sha256": "b" * 64}]},
             {"v": 1, "kind": "evidence", "ticket": ticket, "_comment": "evidence", "_at": "2026-11-22T18:55:00Z",
              "actor": "agent:evidence", "spec_core_sha": core, "ac": ["AC-1"], "commits": [{"sha": HEAD}],
@@ -567,6 +573,18 @@ class NativeReviewContracts(TestCase):
         ]
         index = {a["id"]: {"commentId": r["_comment"], "completionState": "completed", "sha256": a["sha256"]}
                  for r in records for a in r.get("attachments", [])}
+        index["spec-file"].update(id="spec-file", mime="text/markdown", _comment_at=records[0]["_at"],
+                                  _spec_bytes=source_bytes)
+        if owners:
+            from test_spec_flow_owners import proof
+
+            spec = records[0]
+            spec.update(v=2, owners=owners, owners_core_sha=core, owner_proofs=[proof(owner) for owner in owners])
+            spec["owner_proof_sha256"] = n.digest(n.spec_flow.ownership_payload(spec))
+            attachment = {"id": "owner-proof", "role": "owner-provenance", "sha256": spec["owner_proof_sha256"]}
+            spec["attachments"].append(attachment)
+            index["owner-proof"] = {"commentId": spec["_comment"], "completionState": "completed",
+                                    "sha256": spec["owner_proof_sha256"]}
         return records, index, {"_label": ticket}
 
     def test_staged_receipt_defers_only_the_normal_live_location_check(self):
@@ -596,7 +614,11 @@ class NativeReviewContracts(TestCase):
         assert_blocks(lambda rows, _index: rows[2].update(covers_commits=[]), "evidence commits")
         assert_blocks(lambda rows, _index: rows[2].update(result="fail"), "latest click-test failed")
         assert_blocks(lambda _rows, index: index["report"].update(sha256="0" * 64), "does not verify")
-        assert_blocks(lambda rows, _index: rows[0].update(author="agent:" + OWNER), "independent click-tester")
+        assert_blocks(lambda rows, _index: rows[0].update(author="agent:" + OWNER), "author/core differs")
+        records, index, issue = self.staged_acceptance(author="agent:" + OWNER)
+        with mock.patch.object(n.spec_flow, "_native_click_record_proof"):
+            result = n.spec_flow.evaluate(records, index, issue, staged_commit=HEAD, staged_repo="github.com/fixture/project")
+        self.assertTrue(any("independent click-tester" in problem for problem in result["missing"]), result["missing"])
 
     def test_incomplete_premerge_claim_refuses_before_native_bundle_access(self):
         ctx = context()
@@ -635,6 +657,35 @@ class NativeReviewContracts(TestCase):
                 "commits: no current structured evidence names the exact candidate",
                 "commits: current evidence includes a commit outside the exact candidate ancestry",
             ])
+
+    def test_tracker_excludes_all_artifact_validated_owners_and_binds_frozen_proof(self):
+        from types import SimpleNamespace
+
+        owners = ["agent:" + ACCEPTANCE, "agent:" + WORKER]
+        records, index, issue = self.staged_acceptance(author=owners[0], owners=owners)
+        issue["status"] = "in_review"
+        tracker = mock.Mock()
+        tracker.ticket = SimpleNamespace(id="fixture", label=issue["_label"])
+        tracker.records.return_value = records, [], index
+        tracker.latest_spec.side_effect = lambda rows, attachments: n.spec_flow.current_artifact_spec(
+            rows, attachments, tracker.ticket.label)
+        tracker.adapter.issue.return_value = issue
+        with mock.patch("commit_policy._commit_refs", return_value=[("goodqa", "fixture", 3)]), \
+             mock.patch.object(n, "_git", return_value="fixture commit body"), \
+             mock.patch.object(n.spec_flow, "Session", return_value=tracker), \
+             mock.patch.object(n.spec_flow, "_native_click_record_proof"), \
+             mock.patch.object(n, "_is_ancestor", return_value=True):
+            first, excluded = n._tracker_claims(self.repo, "fixture/project", [HEAD], HEAD)
+            self.assertEqual(first[0]["premerge_missing"], [])
+            self.assertCountEqual(excluded, [ACCEPTANCE, WORKER])
+            spec = records[0]
+            spec["owner_proofs"][1]["event_sha256"] = "f" * 64
+            frozen = n.digest(n.spec_flow.ownership_payload(spec))
+            spec["owner_proof_sha256"] = frozen
+            spec["attachments"][-1]["sha256"] = frozen
+            index["owner-proof"]["sha256"] = frozen
+            second, _ = n._tracker_claims(self.repo, "fixture/project", [HEAD], HEAD)
+            self.assertNotEqual(first[0]["review_sha256"], second[0]["review_sha256"])
 
 
     def test_declared_contribution_paths_are_real_git_changes(self):

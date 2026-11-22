@@ -25,6 +25,43 @@ BASE_SETTINGS = (('core.hooksPath', os.devnull), ('core.fsmonitor', 'false'),
                  ('core.trustctime', 'true'), ('core.checkStat', 'default'),
                  ('commit.gpgsign', 'false'), ('tag.gpgsign', 'false'))
 FILTER_PATTERN = r'^filter\..*\.(clean|process|smudge)$'
+SITES_CONFIG_KEYS = frozenset(
+    f'{section}.{scope}.{option}'
+    for scope in ('https://chatgpt.com/backend-api/codex/sites/git/',
+                  'https://chatgpt-staging.com/backend-api/codex/sites/git/')
+    for section, option in (('credential', 'helper'), ('credential', 'useHttpPath'),
+                            ('http', 'proactiveAuth'), ('http', 'followRedirects'))
+)
+
+
+def unsupported_git_environment(environment, allowed_names):
+    """Admit only the complete, bounded official Sites metadata family.
+
+    Indexed values may contain credentials or executable helpers: do not read
+    them. Admission grants no configuration authority. git_environment drops
+    this entire family before building helper-owned Git subprocess settings.
+    """
+    names = set(environment)
+    if any(not isinstance(name, str) for name in names):
+        return True
+    git_names = {name for name in names if name.startswith('GIT_')}
+    indexed = {name for name in git_names if name == 'GIT_CONFIG_COUNT'
+               or name.startswith(('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))}
+    if not indexed:
+        return bool(git_names - set(allowed_names))
+    count = environment.get('GIT_CONFIG_COUNT')
+    if not isinstance(count, str) or not re.fullmatch(r'0|[1-9][0-9]?', count) or int(count) > 20:
+        return True
+    expected = {'GIT_CONFIG_COUNT'}
+    for index in range(int(count)):
+        expected.update((f'GIT_CONFIG_KEY_{index}', f'GIT_CONFIG_VALUE_{index}'))
+    if indexed != expected or git_names - set(allowed_names) - expected:
+        return True
+    for index in range(int(count)):
+        key = environment[f'GIT_CONFIG_KEY_{index}']
+        if not isinstance(key, str) or key not in SITES_CONFIG_KEYS:
+            return True
+    return False
 
 
 def git_environment(*, isolated=False, allow_hooks=False, preserve_identity=False,

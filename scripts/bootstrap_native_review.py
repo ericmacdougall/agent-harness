@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 REPOSITORY = "https://github.com/ericmacdougall/agent-harness.git"
-FILES = ("native_pr_review.py", "native_pr_dispatch.py", "spec_flow.py", "merge_gate.py", "caller_identity.py")
+FILES = ("native_pr_review.py", "native_pr_dispatch.py", "spec_flow.py", "merge_gate.py", "caller_identity.py", "ticket_adapters.py")
 EDITIONS = (".claude/hooks", ".codex/agent-harness")
 HOSTS = ("local", "t2-dev")
 MAX_MESSAGE = 8 * 1024 * 1024
@@ -29,7 +29,7 @@ AGENT_SOURCE = r'''
 import base64, hashlib, json, os, re, stat, sys
 from pathlib import Path
 
-FILES = ("native_pr_review.py", "native_pr_dispatch.py", "spec_flow.py", "merge_gate.py", "caller_identity.py")
+FILES = ("native_pr_review.py", "native_pr_dispatch.py", "spec_flow.py", "merge_gate.py", "caller_identity.py", "ticket_adapters.py")
 EDITIONS = (".claude/hooks", ".codex/agent-harness")
 def digest(data):
     return hashlib.sha256(data).hexdigest()
