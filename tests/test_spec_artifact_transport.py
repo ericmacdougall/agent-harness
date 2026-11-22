@@ -1,6 +1,9 @@
 """Read-only artifact authority through owned HTTP fixtures, never real services."""
 import json
 import os
+import socketserver
+import threading
+import time
 from unittest import mock
 import unittest
 
@@ -17,6 +20,42 @@ def tearDownModule():
 
 
 class ArtifactTransport(unittest.TestCase):
+    def test_absolute_deadline_interrupts_slow_headers_and_body(self):
+        for phase in ('headers', 'body'):
+            with self.subTest(phase=phase):
+                class Handler(socketserver.BaseRequestHandler):
+                    def handle(inner):
+                        inner.request.recv(4096)
+                        prefix = b'HTTP/1.0 200 OK\r\nContent-Length: 20\r\n'
+                        try:
+                            inner.request.sendall(prefix)
+                            if phase == 'headers':
+                                inner.request.sendall(b'X-Slow: ')
+                            else:
+                                inner.request.sendall(b'\r\n')
+                            for _ in range(20):
+                                inner.request.sendall(b'x')
+                                time.sleep(.025)
+                            if phase == 'headers':
+                                inner.request.sendall(b'\r\n\r\n' + b'x' * 20)
+                        except OSError:
+                            pass
+                with socketserver.ThreadingTCPServer(('127.0.0.1', 0), Handler) as server:
+                    server.daemon_threads = True
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    adapter = ta.GoodQAAdapter(dict(self.case.config, total_deadline_seconds=.12,
+                                                    timeout_seconds=1))
+                    start = time.monotonic()
+                    try:
+                        with self.assertRaises(ta.TicketSystemUnavailable):
+                            adapter._artifact_get(('http', '127.0.0.1', server.server_address[1]),
+                                                  '/fixture', 100, fixture=True)
+                        self.assertLess(time.monotonic() - start, .4)
+                    finally:
+                        server.shutdown()
+                        thread.join(1)
+
     def setUp(self):
         self.case = base.SpecFlowCase()
         self.case.setUp()
