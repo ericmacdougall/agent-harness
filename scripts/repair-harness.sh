@@ -15,7 +15,9 @@ done
 if [[ -n $choice ]]; then
     candidates=("$choice")
 else
-    candidates=(python3 python3.15 python3.14 python3.13 python3.12 python3.11)
+    candidates=(python3 python3.15 python3.14 python3.13 python3.12 python3.11
+        /opt/homebrew/bin/python3.15 /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13
+        /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /usr/local/bin/python3)
 fi
 for candidate in "${candidates[@]}"; do
     if "$candidate" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then

@@ -2,11 +2,14 @@
 """Refresh existing harness files from a pinned, canonically merged release."""
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import resource
 import runpy
 import shlex
 import shutil
@@ -32,6 +35,7 @@ LOCAL_PROFILES = tuple(f"{folder}/{name}.local.json"
 BACKUPS = (".claude/agent-harness-backups", ".codex/agent-harness/backups")
 HOOK_PATHS = (".claude/hooks/ah.py", ".codex/agent-harness/ah.py")
 MAX_ARCHIVE = 64 * 1024 * 1024
+MIN_FREE = 512 * 1024 * 1024
 MAX_LOG = 65536
 INSTALL_TIMEOUT = 80
 SSH_TIMEOUT = 185
@@ -83,25 +87,61 @@ def work_dir(home):
     return private_dir(private_dir(home / ".agent-harness") / "work")
 
 
-def git(args, *, cwd, timeout=40):
+def ensure_space(path):
+    free = shutil.disk_usage(path).free
+    require(free >= MIN_FREE, "Insufficient free space: repair requires at least 512 MiB before staging or applying.")
+    return free
+
+
+@contextmanager
+def host_lock(work, name):
+    # A stable inode keeps overlapping attempts and a surviving SSH worker apart.
+    fd = os.open(work / name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                and info.st_nlink == 1 and not info.st_mode & 0o077,
+                "Unsafe repair lock file.")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RepairError("Another repair still holds the host lock. Reconcile its result first.") from error
+        yield
+    finally:
+        os.close(fd)
+
+
+def git(args, *, cwd, timeout=40, file_limit=None):
     env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    def limit_output():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
     return subprocess.run([GIT, *args], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=True).stdout
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=timeout, check=True,
+                          preexec_fn=limit_output if file_limit is not None else None).stdout
 
 
 def canonical_archive(ref, stage):
-    repo = stage / "verified"
-    repo.mkdir(mode=0o700)
-    git(["init", "--quiet"], cwd=repo)
-    git(["fetch", "--quiet", "--no-tags", ORIGIN, "+refs/heads/main:refs/remotes/canonical/main"], cwd=repo)
-    main = git(["rev-parse", "refs/remotes/canonical/main"], cwd=repo).decode().strip()
-    try:
-        require(git(["cat-file", "-t", ref], cwd=repo).strip() == b"commit", "Select an exact commit.")
-        git(["merge-base", "--is-ancestor", ref, main], cwd=repo)
-    except subprocess.CalledProcessError as error:
-        raise RepairError("The selected commit is outside canonical main history.") from error
-    git(["archive", "--format=tar", f"--output={stage / 'release.tar'}", ref], cwd=repo)
+    ensure_space(stage)
+    # Reuse one blob-filtered canonical object store, not another complete clone
+    # per repair. Each run still gets a fresh archive and two fresh extractions.
+    with host_lock(stage.parent, "repair-source.lock"):
+        repo = stage.parent / "repair-source.git"
+        if not repo.exists():
+            repo.mkdir(mode=0o700)
+            git(["init", "--quiet", "--bare"], cwd=repo)
+        private_dir(repo)
+        git(["fetch", "--quiet", "--filter=blob:none", "--no-tags", ORIGIN,
+             "+refs/heads/main:refs/remotes/canonical/main"], cwd=repo)
+        main = git(["rev-parse", "refs/remotes/canonical/main"], cwd=repo).decode().strip()
+        try:
+            require(git(["cat-file", "-t", ref], cwd=repo).strip() == b"commit", "Select an exact commit.")
+            git(["merge-base", "--is-ancestor", ref, main], cwd=repo)
+        except subprocess.CalledProcessError as error:
+            raise RepairError("The selected commit is outside canonical main history.") from error
+        git(["archive", "--format=tar", f"--output={stage / 'release.tar'}", ref], cwd=repo,
+            file_limit=MAX_ARCHIVE)
     require(0 < (stage / "release.tar").stat().st_size <= MAX_ARCHIVE, "Canonical release archive is too large.")
     return main
 
@@ -217,42 +257,49 @@ def host_worker(phase, expected, token, size, source, home):
              "log_dir": str(stage)}
     old_backups = backup_paths(home)
     try:
-        require(all((home / path).is_file() for path in HOOK_PATHS), "Both harness editions must already exist.")
-        archive = stage / "release.tar"
-        if checking:
-            receive_archive(source, archive, size)
-        else:
-            require(size == 0 and not source.read(1), "Unexpected apply payload.")
-        files = stage / f"source-{phase}"
-        extraction(archive, files, expected)
-        mappings = inventory(files, home)
-        required = {path: digest(payload) for path, payload in mappings.items()}
-        settings = [home / path for path in SETTINGS]
-        # Existing personalized profiles are immutable. The stock installers may migrate a missing one.
-        settings.extend(home / path for path in LOCAL_PROFILES if os.path.lexists(home / path))
-        before = {"files": snapshot(mappings), "settings": snapshot(settings)}
-        record = stage / "preview.json"
-        if not checking:
-            require(json.loads(record.read_text()) == before, "The installation changed after preview. Reconcile first.")
-        for name in INSTALLERS:
-            log = bounded_install(files, name, stage / f"{phase}-{name}.log", apply=not checking, home=home)
-            version = re.search(r"commit-msg backstop inactive: (?:git )+(?:version )?([0-9.]+) lacks", log)
-            if version:
-                reply["git_backstop"] = f"inactive (Git {version[1]}; requires 2.54+)"
-            elif "commit-msg backstop inactive" in log:
-                reply["git_backstop"] = "inactive"
-            elif "register git hook." in log or "registered git hook." in log:
-                if not reply["git_backstop"].startswith("inactive"):
-                    reply["git_backstop"] = "available"
-        require(snapshot(settings) == before["settings"], "Instructions or settings changed unexpectedly.")
-        if checking:
-            require(snapshot(mappings) == before["files"], "Managed files changed during preview.")
-            with record.open("x") as receipt:
-                json.dump(before, receipt)
-        else:
-            require(all(digest(path) == checksum for path, checksum in required.items()),
-                    "An installer-owned file differs from the verified release.")
-        reply["status"] = "ok"
+        with host_lock(work, "repair-apply.lock"):
+            free = ensure_space(work)
+            (stage / f"{phase}-runtime.json").write_text(json.dumps({
+                "python": sys.executable, "python_version": sys.version.split()[0],
+                "free_bytes": free, "minimum_free_bytes": MIN_FREE,
+                "archive_bytes": size if checking else (stage / "release.tar").stat().st_size,
+            }))
+            require(all((home / path).is_file() for path in HOOK_PATHS), "Both harness editions must already exist.")
+            archive = stage / "release.tar"
+            if checking:
+                receive_archive(source, archive, size)
+            else:
+                require(size == 0 and not source.read(1), "Unexpected apply payload.")
+            files = stage / f"source-{phase}"
+            extraction(archive, files, expected)
+            mappings = inventory(files, home)
+            required = {path: digest(payload) for path, payload in mappings.items()}
+            settings = [home / path for path in SETTINGS]
+            # Existing personalized profiles are immutable. The stock installers may migrate a missing one.
+            settings.extend(home / path for path in LOCAL_PROFILES if os.path.lexists(home / path))
+            before = {"files": snapshot(mappings), "settings": snapshot(settings)}
+            record = stage / "preview.json"
+            if not checking:
+                require(json.loads(record.read_text()) == before, "The installation changed after preview. Reconcile first.")
+            for name in INSTALLERS:
+                log = bounded_install(files, name, stage / f"{phase}-{name}.log", apply=not checking, home=home)
+                version = re.search(r"commit-msg backstop inactive: (?:git )+(?:version )?([0-9.]+) lacks", log)
+                if version:
+                    reply["git_backstop"] = f"inactive (Git {version[1]}; requires 2.54+)"
+                elif "commit-msg backstop inactive" in log:
+                    reply["git_backstop"] = "inactive"
+                elif "register git hook." in log or "registered git hook." in log:
+                    if not reply["git_backstop"].startswith("inactive"):
+                        reply["git_backstop"] = "available"
+            require(snapshot(settings) == before["settings"], "Instructions or settings changed unexpectedly.")
+            if checking:
+                require(snapshot(mappings) == before["files"], "Managed files changed during preview.")
+                with record.open("x") as receipt:
+                    json.dump(before, receipt)
+            else:
+                require(all(digest(path) == checksum for path, checksum in required.items()),
+                        "An installer-owned file differs from the verified release.")
+            reply["status"] = "ok"
     except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError, KeyError) as error:
         detail = str(error) if isinstance(error, RepairError) else type(error).__name__
         (stage / f"{phase}-failure.log").write_text(detail[:500] + "\n", encoding="utf-8")
@@ -262,6 +309,8 @@ def host_worker(phase, expected, token, size, source, home):
 
 def report(label, reply):
     print(f"{label}: {reply['status']}. Logs: {reply['log_dir']}. Git backstop: {reply['git_backstop']}.")
+    if reply["status"] == "ok":
+        print(f"{label} agent hook registration: unchanged (hooks-only); enrollment and trust were not granted.")
     for path in reply["backups"]:
         print(f"{label} backup: {path}")
 
@@ -306,7 +355,9 @@ def remote_client(host, worker_code, expected, stage):
         argv = ["-IB", "-c", worker_code, "--worker", phase, expected, token, str(size), host.split(".")[0]]
         command = (
             "for py in /usr/bin/python3 /usr/bin/python3.15 /usr/bin/python3.14 /usr/bin/python3.13 "
-            "/usr/bin/python3.12 /usr/bin/python3.11; do "
+            "/usr/bin/python3.12 /usr/bin/python3.11 /opt/homebrew/bin/python3.15 "
+            "/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 "
+            "/opt/homebrew/bin/python3.11 /usr/local/bin/python3; do "
             'if "$py" -I -c "import sys; sys.exit(sys.version_info < (3, 11))" 2>/dev/null; then '
             'exec "$py" ' + shlex.join(argv) + "; fi; done; exit 2"
         )

@@ -265,6 +265,17 @@ exec "$FIXTURE_REAL_GIT" "$@"
         self.assertEqual(command('git', 'rev-parse', 'HEAD', cwd=self.original,
                                  env=self.env).stdout.strip(), self.base)
 
+    def test_sites_metadata_admitted_but_unknown_git_routing_still_refused(self):
+        self.env.update(GIT_CONFIG_COUNT='1',
+                        GIT_CONFIG_KEY_0='credential.https://chatgpt.com/backend-api/codex/sites/git/.helper',
+                        GIT_CONFIG_VALUE_0='!false')
+        result, prepared = self.invoke(*self.prepare_args(), '--local-only')
+        self.assertEqual((result.returncode, prepared['status']), (0, 'LOCAL_READY'), result.stdout)
+        self.env['GIT_DIR'] = ''
+        result, denied = self.invoke(*self.prepare_args(), '--local-only')
+        self.assertEqual((result.returncode, denied['status']), (2, 'BLOCKED_POLICY'), result.stdout)
+        self.assertEqual(denied['message'], 'Unsupported Git routing environment')
+
     def test_explicit_local_only_delivers_and_repeats_without_home_state(self):
         result, prepared = self.invoke(*self.prepare_args(), '--local-only')
         self.assertEqual((result.returncode, prepared['status']), (0, 'LOCAL_READY'), result.stdout)

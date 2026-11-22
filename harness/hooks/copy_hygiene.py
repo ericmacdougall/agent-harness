@@ -10,7 +10,8 @@ WHAT.
   acquire       `copy_hygiene.py acquire --repo <checkout> --key <pr-1408|lane> [--ref <ref>]` returns ONE stable path
                 (~/.agent-harness/test-copies/<repo>-<id>/<key>) per repository and PR/lane. The first call makes a
                 detached linked worktree; later calls reuse it and check out the requested commit. It refuses (exit 4)
-                when tracked changes would have to be discarded, so a round never silently tests an older commit. It
+                when a ref move could disturb tracked, untracked or ignored data. --require-reuse forbids creating a
+                missing copy. --run COMMAND ... holds the lease for the command in the verified checkout. It
                 refuses to create a copy below the free-space floor (exit 3) and writes an alert.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
                 add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. It always denies writing scratch INTO
@@ -22,9 +23,9 @@ WHAT.
                 total is over max_total_gb, the oldest copies above the cap. REPORT-ONLY unless BOTH the config value
                 "reaper_delete_enabled": true (a literal JSON true) is set in ~/.agent-harness/state/copy-hygiene.json
                 AND --apply is passed. The installer never sets it, so installing or a first run deletes nothing.
-                Even when enabled it removes only a git checkout with no tracked or untracked changes, no stash, no
-                local commits missing from its remotes, no ignored files except regenerable build output, and no
-                process inside it. Linked worktrees go through plain `git worktree remove` (no --force).
+                Even when enabled it removes only an indexed managed linked checkout with no tracked, untracked or
+                ignored changes, no stash, no local commits missing from its remotes, no live or unknown use, and
+                an idle exclusive lease. It uses plain `git worktree remove` (no --force). Legacy copies are report-only.
 
   protected     Paths a live service depends on are NEVER deleted (2026-11-21: cleanups on t2-dev removed
                 ~/coordinator-v2/rc/agent-harness, claude-rc's WorkingDirectory, plus ~/pp-ci/runner and the ~/pp-ci/nm
@@ -69,6 +70,8 @@ import pwd
 import re
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -88,9 +91,6 @@ DEFAULTS = {
 }
 GIT_TIMEOUT = 60
 REPORT_EVERY_S = 6 * 3600
-REGENERABLE_IGNORED = ("node_modules", ".next", "dist", "build", "target", ".venv", "venv", "__pycache__",
-                       ".pytest_cache", ".mypy_cache", ".ruff_cache", "coverage", ".turbo", ".cache", ".parcel-cache",
-                       ".gradle", "DerivedData", ".nuxt", ".svelte-kit", "out")
 PREFIXES = frozenset(("sudo", "command", "time", "env", "nice", "nohup", "exec", "builtin", "ionice", "timeout"))
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SHM = "/dev/shm"
@@ -112,7 +112,7 @@ def config_path() -> str:
 
 
 def copies_root() -> str:
-    return os.path.join(home(), ".agent-harness", "test-copies")
+    return os.path.join(os.path.realpath(home()), ".agent-harness", "test-copies")
 
 
 def _num(v, default: float) -> float:
@@ -232,10 +232,17 @@ def low_disk_message(path: str, free_gb: float, fl: float) -> str:
 # ---------------------------------------------------------------- git helpers
 def git(cwd: str, *args: str) -> "tuple[int, str]":
     try:
+        # A caller inspecting another Git index must not redirect managed-copy operations.
+        env = {k: v for k, v in os.environ.items() if k not in {
+            "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS", "GIT_PREFIX", "GIT_IMPLICIT_WORK_TREE", "GIT_QUARANTINE_PATH",
+        }}
+        env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1")
         p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=GIT_TIMEOUT,
-                           env=dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0"))
+                           env=env)
         return p.returncode, (p.stdout + p.stderr).strip()
-    except (OSError, subprocess.TimeoutExpired) as e:
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as e:
         return 99, str(e)
 
 
@@ -284,7 +291,57 @@ def touch_index(path: str, **extra) -> None:
 
 
 # ---------------------------------------------------------------- acquire
-def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -> dict:
+def copy_lock(path: str):
+    """The permanent sibling lock is never moved or unlinked while recycling a copy."""
+    if os.path.realpath(os.path.dirname(path)) != os.path.dirname(path):
+        raise ValueError("copy lock parent is redirected")
+    fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    lk = os.fdopen(fd, "rb")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1:
+            raise ValueError("copy lease is not an owned regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        lk.close()
+        raise
+    return lk
+
+
+def managed_head(path: str, key: str, common: str) -> "str | None":
+    rec = load_index().get(path)
+    if not isinstance(rec, dict) or not isinstance(rec.get("repo"), str) or rec.get("key") != key:
+        return None
+    rc, origin_common = git(rec["repo"], "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc or os.path.realpath(origin_common) != common:
+        return None
+    dotgit = os.path.join(path, ".git")
+    if os.path.realpath(path) != path or os.path.islink(dotgit) or not os.path.isfile(dotgit):
+        return None
+    rc, top = git(path, "rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir")
+    if rc or top.splitlines() != [path, common]:
+        return None
+    rc, head = git(path, "rev-parse", "--verify", "HEAD^{commit}")
+    if rc or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", head):
+        return None
+    rc, rows = git(common, "worktree", "list", "--porcelain", "-z")
+    if rc or not any(set(row.split("\0")) == {f"worktree {path}", f"HEAD {head}", "detached"}
+                     for row in rows.split("\0\0")):
+        return None
+    return head
+
+
+def copy_changes(path: str, *, include_local=True) -> str:
+    rc, files = git(path, "ls-files", "-v", "-z")
+    if rc or any(not entry.startswith("H ") for entry in files.rstrip("\0").split("\0") if entry):
+        return "unknown or nonstandard Git index"
+    options = ("--ignored", "--untracked-files=all") if include_local else ("--untracked-files=no",)
+    rc, status = git(path, "status", "--porcelain", "--ignore-submodules=none", *options)
+    return "could not establish clean status" if rc else "tracked, untracked or ignored changes" if status else ""
+
+
+def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None, *,
+            require_reuse: bool = False, run=None) -> dict:
     cfg = normalize(cfg) if cfg is not None else load_config()
     try:
         k = safe_key(key)
@@ -296,46 +353,65 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -
         return {"ok": False, "error": f"not a git checkout: {repo}"}
     top = top.splitlines()[-1].strip()
     # Resolve the ref in the SOURCE checkout: "HEAD" inside the copy would mean the copy's own commit.
-    rc, sha = git(top, "rev-parse", "--verify", "--quiet", ref + "^{commit}")
+    rc, sha = git(top, "rev-parse", "--verify", "--quiet", "--end-of-options", ref + "^{commit}")
     if rc != 0 or not sha:
         return {"ok": False, "error": f"unknown ref in {top}: {ref}"}
     sha = sha.splitlines()[-1].strip()
     rid, common = repo_identity(top)
     path = os.path.join(copies_root(), rid, k)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".lock", "w") as lk:            # one acquire per copy at a time
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        if os.path.isdir(path):
-            rc, cur = git(path, "rev-parse", "HEAD")
-            if rc != 0:
-                return {"ok": False, "path": path, "error": f"existing copy is not a usable checkout: {path}; "
-                        "move it aside by hand (nothing was changed)"}
-            cur = cur.strip()
-            if cur != sha:
-                rc, dirty = git(path, "status", "--porcelain", "--untracked-files=no")
-                if rc != 0 or dirty:
-                    touch_index(path, repo=top, key=key)
-                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
-                            "error": "the copy has uncommitted tracked changes and is still at an older commit; "
-                                     "commit or remove them, then acquire again (nothing was discarded)"}
-                rc, local = git(path, "log", "--oneline", "-1", "HEAD", "--not", "--remotes", "--branches")
-                if rc == 0 and local:
-                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
-                            "error": "the copy's HEAD holds a commit on no branch or remote; save it on a branch first"}
-                rc, out = git(path, "checkout", "--detach", "--quiet", sha)
-                if rc != 0:
-                    return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha, "error": out[-300:]}
+    stale = {"ok": False, "stale": True, "path": path, "wanted": sha}
+    if require_reuse and not os.path.lexists(path):
+        return dict(stale, error="no managed copy exists and --require-reuse forbids creating one")
+    try:
+        if os.path.realpath(os.path.dirname(path)) != os.path.dirname(path):
+            return dict(stale, error="managed copy parent is redirected")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with copy_lock(path):
+            reused = os.path.lexists(path)
+            cur = None
+            if reused:
+                cur = managed_head(path, key, common)
+                if cur is None:
+                    return dict(stale, error="existing copy does not have verified managed Git registration")
+                if cur != sha:
+                    if changes := copy_changes(path):
+                        return dict(stale, commit=cur, error=f"{changes}; checkout left at its previous commit")
+                    rc, changed = git(path, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff",
+                                      "--no-textconv", "--diff-filter=DMRT", cur, sha, "--")
+                    if rc or any(protected_git_path(p) for p in changed.rstrip("\0").split("\0") if p):
+                        return dict(stale, commit=cur, error="tracked protected logs or WAL evidence may change")
+                    rc, local = git(path, "log", "--oneline", "-1", "HEAD", "--not", "--remotes", "--branches")
+                    if rc or local:
+                        return dict(stale, commit=cur, error="could not prove previous HEAD is saved on a branch")
+                    rc, out = git(path, "checkout", "--no-overwrite-ignore", "--detach", "--quiet", sha)
+                    if rc:
+                        return dict(stale, commit=cur, error=out[-300:])
+            else:
+                if require_reuse:
+                    return dict(stale, error="managed copy disappeared; --require-reuse forbids creating another")
+                low, gb, fl = disk_low(path, cfg)
+                if low:
+                    alert("disk-low-refused-acquire", {"path": path, "free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
+                    return {"ok": False, "refused": "disk-low", "free_gb": round(gb, 2), "error": low_disk_message(path, gb, fl)}
+                rc, out = git(common, "worktree", "add", "--detach", path, sha)
+                if rc:
+                    return {"ok": False, "error": out[-300:]}
             touch_index(path, repo=top, key=key)
-            return {"ok": True, "path": path, "commit": sha, "reused": True, "moved": cur != sha}
-        low, gb, fl = disk_low(path, cfg)
-        if low:
-            alert("disk-low-refused-acquire", {"path": path, "free_gb": round(gb, 2), "floor_gb": round(fl, 2)})
-            return {"ok": False, "refused": "disk-low", "free_gb": round(gb, 2), "error": low_disk_message(path, gb, fl)}
-        rc, out = git(common if os.path.isdir(common) else top, "worktree", "add", "--detach", path, sha)
-        if rc != 0:
-            return {"ok": False, "error": out[-300:]}
-        touch_index(path, repo=top, key=key)
-        return {"ok": True, "path": path, "commit": sha, "reused": False, "moved": True}
+            if managed_head(path, key, common) != sha:
+                return dict(stale, error="could not confirm the managed checkout at the requested commit")
+            if run and (changes := copy_changes(path, include_local=False)):
+                return dict(stale, commit=sha, error=f"{changes}; leased command refused")
+            result = {"ok": True, "path": path, "commit": sha, "reused": reused, "moved": cur != sha}
+            if run:
+                try:
+                    result["exit_code"] = run(result)
+                finally:
+                    touch_index(path, repo=top, key=key)
+            return result
+    except BlockingIOError:
+        return dict(stale, error="managed copy lease is currently held")
+    except (OSError, ValueError):
+        return dict(stale, error="could not acquire a verified managed copy lease")
 
 
 # ---------------------------------------------------------------- protected paths (live services)
@@ -559,7 +635,7 @@ def _k(p: str) -> str:
     return p.lower() if sys.platform == "darwin" else p
 
 
-def protected_scan(cfg: "dict | None" = None) -> "tuple[dict, int]":
+def protected_scan(cfg: "dict | None" = None, *, fresh=False) -> "tuple[dict, int]":
     """({key: (path, where it is named)}, unreadable-unit count). Cached for 60 s keyed on the directory mtimes."""
     cfg = normalize(cfg) if cfg is not None else load_config()
     _f, _e, sig = _scan_files(_unit_dirs())
@@ -569,7 +645,7 @@ def protected_scan(cfg: "dict | None" = None) -> "tuple[dict, int]":
     try:
         with open(cache) as f:
             c = json.load(f)
-        if c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
+        if not fresh and c.get("key") == key and time.time() - float(c.get("ts", 0)) < PROTECTED_CACHE_TTL_S:
             prot = {k: tuple(v) for k, v in c["prot"].items()}
             errors = int(c.get("errors", 0))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -1504,43 +1580,86 @@ def in_use(path: str) -> bool:
     if not shutil.which("lsof"):
         return True
     try:
-        p = subprocess.run(["lsof", "-t", "+D", path], capture_output=True, text=True, timeout=300)
-        return bool(p.stdout.strip())
-    except (OSError, subprocess.TimeoutExpired):
+        p = subprocess.run(["lsof", "-t", "+w", "+D", path], capture_output=True, text=True, timeout=300)
+        # lsof uses 1 for no match. Treat diagnostics or any other exit as unknown.
+        return p.returncode != 1 or bool(p.stdout.strip() or p.stderr.strip())
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
         return True
 
 
-def deletable(path: str) -> "tuple[bool, str]":
+def protected_git_path(path: str) -> bool:
+    parts = path.casefold().split("/")
+    if any(p in {"wal", "wals", "codex-wals"} or p.startswith(("wal-", "wal_", "wal."))
+           or p.endswith(".wal.jsonl") for p in parts):
+        return True
+    if parts[-1] == "main.jsonl":
+        return True
+    if any(p in {".claude", ".codex"} for p in parts[:-1]):
+        return any(p in {"projects", "sessions", "transcripts", "archived_sessions", "file-history", "logs"}
+                   or p.startswith("history") for p in parts[1:])
+    return parts[-1].startswith(("claude-", "codex-")) and parts[-1].endswith((".log", ".jsonl"))
+
+
+def deletable(path: str, head: str = "HEAD") -> "tuple[bool, str]":
     if not os.path.exists(os.path.join(path, ".git")):
         return False, "not a git checkout (kept; check by hand)"
-    rc, dirty = git(path, "status", "--porcelain", "--untracked-files=all")
-    if rc != 0:
-        return False, "git status failed"
-    if dirty:
-        return False, "uncommitted or untracked changes"
+    if changes := copy_changes(path):
+        return False, changes
+    rc, tracked = git(path, "ls-files", "-z")
+    if rc:
+        return False, "could not check tracked protection"
+    if any(protected_git_path(p) for p in tracked.rstrip("\0").split("\0") if p):
+        return False, "tracked protected logs or WAL evidence"
     rc, stash = git(path, "stash", "list")
     if rc != 0 or stash:
         return False, "has a stash"
-    rc, remote = git(path, "branch", "-r", "--contains", "HEAD")
+    rc, remote = git(path, "branch", "-r", "--contains", head)
     if rc != 0 or not remote.strip():
         return False, "HEAD is on no remote ref"
     rc, local = git(path, "log", "--oneline", "-1", "--branches", "--not", "--remotes")
     if rc != 0 or local:
         return False, "a local branch has commits on no remote"
-    rc, ign = git(path, "status", "--porcelain", "--ignored", "--untracked-files=normal")
-    if rc != 0:
-        return False, "git status --ignored failed"
-    for line in ign.splitlines():
-        if line.startswith("!! "):
-            first = line[3:].strip().strip('"').rstrip("/").split("/")
-            if not any(part in REGENERABLE_IGNORED for part in first):
-                return False, f"ignored files that may be evidence ({line[3:].strip()[:80]})"
     if in_use(path):
-        return False, "a process is working in it"
+        return False, "a process is working in it or liveness is unknown"
     return True, "clean and pushed"
 
 
-def remove_copy(path: str, prot: "dict | None" = None) -> "tuple[bool, str]":
+def copy_snapshot(path: str):
+    """Bind retirement to the verified physical directory, registration, HEAD, tree and index."""
+    rec = load_index().get(path)
+    if not isinstance(rec, dict) or not isinstance(rec.get("repo"), str):
+        return None
+    rc, common = git(rec["repo"], "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc:
+        return None
+    common = os.path.realpath(common)
+    head = managed_head(path, os.path.basename(path), common)
+    if head is None:
+        return None
+    rc, tree = git(path, "rev-parse", "--verify", head + "^{tree}")
+    if rc or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", tree):
+        return None
+    rc, index = git(path, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    if (rc or os.path.dirname(os.path.dirname(index)) != os.path.join(common, "worktrees")
+            or os.path.realpath(index) != index):
+        return None
+    source = os.lstat(path)
+    digest = hashlib.sha256()
+    fd = os.open(index, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        for data in iter(lambda: f.read(1 << 20), b""):
+            digest.update(data)
+        current = os.lstat(index)
+        index_identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        if index_identity != (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns):
+            return None
+    return (common, head, tree, source.st_dev, source.st_ino, index, index_identity, digest.digest())
+
+
+def remove_copy(path: str, prot: "dict | None" = None, *, expected=None) -> "tuple[bool, str]":
     try:
         if prot is None:
             prot, errors = protected_scan()
@@ -1549,18 +1668,44 @@ def remove_copy(path: str, prot: "dict | None" = None) -> "tuple[bool, str]":
         hit = protecting(path, prot)
         if hit:
             return False, f"protected: a service uses {hit[0]}"
-        dotgit = os.path.join(path, ".git")
-        if os.path.isfile(dotgit):   # linked worktree
-            rc, common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-            if rc != 0:
-                return False, "cannot find the main repository"
-            main = os.path.dirname(common.strip()) if os.path.basename(common.strip()) == ".git" else common.strip()
-            rc, out = git(main, "worktree", "remove", path)
-            return rc == 0, (out[-200:] if rc else "git worktree remove")
-        shutil.rmtree(path)
-        return True, "removed standalone clone"
+        if expected is None or copy_snapshot(path) != expected:
+            return False, "managed checkout identity changed or is unverified"
+        rc, out = git(expected[0], "worktree", "remove", path)
+        return rc == 0, (out[-200:] if rc else "git worktree remove")
     except OSError as e:
         return False, f"{type(e).__name__}: {str(e)[:160]}"
+
+
+def retire_copy(path: str, cfg: dict, planned_activity: float) -> str:
+    if os.path.dirname(os.path.dirname(path)) != copies_root():
+        return "kept: legacy or unmanaged copy; report only"
+    try:
+        with copy_lock(path):
+            if last_activity(path, load_index()) > planned_activity:
+                return "kept: copy was used after planning"
+            expected = copy_snapshot(path)
+            if expected is None:
+                return "kept: managed checkout identity unverified"
+            head = expected[1]
+            ok, why = deletable(path, head)
+            if not ok:
+                return f"kept: {why}"
+            prot, errors = protected_scan(cfg, fresh=True)
+            if errors or protecting(path, prot):
+                return "kept: service protection changed or is unknown"
+            if copy_snapshot(path) != expected or last_activity(path, load_index()) > planned_activity:
+                return "kept: managed checkout identity or activity changed"
+            ok, why = deletable(path, head)
+            if not ok:
+                return f"kept: {why}"
+            if last_activity(path, load_index()) > planned_activity:
+                return "kept: copy was used after planning"
+            done, why = remove_copy(path, prot, expected=expected)
+            return "removed" if done else f"remove failed: {why}"
+    except BlockingIOError:
+        return "kept: managed copy lease is currently held"
+    except (OSError, ValueError):
+        return "kept: managed lease or directory identity unavailable"
 
 
 def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = None) -> dict:
@@ -1568,10 +1713,12 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
     now = now or time.time()
     idx = load_index()
     rows = []
+    activities = {}
     for p in candidates(cfg):
         size = dir_size(p)
+        activities[p] = last_activity(p, idx)
         rows.append({"path": p, "bytes": size or 0, "size_known": size is not None,
-                     "idle_hours": round((now - last_activity(p, idx)) / 3600, 1)})
+                     "idle_hours": round((now - activities[p]) / 3600, 1)})
     rows.sort(key=lambda r: -r["idle_hours"])            # oldest first
     total = sum(r["bytes"] for r in rows)
     over = total - cfg["max_total_gb"] * GB
@@ -1602,12 +1749,7 @@ def reap(apply: bool = False, cfg: "dict | None" = None, now: "float | None" = N
         elif not deleting:
             r["action"] = "would-remove (report-only)"
         else:
-            ok, why = deletable(r["path"])
-            if not ok:
-                r["action"] = f"kept: {why}"
-            else:
-                done, msg = remove_copy(r["path"], prot)
-                r["action"] = "removed" if done else f"remove failed: {msg}"
+            r["action"] = retire_copy(r["path"], cfg, activities[r["path"]])
     res = {"mode": "delete" if deleting else "report-only", "delete_enabled": cfg["reaper_delete_enabled"],
            "total_gb": round(total / GB, 2), "cap_gb": cfg["max_total_gb"], "max_age_hours": cfg["max_age_hours"],
            "size_unknown": sum(not r["size_known"] for r in rows), "copies": rows, "ts": int(now)}
@@ -1676,11 +1818,59 @@ def scratch(key: str = "") -> "str | None":
     return d
 
 
+def acquire_cli(args) -> int:
+    def run_command(result):
+        print(json.dumps(result), flush=True)
+        try:
+            rc = subprocess.call(args.run, cwd=result["path"])
+        except OSError:
+            print("could not start leased command", file=sys.stderr)
+            return 127
+        return rc if rc >= 0 else 128 - rc
+
+    res = acquire(args.repo, args.key, args.ref, require_reuse=args.require_reuse,
+                  run=run_command if args.run else None)
+    if "exit_code" in res:
+        return res["exit_code"]
+    print(json.dumps(res), flush=True)
+    return 0 if res.get("ok") else (3 if res.get("refused") else 4 if res.get("stale") else 1)
+
+
+def supervise_acquire(args) -> int:
+    """A child owns the lease, so controller death does not release it during the command.
+
+    Do not pass the lock FD to the command. A detached command descendant must not hold the
+    lease forever; commands must wait for any descendants using the worktree.
+    """
+    pid = os.fork()
+    if pid == 0:
+        # Caught handlers reset on exec, so a normally behaved payload still gets the
+        # foreground signal. The supervisor keeps waiting if the payload handles it.
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, lambda *_: None)
+        try:
+            code = acquire_cli(args)
+        except KeyboardInterrupt:
+            code = 130
+        except BaseException:
+            print("leased acquire failed", file=sys.stderr, flush=True)
+            code = 1
+        os._exit(code)
+    try:
+        _, status = os.waitpid(pid, 0)
+    except KeyboardInterrupt:
+        return 130
+    code = os.waitstatus_to_exitcode(status)
+    return code if code >= 0 else 128 - code
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="copy_hygiene.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("acquire"); a.add_argument("--repo", required=True); a.add_argument("--key", required=True)
     a.add_argument("--ref", default="HEAD")
+    a.add_argument("--require-reuse", action="store_true", help="refuse when the managed copy is missing")
+    a.add_argument("--run", nargs=argparse.REMAINDER, help="hold an exclusive lease while running COMMAND ... in the copy")
     r = sub.add_parser("reap"); r.add_argument("--apply", action="store_true"); r.add_argument("--json", action="store_true")
     r.add_argument("--write-report", action="store_true", help="store the report for the SessionStart line")
     sub.add_parser("pretool")
@@ -1690,6 +1880,8 @@ def main(argv=None) -> int:
     pr = sub.add_parser("protected", help="list protected paths, or --check <path> (exit 1 when protected)")
     pr.add_argument("--check", default="")
     args = ap.parse_args(argv)
+    if args.cmd == "acquire" and args.run == []:
+        ap.error("--run requires a command")
     if args.cmd == "scratch":
         d = scratch(args.key)
         if not d:
@@ -1736,9 +1928,7 @@ def main(argv=None) -> int:
             print(json.dumps({"systemMessage": msg}))
         return 0
     if args.cmd == "acquire":
-        res = acquire(args.repo, args.key, args.ref)
-        print(json.dumps(res))
-        return 0 if res.get("ok") else (3 if res.get("refused") else 4 if res.get("stale") else 1)
+        return supervise_acquire(args) if args.run else acquire_cli(args)
     if args.cmd == "check-disk":
         cfg = load_config()
         low, gb, fl = disk_low(copies_root(), cfg)

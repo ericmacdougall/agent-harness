@@ -55,6 +55,10 @@ import unicodedata
 import urllib.parse
 from pathlib import Path
 
+# Reviewed first-party why implementation. No name-only exemption: a changed
+# implementation must be reviewed and explicitly pinned again.
+WHY_SET_SCRIPT_SHA256 = '92dcbb67993947506b9c139521a53e25d83cf9e8a2a127bf8e88237b2d170918'
+
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:  # python3 -I (3.11+) no longer puts the script's directory on sys.path
     sys.path.insert(0, str(HERE))
@@ -4659,7 +4663,7 @@ class Analyzer:
             return
         if '/' in name or '/' in words[0].text:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
-            self.script_file(words[0], depth, require_shell=True)
+            self.script_file(words[0], depth, require_shell=True, invocation=words, command=cmd)
         if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
             if self.launcher(name, args, depth, pl, idx):
                 return
@@ -4827,7 +4831,7 @@ class Analyzer:
         self.ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a '
                      'pinned route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
 
-    def script_file(self, word, depth, require_shell=False):
+    def script_file(self, word, depth, require_shell=False, invocation=None, command=None):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
         ctx = self.ctx
         if word is None or word.dynamic or not word.text:
@@ -4841,9 +4845,100 @@ class Analyzer:
                 self._script_on_disk(path, depth, require_shell)
             self.script(ctx.written[key], depth + 1, tail_visible=True)
             return
-        self._script_on_disk(path, depth, require_shell)
+        self._script_on_disk(path, depth, require_shell, invocation, command)
 
-    def _script_on_disk(self, path, depth, require_shell):
+    def _why_set_text(self, path, data, invocation, command):
+        """Model only the pinned, direct, literal .git-scoped set operation.
+
+        The ordinary shell analyser cannot bind positional parameters or the
+        note_of function result. Keep analysing the script, but remove its
+        unreachable clear arm and bind that result to the validated literal
+        note path. Every unsupported case keeps ordinary conservative analysis.
+        """
+        ctx = self.ctx
+        if ctx.ps or not invocation or command is None or ctx.cwd_unknown or not ctx.cwd_known \
+                or path != posixpath.join(ctx.cwd, 'bin/why') \
+                or hashlib.sha256(data).hexdigest() != WHY_SET_SCRIPT_SHA256:
+            return None
+        if any(k in ctx.vars or k in ctx.var_hints for k in ('PATH', 'BASH_ENV', 'ENV')) \
+                or any(os.environ.get(k) for k in ('BASH_ENV', 'ENV')):
+            return None
+        if any(w.dynamic or w.vars or w.subs or w.glob or len(w.alts) != 1 for w in invocation):
+            return None
+        assigns, _ = self._skip_assigns([self.resolve(w) for w in strip_reserved(command.words)])
+        if len(assigns) != 1 or assigns[0].text != 'WHY_GIT_DIRS=.git' \
+                or assigns[0].dynamic or assigns[0].vars or assigns[0].subs:
+            return None
+        texts = [w.text for w in invocation[1:]]
+        if any(t in ('--clear', '--show', '-h', '--help', '--shared') for t in texts):
+            return None
+        lane, subject, i = None, False, 0
+        while i < len(texts):
+            t = texts[i]
+            if t in ('-l', '--lane', '-m', '-p', '--path'):
+                if i + 1 == len(texts):
+                    return None
+                value = texts[i + 1]
+                if t in ('-l', '--lane'):
+                    if not re.fullmatch(r'[A-Za-z0-9._-]{1,120}', value) or value in ('.', '..'):
+                        return None
+                    lane = value
+                elif t == '-m' and not re.fullmatch(r'[0-9]+', value):
+                    return None
+                i += 2
+            elif t.startswith('-'):
+                return None  # includes every --clear/--show/help occurrence
+            else:
+                subject = subject or bool(t)
+                i += 1
+        if not lane or not subject:
+            return None
+        gitdir = posixpath.join(ctx.cwd, '.git')
+        note = posixpath.join(gitdir, 'autocommit.why.d', lane)
+        # No symlinks (including nonexistent target's existing ancestors),
+        # untrusted owners, writable parents, or same-command path replacement.
+        for target in (path, gitdir, note, note + '.tmp'):
+            p = target
+            while True:
+                key = p.casefold()
+                if key in ctx.written or key in ctx.created or key in ctx.links or p in ctx.links:
+                    return None
+                try:
+                    s = os.lstat(p)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return None
+                else:
+                    if stat.S_ISLNK(s.st_mode) or s.st_uid not in (0, os.getuid()) \
+                            or s.st_mode & 0o022 and not (stat.S_ISDIR(s.st_mode) and s.st_mode & stat.S_ISVTX):
+                        return None
+                parent = posixpath.dirname(p)
+                if parent == p:
+                    break
+                p = parent
+        try:
+            if os.stat(gitdir).st_uid != os.getuid() or not os.path.isdir(gitdir):
+                return None
+            if os.path.lexists(note + '.tmp'):
+                return None  # never truncate an existing temporary file
+            if os.path.lexists(note):
+                s = os.lstat(note)
+                if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or s.st_nlink != 1:
+                    return None
+            if _git_out(ctx.cwd, ['rev-parse', '--absolute-git-dir'], 1.0).strip() != gitdir:
+                return None
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            return None
+        text = data.decode('utf-8')
+        start = text.find('  clear)\n')
+        end = text.find('\nesac', start)
+        if start < 0 or end < 0 or text.count('f=$(note_of "$d")') != 1:
+            return None
+        text = text[:start] + '  clear) :;;' + text[end:]
+        return text.replace('f=$(note_of "$d")', 'f=' + _quote_for_rebuild(note)), note
+
+    def _script_on_disk(self, path, depth, require_shell, invocation=None, command=None):
         ctx = self.ctx
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
@@ -4855,7 +4950,8 @@ class Analyzer:
                 data = handle.read(262145)
         except (OSError, ValueError):
             return
-        text = data.decode('utf-8', 'replace')
+        modeled = self._why_set_text(path, data, invocation, command)
+        text = modeled[0] if modeled else data.decode('utf-8', 'replace')
         if require_shell:
             first = text.split('\n', 1)[0]
             if not (first.startswith('#!') and re.search(r'\b(?:ba|z|k|da|)sh\b', first)) \
@@ -4872,9 +4968,15 @@ class Analyzer:
                 if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
         self.disk_depth += 1
         try:
+            if modeled:
+                # Only this pinned script's exact dedicated atomic publication.
+                # Destination checks and all surrounding command checks remain.
+                ctx.why_note_publish = (modeled[1] + '.tmp', modeled[1])
             self.script(text, depth + 1, tail_visible=True)
         finally:
             self.disk_depth -= 1
+            if modeled:
+                del ctx.why_note_publish
             for k, v in keep.items():
                 setattr(ctx, k, v)
             ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE
@@ -7336,6 +7438,10 @@ class Analyzer:
             elif len(nd) >= 2:
                 dest, sources = nd[-1], nd[:-1]
             for w in sources:
+                if name == 'mv' and len(args) == 2 and len(sources) == 1 and dest is not None \
+                        and not w.dynamic and not dest.dynamic \
+                        and (norm_path(w.text, ctx), norm_path(dest.text, ctx)) == getattr(ctx, 'why_note_publish', None):
+                    continue  # freshly created, validated why note temp; not a general .git deletion allowance
                 self.refuse(name + ' (moves it away)', w)
             if dest is not None and not self.state_dest(dest):
                 self.overwrite_dest(name, dest)

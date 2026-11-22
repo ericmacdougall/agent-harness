@@ -2917,6 +2917,28 @@ class DeliveryHelpers(unittest.TestCase):
         self.assertFalse(scratch_link.is_symlink())
         self.assertEqual(scratch_link.read_text(), 'target.txt')
 
+    def test_sites_metadata_is_admitted_by_both_integration_entrypoints(self):
+        self.add_feature_test()
+        env = isolated_env()
+        python_bin = self.root / 'supported-python'
+        python_bin.mkdir()
+        (python_bin / 'python3').symlink_to(sys.executable)
+        env['PATH'] = str(python_bin) + os.pathsep + env['PATH']
+        env.update(GIT_CONFIG_COUNT='1',
+                   GIT_CONFIG_KEY_0='credential.https://chatgpt.com/backend-api/codex/sites/git/.helper',
+                   GIT_CONFIG_VALUE_0='!false')
+        spec = importlib.util.spec_from_file_location('sites_scope_integration', INTEGRATE)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(sys, 'path', [str(INTEGRATE.parent), *sys.path]):
+            spec.loader.exec_module(module)
+        with patch.dict(os.environ, env, clear=True):
+            with module.OriginalScope(self.repo, 'main', 20) as scope:
+                self.assertIsNotNone(scope.identity)
+        result = subprocess.run(self.integrate_args(), text=True, capture_output=True,
+                                env=env, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual((result.returncode, json.loads(result.stdout)['status']),
+                         (0, 'INTEGRATED'), result.stdout + result.stderr)
+
     def test_git_routing_environment_is_rejected_before_git(self):
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
@@ -2926,7 +2948,7 @@ class DeliveryHelpers(unittest.TestCase):
                            f'Path({str(marker)!r}).touch()\n')
         wrapper.chmod(0o700)
         for name, value in (('GIT_INDEX_FILE', ''), ('GIT_DIR', ''),
-                            ('GIT_CONFIG_COUNT', '0'), ('GIT_CONFIG_VALUE_0', '')):
+                            ('GIT_CONFIG_COUNT', '01'), ('GIT_CONFIG_VALUE_0', '')):
             with self.subTest(name=name):
                 env = isolated_env()
                 env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
