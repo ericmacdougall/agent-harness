@@ -775,7 +775,7 @@ def _native_review_source(path, agent, role):
 
 def _native_agent_source(path, agent, expected, *, purpose):
     """Bind a native child and its main WAL by the account's stored metadata."""
-    click = purpose == "click-test"
+    rollout_proof = purpose in ("click-test", "pr-review")
     raw = Path(os.path.expanduser(str(path))).absolute()
     try:
         resolved = raw.resolve()
@@ -807,12 +807,12 @@ def _native_agent_source(path, agent, expected, *, purpose):
         directories = (home, home / ".agent-harness", root, raw.parent)
         before = tuple(_native_path(item, uid, directory=True) for item in directories)
         wal_binding = _native_path(raw, uid, maximum=64_000_000)
-        if click and (parent != parent.lower() or agent != agent.lower()):
+        if rollout_proof and (parent != parent.lower() or agent != agent.lower()):
             raise ValueError("noncanonical child identity")
-        rows = _native_review_rows(home, uid, agent, parent, rollout=True) if click else _native_review_rows(home, uid, agent, parent)
+        rows = _native_review_rows(home, uid, agent, parent, rollout=True) if rollout_proof else _native_review_rows(home, uid, agent, parent)
         parent_row, child = rows[parent], rows[agent]
         if (parent_row[1:4] != ("vscode", "user", "Codex Desktop") or any(parent_row[i] is not None for i in (4, 5, 6))
-                or (click and parent_row[7] != 0)
+                or (rollout_proof and parent_row[7] != 0)
                 or child[2:4] != ("subagent", "Codex Desktop") or child[5] != expected or expected is None
                 or child[6] not in (None, parent)):
             raise ValueError("native reviewer family or role unavailable")
@@ -838,11 +838,11 @@ def _native_agent_source(path, agent, expected, *, purpose):
                 or _native_path(raw, uid, maximum=64_000_000) != wal_binding):
             raise ValueError("native review WAL binding changed")
         return {"home": home, "uid": uid, "parent": parent, "agent_path": child[4],
-                "main": raw, "main_binding": wal_binding, "rollout": child[8] if click else None,
+                "main": raw, "main_binding": wal_binding, "rollout": child[8] if rollout_proof else None,
                 "archived": bool(child[7]), "child_source": source,
-                "child_provider": child[9] if click else None, "parent_provider": parent_row[9] if click else None}
+                "child_provider": child[9] if rollout_proof else None, "parent_provider": parent_row[9] if rollout_proof else None}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
-        label = "click-tester" if click else "reviewer"
+        label = "click-tester" if purpose == "click-test" else "reviewer"
         raise SpecError(f"native {label} metadata unavailable or conflicting", EXIT_USAGE) from None
 
 
@@ -922,84 +922,97 @@ def _check_native_inherited_header(entry, identity, first_at, observed_start):
 
 
 def _native_click_proof(identity, agent, line, started, ended):
-    """Require the same statement in the child's native final answer and own WAL."""
     try:
-        raw_rollout = identity["rollout"]
-        if not isinstance(raw_rollout, str):
-            raise ValueError("native rollout unavailable")
-        rollout = Path(raw_rollout)
-        codex = identity["home"] / ".codex"
-        relative = rollout.relative_to(codex)
-        if (not re.fullmatch(rf"rollout-[0-9T-]+-{re.escape(agent)}\.jsonl", rollout.name)
-                or not re.fullmatch(r"sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}|archived_sessions", str(relative.parent))
-                or (relative.parts[0] == "archived_sessions") != identity["archived"]
-                or ".." in relative.parts):
-            raise ValueError("native rollout path unavailable")
-        start, end = _native_stamp(started), _native_stamp(ended)
-        if start > end:
-            raise ValueError("native observed time order invalid")
-        parent = identity["parent"]
-        agent_wal = identity["main"].with_name(f"agent-{agent}.jsonl")
-        main_data = _native_read(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
-        main_rows = [_native_json(raw, 4_000_000) for raw in main_data.splitlines()]
-        child_rows = [_native_json(raw, 4_000_000) for raw in _native_read(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
-        starts = [e for e in main_rows if e.get("event") == "SubagentStart" and e.get("agent_id") == agent]
-        child_starts = [e for e in child_rows if e.get("event") == "SubagentStart"]
-        notes = [e for e in child_rows if isinstance(e.get("note"), str) and e["note"].startswith(NATIVE_CLICK_PREFIX)]
-        if (len(starts) != 1 or starts != child_starts or starts[0].get("agent_type") != NATIVE_CLICK_ROLE
-                or len(notes) != 1 or notes[0].get("event") != "check" or notes[0].get("note") != line
-                or not _native_stamp(starts[0].get("at")) <= start <= end <= _native_stamp(notes[0].get("at"))):
-            raise ValueError("native WAL witness missing or mismatched")
-        entries = iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
-        first = _native_json(next(entries), 4_000_000)
-        meta = first.get("payload")
-        first_at = _native_stamp(first.get("timestamp"))
-        if (first.get("type") != "session_meta" or not isinstance(meta, dict) or meta.get("id") != agent
-                or meta.get("session_id") != parent or meta.get("parent_thread_id") != parent
-                or meta.get("originator") != "Codex Desktop" or meta.get("thread_source") != "subagent"
-                or meta.get("agent_role") != NATIVE_CLICK_ROLE or meta.get("agent_path") != identity["agent_path"]
-                or first_at > start):
-            raise ValueError("native rollout metadata mismatched")
-        cutoff = meta.get("subagent_history_start_ordinal")
-        if cutoff is not None:
-            if (type(cutoff) is not int or cutoff < 2 or not identity["child_provider"]
-                    or meta.get("model_provider") != identity["child_provider"]
-                    or meta.get("source") != identity["child_source"]):
-                raise ValueError("native fork history boundary unavailable")
-        matches = []
-        for ordinal, raw in enumerate(entries, start=1):
-            entry = _native_json(raw, 4_000_000)
-            if cutoff is not None and ordinal == 1:
-                _check_native_inherited_header(entry, identity, first_at, start)
-                continue
-            if entry.get("type") == "session_meta":
-                raise ValueError("unexpected native rollout header")
-            if cutoff is not None and ordinal < cutoff:
-                continue
-            payload = entry.get("payload")
-            settings = (entry.get("type") == "event_msg" and isinstance(payload, dict)
-                        and payload.get("type") == "thread_settings_applied")
-            if ordinal == cutoff and (not settings or _native_stamp(entry.get("timestamp")) > start):
-                raise ValueError("native fork history boundary unavailable")
-            if settings and payload.get("thread_id") != agent:
-                raise ValueError("native rollout settings name another thread")
-            if (entry.get("type") != "response_item" or not isinstance(payload, dict)
-                    or payload.get("type") != "message" or payload.get("role") != "assistant"
-                    or payload.get("phase") != "final_answer" or payload.get("status") != "completed"):
-                continue
-            content = payload.get("content")
-            if not isinstance(content, list):
-                raise ValueError("native rollout message unavailable")
-            for item in content:
-                if not isinstance(item, dict) or item.get("type") != "output_text" or not isinstance(item.get("text"), str):
-                    raise ValueError("native rollout message unavailable")
-                for text in item["text"].splitlines():
-                    if text.startswith(NATIVE_CLICK_PREFIX):
-                        matches.append((text, _native_stamp(entry.get("timestamp"))))
-        if len(matches) != 1 or matches[0][0] != line or matches[0][1] < _native_stamp(notes[0].get("at")):
-            raise ValueError("native assistant witness missing, mismatched or replayed")
+        return _native_authored_witness(identity, agent, NATIVE_CLICK_ROLE, NATIVE_CLICK_PREFIX, line, started, ended)
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, StopIteration):
         raise SpecError("native click-test witness unavailable, conflicting or not authored by this tester", EXIT_USAGE) from None
+
+
+def _native_authored_witness(identity, agent, role, marker, line, started, ended, *, require_fork_boundary=False,
+                             observe=None):
+    """Require the same statement in the child's native final answer and own WAL."""
+    if not line.startswith(marker):
+        raise ValueError("unexpected native witness type")
+
+    raw_rollout = identity["rollout"]
+    if not isinstance(raw_rollout, str):
+        raise ValueError("native rollout unavailable")
+    rollout = Path(raw_rollout)
+    codex = identity["home"] / ".codex"
+    relative = rollout.relative_to(codex)
+    if (not re.fullmatch(rf"rollout-[0-9T-]+-{re.escape(agent)}\.jsonl", rollout.name)
+            or not re.fullmatch(r"sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}|archived_sessions", str(relative.parent))
+            or (relative.parts[0] == "archived_sessions") != identity["archived"]
+            or ".." in relative.parts):
+        raise ValueError("native rollout path unavailable")
+    start, end = _native_stamp(started), _native_stamp(ended)
+    if start > end:
+        raise ValueError("native observed time order invalid")
+    parent = identity["parent"]
+    agent_wal = identity["main"].with_name(f"agent-{agent}.jsonl")
+    main_data = _native_read(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
+    main_rows = [_native_json(raw, 4_000_000) for raw in main_data.splitlines()]
+    child_rows = [_native_json(raw, 4_000_000) for raw in _native_read(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
+    starts = [e for e in main_rows if e.get("event") == "SubagentStart" and e.get("agent_id") == agent]
+    child_starts = [e for e in child_rows if e.get("event") == "SubagentStart"]
+    notes = [e for e in child_rows if isinstance(e.get("note"), str) and e["note"].startswith(marker)]
+    if (len(starts) != 1 or starts != child_starts or starts[0].get("agent_type") != role
+            or len(notes) != 1 or notes[0].get("event") != "check" or notes[0].get("note") != line
+            or not _native_stamp(starts[0].get("at")) <= start <= end <= _native_stamp(notes[0].get("at"))):
+        raise ValueError("native WAL witness missing or mismatched")
+    entries = iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
+    first = _native_json(next(entries), 4_000_000)
+    meta = first.get("payload")
+    first_at = _native_stamp(first.get("timestamp"))
+    if (first.get("type") != "session_meta" or not isinstance(meta, dict) or meta.get("id") != agent
+            or meta.get("session_id") != parent or meta.get("parent_thread_id") != parent
+            or meta.get("originator") != "Codex Desktop" or meta.get("thread_source") != "subagent"
+            or meta.get("agent_role") != role or meta.get("agent_path") != identity["agent_path"]
+            or first_at > start):
+        raise ValueError("native rollout metadata mismatched")
+    cutoff = meta.get("subagent_history_start_ordinal")
+    if require_fork_boundary and cutoff is None:
+        raise ValueError("native fork history boundary absent")
+    if cutoff is not None:
+        if (type(cutoff) is not int or cutoff < 2 or not identity["child_provider"]
+                or meta.get("model_provider") != identity["child_provider"]
+                or meta.get("source") != identity["child_source"]):
+            raise ValueError("native fork history boundary unavailable")
+    matches = []
+    for ordinal, raw in enumerate(entries, start=1):
+        entry = _native_json(raw, 4_000_000)
+        if cutoff is not None and ordinal == 1:
+            _check_native_inherited_header(entry, identity, first_at, start)
+            continue
+        if entry.get("type") == "session_meta":
+            raise ValueError("unexpected native rollout header")
+        if cutoff is not None and ordinal < cutoff:
+            continue
+        payload = entry.get("payload")
+        settings = (entry.get("type") == "event_msg" and isinstance(payload, dict)
+                    and payload.get("type") == "thread_settings_applied")
+        if ordinal == cutoff and (not settings or _native_stamp(entry.get("timestamp")) > start):
+            raise ValueError("native fork history boundary unavailable")
+        if settings and payload.get("thread_id") != agent:
+            raise ValueError("native rollout settings name another thread")
+        if observe is not None:
+            observe(entry)
+        if (entry.get("type") != "response_item" or not isinstance(payload, dict)
+                or payload.get("type") != "message" or payload.get("role") != "assistant"
+                or payload.get("phase") != "final_answer" or payload.get("status") != "completed"):
+            continue
+        content = payload.get("content")
+        if not isinstance(content, list):
+            raise ValueError("native rollout message unavailable")
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "output_text" or not isinstance(item.get("text"), str):
+                raise ValueError("native rollout message unavailable")
+            for text in item["text"].splitlines():
+                if text.startswith(marker):
+                    matches.append((text, _native_stamp(entry.get("timestamp"))))
+    if len(matches) != 1 or matches[0][0] != line or matches[0][1] < _native_stamp(notes[0].get("at")):
+        raise ValueError("native assistant witness missing, mismatched or replayed")
+    return matches[0][1]
 
 
 def _native_click_origin(repo):
