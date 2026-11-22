@@ -335,6 +335,77 @@ class WorktreeRemoveCase(unittest.TestCase):
         self.assertEqual(len(git_removals), 1, 'retry must not reach Git with spent approvals')
         self.assertTrue(all(path.exists() for path in paths))
 
+    def test_late_membership_sibling_during_final_idle_preserves_files_and_grants(self):
+        self.late_membership('idle', 'sibling')
+
+    def test_late_membership_root_during_final_idle_preserves_files_and_grants(self):
+        self.late_membership('idle', 'root')
+
+    def test_late_membership_sibling_during_lock_wait_preserves_files_and_grants(self):
+        self.late_membership('lock', 'sibling')
+
+    def test_late_membership_root_during_lock_wait_preserves_files_and_grants(self):
+        self.late_membership('lock', 'root')
+
+    def late_membership(self, boundary, location):
+        import fcntl
+        folder, paths, policy = self.backed_ignored_fixture()
+        addition = (folder if location == 'sibling' else self.linked) / 'unapproved.tsbuildinfo'
+        original, _ = cg.load_marker(self.home)
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        results, errors, idle_calls = [], [], []
+        waiting = threading.Event()
+        real_flock = fcntl.flock
+        held = os.open(cg.state_dir(self.home) / cg.LOCK_NAME, os.O_WRONLY | os.O_CREAT, 0o600)
+        if boundary == 'lock':
+            real_flock(held, fcntl.LOCK_EX)
+
+        def observed_idle(backups):
+            idle_calls.append(True)
+            if boundary == 'idle' and len(idle_calls) == 2:
+                addition.write_text('new content with no recovery grant\n')
+            return True
+
+        def observed_flock(fd, operation):
+            if boundary == 'lock' and operation == fcntl.LOCK_EX and fd != held:
+                waiting.set()
+            return real_flock(fd, operation)
+
+        def remove():
+            try:
+                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy))
+            except BaseException as error:
+                errors.append(error)
+
+        try:
+            with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                    mock.patch.object(cg, 'busy_scan', return_value=idle), \
+                    mock.patch.object(cg._IgnoredBackups, 'idle', observed_idle), \
+                    mock.patch.object(fcntl, 'flock', observed_flock), \
+                    mock.patch.object(cg, '_worktree_audit') as audit:
+                if boundary == 'lock':
+                    worker = threading.Thread(target=remove, daemon=True)
+                    worker.start()
+                    try:
+                        self.assertTrue(waiting.wait(timeout=15), 'consumer never reached real approval lock')
+                        addition.write_text('new content created while approval lock is held\n')
+                    finally:
+                        real_flock(held, fcntl.LOCK_UN)
+                    worker.join(timeout=25)
+                    self.assertFalse(worker.is_alive())
+                else:
+                    remove()
+                self.assertFalse(audit.called, 'unapproved membership must refuse before Git removal intent')
+        finally:
+            real_flock(held, fcntl.LOCK_UN)
+            os.close(held)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0]['removed'], results)
+        self.assertTrue(addition.exists(), 'new unapproved content must be retained')
+        self.assertTrue(all(path.exists() for path in paths))
+        self.assertEqual(cg.load_marker(self.home)[0], original, 'failure must spend no leaf grant')
+
     def test_unpushed_commit_and_remote_without_exact_head_block(self):
         (self.linked / 'local.txt').write_text('local\n')
         git(self.linked, 'add', 'local.txt')

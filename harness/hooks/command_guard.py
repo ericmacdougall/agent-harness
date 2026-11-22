@@ -1815,8 +1815,38 @@ class _IgnoredBackups:
         self.policy = policy
         self.approvals = None
         self.snapshot = {}
+        self.memberships = {}
         self.leaves = {}
         self.head = None
+
+    def remember_directory(self, path, deadline):
+        if time.monotonic() > deadline or os.path.realpath(path) != path:
+            return None
+        info = os.lstat(path)
+        identity = _backed_stat(info)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_dev != os.lstat(self.path).st_dev
+                or (path in self.snapshot and self.snapshot[path] != identity)):
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if _backed_stat(os.fstat(fd)) != identity:
+                return None
+            names = []
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    names.append(entry.name)
+                    if (time.monotonic() > deadline or sum(map(len, self.memberships.values()))
+                            - len(self.memberships.get(path, ())) + len(names) > MAX_BACKED_IGNORED_ENTRIES):
+                        return None
+            if _backed_stat(os.fstat(fd)) != identity or _backed_stat(os.lstat(path)) != identity:
+                return None
+        finally:
+            os.close(fd)
+        names = tuple(sorted(names))
+        if path in self.memberships and self.memberships[path] != names:
+            return None
+        self.snapshot[path], self.memberships[path] = identity, names
+        return names
 
     def cover(self, relative, seconds):
         name = relative.rstrip('/')
@@ -1833,6 +1863,13 @@ class _IgnoredBackups:
             return False
         device = os.lstat(self.path).st_dev
         deadline = time.monotonic() + seconds
+        ancestor = os.path.dirname(path)
+        while True:
+            if self.remember_directory(ancestor, deadline) is None:
+                return False
+            if ancestor == self.path:
+                break
+            ancestor = os.path.dirname(ancestor)
         pending = [path]
         count = 0
         while pending:
@@ -1844,27 +1881,18 @@ class _IgnoredBackups:
             if (info.st_dev != device or os.path.realpath(candidate) != candidate
                     or os.path.basename(candidate).casefold() == '.git'):
                 return False
-            self.snapshot[candidate] = identity
             if stat.S_ISDIR(info.st_mode):
-                fd = os.open(candidate, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                try:
-                    if _backed_stat(os.fstat(fd)) != identity:
-                        return False
-                    names = []
-                    with os.scandir(fd) as entries:
-                        for entry in entries:
-                            names.append(entry.name)
-                            if len(self.snapshot) + len(pending) + len(names) > MAX_BACKED_IGNORED_ENTRIES:
-                                return False
-                    if 'HEAD' in names and 'objects' in names:
-                        return False  # bare repository
-                    pending.extend(os.path.join(candidate, name) for name in names)
-                finally:
-                    os.close(fd)
+                names = self.remember_directory(candidate, deadline)
+                if names is None or len(self.snapshot) + len(pending) + len(names) > MAX_BACKED_IGNORED_ENTRIES:
+                    return False
+                if 'HEAD' in names and 'objects' in names:
+                    return False  # bare repository
+                pending.extend(os.path.join(candidate, name) for name in names)
             else:
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                         or not self.approvals.covers(candidate, backup_only=True)):
                     return False
+                self.snapshot[candidate] = identity
                 self.leaves[candidate] = identity
                 count += 1
         return count > 0
@@ -1899,7 +1927,36 @@ class _IgnoredBackups:
         return True
 
     def consume(self):
-        return self.approvals.consume(backup_leaves=self.leaves, backup_root=self.path)
+        return self.approvals.consume(backup_leaves=self.leaves, backup_root=self.path, backup_scope=self)
+
+    def locked_scope_matches(self):
+        """Rebuild the full removal scope after activity checks and the approval-lock wait."""
+        deadline = time.monotonic() + BACKED_CHECK_SECONDS
+        cfg = dict(DEFAULT_POLICY['reproducible_clone'], **delegated_policy(self.policy)['reproducible_clone'])
+
+        def step(seconds):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError('locked removal scope check timed out')
+            return min(remaining, seconds * cfg['scale'])
+
+        try:
+            fresh = _IgnoredBackups(self.path, self.policy)
+            if (_git_out(self.path, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip() != self.head
+                    or any(entry and entry[0] != 'H' for entry in
+                           _git_out(self.path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'))
+                    or _linked_status_refusal(self.path, cfg, step, fresh)
+                    or fresh.snapshot != self.snapshot or fresh.memberships != self.memberships
+                    or fresh.leaves != self.leaves or fresh.approvals is None
+                    or fresh.approvals.backup_records != self.approvals.backup_records):
+                return False
+            # The final Git/status calls must not leave an unchecked membership change.
+            for path, names in tuple(fresh.memberships.items()):
+                if fresh.remember_directory(path, deadline) != names:
+                    return False
+            return fresh.snapshot == self.snapshot
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
 
 
 def _linked_status_refusal(path, cfg, step, backups):
@@ -2494,6 +2551,7 @@ def _worktree_audit(record):
 def _consume_worktree_backups(path, previous, policy, directory):
     """Check the same scope as late as possible; no partial consumption."""
     fresh = _IgnoredBackups(path, policy or DEFAULT_POLICY)
+    fresh.head = previous.head
     cfg = delegated_policy(policy)['reproducible_clone']
     cfg = dict(DEFAULT_POLICY['reproducible_clone'], **cfg)
     deadline = time.monotonic() + BACKED_CHECK_SECONDS
@@ -8101,7 +8159,7 @@ class Approvals:
             return True
         return False
 
-    def consume(self, *, backup_leaves=None, backup_root=None):
+    def consume(self, *, backup_leaves=None, backup_root=None, backup_scope=None):
         """Remove every used entry under an exclusive lock. True when all of them were still present."""
         if not self.used:
             return True
@@ -8125,6 +8183,9 @@ class Approvals:
                         or not _private_backup_state(self.home)
                         or not self._recheck_backups(entries, key, backup_leaves)
                         or not backup_root or not _worktree_mount_clear(backup_root)
+                        or not isinstance(backup_scope, _IgnoredBackups) or backup_scope.path != backup_root
+                        or backup_scope.leaves != backup_leaves or backup_scope.approvals is not self
+                        or not backup_scope.locked_scope_matches()
                         or load_marker(self.home) != (entries, key)):
                     return False
             wanted = set(self.used.values())
