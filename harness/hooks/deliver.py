@@ -9,6 +9,8 @@ command merges a remote PR or executes text from the run kit.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -70,13 +72,14 @@ def report(status, message, **facts):
     print(json.dumps({"status": status, "message": message, **facts}, sort_keys=True))
 
 
-def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
+def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, pass_fds=()):
     """Bound a child process group and output without echoing its private output."""
-    code, output, _ = bounded_with_stderr(command, cwd=cwd, env=env, timeout=timeout, limit=limit)
+    code, output, _ = bounded_with_stderr(command, cwd=cwd, env=env, timeout=timeout, limit=limit,
+                                        pass_fds=pass_fds)
     return code, output
 
 
-def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, stderr_limit=0):
+def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, stderr_limit=0, pass_fds=()):
     """Like bounded, optionally keeping the first stderr_limit bytes.
 
     stderr is drained through a pipe and the excess discarded, so a child that
@@ -85,7 +88,7 @@ def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OU
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE if stderr_limit else subprocess.DEVNULL,
-                               start_new_session=True)
+                               start_new_session=True, pass_fds=pass_fds)
     data, errors, deadline = bytearray(), bytearray(), time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as poller:
@@ -1184,6 +1187,58 @@ def scan_gate(args, source, head):
                             reason="SCAN_UNAVAILABLE", scan=lines[-1])
 
 
+@contextmanager
+def publication_attempt(flow, resume, url):
+    """Contain known publishers; legacy absence never proves an old write failed."""
+    flow.assert_state()
+    path = flow.directory / "publication.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        def verify_lease():
+            info = os.fstat(fd)
+            named = path.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
+                    or info.st_mode & 0o077 or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+                raise DeliveryError("RECOVERY_REQUIRED", "Publication lease identity is unsafe")
+        verify_lease()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DeliveryError("BUSY", "A known publisher still holds this generation's lease") from None
+        verify_lease()
+        flow.assert_state()
+        if resume:
+            verify_source(flow)
+            if snapshot(flow.original, flow.branch) != flow.state["baseline"]:
+                raise DeliveryError("BLOCKED_LOCAL", "Original checkout changed before publication resume")
+            matching_origins(Path(flow.state["source"]), flow.original, flow.state["repository"])
+            # Query before any retry. A legacy publisher may still be alive;
+            # explicit authority covers only its identical nonforce write.
+            observed = published_ref(flow.original, url, flow.state, flow.args.timeout)
+            if observed is not None:
+                verify_lease()
+                flow.save(phase="PR_LOOKUP")
+                yield False, fd
+                return
+            verify_source(flow)
+            if snapshot(flow.original, flow.branch) != flow.state["baseline"]:
+                raise DeliveryError("BLOCKED_LOCAL", "Original checkout changed during publication resume preflight")
+            matching_origins(Path(flow.state["source"]), flow.original, flow.state["repository"])
+            verify_lease()
+            record = {"schema": 1, "kind": "publication_resume", "attempt": secrets.token_hex(16),
+                      "reason": flow.args.resume_reason, "prior_outcome": "UNKNOWN",
+                      "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "generation": flow.generation, "scope": dict(flow.state)}
+            _write_private_json(flow.directory / ("publication-resume-" + record["attempt"] + ".json"), record)
+            fsync_directory(flow.directory)
+        # The descriptor is inherited by the native publisher below. It remains
+        # locked if the coordinator dies, until that publisher itself exits.
+        yield True, fd
+        verify_lease()
+    finally:
+        os.close(fd)
+
+
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
@@ -1220,6 +1275,9 @@ def prepare(args):
             origin_error = error
     with Workflow(args) as flow:
         state = flow.load()
+        resuming_publication = getattr(args, "resume_publication", False)
+        if resuming_publication and (state is None or state["phase"] != "PUBLISHING"):
+            raise DeliveryError("BLOCKED_POLICY", "Publication resume requires this generation in PUBLISHING", code=2)
         if state is not None and not getattr(args, "new_generation", False):
             if (state["source"] != str(source) or state["source_branch"] != branch
                     or state["source_head"] != head or state["baseline"] != baseline
@@ -1254,48 +1312,56 @@ def prepare(args):
             return record_pr(flow, found)
         if state["phase"] not in {"INITIAL", "PUBLISHING", "PR_LOOKUP", "PR_CREATING", "REMOTE_UNCERTAIN"}:
             raise DeliveryError("RECOVERY_REQUIRED", "Generation has pending checkout recovery", **flow.facts())
-        if state["phase"] == "INITIAL":
-            require_remote_base(flow, url)
-            flow.save(phase="PUBLISHING")
-            try:
-                code, output = bounded([sys.executable, str(Path(__file__).with_name("publish_feature.py")),
-                                        "--repo", str(source), "--branch", branch,
-                                        "--original-branch", flow.branch, "--expected-head", head,
-                                        "--expected-repository", repository, "--timeout", str(args.timeout)],
-                                       # At most 24 sequential bounded Git waits,
-                                       # including source guards and the one-deadline LFS scan.
-                                       timeout=24 * args.timeout + 30)
-                published = json.loads(output)
-                if not isinstance(published, dict):
-                    raise ValueError
-            except (OSError, DeliveryError, ValueError):
-                pass  # Durable PUBLISHING intent requires exact reconciliation.
-            else:
-                if (code == 0 and published.get("status") == "PUSHED"
-                        and published.get("repository") == repository):
-                    flow.save(phase="PR_LOOKUP")
-                elif published.get("status") == "BLOCKED_POLICY":
-                    flow.save(phase="POLICY_BLOCKED")
-                    raise DeliveryError("BLOCKED_POLICY", "Publisher refused the pinned repository or source policy", code=2)
-                elif code == 4 and published.get("push_rejected") is True:
-                    flow.save(phase="POLICY_BLOCKED")
+        if state["phase"] == "INITIAL" or resuming_publication:
+            with publication_attempt(flow, resuming_publication, url) as (launch, lease_fd):
+                if state["phase"] == "INITIAL":
+                    require_remote_base(flow, url)
+                    flow.save(phase="PUBLISHING")
+                if launch:
                     try:
-                        published_ref(flow.original, url, flow.state, args.timeout)
-                    except DeliveryError as error:
-                        if error.status == "BLOCKED_POLICY":
-                            raise
-                    raise DeliveryError("BLOCKED_POLICY", "Remote refused the push; review a new branch generation",
-                                        code=2, **flow.facts())
-                elif code == 4 and published.get("push_attempted") is False:
-                    flow.save(phase="REMOTE_BLOCKED")
-                    raise DeliveryError("REMOTE_BLOCKED", "Publisher preflight failed before any push attempt",
-                                        code=4, **flow.facts())
-                else:
-                    pass  # A failed push can still have reached the remote.
+                        code, output = bounded([sys.executable, str(Path(__file__).with_name("publish_feature.py")),
+                                                "--repo", str(source), "--branch", branch,
+                                                "--original-branch", flow.branch, "--expected-head", head,
+                                                "--expected-repository", repository, "--timeout", str(args.timeout)],
+                                               # At most 24 sequential bounded Git waits,
+                                               # including source guards and the one-deadline LFS scan.
+                                               timeout=24 * args.timeout + 30, pass_fds=(lease_fd,))
+                        published = json.loads(output)
+                        if not isinstance(published, dict):
+                            raise ValueError
+                    except (OSError, DeliveryError, ValueError):
+                        pass  # Durable PUBLISHING intent requires exact reconciliation.
+                    else:
+                        if resuming_publication:
+                            if published.get("status") == "BLOCKED_POLICY":
+                                raise DeliveryError("BLOCKED_POLICY", "Retry publisher refused the pinned source policy; prior publication remains unknown", code=2)
+                        elif (code == 0 and published.get("status") == "PUSHED"
+                                and published.get("repository") == repository):
+                            flow.save(phase="PR_LOOKUP")
+                        elif published.get("status") == "BLOCKED_POLICY":
+                            flow.save(phase="POLICY_BLOCKED")
+                            raise DeliveryError("BLOCKED_POLICY", "Publisher refused the pinned repository or source policy", code=2)
+                        elif code == 4 and published.get("push_rejected") is True:
+                            flow.save(phase="POLICY_BLOCKED")
+                            try:
+                                published_ref(flow.original, url, flow.state, args.timeout)
+                            except DeliveryError as error:
+                                if error.status == "BLOCKED_POLICY":
+                                    raise
+                            raise DeliveryError("BLOCKED_POLICY", "Remote refused the push; review a new branch generation",
+                                                code=2, **flow.facts())
+                        elif code == 4 and published.get("push_attempted") is False:
+                            flow.save(phase="REMOTE_BLOCKED")
+                            raise DeliveryError("REMOTE_BLOCKED", "Publisher preflight failed before any push attempt",
+                                                code=4, **flow.facts())
+                        else:
+                            pass  # A failed push can still have reached the remote.
         if flow.state["phase"] == "PUBLISHING":
             try:
                 published = published_ref(flow.original, url, flow.state, args.timeout)
             except DeliveryError as error:
+                if resuming_publication and error.status == "BLOCKED_POLICY":
+                    raise
                 raise DeliveryError("REMOTE_UNCERTAIN", "Publisher completion is not yet positively verified",
                                     code=4, **{**flow.facts(), **error.facts}) from None
             if published is None:
@@ -1867,6 +1933,9 @@ def parse_args():
     prep.add_argument("--pr-body-file", type=Path,
                       help="mode-0600 PR body, e.g. ~/.agent-harness/work/<session-id>/<task>/pr-body.md")
     prep.add_argument("--reconcile-only", action="store_true", help="Query a pending remote outcome without publishing or changing checkout")
+    prep.add_argument("--resume-publication", action="store_true",
+                      help="Explicitly reauthorize only the identical pinned nonforce write of a PUBLISHING generation")
+    prep.add_argument("--resume-reason", help="Private explanation for reauthorizing an uncertain publication")
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
     prep.add_argument("--target-policy", choices=("refuse", "warn"), default=None,
                       help="Original-checkout sanity preflight: refuse (default) or warn and continue; "
@@ -1897,6 +1966,16 @@ def parse_args():
         parser.error("--timeout must be between 1 and 3600 seconds")
     if args.phase == "finish" and not 1 <= args.check_timeout <= MAX_CHECK_TIMEOUT:
         parser.error(f"--check-timeout must be between 1 and {MAX_CHECK_TIMEOUT} seconds")
+    if args.phase == "prepare":
+        if args.resume_publication:
+            if (not args.generation or args.kit_file is None or not args.expected_source_head
+                    or not args.expected_original_head or args.reconcile_only or args.local_only or args.new_generation):
+                parser.error("--resume-publication requires the exact --generation, --kit-file and expected HEADs; it cannot change modes or generations")
+            if (not valid_identity_text(args.resume_reason) or not 1 <= len(args.resume_reason.strip()) <= 512
+                    or any(ord(char) < 32 for char in args.resume_reason)):
+                parser.error("--resume-publication requires a nonempty --resume-reason of at most 512 characters without controls")
+        elif args.resume_reason is not None:
+            parser.error("--resume-reason requires --resume-publication")
     if args.phase == "finish":
         if args.resume and (args.mode != "remote" or not args.generation or args.kit_file is None):
             parser.error("--resume requires --mode remote, --generation and --kit-file")
