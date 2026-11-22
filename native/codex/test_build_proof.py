@@ -77,13 +77,29 @@ assert sys.argv[1:] == ["--check", "--strict", "-"]
 assert sys.stdin.read().strip() == {SOURCE["patchSha256"] + "  " + str(source)!r}
 ''')
         self.stand_in(tools / "rustup", f'''
+import os
 from pathlib import Path
 import sys
-assert sys.argv[1:] == ["toolchain", "install", "1.95.0", "--profile", "minimal", "--target", "x86_64-unknown-linux-gnu"]
-Path({str(sentinel)!r}).write_text("entered the build step")
+
+stage = Path({str(sentinel)!r})
+assert os.environ["HOME"] == {str(root / 'fresh-home')!r}
+assert os.environ["CARGO_HOME"] == {str(root / 'fresh-home/.cargo')!r}
+assert os.environ["RUSTUP_HOME"] == {str(root / 'fresh-home/.rustup')!r}
+assert "CI" not in os.environ
+if sys.argv[1:3] == ["toolchain", "install"]:
+    assert sys.argv[3:] == ["1.95.0", "--profile", "minimal", "--target",
+                           "x86_64-unknown-linux-gnu", "--no-self-update"]
+    stage.write_text("exact toolchain install invoked")
+    sys.exit(78 if os.environ["PROOF_DRIVER_FIXTURE"] == "rustup-install-failed" else 0)
+assert sys.argv[1:] == ["run", "1.95.0", "rustc", "--version", "--verbose"]
+assert stage.read_text() == "exact toolchain install invoked"
+stage.write_text("rustc probe invoked after install success")
 sys.exit(79)
 ''')
-        environment = {"PATH": f"{tools}:/usr/bin:/bin", "LC_ALL": "C",
+        home = root / "fresh-home"
+        home.mkdir()
+        environment = {"PATH": f"{tools}:/usr/bin:/bin", "LC_ALL": "C", "HOME": str(home),
+                       "CARGO_HOME": str(home / ".cargo"), "RUSTUP_HOME": str(home / ".rustup"),
                        "PROOF_DRIVER_FIXTURE": case, "PROOF_FIXTURE_PATCH": str(source)}
         result = subprocess.run(["/bin/bash", str(DRIVER), str(run_temp)], cwd=work, env=environment,
                                 capture_output=True, text=True, timeout=5)
@@ -94,10 +110,15 @@ sys.exit(79)
         path.write_text(f"#!{sys.executable}\n{source}")
         path.chmod(0o700)
 
-    def test_valid_source_prefix_reaches_only_the_rustup_sentinel(self):
+    def test_valid_source_installs_without_self_update_then_probes_rustc(self):
         result, sentinel = self.run_driver("valid")
         self.assertEqual(result.returncode, 79, result.stderr)
-        self.assertEqual(sentinel.read_text(), "entered the build step")
+        self.assertEqual(sentinel.read_text(), "rustc probe invoked after install success")
+
+    def test_failed_toolchain_install_refuses_before_rustc_probe(self):
+        result, sentinel = self.run_driver("rustup-install-failed")
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertEqual(sentinel.read_text(), "exact toolchain install invoked")
 
     def test_provenance_command_errors_refuse_even_with_valid_looking_output(self):
         for case, code in (("write-tree-failed", 41), ("rev-parse-failed", 42)):
