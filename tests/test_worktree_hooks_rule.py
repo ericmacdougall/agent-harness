@@ -58,7 +58,8 @@ class Hooks(Repo):
         used = []
         real = cg.linked_worktree_remove_refusal
         with mock.patch.object(cg, "linked_worktree_remove_refusal",
-                               lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real(path, cwd, policy, remote_ls)):
+                               lambda path, cwd, policy=None, remote_ls=None, **kwargs:
+                               used.append(policy) or real(path, cwd, policy, remote_ls, **kwargs)):
             self.run_cli("verify-worktree", "--path", str(self.linked))
         cfg = used[0]["reproducible_clone"]
         self.assertIs(cfg["allow_hooks"], True)
@@ -73,7 +74,8 @@ class Hooks(Repo):
             used = []
             real = cg.linked_worktree_remove_refusal
             with mock.patch.object(cg, "linked_worktree_remove_refusal",
-                                   lambda path, cwd, policy=None, remote_ls=None: used.append(policy) or real(path, cwd, policy, remote_ls)):
+                                   lambda path, cwd, policy=None, remote_ls=None, **kwargs:
+                                   used.append(policy) or real(path, cwd, policy, remote_ls, **kwargs)):
                 cg.verify_worktree(str(self.linked), policy=base)
             self.assertIs(used[0]["reproducible_clone"]["allow_hooks"], True)
             self.assertEqual(used[0]["reproducible_clone"]["scale"], 15.0)

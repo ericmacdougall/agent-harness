@@ -339,6 +339,90 @@ class CopyLifecycle(CopyFixture):
         self.assertEqual(result["status"], "retained")
         self.assertTrue(cleanup.copy_hygiene.acquire(repo, "pr-1", cfg=self.cfg(min_free_gb=0))["ok"])
 
+    def managed_backed_fixture(self):
+        task, repo, path, head = self.completed_fixture()
+        cg = cleanup.command_guard
+        live_output = subprocess.check_output(["/usr/bin/git", "ls-remote", str(self.origin)], text=True)
+        live = {ref: sha for sha, ref in (line.split() for line in live_output.splitlines())}
+        cleanup.safe_git(repo, "remote", "set-url", "origin", "https://github.com/fixture/project.git")
+        (Path(repo) / ".git/info/exclude").write_text(".cache/\n")
+        folder = Path(path) / ".cache"
+        folder.mkdir()
+        leaves = [folder / name for name in ("first.tsbuildinfo", "second.tsbuildinfo")]
+        policy = cg.load_policy()
+        policy = dict(policy, marker=dict(policy['marker'], recent_change_seconds=0))
+
+        class SyntheticMirror:
+            def remote_types(self):
+                return {'dropbox': 'dropbox'}
+
+            def verify(self, local_root, manifest, remote):
+                return cg.VerifyResult(True, checked=len(manifest))
+
+        for leaf in leaves:
+            leaf.write_text("synthetic backed managed output\n")
+            cg.approve_delete(str(leaf), 'dropbox:fixture/managed', verifier=SyntheticMirror(),
+                              home=str(self.home.resolve()), policy=policy)
+        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home.resolve())}))
+        self.enterContext(patch.object(cg, "_pinned_home", return_value=str(self.home.resolve())))
+        self.enterContext(patch.object(cg, "authenticated_remote_refs", return_value=live))
+        self.enterContext(patch.object(cg, "load_policy", return_value=policy))
+        return task, repo, path, head, leaves
+
+    def test_managed_backed_copy_consumes_once_and_passes_both_locks_to_plain_git(self):
+        task, repo, path, head, leaves = self.managed_backed_fixture()
+        cg = cleanup.command_guard
+        real_run, writers = subprocess.run, []
+
+        def observe(argv, *args, **kwargs):
+            if 'worktree' in argv and 'remove' in argv:
+                writers.append((list(argv), tuple(kwargs.get('pass_fds', ()))))
+            return real_run(argv, *args, **kwargs)
+
+        with cleanup.completed_task(task) as (manifest, state, task_lock), patch.object(cg.subprocess, 'run', observe):
+            result = cleanup.retire_copy(task, manifest, state['copy_generation'], repo, 'pr-1', head, True,
+                                         task_lock=task_lock)
+        self.assertEqual(result['status'], 'removed', result)
+        self.assertEqual(len(writers), 1)
+        self.assertEqual(len(set(writers[0][1])), 2)
+        self.assertNotIn('--force', writers[0][0])
+        self.assertEqual(cg.load_marker(self.home.resolve())[0], [])
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(cleanup.task_recovery.load(task)[1]['status'], 'complete')
+
+    def test_new_protection_after_backed_consume_retains_managed_copy_without_refunding_grants(self):
+        task, repo, path, head, leaves = self.managed_backed_fixture()
+        cg = cleanup.command_guard
+
+        def new_dependency(candidate):
+            if not cg.load_marker(self.home.resolve())[0]:
+                raise ValueError('new protected service dependency')
+
+        with cleanup.completed_task(task) as (manifest, state, task_lock), \
+                patch.object(cleanup, 'idle', side_effect=new_dependency), \
+                patch.object(cg, '_worktree_audit') as audit:
+            result = cleanup.retire_copy(task, manifest, state['copy_generation'], repo, 'pr-1', head, True,
+                                         task_lock=task_lock)
+        self.assertEqual(result['status'], 'retained', result)
+        self.assertFalse(audit.called, 'fresh service refusal must precede Git writer intent')
+        self.assertTrue(all(leaf.exists() for leaf in leaves))
+        self.assertEqual(cg.load_marker(self.home.resolve())[0], [], 'spent grants must not be refunded')
+        with cleanup.copy_hygiene.copy_lock(path, create=False, wait=True) as lock:
+            self.assertFalse(cleanup.copy_hygiene.copy_retirement_unconfirmed(lock))
+
+    def test_managed_backed_copy_without_both_locks_refuses_before_any_grant_spend(self):
+        _, _, path, head, leaves = self.managed_backed_fixture()
+        cg = cleanup.command_guard
+        original = cg.load_marker(self.home.resolve())[0]
+        with patch.object(cg, '_worktree_audit') as audit:
+            result = cg.remove_worktree(path, authenticated=True, expect_head=head,
+                                        _managed_copy=path, _before_remove=lambda: None)
+        self.assertFalse(result['removed'], result)
+        self.assertIn('both held lock', result['reason'])
+        self.assertFalse(audit.called)
+        self.assertTrue(all(leaf.exists() for leaf in leaves))
+        self.assertEqual(cg.load_marker(self.home.resolve())[0], original)
+
     def test_lost_worker_leaves_actual_removal_child_holding_both_locks(self):
         task, repo, path, head = self.completed_fixture()
         ready, release, exited = (task / name for name in ("writer-ready", "writer-release", "writer-exited"))
