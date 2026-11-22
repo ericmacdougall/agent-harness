@@ -8,13 +8,17 @@ readonly upstream="$harness_root/codex-upstream"
 readonly capsule="$harness_root/codex-receipt-capsule"
 readonly manifest="$capsule/native/codex/source.json"
 readonly patch="$capsule/native/codex/model-receipt.patch"
+readonly test_home_patch="$harness_root/native/codex/test-arg0-home.patch"
 readonly run_root="${1:?expected runner temp directory}/codex-receipt-work"
 readonly output="${1:?expected runner temp directory}/codex-receipt-output"
+readonly test_home_base="$run_root/fixture-homes"
 readonly upstream_commit=d32063f96c2dff1dc96af839b3952abb6acfeda4
 readonly capsule_commit=8d688c1c9a548f14de0a1c4b9475ef42e607684b
 readonly patch_sha=90141e64b41ec86c31c5a320535c4cb9300aab29894117544a44a746386d9c1f
+readonly test_home_patch_sha=628279287a3510edaa65a3a585f7e9979f261a30487fb3b894f67d4377d78ffc
 readonly toolchain=1.95.0
 readonly target=x86_64-unknown-linux-gnu
+unset CODEX_TEST_ARG0_HOME_BASE
 
 [[ "$(uname -m)" == x86_64 ]]
 actual_upstream="$(git -C "$upstream" rev-parse --verify HEAD)"
@@ -27,6 +31,7 @@ if [[ "$actual_upstream" != "$upstream_commit" || "$actual_capsule" != "$capsule
   exit 1
 fi
 printf '%s  %s\n' "$patch_sha" "$patch" | sha256sum --check --strict -
+printf '%s  %s\n' "$test_home_patch_sha" "$test_home_patch" | sha256sum --check --strict -
 python3 - "$manifest" "$upstream_commit" "$patch_sha" "$toolchain" "$target" <<'PY'
 import json
 import sys
@@ -44,8 +49,26 @@ assert doc == {
 }
 PY
 mkdir -m 700 "$run_root" "$output"
+mkdir -m 700 "$test_home_base"
+python3 - "$test_home_base" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+base = Path(sys.argv[1])
+temp = Path(os.environ.get("TMPDIR") or "/tmp")
+info = base.lstat()
+if (not base.is_absolute() or base.resolve(strict=True) != base
+        or base.is_relative_to(temp) or base.is_relative_to(temp.resolve(strict=True))
+        or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_uid != os.geteuid() or any(base.iterdir())):
+    raise SystemExit("The isolated fixture home must be fresh, private and outside the system temp root.")
+PY
 git -C "$upstream" apply --check --index --whitespace=error "$patch"
 git -C "$upstream" apply --index --whitespace=error "$patch"
+git -C "$upstream" apply --check --index --whitespace=error "$test_home_patch"
+git -C "$upstream" apply --index --whitespace=error "$test_home_patch"
 python3 "$harness_root/native/codex/normalize-lock.py" "$upstream/codex-rs" > "$run_root/lock-provenance.txt"
 git -C "$upstream" add -- codex-rs/Cargo.lock
 patched_tree="$(git -C "$upstream" write-tree)"
@@ -100,7 +123,8 @@ readonly -a cargo_cmd=(rustup run "$toolchain" cargo)
 run_focused() {
   local label="$1"
   shift
-  "${cargo_cmd[@]}" test --locked --release --target "$target" "$@" 2>&1 | tee -a "$run_root/$label.log"
+  CODEX_TEST_ARG0_HOME_BASE="$test_home_base" \
+    "${cargo_cmd[@]}" test --locked --release --target "$target" "$@" 2>&1 | tee -a "$run_root/$label.log"
   python3 "$harness_root/native/codex/verify-focused.py" "$label" "$run_root/$label.log"
 }
 run_focused tracker -p codex-api --lib response_model_observation
@@ -132,6 +156,7 @@ cp app-server-protocol/schema/precomputed/app-server-exports-stable.json.zst "$o
 cp app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst "$output/"
 printf 'harness_commit=%s\ncapsule_commit=%s\npatched_tree=%s\nprofile=release-opt1-no-lto\n' \
   "$harness_commit" "$capsule_commit" "$patched_tree" > "$output/build-provenance.txt"
+printf 'fixture_home_patch_sha256=%s\n' "$test_home_patch_sha" >> "$output/build-provenance.txt"
 cat "$run_root/lock-provenance.txt" >> "$output/build-provenance.txt"
 (
   cd "$output"
