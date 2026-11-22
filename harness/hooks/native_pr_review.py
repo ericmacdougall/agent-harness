@@ -96,7 +96,15 @@ def _remote(client, repository, pr, head, base):
     return ref, no_ci
 
 
-def _tracker_claims(repo, commits):
+def _is_ancestor(repo, older, newer):
+    if not _matches(OID, older) or not _matches(OID, newer):
+        return False
+    code, _ = git_safety._bounded_git(Path(repo), ["merge-base", "--is-ancestor", older, newer],
+                                      git_safety.git_environment(isolated=True), timeout=5, limit=4096)
+    return code == 0
+
+
+def _tracker_claims(repo, repository, commits, head):
     import commit_policy
 
     policy = commit_policy.load_policy()
@@ -119,17 +127,34 @@ def _tracker_claims(repo, commits):
         issue = ticket.adapter.issue(ticket.ticket.id)
         if not isinstance(issue, dict) or not isinstance(issue.get("status"), str):
             raise ValueError("the candidate ticket status is unavailable")
-        result = spec_flow.evaluate(records, index, dict(issue, _label=ticket.ticket.label), ignored)
+        evaluation_issue = dict(issue, _label=ticket.ticket.label)
+        result = spec_flow.evaluate(records, index, evaluation_issue, ignored)
+        premerge = spec_flow.evaluate(records, index, evaluation_issue, ignored, staged_commit=head,
+                                      staged_repo="github.com/" + repository)
         current = [r for r in spec_flow.verified(records, index, "evidence")[0]
                    if r.get("spec_core_sha") == spec["spec_core_sha"]]
+        evidence_commits = {c.get("sha") for r in current for c in r.get("commits") or []}
+        missing = list(premerge["missing"])
+        if head not in evidence_commits:
+            missing.append("commits: no current structured evidence names the exact candidate")
+        if len(evidence_commits) > MAX_COMMITS:
+            missing.append("commits: too many current evidence commits for bounded ancestry verification")
+        elif any(not _is_ancestor(repo, sha, head) for sha in evidence_commits):
+            missing.append("commits: current evidence includes a commit outside the exact candidate ancestry")
         authors = {r.get("actor") for r in current} | {spec.get("author")}
         writers.update(value.partition(":")[2] for value in authors
                        if isinstance(value, str) and value.startswith("agent:") and _identifier(value.partition(":")[2]))
+        gates = [r for r in records if r.get("spec_core_sha") == spec["spec_core_sha"]
+                 and r["kind"] in ("click_test", "signoff")]
+        attachment_ids = {a.get("id") for r in gates for a in r.get("attachments") or []
+                          if isinstance(a, dict) and isinstance(a.get("id"), str)}
+        gate_index = {ident: index.get(ident) for ident in attachment_ids}
         claims.append({"ticket": ticket.ticket.label, "state": issue["status"],
                        "spec_core_sha": spec["spec_core_sha"],
                        "review_sha256": digest(canonical(spec.get("reviews") or []).encode()),
                        "evidence_sha256": digest(canonical(current).encode()),
-                       "missing": result["missing"]})
+                       "release_records_sha256": digest(canonical([gates, gate_index]).encode()),
+                       "missing": result["missing"], "premerge_missing": missing})
     return claims, sorted(writers)
 
 
@@ -149,10 +174,12 @@ def _validate_context(context):
         raise ValueError("review context is invalid")
     for claim in context["tickets"]:
         if (not isinstance(claim, dict)
-                or set(claim) != {"ticket", "state", "spec_core_sha", "review_sha256", "evidence_sha256", "missing"}
+                or set(claim) != {"ticket", "state", "spec_core_sha", "review_sha256", "evidence_sha256",
+                                  "release_records_sha256", "missing", "premerge_missing"}
                 or not isinstance(claim["ticket"], str) or not isinstance(claim["state"], str)
-                or not all(_matches(DIGEST, claim[k]) for k in ("spec_core_sha", "review_sha256", "evidence_sha256"))
-                or not isinstance(claim["missing"], list) or not all(isinstance(x, str) for x in claim["missing"])):
+                or not all(_matches(DIGEST, claim[k]) for k in ("spec_core_sha", "review_sha256", "evidence_sha256", "release_records_sha256"))
+                or any(not isinstance(claim[key], list) or not all(isinstance(x, str) for x in claim[key])
+                       for key in ("missing", "premerge_missing"))):
             raise ValueError("candidate ticket claims are invalid")
     commits = context["commits"]
     if (not isinstance(commits, list) or not 1 <= len(commits) <= MAX_COMMITS
@@ -182,7 +209,7 @@ def build_context(repo, repository, pr, head, base, packet, tests, client):
     base_ref, no_ci = _remote(client, repository, pr, head, base)
     if not 1 <= len(commits) <= MAX_COMMITS:
         raise ValueError("candidate commit set is invalid")
-    tickets, evidence_authors = _tracker_claims(repo, commits)
+    tickets, evidence_authors = _tracker_claims(repo, repository, commits, head)
     context = {"version": 1, "repo": repository, "pr": pr, "head": head, "base": base, "base_ref": base_ref,
                "commits": commits, "packet_sha256": digest(packet_bytes), "tests_sha256": digest(tests_bytes), "no_ci": no_ci,
                "tickets": tickets, "evidence_authors": evidence_authors}
@@ -327,14 +354,21 @@ def _witness_scope(context_sha):
     return matches
 
 
+def require_premerge(context):
+    """Require the same formal acceptance gates for native review and dispatch."""
+    _validate_context(context)
+    if any(claim["premerge_missing"] for claim in context["tickets"]):
+        raise ValueError("current GoodQA pre-merge verification is incomplete")
+
+
 def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected_digest=None):
+    require_premerge(expected_context)
     raw = spec_flow.read_regular(Path(path), MAX_FILE)
     if expected_digest is not None and (not _matches(DIGEST, expected_digest) or digest(raw) != expected_digest):
         raise ValueError("native review bundle digest changed")
     bundle = spec_flow._native_json(raw, MAX_FILE)
     if set(bundle) != {"root", "context", "proofs"} or bundle["context"] != expected_context:
         raise ValueError("native review bundle does not bind the fresh candidate context")
-    _validate_context(expected_context)
     parent, proofs = bundle["root"], bundle["proofs"]
     if (not _identifier(parent) or (root is not None and root != parent)
             or not isinstance(proofs, dict) or set(proofs) != set(ROLES)):

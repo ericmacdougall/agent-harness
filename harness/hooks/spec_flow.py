@@ -1512,8 +1512,12 @@ def _latest_click_result(records, index, spec, label, notes):
     return latest, True, None
 
 
-def evaluate(records: list, index: dict, issue: dict, ignored=()):
-    """Return {"ready", "missing", "self_attested", "notes"} for one ticket."""
+def evaluate(records: list, index: dict, issue: dict, ignored=(), *, staged_commit=None, staged_repo=None):
+    """Evaluate a ticket; the pre-merge caller can require a formal exact staged test."""
+    if (staged_commit is None) != (staged_repo is None) or (staged_commit is not None
+            and (not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", staged_commit)
+                 or not re.fullmatch(r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", staged_repo))):
+        raise ValueError("staged evaluation requires an exact full commit and GitHub repository")
     missing, attested, notes = [], [], list(ignored)
     label = issue.get("_label") or issue.get("id")
     specs, bad_specs = verified(records, index, "spec")
@@ -1578,7 +1582,7 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                        f"evidence --ticket '{label}' --ac <AC> --log <test or run output>")
     # click test
     click = spec.get("click_test") or {}
-    if click.get("required", True):
+    if click.get("required", True) or staged_commit is not None:
         latest, had_results, click_problem = _latest_click_result(records, index, spec, label, notes)
         if click_problem:
             missing.append(f"click-test: {click_problem}")
@@ -1596,7 +1600,15 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         elif not (latest.get("deployed_commit") or {}).get("sha"):
             missing.append("click-test: the passing record names no deployed commit; rerun click-test with "
                            "--deployed-commit <sha> after deploy")
-        elif LOCAL_URL_RE.match(str(latest.get("url") or "")):
+        elif staged_commit is not None and (
+                latest.get("v") != 2 or latest.get("pass_source") != NATIVE_CLICK_SOURCE
+                or (latest.get("tester") or {}).get("family") != "codex"):
+            missing.append("click-test: pre-merge verification requires an independent formal native staged receipt")
+        elif staged_commit is not None and latest["deployed_commit"]["sha"] != staged_commit:
+            missing.append("click-test: the staged receipt did not test the exact candidate commit")
+        elif staged_repo is not None and str((latest.get("tester") or {}).get("repo") or "").lower() != staged_repo.lower():
+            missing.append("click-test: the staged receipt names another repository")
+        elif staged_commit is None and LOCAL_URL_RE.match(str(latest.get("url") or "")):
             missing.append(f"click-test: it ran on {safe(latest.get('url'), 80)}, which is not the live deployment; done "
                            "means deployed to live and tested, so click-test the live URL")
         elif uncovered := sorted({c.get("sha") for r in evidence if r.get("spec_core_sha") == core
@@ -1610,6 +1622,8 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                            "an independent click-tester must run it")
         else:
             tester = latest.get("tester") or {}
+            if staged_commit is not None and LOCAL_URL_RE.match(str(latest.get("url") or "")):
+                notes.append("the formal staged click-test is accepted for pre-merge verification; live remains required for done")
             attested.append(f"deployed commit {safe(latest['deployed_commit'].get('sha'), 12)} at "
                             f"{safe(latest.get('url'), 160)} is declared by the recorder, not read back from the deployment")
             if latest.get("pass_source") == "self-attested":

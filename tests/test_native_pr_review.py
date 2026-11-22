@@ -22,7 +22,7 @@ def context():
     return {"version": 1, "repo": "fixture/project", "pr": 3, "head": HEAD, "base": BASE, "base_ref": "main",
             "commits": [HEAD], "packet_sha256": "c" * 64, "tests_sha256": "d" * 64, "no_ci": True, "evidence_authors": [],
             "tickets": [{"ticket": "GoodQA fixture#3", "state": "in_review", "spec_core_sha": "2" * 64,
-                         "review_sha256": "3" * 64, "evidence_sha256": "4" * 64, "missing": ["live proof pending"]}]}
+                         "review_sha256": "3" * 64, "evidence_sha256": "4" * 64, "release_records_sha256": "5" * 64, "missing": ["live proof pending"], "premerge_missing": []}]}
 
 
 class NativeReviewContracts(TestCase):
@@ -230,3 +230,100 @@ class NativeReviewContracts(TestCase):
             self.report.write_text("VERDICT: PASS\nChanged attachment content.\n")
             with self.assertRaisesRegex(ValueError, "WAL witness missing or mismatched"):
                 n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+
+    def staged_acceptance(self):
+        core = "7" * 64
+        ticket = "GoodQA fixture#3"
+        records = [
+            {"v": 1, "kind": "spec", "ticket": ticket, "_comment": "spec", "_at": "2026-11-22T18:50:00Z",
+             "author": "agent:author", "actor": "agent:author", "ac": ["AC-1"], "spec_core_sha": core,
+             "spec_file_sha": "a" * 64, "click_test": {"required": True},
+             "reviews": [{"role": role, "verdict": "ACCEPT", "core_sha": core, "key": "agent:" + role}
+                         for role in ("adversarial", "acceptance")],
+             "attachments": [{"id": "spec-file", "role": "spec", "sha256": "a" * 64},
+                             {"id": "spec-reviews", "role": "reviews", "sha256": "b" * 64}]},
+            {"v": 1, "kind": "evidence", "ticket": ticket, "_comment": "evidence", "_at": "2026-11-22T18:55:00Z",
+             "actor": "agent:evidence", "spec_core_sha": core, "ac": ["AC-1"], "commits": [{"sha": HEAD}],
+             "attachments": [{"id": "log", "role": "log", "sha256": "c" * 64}]},
+            {"v": 2, "kind": "click_test", "ticket": ticket, "actor": "agent:uploader",
+             "_comment": "click", "_at": "2026-11-22T19:02:00Z", "spec_core_sha": core, "result": "pass",
+             "covers_commits": [HEAD], "url": "http://127.0.0.1:60001", "deployed_commit": {"sha": HEAD},
+             "pass_source": n.spec_flow.NATIVE_CLICK_SOURCE,
+             "tester": {"kind": "agent", "family": "codex", "agent_type": n.spec_flow.NATIVE_CLICK_ROLE,
+                        "identity": OWNER, "parent": ROOT_ID, "repo": "github.com/fixture/project",
+                        "report_sha256": "d" * 64, "started_at": "2026-11-22T19:00:00Z",
+                        "ended_at": "2026-11-22T19:01:00Z"},
+             "attachments": [{"id": "report", "role": "report", "name": "staging.txt", "sha256": "e" * 64}]},
+            {"v": 1, "kind": "signoff", "ticket": ticket, "_comment": "signed", "_at": "2026-11-22T19:03:00Z",
+             "actor": "agent:signer", "by": "agent:signer", "signer_kind": "agent", "spec_core_sha": core},
+        ]
+        index = {a["id"]: {"commentId": r["_comment"], "completionState": "completed", "sha256": a["sha256"]}
+                 for r in records for a in r.get("attachments", [])}
+        return records, index, {"_label": ticket}
+
+    def test_staged_receipt_defers_only_the_normal_live_location_check(self):
+        records, index, issue = self.staged_acceptance()
+        with mock.patch.object(n.spec_flow, "_native_click_record_proof"):
+            normal = n.spec_flow.evaluate(records, index, issue)
+            staged = n.spec_flow.evaluate(records, index, issue, staged_commit=HEAD, staged_repo="github.com/fixture/project")
+        self.assertFalse(normal["ready"])
+        self.assertEqual(len(normal["missing"]), 1)
+        self.assertIn("not the live deployment", normal["missing"][0])
+        self.assertTrue(staged["ready"], staged["missing"])
+
+    def test_premerge_keeps_other_current_spec_gates_and_correct_candidate_proof(self):
+        def assert_blocks(change, fragment):
+            records, index, issue = self.staged_acceptance()
+            change(records, index)
+            with mock.patch.object(n.spec_flow, "_native_click_record_proof"):
+                result = n.spec_flow.evaluate(records, index, issue, staged_commit=HEAD, staged_repo="github.com/fixture/project")
+            self.assertFalse(result["ready"])
+            self.assertTrue(any(fragment in problem for problem in result["missing"]), result["missing"])
+        assert_blocks(lambda rows, _index: rows[0]["reviews"].pop(), "spec review")
+        assert_blocks(lambda rows, _index: rows[1].update(ac=[]), "AC-1: no evidence")
+        assert_blocks(lambda _rows, index: index.pop("log"), "execution logs")
+        assert_blocks(lambda rows, _index: rows.pop(), "sign-off: none valid")
+        assert_blocks(lambda rows, _index: rows[2].update(deployed_commit={"sha": BASE}), "exact candidate")
+        assert_blocks(lambda rows, _index: rows[2]["tester"].update(repo="github.com/other/project"), "another repository")
+        assert_blocks(lambda rows, _index: rows[2].update(covers_commits=[]), "evidence commits")
+        assert_blocks(lambda rows, _index: rows[2].update(result="fail"), "latest click-test failed")
+        assert_blocks(lambda _rows, index: index["report"].update(sha256="0" * 64), "does not verify")
+        assert_blocks(lambda rows, _index: rows[0].update(author="agent:" + OWNER), "independent click-tester")
+
+    def test_incomplete_premerge_claim_refuses_before_native_bundle_access(self):
+        ctx = context()
+        ctx["tickets"][0]["premerge_missing"] = ["sign-off: none valid"]
+        with mock.patch.object(n.spec_flow, "read_regular") as read_file:
+            with self.assertRaisesRegex(ValueError, "pre-merge verification is incomplete"):
+                n.verify_bundle(self.repo / "unopened.json", ctx, self.repo)
+        read_file.assert_not_called()
+
+    def test_tracker_checks_exact_evidence_and_candidate_ancestry(self):
+        from types import SimpleNamespace
+
+        other = "f" * 40
+        records, index, issue = self.staged_acceptance()
+        issue["status"] = "in_review"
+        tracker = mock.Mock()
+        tracker.ticket = SimpleNamespace(id="fixture", label=issue["_label"])
+        tracker.records.return_value = records, [], index
+        tracker.latest_spec.return_value = records[0]
+        tracker.adapter.issue.return_value = issue
+        with mock.patch("commit_policy._commit_refs", return_value=[("goodqa", "fixture", 3)]), \
+             mock.patch.object(n, "_git", return_value="fixture commit body"), \
+             mock.patch.object(n.spec_flow, "Session", return_value=tracker), \
+             mock.patch.object(n.spec_flow, "_native_click_record_proof"), \
+             mock.patch.object(n, "_is_ancestor", side_effect=lambda _repo, older, _head: older != other):
+            clean, _ = n._tracker_claims(self.repo, "fixture/project", [HEAD], HEAD)
+            self.assertEqual(clean[0]["premerge_missing"], [])
+            first_digest = clean[0]["release_records_sha256"]
+            records[3]["_comment"] = "another-signoff"
+            clean, _ = n._tracker_claims(self.repo, "fixture/project", [HEAD], HEAD)
+            self.assertNotEqual(clean[0]["release_records_sha256"], first_digest)
+            records[1]["commits"] = [{"sha": other}]
+            records[2]["covers_commits"] = [other]
+            blocked, _ = n._tracker_claims(self.repo, "fixture/project", [HEAD], HEAD)
+            self.assertEqual(blocked[0]["premerge_missing"], [
+                "commits: no current structured evidence names the exact candidate",
+                "commits: current evidence includes a commit outside the exact candidate ancestry",
+            ])
