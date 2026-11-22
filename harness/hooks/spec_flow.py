@@ -1119,15 +1119,17 @@ class Session:
         comment = self.adapter.comment_with_files(self.ticket.id, record_body(summary, record),
                                                   op_id(self.ticket.id, op_key),
                                                   [item["id"] for item in attachments])
-        if comment.get("id") in rejected:
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, str) or not comment_id:
+            raise SpecError("GoodQA did not return a comment identifier", EXIT_TRACKER)
+        if comment_id in rejected:
             raise SpecError("GoodQA replayed an earlier rejected comment instead of recording this one", EXIT_TRACKER)
         bound = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
-        unbound = [item["name"] for item in attachments if (bound.get(item["id"]) or {}).get("commentId") != comment.get("id")]
-        if unbound:
-            raise SpecError(f"GoodQA did not bind {', '.join(unbound)} to the new comment; the record will not "
-                            "verify", EXIT_TRACKER)
+        problems = attachment_problems(dict(record, _comment=comment_id), bound)
+        if problems:
+            raise SpecError("GoodQA attachment verification failed: " + "; ".join(problems), EXIT_TRACKER)
         print(json.dumps({"status": "RECORDED", "kind": kind, "ticket": self.ticket.label,
-                          "comment": comment["id"], "attachments": len(attachments)}))
+                          "comment": comment_id, "attachments": len(attachments)}))
         return comment
 
 
