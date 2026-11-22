@@ -18,6 +18,32 @@ Finish verifies PR identity, fetches a pinned target through isolated transport 
 
 A definite `REMOTE_BLOCKED` permits `finish --mode local`; explicit local-only work starts with `prepare --local-only` then local finish. Local delivery requires worktrees sharing Git metadata and leaves publication outstanding. Policy refusals and `REMOTE_UNCERTAIN` do not authorize fallback. Continue independent feature work while blocked, report the safe error and avoid credential loops or another remote. Query-only `prepare --reconcile-only --task OWNER_TASK --original /absolute/original --original-branch main` settles an uncertain exact remote outcome without publishing, creating a PR or changing the checkout. Temporary absence cannot settle a possible push/create. A possible create requires positive matching PR evidence; only durably known pre-create stages can settle an absent PR. Definite publisher preflight failure before any push permits fallback; a rejected push or bounded/invalid owned listing settles `POLICY_BLOCKED`, allowing a new reviewed generation without local fallback. Unrelated fork PRs sharing a branch name are ignored. A new reviewed source/run kit requires `--new-generation` after the old generation is settled; stale generations cannot mutate the current task.
 
+An existing generation stuck specifically in `PUBLISHING` can explicitly
+reauthorize its identical publication with `prepare --resume-publication
+--resume-reason "why this same write is authorized" --generation GENERATION`,
+alongside all original prepare arguments, expected source/original HEADs and the
+same run kit. This is a write operation. The flag cannot change generation,
+source, branch, repository or kit, and cannot combine with reconciliation-only
+or local-only modes. A matching remote commit reconciles without another push;
+a different commit or failed lookup refuses. A confirmed absent ref permits
+one audited retry of the same ordinary nonforce pinned push. Absence never
+proves the first request failed or that its publisher is dead. A late original
+request can still complete the identical write; a newer/divergent remote ref
+cannot be overwritten by force. Ordinary Git may fast-forward a concurrently
+created ancestor ref, preserving its history; this is not atomic create-only.
+
+Each attempt records a private `publication-resume-*.json` beside the generation
+journal with its reason and frozen scope. Known publishers retain an inherited
+generation lease through their native process lifetime, so a busy lease refuses
+another attempt even after its coordinator exits. The lease does not prove all
+descendants or server requests ended. Legacy generations lacking that lease
+can use the explicit identical-write authorization without inventing liveness
+or failure evidence. Retry errors remain uncertain and never create a local
+fallback merely because the latest attempt did not push. Inspect the exact
+remote result and generation before another explicit attempt. This flag never
+retries `PR_CREATING` or `REMOTE_UNCERTAIN`: uncertain PR creation still requires
+positive matching-PR reconciliation.
+
 Local and remote applies share original-scope recovery barriers under the Git common directory, independent of HOME/session. Failed applies preserve refs and journals and report observed HEAD. Only explicit typed proof that no own reservation began permits a same-generation pre-apply retry; missing journals alone prove nothing. Fresh generations can retry an older resolved local tuple while retaining its history. Use `integrate_local.py --resolve-journal KEY` only for a confirmed clean tested baseline; `RESOLVED` does not prove delivery. After all actual barriers are resolved, an unbound interrupted workflow can use `finish --resolve-baseline FULL_CONFIRMED_SHA --task OWNER_TASK --original /absolute/original --original-branch main --check '<real-check>'`; `RESOLVED_BASELINE` requires a new generation and fresh delivery proofs. Never infer a failed child succeeded. An `ALREADY_DELIVERED` repeat proves historical target ancestry in the current clean original; it does not sync newer remote work. Deliberately reconcile later remote history after local delivery.
 
 The handoff names original checkout/current HEAD and delivered commit, or the ready feature checkout/commit and specific blocker. Provide a working start/preview URL or CLI/API sample, safe seed/test-account setup, exact test/watch commands, results/log location and stop command. For repos without a watcher, verify `python3 ~/.codex/agent-harness/watch-tests.py --root <checkout> --once -- <test-command>`, then omit `--once` for continuous watching; Ctrl-C stops it. Never invent a UI or an unused service. Tell dependent owners their new base after integration.

@@ -5,6 +5,7 @@ read or written.
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -102,14 +103,162 @@ class Acquire(Base):
         self.assertEqual((p / "a.txt").read_text(), "local edit\n")
         self.assertFalse((p / "b.txt").exists())
 
-    def test_untracked_files_do_not_stop_the_move(self):
+    def test_untracked_files_refuse_the_move(self):
         p = Path(tc.acquire(str(self.repo), "pr-2", cfg=self.cfg(min_free_gb=0))["path"])
         (p / "screenshot.png").write_text("x")
         self.advance()
         res = tc.acquire(str(self.repo), "pr-2", cfg=self.cfg(min_free_gb=0))
-        self.assertTrue(res["ok"], res)
-        self.assertTrue((p / "b.txt").exists())
+        self.assertFalse(res["ok"], res)
+        self.assertFalse((p / "b.txt").exists())
         self.assertTrue((p / "screenshot.png").exists())
+
+    def run_acquire(self, *args):
+        return subprocess.run(
+            [sys.executable, str(HOOKS / "copy_hygiene.py"), "acquire", "--repo", str(self.repo),
+             "--key", "leased", *args], capture_output=True, text=True,
+            env=dict(os.environ, HARNESS_COPY_HYGIENE_MIN_FREE_GB="0"), timeout=10)
+
+    def test_require_reuse_refuses_missing_path_before_making_copy(self):
+        for extra in ([], ["--run", sys.executable, "-c", "raise SystemExit(99)"]):
+            r = self.run_acquire("--require-reuse", *extra)
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertFalse((self.home / ".agent-harness" / "test-copies").exists())
+
+    def test_pending_or_malformed_retirement_fences_leased_cli_before_payload(self):
+        path = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))["path"]
+        lock = Path(path + ".lock")
+        marker = self.home / "payload-started"
+        index_before = Path(tc.index_path()).read_bytes()
+        for fence in (b"retiring " + b"1" * 32 + b"\n", b"incomplete write"):
+            with self.subTest(fence=fence):
+                lock.write_bytes(fence)
+                result = self.run_acquire("--require-reuse", "--run", sys.executable, "-c",
+                                          "from pathlib import Path; import sys; Path(sys.argv[1]).touch()",
+                                          str(marker))
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)["refused"], "retirement-unconfirmed")
+                self.assertFalse(marker.exists())
+                self.assertEqual(lock.read_bytes(), fence)
+                self.assertEqual(Path(tc.index_path()).read_bytes(), index_before)
+
+    def test_same_head_leased_cli_rotates_generation_before_payload(self):
+        first = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))
+        lock = Path(first["path"] + ".lock")
+        old_generation = b"1" * 32 + b"\n"
+        lock.write_bytes(old_generation)
+        marker = self.home / "observed-generation"
+        result = self.run_acquire("--require-reuse", "--run", sys.executable, "-c",
+                                  "from pathlib import Path; import sys; "
+                                  "Path(sys.argv[1]).write_bytes(Path(sys.argv[2]).read_bytes())",
+                                  str(marker), str(lock))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["commit"], first["commit"])
+        generation = marker.read_bytes()
+        self.assertRegex(generation, rb"^[0-9a-f]{32}\n$")
+        self.assertNotEqual(generation, old_generation)
+        self.assertEqual(generation, lock.read_bytes())
+
+    def test_ignored_destination_file_survives_ref_advance(self):
+        (self.repo / ".gitignore").write_text("ignored.txt\n")
+        sh("git", "add", ".gitignore", cwd=self.repo)
+        sh("git", "commit", "-qm", "ignore local file", cwd=self.repo)
+        first = tc.acquire(str(self.repo), "pr-ignored", cfg=self.cfg(min_free_gb=0))
+        p = Path(first["path"])
+        (p / "ignored.txt").write_text("local evidence")
+        (self.repo / "ignored.txt").write_text("new tracked source")
+        sh("git", "add", "-f", "ignored.txt", cwd=self.repo)
+        sh("git", "commit", "-qm", "track ignored filename", cwd=self.repo)
+        res = tc.acquire(str(self.repo), "pr-ignored", cfg=self.cfg(min_free_gb=0))
+        self.assertFalse(res["ok"], res)
+        self.assertEqual((p / "ignored.txt").read_text(), "local evidence")
+        self.assertEqual(tc.git(str(p), "rev-parse", "HEAD")[1], first["commit"])
+
+    def test_ref_advance_preserves_tracked_wal(self):
+        (self.repo / "WAL.md").write_text("original evidence")
+        sh("git", "add", "WAL.md", cwd=self.repo)
+        sh("git", "commit", "-qm", "track WAL", cwd=self.repo)
+        first = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))
+        (self.repo / "WAL.md").write_text("different evidence")
+        sh("git", "commit", "-qam", "change WAL", cwd=self.repo)
+        r = self.run_acquire("--require-reuse")
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertIn("tracked protected logs or WAL evidence", r.stdout)
+        self.assertEqual((Path(first["path"]) / "WAL.md").read_text(), "original evidence")
+
+    def test_reuse_refuses_an_unregistered_managed_path(self):
+        first = tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))
+        idx = Path(tc.index_path())
+        idx.write_text("{}")
+        r = self.run_acquire("--require-reuse")
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertEqual(tc.git(first["path"], "rev-parse", "HEAD")[1], first["commit"])
+
+    def test_redirected_lock_preserves_existing_target(self):
+        rid, _ = tc.repo_identity(str(self.repo))
+        parent = Path(tc.copies_root()) / rid
+        parent.mkdir(parents=True)
+        target = self.home / "foreign-lock-target"
+        target.write_text("keep me")
+        (parent / "leased.lock").symlink_to(target)
+        r = self.run_acquire("--run", sys.executable, "-c", "raise SystemExit(99)")
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertEqual(target.read_text(), "keep me")
+        self.assertFalse((parent / "leased").exists())
+
+    def test_leased_command_refuses_tracked_changes_at_same_commit(self):
+        path = Path(tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))["path"])
+        (path / "a.txt").write_text("saved for review")
+        r = self.run_acquire("--require-reuse", "--run", sys.executable, "-c", "raise SystemExit(99)")
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertEqual((path / "a.txt").read_text(), "saved for review")
+
+    def test_lease_spans_command_and_survives_controller_exit(self):
+        path = Path(tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))["path"])
+        ready, release = self.home / "ready", self.home / "release"
+        # Fault-inject a platform controller exit immediately after fork, leaving the actual
+        # supervisor and its real command running. This needs no signals to unrelated processes.
+        controller = (
+            "import os,sys; import copy_hygiene as tc; parent=os.getpid(); wait=os.waitpid; "
+            "os.waitpid=lambda *a: os._exit(72) if os.getpid()==parent else wait(*a); "
+            "raise SystemExit(tc.main(sys.argv[1:]))"
+        )
+        command = (
+            "import subprocess,sys,time; from pathlib import Path; "
+            "assert Path.cwd()==Path(sys.argv[1]); "
+            "Path(sys.argv[2]).touch(); deadline=time.monotonic()+10; "
+            "exec('while not Path(sys.argv[3]).exists() and time.monotonic()<deadline: time.sleep(.01)'); "
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(2)'], "
+            "cwd=Path(sys.argv[2]).parent, close_fds=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"
+        )
+        env = dict(os.environ, HARNESS_COPY_HYGIENE_MIN_FREE_GB="0", PYTHONPATH=str(HOOKS))
+        r = subprocess.run(
+            [sys.executable, "-c", controller, "acquire", "--repo", str(self.repo), "--key", "leased",
+             "--require-reuse", "--run", sys.executable, "-c", command, str(path), str(ready), str(release)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, timeout=5)
+        self.assertEqual(r.returncode, 72)
+        try:
+            deadline = time.monotonic() + 4
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "real leased command did not start")
+            busy = self.run_acquire("--require-reuse")
+            self.assertEqual(busy.returncode, 4, busy.stdout + busy.stderr)
+            self.assertIn("lease is currently held", busy.stdout)
+            before = time.time() - 90000
+            with mock.patch.object(tc, "in_use", return_value=False), \
+                    mock.patch.object(tc, "last_activity", return_value=before):
+                rows = tc.reap(apply=True, cfg=self.cfg(reaper_delete_enabled=True, max_age_hours=0))["copies"]
+            self.assertIn("lease is currently held", next(row["action"] for row in rows if row["path"] == str(path)))
+        finally:
+            release.touch()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            r = self.run_acquire("--require-reuse")
+            if r.returncode == 0:
+                break
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.run_acquire("--require-reuse", "--run", sys.executable, "-c",
+                                         "raise SystemExit(37)").returncode, 37)
 
     def test_cli_exit_code_for_stale_copy(self):
         p = Path(tc.acquire(str(self.repo), "pr-3", cfg=self.cfg(min_free_gb=0))["path"])
@@ -118,6 +267,43 @@ class Acquire(Base):
         r = subprocess.run([sys.executable, str(HOOKS / "copy_hygiene.py"), "acquire", "--repo", str(self.repo),
                             "--key", "pr-3"], capture_output=True, text=True, env=dict(os.environ, HARNESS_COPY_HYGIENE_MIN_FREE_GB="0"))
         self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+
+    def test_group_interrupt_keeps_lease_when_payload_ignores_signal(self):
+        path = Path(tc.acquire(str(self.repo), "leased", cfg=self.cfg(min_free_gb=0))["path"])
+        ready, release = self.home / "group-ready", self.home / "group-release"
+        code = (
+            "import signal,sys,time; from pathlib import Path; "
+            "signal.signal(signal.SIGINT,signal.SIG_IGN); "
+            "Path(sys.argv[1]).touch(); deadline=time.monotonic()+10; "
+            "exec('while not Path(sys.argv[2]).exists() and time.monotonic()<deadline: time.sleep(.01)')"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, str(HOOKS / "copy_hygiene.py"), "acquire", "--repo", str(self.repo), "--key", "leased",
+             "--require-reuse", "--run", sys.executable, "-c", code, str(ready), str(release)],
+            start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=dict(os.environ, HARNESS_COPY_HYGIENE_MIN_FREE_GB="0"))
+        try:
+            deadline = time.monotonic() + 4
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists())
+            os.killpg(proc.pid, signal.SIGINT)  # Only the isolated process group above.
+            self.assertIn(proc.wait(timeout=4), (130, -signal.SIGINT))
+            deadline = time.monotonic() + 0.8
+            while time.monotonic() < deadline:
+                r = self.run_acquire("--require-reuse")
+                self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertTrue(path.exists())
+        finally:
+            release.touch()
+            if proc.poll() is None:
+                proc.wait(timeout=12)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            r = self.run_acquire("--require-reuse")
+            if r.returncode == 0:
+                break
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_two_worktrees_of_one_repo_share_the_copy_and_bad_keys_are_refused(self):
         wt = self.home / "repos" / "proj-wt"
@@ -239,8 +425,9 @@ class OldCopies:
 
     def enabled_reap(self):
         self.write_config(reaper_delete_enabled=True, max_age_hours=24)
+        past = time.time() - 72 * 3600
         with mock.patch.object(tc, "in_use", return_value=False), \
-                mock.patch.object(tc, "last_activity", side_effect=lambda p, idx: time.time() - 72 * 3600):
+                mock.patch.object(tc, "last_activity", return_value=past):
             return {r["path"]: r["action"] for r in tc.reap(apply=True)["copies"]}
 
 
@@ -268,31 +455,41 @@ class Reap(OldCopies, Base):
         self.write_config(reaper_delete_enabled="yes")
         self.assertFalse(tc.load_config()["reaper_delete_enabled"])
 
-    def test_enabled_and_apply_removes_only_clean_pushed_idle_copies(self):
+    def test_enabled_and_apply_keeps_legacy_unmanaged_copies(self):
         old, dirty, keep = self.make_old_copies()
         acts = self.enabled_reap()
-        self.assertEqual(acts[str(old)], "removed")
-        self.assertEqual(acts[str(dirty)], "kept: uncommitted or untracked changes")
-        self.assertFalse(old.exists())
+        self.assertEqual(acts[str(old)], "kept: legacy or unmanaged copy; report only")
+        self.assertEqual(acts[str(dirty)], "kept: legacy or unmanaged copy; report only")
+        self.assertTrue(old.exists())
         self.assertTrue(dirty.exists() and keep.exists())
 
     def test_in_use_copy_is_kept(self):
-        old, _, _ = self.make_old_copies()
+        old = Path(tc.acquire(str(self.repo), "pr-active", cfg=self.cfg(min_free_gb=0))["path"])
         self.write_config(reaper_delete_enabled=True)
+        past = time.time() - 72 * 3600
         with mock.patch.object(tc, "in_use", return_value=True), \
-                mock.patch.object(tc, "last_activity", side_effect=lambda p, idx: time.time() - 72 * 3600):
+                mock.patch.object(tc, "last_activity", return_value=past):
             res = tc.reap(apply=True)
         self.assertTrue(old.exists())
         self.assertIn("a process is working in it", {r["path"]: r["action"] for r in res["copies"]}[str(old)])
 
     def test_unpushed_head_is_kept(self):
-        old, _, _ = self.make_old_copies()
+        old = Path(tc.acquire(str(self.repo), "pr-local", cfg=self.cfg(min_free_gb=0))["path"])
         (old / "c.txt").write_text("c\n")
         sh("git", "add", "c.txt", cwd=old)
         sh("git", "commit", "-q", "-m", "local only", cwd=old)
         acts = self.enabled_reap()
         self.assertTrue(old.exists())
         self.assertEqual(acts[str(old)], "kept: HEAD is on no remote ref")
+
+    def test_lsof_error_and_diagnostics_fail_closed(self):
+        for rc, out, err, active in (
+            (1, "", "", False), (1, "", "permission denied", True),
+            (0, "123\n", "", True), (0, "", "", True), (2, "", "", True),
+        ):
+            with mock.patch.object(tc.shutil, "which", return_value="/fixture/lsof"), \
+                    mock.patch.object(tc.subprocess, "run", return_value=subprocess.CompletedProcess([], rc, out, err)):
+                self.assertIs(tc.in_use("/fixture/worktree"), active)
 
     def test_linked_worktree_copy_removed_with_plain_worktree_remove(self):
         p = Path(tc.acquire(str(self.repo), "pr-1", cfg=self.cfg(min_free_gb=0))["path"])
@@ -313,7 +510,7 @@ class Reap(OldCopies, Base):
         os.utime(p, (past, past))
 
     def test_unpushed_local_branch_is_kept(self):
-        old, _, _ = self.make_old_copies()
+        old = Path(tc.acquire(str(self.repo), "pr-side", cfg=self.cfg(min_free_gb=0))["path"])
         sh("git", "checkout", "-q", "-b", "side", cwd=old)
         (old / "s.txt").write_text("s")
         sh("git", "add", "s.txt", cwd=old)
@@ -324,27 +521,67 @@ class Reap(OldCopies, Base):
         self.assertEqual(acts[str(old)], "kept: a local branch has commits on no remote")
 
     def test_stash_is_kept(self):
-        old, _, _ = self.make_old_copies()
+        old = Path(tc.acquire(str(self.repo), "pr-stash", cfg=self.cfg(min_free_gb=0))["path"])
         (old / "a.txt").write_text("stash me\n")
         sh("git", "stash", "-q", cwd=old)
         acts = self.enabled_reap()
         self.assertTrue(old.exists())
         self.assertEqual(acts[str(old)], "kept: has a stash")
 
-    def test_ignored_evidence_is_kept_but_build_output_is_not(self):
-        old, _, _ = self.make_old_copies()
-        (old / ".git" / "info" / "exclude").write_text("evidence/\nnode_modules/\n")
-        (old / "node_modules").mkdir()
-        (old / "node_modules" / "x.js").write_text("x")
-        acts = self.enabled_reap()
-        self.assertEqual(acts[str(old)], "removed")
-        old2, _, _ = self.make_old_copies_named("s2")
-        (old2 / ".git" / "info" / "exclude").write_text("evidence/\n")
-        (old2 / "evidence").mkdir()
-        (old2 / "evidence" / "shot.png").write_text("x")
-        acts = self.enabled_reap()
-        self.assertTrue(old2.exists())
-        self.assertTrue(acts[str(old2)].startswith("kept: ignored files that may be evidence"))
+    def test_ignored_evidence_and_build_output_are_kept(self):
+        (self.repo / ".git" / "info" / "exclude").write_text("evidence/\nnode_modules/\n")
+        for name in ("evidence", "node_modules"):
+            path = Path(tc.acquire(str(self.repo), "pr-" + name, cfg=self.cfg(min_free_gb=0))["path"])
+            (path / name).mkdir()
+            item = path / name / "retained.txt"
+            item.write_text("local content")
+            self.assertEqual(self.enabled_reap()[str(path)], "kept: tracked, untracked or ignored changes")
+            self.assertEqual(item.read_text(), "local content")
+
+    def test_pushed_tracked_wal_is_kept(self):
+        wal = self.repo / "evidence" / "WAL.md"
+        wal.parent.mkdir()
+        wal.write_text("important tracked evidence")
+        sh("git", "add", ".", cwd=self.repo)
+        sh("git", "commit", "-qm", "track evidence", cwd=self.repo)
+        sh("git", "push", "-q", "origin", "HEAD:main", cwd=self.repo)
+        path = Path(tc.acquire(str(self.repo), "pr-wal", cfg=self.cfg(min_free_gb=0))["path"])
+        self.assertEqual(self.enabled_reap()[str(path)], "kept: tracked protected logs or WAL evidence")
+        self.assertEqual((path / "evidence" / "WAL.md").read_text(), "important tracked evidence")
+
+    def test_reaper_refuses_head_advanced_during_service_scan(self):
+        path = Path(tc.acquire(str(self.repo), "pr-race", cfg=self.cfg(min_free_gb=0))["path"])
+        original_scan = tc.protected_scan
+
+        def later_scan(*args, **kwargs):
+            if kwargs.get("fresh"):
+                (path / "new.txt").write_text("unpublished")
+                sh("git", "add", "new.txt", cwd=path)
+                sh("git", "commit", "-qm", "private commit", cwd=path)
+            return original_scan(*args, **kwargs)
+
+        with mock.patch.object(tc, "remove_copy") as remove, \
+                mock.patch.object(tc, "protected_scan", side_effect=later_scan):
+            report = self.enabled_reap()
+        remove.assert_not_called()
+        self.assertIn("changed", report[str(path)])
+        self.assertEqual((path / "new.txt").read_text(), "unpublished")
+
+    def test_reaper_refuses_index_changed_during_service_scan(self):
+        path = Path(tc.acquire(str(self.repo), "pr-index", cfg=self.cfg(min_free_gb=0))["path"])
+        original_scan = tc.protected_scan
+
+        def later_scan(*args, **kwargs):
+            if kwargs.get("fresh"):
+                sh("git", "update-index", "--assume-unchanged", "a.txt", cwd=path)
+            return original_scan(*args, **kwargs)
+
+        with mock.patch.object(tc, "remove_copy") as remove, \
+                mock.patch.object(tc, "protected_scan", side_effect=later_scan):
+            report = self.enabled_reap()
+        remove.assert_not_called()
+        self.assertIn("identity or activity changed", report[str(path)])
+        self.assertTrue(path.exists())
 
     def test_fresh_copy_with_preserved_mtimes_is_not_idle(self):
         work = self.home / ".agent-harness" / "work" / "s3"
@@ -826,6 +1063,7 @@ class Install(unittest.TestCase):
     def test_click_tester_brief_uses_acquire(self):
         brief = (ROOT / "harness" / "agents" / "click-tester.md").read_text()
         self.assertIn("copy_hygiene.py acquire", brief)
+        self.assertIn("--require-reuse --run", brief)
 
     def test_session_start_reports_idle_copies_and_never_deletes(self):
         with tempfile.TemporaryDirectory() as h:

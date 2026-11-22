@@ -11,7 +11,6 @@ import subprocess
 import tarfile
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from unittest.mock import Mock, call, patch
@@ -238,18 +237,23 @@ class CopyLifecycle(CopyFixture):
         self.assertEqual(Path(path + ".lock").read_text(), record)
         self.assertTrue(Path(path).is_dir())
 
-    def test_enabled_legacy_reaper_preserves_fenced_copy(self):
+    def test_enabled_managed_reaper_preserves_pending_or_malformed_fence(self):
         _, _, _, path, _ = self.fixture()
         generation = cleanup.task_recovery.enrolled_copy_generation(path)
         cfg = self.cfg(reaper_delete_enabled=True, max_age_hours=0)
-        with patch.object(cleanup.copy_hygiene, "deletable") as eligible:
+        with patch.object(cleanup.copy_hygiene, "copy_snapshot") as snapshot:
             with cleanup.copy_hygiene.copy_lock(path, create=False, wait=True) as lock:
                 cleanup.copy_hygiene.set_copy_retirement(lock, generation, pending=True)
                 busy = cleanup.copy_hygiene.reap(apply=True, cfg=cfg)["copies"][0]
-                self.assertIn("lock is busy", busy["action"])
-            pending = cleanup.copy_hygiene.reap(apply=True, cfg=cfg)["copies"][0]
-            self.assertIn("retirement is unconfirmed", pending["action"])
-            eligible.assert_not_called()
+                self.assertIn("lease is currently held", busy["action"])
+            lock_path = Path(path + ".lock")
+            for record in (lock_path.read_bytes(), b"incomplete write"):
+                with self.subTest(record=record):
+                    lock_path.write_bytes(record)
+                    fenced = cleanup.copy_hygiene.reap(apply=True, cfg=cfg)["copies"][0]
+                    self.assertIn("retirement is unconfirmed", fenced["action"])
+                    self.assertEqual(lock_path.read_bytes(), record)
+            snapshot.assert_not_called()
         self.assertTrue(Path(path).is_dir())
 
     def test_fresh_same_head_reuse_invalidates_earlier_completion(self):
@@ -460,13 +464,6 @@ exited.touch()
 
         worker = multiprocessing.get_context("fork").Process(target=worker_entry)
         worker.start()
-        reaching_lock = threading.Event()
-        copy_lock = cleanup.copy_hygiene.copy_lock
-
-        def observe_lock(*args, **kwargs):
-            reaching_lock.set()
-            return copy_lock(*args, **kwargs)
-
         with ThreadPoolExecutor(max_workers=1) as contender:
             try:
                 worker.join(timeout=5)
@@ -475,18 +472,17 @@ exited.touch()
                 self.assertFalse(exited.exists())
                 with self.assertRaises(BlockingIOError), cleanup.completed_task(task):
                     self.fail("task lock released while the removal child is still running")
-                with patch.object(cleanup.copy_hygiene, "copy_lock", side_effect=observe_lock):
-                    acquisition = contender.submit(cleanup.copy_hygiene.acquire, repo, "pr-1",
-                                                   cfg=self.cfg(min_free_gb=0))
-                    self.assertTrue(reaching_lock.wait(timeout=3))
-                    with self.assertRaises(TimeoutError):
-                        acquisition.result(timeout=0.1)
-                    release.touch()
-                    refused = acquisition.result(timeout=3)
+                acquisition = contender.submit(cleanup.copy_hygiene.acquire, repo, "pr-1", cfg=self.cfg(min_free_gb=0))
+                busy = acquisition.result(timeout=3)
+                self.assertIn("lease is currently held", busy["error"])
+                self.assertFalse(exited.exists())
             finally:
                 release.touch()
                 worker.join(timeout=3)
-        self.assertTrue(exited.exists())
+        # Wait for the writer's inherited lease to close before checking the durable record.
+        with cleanup.copy_hygiene.copy_lock(path, create=False, wait=True):
+            self.assertTrue(exited.exists())
+        refused = cleanup.copy_hygiene.acquire(repo, "pr-1", cfg=self.cfg(min_free_gb=0))
         self.assertEqual(refused.get("refused"), "retirement-unconfirmed")
         self.assertEqual(json.loads(cleanup.audit_path(task, Path(path)).read_text())["status"], "removing")
         self.assertTrue(Path(path).is_dir())

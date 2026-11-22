@@ -263,7 +263,10 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 10, 30, 20, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), status truth, WAL cadence, worktree hygiene, Mission Control inbox follow
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 10, 30, 20, 5, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), status truth, WAL cadence, worktree hygiene, Mission Control inbox follow
+        self.assertEqual([h["args"] for g in stop for h in g["hooks"]
+                          if h.get("args", [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
+                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -273,8 +276,11 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), status truth (goodqa#15754), WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), status truth (goodqa#15754), WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
+        self.assertEqual([h["args"] for g in hooks["Stop"] for h in g["hooks"]
+                          if h.get("args", [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
+                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
 
     def test_idle_guard_registrations_survive_reinstall_once_each(self):  # goodqa#15943 (receipt r6 F2)

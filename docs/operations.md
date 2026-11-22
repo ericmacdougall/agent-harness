@@ -29,6 +29,21 @@ No background process is installed. Claude Code runs hooks, and the main agent i
 
 Before replacing a managed file, both installers also compare its current bytes and permission mode with the original snapshot. If either differs, they refuse the write and leave that path untouched. Rollback acts only on files this run published and refuses to replace or remove one whose published bytes or mode were edited in place. The backup contains the preflight snapshot, not a later external edit. A noncooperating editor can still write in the narrow interval between the final comparison and atomic replacement; filesystem rename has no portable compare-and-swap guard for file contents. Coordinate installers and editors if that race matters.
 
+## Managed test checkouts
+
+Use one copy per repository and PR or lane. Run the test under the lease.
+
+```sh
+python3 ~/.claude/hooks/copy_hygiene.py acquire --repo "$owner_checkout" --key "pr-$pr" \
+  --ref "$reviewed_commit" --require-reuse --run your-test-command
+```
+
+Omit `--require-reuse` only for an authorized first checkout. Without `--run`, acquisition reports the path and releases its lease immediately. With `--run`, the first output line records the verified path and commit, and the command runs in that checkout with its exit status propagated. The lease survives the CLI controller exiting while the command runs. The command must wait for workers it starts before it exits. The lease is held by the supervisor and ends when the foreground command returns. It does not protect a background worker after that point.
+
+An existing checkout can be reused at the disk floor. An advance to a different commit requires a clean, registered copy with no tracked, untracked or ignored changes and preserves tracked protected logs and WALs. At the same commit a leased command requires clean tracked files and can use existing local byproducts. A busy lease, absent copy under `--require-reuse`, or uncertain checkout fails acquisition without opening a fallback checkout.
+
+Reaping reports by default. If enabled explicitly, it holds the managed checkout lease and checks liveness, service protection and local state. It confirms the same directory, Git registration, commit, tree and index before asking Git to remove the linked checkout without force. Keep legacy and unmanaged copies and copies with tracked protected logs or WALs for separate disposition. Tools that operate outside the managed lease must be stopped before reaping.
+
 ## Installer scan (installer_scan.py)
 
 `installer_scan.py <dir-or-file> [--json]` statically scans third-party shell and Python installers (`*.sh`, `*.py`, `install*`, `setup*`, `Makefile`) before anyone runs them. It never executes or imports the target and reads each file with a 2 MB cap (larger files are listed as skipped). Findings carry a category and `file:line`: `mcp` (agent CLI `mcp add`, `[mcp_servers.`, `mcpServers`), `agent-rules` (CLAUDE.md, AGENTS.md, settings files, config.toml, permission grants), `launchd` (launchctl, LaunchAgents, systemctl, crontab, schtasks), `shell-rc` (rc files, `PATH=`), `network-exec` (`curl | sh`, wget, pip/npm -g/brew install), `credentials` (keychain, keyring, `~/.ssh`, `~/.aws`, `~/.kimi-code`) and `privileged` (sudo, setuid, writes under `/usr/local`, `/etc`, `/Library`). Exit 0 means at least one file was scanned with no findings and nothing was left unscanned. Exit 1 means findings, a skipped file (oversize or unreadable), an executable-looking file the scan does not parse (`.js`, `.mjs`, `package.json`, `.plist`, `.ps1`, `.rb`, an executable or `#!` file, listed as skipped), no file scanned, or the 5,000-file limit reached. Exit 2 means bad usage. The rule is scan, then read. A clean scan is not a safety proof: it is regex matching on source text, so obfuscated or generated commands are missed. Review the installer anyway; the scan only makes the known side effects (for example the GoodQA MCP registration in the secure-login installer) visible first.
@@ -310,6 +325,8 @@ The rescue wrapper does not stage or commit leftover model edits. It always exit
 | `ISOLATION_FAILED` | `UNKNOWN` | Review isolation failed for a reason without a specific code. | Read the Detail line, fix the cause, rerun once; reconcile if a provider was launched. |
 
 ## Delivery workflow
+
+Delivery and integration admit the official Desktop Sites indexed Git metadata only when `GIT_CONFIG_COUNT` is canonical `0` through `20`, all indexed key/value names are present without extras, and every key is one of the exact credential-helper/useHttpPath or HTTP proactiveAuth/followRedirects keys scoped to `https://chatgpt.com/backend-api/codex/sites/git/` or `https://chatgpt-staging.com/backend-api/codex/sites/git/`. The classifier reads key metadata, never indexed values. This admits and strips ambient Sites metadata; it grants no authentication or configuration authority. Helper-owned Git processes discard the inherited indexed family and compose their own settings. Other routing overrides remain refused, and the existing global-config/test-isolation policy is unchanged. User-approved external check commands retain their separate environment contract.
 
 Both editions install the same delivery implementation and dependencies. Claude uses `~/.claude/hooks/deliver.py`; Codex uses `~/.codex/agent-harness/deliver.py` and needs no Claude installation. Remote delivery also needs an authenticated Git transport and GitHub CLI (`gh`). The helper never merges a remote PR. Repository review, authorization and scope checks remain the main agent's responsibility.
 
@@ -1012,6 +1029,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - **Header lines:**
   - `Ticket: GoodQA <project>#<n>`. The project slug is required; a bare `GoodQA #N` is rejected.
   - `Author: agent:<id> (<model>)`, `human:<name>` or `model:<name>`.
+  - Optional `Owners: agent:<native UUID>, agent:<native UUID>`. This reviewed declaration lists all substantive component owners, includes the author, and accepts 1–8 unique lowercase native UUID identities. Changing it changes the core and stales reviews. A missing header keeps legacy conservative owner inference from posting actors; an empty or malformed header never selects legacy behavior.
   - `Click-test: required` or `not-applicable (<reason>)`.
   - `Sign-off: main` or `human`.
 - **Sections:** `## Outcome`, `## Scope`, `## Acceptance criteria`, `## Negative cases` and `## Risks`.
@@ -1021,6 +1039,56 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not. Keep `## Reviews` last: `attach` refuses a spec with a section after it, since that section would be lost.
 
 ### Reviews
+
+For an explicit native `Owners:` declaration, attachment also needs
+`--owners-wal ~/.agent-harness/codex-wals/SESSION_UUID/main.jsonl`. The attacher
+checks each owner's native parent and `harness_owner` assignment, then captures
+an owner-recorded `handoff` or `result` from its exact sibling agent WAL. This
+attestation is not native process completion or cryptographic proof of code
+ownership. Completeness of the declared owner list remains a semantic review
+duty. Missing, torn, aliased or changing evidence refuses attachment.
+
+Explicit-owner specs produce a version-2 spec record and a digest-mirrored
+`owner-provenance.json` attachment. Only identity/role, timestamps and digests
+are retained; owner notes and full WALs are not uploaded. Current remote gates
+verify the frozen proof without querying the Mac database. Missing or malformed
+explicit metadata refuses instead of choosing older legacy ownership data.
+Update participating helpers before using this record version; older helpers
+do not enforce explicit-owner semantics.
+
+Owner attestations must follow the matching native `SubagentStart` event; both
+timestamps and event digests are retained. The gate derives Author, Owners and
+the core from actual checksum-verified attached specification bytes, selected
+by server comment binding rather than mutable JSON roles/version. Stripping
+record fields, downgrading a record or remirroring a smaller owner list cannot
+turn an explicit artifact into legacy ownership. An unavailable current source
+refuses rather than selecting an older specification.
+
+Artifact reads use the existing authenticated API read-target route. A separate
+empty HTTP client fetches approved storage without API credentials, cookies,
+environment proxies or redirects, after checking the actual public peer. The
+production default permits only `https://goodqa-uploads.tor1.digitaloceanspaces.com`
+for the production `https://goodqa.app` API; development is not implicitly
+allowed. Custom deployments need an explicit trusted `artifact_download_origins`
+list. Header and body receives enforce the absolute verification deadline at
+each socket read, including final completion; slow byte streams cannot extend
+it by resetting an idle timeout. OS DNS resolution and multi-address connection
+setup are not hard wall-clock bounded: connection/TLS timeouts and post-connect
+deadline checks remain, so this is not a whole-command cancellation guarantee.
+Reads have a 64 KiB target-JSON limit, a 1 MB source
+limit, 64 markdown candidates and an 8 MB aggregate source budget. Download
+capabilities and headers are never logged. Access failures remain verification
+failures, not permission changes.
+
+In explicit mode, a coordinator can transport someone else's spec, evidence or
+tester report without becoming an inferred owner. Author, declared owners,
+current spec reviewers and all historical attachment-verified actual testers
+remain excluded from signoff through the same CLI/done-gate calculation.
+Unverified comments cannot manufacture a tester role. The actual tester must
+remain independent of the current owners, author and reviewers. Posting an
+attachment grants neither a role nor authority, and record identities retain
+their existing disclosed trust limits. Legacy specs keep conservative posting
+actor inference; CLI signoff now also refuses an actual tester immediately.
 
 - **Two roles, distinct reviewers.** The `adversarial` and `acceptance` roles each need an `ACCEPT` on the current core.
   - The two reviewers must differ in model, agent or person. Two runs of the same helper model count as one reviewer.
@@ -1053,7 +1121,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
     - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
     - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
     - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
-    - A Codex native `harness_click_tester` supplies its UUID and parent session directory. The helper checks its typed role and parent in the owned native database. Its report digest must appear as a complete `REPORT_SHA256 <digest>` line in its own assistant final response. The database-bound session rollout must identify the same child. The recorded observation time is the final response timestamp.
+    - Codex native `harness_click_tester` records use the exact `CLICK_TEST_WITNESS_V1` procedure above, including current spec, observation window, deployed commit and report binding. Report-digest-only final text cannot substitute for that witness.
   - **Human click-tests** are self-attested.
 - **Sign-off:**
   - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.

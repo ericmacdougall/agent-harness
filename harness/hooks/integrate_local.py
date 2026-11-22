@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from git_safety import _bounded_git, git_environment, require_safe_source
+from git_safety import _bounded_git, git_environment, require_safe_source, unsupported_git_environment
 from process import cleanup_discarded, run as run_process
 
 
@@ -1458,7 +1458,7 @@ class OriginalScope:
             raise ExternalApplyError('Original scope context cannot be reused')
         self._entered = True
         try:
-            if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
+            if unsupported_git_environment(os.environ, ALLOWED_GIT_ENV):
                 raise OSError('unsupported Git routing environment')
             top = inspect_git(self.repo, 'rev-parse', '--show-toplevel', timeout=self.timeout)
             if (top.returncode or not top.stdout.strip()
@@ -1646,7 +1646,7 @@ class OriginalScope:
 
 
 def integrate_scratch(args, preparations, checks):
-    if any(name.startswith('GIT_') and name not in ALLOWED_GIT_ENV for name in os.environ):
+    if unsupported_git_environment(os.environ, ALLOWED_GIT_ENV):
         report('BLOCKED_POLICY', 'Inherited Git routing or configuration override is unsupported')
         return 2
     identities = [str(args.repo), args.original_branch, args.expected_head]
