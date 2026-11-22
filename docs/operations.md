@@ -1027,6 +1027,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - **Header lines:**
   - `Ticket: GoodQA <project>#<n>`. The project slug is required; a bare `GoodQA #N` is rejected.
   - `Author: agent:<id> (<model>)`, `human:<name>` or `model:<name>`.
+  - Optional `Owners: agent:<native UUID>, agent:<native UUID>`. This reviewed declaration lists all substantive component owners, includes the author, and accepts 1–8 unique lowercase native UUID identities. Changing it changes the core and stales reviews. A missing header keeps legacy conservative owner inference from posting actors; an empty or malformed header never selects legacy behavior.
   - `Click-test: required` or `not-applicable (<reason>)`.
   - `Sign-off: main` or `human`.
 - **Sections:** `## Outcome`, `## Scope`, `## Acceptance criteria`, `## Negative cases` and `## Risks`.
@@ -1036,6 +1037,32 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not. Keep `## Reviews` last: `attach` refuses a spec with a section after it, since that section would be lost.
 
 ### Reviews
+
+For an explicit native `Owners:` declaration, attachment also needs
+`--owners-wal ~/.agent-harness/codex-wals/SESSION_UUID/main.jsonl`. The attacher
+checks each owner's native parent and `harness_owner` assignment, then captures
+an owner-recorded `handoff` or `result` from its exact sibling agent WAL. This
+attestation is not native process completion or cryptographic proof of code
+ownership. Completeness of the declared owner list remains a semantic review
+duty. Missing, torn, aliased or changing evidence refuses attachment.
+
+Explicit-owner specs produce a version-2 spec record and a digest-mirrored
+`owner-provenance.json` attachment. Only identity/role, timestamps and digests
+are retained; owner notes and full WALs are not uploaded. Current remote gates
+verify the frozen proof without querying the Mac database. Missing or malformed
+explicit metadata refuses instead of choosing older legacy ownership data.
+Update participating helpers before using this record version; older helpers
+do not enforce explicit-owner semantics.
+
+In explicit mode, a coordinator can transport someone else's spec, evidence or
+tester report without becoming an inferred owner. Author, declared owners,
+current spec reviewers and all historical attachment-verified actual testers
+remain excluded from signoff through the same CLI/done-gate calculation.
+Unverified comments cannot manufacture a tester role. The actual tester must
+remain independent of the current owners, author and reviewers. Posting an
+attachment grants neither a role nor authority, and record identities retain
+their existing disclosed trust limits. Legacy specs keep conservative posting
+actor inference; CLI signoff now also refuses an actual tester immediately.
 
 - **Two roles, distinct reviewers.** The `adversarial` and `acceptance` roles each need an `ACCEPT` on the current core.
   - The two reviewers must differ in model, agent or person. Two runs of the same helper model count as one reviewer.

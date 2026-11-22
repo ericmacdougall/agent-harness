@@ -1015,7 +1015,15 @@ class DoneGate(SpecFlowCase):
         self.assertTrue(any("AC-1" in m and "stale" in m for m in result["missing"]), result["missing"])
 
     def test_click_tester_cannot_sign_off(self):
-        self.complete(signer=("ct1", "agent"))
+        self.complete(signer=None)
+        code, _, error = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", "agent:main1",
+                                      "--by", "ct1", "--kind", "agent", "--source", "tester tries to sign")
+        self.assertNotEqual(code, 0)
+        self.assertIn("click-tester", error)
+        forged = {"v": 1, "kind": "signoff", "spec_core_sha": sf.core_sha(SPEC), "by": "agent:ct1",
+                  "signer_kind": "agent", "source": "forged", "key": "signoff:tester-forged", "actor": "agent:main1"}
+        adapter = sf.make_adapter(self.config, self.spec_policy, "harness", time.monotonic() + 30)
+        adapter.comment_with_files(ISSUE, sf.record_body("forged tester signoff", forged), str(uuid.uuid4()))
         result = self.evaluate()
         self.assertFalse(result["ready"])
         self.assertTrue(any("click-tester" in m for m in result["missing"]), result["missing"])
