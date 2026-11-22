@@ -99,10 +99,15 @@ class IndexInspectionError(Exception):
         self.cleanup_incomplete = cleanup_incomplete
 
 
-def index_unflagged(repo, timeout):
+def index_unflagged(repo, timeout, *, sparse_layout=None):
     """Check NUL records without retaining paths or trusting Git's fsmonitor cache."""
     command = ['git', *INSPECTION_CONFIG, 'ls-files', '-v', '-s', '-z']
     deadline = time.monotonic() + min(timeout, INDEX_MAX_SECONDS)
+    # Only the original checkout supplies this evidence. Scratch remains H-only.
+    # Repeat the complete omission proof rather than trusting an S flag alone.
+    if sparse_layout is not None:
+        if sparse_layout == 'ordinary' or safe_source(repo, timeout, deadline=deadline) != sparse_layout:
+            raise IndexInspectionError()
     try:
         process = subprocess.Popen(command, cwd=repo,
                                    env={**git_environment(), 'PYTHONDONTWRITEBYTECODE': '1'},
@@ -137,7 +142,8 @@ def index_unflagged(repo, timeout):
                         prefix += segment[:INDEX_HEADER_BYTES - len(prefix)]
                     if end < 0:
                         break
-                    if (len(prefix) != INDEX_HEADER_BYTES or prefix[:2] != b'H '
+                    if (len(prefix) != INDEX_HEADER_BYTES
+                            or prefix[:2] not in ((b'H ', b'S ') if sparse_layout is not None else (b'H ',))
                             or prefix[2:8] not in {b'100644', b'100755', b'120000'}
                             or prefix[8:] != b' '):
                         # A gitlink has its own index, where hidden flags can
@@ -558,7 +564,7 @@ def run_git_discard_nohooks(repo, *args, timeout=600):
 
 def safe_source(repo, timeout, *, allow_unmerged=False, deadline=None):
     try:
-        require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS),
+        return require_safe_source(repo, git_environment(), timeout=min(timeout, INDEX_MAX_SECONDS),
                             allow_unmerged=allow_unmerged, deadline=deadline)
     except OSError:
         raise IndexInspectionError() from None
@@ -1178,8 +1184,8 @@ def scratch_abort(repo, scratch, journal, message, *, phase, exit_code=None,
 def checked_original(repo, branch, base, timeout, *, deadline=None):
     def budget():
         return timeout if deadline is None else remaining_budget(deadline, timeout)
-    safe_source(repo, budget(), deadline=deadline)
-    index_unflagged(repo, budget())
+    layout = safe_source(repo, budget(), deadline=deadline)
+    index_unflagged(repo, budget(), sparse_layout=layout if layout != 'ordinary' else None)
     current_branch = inspect_git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD', timeout=budget())
     current_head = inspect_git(repo, 'rev-parse', 'HEAD', timeout=budget())
     status = inspect_git(repo, 'status', '--porcelain', '--untracked-files=all',
