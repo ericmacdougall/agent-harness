@@ -35,7 +35,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'node_check_reporter.mjs', 'deliver.py',
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
-                    'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
+                    'spec_flow.py', 'native_pr_review.py', 'native_pr_dispatch.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
                     'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py',
                     'idle_guard.py',  # ops_watch's default idle_guard check imports it (goodqa#15943)
