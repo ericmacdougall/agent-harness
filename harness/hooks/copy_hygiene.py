@@ -58,6 +58,7 @@ HARNESS_COPY_HYGIENE_UNIT_DIRS (os.pathsep list) replaces the systemd/launchd di
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import fcntl
 import fnmatch
 import glob
@@ -69,6 +70,7 @@ import pwd
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -246,9 +248,9 @@ def safe_key(key: str) -> str:
     return k[:80]
 
 
-def repo_identity(top: str) -> "tuple[str, str]":
+def repo_identity(top: str, read_git=None) -> "tuple[str, str]":
     """(<repo name>-<8 hex>, common dir): one id for every worktree of a repository, distinct for same-named repos."""
-    rc, common = git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    rc, common = (read_git or git)(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
     common = os.path.realpath(common.splitlines()[-1].strip()) if rc == 0 and common else os.path.realpath(top)
     base = os.path.basename(os.path.dirname(common)) if os.path.basename(common) == ".git" else os.path.basename(common)
     base = re.sub(r"\.git$", "", base) or "repo"
@@ -284,6 +286,30 @@ def touch_index(path: str, **extra) -> None:
 
 
 # ---------------------------------------------------------------- acquire
+@contextmanager
+def copy_lock(path, *, create, wait):
+    lock_path = path + ".lock"
+    flags = os.O_RDWR | os.O_NOFOLLOW | (os.O_CREAT if create else 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                or opened.st_nlink != 1 or opened.st_mode & 0o022):
+            raise ValueError("Unsafe reusable-copy lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        named = os.lstat(lock_path)
+        if (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("Reusable-copy lock changed")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def copy_generation(descriptor):
+    value = os.pread(descriptor, 34, 0)
+    return value[:-1].decode("ascii") if re.fullmatch(rb"[0-9a-f]{32}\n", value) else None
+
+
 def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -> dict:
     cfg = normalize(cfg) if cfg is not None else load_config()
     try:
@@ -303,8 +329,13 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -
     rid, common = repo_identity(top)
     path = os.path.join(copies_root(), rid, k)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path + ".lock", "w") as lk:            # one acquire per copy at a time
-        fcntl.flock(lk, fcntl.LOCK_EX)
+    with copy_lock(path, create=True, wait=True) as descriptor:
+        # Record a new use even at identical HEAD and regardless of the wall clock.
+        generation = os.urandom(16).hex().encode("ascii") + b"\n"
+        if os.pwrite(descriptor, generation, 0) != len(generation):
+            raise OSError("Could not record the reusable-copy generation")
+        os.ftruncate(descriptor, len(generation))
+        os.fsync(descriptor)
         if os.path.isdir(path):
             rc, cur = git(path, "rev-parse", "HEAD")
             if rc != 0:
@@ -319,9 +350,9 @@ def acquire(repo: str, key: str, ref: str = "HEAD", cfg: "dict | None" = None) -
                             "error": "the copy has uncommitted tracked changes and is still at an older commit; "
                                      "commit or remove them, then acquire again (nothing was discarded)"}
                 rc, local = git(path, "log", "--oneline", "-1", "HEAD", "--not", "--remotes", "--branches")
-                if rc == 0 and local:
+                if rc != 0 or local:
                     return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha,
-                            "error": "the copy's HEAD holds a commit on no branch or remote; save it on a branch first"}
+                            "error": "could not verify the copy's HEAD is preserved on a branch or remote"}
                 rc, out = git(path, "checkout", "--detach", "--quiet", sha)
                 if rc != 0:
                     return {"ok": False, "stale": True, "path": path, "commit": cur, "wanted": sha, "error": out[-300:]}
@@ -1689,7 +1720,23 @@ def main(argv=None) -> int:
     sc = sub.add_parser("scratch"); sc.add_argument("--key", default="")
     pr = sub.add_parser("protected", help="list protected paths, or --check <path> (exit 1 when protected)")
     pr.add_argument("--check", default="")
+    finish = sub.add_parser("finish", help="verify and optionally retire one completed task's indexed copy")
+    finish.add_argument("--repo", required=True)
+    finish.add_argument("--key", required=True)
+    finish.add_argument("--expect-head", required=True)
+    archive = sub.add_parser("archive-artifact", help="verify and optionally retire one completed task artifact to B2")
+    archive.add_argument("--name", required=True)
+    archive.add_argument("--b2-remote")
+    archive.add_argument("--max-bytes", type=int, help="explicit artifact limit, up to 4 GiB (defaults to 256 MiB)")
+    for scoped in (finish, archive):
+        scoped.add_argument("--task-dir", required=True)
+        scoped.add_argument("--apply", action="store_true")
     args = ap.parse_args(argv)
+    if args.cmd in ("finish", "archive-artifact"):
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import lifecycle_cleanup
+
+        return lifecycle_cleanup.run(args)
     if args.cmd == "scratch":
         d = scratch(args.key)
         if not d:
