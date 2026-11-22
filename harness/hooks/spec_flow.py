@@ -786,7 +786,8 @@ def _native_review_source(path, agent, role):
         directories = (home, home / ".agent-harness", root, raw.parent)
         before = tuple(_native_path(item, uid, directory=True) for item in directories)
         wal_binding = _native_path(raw, uid, maximum=64_000_000)
-        expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer"}.get(role)
+        expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer",
+                    "click-test": "harness_click_tester"}.get(role)
         rows = _native_review_rows(home, uid, agent, parent)
         parent_row, child = rows[parent], rows[agent]
         if (parent_row[1:4] != ("vscode", "user", "Codex Desktop") or any(parent_row[i] is not None for i in (4, 5, 6))
@@ -818,6 +819,71 @@ def _native_review_source(path, agent, role):
                 "source": "Codex native reviewer metadata; parent bound to native WAL session"}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
         raise SpecError("native reviewer metadata unavailable or conflicting", EXIT_USAGE) from None
+
+
+def _native_click_tester(wal_dir, agent, report_sha):
+    """Bind a tester's report to its own recorded final response."""
+    native = _native_review_source(wal_dir / "main.jsonl", agent, "click-test")
+    if native is None:
+        return None
+    if not report_sha:
+        raise SpecError("native click-test requires a report bound by SHA-256", EXIT_USAGE)
+    import pwd
+    import sqlite3
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    uid = os.getuid()
+    try:
+        before = _native_database_binding(home, uid)
+        connection = sqlite3.connect((home / ".codex/state_5.sqlite").as_uri() + "?mode=ro", timeout=.05, uri=True)
+        try:
+            connection.execute("PRAGMA trusted_schema=OFF")
+            connection.execute("PRAGMA query_only=ON")
+            row = connection.execute("SELECT rollout_path FROM threads WHERE id=?", (agent,)).fetchone()
+        finally:
+            connection.close()
+        if not row or len(row) != 1 or type(row[0]) is not str:
+            raise ValueError("native rollout unavailable")
+        path = Path(row[0])
+        sessions = home / ".codex/sessions"
+        if not path.is_absolute() or path != path.resolve() or not path.is_relative_to(sessions):
+            raise ValueError("native rollout outside session store")
+        # Validate every absolute directory from the owned session root.
+        chain = [sessions]
+        for part in path.relative_to(sessions).parts[:-1]:
+            chain.append(chain[-1] / part)
+        bindings = tuple(_native_path(item, uid, directory=True) for item in chain)
+        binding = _native_path(path, uid, maximum=64_000_000)
+        snapshot = (path.stat().st_size, path.stat().st_mtime_ns)
+        raw = read_regular(path, 64_000_000)
+        marker = "REPORT_SHA256 " + report_sha
+        found, session_id = None, None
+        for line in raw.splitlines():
+            event = safe_input.safe_json_loads(line, max_depth=48, max_bytes=2_000_000)
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if isinstance(event, dict) and event.get("type") == "session_meta" and isinstance(payload, dict):
+                if session_id is not None or payload.get("id") != agent:
+                    raise ValueError("native rollout identity conflicts")
+                session_id = payload["id"]
+            if (not isinstance(event, dict) or event.get("type") != "response_item" or not isinstance(payload, dict)
+                    or payload.get("type") != "message" or payload.get("role") != "assistant"
+                    or payload.get("channel") != "final"):
+                continue
+            content = payload.get("content")
+            text = "\n".join(item.get("text", "") for item in content
+                             if isinstance(item, dict) and isinstance(item.get("text"), str)) if isinstance(content, list) else ""
+            if marker in text.splitlines():
+                found = event.get("timestamp")
+        if session_id != agent or not isinstance(found, str) or not found:
+            raise ValueError("tester final does not bind report digest")
+        if (_native_database_binding(home, uid) != before or
+                tuple(_native_path(item, uid, directory=True) for item in chain) != bindings or
+                _native_path(path, uid, maximum=64_000_000) != binding or
+                (path.stat().st_size, path.stat().st_mtime_ns) != snapshot):
+            raise ValueError("native rollout changed")
+        return {"kind": "agent", "identity": agent, "agent_type": "harness_click_tester",
+                "family": "codex", "started_at": found, "ended_at": found, "last_activity_at": found}
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
+        raise SpecError("native click-test report provenance unavailable or conflicting", EXIT_USAGE) from None
 
 
 def wal_entries(path: Path):
@@ -1884,31 +1950,36 @@ def cmd_click_test(args, spec_policy):
         if not args.wal_dir:
             raise SpecError("--agent-id needs --wal-dir <the session WAL directory>", EXIT_USAGE)
         wal_dir = Path(os.path.expanduser(args.wal_dir)).absolute()
-        if wal_dir.parent != wal_root():
-            raise SpecError("--wal-dir must be a session directory under ~/.claude/wals", EXIT_USAGE)
         agent = safe_id(args.agent_id)
-        main_entries = wal_entries(wal_dir / "main.jsonl")
-        starts = [e for e in main_entries if e.get("event") == "subagent" and e.get("agent_id") == agent
-                  and e.get("agent_type") == "click-tester"]
-        if not starts:
-            raise SpecError(f"agent {args.agent_id} is not a click-tester recorded in {wal_dir}/main.jsonl")
-        started = str(starts[0].get("at"))
-        agent_entries = wal_entries(wal_dir / f"agent-{agent}.jsonl")
-        stops = sorted(str(e.get("at")) for e in main_entries + agent_entries
-                       if e.get("event") == "subagent_stop" and e.get("agent_id") == agent
-                       and str(e.get("at")) >= started)
-        last = max([str(e.get("at")) for e in agent_entries if e.get("at")] or [started])
-        tester = {"kind": "agent", "identity": agent, "agent_type": "click-tester", "started_at": started,
-                  "ended_at": stops[0] if stops else None, "last_activity_at": last}
-        pass_source = None
-        if args.result == "pass":
-            if report_sha and any(report_sha in str(e.get("note") or "") for e in agent_entries):
-                pass_source = "report+agent-wal-sha256"
-            elif args.really_tested and really_tested(agent_entries, args.really_tested):
-                pass_source = "agent-wal-really-tested"
-            else:
-                raise SpecError("a pass must come from the click-tester itself: its report's sha256 in a note in "
-                                f"agent-{agent}.jsonl, or --really-tested <id> found in that WAL")
+        tester = _native_click_tester(wal_dir, agent, report_sha)
+        if tester is not None:
+            pass_source = "report+codex-tester-final-sha256" if args.result == "pass" else None
+        else:
+            if wal_dir.parent != wal_root():
+                raise SpecError("--wal-dir must be a session directory under ~/.claude/wals", EXIT_USAGE)
+            agent = safe_id(args.agent_id)
+            main_entries = wal_entries(wal_dir / "main.jsonl")
+            starts = [e for e in main_entries if e.get("event") == "subagent" and e.get("agent_id") == agent
+                      and e.get("agent_type") == "click-tester"]
+            if not starts:
+                raise SpecError(f"agent {args.agent_id} is not a click-tester recorded in {wal_dir}/main.jsonl")
+            started = str(starts[0].get("at"))
+            agent_entries = wal_entries(wal_dir / f"agent-{agent}.jsonl")
+            stops = sorted(str(e.get("at")) for e in main_entries + agent_entries
+                           if e.get("event") == "subagent_stop" and e.get("agent_id") == agent
+                           and str(e.get("at")) >= started)
+            last = max([str(e.get("at")) for e in agent_entries if e.get("at")] or [started])
+            tester = {"kind": "agent", "identity": agent, "agent_type": "click-tester", "started_at": started,
+                      "ended_at": stops[0] if stops else None, "last_activity_at": last}
+            pass_source = None
+            if args.result == "pass":
+                if report_sha and any(report_sha in str(e.get("note") or "") for e in agent_entries):
+                    pass_source = "report+agent-wal-sha256"
+                elif args.really_tested and really_tested(agent_entries, args.really_tested):
+                    pass_source = "agent-wal-really-tested"
+                else:
+                    raise SpecError("a pass must come from the click-tester itself: its report's sha256 in a note in "
+                                    f"agent-{agent}.jsonl, or --really-tested <id> found in that WAL")
     elif args.human:
         if not (args.started and args.ended):
             raise SpecError("--human needs --started and --ended (ISO 8601)", EXIT_USAGE)
