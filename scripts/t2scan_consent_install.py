@@ -28,6 +28,7 @@ SOCKET = f"{NAME}.socket"
 SERVICE = f"{NAME}.service"
 TARGETS = {"verifier": BIN, "socket": SYSTEMD / SOCKET, "service": SYSTEMD / SERVICE}
 KEY = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+ADDRESS = Path("/run/agent-harness") / f"{NAME}.sock"
 MAX_REQUEST = 65536
 
 
@@ -97,11 +98,11 @@ def root_file(path):
 
 
 def no_conflicts():
-    for path in (*TARGETS.values(), CONFIG, STATE):
+    for path in (*TARGETS.values(), CONFIG, STATE, ADDRESS):
         require(not os.path.lexists(path), "Existing consent installation or state needs reconciliation.")
-    for folder in (BIN.parent.parent, CONFIG.parent.parent, STATE.parent, SYSTEMD):
+    for folder in (BIN.parent.parent, CONFIG.parent.parent, STATE.parent, SYSTEMD, ADDRESS.parent.parent):
         paths_are_protected(folder)
-    for folder in (BIN.parent, CONFIG.parent):
+    for folder in (BIN.parent, CONFIG.parent, ADDRESS.parent):
         if os.path.lexists(folder):
             paths_are_protected(folder)
 
@@ -151,7 +152,7 @@ def disable():
 
 
 def peer_probe(peer):
-    address = Path("/run/agent-harness") / SOCKET.replace(".socket", ".sock")
+    address = ADDRESS
     info = address.lstat()
     require(stat.S_ISSOCK(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o660
             and info.st_gid == grp.getgrnam(CLIENTS).gr_gid, "Installed socket identity differs.")
@@ -222,7 +223,8 @@ def run(phase, config, payload, verify_key):
         no_conflicts()
         require(not any(lookup(grp.getgrnam, name) for name in (ACCOUNT, CLIENTS))
                 and lookup(pwd.getpwnam, ACCOUNT) is None, "Dedicated consent account already exists.")
-        for command_path in ("/usr/sbin/runuser", "/usr/bin/openssl", "/usr/bin/systemctl"):
+        for command_path in ("/usr/sbin/runuser", "/usr/sbin/groupadd", "/usr/sbin/useradd", "/usr/sbin/usermod",
+                             "/usr/bin/openssl", "/usr/bin/systemctl", "/usr/bin/python3"):
             require(os.access(command_path, os.X_OK), "A provisioning prerequisite is unavailable.")
     elif phase == "install":
         return install(config, payload, verify_key)
@@ -234,7 +236,13 @@ def run(phase, config, payload, verify_key):
     return {}
 
 
-def worker(verify_key):
+def bind_release(payload, ref, hashes):
+    assets = decode_payload(payload)
+    require(payload["ref"] == ref and {name: sha(assets[name]) for name in TARGETS} == hashes,
+            "Received assets differ from the verified release.")
+
+
+def worker(verify_key, ref, hashes):
     os.umask(0o022)
     raw = sys.stdin.buffer.read(MAX_REQUEST + 1)
     require(len(raw) <= MAX_REQUEST, "Setup request is over the limit.")
@@ -243,6 +251,10 @@ def worker(verify_key):
             "Unexpected setup request.")
     config = target_identity(request["issuer"], request["fingerprint"], request["uid"])
     phase = request["phase"]
+    if phase == "install":
+        bind_release(request["payload"], ref, hashes)
+    if phase == "rollback":
+        require(request["payload"] == ref, "Requested rollback is outside the verified release.")
     if phase == "check":
         result = run(phase, config, request["payload"], verify_key)
     else:

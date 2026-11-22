@@ -71,6 +71,48 @@ class ProvisionSequence(unittest.TestCase):
         self.assertIn(repr(assets["verifier"]), argv[-1])
         compile(argv[-1], "pinned-remote-worker", "exec")
 
+    def test_export_is_published_only_after_detached_verification(self):
+        for failure in (True, False):
+            with self.subTest(verification_refused=failure):
+                stage = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                (stage / "scoped-assignments.json").write_bytes(b"scope fixture")
+                signer = stage / "signer"
+                signer.write_bytes(b"fixture executable")
+                (stage / "issuer.pem").write_bytes(b"fixture public key")
+                options = SimpleNamespace(ref="a" * 40, run="run_fixture")
+                item = {"assignment": "executive-synthesis", "work_item_id": "wrk_item", "task_key": "test-task",
+                        "packet_sha256": "b" * 64}
+                challenge = dict(run_id=options.run, project_id="prj_fixture", provider="codex", model="gpt-6-astra",
+                                 mode="direct", issuer="operator", audience="target", created_at=40, expires_at=80,
+                                 assignments=[item])
+
+                def execute(argv, **kwargs):
+                    if argv[0] == "proposal":
+                        Path(argv[-1]).write_text(json.dumps(challenge))
+                    elif argv[0] == str(signer):
+                        Path(argv[-1]).write_bytes(b"fake DER fixture")
+                    else:
+                        self.assertEqual(argv[0], "/usr/bin/openssl")
+                        if failure:
+                            raise provision.Refusal("verification fixture refused")
+
+                result = stage / "approval-export.json"
+                with patch.object(provision, "execute", side_effect=execute), patch.object(
+                    provision.time, "time", return_value=42
+                ):
+                    if failure:
+                        with self.assertRaisesRegex(provision.Refusal, "verification fixture"):
+                            provision.output_bundle(options, stage, (["proposal"], provision.sha(b"scope fixture")),
+                                                    signer, provision.sha(b"fixture executable"))
+                        self.assertFalse(result.exists())
+                        continue
+                    provision.output_bundle(options, stage, (["proposal"], provision.sha(b"scope fixture")),
+                                            signer, provision.sha(b"fixture executable"))
+                receipt = json.loads(result.read_text())
+                self.assertEqual(receipt["run_id"], options.run)
+                self.assertEqual(receipt["signature"]["sha256"], provision.sha(b"fake DER fixture"))
+                self.assertEqual(receipt["assignments"], [dict(item, capsule="portable-consent/test-task.json")])
+
 
 class ProtectedProvision(unittest.TestCase):
     def setUp(self):
@@ -97,6 +139,17 @@ class ProtectedProvision(unittest.TestCase):
         self.assertEqual(proof.read_bytes(), b"state remains")
         verify.assert_not_called()
         accounts.assert_not_called()
+
+    def test_existing_runtime_endpoint_fails_before_account_or_systemd_changes(self):
+        endpoint = self.stage / linux.SOCKET
+        endpoint.symlink_to(self.stage / "unrelated-endpoint")
+        with patch.object(linux, "ADDRESS", endpoint), patch.object(linux, "create_accounts") as accounts, \
+                patch.object(linux, "systemctl") as system:
+            with self.assertRaisesRegex(linux.Refusal, "Existing consent"):
+                linux.install(self.config, self.payload, Mock())
+            accounts.assert_not_called()
+            system.assert_not_called()
+        self.assertTrue(endpoint.is_symlink())
 
     def test_fingerprint_or_uid_mismatch_stops_before_scope_record(self):
         fixed = self.config["ssh_ed25519_fingerprint"]
@@ -129,6 +182,15 @@ class ProtectedProvision(unittest.TestCase):
         self.assertTrue((linux.CONFIG / "issuer.pem").is_file())
         self.assertTrue(linux.STATE.is_dir())
         verify.assert_called_once()
+
+    def test_received_asset_or_source_ref_mismatch_is_refused(self):
+        hashes = {name: linux.sha(f"{name} fixture".encode()) for name in self.targets}
+        linux.bind_release(self.payload, self.payload["ref"], hashes)
+        with self.assertRaisesRegex(linux.Refusal, "differ"):
+            linux.bind_release(self.payload, "b" * 40, hashes)
+        with self.assertRaisesRegex(linux.Refusal, "differ"):
+            linux.bind_release(dict(self.payload, service=provision.base64str(b"other")),
+                               self.payload["ref"], hashes)
 
     def test_rollback_invalid_release_or_issuer_cannot_stop_broker(self):
         linux.CONFIG.mkdir()

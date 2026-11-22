@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 ORIGIN = "https://github.com/ericmacdougall/agent-harness.git"
@@ -29,6 +30,7 @@ SOURCES = {
 }
 DIGEST = re.compile(r"[a-f0-9]{40}")
 FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+SIGNING_DOMAIN = b"Agent Harness T2Scan Astra direct approval v1\x00"
 
 
 class Refusal(ValueError):
@@ -104,7 +106,8 @@ def ssh(known, code, *, input=None):
         "/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={known}", "-o", "GlobalKnownHostsFile=/dev/null", "-o", f"HostKeyAlias={HOST}",
         "-o", "HostKeyAlgorithms=ssh-ed25519", "-o", "ClearAllForwardings=yes", "-o",
-        "ConnectTimeout=8", HOST, code,
+        "KnownHostsCommand=none", "-o", "VerifyHostKeyDNS=no", "-o", "UpdateHostKeys=no",
+        "-o", "PermitLocalCommand=no", "-o", "ConnectTimeout=8", HOST, code,
     ], input=input, timeout=125)
 
 
@@ -112,8 +115,10 @@ def remote_factory(known, assets, options, uid):
     # The reviewed verifier source supplies the shared P-256 input check for the root receiver.
     proof_source = repr(assets["verifier"])
     worker_source = assets["worker"].decode("utf-8")
+    hashes = {name: sha(assets[name]) for name in ("verifier", "socket", "service")}
     source = worker_source + f"\nproof = {{'__name__': 't2scan_consent'}}\nexec(compile({proof_source}, 'verified consent', 'exec'), proof)\n"
-    source += "try:\n    worker(proof['public_key_format'])\nexcept Exception:\n    print('T2Scan consent provisioning refused.', file=sys.stderr)\n    sys.exit(2)\n"
+    source += (f"try:\n    worker(proof['public_key_format'], {options.ref!r}, {hashes!r})\n"
+               "except Exception:\n    print('T2Scan consent provisioning refused.', file=sys.stderr)\n    sys.exit(2)\n")
     shell = shlex.join(["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "-c", source])
 
     def invoke(phase, payload):
@@ -125,7 +130,6 @@ def remote_factory(known, assets, options, uid):
                     and reply["status"] == phase and type(reply["result"]) is dict,
                     "Unverified remote consent provisioning response.")
             if phase == "install":
-                hashes = {name: sha(assets[name]) for name in ("verifier", "socket", "service")}
                 expected = dict(ref=options.ref, signer_sha256=payload["signer_sha256"],
                                 public_key_sha256=sha(base64.b64decode(payload["public_key"], validate=True)),
                                 asset_sha256=hashes)
@@ -176,12 +180,38 @@ def output_bundle(options, stage, proposal, signer, signer_sha):
             timeout=900, tty=True)
     signed = challenge.read_bytes()
     value = json.loads(signed)
-    proof = json.dumps({"challenge_b64": base64str(signed), "signature_b64": base64str(signature.read_bytes())})
+    der = signature.read_bytes()
+    require(8 <= len(der) <= 72 and int(time.time()) < value["expires_at"], "Detached signature expired or is malformed.")
+    public_key = stage / "issuer.pem"
+    execute(["/usr/bin/openssl", "dgst", "-sha256", "-verify", str(public_key), "-signature", str(signature)],
+            input=SIGNING_DOMAIN + signed)
+    proof = json.dumps({"challenge_b64": base64str(signed), "signature_b64": base64str(der)})
     directory = stage / "portable-consent"
     directory.mkdir(mode=0o700)
+    assignment_exports = []
     for item in value["assignments"]:
-        (directory / f"{item['task_key']}.json").write_text(proof, encoding="ascii")
-    print(f"Signed exact T2Scan batch for {options.run}. Private capsules: {directory}")
+        capsule = directory / f"{item['task_key']}.json"
+        fd = os.open(capsule, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as output:
+            output.write(proof)
+        fields = {key: item[key] for key in ("assignment", "work_item_id", "task_key", "packet_sha256")}
+        assignment_exports.append(dict(fields, capsule=str(capsule.relative_to(stage))))
+    binding = {name: value[name] for name in (
+        "project_id", "run_id", "provider", "model", "mode", "issuer", "audience", "created_at", "expires_at"
+    )}
+    receipt = dict(
+        binding, schema="agent-harness.t2scan.astra-approval-export.v1", release_ref=options.ref,
+        signer_sha256=signer_sha, public_key_sha256=sha(public_key.read_bytes()), assignments=assignment_exports,
+        challenge={"path": challenge.name, "sha256": sha(signed)},
+        signature={"path": signature.name, "sha256": sha(der)},
+    )
+    result = stage / "approval-export.json"
+    with tempfile.NamedTemporaryFile(dir=stage, delete=False, mode="w", encoding="utf-8") as pending:
+        json.dump(receipt, pending, sort_keys=True)
+        pending.flush()
+        os.fsync(pending.fileno())
+    os.replace(pending.name, result)
+    print(f"Signed exact T2Scan batch for {options.run}. Private handoff record: {result}")
 
 
 def parse():
