@@ -56,13 +56,26 @@ def _identifier(value):
     return _matches(IDENT, value) and value == value.lower()
 
 
-NATIVE_CALL_LIMIT = 32_000_000
+NATIVE_CALL_LIMIT = 64_000_000
 NATIVE_CALL_TAIL = 1_000_000
+_NATIVE_CALL_RECORD_LIMIT = 4_000_000
+_NATIVE_CALL_ROW_LIMIT = 128_000
+_NATIVE_CALL_SCAN_SECONDS = 15
+_NATIVE_CALL_PENDING_LIMIT = 128
+_NATIVE_CALL_INPUT_LIMIT = 8192
 NATIVE_CALL_FIELDS = {"session", "tool_use_id", "call_id", "transcript", "file", "offset", "sha256", "command_sha256"}
 PROVIDER_CALL = re.compile(r"call_[A-Za-z0-9_-]{1,128}")
 EXEC_CALL = re.compile(r"exec-" + spec_flow.UUID.lower())
 CALL_ITEMS = {"function_call", "custom_tool_call"}
 CALL_RESULTS = {"function_call_output", "custom_tool_call_output"}
+_AWAITED_EXEC_PREFIX = (
+    '// @exec: {"yield_time_ms": 120000, "max_output_tokens": 3000}\n'
+    'const nativeRun = await tools.exec_command('
+)
+_AWAITED_EXEC_SUFFIX = (
+    ');\nif (nativeRun.session_id) { text(await tools.write_stdin({session_id: nativeRun.session_id, '
+    'chars: "", yield_time_ms: 60000, max_output_tokens: 3000})); } else { text(nativeRun); }'
+)
 
 
 def _root_rollout(home, uid, session):
@@ -111,30 +124,47 @@ def _root_rollout(home, uid, session):
 def _direct_provider_command(item):
     """Project commands from one direct shell invocation, never evaluate tool input."""
     kind, name = item.get("type"), item.get("name")
+    awaited = False
     if kind == "custom_tool_call" and name == "exec":
         source = item.get("input")
-        if not isinstance(source, str) or len(source) > 8192:
+        if not isinstance(source, str) or len(source) > _NATIVE_CALL_INPUT_LIMIT:
             return None
-        # Require exactly one awaited tools.exec_command call and strict JSON arguments.
-        match = re.fullmatch(r"\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*", source, re.S)
-        if not match:
-            return None
-        blob = match[1]
+        awaited_source = source.removesuffix("\n")
+        if awaited_source.startswith(_AWAITED_EXEC_PREFIX) and awaited_source.endswith(_AWAITED_EXEC_SUFFIX):
+            # Only this literal outer program may wait once on the one command it started.
+            awaited = True
+            blob = awaited_source[len(_AWAITED_EXEC_PREFIX):-len(_AWAITED_EXEC_SUFFIX)]
+        else:
+            match = re.fullmatch(r"\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*", source, re.S)
+            if not match:
+                return None
+            blob = match[1]
     elif kind == "function_call" and name in ("Bash", "exec_command"):
         blob = item.get("arguments")
         if not isinstance(blob, str):
             return None
     else:
         return None
-    data = spec_flow._native_json(blob, 8192)
+    data = spec_flow._native_json(blob, _NATIVE_CALL_INPUT_LIMIT)
+    if awaited:
+        required = {"cmd", "yield_time_ms", "max_output_tokens"}
+        if (set(data) not in (required, required | {"workdir"})
+                or type(data["yield_time_ms"]) is not int or data["yield_time_ms"] != 1000
+                or type(data["max_output_tokens"]) is not int or data["max_output_tokens"] != 3000):
+            return None
+        if "workdir" in data:
+            workdir = data["workdir"]
+            if (not isinstance(workdir, str) or not Path(workdir).is_absolute()
+                    or any(ord(char) < 32 or ord(char) == 127 for char in workdir)):
+                return None
     if set(data) - {"cmd", "command", "workdir", "yield_time_ms", "max_output_tokens"}:
         return None
     commands = [data[key] for key in ("cmd", "command") if key in data]
     return commands[0] if len(commands) == 1 and isinstance(commands[0], str) else None
 
 
-def _root_header(lines, session):
-    first = spec_flow._native_json(lines[0], 4_000_000)
+def _root_header(raw, session):
+    first = spec_flow._native_json(raw, _NATIVE_CALL_RECORD_LIMIT)
     payload = first.get("payload")
     if (first.get("type") != "session_meta" or not isinstance(payload, dict)
             or payload.get("id") != session or payload.get("session_id") != session
@@ -144,22 +174,26 @@ def _root_header(lines, session):
         raise ValueError("native rollout header is not the authenticated root")
 
 
-def _open_provider_call(data, session):
-    lines = data.splitlines()
-    _root_header(lines, session)
+def _open_provider_rows(lines, session):
+    rows = iter(lines)
+    _root_header(next(rows, b""), session)
     calls = {}
-    for raw in lines[1:]:
+    for raw in rows:
         if b'"response_item"' not in raw or not any(label in raw for label in (b'"function_call', b'"custom_tool_call')):
             continue
-        entry = spec_flow._native_json(raw, 4_000_000)
+        entry = spec_flow._native_json(raw, _NATIVE_CALL_RECORD_LIMIT)
         item = entry.get("payload")
         if entry.get("type") != "response_item" or not isinstance(item, dict):
             continue
         kind, call = item.get("type"), item.get("call_id")
         if kind in CALL_ITEMS and _matches(PROVIDER_CALL, call):
-            if call in calls:
-                raise ValueError("native provider call is duplicated")
-            calls[call] = item
+            if call in calls or len(calls) >= _NATIVE_CALL_PENDING_LIMIT:
+                raise ValueError("duplicate or excessive open native provider calls")
+            # Keep each pending entry small. Parse the command only if it survives.
+            calls[call] = {"type": kind, **{
+                key: value for key in ("name", "input", "arguments")
+                if isinstance(value := item.get(key), str) and len(value) <= _NATIVE_CALL_INPUT_LIMIT
+            }}
         elif kind in CALL_RESULTS and isinstance(call, str):
             calls.pop(call, None)
     if len(calls) != 1:
@@ -169,6 +203,65 @@ def _open_provider_call(data, session):
     if not command:
         raise ValueError("the open native provider call is not one direct command")
     return call, command
+
+
+def _open_provider_call(data, session):
+    return _open_provider_rows(data.splitlines(), session)
+
+
+def _root_history_lines(stream, size, deadline):
+    """Yield exact newline-framed bytes from one bounded root file snapshot."""
+    consumed = 0
+    rows = 0
+    while consumed < size:
+        if rows >= _NATIVE_CALL_ROW_LIMIT or time.monotonic() >= deadline:
+            raise ValueError("native root history work limit exceeded")
+        raw = stream.readline(min(_NATIVE_CALL_RECORD_LIMIT + 2, size - consumed + 1))
+        consumed += len(raw)
+        if not raw or consumed > size:
+            raise ValueError("native root history changed or truncated")
+        if not raw.endswith(b"\n") or len(raw.removesuffix(b"\n").removesuffix(b"\r")) > _NATIVE_CALL_RECORD_LIMIT:
+            raise ValueError("native root history record is torn or oversized")
+        rows += 1
+        yield raw
+    if stream.read(1):
+        raise ValueError("native root history grew during read")
+    if time.monotonic() >= deadline:
+        raise ValueError("native root history work limit exceeded")
+
+
+def _read_root_provider_call(path, home, uid, session, file, *, binding=None):
+    """Project one root call while hashing its original bytes and checking its bounded tail."""
+    deadline = time.monotonic() + _NATIVE_CALL_SCAN_SECONDS
+    with spec_flow._native_file_snapshot(path, {"home": home, "uid": uid}, NATIVE_CALL_LIMIT,
+                                         binding=file) as (stream, size):
+        offset = size if binding is None else binding["offset"]
+        if type(offset) is not int or not 0 < offset <= size <= offset + NATIVE_CALL_TAIL:
+            raise ValueError("native root history prefix or tail is out of bounds")
+        lines = _root_history_lines(stream, size, deadline)
+        prefix = hashlib.sha256()
+        length = 0
+
+        def prefix_rows():
+            nonlocal length
+            while length < offset:
+                raw = next(lines)
+                length += len(raw)
+                if length > offset:
+                    raise ValueError("native root history prefix is not a record boundary")
+                prefix.update(raw)
+                yield raw.removesuffix(b"\n").removesuffix(b"\r")
+
+        call, command = _open_provider_rows(prefix_rows(), session)
+        prefix_sha = prefix.hexdigest()
+        if binding is not None and (prefix_sha != binding["sha256"] or call != binding["call_id"]
+                                    or digest(command.encode()) != binding["command_sha256"]):
+            raise ValueError("native root history prefix or call changed")
+        for raw in lines:
+            entry = spec_flow._native_json(raw.removesuffix(b"\n").removesuffix(b"\r"), NATIVE_CALL_TAIL)
+            if binding is None or _terminal_native_event(entry, binding):
+                raise ValueError("native provider call is no longer running")
+    return call, command, offset, prefix_sha
 
 
 def native_call_binding(payload, command):
@@ -188,14 +281,11 @@ def native_call_binding(payload, command):
         if payload.get("transcript_path") not in (None, str(path)):
             return None
         file = spec_flow._native_path(path, uid, maximum=NATIVE_CALL_LIMIT)
-        data = spec_flow._native_read(path, {"home": home, "uid": uid}, NATIVE_CALL_LIMIT, binding=file)
-        if not data.endswith(b"\n"):
-            return None
-        provider_call, observed = _open_provider_call(data, session)
+        provider_call, observed, offset, prefix_sha = _read_root_provider_call(path, home, uid, session, file)
         if observed != command:
             return None
         return {"session": session, "tool_use_id": tool, "call_id": provider_call, "transcript": str(path),
-                "file": list(file), "offset": len(data), "sha256": digest(data),
+                "file": list(file), "offset": offset, "sha256": prefix_sha,
                 "command_sha256": digest(command.encode())}
     except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, sqlite3.Error, spec_flow.SpecError):
         return None
@@ -237,20 +327,9 @@ def native_call_still_running(binding, *, match_command=None):
         path = _root_rollout(home, uid, binding["session"])
         if str(path) != binding["transcript"]:
             return False
-        data = spec_flow._native_read(path, {"home": home, "uid": uid}, NATIVE_CALL_LIMIT, binding=tuple(binding["file"]))
-        offset = binding["offset"]
-        if (not offset <= len(data) <= offset + NATIVE_CALL_TAIL
-                or digest(data[:offset]) != binding["sha256"] or not data.endswith(b"\n")):
-            return False
-        call, command = _open_provider_call(data[:offset], binding["session"])
-        if (call != binding["call_id"] or digest(command.encode()) != binding["command_sha256"]
-                or (match_command is not None and not match_command(command))):
-            return False
-        for raw in data[offset:].splitlines():
-            entry = spec_flow._native_json(raw, NATIVE_CALL_TAIL)
-            if _terminal_native_event(entry, binding):
-                return False
-        return True
+        _, command, _, _ = _read_root_provider_call(path, home, uid, binding["session"], tuple(binding["file"]),
+                                                   binding=binding)
+        return match_command is None or bool(match_command(command))
     except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, sqlite3.Error, spec_flow.SpecError):
         return False
 

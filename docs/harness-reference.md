@@ -112,6 +112,16 @@ The context binds the repository, PR, base and source branches, complete commit 
 
 The installed native dispatcher accepts direct main-agent authorize, merge and reconcile commands. Each requires a fresh hook-issued Desktop root stamp bound to the still-running native tool call and the exact context and bundle digests. The native grant is single-use and belongs only to the native transport. The transport uses the protected GitHub PR merge operation with a server-side expected-head condition and no administrative bypass. Base freshness is checked before sending. That API has no atomic expected-base parameter, so concurrent base movement can only be detected afterward by comparing actual merge commit parents to the reviewed base and head. A mismatch or uncertain operation remains pending and cannot be resent or reported as delivered. Reconcile only confirms observed completion. Actual provider transport must be observed before calling it live-tested.
 
+For a Desktop exec call that needs more than the initial command wait, use the exact bounded wrapper below with the plain installed dispatcher command in the JSON `cmd` string. The argument object may also include an absolute `workdir`. The provider call waits once on the session returned by that command, with empty input. When this call ends, its stamp loses liveness. An unfinished process after the single wait does not carry its authority into another tool call.
+
+The verifier streams the authenticated root history with a fixed 64,000,000-byte file limit and checks the original prefix hash and offset. The streamed reader checks complete records and rejects terminal events in the appended tail. An oversized, truncated or changed history cannot supply call authority.
+
+```javascript
+// @exec: {"yield_time_ms": 120000, "max_output_tokens": 3000}
+const nativeRun = await tools.exec_command({"cmd": "<plain installed dispatcher command>", "yield_time_ms": 1000, "max_output_tokens": 3000});
+if (nativeRun.session_id) { text(await tools.write_stdin({session_id: nativeRun.session_id, chars: "", yield_time_ms: 60000, max_output_tokens: 3000})); } else { text(nativeRun); }
+```
+
 For an explicitly authorized bootstrap, the shell launcher runs the reviewed installer with a separately pinned release manifest. The manifest binds the exact candidate, program, payloads, predecessor bytes on both hosts and qualification hashes. Check previews, apply prepares verified backups on both hosts before writing, and rollback uses retained verified recovery data. Installation supplies no review or merge authority. Review changed hooks through the Codex hook-trust UI when requested, then collect fresh independent review evidence under the installed verifier.
 
 ## Completion

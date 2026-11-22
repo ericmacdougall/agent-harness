@@ -1,4 +1,5 @@
 """Native PR context and authorship controls against disposable local fixtures."""
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -111,6 +112,161 @@ class NativeCallLiveness(TestCase):
         binding = n.native_call_binding(self.payload, self.command)
         self.assertIsNotNone(binding)
         return binding
+
+    def awaited_source(self, **extra):
+        args = {"cmd": self.command, "yield_time_ms": 1000, "max_output_tokens": 3000, **extra}
+        return (
+            '// @exec: {"yield_time_ms": 120000, "max_output_tokens": 3000}\n'
+            f"const nativeRun = await tools.exec_command({json.dumps(args)});\n"
+            'if (nativeRun.session_id) { text(await tools.write_stdin({session_id: nativeRun.session_id, '
+            'chars: "", yield_time_ms: 60000, max_output_tokens: 3000})); } else { text(nativeRun); }'
+        )
+
+    def set_provider_source(self, source):
+        self.pending["payload"]["input"] = source
+        self.write(self.header, self.pending)
+
+    def test_bounded_awaited_provider_call_keeps_only_its_original_command_live(self):
+        self.set_provider_source(self.awaited_source(workdir=str(self.home)))
+        binding = self.capture()
+        self.assertTrue(n.native_call_still_running(binding, match_command=lambda cmd: cmd == self.command))
+        for result in ("denied", "finished"):
+            with self.subTest(result=result):
+                output = self.row("response_item", {"type": "custom_tool_call_output", "call_id": self.call,
+                                                   "output": result})
+                self.write(self.header, self.pending, output)
+                self.assertFalse(n.native_call_still_running(binding))
+                self.assertIsNone(n.native_call_binding(self.payload, self.command))
+
+    def test_bounded_awaited_provider_call_accepts_desktop_terminal_lf(self):
+        self.set_provider_source(self.awaited_source() + "\n")
+        binding = self.capture()
+        self.assertTrue(n.native_call_still_running(binding, match_command=lambda cmd: cmd == self.command))
+
+    def test_bounded_awaited_provider_call_refuses_altered_template_or_arguments(self):
+        original = self.awaited_source()
+        changes = {
+            "pragma budget": original.replace("120000", "120001"),
+            "pragma spacing": original.replace("// @exec:", "//@exec:"),
+            "missing exec await": original.replace("await tools.exec_command", "tools.exec_command"),
+            "missing poll await": original.replace("await tools.write_stdin", "tools.write_stdin"),
+            "wrong session": original.replace("session_id: nativeRun.session_id", "session_id: 99"),
+            "computed session": original.replace("session_id: nativeRun.session_id", "session_id: nativeRun.session_id + 1"),
+            "input": original.replace('chars: ""', 'chars: "x"'),
+            "oversize wait": original.replace("60000", "60001"),
+            "alternate output": original.replace("else { text(nativeRun); }", "else { text(0); }"),
+            "two terminal newlines": original + "\n\n",
+            "terminal CRLF": original + "\r\n",
+            "terminal whitespace": original + " ",
+            "multiline if body": original.replace("if (nativeRun.session_id) { text", "if (nativeRun.session_id) {\ntext"),
+            "trailing call": original + "\ntext(nativeRun);",
+            "second execution": original + "\ntext(await tools.exec_command({}));",
+            "injected command expression": original.replace("const nativeRun =", "const nativeRun = false ||"),
+            "loop": original.replace("if (nativeRun.session_id)", "while (nativeRun.session_id)"),
+            "oversize initial wait": self.awaited_source(yield_time_ms=1001),
+            "noninteger initial wait": self.awaited_source(yield_time_ms=1000.0),
+            "output budget": self.awaited_source(max_output_tokens=3001),
+            "nonabsolute workdir": self.awaited_source(workdir="elsewhere"),
+            "extra input field": self.awaited_source(tty=True),
+            "multiple commands": self.awaited_source(command="echo second"),
+            "duplicate key": original.replace('"yield_time_ms": 1000,', '"yield_time_ms": 1000, "yield_time_ms": 1000,'),
+        }
+        for name, source in changes.items():
+            with self.subTest(name=name):
+                self.set_provider_source(source)
+                self.assertIsNone(n.native_call_binding(self.payload, self.command))
+
+    def write_large_root(self, total):
+        header = (json.dumps(self.header) + "\n").encode()
+        call = (json.dumps(self.pending) + "\n").encode()
+        with self.path.open("wb") as output:
+            output.write(header)
+            remaining = total - len(header) - len(call)
+            while remaining:
+                length = min(3_900_000, remaining)
+                padding = b'{"unrelated":"' + b"p" * (length - 17) + b'"}\n'
+                self.assertEqual(len(padding), length)
+                output.write(padding)
+                remaining -= length
+            output.write(call)
+
+    def test_authenticated_root_beyond_old_cap_preserves_bound_prefix(self):
+        self.write_large_root(32_500_000)
+        binding = self.capture()
+        self.assertEqual(binding["offset"], self.path.stat().st_size)
+        expected = hashlib.sha256()
+        with self.path.open("rb") as retained:
+            for block in iter(lambda: retained.read(1 << 20), b""):
+                expected.update(block)
+        self.assertEqual(binding["sha256"], expected.hexdigest())
+        self.assertTrue(n.native_call_still_running(binding, match_command=lambda cmd: cmd == self.command))
+
+    def test_authenticated_root_exact_logical_cap_and_sparse_excess(self):
+        self.write_large_root(n.NATIVE_CALL_LIMIT)
+        binding = self.capture()
+        self.assertEqual(binding["offset"], n.NATIVE_CALL_LIMIT)
+        with self.path.open("ab") as output:
+            output.truncate(n.NATIVE_CALL_LIMIT + 1)
+        self.assertIsNone(n.native_call_binding(self.payload, self.command))
+        self.assertFalse(n.native_call_still_running(binding))
+
+    def test_root_history_rejects_torn_overlong_and_over_budget_records(self):
+        original = self.path.read_bytes()
+        for bad in (b"{", b"x" * (n._NATIVE_CALL_RECORD_LIMIT + 1) + b"\n"):
+            with self.subTest(size=len(bad)):
+                self.path.write_bytes(original + bad)
+                self.assertIsNone(n.native_call_binding(self.payload, self.command))
+        self.path.write_bytes(original)
+        for setting, limit in (("_NATIVE_CALL_ROW_LIMIT", 1), ("_NATIVE_CALL_SCAN_SECONDS", 0)):
+            with self.subTest(setting=setting), mock.patch.object(n, setting, limit):
+                self.assertIsNone(n.native_call_binding(self.payload, self.command))
+
+    def test_root_stream_preserves_offset_digest_and_consumes_terminal_tail(self):
+        binding = self.capture()
+        original = self.path.read_bytes()
+        self.assertFalse(n.native_call_still_running(dict(binding, offset=True)))
+        cut = len(original) - 1
+        self.assertFalse(n.native_call_still_running(dict(binding, offset=cut, sha256=n.digest(original[:cut]))))
+        # A real parseable continuation followed by a terminal event cannot pass early.
+        continued = self.row("event_msg", {"type": "token_count"})
+        terminal = self.row("event_msg", {"type": "item_completed", "thread_id": ROOT_ID,
+                                          "item": {"type": "CommandExecution", "id": self.tool, "status": "failed"}})
+        self.write(self.header, self.pending, continued)
+        self.assertTrue(n.native_call_still_running(binding))
+        self.write(self.header, self.pending, continued, terminal)
+        self.assertFalse(n.native_call_still_running(binding))
+        self.path.write_bytes(original + b"{\n")
+        self.assertFalse(n.native_call_still_running(binding))
+
+    def test_root_stream_rejects_growth_or_replacement_during_projection(self):
+        original = self.path.read_bytes()
+        parse = n._open_provider_rows
+        for change in ("grow", "replace"):
+            with self.subTest(change=change):
+                def change_after_prefix(rows, session):
+                    result = parse(rows, session)
+                    if change == "grow":
+                        with self.path.open("ab") as output:
+                            output.write(b"{}\n")
+                    else:
+                        self.path.rename(self.path.with_suffix(".original"))
+                        self.path.write_bytes(original)
+                        self.path.chmod(0o600)
+                    return result
+
+                with mock.patch.object(n, "_open_provider_rows", side_effect=change_after_prefix):
+                    self.assertIsNone(n.native_call_binding(self.payload, self.command))
+                self.path.write_bytes(original)
+
+    def test_root_open_call_history_is_bounded_without_discarding_ambiguity(self):
+        other = self.row("response_item", dict(self.pending["payload"], call_id="call_other"))
+        completed = self.row("response_item", {"type": "custom_tool_call_output", "call_id": "call_other"})
+        self.write(self.header, other, self.pending, completed)
+        self.assertIsNotNone(n.native_call_binding(self.payload, self.command))
+        with mock.patch.object(n, "_NATIVE_CALL_PENDING_LIMIT", 1):
+            self.assertIsNone(n.native_call_binding(self.payload, self.command))
+        self.write(self.header, self.pending, self.pending)
+        self.assertIsNone(n.native_call_binding(self.payload, self.command))
 
     def test_native_call_matches_actual_closed_tool_serialization(self):
         binding = self.capture()
