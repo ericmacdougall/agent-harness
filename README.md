@@ -47,6 +47,10 @@ With trusted hooks, Stop can request one automatic continuation per session by d
 
 ## Capabilities by edition
 
+For existing workstation and SSH worker installations, the [repair command](docs/harness-repair.md)
+previews both hosts, applies a reviewed merged revision and verifies the installed files.
+
+
 | | Claude Code | Codex |
 | --- | --- | --- |
 | Guidance and roles | `~/.claude/CLAUDE.md` and four task roles | `~/.codex/AGENTS.md`, one skill, and six custom roles |
