@@ -626,6 +626,10 @@ BASE64_BLOCK = re.compile(r"(?m)^(?:[A-Za-z0-9+/=]{60,76}\n){4,}")
 def prepare_log(path: Path, max_bytes: int):
     """Tail-cut, redact and refuse anything that still looks like key material."""
     data, original = read_regular(path, max_bytes, tail=True)
+    return prepare_log_bytes(path, data, original)
+
+
+def prepare_log_bytes(path: Path, data: bytes, original: int):
     if b"\x00" in data:
         raise SpecError(f"{path} looks binary; attach screenshots with --screenshot and logs as text", EXIT_USAGE)
     text = data.decode("utf-8", "replace")
@@ -701,7 +705,7 @@ def _native_database_binding(home, uid):
             _native_path(db.with_name(db.name + "-shm"), uid, maximum=4 * 1024 * 1024, optional=True))
 
 
-def _native_review_rows(home, uid, agent, parent):
+def _native_review_rows(home, uid, agent, parent, *, rollout=False):
     """Historical identity projection, never a current-caller or main-role grant."""
     import sqlite3
     db = home / ".codex/state_5.sqlite"
@@ -733,19 +737,24 @@ def _native_review_rows(home, uid, agent, parent):
         tables = connection.execute("PRAGMA main.table_list('threads')").fetchmany(2)
         if len(tables) != 1 or tables[0][:3] != ("main", "threads", "table"):
             raise ValueError("native identity table unavailable")
+        columns = (*_NATIVE_REVIEW_COLUMNS, "archived", *(("rollout_path",) if rollout else ()))
+        slots = ",".join("?" for _ in columns)
         count = connection.execute(
-            "SELECT count(*) FROM pragma_table_xinfo('threads','main') WHERE name IN "
-            "('id','source','thread_source','originator','agent_path','agent_role','attached_thread_parent_id','archived') "
-            "AND hidden=0").fetchone()
-        if count != (8,):
+            f"SELECT count(*) FROM pragma_table_xinfo('threads','main') WHERE name IN ({slots}) AND hidden=0",
+            columns).fetchone()
+        if count != (len(columns),):
             raise ValueError("native identity columns unavailable")
-        rows = connection.execute(_NATIVE_REVIEW_QUERY, (agent, parent)).fetchmany(3)
+        query = _NATIVE_REVIEW_QUERY
+        if rollout:
+            query = query.replace(" FROM main.threads", ", CASE WHEN typeof(rollout_path)='text' AND "
+                                  "length(CAST(rollout_path AS BLOB))<=1024 THEN rollout_path END FROM main.threads")
+        rows = connection.execute(query, (agent, parent)).fetchmany(3)
     finally:
         connection.close()
     if time.monotonic() > deadline or _native_database_binding(home, uid) != before or len(rows) != 2:
         raise ValueError("native identity snapshot unavailable")
-    if any(any(value is not None and type(value) is not str for value in row[:-1])
-           or type(row[-1]) is not int or row[-1] not in (0, 1) for row in rows):
+    if any(any(value is not None and type(value) is not str for value in row[:7])
+           or type(row[7]) is not int or row[7] not in (0, 1) for row in rows):
         raise ValueError("native identity fields unavailable")
     indexed = {row[0]: row for row in rows}
     if set(indexed) != {agent, parent}:
@@ -754,12 +763,22 @@ def _native_review_rows(home, uid, agent, parent):
 
 
 def _native_review_source(path, agent, role):
-    """Return explicit native review provenance, or None only for a nonnative path."""
+    expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer"}.get(role)
+    identity = _native_agent_source(path, agent, expected, purpose="review")
+    if identity is None:
+        return None
+    return {"family": "codex", "agent_type": expected, "model": None,
+            "source": "Codex native reviewer metadata; parent bound to native WAL session"}
+
+
+def _native_agent_source(path, agent, expected, *, purpose):
+    """Bind a native child and its main WAL by the account's stored metadata."""
+    click = purpose == "click-test"
     raw = Path(os.path.expanduser(str(path))).absolute()
     try:
         resolved = raw.resolve()
     except (OSError, RuntimeError):
-        raise SpecError("review WAL path unavailable", EXIT_USAGE) from None
+        raise SpecError(f"{purpose} WAL path unavailable", EXIT_USAGE) from None
     # Legacy operation must not acquire a new platform/SQLite prerequisite.
     def native_shape(value):
         return any(value.parts[index:index + 2] == (".agent-harness", "codex-wals")
@@ -770,7 +789,7 @@ def _native_review_source(path, agent, role):
         import pwd
         import sqlite3
     except ImportError:
-        raise SpecError("native review metadata unsupported", EXIT_USAGE) from None
+        raise SpecError(f"native {purpose} metadata unsupported", EXIT_USAGE) from None
     uid = os.getuid()
     try:
         home = Path(pwd.getpwuid(uid).pw_dir)
@@ -786,10 +805,12 @@ def _native_review_source(path, agent, role):
         directories = (home, home / ".agent-harness", root, raw.parent)
         before = tuple(_native_path(item, uid, directory=True) for item in directories)
         wal_binding = _native_path(raw, uid, maximum=64_000_000)
-        expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer"}.get(role)
-        rows = _native_review_rows(home, uid, agent, parent)
+        if click and (parent != parent.lower() or agent != agent.lower()):
+            raise ValueError("noncanonical child identity")
+        rows = _native_review_rows(home, uid, agent, parent, rollout=True) if click else _native_review_rows(home, uid, agent, parent)
         parent_row, child = rows[parent], rows[agent]
         if (parent_row[1:4] != ("vscode", "user", "Codex Desktop") or any(parent_row[i] is not None for i in (4, 5, 6))
+                or (click and parent_row[7] != 0)
                 or child[2:4] != ("subagent", "Codex Desktop") or child[5] != expected or expected is None
                 or child[6] not in (None, parent)):
             raise ValueError("native reviewer family or role unavailable")
@@ -814,10 +835,233 @@ def _native_review_source(path, agent, role):
         if (tuple(_native_path(item, uid, directory=True) for item in directories) != before
                 or _native_path(raw, uid, maximum=64_000_000) != wal_binding):
             raise ValueError("native review WAL binding changed")
-        return {"family": "codex", "agent_type": expected, "model": None,
-                "source": "Codex native reviewer metadata; parent bound to native WAL session"}
+        return {"home": home, "uid": uid, "parent": parent, "agent_path": child[4],
+                "main": raw, "main_binding": wal_binding, "rollout": child[8] if click else None,
+                "archived": bool(child[7])}
     except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
-        raise SpecError("native reviewer metadata unavailable or conflicting", EXIT_USAGE) from None
+        label = "click-tester" if click else "reviewer"
+        raise SpecError(f"native {label} metadata unavailable or conflicting", EXIT_USAGE) from None
+
+
+NATIVE_CLICK_PREFIX = "CLICK_TEST_WITNESS_V1 "
+NATIVE_CLICK_SOURCE = "codex-native-click-witness-v1"
+NATIVE_CLICK_ROLE = "harness_click_tester"
+NATIVE_ROLLOUT_LIMIT = 16_000_000
+NATIVE_CLICK_WAL_LIMIT = 4_000_000
+MAX_NATIVE_CLICK_CANDIDATES = 16
+
+
+def _native_read(path, identity, limit, *, binding=None):
+    """Bound one local file and its ancestors throughout the read."""
+    home, uid = identity["home"], identity["uid"]
+    parents = [home, *(p for p in reversed(path.parents) if p != home and p.is_relative_to(home))]
+    directories = [_native_path(p, uid, directory=True) for p in parents]
+    before = _native_path(path, uid, maximum=limit)
+    if binding is not None and before != binding:
+        raise ValueError("native identity file changed")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        first = os.fstat(fd)
+        if (first.st_dev, first.st_ino, first.st_uid, first.st_mode) != before:
+            raise ValueError("native file changed")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(limit + 1)
+        last = os.fstat(fd)
+        if ((first.st_size, first.st_mtime_ns, first.st_ctime_ns) !=
+                (last.st_size, last.st_mtime_ns, last.st_ctime_ns) or len(raw) != first.st_size or len(raw) > limit
+                or _native_path(path, uid, maximum=limit) != before
+                or [_native_path(p, uid, directory=True) for p in parents] != directories):
+            raise ValueError("native file changed")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _native_json(raw, limit):
+    safe_input.safe_json_loads(raw, max_depth=40, max_bytes=limit)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate native JSON key")
+            result[key] = value
+        return result
+    def constant(_value):
+        raise ValueError("non-finite number")
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    if not isinstance(value, dict):
+        raise ValueError("native document is not an object")
+    return value
+
+
+def _native_stamp(value):
+    if not isinstance(value, str) or len(value) > 40:
+        raise ValueError("native timestamp missing")
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("native timestamp is not timezone aware")
+    return stamp
+
+
+def _native_click_proof(identity, agent, line, started, ended):
+    """Require the same statement in the child's native final answer and own WAL."""
+    try:
+        raw_rollout = identity["rollout"]
+        if not isinstance(raw_rollout, str):
+            raise ValueError("native rollout unavailable")
+        rollout = Path(raw_rollout)
+        codex = identity["home"] / ".codex"
+        relative = rollout.relative_to(codex)
+        if (not re.fullmatch(rf"rollout-[0-9T-]+-{re.escape(agent)}\.jsonl", rollout.name)
+                or not re.fullmatch(r"sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}|archived_sessions", str(relative.parent))
+                or (relative.parts[0] == "archived_sessions") != identity["archived"]
+                or ".." in relative.parts):
+            raise ValueError("native rollout path unavailable")
+        start, end = _native_stamp(started), _native_stamp(ended)
+        if start > end:
+            raise ValueError("native observed time order invalid")
+        parent = identity["parent"]
+        agent_wal = identity["main"].with_name(f"agent-{agent}.jsonl")
+        main_data = _native_read(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
+        main_rows = [_native_json(raw, 4_000_000) for raw in main_data.splitlines()]
+        child_rows = [_native_json(raw, 4_000_000) for raw in _native_read(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
+        starts = [e for e in main_rows if e.get("event") == "SubagentStart" and e.get("agent_id") == agent]
+        child_starts = [e for e in child_rows if e.get("event") == "SubagentStart"]
+        notes = [e for e in child_rows if isinstance(e.get("note"), str) and e["note"].startswith(NATIVE_CLICK_PREFIX)]
+        if (len(starts) != 1 or starts != child_starts or starts[0].get("agent_type") != NATIVE_CLICK_ROLE
+                or len(notes) != 1 or notes[0].get("event") != "check" or notes[0].get("note") != line
+                or not _native_stamp(starts[0].get("at")) <= start <= end <= _native_stamp(notes[0].get("at"))):
+            raise ValueError("native WAL witness missing or mismatched")
+        entries = iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
+        first = _native_json(next(entries), 4_000_000)
+        meta = first.get("payload")
+        if (first.get("type") != "session_meta" or not isinstance(meta, dict) or meta.get("id") != agent
+                or meta.get("session_id") != parent or meta.get("parent_thread_id") != parent
+                or meta.get("originator") != "Codex Desktop" or meta.get("thread_source") != "subagent"
+                or meta.get("agent_role") != NATIVE_CLICK_ROLE or meta.get("agent_path") != identity["agent_path"]
+                or _native_stamp(first.get("timestamp")) > start):
+            raise ValueError("native rollout metadata mismatched")
+        matches = []
+        for raw in entries:
+            entry = _native_json(raw, 4_000_000)
+            if entry.get("type") == "session_meta":
+                raise ValueError("duplicate native rollout header")
+            payload = entry.get("payload")
+            if (entry.get("type") != "response_item" or not isinstance(payload, dict)
+                    or payload.get("type") != "message" or payload.get("role") != "assistant"
+                    or payload.get("phase") != "final_answer" or payload.get("status") != "completed"):
+                continue
+            content = payload.get("content")
+            if not isinstance(content, list):
+                raise ValueError("native rollout message unavailable")
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "output_text" or not isinstance(item.get("text"), str):
+                    raise ValueError("native rollout message unavailable")
+                for text in item["text"].splitlines():
+                    if text.startswith(NATIVE_CLICK_PREFIX):
+                        matches.append((text, _native_stamp(entry.get("timestamp"))))
+        if len(matches) != 1 or matches[0][0] != line or matches[0][1] < _native_stamp(notes[0].get("at")):
+            raise ValueError("native assistant witness missing, mismatched or replayed")
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, StopIteration):
+        raise SpecError("native click-test witness unavailable, conflicting or not authored by this tester", EXIT_USAGE) from None
+
+
+def _native_click_origin(repo):
+    origin = subprocess.run(["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+                            capture_output=True, text=True, timeout=30)
+    text = origin.stdout.strip()
+    scp = re.fullmatch(r"git@([A-Za-z0-9.-]+):([^\s]+)", text)
+    if scp:
+        host, name = scp.groups()
+    else:
+        try:
+            parsed = urllib.parse.urlsplit(text)
+            if (parsed.scheme not in ("https", "ssh") or parsed.username not in (None, "git") or parsed.password is not None
+                    or parsed.query or parsed.fragment or parsed.port is not None):
+                raise ValueError("unsupported origin")
+            host, name = parsed.hostname, parsed.path.removeprefix("/")
+        except ValueError:
+            raise SpecError("native click-test needs a credential-free canonical Git origin", EXIT_USAGE) from None
+    name = name.removesuffix(".git")
+    if (origin.returncode or not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host)
+            or not re.fullmatch(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+", name)
+            or any(part in (".", "..") for part in name.split("/"))):
+        raise SpecError("native click-test needs a credential-free canonical Git origin", EXIT_USAGE)
+    return f"{host.lower()}/{name}"
+
+
+def _native_click_line(record, attachments):
+    tester = record["tester"]
+    deployed = record["deployed_commit"]["sha"]
+    report = tester["report_sha256"]
+    core = record["spec_core_sha"]
+    if (not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", deployed)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", s) for s in (report, core))
+            or record["result"] not in ("pass", "fail") or len(record["url"]) > 512):
+        raise ValueError("native witness fields malformed")
+    url = urllib.parse.urlsplit(record["url"])
+    if (url.scheme not in ("http", "https") or not url.hostname or url.username is not None
+            or url.path not in ("", "/") or url.query or url.fragment or url.netloc.endswith(":")
+            or (url.port is not None and not 1 <= url.port <= 65535)
+            or any(not 33 <= ord(ch) <= 126 for ch in record["url"])):
+        raise ValueError("native witness URL is not a credential-free origin")
+    bound = {key: record[key] for key in ("ticket", "url", "result", "spec_core_sha", "covers_commits")}
+    bound.update({key: tester[key] for key in ("identity", "parent", "repo", "report_sha256", "started_at", "ended_at")})
+    bound["deployed_commit"] = deployed
+    bound["attachments_sha256"] = sha256_bytes(json.dumps(attachments, ensure_ascii=True, separators=(",", ":")).encode())
+    line = NATIVE_CLICK_PREFIX + json.dumps(bound, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    if len(line) > 4000:
+        raise ValueError("native witness too large")
+    return line
+
+
+def _native_click_spec_fresh(record, spec):
+    try:
+        return _native_stamp(record["tester"]["started_at"]) >= _native_stamp(spec["_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _native_click_claim(record):
+    tester = record.get("tester")
+    if not isinstance(tester, dict):
+        tester = {}
+    ident = tester.get("identity")
+    return (record.get("v") == 2 or tester.get("family") == "codex"
+            or tester.get("agent_type") == NATIVE_CLICK_ROLE or record.get("pass_source") == NATIVE_CLICK_SOURCE
+            or (isinstance(ident, str) and re.fullmatch(UUID, ident) is not None))
+
+
+def _native_click_record_line(record, attachments):
+    tester = record["tester"]
+    if (record.get("v") != 2 or tester.get("family") != "codex" or tester.get("kind") != "agent"
+            or tester.get("agent_type") != NATIVE_CLICK_ROLE or record.get("pass_source") != NATIVE_CLICK_SOURCE
+            or not re.fullmatch(UUID, tester["parent"]) or not re.fullmatch(UUID, tester["identity"])
+            or sum(item["role"] == "report" for item in attachments) != 1):
+        raise ValueError("native click-test record shape unavailable")
+    manifest = [[f["role"], f["name"], f["sha256"]] for f in attachments]
+    return _native_click_line(record, manifest)
+
+
+def _native_click_record_proof(record, attachments, cache):
+    import pwd
+
+    line = _native_click_record_line(record, attachments)
+    if cache is not None and line in cache:
+        if not cache[line]:
+            raise ValueError("native click-test witness unavailable")
+        return
+    if cache is not None:
+        cache[line] = False
+    tester = record["tester"]
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    main = home / ".agent-harness/codex-wals" / tester["parent"] / "main.jsonl"
+    identity = _native_agent_source(main, tester["identity"], NATIVE_CLICK_ROLE, purpose="click-test")
+    if identity is None:
+        raise ValueError("native click-test identity unavailable")
+    _native_click_proof(identity, tester["identity"], line, tester["started_at"], tester["ended_at"])
+    if cache is not None:
+        cache[line] = True
 
 
 def wal_entries(path: Path):
@@ -988,13 +1232,18 @@ def ticket_records(comments: list, max_bytes: int):
             except (ValueError, RecursionError):
                 ignored.append(f"comment {comment['id'][:8]}: record is not JSON")
                 continue
-            if not isinstance(record, dict) or record.get("v") != 1 or record.get("kind") not in KINDS:
+            if (not isinstance(record, dict) or record.get("kind") not in KINDS
+                    or (record.get("v") != 1 and not (record.get("v") == 2 and record.get("kind") == "click_test"))):
                 ignored.append(f"comment {comment['id'][:8]}: unknown record version or kind")
                 continue
             shape = record_shape_problem(record)
             if shape:
                 ignored.append(f"comment {comment['id'][:8]}: malformed {record['kind']} record ({shape})")
-                continue
+                if record["kind"] != "click_test" or not _native_click_claim(record):
+                    continue
+                # A malformed current native result must not uncover an older pass.
+                record = {"v": 2, "kind": "click_test", "spec_core_sha": record.get("spec_core_sha"),
+                          "attachments": [], "tester": {}}
             record["_comment"] = comment["id"]
             record["_at"] = str(comment.get("createdAt") or "")
             records.append(record)
@@ -1024,7 +1273,7 @@ def attachment_problems(record: dict, index: dict) -> list:
     return problems
 
 
-def kind_problems(record: dict) -> list:
+def kind_problems(record: dict, *, native_cache=None) -> list:
     """Shape rules beyond attachment integrity: a record must carry the files its kind is trusted for."""
     attachments = [item for item in record.get("attachments") or [] if isinstance(item, dict)]
     roles = {item.get("role"): item for item in attachments}
@@ -1044,16 +1293,23 @@ def kind_problems(record: dict) -> list:
     elif record["kind"] == "click_test":
         if not (roles.get("log") or roles.get("report")):
             problems.append("the click-test record has no log or report attached")
+        if _native_click_claim(record):
+            try:
+                _native_click_record_proof(record, attachments, native_cache)
+            except (SpecError, OSError, ValueError, TypeError, KeyError):
+                problems.append("native click-test witness did not verify on this host")
     return problems
 
 
-def verified(records: list, index: dict, kind: str):
+def verified(records: list, index: dict, kind: str, *, native_cache=None):
     good, bad = [], []
     for record in records:
         if record["kind"] != kind:
             continue
         try:
-            problems = attachment_problems(record, index) + kind_problems(record)
+            problems = attachment_problems(record, index)
+            if not problems or kind != "click_test" or not _native_click_claim(record):
+                problems += kind_problems(record, native_cache=native_cache)
         except Exception as exc:  # comments are untrusted: a shape the checks missed is ignored, not fatal
             problems = [f"record could not be checked ({type(exc).__name__})"]
         (bad if problems else good).append((record, problems))
@@ -1098,14 +1354,29 @@ class Session:
     def post(self, kind: str, summary: str, record: dict, files, records):
         """files: [(role, name, mime, bytes)]. Idempotent on the record key."""
         index = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
-        trusted = verified(records, index, record["kind"])[0] if record["kind"] != "signoff" else \
-            [item for item in records if item["kind"] == "signoff"]
+        key_records = records
+        if kind == "click_test":
+            native = _native_click_claim(record)
+            key_records = [item for item in records if item["kind"] == kind and item.get("key") == record["key"]
+                           and _native_click_claim(item) == native]
+            if native:
+                if len(key_records) > MAX_NATIVE_CLICK_CANDIDATES:
+                    raise SpecError("too many native click-test replays for this receipt; reconcile duplicate ticket records")
+                manifest = [[role, name, sha256_bytes(data)] for role, name, _mime, data in files]
+                line = _native_click_line(record, manifest)
+                trusted = [item for item in verified(key_records, index, kind, native_cache={})[0]
+                           if _native_click_record_line(item, item["attachments"]) == line]
+            else:
+                trusted = verified(key_records, index, kind)[0]
+        else:
+            trusted = verified(records, index, record["kind"])[0] if record["kind"] != "signoff" else \
+                [item for item in records if item["kind"] == "signoff"]
         if any(item.get("key") == record["key"] for item in trusted):
             print(json.dumps({"status": "ALREADY_RECORDED", "kind": kind, "key": record["key"]}))
             return None
         # A same-key record that failed verification must not be replayed by GoodQA's idempotent comment:
         # fold the rejected comment ids into the operationId so this attempt creates a new comment.
-        rejected = sorted(item["_comment"] for item in records
+        rejected = sorted(item["_comment"] for item in key_records
                           if item.get("key") == record["key"] and item not in trusted)
         op_key = record["key"] + ("|retry:" + ",".join(rejected) if rejected else "")
         if not self.project_id:
@@ -1137,6 +1408,56 @@ def tester_key(tester: dict) -> str:
     kind = tester.get("kind")
     identity = str(tester.get("identity") or "")
     return identity_key(kind, safe_id(identity) if kind == "agent" else identity) if kind else ""
+
+
+def _latest_click_result(records, index, spec, label, notes):
+    """Select current native results by witnessed run order, and legacy results by receipt order."""
+    core = spec.get("spec_core_sha")
+    click_records = [r for r in records if r["kind"] == "click_test"]
+    native = [r for r in click_records if r.get("spec_core_sha") == core and _native_click_claim(r)]
+    if not native:
+        legacy = [r for r in click_records if not _native_click_claim(r)]
+        good, bad = verified(legacy, index, "click_test")
+        for record, problems in bad:
+            notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
+        current = [r for r in good if r.get("spec_core_sha") == core]
+        return (current[-1] if current else None), bool(good or any(_native_click_claim(r) for r in click_records)), None
+    if len(native) > MAX_NATIVE_CLICK_CANDIDATES:
+        return None, True, "too many current native records to verify; reconcile duplicate or obsolete ticket records"
+    scoped = [r for r in native if r.get("ticket") == label and _native_click_spec_fresh(r, spec)]
+    good, bad = verified(scoped, index, "click_test", native_cache={})
+    for record, problems in bad:
+        notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
+    observations = {_native_click_record_line(r, r["attachments"]): r for r in good}
+    unknown = [r for r in native if r not in good]
+    if not observations:
+        return None, True, "the latest native result does not verify for this ticket on this host"
+    last_end = max(_native_stamp(r["tester"]["ended_at"]) for r in observations.values())
+    newest = [r for r in observations.values() if _native_stamp(r["tester"]["ended_at"]) == last_end]
+    if len(newest) != 1:
+        return None, True, "the latest native observations conflict at the same end time; run a new independent click-test"
+    # An unverifiable attempt can only be superseded by a verified run that ends after it was posted.
+    try:
+        inconclusive = any(_native_stamp(r.get("_at")) >= last_end for r in unknown)
+    except ValueError:
+        inconclusive = True
+    if inconclusive:
+        return None, True, "the latest native result does not verify for this ticket on this host"
+    latest = newest[0]
+    if latest["result"] == "pass":
+        legacy_failures = [r for r in click_records if r.get("spec_core_sha") == core and r.get("result") == "fail"
+                           and not _native_click_claim(r)]
+        for record in verified(legacy_failures, index, "click_test")[0]:
+            try:
+                failed_at = _native_stamp((record.get("tester") or {}).get("ended_at"))
+            except ValueError:
+                try:
+                    failed_at = _native_stamp(record.get("_at"))
+                except ValueError:
+                    return None, True, "a legacy failure has no verifiable observation or posting time"
+            if failed_at >= last_end:
+                return None, True, "a newer legacy click-test failed after the native pass"
+    return latest, True, None
 
 
 def evaluate(records: list, index: dict, issue: dict, ignored=()):
@@ -1206,12 +1527,10 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     # click test
     click = spec.get("click_test") or {}
     if click.get("required", True):
-        all_tests, bad_tests = verified(records, index, "click_test")
-        tests = [r for r in all_tests if r.get("spec_core_sha") == core]
-        for record, problems in bad_tests:
-            notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
-        latest = tests[-1] if tests else None
-        if latest is None and all_tests:
+        latest, had_results, click_problem = _latest_click_result(records, index, spec, label, notes)
+        if click_problem:
+            missing.append(f"click-test: {click_problem}")
+        elif latest is None and had_results:
             missing.append("click-test: only click-tests of an older spec version exist (stale); record a new "
                            "click-test after deploying the current spec's work")
         elif latest is None:
@@ -1850,7 +2169,17 @@ def cmd_evidence(args, spec_policy):
 
 
 def cmd_click_test(args, spec_policy):
-    session, records, _, spec = _actor_and_spec(args, spec_policy)
+    session, records, index, spec = _actor_and_spec(args, spec_policy)
+    native = None
+    if args.agent_id and args.wal_dir:
+        wal_dir = Path(os.path.expanduser(args.wal_dir)).absolute()
+        native = _native_agent_source(wal_dir / "main.jsonl", args.agent_id, NATIVE_CLICK_ROLE, purpose="click-test")
+    if (args.print_native_witness or args.verify_native_witness) and native is None:
+        raise SpecError("native witness modes require a native Codex click-tester", EXIT_USAGE)
+    if native is None and re.fullmatch(UUID, (args.agent_id or args.human or "").strip()):
+        raise SpecError("a native UUID tester must use its native Codex WAL", EXIT_USAGE)
+    if native and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.deployed_commit):
+        raise SpecError("native click-test needs the full deployed commit", EXIT_USAGE)
     max_log = int(spec_policy.get("max_log_bytes", 2_000_000))
     files = [("log", Path(p).name, "text/plain", prepare_log(Path(p), max_log)) for p in args.log or []]
     report_verdict, report_sha = None, None
@@ -1859,12 +2188,12 @@ def cmd_click_test(args, spec_policy):
         report_sha = sha256_bytes(raw)
         first = next((line.strip() for line in raw.decode("utf-8", "replace").splitlines() if line.strip()), "")
         match = re.match(r"^CLICK_TEST_RESULT: (PASS|FAIL)\b", first)
-        if not match:
+        if not match or (native and match.group(0) != first):
             raise SpecError("the click-test report must start with `CLICK_TEST_RESULT: PASS` or `... FAIL`", EXIT_USAGE)
         report_verdict = match.group(1).lower()
         if report_verdict != args.result:
             raise SpecError(f"--result {args.result} contradicts the report ({match.group(0)})")
-        files.append(("report", Path(args.report).name, "text/plain", prepare_log(Path(args.report), max_log)))
+        files.append(("report", Path(args.report).name, "text/plain", prepare_log_bytes(Path(args.report), raw, len(raw))))
     for path in args.screenshot or []:
         data, mime = prepare_media(Path(path), int(spec_policy.get("max_media_bytes", 15_000_000)))
         files.append(("screenshot", Path(path).name, mime, data))
@@ -1873,12 +2202,26 @@ def cmd_click_test(args, spec_policy):
     # "On deploy": bind the click-test to the deployed commit, which must contain every evidence commit so far.
     repo = Path(args.repo or ".")
     deployed = git_commit(repo, args.deployed_commit, None)
-    evidence_shas = sorted({c.get("sha") for r in records if r["kind"] == "evidence"
+    evidence = verified(records, index, "evidence")[0] if native else records
+    evidence_shas = sorted({c.get("sha") for r in evidence if r["kind"] == "evidence"
                             and r.get("spec_core_sha") == spec["spec_core_sha"]
                             for c in r.get("commits") or [] if c.get("sha")})
     for sha in evidence_shas:  # raises "commit X is not reachable from <deployed>"
         git_commit(repo, sha, deployed["sha"])
-    if args.agent_id:
+    if native:
+        if args.human or args.really_tested or not (args.report and args.started and args.ended):
+            raise SpecError("native click-tests require a report and observed --started/--ended, and accept no manual fallback",
+                            EXIT_USAGE)
+        agent = args.agent_id
+        excluded = ({spec.get("author")} | {r.get("key") for r in spec.get("reviews") or []}
+                    | {r.get("actor") for r in evidence})
+        if identity_key("agent", agent) in excluded:
+            raise SpecError("the native click-tester must be independent of the author, reviewers and evidence posters")
+        tester = {"kind": "agent", "family": "codex", "identity": agent, "agent_type": NATIVE_CLICK_ROLE,
+                  "parent": native["parent"], "repo": _native_click_origin(repo), "report_sha256": report_sha,
+                  "started_at": args.started, "ended_at": args.ended, "last_activity_at": args.ended}
+        pass_source = NATIVE_CLICK_SOURCE
+    elif args.agent_id:
         if not args.wal_dir:
             raise SpecError("--agent-id needs --wal-dir <the session WAL directory>", EXIT_USAGE)
         wal_dir = Path(os.path.expanduser(args.wal_dir)).absolute()
@@ -1915,11 +2258,30 @@ def cmd_click_test(args, spec_policy):
         pass_source = "self-attested" if args.result == "pass" else None
     else:
         raise SpecError("give --agent-id with --wal-dir, or --human", EXIT_USAGE)
-    record = {"v": 1, "kind": "click_test", "ticket": session.ticket.label, "actor": parse_author(args.actor),
+    record = {"v": 2 if native else 1, "kind": "click_test", "ticket": session.ticket.label, "actor": parse_author(args.actor),
               "spec_core_sha": spec["spec_core_sha"], "result": args.result, "url": args.url, "tester": tester,
               "pass_source": pass_source, "deployed_commit": deployed, "covers_commits": evidence_shas}
-    record["key"] = content_key("click_test", [tester, args.result, args.url, deployed["sha"],
-                                               [sha256_bytes(f[3]) for f in files]])
+    manifest = [[role, name, sha256_bytes(data)] for role, name, _mime, data in files]
+    key_parts = [tester, args.result, args.url, deployed["sha"], [f[2] for f in manifest]]
+    if native:
+        if not _native_click_spec_fresh(record, spec):
+            raise SpecError("native click-test must start after the current spec attachment timestamp", EXIT_USAGE)
+        try:
+            line = _native_click_line(record, manifest)
+            if _native_stamp(args.started) > _native_stamp(args.ended):
+                raise ValueError("invalid observed time bounds")
+        except ValueError:
+            raise SpecError("native click-test requires valid witness fields and observed time bounds", EXIT_USAGE) from None
+        if args.print_native_witness:
+            print(line)
+            return EXIT_OK
+        _native_click_proof(native, args.agent_id, line, args.started, args.ended)
+        if args.verify_native_witness:
+            print(json.dumps({"status": "VERIFIED", "kind": "native_click_witness",
+                              "sha256": sha256_bytes(line.encode())}))
+            return EXIT_OK
+        key_parts.append(line)
+    record["key"] = content_key("click_test", key_parts)
     summary = (f"**Click-test {args.result.upper()}** by {tester['kind']} {tester['identity']} on {args.url} "
                f"at deployed commit {deployed['sha'][:12]} "
                f"({tester['started_at']} to {tester.get('ended_at') or 'end not recorded'}), {len(files)} file(s).")
@@ -1932,6 +2294,8 @@ def cmd_signoff(args, spec_policy):
     signer = identity_key(args.kind, safe_id(args.by) if args.kind == "agent" else args.by)
     excluded = {spec.get("author")} | {r.get("key") for r in spec.get("reviews") or []} | \
         {r.get("actor") for r in records if r["kind"] in ("spec", "evidence", "click_test")}
+    excluded.update(tester_key(r.get("tester") or {}) for r in records
+                    if r["kind"] == "click_test" and _native_click_claim(r))
     if signer in excluded:
         raise SpecError("the sign-off must come from someone other than the owner, the spec author and both "
                         "spec reviewers (normally the main agent, or the user)")
@@ -2145,6 +2509,9 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--ended")
     click.add_argument("--really-tested")
     click.add_argument("--report")
+    native_witness = click.add_mutually_exclusive_group()
+    native_witness.add_argument("--print-native-witness", action="store_true", help="print the exact Codex witness line without posting")
+    native_witness.add_argument("--verify-native-witness", action="store_true", help="verify the local Codex witness without posting")
     click.add_argument("--log", action="append")
     click.add_argument("--screenshot", action="append")
     signoff.add_argument("--by", required=True)
