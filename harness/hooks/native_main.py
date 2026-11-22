@@ -1,4 +1,4 @@
-"""Recognize the supported Desktop review root at the existing review hook seam."""
+"""Recognize the supported Desktop root for explicitly scoped hooks."""
 from __future__ import annotations
 
 import ctypes as ct
@@ -307,9 +307,12 @@ def _is_desktop_root(payload, pid, backend, read_thread):
 
 
 def is_desktop_review_root(payload):
-    """The user-driven Codex Desktop root session. Callers: the review stamp and, by the user's decision (answer
-    b6714826, goodqa#15565: a Codex Desktop root may record merge waivers), merge_gate._may_record_waiver. The caller
-    owns command and receipt policy; a spawned child, standalone CLI or unqualified row is never a root."""
+    """Prove the user-driven Codex Desktop root for an explicitly authorized operation.
+
+    The review stamp, audited merge waivers (GoodQA #15565), and the installed hook-file deploy guard
+    each own their command and receipt policy. A spawned child, standalone CLI, or unqualified row is
+    never a root. This identifies the calling session and does not attest a human approval event.
+    """
     if sys.platform != "darwin" or _current_session(payload) is None:
         return False
     try:

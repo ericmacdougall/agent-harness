@@ -10,17 +10,22 @@ from pathlib import Path
 from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(HOOKS))
 import caller_identity  # noqa: E402
 import command_guard as cg  # noqa: E402
+import native_main  # noqa: E402
+from test_native_main import (CHILD_ID, CLI, ROOT_ID, ROOT_ROW, FakeDesktop, HelperDesktop,
+                              ProcessIdentity, payload as native_payload)
 
 HOME = os.path.expanduser("~")
 GOOD = ('python3 -I ~/.claude/hooks/ah.py install-files --host t2-dev --from-ref %s --file ah.py --file doctor.py '
         '--ticket "GoodQA goodqa#15742"' % ("a" * 40))
 
 
-def hook(command, main):
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}).encode()
+def hook(command, main, envelope=None):
+    envelope = {"tool_name": "Bash", **(envelope or {}), "tool_input": {"command": command}}
+    payload = json.dumps(envelope).encode()
     err = io.StringIO()
     with mock.patch.object(caller_identity, "is_main", return_value=main), contextlib.redirect_stderr(err), \
             contextlib.redirect_stdout(io.StringIO()):
@@ -73,7 +78,8 @@ class Forms(unittest.TestCase):
                 self.assertIsNotNone(cg.install_files_refusal(text, False), text)
                 self.assertEqual(hook(text, False)[0], 2, text)
         worktree_in_bash = "bash -c 'python3 harness/hooks/ah.py install-files --host t2-dev'"
-        self.assertIsNotNone(cg.install_files_refusal(worktree_in_bash, True))  # not even main, from a worktree copy
+        with self.subTest("worktree path in nested shell"):
+            self.assertIsNotNone(cg.install_files_refusal(worktree_in_bash, True))
         for text in (GOOD + " > out.json", GOOD + " > out.json 2>&1", GOOD + " 2>&1 | tee out.txt", GOOD + " --allow-older"):
             with self.subTest(text[-30:]):
                 self.assertIsNone(cg.install_files_refusal(text, True), text)
@@ -84,7 +90,9 @@ class Forms(unittest.TestCase):
                 self.assertIsNone(cg.install_files_refusal(viewer, False), viewer)
 
     def test_a_sub_agent_is_refused_even_in_the_literal_form(self):  # AC-9, NEG-11
-        self.assertIn("only the main agent", cg.install_files_refusal(GOOD, False))
+        refusal = cg.install_files_refusal(GOOD, False)
+        self.assertIsNotNone(refusal)
+        self.assertIn("only the main agent", refusal)
         code, message = hook(GOOD, False)
         self.assertEqual(code, 2)
         self.assertIn("main agent", message)
@@ -115,6 +123,70 @@ class Forms(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             code = cg.hook_main("exit2", stdin_bytes=payload, marker=False)  # the real caller_identity: the payload proves nothing
         self.assertEqual(code, 2)
+
+
+class NativeInstallAuthority(unittest.TestCase):
+    def hook_as_desktop(self, backend, payload):
+        def read_row(_home, _uid, session):
+            return (ROOT_ROW, ("fixed fixture binding",)) if session == ROOT_ID else None
+
+        with mock.patch.object(native_main.sys, "platform", "darwin"), \
+                mock.patch.object(native_main.os, "getpid", return_value=10), \
+                mock.patch.object(native_main, "_DesktopBackend", return_value=backend), \
+                mock.patch.object(native_main, "_read_thread", side_effect=read_row):
+            return hook(GOOD, False, payload)
+
+    def test_proven_desktop_main_passes_the_actual_install_hook(self):
+        for backend in (FakeDesktop(), HelperDesktop()):
+            with self.subTest(backend=type(backend).__name__):
+                code, message = self.hook_as_desktop(backend, native_payload())
+                self.assertEqual(code, 0, message)
+                self.assertEqual(backend.gui_calls, 2)
+                if isinstance(backend, HelperDesktop):
+                    self.assertEqual(backend.helper_calls, 2)
+
+    def test_child_context_and_foreign_thread_row_do_not_gain_install_authority(self):
+        for extras in ({"agent_id": CHILD_ID}, {"agentRole": "main"}, {"session_id": CHILD_ID},
+                       {"threadId": CHILD_ID}, {"toolUseId": "exec-other"}, {"hook_event_name": "PostToolUse"}):
+            with self.subTest(extras=extras), mock.patch.dict(os.environ, {"CODEX_THREAD_ID": ROOT_ID, "AH_MAIN": "1"}):
+                backend = FakeDesktop()
+                code, message = self.hook_as_desktop(backend, native_payload(**extras))
+                self.assertEqual(code, 2)
+                self.assertIn("only the main agent", message)
+                self.assertEqual(backend.gui_calls, 0)
+
+    def test_standalone_native_cli_cannot_use_a_desktop_row(self):
+        backend = FakeDesktop()
+        backend.processes[20] = ProcessIdentity(20, 40, 501, 3, CLI)
+        backend.processes[40] = ProcessIdentity(40, 1, 501, 2, "/bin/zsh")
+        code, message = self.hook_as_desktop(backend, native_payload())
+        self.assertEqual(code, 2)
+        self.assertIn("only the main agent", message)
+        self.assertEqual(backend.gui_calls, 0)
+
+    def test_native_proof_is_only_needed_for_sanctioned_install_commands(self):
+        with mock.patch.object(native_main, "is_desktop_review_root", return_value=True) as proof:
+            for command, expected in (("rg install-files", 0),
+                                      (GOOD.replace("~/.claude/hooks/ah.py", "./ah.py"), 2),
+                                      (GOOD + " --repo /fixture/repo", 2),
+                                      (GOOD + "; " + GOOD + " --verbose", 2),
+                                      ("python3 -m ah_install", 2)):
+                with self.subTest(command=command):
+                    self.assertEqual(hook(command, False, native_payload())[0], expected)
+            self.assertEqual(hook(GOOD, True, native_payload())[0], 0)
+            proof.assert_not_called()
+
+    def test_desktop_proof_is_evaluated_once_per_eligible_hook(self):
+        with mock.patch.object(native_main, "is_desktop_review_root", return_value=True) as proof:
+            self.assertEqual(hook(GOOD + "; " + GOOD, False, native_payload())[0], 0)
+        proof.assert_called_once()
+
+    def test_desktop_proof_exceptions_are_local_denials(self):
+        with mock.patch.object(native_main, "is_desktop_review_root", side_effect=RuntimeError("unavailable")) as proof:
+            code, message = hook(GOOD, False, native_payload())
+        self.assertEqual(code, 2)
+        self.assertIn("only the main agent", message)
+        proof.assert_called_once()
 
 
 if __name__ == "__main__":
