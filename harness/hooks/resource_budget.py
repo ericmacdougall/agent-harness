@@ -19,9 +19,9 @@ A plan packet or spec needs a `## Resource budget` section:
     Checkpoint: durable output under ~/.agent-harness/work/<session>/<task>/, steps idempotent, resume by re-running
 
 `check` rejects (exit 2) a packet that omits the section or a field, whose numbers exceed the
-target host's live headroom, or that omits checkpointing for a job over 10 minutes or 4 GB.
+target host's headroom, or that omits checkpointing for a job over 10 minutes or 4 GB.
 The same budget can pass for t2-dev and fail for the Mac. Historical dev2 budgets can still be
-parsed and checked against recorded capacity. Live capacity is available for mac and t2-dev.
+parsed, and validation requires recorded capacity. Live capacity is available for mac and t2-dev.
 Stdlib only, Python 3.9 compatible.
 """
 from __future__ import annotations
@@ -257,7 +257,7 @@ def check(text: str, host=None, cap=None):
         return problems
     host = host or parsed["host"]
     if host == "dev2" and not cap:
-        return problems + ["WARN: dev2 is retired; historical capacity numbers not compared"]
+        return problems + ["Resource budget: dev2 is retired; recorded capacity is required"]
     if host in HOST_LIMITS:
         try:
             cap = cap or capacity(host)

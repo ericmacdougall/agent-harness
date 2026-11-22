@@ -107,7 +107,10 @@ class Budget(unittest.TestCase):
         self.assertEqual(rb.lint_budget(text)[0], [])
         with unittest.mock.patch.object(rb, "_run") as run:
             self.assertEqual(rb.check(text, cap=DEV2), [])
-            self.assertEqual(rb.check(text), ["WARN: dev2 is retired; historical capacity numbers not compared"])
+            code, reason = rb.plan_gate(text, "enforce")
+            self.assertEqual(code, 2, reason)
+            self.assertIn("dev2 is retired", reason)
+            self.assertIn("recorded capacity is required", reason)
             with self.assertRaisesRegex(ValueError, "live capacity is available only"):
                 rb.capacity("dev2")
             run.assert_not_called()
@@ -129,11 +132,17 @@ class Budget(unittest.TestCase):
             Path(tmp, "mac.json").write_text(json.dumps(MAC))
             Path(tmp, "dev2.json").write_text(json.dumps(DEV2))
             Path(tmp, "t2-dev.json").write_text(json.dumps(T2_DEV))
-            def run(host, cap):
-                return subprocess.run([sys.executable, str(HOOKS / "resource_budget.py"), "check", "--host", host, "--packet",
-                                       str(Path(tmp, "p.md")), "--capacity-json", str(Path(tmp, cap))],
-                                      capture_output=True, text=True)
+            def run(host, cap=None):
+                args = [sys.executable, str(HOOKS / "resource_budget.py"), "check", "--host", host, "--packet",
+                        str(Path(tmp, "p.md"))]
+                if cap is not None:
+                    args.extend(["--capacity-json", str(Path(tmp, cap))])
+                return subprocess.run(args, capture_output=True, text=True, timeout=15)
             self.assertEqual(run("dev2", "dev2.json").returncode, 0)
+            missing_capacity = run("dev2")
+            self.assertEqual(missing_capacity.returncode, 2, missing_capacity.stdout)
+            self.assertIn("recorded capacity is required", missing_capacity.stdout)
+            self.assertNotIn("OK:", missing_capacity.stdout)
             Path(tmp, "p.md").write_text(packet(host="t2-dev"))
             self.assertEqual(run("t2-dev", "t2-dev.json").returncode, 0)
             rejected = run("mac", "mac.json")
