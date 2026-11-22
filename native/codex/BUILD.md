@@ -2,12 +2,16 @@
 
 The **Codex receipt proof build** workflow runs by manual dispatch from `main`. It fetches the reviewed source capsule and official Codex source at fixed Git revisions. The driver verifies both revisions and the patch digest before building. The build receives no native account session or customer audit inputs.
 
+The upstream `rust-v0.169.0` tag sets `[workspace.package].version` to `0.169.0` while its checked-in `Cargo.lock` still lists 173 local packages at `0.0.0`. Before building, the driver checks both lockfile digests and the matching inherited-version manifests. It changes only those 173 workspace versions and records the effective lockfile in the patched tree. The receipt source patch stays separate. Dependencies, external source pins and checksums stay byte-identical. Every Cargo test and build uses `--locked`.
+
 After review and delivery of the workflow, use the GitHub Actions page to dispatch it once from `main`.
 
-The job uses a standard public Ubuntu runner and stops after 60 minutes. It checks the exact fixture names and pass totals for transport, compaction, App Server and schema before retaining the compressed proof binary and its build manifest. The run retains test output in its GitHub Actions log even if compilation or a fixture fails. Download the short-lived artifact, verify `artifacts.sha256`, and verify `binary.sha256` against the decompressed `codex` file. The manifest records the build workflow revision, the capsule revision and the patched upstream tree.
+The job uses a standard public Ubuntu runner and stops after 60 minutes. It checks the exact fixture names and pass totals for transport, compaction, App Server and schema before retaining the compressed proof binary and its build manifest. The run retains test output in its GitHub Actions log even if compilation or a fixture fails. Download the short-lived artifact, verify `artifacts.sha256`, and verify `binary.sha256` against the decompressed `codex` file. The manifest records the build workflow revision, the capsule revision, the patched upstream tree, and the original and effective Cargo lockfile digests.
 
 This artifact is for side-by-side testing. Live validation needs a separately reviewed consumer and authorization for a scoped native run.
 
 Run `python3 -B native/codex/test_verify_focused.py` to check the proof parser against independent literal logs. [Fixture sources](FOCUSED_FIXTURES.md) identifies the pinned Rust declarations and macro case names.
 
 Run `python3 -B native/codex/test_build_proof.py` to verify that source and provenance failures stop the driver before the Rust toolchain step. The test exercises the real driver with local stand-ins and an explicit build sentinel.
+
+Run `python3 -B native/codex/test_lock_normalization.py` to check version-only lockfile repair and rejection of unverified lockfiles.

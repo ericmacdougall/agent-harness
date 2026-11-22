@@ -40,7 +40,11 @@ if args == ["rev-parse", "--verify", "HEAD"]:
         sys.exit(42 if case == "rev-parse-failed" else 0)
     else:
         sys.exit(96)
+elif args == ["add", "--", "codex-rs/Cargo.lock"] and checkout == "codex-upstream":
+    assert (Path(directory) / "codex-rs/Cargo.lock").read_text() == "normalized fixture lock"
+    (Path(directory) / "lock-staged").touch()
 elif args == ["write-tree"] and checkout == "codex-upstream":
+    assert (Path(directory) / "lock-staged").is_file()
     print("b" * 39 if case == "malformed-tree" else "b" * 40)
     sys.exit(41 if case == "write-tree-failed" else 0)
 elif args == ["status", "--porcelain=v1"] and checkout in ("codex-upstream", "codex-receipt-capsule"):
@@ -62,7 +66,7 @@ class BuildProofTests(unittest.TestCase):
         run_temp = root / "runner-temp"
         tools = root / "bin"
         capsule = work / "codex-receipt-capsule/native/codex"
-        for directory in (work / "codex-upstream", capsule, run_temp, tools):
+        for directory in (work / "codex-upstream/codex-rs", capsule, run_temp, tools):
             directory.mkdir(parents=True)
         source = capsule / "model-receipt.patch"
         source.write_text("Synthetic prefix fixture\n")
@@ -70,7 +74,19 @@ class BuildProofTests(unittest.TestCase):
         sentinel = root / "rustup-entered"
         self.stand_in(tools / "git", GIT_STAND_IN)
         self.stand_in(tools / "uname", 'import sys\nassert sys.argv[1:] == ["-m"]\nprint("x86_64")\n')
-        self.stand_in(tools / "python3", f'import os,sys\nos.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n')
+        self.stand_in(tools / "python3", f"""
+import os
+from pathlib import Path
+import sys
+if Path(sys.argv[1]).name == "normalize-lock.py":
+    upstream = Path({str(work / 'codex-upstream/codex-rs')!r})
+    assert sys.argv[1:] == [{str(work / 'native/codex/normalize-lock.py')!r}, str(upstream)]
+    if os.environ["PROOF_DRIVER_FIXTURE"] == "lock-unverified":
+        sys.exit(45)
+    (upstream / "Cargo.lock").write_text("normalized fixture lock")
+else:
+    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])
+""")
         self.stand_in(tools / "sha256sum", f'''
 import sys
 assert sys.argv[1:] == ["--check", "--strict", "-"]
@@ -126,6 +142,11 @@ sys.exit(79)
                 result, sentinel = self.run_driver(case)
                 self.assertEqual(result.returncode, code, result.stderr)
                 self.assertFalse(sentinel.exists())
+
+    def test_unverified_lock_refuses_before_rustup(self):
+        result, sentinel = self.run_driver("lock-unverified")
+        self.assertEqual(result.returncode, 45, result.stderr)
+        self.assertFalse(sentinel.exists())
 
     def test_malformed_tree_or_commit_id_refuses_before_rustup(self):
         for case in ("malformed-tree", "malformed-commit"):

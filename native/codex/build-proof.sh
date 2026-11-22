@@ -46,6 +46,8 @@ PY
 mkdir -m 700 "$run_root" "$output"
 git -C "$upstream" apply --check --index --whitespace=error "$patch"
 git -C "$upstream" apply --index --whitespace=error "$patch"
+python3 "$harness_root/native/codex/normalize-lock.py" "$upstream/codex-rs" > "$run_root/lock-provenance.txt"
+git -C "$upstream" add -- codex-rs/Cargo.lock
 patched_tree="$(git -C "$upstream" write-tree)"
 harness_commit="$(git -C "$harness_root" rev-parse --verify HEAD)"
 if ! [[ "$patched_tree" =~ ^[0-9a-f]{40}$ && "$harness_commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -114,6 +116,7 @@ done
 run_focused schema-verify -p codex-app-server-protocol --lib schema_fixtures_tests
 
 "${cargo_cmd[@]}" build --locked --release --target "$target" -p codex-cli --bin codex
+git -C "$upstream" diff --exit-code -- codex-rs/Cargo.lock
 readonly binary="$CARGO_TARGET_DIR/$target/release/codex"
 test -x "$binary"
 test "$("$binary" --version)" = "codex-cli 0.169.0"
@@ -129,6 +132,7 @@ cp app-server-protocol/schema/precomputed/app-server-exports-stable.json.zst "$o
 cp app-server-protocol/schema/precomputed/app-server-exports-experimental.json.zst "$output/"
 printf 'harness_commit=%s\ncapsule_commit=%s\npatched_tree=%s\nprofile=release-opt1-no-lto\n' \
   "$harness_commit" "$capsule_commit" "$patched_tree" > "$output/build-provenance.txt"
+cat "$run_root/lock-provenance.txt" >> "$output/build-provenance.txt"
 (
   cd "$output"
   sha256sum binary.sha256 codex-linux-x64.gz source.json rustc.txt build-provenance.txt \
