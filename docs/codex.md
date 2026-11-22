@@ -37,8 +37,10 @@ Small localized reversible fixes stay in the main checkout with one focused chec
 The hook records session starts, prompt length, local tool name and input length, and subagent starts. It does not store prompt text or tool arguments. The model must add semantic notes for scope, decisions, checks, and handoff. The session or subagent start hook supplies the private WAL path; use:
 
 ```sh
-python3 ~/.codex/agent-harness/wal.py note --wal ~/.agent-harness/codex-wals/SESSION_ID/main.jsonl --event intent --note 'Scoped intent without private values'
+<trusted-absolute-python> -I -S <absolute-home>/.codex/agent-harness/wal.py note --wal <absolute-home>/.agent-harness/codex-wals/SESSION_ID/main.jsonl --event intent --note 'Scoped intent without private values'
 ```
+
+The isolated note form requires a verified absolute system or Homebrew Python path, separate `-I -S` flags, and an existing private native WAL. See [the literal note contract](operations.md#literal-codex-wal-notes). Legacy note calls without isolated flags remain conservatively scanned when their data mentions process signalling.
 
 If the hook is unavailable, `python3 ~/.codex/agent-harness/wal.py start-manual` creates a private manual WAL. Keep WALs out of Git and review them before sharing. A hook can observe supported local tool paths but may not see hosted or specialized calls. Hook metadata proves a call was attempted; it does not establish test quality or model compliance. Custom agent instructions ask reviewers not to edit, but a role file does not give them a separate read-only sandbox; the parent session's permissions apply.
 
