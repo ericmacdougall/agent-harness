@@ -301,8 +301,13 @@ class Hardening(Base):
                 return {"unexpected": "shape"}  # a KeyError for done["live"]
             return out
         with mock.patch.object(ai.Remote, "call", boom):
-            with self.assertRaises(ai.InstallError) as caught:
-                self.install()
+            try:
+                with self.assertRaises(ai.InstallError) as caught:
+                    self.install()
+            except KeyError as error:
+                if error.args != ("live",):
+                    raise
+                self.fail("Installer let the injected commit-reply error escape instead of reporting uncertainty")
         self.assertEqual(caught.exception.exit_code, 5)
         self.assertEqual(caught.exception.data["result"], "unknown")
         self.assertIn("check t2-dev", str(caught.exception.data["reason"]))
@@ -433,7 +438,9 @@ class Install(Base):
             self.assertEqual(self.live(n), plan["new_sha"])
             self.assertNotEqual(plan["new_sha"], old[n])
             self.assertEqual(sha((self.hooks / ".ah-install" / "backups" / out["run"] / n).read_bytes()), old[n])
-            self.assertEqual(sha((self.mac / ".agent-harness" / "install-backups" / out["run"] / n).read_bytes()), old[n])
+            local_backup = self.mac / ".agent-harness" / "install-backups" / out["run"] / n
+            self.assertTrue(local_backup.is_file(), f"Missing local backup for {n}")
+            self.assertEqual(sha(local_backup.read_bytes()), old[n])
             self.assertFalse((self.hooks / ("." + n + ".ah-install-tmp")).exists())
         self.assertEqual(oct((self.hooks / ".ah-install" / "backups").stat().st_mode & 0o777), "0o700")
         self.assertFalse((self.hooks / ".ah-install" / "lock").exists())
@@ -519,6 +526,41 @@ class Install(Base):
 
 
 class SelfTest(Base):
+    def exercise_nested_readonly_imports(self, suffix):
+        guard_module = f"guard_fixture_{suffix}"
+        doctor_module = f"doctor_fixture_{suffix}"
+        for helper in (guard_module, doctor_module):
+            (self.hooks / f"{helper}.py").write_text("VALUE = True\n")
+        guard = (
+            "import json, sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).parent))\n"
+            f"import {guard_module}\n"
+            f"assert {guard_module}.VALUE\n"
+            "print(json.dumps({'verdict': 'allow', 'message': ''}))\n"
+        )
+        doctor = guard.replace(guard_module, doctor_module).replace(
+            "json.dumps({'verdict': 'allow', 'message': ''})", "json.dumps({'findings': []})"
+        )
+        (self.hooks / "command_guard.py").write_text(guard)
+        (self.hooks / "doctor.py").write_text(doctor)
+        observed = ai.Remote("t2-dev", self.runner).call("selftest")
+        self.assertTrue(all(probe["verdict"] == "allow" for probe in observed["guard"].values()))
+        self.assertEqual(observed["doctor"]["failing"], [])
+        return {path.name.split(".")[0] for path in self.hooks.rglob(f"*_{suffix}.*.pyc")}
+
+    def test_nested_readonly_selftests_suppress_bytecode(self):
+        self.assertEqual(self.exercise_nested_readonly_imports("baseline"), set())
+
+    def test_bytecode_control_detects_either_missing_selftest_flag(self):
+        for name in ("guard", "doctor"):
+            with self.subTest(child=name):
+                flags = f'sys.executable, "-I", "-B", {name}'
+                self.assertEqual(ai.REMOTE_SCRIPT.count(flags), 1)
+                without = ai.REMOTE_SCRIPT.replace(flags, f'sys.executable, "-I", {name}', 1)
+                suffix = f"without_{name}"
+                with mock.patch.object(ai, "REMOTE_SCRIPT", without):
+                    self.assertEqual(self.exercise_nested_readonly_imports(suffix), {f"{name}_fixture_{suffix}"})
+
     def broken_commit(self, guard_bytes):
         side = Path(self.tmp, "broken")
         git(self.tmp, "clone", "-q", str(self.origin), str(side))
@@ -771,7 +813,12 @@ class Lock(Base):
         self.assertTrue(lock.exists())
         old = __import__("time").time() - 4000
         os.utime(lock, (old, old))
-        out = self.install()
+        try:
+            out = self.install()
+        except ai.InstallError as error:
+            if error.exit_code != 2 or "locked by another run" not in str(error):
+                raise
+            self.fail("The installer refused to take over the verified stale lock")
         self.assertEqual(out["result"], "installed")
         self.assertFalse([p for p in (self.hooks / ".ah-install").iterdir() if p.name.startswith("lock.stale-")])  # pruned after the run
         self.assertFalse(lock.exists())

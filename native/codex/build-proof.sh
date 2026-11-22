@@ -54,7 +54,8 @@ if ! [[ "$patched_tree" =~ ^[0-9a-f]{40}$ && "$harness_commit" =~ ^[0-9a-f]{40}$
 fi
 readonly patched_tree harness_commit
 
-rustup toolchain install "$toolchain" --profile minimal --target "$target"
+# The isolated Cargo home has no Rustup installation to self-update.
+rustup toolchain install "$toolchain" --profile minimal --target "$target" --no-self-update
 rustup run "$toolchain" rustc --version --verbose > "$run_root/rustc.txt"
 grep -Fx "host: $target" "$run_root/rustc.txt"
 

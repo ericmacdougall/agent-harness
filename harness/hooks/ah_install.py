@@ -150,7 +150,7 @@ def selftest():
             res["guard"][key] = {"exit": None, "verdict": "error:deadline", "rule": ""}
             continue
         try:
-            p = subprocess.run([sys.executable, "-I", guard, "check", cmd], capture_output=True, text=True,
+            p = subprocess.run([sys.executable, "-I", "-B", guard, "check", cmd], capture_output=True, text=True,
                                timeout=max(0.5, min(PROBE_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
             data = json.loads((p.stdout or "").strip().splitlines()[-1])
             rule = re.search(r"\[([A-Za-z0-9_/-]+)\]", data.get("message") or "")
@@ -162,7 +162,7 @@ def selftest():
         res["doctor"] = {"flags": True, "failing": None, "timeout": True}
     elif os.path.exists(doctor):
         try:
-            p = subprocess.run([sys.executable, "-I", doctor, "check", "--json", "--no-canary"], capture_output=True, text=True,
+            p = subprocess.run([sys.executable, "-I", "-B", doctor, "check", "--json", "--no-canary"], capture_output=True, text=True,
                                timeout=max(0.5, min(DOCTOR_TIMEOUT, deadline - time.time())), cwd=os.path.expanduser("~"))
             if "unrecognized arguments" in (p.stderr or ""):
                 res["doctor"] = {"flags": False, "failing": None}
