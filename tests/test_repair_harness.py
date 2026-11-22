@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -103,6 +104,30 @@ class ReleaseAncestry(unittest.TestCase):
             with self.assertRaisesRegex(repair.RepairError, "outside canonical main"):
                 repair.canonical_archive(unmerged, negative)
             self.assertFalse((negative / "release.tar").exists())
+
+
+class ArchiveExtraction(unittest.TestCase):
+    def test_matching_digest_does_not_authorize_escape_link_or_duplicate_members(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for kind in ("traversal", "absolute", "symlink", "hardlink", "duplicate"):
+            with self.subTest(member=kind):
+                archive = root / f"{kind}.tar"
+                with tarfile.open(archive, "w") as bundle:
+                    fixture = tarfile.TarInfo("regular.txt")
+                    fixture.size = 1
+                    bundle.addfile(fixture, io.BytesIO(b"x"))
+                    path = {
+                        "traversal": "../escaped.txt", "absolute": str(root / "escaped.txt"),
+                        "symlink": "unsafe", "hardlink": "unsafe", "duplicate": "regular.txt",
+                    }[kind]
+                    invalid = tarfile.TarInfo(path)
+                    if kind in ("symlink", "hardlink"):
+                        invalid.type = tarfile.SYMTYPE if kind == "symlink" else tarfile.LNKTYPE
+                        invalid.linkname = "../escaped.txt"
+                    bundle.addfile(invalid)
+                with self.assertRaisesRegex(repair.RepairError, "Unexpected member|Duplicate"):
+                    repair.extraction(archive, root / f"extract-{kind}", repair.digest(archive))
+                self.assertFalse((root / "escaped.txt").exists())
 
 
 @unittest.skipIf(os.geteuid() == 0, "Repair deliberately requires a non-root account")
