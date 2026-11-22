@@ -1,5 +1,6 @@
 """Failure and retry controls for the two-host repair sequencer."""
 import argparse
+import fcntl
 from contextlib import redirect_stdout
 import io
 import os
@@ -101,9 +102,48 @@ class ReleaseAncestry(unittest.TestCase):
         with patch.object(repair, "ORIGIN", str(repo)):
             self.assertEqual(repair.canonical_archive(reviewed, positive), tip)
             self.assertTrue((positive / "release.tar").is_file())
+            cache = root / "repair-source.git"
+            cache_inode = cache.stat().st_ino
             with self.assertRaisesRegex(repair.RepairError, "outside canonical main"):
                 repair.canonical_archive(unmerged, negative)
             self.assertFalse((negative / "release.tar").exists())
+            self.assertEqual(cache.stat().st_ino, cache_inode)
+            self.assertFalse((positive / "verified").exists())
+            bounded = root / "bounded"
+            bounded.mkdir()
+            with patch.object(repair, "MAX_ARCHIVE", 1024), self.assertRaises(subprocess.CalledProcessError):
+                repair.canonical_archive(reviewed, bounded)
+            self.assertLessEqual((bounded / "release.tar").stat().st_size, 1024)
+
+
+class HostSafety(unittest.TestCase):
+    def test_lock_refuses_symlink_and_hardlink(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        target = root / 'target'
+        target.write_text('preserve')
+        for kind in ('symlink', 'hardlink'):
+            path = root / (kind + '.lock')
+            path.symlink_to(target) if kind == 'symlink' else os.link(target, path)
+            with self.subTest(kind=kind), self.assertRaises((OSError, repair.RepairError)):
+                with repair.host_lock(root, path.name):
+                    self.fail('unsafe lock acquired')
+        self.assertEqual(target.read_text(), 'preserve')
+
+    def test_low_disk_stops_before_canonical_fetch(self):
+        stage = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with patch.object(repair.shutil, 'disk_usage', return_value=argparse.Namespace(free=1)), patch.object(repair, 'git') as git:
+            with self.assertRaisesRegex(repair.RepairError, 'space'):
+                repair.canonical_archive('a' * 40, stage)
+        git.assert_not_called()
+
+    def test_contended_source_cache_never_fetches(self):
+        work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        stage = work / 'stage'
+        stage.mkdir()
+        with repair.host_lock(work, 'repair-source.lock'), patch.object(repair, 'git') as git:
+            with self.assertRaisesRegex(repair.RepairError, 'host lock'):
+                repair.canonical_archive('a' * 40, stage)
+        git.assert_not_called()
 
 
 class ArchiveExtraction(unittest.TestCase):
@@ -185,6 +225,53 @@ class StockInstallers(unittest.TestCase):
             applied = self.apply(preview["stage"])
         self.assertEqual(applied["status"], "failed")
         installer.assert_not_called()
+
+    def test_low_disk_preview_and_apply_invoke_no_installer(self):
+        with patch.object(repair.shutil, 'disk_usage', return_value=argparse.Namespace(free=1)), patch.object(repair, 'bounded_install') as installer:
+            reply = self.preview()
+        self.assertEqual(reply['status'], 'failed')
+        installer.assert_not_called()
+        preview = self.preview()
+        self.assertEqual(preview['status'], 'ok')
+        with patch.object(repair.shutil, 'disk_usage', return_value=argparse.Namespace(free=1)), patch.object(repair, 'bounded_install') as installer:
+            reply = self.apply(preview['stage'])
+        self.assertEqual(reply['status'], 'failed')
+        installer.assert_not_called()
+
+    def test_host_lock_prevents_overlapping_apply_before_installer(self):
+        preview = self.preview()
+        self.assertEqual(preview['status'], 'ok')
+        with repair.host_lock(repair.work_dir(self.home), 'repair-apply.lock'):
+            with patch.object(repair, 'bounded_install') as installer:
+                reply = self.apply(preview['stage'])
+        self.assertEqual(reply['status'], 'failed')
+        installer.assert_not_called()
+
+    def test_stage_extra_import_does_not_enter_fresh_apply_source(self):
+        preview = self.preview()
+        self.assertEqual(preview['status'], 'ok')
+        stage = self.home / '.agent-harness/work' / preview['stage']
+        (stage / 'source-check' / 'json.py').write_text("raise RuntimeError('injected import')\n")
+        (stage / 'json.py').write_text("raise RuntimeError('injected import')\n")
+        reply = self.apply(preview['stage'])
+        self.assertEqual(reply['status'], 'ok')
+        self.assertFalse((stage / 'source-apply/json.py').exists())
+
+    def test_host_lock_spans_both_real_installers(self):
+        preview = self.preview()
+        self.assertEqual(preview['status'], 'ok')
+        installer = repair.bounded_install
+        observed = []
+        def check_lock(*args, **kwargs):
+            with self.assertRaisesRegex(repair.RepairError, 'host lock'):
+                with repair.host_lock(repair.work_dir(self.home), 'repair-apply.lock'):
+                    self.fail('lifetime lock was released')
+            observed.append(args[1])
+            return installer(*args, **kwargs)
+        with patch.object(repair, 'bounded_install', side_effect=check_lock):
+            applied = self.apply(preview['stage'])
+        self.assertEqual(applied['status'], 'ok')
+        self.assertEqual(observed, list(repair.INSTALLERS))
 
     def test_corrupted_non_ah_file_after_install_is_reported(self):
         preview = self.preview()
