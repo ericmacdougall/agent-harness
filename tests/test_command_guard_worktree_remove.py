@@ -1,6 +1,6 @@
 """Narrow git worktree remove exemption: real temporary repositories, fake network only.
 
-Commands are data passed to decide(); this suite never executes the removal being judged.
+Raw commands are data passed to decide(). The delegated tests remove only disposable fixtures.
 """
 
 import os
@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -105,6 +106,114 @@ class WorktreeRemoveCase(unittest.TestCase):
         (self.linked / 'secret.txt').write_text('unique ignored\n')
         self.assertIn('ignored', self.refusal())
         self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
+
+    def backed_ignored_fixture(self):
+        (self.primary / '.git/info/exclude').write_text('.cache/\n')
+        folder = self.linked / '.cache'
+        folder.mkdir()
+        paths = [folder / name for name in ('first.tsbuildinfo', 'second.tsbuildinfo')]
+        policy = dict(self.policy, marker=dict(self.policy['marker'], recent_change_seconds=0))
+
+        class SyntheticMirror:
+            def remote_types(self):
+                return {'dropbox': 'dropbox'}
+
+            def verify(self, local_root, manifest, remote):
+                return cg.VerifyResult(True, checked=len(manifest))
+
+        for path in paths:
+            path.write_text('synthetic cache bytes\n')
+            cg.approve_delete(str(path), 'dropbox:fixture/cache', verifier=SyntheticMirror(),
+                              home=str(self.home), policy=policy)
+        return folder, paths, policy
+
+    def test_backed_ignored_leaves_preview_then_consume_in_delegated_remove_only(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        self.assertIn('ignored', self.refusal(), 'raw git must not acquire backup authorization')
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', return_value=idle):
+            preview = cg.verify_worktree(str(self.linked), policy=policy)
+            self.assertTrue(preview.get('removable'), preview)
+            self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+        self.assertTrue(result.get('removed'), result)
+        self.assertFalse(self.linked.exists())
+        self.assertEqual(cg.load_marker(self.home)[0], [])
+
+    def test_backed_ignored_late_unapproved_sibling_preserves_all_markers(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+
+        def late_change(*args):
+            (folder / 'new.tsbuildinfo').write_text('unarchived content\n')
+            return idle
+
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', side_effect=late_change):
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+        self.assertFalse(result['removed'])
+        self.assertFalse(result['removable'])
+        self.assertTrue(self.linked.exists())
+        self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
+
+    def test_backed_ignored_preserves_bytes_with_same_size_and_restored_mtime(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        first = paths[0]
+        info = first.stat()
+        first.write_bytes(b'x' * info.st_size)
+        os.utime(first, ns=(info.st_atime_ns, info.st_mtime_ns))
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', return_value=idle):
+            self.assertTrue(cg.verify_worktree(str(self.linked), policy=policy)['removable'])
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+        self.assertFalse(result['removed'])
+        self.assertEqual(first.read_bytes(), b'x' * info.st_size)
+        self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
+
+    def test_backed_ignored_refuses_a_replaced_inode_or_links_and_mounts(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)):
+            with mock.patch.object(cg, '_worktree_mount_clear', return_value=False):
+                self.assertFalse(cg.verify_worktree(str(self.linked), policy=policy)['removable'])
+            replaced = paths[0].with_name('replacement')
+            replaced.write_bytes(paths[0].read_bytes())
+            os.replace(replaced, paths[0])
+            self.assertFalse(cg.verify_worktree(str(self.linked), policy=policy)['removable'])
+            paths[0].unlink()
+            paths[0].symlink_to(paths[1])
+            self.assertFalse(cg.verify_worktree(str(self.linked), policy=policy)['removable'])
+        self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
+
+    def test_backed_ignored_revoke_or_different_marker_set_refuses_removal(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        idle = {'busy': [], 'unreadable': [], 'skipped': [], 'failed': False}
+
+        def revoke_during_final_check(*args):
+            cg.revoke_delete(home=self.home)
+            return idle
+
+        with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
+                mock.patch.object(cg, 'busy_scan', side_effect=revoke_during_final_check):
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+        self.assertFalse(result['removed'])
+        self.assertTrue(all(path.exists() for path in paths))
+        self.assertEqual(cg.load_marker(self.home)[0], [])
+
+    def test_backed_ignored_rejects_no_backup_and_expired_marker_without_partial_spend(self):
+        folder, paths, policy = self.backed_ignored_fixture()
+        entries, _ = cg.load_marker(self.home)
+        actual = next(entry for entry in entries if entry['path'] == str(paths[1]))
+        for changes in ({'kind': cg.NO_BACKUP_KIND}, {'expires_at': time.time() - 1}):
+            with self.subTest(changes=changes):
+                replaced = dict(actual, **changes)
+                cg._store_entry(replaced, str(paths[1]), time.time(), str(self.home))
+                with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)):
+                    result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+                self.assertFalse(result['removed'])
+                self.assertTrue(all(path.exists() for path in paths))
+                self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
 
     def test_unpushed_commit_and_remote_without_exact_head_block(self):
         (self.linked / 'local.txt').write_text('local\n')

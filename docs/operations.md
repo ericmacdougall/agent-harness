@@ -604,6 +604,8 @@ The agent may approve a delete itself, but only after a backup that the approval
 python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
 ```
 
+For a clean, published linked worktree retired through `ah worktree-remove`, register a backup approval on the executing host for each otherwise-blocking ignored file. A collapsed ignored subtree qualifies only when every regular file has its own valid approval. The delegated verifier rejects mounted subtrees, special files, links, nested repositories, open backed files and any unfamiliar or changed path. Preview leaves approvals available. During removal, the verifier checks the same ignored content and authorization again, then consumes the full approval set once before non-forced Git removal. A removal that fails or is unconfirmed after consumption requires fresh backup verification and approval. Raw `git worktree remove` keeps its own guard.
+
 `approve-delete` refuses in these cases:
 
 - a glob or variable path;
