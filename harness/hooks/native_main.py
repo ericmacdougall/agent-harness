@@ -23,6 +23,11 @@ _CHILD_FIELDS = (
     "attached_thread_parent_id", "attachedThreadParentId",
 )
 _DESKTOP_IDENTIFIER = "com.openai.codex"
+_HELPER_IDENTIFIER = "com.openai.codex.helper"
+_HELPER_REQUIREMENT = (
+    f'anchor apple generic and identifier "{_HELPER_IDENTIFIER}" '
+    f'and certificate leaf[subject.OU] = "{OPENAI_TEAM}"'
+)
 _DESKTOP_REQUIREMENT = (
     f'anchor apple generic and identifier "{_DESKTOP_IDENTIFIER}" '
     f'and certificate leaf[subject.OU] = "{OPENAI_TEAM}"'
@@ -148,6 +153,10 @@ def _read_thread(home, uid, ident):
 
 
 class _DesktopBackend(DarwinBackend):
+    def helper_signature(self, pid):
+        """Verify the running helper with its fixed signing requirement."""
+        return self._signature(pid, (_HELPER_REQUIREMENT,))
+
     def desktop_signature(self, pid):
         """Check the running GUI guest with the GUI-specific fixed requirement."""
         owned = []
@@ -230,6 +239,31 @@ def _same_package(runtime, gui):
     return bundle.suffix == ".app" and runtime.executable == str(bundle / _APP_RUNTIME)
 
 
+def _same_helper_package(helper, gui):
+    """Allow the observed fixed helper topology within the verified GUI bundle."""
+    app = Path(gui.executable)
+    if app.parts[-3:] != _APP_EXECUTABLE:
+        return False
+    try:
+        relative = Path(helper.executable).relative_to(
+            app.parents[2] / "Contents/Frameworks/Codex Framework.framework/Versions")
+    except ValueError:
+        return False
+    parts = relative.parts
+    return (len(parts) == 6 and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,4}", parts[0]) is not None
+            and parts[1:] == ("Helpers", "Codex (Aperitif).app", "Contents",
+                              "MacOS", "Codex (Aperitif)"))
+
+
+def _helper_code(backend, helper):
+    code = backend.helper_signature(helper.pid)
+    if (not isinstance(code, CodeIdentity) or code.identifier != _HELPER_IDENTIFIER
+            or code.team != OPENAI_TEAM or code.executable != helper.executable
+            or not isinstance(code.cdhash, str) or not _CDHASH.fullmatch(code.cdhash)):
+        raise ValueError("Desktop helper code identity unavailable")
+    return code
+
+
 def _is_desktop_root(payload, pid, backend, read_thread):
     session = _current_session(payload)
     if session is None:
@@ -248,6 +282,14 @@ def _is_desktop_root(payload, pid, backend, read_thread):
         if runtime.parent <= 1:
             return False
         gui = snapshot.process(runtime.parent)
+        helper = None
+        helper_code = None
+        if Path(gui.executable).parts[-3:] != _APP_EXECUTABLE:
+            helper = gui
+            helper_code = _helper_code(backend, helper)
+            gui = snapshot.process(helper.parent)
+            if helper.uid != gui.uid or not _same_helper_package(helper, gui):
+                return False
         caller = snapshot.observed[pid]
         if not (caller.uid == runtime.uid == gui.uid and _same_package(runtime, gui)):
             return False
@@ -260,6 +302,9 @@ def _is_desktop_root(payload, pid, backend, read_thread):
             return False
         snapshot.recheck()
         if backend.desktop_signature(gui.pid) != gui_code or backend.signature(runtime.pid) != origin.code:
+            return False
+        snapshot.recheck()
+        if helper is not None and _helper_code(backend, helper) != helper_code:
             return False
         snapshot.recheck()
         return True

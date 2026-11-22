@@ -77,6 +77,61 @@ class DesktopReviewRole(unittest.TestCase):
         self.assertTrue(self.admit(payload()))
         self.assertEqual(self.reads, [ROOT_ID, ROOT_ID])
 
+    def helper(self):
+        path = "/Applications/Fixture.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.37/Helpers/Codex (Aperitif).app/Contents/MacOS/Codex (Aperitif)"
+        self.backend.processes[20] = ProcessIdentity(20, 25, 501, 3, CLI)
+        self.backend.processes[25] = ProcessIdentity(25, 30, 501, 2, path)
+        code = CodeIdentity("com.openai.codex.helper", OPENAI_TEAM, "c" * 40, path)
+        self.backend.helper_signature = lambda pid: code if pid == 25 else None
+        return path, code
+
+    def test_signed_same_package_helper_parent_can_qualify(self):
+        self.helper()
+        self.assertTrue(self.admit(payload()))
+
+    def test_helper_wrong_identity_package_uid_and_extra_hop_deny(self):
+        path, code = self.helper()
+        for bad in (
+            CodeIdentity("com.example.helper", OPENAI_TEAM, "c" * 40, path),
+            CodeIdentity("com.openai.codex.helper", "OTHER", "c" * 40, path),
+            CodeIdentity("com.openai.codex.helper", OPENAI_TEAM, "invalid", path),
+            CodeIdentity("com.openai.codex.helper", OPENAI_TEAM, "c" * 40, path + ".other"),
+            None,
+        ):
+            self.backend.helper_signature = lambda pid, value=bad: value
+            self.assertFalse(self.admit(payload()))
+        self.backend.helper_signature = lambda pid: code
+        self.backend.processes[25] = ProcessIdentity(25, 30, 502, 2, path)
+        self.assertFalse(self.admit(payload()))
+        self.backend.processes[25] = ProcessIdentity(25, 27, 501, 2, path)
+        self.backend.processes[27] = ProcessIdentity(27, 30, 501, 2, "/bin/zsh")
+        self.assertFalse(self.admit(payload()))
+
+    def test_helper_outside_gui_package_denies(self):
+        path, code = self.helper()
+        other = path.replace("Fixture.app", "Foreign.app")
+        self.backend.processes[25] = ProcessIdentity(25, 30, 501, 2, other)
+        self.backend.helper_signature = lambda pid: CodeIdentity(code.identifier, code.team, code.cdhash, other)
+        self.assertFalse(self.admit(payload()))
+
+    def test_helper_pid_and_code_replacement_deny(self):
+        path, code = self.helper()
+        self.backend.on_gui = lambda: self.backend.processes.update(
+            {25: ProcessIdentity(25, 30, 501, 999, path)})
+        self.assertFalse(self.admit(payload()))
+        self.backend = FakeDesktop()
+        self.helper()
+        calls = []
+        def changed(pid):
+            calls.append(pid)
+            return code if len(calls) == 1 else None
+        self.backend.helper_signature = changed
+        self.assertFalse(self.admit(payload()))
+
+    def test_signed_helper_cannot_admit_child_metadata(self):
+        self.helper()
+        self.assertFalse(self.admit(payload(agent_id=CHILD_ID)))
+
     def test_default_shared_main_predicate_still_denies_native(self):
         with patch.object(ci, "native_deny_reason", return_value="native_origin_has_no_main_admission"):
             self.assertFalse(ci.is_main(payload()))
