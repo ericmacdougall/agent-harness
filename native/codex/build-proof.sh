@@ -88,7 +88,7 @@ run_focused() {
   local label="$1"
   shift
   "${cargo_cmd[@]}" test --locked --release --target "$target" "$@" 2>&1 | tee -a "$run_root/$label.log"
-  grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed;' "$run_root/$label.log"
+  python3 "$harness_root/native/codex/verify-focused.py" "$label" "$run_root/$label.log"
 }
 run_focused tracker -p codex-api --lib response_model_observation
 run_focused sse -p codex-api --test sse_end_to_end responses_sse_binds_http_model_header_to_its_one_response
