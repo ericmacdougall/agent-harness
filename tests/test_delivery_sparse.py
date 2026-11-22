@@ -73,6 +73,8 @@ class SparseDelivery(fixture.DeliveryWorkflow):
         self.assertEqual(result.returncode, 0, result.stdout)
         fixture.command('git', 'sparse-checkout', 'set', '--no-cone', '/app.txt', '/tests/', '/future',
                         cwd=self.source, env=self.env)
+        result, denied = self.invoke(*self.prepare_args())
+        self.assertEqual(denied['status'], 'RECHECK_REQUIRED', result.stdout)
         result, denied = self.invoke(*self.finish_args())
         self.assertEqual(denied['status'], 'RECHECK_REQUIRED', result.stdout)
 

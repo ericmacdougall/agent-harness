@@ -484,9 +484,6 @@ class Workflow:
         replacing = getattr(self.args, "new_generation", False) and self.state["phase"] in SETTLED
         if not replacing:
             self.snapshot()
-            if self.state["phase"] not in {"DELIVERED", "LOCAL_DELIVERED", "RESOLVED_BASELINE"}:
-                snapshot(Path(self.state["source"]), self.state["source_branch"], require_clean=False,
-                         expected_layout=self.state.get("source_layout", "ordinary"))
         return self.state
 
     def validate_state(self, value):
@@ -1309,6 +1306,10 @@ def prepare(args):
                     or state["kit_digest"] != kit or (state["phase"] == "LOCAL_READY") != local_only
                     or state["repository"] != repository):
                 raise DeliveryError("BLOCKED_POLICY", "Prepared scope differs; explicitly request a new generation", code=2)
+            # Prepare consumes source state, including its layout. A merged
+            # remote recovery instead uses pinned remote/guard proof and may
+            # legitimately finish after the source worktree has been retired.
+            verify_source(flow)
         else:
             policy_record = commit_policy_gate(source, args.original_branch, branch, head, baseline,
                                                title, body, local_only)
