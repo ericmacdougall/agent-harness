@@ -929,9 +929,12 @@ def _native_click_proof(identity, agent, line, started, ended):
 
 
 def _native_authored_witness(identity, agent, role, marker, line, started, ended, *, require_fork_boundary=False,
-                             observe=None):
+                             observe=None, witness_scope=None):
     """Require the same statement in the child's native final answer and own WAL."""
-    if not line.startswith(marker):
+    def in_scope(text):
+        return isinstance(text, str) and text.startswith(marker) and (witness_scope is None or witness_scope(text))
+
+    if not in_scope(line):
         raise ValueError("unexpected native witness type")
 
     raw_rollout = identity["rollout"]
@@ -955,7 +958,7 @@ def _native_authored_witness(identity, agent, role, marker, line, started, ended
     child_rows = [_native_json(raw, 4_000_000) for raw in _native_read(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
     starts = [e for e in main_rows if e.get("event") == "SubagentStart" and e.get("agent_id") == agent]
     child_starts = [e for e in child_rows if e.get("event") == "SubagentStart"]
-    notes = [e for e in child_rows if isinstance(e.get("note"), str) and e["note"].startswith(marker)]
+    notes = [e for e in child_rows if in_scope(e.get("note"))]
     if (len(starts) != 1 or starts != child_starts or starts[0].get("agent_type") != role
             or len(notes) != 1 or notes[0].get("event") != "check" or notes[0].get("note") != line
             or not _native_stamp(starts[0].get("at")) <= start <= end <= _native_stamp(notes[0].get("at"))):
@@ -1008,7 +1011,7 @@ def _native_authored_witness(identity, agent, role, marker, line, started, ended
             if not isinstance(item, dict) or item.get("type") != "output_text" or not isinstance(item.get("text"), str):
                 raise ValueError("native rollout message unavailable")
             for text in item["text"].splitlines():
-                if text.startswith(marker):
+                if in_scope(text):
                     matches.append((text, _native_stamp(entry.get("timestamp"))))
     if len(matches) != 1 or matches[0][0] != line or matches[0][1] < _native_stamp(notes[0].get("at")):
         raise ValueError("native assistant witness missing, mismatched or replayed")

@@ -129,8 +129,12 @@ class NativeReviewContracts(TestCase):
         with mock.patch.object(n, "_git", return_value="fixture subject"), \
              mock.patch.object(n.spec_flow, "_native_agent_source", return_value={"role": "fixture"}), \
              mock.patch.object(n.spec_flow, "_native_authored_witness", side_effect=proof_found):
-            result = n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+            result = n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now,
+                                     expected_digest=n.digest(bundle.read_bytes()))
             self.assertEqual(set(result["proofs"]), set(n.ROLES))
+            with self.assertRaisesRegex(ValueError, "bundle digest changed"):
+                n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now,
+                                expected_digest="f" * 64)
             with self.assertRaisesRegex(ValueError, "root or proof set"):
                 n.verify_bundle(bundle, context(), self.repo, root=OWNER, now=now)
             receipts["proofs"]["adversarial"]["agent"] = OWNER
@@ -175,6 +179,7 @@ class NativeReviewContracts(TestCase):
                                     ("adversarial", ADVERSARIAL, self.report)):
             typed = n.ROLES[role]
             line = n.witness_line(context(), role, agent, start, end, report.read_bytes())
+            prior = n.witness_line(dict(context(), pr=9), role, agent, start, end, report.read_bytes())
             relative_agent = f"/root/{role}"
             source = {"subagent": {"thread_spawn": {"parent_thread_id": ROOT_ID, "depth": 1,
                                                      "agent_path": relative_agent, "agent_role": typed}}}
@@ -184,7 +189,8 @@ class NativeReviewContracts(TestCase):
                            None, 0, str(rollout), "fixture"))
             initial = {"at": "2026-11-22T18:54:58Z", "event": "SubagentStart", "agent_id": agent, "agent_type": typed}
             initial_rows.append(initial)
-            put(base / f"agent-{agent}.jsonl", [initial, {"at": "2026-11-22T19:00:11Z", "event": "check", "note": line}])
+            put(base / f"agent-{agent}.jsonl", [initial, {"at": "2026-11-22T19:00:11Z", "event": "check", "note": prior},
+                                                         {"at": "2026-11-22T19:00:11Z", "event": "check", "note": line}])
             def native_entry(kind, payload, timestamp="2026-11-22T18:54:59Z"):
                 return {"timestamp": timestamp, "type": kind, "payload": payload}
             rows = [
@@ -200,7 +206,7 @@ class NativeReviewContracts(TestCase):
             if role == "owner":
                 rows.append(self.event())
             rows.append(native_entry("response_item", {"type": "message", "role": "assistant", "phase": "final_answer",
-                                                       "status": "completed", "content": [{"type": "output_text", "text": line}]},
+                                                       "status": "completed", "content": [{"type": "output_text", "text": prior + "\n" + line}]},
                                      "2026-11-22T19:00:12Z"))
             put(rollout, rows)
             proofs[role] = {"agent": agent, "report": str(report), "started": start, "ended": end}
@@ -214,6 +220,13 @@ class NativeReviewContracts(TestCase):
              mock.patch.object(n, "_git", return_value="fixture subject"):
             passed = n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
             self.assertEqual(passed["context_sha256"], n.context_digest(context()))
+            acceptance_wal = base / f"agent-{ACCEPTANCE}.jsonl"
+            old_wal = acceptance_wal.read_text()
+            with acceptance_wal.open("a") as append:
+                append.write(old_wal.splitlines()[-1] + "\n")
+            with self.assertRaisesRegex(ValueError, "WAL witness missing or mismatched"):
+                n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)
+            acceptance_wal.write_text(old_wal)
             self.report.write_text("VERDICT: PASS\nChanged attachment content.\n")
             with self.assertRaisesRegex(ValueError, "WAL witness missing or mismatched"):
                 n.verify_bundle(bundle, context(), self.repo, root=ROOT_ID, now=now)

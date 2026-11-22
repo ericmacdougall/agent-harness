@@ -317,8 +317,21 @@ def _pure_review(report):
         raise ValueError("native reviewer did not record a pure PASS")
 
 
-def verify_bundle(path, expected_context, repo, *, root=None, now=None):
-    bundle = _object(path)
+def _witness_scope(context_sha):
+    def matches(line):
+        statement = spec_flow._native_json(line.removeprefix(PREFIX), 4000)
+        fields = {"agent", "role", "context_sha256", "report_sha256", "started", "ended"}
+        if set(statement) != fields or not _matches(DIGEST, statement["context_sha256"]):
+            raise ValueError("native PR witness scope is malformed")
+        return statement["context_sha256"] == context_sha
+    return matches
+
+
+def verify_bundle(path, expected_context, repo, *, root=None, now=None, expected_digest=None):
+    raw = spec_flow.read_regular(Path(path), MAX_FILE)
+    if expected_digest is not None and (not _matches(DIGEST, expected_digest) or digest(raw) != expected_digest):
+        raise ValueError("native review bundle digest changed")
+    bundle = spec_flow._native_json(raw, MAX_FILE)
     if set(bundle) != {"root", "context", "proofs"} or bundle["context"] != expected_context:
         raise ValueError("native review bundle does not bind the fresh candidate context")
     _validate_context(expected_context)
@@ -338,6 +351,8 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None):
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     main = home / ".agent-harness/codex-wals" / parent / "main.jsonl"
     hashes = {}
+    reviewed_context_sha = context_digest(expected_context)
+    witness_scope = _witness_scope(reviewed_context_sha)
     subjects = {sha: _git(repo, "show", "-s", "--format=%s", sha) for sha in expected_context["commits"]}
     for role in ROLES:
         proof = proofs[role]
@@ -360,14 +375,15 @@ def verify_bundle(path, expected_context, repo, *, root=None, now=None):
 
         observed = spec_flow._native_authored_witness(identity, proof["agent"], typed_role, PREFIX, line,
                                                       proof["started"], proof["ended"], require_fork_boundary=True,
-                                                      observe=observe if role == "owner" else None)
+                                                      observe=observe if role == "owner" else None,
+                                                      witness_scope=witness_scope)
         if role == "owner" and created != set(subjects):
             raise ValueError("the owner history does not prove creation of every candidate commit")
         current = time.time() if now is None else now
         if not current - MAX_AGE <= spec_flow._native_stamp(proof["started"]).timestamp() <= observed.timestamp() <= current:
             raise ValueError("native PR witness is stale or has a future timestamp")
         hashes[role] = digest(line.encode())
-    return {"context_sha256": context_digest(expected_context), "proofs": hashes}
+    return {"context_sha256": reviewed_context_sha, "proofs": hashes}
 
 
 def add_context_args(parser):
