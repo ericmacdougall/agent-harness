@@ -26,6 +26,94 @@ def context():
                          "review_sha256": "3" * 64, "evidence_sha256": "4" * 64, "release_records_sha256": "5" * 64, "missing": ["live proof pending"], "premerge_missing": []}]}
 
 
+class NativeCallLiveness(TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name).resolve()
+        self.path = self.home / "disposable-native-transcript"
+        self.command = "python3 /fixture/native_action.py --check"
+        self.call = "call_fixture_a"
+        self.tool = "exec-11111111-2222-3333-4444-555555555555"
+        self.payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "session_id": ROOT_ID,
+                        "tool_use_id": self.tool, "transcript_path": str(self.path)}
+        self.header = self.row("session_meta", {"id": ROOT_ID, "session_id": ROOT_ID, "source": "vscode",
+                                                "originator": "Codex Desktop", "thread_source": "user"})
+        call_args = json.dumps({"cmd": self.command})
+        self.pending = self.row("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": self.call,
+                                                 "input": f"text(await tools.exec_command({call_args}));"})
+        self.write(self.header, self.pending)
+        self.path.chmod(0o600)
+        for patch in (mock.patch("pwd.getpwuid", return_value=SimpleNamespace(pw_dir=str(self.home))),
+                      mock.patch.object(n, "_root_rollout", return_value=self.path)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def row(self, kind, item):
+        return {"timestamp": "2026-11-22T19:00:00Z", "type": kind, "payload": item}
+
+    def write(self, *rows):
+        self.path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def capture(self):
+        binding = n.native_call_binding(self.payload, self.command)
+        self.assertIsNotNone(binding)
+        return binding
+
+    def test_native_call_matches_actual_closed_tool_serialization(self):
+        binding = self.capture()
+        self.assertTrue(n.native_call_still_running(binding, match_command=lambda cmd: cmd == self.command))
+        self.assertFalse(n.native_call_still_running(binding, match_command=lambda cmd: cmd == "other"))
+        self.assertIsNone(n.native_call_binding(self.payload, "other command"))
+        self.assertIsNone(n.native_call_binding(dict(self.payload, tool_use_id="call_unbound"), self.command))
+        self.assertIsNone(n.native_call_binding(dict(self.payload, transcript_path="/elsewhere"), self.command))
+        self.assertIsNone(n.native_call_binding(dict(self.payload, agent_id=OWNER), self.command))
+
+    def test_output_or_command_execution_ends_binding_even_on_denial(self):
+        binding = self.capture()
+        for kind in ("function_call_output", "custom_tool_call_output"):
+            for result in ("denied", "completed"):
+                output = self.row("response_item", {"type": kind, "call_id": self.call, "output": result})
+                self.write(self.header, self.pending, output)
+                self.assertFalse(n.native_call_still_running(binding))
+                self.assertIsNone(n.native_call_binding(self.payload, self.command))
+        completed = self.row("event_msg", {"type": "item_completed", "thread_id": ROOT_ID,
+                                          "item": {"type": "CommandExecution", "id": self.tool, "status": "failed"}})
+        self.write(self.header, self.pending, completed)
+        self.assertFalse(n.native_call_still_running(binding))
+
+    def test_conflicting_or_unsupported_provider_input_never_mints(self):
+        changed = self.row("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": "call_other",
+                                             "input": self.pending["payload"]["input"]})
+        self.write(self.header, self.pending, changed)
+        self.assertIsNone(n.native_call_binding(self.payload, self.command))
+        changed["payload"]["input"] += " text(await tools.exec_command({}));"
+        self.write(self.header, changed)
+        self.assertIsNone(n.native_call_binding(self.payload, self.command))
+
+    def test_shrunken_replaced_edited_and_overlimit_history_fail(self):
+        binding = self.capture()
+        data = self.path.read_bytes()
+        self.write(self.header)
+        self.assertFalse(n.native_call_still_running(binding))
+        self.path.write_bytes(data.replace(b"native_action", b"native_change"))
+        self.assertFalse(n.native_call_still_running(binding))
+        self.path.write_bytes(data + b" " * (n.NATIVE_CALL_TAIL + 1) + b"\n")
+        self.assertFalse(n.native_call_still_running(binding))
+        self.path.write_bytes(data)
+        self.path.rename(self.home / "old-fixture")
+        self.path.write_bytes(data)
+        self.assertFalse(n.native_call_still_running(binding))
+
+    def test_missing_current_root_metadata_never_authenticates(self):
+        binding = self.capture()
+        with mock.patch.object(n, "_root_rollout", side_effect=ValueError("no current root binding")):
+            self.assertFalse(n.native_call_still_running(binding))
+            self.assertIsNone(n.native_call_binding(self.payload, self.command))
+
+
 class NativeReviewContracts(TestCase):
     def setUp(self):
         work = TemporaryDirectory()

@@ -80,7 +80,8 @@ def stamp_key(purpose: str, parts) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:40]
 
 
-def put_stamp(purpose: str, parts, session: str = "", home=None, now=None, tool_use_id=None, transcript=None) -> None:
+def put_stamp(purpose: str, parts, session: str = "", home=None, now=None, tool_use_id=None, transcript=None,
+              *, native_binding=None) -> None:
     """Record a one-shot stamp. With tool_use_id and transcript (main's proven transcript path) the stamp is bound to
     that one tool call: see take_stamp(bound=True)."""
     folder = stamp_dir(home)
@@ -94,8 +95,15 @@ def put_stamp(purpose: str, parts, session: str = "", home=None, now=None, tool_
             size = None
         if size is not None:
             record.update(tool_use_id=tool_use_id, transcript=str(transcript)[:4096], offset=size)
+    if native_binding is not None:
+        if not isinstance(native_binding, dict):
+            raise ValueError("native stamp binding must be an object")
+        record["native_binding"] = native_binding
+    encoded = json.dumps(record)
+    if native_binding is not None and len(encoded.encode("utf-8")) > 4096:
+        raise ValueError("stamp exceeds its read budget")
     tmp = folder / ("%s.%s.tmp" % (key, uuid.uuid4().hex[:8]))
-    tmp.write_text(json.dumps(record), encoding="utf-8")
+    tmp.write_text(encoded, encoding="utf-8")
     os.chmod(str(tmp), 0o600)
     os.replace(str(tmp), str(folder / (key + ".json")))
 

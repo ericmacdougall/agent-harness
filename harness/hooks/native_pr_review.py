@@ -54,6 +54,205 @@ def _identifier(value):
     return _matches(IDENT, value) and value == value.lower()
 
 
+NATIVE_CALL_LIMIT = 32_000_000
+NATIVE_CALL_TAIL = 1_000_000
+NATIVE_CALL_FIELDS = {"session", "tool_use_id", "call_id", "transcript", "file", "offset", "sha256", "command_sha256"}
+PROVIDER_CALL = re.compile(r"call_[A-Za-z0-9_-]{1,128}")
+EXEC_CALL = re.compile(r"exec-" + spec_flow.UUID.lower())
+CALL_ITEMS = {"function_call", "custom_tool_call"}
+CALL_RESULTS = {"function_call_output", "custom_tool_call_output"}
+
+
+def _root_rollout(home, uid, session):
+    """Look up only the canonical, current Desktop root and its rollout path."""
+    import sqlite3
+    import native_main
+
+    checked = native_main._read_thread(home, uid, session)
+    if checked is None or checked[0] != (session, "vscode", "user", "Codex Desktop", None, None, None, 0):
+        raise ValueError("native Desktop root is not available")
+    db = home / ".codex/state_5.sqlite"
+    before = spec_flow._native_database_binding(home, uid)
+    if before != checked[1]:
+        raise ValueError("native root database changed")
+    deadline = time.monotonic() + 0.20
+    connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.05)
+    try:
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 100)
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        table = connection.execute("PRAGMA main.table_list('threads')").fetchmany(2)
+        if len(table) != 1 or table[0][:3] != ("main", "threads", "table"):
+            raise ValueError("native root thread table unavailable")
+        plain = connection.execute("SELECT count(*) FROM pragma_table_xinfo('threads','main') "
+                                   "WHERE name='rollout_path' AND hidden=0").fetchone()
+        if plain != (1,):
+            raise ValueError("native root rollout column unavailable")
+        rows = connection.execute(
+            "SELECT CASE WHEN typeof(rollout_path)='text' AND length(CAST(rollout_path AS BLOB))<=1024 "
+            "THEN rollout_path END FROM main.threads WHERE id=? AND source='vscode' AND thread_source='user' "
+            "AND originator='Codex Desktop' AND archived=0 AND agent_path IS NULL AND agent_role IS NULL "
+            "AND attached_thread_parent_id IS NULL LIMIT 2", (session,)).fetchmany(2)
+    finally:
+        connection.close()
+    if (len(rows) != 1 or not isinstance(rows[0][0], str)
+            or time.monotonic() > deadline or spec_flow._native_database_binding(home, uid) != before):
+        raise ValueError("native root rollout path unavailable")
+    path = Path(rows[0][0])
+    relative = path.relative_to(home / ".codex")
+    if (not re.fullmatch(r"sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}", str(relative.parent))
+            or not re.fullmatch(rf"rollout-[0-9T-]+-{re.escape(session)}\.jsonl", path.name)):
+        raise ValueError("native root rollout path is not canonical")
+    return path
+
+
+def _direct_provider_command(item):
+    """Project commands from one direct shell invocation, never evaluate tool input."""
+    kind, name = item.get("type"), item.get("name")
+    if kind == "custom_tool_call" and name == "exec":
+        source = item.get("input")
+        if not isinstance(source, str) or len(source) > 8192:
+            return None
+        # Require exactly one awaited tools.exec_command call and strict JSON arguments.
+        match = re.fullmatch(r"\s*text\(await tools\.exec_command\((\{.*\})\)\);?\s*", source, re.S)
+        if not match:
+            return None
+        blob = match[1]
+    elif kind == "function_call" and name in ("Bash", "exec_command"):
+        blob = item.get("arguments")
+        if not isinstance(blob, str):
+            return None
+    else:
+        return None
+    data = spec_flow._native_json(blob, 8192)
+    if set(data) - {"cmd", "command", "workdir", "yield_time_ms", "max_output_tokens"}:
+        return None
+    commands = [data[key] for key in ("cmd", "command") if key in data]
+    return commands[0] if len(commands) == 1 and isinstance(commands[0], str) else None
+
+
+def _root_header(lines, session):
+    first = spec_flow._native_json(lines[0], 4_000_000)
+    payload = first.get("payload")
+    if (first.get("type") != "session_meta" or not isinstance(payload, dict)
+            or payload.get("id") != session or payload.get("session_id") != session
+            or payload.get("source") != "vscode" or payload.get("originator") != "Codex Desktop"
+            or payload.get("thread_source") != "user"
+            or any(payload.get(key) is not None for key in ("parent_thread_id", "forked_from_id", "agent_path", "agent_role"))):
+        raise ValueError("native rollout header is not the authenticated root")
+
+
+def _open_provider_call(data, session):
+    lines = data.splitlines()
+    _root_header(lines, session)
+    calls = {}
+    for raw in lines[1:]:
+        if b'"response_item"' not in raw or not any(label in raw for label in (b'"function_call', b'"custom_tool_call')):
+            continue
+        entry = spec_flow._native_json(raw, 4_000_000)
+        item = entry.get("payload")
+        if entry.get("type") != "response_item" or not isinstance(item, dict):
+            continue
+        kind, call = item.get("type"), item.get("call_id")
+        if kind in CALL_ITEMS and _matches(PROVIDER_CALL, call):
+            if call in calls:
+                raise ValueError("native provider call is duplicated")
+            calls[call] = item
+        elif kind in CALL_RESULTS and isinstance(call, str):
+            calls.pop(call, None)
+    if len(calls) != 1:
+        raise ValueError("there is no unique open native provider call")
+    call, item = next(iter(calls.items()))
+    command = _direct_provider_command(item)
+    if not command:
+        raise ValueError("the open native provider call is not one direct command")
+    return call, command
+
+
+def native_call_binding(payload, command):
+    """Prepare a call-liveness binding for an already authenticated Desktop root hook."""
+    import pwd
+    import sqlite3
+    import native_main
+
+    try:
+        session = native_main._current_session(payload)
+        tool = payload.get("tool_use_id")
+        if not _identifier(session) or not _matches(EXEC_CALL, tool) or not isinstance(command, str) or not command:
+            return None
+        uid = os.getuid()
+        home = Path(pwd.getpwuid(uid).pw_dir)
+        path = _root_rollout(home, uid, session)
+        if payload.get("transcript_path") not in (None, str(path)):
+            return None
+        file = spec_flow._native_path(path, uid, maximum=NATIVE_CALL_LIMIT)
+        data = spec_flow._native_read(path, {"home": home, "uid": uid}, NATIVE_CALL_LIMIT, binding=file)
+        if not data.endswith(b"\n"):
+            return None
+        provider_call, observed = _open_provider_call(data, session)
+        if observed != command:
+            return None
+        return {"session": session, "tool_use_id": tool, "call_id": provider_call, "transcript": str(path),
+                "file": list(file), "offset": len(data), "sha256": digest(data),
+                "command_sha256": digest(command.encode())}
+    except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, sqlite3.Error, spec_flow.SpecError):
+        return None
+
+
+def _terminal_native_event(entry, binding):
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return True
+    if entry.get("type") in ("session_meta", "turn_context"):
+        return True
+    if entry.get("type") == "response_item":
+        kind = payload.get("type")
+        return kind in CALL_ITEMS or kind in CALL_RESULTS
+    if entry.get("type") == "event_msg":
+        kind = payload.get("type")
+        item = payload.get("item")
+        return (kind in ("turn_aborted", "task_complete", "task_started")
+                or (kind == "item_completed" and isinstance(item, dict) and item.get("id") == binding["tool_use_id"]))
+    return False
+
+
+def native_call_still_running(binding, *, match_command=None):
+    """Reject spent, redirected, damaged or ambiguous account-local native call bindings."""
+    import pwd
+    import sqlite3
+
+    try:
+        if (not isinstance(binding, dict) or set(binding) != NATIVE_CALL_FIELDS
+                or not _identifier(binding["session"]) or not _matches(EXEC_CALL, binding["tool_use_id"])
+                or not _matches(PROVIDER_CALL, binding["call_id"]) or not _matches(DIGEST, binding["sha256"])
+                or not _matches(DIGEST, binding["command_sha256"])
+                or type(binding["offset"]) is not int or not 0 < binding["offset"] <= NATIVE_CALL_LIMIT
+                or not isinstance(binding["file"], list) or len(binding["file"]) != 4
+                or any(type(field) is not int for field in binding["file"])):
+            return False
+        uid = os.getuid()
+        home = Path(pwd.getpwuid(uid).pw_dir)
+        path = _root_rollout(home, uid, binding["session"])
+        if str(path) != binding["transcript"]:
+            return False
+        data = spec_flow._native_read(path, {"home": home, "uid": uid}, NATIVE_CALL_LIMIT, binding=tuple(binding["file"]))
+        offset = binding["offset"]
+        if (not offset <= len(data) <= offset + NATIVE_CALL_TAIL
+                or digest(data[:offset]) != binding["sha256"] or not data.endswith(b"\n")):
+            return False
+        call, command = _open_provider_call(data[:offset], binding["session"])
+        if (call != binding["call_id"] or digest(command.encode()) != binding["command_sha256"]
+                or (match_command is not None and not match_command(command))):
+            return False
+        for raw in data[offset:].splitlines():
+            entry = spec_flow._native_json(raw, NATIVE_CALL_TAIL)
+            if _terminal_native_event(entry, binding):
+                return False
+        return True
+    except (OSError, ValueError, TypeError, KeyError, IndexError, RuntimeError, sqlite3.Error, spec_flow.SpecError):
+        return False
+
+
 def _object(path):
     return spec_flow._native_json(spec_flow.read_regular(Path(path), MAX_FILE), MAX_FILE)
 
