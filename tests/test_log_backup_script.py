@@ -2194,6 +2194,41 @@ class TierOneCheckpoint(Case):
         self.assertRegex(summary, r"(?m)^\.claude/wals pending=\d+ ok=never$")
         self.assertRegex(summary, r"(?m)^\.codex/sessions pending=0 ok=\d{4}-")
 
+    def test_ac6_a_failed_or_cut_short_chunk_is_never_marked_verified_and_is_sent_again(self):
+        # The property that replaces a remote reconcile (main's condition for goodqa#16660): verified holds only files
+        # whose chunk copy exited 0. A failed chunk and a chunk cut short after some files arrived both stay pending.
+        state = self.logs / "log-backup.live.d"
+        trees = {"claude_wals": ".claude/wals/", "claude_projects": ".claude/projects/", "codex_sessions": ".codex/sessions/"}
+
+        def verified(key):
+            path = state / key / "verified"
+            return {l.split("\t", 1)[0] for l in path.read_text().splitlines()} if path.exists() else set()
+
+        done = self.run_script(FAKE_FAIL_MATCH="live.d/claude_wals", LOG_BACKUP_RETRIES="0",
+                               LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(verified("claude_wals"), set(), "nothing of a failed chunk is verified")
+        self.assertFalse(self.source_ok("claude_wals").exists())
+
+        self.tier1_runs(1, 20)   # too few operations: a chunk stops part way with rclone exit 10
+        remote = self.remote_files()
+        cut = {}
+        for key, prefix in trees.items():
+            arrived = {f[len(prefix):] for f in remote if f.startswith(prefix)}
+            self.assertLessEqual(verified(key), arrived, "a verified file is always on the remote")
+            if arrived - verified(key):
+                cut[key] = arrived - verified(key)
+        self.assertTrue(cut, "some files reached the remote in a chunk that did not finish, and are not verified")
+
+        checked = Path(str(self.calls) + ".checked")
+        checked.write_text("")
+        done = self.tier1_runs(6, 40)
+        self.assertEqual(done.returncode, 0, (self.logs / "log-backup.log").read_text()[-2000:])
+        again = set(checked.read_text().split())
+        for key, names in cut.items():
+            self.assertLessEqual(names, again, "%s: files of the cut chunk were checked again" % key)
+        self.assertTrue(self.last_ok().exists())
+
     def test_neg_tier1_checkpoint_state_is_its_own(self):
         # The lane owns log-backup.bulk.d; tier 1 must never write into it (two writers on one checkpoint).
         self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="99999")
