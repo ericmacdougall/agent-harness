@@ -355,6 +355,16 @@ class Guard(Base):
                 self.assertEqual(tc.pretool(self.ev(cmd), self.cfg(min_free_gb=25)), (0, ""), cmd)
             self.assertEqual(tc.pretool({"tool_name": "Edit", "tool_input": {}}, self.cfg(min_free_gb=25)), (0, ""))
 
+    def test_prefix_options_and_keywords_do_not_hide_a_local_copy(self):
+        # goodqa#16811 side finding: `timeout 120 git clone` read as the command `120` and slipped under the floor
+        with mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+            for cmd in ("timeout 120 git clone https://x/y.git z", "timeout -s KILL 5m git worktree add /w HEAD",
+                        "nice -n 5 cp -a repo t11", "sudo -u eric git clone a b", "if true; then git clone a b; fi",
+                        "env -u X timeout 30 rsync -a src/ dst/"):
+                code, err = tc.pretool(self.ev(cmd), self.cfg(min_free_gb=25))
+                self.assertEqual(code, 2, cmd)
+                self.assertIn("DISK LOW", err)
+
     def test_fails_open_on_internal_error(self):
         with mock.patch.object(tc, "free_bytes", side_effect=OSError("boom")):
             self.assertEqual(tc.pretool(self.ev("git clone a b"), self.cfg()), (0, ""))

@@ -771,8 +771,9 @@ def simple_commands(cmd: str) -> list:
             words = shlex.split(seg, comments=True)
         except ValueError:
             words = seg.split()
-        while words and (ASSIGN.match(words[0]) or os.path.basename(words[0]) in PREFIXES):
-            words = words[1:]
+        # _unwrap also drops a prefix's options and values (timeout 120, nice -n 5, sudo -u x) and shell keywords
+        # (then, do): stripping only the prefix word left `120 git clone ...` unrecognised (goodqa#16811).
+        words = _unwrap(words)
         if words:
             out.append(words)
     return out
