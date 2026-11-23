@@ -9380,7 +9380,17 @@ def _hook_wal_predates(wal_real, at, limit=4 << 20):
     (a gap, a non-regular, ambiguous or unreadable segment) answers False, so an approval is never given on a WAL
     whose chain is not whole."""
     import datetime
-    import wal_segments as ws
+    try:
+        try:
+            import wal
+            require = getattr(wal, 'require_segments', None)
+        except Exception:  # noqa: BLE001
+            require = None
+        if require is not None:
+            require(os.path.dirname(wal_real))
+        import wal_segments as ws
+    except Exception:  # noqa: BLE001 - WalSegmentsMissing or ImportError: no approval without the segment reader
+        return False
     probs = []
     found = False
     try:

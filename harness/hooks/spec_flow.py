@@ -719,7 +719,10 @@ def _native_wal_members(path, uid, maximum):
     Every member is qualified like a single WAL (regular, one link, our uid, not group/world writable, within
     `maximum`). Any chain problem, a gap, a segment that is not a regular file or a missing live file raises ValueError:
     a native proof is never made over part of a WAL (goodqa#16751)."""
-    import wal_segments as ws
+    try:
+        ws = _segment_reader(path.parent)
+    except Exception:  # noqa: BLE001 - WalSegmentsMissing or ImportError: a native proof is refused
+        raise ValueError("wal_segments.py is not available") from None
     stem, seq = ws.parse_name(path.name)
     if stem is None or seq is not None:
         raise ValueError("native WAL name unavailable")
@@ -760,7 +763,10 @@ def _native_read_wal(path, identity, limit, *, binding=None):
     as _native_read: each member's binding, size, mtime and ctime must hold throughout, the chain must not change
     while it is read, and the sum of the members is bounded by `limit`. For a WAL that never rotated the result is the
     file's bytes unchanged."""
-    import wal_segments as ws
+    try:
+        ws = _segment_reader(path.parent)
+    except Exception:  # noqa: BLE001 - WalSegmentsMissing or ImportError: a native proof is refused
+        raise ValueError("wal_segments.py is not available") from None
     home, uid = identity["home"], identity["uid"]
     parents = [home, *(p for p in reversed(path.parents) if p != home and p.is_relative_to(home))]
     directories = [_native_path(p, uid, directory=True) for p in parents]
@@ -1251,14 +1257,34 @@ def _native_owner_proof(main_wal, owner):
         raise SpecError("Owner-recorded handoff/result evidence unavailable or changed", EXIT_USAGE) from None
 
 
+WAL_ENTRIES_MAX_BYTES = 64_000_000
+
+
+def _segment_reader(directory):
+    """wal_segments, after wal.require_segments(directory); a missing module raises ImportError-like failure the callers
+    turn into their own refusal (a gate never reads the live tail alone)."""
+    try:
+        import wal  # noqa: PLC0415
+        require = getattr(wal, "require_segments", None)
+    except Exception:  # noqa: BLE001
+        require = None
+    if require is not None:
+        require(directory)
+    import wal_segments  # noqa: PLC0415
+    return wal_segments
+
+
 def wal_entries(path: Path):
     """The parsed rows of a WAL's whole segment chain (open markers dropped). A WAL that does not exist has no rows. A
     chain problem (a gap, a non-regular or unreadable segment, an ambiguous name) or a chain over the 64 MB budget is
     an error, never a partial list: evidence is never judged "absent" over rows that were not read."""
-    import wal_segments as ws
+    try:
+        ws = _segment_reader(Path(path).parent)
+    except Exception as error:  # noqa: BLE001 - WalSegmentsMissing or ImportError: fail closed
+        raise SpecError(f"wal_segments.py is not available ({type(error).__name__}); a WAL is never read without it", EXIT_USAGE) from None
     probs = []
     try:
-        raw = ws.read_logical(path, max_bytes=64_000_000, problems=probs)
+        raw = ws.read_logical(path, max_bytes=WAL_ENTRIES_MAX_BYTES, problems=probs)
     except (OSError, ws.SegmentProblem) as error:
         raise SpecError(f"cannot read the WAL chain of {path} ({type(error).__name__})", EXIT_USAGE) from None
     hard = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]

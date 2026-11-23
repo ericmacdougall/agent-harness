@@ -206,6 +206,154 @@ class EscalationTests(Fixture):
         self.assertIn("chain problem", str(raised.exception))
 
 
+class GateFixture(Fixture):
+    """A rotated main WAL whose gate rows (an approved ask, a pretool row) sit in the LIVE file, so a gate that is
+    handed only part of the chain still looks satisfied unless the chain itself is validated (gate F1)."""
+
+    def setUp(self):
+        super().setUp()
+        import command_guard
+        import escalation
+        import spec_flow
+        self.cg, self.esc, self.sf = command_guard, escalation, spec_flow
+        self.old = datetime.now(timezone.utc) - timedelta(hours=2)
+        self.fill("main.jsonl", n=40, pad=300, event="status")
+        self.append("main.jsonl", {"at": iso(), "id": "w1", "event": "ask", "note": "top for [task:k]",
+                                   "source": 'user:s/u "yes"'})
+        self.append("main.jsonl", {"at": iso(), "id": "w2", "event": "ask_resolved", "ref": "w1", "decision": "approved"})
+        self.append("main.jsonl", {"at": self.old.isoformat(), "event": "pretool", "tool_use_id": "t1"})
+        self.rotated()
+        live = (self.dir / "main.jsonl").read_text()
+        for needle in ('"w1"', '"w2"', "tool_use_id"):
+            self.assertIn(needle, live, "the gate rows must be in the live file for this fixture")
+        self.identity = {"home": self.home, "uid": os.getuid()}
+
+    # the four gate entry points, each returning True when it ACCEPTS the WAL
+    def accepts(self):
+        out = {}
+        with patch.dict(os.environ, {"AGENT_HARNESS_WALS_DIR": str(self.dir.parent)}):
+            try:
+                self.esc.verify_ask_pair(self.path(), "w1", "k", allow_env_root=True)
+                out["verify_ask_pair"] = True
+            except self.esc.LedgerError:
+                out["verify_ask_pair"] = False
+        try:
+            self.sf.wal_entries(self.path())
+            out["wal_entries"] = True
+        except self.sf.SpecError:
+            out["wal_entries"] = False
+        try:
+            self.sf._native_read_wal(self.path(), self.identity, 4_000_000)
+            out["native_read_wal"] = True
+        except ValueError:
+            out["native_read_wal"] = False
+        out["hook_wal_predates"] = self.cg._hook_wal_predates(str(self.path()), time.time() - 3600)
+        return out
+
+    def assertAll(self, expected, got):
+        self.assertEqual(got, {k: expected for k in ("verify_ask_pair", "wal_entries", "native_read_wal",
+                                                     "hook_wal_predates")}, got)
+
+
+class ChainDamageTests(GateFixture):
+    """Gate F1 (CRITICAL): a chain with its newest closed segments (or all of them) removed must be refused by every gate."""
+
+    def test_the_whole_chain_is_accepted_by_every_gate(self):
+        self.assertAll(True, self.accepts())
+
+    # RED until the F1 chain-validation fix of feat/wal-segments (#327 repair) is merged in; then delete this marker
+    @unittest.expectedFailure
+    def test_deleting_the_newest_closed_segment_is_refused_by_every_gate(self):
+        os.unlink(self.dir / self.closed()[-1])
+        self.assertAll(False, self.accepts())
+
+    # RED until the F1 chain-validation fix of feat/wal-segments (#327 repair) is merged in; then delete this marker
+    @unittest.expectedFailure
+    def test_deleting_every_closed_segment_is_refused_by_every_gate(self):
+        for name in self.closed():
+            os.unlink(self.dir / name)
+        self.assertAll(False, self.accepts())
+
+
+class SegmentShapeTests(GateFixture):
+    """Gate F3: a non-regular or ambiguous segment is refused by every gate."""
+
+    def test_a_symlink_in_a_segments_place_is_refused(self):
+        name = self.closed()[1]
+        os.unlink(self.dir / name)
+        os.symlink(self.dir / self.closed()[0], self.dir / name)
+        self.assertAll(False, self.accepts())
+
+    def test_two_names_for_one_segment_are_refused(self):
+        import shutil
+        shutil.copy(self.dir / "main.0002.jsonl", self.dir / "main.00002.jsonl")
+        self.assertAll(False, self.accepts())
+
+
+class EscalationEdgeTests(GateFixture):
+    def env(self):
+        return patch.dict(os.environ, {"AGENT_HARNESS_WALS_DIR": str(self.dir.parent)})
+
+    def test_a_symlinked_main_wal_that_resolves_under_the_root_is_still_accepted(self):
+        other = self.dir.parent / "other-session"
+        other.mkdir()
+        os.rename(self.path(), other / "main.jsonl")  # fixture file, moved: the real WAL is now under another session
+        for name in self.closed():
+            os.rename(self.dir / name, other / name)
+        os.symlink(other / "main.jsonl", self.path())
+        with self.env():
+            self.assertEqual(self.esc.verify_ask_pair(self.path(), "w1", "k", allow_env_root=True)["source"][:5], "user:")
+
+    def test_the_byte_limit_is_unclassifiable_not_a_quiet_stop(self):
+        with self.env(), patch.object(self.esc, "ASK_WAL_MAX_BYTES", 2000):
+            with self.assertRaises(self.esc.LedgerError) as raised:
+                self.esc.verify_ask_pair(self.path(), "w1", "k", allow_env_root=True)
+        self.assertIn("limit", str(raised.exception))
+
+    def test_a_rotation_during_the_read_changes_nothing(self):
+        real = ws.iter_lines
+        rotated = []
+
+        def rotating(path, **kw):
+            for item in real(path, **kw):
+                if not rotated:
+                    rotated.append(True)
+                    self.fill("main.jsonl", n=12, pad=500)  # rotate while the reader is mid-snapshot
+                yield item
+        with self.env(), patch.object(ws, "iter_lines", rotating):
+            self.assertEqual(self.esc.verify_ask_pair(self.path(), "w1", "k", allow_env_root=True)["source"][:5], "user:")
+        self.assertTrue(rotated)
+
+
+class SpecFlowEdgeTests(GateFixture):
+    def test_wal_entries_at_the_byte_limit_is_an_error_not_a_partial_list(self):
+        with patch.object(self.sf, "WAL_ENTRIES_MAX_BYTES", 2000):
+            with self.assertRaises(self.sf.SpecError) as raised:
+                self.sf.wal_entries(self.path())
+        self.assertIn("truncated", str(raised.exception))
+
+
+class RequireSegmentsTests(GateFixture):
+    """A missing wal_segments module must make each gate refuse (wal.require_segments), never crash or read the live tail."""
+
+    def missing(self):
+        import wal
+        stack = patch.dict(sys.modules, {"wal_segments": None})
+        return stack, patch.object(wal, "wal_segments", None)
+
+    def test_every_gate_fails_closed_without_the_module(self):
+        a, b = self.missing()
+        with a, b:
+            self.assertAll(False, self.accepts())
+
+    def test_the_refusal_names_the_missing_module(self):
+        a, b = self.missing()
+        with a, b, patch.dict(os.environ, {"AGENT_HARNESS_WALS_DIR": str(self.dir.parent)}):
+            with self.assertRaises(self.esc.LedgerError) as raised:
+                self.esc.verify_ask_pair(self.path(), "w1", "k", allow_env_root=True)
+        self.assertIn("wal_segments", str(raised.exception))
+
+
 # ---------------------------------------------------------------------------------------------------------------
 MIGRATED = ("command_guard", "escalation", "spec_flow")
 # the two process-safety guards read no WAL, so their decisions cannot change (reviewed, with the reason)
