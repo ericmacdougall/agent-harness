@@ -732,12 +732,36 @@ def results_of(home, run):
     return [r.get("result") for r in audit_rows(home) if r.get("run") == run and r.get("event") == "result"]
 
 
-def require_manifest_grant(host, ref, home):
-    """Manifest installs need the signed self-serve grant `install_files_manifest`; no grant means a refusal that names the user
-    step. The one gate for the capability: install_files and resume both pass through here."""
+def _ops_module():
+    """ah_ops from this file's own directory, never by sys.path name (a planted ah_ops.py must not be able to answer for the gate)."""
+    import importlib.util  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    path = Path(__file__).resolve().parent / "ah_ops.py"
+    loaded = sys.modules.get("ah_ops")
+    if loaded is not None:
+        if getattr(loaded, "__file__", None) and os.path.realpath(loaded.__file__) == os.path.realpath(path):
+            return loaded
+        raise ImportError("a different ah_ops is already loaded")
+    spec = importlib.util.spec_from_file_location("ah_ops", str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["ah_ops"] = module
     try:
-        import ah_ops  # noqa: PLC0415 - lazy: ah_ops imports this module
-        ah_ops.require_grant(MANIFEST_CAPABILITY, evidence={"host": host, "ref": ref}, home=home)
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("ah_ops", None)
+        raise
+    return module
+
+
+def require_manifest_grant(host, ref, home, resume_of=None):
+    """Manifest installs need the signed self-serve grant `install_files_manifest`; no grant means a refusal that names the user
+    step. The one gate for the capability: install_files and resume both pass through here. The grant evidence names the repository, host
+    and ref and a use key (one install of a ref to a host; a resume has its own key), which a single-use scope spends."""
+    try:
+        ops = _ops_module()  # lazy: ah_ops imports this module
+        ops.require_grant(MANIFEST_CAPABILITY, home=home, evidence={
+            "repo": ops.HARNESS_REPO, "host": host, "ref": ref,
+            "use_key": ("manifest-resume:%s" % resume_of) if resume_of else "manifest:%s:%s" % (host, ref)})
     except Exception as error:  # noqa: BLE001 - an OpsError, an ImportError or anything odd all mean: no grant, nothing changed
         raise InstallError("no_grant", str(error)[:600] or "no self-serve grant for install_files_manifest", 2)
 
@@ -762,7 +786,7 @@ def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.ru
         refuse("run %s already finished" % run_id)
     check_inputs(row["host"], None, None, ticket, False, run_id, None, ())
     if row.get("manifest"):
-        require_manifest_grant(row["host"], row["ref"], home)
+        require_manifest_grant(row["host"], row["ref"], home, resume_of=run_id)
     return _run(row["host"], row["ref"], sorted(row["files"], key=lambda n: n), ticket, False, home, session, agent, runner, poster, run_id,
                 row.get("baseline"), "resume")
 

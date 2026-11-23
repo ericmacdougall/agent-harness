@@ -4017,6 +4017,12 @@ def _parse_chat(given):
 
 def main(argv=None) -> int:
     given = list(sys.argv[1:] if argv is None else argv)
+    if given[:1] in (["ops"], ["install-files"]):  # self-serve: take main's one-shot stamp for exactly this command before anything runs
+        try:
+            import ah_ops  # noqa: PLC0415
+            ah_ops.claim_main(given, home_dir())
+        except Exception:  # noqa: BLE001 - no stamp is no proof, which is no grant
+            pass
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])

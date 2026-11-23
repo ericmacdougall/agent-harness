@@ -48,7 +48,7 @@ class FakeSelfServe(types.ModuleType):
         self.calls.append((capability, actor, evidence))
         if not self.allow:
             return None
-        return {"capability": capability, "policy_id": "p" * 32, "key_id": "k" * 16, "expires_at": "2099-01-01T00:00:00Z", "scope": self.scope}
+        return {"capability": capability, "policy_id": "a1" * 16, "key_id": "b2" * 8, "expires_at": "2099-01-01T00:00:00Z", "scope": self.scope}
 
 
 class Done(subprocess.CompletedProcess):
@@ -67,10 +67,11 @@ class Fake:
         self.repair_rc = {"--check": 0, "--apply": 0}
         self.ssh_rc = {}
         self.blob = {}
+        self.files = {7: [["docs/a.md", None], ["tests/test_a.py", None]], 8: [["docs/b.md", None], ["tests/test_b.py", None]]}
 
     @staticmethod
     def pr_state(head, **kw):
-        out = {"state": "OPEN", "isDraft": False, "headRefOid": head, "baseRefName": "main", "mergeCommit": None,
+        out = {"state": "OPEN", "isDraft": False, "headRefOid": head, "baseRefName": "main", "mergeCommit": None, "changedFiles": 2,
                "statusCheckRollup": [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]}
         out.update(kw)
         return out
@@ -87,6 +88,9 @@ class Fake:
             pr = int(argv[3])
             self.pr[pr] = dict(self.pr[pr], state="MERGED", mergeCommit={"oid": self.merge_commits[pr]})
             return Done("")
+        if prog == "gh" and argv[1] == "api" and "--paginate" in argv:
+            pr = int(re.search(r"/pulls/(\d+)/files", " ".join(argv)).group(1))
+            return Done("".join(json.dumps(row) + "\n" for row in self.files.get(pr, [])))
         if prog == "gh" and argv[1] == "api":
             sha = argv[2].rsplit("/", 1)[1]
             pr = next(n for n, m in self.merge_commits.items() if m == sha)
@@ -125,8 +129,10 @@ class Base(unittest.TestCase):
         (self.home / ".claude" / "hooks").mkdir(parents=True)
         self.fake = Fake()
         self.ss = FakeSelfServe()
-        sys.modules["self_serve"] = self.ss
-        self.addCleanup(sys.modules.pop, "self_serve", None)
+        for name, value in (("policy_library", lambda: self.ss), ("store_problems", lambda *a, **k: [])):  # seams; the real ones are in Real*
+            patch = mock.patch.object(ops, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
         env = mock.patch.dict(os.environ, {}, clear=False)
         env.start()
         self.addCleanup(env.stop)
@@ -179,13 +185,12 @@ class GrantGate(Base):
         error = self.refused("merge", "--pr", "7", "--receipt", str(self.rpath), "--apply", code="no_grant")
         self.assertIn("ah_enable_self_serve.py --apply", str(error))
         self.assertIn("Nothing was changed", str(error))
-        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(self.merged_calls(), [])  # reads only: the PR, its files; the grant is asked last, right before the merge
 
     def test_missing_self_serve_library_is_no_grant(self):
-        sys.modules.pop("self_serve")
-        with mock.patch.dict(sys.modules, {"self_serve": None}):  # import raises ImportError
+        with mock.patch.object(ops, "policy_library", mock.Mock(side_effect=ImportError("not installed"))):
             self.refused("repair", "--ref", REF, "--apply", code="no_grant")
-        self.assertEqual([w for w in self.fake.words() if "repair-harness" in w], [])
+        self.assertEqual([w for w in self.fake.words() if "repair-harness" in w and w.endswith("--apply")], [])
 
     def test_grant_that_raises_is_no_grant(self):
         self.ss.grant = mock.Mock(side_effect=RuntimeError("boom"))
@@ -204,7 +209,8 @@ class GrantGate(Base):
         self.run_ops("merge", "--pr", "7", "--receipt", str(self.rpath), "--apply")
         capability, actor, evidence = self.ss.calls[0]
         self.assertEqual(capability, "merge_reviewed_pr")
-        self.assertEqual(evidence, {"repo": ops.HARNESS_REPO, "pr": 7})
+        self.assertEqual(evidence, {"repo": ops.HARNESS_REPO, "pr": 7, "head": HEAD, "changed_paths": ["docs/a.md", "tests/test_a.py"],
+                                    "use_key": "%s#7@%s" % (ops.HARNESS_REPO, HEAD)})
         self.assertIn("pid", actor)
 
     def test_check_mode_needs_no_grant_and_changes_nothing(self):
@@ -276,21 +282,35 @@ class Merge(Base):
         self.assertTrue(out["ok"])
         self.assertEqual(self.merged_calls(), [])
 
-    def test_resume_asks_for_the_grant_again_and_never_merges_twice(self):
-        self.ss.allow = True
-        with mock.patch.object(ops, "HOOK", lambda step, phase: (_ for _ in ()).throw(OSError("crash")) if (step, phase) == ("merge", "after") else None):
-            with self.assertRaises(OSError):
-                self.apply()
+    def crash_at(self, step, phase):
+        def hook(name, when):
+            if (name, when) == (step, phase):
+                raise OSError("crash")
+        return mock.patch.object(ops, "HOOK", hook)
+
+    def test_resume_after_the_merge_only_reverifies_and_asks_nothing(self):
+        with self.crash_at("merge", "after"), self.assertRaises(OSError):
+            self.apply()
         run = os.listdir(self.home / ".agent-harness" / "work" / "self-serve")[0]
         self.assertEqual(len(self.merged_calls()), 1)
         grants_before = len(self.ss.calls)
-        self.ss.allow = False  # revoked meanwhile: the resume must not run on the old grant
-        self.refused("merge", "--resume", run, code="no_grant")
-        self.ss.allow = True
+        self.ss.allow = False  # revoked meanwhile: nothing is left to change, so the resume only checks the merge
         out = self.run_ops("merge", "--resume", run)
         self.assertTrue(out["ok"])
-        self.assertEqual(len(self.merged_calls()), 1)  # the step was started again, saw MERGED and only re-verified
-        self.assertGreater(len(self.ss.calls), grants_before)
+        self.assertEqual(len(self.merged_calls()), 1)
+        self.assertEqual(len(self.ss.calls), grants_before)
+
+    def test_resume_before_the_merge_asks_for_the_grant_again(self):
+        with self.crash_at("merge", "before"), self.assertRaises(OSError):
+            self.apply()
+        run = os.listdir(self.home / ".agent-harness" / "work" / "self-serve")[0]
+        self.assertEqual(self.merged_calls(), [])
+        self.ss.allow = False  # revoked meanwhile: the resume must not run on the old grant
+        self.refused("merge", "--resume", run, code="no_grant")
+        self.assertEqual(self.merged_calls(), [])
+        self.ss.allow = True
+        self.assertTrue(self.run_ops("merge", "--resume", run)["ok"])
+        self.assertEqual(len(self.merged_calls()), 1)
 
     def test_journal_holds_statuses_and_no_secret_text(self):
         out = self.apply()
@@ -335,7 +355,8 @@ class Repair(Base):
     def test_apply_runs_preview_apply_and_verify(self):
         out = self.run_ops("repair", "--ref", REF, "--apply")
         self.assertTrue(out["ok"], out)
-        self.assertEqual(list(out["steps"]), ["ancestor", "grant", "preview", "apply", "verify"])
+        self.assertEqual(list(out["steps"]), ["ancestor", "preview", "apply", "verify"])
+        self.assertEqual(out["steps"]["apply"]["policy_id"], "a1" * 16)
         self.assertEqual([w.split()[-1] for w in self.fake.words() if "repair-harness" in w], ["--check", "--apply"])
         self.assertEqual(out["steps"]["verify"]["equal"], out["steps"]["verify"]["compared"])
 
@@ -377,7 +398,7 @@ class Repair(Base):
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["steps"]["ancestor"]["state"], "skipped_done")
         self.assertEqual(out["steps"]["preview"]["state"], "skipped_done")
-        self.assertEqual(out["steps"]["grant"]["state"], "done")  # asked again
+        self.assertEqual(out["steps"]["apply"]["state"], "done")  # the grant is asked again, inside the step that needs it
         self.assertEqual(len(self.ss.calls), grants + 1)
         self.assertEqual([w for w in self.fake.words() if w.endswith("--check")], previews)
         self.assertEqual([w for w in self.fake.words() if w.endswith("--apply")].__len__(), 1)
@@ -533,8 +554,10 @@ class ManifestMode(tai.Base):
     def setUp(self):
         super().setUp()
         self.ss = FakeSelfServe()
-        sys.modules["self_serve"] = self.ss
-        self.addCleanup(sys.modules.pop, "self_serve", None)
+        for name, value in (("policy_library", lambda: self.ss), ("store_problems", lambda *a, **k: [])):  # seams; the real ones are in Real*
+            patch = mock.patch.object(ops, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
         for key in ("AH_AGENT_ID", "CLAUDE_AGENT_ID"):
             os.environ.pop(key, None)
 

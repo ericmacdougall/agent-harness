@@ -5,6 +5,12 @@
   ah ops central-decisions --harness-pr N --harness-receipt FILE ...   merge, repair, enable, adapter, then STOP
   ah ops doctor                                                        (ah.py hands it to ah_parity.py, lane L7)
 
+Who may apply (the actor proof): the process claims, before it parses anything, the one-shot stamp that main's PreToolUse hook wrote for
+exactly this command (`pretool`, called from a PreToolUse(Bash) hook; caller_identity "Bound stamps"). The stamp yields kind
+`claude_main` and a payload `caller_identity.is_main` can check, which `self_serve.grant` verifies; a Codex root is proved by the library
+from the running code. Without a stamp there is no kind and the library says no. The agent id in the environment is only a courtesy refusal.
+Policy and gate code (self_serve, usage_guard, merge_gate, ah_install ...) load from this file's own directory by path, never by sys.path.
+
 Every recipe is `--check` (read only, the default) or `--apply`, journals each step under
 ~/.agent-harness/work/self-serve/<run>/journal.jsonl (counts, statuses and short redacted reasons only) and is resumable with
 `--resume RUN`. Every `--apply` first asks `self_serve.grant(<capability>, ...)` (lazy import). No grant, or any failure of the
@@ -22,12 +28,14 @@ Threat model: careless or hurried agents, not one that edits this module or the 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
-import importlib
+import importlib.util
 import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -40,6 +48,10 @@ LEDGER_PROJECT, LEDGER_NUMBER, LEDGER_ISSUE = "goodqa", 16652, "df6e5927-0772-41
 HOSTS = ("t2-dev", "ah-mac-mini")
 CAP_MERGE, CAP_REPAIR, CAP_CENTRAL = "merge_reviewed_pr", "harness_repair", "central_decisions_agent_steps"
 ENABLER = "python3 ~/.agent-harness/bin/ah_enable_self_serve.py --apply"
+LIB_DIR = Path(__file__).resolve().parent  # the only place policy and gate code is loaded from (never sys.path)
+STAMP_PURPOSE = "self-serve-ops"  # main's PreToolUse hook stamps `ah ops ...` / `ah install-files ...`; the process claims it
+STAMP_TTL_SECONDS = 120
+STAMPED_COMMANDS = ("ops", "install-files")
 
 REF_RE = re.compile(r"[0-9a-f]{40}")
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
@@ -54,6 +66,18 @@ HOOK = None  # tests only: called as HOOK(step, "before"|"after"); raising from 
 # place commands run is Context.cmd, so a recipe added later cannot reach them without editing this list and its test.
 FORBIDDEN = re.compile(r"approve-top|\bdecision\s+(keygen|pin|publish|withdraw)\b|\bwaive\b|--admin\b|\bgcloud\s+secrets\b|\bkeygen\b")
 PROGRAMS = ("gh", "ssh", "python3", "repair-harness", "git")
+
+# The merge floor: a PR that touches any of these is never merged by a recipe, whatever the signed policy says (the policy can only
+# add to it). They are the gate, the policy, the guards and the installer: changing them needs a person. Case-folded fnmatch over
+# the repository path; a rename's old path counts too.
+DENYLIST_FLOOR = ("*self_serve*", "*self-serve*", "*ah_ops*", "*ah_install*", "*central_decisions*", "*trust-central-decisions*",
+                  "*tier_gate*", "*command_guard*", "*merge_gate*", "*peer_review*", "*spec_policy*", "*caller_identity*",
+                  "*native_context*", "*usage_guard*", "*install.py", "*install_codex.py", "*enable-agent-ops*",
+                  ".github/workflows/*", "*.github/workflows/*")
+MAX_PR_FILES = 3000  # the GitHub files API stops here; a bigger PR cannot be shown to be clean
+# modules a fixed-path load pre-registers so that their own `import x` lines find the same files (sys.modules wins over sys.path)
+LIB_DEPS = {"self_serve": ("safe_input", "native_context", "caller_identity", "self_serve"),
+            "store": ("safe_input", "git_safety", "process", "usage_guard", "native_context", "caller_identity", "merge_gate")}
 
 # Constant remote programs: text never built from caller input; the values arrive as quoted arguments that were validated.
 REMOTE_BLOBS = r'''import hashlib, json, os, re, sys
@@ -103,34 +127,170 @@ def uncertain(message, data=None):
 
 
 # ----------------------------------------------------------------------------- grants
-def actor_facts(env=None):
-    """What this process can say about itself. The policy library decides whether that proves main; this module only refuses the
-    obvious helper (an agent id in the environment) before asking."""
+_PROOF = {}  # the one-shot stamp this process claimed at start (see claim_main); never read from the environment
+_HEX32, _HEX16 = re.compile(r"[0-9a-f]{32}"), re.compile(r"[0-9a-f]{16}")
+
+
+def _home(home=None):
+    return Path(home) if home else Path(os.environ.get("AH_HOME") or Path.home())
+
+
+def argv_key(argv):
+    """The key of an exact argument list (the same rule mission_coverage uses), so a stamp covers that command and no other."""
+    words = []
+    for a in argv:
+        a = str(a)
+        words.extend(a.split("=", 1) if a.startswith("--") and "=" in a else [a])
+    return hashlib.sha256(json.dumps(words, separators=(",", ":")).encode("utf-8", "replace")).hexdigest()
+
+
+def load_sibling(name):
+    """Load NAME from LIB_DIR (the directory of this file) by path, never by sys.path. A module that is missing, not a plain file of
+    this user, writable by group or others, or already loaded from somewhere else is ImportError: the policy and gate code cannot be
+    replaced by a file on PYTHONPATH, in the working directory or in a sys.modules entry. Modules are registered under their own name so
+    the `import x` lines inside them find these same files."""
+    path = LIB_DIR / (name + ".py")
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise ImportError("%s is not installed beside ah_ops.py" % name) from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid not in (os.getuid(), 0) or info.st_mode & 0o022:
+        raise ImportError("%s is not a plain file of this user's" % name)
+    loaded = sys.modules.get(name)
+    if loaded is not None:
+        have = getattr(loaded, "__file__", None)
+        if have and os.path.realpath(have) == os.path.realpath(path):
+            return loaded
+        raise ImportError("a different %s is already loaded" % name)
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def load_lib(group):
+    """{name: module} for a group of LIB_DEPS, loaded in dependency order from LIB_DIR."""
+    return {name: load_sibling(name) for name in LIB_DEPS[group]}
+
+
+def policy_library():
+    return load_lib("self_serve")["self_serve"]
+
+
+def claim_main(argv, home=None):
+    """Take (consume) the one-shot stamp main's PreToolUse hook wrote for exactly this argument list, before anything parses or runs it
+    (the claim never fails loudly: no stamp means no proof, which means no grant). The stamp is bound to main's still-running tool call
+    (caller_identity, "Bound stamps"): it is the only thing that lets this process say it is main."""
+    _PROOF.clear()
+    argv = [str(a) for a in argv or []]
+    if not argv or argv[0] not in STAMPED_COMMANDS:
+        return
+    try:
+        ci = load_lib("self_serve")["caller_identity"]
+        stamp = ci.take_stamp(STAMP_PURPOSE, [argv_key(argv)], home=_home(home), bound=True, ttl=STAMP_TTL_SECONDS)
+    except Exception:  # noqa: BLE001
+        stamp = None
+    if isinstance(stamp, dict):
+        _PROOF.update(stamp=stamp, key=argv_key(argv))
+
+
+def actor_facts(env=None, home=None):
+    """What this process can prove about itself, in the shape self_serve.grant wants: kind `claude_main` plus a hook payload that
+    caller_identity.is_main can check (taken from the claimed stamp, never from the environment, which a helper shares), or kind
+    `codex_root` (the library proves that one by the running code's origin). With neither there is no `kind` and the library says
+    no. The agent id in the environment is a courtesy refusal only: the proof is the control."""
     env = os.environ if env is None else env
     session = env.get("CLAUDE_CODE_SESSION_ID") or env.get("CLAUDE_SESSION_ID") or ""
     agent = env.get("AH_AGENT_ID") or env.get("CLAUDE_AGENT_ID") or ""
     harness = "claude" if session else ("codex" if any(k.startswith("CODEX_") for k in env) else "unknown")
-    return {"session": session or None, "agent_id": agent or None, "harness": harness, "pid": os.getpid(), "ppid": os.getppid(),
-            "entry": "ah-ops", "stdin_tty": bool(getattr(sys.stdin, "isatty", lambda: False)())}
+    facts = {"session": session or None, "agent_id": agent or None, "harness": harness, "pid": os.getpid(), "ppid": os.getppid(),
+             "entry": "ah-ops", "stdin_tty": bool(getattr(sys.stdin, "isatty", lambda: False)())}
+    stamp = _PROOF.get("stamp")
+    if isinstance(stamp, dict) and isinstance(stamp.get("session"), str) and isinstance(stamp.get("transcript"), str):
+        facts.update(kind="claude_main", claude_dir=env.get("CLAUDE_CONFIG_DIR") or str(_home(home) / ".claude"),
+                     payload={"session_id": stamp["session"], "transcript_path": stamp["transcript"]})
+    elif harness == "codex":
+        facts["kind"] = "codex_root"
+    return facts
+
+
+def _script_argv(words, scripts=("ah.py", "ah")):
+    """The words after `ah.py` / `ah` when this simple command runs it at command position; None when the name is only an argument."""
+    i = 0
+    while i < len(words) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[i]):
+        i += 1
+    if i < len(words) and re.match(r"^python(?:\d+(?:\.\d+)*)?$", os.path.basename(words[i])):
+        i += 1
+        while i < len(words) and re.match(r"^-[A-Za-z]+$", words[i]) and words[i] not in ("-c", "-m"):
+            i += 1
+    if i < len(words) and os.path.basename(words[i]) in scripts:
+        return words[i + 1:]
+    return None
+
+
+def stamped_argvs(cmd):
+    """The argument lists of each `ah ops ...` / `ah install-files ...` this Bash line runs at command position. A line whose words only
+    the shell can compute (an expansion, an unquoted glob) gets no stamp: the process would see other words."""
+    shellwords = load_sibling("shellwords")
+    out = []
+    for words in shellwords.simple_commands(cmd):
+        argv = _script_argv(words)
+        if not argv or argv[0] not in STAMPED_COMMANDS or any(getattr(w, "computed", False) for w in argv):
+            continue
+        out.append([os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w) for w in argv])
+    return out
+
+
+def pretool(payload, home=None):
+    """The writer half of the proof, for a PreToolUse(Bash) hook: when main (caller_identity.is_main on the real hook payload) runs
+    `ah ops ...` or `ah install-files ...`, record one stamp bound to this tool call for exactly that argument list. Never denies
+    anything and never raises; a sub-agent's call gets no stamp. Returns the number of stamps written."""
+    try:
+        if not isinstance(payload, dict) or payload.get("tool_name") != "Bash":
+            return 0
+        tool_input = payload.get("tool_input")
+        cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
+        if "ops" not in cmd and "install-files" not in cmd:
+            return 0
+        ci = load_lib("self_serve")["caller_identity"]
+        tool_use_id = payload.get("tool_use_id")
+        if not ci.is_main(payload) or not isinstance(tool_use_id, str) or not ci.TOOL_USE_ID.match(tool_use_id):
+            return 0
+        written = 0
+        for argv in stamped_argvs(cmd)[:10]:
+            ci.put_stamp(STAMP_PURPOSE, [argv_key(argv)], session=str(payload.get("session_id") or ""), home=_home(home),
+                         tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+            written += 1
+        return written
+    except Exception:  # noqa: BLE001 - a hook never fails the call; no stamp is simply no proof
+        return 0
 
 
 def user_step(capability):
     return ("no self-serve grant for %s. That is the user's step: run `%s` yourself (it needs a terminal and your typed nonce), or run "
-            "the underlying command yourself. Nothing was changed." % (capability, ENABLER))
+            "the underlying command yourself. If the policy is enabled and you are the main agent, run ONE plain foreground `ah` "
+            "command (no wrapper, no $(...) in its words) so main's hook can stamp it. Nothing was changed." % (capability, ENABLER))
 
 
 def require_grant(capability, *, evidence=None, home=None, now=None, actor=None):
-    """The grant for one capability, or OpsError naming the user step. self_serve is imported here, lazily and defensively: a
-    missing, broken or older library is simply no grant."""
-    actor = actor if actor is not None else actor_facts()
-    if actor.get("agent_id"):
+    """The grant for one capability, or OpsError naming the user step. The policy library is loaded from this file's own directory
+    (never sys.path); a missing, broken, planted or older library is simply no grant, and so is a grant whose shape is not the contract."""
+    actor = actor if actor is not None else actor_facts(home=home)
+    if actor.get("agent_id"):  # courtesy only: a helper can drop the variable; its missing stamp is what stops it
         refuse("a helper or sub-agent (agent id %s) cannot hold a self-serve grant for %s; the main agent runs this" % (str(actor["agent_id"])[:40], capability), "no_grant")
     try:
-        module = importlib.import_module("self_serve")
-        granted = module.grant(capability, actor=actor, evidence=evidence, now=now, home=str(home) if home else None)
+        granted = policy_library().grant(capability, actor=actor, evidence=evidence, now=now, home=str(home) if home else None)
     except Exception:  # noqa: BLE001 - the library contract says it never raises; if it does, that is no grant
         granted = None
-    if not isinstance(granted, dict) or granted.get("capability") != capability:
+    if not (isinstance(granted, dict) and granted.get("capability") == capability
+            and isinstance(granted.get("policy_id"), str) and _HEX32.fullmatch(granted["policy_id"])
+            and isinstance(granted.get("key_id"), str) and _HEX16.fullmatch(granted["key_id"])
+            and isinstance(granted.get("scope"), dict)):
         refuse(user_step(capability), "no_grant")
     return granted
 
@@ -272,8 +432,10 @@ def execute(journal, recipe, args, steps, ctx):
 
 # ----------------------------------------------------------------------------- source proof and installed bytes
 def _install():
-    import ah_install  # noqa: PLC0415 - lazy: this module is imported by ah_install's gate
-    return ah_install
+    try:
+        return load_sibling("ah_install")  # fixed path, lazy: ah_install's gate imports this module
+    except ImportError as error:
+        refuse("the installer module cannot be loaded from this directory: %s" % error, "unavailable")
 
 
 def prove_on_canonical_main(ctx, ref):
@@ -344,11 +506,13 @@ def read_receipt(path):
     p = Path(path)
     if not p.is_file() or p.is_symlink() or p.stat().st_size > (1 << 20):
         refuse("--receipt must be a regular file under 1 MiB (the exact-HEAD peer_review.py pr report)", "bad_receipt")
-    return p.read_text(encoding="utf-8", errors="replace")
+    return p.read_bytes()
 
 
-def receipt_problems(text, repo, pr, head):
-    header, _, _ = text.partition("\n\n")
+def receipt_problems(data, repo, pr, head):
+    """Cheap, local checks of the receipt text. They only reject early: the receipt is believed only after store_problems."""
+    text = data.decode("utf-8", errors="replace")
+    header, _, body = text.partition("\n\n")
     fields = dict(line.split(": ", 1) for line in header.splitlines() if ": " in line)
     problems = []
     if fields.get("Stage") != "pr":
@@ -361,10 +525,52 @@ def receipt_problems(text, repo, pr, head):
         problems.append("Reviewed HEAD %s is not the PR head %s" % (fields.get("Reviewed HEAD"), head))
     if not re.fullmatch(r"[0-9a-f]{64}", fields.get("Reviewed packet SHA-256", "")):
         problems.append("Reviewed packet SHA-256 is missing")
-    verdict = re.search(r"^VERDICT: (PASS-WITH-TICKETS|PASS|BLOCK)\b", text, re.M)
-    if not verdict or verdict.group(1) == "BLOCK":
-        problems.append("the verdict is not PASS")
+    # anchored like peer_review's own test: the report body opens with the verdict. A BLOCK that quotes `VERDICT: PASS` further down, and
+    # PASS-WITH-TICKETS (which the store predicate does not accept as pure PASS evidence either), both fail here.
+    if not re.match(r"VERDICT: PASS(?:\s|$)", body.lstrip()):
+        problems.append("the report does not open with VERDICT: PASS")
     return problems
+
+
+MAX_RUN_SCAN = 50000
+
+
+def store_problems(ctx, data, repo, pr, head):
+    """The receipt must be the very report that a settled, independent, pure PR PASS FINAL in this machine's review store was written
+    for: the FINAL names the sha256 of these bytes, and the one shared predicate (merge_gate.pr_pass_evidence, the same test the merge gate
+    applies) must hold for it and name this repository, PR and head. A hand-written file has no such record. The store root is fixed
+    to this home (AGENT_HARNESS_USAGE_DIR is the caller's to set, so it is never read here). Returns the list of problems."""
+    digest = hashlib.sha256(data).hexdigest()
+    root = ctx.home / ".agent-harness" / "usage"
+    if not (root / "runs").is_dir() or (root / "runs").is_symlink():
+        return ["no review store on this machine holds a receipt for these bytes"]
+    try:
+        mods = load_lib("store")
+        guard, gate = mods["usage_guard"], mods["merge_gate"]
+        store = guard.UsageStore(root)
+        runs = sorted(os.listdir(root / "runs"))
+    except Exception as error:  # noqa: BLE001 - an unreadable store proves nothing
+        return ["the review store could not be opened (%s)" % type(error).__name__]
+    if len(runs) > MAX_RUN_SCAN:
+        return ["the review store is larger than the %d runs this check reads" % MAX_RUN_SCAN]
+    why = "no settled review FINAL in the store names a report with these bytes"
+    for run in runs:
+        try:
+            raw = guard.file_bytes(root / "runs" / run / "final.json")
+        except Exception:  # noqa: BLE001 - not every run has a final
+            continue
+        if digest.encode() not in raw:
+            continue
+        try:
+            evidence = store.inspect({"run_id": run, "record": "final", "sha256": hashlib.sha256(raw).hexdigest()})
+            bound = gate.pr_pass_evidence(evidence)
+        except Exception as error:  # noqa: BLE001 - a GuardError or ValueError from the predicate names why this FINAL does not count
+            why = "the FINAL for these bytes is not settled independent PR PASS evidence (%s)" % scrub(error, 120)
+            continue
+        if (str(bound[0]).lower(), bound[1], bound[2], bound[3]) == (repo.lower(), pr, head, digest):
+            return []
+        why = "the FINAL for these bytes is for another repository, PR or head"
+    return [why]
 
 
 def checks_problems(rollup):
@@ -390,15 +596,50 @@ def gh_json(ctx, argv, what):
         refuse("%s returned unreadable output" % what, "gh_failed")
 
 
+NO_CHECKS = "no check results are reported on the head"
+
+
 def pr_view(ctx, repo, pr):
-    return gh_json(ctx, ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state,isDraft,headRefOid,baseRefName,mergeCommit,statusCheckRollup"], "gh pr view")
+    return gh_json(ctx, ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state,isDraft,headRefOid,baseRefName,mergeCommit,statusCheckRollup,changedFiles"], "gh pr view")
 
 
-def merge_one(ctx, repo, pr, receipt_path, scope, apply):
-    """Merge ONE PR at its reviewed head, or report what would happen. Idempotent: a PR that is already merged is only re-verified."""
-    allowed = (scope or {}).get("repos") or [HARNESS_REPO]
-    if repo not in allowed:
-        refuse("the grant does not cover %s (it covers %s)" % (repo, ", ".join(allowed)), "out_of_scope")
+def pr_files(ctx, repo, pr, expected):
+    """Every path the PR changes, a rename's old path included, from the files API. Fail closed: no files, a count that is not the one
+    GitHub reports for the PR, or a PR at the API's own limit is a refusal, never a shorter list."""
+    done = _ok(ctx.cmd(["gh", "api", "--paginate", "repos/%s/pulls/%d/files" % (repo, pr), "--jq", ".[] | [.filename, .previous_filename] | @json"],
+                       timeout=120, what="gh api pr files"), "gh api pr files", "gh_failed")
+    rows = 0
+    paths = []
+    for line in (done.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            names = [n for n in row if isinstance(n, str) and n]
+        except (ValueError, TypeError):
+            refuse("%s#%s: the changed-files list was unreadable" % (repo, pr), "no_paths")
+        if not names:
+            refuse("%s#%s: a changed-files row has no path" % (repo, pr), "no_paths")
+        rows += 1
+        paths.extend(n for n in names if n not in paths)
+    if rows == 0 or rows >= MAX_PR_FILES or not isinstance(expected, int) or isinstance(expected, bool) or rows != expected:
+        refuse("%s#%s: the changed-files list (%d rows) is empty, at the API limit, or not the %s files GitHub reports; it cannot be shown clean" % (repo, pr, rows, expected), "no_paths")
+    return paths
+
+
+def floor_hits(paths):
+    """The paths a recipe never merges (DENYLIST_FLOOR), case-folded like the policy library's own denylist."""
+    globs = [g.casefold() for g in DENYLIST_FLOOR]
+    return sorted({p for p in paths if any(fnmatch.fnmatchcase(p.replace("\\", "/").lstrip("/").casefold(), g) for g in globs)})
+
+
+def merge_one(ctx, repo, pr, receipt_path, default_repos, apply):
+    """Merge ONE PR at its reviewed head, or report what would happen. Idempotent: a PR that is already merged is only re-verified.
+
+    The one place a PR is merged, for `ah ops merge` and for the central-decisions recipe alike. In order: the PR is what the receipt
+    says (receipt text, then the review store); the changed paths are known and none is in the floor; checks are green; and only then
+    the grant `merge_reviewed_pr` is asked, with the changed paths and a use key, immediately before `gh pr merge` (a single-use scope
+    is spent by the merge it allows and by nothing earlier)."""
     view = pr_view(ctx, repo, pr)
     head, state = view.get("headRefOid") or "", view.get("state")
     if not REF_RE.fullmatch(head):
@@ -407,19 +648,33 @@ def merge_one(ctx, repo, pr, receipt_path, scope, apply):
         refuse("%s#%s does not target main" % (repo, pr))
     if state not in ("OPEN", "MERGED"):
         refuse("%s#%s is %s" % (repo, pr, state))
-    problems = receipt_problems(read_receipt(receipt_path), repo, pr, head)
+    data = read_receipt(receipt_path)
+    problems = receipt_problems(data, repo, pr, head) or store_problems(ctx, data, repo, pr, head)
     if problems:
         refuse("%s#%s receipt refused: %s" % (repo, pr, "; ".join(problems)), "receipt")
+    granted = {}
     if state == "OPEN":
         if view.get("isDraft"):
             refuse("%s#%s is a draft; mark it ready for review first (the PR author's step)" % (repo, pr), "draft")
+        paths = pr_files(ctx, repo, pr, view.get("changedFiles"))
+        hits = floor_hits(paths)
+        if hits:
+            refuse("%s#%s changes %s, which no recipe merges (the gate, the policy, the guards and the installer need a person)" % (repo, pr, ", ".join(hits[:5])), "denylisted")
         bad = checks_problems(view.get("statusCheckRollup"))
-        if bad and bad == ["no check results are reported on the head"] and (scope or {}).get("allow_no_checks"):
-            bad = []
-        if bad:
+        if bad and bad != [NO_CHECKS]:
             refuse("%s#%s checks are not green on the reviewed head: %s" % (repo, pr, "; ".join(bad[:6])), "checks")
         if not apply:
-            return {"would_merge": True, "repo": repo, "pr": pr, "head": head, "state": "OPEN"}
+            if bad:  # whether a PR without checks may merge is the signed scope's to say, and a check run has no scope
+                refuse("%s#%s checks are not green on the reviewed head: %s" % (repo, pr, bad[0]), "checks")
+            return {"would_merge": True, "repo": repo, "pr": pr, "head": head, "state": "OPEN", "changed_files": len(paths)}
+        granted = require_grant(CAP_MERGE, evidence={"repo": repo, "pr": pr, "head": head, "changed_paths": paths,
+                                                     "use_key": "%s#%d@%s" % (repo, pr, head)}, home=ctx.home)
+        scope = granted["scope"]
+        allowed = scope.get("repos") or list(default_repos)
+        if repo not in allowed:
+            refuse("the grant does not cover %s (it covers %s)" % (repo, ", ".join(allowed)), "out_of_scope")
+        if bad and not scope.get("allow_no_checks"):
+            refuse("%s#%s checks are not green on the reviewed head: %s" % (repo, pr, bad[0]), "checks")
         _ok(ctx.cmd(["gh", "pr", "merge", str(pr), "--repo", repo, "--merge", "--match-head-commit", head], timeout=180, what="gh pr merge"), "gh pr merge", "merge_refused")
     elif not apply:
         return {"would_merge": False, "already_merged": True, "repo": repo, "pr": pr, "head": head}
@@ -434,42 +689,35 @@ def merge_one(ctx, repo, pr, receipt_path, scope, apply):
     done = _ok(ctx.cmd(["gh", "api", "repos/%s/commits/%s" % (repo, merge), "--jq", ".parents[1].sha // empty"], timeout=90, what="gh api"), "gh api", "gh_failed")
     if done.stdout.strip() != head:
         refuse("merge %s of %s#%s does not have the reviewed head %s as its second parent" % (merge[:12], repo, pr, head[:12]), "merge_parent")
-    return {"merged": True, "repo": repo, "pr": pr, "head": head, "merge_commit": merge, "was": state}
+    return {"merged": True, "repo": repo, "pr": pr, "head": head, "merge_commit": merge, "was": state,
+            "policy_id": granted.get("policy_id"), "key_id": granted.get("key_id")}
 
 
 # ----------------------------------------------------------------------------- recipes
 def recipe_merge(a, home, ctx, journal):
-    grant_box = {}
-
-    def grant(c):
-        grant_box["g"] = require_grant(CAP_MERGE, evidence={"repo": a["repo"], "pr": a["pr"]}, home=home)
-        g = grant_box["g"]
-        return {"policy_id": g.get("policy_id"), "key_id": g.get("key_id"), "expires_at": g.get("expires_at")}
-
+    """One step. The grant is asked inside merge_one, after the receipt, paths and checks and immediately before the merge, so a resume of
+    a PR that is already merged only re-verifies it and asks nothing."""
     def merge(c):
-        return merge_one(c, a["repo"], a["pr"], a["receipt"], (grant_box.get("g") or {}).get("scope"), a["apply"])
+        return merge_one(c, a["repo"], a["pr"], a["receipt"], (HARNESS_REPO,), a["apply"])
 
-    steps = [("grant", grant, True)] if a["apply"] else []
-    return steps + [("merge" if a["apply"] else "inspect", merge, False)]
+    return [("merge" if a["apply"] else "inspect", merge, False)]
 
 
 def recipe_repair(a, home, ctx, journal):
-    box = {}
-
     def ancestor(c):
         proof = prove_on_canonical_main(c, a["ref"])
         return {"main": proof["main"], "hooks_listed": len(proof["listed"])}
 
-    def grant(c):
-        g = box["g"] = require_grant(CAP_REPAIR, evidence={"ref": a["ref"], "host": a["host"]}, home=home)
-        return {"policy_id": g.get("policy_id"), "key_id": g.get("key_id"), "expires_at": g.get("expires_at")}
+    def apply(c):
+        """The grant is asked here, immediately before the install: a resume after the install finished skips this step and asks nothing;
+        a resume of one that did not finish asks again (a revoked policy stops it)."""
+        g = require_grant(CAP_REPAIR, evidence={"repo": HARNESS_REPO, "ref": a["ref"], "host": a["host"], "use_key": "repair:%s:%s" % (a["ref"], a["host"])}, home=home)
+        done = run_repair(c, a["ref"], a["host"], True)
+        return dict(done, policy_id=g.get("policy_id"), key_id=g.get("key_id"))
 
-    steps = [("ancestor", ancestor, False)]
+    steps = [("ancestor", ancestor, False), ("preview", lambda c: run_repair(c, a["ref"], a["host"], False), False)]
     if a["apply"]:
-        steps.append(("grant", grant, True))
-    steps.append(("preview", lambda c: run_repair(c, a["ref"], a["host"], False), False))
-    if a["apply"]:
-        steps.append(("apply", lambda c: run_repair(c, a["ref"], a["host"], True), False))
+        steps.append(("apply", apply, False))
         steps.append(("verify", lambda c: verify_installed(c, a["ref"], a["host"], REPAIR_HOOKS), False))
     return steps
 
@@ -490,14 +738,16 @@ def recipe_central(a, home, ctx, journal):
     task = task_key(item.group(2), item.group(3), item.group(4))
 
     def grant(c):
-        g = box["g"] = require_grant(CAP_CENTRAL, evidence={"harness_pr": a["harness_pr"], "t2scan_pr": a.get("t2scan_pr"), "host": a["host"], "task": task}, home=home)
+        g = box["g"] = require_grant(CAP_CENTRAL, evidence={"repo": HARNESS_REPO, "harness_pr": a["harness_pr"], "t2scan_pr": a.get("t2scan_pr"), "host": a["host"],
+                                                            "task": task, "use_key": "central:%s:%s:%s" % (task, a["harness_pr"], a.get("t2scan_pr"))}, home=home)
         return {"policy_id": g.get("policy_id"), "key_id": g.get("key_id"), "expires_at": g.get("expires_at")}
 
     def merges(repo, pr, receipt):
         def go(c):
-            scope = dict((box.get("g") or {}).get("scope") or {})
-            scope.setdefault("repos", [HARNESS_REPO, T2SCAN_REPO])  # this recipe is about these two repositories by definition
-            return merge_one(c, repo, pr, receipt, scope, a["apply"])
+            # Every merge goes through merge_one: its own receipt-in-the-store proof, the path floor and the `merge_reviewed_pr` grant. The
+            # central capability opens the recipe; it does not stand in for the merge capability. This recipe is about these two
+            # repositories by definition, so they are the default when the signed merge scope names none.
+            return merge_one(c, repo, pr, receipt, (HARNESS_REPO, T2SCAN_REPO), a["apply"])
         return go
 
     def preconditions(c):
