@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 import tempfile
@@ -37,7 +38,7 @@ SEGMENT_RE = re.compile(r"^(?P<stem>.+)\.(?P<seq>\d{4,})\.jsonl$")
 STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
 MARKER_EVENT = "wal_segment_open"
 MARKER_BY = "wal_segments"
-FAULT_STEPS = ("after_hash", "after_rename", "after_create", "after_marker", "after_index")
+FAULT_STEPS = ("after_hash", "after_temp", "after_rename", "after_live", "after_index")
 
 
 class SegmentProblem(Exception):
@@ -243,6 +244,29 @@ def exists(path):
         return False
 
 
+class _Changed(OSError):
+    """A segment is not the file that was listed (replaced or swapped after the directory listing)."""
+
+
+def _open_at(dfd, directory, name, ino=None):
+    """Open a regular file read-only through the pinned directory fd (no re-resolution of the path), refusing a
+    file whose inode differs from the one that was listed."""
+    if dfd is None:
+        fd = _open_regular(directory, name)
+    else:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        if ino is not None and st.st_ino != ino:
+            raise _Changed(errno.ESTALE, f"{name} is not the file that was listed")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _open_regular(directory, name):
     fd = os.open(os.path.join(directory, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
@@ -290,9 +314,14 @@ class Snapshot:
         self.problems = []
         self.live_fd = None
         self.live_ino = None
+        self.dfd = None  # pinned directory fd: closed segments are reopened through it, never by re-resolving the path
+        try:
+            self.dfd = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+        except OSError:
+            self.dfd = None
         live_name = self.stem + ".jsonl"
         try:
-            self.live_fd = _open_regular(self.directory, live_name)
+            self.live_fd = _open_at(self.dfd, self.directory, live_name)
             self.live_ino = os.fstat(self.live_fd).st_ino
         except OSError as error:
             if error.errno not in (errno.ENOENT,):
@@ -300,6 +329,7 @@ class Snapshot:
                                       "message": f"{live_name}: {type(error).__name__}", "seq": None})
         _fault_reader()
         self.chain = chain(self.directory, self.stem)
+        self._inos = {s.name: s.ino for s in self.chain.segments}  # what was listed: reopened files must match
         self.problems.extend(p for p in self.chain.problems
                              if not (p["code"] == "live_missing" and self.live_fd is not None))
         # an fd opened before a rotation is now a closed segment: it is the last segment of the snapshot, and the
@@ -318,12 +348,23 @@ class Snapshot:
             raise SegmentProblem(first["code"], first["message"], first.get("seq"))
 
     def close(self):
-        if self.live_fd is not None:
-            try:
-                os.close(self.live_fd)
-            except OSError:
-                pass
-            self.live_fd = None
+        for attr in ("live_fd", "dfd"):
+            fd = getattr(self, attr, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, attr, None)
+
+    def _open_closed(self, name):
+        return _open_at(self.dfd, self.directory, name, self._inos.get(name))
+
+    def _read_problem(self, name, error):
+        code = "segment_changed" if isinstance(error, _Changed) else "unreadable"
+        self.problems.append({"code": code, "message": f"{name}: {type(error).__name__}", "seq": None})
+        if self.strict:
+            raise SegmentProblem(code, name)
 
     def __enter__(self):
         return self
@@ -397,7 +438,7 @@ class Snapshot:
             own = fd is None
             try:
                 if own:
-                    fd = _open_regular(self.directory, name)
+                    fd = self._open_closed(name)
                 with os.fdopen(os.dup(fd), "rb") as handle:
                     handle.seek(0)
                     for raw, nbytes in self._frame(handle, name, seq):
@@ -410,9 +451,7 @@ class Snapshot:
                                 raise SegmentProblem("truncated", "read budget reached")
                             return
             except OSError as error:
-                self.problems.append({"code": "unreadable", "message": f"{name}: {type(error).__name__}", "seq": None})
-                if self.strict:
-                    raise SegmentProblem("unreadable", name)
+                self._read_problem(name, error)
             finally:
                 if own and fd is not None:
                     os.close(fd)
@@ -427,7 +466,7 @@ class Snapshot:
             own = fd is None
             try:
                 if own:
-                    fd = _open_regular(self.directory, name)
+                    fd = self._open_closed(name)
                 size = os.fstat(fd).st_size
                 start = max(0, size - left)
                 data = os.pread(fd, size - start, start)
@@ -438,9 +477,7 @@ class Snapshot:
                 pieces.append(data)
                 left -= (size - start)
             except OSError as error:
-                self.problems.append({"code": "unreadable", "message": f"{name}: {type(error).__name__}", "seq": None})
-                if self.strict:
-                    raise SegmentProblem("unreadable", name)
+                self._read_problem(name, error)
             finally:
                 if own and fd is not None:
                     os.close(fd)
@@ -605,42 +642,76 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         warn("seq_implausible", f"{seq}; rotation refused")
         return SKIPPED, fd
     seg = segment_name(stem, seq)
+    # The new live file is prepared COMPLETE (created under a temp dot-name, locked, marker written and synced) before
+    # anything is renamed, so the live name never exists without its marker (gate F1) and a failure while preparing
+    # it changes nothing on disk: rotation is skipped and the record still lands in the current live file (F2).
+    _discard_stale_temps(dir_fd, stem)
+    tmp = _temp_name(stem)
     try:
-        _exclusive_rename(dir_fd, name, seg)
-    except FileExistsError:
-        warn("rotate_collision", f"{seg} already exists; rotation skipped")
-        return SKIPPED, fd
-    except NotImplementedError as error:
-        warn("rotate_unsupported", str(error))
-        return SKIPPED, fd
-    os.fsync(dir_fd)
-    _fault("after_rename")
-    try:
-        new_fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
+        new_fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
     except OSError as error:
-        try:
-            _exclusive_rename(dir_fd, seg, name)
-            os.fsync(dir_fd)
-        except FileExistsError:  # an old writer recreated the live name: that file IS the live file (R3-8)
-            warn("rotate_create_failed", f"{type(error).__name__}; live name recreated by another writer")
-            return RECREATED, None
-        except (OSError, NotImplementedError):
-            raise RotateFailed(f"create of {name} failed ({type(error).__name__}) and the rename could not be undone")
-        warn("rotate_create_failed", f"{type(error).__name__}; rotation undone")
+        warn("rotate_create_failed", f"{type(error).__name__} creating the marked temp file; rotation skipped")
         return SKIPPED, fd
     try:
         os.fchmod(new_fd, 0o600)
         fcntl.flock(new_fd, fcntl.LOCK_EX)
-        os.fsync(dir_fd)
-        _fault("after_create")
         _write_all(new_fd, _marker(stem, seq + 1, seg, size, lines, sha))
         os.fsync(new_fd)
-        _fault("after_marker")
+        _fault("after_temp")
+    except OSError as error:
+        warn("rotate_create_failed", f"{type(error).__name__} writing the marker; rotation skipped")
+        _discard_temp(dir_fd, tmp, new_fd)
+        os.close(new_fd)
+        return SKIPPED, fd
     except BaseException:
         os.close(new_fd)
         raise
     try:
+        _exclusive_rename(dir_fd, name, seg)
+    except FileExistsError:
+        warn("rotate_collision", f"{seg} already exists; rotation skipped")
+        _discard_temp(dir_fd, tmp, new_fd)
+        os.close(new_fd)
+        return SKIPPED, fd
+    except NotImplementedError as error:
+        warn("rotate_unsupported", str(error))
+        _discard_temp(dir_fd, tmp, new_fd)
+        os.close(new_fd)
+        return SKIPPED, fd
+    except OSError as error:
+        warn("rotate_failed", f"{type(error).__name__} renaming the live file; rotation skipped")
+        _discard_temp(dir_fd, tmp, new_fd)
+        os.close(new_fd)
+        return SKIPPED, fd
+    # from here the live name is absent until the marked file takes it; only a lockless old writer can win that gap
+    try:
+        os.fsync(dir_fd)
+        _fault("after_rename")
+        _exclusive_rename(dir_fd, tmp, name)
+    except FileExistsError:  # a lockless writer created the live name in the gap: that file IS the live file (R3-8)
+        warn("rotate_create_failed", "live name recreated by another writer; retrying into it")
+        _discard_temp(dir_fd, tmp, new_fd)
+        os.close(new_fd)
+        return RECREATED, None
+    except (OSError, NotImplementedError) as error:
+        try:  # undo: put the old live file back under its name
+            _exclusive_rename(dir_fd, seg, name)
+            os.fsync(dir_fd)
+        except FileExistsError:
+            _discard_temp(dir_fd, tmp, new_fd)
+            os.close(new_fd)
+            return RECREATED, None
+        except (OSError, NotImplementedError):
+            os.close(new_fd)  # the marked temp file stays on disk as evidence; the next rotation discards it
+            raise RotateFailed(f"moving the marked file into {name} failed ({type(error).__name__}) and the rename could not be undone")
+        warn("rotate_create_failed", f"{type(error).__name__}; rotation undone")
+        _discard_temp(dir_fd, tmp, new_fd)
+        os.close(new_fd)
+        return SKIPPED, fd
+    try:
         try:
+            os.fsync(dir_fd)
+            _fault("after_live")
             write_index(dir_fd, stem)
         except Exception as error:  # noqa: BLE001 - the index is derived and advisory: never fail an append over it
             warn("index_failed", type(error).__name__)
@@ -649,6 +720,47 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         os.close(new_fd)
         raise
     return ROTATED, new_fd
+
+
+def _temp_name(stem):
+    return f".{stem}.live.{os.getpid()}.{secrets.token_hex(4)}.new"
+
+
+def _discard_temp(dir_fd, name, fd):
+    """Remove OUR marker-only temp file (never a WAL): only while the name still is the inode we created and it holds
+    at most the marker. The only unlink in this module."""
+    try:
+        named = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        opened = os.fstat(fd)
+        if (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino) and opened.st_size <= MARKER_ONLY_BYTES:
+            os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
+def _discard_stale_temps(dir_fd, stem):
+    """Orphans of a crashed rotation: marker-only temp files of this stem that nobody holds (the flock is free)."""
+    prefix = f".{stem}.live."
+    try:
+        with os.scandir(dir_fd) as it:
+            names = [e.name for e in it if e.name.startswith(prefix) and e.name.endswith(".new")]
+    except OSError:
+        return
+    for name in names:
+        try:
+            fd = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError:
+            continue
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue  # held by a live rotation
+            _discard_temp(dir_fd, name, fd)
+        finally:
+            os.close(fd)
 
 
 def _finish_live(dir_fd, stem, fd):
@@ -685,6 +797,23 @@ def _rotated_away(dir_fd, stem, fd):
     return False
 
 
+def _wait_for_live(dir_fd, stem, name, seconds):
+    """A writer that holds no seglock waits (up to `seconds`) for the live name to exist before it may O_CREAT it:
+    with closed segments present a rotation may be between its two renames. After the wait it creates the file as a
+    last resort (a record is never dropped)."""
+    if not _scan(dir_fd, stem).get(stem, ({}, []))[0]:
+        return  # no closed segments: no rotation can be in flight
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            return
+        except FileNotFoundError:
+            time.sleep(0.01)
+        except OSError:
+            return
+
+
 def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01):
     """Append one complete JSONL line to `name` in the pinned directory `dir_fd`, rotating at the segment limit.
     Lock order: seglock, live open, data flock, target check. Raises ValueError for an unsafe target."""
@@ -695,13 +824,14 @@ def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01)
     rotate_on = rotation_enabled()
     lock_fd = None
     lock_name = f".{stem}.seglock"  # taken on every append, switch or not, so flipping the switch cannot race
+    lock_wait = float(os.environ.get("HARNESS_WAL_LOCK_WAIT", "2")) if test_mode() else 2.0
     try:
         lock_fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
         info = os.fstat(lock_fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise OSError(errno.EINVAL, "seglock is not a plain file")
         os.fchmod(lock_fd, 0o600)
-        deadline = time.monotonic() + (float(os.environ.get("HARNESS_WAL_LOCK_WAIT", "2")) if test_mode() else 2.0)
+        deadline = time.monotonic() + lock_wait
         while True:
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -721,6 +851,8 @@ def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01)
             os.close(lock_fd)
         lock_fd, rotate_on = None, False
     recover_on = lock_fd is not None  # the recovery rule needs the seglock, not the switch
+    if lock_fd is None:  # without the seglock never create the live file while a rotation may be moving it into place
+        _wait_for_live(dir_fd, stem, name, lock_wait)
     try:
         for attempt in range(MAX_RETRIES):
             if not check_dir():
