@@ -170,6 +170,7 @@ class GoodQAAdapter:
         self._comment_times = {}
         self._artifact_cache = {}
         self._listed_attachments = {}
+        self.last_server_date = None
 
     def _load_key(self):
         """The private key file wins; without it, a configured Secret Manager key is read-only."""
@@ -203,6 +204,7 @@ class GoodQAAdapter:
             try:
                 with urllib.request.urlopen(request, timeout=self._remaining()) as response:
                     raw = response.read(8_000_001)
+                    self.last_server_date = response.headers.get("Date")  # server clock (central_decisions.py)
                 break
             except urllib.error.HTTPError as error:
                 # Authentication and policy refusals are not retried.

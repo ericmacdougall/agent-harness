@@ -197,6 +197,14 @@ class PublishAndVerify(Base):
             self.publish('k8')
         self.assertEqual(self.fake.items, [])
 
+    def test_unwritable_index_refuses_before_posting(self):  # plan review 3 F3: auto-revocation needs the index
+        self.grant_local('k1')
+        with mock.patch.object(cd, '_append_private', side_effect=OSError('read-only')):
+            with self.assertRaises(cd.Denied) as caught:
+                self.publish('k1')
+        self.assertEqual(caught.exception.code, 'index_unwritable')
+        self.assertFalse(any(str(i['body']).startswith(cd.DECISION_PREFIX) for i in self.fake.items))
+
     def test_later_turn_naming_the_top_rung_blocks_publish(self):  # NEG-14
         self.grant_local('k1')
         fx.user_turn(self.claude, 'actually keep fable off', uid='00000000-0000-4000-8000-0000000000f2', age_seconds=30)
@@ -342,6 +350,23 @@ class Forgery(Base):
             self.verify('k1', now=time.time() - 600)
         self.assertEqual(caught.exception.code, 'clock_behind')
 
+    def test_slow_clock_on_a_quiet_ledger_denies_by_server_time(self):  # plan review 3 F1
+        self.fake.add(self.body(self.payload()), at=time.time() - 7200)  # nothing posted for two hours
+        self.fake.server_time = lambda: time.time()
+        with self.assertRaises(cd.Denied) as caught:
+            self.verify('k1', now=time.time() - 3600)  # this host is an hour slow
+        self.assertEqual(caught.exception.code, 'clock_behind')
+        self.assertEqual(self.verify('k1')['task'], 'k1')  # same ledger, correct clock: valid
+
+    def test_real_ledger_client_requires_a_server_date(self):  # plan review 3 F1
+        adapter = mock.Mock(spec=['last_server_date'])
+        adapter.last_server_date = None
+        with self.assertRaises(cd.Denied) as caught:
+            cd.GoodQALedger(adapter=adapter).server_time()
+        self.assertEqual(caught.exception.code, 'no_server_time')
+        adapter.last_server_date = 'Mon, 23 Nov 2026 01:00:00 GMT'
+        self.assertEqual(cd.GoodQALedger(adapter=adapter).server_time(), 1795395600.0)
+
 
 class Revocation(Base):
     def setUp(self):
@@ -482,8 +507,22 @@ class TierGateAcceptsCentral(Base):
         with mock.patch.object(cd, 'Store', return_value=self.t2.store), mock.patch.object(cd, 'verify', side_effect=slow):
             facts = {}
             self.assertIsNone(gate.central_permission('k1', 'fable', facts))
-        self.assertEqual(seen['deadline'], cd.HOOK_DEADLINE)
+        self.assertTrue(0 < seen['deadline'] <= cd.HOOK_DEADLINE)
         self.assertLess(cd.HOOK_DEADLINE, 10)  # inside the tier_gate hook's 10 s timeout (onFailure block)
+        self.assertEqual(facts['central'], 'ledger_timeout')
+
+    def test_two_consults_in_one_hook_run_share_one_budget(self):  # plan review 3 F2
+        calls = []
+
+        def slow(t, family, store=None, deadline_seconds=None, **kw):
+            calls.append(deadline_seconds)
+            raise cd.Denied('ledger_timeout', 'slow')
+        facts = {}
+        with mock.patch.object(cd, 'Store', return_value=self.t2.store), mock.patch.object(cd, 'verify', side_effect=slow):
+            gate.central_permission('k1', 'fable', facts)
+            facts['central_budget_end'] -= cd.HOOK_DEADLINE  # the first consult used up the run's budget
+            self.assertIsNone(gate.central_permission('k1', 'astra', facts))
+        self.assertEqual(len(calls), 1)  # the second site denied without another ledger read
         self.assertEqual(facts['central'], 'ledger_timeout')
 
 

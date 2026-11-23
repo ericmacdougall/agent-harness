@@ -189,10 +189,12 @@ fi
 # ---------------------------------------------------------------- 3. install on both hosts (supported repair flow)
 "$REPAIR" --ref "$H_MERGE" --host "$HOST" --check || die "repair-harness preview failed"
 "$REPAIR" --ref "$H_MERGE" --host "$HOST" --apply || die "repair-harness apply failed (inspect its logs before retrying)"
-expected=$(gh api "repos/$HARNESS_REPO/contents/harness/hooks/central_decisions.py?ref=$H_MERGE" --jq .sha)
-local_blob=$(git hash-object "$HOME/.claude/hooks/central_decisions.py")
-remote_blob=$(ssh -o BatchMode=yes "$HOST" 'git hash-object "$HOME/.claude/hooks/central_decisions.py"')
-[[ $local_blob == "$expected" && $remote_blob == "$expected" ]] || die "installed central_decisions.py differs from the merged commit"
+for hook in central_decisions.py tier_gate.py provenance_hooks.py escalation.py ticket_adapters.py ah.py; do
+    expected=$(gh api "repos/$HARNESS_REPO/contents/harness/hooks/$hook?ref=$H_MERGE" --jq .sha)
+    local_blob=$(git hash-object "$HOME/.claude/hooks/$hook")
+    remote_blob=$(ssh -o BatchMode=yes "$HOST" "git hash-object \"\$HOME/.claude/hooks/$hook\"")
+    [[ -n $expected && $local_blob == "$expected" && $remote_blob == "$expected" ]] || die "installed $hook differs from the merged commit"
+done
 say "Harness $H_MERGE installed on this Mac and $HOST"
 
 # ---------------------------------------------------------------- 4. key, pin, enable

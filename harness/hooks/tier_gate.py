@@ -59,7 +59,13 @@ def central_permission(task, family, facts):
         store = cd.Store()
         if not store.config.exists():
             return None
-        found = cd.verify(task, family, store=store, deadline_seconds=cd.HOOK_DEADLINE)
+        # One budget per hook run, shared by every consult of that run (a Bash line can reach two sites).
+        import time as _time  # noqa: PLC0415
+        end = facts.setdefault('central_budget_end', _time.monotonic() + cd.HOOK_DEADLINE)
+        remaining = end - _time.monotonic()
+        if remaining < 0.5:
+            raise cd.Denied('ledger_timeout', 'the central decision budget of this hook run is spent')
+        found = cd.verify(task, family, store=store, deadline_seconds=remaining)
     except Exception as error:  # noqa: BLE001  fail closed: no permission
         facts['central'] = str(getattr(error, 'code', type(error).__name__))[:40]
         return None

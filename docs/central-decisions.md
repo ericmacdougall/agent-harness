@@ -56,7 +56,7 @@ Verification checks these time rules:
 - `expires_at <= assent_at + 12 h`;
 - `now < expires_at`.
 
-A host whose clock is more than 120 s behind the newest ledger comment denies.
+A host whose clock is more than 120 s behind the GoodQA server denies. Server time is the newer of the latest ledger comment and the HTTP `Date` header of the read itself, so a quiet ledger does not hide a slow clock; a response without a usable `Date` denies.
 
 ## Revocation
 
@@ -76,13 +76,15 @@ Scope rules:
 
 Hosts keep a sticky local copy of every revoke they have seen (`tombstones.jsonl`).
 
-In the originating session, a later user turn that names the top rung or withdraws makes the provenance prompt hook revoke that session's published decisions by id. It writes a local tombstone first, then posts the revoke. A failed post is queued in `pending-revocations.jsonl`, retried on later prompts and reported in the agent's context. Until the queued post lands, other hosts still accept the decision.
+In the originating session, a later user turn that names the top rung or withdraws makes the provenance prompt hook revoke that session's published decisions by id. It writes a local tombstone first, then posts the revoke. A failed post is queued in `pending-revocations.jsonl`, retried on later prompts and reported in the agent's context. Until the queued post lands, other hosts still accept the decision (at most until its expiry). Publish refuses, before posting, when it cannot write the `published.jsonl` index that this hook relies on.
+
+A retraction typed in a different session does not revoke automatically; use `ah decision withdraw` there.
 
 `ah decision withdraw --task K | --session S | --decision ID | --all` does the same on demand.
 
 ## Consumers
 
-- `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read: the Agent spawn (family fable), the Bash launch (fable or astra by model), and the reviewer path. The rung ceiling is unchanged, and nothing is written into the escalation state. The ledger read has a 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
+- `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read: the Agent spawn (family fable), the Bash launch (fable or astra by model), and the reviewer path. The rung ceiling is unchanged, and nothing is written into the escalation state. All ledger reads of one hook run share one 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
 - The T2Scan Claude adapter (`cli/adapters/claude-assessment.py`) uses the central path only when the approval task has no local escalation record. It still requires the family word, and for `-astra-direct` tasks the direct-assent words, in the signed sentence.
 - Every read fetches the whole ledger: archived comments included, at most 10 pages of 200. Running out of pages, an unreachable tracker, a missing or closed ticket, a missing pinned key or a missing `cryptography` package all deny.
 
@@ -108,5 +110,7 @@ It never pushes to main itself.
 ## Limits
 
 - The residual race is the gap between a passing check and the launch that check gates.
-- Expiry uses each host's clock, with the 120 s check against ledger server time.
+- Expiry uses each host's clock, with the 120 s check against the GoodQA server time.
+- The user's sentence need not name the task keys. With the installer, the keys come from the items the user types on its command line; `ah decision publish` itself is bounded by the 3-key cap, the exact-key match and the 12 h expiry.
+- The installer's receipt check parses the receipt file the user names; it does not prove the file came from `peer_review.py`.
 - About 2,000 junk comments on the ledger make every central check deny. This is an availability attack that the threat model accepts.

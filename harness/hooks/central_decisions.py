@@ -294,6 +294,19 @@ class GoodQALedger:
                 return found
         raise Denied('ledger_truncated', 'the ledger holds more comments than the page budget; refusing to guess')
 
+    def server_time(self):
+        """The GoodQA server's clock from the HTTP Date header of the latest response (each verify reads fresh), so a
+        slow host clock cannot keep an expired grant alive on a quiet ledger. Missing or unparsable: deny."""
+        import email.utils  # noqa: PLC0415
+        value = getattr(self.adapter, 'last_server_date', None)
+        try:
+            stamp = email.utils.parsedate_to_datetime(value).timestamp() if isinstance(value, str) else None
+        except (TypeError, ValueError, IndexError, OverflowError):
+            stamp = None
+        if stamp is None:
+            raise Denied('no_server_time', 'the ledger response carried no usable server time')
+        return stamp
+
     def post(self, issue_id, body, operation_id):
         data = self.adapter.call('comment_on_issue', {'issueId': issue_id, 'body': body, 'operationId': operation_id})
         if not isinstance(data, dict) or '__error__' in data:
@@ -472,9 +485,11 @@ def verify(task, family, *, store=None, client=None, now=None, deadline_seconds=
     config = load_config(store)
     trusted = load_trusted_keys(store)
     crypto = _crypto()
-    decisions, revocations, newest = read_ledger(store, _client(client, deadline_seconds), config, trusted, crypto,
-                                                 with_newest=True)
-    if newest is not None and newest > now + SKEW:
+    client = _client(client, deadline_seconds)
+    decisions, revocations, newest = read_ledger(store, client, config, trusted, crypto, with_newest=True)
+    server_now = client.server_time() if callable(getattr(client, 'server_time', None)) else None
+    reference = max([t for t in (newest, server_now) if t is not None], default=None)
+    if reference is not None and reference > now + SKEW:
         raise Denied('clock_behind', 'this host clock is behind the ledger server by more than %d s' % SKEW)
     remember_revocations(store, revocations)
     revokes = revocations + local_tombstones(store)
@@ -720,7 +735,8 @@ def publish(task, *, ledger=None, store=None, client=None, now=None, claude_home
         _append_private(store.published, {'decision_id': payload['decision_id'], 'task': task, 'session': session,
                                           'turn_uuid': turn, 'expires_at': payload['expires_at']})
     except (OSError, Denied):
-        pass  # the prompt hook's index only; the rescan below still covers the publish window
+        # Without the index the prompt hook could not auto-revoke this decision later: refuse before posting.
+        raise Denied('index_unwritable', 'the published-decisions index could not be written; nothing was posted') from None
     client.post(config['ledger']['issue_id'], body, 'central-decision-' + payload['decision_id'])
     try:
         late = later_mentions(session, turn, home)

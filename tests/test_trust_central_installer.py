@@ -42,7 +42,7 @@ elif args[:2] == ['pr', 'merge']:
 elif args[0] == 'api' and '/commits/' in args[1]:
     print(state['second_parent'])
 elif args[0] == 'api' and '/contents/' in args[1]:
-    print(state['blob'])
+    print(state['blobs'].get(args[1].split('/contents/harness/hooks/')[1].split('?')[0], ''))
 else:
     sys.exit(3)
 '''
@@ -97,12 +97,15 @@ class Installer(unittest.TestCase):
         for path, body in ((bin_dir / 'gh', GH), (bin_dir / 'ssh', SSH),
                            (self.home / '.agent-harness' / 'bin' / 'repair-harness', REPAIR), (hooks / 'ah.py', AH)):
             path.write_text(body); path.chmod(0o755)
-        central = hooks / 'central_decisions.py'
-        central.write_text('# installed\n')
-        blob = subprocess.run(['git', 'hash-object', str(central)], capture_output=True, text=True, check=True).stdout.strip()
+        blobs = {}
+        for name in ('central_decisions.py', 'tier_gate.py', 'provenance_hooks.py', 'escalation.py', 'ticket_adapters.py', 'ah.py'):
+            if name != 'ah.py':
+                (hooks / name).write_text('# installed %s\n' % name)
+            blobs[name] = subprocess.run(['git', 'hash-object', str(hooks / name)], capture_output=True, text=True,
+                                         check=True).stdout.strip()
         self.state = base / 'state.json'
         self.log = base / 'calls.log'
-        self.write_state({'prs': {'311': {'state': 'OPEN', 'head': HEAD}}, 'merge_sha': MERGE, 'second_parent': HEAD, 'blob': blob})
+        self.write_state({'prs': {'311': {'state': 'OPEN', 'head': HEAD}}, 'merge_sha': MERGE, 'second_parent': HEAD, 'blobs': blobs})
         self.receipt = base / 'receipt.md'
         receipt(self.receipt)
         import site
@@ -200,6 +203,15 @@ class Installer(unittest.TestCase):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn('publish refused', out.stderr)
         self.assertFalse(any('decision verify' in c for c in self.calls()))
+
+    def test_any_installed_gate_hook_differing_from_the_merge_stops_before_publish(self):  # spec review 2 item 7
+        state = json.loads(self.state.read_text())
+        state['blobs']['tier_gate.py'] = '0' * 40
+        self.write_state(state)
+        out = self.run_script()
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn('installed tier_gate.py differs', out.stderr)
+        self.assertFalse(any('decision publish' in c for c in self.calls()))
 
 
 if __name__ == '__main__':
