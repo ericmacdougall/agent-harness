@@ -31,7 +31,7 @@ diff --git a/codex-rs/test-binary-support/lib.rs b/codex-rs/test-binary-support/
 diff --git a/codex-rs/app-server/tests/suite/v2/turn_start.rs b/codex-rs/app-server/tests/suite/v2/turn_start.rs
 --- a/codex-rs/app-server/tests/suite/v2/turn_start.rs
 +++ b/codex-rs/app-server/tests/suite/v2/turn_start.rs
-@@ -1340,21 +1340,24 @@
+@@ -1340,28 +1340,37 @@
          "amount": expected_amount,
          "metadata": completed["response"]["usage"],
      });
@@ -52,11 +52,29 @@ diff --git a/codex-rs/app-server/tests/suite/v2/turn_start.rs b/codex-rs/app-ser
      write_models_cache(codex_home.path()).await?;
 -
 +
-     let mut mcp = TestAppServer::builder()
-         .with_codex_home(codex_home.path())
-         .build_initialized()
-         .await?;
+-    let mut mcp = TestAppServer::builder()
+-        .with_codex_home(codex_home.path())
+-        .build_initialized()
+-        .await?;
++    let builder = TestAppServer::builder().with_codex_home(codex_home.path());
++    let builder = if cfg!(debug_assertions) {
++        builder
++    } else {
++        // The release server has no debug-only startup switch.
++        builder
++            .with_plugin_startup_tasks()
++            .with_args(&["-c", "features.plugins=false"])
++    };
++    let mut mcp = builder.build_initialized().await?;
 -
 +
      let ThreadStartResponse { thread, .. } = mcp
          .start_thread(ThreadStartParams {
+             experimental_raw_events: true,
+             ..Default::default()
+         })
+         .await?;
+-
++
+     let TurnStartResponse { turn } = mcp
+         .request(|request_id| ClientRequest::TurnStart {
