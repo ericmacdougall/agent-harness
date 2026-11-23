@@ -1,0 +1,39 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "01a2059e-af0d-7881-aaf7-4ff2098b0f6e",
+   "verdict": "ACCEPT",
+   "family": "codex",
+   "agent_type": "harness_reviewer",
+   "model": null,
+   "source": "Codex native reviewer metadata; parent bound to native WAL session",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/01a20128-a195-7c12-8f61-65c1124c2c2e/delivery-preserve-untracked/formal-acceptance-6357b309.md",
+    "sha256": "dec983231ce55878572e960b90713517edf46e39ffd1cdfb6282e7f9de2caadf"
+   },
+   "role": "acceptance",
+   "core_sha": "6357b309a426b30fc0c2d512353d17d8df14f3c3c07e0d3b3c808d3e0c62a93c",
+   "at": "2026-11-23T00:20:23.679865+00:00",
+   "key": "agent:01a2059e-af0d-7881-aaf7-4ff2098b0f6e"
+  },
+  {
+   "kind": "agent",
+   "identity": "01a2059e-da64-7693-851f-2dec80571f63",
+   "verdict": "ACCEPT",
+   "family": "codex",
+   "agent_type": "harness_red_team",
+   "model": null,
+   "source": "Codex native reviewer metadata; parent bound to native WAL session",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/01a20128-a195-7c12-8f61-65c1124c2c2e/delivery-preserve-untracked/formal-adversarial-6357b309.md",
+    "sha256": "4d4387101127836c51c03ccde7f3bee57b623e02825fd87db7a6b28ba0422634"
+   },
+   "role": "adversarial",
+   "core_sha": "6357b309a426b30fc0c2d512353d17d8df14f3c3c07e0d3b3c808d3e0c62a93c",
+   "at": "2026-11-23T00:20:24.427249+00:00",
+   "key": "agent:01a2059e-da64-7693-851f-2dec80571f63"
+  }
+ ]
+}

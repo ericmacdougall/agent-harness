@@ -13,9 +13,322 @@ import subprocess
 import time
 import stat
 import tempfile
+import json
+from dataclasses import dataclass
 from pathlib import Path
 
 from process import signal_group
+
+
+# Closed preservation policy. No CLI/environment budget overrides.
+PRESERVE_ENTRIES = 4096
+PRESERVE_VISITS = 20000
+PRESERVE_DEPTH = 24
+PRESERVE_NAMES = 2_000_000
+PRESERVE_MANIFEST = 8_000_000
+PRESERVE_SECONDS = 15
+
+
+def _preserve_path(value):
+    if (not isinstance(value, str) or not value or len(value) > 1024
+            or not value.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in value)
+            or any(p in ('', '.', '..') for p in value.split('/')) or value.startswith('/')):
+        raise OSError('preservation path policy refused')
+    return value
+
+
+def _preserve_json(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode('ascii')
+
+
+def _preserve_stat(info, *, ancestor=False):
+    basic = [info.st_dev, info.st_ino, info.st_mode, info.st_uid]
+    return basic if ancestor else basic + [info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _preserve_directory(path):
+    """Open each path component without following aliases; caller owns returned FD."""
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise OSError('preservation directory is not canonical')
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in path.parts[1:]:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _preserve_git(repo, args, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise OSError('preservation metadata deadline exceeded')
+    code, raw = _bounded_git(repo, args, git_environment(), timeout=remaining, limit=PRESERVE_NAMES)
+    if code:
+        raise OSError('preservation Git metadata unavailable')
+    return raw
+
+
+def _preserve_scan(repo, *, anchors=None):
+    """Enumerate metadata only, including ignored data and empty directories."""
+    deadline = time.monotonic() + PRESERVE_SECONDS
+    require_safe_source(repo, git_environment(), deadline=deadline)
+    raw = _preserve_git(repo, ['ls-files', '-z'], deadline)
+    try:
+        tracked = {_preserve_path(p.decode('ascii')) for p in raw.split(b'\0') if p}
+    except UnicodeError:
+        raise OSError('preservation indexed path policy refused') from None
+    shared = {''}
+    for path in tracked:
+        parts = path.split('/')
+        shared.update('/'.join(parts[:i]) for i in range(1, len(parts)))
+    if anchors is not None:
+        shared.update(anchors)
+    records, directories = [], []
+    visits, names = 0, 0
+    root_fd = _preserve_directory(repo)
+    root_info = os.fstat(root_fd)
+
+    def tick():
+        if time.monotonic() > deadline:
+            raise OSError('preservation metadata deadline exceeded')
+
+    def safe(info):
+        if (info.st_uid != os.getuid() or info.st_dev != root_info.st_dev
+                or info.st_mode & 0o022):
+            raise OSError('preservation ownership, mode or device refused')
+
+    def walk(fd, prefix, depth):
+        nonlocal visits, names
+        tick()
+        if depth > PRESERVE_DEPTH:
+            raise OSError('preservation depth budget exceeded')
+        before = os.fstat(fd)
+        safe(before)
+        directories.append([prefix, 'a' if prefix in shared else 'd', _preserve_stat(before)])
+        if prefix and prefix not in shared and len(records) + len(directories) > PRESERVE_ENTRIES + len(shared):
+            raise OSError('preservation entry budget exceeded')
+        entries = []
+        with os.scandir(fd) as scan:
+            for entry in scan:
+                tick()
+                visits += 1
+                if visits > PRESERVE_VISITS:
+                    raise OSError('preservation visited-entry budget exceeded')
+                entries.append(entry.name)
+        for name in sorted(entries):
+            tick()
+            if not prefix and name == '.git':
+                continue  # verified root Git administrative boundary only
+            path = name if not prefix else prefix + '/' + name
+            _preserve_path(path)
+            names += len(path) + 1
+            if names > PRESERVE_NAMES:
+                raise OSError('preservation path-list budget exceeded')
+            if path in tracked:
+                continue
+            if prefix in shared and name.lower() in ('.gitattributes', '.gitignore', '.gitmodules'):
+                # Do not let a later Git inspection interpret an unknown
+                # worktree control file as configuration/attribute content.
+                raise OSError('preservation untracked Git control file refused')
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            safe(info)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    if _preserve_stat(os.fstat(child)) != _preserve_stat(info):
+                        raise OSError('preservation directory changed before inspection')
+                    walk(child, path, depth + 1)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                records.append([path, 'f', _preserve_stat(info)])
+                if len(records) > PRESERVE_ENTRIES:
+                    raise OSError('preservation entry budget exceeded')
+            else:
+                raise OSError('preservation file type or hardlink refused')
+        if _preserve_stat(os.fstat(fd)) != _preserve_stat(before):
+            raise OSError('preservation directory changed during inspection')
+
+    try:
+        walk(root_fd, '', 0)
+        if _preserve_stat(os.fstat(root_fd)) != _preserve_stat(root_info):
+            raise OSError('preservation root changed during inspection')
+    finally:
+        os.close(root_fd)
+    if _preserve_git(repo, ['status', '--porcelain=v1', '-z', '--untracked-files=no'], deadline):
+        raise OSError('preservation requires clean tracked files')
+    full = records + [d for d in directories if d[1] == 'd']
+    if len(full) > PRESERVE_ENTRIES:
+        raise OSError('preservation entry budget exceeded')
+    relevant = {''}
+    for path, _, _ in full:
+        parts = path.split('/')
+        relevant.update('/'.join(parts[:i]) for i in range(1, len(parts)))
+    result = full + [[p, 'a', meta[:4]] for p, kind, meta in directories if kind == 'a' and p in relevant]
+    result.sort(key=lambda r: r[0])
+    tick()
+    return result
+
+
+@dataclass(frozen=True)
+class UntrackedPreservation:
+    """Validated immutable metadata proof, never a generic allow-dirty capability."""
+    raw: bytes
+
+    def __post_init__(self):
+        if type(self.raw) is not bytes or len(self.raw) > PRESERVE_MANIFEST:
+            raise OSError('preservation manifest budget refused')
+        try:
+            d = json.loads(self.raw)
+            fields = {'schema', 'policy', 'original', 'branch', 'baseline', 'source', 'source_head',
+                      'original_layout', 'source_layout', 'entries'}
+            if (type(d) is not dict or set(d) != fields or d['schema'] != 1 or type(d['schema']) is not int
+                    or d['policy'] != 'metadata-ascii-v1' or _preserve_json(d) != self.raw
+                    or any(not isinstance(d[k], str) or not Path(d[k]).is_absolute() for k in ('original', 'source'))
+                    or not isinstance(d['branch'], str) or not d['branch'] or len(d['branch']) > 1024
+                    or any(not isinstance(d[k], str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', d[k])
+                           for k in ('baseline', 'source_head'))
+                    or any(not isinstance(d[k], str) or not (d[k] == 'ordinary' or re.fullmatch(r'[0-9a-f]{64}', d[k]))
+                           for k in ('original_layout', 'source_layout'))
+                    or type(d['entries']) is not list or len(d['entries']) > PRESERVE_VISITS):
+                raise ValueError
+            previous = None
+            full = 0
+            for record in d['entries']:
+                if type(record) is not list or len(record) != 3:
+                    raise ValueError
+                path, kind, meta = record
+                if path != '':
+                    _preserve_path(path)
+                if (not isinstance(path, str) or previous is not None and previous >= path
+                        or kind not in ('a', 'd', 'f') or path == '' and kind != 'a'
+                        or type(meta) is not list or len(meta) != (4 if kind == 'a' else 8)
+                        or any(type(n) is not int or n < 0 or n > 2**64-1 for n in meta)
+                        or meta[3] != os.getuid() or meta[2] & 0o022
+                        or not (stat.S_ISREG(meta[2]) if kind == 'f' else stat.S_ISDIR(meta[2]))
+                        or kind == 'f' and meta[4] != 1):
+                    raise ValueError
+                previous = path
+                full += kind != 'a'
+            if not d['entries'] or d['entries'][0][:2] != ['', 'a'] or full > PRESERVE_ENTRIES:
+                raise ValueError
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            raise OSError('preservation manifest schema refused') from None
+
+    @property
+    def data(self):
+        return json.loads(self.raw)
+
+    @property
+    def digest(self):
+        return hashlib.sha256(self.raw).hexdigest()
+
+    @classmethod
+    def capture(cls, original, branch, baseline, source, head):
+        deadline = time.monotonic() + PRESERVE_SECONDS
+        original, source = Path(original), Path(source)
+        for repo, expected in ((original, baseline), (source, head)):
+            if str(repo) != str(repo.resolve()) or _preserve_git(repo, ['rev-parse', 'HEAD'], deadline).decode().strip() != expected:
+                raise OSError('preservation checkout identity refused')
+        if _preserve_git(original, ['symbolic-ref', '--short', 'HEAD'], deadline).decode().strip() != branch:
+            raise OSError('preservation branch refused')
+        d = {'schema': 1, 'policy': 'metadata-ascii-v1', 'original': str(original), 'branch': branch,
+             'baseline': baseline, 'source': str(source), 'source_head': head,
+             'original_layout': require_safe_source(original, git_environment(), deadline=deadline),
+             'source_layout': require_safe_source(source, git_environment(), deadline=deadline),
+             'entries': _preserve_scan(original)}
+        proof = cls(_preserve_json(d))
+        proof.check_target(source, head)
+        proof.verify(original, branch)
+        return proof
+
+    def binds(self, original, branch, baseline, source, head):
+        d = self.data
+        return (d['original'], d['branch'], d['baseline'], d['source'], d['source_head']) == (
+            str(original), branch, baseline, str(source), head)
+
+    def verify(self, original, branch):
+        d = self.data
+        if (str(original) != d['original'] or branch != d['branch']
+                or require_safe_source(Path(original), git_environment(), timeout=PRESERVE_SECONDS) != d['original_layout']
+                or _preserve_scan(Path(original), anchors={p for p, k, _ in d['entries'] if k == 'a'}) != d['entries']):
+            raise OSError('preservation inventory changed')
+
+    def check_target(self, repo, target):
+        deadline = time.monotonic() + PRESERVE_SECONDS
+        raw = _preserve_git(Path(repo), ['ls-tree', '-rz', target], deadline)
+        paths, ancestors = set(), set()
+        for record in raw.split(b'\0'):
+            if not record:
+                continue
+            try:
+                info, name = record.split(b'\t', 1)
+                if info.split()[1] != b'blob':
+                    raise OSError('preservation target type refused')
+                p = _preserve_path(name.decode('ascii')).lower()
+            except (ValueError, UnicodeError, IndexError):
+                raise OSError('preservation target path refused') from None
+            paths.add(p)
+            parts = p.split('/')
+            ancestors.update('/'.join(parts[:i]) for i in range(1, len(parts)))
+        for p, kind, _ in self.data['entries']:
+            if kind == 'a':
+                continue
+            p = p.lower()
+            parts = p.split('/')
+            if p in paths or p in ancestors or any('/'.join(parts[:i]) in paths for i in range(1, len(parts))):
+                raise OSError('preservation target collision refused')
+        if time.monotonic() > deadline:
+            raise OSError('preservation target deadline exceeded')
+
+    def write(self, path):
+        path = Path(path)
+        parent = _preserve_directory(path.parent)
+        try:
+            s = os.fstat(parent)
+            if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
+                raise OSError('preservation manifest directory is not private')
+            fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+            with os.fdopen(fd, 'wb') as f:
+                f.write(self.raw)
+                f.flush()
+                os.fsync(f.fileno())
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+
+    @classmethod
+    def load(cls, path, digest):
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise OSError('preservation manifest digest refused')
+        path = Path(path)
+        parent = _preserve_directory(path.parent)
+        try:
+            s = os.fstat(parent)
+            if s.st_uid != os.getuid() or stat.S_IMODE(s.st_mode) != 0o700:
+                raise OSError('preservation manifest directory is not private')
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            with os.fdopen(fd, 'rb') as f:
+                before = os.fstat(f.fileno())
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid() or before.st_nlink != 1
+                        or stat.S_IMODE(before.st_mode) != 0o600 or before.st_size > PRESERVE_MANIFEST):
+                    raise OSError('preservation manifest file refused')
+                raw = f.read(PRESERVE_MANIFEST + 1)
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                if (_preserve_stat(os.fstat(f.fileno())) != _preserve_stat(before)
+                        or _preserve_stat(named) != _preserve_stat(before)):
+                    raise OSError('preservation manifest changed during read')
+        finally:
+            os.close(parent)
+        result = cls(raw)
+        if result.digest != digest:
+            raise OSError('preservation manifest digest changed')
+        return result
 
 
 AUTH_GIT_ENV = {'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_SSH_VARIANT',

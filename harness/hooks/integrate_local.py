@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from git_safety import _bounded_git, git_environment, require_safe_source, unsupported_git_environment
+from git_safety import _bounded_git, git_environment, require_safe_source, unsupported_git_environment, UntrackedPreservation
 from process import cleanup_discarded, run as run_process
 
 
@@ -875,6 +875,8 @@ def external_key(record):
     values = ('external-apply', str(record['original_dev']), str(record['original_ino']),
               record['branch'], record['base'], record['target'], record['object_format'],
               record['task_digest'], record['attempt'])
+    if 'preservation_sha256' in record:
+        values += ('preservation-v1', record['preservation_sha256'])
     return hashlib.sha256('\0'.join(values).encode('utf-8')).hexdigest()
 
 
@@ -891,6 +893,10 @@ def validate_external_record(directory, record):
         raise OSError('external apply phase is invalid')
     if phase == 'resolved':
         required |= {'resolved_head', 'resolved_by', 'previous_phase'}
+    if 'preservation_sha256' in record:
+        required.add('preservation_sha256')
+        if not hex_identity(record['preservation_sha256'], 64):
+            raise OSError('external preservation binding is invalid')
     if set(record) != required or record.get('kind') != 'external_apply':
         raise OSError('external apply fields are invalid')
     if (any(not valid_identity_text(record[name]) for name in required
@@ -1181,14 +1187,19 @@ def scratch_abort(repo, scratch, journal, message, *, phase, exit_code=None,
                            original_head=observed_head(repo))
 
 
-def checked_original(repo, branch, base, timeout, *, deadline=None):
+def checked_original(repo, branch, base, timeout, *, deadline=None, preservation=None):
     def budget():
         return timeout if deadline is None else remaining_budget(deadline, timeout)
     layout = safe_source(repo, budget(), deadline=deadline)
     index_unflagged(repo, budget(), sparse_layout=layout if layout != 'ordinary' else None)
     current_branch = inspect_git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD', timeout=budget())
     current_head = inspect_git(repo, 'rev-parse', 'HEAD', timeout=budget())
-    status = inspect_git(repo, 'status', '--porcelain', '--untracked-files=all',
+    if preservation is not None:
+        if type(preservation) is not UntrackedPreservation:
+            raise OSError('external preservation proof type is invalid')
+        preservation.verify(repo, branch)
+    status = inspect_git(repo, 'status', '--porcelain',
+                         '--untracked-files=no' if preservation is not None else '--untracked-files=all',
                          '--ignore-submodules=none', timeout=budget())
     return (current_branch.returncode == 0 and current_branch.stdout.strip() == branch
             and current_head.returncode == 0 and current_head.stdout.strip() == base
@@ -1420,7 +1431,7 @@ class OriginalScope:
     accepts a tested baseline; it cannot prove the caller's PR or checks passed.
     """
 
-    def __init__(self, repo, branch, timeout=30):
+    def __init__(self, repo, branch, timeout=30, *, preservation=None):
         try:
             named = Path(repo)
         except (TypeError, ValueError):
@@ -1430,6 +1441,9 @@ class OriginalScope:
                 or not math.isfinite(timeout) or timeout <= 0):
             raise ExternalApplyError('Original scope arguments are invalid')
         self._repo = named.resolve()
+        if preservation is not None and type(preservation) is not UntrackedPreservation:
+            raise ExternalApplyError('External preservation proof type is invalid')
+        self._preservation = preservation
         self._branch = branch
         self._timeout = timeout
         self._lock_fd = None
@@ -1534,14 +1548,19 @@ class OriginalScope:
             ancestry = inspect_git(self.repo, 'merge-base', '--is-ancestor', base, target,
                                    timeout=self.timeout)
             if (commit.returncode or commit.stdout.strip() != 'commit' or ancestry.returncode
-                    or not checked_original(self.repo, self.branch, base, self.timeout)):
+                    or not checked_original(self.repo, self.branch, base, self.timeout,
+                                            preservation=self._preservation)):
                 raise OSError('external apply baseline or target is invalid')
+            if self._preservation is not None:
+                self._preservation.check_target(self.repo, target)
             self._assert_current()
             record = {'schema': 3, 'kind': 'external_apply', 'phase': 'reserved',
                       'original': str(self.repo), 'original_dev': self.identity[0],
                       'original_ino': self.identity[1], 'branch': self.branch, 'base': base,
                       'target': target, 'object_format': self.object_format,
                       'task_digest': task_digest, 'attempt': secrets.token_hex(16)}
+            if self._preservation is not None:
+                record['preservation_sha256'] = self._preservation.digest
             record['key'] = external_key(record)
             record['ref'] = external_ref(record)
             directory = scope_directory(self.root, self.identity, self.branch) / 'active' / record['key']
@@ -1584,7 +1603,8 @@ class OriginalScope:
             record = read_journal(directory)
             if (record['schema'] != 3 or record['task_digest'] != task_digest
                     or (record['original_dev'], record['original_ino']) != self.identity
-                    or record['branch'] != self.branch or record['object_format'] != self.object_format):
+                    or record['branch'] != self.branch or record['object_format'] != self.object_format
+                    or record.get('preservation_sha256') != (self._preservation.digest if self._preservation else None)):
                 raise OSError('external apply belongs to another scope or task')
             return ExternalApplyGuard(self, directory, record)
         except (IndexInspectionError, OSError, subprocess.TimeoutExpired):
@@ -1604,7 +1624,9 @@ class OriginalScope:
                     or (record['original_dev'], record['original_ino']) != self.identity
                     or record['branch'] != self.branch or record['object_format'] != self.object_format
                     or record.get('phase') == 'resolved' and record.get('resolved_by') != 'workflow'
-                    or not checked_original(self.repo, self.branch, guard.target, self.timeout)
+                    or record.get('preservation_sha256') != (self._preservation.digest if self._preservation else None)
+                    or not checked_original(self.repo, self.branch, guard.target, self.timeout,
+                                            preservation=self._preservation)
                     or external_pin_state(self.repo, record, self.timeout) != ('matches_target', True)):
                 raise OSError('external apply completion state changed')
             blocking, blocked, _ = _scan_journals(self.root, self.repo, self.identity,
@@ -1618,7 +1640,8 @@ class OriginalScope:
                                          target=blocked.get('target') if blocked else None)
             self._assert_current()
             if (not guard._location_is_current() or read_journal(directory) != record
-                    or not checked_original(self.repo, self.branch, guard.target, self.timeout)
+                    or not checked_original(self.repo, self.branch, guard.target, self.timeout,
+                                            preservation=self._preservation)
                     or external_pin_state(self.repo, record, self.timeout) != ('matches_target', True)):
                 raise OSError('external apply changed during recovery scan')
             return directory, record

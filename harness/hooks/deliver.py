@@ -27,7 +27,7 @@ import time
 from urllib.parse import quote
 
 from github_identity import github_repository, repository_name
-from git_safety import git_environment, require_safe_source, unsupported_git_environment
+from git_safety import git_environment, require_safe_source, unsupported_git_environment, UntrackedPreservation
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
                              OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
                              require_check_interpreters,
@@ -156,7 +156,7 @@ def require_arguments(args, *names):
         raise DeliveryError("BLOCKED_POLICY", "Required delivery arguments are missing", code=2)
 
 
-def snapshot(repo, branch, *, require_clean=True, expected_layout=None):
+def snapshot(repo, branch, *, require_clean=True, expected_layout=None, preservation=None):
     if (repo.is_symlink() or not repo.is_dir()
             or Path(git_value(repo, "rev-parse", "--show-toplevel")).resolve() != repo.resolve()):
         raise DeliveryError("BLOCKED_POLICY", "Checkout must be a Git worktree root", code=2)
@@ -169,7 +169,11 @@ def snapshot(repo, branch, *, require_clean=True, expected_layout=None):
         raise DeliveryError("BLOCKED_LOCAL", "Checkout Git metadata is unsafe or unverifiable") from None
     if expected_layout is not None and layout != expected_layout:
         raise DeliveryError("RECHECK_REQUIRED", "Prepared checkout layout changed")
-    if require_clean:
+    if preservation is not None:
+        if type(preservation) is not UntrackedPreservation:
+            raise DeliveryError("BLOCKED_POLICY", "Preservation proof type is invalid", code=2)
+        preservation.verify(repo, branch)
+    elif require_clean:
         code, status = git(repo, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
                            "status", "--porcelain=v1", "-z", "--untracked-files=all")
         if code or status:
@@ -404,7 +408,10 @@ class Workflow:
         self.args, self.original, self.branch = args, args.original.expanduser().absolute(), args.original_branch
         if not valid_identity_text(self.branch):
             raise DeliveryError("BLOCKED_POLICY", "Original branch is invalid", code=2)
-        snapshot(self.original, self.branch)
+        # Finish must first load its immutable generation-bound proof. No
+        # publication/apply occurs before load() performs the full snapshot.
+        snapshot(self.original, self.branch, require_clean=False)
+        self.preservation = getattr(args, "_preservation", None)
         self.identity = checkout_identity(self.original)
         self.common, self.common_info = git_common_directory(self.original, 30)
         self.scope = scope_key(self.identity, self.branch)
@@ -481,6 +488,14 @@ class Workflow:
         private_directory(self.directory)
         self.state = private_json(self.directory / "journal.json")
         self.validate_state(self.state)
+        if self.state["schema"] == 3:
+            self.preservation = UntrackedPreservation.load(self.directory / "preservation.json",
+                                                         self.state["preservation_sha256"])
+            if not self.preservation.binds(self.original, self.branch, self.state["baseline"],
+                                            self.state["source"], self.state["source_head"]):
+                raise DeliveryError("RECOVERY_REQUIRED", "Preservation scope binding changed")
+        else:
+            self.preservation = None
         replacing = getattr(self.args, "new_generation", False) and self.state["phase"] in SETTLED
         if not replacing:
             self.snapshot()
@@ -492,13 +507,17 @@ class Workflow:
                   "phase", "pr_number", "target", "merge_head", "guard_key", "local_key", "checks_digest", "apply_base"}
         strings = ("kind", "task", "scope", "generation", "original", "branch", "source", "source_branch",
                    "source_head", "baseline", "kit_digest", "repository", "phase")
-        if value.get("schema") == 2:
+        if value.get("schema") in (2, 3):
             fields |= {"source_layout", "original_layout"}
             for name in ("source_layout", "original_layout"):
                 item = value.get(name)
                 if not isinstance(item, str) or (item != "ordinary" and not HEX64.fullmatch(item)):
                     raise DeliveryError("RECOVERY_REQUIRED", "Required checkout layout proof is invalid")
-        if (set(value) != fields or type(value.get("schema")) is not int or value["schema"] not in (1, 2)
+        if value.get("schema") == 3:
+            fields.add("preservation_sha256")
+            if not isinstance(value.get("preservation_sha256"), str) or not HEX64.fullmatch(value["preservation_sha256"]):
+                raise DeliveryError("RECOVERY_REQUIRED", "Preservation generation binding is invalid")
+        if (set(value) != fields or type(value.get("schema")) is not int or value["schema"] not in (1, 2, 3)
                 or any(not valid_identity_text(value.get(name)) for name in strings)
                 or value["kind"] != "delivery_workflow" or value["task"] != self.task
                 or value["scope"] != self.scope or value["generation"] != self.generation
@@ -546,6 +565,12 @@ class Workflow:
                       "baseline": baseline, "kit_digest": kit, "repository": repository, "phase": phase,
                       "pr_number": None, "target": None, "merge_head": None, "guard_key": None,
                       "local_key": None, "checks_digest": None, "apply_base": None}
+        self.preservation = getattr(self.args, "_preservation", None)
+        if self.preservation is not None:
+            self.preservation.verify(self.original, self.branch)
+            self.preservation.check_target(source, source_head)
+            self.preservation.write(self.directory / "preservation.json")
+            self.state.update(schema=3, preservation_sha256=self.preservation.digest)
         self.validate_state(self.state)
         write_journal(self.directory, self.state, first=True)
         self.assert_context()
@@ -562,8 +587,12 @@ class Workflow:
         self.state = value
 
     def snapshot(self):
+        if self.state is not None and self.state.get("schema") == 3:
+            self.preservation = UntrackedPreservation.load(self.directory / "preservation.json",
+                                                         self.state["preservation_sha256"])
         return snapshot(self.original, self.branch,
-                        expected_layout=self.state.get("original_layout", "ordinary"))
+                        expected_layout=self.state.get("original_layout", "ordinary"),
+                        preservation=self.preservation)
 
     def assert_state(self):
         self.assert_context()
@@ -574,6 +603,9 @@ class Workflow:
     def facts(self):
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
                  "checkout": str(self.original), "source_head": self.state["source_head"]}
+        if self.preservation is not None:
+            facts["preservation_sha256"] = self.preservation.digest
+            facts["preserved_entries"] = sum(k != 'a' for _, k, _ in self.preservation.data['entries'])
         overrides = self.target_overrides()
         if overrides:
             facts["target_policy_overrides"] = overrides
@@ -924,9 +956,35 @@ def source_inputs(args):
     branch = git_value(source, "symbolic-ref", "--quiet", "--short", "HEAD")
     if branch == args.original_branch or snapshot(source, branch) != source_head:
         raise DeliveryError("BLOCKED_POLICY", "Source branch or reviewed HEAD changed", code=2)
-    if snapshot(original, args.original_branch) != baseline:
+    manifest, digest = getattr(args, "preserve_untracked_manifest", None), getattr(args, "preservation_sha256", None)
+    preservation = None
+    if manifest is not None or digest is not None:
+        if manifest is None or digest is None or getattr(args, "local_only", False):
+            raise DeliveryError("BLOCKED_POLICY", "Preservation requires a manifest and digest in remote mode", code=2)
+        preservation = UntrackedPreservation.load(manifest, digest)
+        if not preservation.binds(original, args.original_branch, baseline, source, source_head):
+            raise DeliveryError("BLOCKED_POLICY", "Preservation scope binding changed", code=2)
+        if require_safe_source(source, git_environment(), timeout=15) != preservation.data['source_layout']:
+            raise DeliveryError("BLOCKED_POLICY", "Preservation source layout changed", code=2)
+        preservation.check_target(source, source_head)
+    args._preservation = preservation
+    if snapshot(original, args.original_branch, preservation=preservation) != baseline:
         raise DeliveryError("BLOCKED_LOCAL", "Original checkout changed since scope capture")
     return source, branch, source_head, baseline, kit_digest(args.kit_file)
+
+
+def inventory(args):
+    original, source = args.original.expanduser().absolute(), args.source.expanduser().absolute()
+    head, base = valid_oid(args.expected_source_head), valid_oid(args.expected_original_head)
+    branch = git_value(source, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if original == source or branch == args.original_branch or snapshot(source, branch) != head:
+        raise DeliveryError("BLOCKED_POLICY", "Preservation source scope is invalid", code=2)
+    proof = UntrackedPreservation.capture(original, args.original_branch, base, source, head)
+    proof.write(args.out.expanduser().absolute())
+    report("INVENTORIED", "Private metadata inventory captured; no publication or checkout effect",
+           preservation_sha256=proof.digest,
+           preserved_entries=sum(k != 'a' for _, k, _ in proof.data['entries']))
+    return 0
 
 
 def verify_source(flow):
@@ -1304,7 +1362,8 @@ def prepare(args):
             if (state["source"] != str(source) or state["source_branch"] != branch
                     or state["source_head"] != head or state["baseline"] != baseline
                     or state["kit_digest"] != kit or (state["phase"] == "LOCAL_READY") != local_only
-                    or state["repository"] != repository):
+                    or state["repository"] != repository
+                    or state.get("preservation_sha256") != (args._preservation.digest if args._preservation else None)):
                 raise DeliveryError("BLOCKED_POLICY", "Prepared scope differs; explicitly request a new generation", code=2)
             # Prepare consumes source state, including its layout. A merged
             # remote recovery instead uses pinned remote/guard proof and may
@@ -1543,7 +1602,7 @@ def resume_remote_finish(flow, preparations, checks):
             or any(state[name] is None for name in ("target", "merge_head", "apply_base", "pr_number"))):
         raise recovery_error(flow, "Resume requires the exact pending remote transaction",
                              state["apply_base"] or state["baseline"])
-    with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
+    with OriginalScope(flow.original, flow.branch, args.timeout, preservation=flow.preservation) as scope:
         guard = scope.load_external(state["guard_key"], task_generation_digest(flow), create=False)
         if (guard.record["phase"] not in {"reserved", "applying"}
                 or guard.target != state["target"] or guard.base != state["apply_base"]
@@ -1624,7 +1683,7 @@ def remote_finish(flow, preparations, checks):
                              state["apply_base"])
     # Operator recovery accepts a baseline, never a delivery receipt.
     if state["phase"] == "REMOTE_APPLYING" and state["guard_key"] is not None:
-        with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
+        with OriginalScope(flow.original, flow.branch, args.timeout, preservation=flow.preservation) as scope:
             external_guard(flow, scope)
     repository, url = origin_destination(flow.original)
     if repository != state["repository"]:
@@ -1650,11 +1709,13 @@ def remote_finish(flow, preparations, checks):
     else:
         target = current_target
     fetch_target(flow, url, target)
+    if flow.preservation is not None:
+        flow.preservation.check_target(flow.original, target)
     if not ancestry(flow.original, merge_head, target):
         raise DeliveryError("BLOCKED_POLICY", "PR merge commit is absent from the remote target", code=2)
     verify_remote_descendant(flow, url, target, observed=current_target)
     digest, guard = checks_digest(preparations, checks), None
-    with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
+    with OriginalScope(flow.original, flow.branch, args.timeout, preservation=flow.preservation) as scope:
         try:
             current = flow.snapshot()
             if not ancestry(flow.original, state["baseline"], current) or not ancestry(flow.original, current, target):
@@ -1816,6 +1877,8 @@ def finish(args):
         state = flow.load()
         if state is None:
             raise DeliveryError("BLOCKED_POLICY", "Prepared generation is missing", code=2)
+        if flow.preservation is not None and (args.mode != "remote" or args.resolve_baseline is not None):
+            raise DeliveryError("BLOCKED_POLICY", "Preserved generations support remote finish only", code=2)
         if args.kit_file is not None and kit_digest(args.kit_file) != state["kit_digest"]:
             raise DeliveryError("BLOCKED_POLICY", "Run kit changed since prepare", code=2)
         if args.resolve_baseline is not None:
@@ -1942,6 +2005,14 @@ def reconcile(args):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="phase", required=True)
+    inv = sub.add_parser("inventory", help="Capture a private metadata-only preservation inventory")
+    inv.add_argument("--original", type=Path, required=True)
+    inv.add_argument("--original-branch", required=True)
+    inv.add_argument("--expected-original-head", required=True)
+    inv.add_argument("--source", type=Path, required=True)
+    inv.add_argument("--expected-source-head", required=True)
+    inv.add_argument("--out", type=Path, required=True)
+    inv.set_defaults(timeout=15)
     for name in ("prepare", "finish"):
         part = sub.add_parser(name)
         part.add_argument("--task", required=True, help="Stable owner task name; state is checkout-scoped")
@@ -1953,6 +2024,9 @@ def parse_args():
         part.add_argument("--timeout", type=int, default=120, help="Seconds for each Git and GitHub command")
     prep = sub.choices["prepare"]
     prep.add_argument("--source", type=Path)
+    prep.add_argument("--preserve-untracked-manifest", type=Path,
+                      help="Explicit private inventory; requires its exact digest and remote delivery")
+    prep.add_argument("--preservation-sha256")
     prep.add_argument("--expected-source-head")
     prep.add_argument("--expected-original-head")
     prep.add_argument("--pr-title")
@@ -2019,6 +2093,8 @@ def main():
     try:
         if unsupported_git_environment(os.environ, ALLOWED_GIT_ENV):
             raise DeliveryError("BLOCKED_POLICY", "Unsupported Git routing environment", code=2)
+        if args.phase == "inventory":
+            return inventory(args)
         return prepare(args) if args.phase == "prepare" else finish(args)
     except DeliveryError as error:
         report(error.status, error.message, **error.facts)

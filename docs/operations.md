@@ -1,5 +1,25 @@
 # Operations and safety boundaries
 
+## Explicit untracked preservation during remote delivery
+
+Ordinary delivery still requires a clean original checkout. When known local files must remain there, a reviewed remote delivery may explicitly use a private metadata inventory. This is a separate admission path, not an ignore rule or a dirty-check waiver. It never moves, copies, stashes or deletes user entries and never opens their regular-file contents or reads symlink targets.
+
+First capture the original's current state, binding the exact original branch/baseline and source HEAD:
+
+```sh
+python3 ~/.codex/agent-harness/deliver.py inventory --original /absolute/original --original-branch main --expected-original-head FULL_BASE --source /absolute/feature --expected-source-head FULL_HEAD --out /private/task/preservation.json
+```
+
+The output contains the digest and count, not private paths. The destination's parent must be owned mode0700 and the new file is created mode0600. Pass both `--preserve-untracked-manifest /private/task/preservation.json` and `--preservation-sha256 EXACT_DIGEST` to normal `prepare`; all other source, expected-HEAD, run-kit, PR and policy arguments remain required. `finish --mode remote` uses the immutable generation copy. An altered manifest, changed inventory or mismatched source/layout cannot be automatically recaptured. Local finish and baseline resolution are unsupported for preserved generations and refuse.
+
+The fixed policy includes ignored files, opaque directory descendants and empty directories. Limits are4096 preserved entries,20000 visited entries,24 levels,2MB path metadata,8MB manifest and15seconds per metadata scan. Only closed ASCII relative paths are admitted; unsupported Unicode/platform semantics refuse. Untracked Git control files in a shared tracked directory are refused before a later Git status could interpret their unknown contents. Symlinks, special files, cross-device paths, unowned or writable-by-others ancestry, multiply-linked regular files and unknown additions refuse. Do not put an inventory inside the original checkout: that would itself change the captured entry set.
+
+A shared tracked directory is valid: untracked `dir/foo` can remain while tracked `dir/bar` arrives. A target blob or symlink replacing `dir`, a target at `dir/foo`, or target content entering a wholly untracked preserved subtree refuses. A noncolliding untracked empty directory remains empty. Conservative case comparisons and both the reviewed source tree and eventual fetched merged target are checked, and Git's `--no-overwrite-ignore`/`--no-autostash` safeguards remain active. A downstream Git refusal is evidence of that layer, not proof of an earlier collision guard.
+
+Preserved generations use delivery journal schema3; strict schema1/2 generations retain their rules. The lower external-apply record includes the same inventory digest in its key and independently validates the typed proof at reservation, completion and recovery. A mismatched or changed proof keeps recovery pending; it never permits local fallback or journal deletion. Older executables must refuse unsupported preserved state. Roll forward with the reviewed compatible helper rather than removing state.
+
+These checks retain the cooperative-local-account threat model: participating delivery processes serialize on their existing lock, and repeated checks detect inspected metadata drift. They do not cryptographically attest unknown contents or atomically exclude a malicious same-UID writer or a mutation fully reverted between checks. Keep nonparticipating editors quiescent during delivery. Detected post-effect drift remains a recovery condition; the helper does not roll user files back automatically. Final checks run in the actual checkout and cannot create untracked byproducts without failing inventory equality.
+
 ## Sparse native delivery
 
 Native delivery supports expanded Git indexes in canonical cone sparse checkouts, and a bounded positive anchored non-cone subset: literal files, trailing-slash directories, and final-component `*.extension` selections. Other non-cone syntax, sparse-directory indexes, malformed settings, unsupported Git `sparse-checkout check-rules` capability, and unverifiable state refuse before publication. This does not change separate review snapshot isolation rules.
