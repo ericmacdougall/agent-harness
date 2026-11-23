@@ -1024,6 +1024,43 @@ def gate_metadata(sidecar):
 
 
 # ----------------------------------------------------------------------------------------------------------
+# A record over the chunk maximum (TRANSCRIPTS_CHUNK_MAX_BYTES) can never be archived whole, so it is a
+# record-level omission with this kind, counted as an incident in the receipt, check and status. It is never a
+# hold: no retry can make it fit (triage of PR #316 at 79d55675).
+OVERSIZE = 'oversize'
+
+
+def oversize_record(line_no, src_len):
+    """The omitted-record line, in transcript_redact's own format ({"_archive":"omitted",...})."""
+    return json.dumps({'_archive': 'omitted', 'reason': OVERSIZE, 'line': int(line_no), 'src_len': int(src_len)},
+                      separators=(',', ':')).encode('ascii')
+
+
+def line_end(f, read, room):
+    """Bytes in the record that starts `read` bytes before f's position, newline included, or None when it has no
+    newline within `room` bytes (still being written). Reads in 1 MiB steps and keeps none of it."""
+    size = read
+    while size < room:
+        block = f.readline(min(1 << 20, room - size))
+        if not block:
+            return None
+        size += len(block)
+        if block.endswith(b'\n'):
+            return size
+    return None
+
+
+def hash_range(f, pos, size, h):
+    f.seek(pos)
+    left = size
+    while left:
+        block = f.read(min(1 << 20, left))
+        if not block:
+            raise OSError('source shrank while hashing an oversize record')
+        h.update(block)
+        left -= len(block)
+
+
 # Hold state: the one owner (gate F1, PR #316). Only hold(), begin_retry() and release() write e['held'];
 # tests.test_transcripts.HoldOwnerTests guards that. Every hold carries a retry rule (exponential backoff,
 # and at once after a ruleset change), and any held file keeps the run status off "ok".
@@ -1438,18 +1475,24 @@ class Run:
             if not line:
                 break
             if not line.endswith(b'\n'):
-                if len(line) > cfg.chunk_max:
-                    hold(cfg, e, 'record-over-max', line_no + 1)
-                break  # partial last line waits for the next run (NEG-7)
-            if pos + len(line) > snap:
-                break
-            line_no += 1
-            out, cnt, kind = tr.redact_line(line[:-1], line_no)
+                if len(line) <= cfg.chunk_max:
+                    break  # partial last line waits for the next run (NEG-7)
+                # A record over the maximum can never fit a chunk, so it is omitted, never held (holds are only for
+                # causes a retry can clear). Find its end without holding it in memory; an unterminated one waits.
+                size = line_end(f, len(line), snap - pos)
+                if size is None:
+                    break
+                line_no += 1
+                out, cnt, kind = oversize_record(line_no, size - 1), {}, OVERSIZE
+            else:
+                if pos + len(line) > snap:
+                    break
+                size = len(line)
+                line_no += 1
+                out, cnt, kind = tr.redact_line(line[:-1], line_no)
+                if len(out) + 1 > cfg.chunk_max:
+                    out, cnt, kind = oversize_record(line_no, size - 1), {}, OVERSIZE
             rec = out + b'\n'
-            if len(rec) > cfg.chunk_max:
-                hold(cfg, e, 'record-over-max', line_no)
-                line_no -= 1
-                break
             if buf and buf_bytes + len(rec) > cfg.chunk_max:
                 self.seal(e, g, key, buf, start, pos, src_h, acc, redactions, omitted, fst)
                 buf, buf_bytes, start = [], 0, pos
@@ -1458,8 +1501,11 @@ class Run:
                 redactions, omitted = {}, []
             buf.append(rec)
             buf_bytes += len(rec)
-            src_h.update(line)
-            pos += len(line)
+            if size == len(line):
+                src_h.update(line)
+            else:
+                hash_range(f, pos, size, src_h)  # the chunk's source hash still covers every byte of the record
+            pos += size  # hash_range leaves f at pos + size as readline does
             counts[0] += 1
             self.records += 1
             for k, v in cnt.items():
@@ -1467,7 +1513,8 @@ class Run:
             if kind:
                 omitted.append({'line': line_no, 'kind': kind})
                 self.omitted.append((key, kind))
-                counts[1] += 1
+                if kind != OVERSIZE:
+                    counts[1] += 1  # an oversize record is an incident, not a redaction failure: no cap counts it
             record_meta(out, acc)
         if buf:
             src_bytes = pos - start
@@ -1479,7 +1526,7 @@ class Run:
                 # the unsealed delta waits; its records were not archived
                 counts[0] -= len(buf)
                 self.records -= len(buf)
-                counts[1] -= len(omitted)
+                counts[1] -= sum(1 for o in omitted if o['kind'] != OVERSIZE)
                 for o in omitted:
                     self.omitted.remove((key, o['kind']))
                 if not e.get('pending_since'):
@@ -1531,7 +1578,8 @@ class Run:
              'zsha256': sidecar['zsha256'], 'src_sha256': sidecar['src_sha256'], 'src': [start, end],
              'line_start': line_start, 'records': len(buf), 'bytes': len(data), 'zbytes': len(zdata),
              'chain_sha256': chain, 'prev_chain': g['chain'], 'prev': sidecar['prev'],
-             'omitted': len(omitted), 'month': datetime.now(timezone.utc).strftime('%Y-%m'), 'run': self.id}
+             'omitted': len(omitted), 'oversize': sum(1 for o in omitted if o['kind'] == OVERSIZE),
+             'month': datetime.now(timezone.utc).strftime('%Y-%m'), 'run': self.id}
         zp, mp, rp = self.outbox_paths(c)
         atomic_write(zp, zdata)
         atomic_write(mp, meta_bytes)
@@ -1936,6 +1984,16 @@ def held_of(st):
     return out
 
 
+def incidents_of(st):
+    """Never-retriable causes recorded as record-level omissions instead of holds, over every archived chunk."""
+    oversize = 0
+    for e in st['files'].values():
+        for g in e['gens']:
+            for c in g['chunks']:
+                oversize += c.get('oversize') or 0
+    return {'oversize_records': oversize}
+
+
 def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
     st = run.st if run else load_state(cfg)
     by_kind = {}
@@ -1954,6 +2012,7 @@ def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
         'shard_commits': run.shard_commits if run else {}, 'catalog_commit': run.catalog_commit if run else None,
         'omitted': {'total': len(run.omitted) if run else 0, 'by_kind': by_kind,
                     'records_processed': run.records if run else 0},
+        'incidents': incidents_of(st),
         'collisions': run.collisions if run else 0,
         'last_progress_at': st.get('last_progress_at') or st.get('created_at'),
         'killswitch': os.path.exists(cfg.p('killswitch.json')), 'notes': run.notes if run else [],
@@ -2016,7 +2075,7 @@ def check(cfg, max_age_min=60):
         status = 'unconfigured'
     return code, {'status': status, 'last_ok_at': lastok.get('finished_at') if lastok else None,
                   'age_min': round(age, 1) if age is not None else None, 'reasons': reasons, 'exit': code,
-                  'held': held}
+                  'held': held, 'incidents': (last or {}).get('incidents') or {'oversize_records': 0}}
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -2768,7 +2827,8 @@ def cmd_status(cfg, a):
         pass
     code, chk = check(cfg)
     out = {'host': cfg.host, 'files': len(st['files']), 'chunks': chunks, 'pushed': pushed, 'staged': staged,
-           'omitted_records': omitted, 'backlog': backlog_of(cfg, st), 'held': held_of(st),
+           'omitted_records': omitted, 'incidents': incidents_of(st), 'backlog': backlog_of(cfg, st),
+           'held': held_of(st),
            'shards': st['shards'], 'catalog_commit': st.get('catalog_commit'),
            'killswitch': read_json(cfg.p('killswitch.json')), 'waivers': waivers, 'check': chk,
            'recovery_truth': RECOVERY_TRUTH}
@@ -2839,8 +2899,9 @@ def main(argv=None):
     try:
         if a.cmd == 'check':
             code, out = check(cfg, a.max_age_min)
-            print(json.dumps(out, sort_keys=True) if a.json else '%s: %s' % (out['status'], '; '.join(
-                out['reasons']) or 'fresh ok receipt'))
+            note = ''.join('; incident %s=%d' % kv for kv in sorted(out['incidents'].items()) if kv[1])
+            print(json.dumps(out, sort_keys=True) if a.json else '%s: %s%s' % (out['status'], '; '.join(
+                out['reasons']) or 'fresh ok receipt', note))
             return code
         if a.cmd == 'sync':
             if a.background and not a.dry_run:

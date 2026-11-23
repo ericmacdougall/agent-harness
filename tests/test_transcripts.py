@@ -170,17 +170,78 @@ class ChunkTests(L.Base):
             joined += b
         self.assertEqual(joined, data)
 
-    def test_record_over_max_is_held(self):
+    def test_record_over_max_is_omitted_not_held(self):
+        """Triage of PR #316 at 79d55675: a record over the maximum can never fit a chunk, so a hold for it would
+        never clear and would fail every check and deliver. It is a record-level omission and an incident count,
+        the file keeps archiving and the check stays ok."""
         self.setenv(TRANSCRIPTS_CHUNK_MAX_BYTES=4096)
-        data = lines(3) + rec(3, text='z' * 5000) + lines(3, start=4)
+        big = rec(3, text='z' * 5000)
+        data = lines(3) + big + lines(3, start=4)
         self.write('claude-projects', 'p/%s.jsonl' % UUID1, data)
         code, r = self.sync('pr')
-        self.assertEqual(r['held'][0]['reason'], 'record-over-max')
-        self.assertEqual(r['held'][0]['line'], 4)
-        code, out = self.main('check', '--json')  # first run held a file, so no ok receipt yet: never-ok (3)
-        self.assertEqual(code, 3)
-        self.assertEqual(json.loads(out)['held'], {'count': 1, 'by_reason': {'record-over-max': 1}})
-        self.assertEqual(b''.join(self.chunk_bytes(p) for p in sorted(self.chunks())), lines(3))
+        self.assertEqual(code, 0, r)
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['held'], [])
+        self.assertEqual(r['omitted']['by_kind'], {'oversize': 1})
+        self.assertEqual(r['incidents'], {'oversize_records': 1})
+        marker = {'_archive': 'omitted', 'reason': 'oversize', 'line': 4, 'src_len': len(big) - 1}
+        archived = b''.join(self.chunk_bytes(p) for p in sorted(self.chunks()))
+        self.assertEqual(archived, lines(3) + json.dumps(marker, separators=(',', ':')).encode() + b'\n'
+                         + lines(3, start=4))
+        self.assertTrue(all(e['stat'] for e in self.state()['files'].values()))  # visited whole, nothing waits
+        code, out = self.main('check', '--json')
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)['held'], {'count': 0, 'by_reason': {}})
+        self.assertEqual(json.loads(out)['incidents'], {'oversize_records': 1})
+        code, out = self.main('check')
+        self.assertEqual(code, 0)
+        self.assertIn('incident oversize_records=1', out)
+        code, out = self.main('status')
+        self.assertEqual(json.loads(out)['incidents'], {'oversize_records': 1})
+
+    def test_record_one_byte_over_max_is_omitted(self):
+        """The other branch: the record and its newline fit one read, but the record is over the maximum."""
+        body = lines(1)
+        self.setenv(TRANSCRIPTS_CHUNK_MAX_BYTES=len(body) - 1)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, body)
+        code, r = self.sync('pr')
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['held'], [])
+        self.assertEqual(r['incidents'], {'oversize_records': 1})
+
+    def test_unterminated_record_over_max_waits_and_is_never_held(self):
+        """A record over the maximum that is still being written waits for its newline (NEG-7), with no hold;
+        once complete it is omitted and the records after it are archived."""
+        self.setenv(TRANSCRIPTS_CHUNK_MAX_BYTES=4096)
+        big = rec(2, text='y' * 6000)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(2) + big[:-1])
+        code, r = self.sync('pr')
+        self.assertEqual(r['held'], [])
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['incidents'], {'oversize_records': 0})
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(2) + big + lines(2, start=3))
+        code, r = self.sync('pr')
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['incidents'], {'oversize_records': 1})
+        archived = b''.join(self.chunk_bytes(p) for p in sorted(self.chunks()))
+        self.assertTrue(archived.startswith(lines(2)))
+        self.assertTrue(archived.endswith(lines(2, start=3)))
+        self.assertNotIn(b'yyyy', archived)
+
+    def test_oversize_records_never_trip_the_omission_cap(self):
+        """10 of 100 records over the maximum would be 10 %, over the 5 % per-file rule, if they counted: they
+        are incidents, not redaction failures, so the file is archived and not held."""
+        self.setenv(TRANSCRIPTS_CHUNK_MAX_BYTES=4096)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1,
+                   b''.join(rec(i, text='z' * 5000 if i % 10 == 0 else None) for i in range(100)))
+        code, r = self.sync('pr')
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r['held'], [])
+        self.assertEqual(r['incidents'], {'oversize_records': 10})
+
+    def test_oversize_marker_matches_the_redactor_format(self):
+        import transcript_redact
+        self.assertEqual(T.oversize_record(4, 10), transcript_redact._omitted(b'x' * 10, 4, 'oversize'))
 
     def test_chunk_names_carry_timestamps(self):
         data = (rec(0, ts='2026-11-01T10:00:00.123+02:00') + rec(1, ts='2026-11-03T23:59:59Z')
@@ -1078,16 +1139,16 @@ class HoldOwnerTests(L.Base):
         code, r = self.sync('pr')
         self.assertTrue(r['ok'], r)
         ok_before = self.receipt('last-ok.json')
-        self.setenv(TRANSCRIPTS_CHUNK_MAX_BYTES=4096)
-        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(2) + rec(2, text='z' * 5000))
-        code, r = self.sync('pr')
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        with mock.patch.object(T.Run, 'chunk_delta', side_effect=OSError('injected')):  # a retriable cause
+            code, r = self.sync('pr')
         self.assertEqual(r['status'], 'held')
         self.assertFalse(r['ok'])
         self.assertEqual(code, 2)
         self.assertEqual(self.receipt('last-ok.json'), ok_before)  # a held run never refreshes last-ok
         code, out = self.main('check', '--json')
         self.assertEqual(code, 2)
-        self.assertEqual(json.loads(out)['held'], {'count': 1, 'by_reason': {'record-over-max': 1}})
+        self.assertEqual(json.loads(out)['held'], {'count': 1, 'by_reason': {'error:OSError': 1}})
         code, out = self.main('check')
         self.assertIn('held=1', out)
 

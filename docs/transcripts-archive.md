@@ -70,8 +70,10 @@ transcripts.py ensure-repos --host H --months YYYY-MM[,YYYY-MM] [--parts N]
   - `1` stale: the last ok receipt is older than `--max-age-min`.
   - `0` ok.
 
-  `--json` prints `{status, last_ok_at, age_min, reasons, exit, held}`, where `held` is
+  `--json` prints `{status, last_ok_at, age_min, reasons, exit, held, incidents}`, where `held` is
   `{count, by_reason}` from the last receipt. Any held file adds a `held=N (reason=n, ...)` reason and exit 2.
+  `incidents` is `{oversize_records}`, the records omitted over the maximum in every archived chunk; it never
+  changes the exit code, and the plain output appends `incident oversize_records=N` when it is not zero.
 - **find** prints one JSON line per matching source file (host, source, relpath, session, parent, project, chunks,
   first/last ts, gens). `--session` also matches subagents whose parent is that session.
 - **cat** streams the latest generation of a session from git, verifying every chunk before writing it.
@@ -138,7 +140,11 @@ Otherwise the new path is archived as a new file.
 - the checkpoint (or a served request) is `pr`, `deploy` or `takeover`.
 
 Otherwise it waits, and `pending_since` is recorded; a delta pending over 2 h is reported as backlog. A partial
-last line always waits. A single record over 48 MiB holds the file, and `check` exits 2.
+last line always waits. A single record over 48 MiB can never fit a chunk, so it is not a hold: it is archived
+as the record-level omission `{"_archive":"omitted","reason":"oversize","line":N,"src_len":L}`, the chunk's
+source hash still covers its bytes, and the receipt, `check` and `status` count it under
+`incidents.oversize_records`. Oversize omissions do not count toward the omission cap. A record over the maximum
+that has no newline yet waits like any partial line, without a hold.
 
 A file's delta is capped at 256 MiB per visit. The redaction pass runs at roughly 1 to 2 s per MB, so the
 checkpoint budget is enforced between records. When the budget runs out, the records gathered so far follow the
@@ -149,6 +155,12 @@ small-chunk rule.
 Each record goes through `transcript_redact.redact_line` (pass 1 redaction, then the independent pass 2 verifier).
 A record that still trips pass 2, or that raises, is replaced by an omitted marker. Its `{line, kind}` is listed in
 the sidecar and counted in the receipt. The file keeps archiving.
+
+No keyword rule runs on transformed text. A run of 1000 or more base64-alphabet characters is collapsed to
+`[OMITTED:base64:<len>:<sha12>]` only after the raw keyword scan, the normalized keyword scan and a pass 2 check
+have seen it intact, and a keyword span that ends inside such a run is extended to the run's end. Collapsing a
+run therefore never removes the key word that ends it (`<1000-char name>_secret: V`), and a value cut at its
+rule's length limit leaves no tail.
 
 Mapping metadata (cwd, models, mentions, session ids) is taken from the redacted bytes only. Each sidecar is itself
 run through the verifier before it is pushed: a field that trips it is dropped and `metadata_dropped` is set.
@@ -168,6 +180,10 @@ The run-level 0.5 % rule applies only when the run processed 1000 or more record
 applies only to files with 100 or more records in the run.
 
 ### Failures and holds
+
+Holds are only for causes a retry can clear: a raised chunking error, a refusal, the omission cap (cleared by a
+rules change or by the cause going away) and a collision (an integrity alarm that is re-checked when due). A
+cause no retry can clear (a record over the maximum) is a recorded record-level omission instead.
 
 One set of functions in `transcripts.py` (`hold`, `hold_due`, `begin_retry`, `release`) is the only writer of a
 file's hold state; a guard test fails if anything else writes it. Every hold carries `since`, `attempts` and
@@ -327,7 +343,7 @@ until it is pushed. The test suite injects a hard crash after each step.
 - `receipts/last.json` is written by every run that took the lock; `last-ok.json` only when ok. Fields: host,
   checkpoint, served_checkpoints, started/finished, ok, status (`ok|held|failed|refused|omission-cap|disk-low|
   killswitch|deferred`), files scanned/changed, chunks staged/pushed, bytes, held (source label, path sha12,
-  reason, line, since, attempts, retry_at), backlog, shard commits, catalog commit, omitted {total, by_kind, records_processed}, collisions,
+  reason, line, since, attempts, retry_at), backlog, shard commits, catalog commit, omitted {total, by_kind, records_processed}, incidents {oversize_records}, collisions,
   last_progress_at, killswitch, notes and error. `sync` exits 0 when the receipt is ok and 2 otherwise.
 
   Receipts, alerts and logs never carry a source value: only kinds, counts, line numbers and path sha12.
