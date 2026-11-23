@@ -23,6 +23,10 @@ F2 = "Hy5T" + "k8Pw3Rn6" + "Qd2Ls9Mx4"
 F3 = "Ue7G" + "j4Vc1Bz8" + "Wo6Ia3Sf5"
 ANT = "sk-" + "ant-" + "api03-" + "Z" * 12 + F
 ANT_BODY = "api03-" + "Z" * 12 + F
+# Column-aligned assignments: 9 to 100 spaces or tabs around the separator.
+ALIGNED = ["password" + " " * 9 + "= " + F, "password =" + " " * 9 + F, "DB_PASSWORD" + " " * 20 + "= \"" + F + "\"",
+           "api_key:" + " " * 12 + F, "client_secret\t\t\t\t\t\t\t\t\t\t= " + F, "secret" + " " * 100 + ": " + F,
+           "PGPASSWORD" + " " * 12 + "= " + F, "Authorization:" + " " * 12 + F]
 
 
 def run(obj_or_text, line_no=1):
@@ -217,6 +221,15 @@ class TextShapes(unittest.TestCase):
                 self.assertIsNone(omitted)
                 self.assertFalse(leaks(out, F))
 
+    def test_aligned_assignments_are_redacted(self):
+        """Delta gate on PR #316: _NAMED replaced redact.py's named-credential shape, whose separator whitespace is
+        unbounded; column-aligned config (.env, TOML, YAML, INI) put 9+ spaces around = or : and leaked."""
+        for i, text in enumerate(ALIGNED):
+            with self.subTest(case=i):
+                out, _, omitted = run(text)
+                self.assertIsNone(omitted)
+                self.assertFalse(leaks(out, F))
+
     def test_psql_port_is_not_redacted(self):
         out, _, _ = run("psql -h db -p 5432 -U app")
         self.assertTrue(b"-p 5432" in out)
@@ -383,6 +396,16 @@ class Pass2AndFailClosed(unittest.TestCase):
         self.assertEqual(rec["reason"], omitted)
         self.assertEqual(rec["src_len"], len(("note " + ANT).encode()))
         self.assertEqual(sorted(rec), ["_archive", "line", "reason", "src_len"])  # no hash of the record
+
+    def test_pass2_catches_aligned_assignments(self):
+        """Delta gate on PR #316: column-aligned config (more than 4 spaces around = or :) must not slip past the
+        verifier when pass 1 misses it."""
+        tr._pass1 = lambda line: (line, {})
+        for i, text in enumerate(ALIGNED[:-1]):  # pass 2 has no authorization-header rule (pass 1 only)
+            with self.subTest(case=i):
+                out, _, omitted = tr.redact_line(json.dumps({"t": text}).encode(), 3)
+                self.assertIsNotNone(omitted)
+                self.assertFalse(leaks(out, F))
 
     def test_pass2_catches_marker_abutting_value(self):
         tr._pass1 = lambda line: (line, {})

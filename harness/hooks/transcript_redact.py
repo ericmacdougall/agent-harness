@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.23-1"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.23-2"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2; read only by _decode_nested
 _MAX_QUOTED_LAYERS = 64  # at the limit, quoted JSON-string layers unwrapped while looking for an object or array
@@ -113,9 +113,16 @@ _VAL = r'(?:[^\s\x22\x27,;}\\]|\\(?![\x22\x27\\]))'  # a value char; a backslash
 _KW = (r'(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|'
        r'client[_-]?secret)')
 
+# Whitespace allowed on each side of a key's separator, in both passes. Column-aligned config (.env, TOML, YAML,
+# INI) puts many spaces there, and redact.py's named-credential, which _NAMED replaces, allows any amount; a bound of
+# 8 leaked aligned values. Every rule using it starts at a literal key word, so each start still does bounded work.
+_SEP_WS = r'{0,256}'
+_WS = r'\s' + _SEP_WS
+_HWS = r'[ \t]' + _SEP_WS
+
 # Keyword rule added beside redact.py's named-credential: it also matches escaped quotes (\"password\": \"x\"),
 # replaces only the value, and allows values up to 4096 characters.
-_NAMED = re.compile(r'(?i)' + _KW + r'(?:[_-]value)?' + _Q + r'\s{0,8}[:=]\s{0,8}' + _Q + r'(?P<v>' + _VAL + r'{3,4096})')
+_NAMED = re.compile(r'(?i)' + _KW + r'(?:[_-]value)?' + _Q + _WS + r'[:=]' + _WS + _Q + r'(?P<v>' + _VAL + r'{3,4096})')
 
 def _imported_patterns():
     """redact.PATTERNS minus its first named-credential shape, which _NAMED supersedes: _NAMED covers the same key
@@ -172,9 +179,9 @@ _EXTRA = [
     # redact.py's bearer needs whitespace; pass 2 also accepts "bearer:" and "bearer=", so pass 1 must too.
     ('bearer', re.compile(r'(?i)bearer[ \t:=]{1,4}(?P<v>[A-Za-z0-9._~+/=-]{8,4096})')),
     ('auth-header', re.compile(
-        r'(?i)\b(?:proxy-)?authorization\b' + _Q + r'[ \t]{0,8}[:=][ \t]{0,8}' + _Q +
+        r'(?i)\b(?:proxy-)?authorization\b' + _Q + _HWS + r'[:=]' + _HWS + _Q +
         r'(?:(?:basic|bearer|token|digest|negotiate|ntlm|apikey)[ \t]{1,8})?(?P<v>[^\s\x22\x27\\,;]{1,4096})')),
-    ('cookie-header', re.compile(r'(?i)\b(?:set-)?cookie' + _Q + r'[ \t]{0,8}:[ \t]{0,8}(?P<v>[^\s;\x22\\]{1,4096}(?:;[ \t]{0,4}[^\s;\x22\\]{1,4096}){0,64};?)')),
+    ('cookie-header', re.compile(r'(?i)\b(?:set-)?cookie' + _Q + _HWS + r':' + _HWS + r'(?P<v>[^\s;\x22\\]{1,4096}(?:;[ \t]{0,4}[^\s;\x22\\]{1,4096}){0,64};?)')),
     ('userpass-flag', re.compile(
         r'(?<![^\s\x22\x27])(?:-u|--user)(?:[ \t]{1,8}|=)' + _Q + r'[^\s:\x22\x27\\]{1,256}:(?P<v>[^\s\x22\x27\\]{1,512})')),
     ('secret-flag', re.compile(
@@ -188,7 +195,7 @@ _EXTRA = [
     ('psql-password', re.compile(
         r'(?<=\s)-p[ \t]{0,8}(?P<v>(?![0-9]{1,5}(?![^\s\x22\x27]))(?!-)[^\s\x22\x27\\]{1,256})')),
     ('env-secret', re.compile(
-        r'(?i)(?:_PWD|\bPWD|PGPASSWORD|SECRET[_-]?KEY)[A-Za-z0-9_]{0,64}' + _Q + r'[ \t]{0,8}[:=][ \t]{0,8}' + _Q +
+        r'(?i)(?:_PWD|\bPWD|PGPASSWORD|SECRET[_-]?KEY)[A-Za-z0-9_]{0,64}' + _Q + _HWS + r'[:=]' + _HWS + _Q +
         r'(?P<v>' + _VAL + r'{1,4096})')),
     ('url-secret', re.compile(
         r'(?i)[?&;](?:x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature|x-goog-credential|'
@@ -671,6 +678,7 @@ def _pass1(line):
 # ----------------------------------------------------------------------------------------------------------
 
 _V2_MARK = r'(?:\[(?:REDACTED|OMITTED):[A-Za-z0-9:_.\-]{1,80}\])'
+_V2_WS = r'[ \t]{0,256}'  # separator whitespace: column-aligned config puts many spaces around = and :
 _V2 = [
     ('v2-anthropic', ('sk-ant-',), re.compile(r'sk-ant-[A-Za-z0-9_\-]{12,}')),
     ('v2-openai', ('sk-',), re.compile(r'(?<![A-Za-z0-9])sk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{24,}')),
@@ -688,7 +696,7 @@ _V2 = [
     ('v2-bearer', ('bearer',), re.compile(r'(?i)bearer[ \t:=]{1,4}(?=[A-Za-z0-9._~+/\-]{0,200}[0-9])[A-Za-z0-9._~+/\-]{16,}')),
     ('v2-keyword', ('passw', 'secret', 'api', 'access', 'auth', 'private'), re.compile(
         r'(?i)(?:passw(?:or)?d|secret|api[_\-]?key|access[_\-]?token|auth[_\-]?token|client[_\-]?secret|'
-        r'private[_\-]?key)["\']?[ \t]{0,4}[:=][ \t]{0,4}["\']?' + _V2_MARK + r'{0,4}'
+        r'private[_\-]?key)["\']?' + _V2_WS + r'[:=]' + _V2_WS + r'["\']?' + _V2_MARK + r'{0,4}'
         r'(?!(?:true|false|null)(?![A-Za-z0-9]))(?!-?[0-9][0-9.eE+\-]{0,64}(?![^\s"\'\[\],;{}]))'
         r'[^\s"\'\[\],;{}]{4,}')),  # a bare number is a kept JSON number; numbers under password keys are keyed
     ('v2-presigned', ('sig', 'x-amz-'), re.compile(
@@ -696,8 +704,8 @@ _V2 = [
         r'(?!\[)[^&\s"]{8,}')),
     ('v2-userpass', ('-u',), re.compile(r'(?<![^\s"\'])(?:-u|--user)[ \t=]{1,4}[^\s:"\']{1,64}:(?!\[)[^\s"\']{4,}')),
     ('v2-envpass', ('pgpassword', '_pwd', 'secret_key'), re.compile(
-        r'(?i)(?:pgpassword|_pwd|secret_key)[ \t]{0,4}=[ \t]{0,4}(?!\[)[^\s"\']{4,}')),
-    ('v2-cookie', ('cookie',), re.compile(r'(?i)cookie:[ \t]{0,4}(?!\[)[^=\s;"]{1,64}=[^;\s"]{8,}')),
+        r'(?i)(?:pgpassword|_pwd|secret_key)' + _V2_WS + r'=' + _V2_WS + r'(?!\[)[^\s"\']{4,}')),
+    ('v2-cookie', ('cookie',), re.compile(r'(?i)cookie:' + _V2_WS + r'(?!\[)[^=\s;"]{1,64}=[^;\s"]{8,}')),
 ]
 _V2_KEY_SUFFIX = ('password', 'passwd', 'secret', 'apikey', 'accesstoken', 'refreshtoken', 'authtoken',
                   'clientsecret', 'privatekey', 'sessiontoken', 'authorization', 'cookie')
