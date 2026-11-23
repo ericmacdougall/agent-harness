@@ -972,6 +972,29 @@ def _row_foreign_pack_parked(t):
     os.symlink(str(t.nm / 'p'), str(r / '.git/objects/pack'))
 
 
+def _row_foreign_fanout_parked_renamed(t):
+    t.nm = t.repo.path / 'node_modules'
+    t.nm.mkdir()
+    r = t.foreign()
+    objs = r / '.git/objects'
+    fan = sorted(d for d in os.listdir(str(objs)) if re.fullmatch(r'[0-9a-f]{2}', d))[0]
+    _move(objs / fan, t.nm / 'x')  # not a two-hex name inside TARGET
+    os.symlink(str(t.nm / 'x'), str(objs / fan))
+
+
+def _row_regression_core_worktree(t):
+    sh('git', 'config', 'core.worktree', str(t.wt), cwd=t.repo.path)
+
+
+def _row_regression_config_worktree(t):
+    sh('git', 'config', 'extensions.worktreeConfig', 'true', cwd=t.repo.path)
+    sh('git', 'config', '--worktree', 'core.worktree', str(t.repo.task / 'elsewhere'), cwd=t.wt)
+
+
+def _row_regression_core_bare(t):
+    sh('git', 'config', 'core.bare', 'true', cwd=t.repo.path)
+
+
 def _row_main_rebase_in_progress(t):
     (t.cd / 'rebase-merge').mkdir()
 
@@ -988,39 +1011,44 @@ def _row_regression_c1_commondir_inside_target(t):
     sh('git', 'read-tree', 'HEAD', cwd=path)
 
 
-# (name, builder, target 'linked' or 'main', regression-only)
+# (name, builder, target 'linked' or 'main', regression-only, the reason fragment the head refuses with)
 ESCAPES = [
-    ('d1a_symlinked_objects', _row_d1a_symlinked_objects, 'linked', False),
-    ('d1b_alternates', _row_d1b_alternates, 'linked', False),
-    ('relative_alternates', _row_relative_alternates, 'linked', False),
-    ('nested_alternates_chain', _row_nested_alternates_chain, 'linked', False),
-    ('d1c_symlinked_refs', _row_d1c_symlinked_refs, 'linked', False),
-    ('symlinked_packed_refs', _row_symlinked_packed_refs, 'linked', False),
-    ('symlinked_loose_object', _row_symlinked_loose_object, 'linked', False),
-    ('http_alternates', _row_http_alternates, 'linked', False),
-    ('config_include', _row_config_include, 'linked', False),
-    ('config_include_if', _row_config_include_if, 'linked', False),
-    ('mount_on_parent_store', _row_mount_on_parent_store, 'linked', False),
-    ('git_dir_parked_in_node_modules', _row_git_dir_parked_in_node_modules, 'linked', False),
-    ('worktree_rebase_in_progress', _row_worktree_rebase_in_progress, 'linked', False),
-    ('worktree_merge_in_progress', _row_worktree_merge_in_progress, 'linked', False),
-    ('worktree_rewritten_ref', _row_worktree_rewritten_ref, 'linked', False),
-    ('worktree_ref_write_in_flight', _row_worktree_ref_write_in_flight, 'linked', False),
-    ('unknown_common_entry', _row_unknown_common_entry, 'linked', False),
-    ('unknown_worktree_entry', _row_unknown_worktree_entry, 'linked', False),
-    ('regression_submodule_store_in_modules', _row_regression_submodule_store_in_modules, 'linked', True),
-    ('bare_store_in_node_modules', _row_bare_store_in_node_modules, 'main', False),
-    ('git_dir_parked_main', _row_git_dir_parked_main, 'main', False),
-    ('foreign_objects_parked', _row_foreign_objects_parked, 'main', False),
-    ('foreign_refs_parked', _row_foreign_refs_parked, 'main', False),
-    ('foreign_pack_parked', _row_foreign_pack_parked, 'main', False),
-    ('main_rebase_in_progress', _row_main_rebase_in_progress, 'main', False),
-    ('regression_c1_commondir_inside_target', _row_regression_c1_commondir_inside_target, 'main', True),
+    ('d1a_symlinked_objects', _row_d1a_symlinked_objects, 'linked', False, 'object store is not a plain directory'),
+    ('d1b_alternates', _row_d1b_alternates, 'linked', False, 'alternate object store is inside the path'),
+    ('relative_alternates', _row_relative_alternates, 'linked', False, 'alternate object store is inside the path'),
+    ('nested_alternates_chain', _row_nested_alternates_chain, 'linked', False, 'alternate object store is inside the path'),
+    ('d1c_symlinked_refs', _row_d1c_symlinked_refs, 'linked', False, 'git store entry is a symlink (refs)'),
+    ('symlinked_packed_refs', _row_symlinked_packed_refs, 'linked', False, 'git store entry is a symlink (packed-refs)'),
+    ('symlinked_loose_object', _row_symlinked_loose_object, 'linked', False, 'git store entry is a symlink'),
+    ('http_alternates', _row_http_alternates, 'linked', False, 'http-alternates'),
+    ('config_include', _row_config_include, 'linked', False, 'config includes another file'),
+    ('config_include_if', _row_config_include_if, 'linked', False, 'config includes another file'),
+    ('mount_on_parent_store', _row_mount_on_parent_store, 'linked', False, 'mount is at or under a git store'),
+    ('git_dir_parked_in_node_modules', _row_git_dir_parked_in_node_modules, 'linked', False, 'git store look-alike'),
+    ('worktree_rebase_in_progress', _row_worktree_rebase_in_progress, 'linked', False, 'in progress in the worktree (rebase-merge)'),
+    ('worktree_merge_in_progress', _row_worktree_merge_in_progress, 'linked', False, 'in progress in the worktree (MERGE_HEAD)'),
+    ('worktree_rewritten_ref', _row_worktree_rewritten_ref, 'linked', False, 'per-worktree refs'),
+    ('worktree_ref_write_in_flight', _row_worktree_ref_write_in_flight, 'linked', False, 'in progress in the worktree (HEAD.lock)'),
+    ('unknown_common_entry', _row_unknown_common_entry, 'linked', False, 'git directory has an unknown entry (frobnicate)'),
+    ('unknown_worktree_entry', _row_unknown_worktree_entry, 'linked', False, 'worktree git directory has an unknown entry'),
+    ('regression_submodule_store_in_modules', _row_regression_submodule_store_in_modules, 'linked', True, 'submodules'),
+    ('regression_core_worktree', _row_regression_core_worktree, 'linked', True, 'sets core.worktree'),
+    ('regression_config_worktree', _row_regression_config_worktree, 'linked', True, 'not the top of its git working tree'),
+    ('regression_core_bare', _row_regression_core_bare, 'linked', True, 'no main working tree'),
+    ('bare_store_in_node_modules', _row_bare_store_in_node_modules, 'main', False, 'git store look-alike'),
+    ('git_dir_parked_main', _row_git_dir_parked_main, 'main', False, 'git store look-alike'),
+    ('foreign_objects_parked', _row_foreign_objects_parked, 'main', False, 'loose git object'),
+    ('foreign_fanout_parked_renamed', _row_foreign_fanout_parked_renamed, 'main', False, 'loose git object'),
+    ('foreign_refs_parked', _row_foreign_refs_parked, 'main', False, 'git ref file'),
+    ('foreign_pack_parked', _row_foreign_pack_parked, 'main', False, 'git pack is inside the path'),
+    ('main_rebase_in_progress', _row_main_rebase_in_progress, 'main', False, 'git operation is in progress (rebase-merge)'),
+    ('regression_c1_commondir_inside_target', _row_regression_c1_commondir_inside_target, 'main', True,
+     'inside the path'),
 ]
 
 
 class FootprintEscapes(FootprintBase):
-    def check_escape(self, build, kind):
+    def check_escape(self, build, kind, fragment):
         if kind == 'main':
             sh('git', 'worktree', 'remove', str(self.wt), cwd=self.repo.path)
         target = str(self.wt if kind == 'linked' else self.repo.path)
@@ -1029,18 +1057,20 @@ class FootprintEscapes(FootprintBase):
         build(self)
         out = self.run_program(path=target)
         self.assertFalse(out['ok'], 'escape approved: %s' % out)
+        self.assertIn(fragment, out['reason'])  # refused by the rule meant for this escape, not a neighbour
         again = self.run_program(path=target, mode='recheck')
         self.assertFalse(again['ok'], 'escape approved at recheck: %s' % again)
+        self.assertIn(fragment, again['reason'])
 
 
-def _escape_test(build, kind):
+def _escape_test(build, kind, fragment):
     def test(self):
-        self.check_escape(build, kind)
+        self.check_escape(build, kind, fragment)
     return test
 
 
-for _name, _build, _kind, _reg in ESCAPES:
-    setattr(FootprintEscapes, 'test_escape_%s' % _name, _escape_test(_build, _kind))
+for _name, _build, _kind, _reg, _fragment in ESCAPES:
+    setattr(FootprintEscapes, 'test_escape_%s' % _name, _escape_test(_build, _kind, _fragment))
 
 
 class FootprintRecheck(FootprintBase):
@@ -1084,6 +1114,33 @@ class FootprintRecheck(FootprintBase):
 
 
 class FootprintGuards(FootprintBase):
+    def test_hostile_git_environment_does_not_steer_the_validator(self):
+        """The validator runs git with a fresh environment: GIT_DIR, GIT_OBJECT_DIRECTORY and friends in the caller's
+        environment reach neither the clean answer nor the refusal of an escape."""
+        decoy = self.home / 'decoy.git'
+        sh('git', 'init', '-q', '--bare', str(decoy))
+        hostile = {'GIT_DIR': str(decoy), 'GIT_COMMON_DIR': str(decoy), 'GIT_WORK_TREE': str(self.home),
+                   'GIT_OBJECT_DIRECTORY': str(decoy / 'objects'), 'GIT_INDEX_FILE': str(self.home / 'idx'),
+                   'GIT_ALTERNATE_OBJECT_DIRECTORIES': str(self.nm), 'GIT_CONFIG_PARAMETERS': "'core.worktree=/'",
+                   'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true'}
+        def hostile_run():
+            saved = {k: os.environ.get(k) for k in hostile}
+            os.environ.update(hostile)  # only around the validator run: the fixture's own git calls stay clean
+            try:
+                return self.run_program(path=str(self.wt))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+        clean = hostile_run()
+        self.assertTrue(clean['ok'], clean)
+        _row_d1a_symlinked_objects(self)
+        out = hostile_run()
+        self.assertFalse(out['ok'], out)
+        self.assertIn('object store is not a plain directory', out['reason'])
+
     def test_unknown_git_dir_entries_default_to_refused(self):
         """A name git might add tomorrow is refused until someone allow-lists it, in each store directory."""
         for where in (self.cd, self.gd, self.cd / 'objects', self.cd / 'objects/info'):

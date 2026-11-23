@@ -10049,7 +10049,6 @@ def store_scan():
         if here != TARGET and head is not None and head.is_file(follow_symlinks=False) and \
                 any(k in names for k in ('objects', 'refs', 'commondir', 'gitdir')):
             refuse('a git store look-alike is inside the path (%s)' % clean(rel))
-        fanout = FANOUT.fullmatch(os.path.basename(here)) is not None
         for entry in entries:
             count += 1
             if count % 512 == 0 and time.monotonic() > deadline:
@@ -10070,7 +10069,8 @@ def store_scan():
                 refuse('a packed-refs file is inside the path (%s)' % clean(rel))
             if name.endswith(('.pack', '.idx')) and head_bytes(entry.path, 4) in (b'PACK', b'\xfftOc'):
                 refuse('a git pack is inside the path (%s)' % clean(rel + '/' + name))
-            if fanout and LOOSE.fullmatch(name) and head_bytes(entry.path, 1) == b'\x78':
+            # any directory name: a foreign fan-out dir (objects/ab) may be symlinked here under another name
+            if LOOSE.fullmatch(name) and head_bytes(entry.path, 1) == b'\x78':
                 refuse('a loose git object is inside the path (%s)' % clean(rel))
             if refs_like and entry.stat(follow_symlinks=False).st_size in (40, 41, 64, 65) and \
                     REF_BODY.fullmatch(head_bytes(entry.path, 66) or b''):
