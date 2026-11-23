@@ -61,6 +61,15 @@ class FakeProbe:
     def table(self):
         return {pid: p["ppid"] for pid, p in self.procs.items()}
 
+    def comm_table(self):
+        return {pid: p["comm"] for pid, p in self.procs.items()}
+
+    def exe_path(self, pid):
+        return None  # lsof reports no txt path (T1 is unverified)
+
+    def txt_scan(self):
+        return {}
+
     def signal(self, pid, sig):
         self.sent.append((pid, sig))
         if sig == signal.SIGKILL or pid not in self.ignore_term:
@@ -1236,6 +1245,339 @@ class SessionScopeGuard(unittest.TestCase):
                 done = subprocess.run([sys.executable, "-I", str(Path(kg.__file__)), "hook"], input=body.encode(),
                                       capture_output=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
                 self.assertEqual(done.returncode, code, (extra, done.stderr[-300:]))
+
+
+# ---- takeover cleanup (goodqa#16441): session detection, desktop apps, stale helpers, dry run, exact identity
+
+ROW_2666_CMD = ("/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/157.0.8103.78/Helpers/"
+                "browser_crashpad_handler --monitor-self --monitor-self-annotation=ptype=crashpad-handler "
+                "--database=/Users/eric/Library/Application Support/Codex/Crashpad --annotation=plat=OS X")
+ROW_2666_COMM = ROW_2666_CMD.split(" --")[0]
+
+
+class SessionDetectionPaths(unittest.TestCase):
+    def test_the_refused_crashpad_handler_is_not_a_session_process(self):
+        self.assertFalse(ak.is_session_process(proc(64064, 1, cmd=ROW_2666_CMD, comm=ROW_2666_COMM)))
+
+    def test_real_session_processes_still_are(self):
+        self.assertTrue(ak.is_session_process(proc(1, cmd="claude", comm="claude")))
+        self.assertTrue(ak.is_session_process(proc(2, cmd="node /x/bin/claude --resume", comm="node")))
+        self.assertTrue(ak.is_session_process(proc(3, cmd="/usr/local/bin/codex exec foo", comm="/usr/local/bin/codex")))
+        self.assertTrue(ak.is_session_process(proc(4, cmd="node /opt/lib/codex serve", comm="node")))
+
+    def test_a_path_with_spaces_and_a_codex_word_in_the_directory_is_not_split(self):
+        cmd = "/Applications/Some Tool/Codex Helper/run --x"
+        self.assertFalse(ak.is_session_process(proc(5, 1, cmd=cmd, comm="/Applications/Some Tool/Codex Helper/run")))
+
+
+class AppBase(KillBase):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(ak, "PLATFORM", "darwin")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def app_proc(self, pid, comm, ppid=1, cmd=None, start="Thu Nov  5 17:00:00 2026"):
+        return proc(pid, ppid, cmd=cmd or comm + " --flag", comm=comm, start=start)
+
+
+class DesktopAppRefusal(AppBase):
+    CURRENT = ("/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/158.0.8127.37/Helpers/"
+               "browser_crashpad_handler")
+    MAIN = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+
+    def refused(self, comm, cmd=None):
+        p = self.app_proc(300, comm, cmd=cmd)
+        probe = self.base(p)
+        probe.cwds = {300: "/"}
+        out = self.run_kill(probe, [300], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+        self.assertIn("desktop app", out["results"][0]["detail"])
+        self.assertEqual(probe.sent, [])
+
+    def test_app_processes_are_refused_even_with_foreign(self):
+        for comm in (self.MAIN, "/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper",
+                     "/Applications/ChatGPT.app/Contents/Frameworks/Codex Helper (GPU).app/Contents/MacOS/Codex Helper (GPU)",
+                     self.CURRENT):
+            self.refused(comm)
+
+    def test_case_and_other_roots(self):
+        self.refused("/Users/eric/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+        self.refused("/tmp/chatgpt.app/Contents/MacOS/x")
+        self.refused("/Applications/CLAUDE.APP/Contents/MacOS/x")
+
+    def test_unversioned_claude_crashpad_and_disclaimer_stay_refused(self):
+        self.refused("/Applications/Claude.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler")
+        self.refused("/Applications/Claude.app/Contents/Helpers/disclaimer")
+
+    def test_a_verified_approval_still_lifts_the_reason(self):
+        info = proc(300, 1, cmd=self.MAIN, comm=self.MAIN)
+        self.assertIsNotNone(ak.refusal(info, ME, set(), None, None))
+        self.assertIsNone(ak.refusal(info, ME, set(), None, None, skip_approvable=True))
+        self.assertRegex("claude/codex desktop app process", ak.APPROVABLE)
+
+    def test_linux_comm_names_are_not_refused_by_the_path_rule(self):
+        with mock.patch.object(ak, "PLATFORM", "linux"):
+            info = proc(300, 1, cmd="/opt/chatgpt.app/x/run", comm="run")
+            self.assertIsNone(ak.refusal(info, ME, set(), None, None))
+
+
+class AgentHostAncestor(AppBase):
+    def test_an_mcp_server_under_a_desktop_app_is_protected(self):
+        main = self.app_proc(900, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", ppid=1,
+                             cmd="/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+        mcp = proc(901, 900, cmd="node /x/mcp-server.js", comm="node")
+        probe = self.base(main, mcp)
+        probe.cwds = {901: "/elsewhere/x"}
+        out = self.run_kill(probe, [901], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+        self.assertIn("MCP server", out["results"][0]["detail"])
+
+    def test_agent_host_is_a_session_process_or_a_desktop_app(self):
+        self.assertTrue(ak.is_agent_host(proc(1, cmd="claude", comm="claude")))
+        with mock.patch.object(ak, "PLATFORM", "darwin"):
+            self.assertTrue(ak.is_agent_host(proc(2, cmd="x", comm="/Applications/Claude.app/Contents/MacOS/Claude")))
+        self.assertFalse(ak.is_agent_host(proc(3, cmd="/usr/bin/sleep 3", comm="/usr/bin/sleep")))
+
+
+class StaleAppHelper(AppBase):
+    """A 157 crashpad handler whose app now runs 158: the one desktop-app process `ah kill --foreign` may stop."""
+    STALE_START = 1_700_000_000
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.home / "Applications"
+        fw = self.root / "ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions"
+        (fw / "158.0.8127.37").mkdir(parents=True)
+        self.link = fw / "Current"
+        self.link.symlink_to("158.0.8127.37")
+        self.set_current_mtime(self.STALE_START + 3600)
+        patch = mock.patch.object(ak, "APP_ROOT", str(self.root))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.comm = ("%s/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/157.0.8103.78/Helpers/"
+                     "browser_crashpad_handler" % self.root)
+
+    def set_current_mtime(self, epoch):
+        os.utime(self.link, (epoch, epoch), follow_symlinks=False)
+
+    def lstart(self, epoch):
+        return time.strftime("%a %b %e %H:%M:%S %Y", time.localtime(epoch))
+
+    def helper(self, pid=64064, ppid=1, epoch=None, comm=None, cmd=None):
+        comm = comm or self.comm
+        return self.app_proc(pid, comm, ppid=ppid, cmd=cmd or (comm + " --database=/x/Codex/Crashpad --annotation=plat=OS X"),
+                             start=self.lstart(self.STALE_START if epoch is None else epoch))
+
+    def probe(self, *extra):
+        probe = self.base(*extra)
+        probe.cwds = {64064: "/"}
+        return probe
+
+    def verdict(self, probe, pid=64064):
+        return self.run_kill(probe, [pid], foreign=True, dry_run=True)["results"][0]
+
+    def test_refused_without_foreign(self):
+        out = self.run_kill(self.probe(self.helper()), [64064], dry_run=True)["results"][0]
+        self.assertEqual(out["status"], "refused", out)
+
+    def test_would_stop_with_dry_run_and_foreign(self):
+        probe = self.probe(self.helper())
+        out = self.verdict(probe)
+        self.assertEqual(out["status"], "would-stop", out)
+        self.assertEqual(probe.sent, [])
+        self.assertEqual(self.notices, [], "a dry run raises no notice")
+
+    def test_stopped_with_foreign_and_a_high_notice_and_audit_field(self):
+        probe = self.probe(self.helper())
+        out = self.run_kill(probe, [64064], foreign=True)
+        self.assertEqual(out["results"][0]["status"], "exited", out)
+        self.assertEqual(self.notices[0]["severity"], "high")
+        self.assertTrue(any((r.get("stale_app_helper") or {}).get("ver") == "157.0.8103.78" for r in self.audit()),
+                        self.audit())
+
+    def test_it_is_foreign_even_when_its_cwd_is_in_the_callers_worktree(self):
+        probe = self.base(self.helper())
+        probe.cwds = {64064: "/work/here"}
+        out = self.run_kill(probe, [64064])
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+
+    def refuses(self, probe, pid=64064, why=None):
+        out = self.verdict(probe, pid)
+        self.assertEqual(out["status"], "refused", out)
+        self.assertIn(why or "desktop app", out["detail"])
+
+    def test_h1_comm_must_equal_the_argv_prefix(self):
+        self.refuses(self.probe(self.helper(cmd="/elsewhere/other --x")))
+        # an unbound argv is split on whitespace again, and its first word then names a codex path: still a refusal
+        self.refuses(self.probe(self.helper(cmd=self.comm + "x --y")), why="claude/codex")
+
+    def test_h2_only_allowlisted_helper_names_and_version_shapes(self):
+        for comm in (self.comm.replace("browser_crashpad_handler", "disclaimer"),
+                     self.comm.replace("157.0.8103.78", "x7"),
+                     self.comm.replace("Helpers/browser_crashpad_handler", "Helpers/Extra/browser_crashpad_handler")):
+            self.refuses(self.probe(self.helper(comm=comm)))
+
+    def test_h3_lsof_txt_must_agree_with_comm(self):
+        probe = self.probe(self.helper())
+        probe.exe_path = lambda pid: "/somewhere/else"
+        self.refuses(probe)
+        probe.exe_path = lambda pid: self.comm
+        self.assertEqual(self.verdict(probe)["status"], "would-stop")
+
+        def boom(pid):
+            raise ak.KillError("probe_failed", "lsof")
+        probe.exe_path = boom
+        self.refuses(probe)
+
+    def test_h4_current_must_name_a_different_existing_version(self):
+        probe = self.probe(self.helper())
+        for target in ("157.0.8103.78", "/abs", "..", "9.9.9", "158.0.8127.37/../x"):
+            self.link.unlink()
+            self.link.symlink_to(target)
+            self.set_current_mtime(self.STALE_START + 3600)
+            self.refuses(probe)
+        self.link.unlink()
+        self.refuses(probe)
+        self.link.symlink_to("158.0.8127.37")
+        self.set_current_mtime(self.STALE_START + 3600)
+        self.assertEqual(self.verdict(probe)["status"], "would-stop")
+
+    def test_h5_start_must_precede_the_current_swap_by_two_seconds(self):
+        probe = self.probe(self.helper())
+        self.set_current_mtime(self.STALE_START + 1)
+        self.refuses(probe)
+        self.set_current_mtime(self.STALE_START + 2)
+        self.assertEqual(self.verdict(probe)["status"], "would-stop")
+
+    def test_h6_a_bundle_process_started_before_the_helper_blocks(self):
+        main = "%s/ChatGPT.app/Contents/MacOS/ChatGPT" % self.root
+        early = self.app_proc(910, main, ppid=1, start=self.lstart(self.STALE_START - 5))
+        self.refuses(self.probe(self.helper(), early))
+        late = self.app_proc(910, main, ppid=1, start=self.lstart(self.STALE_START + 5000))
+        self.assertEqual(self.verdict(self.probe(self.helper(), late))["status"], "would-stop")
+
+    def test_h7_another_user_of_the_stale_version_blocks(self):
+        other = self.comm.replace("Helpers/browser_crashpad_handler", "Helpers/Other Thing")
+        self.refuses(self.probe(self.helper(), self.app_proc(911, other, ppid=1, start=self.lstart(self.STALE_START + 9000))))
+        probe = self.probe(self.helper(), proc(912, 1, cmd="/usr/bin/x", comm="/usr/bin/x"))
+        mapped = ("%s/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/157.0.8103.78/Libraries/x.dylib"
+                  % self.root)
+        probe.txt_scan = lambda: {912: [mapped]}
+        self.refuses(probe)
+
+    def test_h7_the_other_stale_crashpad_helper_does_not_block(self):
+        probe = self.probe(self.helper(), self.helper(pid=64066))
+        probe.cwds[64066] = "/"
+        self.assertEqual(self.verdict(probe)["status"], "would-stop")
+
+    def test_h8_ppid_must_be_one(self):
+        self.refuses(self.probe(self.helper(ppid=4000)))
+
+    def test_probe_failures_refuse(self):
+        probe = self.probe(self.helper())
+
+        def boom():
+            raise ak.KillError("probe_failed", "ps")
+        probe.comm_table = boom
+        self.refuses(probe)
+
+    def test_the_version_in_use_is_never_a_candidate(self):
+        self.refuses(self.probe(self.helper(comm=self.comm.replace("157.0.8103.78", "158.0.8127.37"))))
+
+    def test_macos_only(self):
+        with mock.patch.object(ak, "PLATFORM", "linux"):
+            self.assertIsNone(ak.stale_app_helper(self.helper(), self.probe()))
+
+
+class LinuxInert(KillBase):
+    def test_stale_helper_and_path_rule_are_inert_on_linux(self):
+        with mock.patch.object(ak, "PLATFORM", "linux"):
+            self.assertFalse(ak.desktop_app(proc(1, cmd=ROW_2666_CMD, comm=ROW_2666_COMM)))
+            self.assertIsNone(ak.stale_app_helper(proc(1, cmd=ROW_2666_CMD, comm=ROW_2666_COMM), FakeProbe([])))
+
+    def test_dry_run_on_linux_reports_a_plain_sleep(self):
+        with mock.patch.object(ak, "PLATFORM", "linux"):
+            probe = self.base(proc(700, 100, cmd="/usr/bin/sleep 300"))
+            out = self.run_kill(probe, [700], dry_run=True)
+            self.assertEqual(out["results"][0]["status"], "would-stop")
+
+
+class DryRun(KillBase):
+    def test_never_signals_writes_dry_run_rows_and_raises_no_notice(self):
+        class Boom(FakeProbe):
+            def signal(self, pid, sig):
+                raise AssertionError("a dry run must never signal")
+        probe = Boom([proc(OWN, 4000, cmd="python3 ah.py"), proc(4000, 3000, cmd="-zsh", comm="-zsh"),
+                      proc(3000, 1, cmd="claude", comm="claude"), proc(810, 100, cmd="/usr/bin/sleep 300")])
+        out = self.run_kill(probe, [810, 3000, 9999], dry_run=True)
+        self.assertEqual([r["status"] for r in out["results"]], ["would-stop", "refused", "gone"])
+        self.assertTrue(out["dry_run"])
+        self.assertEqual(self.notices, [])
+        rows = self.audit()
+        self.assertTrue(rows and all(r.get("dry_run") is True for r in rows), rows)
+        self.assertNotIn("signal", [r["event"] for r in rows])
+
+    def test_foreign_dry_run_is_still_a_dry_run_without_notice(self):
+        probe = self.base(proc(811, 100, cmd="/usr/bin/sleep 300"))
+        probe.cwds = {811: "/elsewhere/x"}
+        out = self.run_kill(probe, [811], foreign=True, dry_run=True)
+        self.assertEqual(out["results"][0]["status"], "would-stop")
+        self.assertEqual((self.notices, probe.sent), ([], []))
+
+
+class CandidateChanged(KillBase):
+    def candidate(self, pid=820):
+        return proc(pid, 100, cmd="/usr/bin/sleep 300", start="Thu Nov  5 17:00:00 2026")
+
+    def test_a_reused_pid_with_another_start_is_refused(self):
+        probe = self.base(self.candidate())
+        probe.cwds = {820: "/elsewhere/x"}
+        expect = {820: ak._epoch_lstart("Thu Nov  5 16:00:00 2026")}
+        out = self.run_kill(probe, [820], foreign=True, expect=expect)
+        self.assertEqual(out["results"][0]["status"], "refused", out)
+        self.assertIn("candidate_changed", out["results"][0]["detail"])
+        self.assertEqual(probe.sent, [])
+
+    def test_a_false_predicate_on_the_fresh_snapshot_is_refused(self):
+        probe = self.base(self.candidate())
+        probe.cwds = {820: "/elsewhere/x"}
+        expect = {820: ak._epoch_lstart("Thu Nov  5 17:00:00 2026")}
+        out = self.run_kill(probe, [820], foreign=True, expect=expect, predicate=lambda probe, info: False)
+        self.assertIn("candidate_changed", out["results"][0]["detail"])
+
+    def test_a_pid_outside_expect_is_refused_and_a_match_is_stopped(self):
+        probe = self.base(self.candidate(), self.candidate(821))
+        probe.cwds = {820: "/elsewhere/x", 821: "/elsewhere/x"}
+        expect = {820: ak._epoch_lstart("Thu Nov  5 17:00:00 2026")}
+        out = self.run_kill(probe, [820, 821], foreign=True, expect=expect, predicate=lambda probe, info: True)
+        self.assertEqual([r["status"] for r in out["results"]], ["exited", "refused"])
+
+
+class NoticeExactIdentity(KillBase):
+    def stop(self, pairs):
+        probe = self.base(proc(1301, 77, cmd="/usr/bin/sleep 300"), proc(77, 1, cmd="claude", comm="claude"))
+        probe.cwds = {1301: "/elsewhere/repo"}
+        probe.session_pairs = lambda pid: set(pairs)
+        with mock.patch.object(ak, "session_ancestor", lambda *a, **k: 77):
+            self.run_kill(probe, [1301], foreign=True, reason="stop")
+        return self.notices[0]
+
+    def test_exact_pair_of_the_caller_is_info(self):
+        self.assertEqual(self.stop([("claude", "sess-1")])["severity"], "info")
+
+    def test_two_differing_ids_keep_the_notice_high_even_if_one_is_the_callers(self):
+        self.assertEqual(self.stop([("claude", "sess-1"), ("codex", "other")])["severity"], "high")
+
+    def test_a_foreign_pair_alone_is_high(self):
+        self.assertEqual(self.stop([("codex", "other")])["severity"], "high")
+
+    def test_a_target_with_no_readable_owner_is_high(self):
+        self.assertEqual(self.stop([])["severity"], "high")
+
+    def test_real_probe_extracts_both_variables(self):
+        text = "x CLAUDE_CODE_SESSION_ID=aaa1 y CODEX_THREAD_ID=bbb2 z"
+        self.assertEqual(ak.session_pairs_from(text), {("claude", "aaa1"), ("codex", "bbb2")})
 
 
 if __name__ == "__main__":

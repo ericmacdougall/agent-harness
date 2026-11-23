@@ -19,6 +19,7 @@ import pwd
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -61,6 +62,12 @@ MCP_WORD = re.compile(r"(?i)(?<![a-z])mcp(?![a-z])|modelcontextprotocol")
 REJECT_ROOTS = {"/", "/tmp", "/private/tmp", "/var", "/private/var", "/var/tmp", "/opt", "/usr", "/private", "/etc",
                 "/home", "/Users", "/mnt", "/srv", "/root"}
 SESSION_ENV = re.compile(r"CLAUDE_CODE_SESSION_ID=([A-Za-z0-9._-]{1,128})")
+# Every (flavor, id) pair a process environment carries: a process with two differing ids is not "own" (takeover M7).
+SESSION_PAIR = re.compile(r"(CLAUDE_CODE_SESSION_ID|CODEX_THREAD_ID)=([A-Za-z0-9._-]{1,128})")
+PLATFORM = sys.platform  # tests replace it; every macOS-only rule (K2, K3) reads it at call time
+APP_ROOT = "/Applications"  # only tests replace it
+# A claude/codex desktop app bundle anywhere in a command or comm path (APFS is case insensitive).
+SESSION_APP = re.compile(r"(?:^|/)(?:chatgpt|claude|codex)[^/]*\.app/", re.I)
 PID_LIST = re.compile(r"[0-9]+(?:,[0-9]+)*")
 
 
@@ -157,17 +164,55 @@ class Probe:
             return None
         return top
 
-    def session_env(self, pid: int):
-        """CLAUDE_CODE_SESSION_ID of a process, best effort (ps eww shows the environment of own processes)."""
-        out = ""
+    def session_pairs(self, pid: int):
+        """{(flavor, id)} from the environment of a process, best effort (ps eww shows the environment of own
+        processes). The raw output is parsed in memory and dropped: only the two ids are kept."""
         try:
             r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True,
                                timeout=8, env=dict(os.environ, LC_ALL="C"))
-            out = r.stdout
         except (OSError, subprocess.SubprocessError):
             return None
-        m = SESSION_ENV.search(out)
-        return m.group(1) if m else None
+        return session_pairs_from(r.stdout)
+
+    def session_env(self, pid: int):
+        """The session id of a process, best effort (the first pair; see session_pairs)."""
+        pairs = self.session_pairs(pid)
+        return sorted(p[1] for p in pairs)[0] if pairs else None
+
+    def comm_table(self):
+        """{pid: comm} for every process. On macOS comm is the full executable path, spaces included."""
+        rows = {}
+        for line in self._ps("pid", "comm").splitlines():
+            m = re.match(r"\s*(\d+)\s+(.*\S)\s*$", line)
+            if m:
+                rows[int(m.group(1))] = m.group(2)
+        return rows
+
+    def _lsof(self, argv):
+        try:
+            r = subprocess.run(["lsof"] + argv, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            raise KillError("probe_failed", "lsof could not be run")
+        if r.returncode not in (0, 1) or (r.returncode == 1 and r.stderr.strip()):
+            raise KillError("probe_failed", "lsof failed (exit %d)" % r.returncode)
+        return r.stdout
+
+    def exe_path(self, pid: int):
+        """The first txt path lsof reports for the pid (its executable), or None when lsof lists none."""
+        for line in self._lsof(["-a", "-p", str(pid), "-d", "txt", "-Fn"]).splitlines():
+            if line.startswith("n"):
+                return line[1:]
+        return None
+
+    def txt_scan(self):
+        """{pid: [framework paths]} for every process with a txt mapping inside a *.framework/Versions/ directory."""
+        found, pid = {}, None
+        for line in self._lsof(["-d", "txt", "-Fpn"]).splitlines():
+            if line.startswith("p") and line[1:].isdigit():
+                pid = int(line[1:])
+            elif line.startswith("n") and pid is not None and ".framework/Versions/" in line:
+                found.setdefault(pid, []).append(line[1:])
+        return found
 
     def cpu(self, pid: int):
         """Current %CPU as a float, or None."""
@@ -188,6 +233,11 @@ class Probe:
 
     def signal(self, pid: int, sig: int) -> None:
         os.kill(pid, sig)
+
+
+def session_pairs_from(text):
+    """{(flavor, id)} found in a block of environment text."""
+    return {("claude" if name.startswith("CLAUDE") else "codex", value) for name, value in SESSION_PAIR.findall(text or "")}
 
 
 def fingerprint(info) -> str:
@@ -212,11 +262,37 @@ def protected_ids(probe, own_pid: int):
     return ids
 
 
+def _exe_and_rest(info):
+    """(executable, argument words). On macOS comm is the full path and may hold spaces ("Codex Framework.framework"):
+    when the command starts with that exact path, the path is the executable and only what follows is split into
+    words. Otherwise the first whitespace word is the executable (Linux comm is a truncated name)."""
+    comm = info.get("comm") or ""
+    command = info.get("command") or ""
+    if comm.startswith("/") and (command == comm or command.startswith(comm + " ")):
+        return comm, command[len(comm):].split()
+    words = command.split()
+    return (words[0] if words else ""), words[1:]
+
+
 def is_session_process(info) -> bool:
     """A claude/codex process, however it was launched (a node-wrapped install shows comm=node)."""
-    names = [os.path.basename(info.get("comm") or "").lower()]
-    names += [os.path.basename(w).lower() for w in (info.get("command") or "").split()[:3]]
+    exe, rest = _exe_and_rest(info)
+    names = [os.path.basename(info.get("comm") or "").lower(), os.path.basename(exe).lower()]
+    names += [os.path.basename(w).lower() for w in rest[:2]]
     return any(n in SESSION_COMM for n in names)
+
+
+def desktop_app(info) -> bool:
+    """macOS only: the process runs from inside a ChatGPT, Claude or Codex app bundle (case-insensitive path rule)."""
+    if PLATFORM != "darwin":
+        return False
+    exe, _rest = _exe_and_rest(info)
+    return bool(SESSION_APP.search(info.get("comm") or "") or SESSION_APP.search(exe))
+
+
+def is_agent_host(info) -> bool:
+    """A claude/codex process or a desktop app process: what an MCP server or a tool shell hangs under."""
+    return is_session_process(info) or desktop_app(info)
 
 
 def interactive_shell(info, base) -> bool:
@@ -254,6 +330,7 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_appr
         return "protected process (%s)" % base
     if is_session_process(info) and not skip_approvable:
         return "claude/codex session process"
+    app_process = desktop_app(info) and not skip_approvable  # K2: judged at the end, after every other gate
     if interactive_shell(info, base):
         return "interactive shell"
     if PROTECTED_PATH.search(comm) or PROTECTED_PATH.search(info.get("command") or ""):
@@ -268,7 +345,85 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_appr
         owner = session_ancestor(probe, table, pid)
         if owner is not None:  # stopping one breaks that session's tools, mine included
             return "MCP server of a live claude/codex session (pid %d)" % owner
+    if app_process:
+        # K3: the one exception, evaluated only after every other gate. No probe (no scope) means refuse.
+        stale = stale_app_helper(info, probe) if probe is not None else None
+        if stale is None:
+            return "claude/codex desktop app process"
+        info["_stale_app"] = stale
     return None
+
+
+VERSION_NAME = re.compile(r"[0-9][0-9.]{0,31}")
+STALE_MARGIN_S = 2  # the helper must have started at least this long before the Current symlink was swapped
+
+
+def _stale_pattern():
+    return re.compile(
+        r"^(?P<bundle>" + re.escape(APP_ROOT) + r"/(?P<app>ChatGPT|Claude|Codex)[^/]*\.app)/Contents/Frameworks/"
+        r"(?P<fw>[A-Za-z0-9 ]{1,40}) Framework\.framework/Versions/(?P<ver>[0-9][0-9.]{0,31})/Helpers/"
+        r"(?P<helper>browser_crashpad_handler|chrome_crashpad_handler)$")
+
+
+def stale_app_helper(info, probe):
+    """A dict {app, framework, ver, current} when this process is an orphaned crashpad handler of an OLD version of a
+    desktop app that now runs a newer one, else None (never raises: any surprise keeps the refusal). macOS only.
+
+    Every condition must hold: H1 comm is absolute and the argv starts with exactly that path; H2 the path is
+    <app>/Contents/Frameworks/<fw> Framework.framework/Versions/<ver>/Helpers/<allowlisted handler>; H3 lsof, when it
+    reports a text path, agrees with comm; H4 Versions/Current names a different, existing version directory; H5 the
+    helper started at least two seconds before that symlink was swapped; H6 no other process of the bundle started at
+    or before it; H7 no other process runs from, or maps, the stale version; H8 its parent is pid 1 (necessary, never
+    sufficient). The caller still needs --foreign, gets a high notice, and the audit row records this dict."""
+    try:
+        return _stale_app_helper(info, probe)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _stale_app_helper(info, probe):
+    if PLATFORM != "darwin":  # H0
+        return None
+    comm, command = info.get("comm") or "", info.get("command") or ""
+    if not comm.startswith("/") or not (command == comm or command.startswith(comm + " ")):  # H1
+        return None
+    pattern = _stale_pattern()
+    m = pattern.match(comm)  # H2
+    if not m or info.get("ppid") != 1:  # H8
+        return None
+    pid, bundle, fw, ver = info["pid"], m.group("bundle"), m.group("fw"), m.group("ver")
+    exe = probe.exe_path(pid)  # H3 (T1 unverified: no text path passes; a probe error propagates and refuses)
+    if exe is not None and exe != comm:
+        return None
+    versions = "%s/Contents/Frameworks/%s Framework.framework/Versions" % (bundle, fw)
+    current = os.readlink(versions + "/Current")  # H4
+    if not VERSION_NAME.fullmatch(current) or current == ver:
+        return None
+    if not stat.S_ISDIR(os.lstat(versions + "/" + current).st_mode):
+        return None
+    started = _epoch_lstart(info.get("start"))  # H5
+    if started is None or os.lstat(versions + "/Current").st_mtime - started < STALE_MARGIN_S:
+        return None
+    stale_dir = "/%s Framework.framework/Versions/%s/" % (fw, ver)
+    table = probe.comm_table()
+    for other_pid, other_comm in table.items():  # H6 and H7 (comm)
+        if other_pid == pid or pattern.match(other_comm):
+            continue
+        if other_comm.startswith(bundle + "/"):
+            other = probe.info(other_pid)
+            if other is None:
+                continue
+            other_start = _epoch_lstart(other.get("start"))
+            if other_start is None or other_start <= started:
+                return None
+        if stale_dir in other_comm:
+            return None
+    for other_pid, paths in probe.txt_scan().items():  # H7 (mappings)
+        if other_pid == pid or pattern.match(table.get(other_pid, "")):
+            continue
+        if any(stale_dir in path for path in paths):
+            return None
+    return {"app": m.group("app"), "framework": fw, "ver": ver, "current": current}
 
 
 # ---- --approved-by (goodqa#15253): a stop of a stale protected process that the user approved
@@ -276,6 +431,7 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_appr
 APPROVABLE_COMM = {"claude", "codex"}
 # Only the harness console daemon: backups (rclone, log_backup), netwatch, hookd and ahd stay unstoppable here.
 APPROVABLE = re.compile(r"^(?:harness daemon or backup job \(harness-console[\w.-]*\)$|claude/codex session process$|"
+                        r"claude/codex desktop app process$|"
                         r"protected process \((?:claude|codex)\)$)")
 APPROVAL_MAX_AGE_S = 24 * 3600
 APPROVED_IDLE_S = 24 * 3600
@@ -393,7 +549,7 @@ def session_ancestor(probe, table, pid):
             return None
         seen.add(pid)
         info = probe.info(pid)
-        if info and is_session_process(info):
+        if info and is_agent_host(info):
             return pid
     return None
 
@@ -563,6 +719,11 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
            "uid": info["uid"], "start": info["start"], "cmd": _clip(info["command"]), "cwd": probe.cwd(pid),
            "id": fingerprint(info), "_info": info}
     table = scope["table"] if scope else None
+    if role == "target" and scope and scope.get("expect") is not None:
+        problem = _candidate_problem(probe, info, pid, scope)
+        if problem:
+            rec["status"], rec["detail"] = "refused", problem
+            return rec
     why = refusal(info, my_uid, protected, probe if scope else None, table)
     approval = scope.get("approval") if scope else None
     if approval and not info["stat"].startswith("Z") and (
@@ -580,12 +741,16 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
         rec["status"], rec["detail"] = "refused", why
     elif info["stat"].startswith("Z"):
         rec["status"], rec["detail"] = "gone", "already a zombie"
-    elif scope and scope.get("session_spawns") and not in_own_scope(
+    elif scope and not info.get("_stale_app") and scope.get("session_spawns") and not in_own_scope(
             probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]) and (
             pid, spawn_start(probe, pid)) in scope["session_spawns"]:
         rec["scope"] = "session-spawn"  # spawned by a worktree in main's session work dir: audited, no notice
-    elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
+    elif scope and (info.get("_stale_app") or not in_own_scope(
+            probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"])):
+        # A stale app helper is foreign whatever its cwd says: it belongs to no session of the caller's.
         rec["scope"] = "foreign"
+        if info.get("_stale_app"):
+            rec["stale_app_helper"] = info["_stale_app"]
         if not scope["foreign"]:
             rec["status"] = "refused"
             rec["detail"] = ("foreign: outside your worktree and process tree; pass --foreign to stop it "
@@ -595,8 +760,38 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
             rec["foreign"] = True
             rec["target_worktree"] = probe.git_top(rec["cwd"])
             rec["owner_pid"] = owner
-            rec["owner_session"] = probe.session_env(owner) if owner else None
+            ids = sorted({value for _flavor, value in _owner_pairs(probe, owner)}) if owner else []
+            rec["owner_ids"] = ids
+            rec["owner_session"] = ids[0] if len(ids) == 1 else (",".join(ids) or None)
     return rec
+
+
+def _owner_pairs(probe, owner):
+    """{(flavor, id)} of the owner process: a probe's session_pairs, else its single session_env id (as claude)."""
+    getter = getattr(probe, "session_pairs", None)
+    if getter is not None:
+        return set(getter(owner) or ())
+    found = probe.session_env(owner)
+    return {("claude", found)} if found else set()
+
+
+def _candidate_problem(probe, info, pid, scope):
+    """None when the pid is the exact process the caller planned (same start time, predicate still true on this fresh
+    snapshot), else the refusal text. A pid reused between the plan and now has another start time."""
+    want = scope["expect"].get(pid)
+    if want is None:
+        return "candidate_changed: pid %d is not in the planned candidate set" % pid
+    if _epoch_lstart(info.get("start")) != want:
+        return "candidate_changed: pid %d has a different start time than planned" % pid
+    predicate = scope.get("predicate")
+    if predicate is not None:
+        try:
+            ok = bool(predicate(probe, info))
+        except Exception:  # noqa: BLE001 - a predicate that cannot be evaluated is a refusal
+            ok = False
+        if not ok:
+            return "candidate_changed: pid %d no longer meets the candidate rule" % pid
+    return None
 
 
 def same_process(probe, rec) -> bool:
@@ -618,7 +813,7 @@ def alive(probe, rec) -> bool:
 def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=None, sleep=time.sleep,
                clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None, foreign=False,
                worktree="auto", notify=None, session_scope=False, approved_by=None, approval_resolver=None,
-               now=None):
+               now=None, dry_run=False, expect=None, predicate=None):
     reason = (reason or "").strip()
     if not reason:
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
@@ -646,7 +841,8 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
     scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
-             "session_spawns": session_spawns(home, session_dir) if session_dir else set()}
+             "session_spawns": session_spawns(home, session_dir) if session_dir else set(),
+             "expect": expect, "predicate": predicate}
     if approved_by:
         scope["approval"] = (approval_resolver or resolve_approval)(approved_by, session, home)
         scope["now"] = time.time() if now is None else now
@@ -669,6 +865,15 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
                 seen.add(rec["pid"])
                 plan.append(rec)
     live = [r for r in plan if "status" not in r]
+    if dry_run:
+        # Report what would happen: no signal, no ops-watch notice, no WAL note. The rows say dry_run so a reader of
+        # the audit log never mistakes them for a stop.
+        for rec in plan:
+            if "status" not in rec:
+                rec["status"], rec["detail"] = "would-stop", "dry run: nothing was signalled"
+            audit.row({"event": "dry_run", "run": run_id, "reason": reason, "tree": tree, "dry_run": True, **_public(rec)})
+        return {"ok": all(r["status"] in ("would-stop", "gone") for r in plan), "run": run_id, "dry_run": True,
+                "audit": str(audit.path), "wal": None, "results": [_public(r, result=True) for r in plan]}
     # Intent rows first: fail closed. Nothing is signalled unless every row is on disk.
     for rec in plan:
         audit.row({"event": "intent" if rec in live else "refused", "run": run_id, "reason": reason,
@@ -694,7 +899,8 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     if foreign_live:
         # Stopping the caller's OWN session's processes outside its tree is info; another owner's stays high. One
         # aggregated row per caller session either way, so 40 stops are one alert, not 40.
-        own_session = bool(session) and all(r.get("owner_session") == session for r in foreign_live)
+        # Exact identity: every (flavor, id) pair the owner carries is the caller's. Two differing ids stay high.
+        own_session = bool(session) and all(r.get("owner_ids") == [session] for r in foreign_live)
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info" if own_session else "high",
                  "check": "ah-kill", "key": "ah-kill:foreign:" + _who(session, agent) + (":own" if own_session else ""),
                  "message": "ah kill --foreign stopped/will stop %d process(es) outside the caller's tree: %s (reason: %s)" % (
@@ -918,8 +1124,11 @@ def kill_remote_windows(host, pids, reason, tree, grace, session="", agent="", h
     return {"ok": rec["status"] in ("stopped", "gone"), "run": run_id, "host": host, "results": [rec]}
 
 
-def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run, foreign=False, notify=None):
+def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None, runner=subprocess.run, foreign=False, notify=None,
+                dry_run=False, expect=None, takeover_of=None):
     if host in WINDOWS_HOSTS:
+        if dry_run:
+            raise KillError("bad_request", "--dry-run is not supported on a Windows --host")
         return kill_remote_windows(host, pids, reason, tree, grace, session, agent, home, runner, foreign, notify)
     if host not in HOSTS:
         raise KillError("bad_request", "--host must be one of %s" % ", ".join(HOSTS + WINDOWS_HOSTS))
@@ -929,7 +1138,7 @@ def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
     if len(reason) > MAX_REASON or not 0 <= grace <= MAX_GRACE:
         raise KillError("bad_request", "--reason or --grace is out of range")
-    if not foreign:
+    if not foreign and not dry_run:
         raise KillError("foreign_required", "--host targets are outside this session's tree and worktree; pass --foreign "
                         "(audited, and main is notified)")
     cmd = "python3 -I .claude/hooks/ah.py kill --pid %s --reason %s --grace %g --via %s" % (
@@ -938,9 +1147,28 @@ def kill_remote(host, pids, reason, tree, grace, session="", agent="", home=None
         cmd += " --tree"
     if foreign:
         cmd += " --foreign"
+    if dry_run:
+        cmd += " --dry-run"
+    # Both only narrow what the remote may stop: it re-evaluates the candidate rule itself and refuses anything outside.
+    for pid, started in sorted((expect or {}).items()):
+        cmd += " --expect-start %d:%d" % (pid, started)
+    if takeover_of:
+        cmd += " --takeover-of %s" % shlex.quote(takeover_of)
     argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", host, cmd]
     audit = Audit(home, default_wal(home, session), {"session": session or None, "agent": agent or None})
-    audit.row({"event": "remote", "host": host, "pids": pids, "reason": reason, "tree": tree})
+    audit.row({"event": "remote", "host": host, "pids": pids, "reason": reason, "tree": tree,
+               **({"dry_run": True} if dry_run else {})})
+    if dry_run:  # nothing is signalled, so there is nothing to notify
+        try:
+            r = runner(argv, capture_output=True, text=True, timeout=grace * 2 + 60)
+            data = json.loads(r.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            audit.row({"event": "remote_result", "host": host, "status": "unreachable-or-unparsable", "dry_run": True})
+            raise KillError("host_unreachable", "could not run ah kill on %s" % host, 3)
+        if not isinstance(data, dict):
+            raise KillError("host_unreachable", "unexpected answer from %s" % host, 3)
+        data["host"] = host
+        return data
     event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "high", "check": "ah-kill",
              "key": "ah-kill:foreign:remote-%s-%s" % (host, _who(session, agent)),
              "message": "ah kill --foreign on %s for pids %s (reason: %s)" % (host, ",".join(str(p) for p in pids), _clip(reason, 120)),
