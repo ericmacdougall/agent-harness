@@ -153,6 +153,180 @@ class AhPassthrough(Base):
         self.assertEqual(json.loads(done.stdout)["code"], "missing")
 
 
+# ---------------------------------------------------------------- deliver.py prepare
+
+class DeliverGate(Base):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, self.env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        import deliver  # noqa: PLC0415
+        self.deliver = deliver
+        self.wal = self.home / ".claude" / "wals" / "sess-1" / "main.jsonl"
+
+    def args(self, **kw):
+        base = {"wal": None, "transcripts_waiver": None, "task": "fixture"}
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def check_json(self, status, last_ok_at, rc=0, **extra):
+        os.environ["FAKE_CHECK_JSON"] = json.dumps({"status": status, "last_ok_at": last_ok_at, "age_min": None,
+                                                    "reasons": [status], **extra})
+        os.environ["FAKE_CHECK_RC"] = str(rc)
+
+    def gate(self, args=None):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            result = self.deliver.transcripts_gate(args or self.args())
+        return result, err.getvalue()
+
+    def refused(self, args=None):
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(self.deliver.DeliveryError) as caught:
+            self.deliver.transcripts_gate(args or self.args())
+        self.assertEqual((caught.exception.status, caught.exception.code), ("BLOCKED_POLICY", 2))
+        self.assertEqual(caught.exception.facts.get("reason"), "TRANSCRIPTS_RECEIPT")
+        return caught.exception, err.getvalue()
+
+    def wal_rows(self):
+        try:
+            return [json.loads(x) for x in self.wal.read_text().splitlines()]
+        except FileNotFoundError:
+            return []
+
+    def test_deliver_refuses_without_receipt(self):
+        self.check_json("never-ok", None, rc=3)
+        error, _ = self.refused()
+        self.assertIn("transcript archive receipt", error.message)
+        self.assertIn("ah transcripts sync --checkpoint pr", error.facts.get("hint", ""))
+        self.assertEqual(self.calls(2)[:2], [["sync", "--checkpoint", "pr", "--budget-seconds", "90"],
+                                             ["check", "--json"]])
+
+    def test_refuses_when_last_ok_is_over_24h(self):
+        self.check_json("stale", iso(25), rc=1)
+        self.refused()
+
+    def test_deliver_warns_on_stale(self):
+        self.check_json("stale", iso(2), rc=1)
+        result, err = self.gate(self.args(wal=self.wal))
+        self.assertIn("stale", err)
+        self.assertEqual(result["status"], "stale")
+        risk = [r for r in self.wal_rows() if r.get("event") == "risk"]
+        self.assertEqual(len(risk), 1)
+        self.assertIn("transcript", risk[0]["note"])
+
+    def test_warns_on_held_and_cap_and_passes_quietly_when_fresh(self):
+        for status in ("held", "cap"):
+            with self.subTest(status=status):
+                self.check_json(status, iso(1), rc=2)
+                _, err = self.gate()
+                self.assertIn(status, err)
+        self.check_json("ok", iso(0.2, z=False), rc=0)
+        _, err = self.gate()
+        self.assertEqual(err, "")
+
+    def test_network_failure_refuses_only_when_last_ok_is_also_old(self):
+        os.environ["FAKE_SYNC_RC"] = "1"
+        self.check_json("failed", iso(3), rc=2)
+        _, err = self.gate()
+        self.assertIn("sync", err)
+        self.check_json("failed", iso(30), rc=2)
+        self.refused()
+
+    def test_unreadable_or_impossible_receipts_refuse(self):
+        for status, last in (("ok", None), ("ok", "yesterday"), ("ok", iso(-3))):
+            with self.subTest(last=last):
+                self.check_json(status, last)
+                self.refused()
+        os.environ["FAKE_CHECK_JSON"] = "not json"
+        self.refused()
+
+    def test_missing_tool_refuses(self):
+        os.environ["TRANSCRIPTS_BIN"] = str(self.root / "absent.py")
+        error, _ = self.refused()
+        self.assertIn("not installed", error.message)
+
+    def test_sync_that_hangs_is_killed_at_the_timeout_and_treated_as_failed(self):
+        os.environ["FAKE_SYNC_SLEEP"] = "60"
+        self.check_json("ok", iso(0.5))
+        started = time.monotonic()
+        with mock.patch.object(self.deliver, "TRANSCRIPTS_SYNC_TIMEOUT", 1):
+            result, err = self.gate()
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIn("sync", err)
+        self.assertIn("timed out", err)
+        self.assertTrue(result["sync_failed"])
+        self.check_json("ok", iso(26))
+        with mock.patch.object(self.deliver, "TRANSCRIPTS_SYNC_TIMEOUT", 1):
+            self.refused()
+
+    def test_check_that_hangs_is_killed_and_refuses(self):
+        os.environ["FAKE_CHECK_SLEEP"] = "60"
+        self.check_json("ok", iso(0.5))
+        started = time.monotonic()
+        with mock.patch.object(self.deliver, "TRANSCRIPTS_CHECK_TIMEOUT", 1):
+            self.refused()
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_waiver_proceeds_and_is_recorded(self):
+        self.check_json("never-ok", None, rc=3)
+        reason = "GitHub archive repos not created on this host yet"
+        result, err = self.gate(self.args(wal=self.wal, transcripts_waiver=reason))
+        self.assertTrue(result["waived"])
+        self.assertIn("waiver", err)
+        rows = [r for r in self.wal_rows() if r.get("event") == "decision"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["transcripts_waiver"]["reason"], reason)
+        self.assertEqual(rows[0]["transcripts_waiver"]["status"], "never-ok")
+        import ops_watch  # noqa: PLC0415
+        ring = ops_watch.read_ring(ops_watch.ring_path(self.home))
+        keys = [(e["key"], e["severity"], e["event"]) for e in ring]
+        self.assertIn(("transcripts-waiver:fixture", "high", "raise"), keys)
+        self.assertTrue(any(k.startswith("transcripts-waiver:") for k in ops_watch.defaults("h")["point_events"]["prefixes"]))
+
+    def test_waiver_that_cannot_be_recorded_refuses(self):
+        self.check_json("never-ok", None, rc=3)
+        bad = self.root / "not-a-wal.jsonl"
+        self.refused(self.args(wal=bad, transcripts_waiver="a perfectly long reason"))
+
+    def test_waiver_flag_is_validated(self):
+        base = ["deliver.py", "prepare", "--task", "t", "--original", "/x", "--original-branch", "main"]
+        for extra in (["--transcripts-waiver", "too short", "--wal", str(self.wal)],
+                      ["--transcripts-waiver", "long enough reason here"],
+                      ["--transcripts-waiver", "token=" + "a" * 30, "--wal", str(self.wal)],
+                      ["--transcripts-waiver", "bad\x07control chars", "--wal", str(self.wal)]):
+            with self.subTest(extra=extra[:2]), mock.patch.object(sys, "argv", base + extra), \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.deliver.parse_args()
+        with mock.patch.object(sys, "argv", base + ["--transcripts-waiver", "long enough reason here",
+                                                    "--wal", str(self.wal)]):
+            self.assertEqual(self.deliver.parse_args().transcripts_waiver, "long enough reason here")
+
+    def test_prepare_runs_the_gate_before_publishing_and_skips_local_only(self):
+        class Gate(Exception):
+            pass
+
+        class Entered(Exception):
+            pass
+
+        args = argparse.Namespace(reconcile_only=False, original=None, original_branch=None, scan=None,
+                                  local_only=False, pr_title="t", pr_body_file=Path("/b"), wal=None,
+                                  transcripts_waiver=None, task="fixture")
+        with mock.patch.object(self.deliver, "source_inputs", return_value=(Path("/s"), "b", "h", "o", "k")), \
+                mock.patch.object(self.deliver, "checked_body", return_value=b"body"), \
+                mock.patch.object(self.deliver, "valid_identity_text", return_value=True), \
+                mock.patch.object(self.deliver, "matching_origins", return_value=("o/r", "url")), \
+                mock.patch.object(self.deliver, "Workflow", side_effect=Entered), \
+                mock.patch.object(self.deliver, "transcripts_gate", side_effect=Gate) as gate:
+            with self.assertRaises(Gate):
+                self.deliver.prepare(args)
+            args.local_only = True
+            with self.assertRaises(Entered):
+                self.deliver.prepare(args)
+            self.assertEqual(gate.call_count, 1)
+
+
 # ---------------------------------------------------------------- wal_note.py --event deploy
 
 class WalNoteDeploy(Base):
@@ -214,6 +388,68 @@ class CodexSessionStart(Base):
         self.assertEqual(done.returncode, 0, done.stderr)
         time.sleep(0.3)
         self.assertEqual(transcripts_fake.read_log(self.log), [])
+
+
+# ---------------------------------------------------------------- AC-8: every checkpoint fires
+
+class HookPointsFire(Base):
+    def test_hook_points_fire(self):
+        self.run_py([HOOKS / "transcripts_hook.py", "session-start"], '{"source": "startup"}')
+        self.run_py([HOOKS / "transcripts_hook.py", "session-start"], '{"source": "resume"}')
+        self.run_py([HOOKS / "ah.py", "transcripts", "sync", "--checkpoint", "takeover"])
+        wal = self.home / ".claude" / "wals" / "sess-3" / "main.jsonl"
+        self.run_py([HOOKS / "wal_note.py", "--wal", wal, "--event", "deploy", "--note", "released v1.2.3"])
+        with mock.patch.dict(os.environ, {**self.env, "FAKE_CHECK_JSON": json.dumps({"status": "ok",
+                                                                                     "last_ok_at": iso(0.1)})}):
+            import deliver  # noqa: PLC0415
+            deliver.transcripts_gate(argparse.Namespace(wal=None, transcripts_waiver=None, task="t"))
+        rows = self.calls(6)
+        fired = {r[r.index("--checkpoint") + 1] for r in rows if r and r[0] == "sync"}
+        self.assertEqual(fired, {"start", "recovery", "takeover", "deploy", "pr"})
+
+
+# ---------------------------------------------------------------- AC-14: WAL size alarm
+
+class WalSizeAlarm(Base):
+    def setUp(self):
+        super().setUp()
+        import ops_watch  # noqa: PLC0415
+        self.ow = ops_watch
+        self.cfg = ops_watch.load_config(self.home, host="testhost", overrides={})
+
+    def sparse(self, path, mib):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.truncate(mib * 1024 * 1024)
+        return path
+
+    def test_wal_size_alarm(self):
+        big = self.sparse(self.home / ".claude" / "wals" / "s1" / "main.jsonl", 41)
+        self.sparse(self.home / ".claude" / "wals" / "s1" / "agent-x.jsonl", 39)
+        codex = self.sparse(self.home / ".agent-harness" / "codex-wals" / "c1" / "main.jsonl", 45)
+        self.assertIn("wal_size", self.ow.DEFAULT_CHECKS)
+        alerts = self.ow.DEFAULT_CHECKS["wal_size"](self.cfg, {}, None, time.time())
+        self.assertEqual(len(alerts), 2)
+        self.assertEqual({a["severity"] for a in alerts}, {"high"})
+        text = " ".join(a["message"] for a in alerts)
+        self.assertIn("s1/main.jsonl", text)
+        self.assertIn("c1/main.jsonl", text)
+        self.assertNotIn("agent-x", text)
+        keys = {a["key"] for a in alerts}
+        again = {a["key"] for a in self.ow.DEFAULT_CHECKS["wal_size"](self.cfg, {}, None, time.time())}
+        self.assertEqual(keys, again)  # one stable key per file
+        big.unlink()
+        codex.unlink()
+        self.assertEqual(self.ow.DEFAULT_CHECKS["wal_size"](self.cfg, {}, None, time.time()), [])
+
+    def test_symlinks_are_not_followed_and_missing_roots_are_quiet(self):
+        self.assertEqual(self.ow.DEFAULT_CHECKS["wal_size"](self.cfg, {}, None, time.time()), [])
+        target = self.sparse(self.root / "elsewhere" / "huge.jsonl", 50)
+        link = self.home / ".claude" / "wals" / "s2" / "main.jsonl"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+        (self.home / ".claude" / "wals" / "linked").symlink_to(target.parent, target_is_directory=True)
+        self.assertEqual(self.ow.DEFAULT_CHECKS["wal_size"](self.cfg, {}, None, time.time()), [])
 
 
 # ---------------------------------------------------------------- backfill scheduler
