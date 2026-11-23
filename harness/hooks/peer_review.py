@@ -372,8 +372,82 @@ def parse_provider_records(provider, stripped, side):
     return records or 'INVALID'
 
 
+PROVIDER_MARKER = re.compile(r'(?:ERROR|Error): (ACCOUNT_QUOTA_EXCEEDED|AUTHENTICATION_REQUIRED|MODEL_UNAVAILABLE)\s*')
+CODEX_PRE_WORK_RECORDS = frozenset({'thread.started', 'turn.started', 'error', 'turn.failed'})
+CLAUDE_PRE_WORK_RECORDS = frozenset({'system', 'error', 'result'})
+
+
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
-    """Validate supported terminal envelopes before extracting model verdict text."""
+    """Validate supported terminal envelopes before extracting model verdict text.
+
+    This is the one place that decides `provider_refused`: an error code alone never proves the provider did no
+    work, so the refusal stands only when the transcript itself shows no work (goodqa#16725, PR 318 review F1).
+    """
+    outcome = classify_provider(provider, code, stdout, stderr, last_message, requested_stage)
+    if outcome.get('provider_refused') is True and not (
+            not work_signal(outcome.get('usage')) and refusal_before_work(provider, stdout, last_message)):
+        outcome = {**outcome, 'provider_refused': False}
+    return outcome
+
+
+WORK_SIGNAL_KEYS = ('usage', 'total_cost_usd', 'modelUsage', 'costUSD', 'duration_api_ms', 'server_tool_use')
+
+
+def work_signal(value, depth=0):
+    """True when a value could show spent work: any positive number, any text, any unknown leaf, or too deep to
+    read. Only absent values, empty containers, booleans and zeros read as no work."""
+    if value is None or type(value) is bool:
+        return False
+    if type(value) in (int, float):
+        return not (math.isfinite(value) and value == 0)
+    if isinstance(value, dict):
+        return depth > 4 or any(work_signal(item, depth + 1) for item in value.values())
+    if isinstance(value, list):
+        return depth > 4 or any(work_signal(item, depth + 1) for item in value)
+    return True
+
+
+def refusal_before_work(provider, stdout, last_message=''):
+    """True only when the provider's whole transcript is a refusal: no work records, no usage, cost or API time.
+
+    Only Codex and Claude transcripts are read. Kimi's wrapper discards its transcript before this point, so a
+    Kimi refusal is never taken as proof of no work. Unknown shapes are treated as work, so a doubtful run keeps
+    counting against the repeat budget.
+    """
+    if provider not in ('codex', 'claude') or (last_message or '').strip():
+        return False
+    stripped = stdout.strip()
+    if not stripped:
+        return True
+    if not stripped.startswith(('{', '[')):
+        return bool(PROVIDER_MARKER.fullmatch(stripped))
+    records = parse_provider_records(provider, stripped, 0)
+    if not isinstance(records, list) or not records:
+        return False
+    allowed = CODEX_PRE_WORK_RECORDS if provider == 'codex' else CLAUDE_PRE_WORK_RECORDS
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        kind = record.get('type')
+        warning = (provider == 'codex' and kind == 'item.completed' and isinstance(record.get('item'), dict)
+                   and record['item'].get('type') == 'error' and set(record['item']) <= {'id', 'type', 'message'})
+        if kind not in allowed and not warning:
+            return False
+        if any(work_signal(record.get(key)) for key in WORK_SIGNAL_KEYS):
+            return False
+        turns = record.get('num_turns')
+        if turns is not None and (type(turns) is not int or turns > 1):
+            return False
+    return True
+
+
+def with_reported_usage(failure, record):
+    """Keep the usage an error record reports, so a paid failure is never mistaken for a free refusal."""
+    usage = provider_usage(record)
+    return {**failure, 'usage': usage} if usage is not None else failure
+
+
+def classify_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
     invalid = provider_failure({})
     too_large = {**invalid, 'reason': 'OUTPUT_TOO_LARGE'}
     if code == 124 and stderr == 'HARNESS_PROVIDER_TIMEOUT':
@@ -416,7 +490,8 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                     # final `turn.failed`; classify the pair by that final record.
                     continue
                 if kind in {'error', 'turn.failed'} or record.get('is_error') is True or record.get('error') is not None:
-                    return codex_failure(record, terminal=record is records[-1] and not completed and not messages)
+                    return with_reported_usage(
+                        codex_failure(record, terminal=record is records[-1] and not completed and not messages), record)
                 if kind == 'turn.completed':
                     if (record.get('status') not in (None, 'success', 'completed')
                             or record.get('subtype') not in (None, 'success', 'completed')):
@@ -443,7 +518,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                     failure = provider_failure(record)
                     if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
                         failure = prose_quota_failure(record.get('result')) or failure
-                    return failure
+                    return with_reported_usage(failure, record)
             terminal = [record for record in records if record.get('type') == 'result']
             if len(terminal) != 1 or records[-1] is not terminal[0]:
                 return invalid
@@ -452,7 +527,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                 failure = provider_failure(record)
                 if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
                     failure = prose_quota_failure(record.get('result')) or failure
-                return failure
+                return with_reported_usage(failure, record)
             if (record.get('stop_reason') is not None and not isinstance(record['stop_reason'], str)
                     or record.get('terminal_reason') is not None and not isinstance(record['terminal_reason'], str)
                     or record.get('stop_reason') not in (None, 'end_turn', 'stop_sequence', 'completed', 'success', 'complete', 'normal', 'done')
@@ -467,8 +542,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         # terminal error, never an arbitrary progress transcript containing PASS.
         text = last_message if not stripped and last_message else stdout
         if code != 0:
-            marker = re.fullmatch(r'(?:ERROR|Error): (ACCOUNT_QUOTA_EXCEEDED|AUTHENTICATION_REQUIRED|MODEL_UNAVAILABLE)\s*',
-                                  stderr.strip() or stripped)
+            marker = PROVIDER_MARKER.fullmatch(stderr.strip() or stripped)
             if marker:
                 return provider_failure({'code': marker[1].lower()})
             # Free-text stderr counts only for codex with no stdout, and only its last line (the CLI's own
