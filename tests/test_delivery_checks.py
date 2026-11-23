@@ -338,6 +338,53 @@ class CheckInterpreter(unittest.TestCase):
         self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
         self.assertTrue(selected.is_symlink(), 'fixture missed the loader boundary')
 
+    def test_delivery_native_rejects_identity_changes_before_module_exec(self):
+        for change in ('root-directory', 'root-symlink-back', 'regular-leaf', 'same-leaf-write'):
+            with self.subTest(change=change):
+                base = self.root / change
+                repo = base / 'repo'
+                selected = repo / 'native' / 'codex' / 'test_build_proof.py'
+                selected.parent.mkdir(parents=True)
+                marker = base / 'foreign-code-ran'
+                marked = f'from pathlib import Path\nPath({str(marker)!r}).touch()\n{self.GOOD}'
+                original = self.GOOD + '#' + ' ' * (len(marked) - len(self.GOOD) - 1)
+                selected.write_text(marked if change == 'root-symlink-back' else original)
+                initial = selected.stat()
+                run = self.delivery.run_check.__globals__['run_process']
+                attempted = []
+
+                def substitute_before_loader(command, **kwargs):
+                    if command[1:4] == ['-I', '-B', '-c']:
+                        attempted.append(change)
+                        if change in {'root-directory', 'root-symlink-back'}:
+                            parked = repo.with_name('parked')
+                            repo.rename(parked)
+                            if change == 'root-symlink-back':
+                                repo.symlink_to(parked, target_is_directory=True)
+                            else:
+                                selected.parent.mkdir(parents=True)
+                                selected.write_text(marked)
+                        elif change == 'regular-leaf':
+                            replacement = selected.with_name('replacement.py')
+                            replacement.write_text(marked)
+                            replacement.replace(selected)
+                            self.assertNotEqual(selected.stat().st_ino, initial.st_ino)
+                        else:
+                            selected.write_text(marked)
+                            os.utime(selected, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+                            current = selected.stat()
+                            self.assertEqual((current.st_ino, current.st_mtime_ns, current.st_size),
+                                             (initial.st_ino, initial.st_mtime_ns, initial.st_size))
+                            self.assertNotEqual(current.st_ctime_ns, initial.st_ctime_ns)
+                    return run(command, **kwargs)
+
+                with patch.dict(self.delivery.run_check.__globals__, {'run_process': substitute_before_loader}):
+                    with self.assertRaises(self.delivery.DeliveryError) as raised:
+                        self.run_native_check(repo)
+                self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+                self.assertEqual(attempted, [change], 'fixture missed the loader boundary')
+                self.assertFalse(marker.exists(), 'replacement code was evaluated')
+
     def test_delivery_native_arguments_keep_exact_literal_selection(self):
         prefix = 'python3 -m unittest discover -s '
         cases = [
