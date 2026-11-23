@@ -59,6 +59,8 @@ MUTANTS = {
                                    "        try:\n            os.rename(taken, target)\n        except OSError:\n            pass\n    if not isinstance(data, dict)", IDENTITY),
     "ID grants only for the payload session's own dirs": ("command_guard.py", "if not owner or owner.casefold() != str(HOOK_SESSION).casefold():",
                                                           "if not owner:", IDENTITY),
+    "ID a piped payload gets no grant": ("command_guard.py", "        if not cli or cli.casefold() != str(HOOK_SESSION).casefold():\n            return 0",
+                                         "        if False:\n            return 0", IDENTITY),
     "ID the Mac verifier reads t2-dev too": ("command_guard.py", "            if here.get('state') not in ('retired', 'walless') or sys.platform.startswith('linux'):",
                                              "            if True:", IDENTITY),
     "m2 stale helpers keep their predicate": ("takeover.py", "                                     predicate=still_stale)", "                                     predicate=None)", IDENTITY),

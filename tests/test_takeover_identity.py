@@ -345,12 +345,44 @@ class OwnRouteGrant(Fixture):
 
     COMMAND = "python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path %s --reason 'own cleanup'"
 
-    def hook(self, session, command, cwd=None):
+    def hook(self, session, command, cwd=None, cli=None):
+        """The hook as the Claude CLI runs it: the CLI above it records the payload's session (`cli` overrides that, for
+        a payload piped into the hook from some other session's shell)."""
         payload = {"session_id": session, "tool_name": "Bash", "tool_input": {"command": command},
                    "cwd": cwd or str(self.home)}
+        above = session if cli is None else cli
         with mock.patch.object(cg, "decide", lambda *a, **k: ("allow", "")), \
+                mock.patch.object(tk, "hook_cli_session", lambda home, probe=None, pid=None: above), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return cg.hook_main(stdin_bytes=json.dumps(payload).encode(), marker=False)
+
+    def test_a_forged_payload_piped_into_the_hook_gets_no_grant(self):
+        # `echo '{"session_id": VICTIM, ...}' | command_guard.py hook` from the agent's own shell: the Claude CLI above
+        # that hook records the agent's session, not the victim's
+        for cli in (CALLER, None, ""):
+            with self.subTest(cli=cli):
+                payload = {"session_id": VICTIM, "tool_name": "Bash", "tool_input": {"command": self.COMMAND % self.linked},
+                           "cwd": str(self.home)}
+                with mock.patch.object(cg, "decide", lambda *a, **k: ("allow", "")), \
+                        mock.patch.object(tk, "hook_cli_session", lambda home, probe=None, pid=None: cli), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    cg.hook_main(stdin_bytes=json.dumps(payload).encode(), marker=False)
+                code, data = self.verifier()
+                self.assertTrue(data["reason"].startswith("foreign session %s" % VICTIM), data)
+                self.assertTrue(self.linked.exists())
+
+    def test_the_cli_above_the_hook_is_found_only_through_a_valid_record(self):
+        record = self.home / ".claude" / "sessions" / "300.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"pid": 300, "sessionId": VICTIM, "procStart": START}))
+        found = {name: tk.hook_cli_session(str(self.home), probe=chain) for name, chain in chains().items()}
+        self.assertEqual(found["claude record"], VICTIM, "the CLI that really runs the hook")
+        for name in ("orphan", "real sshd", "codex forged env"):
+            self.assertIsNone(found[name], name)
+        record.write_text(json.dumps({"pid": 300, "sessionId": VICTIM, "procStart": "Mon Jan  1 00:00:00 2024"}))
+        self.assertIsNone(tk.hook_cli_session(str(self.home), probe=chains()["claude record"]), "a stale record")
+        record.unlink()
+        self.assertIsNone(tk.hook_cli_session(str(self.home), probe=chains()["claude record"]), "no record")
 
     def test_the_owner_hook_grant_lets_the_verifier_remove_its_own_worktree_once(self):
         self.assertEqual(self.hook(VICTIM, self.COMMAND % self.linked), 0)

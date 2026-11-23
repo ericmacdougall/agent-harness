@@ -2281,10 +2281,13 @@ def issue_own_grants(command, home=None):
         if not HOOK_SESSION or ('worktree-remove' not in text and 'remove-worktree' not in text) or re.search(r'[$`]', text):
             return 0
         takeover = _takeover()
+        root = os.path.realpath(home or os.path.expanduser('~'))
+        cli = takeover.hook_cli_session(root)
+        if not cli or cli.casefold() != str(HOOK_SESSION).casefold():
+            return 0  # the payload must be the one the Claude CLI above this hook would send: a piped payload is not
         words = shlex.split(text)
         paths = [words[i + 1] for i, w in enumerate(words[:-1]) if w == '--path']
         paths += [w.split('=', 1)[1] for w in words if w.startswith('--path=')]
-        root = os.path.realpath(home or os.path.expanduser('~'))
         issued = 0
         for raw in paths[:takeover.GRANT_CAP]:
             expanded = os.path.expanduser(raw)  # the shell expands a leading ~ before the tool sees it

@@ -1006,6 +1006,36 @@ def claude_record(home, pid, info, probe=None):
     return sid
 
 
+HOOK_ANCESTRY_DEPTH = 6
+
+
+def hook_cli_session(home, probe=None, pid=None):
+    """The session id of the Claude CLI that ran this hook: the nearest ancestor with a valid own session record
+    (claude_record: exact executable, live start time), or None. It never supplies an identity; the hook uses it only
+    as a second condition on its payload's session before it writes a grant, so an agent that pipes a forged payload
+    into the hook from its own shell (whose CLI records the agent's session) gets no grant. A failure is None."""
+    try:
+        probe = probe or HostProbe()
+        current = os.getpid() if pid is None else int(pid)
+        for _ in range(HOOK_ANCESTRY_DEPTH):
+            info = probe.info(current)
+            if not info:
+                return None
+            parent = int(info.get("ppid") or 0)
+            if parent <= 1:
+                return None
+            parent_info = probe.info(parent)
+            if not parent_info:
+                return None
+            sid = claude_record(home, parent, parent_info, probe)
+            if sid:
+                return sid
+            current = parent
+    except Exception:  # noqa: BLE001 - an ancestry that cannot be read proves nothing
+        return None
+    return None
+
+
 # ------------------------------------------------------------------------------------ the hook's own-session grant
 #
 # `ah worktree-remove` runs the verifier in a process that cannot know its session, so for a path in the caller's own
