@@ -91,6 +91,32 @@ ws.exists(live_path)       # live or any closed segment (a crashed rotation stil
 ws.list_wals(directory)    # {stem: Chain}; segments folded into their stem
 ```
 
+A reader that walks many WALs scans each directory once and passes the listing to every read:
+
+```python
+listing = ws.list_wals(directory)                                   # one scandir for the whole directory
+for stem, ch in listing.items():
+    path = os.path.join(directory, stem + ".jsonl")
+    for seg, n, raw in ws.iter_lines(path, chain=ch): ...          # also read_tail(..., chain=), read_logical(..., chain=),
+                                                                    # open_chain(path, chain=)
+```
+
+The listing is adopted only after the live fd of that read is open and only when it agrees with that fd (the live name it
+lists is the inode we hold, or our fd is one of its closed segments); a stale listing (a rotation happened after it was
+taken), another WAL's listing or another directory's listing is ignored and the directory is scanned again. Measured on
+2,300 WALs in one directory (the Mac, `tests/test_wal_segments_api.py::LatencyTests`): 0.34 s for plain reads, about
+34 s extrapolated for a private scan per WAL, 2.1 s with a pre-scanned listing.
+
+Public pieces for readers that keep their own caches or fast paths: `Snapshot.sources()` (the files of a snapshot as
+`Source(name, fd, seq, ino)`), `valid_marker(first_line, stem, seq)` (the one marker rule) and
+`closed_digests(directory, stem, chain=None)` (`{seq: {name, bytes, lines, sha256}}` of the closed segments from the
+open markers, no hashing; a cache key for a closed segment is `(name, bytes, sha256)`).
+
+`wal.require_segments(directory)` (in `wal.py` and the Codex `wal.py`) is the fail-closed gate for writers, readers and
+gates: it returns normally when `wal_segments` is importable or nothing needs it, and raises `WalSegmentsMissing`
+when the module is missing while `wal-rotation.on` exists or segment-shaped files are in `directory`. Both writers call
+it before any plain-append fallback.
+
 The reader opens the live fd first, lists the directory, and reconciles by inode, so a concurrent rotation gives a
 consistent prefix: no duplicate and no lost pre-snapshot line. Problem codes: `gap` (reported as a `[lo, hi]` range),
 `not_regular` (symlink, FIFO or directory in a segment's place; never followed), `ambiguous`, `marker_mismatch`,
@@ -105,9 +131,16 @@ python3 wal_segments.py map DIR                 # JSON: every logical WAL, segme
 python3 wal_segments.py verify DIR [STEM] [--deep]   # exit 1 on any problem; --deep rehashes against the markers
 python3 wal_segments.py cat DIR STEM [--allow-gaps]  # the whole logical WAL in order, markers dropped
 python3 wal_segments.py reindex DIR STEM [--write]   # rebuild STEM.segments.json (dry run unless --write)
+python3 wal_segments.py recover DIR STEM [--write]   # finish a crashed rotation (live WAL folders only)
 ```
 
-All four work on a copy of a WAL folder (a git backup checkout) using only the file names; they refuse a symlinked
+`recover` is the repair named by the ops_watch alert for a persistent `live_missing`. It works only in a live WAL folder
+(a session directory whose parent is named `wals` or `codex-wals`; never a backup copy), refuses a symlinked directory,
+takes the seglock, and either creates the missing live file with its marker or writes the marker into an EMPTY live
+file. A live file that already holds records is never edited: it is reported as `marker_missing` and the command exits
+1. Without `--write` it only says what it would do.
+
+`map`, `verify`, `cat` and `reindex` work on a copy of a WAL folder (a git backup checkout) using only the file names; they refuse a symlinked
 directory argument and a stem with a path or a segment shape, and open only names found by scanning the directory, never
 a name taken from a marker or the index. The index is advisory: the directory is authoritative.
 
