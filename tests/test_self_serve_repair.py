@@ -3,7 +3,7 @@
 1. Nothing the caller hands in may choose where main is proven, where the policy lives, or what time it is.
 2. A Codex root is not told apart from a Codex helper, so merge-class capabilities are Claude-main-only.
 3. single_use binds the object (repo, PR, head), is spent only by an explicit consume(), and only by a proven actor.
-4. The fallback denylist has a built-in floor that no policy can remove.
+4. The fallback denylist is optional and empty by default; there is no built-in floor (user: "Allow every path").
 Run: python3 -m unittest tests.test_self_serve_repair   (from the repository root)
 """
 import copy
@@ -190,50 +190,14 @@ class HomeAndClockAreNotCallerChoices(Repair):
         self.assertEqual(out.stdout.strip(), "{'home': None, 'claude_dir': None, 'clock': False}", out.stderr)
 
 
-# ---------------------------------------------------------------- finding 4: the fallback denylist has a floor
+# ---------------------------------------------------------------- finding 4 (revised): no built-in floor
 
-class FallbackFloor(Repair):
-    CAP = "same_harness_fallback_review"
-    DENIED = ("harness/hooks/auth.py", "src/auth/login.py", "db/migrations/001.sql", "app/migrate.py", "config/secrets.env",
-              "harness/hooks/command_guard.py", "harness/hooks/merge_gate.py", "harness/hooks/self_serve.py",
-              "keys/id.pem", "scripts/keygen.sh", ".env", "svc/.env.local", "AUTH/Readme.md", ".github/workflows/ci.yml",
-              "harness/hooks/peer_review.py", "docs/../auth/x", "/etc/passwd", "a/\x00b", "ａuth/x.py")
-    FINE = ("docs/readme.md", "src/render.py", "tests/test_thing.py", "harness/hooks/ah.py")
-
-    def test_a_policy_with_no_denylist_still_blocks_the_floor(self):
-        self.scoped({}, self.CAP)
-        self.assertIsNotNone(self.grant(self.CAP, evidence={"changed_paths": list(self.FINE)}))
-        for path in self.DENIED:
-            self.assertEqual(self.why(self.CAP, evidence={"changed_paths": [path]}), "path_denylisted", repr(path))
-
-    def test_one_denied_path_among_many_blocks_the_whole_change(self):
-        self.scoped({}, self.CAP)
-        self.assertIsNone(self.grant(self.CAP, evidence={"changed_paths": list(self.FINE) + ["db/migrations/2.sql"]}))
-
-    def test_changed_paths_are_required_even_with_no_policy_denylist(self):
-        self.scoped({}, self.CAP)
-        for ev in (None, {}, {"changed_paths": []}, {"changed_paths": "docs/a.md"}, {"changed_paths": [1]}):
-            self.assertIsNone(self.grant(self.CAP, evidence=ev), ev)
-
-    def test_a_policy_denylist_is_added_to_the_floor_never_replaces_it(self):
-        self.scoped({"denylist_paths": ["docs/*"]}, self.CAP)
-        self.assertEqual(self.why(self.CAP, evidence={"changed_paths": ["docs/a.md"]}), "path_denylisted")
-        self.assertEqual(self.why(self.CAP, evidence={"changed_paths": ["db/migrations/1.sql"]}), "path_denylisted")
-        self.assertIsNotNone(self.grant(self.CAP, evidence={"changed_paths": ["src/x.py"]}))
-
-    def test_a_repo_narrowing_cannot_lower_the_floor(self):
-        self.scoped({}, self.CAP)
-        ev = {"changed_paths": ["db/migrations/1.sql"], "repo_narrowing": {"denylist_paths": [], "repos": [], "allow": ["*"]}}
-        self.assertIsNone(self.grant(self.CAP, evidence=ev))
+class FallbackFloorRemoved(Repair):
+    """The floor guards moved to tests.test_self_serve_allow_every_path (user: "Allow every path")."""
 
     def test_the_floor_is_only_for_the_fallback_capability(self):
         self.scoped({}, "merge_reviewed_pr")
         self.assertIsNotNone(self.grant("merge_reviewed_pr", evidence=None))
-
-    def test_floor_is_exported_for_the_consumer_to_share(self):
-        self.assertTrue(ss.fallback_path_denied("db/migrations/1.sql"))
-        self.assertFalse(ss.fallback_path_denied("docs/readme.md"))
-        self.assertTrue(ss.fallback_path_denied(5))
 
 
 # ---------------------------------------------------------------- finding 2: Codex root versus helper
