@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.22-2"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.22-3"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2
 _MISSING = object()
@@ -373,20 +373,25 @@ def _redact_text(text, counts):
 # ----------------------------------------------------------------------------------------------------------
 # Pass 1 key-aware walk
 # ----------------------------------------------------------------------------------------------------------
-# Key choice: a key is split on `_`, `-`, spaces and camelCase into lowercase tokens.
+# Key choice: a key is split on `_`, `-`, spaces and camelCase into lowercase tokens, and every rule is tried on
+# both the raw words and their singular forms (spec r4/r5: api_keys -> api key, passwords -> password,
+# accessTokens -> access token; "pass" stays "pass" in the raw form).
 #  * _STRONG anywhere in the key: words that only name secrets (password_hint and secret_count are redacted too;
 #    a false positive costs a placeholder, a miss costs a credential).
 #  * _LAST only as the final token: words that are also ordinary nouns or prefixes (token_count, auth_method,
 #    session_meta and signature_version stay; GITHUB_TOKEN, basic_auth, user_session are redacted).
 #  * _PAIRS anywhere as adjacent tokens (api key, session id, ...), and fused forms by suffix (userpassword).
 #  * "x-...-key|token|secret" header names.
-# Not included: bare "key" (React keys, dict entries), "pin" (pinned, pin numbers in configs are rare in
-# transcripts), "tokens" (usage counters such as input_tokens and max_tokens).
+#  * "<credential word> string|str|value" (tokenString, password_value).
+# Not included: bare "key" (React keys, dict entries) and "pin" (only its numbers are redacted). Usage counters
+# (input_tokens, max_tokens) singularize to "... token" and are keyed, but the allowlist exempts numbers, and
+# numbers are kept by the keyed rule anyway; a string or list under them is redacted.
 _STRONG = {'password', 'passwd', 'passphrase', 'secret', 'secrets', 'credential', 'credentials', 'apikey',
            'privatekey', 'clientsecret', 'sessiontoken', 'sessionid', 'accesskey', 'secretkey', 'authtoken',
            'accesstoken', 'refreshtoken'}
-_LAST = {'pwd', 'pass', 'passcode', 'token', 'auth', 'authorization', 'cookie', 'cookies', 'session', 'sig',
-         'signature', 'bearer', 'otp'}
+_LAST = {'pwd', 'pw', 'pass', 'passcode', 'token', 'auth', 'authorization', 'cookie', 'cookies', 'session',
+         'sid', 'sig', 'signature', 'bearer', 'jwt', 'otp'}
+_VALUE_WORDS = {'string', 'str', 'value'}
 _PAIRS = {('api', 'key'), ('access', 'key'), ('private', 'key'), ('secret', 'key'), ('signing', 'key'),
           ('encryption', 'key'), ('master', 'key'), ('session', 'id'), ('session', 'token'), ('auth', 'token'),
           ('access', 'token'), ('refresh', 'token'), ('id', 'token'), ('client', 'secret')}
@@ -406,15 +411,7 @@ def _key_is_credential(key):
     cached = _KEY_CACHE.get(key)
     if cached is not None:
         return cached
-    tokens = _key_tokens(key)
-    result = False
-    if tokens:
-        joined = ''.join(tokens)
-        result = (any(t in _STRONG for t in tokens) or tokens[-1] in _LAST
-                  or any((a, b) in _PAIRS for a, b in zip(tokens, tokens[1:]))
-                  or joined.endswith(_FUSED_SUFFIX)
-                  or (len(tokens) >= 2 and tokens[0] == 'x' and tokens[-1] in _X_HEADER_LAST)
-                  or (len(tokens) >= 2 and tokens[-1] == 'key' and key.isupper()))  # APP_KEY, DEPLOY_KEY
+    result = any(_credential_words(tokens, key) for tokens in _key_forms(key))
     if len(_KEY_CACHE) < 4096 and len(key) <= 256:
         _KEY_CACHE[key] = result
     return result
@@ -436,7 +433,7 @@ def _pair_is_credential(d):
 
 _NUMERIC_SECRET_ANY = {'password', 'passwd', 'passcode'}
 _NUMERIC_SECRET_LAST = {'pwd', 'pin', 'otp'}
-_ID_KEYS = {'sessionid', 'session', 'parentuuid', 'uuid', 'requestid', 'id', 'threadid', 'parentthreadid',
+_ID_KEYS = {'sessionid', 'session', 'sid', 'parentuuid', 'uuid', 'requestid', 'id', 'threadid', 'parentthreadid',
             'forkedfromid', 'conversationid', 'parentsessionid'}
 _UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 _ULID = re.compile(r'[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}')
@@ -447,16 +444,52 @@ def _key_tokens(key):
     return [t for t in _SPLIT.split(spaced.lower()) if t]
 
 
+def _singular(word):
+    if len(word) > 4 and word.endswith('ies'):
+        return word[:-3] + 'y'
+    if len(word) > 3 and word.endswith('s') and not word.endswith(('ss', 'us', 'is')):
+        return word[:-1]
+    return word
+
+
+def _key_forms(key):
+    """The raw words and, when different, the singular words. Rules match if either form matches."""
+    raw = _key_tokens(key)
+    sing = [_singular(t) for t in raw]
+    return (raw,) if sing == raw else (raw, sing)
+
+
+def _credential_words(tokens, key):
+    if not tokens:
+        return False
+    joined = ''.join(tokens)
+    return (any(t in _STRONG for t in tokens) or tokens[-1] in _LAST
+            or any((a, b) in _PAIRS for a, b in zip(tokens, tokens[1:]))
+            or joined.endswith(_FUSED_SUFFIX) or _singular(joined).endswith(_FUSED_SUFFIX)
+            or (len(tokens) >= 2 and tokens[-1] in _VALUE_WORDS and (tokens[-2] in _LAST or tokens[-2] in _STRONG))
+            or (len(tokens) >= 2 and tokens[0] == 'x' and tokens[-1] in _X_HEADER_LAST)
+            or (len(tokens) >= 2 and tokens[-1] == 'key' and key.isupper()))  # APP_KEY, DEPLOY_KEY
+
+
 def _numeric_secret_key(key):
     if not isinstance(key, str) or not key:
         return False
-    tokens = _key_tokens(key)
-    return bool(tokens) and (any(t in _NUMERIC_SECRET_ANY for t in tokens) or tokens[-1] in _NUMERIC_SECRET_LAST
-                             or ''.join(tokens).endswith(('password', 'passwd', 'passcode')))
+    return any(tokens and (any(t in _NUMERIC_SECRET_ANY for t in tokens) or tokens[-1] in _NUMERIC_SECRET_LAST
+                           or ''.join(tokens).endswith(('password', 'passwd', 'passcode')))
+               for tokens in _key_forms(key))
+
+
+_SHAPED = re.compile(r'[A-Za-z0-9._:/@-]{1,64}')
+
+
+def _shape_keyed(key):
+    """model and type are keyed only to enforce their shape (spec r5)."""
+    return isinstance(key, str) and ''.join(_key_tokens(key)) in ('model', 'type')
 
 
 def _allowlisted(key, value):
-    """Mapping and counter fields that are never redacted (spec r3)."""
+    """Fields exempt from the keyed rule ONLY, and only for the value shape given (spec r4/r5). Text shapes and
+    pass 2 still apply to the value."""
     if not isinstance(key, str) or not key or isinstance(value, (dict, list)):
         return False
     tokens = _key_tokens(key)
@@ -466,9 +499,9 @@ def _allowlisted(key, value):
     if joined in _ID_KEYS:
         return isinstance(value, str) and bool(_UUID.fullmatch(value) or _ULID.fullmatch(value))
     if joined in ('model', 'type'):
-        return True
+        return isinstance(value, str) and bool(_SHAPED.fullmatch(value))
     if tokens[-1] == 'tokens' or tokens[-2:] == ['token', 'count']:
-        return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
     return False
 
 
@@ -490,7 +523,9 @@ def _walk(value, counts, nest):
         for key, item in value.items():
             new_key = _redact_string(key, counts, nest) if isinstance(key, str) else key
             if _allowlisted(key, item):
-                out[new_key] = item
+                out[new_key] = _walk(item, counts, nest)  # exempt from the keyed rule only
+            elif _shape_keyed(key):
+                out[new_key] = _keyed(item, counts, True)  # off-shape model/type (bool and null are kept)
             elif pair and key == 'value':
                 out[new_key] = _keyed(item, counts, pair_numeric)
             elif _key_is_credential(key):
@@ -651,7 +686,10 @@ _V2_ALNUM = re.compile(r'[^a-z0-9]')
 
 
 def _v2_key_hit(key):
-    return isinstance(key, str) and _V2_ALNUM.sub('', key.lower()).endswith(_V2_KEY_SUFFIX)
+    if not isinstance(key, str):
+        return False
+    norm = _V2_ALNUM.sub('', key.lower())
+    return norm.endswith(_V2_KEY_SUFFIX) or (norm.endswith('s') and norm[:-1].endswith(_V2_KEY_SUFFIX))
 
 
 def _v2_value_hit(value, key=''):
@@ -760,6 +798,10 @@ def _omitted(line, line_no, kind):
 
 def redact_line(line: bytes, line_no: int) -> tuple[bytes, dict, str | None]:
     """One record without its trailing newline -> (output without newline, counts by kind, omitted kind or None).
+
+    The caller splits on b"\n" and passes each record WITHOUT its newline. redact_line strips nothing: a newline
+    inside the input fails closed as "embedded-newline", and text-mode output keeps surrounding whitespace.
+    (A JSON record is re-serialized, so whitespace between JSON tokens is normalized, as the spec requires.)
 
     On a pass 2 hit or any exception the output is the omitted marker and counts is empty."""
     try:
