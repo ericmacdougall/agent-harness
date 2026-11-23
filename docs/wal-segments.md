@@ -40,18 +40,32 @@ derived (segment k is followed by k+1; the last closed segment by the live file)
 
 ## The rotation protocol (writers)
 
-Every append takes, in this order: the seglock (`.stem.seglock`, flock with a 2 s deadline), the live file (O_CREAT only
-under the seglock), the data flock, the target check. When `size + record > limit` (and the file is more than a marker
-long), under all locks: repair a torn tail, hash the live file, exclusive-rename it to the next segment, fsync the
-directory, create the new live file (O_EXCL), write the marker, rewrite the index, then append the record. Recovery rule:
-a live file that is missing or empty next to closed segments is finished with a fresh marker by the next append, with the
-enable file off too.
+Every append takes, in this order: the seglock (`.stem.seglock`, flock with a 2 s deadline), the live file, the data
+flock, the target check. A writer that holds the seglock may create the live file (O_CREAT). A writer that could not take
+the seglock (timeout or unusable lock file) does not create it at once: if closed segments exist it waits up to the same
+deadline for the live name to exist (a rotation may be between its two renames) and only then creates it as a last
+resort, so a record is never dropped.
+
+When `size + record > limit` (and the file is more than a marker long), under all locks: repair a torn tail, hash the live
+file, prepare the NEW live file complete (create it under a temp dot-name `.<stem>.live.<pid>.<rand>.new`, lock it, write
+the open marker, fsync), exclusive-rename the live file to the next segment, fsync the directory, exclusive-rename the
+marked temp file into the live name, fsync the directory, rewrite the index, then append the record to the new live
+file. The live name therefore never exists without its marker (a failure while preparing the temp file changes nothing on
+disk: rotation is skipped and the record still lands in the old live file). The only gap is the instant between the two
+renames, during which the live name is absent; only a lockless old writer can win it, and then the rotator discards its
+temp file and retries into that file (that file lacks a marker: `verify` reports `marker_missing`).
+
+Recovery rule: a live file that is missing or empty next to closed segments is finished with a fresh marker by the next
+append, with the enable file off too. An orphan temp file (a crash between the steps) is marker-only and is discarded by
+the next rotation when nobody holds its flock; it is the only thing this module ever unlinks, and never a WAL.
 
 Stderr codes (hooks show nothing; the ops_watch alert on an oversize live file and on a persistent `live_missing` is part of the reader-migration PR, PENDING): `rotate_collision` (the target
 name exists; rotation skipped), `rotate_unsupported` (no exclusive rename on this platform or filesystem),
-`seq_implausible`, `seglock_timeout`, `seglock_unusable`, `rotate_create_failed` (rotation undone, record kept),
-`rotate_failed_record_not_written` (rename could not be undone: the record is NOT written into a closed segment; the next
-append repairs).
+`seq_implausible`, `seglock_timeout`, `seglock_unusable`, `rotate_create_failed` (the marked temp file could not be
+prepared or moved, rotation skipped or undone, record kept), `rotate_failed` (the live file could not be renamed,
+rotation skipped), `rotate_failed_record_not_written` (the second rename failed and the first could not be undone: the
+record is NOT written into a closed segment and the writer raises `ValueError` starting with this code; the next append
+recovers by recreating the live file with a marker).
 
 ## Switch and rollout
 
@@ -71,6 +85,32 @@ ws.exists(live_path)       # live or any closed segment (a crashed rotation stil
 ws.list_wals(directory)    # {stem: Chain}; segments folded into their stem
 ```
 
+A reader that walks many WALs scans each directory once and passes the listing to every read:
+
+```python
+listing = ws.list_wals(directory)                                   # one scandir for the whole directory
+for stem, ch in listing.items():
+    path = os.path.join(directory, stem + ".jsonl")
+    for seg, n, raw in ws.iter_lines(path, chain=ch): ...          # also read_tail(..., chain=), read_logical(..., chain=),
+                                                                    # open_chain(path, chain=)
+```
+
+The listing is adopted only after the live fd of that read is open and only when it agrees with that fd (the live name it
+lists is the inode we hold, or our fd is one of its closed segments); a stale listing (a rotation happened after it was
+taken), another WAL's listing or another directory's listing is ignored and the directory is scanned again. Measured on
+2,300 WALs in one directory (the Mac, `tests/test_wal_segments_api.py::LatencyTests`): 0.34 s for plain reads, about
+34 s extrapolated for a private scan per WAL, 2.1 s with a pre-scanned listing.
+
+Public pieces for readers that keep their own caches or fast paths: `Snapshot.sources()` (the files of a snapshot as
+`Source(name, fd, seq, ino)`), `valid_marker(first_line, stem, seq)` (the one marker rule) and
+`closed_digests(directory, stem, chain=None)` (`{seq: {name, bytes, lines, sha256}}` of the closed segments from the
+open markers, no hashing; a cache key for a closed segment is `(name, bytes, sha256)`).
+
+`wal.require_segments(directory)` (in `wal.py` and the Codex `wal.py`) is the fail-closed gate for writers, readers and
+gates: it returns normally when `wal_segments` is importable or nothing needs it, and raises `WalSegmentsMissing`
+when the module is missing while `wal-rotation.on` exists or segment-shaped files are in `directory`. Both writers call
+it before any plain-append fallback.
+
 The reader opens the live fd first, lists the directory, and reconciles by inode, so a concurrent rotation gives a
 consistent prefix: no duplicate and no lost pre-snapshot line. Problem codes: `gap` (reported as a `[lo, hi]` range),
 `not_regular` (symlink, FIFO or directory in a segment's place; never followed), `ambiguous`, `marker_mismatch`,
@@ -85,11 +125,35 @@ python3 wal_segments.py map DIR                 # JSON: every logical WAL, segme
 python3 wal_segments.py verify DIR [STEM] [--deep]   # exit 1 on any problem; --deep rehashes against the markers
 python3 wal_segments.py cat DIR STEM [--allow-gaps]  # the whole logical WAL in order, markers dropped
 python3 wal_segments.py reindex DIR STEM [--write]   # rebuild STEM.segments.json (dry run unless --write)
+python3 wal_segments.py recover DIR STEM [--write]   # finish a crashed rotation (live WAL folders only)
 ```
 
-All four work on a copy of a WAL folder (a git backup checkout) using only the file names; they refuse a symlinked
+`recover` is the repair named by the ops_watch alert for a persistent `live_missing`. It works only in a live WAL folder
+(a session directory whose parent is named `wals` or `codex-wals`; never a backup copy), refuses a symlinked directory,
+takes the seglock, and either creates the missing live file with its marker or writes the marker into an EMPTY live
+file. A live file that already holds records is never edited: it is reported as `marker_missing` and the command exits
+1. Without `--write` it only says what it would do.
+
+`map`, `verify`, `cat` and `reindex` work on a copy of a WAL folder (a git backup checkout) using only the file names; they refuse a symlinked
 directory argument and a stem with a path or a segment shape, and open only names found by scanning the directory, never
 a name taken from a marker or the index. The index is advisory: the directory is authoritative.
+
+## Known residual: a live file left without its marker
+
+If a rotation crashes after the rename or the create, and the next append comes from a writer that could not take the
+seglock (`seglock_timeout`), that writer does not run the recovery rule: it still writes its record (a record is never
+dropped), as line 1 of a live file that has closed predecessors and no open marker. The chain then reports
+`marker_missing`. `verify` (exit 1) and `reindex` both print it. That first record is kept as an ordinary record, never
+dropped by the marker rule. A live file that already holds a record is not rewritten (rotation never edits a WAL), so
+the flag stays until the next rotation closes that file.
+
+## Reader framing rules (one place: `Snapshot._frame` and `_drops_marker`)
+
+- A line longer than 8 MiB is discarded up to its newline and yielded once as `None`; it is never split into fake lines.
+- Line 1 of a source is dropped only when it is exactly that source's open marker (seq >= 2, `segment` equal to the
+  source's seq, `stem` equal). Any other marker-shaped line is an ordinary record and adds a `marker_mismatch` problem.
+- Closed segments are reopened through the pinned directory fd (not by re-resolving the path) and must be the inode
+  that was listed; a replaced or swapped segment is reported as `segment_changed` and not read.
 
 ## Transcripts
 
