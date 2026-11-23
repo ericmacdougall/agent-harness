@@ -12,6 +12,7 @@ CLI: wal_segments.py {map,verify,cat,reindex} DIR [STEM].
 """
 
 import argparse
+import collections
 import ctypes
 import ctypes.util
 import errno
@@ -108,9 +109,9 @@ def rotation_enabled():
 
 
 def _fault(step):
-    if test_mode() and os.environ.get("HARNESS_WAL_FAULT") == step:
+    if os.environ.get("HARNESS_WAL_FAULT") == step and test_mode():  # cheap env check first: test_mode() does realpath calls
         os._exit(77)
-    if test_mode() and os.environ.get("HARNESS_WAL_PAUSE") == step:
+    if os.environ.get("HARNESS_WAL_PAUSE") == step and test_mode():
         marker = os.environ.get("HARNESS_WAL_PAUSE_FILE")
         if marker:
             Path(marker).write_text("paused")
@@ -221,6 +222,9 @@ def chain(directory, stem):
     return _build_chain(directory, stem, _scan(directory, stem))
 
 
+scan_chain = chain  # the Snapshot parameter and the public functions below name their argument `chain`
+
+
 def list_wals(directory):
     """{stem: Chain} for every logical WAL in a directory; segment files are folded into their stem."""
     directory = str(directory)
@@ -296,6 +300,19 @@ def _first_line(fd, limit=8192):
     return os.pread(fd, limit, 0).split(b"\n", 1)[0]
 
 
+def valid_marker(first_line, stem, seq):
+    """THE marker rule, public: the marker dict when `first_line` is exactly the open marker of the source `stem`
+    segment `seq` (seq >= 2, `segment` equal to seq, `stem` equal), else None. A marker-shaped line that fails this is
+    an ordinary record."""
+    m = parse_marker(first_line)
+    if m is not None and seq >= 2 and m["segment"] == seq and m["stem"] == stem:
+        return m
+    return None
+
+
+Source = collections.namedtuple("Source", "name fd seq ino")  # fd is None for a closed segment (opened lazily)
+
+
 # ---------------------------------------------------------------------------------------------------------
 # reader snapshot
 # ---------------------------------------------------------------------------------------------------------
@@ -304,7 +321,29 @@ class Snapshot:
     """A consistent point-in-time read of one logical WAL. Opens the live fd FIRST, then lists the directory, then
     reconciles by inode, so a concurrent rotation yields neither a duplicated nor a lost pre-snapshot line."""
 
-    def __init__(self, path, strict=False, include_markers=False, max_total_bytes=None):
+    def _adopt(self, listing):
+        """A private copy of `listing` when it can be trusted against the live fd opened BEFORE it was used, else None.
+        Trusted means: same directory and stem; the live name it lists is the inode we hold (or both agree there is
+        no live file); or our fd is a closed segment of the listing (a rotation moved it after we opened it).
+        Anything else (a rotation happened after the listing was taken) is stale."""
+        if listing is None or getattr(listing, "stem", None) != self.stem:
+            return None
+        if os.path.abspath(str(listing.directory)) != os.path.abspath(self.directory):
+            return None
+        live = listing.live
+        if self.live_fd is None:
+            if live is not None:
+                return None
+        else:
+            listed_inos = {s.ino for s in listing.segments}
+            if (live is None or live.ino != self.live_ino) and self.live_ino not in listed_inos:
+                return None
+        copy = Chain(listing.directory, listing.stem)
+        copy.segments, copy.live = list(listing.segments), live
+        copy.problems, copy.max_seq = list(listing.problems), listing.max_seq
+        return copy
+
+    def __init__(self, path, strict=False, include_markers=False, max_total_bytes=None, chain=None):
         self.directory, name = os.path.split(str(path))
         self.directory = self.directory or "."
         self.stem, _ = parse_name(name)
@@ -314,22 +353,25 @@ class Snapshot:
         self.problems = []
         self.live_fd = None
         self.live_ino = None
-        self.dfd = None  # pinned directory fd: closed segments are reopened through it, never by re-resolving the path
-        try:
-            self.dfd = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
-        except OSError:
-            self.dfd = None
+        self.dfd = None  # pinned directory fd (opened only when closed segments exist; see below)
         live_name = self.stem + ".jsonl"
         try:
-            self.live_fd = _open_at(self.dfd, self.directory, live_name)
+            self.live_fd = _open_regular(self.directory, live_name)  # O_NOFOLLOW on the final component
             self.live_ino = os.fstat(self.live_fd).st_ino
         except OSError as error:
             if error.errno not in (errno.ENOENT,):
                 self.problems.append({"code": "not_regular" if error.errno in (errno.ELOOP, errno.EINVAL) else "unreadable",
                                       "message": f"{live_name}: {type(error).__name__}", "seq": None})
         _fault_reader()
-        self.chain = chain(self.directory, self.stem)
+        # A pre-scanned listing (list_wals) is adopted only after the live fd is open and only when it is consistent
+        # with that fd; a stale, foreign or contradictory listing is ignored and the directory is scanned again.
+        self.chain = self._adopt(chain) or scan_chain(self.directory, self.stem)
         self._inos = {s.name: s.ino for s in self.chain.segments}  # what was listed: reopened files must match
+        if self.chain.segments:  # closed segments are reopened through a pinned directory fd, never by re-resolving the path
+            try:
+                self.dfd = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+            except OSError:
+                self.dfd = None
         self.problems.extend(p for p in self.chain.problems
                              if not (p["code"] == "live_missing" and self.live_fd is not None))
         # an fd opened before a rotation is now a closed segment: it is the last segment of the snapshot, and the
@@ -378,13 +420,18 @@ class Snapshot:
         except Exception:  # noqa: BLE001
             pass
 
-    def _sources(self):
-        """[(name, fd_or_None, seq)] in order; closed segments are opened lazily by name, the tail by its pinned fd."""
-        out = [(s.name, None, s.seq) for s in self.chain.segments if s.name != self.tail_name]
+    def sources(self):
+        """The snapshot's files in order as Source(name, fd, seq, ino): closed segments (fd None, opened lazily through
+        the pinned directory fd) then the tail (the live file, pinned by its fd, or the segment it was rotated into)."""
+        out = [Source(s.name, None, s.seq, s.ino) for s in self.chain.segments if s.name != self.tail_name]
         if self.tail_fd is not None:
             seq = parse_name(self.tail_name)[1] or (self.chain.max_seq + 1)
-            out.append((self.tail_name, self.tail_fd, seq))
+            out.append(Source(self.tail_name, self.tail_fd, seq, self.live_ino))
         return out
+
+    def _sources(self):
+        """[(name, fd_or_None, seq)] in order (internal form of sources())."""
+        return [(s.name, s.fd, s.seq) for s in self.sources()]
 
     def _marker_note(self, name, seq):
         self.problems.append({"code": "marker_mismatch", "seq": seq,
@@ -393,10 +440,9 @@ class Snapshot:
     def _drops_marker(self, first_line, name, seq):
         """THE marker rule, shared by every reader: line 1 is dropped only when it is exactly this source's open
         marker (seq >= 2, segment == seq, stem equal). Any other marker-shaped line is a record plus a problem."""
-        m = parse_marker(first_line)
-        if m is None:
+        if parse_marker(first_line) is None:
             return False
-        if seq >= 2 and m["segment"] == seq and m["stem"] == self.stem:
+        if valid_marker(first_line, self.stem, seq) is not None:
             return not self.include_markers
         self._marker_note(name, seq)
         return False
@@ -485,7 +531,7 @@ class Snapshot:
 
 
 def _fault_reader():
-    if test_mode() and os.environ.get("HARNESS_WAL_READER_PAUSE") == "after_open":
+    if os.environ.get("HARNESS_WAL_READER_PAUSE") == "after_open" and test_mode():
         marker = os.environ.get("HARNESS_WAL_PAUSE_FILE")
         if marker:
             Path(marker).write_text("reader-paused")
@@ -498,10 +544,12 @@ def open_chain(path, **kw):
     return Snapshot(path, **kw)
 
 
-def iter_lines(path, strict=False, include_markers=False, max_total_bytes=None, problems=None):
+def iter_lines(path, strict=False, include_markers=False, max_total_bytes=None, problems=None, chain=None):
     """Drop-in for a reader's `for raw in open(path)` loop: yields (segment, logical_line_no, bytes). Problems are
-    appended to `problems` (a list) when given; strict=True raises SegmentProblem instead of reading past one."""
-    with Snapshot(path, strict=strict, include_markers=include_markers, max_total_bytes=max_total_bytes) as snap:
+    appended to `problems` (a list) when given; strict=True raises SegmentProblem instead of reading past one.
+    `chain` is an optional pre-scanned listing (`list_wals(dir)[stem]`), used only when it is consistent with the
+    live fd opened for this read, so a reader that walks many WALs scans each directory once, not once per WAL."""
+    with Snapshot(path, strict=strict, include_markers=include_markers, max_total_bytes=max_total_bytes, chain=chain) as snap:
         try:
             yield from snap.lines()
         finally:
@@ -509,18 +557,48 @@ def iter_lines(path, strict=False, include_markers=False, max_total_bytes=None, 
                 problems.extend(snap.problems)
 
 
-def read_tail(path, window, problems=None, strict=False):
-    with Snapshot(path, strict=strict) as snap:
+def read_tail(path, window, problems=None, strict=False, chain=None):
+    """The last `window` bytes of the logical WAL (markers dropped); `chain` as for iter_lines."""
+    with Snapshot(path, strict=strict, chain=chain) as snap:
         data = snap.read_tail(window)
         if problems is not None:
             problems.extend(snap.problems)
         return data
 
 
-def read_logical(path, max_bytes=None, problems=None):
+def closed_digests(directory, stem, chain=None):
+    """{seq: {"name", "bytes", "lines", "sha256"}} for the closed segments of a WAL, taken from the open markers of
+    the NEXT source (segment seq+1 or the live file): no hashing, one small read per source. A closed segment whose
+    successor has no valid marker naming it (a legacy segment, a crashed rotation) is left out. `chain` as for
+    iter_lines (no directory scan when given). Cache keys for incremental readers: (name, bytes, sha256)."""
+    directory = str(directory)
+    ch = chain if (chain is not None and getattr(chain, "stem", None) == stem
+                   and os.path.abspath(str(chain.directory)) == os.path.abspath(directory)) else scan_chain(directory, stem)
+    ordered = list(ch.segments) + ([ch.live] if ch.live else [])
+    names = {s.seq: s.name for s in ch.segments}
+    out = {}
+    for seg in ordered:
+        if seg.seq < 2:
+            continue
+        try:
+            fd = _open_regular(directory, seg.name)
+        except OSError:
+            continue
+        try:
+            m = valid_marker(_first_line(fd), stem, seg.seq)
+        finally:
+            os.close(fd)
+        prev = names.get(seg.seq - 1)
+        if m is not None and prev is not None and m.get("prev") == prev:
+            out[seg.seq - 1] = {"name": prev, "bytes": m.get("prev_bytes"), "lines": m.get("prev_lines"),
+                                "sha256": m.get("prev_sha256")}
+    return out
+
+
+def read_logical(path, max_bytes=None, problems=None, chain=None):
     """The whole logical WAL as bytes (markers dropped); `max_bytes` bounds it and reports `truncated`."""
     out, size = [], 0
-    with Snapshot(path, max_total_bytes=max_bytes) as snap:
+    with Snapshot(path, max_total_bytes=max_bytes, chain=chain) as snap:
         for _, _, raw in snap.lines():
             if raw is None:
                 continue
@@ -1074,6 +1152,64 @@ def map_directory(directory):
     return {"directory": str(directory), "wals": out}
 
 
+def _live_layout(directory):
+    """True for a session directory of a real WAL root (its parent is named `wals` or `codex-wals`); a backup copy
+    or any other path is not."""
+    return os.path.basename(os.path.dirname(os.path.realpath(directory))) in ("wals", "codex-wals")
+
+
+def recover_live(directory, stem, write=False):
+    """Finish a crashed rotation: create the live file (when missing) or fill an EMPTY one with its open marker.
+    Returns (code, message): 0 done or nothing to do, 1 when a live file that already holds records has no valid
+    marker (a rotation never edits a WAL: it is reported, not repaired). Needs the seglock (2 s)."""
+    ch = scan_chain(directory, stem)
+    if not ch.segments:
+        return 0, "nothing to do: no closed segments"
+    live = ch.live
+    if live is not None and live.size > 0:
+        fd = _open_regular(directory, live.name)
+        try:
+            ok = valid_marker(_first_line(fd), stem, live.seq) is not None
+        finally:
+            os.close(fd)
+        if ok:
+            return 0, "nothing to do: the live file has its marker"
+        return 1, f"problem {stem}: marker_missing: {live.name} holds records but no open marker; not edited"
+    action = "create the live file with its marker" if live is None else "write the marker into the empty live file"
+    if not write:
+        return 0, f"would {action} (dry run; add --write)"
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        lock_fd = os.open(f".{stem}.seglock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+                return 1, "problem: the seglock is not a regular file"
+            end = time.monotonic() + 2.0
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EWOULDBLOCK, errno.EAGAIN) or time.monotonic() > end:
+                        return 1, "problem: could not take the seglock (a writer is rotating); retry"
+                    time.sleep(0.01)
+            fd = os.open(f"{stem}.jsonl", os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                if os.fstat(fd).st_size == 0:
+                    _finish_live(dir_fd, stem, fd)
+                    os.fsync(dir_fd)
+                else:
+                    return 1, "problem: the live file received a record meanwhile; not edited"
+            finally:
+                os.close(fd)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(dir_fd)
+    return 0, f"recovered: {action}"
+
+
 def _checked_dir(raw):
     if os.path.islink(raw):
         raise SystemExit("wal_segments: refusing a symlinked directory argument")
@@ -1105,6 +1241,10 @@ def main(argv=None):
     p.add_argument("dir")
     p.add_argument("stem")
     p.add_argument("--write", action="store_true")
+    p = sub.add_parser("recover", help="finish a crashed rotation in a live WAL folder (under a wals root only)")
+    p.add_argument("dir")
+    p.add_argument("stem")
+    p.add_argument("--write", action="store_true", help="make the change; without it only say what would happen")
     args = ap.parse_args(argv)
     directory = _checked_dir(args.dir)
     if args.cmd == "map":
@@ -1123,6 +1263,13 @@ def main(argv=None):
                 print(f"problem {stem}: {pr['code']}: {pr['message']}", file=sys.stderr)
         return 1 if bad else 0
     stem = _checked_stem(args.stem)
+    if args.cmd == "recover":
+        if not _live_layout(directory):
+            raise SystemExit("wal_segments: recover works only in a live WAL folder (a session directory under a `wals` or "
+                             "`codex-wals` root); never in a backup copy")
+        code, message = recover_live(directory, stem, write=args.write)
+        print(message, file=sys.stderr if code else sys.stdout)
+        return code
     if args.cmd == "cat":
         probs = []
         snap = Snapshot(os.path.join(directory, stem + ".jsonl"))
