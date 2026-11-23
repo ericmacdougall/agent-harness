@@ -182,8 +182,8 @@ applies only to files with 100 or more records in the run.
   not know, so a lost or replaced `state.json` can never shrink the host's catalog index.
 - The host label comes from `TRANSCRIPTS_HOST`, else from the pinned `host` file in the state dir, which is
   written on first use from the short hostname. macOS hostnames drift; the label must not.
-- The catalog README is pushed from `harness/transcripts/catalog-README.md`, located relative to the hook
-  directory (`<hooks>/../transcripts/catalog-README.md`). The installer must ship it; when it is missing, the
+- The catalog README is pushed from `harness/hooks/transcripts_catalog_README.md`, installed beside
+  `transcripts.py` in the hooks directory. The installer must ship it; when it is missing, the
   catalog push refuses visibly.
 
 ### Chunks and sidecars
