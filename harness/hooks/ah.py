@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import hashlib
 import json
 import math
@@ -19,6 +20,7 @@ import platform
 import re
 import socket
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -166,35 +168,40 @@ def atomic_json(path: Path, data) -> None:
 
 # ------------------------------------------------------------------ incremental line index
 
-def read_new_lines(path: Path, meta: dict):
+def read_new_lines(path: Path, meta: dict, fd=None):
     """(iterator of (offset, line), rebuilt) over complete lines appended since meta['offset'].
 
     Reads in bounded chunks, so memory stays flat for any file size. meta (inode, offset, tail = sha256 of the
     up-to-64 bytes before offset) is cleared when the file was replaced or truncated and advanced once the
     iterator is exhausted. A partial last line is left for the next call.
+
+    `fd` (WAL chain readers): a descriptor the caller already holds on the file. It is read instead of opening
+    `path`, so a rename of the path cannot swap another file under the read, and it is never closed here.
     """
-    st = path.stat()
+    pinned = fd is not None
+    st = os.fstat(fd) if pinned else path.stat()
     rebuilt = False
     offset = meta.get("offset", 0)
     if offset:
-        fd = os.open(path, os.O_RDONLY)
+        vfd = fd if pinned else os.open(path, os.O_RDONLY)
         try:
             ok = meta.get("inode") == st.st_ino and st.st_size >= offset
             if ok:
                 n = min(64, offset)
-                ok = hashlib.sha256(os.pread(fd, n, offset - n)).hexdigest() == meta.get("tail")
+                ok = hashlib.sha256(os.pread(vfd, n, offset - n)).hexdigest() == meta.get("tail")
         finally:
-            os.close(fd)
+            if not pinned:
+                os.close(vfd)
         if not ok:
             meta.clear()
             offset, rebuilt = 0, True
 
     def gen():
-        fd = os.open(path, os.O_RDONLY)
+        fd_ = fd if pinned else os.open(path, os.O_RDONLY)
         try:
             pos, carry, carry_off = offset, b"", offset
             while True:
-                chunk = os.pread(fd, 4 << 20, pos)
+                chunk = os.pread(fd_, 4 << 20, pos)
                 if not chunk:
                     break
                 pos += len(chunk)
@@ -209,9 +216,187 @@ def read_new_lines(path: Path, meta: dict):
                 carry, carry_off = data[start:], carry_off + start
             n = min(64, carry_off)
             meta.update(inode=st.st_ino, offset=carry_off,
-                        tail=hashlib.sha256(os.pread(fd, n, carry_off - n)).hexdigest() if n else "")
+                        tail=hashlib.sha256(os.pread(fd_, n, carry_off - n)).hexdigest() if n else "")
         finally:
-            os.close(fd)
+            if not pinned:
+                os.close(fd_)
+    return gen(), rebuilt
+
+
+# ------------------------------------------------------------------ WAL segments (docs/wal-segments.md)
+# Every WAL read in this module goes through the wal_segments reader API (exists, chain, list_wals, open_chain,
+# iter_lines, read_tail); none opens `<stem>.jsonl` itself. A problem in a chain (a gap, an ambiguous or non-regular
+# segment, a line over 8 MiB) is said, never skipped: to the tally (`ah owners`, `ah status`) or, for a caller with
+# nowhere to say it, as an AhError.
+
+_WAL_BENIGN = ("schema_newer", "marker_info")   # live_missing is NOT benign: a crashed rotation is said, and recoverable
+WAL_STATUS_MAX = 64 << 20   # bytes of one WAL `ah status` reads, newest first
+
+
+def _ws():
+    import wal_segments  # noqa: PLC0415
+    return wal_segments
+
+
+def _wal_bad(problems) -> list:
+    return [p for p in problems if p.get("code") not in _WAL_BENIGN]
+
+
+def _wal_say(problem) -> str:
+    return f"{problem.get('code')}: {problem.get('message')}"[:200]
+
+
+def _wal_report(problems, source: str, tally=None, strict: bool = False) -> None:
+    """Say what a read of one chain did not cover: to the tally as an unread source, else (strict) refuse."""
+    bad = _wal_bad(problems)
+    if tally is not None:
+        for p in bad:
+            tally.missed(source, _wal_say(p))
+    elif strict and bad:
+        raise AhError("wal_incomplete", f"{source}: {_wal_say(bad[0])}; `ah doctor` names the chain and the recover command", 3)
+
+
+def _wal_exists(path) -> bool:
+    """True when the live file or any closed segment of this WAL exists (a crashed rotation still counts)."""
+    return _ws().exists(path)
+
+
+def _wal_lines(path, problems: list):
+    """(segment, logical line no, raw bytes) over the whole chain. A line over 8 MiB is a reported problem, not a line."""
+    for seg, number, raw in _ws().iter_lines(path, problems=problems):
+        if raw is None:
+            if not any(p.get("code") == "line_too_long" for p in problems):
+                problems.append({"code": "line_too_long", "message": f"a line over 8 MiB in {seg} was not read", "seq": None})
+            continue
+        yield seg, number, raw
+
+
+def _wal_stem(path) -> str:
+    stem = _ws().parse_name(Path(path).name)[0]
+    if stem is None:
+        raise ValueError(f"not a WAL name: {Path(path).name}")
+    return stem
+
+
+def _wal_chain(path):
+    return _ws().chain(Path(path).parent, _wal_stem(path))
+
+
+def _wal_last(ch):
+    """The newest file of a chain (the live file, else the newest closed segment), or None."""
+    return ch.live or (ch.segments[-1] if ch.segments else None)
+
+
+def _wal_mtime_of(ch) -> float:
+    seg = _wal_last(ch)
+    if seg is None:
+        raise FileNotFoundError(ch.stem)
+    return os.stat(ch.path(seg)).st_mtime
+
+
+def _wal_mtime(path) -> float:
+    """Newest write time of a WAL chain; FileNotFoundError when it has no file."""
+    try:
+        st = os.lstat(path)
+        if stat.S_ISREG(st.st_mode):
+            return st.st_mtime   # the common case: the live file, no directory listing
+    except FileNotFoundError:
+        pass
+    return _wal_mtime_of(_wal_chain(path))
+
+
+def _wal_ends_with_newline(path) -> bool:
+    return _ws().read_tail(path, 1).endswith(b"\n")
+
+
+_CHAIN_HINT: dict = {}   # str(live path) -> the chain summarize_agent_wal was handed (one directory listing per session)
+
+
+
+
+def chain_new_lines(snap, meta: dict, torn: dict):
+    """(iterator of (offset, line), rebuilt): the complete lines of a whole WAL chain not yet read, oldest first.
+
+    `snap` is a wal_segments snapshot (the live fd pinned before the directory was listed, so a rotation during the
+    read loses and duplicates nothing; opened with the caller's one-time listing, so no directory scan per WAL). meta describes where the last call stopped: the inode, offset and tail hash
+    of the LAST file it read, plus `prior`, the [name, inode, size, mtime_ns] of every file before it. A rotation renames that
+    file (its inode survives), so the read resumes in it and goes on through the segments after it. It rescans from
+    the first segment when the file is gone, changed, or the files before it are no longer the ones it was
+    built from (a segment replaced, deleted, or restored). An open marker (line 1 of a file) is never a line. A
+    closed segment ends with a newline: a partial last line in one is counted in torn["closed"] (a lost line).
+    """
+    ws = _ws()
+    directory = snap.directory
+    files = []
+    for src in snap.sources():   # closed segments (fd None, opened lazily by the snapshot), then the pinned tail
+        if src.fd is None:
+            st = os.lstat(os.path.join(directory, src.name))
+            files.append({"name": src.name, "ino": src.ino, "size": st.st_size, "fd": None, "own": True, "seq": src.seq,
+                          "mtime": st.st_mtime_ns})
+        else:
+            st = os.fstat(src.fd)
+            files.append({"name": src.name, "ino": st.st_ino, "size": st.st_size, "fd": src.fd, "own": False, "seq": src.seq,
+                          "mtime": st.st_mtime_ns})
+    live_name = snap.stem + ".jsonl"
+    for p in snap.problems:   # the live file is there but could not be opened: the newest records are unreadable
+        if p["code"] in ("unreadable", "not_regular") and str(p["message"]).startswith(live_name):
+            raise OSError(errno.EACCES if p["code"] == "unreadable" else errno.EINVAL, str(p["message"]))
+    if not files:
+        raise FileNotFoundError(snap.stem)
+
+    def ident(f):
+        return [f["name"], f["ino"], f["size"], f["mtime"]]
+
+    prior = meta.get("prior") if isinstance(meta.get("prior"), list) else []
+    start, resumed, rebuilt, first = 0, False, False, None
+    if meta.get("offset"):
+        k = len(prior)
+        f = files[k] if k < len(files) else None
+        if f is not None and f["ino"] == meta.get("inode") and [ident(x) for x in files[:k]] == prior:
+            if f["fd"] is None:
+                f["fd"] = snap._open_closed(f["name"])   # inode-checked against the listing
+            try:
+                first, rb = read_new_lines(Path(directory) / f["name"], meta, fd=f["fd"])
+            except BaseException:
+                if f["own"]:
+                    os.close(f["fd"])
+                raise
+            if rb:   # the file is not the one the cache described (meta was cleared)
+                if f["own"]:
+                    os.close(f["fd"])
+                f["fd"] = None if f["own"] else f["fd"]
+            else:
+                start, resumed = k, True
+        if not resumed:
+            meta.clear()
+            rebuilt = True
+    last = len(files) - 1
+
+    def gen():
+        for i in range(start, len(files)):
+            f = files[i]
+            fd = f["fd"] if f["fd"] is not None else snap._open_closed(f["name"])
+            try:
+                if resumed and i == start:
+                    sub, it = meta, first
+                else:
+                    sub = {}
+                    it, _ = read_new_lines(Path(directory) / f["name"], sub, fd=fd)
+                for off, raw in it:
+                    if off == 0 and ws.valid_marker(raw, snap.stem, f["seq"]) is not None:
+                        continue
+                    yield off, raw
+                if i < last and sub.get("offset", 0) < f["size"]:
+                    torn["closed"] += 1
+                if i == last:
+                    if sub is not meta:
+                        meta.clear()
+                        meta.update(sub)
+                    meta["prior"] = [ident(x) for x in files[:last]]
+            finally:
+                if f["own"]:
+                    os.close(fd)
+                    f["fd"] = None
     return gen(), rebuilt
 
 
@@ -228,7 +413,7 @@ def wal_roots(home: Path) -> list:
 def session_dir(home: Path, session: str) -> Path:
     """The directory holding a session's WALs, whichever runtime wrote them; the Claude root when neither has it."""
     for root in wal_roots(home):
-        if (root / session / "main.jsonl").is_file():
+        if _wal_exists(root / session / "main.jsonl"):
             return root / session
     return wal_roots(home)[0] / session
 
@@ -245,27 +430,39 @@ def newest_session(home: Path):
                 continue
             for entry in os.scandir(root):
                 main = Path(entry.path) / "main.jsonl"
-                if main.is_file() and main.stat().st_mtime > stamp:
-                    best, stamp = entry.name, main.stat().st_mtime
+                if _wal_exists(main):
+                    mtime = _wal_mtime(main)
+                    if mtime > stamp:
+                        best, stamp = entry.name, mtime
     except OSError:
         pass
     return best
 
 
-def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" = None, cache: dict | None = None) -> dict:
-    """The owner facts of one agent or task WAL, read incrementally from a cached offset. `tally` (ah owners): lines
-    that could not be used are kept in the summary (`skipped`), so a torn line seen once still counts on every later
-    call, and a read that fails is an unread source instead of an exception (PR 234 v8, receipt v7 F1)."""
+def summarize_agent_wal(path: Path, index_dir: Path, tally: "ReadTally | None" = None, cache: dict | None = None,
+                        chain=None) -> dict:
+    """The owner facts of one agent or task WAL (its whole segment chain), read incrementally from a cached offset.
+    `tally` (ah owners): lines that could not be used are kept in the summary (`skipped`), so a torn line seen once
+    still counts on every later call, and a read that fails is an unread source instead of an exception (PR 234 v8,
+    receipt v7 F1). A gap or another chain problem is an unread source on every call, cache hit or not. `chain` is
+    the wal_segments chain of this WAL when the caller listed the directory once for all of them."""
     if tally is not None:
+        ch = None
         try:
-            summary = _summarize_cached(path, index_dir, cache)
+            ch = chain if chain is not None else _wal_chain(path)
+            _CHAIN_HINT[str(path)] = ch
+            try:
+                summary = _summarize_cached(path, index_dir, cache, ch)
+            finally:
+                _CHAIN_HINT.pop(str(path), None)
         except OSError as error:
             tally.missed(f"WAL {path.name[:60]}", error)
             return {"first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         tally.read_ok += 1
+        _wal_report(ch.problems, f"WAL {path.name[:60]}", tally)
         trail = (_prov().LostTrail.from_state(summary.get("lost_trail")) or _prov().LostTrail()).copy()
         try:   # an unterminated last line read_new_lines leaves for later: torn unless it is still being written
-            st = path.stat()
+            st = os.stat(ch.path(_wal_last(ch)))
             if (summary.get("meta") or {}).get("offset", 0) < st.st_size \
                     and not _prov().tail_in_progress(True, st.st_mtime):
                 trail.lost()   # this call's evidence only: no dated record after it, so the shared rule keeps it inside
@@ -304,42 +501,48 @@ def _summarize_agent_wal(path: Path, index_dir: Path, prior: dict | None = None)
         # an index written before outcome_at (goodqa#15943 r5) or skipped (PR 234 v8) existed, or one an older ah
         # advanced without counting the lines it skipped (skipped_to is where the count was last brought up to): rescan
         meta.clear()
-    lines, rebuilt = read_new_lines(path, meta)
-    if rebuilt or "first" not in summary or "outcome_at" not in summary or "skipped" not in summary \
-            or not meta.get("offset"):
-        summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0,
-                       skipped=0, lost_trail=_prov().LostTrail().state())
-    trail = _prov().LostTrail.from_state(summary.get("lost_trail")) or _prov().LostTrail()
-    for _off, raw in lines:
-        try:
-            rec = json.loads(raw)
-        except (ValueError, RecursionError):   # goodqa#15963: a deeply nested line is a lost line, never a crash
-            summary["skipped"] += 1  # a complete line that is not a record: kept with the summary, counted every call
-            trail.lost()
-            continue
-        if _prov().wal_record_problem(rec):   # receipt v10 F2: never activity, never dated evidence
+    torn = {"closed": 0}
+    snap = _ws().open_chain(path, chain=_CHAIN_HINT.get(str(path)))   # the listing is used only if it agrees with the live fd
+    with snap:   # the whole segment chain, the live fd pinned first (a rotation mid-read is safe)
+        lines, rebuilt = chain_new_lines(snap, meta, torn)
+        if rebuilt or "first" not in summary or "outcome_at" not in summary or "skipped" not in summary \
+                or not meta.get("offset"):
+            summary.update(first=None, last_at=0.0, outcome=None, outcome_at=0.0, last_note="", tickets=[], events=0,
+                           skipped=0, lost_trail=_prov().LostTrail().state())
+        trail = _prov().LostTrail.from_state(summary.get("lost_trail")) or _prov().LostTrail()
+        for _off, raw in lines:
+            try:
+                rec = json.loads(raw)
+            except (ValueError, RecursionError):   # goodqa#15963: a deeply nested line is a lost line, never a crash
+                summary["skipped"] += 1  # a complete line that is not a record: kept with the summary, counted every call
+                trail.lost()
+                continue
+            if _prov().wal_record_problem(rec):   # receipt v10 F2: never activity, never dated evidence
+                summary["skipped"] += 1
+                trail.lost()
+                continue
+            at = parse_ts(rec.get("at"))
+            trail.dated(at)
+            if not rec.get("by") or rec.get("by") == own:  # a record another actor wrote on this owner's behalf is not its activity (review H2)
+                summary["last_at"] = max(summary["last_at"], at)
+            summary["events"] += 1
+            event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
+            if event == "intent":
+                summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
+                if summary["first"] is None and note:
+                    summary["first"] = note[:160]
+            if event in ("handoff", "result"):
+                # outcome_at is the time of this result record itself, never later activity (receipt r5 F2): it orders
+                # main's acknowledgement and ages the result
+                summary["outcome"], summary["outcome_at"] = event, at
+            if event in ("handoff", "result", "status", "blocker", "decision") and note:
+                summary["last_note"] = note[:300]
+            for match in TICKET_IN_NOTE.findall(note):
+                if match not in summary["tickets"] and len(summary["tickets"]) < 8:
+                    summary["tickets"].append(match)
+        for _ in range(torn["closed"]):   # a closed segment ends with a newline: a partial last line there is lost
             summary["skipped"] += 1
             trail.lost()
-            continue
-        at = parse_ts(rec.get("at"))
-        trail.dated(at)
-        if not rec.get("by") or rec.get("by") == own:  # a record another actor wrote on this owner's behalf is not its activity (review H2)
-            summary["last_at"] = max(summary["last_at"], at)
-        summary["events"] += 1
-        event, note = rec.get("event"), rec.get("note") if isinstance(rec.get("note"), str) else ""
-        if event == "intent":
-            summary["outcome"], summary["outcome_at"] = None, 0.0  # new work after an earlier result/handoff: not finished
-            if summary["first"] is None and note:
-                summary["first"] = note[:160]
-        if event in ("handoff", "result"):
-            # outcome_at is the time of this result record itself, never later activity (receipt r5 F2): it orders
-            # main's acknowledgement and ages the result
-            summary["outcome"], summary["outcome_at"] = event, at
-        if event in ("handoff", "result", "status", "blocker", "decision") and note:
-            summary["last_note"] = note[:300]
-        for match in TICKET_IN_NOTE.findall(note):
-            if match not in summary["tickets"] and len(summary["tickets"]) < 8:
-                summary["tickets"].append(match)
     summary["skipped_to"] = meta.get("offset", 0)   # the skipped count covers every line before this offset
     summary["lost_trail"] = trail.state()   # and the evidence for each lost line, for the shared window rule
     summary["record_rule"] = _prov().RECORD_RULE   # every record in this summary passed this contract
@@ -531,7 +734,10 @@ _SUMMARY_FIELDS = {
     "skipped": _count, "skipped_to": _count, "record_rule": lambda v: isinstance(v, str),
     "lost_trail": lambda v: _prov().LostTrail.from_state(v) is not None,
     "meta": lambda m: isinstance(m, dict) and all(k not in m or check(m[k]) for k, check in (
-        ("offset", _count), ("inode", _count), ("tail", lambda t: isinstance(t, str)))),
+        ("offset", _count), ("inode", _count), ("tail", lambda t: isinstance(t, str)),
+        ("prior", lambda p: isinstance(p, list) and len(p) <= 4096 and all(
+            isinstance(r, list) and len(r) == 4 and isinstance(r[0], str) and all(_count(x) for x in r[1:]) for r in p))
+    )),
 }
 _SUMMARY_REQUIRED = ("first", "last_at", "outcome", "outcome_at", "last_note", "tickets", "events", "skipped", "meta",
                      "lost_trail", "record_rule")
@@ -557,16 +763,24 @@ def _cached_meta_ok(m) -> bool:
     return isinstance(m, dict) and set(m) == set(_META_FIELDS) and isinstance(m.get("finished"), bool)
 
 
-def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
-    """_summarize_agent_wal, served from the owners cache while the file is unchanged (same inode, size, mtime_ns).
-    Only the file's own facts are cached: what depends on the time of this call (an unterminated tail still inside
-    the append grace) is decided by summarize_agent_wal on every call, cache hit or not."""
+def _wal_fingerprint(ch):
+    """The cache key of a WAL chain: name and (inode, size, mtime_ns, ctime_ns) of every segment and the live file.
+    None when the chain has no file. A closed segment that is replaced, restored or deleted changes it."""
+    rows = [[seg.name] + _fingerprint(os.lstat(ch.path(seg))) for seg in list(ch.segments) + ([ch.live] if ch.live else [])]
+    return rows or None
+
+
+def _summarize_cached(path: Path, index_dir: Path, cache: dict | None, ch=None) -> dict:
+    """_summarize_agent_wal, served from the owners cache while the chain is unchanged (the same files, each with the
+    same inode, size, mtime_ns). Only the WAL's own facts are cached: what depends on the time of this call (an
+    unterminated tail still inside the append grace) is decided by summarize_agent_wal on every call, cache hit or not.
+    `ch` is the chain the caller listed (one directory listing for every WAL of a session)."""
     if cache is None:
         return _summarize_agent_wal(path, index_dir)
     key = str(path)
     cache["seen"].add(key)
     try:
-        fp = _fingerprint(os.stat(path))
+        fp = _wal_fingerprint(ch if ch is not None else _wal_chain(path))
     except OSError:
         fp = None
     try:   # PR 245 m3 receipt: the validation of cached state runs inside the miss handler too
@@ -613,8 +827,9 @@ def discover_agents(home: Path, session: str, wal: Path, unread: list | None = N
     try:
         with os.scandir(wal) as it:
             for e in it:
-                if e.name.startswith("agent-") and e.name.endswith(".jsonl"):
-                    found.setdefault(e.name[6:-6], {})
+                stem = _ws().parse_name(e.name)[0]   # agent-ID.0001.jsonl is a segment of agent ID, not an agent
+                if stem is not None and stem.startswith("agent-") and not e.name.startswith("."):
+                    found.setdefault(stem[6:], {})
     except OSError as error:
         missed("session WAL folder", error)
     try:
@@ -668,7 +883,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     now = time.time() if now is None else now
     wal = session_dir(home, session)
     main = wal / "main.jsonl"
-    if not main.is_file():
+    if not _wal_exists(main):
         raise AhError("session_unknown", f"no main WAL for session {session!r}")
     index_dir = state_dir(home, "ah-index")
     cache_path = _owners_cache_path(index_dir, session)
@@ -677,28 +892,37 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     spawned, stopped, named, stop_at = {}, set(), [], {}
     tally = ReadTally()   # PR 234 v8: what this view actually read; the read block is built from it alone
     tally.window = _prov().LostWindow(now - OWNERS_RECENT_S)   # the default view's window (shown_owner)
-    with open(main, "rb") as handle:
-        main_mtime = os.fstat(handle.fileno()).st_mtime
-        for raw in handle:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                if raw.strip():   # e.g. a torn subagent_stop: a stopped agent could show as running
-                    tally.line_lost(not raw.endswith(b"\n"), main_mtime)
-                continue
-            if _prov().wal_record_problem(rec):   # receipt v10 F2: e.g. a subagent_stop with no event or a bad time
-                tally.skipped += 1
-                continue
-            if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
-                    and isinstance(rec.get("note"), str):
-                named.append(rec["note"])
-            if not isinstance(rec, dict) or not isinstance(rec.get("agent_id"), str):
-                continue
-            if rec.get("event") == "subagent":
-                spawned.setdefault(rec["agent_id"], {"type": rec.get("agent_type"), "at": parse_ts(rec.get("at"))})
-            elif rec.get("event") == "subagent_stop":
-                stopped.add(rec["agent_id"])
-                stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
+    main_problems = []
+    try:
+        main_mtime = _wal_mtime(main)
+    except OSError:   # e.g. a directory where the main WAL should be: read below as a problem, not a crash
+        main_mtime = now
+    bad_line = False   # a line that did not parse: a write in progress only when it is the last line of an unterminated file
+    for _seg, _n, raw in _wal_lines(main, main_problems):   # the whole chain, oldest segment first
+        if bad_line:
+            tally.line_lost(False, main_mtime)   # another line follows it: it was complete
+            bad_line = False
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            bad_line = bool(raw.strip())   # e.g. a torn subagent_stop: a stopped agent could show as running
+            continue
+        if _prov().wal_record_problem(rec):   # receipt v10 F2: e.g. a subagent_stop with no event or a bad time
+            tally.skipped += 1
+            continue
+        if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
+                and isinstance(rec.get("note"), str):
+            named.append(rec["note"])
+        if not isinstance(rec, dict) or not isinstance(rec.get("agent_id"), str):
+            continue
+        if rec.get("event") == "subagent":
+            spawned.setdefault(rec["agent_id"], {"type": rec.get("agent_type"), "at": parse_ts(rec.get("at"))})
+        elif rec.get("event") == "subagent_stop":
+            stopped.add(rec["agent_id"])
+            stop_at[rec["agent_id"]] = parse_ts(rec.get("at"))
+    if bad_line:
+        tally.line_lost(not _wal_ends_with_newline(main), main_mtime)
+    _wal_report(main_problems, "main WAL", tally)   # a gap in the main chain: the owner list may be short
     tally.read_ok += 1
     unread = tally.unread  # places that exist but could not be read: the owner list may be short (goodqa#15920)
     for agent, meta in discover_agents(home, session, wal, unread, cache).items():
@@ -710,13 +934,19 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     pending = pending_stops(home, session, led)
     sub_dirs = transcript_mtimes(home, session, tally=tally)  # one scan of the subagents dirs, not one stat per agent per dir
     named_text = "\n".join(named)
+    try:
+        chains = _ws().list_wals(wal)   # one directory listing for every WAL of the session, segments folded into stems
+    except OSError as error:
+        chains = {}
+        tally.missed("session WAL folder", error)
     rows = []
     for agent, info in spawned.items():
         path = wal / f"agent-{agent}.jsonl"
-        if path.is_file():
-            summary = summarize_agent_wal(path, index_dir, tally, cache)
+        ch = chains.get(f"agent-{agent}")
+        if ch is not None and (ch.live or ch.segments):
+            summary = summarize_agent_wal(path, index_dir, tally, cache, ch)
         else:
-            if os.path.lexists(path):   # PR 234 v8: there, but not a WAL that can be read (a directory, a link)
+            if ch is not None:   # PR 234 v8: there, but not a WAL that can be read (a directory, a link)
                 tally.unread.append({"source": f"WAL {path.name[:60]}", "reason": "not a regular file"})
             summary = {"first": None, "last_at": 0.0, "outcome": None, "outcome_at": 0.0, "last_note": "", "tickets": []}
         last_wal = max(summary["last_at"], 0.0) or info["at"]
@@ -747,20 +977,20 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if comments and row["ticket"]:
             row["ticket_comment_age_s"] = comments(row["ticket"], now)
         rows.append(row)
-    for f in sorted(wal.glob("*.jsonl")):  # I8: task-named WALs are owners too, with no process behind them
-        name = f.name[:-len(".jsonl")]
+    for name, ch in chains.items():  # I8: task-named WALs are owners too, with no process behind them
+        f = wal / f"{name}.jsonl"
         if name == "main" or name.startswith("agent-") or not OWNER_ID_RE.match(name):
             continue
-        if not f.is_file():   # PR 234 v8: a task WAL that is not a regular file is unread, never skipped silently
+        if not (ch.live or ch.segments):   # PR 234 v8: a task WAL that is not a regular file is unread, never skipped silently
             tally.unread.append({"source": f"WAL {f.name[:60]}", "reason": "not a regular file"})
             continue
         try:
-            if now - f.stat().st_mtime > TASK_WAL_WINDOW_S:
+            if now - _wal_mtime_of(ch) > TASK_WAL_WINDOW_S:
                 continue  # history, not an owner (same window ahd uses for sessions)
         except OSError as error:
             unread.append({"source": f.name, "reason": f"file-unreadable: {type(error).__name__}"})
             continue
-        summary = summarize_agent_wal(f, index_dir, tally, cache)
+        summary = summarize_agent_wal(f, index_dir, tally, cache, ch)
         verdict = liveness.classify_task_wal(now, summary["last_at"], summary["outcome"], summary["last_note"])
         idle = verdict["idle_s"]
         text = summary["first"] or ""
@@ -953,12 +1183,18 @@ def _prov():
     return provenance
 
 
-def _segs():
-    """wal_segments (docs/wal-segments.md), or None on an install that has not shipped it yet."""
+def _segs(directory=None):
+    """wal_segments (docs/wal-segments.md), or None on an install that has not shipped it and has nothing rotated:
+    wal.require_segments raises when rotation is on or segment files exist, so a missing module is fatal there."""
     try:
         import wal_segments
         return wal_segments
     except ImportError:
+        try:
+            import wal  # noqa: PLC0415
+        except ImportError:
+            return None
+        wal.require_segments(directory)
         return None
 
 
@@ -1784,7 +2020,7 @@ def _wal_path(home: Path, session: str, agent: str) -> Path:
 
 def _wal_append(home: Path, path: Path, record: dict) -> None:
     try:  # a retry after a crash between this append and the ledger row must not duplicate the entry
-        segs = _segs()
+        segs = _segs(path.parent)
         if segs is not None:  # the tail window spans closed segments, so a rotation cannot hide the earlier append
             window = segs.read_tail(path, 262144)
         else:
@@ -1804,7 +2040,7 @@ def _wal_append(home: Path, path: Path, record: dict) -> None:
         raise AhError("bad_request", "WAL path must be a session JSONL under ~/.claude/wals or ~/.agent-harness/codex-wals", 3)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    segs = _segs()
+    segs = _segs(path.parent)
     if segs is not None:  # one shared writer: seglock, rotation at the segment limit, crash-tail repair
         try:
             dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
@@ -1855,24 +2091,28 @@ def _evidence_ok(home: Path, ev: list, allowed: set, reg: dict, ledger=None) -> 
             try:
                 p = Path(e["wal"]).expanduser().resolve(strict=True)
             except OSError:
-                raise AhError("evidence", f"WAL not found: {e['wal'][:80]}", 3)
+                p = Path(e["wal"]).expanduser().resolve()   # a chain whose live file is missing still has segments
+                if not _wal_exists(p):
+                    raise AhError("evidence", f"WAL not found: {e['wal'][:80]}", 3)
             if not any(root in p.parents for root in roots):
                 raise AhError("evidence", "evidence WAL must be under ~/.claude/wals", 3)
             if p not in allowed:
                 raise AhError("evidence", "evidence WAL must be this task's session or owner WAL", 3)
-            found = False
-            with open(p, "rb") as handle:
-                for raw in handle:
-                    try:
-                        rec = json.loads(raw)
-                    except ValueError:
-                        continue
-                    note = rec.get("note") if isinstance(rec, dict) and isinstance(rec.get("note"), str) else ""
-                    # token-exact, and written after the task was registered (an old test proves nothing for this task)
-                    if note.startswith(f"REALLY_TESTED {wid}:") and parse_ts(rec.get("at")) >= reg_ts:
-                        found = True
-                        break
+            found, problems = False, []
+            for _seg, _n, raw in _wal_lines(p, problems):   # the whole chain: the entry may sit in a closed segment
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    continue
+                note = rec.get("note") if isinstance(rec, dict) and isinstance(rec.get("note"), str) else ""
+                # token-exact, and written after the task was registered (an old test proves nothing for this task)
+                if note.startswith(f"REALLY_TESTED {wid}:") and parse_ts(rec.get("at")) >= reg_ts:
+                    found = True
+                    break
             if not found:
+                bad = _wal_bad(problems)
+                if bad:   # not found across a gap is unknown, not absent
+                    raise AhError("evidence_unverifiable", f"evidence WAL {p.name} could not be read whole ({_wal_say(bad[0])})", 3)
                 raise AhError("evidence", f"no REALLY_TESTED entry {wid} in that WAL", 3)
         else:
             repo = reg_args.get("worktree") or e["repo"]  # the registered checkout wins over a caller-chosen repo
@@ -1935,7 +2175,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         comment(r["ticket"], rec["note"])
     elif op in ("deadline.add", "deadline.done"):
         main_wal = _wal_path(home, args["session"], "main")
-        if not main_wal.is_file():
+        if not _wal_exists(main_wal):
             raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
         if op == "deadline.add":
             did = "dl" + hashlib.sha256(key.encode()).hexdigest()[:10]
@@ -1954,7 +2194,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         # GoodQA #15565: one marker per stop episode. The gate fires on every stop, and 1,130 pending_stop lines in a
         # session's WALs were read as work items by the audit and Mission Control. The ledger row (liveness reads it)
         # is written every time; the WAL line only when the last line is not already a pending_stop.
-        if wal.is_file() and not _last_line_is(wal, "pending_stop"):  # the marker is never counted as owner activity
+        if _wal_exists(wal) and not _last_line_is(wal, "pending_stop"):  # the marker is never counted as owner activity
             _wal_append(home, wal, {"at": now, "event": "pending_stop", "id": wid, "by": "dropped_gate",
                                     "note": "stopped with pending work and no armed waiter (goodqa#14791 I7)"})
         out["wal"] = wid
@@ -1974,7 +2214,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             raise AhError("forbidden", f"task.dispose {args['kind']}: a sub-agent or the owner itself cannot acknowledge; "
                                        "main records it (waiting is allowed)", 3)
         main_wal = _wal_path(home, args["session"], "main")
-        if not main_wal.is_file():
+        if not _wal_exists(main_wal):
             raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
         ref = args.get("ref") or ""
         if args["kind"] == "waiting" and ASK_ID_RE.match(ref) and ask_states(main_wal).get(ref) != "open":
@@ -1984,7 +2224,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if args["kind"] == "waiting" and ASK_ID_RE.match(ref):
             narrow_wait(home, main_wal, args["session"], args["agent"], ref)
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
-                                                or (main_wal.parent / f"{ref}.jsonl").is_file()):
+                                                or _wal_exists(main_wal.parent / f"{ref}.jsonl")):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
         if (args["kind"] == "closed" and not args.get("deploy_at")) or (args["kind"] == "legacy" and not args.get("gate_epoch")) \
                 or (args["kind"] in ("superseded", "wontdo") and not args.get("ref_checked")):
@@ -2017,15 +2257,11 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
 
 def _last_line_is(path: Path, event: str) -> bool:
     """Whether the last complete JSON line of a WAL has this event (reads only the final 8 KiB)."""
-    try:
-        with open(path, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - 8192))
-            tail = handle.read(8192)
+    try:   # the tail window spans closed segments and skips an open marker: a rotation cannot hide the last line
+        tail = _ws().read_tail(path, 8192)
         lines = [ln for ln in tail.splitlines() if ln.strip()]
         return bool(lines) and json.loads(lines[-1]).get("event") == event
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, _ws().SegmentProblem):
         return False
 
 
@@ -2111,24 +2347,26 @@ def leftover_waiters(home: Path, agent: str, session: str, ps_rows=None, session
 def ask_owners(main_wal: Path, tally: "ReadTally | None" = None) -> dict:
     """{ask id: owner agent id} for the asks of the session main WAL that name an owner (wal_note --owner). A line the
     shared validator rejects names no owner (receipt v11 F3); ah owners counts it in its main-WAL pass."""
-    out = {}
+    out, problems = {}, []
     try:
-        with open(main_wal, "rb") as handle:
-            for raw in handle:
-                if b'"owner"' not in raw or b'"ask"' not in raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if _prov().wal_record_problem(rec):
-                    continue
-                if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
-                        and isinstance(rec.get("owner"), str) and rec["owner"]:
-                    out[rec["id"]] = rec["owner"]
+        if not _wal_exists(main_wal):
+            raise FileNotFoundError(str(main_wal))
+        for _seg, _n, raw in _wal_lines(main_wal, problems):
+            if b'"owner"' not in raw or b'"ask"' not in raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if _prov().wal_record_problem(rec):
+                continue
+            if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")) \
+                    and isinstance(rec.get("owner"), str) and rec["owner"]:
+                out[rec["id"]] = rec["owner"]
     except OSError as error:
         if tally is not None:   # the owner of each ask is unknown: never an empty "nobody owns it" read
             tally.missed("main WAL (ask owners)", error if not isinstance(error, FileNotFoundError) else "file-missing")
+    _wal_report(problems, "main WAL (ask owners)", tally, strict=True)   # a gap hides asks: said, never an empty answer
     return out
 
 
@@ -2136,9 +2374,10 @@ def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) 
     """goodqa#15943: a wait on a user ask excuses only the owner whose stream the ask belongs to. Refused when the ask
     names another owner (`owner` field, wal_note --owner) or is already the live wait of another owner; an ask that
     names nobody and is unused stays allowed (back-compat)."""
+    problems = []
     try:
-        with open(main_wal, "rb") as handle:
-            for raw in handle:
+        if _wal_exists(main_wal):
+            for _seg, _n, raw in _wal_lines(main_wal, problems):
                 if b'"ask"' not in raw:
                     continue
                 try:
@@ -2152,6 +2391,7 @@ def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) 
                                                      "a wait on one ask excuses only its own owner", 3)
     except OSError:
         pass
+    _wal_report(problems, "main WAL (ask owner check)", strict=True)   # a gap may hide the ask's owner: no wait is granted on it
     now = time.time()
     for other, d in dispositions(home, session).items():
         if other != agent and d.get("kind") == "waiting" and d.get("ref") == ref and float(d.get("until") or 0.0) > now:
@@ -2162,43 +2402,48 @@ def narrow_wait(home: Path, main_wal: Path, session: str, agent: str, ref: str) 
 def ask_states(main_wal: Path, tally: "ReadTally | None" = None) -> dict:
     """{ask id: "open" | "resolved"} from the session main WAL (an `ask` entry, closed by `ask_resolved --ref`). A line
     the shared validator rejects opens and resolves nothing (receipt v11 F3); ah owners counts it in its main-WAL pass."""
-    states = {}
+    states, problems = {}, []
     try:
-        with open(main_wal, "rb") as handle:
-            for raw in handle:
-                if b'"ask' not in raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if _prov().wal_record_problem(rec):
-                    continue
-                if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")):
-                    states.setdefault(rec["id"], "open")
-                elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
-                    states[rec["ref"]] = "resolved"
+        if not _wal_exists(main_wal):
+            raise FileNotFoundError(str(main_wal))
+        for _seg, _n, raw in _wal_lines(main_wal, problems):
+            if b'"ask' not in raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if _prov().wal_record_problem(rec):
+                continue
+            if rec.get("event") == "ask" and ASK_ID_RE.match(str(rec.get("id") or "")):
+                states.setdefault(rec["id"], "open")
+            elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
+                states[rec["ref"]] = "resolved"
     except OSError as error:
         if tally is not None:   # which asks are open is unknown: never an empty "every wait is on a missing ask" read
             tally.missed("main WAL (ask states)", error if not isinstance(error, FileNotFoundError) else "file-missing")
+    _wal_report(problems, "main WAL (ask states)", tally, strict=True)   # a gap hides asks: said, never a partial answer
     return states
 
 
 def _wal_has(path: Path, event: str, ident, agent=None) -> bool:
     """True when the session WAL holds an entry of `event` with that id (or that agent_id)."""
+    problems = []
     try:
-        with open(path, "rb") as handle:
-            for raw in handle:
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if _prov().wal_record_problem(rec) or (event is not None and rec.get("event") != event):
-                    continue   # receipt v11 F3: a rejected record is not an entry the WAL holds
-                if (ident is not None and rec.get("id") == ident) or (agent is not None and rec.get("agent_id") == agent):
-                    return True
+        if not _wal_exists(path):
+            return False
+        for _seg, _n, raw in _wal_lines(path, problems):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if _prov().wal_record_problem(rec) or (event is not None and rec.get("event") != event):
+                continue   # receipt v11 F3: a rejected record is not an entry the WAL holds
+            if (ident is not None and rec.get("id") == ident) or (agent is not None and rec.get("agent_id") == agent):
+                return True
     except OSError:
         return False
+    _wal_report(problems, "WAL entry check", strict=True)   # not found across a gap is not "absent": it is unknown
     return False
 
 
@@ -2384,9 +2629,9 @@ def _owner_context(home: Path, session: str, agent: str, ledger: list, task: str
             ctx["tickets"] |= _tickets_in(a.get("ticket") or "")
             ctx["branch"], ctx["repo"] = a.get("branch") or ctx["branch"], a.get("worktree") or ctx["repo"]
     path = _wal_path(home, session, agent)
-    if not path.is_file():
+    if not _wal_exists(path):
         path = session_dir(home, session) / f"{agent}.jsonl"  # a task-named WAL
-    if path.is_file():
+    if _wal_exists(path):
         try:
             for t in summarize_agent_wal(path, state_dir(home, "ah-index")).get("tickets") or []:
                 ctx["tickets"] |= _tickets_in(t)
@@ -2436,21 +2681,30 @@ def _sha_contains_branch(ctx: dict, sha: str) -> None:
 
 def _session_entries(home: Path, session: str, match):
     """WAL entries of the session (any of its WALs) for which match(raw bytes, record) is true, oldest first."""
-    seen, out = 0, []
-    for f in sorted(session_dir(home, session).glob("*.jsonl")):
-        try:
-            if not os.path.isfile(f) or os.path.islink(f):
-                continue
-            with open(f, "rb") as handle:
-                for raw in handle:
-                    seen += len(raw)
-                    if seen > WAL_SCAN_MAX:
-                        raise AhError("evidence_unverifiable", "the session's WALs are too large to search", 3)
-                    rec = match(raw)
-                    if rec is not None:
-                        out.append(rec)
-        except OSError:
+    seen, out, problems = 0, [], []
+    sd = session_dir(home, session)
+    try:
+        chains = _ws().list_wals(sd)   # every WAL of the session, its segments folded in
+    except OSError:
+        chains = {}
+    for stem, ch in chains.items():
+        if not (ch.live or ch.segments):
+            problems.extend(ch.problems)   # a link or a directory where a WAL should be: never followed, said
             continue
+        wal_problems = []
+        try:
+            for _seg, _n, raw in _wal_lines(sd / f"{stem}.jsonl", wal_problems):
+                seen += len(raw) + 1
+                if seen > WAL_SCAN_MAX:
+                    raise AhError("evidence_unverifiable", "the session's WALs are too large to search", 3)
+                rec = match(raw)
+                if rec is not None:
+                    out.append(rec)
+        except OSError as error:
+            wal_problems.append({"code": "unreadable", "message": f"{stem}.jsonl: {type(error).__name__}", "seq": None})
+        problems.extend(wal_problems)
+    if not out and _wal_bad(problems):   # nothing found across a gap or an unreadable WAL: unknown, not absent
+        raise AhError("evidence_unverifiable", f"the session's WALs could not all be searched ({_wal_say(_wal_bad(problems)[0])})", 3)
     return sorted(out, key=lambda r: parse_ts(r.get("at")) or 0.0)
 
 
@@ -2875,9 +3129,8 @@ def render_text(cmd: str, data: dict) -> str:
 def nearest_source(wal: Path, before_id: str | None = None) -> dict | None:
     """The newest sourced scope/decision/requirement/ask entry of `wal` (before `before_id` when given): a wal: source
     that follows that entry's own source, so a re-cited note never invents provenance (goodqa#14791 P11)."""
-    import safe_input  # noqa: PLC0415
     try:
-        tail = safe_input.read_tail(wal, 4 << 20)
+        tail = _ws().read_tail(wal, 4 << 20)   # the newest 4 MiB of the chain, across segments
     except Exception:  # noqa: BLE001
         return None
     rows = []
@@ -2954,18 +3207,40 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
 
     if given is None:  # ah status: filter while reading, so only rows in the window are kept (code inspection 6)
         sd = session_dir(home, session)
-        if not (sd / "main.jsonl").is_file():
+        if not _wal_exists(sd / "main.jsonl"):
             raise AhError("session_unknown", f"no main WAL for session {session!r}")
-        for path in sorted(sd.glob("*.jsonl")):
-            agent = "main" if path.name == "main.jsonl" else path.stem[len("agent-"):] if path.stem.startswith("agent-") else path.stem
-            try:
-                text = _bounded(path).decode("utf-8", "replace")
-            except OSError as e:  # F9: an evidence report names what it did not read (over 64 MB, not a regular file)
+        try:
+            chains = _ws().list_wals(sd)   # every WAL of the session, its segments folded into one logical WAL
+        except OSError as e:
+            chains = {}
+            unread.append({"source": "session WAL folder", "reason": f"file-unreadable: {type(e).__name__}"})
+        for stem, ch in chains.items():
+            path = sd / f"{stem}.jsonl"
+            agent = "main" if stem == "main" else stem[len("agent-"):] if stem.startswith("agent-") else stem
+            if not (ch.live or ch.segments):   # a link or a directory where a WAL should be: never followed, said
+                for problem in _wal_bad(ch.problems):
+                    unread.append({"wal": path.name, "agent": agent, "reason": _wal_say(problem)})
+                continue
+            total = sum(s.size for s in ch.segments) + (ch.live.size if ch.live else 0)
+            read_problems = []
+            try:   # F9: an evidence report names what it did not read. Newest first: the budget drops the oldest bytes
+                data = _ws().read_tail(path, WAL_STATUS_MAX, problems=read_problems)
+            except OSError as e:
                 unread.append({"wal": path.name, "agent": agent, "reason": str(e) or type(e).__name__})
                 continue
+            for problem in _wal_bad(read_problems):   # a gap, or a file that could not be opened: said, the rest is read
+                unread.append({"wal": path.name, "agent": agent, "reason": _wal_say(problem)})
+            if any(p["code"] == "unreadable" for p in read_problems):
+                continue   # a part of the chain was not read: not a source read whole
+            if total > WAL_STATUS_MAX:
+                data = data.partition(b"\n")[2]   # the window starts inside a line
+                unread.append({"wal": path.name, "agent": agent,
+                               "reason": (f"over {WAL_STATUS_MAX >> 20} MiB" if WAL_STATUS_MAX >= 1 << 20 else f"over {WAL_STATUS_MAX} bytes")
+                               + ": the oldest records were not read"})
+            text = data.decode("utf-8", "replace")
             read_ok += 1
             try:
-                mtime = path.stat().st_mtime
+                mtime = _wal_mtime_of(ch)
             except OSError:
                 mtime = now
             lines = text.splitlines()
@@ -3158,7 +3433,7 @@ def approve_top_cmd(home: Path, args) -> dict:
     task = args.task
     if not escalation.SAFE_KEY.fullmatch(task):
         raise AhError("bad_request", "approve-top: --task must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}", 2)
-    if not wal.is_file():
+    if not _wal_exists(wal):
         raise AhError("bad_request", f"approve-top: no WAL at {wal}; pass the main session WAL (~/.claude/wals/<session>/main.jsonl)", 2)
     wanted = str(args.user_msg or "").strip()
     lookup = f"python3 {me} user-msg --session {session} --text-match fable"
@@ -3233,8 +3508,7 @@ def note_cmd(home: Path, args) -> dict:
     if args.id and not ASK_ID_RE.match(args.id):
         raise AhError("bad_request", "note: --id must be a WAL entry id (w + 11 hex)")
     if args.id:  # re-cite an existing quarantined entry: its event kind is kept; its text unless --note overrides
-        import safe_input  # noqa: PLC0415
-        for raw in (safe_input.read_tail(wal, 4 << 20).splitlines() if wal.is_file() else []):
+        for raw in (_ws().read_tail(wal, 4 << 20).splitlines() if _wal_exists(wal) else []):
             try:
                 rec = json.loads(raw)
             except ValueError:
@@ -3283,10 +3557,45 @@ def note_cmd(home: Path, args) -> dict:
     return plan
 
 
+WAL_DOCTOR_SESSIONS = 200   # newest session folders scanned per WAL root
+
+
+def _wal_chain_checks(home: Path) -> list:
+    """One failing check per WAL chain with a problem (a lost or ambiguous segment, an unreadable or non-regular file),
+    with the commands that find and repair it. A healthy chain adds nothing. Fail closed is right for the readers (a
+    gap is never read past), so the operator must be able to see what is missing and how to recover it."""
+    out = []
+    ws = _ws()
+    cli = Path(ws.__file__).resolve()
+    for root in wal_roots(home):
+        try:
+            sessions = sorted((e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)),
+                              key=lambda e: e.stat().st_mtime, reverse=True)[:WAL_DOCTOR_SESSIONS]
+        except OSError:
+            continue
+        for entry in sessions:
+            try:
+                chains = ws.list_wals(entry.path)
+            except OSError:
+                continue
+            for stem, ch in chains.items():
+                for problem in _wal_bad(ch.problems):
+                    if problem.get("code") == "live_missing":   # a crashed rotation: every record is there, the live file is not
+                        recover = (f"python3 {cli} recover {entry.path} {stem}   # dry run; add --write to create the live file "
+                                   f"with its marker (the next append also repairs it)")
+                    else:
+                        recover = (f"python3 {cli} verify {entry.path} {stem}   # then restore the missing segment file "
+                                   f"from a git or Dropbox backup (same name), or read what is left with: "
+                                   f"python3 {cli} cat {entry.path} {stem} --allow-gaps")
+                    out.append({"check": f"wal chain {entry.name[:40]}/{stem}", "ok": False, "problem": _wal_say(problem),
+                                "dir": entry.path, "recover": recover})
+    return out
+
+
 def doctor() -> dict:
     """Partial installs are the common failure: import every module ah needs and hash the files."""
     checks = []
-    for name in ("liveness", "provenance", "safe_input", "redact", "wal", "wal_note", "ticket_adapters"):
+    for name in ("liveness", "provenance", "safe_input", "redact", "wal", "wal_segments", "wal_note", "ticket_adapters"):
         try:
             __import__(name)
             checks.append({"check": f"import {name}", "ok": True})
@@ -3299,6 +3608,7 @@ def doctor() -> dict:
             checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(_bounded(f, 16 << 20)).hexdigest()[:16]})
         except OSError:
             checks.append({"check": f"file {name}", "ok": False})
+    checks.extend(_wal_chain_checks(home_dir()))
     running = ahd_running_check(home_dir())
     if os.environ.get("AH_EXPECT_AHD", "1") == "0":  # hosts without the daemon (and partial-install tests) only report it
         running = dict(running, ok=True, expected=False)
@@ -3408,8 +3718,8 @@ def list_sessions(home: Path) -> list:
     try:
         for entry in os.scandir(wal_dirs(home)):
             main = Path(entry.path) / "main.jsonl"
-            if SESSION_RE.match(entry.name) and main.is_file():
-                out.append((entry.name, main.stat().st_mtime))
+            if SESSION_RE.match(entry.name) and _wal_exists(main):
+                out.append((entry.name, _wal_mtime(main)))
     except OSError:
         pass
     return sorted(out, key=lambda x: -x[1])
@@ -3513,7 +3823,7 @@ def requirements_view(home: Path, session=None, every: bool = False, now=None) -
             break
         path = wal_dirs(home) / s / "main.jsonl"
         try:
-            if not os.path.lexists(path):
+            if not _wal_exists(path):
                 raise prov.Problem("missing", "no main WAL for this session")
             # PR 234 v8: the JSON string value alone, so a spaced `"event": "requirement"` is read too
             lines = list(prov._lines_containing(path, b'"requirement"', tails=True))
