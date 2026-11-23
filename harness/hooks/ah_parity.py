@@ -418,9 +418,11 @@ def judge(snapshot, info):
         if r["ok"] + len(r["differ"]) + len(r["missing"]) != len(set(names)) or len(set(names)) == 0:
             raise ParityError("%s: the comparison did not cover every listed name" % flavor)
         for name, have in (section.get("extras") or {}).items():
-            if table.get(name) != have:  # shipped at the commit with the same bytes is fine; anything else is not
-                r["unexpected"].append(name)
-        r["differ"].sort()
+            if name == "__too_many_entries__" or (name in table and table[name] != have):
+                r["differ"].append(name)  # an unlistable directory, or a file canonical main ships with other bytes: FAIL
+            elif name not in table:
+                r["unexpected"].append(name)  # in neither the manifest nor the repo: WARN (named in the report)
+        r["differ"] = sorted(set(r["differ"]))
         r["missing"].sort()
         r["unexpected"].sort()
     settings = info.get("settings") or {}
@@ -441,7 +443,12 @@ def judge(snapshot, info):
                 result["codex"]["registrations"].append("%s %s" % (event, script))
     result["trust"] = {"present": bool(trust.get("present")), "untrusted": list(trust.get("untrusted") or []),
                        "changed": list(trust.get("changed") or [])}
-    drift = any(result[f][k] for f in ("claude", "codex") for k in ("differ", "missing", "unexpected", "registrations"))
+    # An importable file in the hooks dir that is in neither the manifest nor the repo is a WARN, never a failure: other
+    # sessions keep live tools there (decision of main, goodqa#16810). It is named in the report. Byte drift of a listed
+    # file, a missing one and an unregistered guard stay DRIFT, and a comparison that covered nothing stays UNKNOWN.
+    result["warnings"] = ["%s: unexpected importable file or package %s" % (f, n)
+                          for f in ("claude", "codex") for n in result[f]["unexpected"]]
+    drift = any(result[f][k] for f in ("claude", "codex") for k in ("differ", "missing", "registrations"))
     complete = result["claude"]["ok"] == len(set(snapshot["claude"])) and (
         not result["codex"]["present"] or result["codex"]["ok"] == len(set(snapshot["codex"])))
     result["status"] = "DRIFT" if drift else ("CLEAN" if complete else "UNKNOWN")
@@ -719,7 +726,7 @@ def render(report):
             for n in r["missing"]:
                 lines.append("    MISSING %s" % n)
             for n in r["unexpected"]:
-                lines.append("    UNEXPECTED importable file or package (not shipped by canonical main): %s" % n)
+                lines.append("    WARN unexpected importable file or package (not shipped by canonical main, not a failure): %s" % n)
             for n in r["registrations"]:
                 lines.append("    GUARD NOT REGISTERED as the installer writes it: %s" % n)
         t = v["trust"]

@@ -434,13 +434,14 @@ class Scope(unittest.TestCase):
         h = Installed(self)
         return h, h.install(h.tmp / "home", **kw)
 
-    def test_planted_importable_file_or_package_is_drift(self):
+    def test_planted_importable_file_or_package_is_a_named_warning_not_drift(self):  # goodqa#16810
         for planted in ("json.py", "sitecustomize.py", "typing.cpython-39-darwin.so", "os.pyc"):
             h, home = self.home()
             h.claude(home, planted).write_bytes(b"import os\n")
             v = h.judge(home)
-            self.assertEqual(v["status"], "DRIFT", planted)
+            self.assertEqual(v["status"], "CLEAN", planted)
             self.assertEqual(v["claude"]["unexpected"], [planted])
+            self.assertEqual(v["warnings"], ["claude: unexpected importable file or package " + planted])
         h, home = self.home()
         pkg = home.joinpath(*ah_parity.CLAUDE_DIR, "re")
         pkg.mkdir()
@@ -464,8 +465,9 @@ class Scope(unittest.TestCase):
         (d / "__pycache__" / "ah.cpython-39.pyc").write_bytes(b"x")
         (d / "extra_tool.py").write_bytes(EXTRA_SHIPPED["extra_tool.py"])  # shipped by canonical, same bytes
         self.assertEqual(h.judge(home)["status"], "CLEAN")
-        (d / "extra_tool.py").write_bytes(b"tampered\n")  # shipped by canonical, different bytes
-        self.assertEqual(h.judge(home)["claude"]["unexpected"], ["extra_tool.py"])
+        (d / "extra_tool.py").write_bytes(b"tampered\n")  # shipped by canonical, different bytes: byte drift, a FAIL
+        v = h.judge(home)
+        self.assertEqual((v["status"], v["claude"]["differ"], v["claude"]["unexpected"]), ("DRIFT", ["extra_tool.py"], []))
 
     def test_oversized_listing_fails_closed(self):
         h, home = self.home()
@@ -475,7 +477,9 @@ class Scope(unittest.TestCase):
         self.addCleanup(setattr, ah_parity, "MAX_ENTRIES", orig)
         for i in range(8):
             (d / ("n%d.txt" % i)).write_text("x")
-        self.assertIn("__too_many_entries__", h.judge(home)["claude"]["unexpected"])
+        v = h.judge(home)
+        self.assertEqual(v["status"], "DRIFT")  # a directory that cannot be listed fails closed
+        self.assertIn("__too_many_entries__", v["claude"]["differ"])
 
     def test_unregistered_or_weakened_guard_is_drift(self):
         h, home = self.home()
@@ -525,6 +529,7 @@ class Scope(unittest.TestCase):
         f.claude(f.remote_home, "json.py").write_text("x = 1\n")
         r = f.verify(("t2-dev",))
         self.assertEqual(r["hosts"]["t2-dev"]["claude"]["unexpected"], ["json.py"])
+        self.assertEqual(r["hosts"]["t2-dev"]["status"], "CLEAN")
         f.claude(f.remote_home, "json.py").unlink()
         f.write_settings(f.remote_home, drop=("tier_gate.py",))
         self.assertEqual(f.verify(("t2-dev",))["hosts"]["t2-dev"]["claude"]["registrations"], ["PreToolUse tier_gate.py hook"])
@@ -588,10 +593,11 @@ class Contract(unittest.TestCase):
         self.assertEqual(v["claude"]["ok"], len(set(snap["claude"])))
         self.assertEqual(v["codex"]["ok"], len(set(snap["codex"])))
         self.assertGreater(v["codex"]["ok"], len(install_codex.DELIVERY_HELPERS) - 1)  # wal.py, ops_watch.py, watch-tests.py counted
-        # and a stray file the installers do not write is the one thing that makes it drift
+        # and a stray file the installers do not write is only a named warning
+        before = v["status"]  # (no settings.json in this temp home, so the registrations decide it; the stray file must not)
         (home / ".codex" / "agent-harness" / "planted.py").write_text("x = 1\n")
         v = ah_parity.judge(snap, ah_parity.collect(home, snap["claude"], snap["codex"]))
-        self.assertEqual(v["codex"]["unexpected"], ["planted.py"])
+        self.assertEqual((v["codex"]["unexpected"], v["status"]), (["planted.py"], before))
 
     def test_allow_rule_literal_matches_the_enabler(self):
         self.assertTrue(ah_parity.is_exact_allow_rule(PROBE_RULE, Path("/H")))
@@ -853,7 +859,7 @@ class Cli(unittest.TestCase):
         buf = io.StringIO()
         self.assertEqual(ah_parity.main(["doctor", "--host", "mac"], f.home, f.runner(), buf), 1)
         self.assertIn("DIFFERS ah.py", buf.getvalue())
-        self.assertIn("UNEXPECTED importable file or package (not shipped by canonical main): json.py", buf.getvalue())
+        self.assertIn("WARN unexpected importable file or package (not shipped by canonical main, not a failure): json.py", buf.getvalue())
         self.assertEqual(ah_parity.main(["nonsense"], f.home, f.runner(), io.StringIO()), 2)
 
     def test_doctor_entry_for_ah_py_returns_the_report_dict(self):

@@ -1727,9 +1727,11 @@ doctor-only comparison and is labelled "not the tip, never a gate result".
    `__init__.py`, under an identifier name) in either hooks directory that the canonical tree does not ship, because
    hook scripts run with their own directory first on `sys.path` and a planted `json.py` or `sitecustomize.py` would
    load before any guard; the expected set is exactly what the real installers write, a contract test runs both
-   installers into a temp HOME and judges the result, and anything else is drift (on 2026-11-23 the Mac held
-   `native_pr_review.py`, `native_pr_dispatch.py` and `codex_pool.py`, which no installer writes: the gate refuses until
-   they are removed or shipped from canonical main); (b) each fail-closed guard
+   installers into a temp HOME and judges the result. Such a file is reported as a named `WARN` (under `warnings` in
+   the report), never a failure and never a refusal by the enabler's gate, because other sessions keep live tools in
+   that directory (on 2026-11-23 the Mac held `native_pr_review.py`, `native_pr_dispatch.py` and `codex_pool.py`; main
+   decided they stay, GoodQA #16810). A file canonical main ships with other bytes, a missing file and a directory too
+   large to list stay drift; (b) each fail-closed guard
    (`GUARD_REGISTRATIONS` in `ah_parity.py`: command guard, kill guard, merge gate, WAL prompt and pretool, tier gate,
    commit policy, spec gate) is registered in `~/.claude/settings.json` with the installer's matcher, script path,
    arguments and `onFailure: block`, and neither settings file sets `disableAllHooks`; (c) when Codex is installed,
