@@ -215,7 +215,7 @@ def _read(ah, sd: Path):
             total, files = total + size, files + len(members)
             probs, lines = [], []
             try:
-                lines = [raw for _seg, _n, raw in ws.iter_lines(os.path.join(sd, name), problems=probs)]
+                lines = [raw for _seg, _n, raw in ws.iter_lines(os.path.join(sd, name), problems=probs, chain=chain)]
             except (OSError, ws.SegmentProblem) as error:
                 reason = type(error).__name__
             late = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]

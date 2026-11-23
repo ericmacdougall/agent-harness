@@ -36,7 +36,7 @@ INFO_CODES = ("live_missing", "schema_newer", "marker_info")
 CHAIN_WINDOW_BYTES = 64 * 1024 * 1024  # the newest bytes of each WAL chain that are counted (a test may lower it)
 
 
-def jsonl_records(path, problems=None, deadline_s=5.0):
+def jsonl_records(path, problems=None, deadline_s=5.0, chain=None):
     """Parsed WAL records of the whole segment chain of `path`, NEWEST first, bounded per line. Only the newest 64 MiB
     of the chain is read, so a budget or the deadline drops the OLDEST records, never the newest (R2-4). A gap, an
     unreadable segment, the 64 MiB window or the deadline is appended to `problems` (never silent); a path that is
@@ -46,7 +46,7 @@ def jsonl_records(path, problems=None, deadline_s=5.0):
     probs = []
     window = CHAIN_WINDOW_BYTES
     try:
-        with ws.open_chain(path) as snap:  # one directory scan: the snapshot lists the chain once
+        with ws.open_chain(path, chain=chain) as snap:  # one directory scan: the snapshot lists the chain once
             data = snap.read_tail(window)
             total = sum(seg.size for seg in snap.chain.segments) + (snap.chain.live.size if snap.chain.live else 0)
             probs.extend(snap.problems)
@@ -118,7 +118,7 @@ def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S, problem
             # (Measured: with 2,300 owner WALs each read costs a directory scan; skipping cold ones keeps the hook fast.)
             continue
         path = os.path.join(wal_dir, stem + ".jsonl")
-        for record in jsonl_records(path, problems):  # newest first
+        for record in jsonl_records(path, problems, chain=chains[stem]):  # newest first
             if not isinstance(record, dict):
                 continue
             try:
