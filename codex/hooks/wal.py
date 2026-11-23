@@ -461,6 +461,28 @@ def checkpoint_context(session: str, text: str) -> str:
     return text
 
 
+TRANSCRIPT_RECOVERY_SOURCES = frozenset({"resume", "compact", "clear"})
+
+
+def spawn_transcripts_sync(source) -> None:
+    """goodqa#16650 AC-8: after the SessionStart output, start a detached `transcripts.py sync --background` (beside
+    this hook; TRANSCRIPTS_BIN overrides it for tests): `start` for a startup or an unknown source, `recovery` for
+    resume, compact or clear. No inherited pipes, no wait; never raises and never changes the hook's output."""
+    try:
+        import subprocess  # noqa: PLC0415
+        sys.stdout.flush()
+        checkpoint = "recovery" if source in TRANSCRIPT_RECOVERY_SOURCES else "start"
+        override = os.environ.get("TRANSCRIPTS_BIN")
+        script = Path(override) if override else Path(__file__).resolve().with_name("transcripts.py")
+        if not script.is_file():
+            return
+        argv = [sys.executable, str(script)] if script.suffix == ".py" else [str(script)]
+        subprocess.Popen(argv + ["sync", "--checkpoint", checkpoint, "--background"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:  # noqa: BLE001 - a Codex session must never fail because the archive could not start
+        pass
+
+
 def hook() -> None:
     data = json.load(sys.stdin)
     event = data.get('hook_event_name')
@@ -485,6 +507,7 @@ def hook() -> None:
         except OSError as error:
             note = degraded_note(error)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event)}}))
+        spawn_transcripts_sync(data.get("source"))
     elif event == "UserPromptSubmit":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.ericmacdougall.transcripts-backfill</string>
+<key>ProgramArguments</key><array><string>/usr/bin/env</string><string>python3</string><string>@HOME@/.claude/hooks/transcripts.py</string><string>backfill</string><string>--budget-seconds</string><string>1500</string></array>
+<key>StartInterval</key><integer>1800</integer>
+<key>RunAtLoad</key><false/>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string></dict>
+<key>StandardOutPath</key><string>@HOME@/.agent-harness/logs/transcripts-backfill.out</string>
+<key>StandardErrorPath</key><string>@HOME@/.agent-harness/logs/transcripts-backfill.err</string>
+<key>LowPriorityIO</key><true/><key>Nice</key><integer>10</integer>
+</dict></plist>
