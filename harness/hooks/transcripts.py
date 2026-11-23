@@ -119,6 +119,32 @@ class Cfg:
         self.min_free_gb = float(env.get('TRANSCRIPTS_MIN_FREE_GB') or 12)
         self.crash_at = env.get('TRANSCRIPTS_CRASH_AT') if t else None
         self.ignore_load = t and env.get('TRANSCRIPTS_IGNORE_LOAD') == '1'
+        self.style = (env.get('TRANSCRIPTS_GIT_URL_STYLE') or 'auto').lower()
+        if self.style not in ('auto', 'https', 'ssh'):
+            raise Refused('TRANSCRIPTS_GIT_URL_STYLE must be auto, https or ssh')
+        self.test_no_gh = t and env.get('TRANSCRIPTS_TEST_NO_GH') == '1'
+        self._gh_ok = None
+
+    @property
+    def has_gh(self):
+        """An authenticated gh: repo creation and the full privacy checks. Local test remotes stub it."""
+        if self.local:
+            return not self.test_no_gh
+        if self._gh_ok is None:
+            try:
+                r = subprocess.run(['gh', 'auth', 'status'], capture_output=True, timeout=bounded(15))
+                self._gh_ok = r.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                self._gh_ok = False
+        return self._gh_ok
+
+    @property
+    def url_style(self):
+        if self.local:
+            return 'local'
+        if self.style != 'auto':
+            return self.style
+        return 'https' if self.has_gh else 'ssh'
 
     def p(self, *parts):
         return os.path.join(self.home, *parts)
@@ -126,6 +152,8 @@ class Cfg:
     def url(self, repo):
         if self.local:
             return os.path.join(self.remote_base, repo + '.git')
+        if self.url_style == 'ssh':
+            return 'git@github.com:%s/%s.git' % (OWNER, repo)
         return 'https://github.com/%s/%s.git' % (OWNER, repo)
 
 
@@ -320,7 +348,7 @@ def run_child(args, **kw):
 
 def git(cfg, args, cwd=None, inp=None, timeout=120, env_extra=None, check=True):
     base = ['git']
-    if not cfg.local:
+    if not cfg.local and cfg.url_style == 'https':
         base += ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential']
     env = git_env()
     if env_extra:
@@ -349,27 +377,59 @@ def git_blob_sha(data):
     return h.hexdigest()
 
 
+ATTEST_MAX_AGE = 86400     # a gh-less host trusts an attestation for 24 h
+ATTEST_REFRESH = 6 * 3600  # a gh host refreshes attestations older than 6 h on its push runs
+
+
 class Remote:
-    """Repo existence, creation and the privacy checks, real (gh) or local stub."""
+    """Repo existence, creation and the privacy checks.
+
+    A host with an authenticated gh checks each repo itself (visibility, fork, owner, collaborators) and writes
+    `repo-checks/<repo>.json` attestations into the catalog. A gh-less host (SSH push only) checks visibility
+    with an unauthenticated API read (200 = public = refuse; 404 plus a working SSH ls-remote = private) and
+    requires a fresh attestation for the rest. Local test remotes stub both paths."""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.checked = {}  # per-run cache only
+        self._snapshot = None
+
+    def _stub(self):
+        return read_json(os.path.join(self.cfg.remote_base, 'repo-checks.json'), {}) or {}
+
+    def ls_remote_ok(self, repo):
+        try:
+            r = git(self.cfg, ['ls-remote', self.cfg.url(repo)], timeout=60, check=False)
+        except subprocess.TimeoutExpired:
+            raise Refused('repo lookup timed out for %s' % repo)
+        return r
 
     def exists(self, repo):
         if self.cfg.local:
             return os.path.isdir(self.cfg.url(repo))
-        r = run_child(['gh', 'api', 'repos/%s/%s' % (OWNER, repo), '--jq', '.name'],
-                           capture_output=True, timeout=60)
+        if self.cfg.has_gh:
+            r = run_child(['gh', 'api', 'repos/%s/%s' % (OWNER, repo), '--jq', '.name'],
+                          capture_output=True, timeout=60)
+            if r.returncode == 0:
+                return True
+            if b'Not Found' in r.stderr or b'404' in r.stderr:
+                return False
+            raise Refused('repo lookup failed for %s' % repo)
+        r = self.ls_remote_ok(repo)
         if r.returncode == 0:
             return True
-        if b'Not Found' in r.stderr or b'404' in r.stderr:
+        err = r.stderr.decode('utf-8', 'replace').lower()
+        if 'not found' in err or 'does not exist' in err:
             return False
-        raise Refused('repo lookup failed for %s' % repo)
+        raise Refused('repo lookup failed for %s (ssh)' % repo)
 
     def ensure(self, repo):
         if self.exists(repo):
             return
+        if not self.cfg.has_gh:
+            what = 'catalog-repo-missing' if repo == CATALOG else 'shard-repo-missing'
+            raise Refused('%s: %s; create with gh on an authenticated host (transcripts.py ensure-repos)'
+                          % (what, repo))
         if self.cfg.local:
             url = self.cfg.url(repo)
             os.makedirs(url, exist_ok=True)
@@ -378,14 +438,14 @@ class Remote:
             git(self.cfg, ['config', 'uploadpack.allowAnySHA1InWant', 'true'], cwd=url)
             return
         r = run_child(['gh', 'repo', 'create', '%s/%s' % (OWNER, repo), '--private',
-                            '--description', 'Private redacted agent transcripts archive (agent-harness)'],
-                           capture_output=True, timeout=120)
+                       '--description', 'Private redacted agent transcripts archive (agent-harness)'],
+                      capture_output=True, timeout=120)
         if r.returncode != 0:
             raise Refused('gh repo create failed for %s' % repo)
 
     def _facts(self, repo):
         if self.cfg.local:
-            stub = read_json(os.path.join(self.cfg.remote_base, 'repo-checks.json'), {}) or {}
+            stub = self._stub()
             f = {'visibility': 'PRIVATE', 'fork': False, 'owner': OWNER, 'collaborators': [OWNER]}
             f.update(stub.get('*', {}))
             f.update(stub.get(repo, {}))
@@ -397,12 +457,84 @@ class Remote:
             raise Refused('visibility unknown for %s (gh api failed)' % repo)
         meta = json.loads(r.stdout.decode('utf-8'))
         r2 = run_child(['gh', 'api', '--paginate', 'repos/%s/%s/collaborators' % (OWNER, repo), '--jq',
-                             '.[].login'], capture_output=True, timeout=60)
+                        '.[].login'], capture_output=True, timeout=60)
         if r2.returncode != 0:
             raise Refused('collaborators unknown for %s (gh api failed)' % repo)
         return {'visibility': str(meta.get('visibility', '')).upper(), 'fork': bool(meta.get('fork')),
                 'owner': (meta.get('owner') or {}).get('login'),
                 'collaborators': [x for x in r2.stdout.decode('utf-8').split() if x]}
+
+    def _unauth_status(self, repo):
+        """HTTP status of an unauthenticated GET of the repo; None on any error."""
+        if self.cfg.local:
+            stub = self._stub()
+            st = (stub.get(repo) or {}).get('unauth_status', (stub.get('*') or {}).get('unauth_status', 404))
+            return int(st) if st is not None else None
+        import urllib.error
+        import urllib.request
+        req = urllib.request.Request('https://api.github.com/repos/%s/%s' % (OWNER, repo),
+                                     headers={'User-Agent': 'agent-transcripts-archiver',
+                                              'Accept': 'application/vnd.github+json'})
+        try:
+            with urllib.request.urlopen(req, timeout=bounded(10)) as resp:
+                return resp.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:  # noqa: BLE001 - unknown means refuse
+            return None
+
+    def snapshot(self):
+        """Catalog incident files, attestations and ledgers, fetched once per run."""
+        if self._snapshot is None:
+            self._snapshot = catalog_snapshot(self.cfg)
+        return self._snapshot
+
+    def attestation(self, repo):
+        raw = self.snapshot().get('repo-checks/%s.json' % repo)
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def attestation_ok(rec):
+        if not rec:
+            return False
+        t = parse_iso(rec.get('checked_at'))
+        return (t is not None and time.time() - t <= ATTEST_MAX_AGE and rec.get('private') is True
+                and rec.get('fork') is False and rec.get('owner') == OWNER and rec.get('collaborators_count') == 0)
+
+    def attest_record(self, repo):
+        f = self._facts(repo)
+        return {'schema': SCHEMA, 'repo': repo, 'checked_at': now_iso(), 'checked_by': self.cfg.host,
+                'private': str(f.get('visibility')).upper() == 'PRIVATE', 'fork': bool(f.get('fork')),
+                'owner': f.get('owner'),
+                'collaborators_count': len(set(f.get('collaborators') or []) - {OWNER})}
+
+    def _check_gh(self, repo):
+        f = self._facts(repo)
+        problems = []
+        if str(f.get('visibility')).upper() != 'PRIVATE':
+            problems.append('visibility=%s' % f.get('visibility'))
+        if f.get('fork'):
+            problems.append('fork')
+        if f.get('owner') != OWNER:
+            problems.append('owner')
+        if set(f.get('collaborators') or []) - {OWNER}:
+            problems.append('collaborators')
+        if problems:
+            raise Refused('repo check failed for %s: %s' % (repo, ','.join(problems)))
+
+    def _check_ghless(self, repo):
+        status = self._unauth_status(repo)
+        if status == 200:
+            raise Refused('repo check failed for %s: visibility=PUBLIC (unauthenticated read succeeded)' % repo)
+        if status != 404:
+            raise Refused('repo check failed for %s: visibility unknown (unauthenticated status %s)' % (repo, status))
+        if self.ls_remote_ok(repo).returncode != 0:
+            raise Refused('repo check failed for %s: ssh ls-remote failed, visibility unproven' % repo)
+        if not self.attestation_ok(self.attestation(repo)):
+            raise Refused('repo-attestation-stale: %s needs a fresh attestation (<24 h) from a gh host' % repo)
 
     def check(self, repo):
         if repo in self.checked:
@@ -410,18 +542,10 @@ class Remote:
                 raise Refused(self.checked[repo])
             return
         try:
-            f = self._facts(repo)
-            problems = []
-            if str(f.get('visibility')).upper() != 'PRIVATE':
-                problems.append('visibility=%s' % f.get('visibility'))
-            if f.get('fork'):
-                problems.append('fork')
-            if f.get('owner') != OWNER:
-                problems.append('owner')
-            if set(f.get('collaborators') or []) - {OWNER}:
-                problems.append('collaborators')
-            if problems:
-                raise Refused('repo check failed for %s: %s' % (repo, ','.join(problems)))
+            if self.cfg.has_gh:
+                self._check_gh(repo)
+            else:
+                self._check_ghless(repo)
         except Refused as e:
             self.checked[repo] = str(e)
             raise
@@ -429,6 +553,46 @@ class Remote:
             self.checked[repo] = 'repo check failed for %s: unknown' % repo
             raise Refused(self.checked[repo])
         self.checked[repo] = True
+
+    def attestation_files(self, repos):
+        """gh host only: fresh repo-checks/<repo>.json for repos whose attestation is missing or over 6 h old."""
+        out = {}
+        if not self.cfg.has_gh:
+            return out
+        for repo in sorted(set(repos)):
+            rec = self.attestation(repo)
+            t = parse_iso(rec.get('checked_at')) if rec else None
+            if t is not None and time.time() - t < ATTEST_REFRESH:
+                continue
+            try:
+                if not self.exists(repo):
+                    continue
+                out['repo-checks/%s.json' % repo] = jdump(self.attest_record(repo)) + b'\n'
+            except Refused:
+                continue
+        return out
+
+
+def catalog_snapshot(cfg):
+    tr = TmpRepo(cfg, CATALOG)
+    try:
+        if not tr.fetch_tip():
+            return {}
+        return {p: tr.blob(oid) for p, oid in sorted(tr.entries.items())
+                if p.startswith(('incident/', 'repo-checks/', 'shards/'))}
+    finally:
+        tr.close()
+
+
+def ledger_repos(snapshot):
+    repos = []
+    for p, b in snapshot.items():
+        if p.startswith('shards/'):
+            try:
+                repos += [x['repo'] for x in json.loads(b).get('shards', [])]
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+    return repos
 
 
 class TmpRepo:
@@ -1427,7 +1591,7 @@ class Run:
         if not todo and not need_catalog:
             return
         try:
-            for repo in repos + [CATALOG]:
+            for repo in [CATALOG] + repos:  # the catalog first: gh-less checks read attestations from it
                 self.remote.ensure(repo)
                 self.remote.check(repo)
         except Refused as ex:
@@ -1435,7 +1599,7 @@ class Run:
             self.status = 'refused'
             alert(cfg, 'repo-check', str(ex))
             return
-        kinds = open_incidents(cfg)
+        kinds = open_incidents(cfg, self.remote)
         if kinds:
             self.status = 'killswitch'
             self.refused = 'catalog incident open kind=%s; pushes stop on every host' % ','.join(kinds)
@@ -1511,6 +1675,10 @@ class Run:
     def push_catalog(self):
         cfg = self.cfg
         files = catalog_files(cfg, self.st, self.whole_final())
+        snap = self.remote.snapshot()
+        files.update(self.remote.attestation_files(
+            [CATALOG] + [x['repo'] for x in self.st['shards']] + ledger_repos(snap)
+            + [p[len('repo-checks/'):-5] for p in snap if p.startswith('repo-checks/')]))
         if self.st.get('catalog_commit') is None:
             self.guard_lost_state(files)
         commit, _, _ = publish_tree(cfg, CATALOG, files, 'catalog update from %s' % cfg.host,
@@ -2444,24 +2612,40 @@ def incident_path(kind):
     return 'incident/%s.json' % safe_comp(kind)[:80]
 
 
-def open_incidents(cfg):
+def open_incidents(cfg, remote=None):
     """Kinds with an uncleared incident file in the catalog (raised by any host)."""
-    tr = TmpRepo(cfg, CATALOG)
-    try:
-        if not tr.fetch_tip():
-            return []
-        kinds = []
-        for path, oid in sorted(tr.entries.items()):
-            if path.startswith('incident/') and path.endswith('.json'):
-                try:
-                    rec = json.loads(tr.blob(oid))
-                except ValueError:
-                    rec = {}
-                if not rec.get('cleared'):
-                    kinds.append(str(rec.get('kind') or path[len('incident/'):-5]))
-        return kinds
-    finally:
-        tr.close()
+    snap = remote.snapshot() if remote else catalog_snapshot(cfg)
+    kinds = []
+    for path, raw in sorted(snap.items()):
+        if path.startswith('incident/') and path.endswith('.json'):
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                rec = {}
+            if not rec.get('cleared'):
+                kinds.append(str(rec.get('kind') or path[len('incident/'):-5]))
+    return kinds
+
+
+def cmd_ensure_repos(cfg, a):
+    """gh host: pre-create another host's private shard repos (p1..pN per month) and attest them."""
+    ensure_home(cfg)
+    if not cfg.has_gh:
+        raise Refused('ensure-repos needs an authenticated gh host')
+    host = _SAFE.sub('_', a.host)[:40]
+    months = [m.strip() for m in a.months.split(',') if m.strip()]
+    for m in months:
+        if not re.fullmatch(r'\d{4}-\d{2}', m):
+            raise Refused('months must look like YYYY-MM[,YYYY-MM]')
+    remote = Remote(cfg)
+    repos = [CATALOG] + ['agent-transcripts-%s-%s-p%d' % (host, m, n) for m in months for n in range(1, a.parts + 1)]
+    for repo in repos:
+        remote.ensure(repo)
+        remote.check(repo)
+    files = {'repo-checks/%s.json' % r: jdump(remote.attest_record(r)) + b'\n' for r in repos}
+    commit, _, _ = publish_tree(cfg, CATALOG, files, 'attest %d repo(s) for %s' % (len(repos), host), overwrite=True)
+    print(json.dumps({'ensured': repos, 'attested': len(files), 'catalog_commit': commit}))
+    return 0
 
 
 def cmd_status(cfg, a):
@@ -2526,6 +2710,10 @@ def build_parser():
     v.add_argument('--kind')
     ri = sub.add_parser('reindex')
     ri.add_argument('--from-sidecars', action='store_true')
+    er = sub.add_parser('ensure-repos', help='gh host: pre-create and attest private shard repos for a host')
+    er.add_argument('--host', required=True)
+    er.add_argument('--months', required=True)
+    er.add_argument('--parts', type=int, default=1)
     i = sub.add_parser('incident', help='host-wide kill switch: stops every push on this host')
     i.add_argument('--kind', required=True)
     i.add_argument('--shard')
@@ -2566,7 +2754,8 @@ def main(argv=None):
             return do_sync(cfg, 'backfill', a.budget_seconds, backfill=True)
         ensure_home(cfg)
         return {'status': cmd_status, 'find': cmd_find, 'cat': cmd_cat, 'recover': cmd_recover,
-                'verify': cmd_verify, 'reindex': cmd_reindex, 'incident': cmd_incident}[a.cmd](cfg, a)
+                'verify': cmd_verify, 'reindex': cmd_reindex, 'incident': cmd_incident,
+                'ensure-repos': cmd_ensure_repos}[a.cmd](cfg, a)
     except Refused as ex:
         sys.stderr.write('transcripts: refused: %s\n' % ex)
         return 2

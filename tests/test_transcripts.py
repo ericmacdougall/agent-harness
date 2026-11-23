@@ -594,9 +594,12 @@ class PublisherTests(L.Base):
 
         def racing(self_):
             tip = orig(self_)
-            if self_.repo == T.CATALOG and state['n'] == 0:
-                state['n'] = 1
-                T.publish_tree(cfg, T.CATALOG, {'index/otherhost.jsonl': b'{}\n'}, 'other host')
+            if self_.repo == T.CATALOG:
+                state['n'] += 1
+                # catalog fetches per run: incident/attestation snapshot, lost-state guard, publisher.
+                # Land another host's commit right after the publisher read its tip.
+                if state['n'] == 3:
+                    T.publish_tree(cfg, T.CATALOG, {'index/otherhost.jsonl': b'{}\n'}, 'other host')
             return tip
         T.TmpRepo.fetch_tip = racing
         try:
@@ -607,6 +610,94 @@ class PublisherTests(L.Base):
         tree = self.tree(T.CATALOG)
         self.assertIn('index/otherhost.jsonl', tree)
         self.assertIn('index/testhost.jsonl', tree)
+
+
+class GhlessHostTests(L.Base):
+    """A host with no gh login pushes over SSH: unauthenticated visibility read plus a gh host's attestation."""
+
+    def host_b(self):
+        b_src = Path(self.tmp) / 'srcb'
+        (b_src / 'p').mkdir(parents=True, exist_ok=True)
+        f = b_src / 'p' / ('%s.jsonl' % UUID2)
+        with open(f, 'ab') as fh:
+            fh.write(lines(3, start=40 + (f.stat().st_size if f.exists() else 0) % 1000))
+        return {'TRANSCRIPTS_HOME': str(Path(self.tmp) / 'stateb'), 'TRANSCRIPTS_HOST': 'hostb',
+                'TRANSCRIPTS_TEST_NO_GH': '1', 'TRANSCRIPTS_SOURCES': json.dumps({'claude-projects': str(b_src)})}
+
+    def receipt_b(self):
+        return T.read_json(str(Path(self.tmp) / 'stateb' / 'receipts' / 'last.json'))
+
+    def setUp(self):
+        super().setUp()
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        code, r = self.sync('pr')  # the gh host creates the catalog and attests its repos
+        self.assertEqual(code, 0, r)
+        self.month = time.strftime('%Y-%m', time.gmtime())
+        self.shard_b = 'agent-transcripts-hostb-%s-p1' % self.month
+
+    def test_missing_shard_refuses_then_ensure_repos(self):
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertEqual(code, 2)
+        self.assertIn('shard-repo-missing', self.receipt_b()['error'])
+        self.assertNotIn(self.shard_b, self.repos())
+        code, out = self.main('ensure-repos', '--host', 'hostb', '--months', self.month)
+        self.assertEqual(code, 0, self.last_err)
+        att = json.loads(self.blob(T.CATALOG, self.tree(T.CATALOG)['repo-checks/%s.json' % self.shard_b]))
+        self.assertEqual((att['private'], att['fork'], att['owner'], att['collaborators_count']),
+                         (True, False, T.OWNER, 0))
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertEqual(code, 0, err[-300:] + out)
+        self.assertTrue(any(p.startswith('hostb/') for p in self.chunks()))
+
+    def test_unauthenticated_200_refuses(self):
+        self.main('ensure-repos', '--host', 'hostb', '--months', self.month)
+        (self.remote / 'repo-checks.json').write_text(json.dumps({self.shard_b: {'unauth_status': 200}}))
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertEqual(code, 2)
+        r = self.receipt_b()
+        self.assertEqual(r['status'], 'refused')
+        self.assertIn('visibility=PUBLIC', r['error'])
+        self.assertFalse(self.tip(self.shard_b))
+        (self.remote / 'repo-checks.json').write_text(json.dumps({self.shard_b: {'unauth_status': 500}}))
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertIn('visibility unknown', self.receipt_b()['error'])
+
+    def test_stale_attestation_refuses_fresh_passes(self):
+        self.main('ensure-repos', '--host', 'hostb', '--months', self.month)
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertEqual(code, 0, err[-300:] + out)
+        path = 'repo-checks/%s.json' % self.shard_b
+        att = json.loads(self.blob(T.CATALOG, self.tree(T.CATALOG)[path]))
+        att['checked_at'] = '2020-01-01T00:00:00Z'
+        T.publish_tree(T.Cfg(), T.CATALOG, {path: T.jdump(att) + b'\n'}, 'age attestation', overwrite=True)
+        tip = self.tip(self.shard_b)
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertEqual(code, 2)
+        self.assertIn('repo-attestation-stale', self.receipt_b()['error'])
+        self.assertEqual(self.tip(self.shard_b), tip)
+        att['checked_at'] = T.now_iso()
+        att['collaborators_count'] = 1
+        T.publish_tree(T.Cfg(), T.CATALOG, {path: T.jdump(att) + b'\n'}, 'bad attestation', overwrite=True)
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=self.host_b())
+        self.assertIn('repo-attestation-stale', self.receipt_b()['error'])
+
+    def test_url_style(self):
+        env = dict(os.environ)
+        try:
+            for k in ('TRANSCRIPTS_REMOTE_BASE', 'TRANSCRIPTS_ALLOW_LOCAL_REMOTE'):
+                os.environ.pop(k, None)
+            os.environ['TRANSCRIPTS_GIT_URL_STYLE'] = 'ssh'
+            self.assertEqual(T.Cfg().url('r'), 'git@github.com:ericmacdougall/r.git')
+            os.environ['TRANSCRIPTS_GIT_URL_STYLE'] = 'https'
+            self.assertEqual(T.Cfg().url('r'), 'https://github.com/ericmacdougall/r.git')
+            os.environ['TRANSCRIPTS_GIT_URL_STYLE'] = 'auto'  # the gh stub on PATH fails `gh auth status`
+            self.assertEqual(T.Cfg().url('r'), 'git@github.com:ericmacdougall/r.git')
+            os.environ['TRANSCRIPTS_GIT_URL_STYLE'] = 'ftp'
+            with self.assertRaises(T.Refused):
+                T.Cfg()
+        finally:
+            os.environ.clear()
+            os.environ.update(env)
 
 
 class ReadSideTests(L.Base):
