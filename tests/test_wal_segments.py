@@ -324,7 +324,7 @@ class CrashTests(Base):
         real = os.open
 
         def fake(path, flags, mode=0o777, *, dir_fd=None):
-            if path.startswith(".main.live.") and flags & os.O_EXCL:
+            if str(path).startswith(".main.live.") and flags & os.O_EXCL:
                 raise OSError(28, "No space left on device")
             return real(path, flags, mode, dir_fd=dir_fd)
         with patch.object(ws.os, "open", side_effect=fake):
@@ -541,7 +541,7 @@ class AppendInvariantTests(Base):
         real = os.open
 
         def fake(path, flags, mode=0o777, *, dir_fd=None):
-            if path.startswith(".main.live.") and flags & os.O_EXCL:
+            if str(path).startswith(".main.live.") and flags & os.O_EXCL:
                 raise OSError(28, "No space left on device")
             return real(path, flags, mode, dir_fd=dir_fd)
         self.run_scenario(patch.object(ws.os, "open", side_effect=fake), expect_closed=0)
@@ -607,6 +607,7 @@ class AppendInvariantTests(Base):
         import threading
         for i in range(3):
             self.append("main.jsonl", rec(i, 50))
+        (self.dir / ".main.seglock").unlink()
         (self.dir / ".main.seglock").mkdir()  # an unusable seglock: the writer proceeds without it
         seg = (self.dir / "main.jsonl").read_bytes()
         os.rename(self.dir / "main.jsonl", self.dir / "main.0001.jsonl")  # a rotation is mid-flight: live name absent
