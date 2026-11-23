@@ -396,6 +396,23 @@ class BudgetTests(Fixture):
             self.assertEqual(agent_gate.live_agents(str(self.dir), time.time() + 1), ["a1"])
         self.assertEqual([os.path.basename(c) for c in calls], ["main.jsonl"])
 
+    def test_the_real_hook_writes_subagent_start_and_stop_rows_to_main(self):
+        """The cold-WAL skip in agent_gate rests on this: start and stop rows reach main.jsonl, not only the owner WAL."""
+        import subprocess
+        hook = HOOKS / "wal.py"
+        env = dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_OFFLINE="1")
+        for event, payload in (("subagent", {"session_id": SESSION, "agent_id": "a1", "agent_type": "task-owner"}),
+                               ("subagent_stop", {"session_id": SESSION, "agent_id": "a1", "agent_type": "task-owner"})):
+            done = subprocess.run([sys.executable, str(hook), event], input=json.dumps(payload), text=True,
+                                  capture_output=True, env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        events = [(r["event"], r.get("agent_id")) for r in self.records_of("main.jsonl")]
+        self.assertIn(("subagent", "a1"), events)
+        self.assertIn(("subagent_stop", "a1"), events)
+
+    def records_of(self, name):
+        return [json.loads(raw) for _s, _n, raw in ws.iter_lines(self.dir / name) if raw]
+
     def test_ahd_wal_asks_window_keeps_the_newest_ask(self):
         import ahd
         self.append("main.jsonl", {"at": "2027-01-15T07:00:00+00:00", "event": "ask", "id": "wold", "note": "old ask"})
