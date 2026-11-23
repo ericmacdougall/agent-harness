@@ -472,9 +472,7 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
                     permission = ledger.status(task).get('permission')
                 except (esc.LedgerError, tiers.TierError) as error:
                     facts['ladder_error'] = getattr(error, 'code', 'error')
-            if not permission:
-                harness_family = 'astra' if selection.get('harness') == 'openai' else 'fable'
-                permission = central_permission(task, harness_family, facts)
+            # Central decisions do not apply to reviewers: peer_review.py itself honours only the local permission.
             if not permission:
                 return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
     if model is None:

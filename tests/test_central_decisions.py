@@ -517,6 +517,36 @@ class TierGateAcceptsCentral(Base):
         self.assertEqual(decision, 'deny')
         self.assertIn('above task k1', reason)  # ...and the unchanged ceiling still denied the launch
 
+    def bash_with_central(self, command):
+        real = cd.verify
+
+        def fake_verify(t, family, store=None, deadline_seconds=None, **kw):
+            return real(t, family, store=self.t2.store, client=self.fake)
+        with mock.patch.object(cd, 'Store', return_value=self.t2.store), mock.patch.object(cd, 'verify', side_effect=fake_verify):
+            return gate.decide_bash({'tool_name': 'Bash', 'tool_input': {'command': command}}, self.policy,
+                                    esc.Ledger(self.root, self.policy))
+
+    def test_bash_permission_site_uses_the_model_family(self):  # plan review 5 F1: Bash sites and family mismatch
+        sentence = 'use astra'
+        self.fake.add(self.body(self.payload(sentence=sentence, families=['astra'],
+                                             sentence_sha256=hashlib.sha256(sentence.encode()).hexdigest(),
+                                             source='user:%s/%s "%s"' % (SESSION, UID, sentence))))
+        decision, reason, _, facts = self.bash_with_central('claude -p --model fable --task k1 x')
+        self.assertEqual(decision, 'deny')
+        self.assertIn('needs the user permission', reason)  # fable launch: an astra-only decision is no permission
+        self.assertEqual(facts.get('central'), 'no_decision')
+        decision, reason, _, facts = self.bash_with_central('codex exec --model gpt-6-astra --task k1 -')
+        self.assertEqual(facts.get('central'), 'a' * 32)  # astra launch: the permission site accepts it
+        self.assertIn('above task k1', reason)  # and the unchanged ceiling decides
+
+    def test_reviewer_site_never_consults_central_decisions(self):  # plan review 5 F1 option (b)
+        self.fake.add(self.body(self.payload()))
+        decision, reason, _, facts = self.bash_with_central(
+            'python3 ~/.claude/hooks/peer_review.py pr --repo r --packet p --output o --task k1 --author-rung R5')
+        self.assertEqual(decision, 'deny')
+        self.assertIn('needs recorded user permission', reason)
+        self.assertNotIn('central', facts)
+
     def test_hook_consult_uses_the_short_deadline_and_fails_closed(self):  # NEG-20
         seen = {}
 

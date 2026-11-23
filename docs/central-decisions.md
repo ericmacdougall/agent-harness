@@ -74,7 +74,7 @@ Scope rules:
 - `task`, `session` and `all` revokes cover every decision whose user words came before the revoke. A re-publish of the same words therefore stays revoked, and new words after a revoke are a new decision.
 - Closing the ledger ticket revokes everything.
 
-Hosts keep a sticky local copy of every revoke they have seen (`tombstones.jsonl`).
+Hosts keep a sticky local copy of every revoke they have seen (`tombstones.jsonl`). Tombstones only deny. A revoke without a server time is kept as newer than every grant, so a scope revoke of that kind blocks later decisions in its scope on that host. To recover after removing such a comment from the ledger, the user moves `~/.agent-harness/decisions/tombstones.jsonl` aside on that host; the next read rebuilds it from the ledger.
 
 In the originating session, a later user turn that names the top rung or withdraws makes the provenance prompt hook revoke that session's published decisions by id. It writes a local tombstone first, then posts the revoke. A failed post is queued in `pending-revocations.jsonl`, retried on later prompts and reported in the agent's context. Until the queued post lands, other hosts still accept the decision (at most until its expiry). Publish refuses, before posting, when it cannot write the `published.jsonl` index that this hook relies on.
 
@@ -84,7 +84,7 @@ A retraction typed in a different session does not revoke automatically; use `ah
 
 ## Consumers
 
-- `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read: the Agent spawn (family fable), the Bash launch (fable or astra by model), and the reviewer path. The rung ceiling is unchanged, and nothing is written into the escalation state. All ledger reads of one hook run share one 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
+- `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read for launches: the Agent spawn (family fable) and the Bash launch and climbed-rung checks (fable or astra by model). Reviewers are excluded, because `peer_review.py` honours only local permissions. The rung ceiling is unchanged, and nothing is written into the escalation state. All ledger reads of one hook run share one 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
 - The T2Scan Claude adapter (`cli/adapters/claude-assessment.py`) uses the central path only when the approval task has no local escalation record. It still requires the family word, and for `-astra-direct` tasks the direct-assent words, in the signed sentence.
 - A revoke comment without a usable server time still denies (it counts as newer than every grant); a grant without one is not valid. Publish refuses when the Mac clock is more than 120 s from the server's.
 - Every read fetches the whole ledger: archived comments included, at most 10 pages of 200. Running out of pages, an unreachable tracker, a missing or closed ticket, a missing pinned key or a missing `cryptography` package all deny.
