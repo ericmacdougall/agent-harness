@@ -816,5 +816,20 @@ def doctor(rest, home=None):
     return report
 
 
+def verify_parity(rest, home=None):
+    """What ah.py's `ops verify-parity` imports: the gate form (tip of canonical main, strict about Codex trust, no --ref)
+    with argv `rest`, returned as the JSON-able report plus `ok` and `exit_code`, like doctor()."""
+    buf = io.StringIO()
+    argv = ["verify-parity"] + [a for a in rest if a != "--json"] + ["--json"]
+    code = main(argv, home, default_runner, buf)
+    try:
+        report = json.loads(buf.getvalue())
+    except ValueError:
+        report = {"ok": False, "error": "usage error or no report (exit %s)" % code, "hosts": {}}
+    report["ok"] = code == 0
+    report["exit_code"] = code
+    return report
+
+
 if __name__ == "__main__" and len(sys.argv) > 1:
     sys.exit(main())
