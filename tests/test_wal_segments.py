@@ -102,9 +102,7 @@ class RotationTests(Base):
         fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY)
         again = ws.build_index(fd, "main")
         os.close(fd)
-        for d in (idx, again):
-            d.pop("updated")
-        self.assertEqual(idx, again)
+        self.assertEqual(idx["segments"], again["segments"])  # live bytes move after the last rotation: segments only
         os.chmod(self.dir / "main.segments.json", 0o600)
         (self.dir / "main.segments.json").unlink()  # a missing index never changes what a reader returns
         self.assertEqual([r["n"] for r in self.records()], list(range(40)))

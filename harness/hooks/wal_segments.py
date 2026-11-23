@@ -628,6 +628,20 @@ def _finish_live(dir_fd, stem, fd):
     os.fsync(fd)
 
 
+def _rotated_away(dir_fd, stem, fd):
+    """True when the inode behind `fd` is now a closed segment of this stem (a rotation moved it)."""
+    try:
+        want = os.fstat(fd)
+        for seq, names in _scan(dir_fd, stem).get(stem, ({}, []))[0].items():
+            for n in names:
+                st = os.stat(n, dir_fd=dir_fd, follow_symlinks=False)
+                if (st.st_dev, st.st_ino) == (want.st_dev, want.st_ino):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01):
     """Append one complete JSONL line to `name` in the pinned directory `dir_fd`, rotating at the segment limit.
     Lock order: seglock, live open, data flock, target check. Raises ValueError for an unsafe target."""
@@ -670,6 +684,8 @@ def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01)
                 raise ValueError("WAL session directory changed")
             fd = None
             for tries in range(4):
+                if tries and not check_dir():  # re-pin after the backoff: never open through a redirected directory
+                    raise ValueError("WAL session directory changed")
                 try:
                     fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
                     break
@@ -698,9 +714,12 @@ def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01)
                 os.fchmod(fd, 0o600)
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 if not current_target():
+                    # Retry only when OUR rotation renamed this inode to a closed segment; any other change of the
+                    # target (replacement, swap, link) is refused as before.
+                    rotated = _rotated_away(dir_fd, stem, fd)
                     os.close(fd)
                     fd = None
-                    if attempt == MAX_RETRIES - 1:
+                    if not rotated or attempt == MAX_RETRIES - 1:
                         raise ValueError("WAL target changed before append")
                     time.sleep(retry_sleep)
                     continue
