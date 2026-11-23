@@ -2290,7 +2290,13 @@ class TierOneCheckpoint(Case):
         stage = str(self.home / ".agent-harness/backup-stage")
         lists = [c for c in self.recorded() if c["argv"][0] == "lsf" and c["argv"][-1].startswith(stage)
                  and "pst" in c["argv"]]   # the tree listings; the upload guard's name checks print no times
-        self.assertEqual(len(lists), 3, lists)
+        # Each tree is listed for its pending files and, once complete, again by the completion invariant
+        # (live_unverified): both go through live_list, so every one must run in UTC.
+        per_tree = {}
+        for c in lists:
+            per_tree[c["argv"][-1]] = per_tree.get(c["argv"][-1], 0) + 1
+        self.assertEqual(len(per_tree), 3, lists)
+        self.assertLessEqual(set(per_tree.values()), {1, 2}, per_tree)
         self.assertEqual({c["tz"] for c in lists}, {"UTC"})
 
     def test_f4_a_throttled_tree_that_runs_first_does_not_skip_the_wal_tree(self):

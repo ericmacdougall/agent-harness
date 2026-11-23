@@ -381,7 +381,8 @@ class PerTree(Base):
     log-backup.sources. A backlog in one tree must not hide that the others are fresh, and must not make tier 1 fresh."""
 
     def run_cli(self, *argv):
-        return subprocess.run([sys.executable, str(TOOL), "--home", str(self.home), *argv],
+        # stdin=DEVNULL: session-start drains its hook payload from stdin, so an inherited open pipe would block it.
+        return subprocess.run([sys.executable, str(TOOL), "--home", str(self.home), *argv], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
 
     def write_trees(self, now):
