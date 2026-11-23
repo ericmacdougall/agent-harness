@@ -299,16 +299,22 @@ class CrashTests(Base):
             self.assertTrue(ws.exists(self.dir / "main.jsonl"))
         self.converge(state)
 
-    def test_after_create(self):
-        self.run_to("after_create")
+    def test_after_temp(self):  # the marked temp file exists; nothing renamed yet
+        before = self.run_to("after_temp")
 
         def state():
-            self.assertEqual((self.dir / "main.jsonl").stat().st_size, 0)
+            self.assertEqual(self.closed(), before)
+            self.assertTrue(list(self.dir.glob(".main.live.*.new")), "the temp file is the only new thing")
+            self.assertIsNone(ws.parse_marker((self.dir / "main.jsonl").read_bytes().split(b"\n")[0]))
         self.converge(state)
 
-    def test_after_marker(self):
-        self.run_to("after_marker")
-        self.converge(lambda: self.assertIsNotNone(ws.parse_marker((self.dir / "main.jsonl").read_bytes().split(b"\n")[0])))
+    def test_after_live(self):  # the marked file was renamed into the live name
+        before = self.run_to("after_live")
+
+        def state():
+            self.assertEqual(len(self.closed()), len(before) + 1)
+            self.assertIsNotNone(ws.parse_marker((self.dir / "main.jsonl").read_bytes().split(b"\n")[0]))
+        self.converge(state)
 
     def test_after_index(self):
         self.run_to("after_index")
@@ -318,13 +324,13 @@ class CrashTests(Base):
         real = os.open
 
         def fake(path, flags, mode=0o777, *, dir_fd=None):
-            if path == "main.jsonl" and flags & os.O_EXCL:
+            if str(path).startswith(".main.live.") and flags & os.O_EXCL:
                 raise OSError(28, "No space left on device")
             return real(path, flags, mode, dir_fd=dir_fd)
         with patch.object(ws.os, "open", side_effect=fake):
             for i in range(30):
                 self.append("main.jsonl", rec(i, 300))
-        self.assertEqual(self.closed(), [])  # rotation undone
+        self.assertEqual(self.closed(), [])  # rotation skipped before anything was renamed
         self.assertEqual([r["n"] for r in self.records()], list(range(30)))  # record kept, nothing lost
 
 
@@ -535,25 +541,89 @@ class AppendInvariantTests(Base):
         real = os.open
 
         def fake(path, flags, mode=0o777, *, dir_fd=None):
-            if path == "main.jsonl" and flags & os.O_EXCL:
+            if str(path).startswith(".main.live.") and flags & os.O_EXCL:
                 raise OSError(28, "No space left on device")
             return real(path, flags, mode, dir_fd=dir_fd)
         self.run_scenario(patch.object(ws.os, "open", side_effect=fake), expect_closed=0)
 
-    def test_rotation_failure_raises_handled_error_and_does_not_leak(self):
-        real = ws._fault
+    def test_io_error_writing_the_marker_skips_rotation_and_keeps_every_record(self):  # F2, before any rename
+        real = ws._write_all
 
-        def boom(step):
-            if step == "after_create":
-                raise OSError(5, "injected I/O error")
-            return real(step)
+        def eio(fd, data):
+            if ws.MARKER_EVENT.encode() in data:
+                raise OSError(5, "injected EIO writing the marker")
+            return real(fd, data)
+        self.run_scenario(patch.object(ws, "_write_all", eio), expect_closed=0)
+
+    def test_failure_after_rename_raises_the_documented_code_then_recovers(self):  # F2, after the rename
         for i in range(8):
             self.append("main.jsonl", rec(i, 400))
+        real = ws._exclusive_rename
+        calls = []
+
+        def flaky(dir_fd, old, new):
+            calls.append((old, new))
+            if len(calls) == 1:
+                return real(dir_fd, old, new)  # live -> segment succeeds
+            raise OSError(5, "injected EIO moving the marked file into the live name")
         before = open_fds()
-        with patch.object(ws, "_fault", boom), self.assertRaises(OSError):
+        failed = None
+        with patch.object(ws, "_exclusive_rename", flaky):
             for i in range(8, 30):
-                self.append("main.jsonl", rec(i, 400))
+                try:
+                    self.append("main.jsonl", rec(i, 400))
+                except ValueError as error:
+                    failed = (i, str(error))
+                    break
+        self.assertIsNotNone(failed, "the rotation never reached the failure")
+        self.assertTrue(failed[1].startswith("rotate_failed_record_not_written"), failed[1])  # the documented code
         self.assertEqual(open_fds(), before)
+        for i in range(100, 105):  # the next appends recover: live file recreated with its marker
+            self.append("main.jsonl", rec(i, 50))
+        got = [r["n"] for r in self.records()]
+        self.assertEqual(got, list(range(failed[0])) + list(range(100, 105)))  # the failed record was not written anywhere
+        self.assertEqual(hard(ws.verify_chain(self.dir, "main", deep=True)), [])
+
+    def test_live_name_is_never_visible_without_its_marker(self):  # F1: a record can never precede the marker
+        seen = []
+        real = ws._fault
+
+        def check(step):
+            live = self.dir / "main.jsonl"
+            if live.exists() and self.closed():
+                data = live.read_bytes()
+                seen.append((step, bool(data) and ws.parse_marker(data.split(b"\n")[0]) is not None, bool(data)))
+            return real(step)
+        with patch.object(ws, "_fault", check):
+            for i in range(40):
+                self.append("main.jsonl", rec(i, 300))
+        self.assertGreaterEqual(len(self.closed()), 2)
+        # a live file that exists next to closed segments is, at every fault point of every later rotation, either
+        # the previous live file (marked) or the new one (marked): never empty or unmarked
+        self.assertTrue(seen)
+        self.assertEqual([s for s in seen if not s[1]], [])
+
+    def test_writer_without_the_seglock_never_creates_the_live_file_early(self):  # F3 docs vs code
+        import threading
+        for i in range(3):
+            self.append("main.jsonl", rec(i, 50))
+        (self.dir / ".main.seglock").unlink()
+        (self.dir / ".main.seglock").mkdir()  # an unusable seglock: the writer proceeds without it
+        seg = (self.dir / "main.jsonl").read_bytes()
+        os.rename(self.dir / "main.jsonl", self.dir / "main.0001.jsonl")  # a rotation is mid-flight: live name absent
+
+        def rotator_finishes():  # the rotator moves its marked file into the live name a moment later
+            time.sleep(0.15)
+            tmp = self.dir / ".main.live.test.new"
+            tmp.write_bytes(ws._marker("main", 2, "main.0001.jsonl", len(seg), 3, hashlib.sha256(seg).hexdigest()))
+            os.rename(tmp, self.dir / "main.jsonl")
+        t = threading.Thread(target=rotator_finishes)
+        t.start()
+        self.append("main.jsonl", rec(3, 50))
+        t.join()
+        first = (self.dir / "main.jsonl").read_bytes().split(b"\n")[0]
+        self.assertIsNotNone(ws.parse_marker(first), "the writer created the live file itself and put its record before the marker")
+        self.assertEqual([r["n"] for r in self.records()], [0, 1, 2, 3])
 
 
 class FramingTests(Base):
@@ -610,6 +680,41 @@ class FramingTests(Base):
         self.assertIn("marker_missing", again.stderr)
 
 
+class HardeningTests(Base):
+    """goodqa#16787 gate findings F4 and F5."""
+
+    def test_closed_segment_replaced_after_listing_is_reported_not_read(self):  # F5
+        for i in range(30):
+            self.append("main.jsonl", rec(i, 300))
+        segs = self.closed()
+        self.assertGreaterEqual(len(segs), 2)
+        snap = ws.Snapshot(self.dir / "main.jsonl")
+        imposter = self.dir / "imposter.tmp"
+        imposter.write_bytes(line(rec(999)))
+        os.replace(imposter, self.dir / segs[0])  # swapped after the directory was listed
+        got = [json.loads(raw)["n"] for _, _, raw in snap.lines() if raw]
+        problems = [p["code"] for p in snap.problems]
+        snap.close()
+        self.assertNotIn(999, got)
+        self.assertIn("segment_changed", problems)
+
+    def test_installed_codex_hook_does_not_import_from_a_stray_harness_dir(self):  # F4
+        import shutil
+        inst = self.home / ".codex" / "agent-harness"
+        inst.mkdir(parents=True)
+        shutil.copy(HOOKS.parents[1] / "codex/hooks/wal.py", inst / "wal.py")
+        decoy = self.home / "harness" / "hooks"  # where parents[2]/harness/hooks points for an installed copy
+        decoy.mkdir(parents=True)
+        (decoy / "wal_segments.py").write_text("DECOY = True\n")
+        code = ("import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('wal_installed', %r)\n"
+                "mod = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(mod)\n"
+                "print(getattr(mod.wal_segments, 'DECOY', None) if mod.wal_segments else 'none')\n") % str(inst / "wal.py")
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(self.home),
+                             env={"PATH": os.environ.get("PATH", ""), "HOME": str(self.home)})
+        self.assertEqual(out.stdout.strip(), "none", out.stderr)  # the decoy was not imported
+
+
 class NoDestructiveTests(unittest.TestCase):
     FORBIDDEN = {"unlink", "remove", "rmdir", "rmtree", "truncate", "ftruncate", "move", "replace", "rename", "renames"}
 
@@ -627,9 +732,19 @@ class NoDestructiveTests(unittest.TestCase):
 
     def test_only_reviewed_functions_may_remove_or_rename(self):
         found = self.violations((HOOKS / "wal_segments.py").read_text())
-        allowed = {("_repair_tail", "ftruncate"), ("write_index", "rename")}  # torn tail line; the derived index
+        # torn tail line; the derived index; our own marker-only temp file (never a WAL)
+        allowed = {("_repair_tail", "ftruncate"), ("write_index", "rename"), ("_discard_temp", "unlink")}
         self.assertEqual(sorted(set(found) - allowed), [])
         self.assertIn(("_repair_tail", "ftruncate"), found)  # the guard sees what it should
+
+    def test_exclusive_rename_is_only_called_by_rotate(self):  # the ctypes rename is not on the name list above
+        tree = ast.parse((HOOKS / "wal_segments.py").read_text())
+        callers = set()
+        for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_exclusive_rename":
+                    callers.add(fn.name)
+        self.assertEqual(callers, {"_rotate"})
 
     def test_guard_has_teeth(self):
         self.assertEqual(self.violations("import os\ndef f():\n    os.replace('a','b')\n"), [("f", "replace")])
