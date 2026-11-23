@@ -309,79 +309,16 @@ def _wal_ends_with_newline(path) -> bool:
     return _ws().read_tail(path, 1).endswith(b"\n")
 
 
-def _segment_fd(directory: str, seg) -> int:
-    fd = os.open(os.path.join(directory, seg.name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_ino != seg.ino:
-            raise OSError(errno.ESTALE, f"{seg.name} changed after the chain was listed")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
 _CHAIN_HINT: dict = {}   # str(live path) -> the chain summarize_agent_wal was handed (one directory listing per session)
 
 
-class _NoSegments:
-    segments: list = []
-    live = None
-    max_seq = 0
-
-
-class _LiveOnlySnapshot:
-    """The snapshot of a chain that was only a live file when the directory was listed (the common agent WAL). The
-    listing is the caller's single `list_wals` call; this opens the live file at once and accepts it only when it is
-    the very file the listing saw (same inode), so a rotation between the listing and the open is never missed (it
-    leaves another file under the name and the caller falls back to wal_segments.open_chain). Without it every one
-    of 2,400 agent summaries lists a 2,400-entry directory again: cold `ah owners` 1.1 s -> 8.0 s on t2-dev."""
-
-    def __init__(self, directory: str, stem: str, fd: int, name: str):
-        self.directory, self.stem, self.tail_fd, self.tail_name = directory, stem, fd, name
-        self.chain, self.problems = _NoSegments(), []
-
-    def close(self) -> None:
-        if self.tail_fd is not None:
-            os.close(self.tail_fd)
-            self.tail_fd = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-
-def _live_only_snapshot(path: Path, ch):
-    if ch is None or ch.segments or ch.live is None or _wal_bad(ch.problems):
-        return None
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return None
-    try:
-        st = os.fstat(fd)
-        if stat.S_ISREG(st.st_mode) and st.st_ino == ch.live.ino:
-            return _LiveOnlySnapshot(str(path.parent), ch.stem, fd, path.name)
-    except OSError:
-        pass
-    os.close(fd)
-    return None
-
-
-def _is_own_marker(raw: bytes, stem: str, seq: int) -> bool:
-    """wal_segments' marker rule for line 1 of a file: seq >= 2, the marker's segment equals the file's seq and its stem
-    is this WAL's. test_ah_wal_segments_readers compares it with Snapshot's own rule so the two cannot drift apart."""
-    marker = _ws().parse_marker(raw)
-    return marker is not None and seq >= 2 and marker["segment"] == seq and marker["stem"] == stem
 
 
 def chain_new_lines(snap, meta: dict, torn: dict):
     """(iterator of (offset, line), rebuilt): the complete lines of a whole WAL chain not yet read, oldest first.
 
     `snap` is a wal_segments snapshot (the live fd pinned before the directory was listed, so a rotation during the
-    read loses and duplicates nothing). meta describes where the last call stopped: the inode, offset and tail hash
+    read loses and duplicates nothing; opened with the caller's one-time listing, so no directory scan per WAL). meta describes where the last call stopped: the inode, offset and tail hash
     of the LAST file it read, plus `prior`, the [name, inode, size, mtime_ns] of every file before it. A rotation renames that
     file (its inode survives), so the read resumes in it and goes on through the segments after it. It rescans from
     the first segment when the file is gone, changed, or the files before it are no longer the ones it was
@@ -390,13 +327,16 @@ def chain_new_lines(snap, meta: dict, torn: dict):
     """
     ws = _ws()
     directory = snap.directory
-    files = [{"name": s.name, "ino": s.ino, "size": s.size, "seg": s, "fd": None, "own": True, "seq": s.seq,
-              "mtime": os.lstat(os.path.join(directory, s.name)).st_mtime_ns}
-             for s in snap.chain.segments if s.name != snap.tail_name]
-    if snap.tail_fd is not None:
-        st = os.fstat(snap.tail_fd)
-        files.append({"name": snap.tail_name, "ino": st.st_ino, "size": st.st_size, "seg": None, "fd": snap.tail_fd, "own": False,
-                      "mtime": st.st_mtime_ns, "seq": ws.parse_name(snap.tail_name)[1] or (snap.chain.max_seq + 1)})
+    files = []
+    for src in snap.sources():   # closed segments (fd None, opened lazily by the snapshot), then the pinned tail
+        if src.fd is None:
+            st = os.lstat(os.path.join(directory, src.name))
+            files.append({"name": src.name, "ino": src.ino, "size": st.st_size, "fd": None, "own": True, "seq": src.seq,
+                          "mtime": st.st_mtime_ns})
+        else:
+            st = os.fstat(src.fd)
+            files.append({"name": src.name, "ino": st.st_ino, "size": st.st_size, "fd": src.fd, "own": False, "seq": src.seq,
+                          "mtime": st.st_mtime_ns})
     live_name = snap.stem + ".jsonl"
     for p in snap.problems:   # the live file is there but could not be opened: the newest records are unreadable
         if p["code"] in ("unreadable", "not_regular") and str(p["message"]).startswith(live_name):
@@ -414,7 +354,7 @@ def chain_new_lines(snap, meta: dict, torn: dict):
         f = files[k] if k < len(files) else None
         if f is not None and f["ino"] == meta.get("inode") and [ident(x) for x in files[:k]] == prior:
             if f["fd"] is None:
-                f["fd"] = _segment_fd(directory, f["seg"])
+                f["fd"] = snap._open_closed(f["name"])   # inode-checked against the listing
             try:
                 first, rb = read_new_lines(Path(directory) / f["name"], meta, fd=f["fd"])
             except BaseException:
@@ -435,7 +375,7 @@ def chain_new_lines(snap, meta: dict, torn: dict):
     def gen():
         for i in range(start, len(files)):
             f = files[i]
-            fd = f["fd"] if f["fd"] is not None else _segment_fd(directory, f["seg"])
+            fd = f["fd"] if f["fd"] is not None else snap._open_closed(f["name"])
             try:
                 if resumed and i == start:
                     sub, it = meta, first
@@ -443,7 +383,7 @@ def chain_new_lines(snap, meta: dict, torn: dict):
                     sub = {}
                     it, _ = read_new_lines(Path(directory) / f["name"], sub, fd=fd)
                 for off, raw in it:
-                    if off == 0 and _is_own_marker(raw, snap.stem, f["seq"]):
+                    if off == 0 and ws.valid_marker(raw, snap.stem, f["seq"]) is not None:
                         continue
                     yield off, raw
                 if i < last and sub.get("offset", 0) < f["size"]:
@@ -562,7 +502,7 @@ def _summarize_agent_wal(path: Path, index_dir: Path, prior: dict | None = None)
         # advanced without counting the lines it skipped (skipped_to is where the count was last brought up to): rescan
         meta.clear()
     torn = {"closed": 0}
-    snap = _live_only_snapshot(path, _CHAIN_HINT.get(str(path))) or _ws().open_chain(path)
+    snap = _ws().open_chain(path, chain=_CHAIN_HINT.get(str(path)))   # the listing is used only if it agrees with the live fd
     with snap:   # the whole segment chain, the live fd pinned first (a rotation mid-read is safe)
         lines, rebuilt = chain_new_lines(snap, meta, torn)
         if rebuilt or "first" not in summary or "outcome_at" not in summary or "skipped" not in summary \
@@ -1243,12 +1183,18 @@ def _prov():
     return provenance
 
 
-def _segs():
-    """wal_segments (docs/wal-segments.md), or None on an install that has not shipped it yet."""
+def _segs(directory=None):
+    """wal_segments (docs/wal-segments.md), or None on an install that has not shipped it and has nothing rotated:
+    wal.require_segments raises when rotation is on or segment files exist, so a missing module is fatal there."""
     try:
         import wal_segments
         return wal_segments
     except ImportError:
+        try:
+            import wal  # noqa: PLC0415
+        except ImportError:
+            return None
+        wal.require_segments(directory)
         return None
 
 
@@ -2074,7 +2020,7 @@ def _wal_path(home: Path, session: str, agent: str) -> Path:
 
 def _wal_append(home: Path, path: Path, record: dict) -> None:
     try:  # a retry after a crash between this append and the ledger row must not duplicate the entry
-        segs = _segs()
+        segs = _segs(path.parent)
         if segs is not None:  # the tail window spans closed segments, so a rotation cannot hide the earlier append
             window = segs.read_tail(path, 262144)
         else:
@@ -2094,7 +2040,7 @@ def _wal_append(home: Path, path: Path, record: dict) -> None:
         raise AhError("bad_request", "WAL path must be a session JSONL under ~/.claude/wals or ~/.agent-harness/codex-wals", 3)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    segs = _segs()
+    segs = _segs(path.parent)
     if segs is not None:  # one shared writer: seglock, rotation at the segment limit, crash-tail repair
         try:
             dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))

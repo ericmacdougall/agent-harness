@@ -211,7 +211,6 @@ class SummaryAndItsCaches(Base):
         self.assertEqual((listed.segments, listed.live.name), ([], "agent-ownera.jsonl"))
         os.rename(live, w / "agent-ownera.0001.jsonl")      # the rotation, after the listing
         put(w, "agent-ownera.jsonl", [marker("agent-ownera", 2)] + OWNERA[2:])
-        self.assertIsNone(ah._live_only_snapshot(live, listed))      # a different file under the listed name
         ah._CHAIN_HINT[str(live)] = listed
         try:
             s = ah._summarize_agent_wal(live, ah.state_dir(self.home, "ah-index"))
@@ -440,14 +439,9 @@ class NoDirectOpen(unittest.TestCase):
                "narrow_wait", "ask_states", "_wal_has", "_last_line_is", "_evidence_ok", "_session_entries",
                "_owner_context", "status_report", "nearest_source", "note_cmd", "newest_session", "list_sessions",
                "session_dir", "requirements_view", "chain_new_lines", "_wal_lines", "_wal_exists", "_wal_mtime",
-               "_wal_fingerprint", "_wal_chain")
+               "_wal_fingerprint", "_wal_chain", "_segs")
     # The only functions of the WAL read path that open a file themselves, each with why (reviewer question 1).
     OPENERS = {
-        "_segment_fd": "opens one CLOSED segment by the name wal_segments.chain listed, O_NOFOLLOW, accepted only when "
-                       "its inode is the listed one",
-        "_live_only_snapshot": "opens a WAL that the single list_wals listing showed as a live file only, accepted only "
-                               "when its inode is the listed one (else wal_segments.open_chain is used): one directory "
-                               "listing per agent made cold `ah owners` on 2,400 agents 8.0 s instead of 1.1 s",
         "read_new_lines": "shared with the transcript indexer: reads a path (a transcript) or a descriptor the caller "
                           "pinned (a WAL chain); never a WAL by name",
     }
