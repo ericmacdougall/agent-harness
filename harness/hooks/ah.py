@@ -953,6 +953,15 @@ def _prov():
     return provenance
 
 
+def _segs():
+    """wal_segments (docs/wal-segments.md), or None on an install that has not shipped it yet."""
+    try:
+        import wal_segments
+        return wal_segments
+    except ImportError:
+        return None
+
+
 def find_transcript(home: Path, session: str) -> Path:
     if not SESSION_RE.match(session):
         raise AhError("session_invalid", "session id has characters a transcript name cannot have")
@@ -1775,12 +1784,17 @@ def _wal_path(home: Path, session: str, agent: str) -> Path:
 
 def _wal_append(home: Path, path: Path, record: dict) -> None:
     try:  # a retry after a crash between this append and the ledger row must not duplicate the entry
-        with open(path, "rb") as handle:
-            handle.seek(0, 2)
-            handle.seek(max(0, handle.tell() - 262144))
-            if (b'"id":"%s"' % record["id"].encode()) in handle.read(262144):  # input-ok: tail window only
-                return
-    except OSError:
+        segs = _segs()
+        if segs is not None:  # the tail window spans closed segments, so a rotation cannot hide the earlier append
+            window = segs.read_tail(path, 262144)
+        else:
+            with open(path, "rb") as handle:
+                handle.seek(0, 2)
+                handle.seek(max(0, handle.tell() - 262144))
+                window = handle.read(262144)  # input-ok: tail window only
+        if (b'"id":"%s"' % record["id"].encode()) in window:
+            return
+    except (OSError, ValueError):
         pass
     # ah is the writer: its own bounded append, valid under either WAL root, independent of which wal.py is installed
     import fcntl  # noqa: PLC0415
@@ -1790,6 +1804,19 @@ def _wal_append(home: Path, path: Path, record: dict) -> None:
         raise AhError("bad_request", "WAL path must be a session JSONL under ~/.claude/wals or ~/.agent-harness/codex-wals", 3)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     payload = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    segs = _segs()
+    if segs is not None:  # one shared writer: seglock, rotation at the segment limit, crash-tail repair
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as e:
+            raise AhError("wal_unsafe", f"WAL directory of {path.name} cannot be opened ({e.__class__.__name__})", 3)
+        try:
+            segs.append_line(dfd, path.name, payload)
+        except (OSError, ValueError) as e:
+            raise AhError("wal_unsafe", f"WAL {path.name} is not a writable regular file ({e.__class__.__name__}); a symlinked WAL is refused", 3)
+        finally:
+            os.close(dfd)
+        return
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
     except OSError as e:
