@@ -28,10 +28,12 @@ CLI finds and reads a WAL chain locally or in a copy (a git backup checkout) wit
   tests). A WAL that never reaches the limit is byte-identical to today's: no markers, no sidecars except the lock.
 - **Rotate.** Under the sidecar lock `.<stem>.seglock` (a regular 0600 file, O_NOFOLLOW, never removed) and the data-fd
   flock, when the live file is longer than 1024 bytes and `size + len(record) > limit`: (1) crash-tail repair as
-  today; (2) hash the live file (sha256, bytes, lines); (3) `rename(S.jsonl, S.NNNN.jsonl)` (atomic, same directory,
-  dir_fd); (4) create new `S.jsonl` with O_CREAT|O_EXCL|O_NOFOLLOW 0600; (5) write the open marker; (6) rewrite the
+  today; (2) hash the live file (sha256, bytes, lines); **[steps (3) to (5) as first written (rename live to segment,
+  then create the new live file, then write its marker) are REPLACED BY R4 below: the marked temp file is prepared
+  first, then live is renamed to the segment, then the temp file is renamed into the live name]**; (6) rewrite the
   index; (7) append the record to the new live file. Rotation only renames and creates; it never truncates, rewrites
-  or deletes a WAL. The closed segment is not modified (no close marker): links live in the NEW file's open marker.
+  or deletes a WAL (the one unlink is of our own marker-only temp file, R4). The closed segment is not modified (no
+  close marker): links live in the NEW file's open marker.
 - **Open marker** (first line of every live file after a rotation):
   `{"at":ISO,"event":"wal_segment_open","schema":1,"stem":S,"segment":N,"prev":"S.NNNN.jsonl","prev_bytes":B,"prev_lines":L,"prev_sha256":H,"limit":LIMIT}`.
   A forward link is derived (segment k's next is k+1, the last closed segment's next is the live file) and stored in

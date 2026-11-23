@@ -124,10 +124,16 @@ def _fault(step):
 # ---------------------------------------------------------------------------------------------------------
 
 class Seg:
-    __slots__ = ("seq", "name", "kind", "size", "ino")
+    __slots__ = ("seq", "name", "kind", "size", "ino", "dev", "mtime_ns")
 
-    def __init__(self, seq, name, kind, size, ino):
+    def __init__(self, seq, name, kind, size, ino, dev=None, mtime_ns=None):
         self.seq, self.name, self.kind, self.size, self.ino = seq, name, kind, size, ino
+        self.dev, self.mtime_ns = dev, mtime_ns
+
+    @property
+    def ident(self):
+        """(st_dev, st_ino): the identity a reopened file must have; the inode number alone is not unique across devices."""
+        return (self.dev, self.ino)
 
     def as_dict(self):
         return {"seq": self.seq, "name": self.name, "bytes": self.size, "kind": self.kind}
@@ -142,13 +148,46 @@ class Chain:
         self.live = None
         self.problems = []
         self.max_seq = 0
+        self._tail_cache = {}
 
     def problem(self, code, message, seq=None):
         self.problems.append({"code": code, "message": message, "seq": seq})
 
+    def validate_tail(self, deep=False, first_line=None):
+        """The tail problems of this chain: the live file's open marker must be the successor of the newest closed
+        segment (see tail_problems). One cached open of the live file; `deep` also rehashes the newest closed segment
+        against the marker's prev_sha256 (cached per process by file identity). A chain with no live file has no tail
+        to validate here (`live_missing` is reported separately). Hard problems: a gate must not treat the chain as
+        complete when any is present."""
+        cached = first_line is None and bool(deep) in self._tail_cache
+        if cached:
+            return list(self._tail_cache[bool(deep)])
+        live = self.live
+        if live is None:
+            return []
+        read_here = first_line is None
+        if read_here:
+            try:
+                fd = _open_regular(self.directory, live.name)
+                try:
+                    first_line = _first_line(fd)
+                finally:
+                    os.close(fd)
+            except OSError as error:
+                return [{"code": "unreadable", "message": f"{live.name}: {type(error).__name__}", "seq": live.seq}]
+        prev = next((s for s in self.segments if s.seq == self.max_seq), None)
+        found = tail_problems(self.stem, live.seq, segment_name(self.stem, self.max_seq) if self.max_seq else None,
+                              prev.size if prev else None, first_line)
+        if deep and not found and prev is not None:
+            found = deep_tail_problems(self.directory, None, prev, first_line)
+        if read_here:
+            self._tail_cache[bool(deep)] = list(found)
+        return found
+
     @property
     def complete(self):
-        return not [p for p in self.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+        hard = [p for p in self.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+        return not hard and not self.validate_tail()
 
     def path(self, seg):
         return os.path.join(self.directory, seg.name)
@@ -194,7 +233,7 @@ def _build_chain(directory, stem, scan_dir, dfd=None):
         if not stat.S_ISREG(st.st_mode):
             ch.problem("not_regular", f"{name} is not a regular file (never followed)", seq)
             continue
-        ch.segments.append(Seg(seq, name, "segment", st.st_size, st.st_ino))
+        ch.segments.append(Seg(seq, name, "segment", st.st_size, st.st_ino, st.st_dev, st.st_mtime_ns))
     present = sorted(seqs)
     if present:  # gaps are reported as [lo, hi] ranges, never enumerated
         expect = 1
@@ -206,7 +245,7 @@ def _build_chain(directory, stem, scan_dir, dfd=None):
         try:
             st = lstat_name(lives[0])
             if stat.S_ISREG(st.st_mode):
-                ch.live = Seg(ch.max_seq + 1, lives[0], "live", st.st_size, st.st_ino)
+                ch.live = Seg(ch.max_seq + 1, lives[0], "live", st.st_size, st.st_ino, st.st_dev, st.st_mtime_ns)
             else:
                 ch.problem("not_regular", f"{lives[0]} is not a regular file (never followed)", ch.max_seq + 1)
         except OSError as error:
@@ -248,9 +287,9 @@ class _Changed(OSError):
     """A segment is not the file that was listed (replaced or swapped after the directory listing)."""
 
 
-def _open_at(dfd, directory, name, ino=None):
+def _open_at(dfd, directory, name, ident=None):
     """Open a regular file read-only through the pinned directory fd (no re-resolution of the path), refusing a
-    file whose inode differs from the one that was listed."""
+    file whose (st_dev, st_ino) differs from the identity that was listed."""
     if dfd is None:
         fd = _open_regular(directory, name)
     else:
@@ -259,7 +298,7 @@ def _open_at(dfd, directory, name, ino=None):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise OSError(errno.EINVAL, "not a regular file")
-        if ino is not None and st.st_ino != ino:
+        if ident is not None and (st.st_dev, st.st_ino) != tuple(ident):
             raise _Changed(errno.ESTALE, f"{name} is not the file that was listed")
     except BaseException:
         os.close(fd)
@@ -296,6 +335,76 @@ def _first_line(fd, limit=8192):
     return os.pread(fd, limit, 0).split(b"\n", 1)[0]
 
 
+def _tp(code, message, seq):
+    return {"code": code, "message": message, "seq": seq}
+
+
+def tail_problems(stem, expected_seq, prev_name, prev_bytes, first_line):
+    """THE tail rule (one validator for every gate and tool): is the file whose first line is `first_line` the
+    successor of the newest closed segment? `expected_seq` is that file's sequence number (newest closed + 1),
+    `prev_name`/`prev_bytes` the newest closed segment (None when there is none). Returns hard problems:
+      - nothing closed before it but its marker claims segment >= 2: closed segments were deleted (tail_missing);
+      - closed segments exist but it has no marker (marker_missing);
+      - its marker names a LATER segment than expected: the newest closed segment(s) were deleted (tail_missing);
+      - its marker names another stem or an earlier segment (marker_mismatch);
+      - its marker's prev is not the newest closed segment's name, or prev_bytes differs from its size (marker_mismatch).
+    prev_sha256 is checked by deep_tail_problems (it needs a hash of the segment)."""
+    m = parse_marker(first_line)
+    if prev_name is None:
+        if m is not None and m["stem"] == stem and m["segment"] >= 2:
+            return [_tp("tail_missing", f"the open marker says segment {m['segment']} but no closed segment precedes it", expected_seq)]  # outcome: tail_missing_all
+        return []
+    if m is None:
+        return [_tp("marker_missing", f"segment {expected_seq} has no open marker but closed segments exist", expected_seq)]  # outcome: tail_marker_missing
+    if m["stem"] == stem and m["segment"] > expected_seq:
+        msg = f"the open marker says segment {m['segment']} but the newest closed segment is {prev_name}: {m['segment'] - expected_seq} newer closed segment(s) are missing"
+        return [_tp("tail_missing", msg, expected_seq)]  # outcome: tail_missing
+    if m["stem"] != stem or m["segment"] != expected_seq:
+        return [_tp("marker_mismatch", f"the open marker is for {m['stem']} segment {m['segment']}, expected {stem} segment {expected_seq}", expected_seq)]  # outcome: tail_segment_mismatch
+    if m.get("prev") != prev_name:
+        return [_tp("marker_mismatch", f"the open marker names prev {m.get('prev')!r}, the newest closed segment is {prev_name!r}", expected_seq)]  # outcome: tail_marker_mismatch
+    if prev_bytes is not None and m.get("prev_bytes") != prev_bytes:
+        return [_tp("marker_mismatch", f"{prev_name} is {prev_bytes} bytes, the open marker recorded {m.get('prev_bytes')}", expected_seq)]  # outcome: tail_bytes_mismatch
+    return []
+
+
+_DEEP_CACHE = {}  # (name, st_dev, st_ino, st_size, st_mtime_ns) -> (sha256, bytes, lines); digests only, never a verdict
+
+
+def _deep_digest(directory, dfd, seg):
+    """sha256, size and line count of a closed segment, cached per process by the file's identity taken from a fresh
+    fstat of the opened file (so a changed file always re-hashes); a failed comparison is never cached."""
+    fd = _open_at(dfd, directory, seg.name, None)
+    try:
+        st = os.fstat(fd)
+        key = (seg.name, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        hit = _DEEP_CACHE.get(key)
+        if hit is None:
+            sha, size, lines = _hash_fd(fd)
+            if len(_DEEP_CACHE) >= 64:
+                _DEEP_CACHE.clear()
+            hit = _DEEP_CACHE[key] = (sha, size, lines)
+        return hit
+    finally:
+        os.close(fd)
+
+
+def deep_tail_problems(directory, dfd, prev_seg, first_line):
+    """The prev_sha256 / prev_lines check of the live marker against the newest closed segment (a hash of up to
+    50 MB, cached by identity). Run only after tail_problems found nothing."""
+    m = parse_marker(first_line)
+    if m is None:
+        return []
+    try:
+        sha, size, lines = _deep_digest(directory, dfd, prev_seg)
+    except OSError as error:
+        return [_tp("unreadable", f"{prev_seg.name}: {type(error).__name__}", prev_seg.seq)]
+    if (sha, size, lines) != (m.get("prev_sha256"), m.get("prev_bytes"), m.get("prev_lines")):
+        msg = f"{prev_seg.name} no longer matches the digest its successor's open marker recorded (modified, or a writer appended after the rotation)"
+        return [_tp("marker_mismatch", msg, prev_seg.seq)]  # outcome: tail_deep_mismatch
+    return []
+
+
 # ---------------------------------------------------------------------------------------------------------
 # reader snapshot
 # ---------------------------------------------------------------------------------------------------------
@@ -304,7 +413,7 @@ class Snapshot:
     """A consistent point-in-time read of one logical WAL. Opens the live fd FIRST, then lists the directory, then
     reconciles by inode, so a concurrent rotation yields neither a duplicated nor a lost pre-snapshot line."""
 
-    def __init__(self, path, strict=False, include_markers=False, max_total_bytes=None):
+    def __init__(self, path, strict=False, include_markers=False, max_total_bytes=None, deep_tail=False):
         self.directory, name = os.path.split(str(path))
         self.directory = self.directory or "."
         self.stem, _ = parse_name(name)
@@ -313,7 +422,7 @@ class Snapshot:
         self.strict, self.include_markers, self.max_total_bytes = strict, include_markers, max_total_bytes
         self.problems = []
         self.live_fd = None
-        self.live_ino = None
+        self.live_ino = self.live_dev = None
         self.dfd = None  # pinned directory fd: closed segments are reopened through it, never by re-resolving the path
         try:
             self.dfd = os.open(self.directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
@@ -322,14 +431,18 @@ class Snapshot:
         live_name = self.stem + ".jsonl"
         try:
             self.live_fd = _open_at(self.dfd, self.directory, live_name)
-            self.live_ino = os.fstat(self.live_fd).st_ino
+            info = os.fstat(self.live_fd)
+            self.live_ino, self.live_dev = info.st_ino, info.st_dev
         except OSError as error:
             if error.errno not in (errno.ENOENT,):
                 self.problems.append({"code": "not_regular" if error.errno in (errno.ELOOP, errno.EINVAL) else "unreadable",
                                       "message": f"{live_name}: {type(error).__name__}", "seq": None})
         _fault_reader()
-        self.chain = chain(self.directory, self.stem)
-        self._inos = {s.name: s.ino for s in self.chain.segments}  # what was listed: reopened files must match
+        if self.dfd is not None:  # list and stat through the pinned directory fd, never by re-resolving the path
+            self.chain = _build_chain(self.directory, self.stem, _scan(self.dfd, self.stem), self.dfd)
+        else:
+            self.chain = chain(self.directory, self.stem)
+        self._ids = {s.name: s.ident for s in self.chain.segments}  # what was listed: reopened files must match (dev, ino)
         self.problems.extend(p for p in self.chain.problems
                              if not (p["code"] == "live_missing" and self.live_fd is not None))
         # an fd opened before a rotation is now a closed segment: it is the last segment of the snapshot, and the
@@ -337,11 +450,12 @@ class Snapshot:
         self.tail_fd, self.tail_name = self.live_fd, live_name
         if self.live_fd is not None:
             for seg in self.chain.segments:
-                if seg.ino == self.live_ino:
+                if seg.ident == (self.live_dev, self.live_ino):
                     self.tail_name = seg.name
                     self.chain.segments = [s for s in self.chain.segments if s.seq <= seg.seq]
                     self.chain.live = None
                     break
+        self._check_tail(deep_tail)
         if self.strict and [p for p in self.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")]:
             first = [p for p in self.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")][0]
             self.close()
@@ -358,7 +472,21 @@ class Snapshot:
                 setattr(self, attr, None)
 
     def _open_closed(self, name):
-        return _open_at(self.dfd, self.directory, name, self._inos.get(name))
+        return _open_at(self.dfd, self.directory, name, self._ids.get(name))
+
+    def _check_tail(self, deep):
+        """The shared tail rule (tail_problems) against the tail this snapshot pinned, reusing the live fd it already
+        holds: deleting the newest closed segment, or all of them, is a hard problem, never a clean chain."""
+        if self.tail_fd is None:
+            return
+        seq = parse_name(self.tail_name)[1] or (self.chain.max_seq + 1)
+        prev = next((s for s in self.chain.segments if s.seq == seq - 1), None)
+        first = _first_line(self.tail_fd)
+        found = tail_problems(self.stem, seq, segment_name(self.stem, seq - 1) if seq > 1 else None,
+                              prev.size if prev else None, first)
+        if deep and not found and prev is not None:
+            found = deep_tail_problems(self.directory, self.dfd, prev, first)
+        self.problems.extend(found)
 
     def _read_problem(self, name, error):
         code = "segment_changed" if isinstance(error, _Changed) else "unreadable"
@@ -640,7 +768,7 @@ def _rotate(dir_fd, stem, name, fd, current_target):
     current_max = max(_scan(dir_fd, stem).get(stem, ({}, []))[0] or {0: 0})
     if seq > current_max + 1000:
         warn("seq_implausible", f"{seq}; rotation refused")
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: implausible_seq
     seg = segment_name(stem, seq)
     # The new live file is prepared COMPLETE (created under a temp dot-name, locked, marker written and synced) before
     # anything is renamed, so the live name never exists without its marker (gate F1) and a failure while preparing
@@ -651,7 +779,7 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         new_fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=dir_fd)
     except OSError as error:
         warn("rotate_create_failed", f"{type(error).__name__} creating the marked temp file; rotation skipped")
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: temp_create_failed
     try:
         os.fchmod(new_fd, 0o600)
         fcntl.flock(new_fd, fcntl.LOCK_EX)
@@ -662,7 +790,7 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         warn("rotate_create_failed", f"{type(error).__name__} writing the marker; rotation skipped")
         _discard_temp(dir_fd, tmp, new_fd)
         os.close(new_fd)
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: marker_write_failed
     except BaseException:
         os.close(new_fd)
         raise
@@ -672,17 +800,17 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         warn("rotate_collision", f"{seg} already exists; rotation skipped")
         _discard_temp(dir_fd, tmp, new_fd)
         os.close(new_fd)
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: collision
     except NotImplementedError as error:
         warn("rotate_unsupported", str(error))
         _discard_temp(dir_fd, tmp, new_fd)
         os.close(new_fd)
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: unsupported
     except OSError as error:
         warn("rotate_failed", f"{type(error).__name__} renaming the live file; rotation skipped")
         _discard_temp(dir_fd, tmp, new_fd)
         os.close(new_fd)
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: live_rename_failed
     # from here the live name is absent until the marked file takes it; only a lockless old writer can win that gap
     try:
         os.fsync(dir_fd)
@@ -692,7 +820,7 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         warn("rotate_create_failed", "live name recreated by another writer; retrying into it")
         _discard_temp(dir_fd, tmp, new_fd)
         os.close(new_fd)
-        return RECREATED, None
+        return RECREATED, None  # outcome: recreated_in_gap
     except (OSError, NotImplementedError) as error:
         try:  # undo: put the old live file back under its name
             _exclusive_rename(dir_fd, seg, name)
@@ -700,14 +828,14 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         except FileExistsError:
             _discard_temp(dir_fd, tmp, new_fd)
             os.close(new_fd)
-            return RECREATED, None
+            return RECREATED, None  # outcome: recreated_before_undo
         except (OSError, NotImplementedError):
             os.close(new_fd)  # the marked temp file stays on disk as evidence; the next rotation discards it
-            raise RotateFailed(f"moving the marked file into {name} failed ({type(error).__name__}) and the rename could not be undone")
+            raise RotateFailed(f"moving the marked file into {name} failed ({type(error).__name__}) and the rename could not be undone")  # outcome: rotate_failed_record_not_written
         warn("rotate_create_failed", f"{type(error).__name__}; rotation undone")
         _discard_temp(dir_fd, tmp, new_fd)
         os.close(new_fd)
-        return SKIPPED, fd
+        return SKIPPED, fd  # outcome: undo_ok
     try:
         try:
             os.fsync(dir_fd)
@@ -719,7 +847,7 @@ def _rotate(dir_fd, stem, name, fd, current_target):
     except BaseException:
         os.close(new_fd)
         raise
-    return ROTATED, new_fd
+    return ROTATED, new_fd  # outcome: rotated
 
 
 def _temp_name(stem):
@@ -1030,16 +1158,18 @@ def verify_chain(directory, stem, deep=False):
             continue
         try:
             m = parse_marker(_first_line(fd))
+            is_live = seg.kind == "live"  # the live file is judged by the shared tail rule below (validate_tail)
             if seg.seq > 1:
                 if m is None:
-                    problems.append({"code": "marker_missing", "message": f"{seg.name} has no open marker on line 1", "seq": seg.seq})
-                elif prev is not None and (m["prev"] != prev.name or m["stem"] != stem or m["segment"] != seg.seq):
+                    if not is_live:
+                        problems.append({"code": "marker_missing", "message": f"{seg.name} has no open marker on line 1", "seq": seg.seq})
+                elif not is_live and prev is not None and (m["prev"] != prev.name or m["stem"] != stem or m["segment"] != seg.seq):
                     problems.append({"code": "marker_mismatch", "message": f"{seg.name} marker names prev {m.get('prev')!r}, expected {prev.name!r}", "seq": seg.seq})
                 if m and m.get("schema", 1) > SCHEMA:
                     problems.append({"code": "schema_newer", "message": f"{seg.name} marker schema {m['schema']}", "seq": seg.seq})
                 if m and m.get("limit") != SEGMENT_BYTES:
                     problems.append({"code": "marker_info", "message": f"{seg.name} marker limit {m.get('limit')} differs from the default", "seq": seg.seq})
-                if deep and m and prev is not None:
+                if deep and m and prev is not None and not is_live:
                     pfd = _open_regular(str(directory), prev.name)
                     try:
                         sha, size, lines = _hash_fd(pfd)
@@ -1050,6 +1180,7 @@ def verify_chain(directory, stem, deep=False):
         finally:
             os.close(fd)
         prev = seg
+    problems.extend(ch.validate_tail(deep=deep))  # the live file against the newest closed segment (tail_missing, ...)
     return problems
 
 

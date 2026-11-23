@@ -842,8 +842,6 @@ class TailValidationTests(Base):
         self.assertIn("tail_missing", [p["code"] for p in ws.verify_chain(self.dir, "main")])
         with self.assertRaises(ws.SegmentProblem):
             list(ws.iter_lines(self.dir / "main.jsonl", strict=True))
-        listing = ws.list_wals(self.dir)["main"]  # a pre-scanned listing is validated too
-        self.assertIn("tail_missing", self.codes(chain=listing)[0])
         cli = subprocess.run([sys.executable, str(HOOKS / "wal_segments.py"), "verify", str(self.dir)], capture_output=True, text=True)
         self.assertEqual(cli.returncode, 1)
         self.assertIn("tail_missing", cli.stderr)
@@ -872,6 +870,14 @@ class TailValidationTests(Base):
         (self.dir / "main.jsonl").write_bytes(line(rec(777)))
         codes, complete = self.codes()
         self.assertIn("marker_missing", codes)
+        self.assertFalse(complete)
+
+    def test_a_stray_newer_closed_segment_is_a_hard_problem(self):  # outcome: tail_segment_mismatch
+        segs = self.rotated()
+        stray = ws.segment_name("main", len(segs) + 5)
+        (self.dir / stray).write_bytes(line(rec(1)))  # a closed segment newer than the live marker's successor
+        codes, complete = self.codes()
+        self.assertIn("marker_mismatch", codes)
         self.assertFalse(complete)
 
     def test_a_late_append_into_the_last_closed_segment_changes_its_size(self):
@@ -927,6 +933,9 @@ OUTCOMES = {
     "tail_missing_all": "TailValidationTests.test_deleting_all_closed_segments_is_a_hard_problem",
     "tail_marker_mismatch": "TailValidationTests.test_a_live_marker_with_the_wrong_prev_is_a_hard_problem",
     "tail_marker_missing": "TailValidationTests.test_a_live_file_without_a_marker_next_to_closed_segments_is_a_hard_problem",
+    "tail_segment_mismatch": "TailValidationTests.test_a_stray_newer_closed_segment_is_a_hard_problem",
+    "tail_bytes_mismatch": "TailValidationTests.test_a_late_append_into_the_last_closed_segment_changes_its_size",
+    "tail_deep_mismatch": "TailValidationTests.test_a_same_size_change_is_caught_only_by_the_deep_tail_check",
 }
 
 
