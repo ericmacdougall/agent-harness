@@ -154,6 +154,23 @@ def sibling_ask_wal(path, ref: str):
     return holders[0].stem
 
 
+def spawn_transcripts_sync(checkpoint):
+    """goodqa#16650 AC-8: start `transcripts.py sync --checkpoint <c> --background` (beside this file; TRANSCRIPTS_BIN
+    overrides it for tests) detached, with no inherited pipes, and return at once. Never raises, never changes the exit
+    code: a missing tool or a failed spawn only means no sync. Self-contained because on a Codex host `wal` is Codex's."""
+    try:
+        import subprocess  # noqa: PLC0415
+        override = os.environ.get('TRANSCRIPTS_BIN')
+        script = Path(override) if override else Path(__file__).resolve().with_name('transcripts.py')
+        if not script.is_file():
+            return
+        argv = [sys.executable, str(script)] if script.suffix == '.py' else [str(script)]
+        subprocess.Popen(argv + ['sync', '--checkpoint', checkpoint, '--background'], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wal', type=Path, required=True)
@@ -290,6 +307,8 @@ def main():
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
         record['recites'] = args.recites
     append(path, record)
+    if args.event == 'deploy':
+        spawn_transcripts_sync('deploy')
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'id': record['id'], 'wal': str(path),
