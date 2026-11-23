@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -1782,11 +1783,13 @@ def chain_bytes(ch) -> int:
     return sum(seg.size for seg in chain_files(ch))
 
 
-def hard_problems(ws, ch, now, deep=True):
+def hard_problems(ws, ch, now, markers=True):
     """The problems of a chain that need a person: every code but the info ones, and live_missing once it has lasted past
-    the grace. deep adds the marker checks (marker_missing, marker_mismatch), which only a chain with closed segments has."""
-    problems = ws.verify_chain(ch.directory, ch.stem) if (deep and ch.segments) else list(ch.problems)
-    newest = max((chain_mtime(ch),), default=0.0)
+    the grace. markers=True runs `verify_chain` (without its deep flag, so closed segments are NOT rehashed) to add the
+    first-line marker checks (marker_missing, marker_mismatch), which only a chain with closed segments has; markers=False
+    uses the directory-level problems of the chain only (gap, ambiguous, unreadable, not_regular, live_missing)."""
+    problems = ws.verify_chain(ch.directory, ch.stem) if (markers and ch.segments) else list(ch.problems)
+    newest = chain_mtime(ch)
     out = []
     for p in problems:
         if p["code"] == "live_missing":
@@ -1800,6 +1803,41 @@ def hard_problems(ws, ch, now, deep=True):
 
 def problem_codes(problems):
     return sorted({p["code"] for p in problems})
+
+
+def wals_present(roots) -> bool:
+    """True when any WAL file name sits under one of the roots (names only, never read, bounded)."""
+    budget = 20000
+    for root in roots:
+        try:
+            if os.path.islink(root) or not os.path.isdir(root):
+                continue
+        except OSError:
+            continue
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+            budget -= len(files) + 1
+            if any(name.endswith(".jsonl") for name in files):
+                return True
+            if budget < 0:
+                return True  # too many to look through: assume present, so the missing reader is reported
+    return False
+
+
+def reader_unavailable(check, state, roots):
+    """wal_segments is not installed: the check cannot judge any WAL chain, and reading around the reader API would
+    misread a rotated WAL. It must not silently clear what it raised (gate F2, #330): every active alert of this check
+    is kept as it was, and, while WALs exist, wal:reader-unavailable:<check> says why nothing new is judged."""
+    kept = [{"check": check, "key": key, "severity": a.get("severity", "warning"), "message": a.get("message", ""),
+             "detail": a.get("detail") or {}}
+            for key, a in sorted((state.get("active") or {}).items())
+            if a.get("check") == check and not key.startswith("wal:reader-unavailable:")]
+    if not wals_present(roots):
+        return kept
+    return kept + [alert(check, f"wal:reader-unavailable:{check}", "warning",
+                         f"wal_segments.py is not installed beside ops_watch.py, so the {check} check cannot read WAL "
+                         "chains: its active alerts are kept and nothing new is judged until it is installed",
+                         {"fix": "reinstall the harness"})]
 
 
 def chain_head(ws, path, limit):
@@ -2031,7 +2069,7 @@ def check_liveness(cfg, state, runner, now):
     out = []
     ws = wal_api()
     if ws is None:
-        return []  # check_wal_size says so (wal:reader-unavailable); no WAL is read around the reader API
+        return reader_unavailable("liveness", state, [str(root)])  # no WAL is read around the reader API
     for sess in sorted(sessions, key=lambda e: e.name):
         try:
             chains = {stem: ch for stem, ch in ws.list_wals(sess.path).items() if ch.live or ch.segments}
@@ -2073,6 +2111,8 @@ def check_wal_size(cfg, state, runner, now):
     chain_max = int(float(wc.get("chain_max_mib", 1024)) * 1024 * 1024)
     budget = int(wc.get("max_files", 200000))
     ws = wal_api()
+    if ws is None:
+        return reader_unavailable("wal_size", state, [expand(home_of(cfg), r) for r in wc.get("roots") or []])
     rotation_on = (home_of(cfg) / ".agent-harness" / "state" / "wal-rotation.on").is_file()
     sized, totals, broken = [], [], []
     for raw in wc.get("roots") or []:
@@ -2089,11 +2129,6 @@ def check_wal_size(cfg, state, runner, now):
                 break
             if not any(name.endswith(".jsonl") for name in files):
                 continue
-            if ws is None:
-                return [alert("wal_size", "wal:reader-unavailable", "warning",
-                              f"wal_segments.py is not installed beside ops_watch.py but WALs exist under {root}; "
-                              "WAL size, chain and liveness checks are off until it is installed",
-                              {"fix": "reinstall the harness"})]
             try:
                 chains = ws.list_wals(current)
             except OSError:
@@ -2135,10 +2170,16 @@ def check_wal_size(cfg, state, runner, now):
         codes = problem_codes(problems)
         fix = ""
         if "live_missing" in codes:
-            fix = (f"; a crashed rotation: the next append finishes it, or run `python3 wal_segments.py recover --write "
-                   f"{ch.directory} {ch.stem}` as the harness user")
-        shown = "; ".join(f"{p['code']}: {p['message']}" for p in problems[:3])
-        out.append(alert("wal_size", f"wal:chain:{digest}", "high",
+            tool = shlex.quote(str(Path(ws.__file__).resolve()))
+            fix = (f"; a crashed rotation: the next append finishes it, or run `python3 {tool} recover "
+                   f"{shlex.quote(str(ch.directory))} {shlex.quote(ch.stem)} --write` as the harness user "
+                   "(without --write it only says what it would do)")
+        # live_missing's own wording names `reindex --write`, which never creates a live file (spec R3-3): use ours
+        shown = "; ".join(f"{p['code']}: {'no live file' if p['code'] == 'live_missing' else p['message']}"
+                          for p in problems[:3])
+        # marker_missing alone is what an old writer leaves during the rollout: a warning until rotation is switched on
+        quiet = codes == ["marker_missing"] and not rotation_on
+        out.append(alert("wal_size", f"wal:chain:{digest}", "warning" if quiet else "high",
                          f"WAL {root.name}/{rel} chain is not clean ({shown}){fix}; report it to main; never edit, "
                          "split or delete a WAL", {"path": path, "codes": codes, "problems": problems[:10]}))
     return out
@@ -2168,9 +2209,7 @@ def check_idle_guard(cfg, state, runner, now):
                       {"fix": "reinstall the harness"})]
     ws = wal_api()
     if ws is None:
-        return [alert("idle_guard", "idle-guard:unavailable", "warning",
-                      "wal_segments.py is not installed beside ops_watch.py; main-idle detection is off",
-                      {"fix": "reinstall the harness"})]
+        return reader_unavailable("idle_guard", state, [str(root)])
     for sess in sorted(sessions, key=lambda e: e.name):
         try:
             main_chain = ws.chain(sess.path, "main")  # the whole chain: a crashed rotation or a rotated main still counts
@@ -2316,6 +2355,9 @@ def check_deploys(cfg, state, runner, now):
         sessions = []
     cap = int(float(d.get("max_chain_mib")) * 1024 * 1024) if d.get("max_chain_mib") else MAX_DEPLOY_WAL_BYTES
     ws = wal_api()
+    if ws is None:  # the drift alerts above stand; every active pending alert is kept, never cleared by a missing module
+        kept = reader_unavailable("deploys", state, [str(root)])
+        return out + [a for a in kept if a["key"].startswith(("pending-", "wal:reader-unavailable:"))]
     for session in sessions:
         events, unscanned, chain_codes = {}, [], set()  # id -> [(time, "P" pending | "T" tested)]
         try:

@@ -5,6 +5,9 @@ make the size cases cheap. Synthetic data only."""
 import hashlib
 import json
 import os
+import re
+import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -173,6 +176,21 @@ class ChainProblemTests(Fx):
         self.assertEqual(len(got), 1)
         self.assertIn("marker_missing", got[0]["detail"]["codes"])
 
+    def test_marker_missing_is_a_warning_until_rotation_is_on(self):
+        # gate Q3: an old writer during the rollout produces it, so it is noisy only once rotation is switched on
+        self.switch(False)
+        d = self.chain("main", ["a\n", "b\n"], live=rec(NOW, "status"))
+        (d / "main.jsonl").write_text(rec(NOW, "status"))
+        got = self.alerts()
+        self.assertEqual([a["severity"] for a in got], ["warning"])
+        self.switch(True)
+        self.assertEqual([a["severity"] for a in self.alerts()], ["high"])
+        # a gap stays high either way
+        self.switch(False)
+        gap = self.sess.parent / "sess-bbbb2222"
+        self.chain("main", ["a\n", "b\n", "c\n"], live=rec(NOW, "status"), gap=True, session=gap)
+        self.assertIn("high", [a["severity"] for a in self.alerts()])
+
     def test_live_missing_alerts_only_after_ten_minutes_and_names_the_fix(self):
         self.switch(True)
         d = self.chain("main", ["a\n", "b\n"], live=None, mtime=NOW - 5 * 60)
@@ -182,7 +200,25 @@ class ChainProblemTests(Fx):
         got = self.alerts()
         self.assertEqual(len(got), 1)
         self.assertIn("live_missing", got[0]["detail"]["codes"])
-        self.assertIn(f"wal_segments.py recover --write {d} main", got[0]["message"])
+        self.assertIn(f"recover {d} main --write", got[0]["message"])
+
+    def test_the_command_the_alert_names_exists_and_runs(self):
+        # gate F1 (#330): the alert must never name a command the CLI does not have
+        self.switch(True)
+        d = self.chain("main", ["a\n", "b\n"], live=None, mtime=NOW - 11 * 60)
+        msg = self.alerts()[0]["message"]
+        named = re.search(r"`(python3 [^`]*recover[^`]*)`", msg)
+        self.assertIsNotNone(named, msg)
+        argv = shlex.split(named.group(1))
+        self.assertTrue(Path(argv[1]).is_file(), argv)  # the module path in the text is real
+        help_run = subprocess.run(argv[:2] + ["recover", "--help"], capture_output=True, text=True, env=dict(os.environ))
+        self.assertEqual(help_run.returncode, 0, help_run.stderr)
+        self.assertEqual(argv[2], "recover")
+        self.assertEqual(argv[-1], "--write")
+        dry = subprocess.run(argv[:-1], capture_output=True, text=True, env=dict(os.environ))  # a dry run: no --write
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("would create the live file", dry.stdout)
+        self.assertFalse((d / "main.jsonl").exists())  # and it wrote nothing
 
     def test_info_codes_do_not_alert_and_ops_watch_never_writes(self):
         self.switch(True)
@@ -316,6 +352,67 @@ class DeploysChainTests(Fx):
         # AC-9: an index or a stray file never becomes a log
         (self.sess / "main.segments.json").write_text("{}")
         self.assertEqual(self.pending(self.sess.name), [])
+
+
+class ReaderUnavailableTests(Fx):
+    """Gate F2 (#330): with wal_segments missing no check may drop an active alert, and each raises its own
+    wal:reader-unavailable:<check> while WALs exist."""
+
+    CHECKS = {
+        "wal_size": ow.check_wal_size,
+        "liveness": ow.check_liveness,
+        "idle_guard": ow.check_idle_guard,
+        "deploys": ow.check_deploys,
+    }
+    KEPT = {
+        "wal_size": "wal:size:abc123abc123",
+        "liveness": "liveness:sess-aaa/stuck",
+        "idle_guard": "idle-guard:sess-aaa",
+        "deploys": "pending-open:sess-aaa",
+    }
+
+    def active_state(self):
+        return {"active": {key: {"severity": "high", "message": f"was raised for {key}", "detail": {"k": 1}, "check": name}
+                           for name, key in self.KEPT.items()}}
+
+    def test_no_active_alert_disappears_when_the_module_is_missing(self):
+        (self.sess / "main.jsonl").write_text(rec(NOW - 60, "prompt"))  # WALs exist on this host
+        state = self.active_state()
+        with mock.patch.object(ow, "_WAL_API", [None]):
+            for name, fn in self.CHECKS.items():
+                got = by_key(fn(self.cfg, state, mock.Mock(), NOW))
+                self.assertIn(self.KEPT[name], got, f"{name} dropped its active alert")
+                self.assertEqual(got[self.KEPT[name]]["message"], f"was raised for {self.KEPT[name]}")
+                self.assertIn(f"wal:reader-unavailable:{name}", got, f"{name} did not say the reader is missing")
+                self.assertEqual(got[f"wal:reader-unavailable:{name}"]["severity"], "warning")
+
+    def test_nothing_is_raised_on_a_host_with_no_wals(self):
+        with mock.patch.object(ow, "_WAL_API", [None]):
+            for name, fn in self.CHECKS.items():
+                got = by_key(fn(self.cfg, {}, mock.Mock(), NOW))
+                self.assertNotIn(f"wal:reader-unavailable:{name}", got)
+
+    def test_run_once_keeps_the_real_alerts_end_to_end(self):
+        old = NOW - 3 * 3600
+        self.chain("stuck", [rec(old - 600, "status", "a"), rec(old - 300, "status", "b")], live=rec(old, "blocker", "tests fail"))
+        pending_at = NOW - 8 * 3600  # past pending_after_h (6)
+        self.chain("main", [rec(pending_at, "check", "PENDING_REAL_TEST T1: x"), rec(pending_at, "status", "y")],
+                   live=rec(NOW - 60, "status", "n"))
+        for p in self.sess.glob("stuck*.jsonl"):
+            os.utime(p, (old, old))
+        cfg = dict(self.cfg)
+        cfg["sinks"] = {"comment": {"mode": "none"}, "deadman": []}
+        checks = {"liveness": ow.check_liveness, "deploys": ow.check_deploys}
+        ow.run_once(cfg, self.home, runner=mock.Mock(), checks=checks, now=NOW)
+        before = {e["key"] for e in ow.active_alerts(self.home)}
+        self.assertIn("liveness:sess-aaa/stuck", before)
+        self.assertIn("pending-open:sess-aaa", before)
+        with mock.patch.object(ow, "_WAL_API", [None]):
+            ow.run_once(cfg, self.home, runner=mock.Mock(), checks=checks, now=NOW + 1)
+        after = {e["key"] for e in ow.active_alerts(self.home)}
+        self.assertTrue(before <= after, before - after)
+        self.assertIn("wal:reader-unavailable:liveness", after)
+        self.assertIn("wal:reader-unavailable:deploys", after)
 
 
 if __name__ == "__main__":
