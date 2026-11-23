@@ -222,9 +222,16 @@ class DeliverGate(Base):
                 self.check_json(status, iso(1), rc=2)
                 _, err = self.gate()
                 self.assertIn(status, err)
+        # the core's own shape: held and omission caps come back as status failed with the reason listed
+        os.environ["FAKE_CHECK_JSON"] = json.dumps({"status": "failed", "last_ok_at": iso(1), "age_min": 60.0,
+                                                    "reasons": ["held=2", "omission-cap: 0.7%"], "exit": 2})
+        _, err = self.gate()
+        self.assertIn("held=2", err)
+        self.assertIn("omission-cap", err)
         self.check_json("ok", iso(0.2, z=False), rc=0)
         _, err = self.gate()
-        self.assertEqual(err, "")
+        self.assertEqual([l for l in err.splitlines() if "TRANSCRIPTS_BIN is set" not in l], [])
+        self.assertIn("TRANSCRIPTS_BIN is set", err)  # the override is never silent
 
     def test_network_failure_refuses_only_when_last_ok_is_also_old(self):
         os.environ["FAKE_SYNC_RC"] = "1"
@@ -279,6 +286,9 @@ class DeliverGate(Base):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["transcripts_waiver"]["reason"], reason)
         self.assertEqual(rows[0]["transcripts_waiver"]["status"], "never-ok")
+        counted = (self.home / ".agent-harness" / "transcripts" / "waivers.jsonl").read_text().splitlines()
+        self.assertEqual(len(counted), 1)  # `ah transcripts status` counts this file
+        self.assertEqual(json.loads(counted[0])["wal_row"], rows[0]["id"])
         import ops_watch  # noqa: PLC0415
         ring = ops_watch.read_ring(ops_watch.ring_path(self.home))
         keys = [(e["key"], e["severity"], e["event"]) for e in ring]
