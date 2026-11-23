@@ -555,6 +555,70 @@ class AppendInvariantTests(Base):
             return real(fd, data)
         self.run_scenario(patch.object(ws, "_write_all", eio), expect_closed=0)
 
+    def crossing(self):  # records just below the limit, so the NEXT append starts a rotation
+        for i in range(8):
+            self.append("main.jsonl", rec(i, 400))
+        self.assertEqual(self.closed(), [])
+
+    def leftovers(self):
+        return sorted(p.name for p in self.dir.glob(".main.live.*.new"))
+
+    def test_first_rename_fails_rotation_is_skipped_and_the_record_kept(self):  # outcome: live_rename_failed
+        self.crossing()
+
+        def eio(dir_fd, old, new):
+            raise OSError(5, "injected EIO renaming the live file")
+        before = open_fds()
+        with patch.object(ws, "_exclusive_rename", eio):
+            self.append("main.jsonl", rec(8, 400))
+        self.assertEqual(open_fds(), before)
+        self.assertEqual(self.closed(), [])
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual([r["n"] for r in self.records()], list(range(9)))
+
+    def test_second_rename_fails_and_the_undo_succeeds(self):  # gate #327 F1, outcome: undo_ok (SKIPPED)
+        self.crossing()
+        real = ws._exclusive_rename
+        calls = []
+
+        def flaky(dir_fd, old, new):
+            calls.append((old, new))
+            if len(calls) == 2:
+                raise OSError(5, "injected EIO moving the marked file into the live name")
+            return real(dir_fd, old, new)
+        before = open_fds()
+        with patch.object(ws, "_exclusive_rename", flaky):
+            self.append("main.jsonl", rec(8, 400))
+        self.assertEqual(len(calls), 3, calls)  # live->segment, temp->live (EIO), segment->live (the undo)
+        self.assertEqual(calls[0][1], "main.0001.jsonl")
+        self.assertEqual(calls[2], ("main.0001.jsonl", "main.jsonl"))
+        self.assertEqual(open_fds(), before, "fd leaked")
+        self.assertEqual(self.closed(), [], "the undo must put the segment back: same closed count as before")
+        self.assertEqual(self.leftovers(), [], "no temp file may be left behind")
+        self.assertEqual([r["n"] for r in self.records()], list(range(9)))  # no record lost, none twice
+        self.assertEqual(hard(ws.verify_chain(self.dir, "main")), [])
+
+    def test_second_rename_fails_and_the_live_name_is_recreated_before_the_undo(self):  # outcome: recreated_before_undo
+        self.crossing()
+        real = ws._exclusive_rename
+        calls = []
+
+        def flaky(dir_fd, old, new):
+            calls.append((old, new))
+            if len(calls) == 2:  # a writer without the seglock recreates the live name and writes its own record
+                (self.dir / "main.jsonl").write_bytes(line(rec(500, 10, "lockless")))
+                raise OSError(5, "injected EIO moving the marked file into the live name")
+            return real(dir_fd, old, new)  # the undo then finds the live name taken: FileExistsError -> RECREATED
+        before = open_fds()
+        with patch.object(ws, "_exclusive_rename", flaky):
+            self.append("main.jsonl", rec(8, 400))
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual(open_fds(), before, "fd leaked")
+        self.assertEqual(self.closed(), ["main.0001.jsonl"])
+        self.assertEqual(self.leftovers(), [], "no temp file may be left behind")
+        self.assertEqual([r["n"] for r in self.records()], list(range(8)) + [500, 8])  # every record kept
+        self.assertIn("marker_missing", [p["code"] for p in ws.verify_chain(self.dir, "main")])  # reported, not hidden
+
     def test_failure_after_rename_raises_the_documented_code_then_recovers(self):  # F2, after the rename
         for i in range(8):
             self.append("main.jsonl", rec(i, 400))
@@ -698,12 +762,38 @@ class HardeningTests(Base):
         self.assertNotIn(999, got)
         self.assertIn("segment_changed", problems)
 
-    def test_installed_codex_hook_does_not_import_from_a_stray_harness_dir(self):  # F4
+    def test_snapshot_lists_and_stats_through_the_pinned_directory_fd(self):  # #327 F2
+        for i in range(30):
+            self.append("main.jsonl", rec(i, 300))
+        scans = []
+        real = os.scandir
+        with patch.object(ws.os, "scandir", lambda *a, **k: (scans.append(a), real(*a, **k))[1]):
+            with ws.Snapshot(self.dir / "main.jsonl") as snap:
+                list(snap.lines())
+        self.assertTrue(scans)
+        self.assertTrue(all(isinstance(a[0], int) for a in scans), f"a Snapshot scanned by path: {scans}")
+
+    def test_segment_identity_compares_device_and_inode(self):  # #327 F2
+        for i in range(30):
+            self.append("main.jsonl", rec(i, 300))
+        name = self.closed()[0]
+        with ws.Snapshot(self.dir / "main.jsonl") as snap:
+            dev, ino = snap._ids[name]
+            snap._ids[name] = (dev + 1, ino)  # same inode number on another device is not the same file
+            list(snap.lines())
+            self.assertIn("segment_changed", [p["code"] for p in snap.problems])
+
+    def test_installed_codex_hook_ignores_a_stray_harness_dir_even_when_home_is_git_tracked(self):  # #327 F3
+        self.test_installed_codex_hook_does_not_import_from_a_stray_harness_dir(git_home=True)
+
+    def test_installed_codex_hook_does_not_import_from_a_stray_harness_dir(self, git_home=False):  # F4
         import shutil
+        if git_home:
+            (self.home / ".git").mkdir()  # a dotfiles-style home under git must not re-enable the fallback
         inst = self.home / ".codex" / "agent-harness"
         inst.mkdir(parents=True)
         shutil.copy(HOOKS.parents[1] / "codex/hooks/wal.py", inst / "wal.py")
-        decoy = self.home / "harness" / "hooks"  # where parents[2]/harness/hooks points for an installed copy
+        decoy = self.home / "harness" / "hooks"  # where parents[1]/harness/hooks points for an installed copy
         decoy.mkdir(parents=True)
         (decoy / "wal_segments.py").write_text("DECOY = True\n")
         code = ("import importlib.util, sys\n"
@@ -713,6 +803,187 @@ class HardeningTests(Base):
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(self.home),
                              env={"PATH": os.environ.get("PATH", ""), "HOME": str(self.home)})
         self.assertEqual(out.stdout.strip(), "none", out.stderr)  # the decoy was not imported
+
+
+class TailValidationTests(Base):
+    """CRITICAL (gate #331 F1): deleting the newest closed segment, or all of them, must not leave a clean chain."""
+
+    def rotated(self, n=40):
+        for i in range(n):
+            self.append("main.jsonl", rec(i, 300))
+        segs = self.closed()
+        self.assertGreaterEqual(len(segs), 3)
+        return segs
+
+    def codes(self, **kw):
+        with ws.Snapshot(self.dir / "main.jsonl", **kw) as snap:
+            list(snap.lines())
+            return [p["code"] for p in snap.problems], snap.complete
+
+    def set_aside(self, name):
+        os.rename(self.dir / name, self.dir / (name + ".aside"))
+
+    def test_an_intact_chain_and_an_unrotated_wal_are_clean(self):
+        self.rotated()
+        self.assertEqual(self.codes(), ([], True))
+        self.assertEqual(ws.chain(self.dir, "main").validate_tail(), [])
+        (self.dir / "agent-y.jsonl").write_bytes(line(rec(1)))
+        self.assertEqual(ws.chain(self.dir, "agent-y").validate_tail(), [])
+
+    def test_deleting_the_newest_closed_segment_is_a_hard_problem(self):  # outcome: tail_missing
+        segs = self.rotated()
+        self.set_aside(segs[-1])
+        codes, complete = self.codes()
+        self.assertIn("tail_missing", codes)
+        self.assertFalse(complete)
+        ch = ws.chain(self.dir, "main")
+        self.assertIn("tail_missing", [p["code"] for p in ch.validate_tail()])
+        self.assertFalse(ch.complete)
+        self.assertIn("tail_missing", [p["code"] for p in ws.verify_chain(self.dir, "main")])
+        with self.assertRaises(ws.SegmentProblem):
+            list(ws.iter_lines(self.dir / "main.jsonl", strict=True))
+        listing = ws.list_wals(self.dir)["main"]  # a pre-scanned listing is validated too
+        self.assertIn("tail_missing", self.codes(chain=listing)[0])
+        cli = subprocess.run([sys.executable, str(HOOKS / "wal_segments.py"), "verify", str(self.dir)], capture_output=True, text=True)
+        self.assertEqual(cli.returncode, 1)
+        self.assertIn("tail_missing", cli.stderr)
+
+    def test_deleting_all_closed_segments_is_a_hard_problem(self):  # outcome: tail_missing_all
+        for name in self.rotated():
+            self.set_aside(name)
+        codes, complete = self.codes()
+        self.assertIn("tail_missing", codes)
+        self.assertFalse(complete)
+        self.assertIn("tail_missing", [p["code"] for p in ws.verify_chain(self.dir, "main")])
+
+    def test_a_live_marker_with_the_wrong_prev_is_a_hard_problem(self):  # outcome: tail_marker_mismatch
+        segs = self.rotated()
+        live = self.dir / "main.jsonl"
+        data = live.read_bytes()
+        wrong = ws.segment_name("main", 99).encode()
+        self.assertEqual(len(wrong), len(segs[-1]))
+        live.write_bytes(data.replace(segs[-1].encode(), wrong, 1))  # same length: only prev changes
+        codes, complete = self.codes()
+        self.assertIn("marker_mismatch", codes)
+        self.assertFalse(complete)
+
+    def test_a_live_file_without_a_marker_next_to_closed_segments_is_a_hard_problem(self):  # outcome: tail_marker_missing
+        self.rotated()
+        (self.dir / "main.jsonl").write_bytes(line(rec(777)))
+        codes, complete = self.codes()
+        self.assertIn("marker_missing", codes)
+        self.assertFalse(complete)
+
+    def test_a_late_append_into_the_last_closed_segment_changes_its_size(self):
+        segs = self.rotated()
+        with open(self.dir / segs[-1], "ab") as f:
+            f.write(line(rec(888)))
+        codes, complete = self.codes()
+        self.assertIn("marker_mismatch", codes)  # prev_bytes no longer matches (cheap check, always on)
+        self.assertFalse(complete)
+
+    def test_a_same_size_change_is_caught_only_by_the_deep_tail_check(self):
+        segs = self.rotated()
+        path = self.dir / segs[-1]
+        data = path.read_bytes()
+        path.write_bytes(data.replace(b'"who":"w"', b'"who":"x"', 1))
+        self.assertEqual(self.codes(), ([], True))
+        codes, complete = self.codes(deep_tail=True)
+        self.assertIn("marker_mismatch", codes)
+        self.assertFalse(complete)
+        self.assertIn("marker_mismatch", [p["code"] for p in ws.verify_chain(self.dir, "main", deep=True)])
+
+    def test_the_deep_tail_hash_is_cached_by_identity_and_never_skips_a_changed_file(self):
+        self.rotated()
+        real = ws._hash_fd
+        hashes = []
+        with patch.object(ws, "_hash_fd", lambda fd: (hashes.append(fd), real(fd))[1]):
+            self.codes(deep_tail=True)
+            first = len(hashes)
+            self.codes(deep_tail=True)
+            self.assertEqual(len(hashes), first, "an unchanged last segment is hashed once per process")
+            segs = self.closed()
+            os.utime(self.dir / segs[-1], ns=(time.time_ns(), time.time_ns() + 5_000_000_000))
+            self.codes(deep_tail=True)
+            self.assertGreater(len(hashes), first, "a changed mtime forces a re-hash")
+
+
+# Outcome coverage guard (gate #327 F1, the class fix): every documented rotation or tail outcome is tagged in
+# wal_segments.py with `# outcome: <name>`; this table names the test that must REACH that exact line. The guard
+# runs the test under a line tracer, so a test cannot claim a branch it never executes.
+OUTCOMES = {
+    "implausible_seq": "AppendInvariantTests.test_implausible_seq_without_leak",
+    "temp_create_failed": "AppendInvariantTests.test_create_failure_undone_without_leak",
+    "marker_write_failed": "AppendInvariantTests.test_io_error_writing_the_marker_skips_rotation_and_keeps_every_record",
+    "collision": "AppendInvariantTests.test_collision_skips_rotation_without_leak",
+    "unsupported": "AppendInvariantTests.test_unsupported_rename_without_leak",
+    "live_rename_failed": "AppendInvariantTests.test_first_rename_fails_rotation_is_skipped_and_the_record_kept",
+    "undo_ok": "AppendInvariantTests.test_second_rename_fails_and_the_undo_succeeds",
+    "recreated_in_gap": "AppendInvariantTests.test_live_name_recreated_between_rename_and_create",
+    "recreated_before_undo": "AppendInvariantTests.test_second_rename_fails_and_the_live_name_is_recreated_before_the_undo",
+    "rotate_failed_record_not_written": "AppendInvariantTests.test_failure_after_rename_raises_the_documented_code_then_recovers",
+    "rotated": "RotationTests.test_rotates_and_links",
+    "tail_missing": "TailValidationTests.test_deleting_the_newest_closed_segment_is_a_hard_problem",
+    "tail_missing_all": "TailValidationTests.test_deleting_all_closed_segments_is_a_hard_problem",
+    "tail_marker_mismatch": "TailValidationTests.test_a_live_marker_with_the_wrong_prev_is_a_hard_problem",
+    "tail_marker_missing": "TailValidationTests.test_a_live_file_without_a_marker_next_to_closed_segments_is_a_hard_problem",
+}
+
+
+def outcome_tags():
+    """{line_number: outcome} for the `# outcome: name` tags in wal_segments.py."""
+    import re
+    tags = {}
+    for number, text in enumerate(Path(ws.__file__).read_text().splitlines(), 1):
+        m = re.search(r"#\s*outcome:\s*([a-z_]+)\s*$", text)
+        if m:
+            tags[number] = m.group(1)
+    return tags
+
+
+def outcomes_reached(test_id):
+    """(set of outcome names whose tagged line executed, the unittest result) while running one test."""
+    import io
+    tags = outcome_tags()
+    path = ws.__file__
+    reached = set()
+
+    def local(frame, event, arg):
+        if event == "line" and frame.f_lineno in tags:
+            reached.add(tags[frame.f_lineno])
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code.co_filename == path else None
+    suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_wal_segments." + test_id)
+    old = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+    finally:
+        sys.settrace(old)
+    return reached, result
+
+
+class OutcomeCoverageTests(unittest.TestCase):
+    def test_every_tagged_outcome_has_a_row_and_every_row_has_a_tag(self):
+        tags = set(outcome_tags().values())
+        self.assertEqual(tags - set(OUTCOMES), set(), "a new outcome branch needs a table row and a test that reaches it")
+        self.assertEqual(set(OUTCOMES) - tags, set(), "a table row names an outcome that no longer exists in the source")
+
+    def test_each_mapped_test_really_reaches_its_branch(self):
+        for name, test_id in sorted(OUTCOMES.items()):
+            with self.subTest(outcome=name):
+                reached, result = outcomes_reached(test_id)
+                self.assertTrue(result.wasSuccessful(), f"{test_id} failed")
+                self.assertIn(name, reached, f"{test_id} never executes the `{name}` branch it is mapped to")
+
+    def test_the_guard_has_teeth(self):  # negative control: a test that does not reach a branch is detected
+        reached, result = outcomes_reached("AppendInvariantTests.test_unsupported_rename_without_leak")
+        self.assertTrue(result.wasSuccessful())
+        self.assertNotIn("undo_ok", reached)
+        self.assertNotIn("recreated_before_undo", reached)
+        self.assertIn("unsupported", reached)
 
 
 class NoDestructiveTests(unittest.TestCase):
