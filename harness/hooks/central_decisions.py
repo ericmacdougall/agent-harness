@@ -819,9 +819,10 @@ def _drop_pending(store, posted):
 
 def withdraw(scope, value=None, *, store=None, client=None, now=None, reason='withdrawn', deadline_seconds=None,
              post=True):
-    """Local tombstone first (denies on this host at once), then the queued ledger line, then (with `post`) the
-    post, and the queue row is removed only after the post succeeded. A process killed at any point leaves the
-    line queued, and every hook verb retries the queue. The caller hears whether it was posted."""
+    """The queued ledger line, then the local tombstone (denies on this host at once), then (with `post`) the
+    post; the queue row is removed only after the post succeeded. A process stopped at any point after the queue
+    row is written leaves the line queued, and every hook verb retries the queue; one stopped before it wrote
+    anything leaves nothing. The caller hears whether it was posted."""
     store = store or Store()
     line = 'agent-harness-revoke ' + ('all' if scope == 'all' else '%s %s' % (scope, value))
     match = REVOKE.fullmatch(line)
@@ -829,9 +830,12 @@ def withdraw(scope, value=None, *, store=None, client=None, now=None, reason='wi
         raise Denied('bad_request', 'revoke scope must be all, task <key>, session <uuid> or decision <id>')
     now = time.time() if now is None else now
     store.ensure_dirs()
-    _append_private(store.tombstones, {'scope': scope, 'value': value, 'at': now, 'origin': 'local:' + reason})
+    # queue row before tombstone: a tombstone hides the decision from later hooks (live_published), so a process
+    # stopped between the two writes must leave the row, never a tombstone alone. The tombstone still lands before
+    # any network call, so this host denies at once.
     with _PendingLock(store):
         _append_private(store.pending, {'line': line, 'at': now, 'error': 'not_posted_yet'})
+    _append_private(store.tombstones, {'scope': scope, 'value': value, 'at': now, 'origin': 'local:' + reason})
     if not post:
         return {'revoked': line, 'posted': False, 'queued': True}
     try:

@@ -634,6 +634,31 @@ class EveryWithdrawalChannelRevokes(Base):
         with self.assertRaises(cd.Denied):
             self.verify('k1')
 
+    def test_hook_killed_between_its_two_local_writes_still_gets_the_revoke_posted(self):
+        # withdraw writes a tombstone and a queue row; a kill after the first of them must not strand the decision
+        # (a tombstone alone hides it from every later hook, so the ledger would never hear of it)
+        real_append, writes = cd._append_private, []
+
+        def append(path, row):
+            if path in (self.mac.store.tombstones, self.mac.store.pending):
+                writes.append(path)
+                if len(writes) == 2:
+                    raise KeyboardInterrupt()
+            return real_append(path, row)
+        with mock.patch.object(cd, '_append_private', side_effect=append):
+            with self.assertRaises(KeyboardInterrupt):
+                cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_a_hook_in_another_session_posts_the_queued_revoke(self):
+        with mock.patch.object(cd, 'HOOK_DEADLINE', 0.0):
+            cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
+        self.assertEqual(self.revoke_lines(), [])
+        other = '99999999-2222-4333-8444-555555555555'
+        cd.on_stop(other, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
     def test_spent_budget_queues_without_posting_and_the_next_hook_posts(self):
         with mock.patch.object(cd, 'HOOK_DEADLINE', 0.0):
             note = cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
