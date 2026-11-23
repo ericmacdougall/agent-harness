@@ -63,6 +63,19 @@ class KeyedValues(unittest.TestCase):
                 self.assertTrue(b"visible" in out)
                 self.assertTrue(counts.get("keyed", 0) >= 1)
 
+    def test_neg15_plural_and_short_credential_keys(self):
+        # NEG-15 (r4): singularized key words, pw/jwt, token as the last word (red-team r3 CRITICAL).
+        for i, rec in enumerate([{"api_keys": [F]}, {"tokens": [F]}, {"passwords": [F]},
+                                 {"login": {"user": "x", "pw": F}}, {"tokenString": F}, {"jwt": F},
+                                 {"authToken": F}, {"client_secrets": {"a": F}}, {"cookies": [{"v": F}]},
+                                 {"passphrase": F}, {"bearer": F}, {"pass": F}, {"session": F},
+                                 {"accessTokens": [F]}, {"sid": F}]):
+            with self.subTest(case=i):
+                out, _, omitted = run(rec)
+                self.assertIsNone(omitted)
+                self.assertFalse(leaks(out, F))
+                self.assertTrue(b"[REDACTED:keyed]" in out)
+
     def test_nested_containers_under_a_key_are_replaced_whole(self):
         out, _, omitted = run({"credentials": {"user": "u1", "inner": [F, {"deeper": F2}]}, "other": 1})
         self.assertIsNone(omitted)
@@ -452,6 +465,22 @@ class Properties(unittest.TestCase):
         self.assertEqual(json.loads(out), rec)
         self.assertEqual(counts, {})
 
+    def test_neg18_allowlist_holds_only_for_its_value_shape(self):
+        out, _, omitted = run({"tokens": ["opaque"], "sessionId": "not-a-uuid-" + F, "model": "m" * 70,
+                               "type": "has spaces " + F2, "max_tokens": "str" + F3, "session": F2})
+        self.assertIsNone(omitted)
+        self.assertFalse(leaks(out, F, F2, F3, "opaque", "m" * 70))
+        got = json.loads(out)
+        for key in ("tokens", "sessionId", "model", "type", "max_tokens", "session"):
+            with self.subTest(key=key):
+                self.assertEqual(got[key], "[REDACTED:keyed]")
+
+    def test_allowlist_exempts_only_the_keyed_rule(self):
+        # Text shapes still apply to an allowlisted value; pass 2 still verifies it.
+        out, _, omitted = run({"model": "someone@example.invalid"})
+        self.assertIsNone(omitted)
+        self.assertEqual(json.loads(out)["model"], "[REDACTED:email]")
+
     def test_session_keys_with_non_id_values_are_redacted(self):
         out, _, _ = run({"sessionId": F, "session": F2, "session_id": "not-a-uuid-" + F3})
         self.assertFalse(leaks(out, F, F2, F3))
@@ -478,6 +507,17 @@ class Properties(unittest.TestCase):
         out, _, omitted = tr.redact_line(raw, 1)
         self.assertIsNone(omitted)
         self.assertEqual(json.loads(out.decode("utf-8")), json.loads(raw.decode("utf-8")))
+
+    def test_no_newline_is_stripped(self):
+        # redact_line takes a record WITHOUT its trailing newline and strips nothing itself: a newline inside the
+        # input fails closed instead of being silently removed, and output never ends with a newline.
+        out, _, omitted = tr.redact_line(b'{"a":"x"}\n', 4)
+        self.assertEqual(omitted, "embedded-newline")
+        self.assertEqual(json.loads(out)["line"], 4)
+        out, _, omitted = tr.redact_line(b"plain text with trailing spaces  ", 1)
+        self.assertEqual(out, b"plain text with trailing spaces  ")
+        out, _, _ = tr.redact_line(b'{"a":"x"}', 1)
+        self.assertFalse(out.endswith(b"\n"))
 
     def test_ruleset_version(self):
         self.assertTrue(isinstance(tr.RULESET_VERSION, str) and tr.RULESET_VERSION not in ("", "0"))
