@@ -9375,29 +9375,31 @@ def _question_names_only(question, real):
 
 
 def _hook_wal_predates(wal_real, at, limit=4 << 20):
-    """True when the WAL holds a hook-written (pretool) entry dated before `at` (an epoch)."""
+    """True when the WAL holds a hook-written (pretool) entry dated before `at` (an epoch), read from the head of the
+    WAL's whole segment chain (oldest first, markers dropped, at most `limit` bytes). Fails closed: any chain problem
+    (a gap, a non-regular, ambiguous or unreadable segment) answers False, so an approval is never given on a WAL
+    whose chain is not whole."""
     import datetime
+    import wal_segments as ws
+    probs = []
+    found = False
     try:
-        fd = os.open(wal_real, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
-    except OSError:
+        for _segment, _number, raw in ws.iter_lines(wal_real, max_total_bytes=limit, problems=probs):
+            if raw is None or b'"pretool"' not in raw:
+                continue
+            try:
+                rec = json.loads(raw.decode('utf-8', 'replace'))
+                when = datetime.datetime.fromisoformat(str(rec.get('at')).replace('Z', '+00:00')).timestamp()
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if isinstance(rec, dict) and rec.get('event') == 'pretool' and rec.get('tool_use_id') and when < at:
+                found = True
+                break
+    except (OSError, ws.SegmentProblem):
         return False
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return False
-        raw = os.read(fd, limit)
-    finally:
-        os.close(fd)
-    for line in raw.decode('utf-8', 'replace').splitlines():
-        if '"pretool"' not in line:
-            continue
-        try:
-            rec = json.loads(line)
-            when = datetime.datetime.fromisoformat(str(rec.get('at')).replace('Z', '+00:00')).timestamp()
-        except (ValueError, TypeError, AttributeError):
-            continue
-        if isinstance(rec, dict) and rec.get('event') == 'pretool' and rec.get('tool_use_id') and when < at:
-            return True
-    return False
+    # `truncated` is the 4 MiB head window itself (the same limit as before), not a chain problem
+    hard = [p for p in probs if p['code'] not in ('live_missing', 'schema_newer', 'marker_info', 'truncated')]
+    return found and not hard
 
 
 def _uses_of_source(canonical, home=None):
@@ -9533,19 +9535,41 @@ def scan_paths(paths, max_files=2000, max_seconds=60.0):
     """[(file, line, {kind: count})] for secret-shaped text; values are never returned."""
     import redact
     import safe_input
+    import wal_segments as ws
     deadline = time.monotonic() + max_seconds
     files = []
+    report = []
+
+    def chain_problems(directory, stem=None):
+        """A gap or a non-regular segment in a WAL chain: the scan covers every segment file that exists, and says that
+        the chain is not whole, never silently skipping it."""
+        try:
+            chains = {stem: ws.chain(directory, stem)} if stem else ws.list_wals(directory)
+        except OSError:
+            return
+        for name, chain in sorted(chains.items()):
+            for problem in chain.problems:
+                if problem['code'] not in ('live_missing', 'schema_newer', 'marker_info'):
+                    report.append((os.path.join(directory, name + '.jsonl'), 0, {'wal-chain-' + problem['code']: 1}))
+
     for p in paths:
         if os.path.isdir(p):
             for root, _dirs, names in os.walk(p):
+                chain_problems(root)
                 for name in sorted(names):
-                    if name.endswith(('.jsonl', '.json', '.log', '.txt', '.md')):
+                    if name.endswith(('.jsonl', '.json', '.log', '.txt', '.md')):  # every segment file is a .jsonl file
                         files.append(os.path.join(root, name))
                         if len(files) >= max_files:
                             break
         else:
+            directory, name = os.path.split(p)
+            stem, seq = ws.parse_name(name)
+            if stem is not None and seq is None and os.path.isdir(directory or '.'):
+                # a WAL named by its live file: its closed segments are part of it, so they are scanned too
+                chain = ws.chain(directory or '.', stem)
+                chain_problems(directory or '.', stem)
+                files.extend(os.path.join(directory or '.', seg.name) for seg in chain.segments)
             files.append(p)
-    report = []
     for f in files[:max_files]:
         if time.monotonic() > deadline:
             report.append((f, 0, {'scan-stopped': 1}))

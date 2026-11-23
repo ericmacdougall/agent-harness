@@ -1246,15 +1246,24 @@ def verify_ask_pair(wal, ask_id, task, allow_env_root=False):
     resolved_wal = Path(wal).resolve()
     if wals_root not in resolved_wal.parents or resolved_wal.name != 'main.jsonl':
         raise LedgerError('unclassifiable_evidence', 'permission must come from a session main WAL under ' + str(wals_root))
+    import wal_segments as ws  # noqa: PLC0415
+    probs = []
     try:
-        lines = wal.read_text(encoding='utf-8', errors='replace').splitlines()  # input-ok: session WAL, bounded by the hooks
-    except OSError:
+        # the whole segment chain of the (resolved, root-checked) main WAL, markers dropped; a segment is never skipped
+        lines = [raw for _seg, _n, raw in ws.iter_lines(resolved_wal, problems=probs) if raw is not None]
+    except (OSError, ws.SegmentProblem):
         raise LedgerError('unclassifiable_evidence', 'WAL unreadable') from None
+    hard = [p for p in probs if p['code'] not in ('live_missing', 'schema_newer', 'marker_info')]
+    if hard:  # a gap or an unreadable segment may hold the ask, its resolution or a later retraction: fail closed
+        raise LedgerError('unclassifiable_evidence', 'WAL segment chain problem (%s: %s); an approval is never read '
+                          'from part of a WAL.' % (hard[0]['code'], str(hard[0].get('message'))[:120]))
     ask = resolved = None
     for line in lines:
         try:
             entry = json.loads(line)
         except ValueError:
+            continue
+        if not isinstance(entry, dict):
             continue
         if entry.get('id') == ask_id and entry.get('event') == 'ask':
             ask = entry

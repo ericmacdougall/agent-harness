@@ -305,14 +305,14 @@ class NativeOwnerProvenance(unittest.TestCase):
             self.get()
         self.owner_wal.unlink()
         target.rename(self.owner_wal)
-        original = sf.read_regular
-        def changed(path, *args, **kwargs):
-            data = original(path, *args, **kwargs)
-            if path == self.owner_wal:
-                with path.open('a') as output:
+        original = sf._native_read_member  # the owner WAL is read member by member (goodqa#16751): same injection point
+        def changed(member, *args, **kwargs):
+            data = original(member, *args, **kwargs)
+            if member == self.owner_wal:
+                with member.open('a') as output:
                     output.write('{}\n')
             return data
-        with mock.patch.object(sf, 'read_regular', side_effect=changed), self.assertRaises(sf.SpecError):
+        with mock.patch.object(sf, '_native_read_member', side_effect=changed), self.assertRaises(sf.SpecError):
             self.get()
 
 

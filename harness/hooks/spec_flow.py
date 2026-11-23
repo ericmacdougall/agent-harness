@@ -714,6 +714,81 @@ def _native_path(path, uid, *, directory=False, maximum=None, optional=False):
     return item.st_dev, item.st_ino, item.st_uid, item.st_mode
 
 
+def _native_wal_members(path, uid, maximum):
+    """[(member path, binding)] for a native WAL's whole segment chain: closed segments in order, then the live file.
+    Every member is qualified like a single WAL (regular, one link, our uid, not group/world writable, within
+    `maximum`). Any chain problem, a gap, a segment that is not a regular file or a missing live file raises ValueError:
+    a native proof is never made over part of a WAL (goodqa#16751)."""
+    import wal_segments as ws
+    stem, seq = ws.parse_name(path.name)
+    if stem is None or seq is not None:
+        raise ValueError("native WAL name unavailable")
+    chain = ws.chain(str(path.parent), stem)
+    if [p for p in chain.problems if p["code"] not in ("schema_newer", "marker_info")] or chain.live is None:
+        raise ValueError("native WAL segment chain incomplete")
+    members = [path.parent / seg.name for seg in chain.segments] + [path.parent / chain.live.name]
+    return [(member, _native_path(member, uid, maximum=maximum)) for member in members]
+
+
+def _native_wal_binding(path, uid, maximum):
+    return tuple(binding for _member, binding in _native_wal_members(path, uid, maximum))
+
+
+def _native_read_member(member, bound, room, limit):
+    """One member of a native WAL chain, read under the _native_read stability rules; returns (bytes, (size, mtime_ns,
+    ctime_ns)). `room` is what is left of the chain's `limit`."""
+    uid = bound[2]
+    fd = os.open(member, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        first = os.fstat(fd)
+        if (first.st_dev, first.st_ino, first.st_uid, first.st_mode) != bound:
+            raise ValueError("native file changed")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(room + 1)
+        last = os.fstat(fd)
+        if ((first.st_size, first.st_mtime_ns, first.st_ctime_ns) !=
+                (last.st_size, last.st_mtime_ns, last.st_ctime_ns) or len(raw) != first.st_size
+                or len(raw) > room or _native_path(member, uid, maximum=limit) != bound):
+            raise ValueError("native file changed")
+        return raw, (first.st_size, first.st_mtime_ns, first.st_ctime_ns)
+    finally:
+        os.close(fd)
+
+
+def _native_read_wal(path, identity, limit, *, binding=None):
+    """The logical bytes of a native WAL (open markers dropped), read member by member under the same stability rules
+    as _native_read: each member's binding, size, mtime and ctime must hold throughout, the chain must not change
+    while it is read, and the sum of the members is bounded by `limit`. For a WAL that never rotated the result is the
+    file's bytes unchanged."""
+    import wal_segments as ws
+    home, uid = identity["home"], identity["uid"]
+    parents = [home, *(p for p in reversed(path.parents) if p != home and p.is_relative_to(home))]
+    directories = [_native_path(p, uid, directory=True) for p in parents]
+    members = _native_wal_members(path, uid, limit)
+    before = tuple(item for _member, item in members)
+    if binding is not None and before != binding:
+        raise ValueError("native identity file changed")
+    pieces, total, seen = [], 0, []
+    for member, bound in members:
+        raw, state = _native_read_member(member, bound, limit - total, limit)
+        seen.append((member, state))
+        first_line, newline, rest = raw.partition(b"\n")
+        if newline and ws.parse_marker(first_line.rstrip(b"\r")) is not None:
+            raw = rest  # an open marker is linkage, not a row
+        if member is not members[-1][0] and raw and not raw.endswith(b"\n"):
+            raise ValueError("native WAL segment is torn")
+        total += len(raw)
+        pieces.append(raw)
+    for member, state in seen:  # nothing may have been appended or rewritten after its member was read
+        item = member.lstat()
+        if (item.st_size, item.st_mtime_ns, item.st_ctime_ns) != state:
+            raise ValueError("native file changed")
+    if (tuple(item for _member, item in _native_wal_members(path, uid, limit)) != before
+            or [_native_path(p, uid, directory=True) for p in parents] != directories):
+        raise ValueError("native file changed")
+    return b"".join(pieces)
+
+
 def _native_database_binding(home, uid):
     db = home / ".codex/state_5.sqlite"
     return (_native_path(home, uid, directory=True),
@@ -824,7 +899,7 @@ def _native_agent_source(path, agent, expected, *, purpose):
         parent = parts[0]
         directories = (home, home / ".agent-harness", root, raw.parent)
         before = tuple(_native_path(item, uid, directory=True) for item in directories)
-        wal_binding = _native_path(raw, uid, maximum=64_000_000)
+        wal_binding = _native_wal_binding(raw, uid, 64_000_000)
         if click and (parent != parent.lower() or agent != agent.lower()):
             raise ValueError("noncanonical child identity")
         rows = _native_review_rows(home, uid, agent, parent, rollout=True) if click else _native_review_rows(home, uid, agent, parent)
@@ -853,7 +928,7 @@ def _native_agent_source(path, agent, expected, *, purpose):
                 or not child[4] or spawn.get("agent_path") != child[4] or spawn.get("agent_role") != expected):
             raise ValueError("native reviewer parent or role conflicts")
         if (tuple(_native_path(item, uid, directory=True) for item in directories) != before
-                or _native_path(raw, uid, maximum=64_000_000) != wal_binding):
+                or _native_wal_binding(raw, uid, 64_000_000) != wal_binding):
             raise ValueError("native review WAL binding changed")
         identity = {"home": home, "uid": uid, "parent": parent, "agent_path": child[4],
                 "main": raw, "main_binding": wal_binding, "rollout": child[8] if click else None,
@@ -962,9 +1037,9 @@ def _native_click_proof(identity, agent, line, started, ended):
             raise ValueError("native observed time order invalid")
         parent = identity["parent"]
         agent_wal = identity["main"].with_name(f"agent-{agent}.jsonl")
-        main_data = _native_read(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
+        main_data = _native_read_wal(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
         main_rows = [_native_json(raw, 4_000_000) for raw in main_data.splitlines()]
-        child_rows = [_native_json(raw, 4_000_000) for raw in _native_read(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
+        child_rows = [_native_json(raw, 4_000_000) for raw in _native_read_wal(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
         starts = [e for e in main_rows if e.get("event") == "SubagentStart" and e.get("agent_id") == agent]
         child_starts = [e for e in child_rows if e.get("event") == "SubagentStart"]
         notes = [e for e in child_rows if isinstance(e.get("note"), str) and e["note"].startswith(NATIVE_CLICK_PREFIX)]
@@ -1133,13 +1208,9 @@ def _native_owner_proof(main_wal, owner):
     home = Path(pwd.getpwuid(uid).pw_dir)
     path = home / ".agent-harness/codex-wals" / native["parent"] / f"agent-{agent}.jsonl"
     try:
-        before = _native_path(path, uid, maximum=64_000_000)
-        detail = path.stat()
-        data = read_regular(path, 64_000_000)
-        after = path.stat()
-        if (_native_path(path, uid, maximum=64_000_000) != before
-                or (detail.st_size, detail.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
-                or len(data) != detail.st_size or not data.endswith(b"\n")):
+        # the owner's whole segment chain (each member bound and read under stability checks, a chain problem raises)
+        data = _native_read_wal(path, {"home": home, "uid": uid}, 64_000_000)
+        if not data.endswith(b"\n"):
             raise ValueError("owner WAL changed or is incomplete")
         def unique(items):
             value = {}
@@ -1181,10 +1252,19 @@ def _native_owner_proof(main_wal, owner):
 
 
 def wal_entries(path: Path):
+    """The parsed rows of a WAL's whole segment chain (open markers dropped). A WAL that does not exist has no rows. A
+    chain problem (a gap, a non-regular or unreadable segment, an ambiguous name) or a chain over the 64 MB budget is
+    an error, never a partial list: evidence is never judged "absent" over rows that were not read."""
+    import wal_segments as ws
+    probs = []
     try:
-        raw = read_regular(path, 64_000_000)
-    except SpecError:
-        return []
+        raw = ws.read_logical(path, max_bytes=64_000_000, problems=probs)
+    except (OSError, ws.SegmentProblem) as error:
+        raise SpecError(f"cannot read the WAL chain of {path} ({type(error).__name__})", EXIT_USAGE) from None
+    hard = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+    if hard:
+        raise SpecError(f"WAL chain problem in {Path(path).name}: {hard[0]['code']} ({hard[0].get('message')}); "
+                        "repair or restore the segment before using this WAL as evidence", EXIT_USAGE)
     entries = []
     for line in raw.decode("utf-8", "replace").splitlines():
         try:
