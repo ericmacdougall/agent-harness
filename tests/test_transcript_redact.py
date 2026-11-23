@@ -70,12 +70,29 @@ class KeyedValues(unittest.TestCase):
         self.assertEqual(json.loads(out)["credentials"], "[REDACTED:keyed]")
         self.assertEqual(json.loads(out)["other"], 1)
 
-    def test_numeric_secret_redacted_but_booleans_and_null_kept(self):
-        out, _, _ = run({"otp": 918273, "pass": True, "token": None})
+    def test_numbers_kept_except_under_password_pin_otp_passcode(self):
+        out, _, _ = run({"otp": 918273, "user_pin": 4321, "passcode": 1234, "dbPassword": 99, "pass": True,
+                         "token": None, "secret": 5, "api_key": 7.5})
         obj = json.loads(out)
-        self.assertEqual(obj["otp"], "[REDACTED:keyed]")
+        for key in ("otp", "user_pin", "passcode", "dbPassword"):
+            with self.subTest(key=key):
+                self.assertEqual(obj[key], "[REDACTED:keyed]")
         self.assertIs(obj["pass"], True)
         self.assertIsNone(obj["token"])
+        self.assertEqual(obj["secret"], 5)
+        self.assertEqual(obj["api_key"], 7.5)
+        for i, rec in enumerate([{"secret": 123456, "api_key": 9876.5}, {"x": {"client_secret": 44444}},
+                                 {"auth_token": -1234567}]):
+            with self.subTest(kept_number=i):
+                out, _, omitted = run(rec)
+                self.assertIsNone(omitted)
+                self.assertEqual(json.loads(out), rec)
+        tr_pass1 = tr._pass1
+        try:
+            tr._pass1 = lambda line: (line, {})
+            self.assertIsNotNone(run({"password": 12345678})[2])  # pass 2 still flags a numeric password
+        finally:
+            tr._pass1 = tr_pass1
 
     def test_non_credential_keys_are_not_redacted(self):
         clean = {"pin": "1234", "passage": "a long passage", "passenger": "p", "input_tokens": 12,
@@ -341,7 +358,8 @@ class Pass2AndFailClosed(unittest.TestCase):
         self.assertEqual(rec["_archive"], "omitted")
         self.assertEqual(rec["line"], 7)
         self.assertEqual(rec["reason"], omitted)
-        self.assertEqual(rec["src_sha256"], hashlib.sha256(("note " + ANT).encode()).hexdigest())
+        self.assertEqual(rec["src_len"], len(("note " + ANT).encode()))
+        self.assertEqual(sorted(rec), ["_archive", "line", "reason", "src_len"])  # no hash of the record
 
     def test_pass2_catches_marker_abutting_value(self):
         tr._pass1 = lambda line: (line, {})
@@ -408,9 +426,35 @@ class Properties(unittest.TestCase):
                 self.assertEqual(json.loads(out), rec)
                 self.assertEqual(counts, {})
 
-    def test_session_id_is_redacted_as_specified(self):
-        out, _, _ = run({"sessionId": "550e8400-e29b-41d4-a716-446655440000", "type": "user"})
-        self.assertEqual(json.loads(out)["sessionId"], "[REDACTED:keyed]")
+    def test_neg18_mapping_fields_survive(self):
+        # NEG-18 (AC-10): a Claude-shaped record keeps its mapping fields; a session token is still redacted.
+        rec = {"parentUuid": "550e8400-e29b-41d4-a716-446655440000", "sessionId": "6fa459ea-ee8a-3ca4-894e-db77e160355e",
+               "uuid": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "requestId": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+               "type": "assistant", "message": {"model": "claude-x", "max_tokens": 4096,
+                                                "usage": {"input_tokens": 12, "output_tokens": 345,
+                                                          "cache_read_input_tokens": 0}},
+               "token_count": 7, "sessionToken": F}
+        out, counts, omitted = run(rec)
+        self.assertIsNone(omitted)
+        self.assertFalse(leaks(out, F))
+        got = json.loads(out)
+        self.assertEqual(got["sessionToken"], "[REDACTED:keyed]")
+        del got["sessionToken"], rec["sessionToken"]
+        self.assertEqual(got, rec)
+        self.assertEqual(counts, {"keyed": 1})
+
+    def test_codex_session_ids_survive(self):
+        rec = {"type": "session_meta", "payload": {"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+               "session_id": "550e8400-e29b-41d4-a716-446655440000",
+               "parent_thread_id": "6fa459ea-ee8a-3ca4-894e-db77e160355e", "forked_from_id": None}}
+        out, counts, omitted = run(rec)
+        self.assertIsNone(omitted)
+        self.assertEqual(json.loads(out), rec)
+        self.assertEqual(counts, {})
+
+    def test_session_keys_with_non_id_values_are_redacted(self):
+        out, _, _ = run({"sessionId": F, "session": F2, "session_id": "not-a-uuid-" + F3})
+        self.assertFalse(leaks(out, F, F2, F3))
 
     def test_determinism(self):
         for i, item in enumerate(self.all_secret_inputs()[:20] + CLEAN_RECORDS):
