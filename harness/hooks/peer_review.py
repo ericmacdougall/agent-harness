@@ -1658,6 +1658,19 @@ def build_fallback_block(args, binding, options, selection, author_rung, packet_
         return _fallback_not_recorded('%s (%s)' % (type(error).__name__, str(error)[:200]))
 
 
+def fallback_actor_for(stamp, author_harness):
+    """The actor dict self_serve proves, built only from the one-shot stamp main's own hook wrote for this run
+    (merge_gate._stamp_review: session id and main's proven transcript path), never from argv or the environment.
+    None when there is no stamp, no transcript in it, or the author is not Claude: the self-serve fallback capability
+    is Claude-main-only (self_serve.CLAUDE_MAIN_ONLY), so a Codex-authored run gets no actor and no fallback."""
+    if not isinstance(stamp, dict) or author_harness != 'claude':
+        return None
+    session, transcript = stamp.get('session'), stamp.get('transcript')
+    if not isinstance(session, str) or not session or not isinstance(transcript, str) or not transcript:
+        return None
+    return {'kind': 'claude_main', 'payload': {'session_id': session, 'transcript_path': transcript}}
+
+
 def file_followup_ticket(binding, waiver, runner=None):
     """Spec section 4: the 'cross-harness re-review when quota returns' ticket, filed in the same run. Best effort and
     never blocking; returns the ticket label or None. `runner` is the test seam."""
@@ -2431,9 +2444,7 @@ def main() -> int:
             verify_pr_binding(binding['repo'], binding['pr'], before[0])
             same_harness = actual_selection.get('harness') == args.author_harness
             # NEG-10: the actor is proven by the main stamp this run took; a run without it never reaches here
-            actor = ({'kind': 'main', 'proof': 'review-auth-stamp', 'session': str(args.main_stamp.get('session', ''))[:80],
-                      'harness': args.author_harness, 'command': 'peer_review pr'}
-                     if same_harness and isinstance(args.main_stamp, dict) else None)
+            actor = fallback_actor_for(args.main_stamp, args.author_harness) if same_harness else None
             waiver = merge_gate.add_review_waiver(
                 merge_gate.default_state_dir(), reference, store=store, fallback_actor=actor)
             print('Merge authorization: ' + waiver['id'], flush=True)

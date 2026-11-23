@@ -1670,7 +1670,7 @@ def fallback_live_paths_ok(record, live):
             or record.get("changed_paths_sha256") != fallback_paths_digest(live)):
         return False
     try:
-        return not fallback_denied_paths(live, record.get("deny_paths"), record.get("allow_paths"))
+        return not fallback_denied_paths(live, record.get("denylist_paths"))
     except ValueError:
         return False
 
@@ -1844,44 +1844,16 @@ FALLBACK_BLOCK_KEY = "same_harness_fallback"
 FALLBACK_MAX_PATHS = 400
 FALLBACK_REASONS = {"QUOTA", "AUTH"}
 _PROVIDER_OF = {"openai": "codex", "claude": "claude"}
-FALLBACK_SCOPE_KEYS = {"repos", "deny_paths", "allow_paths"}
+FALLBACK_SCOPE_KEYS = {"repos", "denylist_paths", "single_use", "single_use_bind"}  # the L1 vocabulary
 FALLBACK_BASIS = "merge-base+github-files"
 FALLBACK_PATTERN_MAX = 500
 
-# The path policy has two layers and a path needs both (goodqa#16756 review round 1, finding 2). A denylist can only
-# enumerate, so it is the second layer, not the first.
-#
-# Layer 1, the allowlist: a same-harness review covers only path classes named here (documentation and tests) or by
-# the signed grant's `allow_paths` (the source dirs the user named for a repo). Everything else, including every path
-# nobody thought of, needs a cross-harness review or a manual waiver. A repo file never widens this: the patterns come
-# from the signed policy only.
-FALLBACK_ALLOW = re.compile(
-    r"(?:^|/)docs?/.+\.(?:md|mdx|rst|adoc|txt|png|jpe?g|gif)$"           # documentation tree
-    r"|\.(?:md|mdx|rst|adoc)$"                                          # prose anywhere (control .md files are denied below)
-    r"|^(?:readme|changelog|contributing|license|notice)[\w.\-]*$"       # top-level project prose
-    r"|(?:^|/)(?:tests?|__tests__|specs?)/.+"                           # test trees
-    r"|(?:^|/)test_[\w.\-]+\.py$|[\w.\-]+_test\.(?:py|go|rs)$"
-    r"|[\w.\-]+\.(?:test|spec)\.(?:jsx?|tsx?|mjs|cjs)$", re.I)
-# Layer 2, control files: these never take a same-harness review, even when the grant allows every path, because
-# changing them changes what authorizes what (credentials, permissions, hook wiring, review and tier policy, release
-# and install tooling, dependency manifests). Substring words have no boundary on purpose (AuthController.ts,
-# authentication.py, session.py, jwt.py); a false positive costs one cross-harness review, a miss costs a merge.
-FALLBACK_DENY = re.compile(
-    r"auth|secret|credential|passw|token|permission|privilege|session|jwt|crypt|cipher|oauth|login|signin|signup|"
-    r"keychain|keyring|keystore|apikey|api_key|keyfile|keygen|ed25519|pubkey|private|sudo|rbac|migrat|"
-    r"guard|policy|merge_gate|peer_review|caller_identity|self_serve|central_decisions|escalation|ladder|"
-    r"provenance|wal_note|run_probe|model_tiers|spec_|deliver|install|"
-    r"(?:^|[/_.\-])(?:keys?|certs?|ssl|tls)(?:$|[/_.\-])|"
-    r"(?:^|/)(?:\.claude|\.codex|\.github|\.githooks|\.husky|\.circleci|\.gitlab|\.vscode|\.idea|hooks?|workflows?|"
-    r"deploy\w*|infra\w*|terraform|k8s|helm|ansible|ci|scripts?|bin|skills?|commands|agents|secrets?)(?:/|$)|"
-    r"(?:^|/)(?:ah\.py|claude\.md|agents\.md|skill\.md|hooks\.json|mcp[\w.\-]*\.json|\.mcp\.json|\.env[\w.\-]*|\.envrc|"
-    r"settings[\w.\-]*\.json|dockerfile[\w.\-]*|docker-compose[\w.\-]*|makefile|codeowners|\.gitattributes|"
-    r"\.gitmodules|\.pre-commit-config\.ya?ml|\.npmrc|\.pypirc|\.netrc|"
-    r"package(?:-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.ya?ml|requirements[\w.\-]*\.(?:txt|in)|"
-    r"pipfile(?:\.lock)?|poetry\.lock|pyproject\.toml|setup\.(?:py|cfg)|tox\.ini|cargo\.(?:toml|lock)|go\.(?:mod|sum)|"
-    r"gemfile(?:\.lock)?|composer\.(?:json|lock)|build\.gradle(?:\.kts)?|settings\.gradle|pom\.xml|package\.swift|"
-    r"podfile(?:\.lock)?|[\w.\-]+\.csproj)$|"
-    r"\.(?:pem|p12|pfx|key|crt|cer|jks|sh|bash|zsh|ps1|service|plist)$|id_rsa|id_ed25519", re.I)
+# The path policy ("Allow every path", Source: answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06):
+# a same-harness review covers every changed path. There is no built-in allowlist and no built-in control-file floor.
+# The only path rule is the signed grant's optional `denylist_paths` scope (case-insensitive globs, empty by default),
+# enforced by self_serve itself at grant time and rechecked here, with the same rule, on the record at merge time.
+# A repo file never widens it: the globs come from the signed policy only. A malformed path (empty, absolute,
+# traversing, control characters, over-long) is refused as a format error, not a content rule.
 
 
 def _norm_path(path):
@@ -1890,31 +1862,29 @@ def _norm_path(path):
     return text
 
 
-def _scope_patterns(patterns, what):
-    """Compile grant-scope regexes; anything unreadable is a ValueError (fail closed), never a stray re.error."""
-    if patterns is None:
+def _scope_globs(globs, what):
+    """The grant's denylist_paths: a list of non-empty strings, else ValueError (fail closed)."""
+    if globs is None:
         return []
-    if not isinstance(patterns, (list, tuple)):
-        raise ValueError("fallback: grant scope %s must be a list of patterns" % what)
-    compiled = []
-    for pattern in patterns:
-        if not isinstance(pattern, str) or not pattern or len(pattern) > FALLBACK_PATTERN_MAX:
-            raise ValueError("fallback: grant scope %s has an unusable pattern" % what)
-        try:
-            compiled.append(re.compile(pattern, re.I))
-        except re.error:
-            raise ValueError("fallback: grant scope %s has an invalid pattern" % what) from None
-    return compiled
+    if (not isinstance(globs, (list, tuple)) or any(not isinstance(g, str) or not g or len(g) > FALLBACK_PATTERN_MAX
+                                                   for g in globs)):
+        raise ValueError("fallback: grant scope %s must be a list of glob strings" % what)
+    return list(globs)
 
 
-def fallback_denied_paths(paths, extra_patterns=(), allow_patterns=()):
+def fallback_denied_paths(paths, denylist_globs=()):
     """The subset of changed paths a same-harness review may not cover. THE one path policy: the mint, the receipt
-    check and the merge-time recheck all call it, so they cannot drift apart. A path is covered only when it is
-    well-formed, on the allowlist (docs, tests, or a grant `allow_paths` pattern anchored at the start) and not a
-    control file; a malformed path counts as denied."""
-    extra = _scope_patterns(extra_patterns, "deny_paths")
-    allow = _scope_patterns(allow_patterns, "allow_paths")
+    check and the merge-time recheck all call it, so they cannot drift apart. A path is denied only when it is
+    malformed or matches the grant's optional denylist_paths; with no denylist every well-formed path is covered."""
+    globs = _scope_globs(denylist_globs, "denylist_paths")
     denied = []
+    matcher = None
+    if globs:
+        try:
+            import self_serve
+        except ImportError:
+            raise ValueError("fallback: no self-serve policy library to apply denylist_paths") from None
+        matcher = self_serve.paths_denied
     for path in paths:
         if not isinstance(path, str) or not path or len(path) > 1024 or CTRL.search(path):
             denied.append(clean(path, 120))
@@ -1923,8 +1893,7 @@ def fallback_denied_paths(paths, extra_patterns=(), allow_patterns=()):
         if norm.startswith("/") or any(part in ("", ".", "..") for part in norm.split("/")):
             denied.append(path)
             continue
-        covered = FALLBACK_ALLOW.search(norm) or any(p.match(norm) for p in allow)
-        if not covered or FALLBACK_DENY.search(norm) or any(p.search(norm) for p in extra):
+        if matcher is not None and matcher([norm], globs):
             denied.append(path)
     return denied
 
@@ -1998,14 +1967,14 @@ def fallback_evidence(evidence, scope=None):
             or block.get("snapshot_base") != merge_base or review.get("snapshot_base") != merge_base):
         raise ValueError("fallback: the changed paths are not bound to the PR merge-base that the reviewer's "
                          "snapshot started from")
-    extra = allow = None
+    extra = None
     if scope:
-        extra, allow = scope.get("deny_paths"), scope.get("allow_paths")
+        extra = scope.get("denylist_paths")
         repos = scope.get("repos")
         if repos is not None and (not isinstance(repos, list)
                                   or repo_key(repo) not in {repo_key(r) for r in repos if isinstance(r, str)}):
             raise ValueError("fallback: the grant scope does not cover this repository")
-    denied = fallback_denied_paths(paths, extra, allow)
+    denied = fallback_denied_paths(paths, extra)
     if denied:
         raise ValueError("fallback: changed paths need a cross-harness review or a manual waive: "
                          + ", ".join(clean(p, 60) for p in denied[:5]))
@@ -2032,18 +2001,23 @@ def _grant_expiry(value):
 
 def fallback_grant(actor, binding, final_sha256, evidence, now=None):
     """self_serve.grant for this capability, or ValueError. A missing module, a None grant and any exception are all
-    "no grant". The scope vocabulary here is {repos, deny_paths}; an unknown scope key refuses (fail closed)."""
+    "no grant". The scope vocabulary is L1's {repos, denylist_paths, single_use, single_use_bind}; an unknown
+    key refuses (fail closed). The receipt's changed paths go to L1 as evidence, so a signed denylist_paths is enforced
+    by the library itself; consume() (not grant()) is used so a single_use scope is honoured."""
     try:
         import self_serve
     except ImportError:
         raise ValueError("fallback: no self-serve policy is installed")
     repo, pr, head, report = binding
     try:
-        granted = self_serve.grant(
-            FALLBACK_CAPABILITY, actor=actor, now=now,
-            evidence={"repo": repo, "pr": pr, "head": head, "report_sha256": report, "final_sha256": final_sha256,
-                      "author_harness": evidence["review"]["author_harness"],
-                      "reviewer_harness": evidence["review"]["reviewer_harness"]})
+        usage = evidence.get("usage") if isinstance(evidence.get("usage"), dict) else {}
+        block = usage.get(FALLBACK_BLOCK_KEY) if isinstance(usage.get(FALLBACK_BLOCK_KEY), dict) else {}
+        grant_evidence = {"repo": repo, "pr": pr, "head": head, "report_sha256": report, "final_sha256": final_sha256,
+                          "author_harness": evidence["review"]["author_harness"],
+                          "reviewer_harness": evidence["review"]["reviewer_harness"]}
+        if isinstance(block.get("changed_paths"), list):  # needed by L1 only when the signed scope has a denylist
+            grant_evidence["changed_paths"] = block["changed_paths"]
+        granted = self_serve.consume(FALLBACK_CAPABILITY, actor=actor, now=now, evidence=grant_evidence)
     except Exception:  # noqa: BLE001 - the contract says never raises; if it does that is no grant
         granted = None
     if (not isinstance(granted, dict) or not isinstance(granted.get("policy_id"), str)
@@ -2202,8 +2176,7 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None, fallback_ac
                 "fallback_receipt_sha256": fallback_block_digest(block),
                 # what the merge-time recheck compares GitHub's live PR file list against (finding 1)
                 "changed_paths_sha256": block["changed_paths_sha256"],
-                "deny_paths": list((granted.get("scope") or {}).get("deny_paths") or []),
-                "allow_paths": list((granted.get("scope") or {}).get("allow_paths") or []),
+                "denylist_paths": list((granted.get("scope") or {}).get("denylist_paths") or []),
                 "merge_trailer": fallback_trailer(final_sha256),
                 "policy_id": granted["policy_id"], "key_id": granted["key_id"], "expires_at": bound,
                 "followup": "cross-harness re-review when quota returns"})
@@ -2571,8 +2544,15 @@ def _stamp_review(command, payload, now):
             elif token.startswith(name + "="):
                 values[name] = token.split("=", 1)[1]
     if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
+        # main's own proven transcript path rides in the stamp (with the call id) so a same-harness fallback can hand
+        # the self-serve library the proof it checks itself ({session_id, transcript_path}); the stamp is written
+        # only here, by this hook, in the protected state dir, never from argv or the environment.
+        tool_use_id = payload.get("tool_use_id")
+        transcript = payload.get("transcript_path")
         caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
-                                  session=str(payload.get("session_id") or ""), now=now)
+                                  session=str(payload.get("session_id") or ""), now=now,
+                                  tool_use_id=tool_use_id if isinstance(tool_use_id, str) else None,
+                                  transcript=transcript if isinstance(transcript, str) else None)
 
 
 _SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")

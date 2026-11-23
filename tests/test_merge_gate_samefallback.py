@@ -22,6 +22,7 @@ ROOT = HERE.parent
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 sys.path.insert(0, str(HERE))
+import self_serve as real_self_serve  # noqa: E402  (the real L1 library; the fake below delegates its glob rule to it)
 import merge_gate as mg  # noqa: E402
 import peer_review as review  # noqa: E402
 import usage_guard as guard  # noqa: E402
@@ -76,6 +77,8 @@ class FakeSelfServe:
                       "key_id": "k" * 16, "kill_switch": False}
         module = types.ModuleType("self_serve")
         module.grant = self.grant
+        module.consume = self.grant
+        module.paths_denied = real_self_serve.paths_denied
         module.status = lambda home=None: dict(self.state)
         self.module = module
 
@@ -220,7 +223,7 @@ class AcceptTests(FallbackBase):
             self.mint()
 
     def test_scope_narrows_repos_and_denylist(self):
-        self.ss.result["scope"] = {"repos": ["o/r"], "deny_paths": [r"^docs/"]}
+        self.ss.result["scope"] = {"repos": ["o/r"], "denylist_paths": ["docs/*"]}
         with self.assertRaisesRegex(ValueError, "paths need"):
             self.mint()
         self.ss.result["scope"] = {"repos": ["o/other"]}
@@ -296,63 +299,56 @@ class RefusalTests(FallbackBase):
         many = ["f%03d.txt" % i for i in range(mg.FALLBACK_MAX_PATHS + 1)]
         self.refused("too many", "too many", block=good_block(changed_paths=many, changed_paths_sha256=paths_digest(many)))
 
-    # Finding 2 (the path policy is a class, not a list of names): two independent layers, tested separately.
-    # Layer 1, the allowlist: a path that is not docs, tests or named by the grant's allow_paths needs a
-    # cross-harness review, whatever its name. Layer 2, the control-file denylist: these names refuse even when the
-    # grant allows every path, so a broken deny pattern cannot hide behind the default-deny of layer 1.
-    CONTROL = (
+    # "Allow every path" (Source: answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06):
+    # there is no built-in allowlist or control-file floor. Every well-formed path is covered; the only content rule is
+    # the signed grant's optional denylist_paths. A malformed path is refused as a format error.
+    EVERY_KIND = (
         "harness/hooks/merge_gate.py", "harness/hooks/command_guard_hook.py", "harness/hooks/self_serve.py",
-        "harness/hooks/peer_review.py", "harness/hooks/ah.py", "ah.py", "deliver.py", "spec_flow.py",
-        "provenance.py", "wal_note.py", "run_probe.py", "spec_policy.json", "commit_policy.json",
-        "model_tiers.json", "provenance_policy.json", "settings.json", ".claude/settings.json",
-        "settings.local.json", "hooks.json", "CLAUDE.md", "docs/CLAUDE.md", "AGENTS.md", "SKILL.md",
-        "skills/x/SKILL.md", ".claude/commands/x.md", ".codex/config.toml", "install.sh", "scripts/install.sh",
-        "deploy/release.sh", "deploy/ci.txt", "bin/tool", "Dockerfile", "Makefile", ".github/CODEOWNERS",
-        ".github/workflows/ci.yml", "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-        "requirements.txt", "poetry.lock", "pyproject.toml", "Cargo.lock", "go.sum", "Gemfile.lock",
-        "src/auth/login.py", "app/oauth_callback.py", "AuthController.ts", "UserAuth.ts", "authentication.py",
-        "authorization.py", "permissions.py", "session.py", "jwt.py", "crypto.py", "config/secrets.json",
-        "db/migrations/0001_init.sql", ".env", "deploy/.env.prod", "scripts/gen_key.sh", "keys/dev.pem",
-        "x/ed25519.py", "Credentials.kt", "passwords.txt", "tokenizer.py", "mcp.json", ".mcp.json")
+        "harness/hooks/peer_review.py", "ah.py", "settings.json", ".claude/settings.json", "CLAUDE.md", "SKILL.md",
+        "install.sh", "deploy/release.sh", ".github/workflows/ci.yml", "package.json", "pyproject.toml",
+        "src/auth/login.py", "authentication.py", "config/secrets.json", "db/migrations/0001_init.sql", ".env",
+        "keys/dev.pem", "src/app.py", "lib/util.js", "main.go", "config/app.yaml", "docs/readme.md")
     BAD_SHAPE = ("a/../b.py", "/etc/passwd", "./docs/a.md", "docs//a.md", "docs/a.md/", "docs\\..\\a.md", "")
 
-    def test_neg8_control_files_refuse_even_when_the_grant_allows_every_path(self):
-        self.ss.result["scope"] = {"allow_paths": [".*"]}
-        for path in self.CONTROL + self.BAD_SHAPE:
+    def test_every_kind_of_path_is_covered_by_default(self):
+        for path in self.EVERY_KIND:
+            paths = ["docs/ok.md", path]
+            record = self.mint(block=good_block(changed_paths=paths, changed_paths_sha256=paths_digest(paths)))
+            self.assertEqual(record["approval_source"], mg.FALLBACK_SOURCE, path)
+            self.assertEqual(record["denylist_paths"], [], path)
+        self.assertEqual(mg.fallback_denied_paths(list(self.EVERY_KIND)), [])
+
+    def test_malformed_paths_still_refuse_as_a_format_error(self):
+        for path in self.BAD_SHAPE:
             paths = ["docs/ok.md", path]
             self.refused(path or "<empty>", "cross-harness review", block=good_block(
                 changed_paths=paths, changed_paths_sha256=paths_digest(paths)))
-        self.assertEqual(mg.fallback_denied_paths(list(self.CONTROL), allow_patterns=[".*"]), list(self.CONTROL))
 
-    def test_neg8_unknown_paths_refuse_by_default_and_a_grant_names_the_source_dirs(self):
-        unknown = ("src/app.py", "lib/util.js", "harness/foo.py", "main.go", "config/app.yaml", "src/monkeypatch.py")
-        for path in unknown:
+    def test_a_signed_denylist_scope_refuses_matching_paths_and_is_recorded(self):
+        self.ss.result["scope"] = {"denylist_paths": ["*/migrations/*", "harness/hooks/merge_gate*"]}
+        for path in ("db/migrations/0001_init.sql", "harness/hooks/merge_gate.py", "HARNESS/hooks/Merge_Gate.py"):
             paths = ["docs/ok.md", path]
             self.refused(path, "cross-harness review", block=good_block(
                 changed_paths=paths, changed_paths_sha256=paths_digest(paths)))
-        self.assertEqual(mg.fallback_denied_paths(list(unknown)), list(unknown))
-        self.ss.result["scope"] = {"allow_paths": [r"src/", r"lib/"]}
-        paths = ["src/app.py", "main.go"]
-        self.refused("outside the named dirs", "cross-harness review", block=good_block(
-            changed_paths=paths, changed_paths_sha256=paths_digest(paths)))
-        paths = ["docs/ok.md", "src/app.py", "lib/util.js"]
+        paths = ["docs/ok.md", "src/app.py"]
         record = self.mint(block=good_block(changed_paths=paths, changed_paths_sha256=paths_digest(paths)))
-        self.assertEqual(record["allow_paths"], [r"src/", r"lib/"])
-        # allow patterns are anchored at the start: a nested dir of the same name is not the named dir
-        self.assertEqual(mg.fallback_denied_paths(["vendor/src/app.py"], allow_patterns=[r"src/"]), ["vendor/src/app.py"])
+        self.assertEqual(record["denylist_paths"], ["*/migrations/*", "harness/hooks/merge_gate*"])
 
-    def test_bad_scope_patterns_refuse_with_a_value_error(self):
-        for scope in ({"allow_paths": ["("]}, {"deny_paths": ["("]}, {"allow_paths": "src/"}, {"allow_paths": [3]},
-                      {"allow_paths": ["a" * 600]}):
+    def test_the_grant_call_carries_the_receipt_paths_and_uses_consume(self):
+        paths = ["docs/ok.md", "src/app.py"]
+        self.mint(block=good_block(changed_paths=paths, changed_paths_sha256=paths_digest(paths)))
+        capability, actor, evidence = self.ss.calls[-1]
+        self.assertEqual((capability, evidence["changed_paths"]), (CAP, paths))
+        self.assertEqual(evidence["pr"], 5)
+        self.assertEqual(evidence["head"], HEAD)
+
+    def test_bad_scope_values_refuse_with_a_value_error(self):
+        for scope in ({"denylist_paths": "src/"}, {"denylist_paths": [3]}, {"denylist_paths": ["a" * 600]},
+                      {"allow_paths": ["src/"]}, {"deny_paths": ["docs"]}):
             with self.subTest(scope=scope):
                 self.ss.result["scope"] = scope
                 with self.assertRaises(ValueError):
                     self.mint()
-
-    def test_allowed_paths_are_not_over_blocked(self):
-        for path in ("docs/readme.md", "docs/guide/setup.md", "README.md", "CHANGELOG.md", "docs/img/a.png",
-                     "tests/test_foo.py", "tests/fixtures/data.json", "src/foo_test.go", "web/app.test.ts"):
-            self.assertEqual(mg.fallback_denied_paths([path]), [], path)
 
     def test_the_review_must_have_seen_the_whole_pr(self):
         """Finding 1 at the gate: the paths are bound to the PR merge-base, which must be the reviewer's snapshot base."""
@@ -496,15 +492,19 @@ class MergeTimeTests(FallbackBase):
 
     def test_live_paths_use_the_same_policy_as_the_mint(self):
         """The contract: every name the mint refuses, the merge-time check refuses too, and vice versa."""
-        names = list(RefusalTests.CONTROL) + list(RefusalTests.BAD_SHAPE) + ["src/app.py", "main.go"]
-        good = ["docs/readme.md", "tests/test_foo.py", "README.md"]
-        record = {"changed_paths_sha256": paths_digest(good)}
+        deny = ["*/migrations/*", "harness/hooks/merge_gate*"]
+        names = list(RefusalTests.BAD_SHAPE) + ["db/migrations/1.sql", "harness/hooks/merge_gate.py"]
+        good = ["docs/readme.md", "tests/test_foo.py", "README.md", "src/app.py", "harness/hooks/self_serve.py"]
+        record = {"changed_paths_sha256": paths_digest(good), "denylist_paths": deny}
         self.assertTrue(mg.fallback_live_paths_ok(record, good))
+        self.assertTrue(mg.fallback_live_paths_ok({"changed_paths_sha256": paths_digest(good)}, good),
+                        "with no denylist every well-formed path is covered at merge time too")
         for name in names:
             live = good + [name]
             with self.subTest(name):
-                self.assertTrue(mg.fallback_denied_paths(live), "the mint-time policy refuses it")
-                self.assertFalse(mg.fallback_live_paths_ok({"changed_paths_sha256": paths_digest(live)}, live))
+                self.assertTrue(mg.fallback_denied_paths(live, deny), "the mint-time policy refuses it")
+                self.assertFalse(mg.fallback_live_paths_ok(
+                    {"changed_paths_sha256": paths_digest(live), "denylist_paths": deny}, live))
         self.assertFalse(mg.fallback_live_paths_ok(record, None))
         self.assertFalse(mg.fallback_live_paths_ok(record, []))
         self.assertFalse(mg.fallback_live_paths_ok({}, good))
@@ -643,8 +643,9 @@ class BuildBlockTests(unittest.TestCase):
         self.assertEqual(block["paths_basis"], "merge-base+github-files")
         self.assertEqual((block["author_rung"], block["reviewer_rung"], block["packet_sha256"]), ("R1", "R2", PACKET))
         self.assertEqual(block["primary"]["launches"], 0)
-        self.assertEqual(mg.fallback_denied_paths(block["changed_paths"]), ["harness/hooks/merge_gate.py"],
-                         "the first commit's gate file reaches the policy")
+        self.assertEqual(mg.fallback_denied_paths(block["changed_paths"], ["harness/hooks/merge_gate*"]),
+                         ["harness/hooks/merge_gate.py"], "the first commit's gate file reaches an optional denylist")
+        self.assertEqual(mg.fallback_denied_paths(block["changed_paths"]), [], "no denylist, no refusal")
 
     def test_a_denylisted_file_in_an_earlier_commit_is_never_hidden(self):
         """The snapshot base defaults to head^1, which skips the first commit. That must refuse, not mint."""
