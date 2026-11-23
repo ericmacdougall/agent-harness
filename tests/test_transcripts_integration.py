@@ -499,6 +499,24 @@ class BackfillScheduler(Base):
         self.assertTrue(self.ti.component_installed(self.home))
 
 
+# ---------------------------------------------------------------- AC-9: rule text
+
+class RuleText(unittest.TestCase):
+    SOURCES = (ROOT / "HARNESS.md", ROOT / "codex" / "AGENTS.md", ROOT / "codex" / "skills" / "agent-harness" / "SKILL.md")
+
+    def test_three_rule_sources_carry_the_rule(self):
+        for path in self.SOURCES:
+            text = path.read_text()
+            with self.subTest(file=path.name):
+                self.assertRegex(text, r"ah(?:\.py)? transcripts sync --checkpoint <?start\|takeover\|recovery\|pr\|deploy>?")
+                self.assertIn("transcripts check", text)
+                self.assertRegex(text, r"transcripts find`?/`?cat`?/`?recover")
+                self.assertRegex(text, r"(?i)incomplete without a fresh sync receipt")
+                self.assertRegex(text, r"(?i)byte-identical to the redacted archive")
+                self.assertRegex(text, r"(?i)never treat it as secret-free")
+                self.assertRegex(text, r"(?i)never edit or delete source transcripts")
+                self.assertRegex(text, r"(?i)untrusted")
+
 
 if __name__ == "__main__":
     unittest.main()
