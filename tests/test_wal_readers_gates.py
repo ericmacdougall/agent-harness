@@ -115,6 +115,17 @@ class CommandGuardTests(Fixture):
         self.make_gap()
         self.assertFalse(command_guard._hook_wal_predates(str(self.path()), time.time() - 3600))
 
+    def test_the_head_window_is_the_oldest_bytes_by_design_and_a_row_past_it_is_not_found(self):
+        import command_guard
+        self.fill("main.jsonl", n=30, event="status")
+        old = datetime.now(timezone.utc) - timedelta(hours=2)
+        self.append("main.jsonl", {"at": old.isoformat(), "event": "pretool", "tool_use_id": "t7"})
+        self.rotated()
+        # this gate asks "did the WAL exist before the answer": it reads the HEAD (oldest first); a row beyond the
+        # window is not found, so the approval is refused, never granted on rows that were not read
+        self.assertFalse(command_guard._hook_wal_predates(str(self.path()), time.time() - 3600, limit=2000))
+        self.assertTrue(command_guard._hook_wal_predates(str(self.path()), time.time() - 3600))
+
     def test_a_chain_problem_refuses_even_when_the_live_file_alone_would_approve(self):
         import command_guard
         old = datetime.now(timezone.utc) - timedelta(hours=2)
