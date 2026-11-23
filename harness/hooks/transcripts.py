@@ -69,10 +69,6 @@ class Refused(Exception):
     """A visible refusal: message is ours (never holds a source value)."""
 
 
-class Crash(BaseException):
-    """Test-only crash injection (raised, or the process exits hard)."""
-
-
 # ----------------------------------------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------------------------------------
@@ -99,8 +95,17 @@ class Cfg:
         if self.local and env.get('TRANSCRIPTS_ALLOW_LOCAL_REMOTE') != '1':
             raise Refused('TRANSCRIPTS_REMOTE_BASE needs TRANSCRIPTS_ALLOW_LOCAL_REMOTE=1')
         self.remote_base = os.path.abspath(base) if base else None
-        host = env.get('TRANSCRIPTS_HOST') or socket.gethostname().split('.')[0].lower()
+        host = env.get('TRANSCRIPTS_HOST')
+        pinned = None
+        if not host:
+            try:
+                with open(os.path.join(self.home, 'host'), 'r') as f:
+                    pinned = f.read().strip() or None
+            except OSError:
+                pinned = None
+            host = pinned or socket.gethostname().split('.')[0].lower()
         self.host = _SAFE.sub('_', host)[:40] or 'host'
+        self.host_pinned = bool(pinned) or bool(env.get('TRANSCRIPTS_HOST'))
         t = self.local  # size overrides are honoured only against a local test remote
         self.chunk_max = _env_int('TRANSCRIPTS_CHUNK_MAX_BYTES', 48 * MiB, t)
         self.shard_cap = _env_int('TRANSCRIPTS_SHARD_CAP_BYTES', 1500 * 1000 * 1000, t)
@@ -129,6 +134,9 @@ def ensure_home(cfg):
         d = cfg.p(sub) if sub else cfg.home
         os.makedirs(d, mode=0o700, exist_ok=True)
     os.chmod(cfg.home, 0o700)
+    if not cfg.host_pinned and not os.path.exists(cfg.p('host')):
+        atomic_write(cfg.p('host'), (cfg.host + '\n').encode())  # macOS hostnames drift; the label must not
+        cfg.host_pinned = True
 
 
 def now_iso():
@@ -292,6 +300,24 @@ class GitError(Exception):
     pass
 
 
+_DEADLINE = [None]  # monotonic hard stop of the current run (budget + 10 s); every child timeout honours it
+
+
+def bounded(timeout):
+    """A child timeout that never runs past the run's hard stop (AC-11, NEG-10)."""
+    if _DEADLINE[0] is None:
+        return timeout
+    left = _DEADLINE[0] - time.monotonic()
+    if left <= 0.5:
+        raise subprocess.TimeoutExpired('budget', 0)
+    return min(timeout, left)
+
+
+def run_child(args, **kw):
+    kw['timeout'] = bounded(kw.get('timeout', 120))
+    return subprocess.run(args, **kw)
+
+
 def git(cfg, args, cwd=None, inp=None, timeout=120, env_extra=None, check=True):
     base = ['git']
     if not cfg.local:
@@ -299,13 +325,21 @@ def git(cfg, args, cwd=None, inp=None, timeout=120, env_extra=None, check=True):
     env = git_env()
     if env_extra:
         env.update(env_extra)
-    try:
-        r = subprocess.run(base + list(args), cwd=cwd, input=inp, capture_output=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        raise
+    r = run_child(base + list(args), cwd=cwd, input=inp, capture_output=True, timeout=timeout, env=env)
     if check and r.returncode != 0:
         raise GitError('git %s failed: %s' % (args[0], sanitize_err(r.stderr.decode('utf-8', 'replace'))))
     return r
+
+
+def blob_of(v):
+    if isinstance(v, bytes):
+        return git_blob_sha(v)
+    h = hashlib.sha1()
+    h.update(b'blob %d\0' % os.path.getsize(v))
+    with open(v, 'rb') as f:
+        for b in iter(lambda: f.read(MiB), b''):
+            h.update(b)
+    return h.hexdigest()
 
 
 def git_blob_sha(data):
@@ -325,7 +359,7 @@ class Remote:
     def exists(self, repo):
         if self.cfg.local:
             return os.path.isdir(self.cfg.url(repo))
-        r = subprocess.run(['gh', 'api', 'repos/%s/%s' % (OWNER, repo), '--jq', '.name'],
+        r = run_child(['gh', 'api', 'repos/%s/%s' % (OWNER, repo), '--jq', '.name'],
                            capture_output=True, timeout=60)
         if r.returncode == 0:
             return True
@@ -343,7 +377,7 @@ class Remote:
             git(self.cfg, ['config', 'uploadpack.allowFilter', 'true'], cwd=url)
             git(self.cfg, ['config', 'uploadpack.allowAnySHA1InWant', 'true'], cwd=url)
             return
-        r = subprocess.run(['gh', 'repo', 'create', '%s/%s' % (OWNER, repo), '--private',
+        r = run_child(['gh', 'repo', 'create', '%s/%s' % (OWNER, repo), '--private',
                             '--description', 'Private redacted agent transcripts archive (agent-harness)'],
                            capture_output=True, timeout=120)
         if r.returncode != 0:
@@ -358,11 +392,11 @@ class Remote:
             if f.get('error'):
                 raise Refused('repo check error for %s' % repo)
             return f
-        r = subprocess.run(['gh', 'api', 'repos/%s/%s' % (OWNER, repo)], capture_output=True, timeout=60)
+        r = run_child(['gh', 'api', 'repos/%s/%s' % (OWNER, repo)], capture_output=True, timeout=60)
         if r.returncode != 0:
             raise Refused('visibility unknown for %s (gh api failed)' % repo)
         meta = json.loads(r.stdout.decode('utf-8'))
-        r2 = subprocess.run(['gh', 'api', '--paginate', 'repos/%s/%s/collaborators' % (OWNER, repo), '--jq',
+        r2 = run_child(['gh', 'api', '--paginate', 'repos/%s/%s/collaborators' % (OWNER, repo), '--jq',
                              '.[].login'], capture_output=True, timeout=60)
         if r2.returncode != 0:
             raise Refused('collaborators unknown for %s (gh api failed)' % repo)
@@ -455,7 +489,7 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
             tip = tr.fetch_tip()
             write = {}
             for path, data in files.items():
-                blob = git_blob_sha(data)
+                blob = blob_of(data)
                 have = tr.entries.get(path)
                 if have == blob:
                     continue
@@ -464,6 +498,12 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
                         collisions.append(path)
                     continue
                 write[path] = (blob, data)
+            if not overwrite:
+                # a chunk and its sidecar are one unit: if either collides, neither is written
+                for c in list(collisions):
+                    base = c[:-len('.meta.json')] if c.endswith('.meta.json') else c
+                    write.pop(base, None)
+                    write.pop(base + '.meta.json', None)
             if not write:
                 return (tip if files else None), collisions, False
             env = {'GIT_INDEX_FILE': tr.index}
@@ -471,7 +511,10 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
                 git(cfg, ['read-tree', tip], cwd=tr.dir, env_extra=env)
             info = []
             for path, (blob, data) in sorted(write.items()):
-                got = git(cfg, ['hash-object', '-w', '--stdin'], cwd=tr.dir, inp=data).stdout.decode().strip()
+                if isinstance(data, bytes):
+                    got = git(cfg, ['hash-object', '-w', '--stdin'], cwd=tr.dir, inp=data).stdout.decode().strip()
+                else:
+                    got = git(cfg, ['hash-object', '-w', '--', data], cwd=tr.dir).stdout.decode().strip()
                 if got != blob:
                     raise GitError('hash mismatch')
                 info.append('100644 %s\t%s' % (blob, path))
@@ -490,8 +533,6 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
                 journal.pending(repo, [(p, b) for p, (b, _) in write.items() if p.endswith('.zst')])
             crash_point(cfg, 'before_push')
             timeout = cfg.push_timeout
-            if deadline is not None:
-                timeout = max(15, min(timeout, int(deadline - time.monotonic()) + 10))
             landed = False
             try:
                 r = git(cfg, ['push', '-q', 'origin', '%s:refs/heads/main' % commit], cwd=tr.dir, timeout=timeout,
@@ -580,8 +621,10 @@ def load_state(cfg):
     st = read_json(cfg.p('state.json'))
     if not st:
         st = {'schema': SCHEMA, 'host': cfg.host, 'files': {}, 'shards': [], 'catalog_dirty': False,
-              'catalog_commit': None, 'last_progress_at': None, 'manifest_dirty': []}
+              'catalog_commit': None, 'last_progress_at': None, 'manifest_dirty': [], 'created_at': now_iso()}
     st.setdefault('manifest_dirty', [])
+    st.setdefault('created_at', now_iso())
+    st.setdefault('unvisited', {'files': 0, 'bytes': 0})
     return st
 
 
@@ -788,7 +831,7 @@ def zstd_bin():
 
 def compress(data):
     z = zstd_bin()
-    r = subprocess.run([z, '-12', '-T1', '-q', '-c'], input=data, capture_output=True, timeout=600)
+    r = run_child([z, '-12', '-T1', '-q', '-c'], input=data, capture_output=True, timeout=600)
     if r.returncode != 0:
         raise Refused('zstd compress failed')
     return r.stdout
@@ -796,7 +839,7 @@ def compress(data):
 
 def decompress(zdata):
     z = zstd_bin()
-    r = subprocess.run([z, '-d', '-q', '-c'], input=zdata, capture_output=True, timeout=600)
+    r = run_child([z, '-d', '-q', '-c'], input=zdata, capture_output=True, timeout=600)
     if r.returncode != 0:
         raise ValueError('zstd decompress failed')
     return r.stdout
@@ -830,6 +873,7 @@ class Run:
         reserve = min(30.0, budget * 0.3)
         self.work_deadline = self.started + budget - reserve
         self.deadline = self.started + budget
+        _DEADLINE[0] = self.deadline + 10
         self.served = set()
         self.force = checkpoint in FORCE_SEAL
         self.st = load_state(cfg)
@@ -845,6 +889,7 @@ class Run:
         self.file_counts = {}  # key -> [records, omitted]
         self.whole = {}  # (key, gen) -> hasher for generations begun in this run
         self.errors = []
+        self.notes = []
         self.status = 'ok'
         self.shard_commits = {}
         self.catalog_commit = None
@@ -1003,6 +1048,10 @@ class Run:
         for c in drop:
             self.drop_outbox(c)
             self.chunks_staged -= 1 if c.get('run') == self.id else 0
+            for sh in self.st['shards']:
+                if c.get('shard') and sh['repo'] == c['shard']:
+                    sh['bytes'] -= c['zbytes']
+                    sh['chunks'] -= 1
         first = drop[0]
         g['chunks'] = g['chunks'][:from_idx]
         g['seq'] = first['seq'] - 1
@@ -1105,10 +1154,23 @@ class Run:
             if g['offset'] == 0 and g['seq'] == 0:
                 g['started_run'] = self.id
             self.files_changed += 1
-            e['held'] = None if (e.get('held') or {}).get('reason') != 'collision' else e['held']
+            held = e.get('held') or {}
+            if held.get('reason') == 'omission-cap' and held.get('ruleset') == redact_mod().RULESET_VERSION:
+                return  # the rules must change before this file is retried
+            if held.get('reason') != 'collision':
+                e['held'] = None
             if e.get('held'):
                 return
-            complete = self.chunk_delta(e, g, key, f, fst)
+            try:
+                complete = self.chunk_delta(e, g, key, f, fst)
+            except (Refused, ValueError, OSError, subprocess.SubprocessError) as ex:
+                if isinstance(ex, subprocess.TimeoutExpired) and ex.cmd == 'budget':
+                    raise
+                why = ('refused:' + str(ex)[:60]) if isinstance(ex, Refused) else 'error:' + type(ex).__name__
+                e['held'] = {'reason': why, 'line': None}
+                alert(self.cfg, 'file-held', 'file %s held (%s); the run continues' % (sha12(key), why))
+                self.mark_manifest(key)
+                complete = True
             # an early stop (budget, per-visit cap) leaves stat unset so the next run resumes the file
             e['stat'] = [fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns, fst.st_ino] if complete else None
             e['fp'] = fingerprint(f, g['offset'])
@@ -1277,7 +1339,7 @@ class Run:
                        None)
             if idx is not None:
                 self.rollback(e, g, idx, 'omission-cap')
-            e['held'] = {'reason': 'omission-cap', 'line': None}
+            e['held'] = {'reason': 'omission-cap', 'line': None, 'ruleset': redact_mod().RULESET_VERSION}
             self.mark_manifest(key)
         alert(self.cfg, 'omission-cap', 'omitted %d of %d records; %d file(s) held' % (total_o, total_r, len(bad)))
 
@@ -1315,7 +1377,7 @@ class Run:
         except (OSError, ValueError):
             why = 'unreadable'
         if why is None:
-            return zdata, meta_b
+            return zp, meta_b  # pushed from the outbox file: one chunk in memory at a time
         alert(self.cfg, 'reverify-failed', 'chunk %s held back (%s); re-chunking from source' % (sha12(c['path']), why))
         e['reverify_failures'] = e.get('reverify_failures', 0) + 1
         self.rollback(e, g, i, why)
@@ -1351,21 +1413,16 @@ class Run:
         if os.path.exists(cfg.p('killswitch.json')):
             self.status = 'killswitch'
             return
-        batch = []
-        for key, e, g, i, c in self.staged():
-            if c['status'] != 'staged' or c not in g['chunks']:
-                continue
-            got = self.reverify(key, e, g, i, c)
-            if got is None:
-                continue
-            batch.append((key, e, g, c, got))
-        for item in batch:
-            c = item[3]
+        todo = [(key, e, g, c) for key, e, g, i, c in self.staged()]
+        for key, e, g, c in todo:
             if not c.get('shard'):
                 c['shard'] = self.shard_for(c['month'], c['zbytes'])['repo']
         self.save(force=True)
-        repos = sorted({it[3]['shard'] for it in batch})
-        need_catalog = bool(batch) or bool(self.st.get('catalog_dirty')) or (
+        repos = []
+        for _, _, _, c in todo:
+            if c['shard'] not in repos:
+                repos.append(c['shard'])
+        need_catalog = bool(todo) or bool(self.st.get('catalog_dirty')) or (
             self.st.get('catalog_commit') is None and any(c['status'] == 'pushed' for *_, c in self.all_chunks()))
         try:
             for repo in repos + ([CATALOG] if need_catalog else []):
@@ -1377,24 +1434,25 @@ class Run:
             alert(cfg, 'repo-check', str(ex))
             return
         for repo in repos:
-            items = [it for it in batch if it[3]['shard'] == repo]
-            while items:
+            pending = [it for it in todo if it[3]['shard'] == repo]
+            while pending:
                 group, size = [], 0
-                while items and (not group or size + items[0][3]['zbytes'] <= cfg.push_max):
-                    it = items.pop(0)
-                    group.append(it)
-                    size += it[3]['zbytes']
-                self.push_group(repo, group)
-        if need_catalog or self.st.get('catalog_dirty'):
-            if CATALOG not in self.remote.checked:
-                try:
-                    self.remote.ensure(CATALOG)
-                    self.remote.check(CATALOG)
-                except Refused as ex:
-                    self.refused = str(ex)
-                    self.status = 'refused'
-                    alert(cfg, 'repo-check', str(ex))
-                    return
+                while pending and (not group or size + pending[0][3]['zbytes'] <= cfg.push_max):
+                    if time.monotonic() > self.deadline:
+                        self.notes.append('budget reached; remaining staged chunks wait for the next run')
+                        pending = []
+                        break
+                    key, e, g, c = pending.pop(0)
+                    if c['status'] != 'staged' or c not in g['chunks']:
+                        continue  # rolled back with an earlier chunk of the same file
+                    ok = self.reverify(key, e, g, g['chunks'].index(c), c)
+                    if ok is None:
+                        continue
+                    group.append((key, e, g, c, ok))
+                    size += c['zbytes']
+                if group:
+                    self.push_group(repo, group)
+        if (need_catalog or self.st.get('catalog_dirty')) and time.monotonic() < self.deadline:
             self.push_catalog()
 
     def all_chunks(self):
@@ -1445,6 +1503,8 @@ class Run:
     def push_catalog(self):
         cfg = self.cfg
         files = catalog_files(cfg, self.st, self.whole_final())
+        if self.st.get('catalog_commit') is None:
+            self.guard_lost_state(files)
         commit, _, _ = publish_tree(cfg, CATALOG, files, 'catalog update from %s' % cfg.host,
                                     deadline=self.deadline, overwrite=True)
         crash_point(cfg, 'after_catalog_push')
@@ -1454,6 +1514,23 @@ class Run:
             self.st['catalog_commit'] = commit
             self.catalog_commit = commit
         self.save(force=True)
+
+    def guard_lost_state(self, files):
+        """Refuse to overwrite a host's catalog index with a smaller view (state.json lost or replaced)."""
+        tr = TmpRepo(self.cfg, CATALOG)
+        try:
+            tr.fetch_tip()
+            oid = tr.entries.get('index/%s.jsonl' % self.cfg.host)
+            if not oid:
+                return
+            remote = {json.loads(x).get('path') for x in tr.blob(oid).splitlines() if x.strip()}
+        finally:
+            tr.close()
+        mine = {json.loads(x).get('path') for x in files['index/%s.jsonl' % self.cfg.host].splitlines() if x.strip()}
+        if remote - mine:
+            raise Refused('catalog lists %d chunk(s) for host %s that local state does not know; local state looks '
+                          'lost: restore state.json or rebuild with reindex before syncing' % (len(remote - mine),
+                                                                                            self.cfg.host))
 
     def whole_final(self):
         for (key, gen), h in self.whole.items():
@@ -1473,7 +1550,7 @@ def catalog_files(cfg, st, _unused=None):
         with open(README_SRC, 'rb') as f:
             files['README.md'] = f.read()
     except OSError:
-        pass
+        raise Refused('catalog README source missing (install harness/transcripts/catalog-README.md beside hooks)')
     files['shards/%s.json' % cfg.host] = jdump({'schema': SCHEMA, 'host': cfg.host, 'shards': st['shards']}) + b'\n'
     files['index/%s.jsonl' % cfg.host] = b''.join(jdump(r) + b'\n' for r in index_rows(cfg, st))
     for key in st['manifest_dirty'] if st.get('catalog_commit') else list(st['files'].keys()):
@@ -1550,7 +1627,7 @@ def index_rows(cfg, st):
                     continue
                 meta = read_json(os.path.join(cfg.p('meta'), c['path'] + '.meta.json'))
                 if meta is None:
-                    continue
+                    raise Refused('sidecar copy missing for chunk %s; run reindex --from-sidecars' % sha12(c['path']))
                 rows.append(row_from_sidecar(meta, c['shard'], c['commit']))
     rows.sort(key=lambda r: (r['source'], r['relpath'], r['gen'], r['seq']))
     return rows
@@ -1561,27 +1638,31 @@ def index_rows(cfg, st):
 # ----------------------------------------------------------------------------------------------------------
 
 def backlog_of(cfg, st):
+    """Work left: visits cut short (stat unset), unsealed deltas (pending_since) and files not yet visited.
+    A file whose only unarchived bytes are a partial last line is not backlog."""
     files = 0
     nbytes = 0
     old = 0
     now = time.time()
     for e in st['files'].values():
-        if e.get('missing'):
+        if e.get('missing') or e.get('held'):
             continue
-        s = e.get('stat')
         g = e['gens'][-1] if e['gens'] else None
         off = g['offset'] if g else 0
-        if not s:  # visit stopped early: measure the live file
+        ps = parse_iso(e.get('pending_since'))
+        if e.get('stat') is None or ps:
             try:
-                s = [os.lstat(os.path.join(cfg.sources.get(e['label'], '/nonexistent'), e['relpath'])).st_size]
+                size = os.lstat(os.path.join(cfg.sources.get(e['label'], '/nonexistent'), e['relpath'])).st_size
             except OSError:
                 continue
-        if s[0] > off:
-            files += 1
-            nbytes += s[0] - off
-        ps = parse_iso(e.get('pending_since'))
+            if size > off:
+                files += 1
+                nbytes += size - off
         if ps and now - ps > 7200:
             old += 1
+    un = st.get('unvisited') or {}
+    files += un.get('files', 0)
+    nbytes += un.get('bytes', 0)
     return {'files': files, 'bytes': nbytes, 'pending_over_2h': old}
 
 
@@ -1612,8 +1693,9 @@ def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
         'shard_commits': run.shard_commits if run else {}, 'catalog_commit': run.catalog_commit if run else None,
         'omitted': {'total': len(run.omitted) if run else 0, 'by_kind': by_kind,
                     'records_processed': run.records if run else 0},
-        'collisions': run.collisions if run else 0, 'last_progress_at': st.get('last_progress_at'),
-        'killswitch': os.path.exists(cfg.p('killswitch.json')),
+        'collisions': run.collisions if run else 0,
+        'last_progress_at': st.get('last_progress_at') or st.get('created_at'),
+        'killswitch': os.path.exists(cfg.p('killswitch.json')), 'notes': run.notes if run else [],
         'error': error or (run.refused if run else None) or ((run.disk_low or '; '.join(run.errors)) if run else None)
         or None,
     }
@@ -1695,10 +1777,14 @@ def do_sync(cfg, checkpoint, budget, dry_run=False, backfill=False):
         except GitError as ex:
             run.status = 'failed'
             run.errors.append(str(ex))
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as ex:
             run.status = 'failed'
-            run.errors.append('git timeout')
+            run.errors.append('budget exhausted' if ex.cmd == 'budget' else 'child process timeout')
+        except Exception as ex:  # noqa: BLE001 - always leave a receipt; the class name never holds a value
+            run.status = 'failed'
+            run.errors.append('internal error: %s' % type(ex).__name__)
         finally:
+            _DEADLINE[0] = None
             try:
                 save_state(cfg, run.st)
             except OSError:
@@ -1731,6 +1817,9 @@ def sync_body(run, backfill):
     if run.collisions and run.status == 'ok':
         run.status = 'failed'
         run.errors.append('collision on %d chunk(s)' % run.collisions)
+    if run.errors and run.status == 'ok':
+        run.status = 'failed'
+    # a held file is reported in the receipt (check exits 2) without failing every later run
 
 
 def process_queue(run, backfill):
@@ -1746,11 +1835,16 @@ def process_queue(run, backfill):
         todo = [x for x in found if run.needs_visit(run.st['files'].get(x[0]), x[4])]
         todo.sort(key=lambda x: -x[4].st_mtime_ns)  # newest first
         rescan = False
-        for key, label, rel, path, st in todo:
+        for n, (key, label, rel, path, st) in enumerate(todo):
+            rest = [x for x in todo[n:] if x[0] not in run.st['files']]
+            run.st['unvisited'] = {'files': len(rest), 'bytes': sum(x[4].st_size for x in rest)}
             if time.monotonic() > run.work_deadline:
                 return
             if run.outbox_bytes() > cfg.outbox_cap:
                 run.publish()
+                if run.outbox_bytes() > cfg.outbox_cap:
+                    run.errors.append('outbox over its cap; staging stopped until pushes resume')
+                    return
             run.process_file(key, label, rel, path, seen)
             run.save()
             got = take_requests(cfg)
@@ -1763,6 +1857,7 @@ def process_queue(run, backfill):
                 if load > (os.cpu_count() or 1) * 0.8:
                     time.sleep(min(2.0, max(0.0, run.work_deadline - time.monotonic())))
         if not rescan:
+            run.st['unvisited'] = {'files': 0, 'bytes': 0}
             return
 
 

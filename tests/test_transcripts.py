@@ -194,8 +194,10 @@ class ChunkTests(L.Base):
 
     def test_partial_last_line_waits(self):
         p = self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3) + b'{"type":"user","partial')
-        self.sync('pr')
+        code, r = self.sync('pr')
         self.assertEqual(b''.join(self.chunk_bytes(x) for x in self.chunks()), lines(3))
+        self.assertEqual(r['backlog']['files'], 0)  # a partial last line alone is not backlog
+        self.assertEqual(self.main('check')[0], 0)
         with open(p, 'ab') as f:
             f.write(b'":1}\n')
         self.sync('pr')
@@ -359,6 +361,15 @@ class RedactionGateTests(L.Base):
         self.assertTrue(any(UUID2 in n for n in names))
         self.assertFalse(any(UUID1 in n for n in names))
         self.assertEqual(r['held'][0]['reason'], 'omission-cap')
+        code, r = self.sync('pr')  # same ruleset: the file stays held, the run itself is ok
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['held'][0]['reason'], 'omission-cap')
+        self.assertFalse(any(UUID1 in n for n in self.chunks()))
+        L.IdentityRedact.RULESET_VERSION = 'test-identity-2'  # rules tuned
+        L.IdentityRedact.omit_marker = None
+        code, r = self.sync('pr')
+        self.assertEqual(r['held'], [])
+        self.assertTrue(any(UUID1 in n for n in self.chunks()))
 
     def test_reverify_before_push(self):
         """NEG-16: a corrupted staged chunk and an older-ruleset chunk are kept out and re-chunked."""
@@ -378,6 +389,10 @@ class RedactionGateTests(L.Base):
         self.assertEqual(code, 0, r)
         alerts = (self.home / 'alerts.jsonl').read_text()
         self.assertEqual(alerts.count('reverify-failed'), 2)
+        self.assertEqual(self.chunks(), {})  # both held back, rewound to their source offsets
+        code, r = self.sync('pr')  # re-chunked from source under the current ruleset
+        self.assertEqual(code, 0, r)
+        self.assertEqual(len(self.chunks()), 2)
         for p in self.chunks():
             side = self.sidecar(p)
             self.assertEqual(side['ruleset_version'], 'test-identity-2')
@@ -422,6 +437,29 @@ class RealRedactionTests(L.Base):
         self.assertEqual(side['session'], UUID1)  # index mapping comes from the path and survives redaction
 
 
+class RealGateMappingTests(L.Base):
+    identity = False
+
+    def test_mapping_fields_survive_real_gate(self):
+        r0 = json.dumps({'type': 'assistant', 'timestamp': '2026-11-02T03:04:05Z', 'cwd': '/work/proj',
+                         'message': {'model': 'claude-opus-5-5', 'content': 'shipping GoodQA #16650 via '
+                                     'https://github.com/o/r/pull/77 at ' + 'ab' * 20}},
+                        separators=(',', ':')) + '\n'
+        self.write('claude-projects', 'proj/%s.jsonl' % UUID1, r0.encode())
+        code, r = self.sync('pr')
+        self.assertEqual(code, 0, r)
+        (p,) = self.chunks()
+        side = self.sidecar(p)
+        self.assertNotIn('metadata_dropped', side)
+        self.assertEqual(side['project'], '/work/proj')
+        self.assertEqual(side['models'], ['claude-opus-5-5'])
+        self.assertEqual(side['mentions']['tickets'], ['16650'])
+        self.assertEqual(side['mentions']['prs'], ['https://github.com/o/r/pull/77'])
+        self.assertEqual(side['mentions']['commits'], ['ab' * 20])
+        code, out = self.main('find', '--ticket', '16650')
+        self.assertEqual(json.loads(out)['session'], UUID1)
+
+
 class PublisherTests(L.Base):
 
     def test_publisher_refuses_non_private(self):
@@ -458,6 +496,7 @@ class PublisherTests(L.Base):
         self.assertEqual(code, 2)
         self.assertEqual(r['collisions'], 1)
         self.assertEqual(self.tree(repo)[path], before)
+        self.assertNotIn(path + '.meta.json', self.tree(repo))  # chunk and sidecar are one unit
         self.assertEqual(r['held'][0]['reason'], 'collision')
         self.assertIn('collision', (self.home / 'alerts.jsonl').read_text())
 
@@ -738,6 +777,72 @@ class OperationsTests(L.Base):
         self.assertIn('would_archive', out)
         self.assertFalse((self.home / 'state.json').exists())
         self.assertEqual(self.repos(), [])
+
+    def test_unreachable_remote_fails_within_budget(self):
+        """NEG-10: git network steps hang; the run fails inside budget + 15 s and leaves a receipt."""
+        real_git = shutil.which('git', path=L.GIT_DIR)
+        stub = self.stub / 'git'
+        stub.write_text('#!/bin/sh\nfor a in "$@"; do case "$a" in ls-remote|fetch|push) exec sleep 600;; esac; done\n'
+                        'exec %s "$@"\n' % real_git)
+        stub.chmod(0o755)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        t0 = time.monotonic()
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', '--budget-seconds', '4', timeout=60)
+        self.assertLess(time.monotonic() - t0, 4 + 15)
+        self.assertEqual(code, 2)
+        r = self.receipt()
+        self.assertEqual(r['status'], 'failed')
+        self.assertEqual(self.main('check')[0], 3)
+
+    def test_failing_file_is_held_not_the_run(self):
+        orig = T.gate_metadata
+
+        def gate(side):
+            if side['session'] == UUID1:
+                raise T.Refused('metadata')
+            return orig(side)
+        T.gate_metadata = gate
+        self.addCleanup(setattr, T, 'gate_metadata', orig)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        self.write('claude-projects', 'p/%s.jsonl' % UUID2, lines(3))
+        code, r = self.sync('pr')
+        self.assertTrue(r['ok'], r)
+        self.assertEqual([h['reason'] for h in r['held']], ['refused:metadata'])
+        self.assertEqual([UUID2 in p for p in self.chunks()], [True])
+        self.assertEqual(self.main('check')[0], 2)
+        self.assertNotIn(UUID1, (self.home / 'alerts.jsonl').read_text())
+
+    def test_catalog_readme_missing_refuses(self):
+        orig = T.README_SRC
+        T.README_SRC = str(Path(self.tmp) / 'nope.md')
+        self.addCleanup(setattr, T, 'README_SRC', orig)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        code, r = self.sync('pr')
+        self.assertEqual(r['status'], 'failed')
+        self.assertIn('README', r['error'])
+
+    def test_lost_state_never_shrinks_catalog_index(self):
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        gone = self.write('claude-projects', 'p/%s.jsonl' % UUID2, lines(3, start=10))
+        self.sync('pr')
+        index = self.tree(T.CATALOG)['index/testhost.jsonl']
+        for name in ('state.json', 'meta', 'index.sqlite'):
+            pth = self.home / name
+            shutil.rmtree(pth) if pth.is_dir() else pth.unlink()
+        gone.unlink()
+        code, r = self.sync('pr')
+        self.assertEqual(r['status'], 'failed')
+        self.assertIn('looks lost', r['error'])
+        self.assertEqual(self.tree(T.CATALOG)['index/testhost.jsonl'], index)
+
+    def test_host_label_is_pinned(self):
+        os.environ.pop('TRANSCRIPTS_HOST')
+        self.env.pop('TRANSCRIPTS_HOST')
+        cfg = T.Cfg()
+        T.ensure_home(cfg)
+        self.assertEqual((self.home / 'host').read_text().strip(), cfg.host)
+        (self.home / 'host').write_text('pinned-mac\n')
+        self.assertEqual(T.Cfg().host, 'pinned-mac')
 
     def test_backfill_defers_on_load(self):
         self.setenv(TRANSCRIPTS_IGNORE_LOAD=0)

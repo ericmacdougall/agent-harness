@@ -148,7 +148,32 @@ run through the verifier before it is pushed: a field that trips it is dropped a
 - more than 5 % of a file's records are omitted, for a file of 100+ records.
 
 The failing files' staged chunks from that run are discarded and the files held, so their gaps are never baked
-into immutable chunks before the rules are tuned. The receipt status becomes `omission-cap`.
+into immutable chunks before the rules are tuned. The receipt status becomes `omission-cap`. A held file
+stays held, and is skipped, until `RULESET_VERSION` changes; later runs are ok, and `check` exits 2 while the
+hold lasts.
+
+Note on small runs: the 0.5 % rule is literal, so a run of fewer than 200 records fails on a single omission.
+
+### Failures and holds
+
+- A file that raises during chunking (a zstd failure, a sidecar whose metadata still trips the verifier, an
+  unreadable range) is held with reason `refused:<why>` or `error:<Class>`, and an alert is raised. The rest of
+  the run continues, and the file is retried when it changes.
+- Any other exception still writes a failed receipt naming only the exception class.
+- Every child process (git, gh, zstd) gets a timeout capped at the run's hard stop (budget + 10 s). Publishing
+  re-verifies and pushes one push group at a time, and stops starting new groups at the budget. What remains
+  waits for the next run (receipt `notes`).
+- Backlog is: visits cut short, unsealed deltas, and discovered files not yet visited. A file whose only
+  unarchived bytes are a partial last line is not backlog. `no-progress-24h` counts from `last_progress_at`,
+  or from the state's creation time.
+- **Lost state guard.** Before the first catalog push from a state file, the tool reads the host's committed
+  index. It refuses (status `failed`, "local state looks lost") if that index lists chunks the local state does
+  not know, so a lost or replaced `state.json` can never shrink the host's catalog index.
+- The host label comes from `TRANSCRIPTS_HOST`, else from the pinned `host` file in the state dir, which is
+  written on first use from the short hostname. macOS hostnames drift; the label must not.
+- The catalog README is pushed from `harness/transcripts/catalog-README.md`, located relative to the hook
+  directory (`<hooks>/../transcripts/catalog-README.md`). The installer must ship it; when it is missing, the
+  catalog push refuses visibly.
 
 ### Chunks and sidecars
 
@@ -257,10 +282,11 @@ until it is pushed. The test suite injects a hard crash after each step.
   checkpoint, served_checkpoints, started/finished, ok, status (`ok|failed|refused|omission-cap|disk-low|
   killswitch|deferred`), files scanned/changed, chunks staged/pushed, bytes, held (source label, path sha12,
   reason, line), backlog, shard commits, catalog commit, omitted {total, by_kind, records_processed}, collisions,
-  last_progress_at, killswitch and error.
+  last_progress_at, killswitch, notes and error. `sync` exits 0 when the receipt is ok and 2 otherwise.
 
   Receipts, alerts and logs never carry a source value: only kinds, counts, line numbers and path sha12.
-- `alerts.jsonl`: one row per alert (repo check, collision, reverify, omission cap, incident), for ops_watch.
+- `alerts.jsonl`: one row per alert (repo check, collision, reverify, omission cap, file held, incident), for
+  ops_watch.
 - `waivers.jsonl`: `deliver.py --transcripts-waiver` appends one row per waiver; `status` counts them.
 
 ### Local footprint
