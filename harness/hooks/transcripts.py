@@ -1050,7 +1050,7 @@ def line_end(f, read, room):
     return None
 
 
-def hash_range(f, pos, size, h):
+def feed_range(f, pos, size, h):
     f.seek(pos)
     left = size
     while left:
@@ -1504,7 +1504,7 @@ class Run:
             if size == len(line):
                 src_h.update(line)
             else:
-                hash_range(f, pos, size, src_h)  # the chunk's source hash still covers every byte of the record
+                feed_range(f, pos, size, src_h)  # the chunk's source hash still covers every byte of the record
             pos += size  # hash_range leaves f at pos + size as readline does
             counts[0] += 1
             self.records += 1

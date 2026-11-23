@@ -41,7 +41,7 @@ class ContractTests(L.Base):
         code, out = self.main('check', '--json')
         self.assertEqual(code, 0)
         j = json.loads(out)
-        self.assertEqual(set(j), {'last_ok_at', 'age_min', 'status', 'reasons', 'exit', 'held'})
+        self.assertEqual(set(j), {'last_ok_at', 'age_min', 'status', 'reasons', 'exit', 'held', 'incidents'})
         self.assertEqual(j['held'], {'count': 0, 'by_reason': {}})
         # stale: age the ok receipt
         for name in ('last.json', 'last-ok.json'):
@@ -238,6 +238,22 @@ class ChunkTests(L.Base):
         self.assertEqual(code, 0, r)
         self.assertEqual(r['held'], [])
         self.assertEqual(r['incidents'], {'oversize_records': 10})
+
+    def test_no_module_level_name_is_defined_twice(self):
+        """A second def of an existing helper name (hash_range at bad7fd75) silently replaced the first and broke
+        verify and move detection. Every top-level def, class and assignment target is unique in each module."""
+        import ast
+        hooks = Path(T.__file__).parent
+        for path in (hooks / 'transcripts.py', hooks / 'transcript_redact.py', hooks / 'transcripts_hook.py'):
+            name = path.name
+            tree = ast.parse(path.read_text())
+            seen = {}
+            for node in tree.body:
+                names = [node.name] if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.AsyncFunctionDef)) else []
+                for n in names:
+                    with self.subTest(module=name, name=n):
+                        self.assertNotIn(n, seen, 'line %s redefines line %s' % (node.lineno, seen.get(n)))
+                    seen[n] = node.lineno
 
     def test_oversize_marker_matches_the_redactor_format(self):
         import transcript_redact
