@@ -53,6 +53,7 @@ transcripts.py recover <session> --to DIR [--from git|local]
 transcripts.py verify [--rehash] [--against-source] [--rescan --kind K]
 transcripts.py reindex [--from-sidecars]
 transcripts.py incident --kind K [--shard R]
+transcripts.py ensure-repos --host H --months YYYY-MM[,YYYY-MM] [--parts N]
 ```
 
 - **sync**: handles changed files newest first within the budget (90 s foreground, 600 s with `--background`). With
@@ -258,6 +259,27 @@ becomes `refused` and an alert is raised.
 On any failure the chunk and every later staged chunk of that file are dropped, the generation is rewound and the
 range is re-chunked from source. A file that fails three times is held.
 
+### Hosts without gh (SSH push, e.g. t2-dev)
+
+- **Remote URL style:** `TRANSCRIPTS_GIT_URL_STYLE={auto,https,ssh}`, default `auto`. Auto uses https, through
+  the gh credential helper, when `gh auth status` succeeds, and `git@github.com:ericmacdougall/<repo>.git`
+  otherwise.
+- **Visibility check without gh:** an unauthenticated `GET https://api.github.com/repos/OWNER/REPO` (urllib, 10 s,
+  generic User-Agent). HTTP 200 means the repo is public, so the push is refused. A 404 together with a working
+  SSH `git ls-remote` means private. Any other status or error is a refusal.
+- **Attestations:** fork, owner and collaborator checks need auth. On each of its push runs, a host with gh writes
+  `repo-checks/<repo>.json` to the catalog (schema, repo, checked_at, checked_by, private, fork, owner,
+  collaborators_count). It does this for the catalog, its own shards, every shard in any host's ledger, and every
+  already-attested repo, refreshing records older than 6 h. A gh-less host refuses with `repo-attestation-stale`
+  unless the record exists, is younger than 24 h, and shows private, not a fork, owner ericmacdougall and 0
+  collaborators. A gh host must therefore push at least daily, or run `ensure-repos`, for gh-less hosts to keep
+  pushing.
+- **Repo creation:** a gh-less host cannot create repos. It refuses with `shard-repo-missing` (or
+  `catalog-repo-missing`). On a gh host, run
+  `transcripts.py ensure-repos --host t2-dev --months 2026-11,2026-12 [--parts N]` to create that host's private
+  shards p1..pN for each month and attest them. Pre-create the next month, and higher parts before a shard
+  reaches 1.5 GB.
+
 ### Crash safety (NEG-6, NEG-19)
 
 The order of operations is:
@@ -318,7 +340,9 @@ The sync refuses new work while free disk space is under `min_free_gb`: 12 by de
 - `TRANSCRIPTS_REMOTE_BASE` with `TRANSCRIPTS_ALLOW_LOCAL_REMOTE=1`: shards and the catalog become local bare repos
   under that dir. The repo checks then read `<base>/repo-checks.json` instead of `gh api`. Map a repo name or `*`
   to fact overrides, or to `{"error": ...}`.
-- Only with a local remote: `TRANSCRIPTS_CHUNK_MAX_BYTES`, `TRANSCRIPTS_SHARD_CAP_BYTES`,
+- `TRANSCRIPTS_GIT_URL_STYLE` (see above).
+- Only with a local remote: `TRANSCRIPTS_TEST_NO_GH` (act as a gh-less host; the stub's `unauth_status` stands in
+  for the unauthenticated API read), `TRANSCRIPTS_CHUNK_MAX_BYTES`, `TRANSCRIPTS_SHARD_CAP_BYTES`,
   `TRANSCRIPTS_SEAL_MIN_BYTES`, `TRANSCRIPTS_FILE_DELTA_CAP`, `TRANSCRIPTS_PUSH_TIMEOUT`, `TRANSCRIPTS_CRASH_AT`
   and `TRANSCRIPTS_IGNORE_LOAD`.
 
