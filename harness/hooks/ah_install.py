@@ -37,6 +37,8 @@ CANONICAL_URL = "https://github.com/ericmacdougall/agent-harness.git"
 ALLOW_FILE = False  # tests only: lets the fetch read a local bare repository standing in for the canonical URL
 REMOTE_PREFIX = ""  # tests only: a `HOME=... ` assignment so a real ssh-to-localhost run uses a disposable home
 MAX_FILES = 20
+MANIFEST_MAX = 200  # sanity bound on the installer HOOKS list in manifest mode
+MANIFEST_CAPABILITY = "install_files_manifest"
 MAX_BLOB = 4 * 1024 * 1024
 NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 REF_RE = re.compile(r"[0-9a-f]{40}")
@@ -387,9 +389,11 @@ class Remote:
 
 
 # ----------------------------------------------------------------------------- input and source proof
-def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files, allow_older=False):
+def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files, allow_older=False, manifest=False):
     if host not in HOSTS:
         refuse("--host must be one of %s" % ", ".join(HOSTS))
+    if manifest and (files or resume or rollback):
+        refuse("--manifest installs every file of the installer's HOOKS list at --from-ref: no --file, --resume or --rollback with it")
     if resume and rollback:
         refuse("--resume and --rollback cannot be combined")
     for label, run in (("--resume", resume), ("--rollback", rollback)):
@@ -411,6 +415,8 @@ def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_file
         return
     if not isinstance(ref, str) or not REF_RE.fullmatch(ref):
         refuse("--from-ref must be a full 40-hex lowercase commit sha")
+    if manifest:
+        return
     if not files or len(files) > MAX_FILES:
         refuse("between 1 and %d --file names are required" % MAX_FILES)
     if len(set(files)) != len(files):
@@ -523,7 +529,13 @@ def fetch_source(ref, names, home, allow_older=False):
         if not listed:
             refuse("install.py at that commit has no HOOKS tuple")
         out = {}
+        if names is None:  # manifest mode: every file of the HOOKS list at REF, each still held to the checks below
+            if len(listed) > MANIFEST_MAX or len(set(listed)) != len(listed):
+                refuse("the HOOKS list at that commit is repeated or longer than %d" % MANIFEST_MAX)
+            names = list(listed)
         for name in names:
+            if not NAME_RE.fullmatch(name) or name.startswith(".") or ".." in name:
+                refuse("the HOOKS list at that commit holds a name that is not a bare file name")
             if name not in listed:
                 refuse("%s is not in the installer's HOOKS list at that commit" % name)
             if not allow_older:
@@ -720,9 +732,47 @@ def results_of(home, run):
     return [r.get("result") for r in audit_rows(home) if r.get("run") == run and r.get("event") == "result"]
 
 
-def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None, allow_older=False):
-    check_inputs(host, ref, files, ticket, dry_run, None, None, (), allow_older)
-    return _run(host, ref, list(files), ticket, dry_run, Path(home or Path.home()), session, agent, runner, poster, None, None, "install", allow_older)
+def _ops_module():
+    """ah_ops from this file's own directory, never by sys.path name (a planted ah_ops.py must not be able to answer for the gate)."""
+    import importlib.util  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    path = Path(__file__).resolve().parent / "ah_ops.py"
+    loaded = sys.modules.get("ah_ops")
+    if loaded is not None:
+        if getattr(loaded, "__file__", None) and os.path.realpath(loaded.__file__) == os.path.realpath(path):
+            return loaded
+        raise ImportError("a different ah_ops is already loaded")
+    spec = importlib.util.spec_from_file_location("ah_ops", str(path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["ah_ops"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("ah_ops", None)
+        raise
+    return module
+
+
+def require_manifest_grant(host, ref, home, resume_of=None):
+    """Manifest installs need the signed self-serve grant `install_files_manifest`; no grant means a refusal that names the user
+    step. The one gate for the capability: install_files and resume both pass through here. The grant evidence names the repository, host
+    and ref and a use key (one install of a ref to a host; a resume has its own key), which a single-use scope spends."""
+    try:
+        ops = _ops_module()  # lazy: ah_ops imports this module
+        ops.require_grant(MANIFEST_CAPABILITY, home=home, evidence={
+            "repo": ops.HARNESS_REPO, "host": host, "ref": ref,
+            "use_key": ("manifest-resume:%s" % resume_of) if resume_of else "manifest:%s:%s" % (host, ref)})
+    except Exception as error:  # noqa: BLE001 - an OpsError, an ImportError or anything odd all mean: no grant, nothing changed
+        raise InstallError("no_grant", str(error)[:600] or "no self-serve grant for install_files_manifest", 2)
+
+
+def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None, allow_older=False, manifest=False):
+    check_inputs(host, ref, files, ticket, dry_run, None, None, (), allow_older, manifest)
+    home = Path(home or Path.home())
+    if manifest and not dry_run:
+        require_manifest_grant(host, ref, home)
+    return _run(host, ref, None if manifest else list(files), ticket, dry_run, home, session, agent, runner, poster, None, None, "install", allow_older,
+                manifest=manifest)
 
 
 def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.run, poster=None):
@@ -735,6 +785,8 @@ def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.ru
     if ("installed" in results_of(home, run_id)) or ("rolled_back" in results_of(home, run_id)) or ("restored" in results_of(home, run_id)):
         refuse("run %s already finished" % run_id)
     check_inputs(row["host"], None, None, ticket, False, run_id, None, ())
+    if row.get("manifest"):
+        require_manifest_grant(row["host"], row["ref"], home, resume_of=run_id)
     return _run(row["host"], row["ref"], sorted(row["files"], key=lambda n: n), ticket, False, home, session, agent, runner, poster, run_id,
                 row.get("baseline"), "resume")
 
@@ -750,8 +802,10 @@ def _plan_for(names, sources, state, run):
     return plan
 
 
-def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False):
+def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False, manifest=False):
     sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of))
+    if files is None:
+        files = list(sources)
     remote = Remote(host, runner)
     run = resume_of or new_run_id()
     names = order(files)
@@ -788,7 +842,7 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
     todo = [n for n in applied if not plan[n].get("resumed_already_applied")]
     start = {"event": "start", "kind": kind_, "run": run, "host": host, "url": CANONICAL_URL, "main": main, "ref": ref, "files": plan,
              "baseline": before, "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket,
-             "allow_older": bool(allow_older)}
+             "allow_older": bool(allow_older), "manifest": bool(manifest)}
     try:
         audit(home, start)  # fail closed: nothing is written remotely when this row cannot be written and fsynced
     except OSError:

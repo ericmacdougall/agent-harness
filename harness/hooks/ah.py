@@ -3762,7 +3762,13 @@ def build_parser():
     ip.add_argument("--force-file", dest="force_files", action="append", help="rollback only: restore this file even if a later run changed it")
     ip.add_argument("--allow-older", dest="allow_older", action="store_true",
                     help="install a ref even when a newer merged version of a file exists on main (a downgrade; audited)")
+    ip.add_argument("--manifest", action="store_true",
+                    help="install EVERY file of the installer's HOOKS list at --from-ref (needs the signed self-serve grant "
+                         "install_files_manifest; --dry-run needs none)")
     ip.add_argument("--agent", help="calling agent id for the audit row")
+    op = sub.add_parser("ops", help="journaled recipes: `ops merge`, `ops repair`, `ops central-decisions`, `ops doctor` (see ah_ops.py; "
+                        "each needs a signed self-serve grant, none takes a secret)")
+    op.add_argument("rest", nargs=argparse.REMAINDER, help="the recipe and its own options: `ah ops <recipe> -h`")
     _no_abbrev(p)
     return p
 
@@ -3943,18 +3949,36 @@ def run(args, home: Path) -> dict:
         agent = args.agent or os.environ.get("AH_AGENT_ID", "")
         try:
             ah_install.check_inputs(args.host, args.from_ref, args.files, args.ticket, args.dry_run, args.resume, args.rollback,
-                                    tuple(args.force_files or ()), args.allow_older)
+                                    tuple(args.force_files or ()), args.allow_older, args.manifest)
             if args.rollback:
                 return ah_install.rollback(args.rollback, args.ticket, tuple(args.force_files or ()), home, session, agent)
             if args.resume:
                 return ah_install.resume(args.resume, args.ticket, home, session, agent)
             return ah_install.install_files(args.host, args.from_ref, args.files, args.ticket, args.dry_run, home, session, agent,
-                                            allow_older=args.allow_older)
+                                            allow_older=args.allow_older, manifest=args.manifest)
         except ah_install.InstallError as e:
             if e.data:  # a definite non-success result (rolled_back, unknown, refused after the start row): the full JSON, exit code kept
                 print(json.dumps(e.data, indent=2, default=str))
             raise AhError(e.code, str(e), e.exit_code)
+    if cmd == "ops":
+        if args.rest[:1] == ["doctor"]:  # L7 (ah_parity.py) fills this in; until then it says so and changes nothing
+            return _ops_doctor(args.rest[1:], home)
+        import ah_ops  # noqa: PLC0415
+        try:
+            return ah_ops.run(args.rest, home)
+        except ah_ops.OpsError as e:
+            if e.data:
+                print(json.dumps(e.data, indent=2, default=str))
+            raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
+
+
+def _ops_doctor(rest, home) -> dict:
+    try:
+        import ah_parity  # noqa: PLC0415
+    except ImportError:
+        raise AhError("not_available", "`ah ops doctor` comes with ah_parity.py (self-serve lane L7), which is not installed here; nothing was read or changed", 2)
+    return ah_parity.doctor(rest, home)
 
 
 CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "
@@ -3993,6 +4017,12 @@ def _parse_chat(given):
 
 def main(argv=None) -> int:
     given = list(sys.argv[1:] if argv is None else argv)
+    if given[:1] in (["ops"], ["install-files"]):  # self-serve: take main's one-shot stamp for exactly this command before anything runs
+        try:
+            import ah_ops  # noqa: PLC0415
+            ah_ops.claim_main(given, home_dir())
+        except Exception:  # noqa: BLE001 - no stamp is no proof, which is no grant
+            pass
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
