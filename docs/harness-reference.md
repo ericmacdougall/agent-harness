@@ -104,6 +104,18 @@ These instructions apply to my local Claude Code sessions. Follow repository ins
 - For user interfaces, test keyboard access, focus behavior, semantic labels, text contrast, and error messages against applicable WCAG guidance. Single-character global shortcuts need a way to turn them off or remap them.
 - Every owner proposes applicable documentation changes with evidence: README, architecture/how it works, contributing and standards, ERD, service or deployment maps, API/OpenAPI/MCP docs, and developer or customer docs. Main agent coordinates updates at merge and verifies all factual claims. Update only documents affected by the change; avoid empty boilerplate.
 
+## Agent self-serve
+
+Mechanics live in `docs/operations.md`, "Agent self-serve"; this is the rule set.
+
+- One user-run command (`ah_enable_self_serve.py --apply`, dry run by default, TTY and typed nonce required) installs a signed policy; nothing an agent can run creates, widens or re-enables it. The signing key is a new purpose-bound key, separate from the central-decisions key, and every signed payload carries a `purpose`.
+- The capability list is closed: `same_harness_fallback_review`, `merge_reviewed_pr`, `harness_repair`, `pool_cleanup`, `install_files_manifest`, `central_decisions_agent_steps`. Unknown keys fail closed, a repo file may only narrow a grant, helper subagents never receive one, and only proven main (Claude) or a Codex Desktop root does. Hard rules 1 to 4, accounts, passwords, payments, CAPTCHA and the gated-tier approval have no capability.
+- The policy library fails to no grant on any error. The hooks fail open on a crash, so the library must never turn a crash into a grant.
+- Same-harness fallback review applies only to a settled exact-HEAD PASS with a QUOTA or AUTH receipt for the other harness bound to the same repo, PR, head and packet, a reviewer one rung up in a fresh worktree, no findings, green checks and no denylisted path. The merge carries `SAME_HARNESS_FALLBACK` and the receipt id, and a cross-harness re-review ticket is filed in the same run.
+- Parity: the enabler refuses, and `ah ops doctor` reports, any installed hook that differs from the blob on canonical main, on the Mac and t2-dev, and lists the Codex hooks Codex will skip. An unreachable host is unknown, never clean; there is no local fallback. The doctor never writes `trusted_hash`: the `/hooks` click stays the user's.
+- `ah ops doctor --probe` runs one allow-listed recipe in dry run; a denial is reported as a limitation plus a P0 ticket and is never retried by another route.
+- Rollback: `ah_enable_self_serve.py --undo`, or the kill-switch file `~/.agent-harness/policy/disabled`, which refuses every capability at once.
+
 ## Completion
 
 For fast-path fixes, finish after the direct edit, focused verification, diff self-review, and WAL result. Report the changed file and check. For substantive work, do not tell me it is done until the owner reports, peer review is signed off or explicitly unavailable, relevant tests and click testing pass or limitations are disclosed, the main agent has checked the diff against scope, WAL and docs are current, and verified work is integrated into the original checkout or a concrete local blocker is reported. A draft PR awaiting authorized remote merge is `PR_READY`, not delivered. Report what changed, exact verification, original-checkout HEAD, feature push/PR status, how to run and watch it, and remaining risks. A remote publication failure does not stop local verification or guarded local-only delivery.

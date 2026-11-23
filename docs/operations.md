@@ -1662,6 +1662,92 @@ stalled goal, plus the option to queue the goal on its ticket.
   It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
   successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
 
+## Agent self-serve (signed policy, parity doctor)
+
+Source: the self-serve spec (GoodQA goodqa#16754 and its sibling lane tickets). One user-run command,
+`python3 ~/.agent-harness/bin/ah_enable_self_serve.py --apply`, writes a signed policy that lets main (Claude) or a
+Codex Desktop root run a closed list of recipes without a per-step question. This section is the operator's view. The
+lane that owns each part is named, so a paragraph can be read against the PR that ships it.
+
+### What the policy grants (and what it never does)
+
+The policy file is `~/.agent-harness/policy/self-serve.json` (0600, signed with the purpose-bound key
+`~/.agent-harness/private/self-serve/ed25519.key`; the public half is pinned in
+`~/.agent-harness/policy/self-serve-pubkeys.json`). `harness/hooks/self_serve.py` (lane L1) is the only reader. Any
+failure (absent, expired, revoked, tampered, wrong purpose or key id, unknown capability, kill switch, caller not proven
+main or a Codex root) means no grant and today's behavior, never a crash grant.
+
+| Capability | What it allows |
+|---|---|
+| `same_harness_fallback_review` | A settled exact-HEAD PASS from the same harness as the author, only with a QUOTA or AUTH receipt for the other harness, a reviewer one rung up, no findings, green checks and no denylisted path (lane L2). The merge commit carries `SAME_HARNESS_FALLBACK` and the receipt id. |
+| `merge_reviewed_pr` | `ah ops merge` of one reviewed PR (lane L3). |
+| `harness_repair` | `ah ops repair --check` then `--apply`, journaled and resumable (lane L3). |
+| `pool_cleanup` | `usage_guard.py reap --own-session`: this session's dead reservations only (lane L4). |
+| `install_files_manifest` | `ah install-files` in manifest mode (lane L3). |
+| `central_decisions_agent_steps` | The merge, repair, enable and adapter steps of the central-decisions recipe; it then stops and prints the one command that stays the user's (lane L3). |
+
+Helper subagents never receive a grant. Hard rules 1 to 4, accounts, passwords, payments, CAPTCHA, the gated-tier
+approval, `decision keygen|pin|publish` and `merge_gate.py waive` outside the fallback class have no capability and no
+schema field. The signature and the protected roots stop careless agents, not a malicious local agent; this is stated,
+not oversold.
+
+Kill switch: create `~/.agent-harness/policy/disabled` (any agent may; it fails safe) and every capability refuses at
+once. Only the user brings it back: delete the file, or run `ah_enable_self_serve.py --disable <cap>` or `--undo`.
+
+### `ah ops doctor` and `ah ops verify-parity` (lane L7, `ah_parity.py`)
+
+```
+python3 -I ~/.claude/hooks/ah.py ops doctor [--host mac|t2-dev|all ...] [--ref SHA] [--json] [--strict-trust] [--probe [--file-ticket]]
+python3 -I ~/.claude/hooks/ah.py ops verify-parity [--host ...] [--ref SHA] [--json] [--strict-trust]
+```
+
+Both are read only. `verify-parity` is the terse exit-code form; `doctor` adds `--probe`.
+
+1. **Canonical bytes.** It fetches canonical main (`https://github.com/ericmacdougall/agent-harness.git`) into a fresh
+   temporary repository it owns, blobless, and reads tree entries only. `--ref` accepts a full 40 hex commit that is an
+   ancestor of main and nothing else. A checkout the caller names is never used.
+2. **What is compared.** The git blob sha of every file in `harness/hooks/` that the commit's own `install.py` lists in
+   `HOOKS` is compared with `~/.claude/hooks/`; every name in `install_codex.py` `DELIVERY_HELPERS` with
+   `~/.codex/agent-harness/`. Both lists are parsed with `ast`, never imported or run. A name that is absent, a symlink,
+   not a regular file or different bytes is drift. A host with no Codex install is not drift. Names the installers list
+   but the commit does not ship are reported as not shipped at this commit and ignored.
+3. **Hosts.** The Mac locally. t2-dev through one constant command, `ssh -o BatchMode=yes -o ConnectTimeout=15 t2-dev
+   python3 -I -`, with the module's own source on stdin and the name lists as JSON data; nothing the caller types is part
+   of a shell line. An unreachable host, a failed ssh, or output that is not the expected JSON is `UNKNOWN`: never
+   reported clean and never replaced by a local copy (NEG-12).
+4. **Untrusted Codex hooks (AC-12).** From `~/.codex/hooks.json` and the `[hooks.state."<file>:<event>:<group>:<handler>"]`
+   entries in `~/.codex/config.toml` it lists the hooks Codex will skip: no trust entry (`untrusted`) or a hash that no
+   longer matches (`changed`). The doctor never writes `trusted_hash`; reviewing them with `/hooks` in Codex is the
+   user's click (NEG-11).
+5. **Exit codes.** 0 every host CLEAN; 1 drift (or, with `--strict-trust`, untrusted hooks; or a probe limitation);
+   3 something unknown (no canonical bytes, a host unknown); 2 usage. The enabler calls `ah_parity.verify()` and refuses
+   unless `ok` is true (AC-11).
+6. **`--probe` (AC-14).** Runs `ah.py ops repair --check`, the one allow-listed recipe, in dry run exactly as a fresh
+   agent session would, and checks that `~/.claude/settings.json` holds an exact-prefix allow rule for `ah.py ops *`.
+   The result is `PASS`, or `LIMITATION` with the reason (rule missing, denied, recipe not installed, other exit) and a
+   ready P0 ticket body. A denial is a limitation, never something to retry by re-encoding or another route (hard rule
+   3); `--file-ticket` files the P0 ticket through `ah ticket create`.
+
+A drift report names the installed file. The fix is `repair-harness --apply --ref <canonical SHA>` (the user runs it the
+first time; `ah ops repair` once the policy is in force) or `ah install-files --rollback RUN_ID` for hook files.
+Acceptance AC-13 is `ah ops doctor` showing zero drift on both hosts.
+
+Not covered: block parity of `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` (ops_watch `drift:claude-md` already watches
+the Claude block) and the content of settings.json beyond the allow-rule probe.
+
+### Rollback
+
+User: `ah_enable_self_serve.py --undo` restores the backups, strips the marker blocks and tracked allow rules, removes
+the policy and the key pin on both hosts. The kill switch above is the fast stop. Code: revert the PR on main, then
+`repair-harness --apply --ref <previous SHA>`.
+
+### CI
+
+`.github/workflows/self-serve.yml` runs the self-serve focused tests (`tests/test_ah_parity.py`,
+`tests/test_self_serve*.py`, `tests/test_ah_ops*.py` and `tests/test_enable_agent_ops*.py` when present) on every pull
+request that touches the policy, guards, merge gate, installer or docs. It sits beside `ci.yml`; like it, it is dormant
+while GitHub Actions are off for agent-harness, and the exact-HEAD PR review is the enforced gate.
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
