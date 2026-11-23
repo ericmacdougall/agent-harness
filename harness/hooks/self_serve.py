@@ -98,9 +98,12 @@ class _Deny(Exception):
 def _real_home() -> str:
     """The account's home from the password database. HOME and CLAUDE_CONFIG_DIR are the caller's, so never consulted."""
     try:
-        return pwd.getpwuid(os.getuid()).pw_dir
+        home = pwd.getpwuid(os.getuid()).pw_dir
     except (KeyError, OSError):
-        return os.path.expanduser('~')
+        raise _Deny('home_unknown') from None  # never fall back to $HOME: that is the caller's
+    if not isinstance(home, str) or not os.path.isabs(home):
+        raise _Deny('home_unknown')
+    return home
 
 
 def _root(home=None) -> Path:
@@ -556,6 +559,7 @@ def _check_scope_against_evidence(capability, scope, evidence, policy, home, now
         if not spend:
             raise _Deny('single_use_requires_consume')
         key = _use_key(capability, scope, evidence, policy['policy_id'])
+        _audit_ready(home)  # an unwritable audit log must refuse BEFORE the object is spent, not after
         _spend(home, key)
 
 
@@ -570,6 +574,12 @@ def _spend(home, digest):
 
 
 # ------------------------------------------------------------------ audit
+
+def _audit_ready(home):
+    path = audit_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.close(os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600))
+
 
 def _audit(home, row: dict):
     path = audit_path(home)

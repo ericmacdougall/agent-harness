@@ -94,7 +94,8 @@ class ActorCannotChooseProofRoot(Repair):
         source = (Path(HOOKS) / "self_serve.py").read_text()
         self.assertIsNone(re.search(r"os\.environ|getenv|environb", source))
         self.assertIsNone(re.search(r"actor\s*(\.get\(|\[)\s*['\"](claude_dir|claude_home|home)", source))
-        self.assertLessEqual(source.count("expanduser"), 1, "only the pwd fallback may expand ~")
+        self.assertNotIn("expanduser", source, "~ expands from $HOME, which the caller controls")
+        self.assertNotIn("Path.home", source)
 
 
 # ---------------------------------------------------------------- finding 4: home and clock are not the caller's
@@ -111,6 +112,15 @@ class HomeAndClockAreNotCallerChoices(Repair):
             self.assertIsNotNone(ss.grant("merge_reviewed_pr", actor=self.legit, home=self.home, now=NOW))
             self.assertIsNotNone(ss.grant("merge_reviewed_pr", actor=self.legit, now=NOW))  # clamp aside: seam clock is on
 
+    def test_a_missing_account_entry_denies_and_never_falls_back_to_home(self):
+        with mock.patch.dict(ss._SEAM, {"home": None, "claude_dir": None}), \
+                mock.patch.object(ss.pwd, "getpwuid", side_effect=KeyError("uid")), \
+                mock.patch.dict(os.environ, {"HOME": self.home}):
+            self.assertEqual(ss.explain("merge_reviewed_pr", actor=self.legit, now=NOW)[1], "home_unknown")
+            self.assertEqual(ss.status()["reason"], "home_unknown")
+            self.assertFalse(ss.revoke("all"))
+        self.assertFalse(ss.revoked_dir(self.home).exists())
+
     def test_home_variable_does_not_move_the_policy(self):
         """Process level: HOME and CLAUDE_CONFIG_DIR both point at a throwaway tree holding a valid signed policy and a
         transcript that satisfies is_main there. The library must still read the real account's home and find no grant."""
@@ -125,14 +135,16 @@ class HomeAndClockAreNotCallerChoices(Repair):
         transcript = Path(fake) / ".claude" / "projects" / "p" / (SID + ".jsonl")
         transcript.parent.mkdir(parents=True)
         transcript.write_text("{}\n")
+        account = os.path.realpath(tempfile.mkdtemp(prefix="ss-account-", dir=self.home))  # stands in for the real account
         code = (
-            "import sys; sys.path[:0] = [%r, %r]\n"
+            "import sys, pwd, types; sys.path[:0] = [%r, %r]\n"
+            "pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_dir=%r)\n"
             "import caller_identity, self_serve\n"
             "caller_identity.native_deny_reason = lambda payload: None\n"
             "actor = {'kind': 'claude_main', 'payload': {'session_id': %r, 'transcript_path': %r}}\n"
             "got, why = self_serve.explain('merge_reviewed_pr', actor=actor)\n"
             "print('GRANTED' if got else 'NONE', self_serve.status()['policy_id'], why)\n"
-            % (HOOKS, CRYPTO_DIR, SID, str(transcript)))
+            % (HOOKS, CRYPTO_DIR, account, SID, str(transcript)))
         env = {"HOME": fake, "CLAUDE_CONFIG_DIR": str(Path(fake) / ".claude"), "PATH": os.environ.get("PATH", "")}
         out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -170,8 +182,9 @@ class HomeAndClockAreNotCallerChoices(Repair):
 
     def test_no_seam_value_is_set_by_importing_or_calling(self):
         self.assertEqual(set(ss._SEAM), {"home", "claude_dir", "clock"})
-        code = ("import sys; sys.path.insert(0, %r); import self_serve; self_serve.grant('merge_reviewed_pr', actor={}); "
-                "print(self_serve._SEAM)" % HOOKS)
+        code = ("import sys, pwd, types; pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_dir=%r); "
+                "sys.path.insert(0, %r); import self_serve; self_serve.grant('merge_reviewed_pr', actor={}); "
+                "print(self_serve._SEAM)" % (self.home, HOOKS))
         out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60,
                              env={"HOME": self.home, "PATH": os.environ.get("PATH", "")})
         self.assertEqual(out.stdout.strip(), "{'home': None, 'claude_dir': None, 'clock': False}", out.stderr)
@@ -313,6 +326,13 @@ class SingleUse(Repair):
         self.assertIsNone(self.consume(actor={"kind": "claude_main"}, evidence=dict(PR)))
         self.assertIsNone(self.consume(actor=self.forged_main(), evidence=dict(PR)))
         self.assertIsNotNone(self.consume(evidence=dict(PR)))  # the real merge is not blocked
+
+    def test_an_unwritable_audit_log_refuses_before_the_object_is_spent(self):
+        os.makedirs(ss.audit_path(self.home).parent)
+        os.mkdir(ss.audit_path(self.home))  # unwritable as a log
+        self.assertIsNone(self.consume(evidence=dict(PR)))
+        os.rmdir(ss.audit_path(self.home))
+        self.assertIsNotNone(self.consume(evidence=dict(PR)), "the failed attempt must not have burned the object")
 
     def test_a_failed_precondition_does_not_spend(self):
         self.scoped({"single_use": True, "repos": ["o/r"]})

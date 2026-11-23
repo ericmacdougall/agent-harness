@@ -589,9 +589,11 @@ class AuditAndStatus(Env):
         self.assertEqual(ss.kill_switch_path("/h"), Path("/h/.agent-harness/policy/disabled"))
         self.assertEqual(ss.private_key_path("/h"), Path("/h/.agent-harness/private/self-serve/ed25519.key"))
         self.assertEqual(ss.policy_path(), Path(self.home) / ".agent-harness/policy/self-serve.json")  # the armed test home
-        import pwd
-        with mock.patch.dict(ss._SEAM, {"home": None}):  # production: the account's home, not $HOME
-            self.assertEqual(ss.policy_path(), Path(pwd.getpwuid(os.getuid()).pw_dir) / ".agent-harness/policy/self-serve.json")
+        account = os.path.join(self.home, "account")  # production: the account's home from the password database, not $HOME
+        entry = SimpleNamespace(pw_dir=account)
+        with mock.patch.dict(ss._SEAM, {"home": None}), mock.patch.object(ss.pwd, "getpwuid", return_value=entry), \
+                mock.patch.dict(os.environ, {"HOME": "/elsewhere"}):
+            self.assertEqual(ss.policy_path(), Path(account) / ".agent-harness/policy/self-serve.json")
 
 
 class ImportSafety(unittest.TestCase):
@@ -622,11 +624,17 @@ class ImportSafety(unittest.TestCase):
     def test_the_real_cli_prints_json_and_leaves_a_foreign_home_alone(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.realpath(tmp)
-            out = subprocess.run([sys.executable, "-I", os.path.join(HOOKS, "self_serve.py"), "status"], capture_output=True,
-                                 text=True, cwd=home, env={"HOME": home, "PATH": os.environ.get("PATH", "")}, timeout=60)
+            account = os.path.join(home, "account")  # the child's password-database home: empty, so nothing real is read
+            os.mkdir(account)
+            code = ("import pwd, runpy, sys, types; pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_dir=%r); "
+                    "sys.argv = ['self_serve.py', 'status']; runpy.run_path(%r, run_name='__main__')"
+                    % (account, os.path.join(HOOKS, "self_serve.py")))
+            out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=home,
+                                 env={"HOME": home, "PATH": os.environ.get("PATH", "")}, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertIn("enabled", json.loads(out.stdout))
-            self.assertEqual(os.listdir(home), [])
+            self.assertFalse(json.loads(out.stdout)["enabled"])
+            self.assertEqual(os.listdir(account), [])
+            self.assertEqual(os.listdir(home), ["account"])
 
 
 class SchemaFile(unittest.TestCase):
