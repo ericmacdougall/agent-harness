@@ -1305,6 +1305,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     options = options or {}
     mode = reviewer_mode(options.get('reviewer', 'auto'), options.get('secondary', 'default'))
     options.pop('actual_reviewer', None)  # a reused internal options dict must not reuse a prior reviewer's identity
+    options.pop('primary_attempt', None)
     verdict = verdict_instruction(stage)
     base = options.get('base')
     history = (f"The snapshot holds only the reviewed commit and base {base} (depth 1, no other history); "
@@ -1423,9 +1424,16 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             # Unknown/timeout ownership remains reserved until explicit reconciliation.
             store.release_pool(provider, pool, run_record.run_id, reason=outcome['reason'],
                                account_cooldown=outcome['account_cooldown'], reset_at=outcome['reset_at'])
+        if provider == primary and outcome['result'] == 'NO_RESULT':
+            # Self-serve fallback evidence (spec section 4): what the first-choice reviewer returned and whether it
+            # launched. Only a refusal before any launch is zero; anything else counts as launched.
+            options['primary_attempt'] = {
+                'provider': provider, 'harness': {'codex': 'openai', 'claude': 'claude'}.get(provider, 'unknown'),
+                'result': 'NO_RESULT', 'reason': outcome['reason'],
+                'launches': 0 if launch_state == 'NOT_STARTED' else 1}
         if outcome['result'] != 'NO_RESULT':
-            options['outcome'] = outcome
             options['actual_reviewer'] = provider
+            options['outcome'] = outcome
             options['reviewer_harness'] = {'codex': 'openai', 'claude': 'claude'}.get(provider, 'unknown')
             return source, stage_report(stage, outcome['report']), failure
         if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
@@ -1555,14 +1563,135 @@ def pr_base(repo, base):
     return None
 
 
-def review_merge_eligible(args, binding, report, selection):
-    """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
-    return bool(args.stage == 'pr' and binding and getattr(args, 'main_stamp', None)
+def review_merge_eligible(args, binding, report, selection, fallback=None):
+    """Only a pure PR PASS with a known different-harness reviewer may auto-authorize.
+
+    `fallback` (self-serve spec section 4) is the same-harness fallback receipt block this run built when the other
+    harness returned QUOTA/AUTH. With it, a same-harness pure PASS may TRY to authorize; merge_gate.add_review_waiver
+    still validates the whole block and needs a self_serve grant, so this is only the first filter. Without it the
+    same-harness refusal is unchanged. Everything else (main stamp, binding, pure PASS) is required either way."""
+    pure = bool(args.stage == 'pr' and binding and getattr(args, 'main_stamp', None)
                 and args.author_harness in {'claude', 'openai'}
                 and selection.get('harness') in {'claude', 'openai'}
-                and selection['harness'] != args.author_harness
                 and re.match(r'^VERDICT: PASS(?:\s|$)', report.strip())
                 and finding_ids(report) == ['UNSPECIFIED'] and 'TICKETED:' not in report)
+    if not pure:
+        return False
+    if selection['harness'] != args.author_harness:
+        return True
+    return isinstance(fallback, dict) and fallback.get('schema') == 1
+
+
+FALLBACK_PATH_CAP = 400
+
+
+def fallback_pr_basis(repository, number, head, *, runner=None):
+    """What GitHub says the PR is, for the same-harness fallback: (PR base oid, merge-base of base and head, the PR's
+    file list). The merge-base comes from GitHub's compare endpoint, so it does not depend on which objects the local
+    clone holds. Raises OSError for anything unreadable or inconsistent (the caller records nothing)."""
+    import merge_gate
+    client = merge_gate.Client(runner or merge_gate.SubprocessGh(), time.monotonic() + 45)
+    sha = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+    try:
+        view = client.json(['pr', 'view', str(number), '-R', repository, '--json', 'baseRefOid,headRefOid,state'],
+                           'the reviewed pull request')
+        if (not isinstance(view, dict) or view.get('headRefOid') != head
+                or str(view.get('state') or '').upper() != 'OPEN'
+                or not isinstance(view.get('baseRefOid'), str) or not sha.fullmatch(view['baseRefOid'])):
+            raise OSError('the pull request differs from the reviewed head, is not open or has no base commit')
+        base_oid = view['baseRefOid']
+        compare = client.json(['api', f'repos/{repository}/compare/{base_oid}...{head}?per_page=1', '--jq',
+                               '{sha: .merge_base_commit.sha}'], 'the merge-base')
+        merge_base = compare.get('sha') if isinstance(compare, dict) else None
+        if not isinstance(merge_base, str) or not sha.fullmatch(merge_base):
+            raise OSError('GitHub returned no merge-base for the pull request')
+        return base_oid, merge_base, merge_gate.pr_changed_files(client, repository, number)
+    except merge_gate.GateError as error:
+        raise OSError(str(error)) from None
+
+
+def _fallback_not_recorded(why):
+    print('Same-harness fallback not recorded: ' + why, file=sys.stderr)
+    return None
+
+
+def build_fallback_block(args, binding, options, selection, author_rung, packet_sha256, head, base, repo):
+    """The same-harness fallback receipt block recorded in the FINAL usage, or None when this run is not one.
+
+    It records facts this run observed: the first-choice reviewer's NO_RESULT, the rungs, the isolated snapshot, and
+    the changed paths. The paths are the WHOLE PR (goodqa#16756 review round 1, finding 1): the diff from the PR
+    merge-base that GitHub reports, which must be the snapshot base the reviewer worked from, and it must equal
+    GitHub's own PR file list. A snapshot base that skips an earlier commit, or a list that disagrees with GitHub,
+    records nothing. It carries no secret and no free text, and it never raises: it runs after the provider launch
+    and before the FINAL is written, so a failure here must only mean "no fallback receipt"."""
+    primary = options.get('primary_attempt')
+    actual = options.get('actual_reviewer')
+    if (args.stage != 'pr' or not binding or not isinstance(primary, dict) or actual is None
+            or actual == primary.get('provider')
+            or options.get('reviewer_harness') != args.author_harness or not base or base == head):
+        return None
+    try:
+        pr_base_oid, merge_base, github_files = fallback_pr_basis(binding['repo'], binding['pr'], head)
+        if merge_base != base:
+            return _fallback_not_recorded(
+                'the review snapshot base %s is not the PR merge-base %s, so the reviewer did not see the whole PR; '
+                'rerun the review with --snapshot-base %s' % (base, merge_base, merge_base))
+        raw = git(repo, 'diff', '--name-only', '--no-renames', '-z', merge_base, head)
+        local = {p for p in raw.split('\0') if p}
+        if local != set(github_files):
+            return _fallback_not_recorded('the PR file list on GitHub differs from the local diff against the '
+                                          'merge-base (%d against %d paths)' % (len(github_files), len(local)))
+        paths = sorted(local)
+        if not paths or len(paths) > FALLBACK_PATH_CAP:
+            paths = None
+        return {'schema': 1, 'primary': dict(primary), 'reviewer_actual': actual,
+                'repo': binding['repo'], 'pr': binding['pr'], 'head': head, 'packet_sha256': packet_sha256,
+                'author_rung': author_rung, 'reviewer_rung': selection['rung'],
+                'author_unknown': bool(selection['author_unknown']),
+                # reviewers run from a depth-1 snapshot in a one-shot process (--no-session-persistence / --ephemeral)
+                'isolated_snapshot': True, 'fresh_session': True,
+                'pr_base_oid': pr_base_oid, 'merge_base': merge_base, 'snapshot_base': base,
+                'paths_basis': 'merge-base+github-files',
+                'changed_paths': paths,
+                'changed_paths_sha256': hashlib.sha256('\n'.join(paths or []).encode()).hexdigest()}
+    except Exception as error:  # noqa: BLE001 - never raises; see the docstring
+        return _fallback_not_recorded('%s (%s)' % (type(error).__name__, str(error)[:200]))
+
+
+def fallback_actor_for(stamp, author_harness):
+    """The actor dict self_serve proves, built only from the one-shot stamp main's own hook wrote for this run
+    (merge_gate._stamp_review: session id and main's proven transcript path), never from argv or the environment.
+    None when there is no stamp, no transcript in it, or the author is not Claude: the self-serve fallback capability
+    is Claude-main-only (self_serve.CLAUDE_MAIN_ONLY), so a Codex-authored run gets no actor and no fallback."""
+    if not isinstance(stamp, dict) or author_harness != 'claude':
+        return None
+    session, transcript = stamp.get('session'), stamp.get('transcript')
+    if not isinstance(session, str) or not session or not isinstance(transcript, str) or not transcript:
+        return None
+    return {'kind': 'claude_main', 'payload': {'session_id': session, 'transcript_path': transcript}}
+
+
+def file_followup_ticket(binding, waiver, runner=None):
+    """Spec section 4: the 'cross-harness re-review when quota returns' ticket, filed in the same run. Best effort and
+    never blocking; returns the ticket label or None. `runner` is the test seam."""
+    title = 'Cross-harness re-review when quota returns: %s#%s %s' % (binding['repo'], binding['pr'], waiver['head'][:12])
+    body = ('Merged on a SAME_HARNESS_FALLBACK review (authorization %s, label %s). The other harness reported a '
+            'quota or auth block with zero launches. When it is available again, run a cross-harness peer_review pr '
+            'on the merged head and ticket anything it finds. This does not block the merge.\n'
+            % (waiver['id'], waiver.get('merge_trailer', '')))
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'body.md'
+            path.write_text(body, encoding='utf-8')
+            call = runner or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=60))
+            done = call([sys.executable, str(Path(__file__).resolve().parent / 'ah.py'), 'ticket', 'create',
+                         '--project', 'goodqa', '--title', title, '--body-file', str(path)])
+        if done.returncode != 0:
+            return None
+        found = re.search(r'"ticket":\s*"([^"]{1,80})"', done.stdout or '')
+        return found.group(1) if found else 'filed'
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 FOLLOW_UP_LINE = re.compile(r'^follow-up:[ \t]*(.+)$', re.I | re.M)
@@ -2257,12 +2386,17 @@ def main() -> int:
                 review_metadata['snapshot_base'] = base
         if ticketed_success:
             review_metadata['ticketed'] = [dict(record, report_sha256=report_sha256) for record in ticketed]
+        usage_record = {'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                        'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                        'review_routing': routing_evidence(options)}
+        fallback_block = build_fallback_block(args, binding, options, selection, author_rung, evidence.sha256,
+                                              before[0], base, repo)
+        if fallback_block is not None:
+            usage_record['same_harness_fallback'] = fallback_block
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review=review_metadata,
-            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
-                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
-                   'review_routing': routing_evidence(options)})
+            usage=usage_record)
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):
@@ -2279,7 +2413,7 @@ def main() -> int:
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
         actual_selection = dict(selection, harness=options.get('reviewer_harness', 'unknown'))
-        authorize_review = review_merge_eligible(args, binding, report, actual_selection)
+        authorize_review = review_merge_eligible(args, binding, report, actual_selection, fallback_block)
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         if run_record is not None and not finalized:
             try:
@@ -2308,9 +2442,17 @@ def main() -> int:
             # The PR may have moved or closed while the provider ran; only a
             # still-current exact binding can receive the one-shot waiver.
             verify_pr_binding(binding['repo'], binding['pr'], before[0])
+            same_harness = actual_selection.get('harness') == args.author_harness
+            # NEG-10: the actor is proven by the main stamp this run took; a run without it never reaches here
+            actor = fallback_actor_for(args.main_stamp, args.author_harness) if same_harness else None
             waiver = merge_gate.add_review_waiver(
-                merge_gate.default_state_dir(), reference, store=store)
+                merge_gate.default_state_dir(), reference, store=store, fallback_actor=actor)
             print('Merge authorization: ' + waiver['id'], flush=True)
+            if waiver.get('approval_source') == merge_gate.FALLBACK_SOURCE:
+                print('Merge commit must carry: ' + waiver['merge_trailer'], flush=True)
+                ticket = file_followup_ticket(binding, waiver)
+                print('Follow-up ticket (cross-harness re-review when quota returns): '
+                      + (ticket or 'NOT FILED; file it by hand now, it is a post-merge obligation'), flush=True)
         except (OSError, ValueError, merge_gate.Corrupt, GuardError) as error:
             print('Warning: review passed, but merge authorization could not be created: '
                   + diagnostics.sanitize(error), file=sys.stderr)
