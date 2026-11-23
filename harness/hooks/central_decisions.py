@@ -271,6 +271,15 @@ def families_of(sentence: str):
 
 # ------------------------------------------------------------------ ledger client
 
+def _uuid_operation_id(operation_id):
+    """GoodQA rejects a non-UUID operationId (MCP -32602). A UUID passes through; any other key maps to a uuid5 of
+    it, so a retry of the same decision or revoke line reuses the same id (same convention as ah.operation_id)."""
+    try:
+        return str(uuid.UUID(str(operation_id)))
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, 'central-decisions:' + str(operation_id)))
+
+
 class GoodQALedger:
     """The ledger ticket through the harness's GoodQA adapter (the commit-policy credential of this host)."""
 
@@ -327,7 +336,8 @@ class GoodQALedger:
         return stamp
 
     def post(self, issue_id, body, operation_id):
-        data = self.adapter.call('comment_on_issue', {'issueId': issue_id, 'body': body, 'operationId': operation_id})
+        data = self.adapter.call('comment_on_issue', {'issueId': issue_id, 'body': body,
+                                                      'operationId': _uuid_operation_id(operation_id)})
         if not isinstance(data, dict) or '__error__' in data:
             raise Denied('ledger_write_failed', 'the ledger refused the comment')
         return data
@@ -996,7 +1006,11 @@ def main(argv=None):
             raw = public_raw(_private_key(Store(), ed25519, serialization), serialization)
             value = {'key_id': key_id_of(raw), 'public_key': b64url(raw)}
         elif args.action == 'pin':
-            data = strict_json(args.pubkey_file.read_bytes()[:4096])  # input-ok: a public key record, bounded
+            if str(args.pubkey_file) == '-':  # stdin, for `ssh host ... --pubkey-file - < file` (/dev/stdin is refused on Linux)
+                raw_key = sys.stdin.buffer.read(4096)
+            else:
+                raw_key = args.pubkey_file.read_bytes()[:4096]  # input-ok: a public key record, bounded
+            data = strict_json(raw_key)
             if not isinstance(data, dict) or not isinstance(data.get('public_key'), str):
                 raise Denied('bad_request', 'the pubkey file must hold {"public_key": ...}')
             value = pin(data['public_key'])
