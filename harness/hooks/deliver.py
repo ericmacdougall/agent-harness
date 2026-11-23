@@ -1254,6 +1254,9 @@ def transcripts_receipt(now=None):
     now = time.time() if now is None else now
     result = {"status": None, "last_ok_at": None, "refuse": None, "warnings": [], "sync_failed": False}
     script = transcripts_tool()
+    if os.environ.get("TRANSCRIPTS_BIN"):
+        print("deliver: transcripts: TRANSCRIPTS_BIN is set; the receipt comes from " + str(script)[:200],
+              file=sys.stderr)
     if not script.is_file():
         result["refuse"] = "transcripts.py is not installed beside deliver.py, so no archive receipt can exist"
         return result
@@ -1305,6 +1308,26 @@ def _transcripts_alert(task, message, detail):
         return False
 
 
+def _transcripts_waiver_count(record):
+    """Append the waiver to the archive's waivers.jsonl (TRANSCRIPTS_HOME, else ~/.agent-harness/transcripts), which
+    `ah transcripts status` counts. Private files, no symlink followed. Returns False when it failed."""
+    try:
+        home = Path(os.path.expanduser(os.environ.get("TRANSCRIPTS_HOME") or "~/.agent-harness/transcripts"))
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if home.is_symlink():
+            return False
+        line = (json.dumps({"at": record["at"], "wal_row": record["id"], **record["transcripts_waiver"]},
+                           sort_keys=True) + "\n").encode()
+        fd = os.open(home / "waivers.jsonl", os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def transcripts_gate(args):
     """The PR checkpoint: warn when the receipt is stale, held or capped; refuse without an ok receipt under 24 h,
     unless an audited --transcripts-waiver is given (WAL decision row, which must be written, plus an ops alert)."""
@@ -1343,6 +1366,9 @@ def transcripts_gate(args):
     except (OSError, ValueError):
         raise DeliveryError("BLOCKED_POLICY", "--transcripts-waiver could not be recorded in the WAL; nothing was done",
                             code=2, hint="pass --wal <your session WAL under ~/.claude/wals>", **facts) from None
+    if not _transcripts_waiver_count(record):
+        print("deliver: transcripts: the waiver could not be added to the archive's waivers.jsonl, so "
+              "`ah transcripts status` will not count it; the WAL row " + record["id"] + " is the record", file=sys.stderr)
     if not _transcripts_alert(task, f"transcript receipt waived for deliver prepare (task {task}): {verdict['refuse']}",
                               {"task": task, "status": verdict["status"], "wal_row": record["id"]}):
         print("deliver: transcripts: the waiver alert could not be raised in the ops ring; the WAL row "

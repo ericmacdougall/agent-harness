@@ -2012,8 +2012,8 @@ def check_wal_size(cfg, state, runner, now):
         digest = hashlib.sha256(path.encode("utf-8", "replace")).hexdigest()[:12]
         out.append(alert("wal_size", f"wal:size:{digest}", "high",
                          f"WAL {root.name}/{rel} is {size / 1024 / 1024:.0f} MiB (over {limit // 1024 // 1024} MiB); "
-                         "it is copied to the transcript archive in chunks, but readers slow down: rotate or split it "
-                         "(never delete it)", {"path": path, "bytes": size}))
+                         "early warning before WAL rotation (goodqa#16650 phase 2): report it to main; never edit, "
+                         "split or delete a WAL", {"path": path, "bytes": size}))
     return out
 
 
