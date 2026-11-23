@@ -293,12 +293,37 @@ def ring_state(events: list, src: str, hostname: str) -> dict:
     return latest
 
 
-def wal_problem(path: str, limit: int):
-    """Why `ah owners` must not be given this WAL: not a regular file (a symlink could be /dev/zero), or too big."""
-    st = os.lstat(path)
-    if not stat.S_ISREG(st.st_mode):
-        return "not a regular file"
-    return f"{st.st_size} bytes" if st.st_size > limit else None
+def wal_problem(path: str, limit: int, chain=None):
+    """Why `ah owners` must not be given this WAL: a chain problem (a symlink or FIFO in a segment's place, a gap, an
+    unreadable or ambiguous segment), or too big (the whole chain). `chain` is the wal_segments.Chain the caller already
+    listed with list_wals (one directory scan per session, not one per WAL); without it the chain is listed here."""
+    import wal_segments as ws  # noqa: PLC0415
+    directory, name = os.path.split(path)
+    stem, _seq = ws.parse_name(name)
+    if chain is None and stem:
+        chain = ws.chain(directory, stem)
+    if chain is None or not (chain.segments or chain.live or chain.problems):
+        raise FileNotFoundError(path)  # no such WAL: the caller's OSError path ("unreadable"), as before
+    hard = [p for p in chain.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+    if hard:  # never read around it
+        first = hard[0]
+        return "not a regular file" if first["code"] == "not_regular" else f"WAL chain {first['code']}: {first['message']}"[:160]
+    size = sum(seg.size for seg in chain.segments) + (chain.live.size if chain.live else 0)
+    return f"{size} bytes" if size > limit else None
+
+
+def wal_mtime(directory, stem: str, chain=None) -> float:
+    """Newest mtime over the live file and every closed segment of a WAL chain (lstat, never following a link).
+    Raises FileNotFoundError when the directory holds no such WAL, so a caller's `except OSError` still works."""
+    import wal_segments as ws  # noqa: PLC0415
+    directory = str(directory)
+    chain = chain if chain is not None else ws.chain(directory, stem)
+    names = [s.name for s in chain.segments]
+    if chain.live is not None or os.path.lexists(os.path.join(directory, stem + ".jsonl")):
+        names.append(stem + ".jsonl")  # a symlinked live file still counts as present (wal_problem names it)
+    if not names:
+        raise FileNotFoundError(os.path.join(directory, stem + ".jsonl"))
+    return max(os.lstat(os.path.join(directory, n)).st_mtime for n in names)
 
 
 def scan_sessions(policy: dict, ts: float) -> tuple:
@@ -315,18 +340,20 @@ def scan_sessions(policy: dict, ts: float) -> tuple:
     for d in entries:
         if not SESSION_RE.match(d.name) or not d.is_dir(follow_symlinks=False):
             continue
-        main = os.path.join(d.path, "main.jsonl")
+        import wal_segments as ws  # noqa: PLC0415
         try:
-            st = os.lstat(main)
+            chains = ws.list_wals(d.path)  # ONE directory scan per session; segments are folded into their stem
+            main_mtime = wal_mtime(d.path, "main", chains.get("main") or ws.chain(d.path, "main"))
         except OSError:
             continue
-        if ts - st.st_mtime > look:
+        if ts - main_mtime > look:
             continue
         problem = None
         try:
-            names = ["main.jsonl"] + sorted(n for n in os.listdir(d.path) if n.startswith("agent-") and n.endswith(".jsonl"))
+            # a closed segment (agent-x.0001.jsonl) is part of its WAL's chain, never an agent WAL of its own
+            names = ["main.jsonl"] + sorted(f"{stem}.jsonl" for stem in chains if stem.startswith("agent-"))
             for name in names:
-                why = wal_problem(os.path.join(d.path, name), limit)
+                why = wal_problem(os.path.join(d.path, name), limit, chains.get(name[:-len(".jsonl")]))
                 if why:
                     problem = f"{name}: {why}"
                     break
@@ -377,16 +404,20 @@ def v1_asks(policy: dict) -> list:
     return out
 
 
-def wal_asks(policy: dict, sessions: list) -> list:
-    """`ask` entries in main WALs that no `ask_resolved` names: things agents are waiting on the user for."""
+def wal_asks(policy: dict, sessions: list, problems=None) -> list:
+    """`ask` entries in main WALs that no `ask_resolved` names: things agents are waiting on the user for. Reads the
+    newest wal_asks_max_bytes of each main WAL's whole segment chain; a gap or unreadable segment is appended to
+    `problems` as "<session8>: <code>" (the window itself being shorter than the chain is the policy, not a problem)."""
     out = []
     cap = policy.get("wal_asks_max_bytes", 8 << 20)
     for s in sessions:
         p = home() / ".claude" / "wals" / s / "main.jsonl"
         try:
-            lines, stats = peek.read_tail_lines(str(p), cap, 1 << 20)
+            lines, stats = peek.read_wal_tail_lines(str(p), cap, 1 << 20)
         except OSError:
             continue
+        if problems is not None:
+            problems.extend(f"{s[:8]}: {q['code']}" for q in stats.get("problems", []) if q.get("code") != "truncated")
         asks, resolved = {}, set()
         for ev in peek.parse_lines(lines, stats):
             if ev.get("event") == "ask" and isinstance(ev.get("id"), str):
@@ -517,7 +548,7 @@ def current_sessions(sessions: list, policy: dict, ts: float) -> set:
     out = set()
     for s in sessions:
         try:
-            if ts - os.lstat(home() / ".claude" / "wals" / s / "main.jsonl").st_mtime <= window:
+            if ts - wal_mtime(home() / ".claude" / "wals" / s, "main") <= window:
                 out.add(s[:8])
         except OSError:
             continue
@@ -718,7 +749,10 @@ class Daemon:
         succ = step("successors", lambda: self.request_successors(docs, ts, deadline)) or []
         summary["successors"] = succ
         asks = step("asks", lambda: v1_asks(self.policy)) or []
-        pending = step("wal_asks", lambda: wal_asks(self.policy, sessions)) or []
+        ask_chain_problems = []
+        pending = step("wal_asks", lambda: wal_asks(self.policy, sessions, ask_chain_problems)) or []
+        if ask_chain_problems:  # a gap hid part of a main WAL: the ask view is partial, so it is reported and held below
+            summary.setdefault("errors", []).append("wal_asks: WAL chain problem " + ", ".join(ask_chain_problems[:3]))
         events = read_ring()
         desired = {}
         desired.update(liveness_alerts(docs, self.policy))
@@ -742,7 +776,7 @@ class Daemon:
         bad = set(summary["skipped"]) | {e.split(":", 1)[0] for e in summary.get("errors", [])}
         if bad & {"sessions", "owners"}:
             hold |= {k for k in ring if k.startswith("liveness:") and k not in desired}
-        if "asks" in bad or any("error" in a for a in asks):
+        if "asks" in bad or "wal_asks" in bad or any("error" in a for a in asks):
             # the digest is built from partial data then: hold it too, never lower or rewrite it on missing data
             hold |= {k for k in ring if k.startswith("ask:") and (k not in desired or k == "ask:digest")}
         plan = plan_transitions(desired, ring, frozenset(hold), now=ts)
@@ -824,7 +858,7 @@ class Daemon:
         waits, fresh, done = [], [], []
         for session, doc in docs.items():
             try:
-                idle = ts - os.stat(home() / ".claude" / "wals" / session / "main.jsonl").st_mtime
+                idle = ts - wal_mtime(home() / ".claude" / "wals" / session, "main")
             except OSError:
                 continue
             if idle < limit:

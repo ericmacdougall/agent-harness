@@ -125,11 +125,13 @@ def index_wals(home: Path, wanted: dict, tag_session: str, goal_ids, as_of=None,
     the same timeout (review H2: the rows past the cap are the newest, the likeliest regression FAILs). Returns
     {"rows": {(session, wal, id): record}, "tags": {goal: [(wal, record)]}, "timeout": bool, "tag_partial": bool,
     "capped": [wal names cut at the size cap], "capped_unresolved": [wal names cut with attached ids unresolved]}."""
+    import wal_segments as ws  # noqa: PLC0415
     budget_s = EVIDENCE_BUDGET_S if budget_s is None else budget_s
     started = time.monotonic()
     deadline = started + budget_s
     tags = {g: [] for g in goal_ids}
-    out = {"rows": {}, "tags": tags, "timeout": False, "tag_partial": False, "capped": [], "capped_unresolved": []}
+    out = {"rows": {}, "tags": tags, "timeout": False, "tag_partial": False, "capped": [], "capped_unresolved": [],
+           "chain_problems": [], "chain_unresolved": []}
     plan = {}  # path -> {"session", "ids", "tags"}
     for (session, wal), ids in wanted.items():
         folder = mc.claude_dir() / "wals" / str(session)
@@ -138,13 +140,14 @@ def index_wals(home: Path, wanted: dict, tag_session: str, goal_ids, as_of=None,
         if folder.is_symlink() or not folder.is_dir():
             continue
         path = folder / wal
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink() or not ws.exists(str(path)):  # a crashed rotation (live missing) still has the WAL
             continue
         plan.setdefault(str(path), {"path": path, "session": session, "ids": set(), "tags": False})["ids"] |= set(ids)
     if goal_ids and mc.SESSION_RE.match(tag_session or ""):
         folder = mc.claude_dir() / "wals" / tag_session
         if folder.is_dir() and not folder.is_symlink():
-            for path in folder.glob("*.jsonl"):
+            for stem in sorted(ws.list_wals(folder)):  # one entry per logical WAL: segments are folded into their stem
+                path = folder / f"{stem}.jsonl"
                 if path.is_symlink() or not mc.WAL_NAME_RE.match(path.name):
                     continue
                 plan.setdefault(str(path), {"path": path, "session": tag_session, "ids": set(), "tags": False})
@@ -174,61 +177,56 @@ def index_wals(home: Path, wanted: dict, tag_session: str, goal_ids, as_of=None,
 
 
 def _scan_file(entry: dict, out: dict, as_of, deadline: float) -> str:
-    """Read one WAL file once, line by line (bounded line and file size): 'done', 'timeout' or 'capped'."""
+    """Read one WAL once over its whole segment chain, line by line (bounded line and logical size): 'done', 'timeout'
+    or 'capped'. A chain problem (a gap, a non-regular or unreadable segment) is recorded in out["chain_problems"], and
+    in out["chain_unresolved"] when attached ids stay unresolved: a row may sit in what was not read."""
+    import wal_segments as ws  # noqa: PLC0415
     ids = set(entry["ids"])
     wanted = re.compile(b"|".join(re.escape(i.encode()) for i in sorted(ids))) if ids else None
     want_tags = entry["tags"]
     tags = out["tags"]
+    probs = []
+    status = "done"
     try:
-        fd = safe_input.open_regular_file(entry["path"])
-    except (OSError, safe_input.InputRejected):
-        return "done"  # unreadable: its attached ids read MISSING, as before
-    total = 0
-    try:
-        with os.fdopen(fd, "rb", closefd=False) as handle:
-            number = 0
-            while True:
-                line = handle.readline(WAL_LINE_BYTES + 1)
-                if not line:
-                    return "done"
-                number += 1
-                total += len(line)
-                if total > WAL_SCAN_BYTES:
-                    return "capped"
-                if number % 512 == 0 and time.monotonic() > deadline:
-                    return "timeout"
-                if len(line) > WAL_LINE_BYTES and not line.endswith(b"\n"):
-                    while True:  # drain an over-long line in bounded pieces; it is never evidence
-                        rest = handle.readline(WAL_LINE_BYTES)
-                        total += len(rest)
-                        if not rest or rest.endswith(b"\n") or total > WAL_SCAN_BYTES:
-                            break
-                    continue
-                hit_id = wanted is not None and wanted.search(line) is not None
-                tag = TAG_RE.search(line) if want_tags and b'"goal"' in line else None
-                if not hit_id and not (tag and tag.group(1).decode() in tags):
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                wid = rec.get("id")
-                if hit_id and wid in ids:
-                    key = (entry["session"], entry["path"].name, wid)
-                    out["rows"].setdefault(key, rec)  # the first row with the id, as find_wal_row returns
-                    ids.discard(wid)
-                    wanted = re.compile(b"|".join(re.escape(i.encode()) for i in sorted(ids))) if ids else None
-                if tag and rec.get("goal") == tag.group(1).decode() and rec["goal"] in tags and verdict(rec):
-                    if as_of is None or mc.parse_ts(rec.get("at")) <= as_of:
-                        tags[rec["goal"]].append((entry["path"].name, rec))
-                if not ids and not want_tags:
-                    return "done"
-    except OSError:
-        return "done"
-    finally:
-        os.close(fd)
+        number = 0
+        for _seg, _n, line in ws.iter_lines(entry["path"], max_total_bytes=WAL_SCAN_BYTES, problems=probs):
+            number += 1
+            if number % 512 == 0 and time.monotonic() > deadline:
+                status = "timeout"
+                break
+            if line is None or len(line) > WAL_LINE_BYTES:
+                continue  # an over-long line is never evidence
+            hit_id = wanted is not None and wanted.search(line) is not None
+            tag = TAG_RE.search(line) if want_tags and b'"goal"' in line else None
+            if not hit_id and not (tag and tag.group(1).decode() in tags):
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            wid = rec.get("id")
+            if hit_id and wid in ids:
+                key = (entry["session"], entry["path"].name, wid)
+                out["rows"].setdefault(key, rec)  # the first row with the id, as find_wal_row returns
+                ids.discard(wid)
+                wanted = re.compile(b"|".join(re.escape(i.encode()) for i in sorted(ids))) if ids else None
+            if tag and rec.get("goal") == tag.group(1).decode() and rec["goal"] in tags and verdict(rec):
+                if as_of is None or mc.parse_ts(rec.get("at")) <= as_of:
+                    tags[rec["goal"]].append((entry["path"].name, rec))
+            if not ids and not want_tags:
+                break
+    except (OSError, safe_input.InputRejected, ws.SegmentProblem):
+        probs.append({"code": "unreadable", "message": entry["path"].name})
+    if any(p["code"] == "truncated" for p in probs) and status == "done":
+        status = "capped"
+    hard = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info", "truncated")]
+    if hard:
+        out["chain_problems"].extend(f"{entry['path'].name}: {p['code']}" for p in hard)
+        if ids:  # attached rows are still unresolved: they may be in the part that was not read
+            out["chain_unresolved"].append(entry["path"].name)
+    return status
 
 
 def _goal_patterns(goal: dict) -> list:
@@ -260,17 +258,25 @@ def candidates(home: Path, session=None, per_goal: int = 8, budget_s: float = TA
     if not mc.SESSION_RE.match(session) or not folder.is_dir() or folder.is_symlink():
         return {"state": "ok", "session": session, "goals": found, "partial": False}
     started = time.monotonic()
-    for path in sorted(folder.glob("*.jsonl"), key=lambda q: (q.name != "main.jsonl", -_mtime(q), q.name)):
+    import wal_segments as ws  # noqa: PLC0415
+    paths = [folder / f"{stem}.jsonl" for stem in ws.list_wals(folder)]  # logical WALs: segments folded into their stem
+    for path in sorted(paths, key=lambda q: (q.name != "main.jsonl", -_mtime(q), q.name)):
         if time.monotonic() - started > budget_s:
             partial = True
             break
         if path.is_symlink() or not mc.WAL_NAME_RE.match(path.name):
             continue
+        probs = []
         try:
-            raw_all = safe_input.read_bounded(path, TAG_SCAN_BYTES)
-        except (OSError, safe_input.InputRejected):
+            raw_all = ws.read_logical(path, max_bytes=TAG_SCAN_BYTES, problems=probs)
+        except (OSError, safe_input.InputRejected, ws.SegmentProblem):
             partial = True
             continue
+        if [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]:
+            partial = True  # a gap, a non-regular segment or the size budget: the scan is PARTIAL, and says so
+        if any(p["code"] == "truncated" for p in probs):
+            # over budget: keep the NEWEST bytes of the chain (the likeliest candidates), never the oldest
+            raw_all = ws.read_tail(str(path), TAG_SCAN_BYTES)
         for raw in raw_all.splitlines():
             if b"REALLY_TESTED" not in raw and b"DEPLOY" not in raw.upper() and b"INSTALLED" not in raw \
                     and b"RELEASED" not in raw:
@@ -445,6 +451,12 @@ def goals_report(home: Path, now=None, as_of=None, session=None, owner_rows=None
         return dict(base, state="timeout", error="the WAL read for attached evidence ran out of time "
                                                  f"({EVIDENCE_BUDGET_S if budget_s is None else budget_s:g} s); "
                                                  "run `ah goals` again or check the WAL sizes")
+    if index["chain_problems"]:
+        # a gap or a non-regular segment: rows in the part not read show MISSING and score by their pin (never as
+        # absent evidence), and the scan is said to be partial
+        base["warnings"].append("WAL chain problem, scan was partial: " + ", ".join(sorted(set(index["chain_problems"])))[:200]
+                                + ("; attached rows in " + ", ".join(sorted(set(index["chain_unresolved"])))[:120]
+                                   + " are unresolved and read MISSING" if index["chain_unresolved"] else ""))
     if index["tag_partial"]:
         base["warnings"].append("tag scan was partial (time or size bound); attached evidence is complete")
     if index["capped"]:

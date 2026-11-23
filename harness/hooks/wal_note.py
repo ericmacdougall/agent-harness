@@ -80,11 +80,42 @@ def provenance_check(event, source, allow_mc=False):
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
 
 
-def ask_entry(path, ref: str):
-    """The last `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
+TAIL_WINDOW = 4 << 20
+# chain problem codes that never make a read incomplete (wal_segments.Chain.complete uses the same list)
+INFO_CODES = ('live_missing', 'schema_newer', 'marker_info')
+
+
+def hard_problems(problems):
+    return [p for p in problems if p.get('code') not in INFO_CODES]
+
+
+def _report(problems, sink):
+    """Chain problems are never silent: they go to the caller's list, or to stderr when the caller gave none."""
+    bad = hard_problems(problems)
+    if sink is not None:
+        sink.extend(bad)
+    else:
+        for p in bad:
+            print(f"wal_note: WAL chain problem ({p.get('code')}): {str(p.get('message'))[:200]}", file=sys.stderr)
+
+
+def _chain_tail(path, window=TAIL_WINDOW):
+    """(bytes, problems): the newest `window` bytes of the whole segment chain of `path`. A search that did not reach
+    the start of a chain longer than the window adds a `truncated` problem, so "not found" is never a silent claim."""
+    import wal_segments as ws  # noqa: PLC0415
+    with ws.open_chain(path) as snap:  # one directory scan: the snapshot lists the chain once
+        data = snap.read_tail(window)
+        total = sum(seg.size for seg in snap.chain.segments) + (snap.chain.live.size if snap.chain.live else 0)
+        probs = list(snap.problems)
+    if total > window:  # the window did not reach the start of a longer chain: older rows were not searched
+        probs.append({'code': 'truncated', 'message': f'only the newest {window} of {total} bytes were searched', 'seq': None})
+    return data, probs
+
+
+def ask_entry(path, ref: str, problems=None):
+    """The last `ask` entry with id `ref` in this WAL's segment chain (bounded newest-first tail read), or None."""
     try:
-        import safe_input  # noqa: PLC0415
-        tail = safe_input.read_tail(path, 4 << 20)
+        tail, probs = _chain_tail(path)
     except Exception:  # noqa: BLE001
         return None
     found = None
@@ -97,14 +128,18 @@ def ask_entry(path, ref: str):
             continue
         if isinstance(rec, dict) and rec.get('event') == 'ask' and rec.get('id') == ref:
             found = rec
+    if found is None:
+        _report(probs, problems)
+    else:
+        _report([p for p in probs if p.get('code') != 'truncated'], problems)
     return found
 
 
-def open_ask_exists(path, ref: str) -> bool:
-    """True when `ref` is an `ask` entry of this WAL with no later `ask_resolved` naming it (bounded tail read)."""
+def open_ask_exists(path, ref: str, problems=None) -> bool:
+    """True when `ref` is an `ask` entry of this WAL (its whole segment chain, newest 4 MiB) with no later
+    `ask_resolved` naming it. Chain problems (a gap, an unreadable segment) are reported, never skipped silently."""
     try:
-        import safe_input  # noqa: PLC0415
-        tail = safe_input.read_tail(path, 4 << 20)
+        tail, probs = _chain_tail(path)
     except Exception:  # noqa: BLE001 - a WAL that cannot be read cannot hold an open ask
         return False
     seen, resolved = False, False
@@ -119,36 +154,56 @@ def open_ask_exists(path, ref: str) -> bool:
             seen, resolved = True, False
         elif rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
             resolved = True
+    _report(probs if not seen else [p for p in probs if p.get('code') != 'truncated'], problems)
     return seen and not resolved
 
 
-def sibling_ask_wal(path, ref: str):
+def _session_wals(folder):
+    """main and every owner WAL of a session folder, as live paths, from the segment chains (a closed segment is never
+    its own WAL); a symlinked or redirected WAL is skipped (red-team F4: it could point into another session)."""
+    import wal_segments as ws  # noqa: PLC0415
+    real_folder = os.path.realpath(folder)
+    out = []
+    for stem in sorted(ws.list_wals(folder)):
+        if stem != 'main' and not stem.startswith('agent-'):
+            continue
+        live = folder / (stem + '.jsonl')
+        if live.is_symlink() or (os.path.lexists(live) and os.path.dirname(os.path.realpath(live)) != real_folder):
+            continue
+        out.append(live)
+    return out
+
+
+def sibling_ask_wal(path, ref: str, problems=None):
     """goodqa#15319: the stem of the one other WAL of this session (an owner's agent-*.jsonl) that holds `ref` as an ask
     nobody has resolved, in any WAL of the session; else None. Main may then resolve an owner's ask by citing the answer."""
     folder = path.parent
     if path.name != 'main.jsonl':  # red-team F1: only main resolves an owner's ask, never an owner another WAL's ask
         return None
-    real_folder = os.path.realpath(folder)
-    wals = [w for w in sorted(folder.glob('*.jsonl'))
-            if w.name == 'main.jsonl' or w.name.startswith('agent-')]
-    # red-team F4: a symlinked WAL could point into another session
-    wals = [w for w in wals if not w.is_symlink() and os.path.dirname(os.path.realpath(w)) == real_folder]
-    holders = [w for w in wals if w != path and w.name.startswith('agent-') and open_ask_exists(w, ref)]
+    wals = _session_wals(folder)
+    holders = [w for w in wals if w != path and w.name.startswith('agent-') and open_ask_exists(w, ref, problems)]
     if len(holders) != 1:
         return None
     needle = ref.encode()
     for other in wals:  # a resolution anywhere in the session closes it (provenance ledger rule)
         try:
+            import wal_segments as ws  # noqa: PLC0415
             import provenance  # noqa: PLC0415
-            # red-team F2 and M2: the whole file (not a 4 MiB tail), through the bounded reader that opens regular files
-            # only (a FIFO cannot hang it), caps the size and the scan time, and reports an oversized line as None
-            for raw in provenance._lines_containing(other, needle):
+            # red-team F2 and M2: the whole chain (not a 4 MiB tail), through the segment reader (regular files only, a
+            # FIFO cannot hang it), capped in size and reporting an oversized line as None
+            cap = getattr(provenance, 'MAX_SCAN_BYTES', 256 << 20)
+            probs = []
+            for _seg, _n, raw in ws.iter_lines(other, max_total_bytes=cap, problems=probs):
                 if raw is None:
                     return None  # a line too long to read could hold the resolution: do not guess that it is open
-                if b'"ask_resolved"' in raw:
+                if needle in raw and b'"ask_resolved"' in raw:
                     rec = json.loads(raw)
                     if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
                         return None
+            if hard_problems(probs):
+                # a gap, an unreadable segment or the size cap: the resolution may be in what was not read
+                _report(probs, problems)
+                return None
         except Exception:  # noqa: BLE001 - unreadable, too large or not a regular file: do not guess that it is open
             return None
     return holders[0].stem
@@ -235,13 +290,20 @@ def main():
             parser.error('ask_resolved needs --ref <ask id>')
         # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
         ask_wal = None
-        if not open_ask_exists(path, args.ref):
-            ask_wal = sibling_ask_wal(path, args.ref)
-        if not open_ask_exists(path, args.ref) and ask_wal is None:
+        chain_problems = []
+        here_open = open_ask_exists(path, args.ref, chain_problems)
+        if not here_open:
+            ask_wal = sibling_ask_wal(path, args.ref, chain_problems)
+        if not here_open and ask_wal is None:
+            hint = 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'
+            if chain_problems:  # a gap or a search window that did not reach the ask: say so, never claim "none"
+                hint += '; the WAL chain had problems: ' + '; '.join(
+                    f"{p.get('code')} {str(p.get('message'))[:80]}" for p in chain_problems[:3])
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
-                              'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
-                  file=sys.stderr)
+                              'hint': hint}), file=sys.stderr)
             return 2
+        for p in chain_problems:  # the ask was found, but the chain it sits in has a problem: warn, do not hide it
+            print(f"wal_note: WAL chain problem ({p.get('code')}): {str(p.get('message'))[:200]}", file=sys.stderr)
         if not args.source or not args.source.strip():
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved needs --source',
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),

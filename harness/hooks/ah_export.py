@@ -179,33 +179,61 @@ def _agent_of(name: str) -> str:
 
 
 def _read(ah, sd: Path):
-    """[(agent, record)], unread, skipped. One read per WAL; never follows a link."""
-    import safe_input  # noqa: PLC0415
+    """[(agent, record)], unread, skipped. One read per WAL, over its whole segment chain (a closed segment is part of
+    its WAL, never a source of its own); never follows a link. A WAL whose chain has a problem (gap, non-regular or
+    unreadable segment) is listed as unread with the reason, never read around: the export is partial and says so.
+    WAL_LIMIT bounds each file of a chain; TOTAL_LIMIT and MAX_FILES bound the session as before."""
+    import wal_segments as ws  # noqa: PLC0415
     rows, unread, skipped, agents, total, files = [], [], 0, [], 0, 0
-    for entry in sorted(os.scandir(sd), key=lambda e: e.name):
-        if not entry.name.endswith(".jsonl"):
-            continue
-        agent = _agent_of(entry.name)
-        try:
-            info = os.lstat(entry.path)
-        except OSError as error:
-            unread.append({"wal": entry.name, "agent": agent, "reason": type(error).__name__})
-            continue
-        reason = ("symlink" if stat.S_ISLNK(info.st_mode) else "not a regular file" if not stat.S_ISREG(info.st_mode)
-                  else "over %d bytes" % WAL_LIMIT if info.st_size > WAL_LIMIT
-                  else "over the %d-byte session total" % TOTAL_LIMIT if total + info.st_size > TOTAL_LIMIT
-                  else "over the %d-file limit" % MAX_FILES if files >= MAX_FILES else None)
+    chains = ws.list_wals(sd)
+    for stem in sorted(chains, key=lambda s: s + ".jsonl"):
+        name = stem + ".jsonl"
+        chain = chains[stem]
+        agent = _agent_of(name)
+        members = list(chain.segments) + ([chain.live] if chain.live else [])
+        size = sum(seg.size for seg in members)
+        hard = [p for p in chain.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+        reason = None
+        if hard:
+            first = hard[0]
+            if first["code"] == "not_regular":
+                try:
+                    reason = "symlink" if stat.S_ISLNK(os.lstat(os.path.join(sd, name)).st_mode) else "not a regular file"
+                except OSError:
+                    reason = "not a regular file"
+            else:
+                reason = "WAL chain %s: %s" % (first["code"], str(first.get("message"))[:100])
+        elif not members:
+            reason = "FileNotFoundError"
+        elif any(seg.size > WAL_LIMIT for seg in members):
+            reason = "over %d bytes" % WAL_LIMIT
+        elif total + size > TOTAL_LIMIT:
+            reason = "over the %d-byte session total" % TOTAL_LIMIT
+        elif files >= MAX_FILES:
+            reason = "over the %d-file limit" % MAX_FILES
         if reason is None:
-            total, files = total + info.st_size, files + 1
+            # the read itself is bounded too (the WAL may grow after the listing): this WAL's share of the limits,
+            # and reaching it is `truncated`, which lists the WAL as unread
+            budget = max(0, min(WAL_LIMIT * len(members), TOTAL_LIMIT - total))
+            total, files = total + size, files + len(members)
+            probs, lines = [], []
             try:
-                data = safe_input.read_bounded(entry.path, WAL_LIMIT, allowed_roots=[str(sd)])
-            except safe_input.InputRejected as rejected:
-                reason = rejected.code
+                lines = [raw for _seg, _n, raw in ws.iter_lines(os.path.join(sd, name), problems=probs, chain=chain,
+                                                                max_total_bytes=budget)]
+            except (OSError, ws.SegmentProblem) as error:
+                reason = type(error).__name__
+            late = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+            if reason is None and late:  # the chain changed under the read (a rotation race that left a problem)
+                reason = "WAL chain %s: %s" % (late[0]["code"], str(late[0].get("message"))[:100])
         if reason is not None:
-            unread.append({"wal": entry.name, "agent": agent, "reason": reason})
+            unread.append({"wal": name, "agent": agent, "reason": reason})
             continue
         agents.append(agent)
-        for raw in data.decode("utf-8", "replace").splitlines():
+        for line in lines:
+            if line is None:  # a row over the 8 MiB line cap is malformed, counted like any other skipped row
+                skipped += 1
+                continue
+            raw = line.decode("utf-8", "replace")
             if not raw.strip():
                 continue
             try:
@@ -490,8 +518,9 @@ def export(ah, home, args) -> dict:
         raise ah.AhError("redactor_unavailable", "the redactor could not be loaded (%s); no export written"
                          % type(error).__name__, 4) from None
     sd = ah.session_dir(home, session)
-    if os.path.islink(sd) or not sd.is_dir() or not os.path.isfile(sd / "main.jsonl") \
-            or os.path.islink(sd / "main.jsonl"):
+    import wal_segments as _ws  # noqa: PLC0415
+    if os.path.islink(sd) or not sd.is_dir() or not _ws.exists(str(sd / "main.jsonl")) \
+            or os.path.islink(sd / "main.jsonl"):  # a crashed rotation (live file missing) still has a main WAL
         raise ah.AhError("session_unknown", "no main WAL for session %r" % session)
     now = time.time()
     since_s = ah.parse_since(args.since) if args.since else float("inf")
