@@ -91,6 +91,21 @@ All four work on a copy of a WAL folder (a git backup checkout) using only the f
 directory argument and a stem with a path or a segment shape, and open only names found by scanning the directory, never
 a name taken from a marker or the index. The index is advisory: the directory is authoritative.
 
+## Known residual: a live file left without its marker
+
+If a rotation crashes after the rename or the create, and the next append comes from a writer that could not take the
+seglock (`seglock_timeout`), that writer does not run the recovery rule: it still writes its record (a record is never
+dropped), as line 1 of a live file that has closed predecessors and no open marker. The chain then reports
+`marker_missing`. `verify` (exit 1) and `reindex` both print it. That first record is kept as an ordinary record, never
+dropped by the marker rule. A live file that already holds a record is not rewritten (rotation never edits a WAL), so
+the flag stays until the next rotation closes that file.
+
+## Reader framing rules (one place: `Snapshot._frame` and `_drops_marker`)
+
+- A line longer than 8 MiB is discarded up to its newline and yielded once as `None`; it is never split into fake lines.
+- Line 1 of a source is dropped only when it is exactly that source's open marker (seq >= 2, `segment` equal to the
+  source's seq, `stem` equal). Any other marker-shaped line is an ordinary record and adds a `marker_mismatch` problem.
+
 ## Transcripts
 
 Claude Code and Codex transcript files are read-only sources owned by those tools and are not rotated by us. ASSUMPTION
