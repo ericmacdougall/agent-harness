@@ -1,0 +1,14 @@
+<!-- takeover-cleanup:begin v1 -->
+## Takeover cleanup (mine, 2026-11-23 UTC, "create a 1-shot script that patches the harness with a way for you to take over and be able to do the cleanup/deletes you werent able to.. and ill run it" and "make sure the change is permanent on t2-dev and local and added to the harness code permanently and applies to all agents able to request/do the same cleanup")
+
+Written by `scripts/enable-takeover-cleanup.sh`, which I ran myself. No expiry. Applies to every Claude and Codex agent on this Mac and on t2-dev whose guard hooks are active. If your guard hooks are not active, do no cleanup under this section. Rules 1 to 4 are unchanged.
+
+- When you take over work from a session that stopped (usage limit, crash, handoff), you may clean up its leftovers without asking me, only through these routes and only what the tools themselves allow:
+  - `python3 -I ~/.claude/hooks/ah.py takeover claim --from <S> --reason R --ticket "GoodQA <p>#N"` (Codex: `~/.codex/agent-harness/ah.py`), then `takeover status|plan --from <S>`, then `takeover cleanup --from <S> --action worktrees|processes --reason R --ticket "GoodQA <p>#N" --apply`. The tool acts only when it reports <S> retired, which needs at least 1 hour of quiet for worktrees and 4 hours for processes. Wait; do not work around it.
+  - One worktree of <S>: `ah.py worktree-remove --host local|t2-dev --path <abs top> --reason "takeover of <S>: GoodQA <p>#N"`. The verifier refuses unless <S> is retired.
+  - Old-version Claude, ChatGPT or Codex app helpers that `ah kill` reports as stale: `ah.py kill --dry-run --foreign --pid N --reason R`, then the same without `--dry-run`, or `ah.py takeover cleanup --action stale-helpers ... --apply`.
+  - For a session that ran on this Mac, run the takeover from the Mac, even when its worktrees are on t2-dev.
+- Never: a dirty or unpublished worktree (list it for its owner with the verifier's reason), WALs, transcripts, logs, continuation files, approval state, the session's work directory itself, a live session's processes or its MCP servers, current-version app processes, or claude/codex processes (those need my per-pid answer through `--approved-by`). Never set CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID yourself, and never edit another session's continuation state.
+- No shell loops, `&&`, `--force` or several paths in one removal command. A refusal is final for that target; do not retry it in another shape, shell or tool (rule 3).
+- Record each claim, removal and stop in your WAL and on the GoodQA ticket of the stream you took over, and report it in the status update. Do not bring it to me as a question.
+<!-- takeover-cleanup:end -->

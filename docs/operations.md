@@ -1755,3 +1755,38 @@ directory under `~/.agent-harness/work/<session>/` that is a clean, pushed workt
 - A `waiting` disposition on an ask is per owner: `ah task dispose --kind waiting` refuses an ask that names another owner (`wal_note.py --event ask --owner <agent>`) or is already another owner's live wait.
 - `ah owners` carries `agents_active_1h` (and each row `active_1h`); `ah status` repeats it under `owners`. Collectors that read transcripts skip an unreadable file, never the section.
 - Limits: unreviewed PRs and specs are not looked up over the network; SendMessage is not hooked, so it is not progress.
+
+## Taking over a stopped session's leftovers (goodqa#16441)
+
+A session that stopped (usage limit, crash, handoff) leaves worktrees and processes behind. The agent that takes the work over cleans them up through `ah takeover`, never by deleting under `~/.agent-harness/work/<session>/` or signalling by hand. `takeover.py` decides; the worktree verifier and `ah_kill` keep every refusal they had.
+
+Route (Claude: `python3 -I ~/.claude/hooks/ah.py`; Codex: `python3 -I ~/.codex/agent-harness/ah.py`; one literal command each, no variable, chain, pipe or redirect):
+
+1. `takeover claim --from S --reason R --ticket "GoodQA <p>#N"`: records an HMAC'd claim at `~/.agent-harness/takeover/S.json` (0600). The claim time counts as activity of S, so a claim only starts the waiting period.
+2. `takeover status --from S [--action worktrees|processes]`: the verdict `retired`, `walless`, `live` or `unknown` with the reasons and `eligible_at`.
+3. `takeover plan --from S`: what a cleanup would touch (read only).
+4. `takeover cleanup --from S --action worktrees|processes|stale-helpers --reason R --ticket "GoodQA <p>#N" [--path P]... [--pid N]... --apply`. `--path` and `--pid` only narrow; they never add a target.
+
+A session is `retired` only when all of these hold (R1 to R5, re-checked right before every target):
+
+- one session id with exactly one WAL (Claude `~/.claude/wals/S` or Codex `~/.agent-harness/codex-wals/S`) on one host; an id on both hosts or both flavors is `ambiguous_session`;
+- it declared a stop (Codex continuation `complete` or `handoff`; Claude: the last non-hook WAL row is `handoff`, a `result` row never counts) or this caller holds a valid claim;
+- it has been quiet for 1 h (worktrees) or 4 h (processes), measured from the WALs, the continuation file, the claim time and the app-written transcript or rollout (its mtime and its last-line timestamp, so a backdating `touch` cannot hide activity); a missing transcript is `unknown`; a timestamp in the future is `clock_skew`;
+- no process on either host carries S as its session marker under a Claude, Codex or desktop-app process (a process that also carries the caller's marker neither blocks nor qualifies); a cwd inside the work directory alone never makes a session live;
+- no open ask, open registered task (unless the caller already took it over with `ah task status`) or live bg_job of S.
+
+`walless` (worktrees only) is a work directory with no WAL, transcript or rollout on either host and nothing touched for 24 h; only a two-host judgement (`takeover status`) can say it. Anything unreadable gives `unknown` and nothing is touched. Known gap: the worktree verifier judges one host, so it refuses a `walless` session's worktree (and a Mac session's worktree on t2-dev) as `origin_unreachable` until a cross-host attestation exists (ticket later); `plan` still lists them.
+
+What a cleanup may touch: linked worktrees at depth 1 or 2 under `work/S/` that git confirms, each removed through `ah worktree-remove` with `--expect-head`, so the verifier's own checks (clean, HEAD live on an allowed remote, no process inside, no private files) all apply; a dirty or unpublished one is reported with the verifier's reason and kept. Processes only when they carry S's marker (or are in S's spawn ledger and carry no other session's marker), started no later than S's last activity, have no agent-host ancestor, are not a registered task or bg_job pid and carry no marker of the caller; each is handed to the audited stop as `(pid, start time)`, so a reused pid is `candidate_changed`. Processes named claude or codex are never candidates: they stay behind the user's per-pid `--approved-by`.
+
+Foreign worktrees are enforced in the verifier, which every route reaches (the hook's lone `git worktree remove`, `ah worktree-remove`, a direct `command_guard.py remove-worktree --caller-session`): a path in another session's work directory is refused unless that session is `retired` or `walless`. The hook's lone form refuses it outright (no ps, lsof or ssh in a hook) and points at `ah takeover`. The caller's identity is read from its environment and the hook payload; an agent may not assign `CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID` in a command that runs a harness tool.
+
+Hosts: the caller's host orchestrates. A caller on the Mac reads t2-dev's evidence with `takeover status --from S --evidence-only --json` over ssh (the only takeover command allowed over ssh) and removes remote worktrees through `ah worktree-remove --host t2-dev`. A caller on t2-dev cannot reach the Mac, so a session that ran on the Mac is `unknown` there: run the takeover from the Mac. The verifier itself judges the host it runs on.
+
+Stale app helpers: an orphaned crashpad handler of an old Claude, ChatGPT or Codex app version (a version directory the app no longer runs; `Versions/Current` names another one) is the only desktop-app process the audited stop may stop with `--foreign`. `ah kill --dry-run [--foreign] --pid N --reason R` prints would-stop, refused or gone for every pid, signals nothing and raises no notice. Every other process inside a ChatGPT, Claude or Codex app bundle is refused, current helpers included.
+
+The resumed session is told: a tombstone at `~/.agent-harness/takeover/S.json` (validated fields only, HMAC'd) is injected by the existing SessionStart and UserPromptSubmit hooks of both flavors as a fixed notice (always at start, once per tombstone per prompt).
+
+Install: `scripts/enable-takeover-cleanup.sh` (user-run; `--dry-run` and `--verify` may be run by an agent, `--apply` and `--undo` may not) installs the ref with `repair-harness.sh`, keeps the tuned `model_tiers.json` and `resource_limits.json`, and appends `scripts/takeover-cleanup-policy.md` outside the managed markers of `~/.claude/CLAUDE.md` on both hosts and of `~/.codex/AGENTS.md` where Codex guard hooks are shown active.
+
+Known limits: the text rules are accident prevention (a program that sets its own environment or speaks ssh itself is invisible to them); the guard layer protects only where its hooks run. An idle Codex desktop thread has no process, so its protection is the declared stop, the quiet window and the open-work check. A removal can still race a writer between git's clean check and its delete. `ps eww` shows the session marker of an ordinary own process (a Python or node child) but macOS hides the environment of Apple platform binaries such as `/bin/zsh` and `/bin/sleep` (T3, verified on this Mac): such a process is found only through a descendant that is not a platform binary, or the spawn ledger. The `lsof` text path of a deleted executable is unverified (T1), so the stale-helper text path check passes when lsof reports none.
