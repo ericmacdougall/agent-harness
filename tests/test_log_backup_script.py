@@ -2278,6 +2278,57 @@ class TierOneCheckpoint(Case):
         self.assertIn(".claude/wals", order, "the WAL tree still got its copy after the throttle")
         self.assertNotIn("skipped .claude/wals", (self.logs / "log-backup.log").read_text())
 
+    def test_ac8_a_file_lost_or_damaged_on_the_remote_after_it_was_verified_is_sent_again_within_one_cycle(self):
+        # red-team F2 (blocking; user: "i never want to lose wals or chat transcripts"): a closed WAL never changes
+        # locally, so without a re-check a remote copy lost after verification would never come back.
+        done = self.tier1_runs(4, 100000)
+        self.assertTrue(self.last_ok().exists(), done.stderr)
+        lost = self.remote / "testhost" / self.wals[7]
+        damaged = self.remote / "testhost" / self.projects[2]
+        lost.unlink()
+        damaged.write_bytes(b"truncated")
+        self.tier1_runs(1, 100000)   # inside the cycle (7 days by default): nothing is checked again yet
+        self.assertFalse(lost.exists(), "the re-check waits for its cycle")
+        done = self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0")   # the cycle has passed
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertEqual(done.returncode, 0, log[-1500:])
+        self.assertEqual(lost.read_bytes(), (self.home / self.wals[7]).read_bytes(), "the lost WAL is back")
+        self.assertEqual(damaged.read_bytes(), (self.home / self.projects[2]).read_bytes(), "the damaged copy is fixed")
+        self.assertIn(".claude/wals: re-check complete", log)
+        self.assertTrue(self.last_ok().exists())
+        rechecks = [a for a in self.copies() if "--files-from-raw" in a and "recheck" in a[a.index("--files-from-raw") + 1]]
+        self.assertTrue(rechecks, "the re-check sent its files by list")
+        for argv in rechecks:
+            self.assertIn("--no-traverse", argv)
+
+    def test_ac9_the_re_check_is_bounded_per_run_and_never_withholds_last_ok(self):
+        self.tier1_runs(4, 100000)
+        for rel in self.wals[:8]:
+            (self.remote / "testhost" / rel).unlink()
+        checked = Path(str(self.calls) + ".checked")
+        runs = 0
+        while runs < 20 and not all((self.remote / "testhost" / r).exists() for r in self.wals[:8]):
+            checked.write_text("")
+            self.last_ok().unlink()
+            done = self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", LOG_BACKUP_RECHECK_FILES="5")
+            runs += 1
+            self.assertEqual(done.returncode, 0, (self.logs / "log-backup.log").read_text()[-1500:])
+            self.assertTrue(self.last_ok().exists(), "a re-check spread over runs never withholds last-ok")
+            self.assertLessEqual(len(checked.read_text().split()), 5, "at most RECHECK_FILES files a run")
+        self.assertGreater(runs, 1, "the pass was spread over several runs")
+        self.assertTrue(all((self.remote / "testhost" / r).exists() for r in self.wals[:8]))
+
+    def test_ac10_a_tree_with_fresh_files_pending_gets_no_re_check(self):
+        self.tier1_runs(4, 100000)
+        self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0")
+        for i in range(40):
+            self.put(".claude/wals/n%02d/main.jsonl" % i, b"new %d\n" % i)
+        log = self.logs / "log-backup.log"
+        log.write_text("")
+        self.tier1_runs(1, 20, LOG_BACKUP_RECHECK_DAYS="0")
+        self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=[1-9]")
+        self.assertNotIn(".claude/wals: re-check", log.read_text(), "fresh WALs come before any re-check")
+
     def test_neg_tier1_checkpoint_state_is_its_own(self):
         # The lane owns log-backup.bulk.d; tier 1 must never write into it (two writers on one checkpoint).
         self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="99999")

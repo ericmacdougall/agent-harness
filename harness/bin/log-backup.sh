@@ -25,6 +25,10 @@
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
 #   LOG_BACKUP_BULK_CHUNK   files per checkpointed copy, bulk and tier-1 trees (default 300 in the lane run, 100 otherwise, 1-99999),
 #                           never more than fit the time left at about 2 rate-limited operations a file
+#   LOG_BACKUP_RECHECK_DAYS  days between re-checks of everything a tier-1 tree verified (default 7, 0 = every run):
+#                           a file lost or damaged on the remote after it was verified is sent again (goodqa#16660 F2)
+#   LOG_BACKUP_RECHECK_FILES files re-checked per run across all tier-1 trees (default 300), only in time left over
+#                           once a tree has nothing new pending, so a weekly pass spreads over many runs
 #   LOG_BACKUP_BULK_LANE    exactly 1 runs the bulk tier as its own detached run (the bulk lane), so tier 1 can no
 #                           longer use up the bulk tier's time. The lane yields to tier 1 (goodqa#15147): it never
 #                           copies while a tier-1 run holds the run lock, and a copy in flight when one starts is
@@ -72,6 +76,8 @@ LANE=${LOG_BACKUP_BULK_LANE:-0}          # 1: the bulk tier runs as its own deta
 BULK_TPS=${LOG_BACKUP_BULK_TPS:-$TPSLIMIT}   # the lane's rate; it never copies beside tier 1, so no split
 LANE_POLL=${LOG_BACKUP_LANE_POLL_SECONDS:-2}
 LANE_BUDGET=${LOG_BACKUP_LANE_BUDGET_SECONDS:-10800}
+RECHECK_DAYS=${LOG_BACKUP_RECHECK_DAYS:-7}       # each tier-1 tree re-checks everything it verified this often
+RECHECK_FILES=${LOG_BACKUP_RECHECK_FILES:-300}   # at most this many re-checked files per run, in time tier 1 left over
 TIER=${LOG_BACKUP_TIER:-all}             # all: both tiers in this run; live: tier 1 only; bulk: the lane run
 for rate in TPSLIMIT TRANSFERS BULK_TPS; do
   if ! printf '%s' "${!rate}" | grep -Eq '^[1-9][0-9]?$'; then
@@ -99,7 +105,7 @@ if [ -n "$budget_share" ]; then
 fi
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL RECHECK_DAYS RECHECK_FILES; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
@@ -563,6 +569,7 @@ live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
   printf -v "PEND_$key" '%s' unknown
   mkdir -p "$st" && chmod 700 "$LIVE_STATE" "$st" || { say "cannot create tier-1 state for $rel"; ok=1; return; }
   if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then   # verified belongs to one destination
+    rm -f "$st/recheck" "$st/recheck.cursor" "$st/recheck-done"
     : > "$st/verified" && printf '%s\n' "$R" > "$st/remote" || { say "cannot reset tier-1 state for $rel"; ok=1; return; }
   fi
   touch "$st/verified"
@@ -618,6 +625,61 @@ live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
   [ "$clean" = 1 ] || return
   echo "$STARTED pending=0" > "$LOGDIR/log-backup.source.$key.last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.source.$key.last-ok.tmp.$$" "$LOGDIR/log-backup.source.$key.last-ok"
+}
+# goodqa#16660 F2: verified says a file reached the remote once; a file lost there later (deleted by hand, a moved folder,
+# the remote re-pointed under the same name) would never be sent again, because a closed WAL never changes locally.
+# Every RECHECK_DAYS each tree offers everything it verified again, from a snapshot of verified with a cursor, in
+# --no-traverse chunks: rclone checks each file by its checksum (one metadata call, no folder listing) and sends what is
+# missing or different. At most RECHECK_LEFT files per run, only in the time tier 1 left over. A stop on the budget or
+# the rate limit resumes next run and never withholds last-ok; a chunk that really fails drops its lines from verified,
+# so the normal path sends those files again (and the run is not fresh).
+live_recheck() { # live_recheck STAGE-PATH SRC-REL
+  local snap="$1" rel="$2" st key total cur n size fit a ok0 bh0 f0 p0
+  key=$(live_key "$rel"); st="$LIVE_STATE/$key"
+  [ -s "$st/verified" ] || return 0
+  if [ ! -s "$st/recheck" ]; then
+    # The first time, verified was just copied: start the clock instead of checking it all again at once.
+    [ -e "$st/recheck-done" ] || { touch "$st/recheck-done"; return 0; }
+    a=$(raw_age "$st/recheck-done")
+    if [ -n "$a" ] && [ "$a" -ge 0 ] && [ "$a" -lt $(( RECHECK_DAYS * 86400 )) ]; then return 0; fi
+    cut -f1 "$st/verified" > "$st/recheck.tmp" && mv "$st/recheck.tmp" "$st/recheck" && echo 0 > "$st/recheck.cursor" \
+      || { say "cannot start the $rel re-check"; return 0; }
+    say "$rel: re-check of $(wc -l < "$st/recheck" | tr -d ' ') verified files started (every ${RECHECK_DAYS} days)"
+  fi
+  total=$(wc -l < "$st/recheck" | tr -d ' ')
+  cur=$(cat "$st/recheck.cursor" 2>/dev/null)
+  printf '%s' "$cur" | grep -Eq '^(0|[1-9][0-9]*)$' || cur=0
+  while [ "$cur" -lt "$total" ] && [ "$RECHECK_LEFT" -gt 0 ]; do
+    fit=$(time_left)
+    [ "$fit" -ge "$MIN_SLICE" ] || break
+    size=$BULK_CHUNK fit=$(( fit * TPSLIMIT / 2 ))
+    [ "$fit" -ge "$size" ] || size=$fit
+    [ "$RECHECK_LEFT" -ge "$size" ] || size=$RECHECK_LEFT
+    [ "$size" -ge 1 ] || size=1
+    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/recheck" > "$st/recheck.chunk" || break
+    n=$(wc -l < "$st/recheck.chunk" | tr -d ' ')
+    ok0=$ok bh0=${budget_hit:-0} f0=$found p0=$primary hard_fail=0
+    upload "$snap" "$rel" --files-from-raw "$st/recheck.chunk" --no-traverse
+    found=$f0 primary=$p0
+    if [ "$copied" -eq 1 ]; then
+      ok=$ok0 cur=$((cur + n)) RECHECK_LEFT=$((RECHECK_LEFT - n))
+      echo "$cur" > "$st/recheck.cursor.tmp" && mv "$st/recheck.cursor.tmp" "$st/recheck.cursor"
+    elif [ "${hard_fail:-0}" = 1 ] && [ "$throttled" != 1 ]; then
+      awk -F'\t' 'FILENAME == ARGV[1] {d[$0] = 1; next} !($1 in d)' "$st/recheck.chunk" "$st/verified" > "$st/verified.tmp" \
+        && mv "$st/verified.tmp" "$st/verified"
+      say "$rel: a re-check chunk of $n files failed; they are pending again"
+      cur=$((cur + n)) RECHECK_LEFT=$((RECHECK_LEFT - n))
+      echo "$cur" > "$st/recheck.cursor.tmp" && mv "$st/recheck.cursor.tmp" "$st/recheck.cursor"
+    else
+      ok=$ok0 budget_hit=$bh0   # out of time or rate limited: the pass resumes next run, tier 1 stays fresh
+      break
+    fi
+  done
+  if [ "$cur" -ge "$total" ]; then
+    rm -f "$st/recheck" "$st/recheck.cursor" "$st/recheck.chunk" && touch "$st/recheck-done"
+    say "$rel: re-check complete ($total files)"
+  fi
+  return 0
 }
 live_summary() { # log-backup.sources: one line per tree, read by log_backup.py status
   local t key p okv
@@ -843,6 +905,14 @@ for src in "${LIVE[@]}"; do
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
   if [ $is_tree -eq 1 ]; then live_upload "$snap" "$src" "$snap_clean"; else upload "$snap" "$src"; fi
+done
+# The weekly re-check (goodqa#16660 F2) only runs after every tree had its turn, and only for trees with nothing fresh
+# left pending, so new transcripts always go first.
+RESERVE=0 RECHECK_LEFT=$RECHECK_FILES
+for src in "${LIVE[@]}"; do
+  case " ${TREES[*]} " in *" $src "*) ;; *) continue ;; esac
+  key=$(live_key "$src"); p="PEND_$key"
+  [ "${!p:-unknown}" = 0 ] && [ -d "$STAGE/$src" ] && live_recheck "$STAGE/$src" "$src"
 done
 live_summary
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
