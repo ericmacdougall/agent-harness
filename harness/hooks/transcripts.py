@@ -1,0 +1,2406 @@
+#!/usr/bin/env python3
+"""Private agent-transcripts archive (GoodQA #16650, phase 1).
+
+Copies every Claude Code / Codex transcript and harness WAL on this host, redacts each record through the
+two-pass gate in transcript_redact.py, splits it on record boundaries into chunks of at most 48 MiB raw,
+compresses them with zstd and pushes them to private per-host monthly shard repos. A catalog repo maps
+sessions, projects, hosts, tickets and PRs to chunks (manifests, per-host index JSONL, shard ledger).
+
+Recovery truth:
+  * Recovery from git is byte-identical to the REDACTED archive, never to the source.
+  * Exact-source recovery comes from the local source file or the Dropbox log backup.
+
+Sources are only ever opened read-only ('rb' via O_RDONLY|O_NOFOLLOW); symlinks and non-regular files are
+skipped. The tool never force-pushes and never rewrites a published ref.
+
+Stdlib only, Python 3.9 compatible. Docs: docs/transcripts-archive.md. Index contract:
+docs/transcripts-index.schema.json (schema 1).
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import sqlite3
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+SCHEMA = 1
+CHUNKER_VERSION = 1
+CHECKPOINTS = ('start', 'recovery', 'takeover', 'pr', 'deploy', 'manual')
+FORCE_SEAL = frozenset(('pr', 'deploy', 'takeover'))
+MiB = 1 << 20
+OWNER = 'ericmacdougall'
+CATALOG = 'agent-transcripts'
+DEFAULT_SOURCES = {
+    'claude-projects': '~/.claude/projects',
+    'claude-wals': '~/.claude/wals',
+    'codex-sessions': '~/.codex/sessions',
+    'codex-archived': '~/.codex/archived_sessions',
+    'codex-wals': '~/.agent-harness/codex-wals',
+}
+TOOL_OF = {'claude-projects': 'claude', 'claude-wals': 'claude', 'codex-sessions': 'codex',
+           'codex-archived': 'codex', 'codex-wals': 'codex'}
+RECOVERY_TRUTH = ('Recovery from git is byte-identical to the REDACTED archive, never to the source. '
+                  'Exact-source recovery comes from the local source file or the Dropbox log backup.')
+HERE = os.path.dirname(os.path.abspath(__file__))
+README_SRC = os.path.join(os.path.dirname(HERE), 'transcripts', 'catalog-README.md')
+
+_UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+_SAFE = re.compile(r'[^A-Za-z0-9._-]')
+_TS = re.compile(r'^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,12})?(Z|[+-]\d{2}:?\d{2})?$')
+_TICKET = re.compile(rb'(?i)\bgoodqa\s{0,3}#\s{0,3}(\d{1,7})\b')
+_PR = re.compile(rb'https://github\.com/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/pull/\d{1,7}')
+_COMMIT = re.compile(rb'(?<![0-9a-f])[0-9a-f]{40}(?![0-9a-f])')
+MENTION_CAP = 200
+
+
+class Refused(Exception):
+    """A visible refusal: message is ours (never holds a source value)."""
+
+
+class Crash(BaseException):
+    """Test-only crash injection (raised, or the process exits hard)."""
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------------------------------------------
+
+def _env_int(name, default, allowed):
+    raw = os.environ.get(name)
+    if raw and allowed:
+        return int(raw)
+    return default
+
+
+class Cfg:
+    def __init__(self):
+        env = os.environ
+        self.home = os.path.abspath(os.path.expanduser(env.get('TRANSCRIPTS_HOME') or '~/.agent-harness/transcripts'))
+        raw = env.get('TRANSCRIPTS_SOURCES')
+        srcs = json.loads(raw) if raw else DEFAULT_SOURCES
+        self.sources = {str(k): os.path.abspath(os.path.expanduser(v)) for k, v in srcs.items()}
+        for label in self.sources:
+            if _SAFE.search(label) or label in ('.', '..'):
+                raise Refused('invalid source label')
+        base = env.get('TRANSCRIPTS_REMOTE_BASE')
+        self.local = bool(base)
+        if self.local and env.get('TRANSCRIPTS_ALLOW_LOCAL_REMOTE') != '1':
+            raise Refused('TRANSCRIPTS_REMOTE_BASE needs TRANSCRIPTS_ALLOW_LOCAL_REMOTE=1')
+        self.remote_base = os.path.abspath(base) if base else None
+        host = env.get('TRANSCRIPTS_HOST') or socket.gethostname().split('.')[0].lower()
+        self.host = _SAFE.sub('_', host)[:40] or 'host'
+        t = self.local  # size overrides are honoured only against a local test remote
+        self.chunk_max = _env_int('TRANSCRIPTS_CHUNK_MAX_BYTES', 48 * MiB, t)
+        self.shard_cap = _env_int('TRANSCRIPTS_SHARD_CAP_BYTES', 1500 * 1000 * 1000, t)
+        self.seal_min = _env_int('TRANSCRIPTS_SEAL_MIN_BYTES', 1 * MiB, t)
+        self.idle_s = 1800
+        self.file_delta_cap = _env_int('TRANSCRIPTS_FILE_DELTA_CAP', 256 * MiB, t)
+        self.push_max = 400 * 1000 * 1000
+        self.file_max_z = 50 * 1000 * 1000
+        self.outbox_cap = 1500 * 1000 * 1000
+        self.push_timeout = _env_int('TRANSCRIPTS_PUSH_TIMEOUT', 300, t)
+        self.min_free_gb = float(env.get('TRANSCRIPTS_MIN_FREE_GB') or 12)
+        self.crash_at = env.get('TRANSCRIPTS_CRASH_AT') if t else None
+        self.ignore_load = t and env.get('TRANSCRIPTS_IGNORE_LOAD') == '1'
+
+    def p(self, *parts):
+        return os.path.join(self.home, *parts)
+
+    def url(self, repo):
+        if self.local:
+            return os.path.join(self.remote_base, repo + '.git')
+        return 'https://github.com/%s/%s.git' % (OWNER, repo)
+
+
+def ensure_home(cfg):
+    for sub in ('', 'receipts', 'requests', 'logs', 'outbox', 'tmp', 'meta'):
+        d = cfg.p(sub) if sub else cfg.home
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(cfg.home, 0o700)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def parse_iso(s):
+    try:
+        return datetime.strptime(s, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def sha12(text):
+    return hashlib.sha256(text.encode('utf-8', 'surrogateescape')).hexdigest()[:12]
+
+
+def atomic_write(path, data, mode=0o600):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.tmp-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass
+
+
+def jdump(obj):
+    return json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, 'rb') as f:
+            return json.loads(f.read().decode('utf-8'))
+    except (OSError, ValueError):
+        return default
+
+
+def alert(cfg, kind, detail):
+    """Alerts carry our own words, kinds, counts and path sha12 only."""
+    row = {'ts': now_iso(), 'host': cfg.host, 'kind': kind, 'detail': detail}
+    try:
+        with open(cfg.p('alerts.jsonl'), 'ab') as f:
+            f.write(jdump(row) + b'\n')
+    except OSError:
+        pass
+    sys.stderr.write('ALERT transcripts %s: %s\n' % (kind, detail))
+
+
+def crash_point(cfg, name):
+    if cfg.crash_at == name:
+        sys.stderr.flush()
+        os._exit(97)
+
+
+def sanitize_err(text):
+    text = re.sub(r'https?://[^\s/@]*@', 'https://', text or '')
+    return ' '.join(text.split())[:240]
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Lock and request files
+# ----------------------------------------------------------------------------------------------------------
+
+class Lock:
+    def __init__(self, cfg):
+        self.path = cfg.p('lock')
+        self.fd = None
+
+    def try_acquire(self):
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            os.close(fd)
+            if e.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                return False
+            raise
+        self.fd = fd
+        return True
+
+    def release(self):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+                self.fd = None
+
+
+def drop_request(cfg, checkpoint):
+    if checkpoint not in CHECKPOINTS:
+        raise Refused('invalid checkpoint')
+    name = '%s-%d-%d' % (checkpoint, time.time_ns(), os.getpid())
+    fd = os.open(os.path.join(cfg.p('requests'), name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.close(fd)
+    return name
+
+
+def take_requests(cfg, reap_only=False):
+    served = set()
+    d = cfg.p('requests')
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return served
+    now = time.time()
+    for name in names:
+        path = os.path.join(d, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        parts = name.split('-')
+        valid = stat.S_ISREG(st.st_mode) and len(parts) == 3 and parts[0] in CHECKPOINTS
+        old = now - st.st_mtime > 86400
+        if valid and not old and reap_only:
+            continue
+        if valid and not old:
+            served.add(parts[0])
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return served
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Git and remote checks
+# ----------------------------------------------------------------------------------------------------------
+
+def git_env():
+    e = dict(os.environ)
+    e.update({'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 'agent-transcripts',
+              'GIT_AUTHOR_EMAIL': 'agent-transcripts@noreply.invalid', 'GIT_COMMITTER_NAME': 'agent-transcripts',
+              'GIT_COMMITTER_EMAIL': 'agent-transcripts@noreply.invalid'})
+    e.pop('GIT_INDEX_FILE', None)
+    e.pop('GIT_DIR', None)
+    return e
+
+
+class GitError(Exception):
+    pass
+
+
+def git(cfg, args, cwd=None, inp=None, timeout=120, env_extra=None, check=True):
+    base = ['git']
+    if not cfg.local:
+        base += ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential']
+    env = git_env()
+    if env_extra:
+        env.update(env_extra)
+    try:
+        r = subprocess.run(base + list(args), cwd=cwd, input=inp, capture_output=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        raise
+    if check and r.returncode != 0:
+        raise GitError('git %s failed: %s' % (args[0], sanitize_err(r.stderr.decode('utf-8', 'replace'))))
+    return r
+
+
+def git_blob_sha(data):
+    h = hashlib.sha1()
+    h.update(b'blob %d\0' % len(data))
+    h.update(data)
+    return h.hexdigest()
+
+
+class Remote:
+    """Repo existence, creation and the privacy checks, real (gh) or local stub."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.checked = {}  # per-run cache only
+
+    def exists(self, repo):
+        if self.cfg.local:
+            return os.path.isdir(self.cfg.url(repo))
+        r = subprocess.run(['gh', 'api', 'repos/%s/%s' % (OWNER, repo), '--jq', '.name'],
+                           capture_output=True, timeout=60)
+        if r.returncode == 0:
+            return True
+        if b'Not Found' in r.stderr or b'404' in r.stderr:
+            return False
+        raise Refused('repo lookup failed for %s' % repo)
+
+    def ensure(self, repo):
+        if self.exists(repo):
+            return
+        if self.cfg.local:
+            url = self.cfg.url(repo)
+            os.makedirs(url, exist_ok=True)
+            git(self.cfg, ['init', '-q', '--bare', url])
+            git(self.cfg, ['config', 'uploadpack.allowFilter', 'true'], cwd=url)
+            git(self.cfg, ['config', 'uploadpack.allowAnySHA1InWant', 'true'], cwd=url)
+            return
+        r = subprocess.run(['gh', 'repo', 'create', '%s/%s' % (OWNER, repo), '--private',
+                            '--description', 'Private redacted agent transcripts archive (agent-harness)'],
+                           capture_output=True, timeout=120)
+        if r.returncode != 0:
+            raise Refused('gh repo create failed for %s' % repo)
+
+    def _facts(self, repo):
+        if self.cfg.local:
+            stub = read_json(os.path.join(self.cfg.remote_base, 'repo-checks.json'), {}) or {}
+            f = {'visibility': 'PRIVATE', 'fork': False, 'owner': OWNER, 'collaborators': [OWNER]}
+            f.update(stub.get('*', {}))
+            f.update(stub.get(repo, {}))
+            if f.get('error'):
+                raise Refused('repo check error for %s' % repo)
+            return f
+        r = subprocess.run(['gh', 'api', 'repos/%s/%s' % (OWNER, repo)], capture_output=True, timeout=60)
+        if r.returncode != 0:
+            raise Refused('visibility unknown for %s (gh api failed)' % repo)
+        meta = json.loads(r.stdout.decode('utf-8'))
+        r2 = subprocess.run(['gh', 'api', '--paginate', 'repos/%s/%s/collaborators' % (OWNER, repo), '--jq',
+                             '.[].login'], capture_output=True, timeout=60)
+        if r2.returncode != 0:
+            raise Refused('collaborators unknown for %s (gh api failed)' % repo)
+        return {'visibility': str(meta.get('visibility', '')).upper(), 'fork': bool(meta.get('fork')),
+                'owner': (meta.get('owner') or {}).get('login'),
+                'collaborators': [x for x in r2.stdout.decode('utf-8').split() if x]}
+
+    def check(self, repo):
+        if repo in self.checked:
+            if self.checked[repo] is not True:
+                raise Refused(self.checked[repo])
+            return
+        try:
+            f = self._facts(repo)
+            problems = []
+            if str(f.get('visibility')).upper() != 'PRIVATE':
+                problems.append('visibility=%s' % f.get('visibility'))
+            if f.get('fork'):
+                problems.append('fork')
+            if f.get('owner') != OWNER:
+                problems.append('owner')
+            if set(f.get('collaborators') or []) - {OWNER}:
+                problems.append('collaborators')
+            if problems:
+                raise Refused('repo check failed for %s: %s' % (repo, ','.join(problems)))
+        except Refused as e:
+            self.checked[repo] = str(e)
+            raise
+        except Exception:  # noqa: BLE001 - unknown is a refusal (NEG-8)
+            self.checked[repo] = 'repo check failed for %s: unknown' % repo
+            raise Refused(self.checked[repo])
+        self.checked[repo] = True
+
+
+class TmpRepo:
+    """A temporary bare repo with a promisor remote: blobless shallow fetches, lazy blob reads."""
+
+    def __init__(self, cfg, repo):
+        self.cfg = cfg
+        self.repo = repo
+        self.dir = tempfile.mkdtemp(prefix='%s-' % repo[:60], dir=cfg.p('tmp'))
+        git(cfg, ['init', '-q', '--bare', self.dir])
+        git(cfg, ['remote', 'add', 'origin', cfg.url(repo)], cwd=self.dir)
+        git(cfg, ['config', 'remote.origin.promisor', 'true'], cwd=self.dir)
+        git(cfg, ['config', 'remote.origin.partialclonefilter', 'blob:none'], cwd=self.dir)
+        self.index = os.path.join(self.dir, 'tmp-index')
+        self.tip = None
+        self.entries = {}
+
+    def ls_remote(self, timeout=60):
+        r = git(self.cfg, ['ls-remote', 'origin', 'refs/heads/main'], cwd=self.dir, timeout=timeout)
+        out = r.stdout.decode().split()
+        return out[0] if out else None
+
+    def fetch_tip(self, timeout=300):
+        self.tip = self.ls_remote()
+        self.entries = {}
+        if self.tip:
+            git(self.cfg, ['fetch', '-q', '--depth=1', '--filter=blob:none', 'origin', 'refs/heads/main'],
+                cwd=self.dir, timeout=timeout)
+            self.entries = self.ls_tree(self.tip)
+        return self.tip
+
+    def ls_tree(self, rev):
+        r = git(self.cfg, ['ls-tree', '-r', '-z', rev], cwd=self.dir)
+        entries = {}
+        for item in r.stdout.split(b'\0'):
+            if not item:
+                continue
+            head, path = item.split(b'\t', 1)
+            entries[path.decode('utf-8', 'surrogateescape')] = head.split()[2].decode()
+        return entries
+
+    def blob(self, oid, timeout=300):
+        return git(self.cfg, ['cat-file', 'blob', oid], cwd=self.dir, timeout=timeout).stdout
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwrite=False):
+    """Add files {path: bytes} to repo main. Returns (commit or None if nothing to do, collisions [paths]).
+
+    Chunk paths are never overwritten: an existing path with a different blob is a collision (NEG-17).
+    Catalog files (overwrite=True) are replaced. Never --force; a non-fast-forward refetches (5 tries)."""
+    collisions = []
+    for attempt in range(5):
+        tr = TmpRepo(cfg, repo)
+        try:
+            tip = tr.fetch_tip()
+            write = {}
+            for path, data in files.items():
+                blob = git_blob_sha(data)
+                have = tr.entries.get(path)
+                if have == blob:
+                    continue
+                if have is not None and not overwrite:
+                    if path not in collisions:
+                        collisions.append(path)
+                    continue
+                write[path] = (blob, data)
+            if not write:
+                return (tip if files else None), collisions, False
+            env = {'GIT_INDEX_FILE': tr.index}
+            if tip:
+                git(cfg, ['read-tree', tip], cwd=tr.dir, env_extra=env)
+            info = []
+            for path, (blob, data) in sorted(write.items()):
+                got = git(cfg, ['hash-object', '-w', '--stdin'], cwd=tr.dir, inp=data).stdout.decode().strip()
+                if got != blob:
+                    raise GitError('hash mismatch')
+                info.append('100644 %s\t%s' % (blob, path))
+            git(cfg, ['update-index', '--add', '--index-info'], cwd=tr.dir, env_extra=env,
+                inp=('\n'.join(info) + '\n').encode('utf-8', 'surrogateescape'))
+            tree = git(cfg, ['write-tree', '--missing-ok'], cwd=tr.dir, env_extra=env).stdout.decode().strip()
+            if tip:
+                tip_tree = git(cfg, ['rev-parse', tip + '^{tree}'], cwd=tr.dir).stdout.decode().strip()
+                if tip_tree == tree:
+                    return tip, collisions, False
+            args = ['commit-tree', '--no-gpg-sign', tree, '-m', message]
+            if tip:
+                args[3:3] = ['-p', tip]
+            commit = git(cfg, args, cwd=tr.dir).stdout.decode().strip()
+            if journal is not None:
+                journal.pending(repo, [(p, b) for p, (b, _) in write.items() if p.endswith('.zst')])
+            crash_point(cfg, 'before_push')
+            timeout = cfg.push_timeout
+            if deadline is not None:
+                timeout = max(15, min(timeout, int(deadline - time.monotonic()) + 10))
+            landed = False
+            try:
+                r = git(cfg, ['push', '-q', 'origin', '%s:refs/heads/main' % commit], cwd=tr.dir, timeout=timeout,
+                        check=False)
+                if cfg.crash_at == 'push_timeout_landed' and r.returncode == 0 and not getattr(cfg, '_tl_done', 0):
+                    cfg._tl_done = 1
+                    raise subprocess.TimeoutExpired('git push', timeout)
+                if r.returncode == 0:
+                    landed = True
+                else:
+                    err = r.stderr.decode('utf-8', 'replace')
+                    if 'non-fast-forward' in err or 'fetch first' in err or 'rejected' in err:
+                        continue
+                    raise GitError('git push failed: %s' % sanitize_err(err))
+            except subprocess.TimeoutExpired:
+                # decide whether the push landed before retrying
+                new_tip = tr.ls_remote()
+                if new_tip == commit:
+                    landed = True
+                elif new_tip:
+                    git(cfg, ['fetch', '-q', '--depth=1', '--filter=blob:none', 'origin', 'refs/heads/main'],
+                        cwd=tr.dir, timeout=300)
+                    ents = tr.ls_tree(new_tip)
+                    if all(ents.get(p) == b for p, (b, _) in write.items()):
+                        commit = new_tip
+                        landed = True
+                if not landed:
+                    continue
+            crash_point(cfg, 'after_push')
+            if landed:
+                return commit, collisions, True
+        finally:
+            tr.close()
+    raise GitError('push to %s did not land after 5 tries' % repo)
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Journal
+# ----------------------------------------------------------------------------------------------------------
+
+class Journal:
+    def __init__(self, cfg):
+        self.path = cfg.p('journal.jsonl')
+
+    def _append(self, rows):
+        with open(self.path, 'ab') as f:
+            for row in rows:
+                f.write(jdump(row) + b'\n')
+            f.flush()
+            os.fsync(f.fileno())
+
+    def pending(self, repo, items):
+        self._append([{'ts': now_iso(), 'state': 'pending', 'repo': repo, 'path': p, 'blob': b} for p, b in items])
+
+    def pushed(self, repo, items, commit):
+        self._append([{'ts': now_iso(), 'state': 'pushed', 'repo': repo, 'path': p, 'blob': b, 'commit': commit}
+                      for p, b in items])
+
+    def unresolved(self):
+        rows = {}
+        try:
+            with open(self.path, 'rb') as f:
+                for line in f:
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        continue
+                    k = (row['repo'], row['path'], row['blob'])
+                    if row['state'] == 'pending':
+                        rows[k] = row
+                    else:
+                        rows.pop(k, None)
+        except OSError:
+            pass
+        return list(rows.values())
+
+    def compact(self, keep):
+        atomic_write(self.path, b''.join(jdump(r) + b'\n' for r in keep))
+
+
+# ----------------------------------------------------------------------------------------------------------
+# State
+# ----------------------------------------------------------------------------------------------------------
+
+def load_state(cfg):
+    st = read_json(cfg.p('state.json'))
+    if not st:
+        st = {'schema': SCHEMA, 'host': cfg.host, 'files': {}, 'shards': [], 'catalog_dirty': False,
+              'catalog_commit': None, 'last_progress_at': None, 'manifest_dirty': []}
+    st.setdefault('manifest_dirty', [])
+    return st
+
+
+def save_state(cfg, st):
+    atomic_write(cfg.p('state.json'), jdump(st))
+
+
+def cur_gen(entry):
+    if not entry['gens']:
+        entry['gens'].append(new_gen(1, None))
+    return entry['gens'][-1]
+
+
+def new_gen(n, run_id):
+    return {'gen': n, 'offset': 0, 'lines': 0, 'seq': 0, 'chain': '', 'prev': None, 'chunks': [],
+            'whole_sha256': None, 'whole_sha256_pending': True, 'started_run': run_id}
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Discovery and source reading
+# ----------------------------------------------------------------------------------------------------------
+
+def session_of(label, relpath):
+    parts = relpath.split('/')
+    stem = parts[-1][:-6] if parts[-1].endswith('.jsonl') else parts[-1]
+    found = _UUID.findall(stem)
+    if found:
+        return found[-1], None
+    if label == 'claude-projects' and len(parts) >= 3 and parts[-2] == 'subagents':
+        return stem, parts[-3]
+    for d in reversed(parts[:-1]):
+        m = _UUID.findall(d)
+        if m:
+            return m[-1], None
+    return stem, None
+
+
+def discover(cfg):
+    """Yield (key, label, relpath, abspath, lstat) for regular non-empty .jsonl files; never follows links."""
+    out = []
+    for label, root in cfg.sources.items():
+        try:
+            rst = os.lstat(root)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(rst.st_mode):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = sorted(d for d in dirnames if not os.path.islink(os.path.join(dirpath, d)))
+            for name in filenames:
+                if not name.endswith('.jsonl'):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+                    continue  # symlinks, FIFOs, sockets, devices and empty files are skipped (NEG-4)
+                rel = os.path.relpath(path, root).replace(os.sep, '/')
+                if rel.startswith('../'):
+                    continue
+                out.append(('%s/%s' % (label, rel), label, rel, path, st))
+    return out
+
+
+def open_source(path):
+    """Read-only, no symlink follow, never blocks on a FIFO; refuses anything but a regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise OSError('not a regular file')
+    return os.fdopen(fd, 'rb'), st
+
+
+def fingerprint(f, offset):
+    h = hashlib.sha256()
+    if offset <= 0:
+        return h.hexdigest()
+
+    def rd(pos, n):
+        f.seek(pos)
+        return f.read(n)
+    h.update(rd(0, min(65536, offset)))
+    h.update(rd(max(0, offset - 65536), min(65536, offset)))
+    for i in range(16):
+        pos = (offset * i) // 16
+        h.update(rd(pos, min(4096, offset - pos)))
+    return h.hexdigest()
+
+
+def hash_range(f, start, end):
+    h = hashlib.sha256()
+    f.seek(start)
+    left = end - start
+    while left > 0:
+        b = f.read(min(left, MiB))
+        if not b:
+            break
+        h.update(b)
+        left -= len(b)
+    return h.hexdigest(), left == 0
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Chunk naming and metadata
+# ----------------------------------------------------------------------------------------------------------
+
+def norm_ts(value):
+    if not isinstance(value, str):
+        return None
+    m = _TS.match(value.strip())
+    if not m:
+        return None
+    y, mo, d, hh, mi, ss, tz = m.groups()
+    try:
+        dt = datetime(int(y), int(mo), int(d), int(hh), int(mi), int(ss), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if tz and tz != 'Z':
+        sign = 1 if tz[0] == '+' else -1
+        tzd = tz[1:].replace(':', '')
+        from datetime import timedelta
+        dt = dt - sign * timedelta(hours=int(tzd[:2]), minutes=int(tzd[2:]))
+    return dt.strftime('%Y-%m-%dT%H-%M-%SZ')
+
+
+def safe_comp(c):
+    c = _SAFE.sub('_', c)
+    return '_' if c in ('', '.', '..') else c
+
+
+def chunk_path(cfg, label, relpath, gen, seq, first, last):
+    parts = [safe_comp(p) for p in relpath.split('/')]
+    stem = parts[-1][:-6] if parts[-1].endswith('.jsonl') else parts[-1]
+    reldir = '/'.join(parts[:-1])
+    tail = '.%s_%s.g%d.p%05d.jsonl.zst' % (first, last, gen, seq)
+    prefix = '%s/%s/%s' % (cfg.host, label, (reldir + '/') if reldir else '')
+    if len(prefix) > 120:
+        reldir = 'h_' + hashlib.sha256(reldir.encode()).hexdigest()[:16]
+        prefix = '%s/%s/%s/' % (cfg.host, label, reldir)
+    # the .meta.json sidecar must also stay under 200 characters
+    room = 200 - len(prefix) - len(tail) - len('.meta.json')
+    if len(stem) > room:
+        stem = stem[:max(1, room - 9)] + '-' + hashlib.sha256(stem.encode()).hexdigest()[:8]
+    name = stem + tail
+    return prefix + name, name
+
+
+def record_meta(out_line, acc):
+    """Mapping fields from the REDACTED record only."""
+    try:
+        rec = json.loads(out_line)
+    except ValueError:
+        return
+    if not isinstance(rec, dict):
+        return
+    ts = norm_ts(rec.get('timestamp'))
+    if ts:
+        acc['ts'].append(ts)
+    payload = rec.get('payload') if isinstance(rec.get('payload'), dict) else {}
+    msg = rec.get('message') if isinstance(rec.get('message'), dict) else {}
+    cwd = rec.get('cwd') or payload.get('cwd')
+    if isinstance(cwd, str) and not acc.get('project') and len(cwd) < 400:
+        acc['project'] = cwd
+    for m in (rec.get('model'), msg.get('model'), payload.get('model')):
+        if isinstance(m, str) and len(m) < 100 and m not in acc['models'] and len(acc['models']) < 20:
+            acc['models'].append(m)
+    if rec.get('type') == 'session_meta' and not acc.get('parent'):
+        for k in ('forked_from_id', 'forked_from', 'parent', 'parent_id'):
+            v = payload.get(k)
+            if isinstance(v, str) and _UUID.fullmatch(v):
+                acc['parent'] = v
+                break
+
+
+def mentions_of(data):
+    def uniq(it):
+        seen = []
+        for x in it:
+            x = x.decode('ascii', 'replace')
+            if x not in seen:
+                seen.append(x)
+                if len(seen) >= MENTION_CAP:
+                    break
+        return seen
+    return {'tickets': uniq(m.group(1) for m in _TICKET.finditer(data)),
+            'prs': uniq(m.group(0) for m in _PR.finditer(data)),
+            'commits': uniq(m.group(0) for m in _COMMIT.finditer(data))}
+
+
+def redact_mod():
+    import transcript_redact  # lazy: keeps check and the --background parent fast
+    return transcript_redact
+
+
+def zstd_bin():
+    z = shutil.which('zstd')
+    if not z:
+        raise Refused('zstd is not installed; refusing to archive (install zstd)')
+    return z
+
+
+def compress(data):
+    z = zstd_bin()
+    r = subprocess.run([z, '-12', '-T1', '-q', '-c'], input=data, capture_output=True, timeout=600)
+    if r.returncode != 0:
+        raise Refused('zstd compress failed')
+    return r.stdout
+
+
+def decompress(zdata):
+    z = zstd_bin()
+    r = subprocess.run([z, '-d', '-q', '-c'], input=zdata, capture_output=True, timeout=600)
+    if r.returncode != 0:
+        raise ValueError('zstd decompress failed')
+    return r.stdout
+
+
+def gate_metadata(sidecar):
+    """Sidecars are pushed too: drop optional fields that trip the verifier; refuse if still dirty."""
+    tr = redact_mod()
+    if not tr.verify_bytes(jdump(sidecar)):
+        return sidecar
+    for k in ('project', 'models', 'mentions', 'parent'):
+        sidecar[k] = None if k != 'models' else []
+    sidecar['metadata_dropped'] = True
+    if tr.verify_bytes(jdump(sidecar)):
+        raise Refused('metadata')
+    return sidecar
+
+
+# ----------------------------------------------------------------------------------------------------------
+# The sync run
+# ----------------------------------------------------------------------------------------------------------
+
+class Run:
+    def __init__(self, cfg, checkpoint, budget, background=False):
+        self.cfg = cfg
+        self.checkpoint = checkpoint
+        self.id = '%d-%d' % (time.time_ns(), os.getpid())
+        self.started = time.monotonic()
+        self.started_at = now_iso()
+        self.budget = budget
+        reserve = min(30.0, budget * 0.3)
+        self.work_deadline = self.started + budget - reserve
+        self.deadline = self.started + budget
+        self.served = set()
+        self.force = checkpoint in FORCE_SEAL
+        self.st = load_state(cfg)
+        self.journal = Journal(cfg)
+        self.remote = Remote(cfg)
+        self.files_scanned = 0
+        self.files_changed = 0
+        self.chunks_staged = 0
+        self.chunks_pushed = 0
+        self.bytes_pushed = 0
+        self.records = 0
+        self.omitted = []  # (key, kind)
+        self.file_counts = {}  # key -> [records, omitted]
+        self.whole = {}  # (key, gen) -> hasher for generations begun in this run
+        self.errors = []
+        self.status = 'ok'
+        self.shard_commits = {}
+        self.catalog_commit = None
+        self.collisions = 0
+        self.refused = None
+        self.last_save = time.monotonic()
+        self.disk_low = None
+
+    # -- persistence
+    def save(self, force=False):
+        if force or time.monotonic() - self.last_save > 15:
+            save_state(self.cfg, self.st)
+            self.last_save = time.monotonic()
+
+    def mark_manifest(self, key):
+        if key not in self.st['manifest_dirty']:
+            self.st['manifest_dirty'].append(key)
+        self.st['catalog_dirty'] = True
+
+    # -- outbox
+    def outbox_paths(self, rec):
+        base = os.path.join(self.cfg.p('outbox'), rec['path'])
+        return base, base + '.meta.json', base + '.rec.json'
+
+    def outbox_bytes(self):
+        total = 0
+        for dp, _, fns in os.walk(self.cfg.p('outbox')):
+            for fn in fns:
+                try:
+                    total += os.lstat(os.path.join(dp, fn)).st_size
+                except OSError:
+                    pass
+        return total
+
+    def drop_outbox(self, rec):
+        for p in self.outbox_paths(rec):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # -- startup reconciliation (NEG-6, NEG-19)
+    def adopt_outbox(self):
+        """Adopt staged chunks the state file missed (crash after staging), delete true orphans."""
+        metas = []
+        for dp, _, fns in os.walk(self.cfg.p('outbox')):
+            for fn in fns:
+                if fn.endswith('.rec.json'):
+                    metas.append(os.path.join(dp, fn))
+        recs = []
+        for p in metas:
+            r = read_json(p)
+            if r:
+                recs.append(r)
+        recs.sort(key=lambda r: (r['key'], r['gen'], r['seq']))
+        known = set()
+        for e in self.st['files'].values():
+            for g in e['gens']:
+                for c in g['chunks']:
+                    known.add(c['path'])
+        for r in recs:
+            if r['path'] in known:
+                hit = self.chunk_index().get(r['path'])
+                if hit and hit[2]['status'] == 'pushed':
+                    self.drop_outbox(r['chunk'])
+                continue
+            e = self.st['files'].get(r['key'])
+            if e is None and r['gen'] == 1 and r['seq'] == 1:
+                e = self.new_entry(r['key'], r['label'], r['relpath'])
+                self.st['files'][r['key']] = e
+            g = cur_gen(e) if e else None
+            if g and r['gen'] > g['gen'] and r['seq'] == 1 and r['src'][0] == 0:
+                e['gens'].append(new_gen(r['gen'], None))
+                g = cur_gen(e)
+            if g and g['gen'] == r['gen'] and g['seq'] + 1 == r['seq'] and g['offset'] == r['src'][0]:
+                self.apply_chunk(e, g, r['chunk'])
+                e['stat'] = None  # force a rescan; fingerprint is refreshed on the next visit
+                known.add(r['path'])
+            else:
+                self.drop_outbox(r['chunk'])
+        # chunk files without a .rec.json are orphans from an interrupted write
+        for dp, _, fns in os.walk(self.cfg.p('outbox')):
+            for fn in fns:
+                full = os.path.join(dp, fn)
+                if fn.endswith('.zst') and not os.path.exists(full + '.rec.json'):
+                    for q in (full, full + '.meta.json'):
+                        try:
+                            os.unlink(q)
+                        except OSError:
+                            pass
+
+    def reconcile_journal(self):
+        pend = self.journal.unresolved()
+        if not pend:
+            return
+        by_repo = {}
+        for row in pend:
+            by_repo.setdefault(row['repo'], []).append(row)
+        index = self.chunk_index()
+        for repo, rows in by_repo.items():
+            tr = TmpRepo(self.cfg, repo)
+            try:
+                tip = tr.fetch_tip()
+            finally:
+                tr.close()
+            done = []
+            for row in rows:
+                if tr.entries.get(row['path']) == row['blob']:
+                    hit = index.get(row['path'])
+                    if hit:
+                        e, g, c = hit
+                        c['status'] = 'pushed'
+                        c['shard'] = repo
+                        c['commit'] = c.get('commit') or tip
+                        self.finish_pushed(e, c)
+                    done.append((row['path'], row['blob']))
+            if done:
+                self.journal.pushed(repo, done, tip)
+        self.journal.compact([])
+        self.save(force=True)
+        for e in self.st['files'].values():
+            for g in e['gens']:
+                for c in g['chunks']:
+                    if c['status'] == 'pushed':
+                        self.drop_outbox(c)
+
+    def chunk_index(self):
+        idx = {}
+        for e in self.st['files'].values():
+            for g in e['gens']:
+                for c in g['chunks']:
+                    idx[c['path']] = (e, g, c)
+        return idx
+
+    # -- entries
+    def new_entry(self, key, label, relpath):
+        session, parent = session_of(label, relpath)
+        return {'label': label, 'relpath': relpath, 'session': session, 'parent': parent,
+                'tool': TOOL_OF.get(label, label.split('-')[0]), 'gens': [], 'stat': None, 'fp': None,
+                'held': None, 'missing': False, 'pending_since': None, 'moved_from': None,
+                'force_new_gen': False, 'project': None}
+
+    def apply_chunk(self, e, g, c):
+        g['chunks'].append(c)
+        g['seq'] = c['seq']
+        g['offset'] = c['src'][1]
+        g['lines'] = c['line_start'] - 1 + c['records']
+        g['chain'] = c['chain_sha256']
+        g['prev'] = {'name': c['name'], 'sha256': c['sha256']}
+
+    def rollback(self, e, g, from_idx, reason):
+        """Discard staged chunks g.chunks[from_idx:] (never pushed ones) and rewind the generation."""
+        drop = g['chunks'][from_idx:]
+        if any(c['status'] == 'pushed' for c in drop):
+            raise Refused('internal: rollback of a pushed chunk')
+        for c in drop:
+            self.drop_outbox(c)
+            self.chunks_staged -= 1 if c.get('run') == self.id else 0
+        first = drop[0]
+        g['chunks'] = g['chunks'][:from_idx]
+        g['seq'] = first['seq'] - 1
+        g['offset'] = first['src'][0]
+        g['lines'] = first['line_start'] - 1
+        g['chain'] = first['prev_chain']
+        g['prev'] = first['prev']
+        e['stat'] = None
+        e['fp'] = None
+        self.whole.pop((self.key_of(e), g['gen']), None)
+
+    def key_of(self, e):
+        return '%s/%s' % (e['label'], e['relpath'])
+
+    # -- scanning
+    def needs_visit(self, e, st):
+        if e is None:
+            return True
+        if e.get('force_new_gen'):
+            return True
+        s = e.get('stat')
+        sig = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
+        if s != sig:
+            return True
+        return bool(e.get('pending_since'))  # an unsealed delta waits for the small-chunk rule
+
+    def find_move(self, key, label, relpath, f, size, seen_keys):
+        session, _ = session_of(label, relpath)
+        if getattr(self, '_by_session', None) is None:
+            self._by_session = {}
+            for k, v in self.st['files'].items():
+                self._by_session.setdefault(v['session'], []).append(k)
+        for okey in list(self._by_session.get(session, [])):
+            oe = self.st['files'].get(okey)
+            if oe is None or okey in seen_keys or okey == key or oe['session'] != session or oe['tool'] != TOOL_OF.get(label):
+                continue
+            if os.path.lexists(os.path.join(self.cfg.sources.get(oe['label'], '/nonexistent'), oe['relpath'])):
+                continue
+            g = cur_gen(oe)
+            if g['offset'] == 0 or size < g['offset']:
+                continue
+            ok = True
+            for c in g['chunks']:
+                h, full = hash_range(f, c['src'][0], c['src'][1])
+                if not full or h != c['src_sha256']:
+                    ok = False
+                    break
+            if ok:
+                return okey
+        return None
+
+    def process_file(self, key, label, relpath, path, seen_keys):
+        cfg = self.cfg
+        try:
+            f, fst = open_source(path)
+        except OSError:
+            return
+        with f:
+            e = self.st['files'].get(key)
+            if e is None:
+                mkey = self.find_move(key, label, relpath, f, fst.st_size, seen_keys)
+                if mkey:
+                    e = self.st['files'].pop(mkey)
+                    e['moved_from'] = mkey
+                    e['label'], e['relpath'] = label, relpath
+                    e['tool'] = TOOL_OF.get(label, e['tool'])
+                    e['fp'] = None
+                    e['ino_moved'] = True
+                    self.mark_manifest(mkey)
+                else:
+                    e = self.new_entry(key, label, relpath)
+                self.st['files'][key] = e
+            e['missing'] = False
+            g = cur_gen(e)
+            rewritten = False
+            if g['offset'] > 0:
+                s = e.get('stat')
+                if e.pop('force_new_gen', False):
+                    rewritten = True
+                elif fst.st_size < g['offset']:
+                    rewritten = True
+                elif s and s[3] != fst.st_ino and not e.pop('ino_moved', False):
+                    rewritten = True
+                elif e.get('fp') and fingerprint(f, g['offset']) != e['fp']:
+                    rewritten = True
+                elif not e.get('fp'):
+                    # no fingerprint (move or adoption): confirm the archived prefix chunk by chunk
+                    for c in g['chunks']:
+                        h, full = hash_range(f, c['src'][0], c['src'][1])
+                        if not full or h != c['src_sha256']:
+                            rewritten = True
+                            break
+            else:
+                e.pop('force_new_gen', None)
+            if rewritten:
+                e['gens'].append(new_gen(g['gen'] + 1, self.id))
+                g = cur_gen(e)
+                e['held'] = None
+                self.mark_manifest(key)
+            if g['offset'] == 0 and g['seq'] == 0:
+                g['started_run'] = self.id
+            self.files_changed += 1
+            e['held'] = None if (e.get('held') or {}).get('reason') != 'collision' else e['held']
+            if e.get('held'):
+                return
+            complete = self.chunk_delta(e, g, key, f, fst)
+            # an early stop (budget, per-visit cap) leaves stat unset so the next run resumes the file
+            e['stat'] = [fst.st_size, fst.st_mtime_ns, fst.st_ctime_ns, fst.st_ino] if complete else None
+            e['fp'] = fingerprint(f, g['offset'])
+
+    def chunk_delta(self, e, g, key, f, fst):
+        cfg = self.cfg
+        tr = redact_mod()
+        snap = fst.st_size
+        pos = g['offset']
+        line_no = g['lines']
+        f.seek(pos)
+        limit = pos + cfg.file_delta_cap
+        buf = []
+        buf_bytes = 0
+        src_h = hashlib.sha256()
+        start = pos
+        acc = {'ts': [], 'models': [], 'project': None, 'parent': None}
+        redactions = {}
+        omitted = []
+        counts = self.file_counts.setdefault(key, [0, 0])
+        stopped = None
+        while True:
+            if pos >= snap:
+                break
+            if pos >= limit:
+                stopped = 'cap'
+                break
+            if time.monotonic() > self.work_deadline:
+                stopped = 'budget'
+                break
+            line = f.readline(cfg.chunk_max + 1)
+            if not line:
+                break
+            if not line.endswith(b'\n'):
+                if len(line) > cfg.chunk_max:
+                    e['held'] = {'reason': 'record-over-max', 'line': line_no + 1}
+                break  # partial last line waits for the next run (NEG-7)
+            if pos + len(line) > snap:
+                break
+            line_no += 1
+            out, cnt, kind = tr.redact_line(line[:-1], line_no)
+            rec = out + b'\n'
+            if len(rec) > cfg.chunk_max:
+                e['held'] = {'reason': 'record-over-max', 'line': line_no}
+                line_no -= 1
+                break
+            if buf and buf_bytes + len(rec) > cfg.chunk_max:
+                self.seal(e, g, key, buf, start, pos, src_h, acc, redactions, omitted, fst)
+                buf, buf_bytes, start = [], 0, pos
+                src_h = hashlib.sha256()
+                acc = {'ts': [], 'models': [], 'project': None, 'parent': acc.get('parent')}
+                redactions, omitted = {}, []
+            buf.append(rec)
+            buf_bytes += len(rec)
+            src_h.update(line)
+            pos += len(line)
+            counts[0] += 1
+            self.records += 1
+            for k, v in cnt.items():
+                redactions[k] = redactions.get(k, 0) + v
+            if kind:
+                omitted.append({'line': line_no, 'kind': kind})
+                self.omitted.append((key, kind))
+                counts[1] += 1
+            record_meta(out, acc)
+        if buf:
+            src_bytes = pos - start
+            idle = time.time() - fst.st_mtime >= cfg.idle_s
+            if src_bytes >= cfg.seal_min or idle or self.force or self.served & FORCE_SEAL:
+                self.seal(e, g, key, buf, start, pos, src_h, acc, redactions, omitted, fst)
+                e['pending_since'] = None
+            else:
+                # the unsealed delta waits; its records were not archived
+                counts[0] -= len(buf)
+                self.records -= len(buf)
+                counts[1] -= len(omitted)
+                for o in omitted:
+                    self.omitted.remove((key, o['kind']))
+                if not e.get('pending_since'):
+                    e['pending_since'] = now_iso()
+        elif stopped is None and not e.get('held'):
+            e['pending_since'] = None
+        if e.get('held'):
+            self.mark_manifest(key)
+        return stopped is None
+
+    def seal(self, e, g, key, buf, start, end, src_h, acc, redactions, omitted, fst):
+        cfg = self.cfg
+        data = b''.join(buf)
+        sha = hashlib.sha256(data).hexdigest()
+        zdata = compress(data)
+        if hashlib.sha256(decompress(zdata)).hexdigest() != sha:
+            raise Refused('zstd round trip mismatch')
+        if len(zdata) >= cfg.file_max_z:
+            raise Refused('compressed chunk over 50 MB')
+        if acc['ts']:
+            first, last, ts_source = min(acc['ts']), max(acc['ts']), 'records'
+        else:
+            first = last = datetime.fromtimestamp(fst.st_mtime, timezone.utc).strftime('%Y-%m-%dT%H-%M-%SZ')
+            ts_source = 'mtime'
+        seq = g['seq'] + 1
+        path, name = chunk_path(cfg, e['label'], e['relpath'], g['gen'], seq, first, last)
+        chain = hashlib.sha256((g['chain'] + sha).encode('ascii')).hexdigest()
+        if acc.get('parent') and not e.get('parent'):
+            e['parent'] = acc['parent']
+        if acc.get('project') and not e.get('project'):
+            e['project'] = acc['project']
+        line_start = g['lines'] + 1
+        sidecar = {
+            'schema': SCHEMA, 'chunker_version': CHUNKER_VERSION, 'host': cfg.host, 'tool': e['tool'],
+            'source': e['label'], 'relpath': e['relpath'], 'session': e['session'], 'parent': e.get('parent'),
+            'project': acc.get('project') or e.get('project'), 'models': acc['models'], 'gen': g['gen'],
+            'seq': seq, 'name': name, 'path': path,
+            'prev': dict(g['prev']) if g['prev'] else None,
+            'src_range': [start, end], 'src_sha256': src_h.hexdigest(), 'sha256': sha,
+            'zsha256': hashlib.sha256(zdata).hexdigest(), 'bytes': len(data), 'zbytes': len(zdata),
+            'records': len(buf), 'line_start': line_start, 'first_ts': first,
+            'last_ts': last, 'ts_source': ts_source, 'chain_sha256': chain, 'mentions': mentions_of(data),
+            'redactions': redactions, 'omitted': omitted, 'ruleset_version': redact_mod().RULESET_VERSION,
+        }
+        sidecar = gate_metadata(sidecar)
+        meta_bytes = jdump(sidecar)
+        c = {'name': name, 'path': path, 'seq': seq, 'gen': g['gen'], 'status': 'staged', 'shard': None,
+             'commit': None, 'blob': git_blob_sha(zdata), 'meta_blob': git_blob_sha(meta_bytes), 'sha256': sha,
+             'zsha256': sidecar['zsha256'], 'src_sha256': sidecar['src_sha256'], 'src': [start, end],
+             'line_start': line_start, 'records': len(buf), 'bytes': len(data), 'zbytes': len(zdata),
+             'chain_sha256': chain, 'prev_chain': g['chain'], 'prev': sidecar['prev'],
+             'omitted': len(omitted), 'month': datetime.now(timezone.utc).strftime('%Y-%m'), 'run': self.id}
+        zp, mp, rp = self.outbox_paths(c)
+        atomic_write(zp, zdata)
+        atomic_write(mp, meta_bytes)
+        atomic_write(rp, jdump({'key': key, 'label': e['label'], 'relpath': e['relpath'], 'gen': g['gen'],
+                                'seq': seq, 'src': [start, end], 'path': path, 'chunk': c}))
+        crash_point(cfg, 'after_stage')
+        wk = (key, g['gen'])
+        if g['started_run'] == self.id:
+            self.whole.setdefault(wk, hashlib.sha256()).update(data)
+        if g['started_run'] != self.id:
+            g['whole_sha256'] = None  # appended in a later run: whole hash waits for verify --rehash
+            g['whole_sha256_pending'] = True
+        self.apply_chunk(e, g, c)
+        self.chunks_staged += 1
+        self.mark_manifest(key)
+        self.save()
+
+    # -- omission cap (AC-16)
+    def enforce_omission_cap(self):
+        total_r = self.records
+        total_o = len(self.omitted)
+        bad = set()
+        for key, (r, o) in self.file_counts.items():
+            if r >= 100 and o * 100 > r * 5:
+                bad.add(key)
+        run_bad = total_r > 0 and total_o * 1000 > total_r * 5
+        if run_bad:
+            bad |= {k for k, (r, o) in self.file_counts.items() if o}
+        if not bad:
+            return
+        self.status = 'omission-cap'
+        for key in bad:
+            e = self.st['files'].get(key)
+            if not e:
+                continue
+            g = cur_gen(e)
+            idx = next((i for i, c in enumerate(g['chunks']) if c.get('run') == self.id and c['status'] == 'staged'),
+                       None)
+            if idx is not None:
+                self.rollback(e, g, idx, 'omission-cap')
+            e['held'] = {'reason': 'omission-cap', 'line': None}
+            self.mark_manifest(key)
+        alert(self.cfg, 'omission-cap', 'omitted %d of %d records; %d file(s) held' % (total_o, total_r, len(bad)))
+
+    # -- publishing
+    def staged(self):
+        out = []
+        for key, e in self.st['files'].items():
+            for g in e['gens']:
+                for i, c in enumerate(g['chunks']):
+                    if c['status'] == 'staged':
+                        out.append((key, e, g, i, c))
+        return out
+
+    def reverify(self, key, e, g, i, c):
+        """Last-moment check of a staged chunk (NEG-16). Returns (zdata, meta) or None after a rollback."""
+        tr = redact_mod()
+        zp, mp, _ = self.outbox_paths(c)
+        why = None
+        try:
+            with open(zp, 'rb') as fh:
+                zdata = fh.read()
+            with open(mp, 'rb') as fh:
+                meta_b = fh.read()
+            meta = json.loads(meta_b)
+            if hashlib.sha256(zdata).hexdigest() != c['zsha256'] or meta.get('zsha256') != c['zsha256']:
+                why = 'zsha256'
+            else:
+                data = decompress(zdata)
+                if hashlib.sha256(data).hexdigest() != c['sha256']:
+                    why = 'sha256'
+                elif meta.get('ruleset_version') != tr.RULESET_VERSION:
+                    why = 'ruleset'
+                elif tr.verify_bytes(data) or tr.verify_bytes(meta_b):
+                    why = 'verifier'
+        except (OSError, ValueError):
+            why = 'unreadable'
+        if why is None:
+            return zdata, meta_b
+        alert(self.cfg, 'reverify-failed', 'chunk %s held back (%s); re-chunking from source' % (sha12(c['path']), why))
+        e['reverify_failures'] = e.get('reverify_failures', 0) + 1
+        self.rollback(e, g, i, why)
+        if e['reverify_failures'] >= 3:
+            e['held'] = {'reason': 'reverify-' + why, 'line': None}
+        self.mark_manifest(key)
+        return None
+
+    def shard_for(self, month, zbytes):
+        shards = self.st['shards']
+        mine = [s for s in shards if s['month'] == month]
+        cur = mine[-1] if mine else None
+        if cur is None or (cur['bytes'] > 0 and cur['bytes'] + zbytes > self.cfg.shard_cap):
+            part = (cur['part'] + 1) if cur else 1
+            cur = {'repo': 'agent-transcripts-%s-%s-p%d' % (self.cfg.host, month, part), 'month': month,
+                   'part': part, 'bytes': 0, 'chunks': 0}
+            shards.append(cur)
+        cur['bytes'] += zbytes  # counted at assignment: an assigned chunk is pushed (or retried) to this shard
+        cur['chunks'] += 1
+        return cur
+
+    def finish_pushed(self, e, c):
+        meta_src = self.outbox_paths(c)[1]
+        dst = os.path.join(self.cfg.p('meta'), c['path'] + '.meta.json')
+        if os.path.exists(meta_src):
+            os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+            os.replace(meta_src, dst)
+        self.mark_manifest(self.key_of(e))
+        self.st['last_progress_at'] = now_iso()
+
+    def publish(self):
+        cfg = self.cfg
+        if os.path.exists(cfg.p('killswitch.json')):
+            self.status = 'killswitch'
+            return
+        batch = []
+        for key, e, g, i, c in self.staged():
+            if c['status'] != 'staged' or c not in g['chunks']:
+                continue
+            got = self.reverify(key, e, g, i, c)
+            if got is None:
+                continue
+            batch.append((key, e, g, c, got))
+        for item in batch:
+            c = item[3]
+            if not c.get('shard'):
+                c['shard'] = self.shard_for(c['month'], c['zbytes'])['repo']
+        self.save(force=True)
+        repos = sorted({it[3]['shard'] for it in batch})
+        need_catalog = bool(batch) or bool(self.st.get('catalog_dirty')) or (
+            self.st.get('catalog_commit') is None and any(c['status'] == 'pushed' for *_, c in self.all_chunks()))
+        try:
+            for repo in repos + ([CATALOG] if need_catalog else []):
+                self.remote.ensure(repo)
+                self.remote.check(repo)
+        except Refused as ex:
+            self.refused = str(ex)
+            self.status = 'refused'
+            alert(cfg, 'repo-check', str(ex))
+            return
+        for repo in repos:
+            items = [it for it in batch if it[3]['shard'] == repo]
+            while items:
+                group, size = [], 0
+                while items and (not group or size + items[0][3]['zbytes'] <= cfg.push_max):
+                    it = items.pop(0)
+                    group.append(it)
+                    size += it[3]['zbytes']
+                self.push_group(repo, group)
+        if need_catalog or self.st.get('catalog_dirty'):
+            if CATALOG not in self.remote.checked:
+                try:
+                    self.remote.ensure(CATALOG)
+                    self.remote.check(CATALOG)
+                except Refused as ex:
+                    self.refused = str(ex)
+                    self.status = 'refused'
+                    alert(cfg, 'repo-check', str(ex))
+                    return
+            self.push_catalog()
+
+    def all_chunks(self):
+        for key, e in self.st['files'].items():
+            for g in e['gens']:
+                for i, c in enumerate(g['chunks']):
+                    yield key, e, g, i, c
+
+    def push_group(self, repo, group):
+        files = {}
+        for key, e, g, c, (zdata, meta_b) in group:
+            files[c['path']] = zdata
+            files[c['path'] + '.meta.json'] = meta_b
+        commit, collisions, _ = publish_tree(self.cfg, repo, files, 'archive %d chunk(s) from %s' % (
+            len(group), self.cfg.host), journal=self.journal, deadline=self.deadline)
+        bad = set()
+        for p in collisions:
+            bad.add(p[:-len('.meta.json')] if p.endswith('.meta.json') else p)
+        done = []
+        for key, e, g, c, _ in group:
+            if c['path'] in bad:
+                self.collisions += 1
+                c['status'] = 'collision'
+                e['held'] = {'reason': 'collision', 'line': None}
+                alert(self.cfg, 'collision', 'shard path %s exists with different bytes; refusing to overwrite'
+                      % sha12(c['path']))
+                self.mark_manifest(key)
+                continue
+            done.append((c['path'], c['blob']))
+        if commit:
+            self.journal.pushed(repo, done, commit)
+        for key, e, g, c, _ in group:
+            if c['status'] != 'staged':
+                continue
+            c['status'] = 'pushed'
+            c['commit'] = commit
+            self.finish_pushed(e, c)
+            self.chunks_pushed += 1
+            self.bytes_pushed += c['zbytes']
+        if commit:
+            self.shard_commits[repo] = commit
+        self.save(force=True)
+        crash_point(self.cfg, 'after_state_pushed')
+        for key, e, g, c, _ in group:
+            if c['status'] == 'pushed':
+                self.drop_outbox(c)
+
+    def push_catalog(self):
+        cfg = self.cfg
+        files = catalog_files(cfg, self.st, self.whole_final())
+        commit, _, _ = publish_tree(cfg, CATALOG, files, 'catalog update from %s' % cfg.host,
+                                    deadline=self.deadline, overwrite=True)
+        crash_point(cfg, 'after_catalog_push')
+        self.st['catalog_dirty'] = False
+        self.st['manifest_dirty'] = []
+        if commit:
+            self.st['catalog_commit'] = commit
+            self.catalog_commit = commit
+        self.save(force=True)
+
+    def whole_final(self):
+        for (key, gen), h in self.whole.items():
+            e = self.st['files'].get(key)
+            if not e:
+                continue
+            for g in e['gens']:
+                if g['gen'] == gen and all(c['status'] == 'pushed' for c in g['chunks']):
+                    g['whole_sha256'] = h.hexdigest()
+                    g['whole_sha256_pending'] = False
+        return None
+
+
+def catalog_files(cfg, st, _unused=None):
+    files = {}
+    try:
+        with open(README_SRC, 'rb') as f:
+            files['README.md'] = f.read()
+    except OSError:
+        pass
+    files['shards/%s.json' % cfg.host] = jdump({'schema': SCHEMA, 'host': cfg.host, 'shards': st['shards']}) + b'\n'
+    files['index/%s.jsonl' % cfg.host] = b''.join(jdump(r) + b'\n' for r in index_rows(cfg, st))
+    for key in st['manifest_dirty'] if st.get('catalog_commit') else list(st['files'].keys()):
+        e = st['files'].get(key)
+        label, _, rel = key.partition('/')
+        mpath = 'manifests/%s/%s/%s.json' % (cfg.host, safe_comp(label), '/'.join(safe_comp(p) for p in rel.split('/')))
+        if e is None:
+            continue
+        files[mpath] = jdump(manifest_of(cfg, key, e)) + b'\n'
+    for key in st['manifest_dirty']:
+        e = st['files'].get(key)
+        if e is None:  # moved away: leave a pointer manifest
+            label, _, rel = key.partition('/')
+            mpath = 'manifests/%s/%s/%s.json' % (cfg.host, safe_comp(label), '/'.join(safe_comp(p) for p in rel.split('/')))
+            dest = next((k for k, v in st['files'].items() if v.get('moved_from') == key), None)
+            files[mpath] = jdump({'schema': SCHEMA, 'host': cfg.host, 'source': label, 'relpath': rel,
+                                  'moved_to': dest}) + b'\n'
+    return files
+
+
+def manifest_of(cfg, key, e):
+    gens = []
+    for g in e['gens']:
+        pushed = [c for c in g['chunks'] if c['status'] == 'pushed']
+        gens.append({'gen': g['gen'], 'archived_offset': pushed[-1]['src'][1] if pushed else 0,
+                     'chunks': [{'shard': c['shard'], 'path': c['path'], 'commit': c['commit'], 'sha256': c['sha256'],
+                                 'zsha256': c['zsha256'], 'src_sha256': c['src_sha256'], 'blob': c['blob'],
+                                 'seq': c['seq'], 'src_range': c['src']} for c in pushed],
+                     'chain_sha256': pushed[-1]['chain_sha256'] if pushed else None,
+                     'whole_sha256': g.get('whole_sha256'),
+                     'whole_sha256_pending': bool(g.get('whole_sha256_pending', True))})
+    s = e.get('stat') or [0, 0, 0, 0]
+    g = e['gens'][-1] if e['gens'] else None
+    archived = gens[-1]['archived_offset'] if gens else 0
+    omitted = []
+    for gg in e['gens']:
+        for c in gg['chunks']:
+            if c['status'] == 'pushed' and c.get('omitted'):
+                omitted.append({'gen': gg['gen'], 'chunk': c['name'], 'count': c['omitted']})
+    return {'schema': SCHEMA, 'host': cfg.host, 'source': e['label'], 'relpath': e['relpath'],
+            'source_path': os.path.join(cfg.sources.get(e['label'], ''), e['relpath']), 'session': e['session'],
+            'parent': e.get('parent'), 'tool': e['tool'], 'size': s[0], 'mtime_ns': s[1], 'inode': s[3],
+            'current_gen': g['gen'] if g else None, 'generations': gens,
+            'chain_sha256': gens[-1]['chain_sha256'] if gens else None,
+            'whole_sha256': gens[-1]['whole_sha256'] if gens else None,
+            'whole_sha256_pending': gens[-1]['whole_sha256_pending'] if gens else True,
+            'fully_archived': bool(gens) and archived == s[0] and not e.get('pending_since') and not e.get('held'),
+            'held': e.get('held'), 'missing': bool(e.get('missing')), 'moved_from': e.get('moved_from'),
+            'omitted_chunks': omitted}
+
+
+INDEX_FIELDS = ('host', 'tool', 'source', 'relpath', 'session', 'parent', 'project', 'models', 'gen', 'seq', 'name',
+                'sha256', 'zsha256', 'bytes', 'zbytes', 'records', 'first_ts', 'last_ts', 'ts_source', 'mentions',
+                'chain_sha256', 'line_start', 'src_range')
+
+
+def row_from_sidecar(meta, shard, commit):
+    row = {'schema': SCHEMA}
+    for k in INDEX_FIELDS:
+        row[k] = meta.get(k)
+    row['omitted'] = len(meta.get('omitted') or [])
+    row['shard'] = shard
+    row['path'] = meta.get('path')
+    row['commit'] = commit
+    return row
+
+
+def index_rows(cfg, st):
+    rows = []
+    for key, e in st['files'].items():
+        for g in e['gens']:
+            for c in g['chunks']:
+                if c['status'] != 'pushed':
+                    continue
+                meta = read_json(os.path.join(cfg.p('meta'), c['path'] + '.meta.json'))
+                if meta is None:
+                    continue
+                rows.append(row_from_sidecar(meta, c['shard'], c['commit']))
+    rows.sort(key=lambda r: (r['source'], r['relpath'], r['gen'], r['seq']))
+    return rows
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Receipts and check
+# ----------------------------------------------------------------------------------------------------------
+
+def backlog_of(cfg, st):
+    files = 0
+    nbytes = 0
+    old = 0
+    now = time.time()
+    for e in st['files'].values():
+        if e.get('missing'):
+            continue
+        s = e.get('stat')
+        g = e['gens'][-1] if e['gens'] else None
+        off = g['offset'] if g else 0
+        if not s:  # visit stopped early: measure the live file
+            try:
+                s = [os.lstat(os.path.join(cfg.sources.get(e['label'], '/nonexistent'), e['relpath'])).st_size]
+            except OSError:
+                continue
+        if s[0] > off:
+            files += 1
+            nbytes += s[0] - off
+        ps = parse_iso(e.get('pending_since'))
+        if ps and now - ps > 7200:
+            old += 1
+    return {'files': files, 'bytes': nbytes, 'pending_over_2h': old}
+
+
+def held_of(st):
+    out = []
+    for key, e in st['files'].items():
+        if e.get('held'):
+            out.append({'source': e['label'], 'path_sha12': sha12(key), 'reason': e['held'].get('reason'),
+                        'line': e['held'].get('line')})
+    return out
+
+
+def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
+    st = run.st if run else load_state(cfg)
+    by_kind = {}
+    if run:
+        for _, k in run.omitted:
+            by_kind[k] = by_kind.get(k, 0) + 1
+    status = status or (run.status if run else 'failed')
+    ok = status == 'ok'
+    rec = {
+        'schema': SCHEMA, 'host': cfg.host, 'checkpoint': checkpoint or (run.checkpoint if run else None),
+        'served_checkpoints': sorted(run.served) if run else [], 'started_at': run.started_at if run else now_iso(),
+        'finished_at': now_iso(), 'ok': ok, 'status': status,
+        'files_scanned': run.files_scanned if run else 0, 'files_changed': run.files_changed if run else 0,
+        'chunks_staged': run.chunks_staged if run else 0, 'chunks_pushed': run.chunks_pushed if run else 0,
+        'bytes_pushed': run.bytes_pushed if run else 0, 'held': held_of(st), 'backlog': backlog_of(cfg, st),
+        'shard_commits': run.shard_commits if run else {}, 'catalog_commit': run.catalog_commit if run else None,
+        'omitted': {'total': len(run.omitted) if run else 0, 'by_kind': by_kind,
+                    'records_processed': run.records if run else 0},
+        'collisions': run.collisions if run else 0, 'last_progress_at': st.get('last_progress_at'),
+        'killswitch': os.path.exists(cfg.p('killswitch.json')),
+        'error': error or (run.refused if run else None) or ((run.disk_low or '; '.join(run.errors)) if run else None)
+        or None,
+    }
+    atomic_write(cfg.p('receipts', 'last.json'), jdump(rec) + b'\n')
+    if ok:
+        atomic_write(cfg.p('receipts', 'last-ok.json'), jdump(rec) + b'\n')
+    return rec
+
+
+def check(cfg, max_age_min=60):
+    last = read_json(cfg.p('receipts', 'last.json'))
+    lastok = read_json(cfg.p('receipts', 'last-ok.json'))
+    reasons = []
+    code = 0
+    ks = read_json(cfg.p('killswitch.json'))
+    if ks:
+        reasons.append('killswitch kind=%s' % ks.get('kind'))
+        code = 2
+    if last:
+        if last.get('status') in ('failed', 'omission-cap', 'disk-low', 'refused', 'killswitch'):
+            reasons.append(last['status'] + ((': ' + last['error']) if last.get('error') else ''))
+            code = 2
+        if last.get('held'):
+            reasons.append('held=%d' % len(last['held']))
+            code = 2
+        bl = last.get('backlog') or {}
+        if bl.get('files'):
+            reasons.append('backlog files=%d bytes=%d' % (bl['files'], bl.get('bytes', 0)))
+            lp = parse_iso(last.get('last_progress_at'))
+            if lp is None or time.time() - lp > 86400:
+                reasons.append('no-progress-24h')
+                code = 2
+    age = None
+    if lastok:
+        t = parse_iso(lastok.get('finished_at'))
+        age = (time.time() - t) / 60.0 if t else None
+    if not lastok or age is None:
+        reasons.insert(0, 'never-ok')
+        code = 3
+    elif age > max_age_min and code < 2:
+        reasons.insert(0, 'stale age_min=%d' % int(age))
+        code = 1
+    elif age > max_age_min:
+        reasons.insert(0, 'stale age_min=%d' % int(age))
+    status = {0: 'ok', 1: 'stale', 2: 'failed', 3: 'never-ok'}[code]
+    return code, {'status': status, 'last_ok_at': lastok.get('finished_at') if lastok else None,
+                  'age_min': round(age, 1) if age is not None else None, 'reasons': reasons, 'exit': code}
+
+
+# ----------------------------------------------------------------------------------------------------------
+# Commands
+# ----------------------------------------------------------------------------------------------------------
+
+def do_sync(cfg, checkpoint, budget, dry_run=False, backfill=False):
+    ensure_home(cfg)
+    if dry_run:
+        return dry(cfg)
+    lock = Lock(cfg)
+    if not lock.try_acquire():
+        if checkpoint in CHECKPOINTS:
+            drop_request(cfg, checkpoint)
+        print('skipped: locked (request queued)' if checkpoint in CHECKPOINTS else 'skipped: locked')
+        return 0
+    try:
+        take_requests(cfg, reap_only=True)
+        if backfill and not cfg.ignore_load:
+            load = os.getloadavg()[0]
+            if load > (os.cpu_count() or 1):
+                write_receipt(cfg, None, status='deferred', error='deferred: load %.1f' % load, checkpoint='backfill')
+                print('deferred: load')
+                return 0
+        run = Run(cfg, checkpoint, budget)
+        try:
+            zstd_bin()
+            sync_body(run, backfill)
+        except Refused as ex:
+            run.status = 'failed'
+            run.errors.append(str(ex))
+        except GitError as ex:
+            run.status = 'failed'
+            run.errors.append(str(ex))
+        except subprocess.TimeoutExpired:
+            run.status = 'failed'
+            run.errors.append('git timeout')
+        finally:
+            try:
+                save_state(cfg, run.st)
+            except OSError:
+                pass
+        served = take_requests(cfg)
+        run.served |= served
+        rec = write_receipt(cfg, run)
+        refresh_sqlite(cfg, run.st)
+        print(json.dumps({'status': rec['status'], 'ok': rec['ok'], 'chunks_pushed': rec['chunks_pushed'],
+                          'held': len(rec['held']), 'backlog_files': rec['backlog']['files'],
+                          'error': rec['error']}))
+        return 0 if rec['ok'] else 2
+    finally:
+        lock.release()
+
+
+def sync_body(run, backfill):
+    cfg = run.cfg
+    run.adopt_outbox()
+    run.reconcile_journal()
+    free_gb = shutil.disk_usage(cfg.home).free / 1e9
+    if free_gb < cfg.min_free_gb:
+        run.disk_low = 'disk-low free=%.1fGB floor=%.1fGB' % (free_gb, cfg.min_free_gb)
+    if run.disk_low is None:
+        process_queue(run, backfill)
+        run.enforce_omission_cap()
+    run.publish()
+    if run.disk_low and run.status == 'ok':
+        run.status = 'disk-low'
+    if run.collisions and run.status == 'ok':
+        run.status = 'failed'
+        run.errors.append('collision on %d chunk(s)' % run.collisions)
+
+
+def process_queue(run, backfill):
+    cfg = run.cfg
+    while True:
+        found = discover(cfg)
+        seen = {k for k, *_ in found}
+        run.files_scanned = len(found)
+        for key, e in run.st['files'].items():
+            if key not in seen and not e.get('missing'):
+                e['missing'] = True
+                run.mark_manifest(key)
+        todo = [x for x in found if run.needs_visit(run.st['files'].get(x[0]), x[4])]
+        todo.sort(key=lambda x: -x[4].st_mtime_ns)  # newest first
+        rescan = False
+        for key, label, rel, path, st in todo:
+            if time.monotonic() > run.work_deadline:
+                return
+            if run.outbox_bytes() > cfg.outbox_cap:
+                run.publish()
+            run.process_file(key, label, rel, path, seen)
+            run.save()
+            got = take_requests(cfg)
+            if got:
+                run.served |= got
+                rescan = True  # serve the requesting checkpoint: changed files first
+                break
+            if backfill and not cfg.ignore_load:
+                load = os.getloadavg()[0]
+                if load > (os.cpu_count() or 1) * 0.8:
+                    time.sleep(min(2.0, max(0.0, run.work_deadline - time.monotonic())))
+        if not rescan:
+            return
+
+
+def dry(cfg):
+    st = load_state(cfg)
+    run = type('R', (), {})()
+    n = 0
+    for key, label, rel, path, s in discover(cfg):
+        e = st['files'].get(key)
+        if e is not None and not Run.needs_visit(run, e, s):
+            continue
+        off = e['gens'][-1]['offset'] if e and e['gens'] else 0
+        print(json.dumps({'would_archive': key, 'delta_bytes': max(0, s.st_size - off)}))
+        n += 1
+    print(json.dumps({'dry_run': True, 'files': n}))
+    return 0
+
+
+def background(cfg, argv):
+    ensure_home(cfg)
+    lock = Lock(cfg)
+    cp = None
+    if '--checkpoint' in argv:
+        cp = argv[argv.index('--checkpoint') + 1]
+    if not lock.try_acquire():
+        if cp in CHECKPOINTS:
+            drop_request(cfg, cp)
+        print('skipped: locked (request queued)')
+        return 0
+    lock.release()
+    child = [a for a in argv if a != '--background']
+    if '--budget-seconds' not in child:
+        child += ['--budget-seconds', '600']
+    pid = os.fork()
+    if pid > 0:
+        os.waitpid(pid, 0)
+        print('started: background sync')
+        return 0
+    try:
+        os.setsid()
+        if os.fork() > 0:
+            os._exit(0)
+        logp = cfg.p('logs', 'sync.log')
+        fd = os.open(logp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        nul = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(nul, 0)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + child)
+    finally:
+        os._exit(1)
+
+
+# -- SQLite index
+
+def open_db(cfg):
+    db = sqlite3.connect(cfg.p('index.sqlite'))
+    db.execute('CREATE TABLE IF NOT EXISTS chunks (host TEXT, path TEXT, shard TEXT, commit_sha TEXT, session TEXT, '
+               'parent TEXT, source TEXT, relpath TEXT, project TEXT, gen INT, seq INT, first_ts TEXT, last_ts TEXT, '
+               'row TEXT, PRIMARY KEY (host, path))')
+    db.execute('CREATE TABLE IF NOT EXISTS mentions (host TEXT, path TEXT, kind TEXT, value TEXT)')
+    db.execute('CREATE INDEX IF NOT EXISTS m_kv ON mentions(kind, value)')
+    db.execute('CREATE TABLE IF NOT EXISTS files (host TEXT, source TEXT, relpath TEXT, manifest TEXT, '
+               'PRIMARY KEY (host, source, relpath))')
+    return db
+
+
+def db_load(db, rows, hosts=None, manifests=None):
+    hosts = set(hosts or {r['host'] for r in rows})
+    for h in hosts:
+        db.execute('DELETE FROM chunks WHERE host=?', (h,))
+        db.execute('DELETE FROM mentions WHERE host=?', (h,))
+        if manifests is not None:
+            db.execute('DELETE FROM files WHERE host=?', (h,))
+    for r in rows:
+        db.execute('INSERT OR REPLACE INTO chunks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                   (r['host'], r['path'], r['shard'], r['commit'], r['session'], r.get('parent'), r['source'],
+                    r['relpath'], r.get('project'), r['gen'], r['seq'], r.get('first_ts'), r.get('last_ts'),
+                    json.dumps(r, sort_keys=True)))
+        for kind, key in (('ticket', 'tickets'), ('pr', 'prs'), ('commit', 'commits')):
+            for v in ((r.get('mentions') or {}).get(key) or []):
+                db.execute('INSERT INTO mentions VALUES (?,?,?,?)', (r['host'], r['path'], kind, v))
+    for m in manifests or []:
+        if m.get('relpath') and m.get('generations') is not None:
+            db.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?)',
+                       (m['host'], m['source'], m['relpath'], json.dumps(m, sort_keys=True)))
+    db.commit()
+
+
+def refresh_sqlite(cfg, st):
+    try:
+        db = open_db(cfg)
+        rows = index_rows(cfg, st)
+        mans = [manifest_of(cfg, k, e) for k, e in st['files'].items()]
+        db_load(db, rows, hosts=[cfg.host], manifests=mans)
+        db.close()
+    except sqlite3.Error:
+        pass
+
+
+def db_rows(cfg, where='1=1', args=()):
+    db = open_db(cfg)
+    try:
+        return [json.loads(r[0]) for r in db.execute('SELECT row FROM chunks WHERE ' + where, args)]
+    finally:
+        db.close()
+
+
+def cmd_find(cfg, a):
+    conds, args = [], []
+    if a.session:
+        conds.append('(session=? OR parent=?)')
+        args += [a.session, a.session]
+    if a.project:
+        conds.append('project LIKE ?')
+        args.append('%' + a.project + '%')
+    if a.host:
+        conds.append('host=?')
+        args.append(a.host)
+    if a.since:
+        conds.append('last_ts >= ?')
+        args.append(norm_ts(a.since) or a.since)
+    if a.ticket:
+        conds.append("path IN (SELECT path FROM mentions WHERE kind='ticket' AND value=?)")
+        args.append(str(a.ticket).lstrip('#'))
+    rows = db_rows(cfg, ' AND '.join(conds) or '1=1', args)
+    groups = {}
+    for r in rows:
+        k = (r['host'], r['source'], r['relpath'])
+        g = groups.setdefault(k, {'host': r['host'], 'source': r['source'], 'relpath': r['relpath'],
+                                  'session': r['session'], 'parent': r.get('parent'), 'project': r.get('project'),
+                                  'chunks': 0, 'first_ts': r.get('first_ts'), 'last_ts': r.get('last_ts'),
+                                  'gens': []})
+        g['chunks'] += 1
+        g['first_ts'] = min(filter(None, [g['first_ts'], r.get('first_ts')]), default=None)
+        g['last_ts'] = max(filter(None, [g['last_ts'], r.get('last_ts')]), default=None)
+        if r['gen'] not in g['gens']:
+            g['gens'].append(r['gen'])
+    for g in sorted(groups.values(), key=lambda x: (x['host'], x['source'], x['relpath'])):
+        print(json.dumps(g, sort_keys=True))
+    if not groups:
+        sys.stderr.write('no matches (run `transcripts reindex` if the local index is empty)\n')
+    return 0 if groups else 1
+
+
+def session_files(cfg, session):
+    """{(host, source, relpath): [rows of the latest gen sorted by seq]} for one session."""
+    rows = db_rows(cfg, 'session=?', (session,))
+    files = {}
+    for r in rows:
+        files.setdefault((r['host'], r['source'], r['relpath']), []).append(r)
+    out = {}
+    for k, rs in files.items():
+        gen = max(r['gen'] for r in rs)
+        out[k] = sorted((r for r in rs if r['gen'] == gen), key=lambda r: r['seq'])
+    return out
+
+
+def manifest_from_db(cfg, host, source, relpath):
+    db = open_db(cfg)
+    try:
+        r = db.execute('SELECT manifest FROM files WHERE host=? AND source=? AND relpath=?',
+                       (host, source, relpath)).fetchone()
+        return json.loads(r[0]) if r else None
+    finally:
+        db.close()
+
+
+class VerifyError(Exception):
+    pass
+
+
+def fetch_verified(cfg, rows, readers):
+    """Yield verified raw bytes per chunk, in order; raises VerifyError naming the chunk."""
+    chain = ''
+    prev = None
+    for i, r in enumerate(rows):
+        if r['seq'] != i + 1:
+            raise VerifyError('chunk %s: sequence gap (expected p%05d)' % (r['name'], i + 1))
+        tr = readers.get(r['shard'])
+        if tr is None:
+            tr = TmpRepo(cfg, r['shard'])
+            tr.fetch_tip()
+            readers[r['shard']] = tr
+        oid = tr.entries.get(r['path'])
+        if oid is None:
+            raise VerifyError('chunk %s: missing from shard %s' % (r['name'], r['shard']))
+        zdata = tr.blob(oid)
+        if hashlib.sha256(zdata).hexdigest() != r['zsha256']:
+            raise VerifyError('chunk %s: zsha256 mismatch' % r['name'])
+        try:
+            data = decompress(zdata)
+        except ValueError:
+            raise VerifyError('chunk %s: zstd decode failed' % r['name'])
+        sha = hashlib.sha256(data).hexdigest()
+        if sha != r['sha256']:
+            raise VerifyError('chunk %s: sha256 mismatch' % r['name'])
+        expect_prev = {'name': prev['name'], 'sha256': prev['sha256']} if prev else None
+        meta_oid = tr.entries.get(r['path'] + '.meta.json')
+        if meta_oid:
+            meta = json.loads(tr.blob(meta_oid))
+            if meta.get('prev') != expect_prev or meta.get('sha256') != sha:
+                raise VerifyError('chunk %s: sidecar prev/sha mismatch' % r['name'])
+        chain = hashlib.sha256((chain + sha).encode('ascii')).hexdigest()
+        if r.get('chain_sha256') and chain != r['chain_sha256']:
+            raise VerifyError('chunk %s: chain mismatch' % r['name'])
+        prev = r
+        yield r, data, chain
+
+
+def cmd_cat(cfg, a):
+    files = session_files(cfg, a.session) if not a.local else None
+    if a.local:
+        st = load_state(cfg)
+        hits = [e for e in st['files'].values() if e['session'] == a.session]
+        if not hits:
+            sys.stderr.write('no local source for that session\n')
+            return 1
+        for e in sorted(hits, key=lambda e: (e['label'], e['relpath'])):
+            path = os.path.join(cfg.sources.get(e['label'], '/nonexistent'), e['relpath'])
+            try:
+                f, _ = open_source(path)
+            except OSError:
+                sys.stderr.write('source missing: %s\n' % sha12(e['label'] + '/' + e['relpath']))
+                return 1
+            with f:
+                shutil.copyfileobj(f, sys.stdout.buffer)
+        return 0
+    if not files:
+        sys.stderr.write('session not in the index (run `transcripts reindex`)\n')
+        return 1
+    readers = {}
+    try:
+        for k in sorted(files):
+            for r, data, _ in fetch_verified(cfg, files[k], readers):
+                sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    except VerifyError as ex:
+        sys.stderr.write('verify failed: %s\n' % ex)
+        return 1
+    finally:
+        for tr in readers.values():
+            tr.close()
+    return 0
+
+
+def cmd_recover(cfg, a):
+    target = os.path.abspath(a.to)
+    staging = tempfile.mkdtemp(prefix='recover-', dir=cfg.p('tmp'))
+    written = []
+    try:
+        if a.source == 'local':
+            st = load_state(cfg)
+            hits = [e for e in st['files'].values() if e['session'] == a.session]
+            if not hits:
+                raise VerifyError('no local source for that session')
+            for e in hits:
+                rel = os.path.join(cfg.host, e['label'], e['relpath'])
+                out = os.path.join(staging, rel)
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                f, _ = open_source(os.path.join(cfg.sources[e['label']], e['relpath']))
+                with f, open(out, 'wb') as o:
+                    shutil.copyfileobj(f, o)
+                written.append(rel)
+        else:
+            files = session_files(cfg, a.session)
+            if not files:
+                raise VerifyError('session not in the index (run `transcripts reindex`)')
+            readers = {}
+            try:
+                for (host, source, relpath), rows in sorted(files.items()):
+                    rel = os.path.join(host, source, relpath)
+                    out = os.path.join(staging, rel)
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    whole = hashlib.sha256()
+                    last_chain = None
+                    with open(out, 'wb') as o:
+                        for r, data, chain in fetch_verified(cfg, rows, readers):
+                            o.write(data)
+                            whole.update(data)
+                            last_chain = chain
+                    man = manifest_from_db(cfg, host, source, relpath)
+                    if man:
+                        g = next((x for x in man['generations'] if x['gen'] == rows[0]['gen']), None)
+                        if g:
+                            if len(g['chunks']) != len(rows):
+                                raise VerifyError('%s: manifest lists %d chunks, index %d' % (
+                                    rows[0]['name'], len(g['chunks']), len(rows)))
+                            if g.get('chain_sha256') and g['chain_sha256'] != last_chain:
+                                raise VerifyError('%s: manifest chain mismatch' % rows[-1]['name'])
+                            if g.get('whole_sha256') and g['whole_sha256'] != whole.hexdigest():
+                                raise VerifyError('%s: whole_sha256 mismatch' % rows[-1]['name'])
+                    written.append(rel)
+            finally:
+                for tr in readers.values():
+                    tr.close()
+        for rel in written:
+            if os.path.exists(os.path.join(target, rel)):
+                raise VerifyError('target file exists: %s' % rel)
+        for rel in written:
+            dst = os.path.join(target, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(os.path.join(staging, rel), dst)
+        print(json.dumps({'recovered': written, 'to': target, 'from': a.source, 'truth': RECOVERY_TRUTH}))
+        return 0
+    except (VerifyError, OSError, GitError) as ex:
+        sys.stderr.write('recover failed, nothing written: %s\n' % ex)
+        return 1
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def fetch_catalog(cfg):
+    """Full depth-1 fetch of the small catalog repo -> {path: bytes}."""
+    tr = TmpRepo(cfg, CATALOG)
+    try:
+        if not tr.fetch_tip():
+            return {}
+        return {p: tr.blob(oid) for p, oid in tr.entries.items()}
+    finally:
+        tr.close()
+
+
+def cmd_reindex(cfg, a):
+    ensure_home(cfg)
+    if a.from_sidecars:
+        cat = fetch_catalog(cfg)
+        repos = []
+        for p, b in cat.items():
+            if p.startswith('shards/'):
+                repos += [s['repo'] for s in json.loads(b).get('shards', [])]
+        if not repos:  # catalog unreachable or empty: fall back to the local shard ledger
+            repos = [s['repo'] for s in load_state(cfg)['shards']]
+        rows = rows_from_sidecars(cfg, repos)
+        db = open_db(cfg)
+        db_load(db, rows, hosts={r['host'] for r in rows})
+        db.close()
+        print(json.dumps({'reindexed_from': 'sidecars', 'rows': len(rows), 'repos': len(repos)}))
+        return 0
+    cat = fetch_catalog(cfg)
+    rows, mans = [], []
+    hosts = set()
+    for p, b in sorted(cat.items()):
+        if p.startswith('index/') and p.endswith('.jsonl'):
+            hosts.add(p[len('index/'):-len('.jsonl')])
+            rows += [json.loads(x) for x in b.splitlines() if x.strip()]
+        elif p.startswith('manifests/'):
+            mans.append(json.loads(b))
+    db = open_db(cfg)
+    db_load(db, rows, hosts=hosts, manifests=mans)
+    db.close()
+    print(json.dumps({'reindexed_from': 'catalog', 'rows': len(rows), 'hosts': sorted(hosts)}))
+    return 0
+
+
+def rows_from_sidecars(cfg, repos):
+    rows = []
+    for repo in repos:
+        tr = TmpRepo(cfg, repo)
+        try:
+            if not tr.ls_remote():
+                continue
+            git(cfg, ['fetch', '-q', '--filter=blob:none', 'origin', 'refs/heads/main:refs/heads/main'], cwd=tr.dir,
+                timeout=600)
+            added = {}
+            log = git(cfg, ['log', '--reverse', '--raw', '--no-renames', '--diff-filter=A', '--format=C %H',
+                            'refs/heads/main'], cwd=tr.dir).stdout.decode('utf-8', 'surrogateescape')
+            commit = None
+            for line in log.splitlines():
+                if line.startswith('C '):
+                    commit = line[2:].strip()
+                elif line.startswith(':') and '\t' in line:
+                    path = line.split('\t', 1)[1]
+                    added.setdefault(path, commit)
+            ents = tr.ls_tree('refs/heads/main')
+            for path, oid in ents.items():
+                if not path.endswith('.meta.json'):
+                    continue
+                meta = json.loads(tr.blob(oid))
+                rows.append(row_from_sidecar(meta, repo, added.get(meta.get('path'))))
+        finally:
+            tr.close()
+    rows.sort(key=lambda r: (r['host'], r['source'], r['relpath'], r['gen'], r['seq']))
+    return rows
+
+
+def cmd_verify(cfg, a):
+    ensure_home(cfg)
+    if a.rescan:
+        return verify_rescan(cfg, a.kind)
+    lock = Lock(cfg)
+    if (a.rehash or a.against_source) and not lock.try_acquire():
+        print('skipped: locked')
+        return 0
+    try:
+        st = load_state(cfg)
+        problems = []
+        if a.against_source:
+            n = 0
+            for key, e in st['files'].items():
+                g = cur_gen(e)
+                if not g['chunks']:
+                    continue
+                try:
+                    f, _ = open_source(os.path.join(cfg.sources.get(e['label'], '/nonexistent'), e['relpath']))
+                except OSError:
+                    continue
+                with f:
+                    for c in g['chunks']:
+                        h, full = hash_range(f, c['src'][0], c['src'][1])
+                        if not full or h != c['src_sha256']:
+                            e['force_new_gen'] = True
+                            n += 1
+                            break
+            save_state(cfg, st)
+            print(json.dumps({'against_source': True, 'new_generations_scheduled': n}))
+            return 0
+        by_repo = {}
+        for key, e in st['files'].items():
+            for g in e['gens']:
+                for c in g['chunks']:
+                    if c['status'] == 'pushed':
+                        by_repo.setdefault(c['shard'], []).append((key, e, g, c))
+        orphans = 0
+        for repo, items in sorted(by_repo.items()):
+            tr = TmpRepo(cfg, repo)
+            try:
+                tr.fetch_tip()
+                known = set()
+                for key, e, g, c in items:
+                    known |= {c['path'], c['path'] + '.meta.json'}
+                    have = tr.entries.get(c['path'])
+                    if have is None:
+                        problems.append('chunk %s: missing from %s' % (c['name'], repo))
+                    elif have != c['blob']:
+                        problems.append('chunk %s: blob mismatch in %s' % (c['name'], repo))
+                    elif c.get('meta_blob') and tr.entries.get(c['path'] + '.meta.json') != c['meta_blob']:
+                        problems.append('chunk %s: sidecar mismatch in %s' % (c['name'], repo))
+                for p in tr.entries:
+                    if p.startswith(cfg.host + '/') and p not in known:
+                        orphans += 1
+            finally:
+                tr.close()
+        if a.rehash:
+            readers = {}
+            try:
+                for key, e in st['files'].items():
+                    for g in e['gens']:
+                        pushed = [c for c in g['chunks'] if c['status'] == 'pushed']
+                        if not pushed or len(pushed) != len(g['chunks']) or not g.get('whole_sha256_pending', True):
+                            continue
+                        rows = [{'seq': c['seq'], 'name': c['name'], 'shard': c['shard'], 'path': c['path'],
+                                 'zsha256': c['zsha256'], 'sha256': c['sha256'], 'chain_sha256': c['chain_sha256']}
+                                for c in pushed]
+                        h = hashlib.sha256()
+                        try:
+                            for _, data, _ in fetch_verified(cfg, rows, readers):
+                                h.update(data)
+                        except VerifyError as ex:
+                            problems.append(str(ex))
+                            continue
+                        g['whole_sha256'] = h.hexdigest()
+                        g['whole_sha256_pending'] = False
+                        if key not in st['manifest_dirty']:
+                            st['manifest_dirty'].append(key)
+                        st['catalog_dirty'] = True
+            finally:
+                for tr in readers.values():
+                    tr.close()
+            save_state(cfg, st)
+        print(json.dumps({'ok': not problems, 'problems': problems, 'orphans': orphans}))
+        return 1 if problems else 0
+    finally:
+        lock.release()
+
+
+def verify_rescan(cfg, kind):
+    tr_mod = redact_mod()
+    cat = fetch_catalog(cfg)
+    repos = []
+    for p, b in sorted(cat.items()):
+        if p.startswith('shards/'):
+            repos += [s['repo'] for s in json.loads(b).get('shards', [])]
+    for s in load_state(cfg)['shards']:
+        if s['repo'] not in repos:
+            repos.append(s['repo'])
+    findings = []
+    scanned = 0
+    for repo in repos:
+        tr = TmpRepo(cfg, repo)
+        try:
+            if not tr.fetch_tip():
+                continue
+            for path, oid in sorted(tr.entries.items()):
+                if path.endswith('.zst'):
+                    try:
+                        data = decompress(tr.blob(oid))
+                    except ValueError:
+                        findings.append({'repo': repo, 'path_sha12': sha12(path), 'path': path, 'line': None,
+                                         'kind': 'undecodable'})
+                        continue
+                elif path.endswith('.meta.json'):
+                    data = tr.blob(oid)
+                else:
+                    continue
+                scanned += 1
+                for k, line in tr_mod.verify_bytes(data):
+                    if kind is None or k == kind:
+                        findings.append({'repo': repo, 'path': path, 'line': line, 'kind': k})
+        finally:
+            tr.close()
+    ks = read_json(cfg.p('killswitch.json'))
+    cleared = False
+    if not findings and ks and (kind is None or ks.get('kind') == kind):
+        os.unlink(cfg.p('killswitch.json'))
+        cleared = True
+    print(json.dumps({'rescan': True, 'kind': kind, 'repos': len(repos), 'files_scanned': scanned,
+                      'findings': findings, 'killswitch_cleared': cleared}))
+    return 1 if findings else 0
+
+
+def cmd_incident(cfg, a):
+    ensure_home(cfg)
+    rec = {'kind': a.kind, 'shard': a.shard, 'at': now_iso(), 'host': cfg.host,
+           'note': 'all pushes on this host are stopped; follow the runbook in docs/transcripts-archive.md'}
+    atomic_write(cfg.p('killswitch.json'), jdump(rec) + b'\n')
+    alert(cfg, 'incident', 'kill switch set kind=%s shard=%s; every push on this host is stopped' % (a.kind, a.shard))
+    print(json.dumps(rec))
+    return 0
+
+
+def cmd_status(cfg, a):
+    st = load_state(cfg)
+    chunks = pushed = staged = 0
+    omitted = 0
+    for e in st['files'].values():
+        for g in e['gens']:
+            for c in g['chunks']:
+                chunks += 1
+                pushed += c['status'] == 'pushed'
+                staged += c['status'] == 'staged'
+                omitted += c.get('omitted') or 0
+    waivers = 0
+    try:
+        with open(cfg.p('waivers.jsonl'), 'rb') as f:
+            waivers = sum(1 for line in f if line.strip())
+    except OSError:
+        pass
+    code, chk = check(cfg)
+    out = {'host': cfg.host, 'files': len(st['files']), 'chunks': chunks, 'pushed': pushed, 'staged': staged,
+           'omitted_records': omitted, 'backlog': backlog_of(cfg, st), 'held': held_of(st),
+           'shards': st['shards'], 'catalog_commit': st.get('catalog_commit'),
+           'killswitch': read_json(cfg.p('killswitch.json')), 'waivers': waivers, 'check': chk,
+           'recovery_truth': RECOVERY_TRUTH}
+    print(json.dumps(out, indent=1, sort_keys=True))
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog='transcripts', description=__doc__.split('\n\n')[0] + '\n\n' + RECOVERY_TRUTH,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd')
+    s = sub.add_parser('sync', help='archive changed transcripts now')
+    s.add_argument('--checkpoint', required=True, choices=CHECKPOINTS)
+    s.add_argument('--budget-seconds', type=int, default=None)
+    s.add_argument('--background', action='store_true')
+    s.add_argument('--dry-run', action='store_true')
+    b = sub.add_parser('backfill', help='resumable full-history archive (scheduler)')
+    b.add_argument('--budget-seconds', type=int, default=1800)
+    c = sub.add_parser('check', help='exit 0 ok, 1 stale, 2 failed/cap/held/disk-low/killswitch, 3 never-ok')
+    c.add_argument('--max-age-min', type=int, default=60)
+    c.add_argument('--json', action='store_true')
+    sub.add_parser('status')
+    f = sub.add_parser('find')
+    f.add_argument('--session')
+    f.add_argument('--ticket')
+    f.add_argument('--project')
+    f.add_argument('--since')
+    f.add_argument('--host')
+    ca = sub.add_parser('cat', help='stream a session (redacted archive; --local reads the source)')
+    ca.add_argument('session')
+    ca.add_argument('--local', action='store_true')
+    r = sub.add_parser('recover', help=RECOVERY_TRUTH)
+    r.add_argument('session')
+    r.add_argument('--to', required=True)
+    r.add_argument('--from', dest='source', choices=('git', 'local'), default='git')
+    v = sub.add_parser('verify')
+    v.add_argument('--rehash', action='store_true')
+    v.add_argument('--against-source', action='store_true')
+    v.add_argument('--rescan', action='store_true')
+    v.add_argument('--kind')
+    ri = sub.add_parser('reindex')
+    ri.add_argument('--from-sidecars', action='store_true')
+    i = sub.add_parser('incident', help='host-wide kill switch: stops every push on this host')
+    i.add_argument('--kind', required=True)
+    i.add_argument('--shard')
+    return p
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = build_parser()
+    a = p.parse_args(argv)
+    if not a.cmd:
+        p.print_help()
+        return 2
+    if sys.platform.startswith('win'):
+        sys.stderr.write('transcripts: Windows is not supported yet (no verified lock or zstd path)\n')
+        return 2
+    try:
+        cfg = Cfg()
+    except Refused as ex:
+        sys.stderr.write('transcripts: refused: %s\n' % ex)
+        return 2
+    try:
+        if a.cmd == 'check':
+            code, out = check(cfg, a.max_age_min)
+            print(json.dumps(out, sort_keys=True) if a.json else '%s: %s' % (out['status'], '; '.join(
+                out['reasons']) or 'fresh ok receipt'))
+            return code
+        if a.cmd == 'sync':
+            if a.background and not a.dry_run:
+                return background(cfg, argv)
+            return do_sync(cfg, a.checkpoint, a.budget_seconds or 90, dry_run=a.dry_run)
+        if a.cmd == 'backfill':
+            if not cfg.ignore_load:
+                try:
+                    os.nice(10)
+                except OSError:
+                    pass
+            return do_sync(cfg, 'backfill', a.budget_seconds, backfill=True)
+        ensure_home(cfg)
+        return {'status': cmd_status, 'find': cmd_find, 'cat': cmd_cat, 'recover': cmd_recover,
+                'verify': cmd_verify, 'reindex': cmd_reindex, 'incident': cmd_incident}[a.cmd](cfg, a)
+    except Refused as ex:
+        sys.stderr.write('transcripts: refused: %s\n' % ex)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
