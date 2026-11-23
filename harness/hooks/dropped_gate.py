@@ -157,19 +157,29 @@ def pending_work(home: Path, session: str, agent: str) -> str | None:
     """Why the agent's own WAL says its work is unfinished, or None (handoff/result/named wait/empty)."""
     import ah  # noqa: PLC0415
     import liveness  # noqa: PLC0415
+    import wal_segments as ws  # noqa: PLC0415
     path = ah.session_dir(home, session) / f"agent-{agent}.jsonl"  # either WAL root
-    if not path.is_file():
+    if not ws.exists(str(path)):  # a crashed rotation (live file missing) still has an owner WAL
         return None
     last = None
-    with open(path, "rb") as fh:
-        for raw in fh:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if (isinstance(rec, dict) and rec.get("event") and not rec.get("by")
-                    and rec.get("event") not in LIFECYCLE_EVENTS):  # hook metadata rows are not the owner's own entries
-                last = rec
+    probs = []
+    for _seg, _number, raw in ws.iter_lines(path, problems=probs):  # the whole segment chain, markers dropped
+        if raw is None:
+            continue
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if (isinstance(rec, dict) and rec.get("event") and not rec.get("by")
+                and rec.get("event") not in LIFECYCLE_EVENTS):  # hook metadata rows are not the owner's own entries
+            last = rec
+    hard = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+    if hard and (last is None or any(p["code"] in ("unreadable", "not_regular", "ambiguous") for p in hard)):
+        # the newest rows may be the ones not read: never answer "nothing pending" over data that was not read
+        return (f"its WAL segment chain has a problem ({hard[0]['code']}: {str(hard[0].get('message'))[:100]}), so "
+                "whether its work is finished cannot be told; repair the WAL (python3 wal_segments.py verify)")
+    if hard:  # an older gap does not change which row is last, but it is never silent
+        print(f"dropped_gate: WAL chain problem in {path.name}: {hard[0]['code']}", file=sys.stderr)
     if not last:
         return None
     event, note = str(last.get("event")), str(last.get("note") or "")

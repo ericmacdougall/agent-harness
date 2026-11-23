@@ -379,11 +379,23 @@ def _transcripts(session_id: str, project: str | None = None) -> list[Path]:
         return []
 
 
+def _wal_mtime(wal: Path) -> float:
+    """Newest mtime over a WAL's live file and every closed segment (a rotation or a crashed rotation never makes the
+    session look idle); 0.0 when there is no such WAL."""
+    try:
+        import wal_segments as ws  # noqa: PLC0415
+        stem, _seq = ws.parse_name(wal.name)
+        names = [seg.name for seg in ws.chain(str(wal.parent), stem).segments] if stem else []
+        return max([_mtime(wal.parent / name) for name in names] + [_mtime(wal)])
+    except Exception:  # noqa: BLE001 - the live file alone, as before
+        return _mtime(wal)
+
+
 def _activity(directory: Path, wal: Path, budget: int | None = None,
               extra: list | None = None) -> tuple[float, int, bool]:
     """(latest mtime, total bytes, complete) over the tree, never following symlinks."""
     budget = WALK_BUDGET if budget is None else budget
-    latest = max([_mtime(directory), _mtime(wal), _mtime(wal.parent)] + [_mtime(p) for p in extra or []])
+    latest = max([_mtime(directory), _wal_mtime(wal), _mtime(wal.parent)] + [_mtime(p) for p in extra or []])
     size, seen, stack = 0, 0, [str(directory)]
     while stack:
         current = stack.pop()
@@ -408,15 +420,21 @@ def _activity(directory: Path, wal: Path, budget: int | None = None,
 
 
 def _marked_done(wal: Path) -> bool:
-    """The task is done when its last human WAL entry is a status note starting WORKDIR_DONE."""
+    """The task is done when its last human WAL entry is a status note starting WORKDIR_DONE. Read from the newest
+    256 KiB of the whole segment chain. Pruning work folders depends on this, so any chain problem (a gap, an
+    unreadable segment) means "not done": nothing is pruned on a partial view."""
     try:
-        with open(wal, "rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - 262144))
-            lines = handle.read().splitlines()
-    except OSError:
+        import wal_segments as ws  # noqa: PLC0415
+    except ImportError:
         return False
+    probs = []
+    try:
+        data = ws.read_tail(str(wal), 262144, problems=probs)
+    except (OSError, ws.SegmentProblem):
+        return False
+    if [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]:
+        return False
+    lines = data.splitlines()
     for line in reversed(lines):
         try:
             record = json.loads(line)

@@ -22,14 +22,34 @@ def ah_path() -> Path:
     return Path.home() / ".claude" / "hooks" / "ah.py"
 
 
+def _wal_segments():
+    """The segment-chain reader, from the installed hooks directory or the one beside the skill. Without it the scan
+    cannot tell a rotated main WAL from an absent one, so it stops (never printing "0 dropped" over a view it lacks)."""
+    here = Path(__file__).resolve()
+    for folder in (Path.home() / ".claude" / "hooks", here.parents[2] / "hooks"):
+        if (folder / "wal_segments.py").is_file():
+            sys.path.insert(0, str(folder))
+            import wal_segments  # noqa: PLC0415
+            return wal_segments
+    print("check-dropped-workstreams: wal_segments.py not found beside the hooks; cannot scan segmented WALs",
+          file=sys.stderr)
+    raise SystemExit(2)  # exit 2 is "owners view unavailable"; 1 would claim dropped owners
+
+
 def sessions(home: Path, window_s: float) -> list:
+    """Sessions whose main WAL (the live file or any closed segment: a crashed rotation still counts) moved in the window."""
+    ws = _wal_segments()
     root = home / ".claude" / "wals"
     now = time.time()
     out = []
     try:
         for entry in os.scandir(root):
-            main = Path(entry.path) / "main.jsonl"
-            if entry.is_dir(follow_symlinks=False) and main.is_file() and now - main.stat().st_mtime <= window_s:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            chain = ws.chain(entry.path, "main")
+            members = [Path(entry.path) / seg.name for seg in chain.segments] + (
+                [Path(entry.path) / chain.live.name] if chain.live else [])
+            if members and now - max(m.stat().st_mtime for m in members) <= window_s:
                 out.append(entry.name)
     except OSError:
         pass

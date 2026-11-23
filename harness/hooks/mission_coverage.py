@@ -936,34 +936,53 @@ def set_goal(home: Path, goal_id: str, *, title=None, ticket=None, priority=None
     return doc
 
 
-def find_wal_row(home: Path, session: str, wid: str, wal_name=None):
+WAL_INFO_CODES = ("live_missing", "schema_newer", "marker_info")
+
+
+def find_wal_row(home: Path, session: str, wid: str, wal_name=None, problems=None):
     """(wal file name, record) of WAL entry `wid` in `session`'s WAL folder, or (None, None). Reads lines that hold the
-    id only; no time window (goodqa#15754)."""
+    id only, over each WAL's whole segment chain; no time window (goodqa#15754). A gap, an unreadable or non-regular
+    segment, the 256 MiB budget or the 10 s deadline is appended to `problems` ("<wal>: <code>"), so "not found" is
+    never claimed over data that was not read. The name returned is the logical WAL (`<stem>.jsonl`)."""
+    import wal_segments as ws  # noqa: PLC0415
     if not SESSION_RE.match(session or "") or not ASK_ID_RE.match(wid or ""):
         return None, None
     folder = claude_dir() / "wals" / session
     if not folder.is_dir() or folder.is_symlink():
         return None, None
-    names = [wal_name] if wal_name else sorted(p.name for p in folder.glob("*.jsonl"))
+    if wal_name:
+        stem, _seq = ws.parse_name(str(wal_name))  # a segment name (main.0001.jsonl) means its whole logical WAL
+        names = [f"{stem}.jsonl"] if stem else [wal_name]
+    else:
+        names = [f"{stem}.jsonl" for stem in sorted(ws.list_wals(folder))]
     needle = wid.encode()
     for name in names:
         if not WAL_NAME_RE.match(name or ""):
             continue
         path = folder / name
-        if path.is_symlink() or not path.is_file():
+        if path.is_symlink() or not ws.exists(str(path)):
             continue
+        probs, deadline, found = [], time.monotonic() + 10, None
         try:
-            for _, raw in safe_input.iter_jsonl_lines(path, 1 << 20, max_total_bytes=256 << 20, max_seconds=10):
-                if raw is None or needle not in raw:
+            for n, (_seg, _line, raw) in enumerate(ws.iter_lines(path, max_total_bytes=256 << 20, problems=probs)):
+                if n % 1024 == 0 and time.monotonic() > deadline:
+                    probs.append({"code": "truncated", "message": "10 s read deadline"})
+                    break
+                if raw is None or len(raw) > 1 << 20 or needle not in raw:
                     continue
                 try:
                     rec = json.loads(raw)
                 except ValueError:
                     continue
                 if isinstance(rec, dict) and rec.get("id") == wid:
-                    return name, rec
-        except (OSError, safe_input.InputRejected):
-            continue
+                    found = (name, rec)
+                    break
+        except (OSError, safe_input.InputRejected, ws.SegmentProblem):
+            probs.append({"code": "unreadable", "message": name})
+        if problems is not None:
+            problems.extend(f"{name}: {p['code']}" for p in probs if p["code"] not in WAL_INFO_CODES)
+        if found:
+            return found
     return None, None
 
 
@@ -980,10 +999,17 @@ def _row_names_goal(home: Path, session: str, wal_name: str, rec: dict, goal: di
                                                            re.findall(r"[A-Za-z][A-Za-z0-9-]*\s*#\s*\d+|#\d+",
                                                                       str(rec.get("note") or "")))):
         return True
+    import wal_segments as ws  # noqa: PLC0415
+    probs = []
     try:
-        text = safe_input.read_bounded(claude_dir() / "wals" / session / wal_name, 64 << 20).decode("utf-8", "replace")
-    except (OSError, safe_input.InputRejected):
+        text = ws.read_logical(claude_dir() / "wals" / session / wal_name, max_bytes=64 << 20,
+                               problems=probs).decode("utf-8", "replace")
+    except (OSError, safe_input.InputRejected, ws.SegmentProblem):
         return False
+    hard = [p for p in probs if p["code"] not in WAL_INFO_CODES]
+    if hard:  # the part not read could be the part that names the goal: say so, never answer "does not name it"
+        raise MissionError(f"{wal_name} cannot be checked for goal {goal['id']}: WAL chain problem "
+                           f"({hard[0]['code']}: {clean(str(hard[0].get('message')), 80)}); ask main to attach it")
     if re.search(r'"goal":\s*"' + re.escape(goal["id"]) + '"', text):
         return True
     if key:
@@ -1014,9 +1040,12 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
             g["evidence"] = [r for r in g.get("evidence") or [] if r.get("id") != wid]
             return doc
         return _mutate(home, "detach", goal_id, drop, {"id": wid}, stamp=stamp)
-    wal_name, rec = find_wal_row(home, session, wid)
+    wal_probs = []
+    wal_name, rec = find_wal_row(home, session, wid, problems=wal_probs)
     if rec is None:
-        raise MissionError(f"no WAL entry {wid} in session {session}: attach only rows that exist")
+        why = (f"; the WAL chain has problems ({', '.join(wal_probs[:3])}), so the row may sit in a part that was not read"
+               if wal_probs else "")
+        raise MissionError(f"no WAL entry {wid} in session {session}: attach only rows that exist{why}")
     note = str(rec.get("note") or "")
     import goals_view  # noqa: PLC0415 - one deploy-record rule, shared with ah goals
     if goals_view.is_deploy_record(rec):
@@ -1062,21 +1091,20 @@ def attach_evidence(home: Path, goal_id: str, wid: str, *, kind: str = "", sessi
     return _mutate(home, "attach", goal_id, change, {"id": wid, "kind": kind, "wal": wal_name, "by": by}, stamp=stamp)
 
 
-def ask_states(home: Path, session: str) -> dict:
-    """{ask id: {"state": open|resolved, "note": text}} from the session's main WAL. Read through
-    safe_input.open_regular_file (no FIFO, device or symlink swap can hang or redirect the read)."""
+def ask_states(home: Path, session: str, problems=None) -> dict:
+    """{ask id: {"state": open|resolved, "note": text}} from the session's main WAL, over its whole segment chain
+    (regular files only: no FIFO, device or symlink swap can hang or redirect the read). A gap, an unreadable segment
+    or the 512 MiB budget is appended to `problems` ("<code>: <message>"): an ask may sit in what was not read."""
     if not session or not SESSION_RE.match(session):
         return {}
     import ah  # noqa: PLC0415
+    import wal_segments as ws  # noqa: PLC0415
     path = ah.session_dir(home, session) / "main.jsonl"
     out = {}
+    probs = []
     try:
-        fd = safe_input.open_regular_file(path, max_bytes=512 << 20)
-    except safe_input.InputRejected:
-        return {}
-    with os.fdopen(fd, "rb") as handle:
-        for raw in handle:
-            if b'"ask' not in raw:
+        for _seg, _n, raw in ws.iter_lines(path, max_total_bytes=512 << 20, problems=probs):
+            if raw is None or b'"ask' not in raw:
                 continue
             try:
                 rec = json.loads(raw)
@@ -1089,6 +1117,10 @@ def ask_states(home: Path, session: str) -> dict:
                 out.setdefault(rec["id"], {"state": "open", "note": text[:600]})
             elif rec.get("event") == "ask_resolved" and ASK_ID_RE.match(str(rec.get("ref") or "")):
                 out.setdefault(rec["ref"], {"note": ""})["state"] = "resolved"
+    except (OSError, safe_input.InputRejected, ws.SegmentProblem):
+        probs.append({"code": "unreadable", "message": "main WAL"})
+    if problems is not None:
+        problems.extend(f"{p['code']}: {p.get('message')}" for p in probs if p["code"] not in WAL_INFO_CODES)
     return out
 
 
@@ -1155,9 +1187,11 @@ def defer_goal(home: Path, goal_id: str, *, ask=None, ticket=None, user_source=N
     if ask:
         if not ASK_ID_RE.match(ask):
             raise MissionError("--ask takes an ask id from main's WAL (w + 11 hex digits)")
-        state, note = _ask(ask_states(home, session), ask)
+        ask_probs = []
+        state, note = _ask(ask_states(home, session, ask_probs), ask)
         if state != "open":
-            raise MissionError(f"ask {ask} is not open in main's WAL (answered or unknown); a goal cannot wait on it")
+            why = f" (main's WAL chain has problems: {'; '.join(ask_probs[:3])})" if ask_probs else ""
+            raise MissionError(f"ask {ask} is not open in main's WAL (answered or unknown); a goal cannot wait on it{why}")
         if not names_goal(note, current):
             raise MissionError(f"ask {ask} does not name goal {goal_id} or its ticket; a goal waits only on an ask "
                                "about it")
@@ -1718,14 +1752,20 @@ def owner_progress(home: Path, session: str, agent: str) -> float:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", agent or ""):
         return 0.0
     import ah  # noqa: PLC0415
+    import wal_segments as ws  # noqa: PLC0415
     folder = ah.session_dir(home, session)
     path = folder / f"agent-{agent}.jsonl"
-    if not path.is_file():
+    if not ws.exists(str(path)):
         path = folder / f"{agent}.jsonl"
-    if not path.is_file():
+    if not ws.exists(str(path)):
         return 0.0
     try:
-        tail = safe_input.read_tail(path, 256 * 1024)
+        probs = []
+        tail = ws.read_tail(path, 256 * 1024, problems=probs)  # newest bytes of the whole segment chain
+        hard = [p for p in probs if p["code"] not in WAL_INFO_CODES]
+        if hard:  # best effort stays best effort, but a gap or unreadable segment is never silent
+            print(f"mission_coverage: WAL chain problem in {path.name}: {hard[0]['code']} {hard[0].get('message')}"[:240],
+                  file=sys.stderr)
         for raw in reversed(tail.split(b"\n")):
             try:
                 rec = json.loads(raw)
@@ -1736,12 +1776,8 @@ def owner_progress(home: Path, session: str, agent: str) -> float:
                 at = parse_ts(rec.get("at"))
                 if at:
                     return at
-        fd = safe_input.open_regular_file(path)
-        try:
-            head = os.pread(fd, 4096, 0)
-        finally:
-            os.close(fd)
-        first = json.loads(head.split(b"\n", 1)[0])
+        head = next((raw for _seg, _n, raw in ws.iter_lines(path) if raw is not None), b"")  # first row of the chain
+        first = json.loads(head[:4096].split(b"\n", 1)[0])
         return parse_ts(first.get("at")) if isinstance(first, dict) else 0.0
     except (OSError, ValueError, safe_input.InputRejected):
         return 0.0
@@ -2134,7 +2170,10 @@ def assess(home: Path, session: str, now=None, with_commits: bool = False, deadl
             key = ticket_key(g.get("ticket"))
             if key and g.get("repos"):
                 commits[key] = max(commits.get(key, 0.0), commit_progress(g["repos"], key))
-    asks = ask_states(home, session)
+    ask_probs = []
+    asks = ask_states(home, session, ask_probs)
+    if ask_probs:  # a goal waiting on an ask may be judged on a partial view: say so in the report
+        owners_note = (f"{owners_note}; " if owners_note else "") + "main WAL chain problem: " + "; ".join(ask_probs[:3])
     results = evaluate(goals, rows, now, asks=asks,
                        verify_source=lambda s: _cached(home, "source", str(s), lambda: verify_user_source(s)),
                        verify_evidence=lambda g: _cached(home, "evidence", json.dumps(

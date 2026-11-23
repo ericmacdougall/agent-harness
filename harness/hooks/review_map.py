@@ -468,7 +468,7 @@ def find_reports(roots, shas, branch, tickets) -> list:
     return reports[:30]
 
 
-def find_wal(shas, branch, tickets, since, until) -> list:
+def find_wal(shas, branch, tickets, since, until, problems=None) -> list:
     entries = []
     wanted = [t.split("#")[-1] for t in tickets]
     needles = [re.compile(r"(?<![0-9a-f])" + s[:8] + r"[0-9a-f]*(?![0-9a-f])") for s in shas]
@@ -484,21 +484,37 @@ def find_wal(shas, branch, tickets, since, until) -> list:
     root = wal_root()
     if not root.is_dir():
         return entries
+    import wal_segments as ws
     for session in root.iterdir():
         if session.is_symlink() or not session.is_dir():
             continue
-        for path in session.glob("*.jsonl"):
+        # one logical WAL per stem: a closed segment (main.0001.jsonl) is part of its chain, never a WAL of its own
+        for stem, chain in sorted(ws.list_wals(session).items()):
+            path = session / (stem + ".jsonl")
             try:
-                info = path.lstat()
-            except OSError:
+                members = [session / s.name for s in chain.segments] + ([session / chain.live.name] if chain.live else [])
+                newest = max(m.lstat().st_mtime for m in members)
+                size = sum(m.lstat().st_size for m in members)
+            except (OSError, ValueError):
                 continue
-            if path.is_symlink() or info.st_size > MAX_WAL_BYTES or info.st_mtime < since - 86400:
+            hard = [p for p in chain.problems if p["code"] not in ("live_missing", "schema_newer", "marker_info")]
+            if newest < since - 86400:
                 continue
-            try:
-                handle = open(path, "r", encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            for line in handle:
+            if hard and problems is not None:  # a gap, a symlink in a segment's place: reported, never skipped silently
+                problems.extend(f"{session.name[:8]}/{stem}: {p['code']} {p['message']}"[:200] for p in hard)
+            probs = []
+            if size > MAX_WAL_BYTES:
+                # the newest MAX_WAL_BYTES of the chain (a budget never drops the newest rows); the cut is reported
+                raw = ws.read_tail(str(path), MAX_WAL_BYTES, problems=probs).decode("utf-8", "replace")
+                lines = raw.split("\n")[1:]
+                if problems is not None:
+                    problems.append(f"{session.name[:8]}/{stem}: truncated, only the newest {MAX_WAL_BYTES >> 20} MiB of {size >> 20} MiB read")
+            else:
+                lines = [raw.decode("utf-8", "replace") for _s, _n, raw in ws.iter_lines(str(path), problems=probs) if raw is not None]
+            if problems is not None:
+                problems.extend(f"{session.name[:8]}/{stem}: {p['code']} {p['message']}"[:200] for p in probs
+                                if p["code"] not in ("live_missing", "schema_newer", "marker_info") and p not in hard)
+            for line in lines:
                 if '"note"' not in line:
                     continue
                 try:
@@ -521,7 +537,6 @@ def find_wal(shas, branch, tickets, since, until) -> list:
                     basis = "note cites the PR ticket"
                 if basis:
                     entries.append({"at": row.get("at", ""), "event": row["event"], "note": scrub(note)[:900], "basis": basis})
-            handle.close()
     entries.sort(key=lambda e: e["at"])
     return entries[:150]
 
@@ -690,7 +705,10 @@ def build_model(repo: Path, pr, branch, use_gh=True, roots=None, wal=True) -> di
     specs = find_specs(roots, tickets)
     reports = find_reports(roots, set(shas), meta.get("head") or branch, tickets)
     since = min(_ts(c["date"]) for c in commits) - 3600
-    wal_rows = find_wal(shas, meta.get("head") or branch, tickets, since, time.time()) if wal else []
+    wal_problems = []
+    wal_rows = find_wal(shas, meta.get("head") or branch, tickets, since, time.time(), wal_problems) if wal else []
+    for text in wal_problems[:10]:  # a gap or a cut in a WAL chain is shown, never skipped silently
+        meta.setdefault("warnings", []).append("WAL chain: " + text)
     if SCAN_STATE["truncated"]:
         meta.setdefault("warnings", []).append(f"the work-directory scan stopped after {MAX_SCAN} files; specs or reports may be missing")
     paths = [f["path"] for f in diff["files"]]

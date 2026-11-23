@@ -459,6 +459,41 @@ def read_tail_lines(path: str, max_bytes: int, line_max: int):
     return lines, stats
 
 
+WAL_INFO_CODES = ("live_missing", "schema_newer", "marker_info")
+
+
+def read_wal_tail_lines(path: str, max_bytes: int, line_max: int):
+    """read_tail_lines for a session WAL: the last max_bytes of the WHOLE segment chain of `path` (newest first, so a
+    budget never drops the newest records). stats["problems"] lists chain problems (a gap, an unreadable segment,
+    `truncated` when the window did not reach the start of a longer chain); they are never skipped silently.
+    Raises OSError when `path` names no WAL at all, like read_tail_lines for a missing file."""
+    import wal_segments as ws  # noqa: PLC0415 - installed beside this file
+    stats = {"malformed": 0, "oversized": 0, "partial_head": False, "problems": []}
+    probs = []
+    d, name = os.path.split(str(path))
+    stem, _seq = ws.parse_name(name)
+    if stem is None or not ws.exists(str(path)):
+        raise FileNotFoundError(str(path))
+    raw = ws.read_tail(str(path), max_bytes, problems=probs)
+    ch = ws.chain(d or ".", stem)
+    total = sum(s.size for s in ch.segments) + (ch.live.size if ch.live else 0)
+    stats["problems"] = [p for p in probs if p.get("code") not in WAL_INFO_CODES]
+    chunks = raw.split(b"\n")
+    if total > max_bytes and chunks:
+        chunks = chunks[1:]
+        stats["partial_head"] = True
+        stats["problems"].append({"code": "truncated", "seq": None,
+                                  "message": f"newest {max_bytes} of {total} bytes read"})
+    chunks = chunks[:-1] if chunks else chunks  # the last piece is "" after a final newline, else a half line
+    lines = []
+    for c in chunks:
+        if len(c) > line_max:
+            stats["oversized"] += 1
+            continue
+        lines.append(c)
+    return lines, stats
+
+
 def parse_lines(lines, stats) -> list:
     recs = []
     for c in lines:

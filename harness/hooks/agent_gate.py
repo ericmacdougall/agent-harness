@@ -17,6 +17,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -31,20 +32,42 @@ def load_json_file(path):
     return safe_input.safe_json_loads(safe_input.read_bounded(path, 64 * 1024), max_depth=20, max_bytes=64 * 1024)
 
 
-def jsonl_records(path):
-    """Parsed WAL records, bounded per line; non-regular files and oversize lines are skipped (fail open)."""
+INFO_CODES = ("live_missing", "schema_newer", "marker_info")
+
+
+def jsonl_records(path, problems=None, deadline_s=5.0):
+    """Parsed WAL records of the whole segment chain of `path`, NEWEST first, bounded per line. Only the newest 64 MiB
+    of the chain is read, so a budget or the deadline drops the OLDEST records, never the newest (R2-4). A gap, an
+    unreadable segment, the 64 MiB window or the deadline is appended to `problems` (never silent); a path that is
+    not a WAL is skipped (fail open)."""
     import safe_input
+    import wal_segments as ws
+    probs = []
+    window = 64 * 1024 * 1024
     try:
-        for _number, line in safe_input.iter_jsonl_lines(path, max_line=1024 * 1024, max_total_bytes=64 * 1024 * 1024,
-                                                         max_seconds=5):
-            if line is None:
-                continue
-            try:
-                yield safe_input.safe_json_loads(line, max_depth=20, max_bytes=1024 * 1024)
-            except ValueError:
-                continue
-    except safe_input.InputRejected:
-        return
+        data = ws.read_tail(path, window, problems=probs)
+        chain = ws.chain(os.path.dirname(path) or ".", os.path.basename(path)[:-len(".jsonl")])
+        total = sum(seg.size for seg in chain.segments) + (chain.live.size if chain.live else 0)
+        if total > window:
+            probs.append({"code": "truncated", "message": "only the newest %d of %d bytes were read" % (window, total), "seq": None})
+    except (OSError, ws.SegmentProblem):
+        data = b""
+    if problems is not None:
+        problems.extend(p for p in probs if p.get("code") not in INFO_CODES)
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+    for number, line in enumerate(reversed(data.split(b"\n"))):
+        if not line.strip():
+            continue
+        if len(line) > 1024 * 1024:
+            continue
+        if deadline is not None and number % 256 == 0 and time.monotonic() > deadline:
+            if problems is not None:
+                problems.append({"code": "truncated", "message": "read deadline reached; older records skipped", "seq": None})
+            return
+        try:
+            yield safe_input.safe_json_loads(line, max_depth=20, max_bytes=1024 * 1024)
+        except ValueError:
+            continue
 
 
 def limits():
@@ -68,35 +91,40 @@ def _ts(text):
     return datetime.fromisoformat(text).timestamp()
 
 
-def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S):
-    """Ids of agents started, not stopped, and active within `window` seconds before `now`."""
+def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S, problems=None):
+    """Ids of agents started, not stopped, and active within `window` seconds before `now`. Reads the whole segment
+    chain of main and every agent WAL (a closed segment is never an agent of its own)."""
+    import wal_segments as ws
     started, stopped, last = {}, set(), {}
-    for name in os.listdir(wal_dir):
-        path = os.path.join(wal_dir, name)
-        if name == "main.jsonl" or (name.startswith("agent-") and name.endswith(".jsonl")):
-            for record in jsonl_records(path):
-                try:
-                    at = _ts(record["at"])
-                except (ValueError, KeyError, TypeError):
-                    continue
-                if at > now:
-                    break
-                agent = record.get("agent_id")
-                if not agent:
-                    continue
-                if record.get("event") == "subagent":
-                    started.setdefault(agent, at)
-                elif record.get("event") == "subagent_stop":
-                    stopped.add(agent)
-                last[agent] = max(last.get(agent, 0), at)
+    for stem in sorted(ws.list_wals(wal_dir)):
+        if not (stem == "main" or stem.startswith("agent-")):
+            continue
+        path = os.path.join(wal_dir, stem + ".jsonl")
+        for record in jsonl_records(path, problems):  # newest first
+            if not isinstance(record, dict):
+                continue
+            try:
+                at = _ts(record["at"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if at > now:
+                continue
+            agent = record.get("agent_id")
+            if not agent:
+                continue
+            if record.get("event") == "subagent":
+                started[agent] = min(started.get(agent, at), at)  # the earliest start of the agent
+            elif record.get("event") == "subagent_stop":
+                stopped.add(agent)
+            last[agent] = max(last.get(agent, 0), at)
     return sorted(a for a, t in started.items() if a not in stopped and now - last.get(a, t) <= window)
 
 
-def recent_starts(wal_dir: str, now: float, window: float):
+def recent_starts(wal_dir: str, now: float, window: float, problems=None):
     count = 0
     path = os.path.join(wal_dir, "main.jsonl")
     try:
-        for record in jsonl_records(path):
+        for record in jsonl_records(path, problems):
             try:
                 if record.get("event") == "subagent" and now - window <= _ts(record["at"]) <= now:
                     count += 1
@@ -107,7 +135,7 @@ def recent_starts(wal_dir: str, now: float, window: float):
     return count
 
 
-def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: int, ceiling: int):
+def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: int, ceiling: int, problems=None):
     """Atomically count + reserve a slot (flock), so a burst of parallel spawns cannot all see 'zero live'.
     Reservations not yet matched by a start record count as live; the same applies to agent types that never
     write start records (general-purpose, Explore, Plan) for RESERVE_TTL_S after spawn."""
@@ -131,7 +159,7 @@ def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: in
                         pass
                 else:
                     slots.append(path)
-        unmatched = max(0, len(slots) - recent_starts(wal_dir, now, RESERVE_TTL_S))
+        unmatched = max(0, len(slots) - recent_starts(wal_dir, now, RESERVE_TTL_S, problems))
         total = live + unmatched
         if total >= ceiling:
             return total
@@ -148,22 +176,29 @@ def decide(session_id: str, now: float = None, wal_root: str = None, max_agents:
     warn_at, ceiling = limits()
     ceiling = max_agents or ceiling
     warn_at = warn_agents if warn_agents is not None else min(warn_at, ceiling)
-    live_ids = live_agents(wal_dir, now) if os.path.isdir(wal_dir) else []
+    problems = []
+    live_ids = live_agents(wal_dir, now, problems=problems) if os.path.isdir(wal_dir) else []
     state = state_root or os.path.join(os.path.expanduser("~"), ".agent-harness", "state")
     try:
-        total = reserve(session_id, now, state, wal_dir, len(live_ids), ceiling)
+        total = reserve(session_id, now, state, wal_dir, len(live_ids), ceiling, problems)
     except OSError:
         total = len(live_ids)  # cannot reserve: fall back to the plain count (still fails open on errors)
-    live = list(range(total))
+    note = ""
+    if problems:  # documented fail-open gate, but a chain problem is reported, never skipped silently
+        note = ("Chain problem while counting live agents (%s); the live count may be low (the gate stays fail-open)."
+                % "; ".join(sorted({"%s %s" % (p.get("code"), str(p.get("message"))[:60]) for p in problems})[:3]))
     if total >= ceiling:
-        return {"action": "deny", "live": total, "max": ceiling,
+        return {"action": "deny", "live": total, "max": ceiling, "chain_problems": problems,
                 "message": (f"Agent gate: {total} agents are already live in this session (limit {ceiling}). Queue this work "
                             "until one finishes, resume an existing owner with SendMessage instead of spawning, or move heavy "
                             "work to dev2. The Mac is the fragile host: unbounded fan-out reset it on 2026-11-04.")}
     if total >= warn_at:
-        return {"action": "warn", "live": total, "max": ceiling,
+        return {"action": "warn", "live": total, "max": ceiling, "chain_problems": problems,
                 "message": (f"Agent gate (warning): {total} agents are live in this session (deny at {ceiling}). Prefer resuming an "
-                            "existing owner with SendMessage, queue independent work, and run heavy jobs on dev2.")}
+                            "existing owner with SendMessage, queue independent work, and run heavy jobs on dev2.")
+                + (" " + note if note else "")}
+    if problems:
+        return {"action": "allow", "live": total, "chain_problems": problems, "message": "Agent gate: " + note}
     return {"action": "allow", "live": total}
 
 
@@ -187,7 +222,9 @@ def main() -> int:
         if result["action"] == "deny":
             sys.stderr.write(result["message"] + "\n")
             return 2
-        if result["action"] == "warn":
+        if result["action"] == "warn" or result.get("chain_problems"):
+            if result.get("chain_problems"):
+                sys.stderr.write("agent_gate: warning: WAL chain problem: " + result["message"] + "\n")
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": result["message"]}}))
         return 0
     except Exception as error:  # fail open

@@ -141,15 +141,21 @@ def wal_path(session: str, agent: str) -> Path:
     return root / ("agent-%s.jsonl" % safe_id(agent) if agent else "main.jsonl")
 
 
-def last_human_entry_age(path: Path, now: float):
-    """Seconds since the newest human-readable entry, or None when there is none in the readable tail."""
-    import safe_input  # noqa: PLC0415
-    if not os.path.lexists(path):
+def last_human_entry_age(path: Path, now: float, problems=None):
+    """Seconds since the newest human-readable entry, or None when there is none in the readable tail. The tail is the
+    newest WAL_TAIL_BYTES of the whole segment chain (a rotation never hides the owner's last note); a gap or
+    unreadable segment is appended to `problems`."""
+    import wal_segments as ws  # noqa: PLC0415
+    if not ws.exists(str(path)):
         return None
+    probs = []
     try:
-        tail = safe_input.read_tail(path, WAL_TAIL_BYTES)
-    except safe_input.InputRejected:
+        tail = ws.read_tail(str(path), WAL_TAIL_BYTES, problems=probs)
+    except (OSError, ws.SegmentProblem):
         return None
+    if problems is not None:
+        problems.extend("%s: %s" % (p["code"], p.get("message")) for p in probs
+                        if p["code"] not in ("live_missing", "schema_newer", "marker_info"))
     newest = None
     for line in tail.splitlines():
         try:
@@ -266,13 +272,17 @@ def evaluate(ev, now=None):
         if found[2] < MIN_CHANGED_LINES:
             continue
         wal = wal_path(session, agent)
-        age = last_human_entry_age(wal, now)
+        chain_problems = []
+        age = last_human_entry_age(wal, now, chain_problems)
         if age is not None and age < WAL_STALE_S:
             return None
         key = "%s:%s" % (agent or "main", found[0])
         if already_asked(session, key):
             continue
-        return key, message(found, wal, age), session
+        text = message(found, wal, age)
+        if chain_problems:  # the nudge may be wrong because part of the WAL could not be read: say so
+            text += " (WAL chain problem, so a recent note may be missing from this view: %s)" % "; ".join(chain_problems[:2])
+        return key, text, session
     return None
 
 
