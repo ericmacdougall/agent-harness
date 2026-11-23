@@ -20,6 +20,32 @@ except ImportError:  # an install that has not shipped the module yet: plain app
     wal_segments = None
 
 
+class WalSegmentsMissing(RuntimeError):
+    """wal_segments.py is not installed but something needs it (rotation is on, or segment files exist)."""
+
+
+def require_segments(directory=None) -> None:
+    """Fail-closed gate for writers, readers and gates: returns None when wal_segments is importable, or when nothing
+    needs it (no enable file and no segment-shaped file in `directory`). Otherwise raises WalSegmentsMissing, because
+    appending to or reading only the live file of a rotated WAL silently loses or hides records."""
+    if wal_segments is not None:
+        return None
+    reason = None
+    if (Path.home() / ".agent-harness" / "state" / "wal-rotation.on").is_file():
+        reason = "~/.agent-harness/state/wal-rotation.on exists"
+    elif directory is not None:
+        try:
+            with os.scandir(directory) as it:
+                if any(re.search(r"\.\d{4,}\.jsonl$", e.name) for e in it):
+                    reason = f"segment files exist in {directory}"
+        except OSError:
+            pass
+    if reason:
+        raise WalSegmentsMissing(f"wal_segments.py is missing but {reason}: refusing to continue without it "
+                                 "(install wal_segments.py beside wal.py)")
+    return None
+
+
 def warn_missing_segments() -> None:
     print("wal: wal_segments.py is not installed; appending without rotation support", file=sys.stderr)
 
@@ -83,6 +109,7 @@ def append(path: Path, record: dict) -> None:
         if wal_segments is not None:
             wal_segments.append_line(directory, path.name, payload, current_directory)
             return
+        require_segments(path.parent)  # fail closed when rotation is on or segment files exist
         warn_missing_segments()
         fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
         stack.callback(os.close, fd)
