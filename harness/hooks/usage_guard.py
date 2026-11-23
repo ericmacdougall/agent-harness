@@ -35,7 +35,8 @@ MAX_JSON = 65536
 MAX_MANIFEST = 32768
 MAX_FILE = 2 * 1024 * 1024
 LOCK_SECONDS = 2
-# A dead owner is reconciled automatically only after its own timeout plus this grace (seconds).
+# A dead owner is reconciled automatically after its own timeout plus this grace (seconds), or at once when its
+# death is probed on the same host, kernel boot and pid namespace (owner_liveness 'same_instance', goodqa#16811).
 # AGENT_HARNESS_DEADLINE_GRACE (0..3600) shortens it for live tests; death is still required.
 DEADLINE_GRACE = 60
 # Attempts that never launched a provider do not spend the two-launch repeat budget, but they are
@@ -214,6 +215,47 @@ def same_scheme(recorded, current):
     return recorded.split(':', 1)[0] == current.split(':', 1)[0]
 
 
+BOOT_UUID = re.compile(r'(procboot|bootsession):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                       r'[0-9a-fA-F]{12})')
+
+
+def pid_namespace(pid=None):
+    """The pid namespace `pid` (default: this process) lives in, or None when it cannot be named.
+
+    kill(pid, 0) answers only inside the caller's own pid namespace, so a pid probed from another namespace (a
+    container sharing the host name and boot id) can look gone while it runs. Linux names the namespace by the inode
+    of /proc/<pid>/ns/pid; macOS has a single pid namespace per boot.
+    """
+    try:
+        link = os.readlink('/proc/%s/ns/pid' % ('self' if pid is None else int(pid)))
+    except (OSError, ValueError, TypeError):
+        link = None
+    if link is not None:
+        match = re.fullmatch(r'pid:\[(\d{1,20})\]', link)
+        return 'linuxns:' + match[1] if match else None
+    if sys.platform == 'darwin' and not os.path.exists('/proc'):
+        return 'darwin:single'
+    return None
+
+
+def same_instance(owner):
+    """True only when `owner` was recorded on this host, in this kernel boot and in this pid namespace.
+
+    Every field must be present, well formed and equal: a missing or malformed field, another scheme, another boot
+    (which may also be another machine with the same host name) or another namespace is False.
+    """
+    if not isinstance(owner, dict) or owner.get('host') != host_identity():
+        return False
+    recorded, current = owner.get('boot_id'), boot_identity()
+    if not isinstance(recorded, str) or not isinstance(current, str):
+        return False
+    # Exact equality: incarnation_state reads any byte difference as a reboot, which is inferred, not probed.
+    if BOOT_UUID.fullmatch(current) is None or recorded != current:
+        return False
+    namespace = owner.get('pid_ns')
+    return isinstance(namespace, str) and 0 < len(namespace) <= 64 and namespace == pid_namespace()
+
+
 def process_start_token(pid):
     """A token naming one incarnation of `pid`, or None when the platform cannot say."""
     try:
@@ -279,7 +321,7 @@ def owner_process_facts(pid=None):
     """Who holds a reservation: enough to prove death on the same host, never to prove success."""
     pid = os.getpid() if pid is None else pid
     return {'pid': pid, 'host': host_identity(), 'boot_id': boot_identity(),
-            'process_started': process_start_token(pid)}
+            'process_started': process_start_token(pid), 'pid_ns': pid_namespace(pid)}
 
 
 def owner_liveness(start, children=()):
@@ -287,9 +329,12 @@ def owner_liveness(start, children=()):
 
     ALIVE when the same incarnation answers; anything else (other host, malformed facts, a probe
     that cannot answer, a live or unknown child) is UNCERTAIN and leaves state untouched.
+    `same_instance` is True only when the facts were recorded on this host, boot and pid namespace, so a DEAD
+    verdict rests on kill/start-token probes alone (never an inferred reboot) and needs no deadline.
     """
     owner = start.get('owner_process') if isinstance(start, dict) else None
-    facts = {'state': 'UNCERTAIN', 'past_deadline': False, 'why': 'owner facts missing or malformed'}
+    facts = {'state': 'UNCERTAIN', 'past_deadline': False, 'same_instance': False,
+             'why': 'owner facts missing or malformed'}
     if (not isinstance(owner, dict) or not valid_pid(owner.get('pid'))
             or not isinstance(owner.get('host'), str) or not 1 <= len(owner['host']) <= 255
             or not isinstance(owner.get('deadline'), str) or len(owner['deadline']) > 64):
@@ -307,6 +352,7 @@ def owner_liveness(start, children=()):
     if owner['host'] != host_identity():
         facts['why'] = 'other host'
         return facts
+    facts['same_instance'] = same_instance(owner)
     current_boot = boot_identity()
     state, why = incarnation_state(owner['pid'], owner.get('process_started'), owner.get('boot_id'), current_boot)
     facts.update(state=state, why=why)
@@ -1080,7 +1126,8 @@ class UsageStore:
         return removed
 
     def _auto_reconcile_locked(self, run_id):
-        """Reconcile one reservation only when its owner is provably dead on this host past its deadline.
+        """Reconcile one reservation only when its owner is provably dead on this host past its deadline, or, for a
+        completed run with complete child evidence, probed dead on this host, boot and pid namespace before it.
 
         Never writes a FINAL or completion: the run stays UNKNOWN / NO_RESULT, exactly like a manual
         reconciliation, with the liveness facts as evidence. Cross-host owners stay uncertain.
@@ -1113,7 +1160,12 @@ class UsageStore:
         if liveness['state'] != 'DEAD':
             report['why'] = 'owner ' + liveness['state'].lower() + ': ' + liveness['why']
             return report
-        if not liveness['past_deadline']:
+        # goodqa#16811: the deadline is waived only for a completed run (FINAL-bound, complete child evidence below)
+        # whose owner and children were probed dead on this host, boot and pid namespace. A reboot-inferred death,
+        # another boot (possibly another machine with the same name), a legacy record without a namespace and every
+        # incomplete run keep the deadline.
+        early = final is not None and liveness['same_instance'] is True
+        if not liveness['past_deadline'] and not early:
             report['why'] = 'dead owner before deadline'
             return report
         if final is None and not incomplete_reboot_proven(start):
@@ -1122,12 +1174,17 @@ class UsageStore:
         if final is not None and not self._completed_children_proven(start, final, children):
             report['why'] = 'completed uncertain launch/child evidence is incomplete'
             return report
-        evidence = ('pid %d on host %s: %s; deadline %s; checked %s' % (
-            liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat()))[:500]
-        reason = 'Owner process provably dead on this host past its deadline'
+        evidence = ('pid %d on host %s: %s; deadline %s; checked %s%s' % (
+            liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat(),
+            '' if liveness['past_deadline'] else '; same host, boot and pid namespace'))[:500]
+        if liveness['past_deadline']:
+            reason, why = 'Owner process provably dead on this host past its deadline', 'owner dead past deadline'
+        else:
+            reason = 'Owner process and children probed dead on this host, boot and pid namespace before the deadline'
+            why = 'owner probed dead before deadline'
         report['pools'] = self._publish_reconciliation(run_id, kind='automatic_reconciliation', actor=AUTO_ACTOR,
                                                        reason=reason, evidence=evidence)
-        report.update(reconciled=True, why='owner dead past deadline')
+        report.update(reconciled=True, why=why)
         return report
 
     def auto_reconcile(self, run_id):
