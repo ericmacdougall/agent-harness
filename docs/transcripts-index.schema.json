@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ericmacdougall/agent-harness/docs/transcripts-index.schema.json",
+  "title": "Agent transcripts archive index contract",
+  "description": "Schema 1 for index rows (catalog index/<host>.jsonl), chunk sidecars (<chunk>.meta.json in shard repos) and per-file manifests (catalog manifests/<host>/<source>/<relpath>.json). A field is never removed or renamed without a schema bump; `transcripts reindex` migrates. GoodQA #16650.",
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "gitoid": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "ts": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z$", "description": "UTC, colons replaced by dashes"},
+    "mentions": {
+      "type": "object",
+      "properties": {
+        "tickets": {"type": "array", "items": {"type": "string", "pattern": "^\\d+$"}, "maxItems": 200},
+        "prs": {"type": "array", "items": {"type": "string"}, "maxItems": 200},
+        "commits": {"type": "array", "items": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "maxItems": 200}
+      },
+      "required": ["tickets", "prs", "commits"]
+    },
+    "prev": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object", "properties": {"name": {"type": "string"}, "sha256": {"$ref": "#/$defs/sha256"}}, "required": ["name", "sha256"]}
+      ]
+    },
+    "common": {
+      "type": "object",
+      "properties": {
+        "schema": {"const": 1},
+        "host": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+        "tool": {"enum": ["claude", "codex"]},
+        "source": {"enum": ["claude-projects", "claude-wals", "codex-sessions", "codex-archived", "codex-wals"]},
+        "relpath": {"type": "string"},
+        "session": {"type": "string"},
+        "parent": {"type": ["string", "null"]},
+        "project": {"type": ["string", "null"], "description": "cwd taken from the redacted records"},
+        "models": {"type": "array", "items": {"type": "string"}},
+        "gen": {"type": "integer", "minimum": 1},
+        "seq": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9._-]+\\.[0-9TZ-]+_[0-9TZ-]+\\.g\\d+\\.p\\d{5}\\.jsonl\\.zst$"},
+        "sha256": {"$ref": "#/$defs/sha256", "description": "sha256 of the redacted raw chunk bytes"},
+        "zsha256": {"$ref": "#/$defs/sha256", "description": "sha256 of the compressed file"},
+        "bytes": {"type": "integer", "minimum": 1, "maximum": 50331648},
+        "zbytes": {"type": "integer", "minimum": 1, "maximum": 49999999},
+        "records": {"type": "integer", "minimum": 1},
+        "first_ts": {"$ref": "#/$defs/ts"},
+        "last_ts": {"$ref": "#/$defs/ts"},
+        "ts_source": {"enum": ["records", "mtime"]},
+        "chain_sha256": {"$ref": "#/$defs/sha256", "description": "sha256(prev chain hex || sha256 hex); prev chain is empty for seq 1"},
+        "line_start": {"type": "integer", "minimum": 1, "description": "1-based source line of the first record"},
+        "src_range": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 2, "maxItems": 2},
+        "mentions": {"$ref": "#/$defs/mentions"}
+      }
+    },
+    "index_row": {
+      "allOf": [{"$ref": "#/$defs/common"}],
+      "properties": {
+        "shard": {"type": "string", "pattern": "^agent-transcripts-[A-Za-z0-9._-]+-\\d{4}-\\d{2}-p\\d+$"},
+        "path": {"type": "string", "maxLength": 200},
+        "commit": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+        "omitted": {"type": "integer", "minimum": 0}
+      },
+      "required": ["schema", "host", "tool", "source", "relpath", "session", "gen", "seq", "name", "sha256", "zsha256", "bytes", "zbytes", "records", "first_ts", "last_ts", "chain_sha256", "shard", "path", "commit", "mentions"]
+    },
+    "sidecar": {
+      "allOf": [{"$ref": "#/$defs/common"}],
+      "properties": {
+        "chunker_version": {"type": "integer"},
+        "path": {"type": "string", "maxLength": 200},
+        "prev": {"$ref": "#/$defs/prev"},
+        "src_sha256": {"$ref": "#/$defs/sha256", "description": "sha256 of the SOURCE bytes in src_range"},
+        "redactions": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "omitted": {"type": "array", "items": {"type": "object", "properties": {"line": {"type": "integer"}, "kind": {"type": "string"}}, "required": ["line", "kind"]}},
+        "ruleset_version": {"type": "string"},
+        "metadata_dropped": {"type": "boolean"}
+      },
+      "required": ["schema", "host", "tool", "source", "relpath", "session", "gen", "seq", "name", "path", "prev", "src_range", "src_sha256", "sha256", "zsha256", "records", "first_ts", "last_ts", "ts_source", "chain_sha256", "mentions", "redactions", "omitted", "ruleset_version"]
+    },
+    "manifest": {
+      "type": "object",
+      "properties": {
+        "schema": {"const": 1},
+        "host": {"type": "string"},
+        "source": {"type": "string"},
+        "relpath": {"type": "string"},
+        "source_path": {"type": "string"},
+        "session": {"type": "string"},
+        "parent": {"type": ["string", "null"]},
+        "tool": {"type": "string"},
+        "size": {"type": "integer"},
+        "mtime_ns": {"type": "integer"},
+        "inode": {"type": "integer"},
+        "current_gen": {"type": ["integer", "null"]},
+        "generations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "gen": {"type": "integer"},
+              "archived_offset": {"type": "integer"},
+              "chunks": {"type": "array", "items": {"type": "object", "properties": {
+                "shard": {"type": "string"}, "path": {"type": "string"}, "commit": {"type": ["string", "null"]},
+                "sha256": {"$ref": "#/$defs/sha256"}, "zsha256": {"$ref": "#/$defs/sha256"},
+                "src_sha256": {"$ref": "#/$defs/sha256"}, "blob": {"$ref": "#/$defs/gitoid"},
+                "seq": {"type": "integer"}, "src_range": {"type": "array"}},
+                "required": ["shard", "path", "commit", "sha256", "zsha256", "src_sha256", "blob", "seq"]}},
+              "chain_sha256": {"type": ["string", "null"]},
+              "whole_sha256": {"type": ["string", "null"]},
+              "whole_sha256_pending": {"type": "boolean"}
+            },
+            "required": ["gen", "archived_offset", "chunks", "chain_sha256", "whole_sha256", "whole_sha256_pending"]
+          }
+        },
+        "chain_sha256": {"type": ["string", "null"]},
+        "whole_sha256": {"type": ["string", "null"]},
+        "whole_sha256_pending": {"type": "boolean"},
+        "fully_archived": {"type": "boolean", "description": "archived_offset == size, no pending delta, nothing held"},
+        "held": {"type": ["object", "null"]},
+        "missing": {"type": "boolean"},
+        "moved_from": {"type": ["string", "null"]},
+        "moved_to": {"type": ["string", "null"], "description": "only in a pointer manifest left at a moved file's old path"},
+        "omitted_chunks": {"type": "array"}
+      },
+      "required": ["schema", "host", "source", "relpath"]
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/index_row"},
+    {"$ref": "#/$defs/sidecar"},
+    {"$ref": "#/$defs/manifest"}
+  ]
+}
