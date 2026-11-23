@@ -38,8 +38,16 @@ CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+
                        r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
                        r'|\.vault-token|\.git-credentials')
 
-ENABLER_TEXT = re.compile(r'(?is)(?:ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops).*(?:--(?:apply|undo|disable|resume)\b|'
-                          r'\bimport\b|\brunpy\b|\s-m\s)')
+ENABLER_NAMES = r'(?:ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops)'
+ENABLER_TEXT = re.compile(r'(?is)' + ENABLER_NAMES + r'.*(?:--(?:apply|undo|disable|resume)\b|'
+                          r'\bimport\b|\brunpy\b|\s-m\s|\b(?:cp|ln|mv|dd|tar|rsync|exec|eval|source)\b|-exec|'
+                          r'\|\s*(?:sh|bash|zsh|python[0-9.]*|tee|xargs)\b|>[^&]|\$\(|`|[*?\[])|'
+                          r'\b(?:cp|ln|mv|dd|tar|rsync|install)\b.*' + ENABLER_NAMES + '|'
+                          r'\.agent-harness/+bin/\S*[$*?\[`]')
+PERM_VERB_TEXT = re.compile(r'(?i)(?:(?:^|[;&|(`{\n])[ \t]*|\b(?:exec|xargs|sudo|do|then|time|nohup|env)\b[ \t]*|-exec(?:dir)?[ \t]+|\.)'
+                            r'(?:chmod|chown|chgrp|chattr|setfacl|chflags|xattr|setfattr|lchmod|fchmod|lchown|fchown)\b')
+PERM_PATH_TEXT = re.compile(r'(?i)\.agent-harness(?:/+(?:policy|private)\b|/*(?=[\s\'";|&)]|$))|policy/disabled|self-serve|'
+                            + ENABLER_NAMES)
 
 
 def guarded_text(raw):
@@ -84,8 +92,9 @@ def payload_cwd(raw):
 
 def sensitive(text, cwd=None):
     t = text[:4_000_000]
-    if ENABLER_TEXT.search(re.sub(r'[\'"\\]', '', t)):
-        return True  # self-serve enable/undo/disable is user-only
+    flat = re.sub(r'[\'"\\]', '', t)
+    if ENABLER_TEXT.search(flat) or (PERM_VERB_TEXT.search(flat) and PERM_PATH_TEXT.search(flat)):
+        return True  # self-serve enable/undo/disable is user-only; its files keep their modes
     if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or (EXEC_TEXT.search(t) and DESTROY_TEXT.search(t)):
         return True
     if CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', t)):
