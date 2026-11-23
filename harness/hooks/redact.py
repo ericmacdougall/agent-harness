@@ -24,9 +24,18 @@ _KEY_WORDS = (r'(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-
 _KEYS = r'(?:[a-z0-9]+[_-])*' + _KEY_WORDS
 # For searching: the same name shape with a bounded prefix (at most 16 segments of at most 128 characters). The
 # unbounded prefix restarted at every word boundary of a hyphenated run and scanned to its end, which is
-# quadratic (GoodQA #16680); bounded, each start does constant work. Same start rule (\b) as before, so the set of
-# names matched is unchanged except names with more than 16 segments before the key word.
-_KEYS_SCAN = r'(?:[a-z0-9]{1,128}[_-]){0,16}' + _KEY_WORDS
+# quadratic (GoodQA #16680); bounded, each start does constant work. A match starts at a word boundary, as before.
+# Underscores are word characters, so a name longer than that window has no later \b to start from; two more starts
+# cover it, and each fires only once the window is used up, so short names match exactly as before:
+#   - inside a name, after a letter or digit and _ or -, with exactly 16 full segments to the key word (17+ segments);
+#   - inside a segment, after a letter or digit, with 128 more before its _ or - (a segment over 128 characters).
+# Every value the unbounded form redacted is still redacted; tests/test_redact_perf.py pins this against it, and
+# pins that the repo's own code gains no findings. Past the window the match is a slight superset (the extra starts
+# cannot see whether the whole name began with _), which only over-redacts.
+_KEY_SEG = r'[a-z0-9]{1,128}[_-]'
+_KEYS_SCAN_ANY = (r'(?:\b(?:' + _KEY_SEG + r'){0,16}'
+                  r'|(?<=[a-z0-9][_-])(?:' + _KEY_SEG + r'){16}'
+                  r'|(?<=[a-z0-9])[a-z0-9]{128}[_-](?:' + _KEY_SEG + r'){0,15})' + _KEY_WORDS)
 
 # PEM bodies are unbounded: scan them separately so chunk boundaries and regex body caps cannot expose a tail.
 PEM_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----')
@@ -61,7 +70,7 @@ PATTERNS = [
     ('jwt', re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
     ('bearer', re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}')),
     ('url-userinfo', re.compile(r'(?i)\b[a-z][a-z0-9+.-]{0,30}://[^\s/?#@]{1,256}@[^\s/?#]{1,256}')),
-    ('named-credential', re.compile(r'(?i)\b' + _KEYS_SCAN + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
+    ('named-credential', re.compile(r'(?i)' + _KEYS_SCAN_ANY + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
     ('named-credential', re.compile(r'\b[a-z][a-z0-9]*(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)'
                                     r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
 ]
