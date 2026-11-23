@@ -436,6 +436,58 @@ class CliTests(Base):
         self.assertNotEqual(self.cli("cat", str(dest), "main.0001").returncode, 0)
 
 
+class WriterContractTests(Base):
+    """Every writer (claude wal.py, codex wal.py, ah._wal_append) rotates through the one shared implementation."""
+
+    def load(self, path, name):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def check_rotated(self, directory, total):
+        got = [json.loads(raw)["n"] for _, _, raw in ws.iter_lines(directory / "main.jsonl")]
+        self.assertEqual(got, list(range(total)))
+        segs = [p.name for p in directory.iterdir() if ws.SEGMENT_RE.match(p.name)]
+        self.assertGreaterEqual(len(segs), 2)  # rotation actually happened, not just byte equality
+        self.assertEqual(hard(ws.verify_chain(directory, "main", deep=True)), [])
+
+    def test_claude_hook_writer(self):
+        mod = self.load(HOOKS / "wal.py", "wal_claude")
+        session = self.home / ".claude/wals/claudes"
+        session.mkdir(parents=True)
+        for i in range(40):
+            mod.append(session / "main.jsonl", rec(i, 300))
+        self.check_rotated(session, 40)
+
+    def test_codex_hook_writer(self):
+        mod = self.load(HOOKS.parents[1] / "codex/hooks/wal.py", "wal_codex")
+        session = self.home / ".agent-harness/codex-wals/codexs"
+        session.mkdir(parents=True)
+        for i in range(40):
+            mod.append(session / "main.jsonl", rec(i, 300))
+        self.check_rotated(session, 40)
+
+    def test_ah_writer_and_dedupe_across_segments(self):
+        ah = self.load(HOOKS / "ah.py", "ah_under_test")
+        session = self.home / ".claude/wals/ahsess"
+        session.mkdir(parents=True)
+        path = session / "main.jsonl"
+        for i in range(40):
+            ah._wal_append(self.home, path, dict(rec(i, 300), id=f"wid{i:04d}"))
+        self.check_rotated(session, 40)
+        ah._wal_append(self.home, path, dict(rec(999, 300), id="wid0001"))  # id sits in a closed segment
+        self.assertEqual(len(ws.read_logical(path).splitlines()), 40)  # the retry appended nothing
+
+    def test_segment_shaped_ids_are_escaped(self):
+        for path, name in ((HOOKS / "wal.py", "w1"), (HOOKS.parents[1] / "codex/hooks/wal.py", "w2")):
+            mod = self.load(path, name)
+            safe = mod.safe_id("x.0001")
+            self.assertTrue(safe.startswith("z-"), safe)
+            self.assertIsNone(ws.SEGMENT_RE.match(f"agent-{safe}.jsonl"))
+
+
 class NoDestructiveTests(unittest.TestCase):
     FORBIDDEN = {"unlink", "remove", "rmdir", "rmtree", "truncate", "ftruncate", "move", "replace", "rename", "renames"}
 
