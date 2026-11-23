@@ -472,6 +472,34 @@ class PromptHookRevokes(Base):
                                             client=self.fake))
         self.verify('k1')
 
+    def test_every_adapter_withdrawal_opener_revokes(self):  # PR 14 review F2: harness trigger is a superset
+        for opener in ('no', 'stop', 'cancel', 'revoke', 'do not', "don't", 'withdraw'):
+            with self.subTest(opener):
+                self.fake.items.clear()
+                for path in (self.mac.store.published, self.mac.store.tombstones):
+                    if path.exists():
+                        path.unlink()
+                self.grant_local('k1')
+                self.publish('k1')
+                cd.on_user_prompt(SESSION, opener + ' run that review', store=self.mac.store, client=self.fake)
+                with self.assertRaises(cd.Denied):
+                    self.verify('k1')
+
+
+class CallerFreshnessLimit(Base):
+    def test_verify_honours_the_caller_max_age(self):  # PR 14 review F1 (goodqa#16665)
+        now = time.time()
+        self.fake.add(self.body(self.payload(assent_at=cd.iso(now - 900), expires_at=cd.iso(now - 900 + 12 * 3600))))
+        self.assertEqual(self.verify('k1')['task'], 'k1')  # within the 12 h record limit
+        self.assertEqual(self.verify('k1', max_age_seconds=3600)['task'], 'k1')
+        with self.assertRaises(cd.Denied) as caught:
+            self.verify('k1', max_age_seconds=600)  # the operator's shorter freshness cap wins
+        self.assertIn('older_than_caller_limit', str(caught.exception))
+        for bad in (0, -1, 12 * 3600 + 1, 60.0, '600', True):
+            with self.subTest(bad=bad), self.assertRaises(cd.Denied) as caught:
+                self.verify('k1', max_age_seconds=bad)
+            self.assertEqual(caught.exception.code, 'bad_max_age')
+
 
 class TierGateAcceptsCentral(Base):
     def spawn(self, task, model='fable'):

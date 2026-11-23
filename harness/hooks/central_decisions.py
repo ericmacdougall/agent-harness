@@ -63,7 +63,9 @@ B64URL = re.compile(r'[A-Za-z0-9_-]+')
 KEY_ID = re.compile(r'[0-9a-f]{16}')
 REVOKE = re.compile(r'agent-harness-revoke (?:(all)|task ([A-Za-z0-9][A-Za-z0-9._-]{0,63})|session (%s)|decision ([0-9a-f]{32}))'
                     % UUID.pattern)
-BARE_WITHDRAWAL = re.compile(r"\s*(?:stop|cancel|revoke|withdraw|no|don'?t)\b", re.I)
+# A superset of the T2Scan adapter's own withdrawal openers (no, stop, cancel, revoke, do not, don't), so the prompt
+# hook revokes at least whenever the adapter's local transcript scan would deny.
+BARE_WITHDRAWAL = re.compile(r"\s*(?:stop|cancel|revoke|withdraw|no|do\s+not|don'?t)\b", re.I)
 
 
 class Denied(Exception):
@@ -480,7 +482,7 @@ def _time_ok(p, now):
     return assent <= issued <= now + SKEW and assent <= now + SKEW and issued < expires <= assent + MAX_LIFETIME and now < expires
 
 
-def verify(task, family, *, store=None, client=None, now=None, deadline_seconds=None):
+def verify(task, family, *, store=None, client=None, now=None, deadline_seconds=None, max_age_seconds=None):
     """The valid central decision for exactly `task` and `family` at `now`, else Denied. Reads the ledger fresh
     on every call (no cache), so a revocation posted between two checks denies the second one."""
     store = store or Store()
@@ -489,6 +491,8 @@ def verify(task, family, *, store=None, client=None, now=None, deadline_seconds=
     if family not in FAMILIES:
         raise Denied('bad_family', 'family must be fable or astra')
     now = time.time() if now is None else now
+    if max_age_seconds is not None and (type(max_age_seconds) is not int or not 0 < max_age_seconds <= MAX_LIFETIME):
+        raise Denied('bad_max_age', 'max_age_seconds must be an int in (0, %d]' % MAX_LIFETIME)
     config = load_config(store)
     trusted = load_trusted_keys(store)
     crypto = _crypto()
@@ -515,6 +519,8 @@ def verify(task, family, *, store=None, client=None, now=None, deadline_seconds=
         try:
             if not _time_ok(p, now):
                 reasons.append('expired_or_out_of_window'); continue
+            if max_age_seconds is not None and now - parse_time(p['assent_at']) > max_age_seconds:
+                reasons.append('older_than_caller_limit'); continue
         except Denied:
             reasons.append('time'); continue
         if any(covers(r, p) for r in revokes):

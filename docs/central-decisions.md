@@ -85,7 +85,34 @@ A retraction typed in a different session does not revoke automatically; use `ah
 ## Consumers
 
 - `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read for launches: the Agent spawn (family fable) and the Bash launch and climbed-rung checks (fable or astra by model). Reviewers are excluded, because `peer_review.py` honours only local permissions. The rung ceiling is unchanged, and nothing is written into the escalation state. All ledger reads of one hook run share one 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
-- The T2Scan Claude adapter (`cli/adapters/claude-assessment.py`) uses the central path only when the approval task has no local escalation record. It still requires the family word, and for `-astra-direct` tasks the direct-assent words, in the signed sentence.
+- The T2Scan Claude adapter (`cli/adapters/claude-assessment.py`) uses the central path only when the approval task has no local escalation record. Both paths pass one check, `enforce_assent`:
+  - the caller's freshness cap (for example the launcher's `top_assent_max_age_seconds`);
+  - the family named in the record's family list and in the sentence;
+  - the direct-assent words for `-astra-direct` tasks;
+  - withdrawal.
+
+  The adapter passes its cap to `verify(..., max_age_seconds=N)`, and a decision whose user words are older than N is refused.
+
+## Withdrawal and the local path
+
+A local grant is withdrawn when a later human turn in the same session names the top rung, retracts, or opens with a withdrawal word (no, stop, cancel, revoke, do not, don't) for that task or for all work. The adapter finds this by scanning the transcript.
+
+A central decision is withdrawn by a revoke on the ledger. Revokes come from three places:
+- **The prompt hook in the originating session.** It revokes every published decision of that session on any of those words. Its trigger is a superset of the adapter's, and a test pins that.
+- **`ah decision withdraw`**, run on demand.
+- **A revoke line posted on the ledger ticket.**
+
+When the originating transcript is on the host running the adapter (the Mac), the adapter also runs its own transcript scan on the central decision's source. On a worker host the transcript is absent, so the ledger revocation is what applies there.
+
+Known gaps, both covered by `ah decision withdraw --all`:
+- A withdrawal given as an answer to an AskUserQuestion prompt is not a typed prompt, so the hook does not see it.
+- The same applies to a withdrawal typed in another session.
+
+## Why the hooks directory is trusted
+
+`central_decisions.py` runs from `~/.claude/hooks`, the same directory as `escalation.py`, `provenance.py` and `usage_guard.py`, which the adapter already trusts for local grants. `repair-harness` installs it, and the installer compares its blob with the merged commit on both hosts.
+
+Before importing it, the adapter checks that the directory and the file are owned by root or the runtime user and are not writable by group or others, as `binary_identity` does for the Claude binary. The threat model does not cover a process running as the same user that rewrites those files.
 - A revoke comment without a usable server time still denies (it counts as newer than every grant); a grant without one is not valid. Publish refuses when the Mac clock is more than 120 s from the server's.
 - Every read fetches the whole ledger: archived comments included, at most 10 pages of 200. Running out of pages, an unreachable tracker, a missing or closed ticket, a missing pinned key or a missing `cryptography` package all deny.
 
