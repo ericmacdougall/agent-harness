@@ -172,6 +172,11 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
+    try:  # self-serve: stamp main's `ah ops ...` / `ah install-files ...` for the grant proof (ah_ops.pretool never raises or denies)
+        import ah_ops  # noqa: PLC0415
+        ah_ops.pretool(payload, home=home_dir())
+    except Exception:  # noqa: BLE001
+        pass
     if "mission_coverage" not in cmd and "ahc" not in cmd:
         return {}
     import caller_identity  # noqa: PLC0415
