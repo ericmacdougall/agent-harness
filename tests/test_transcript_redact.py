@@ -207,6 +207,16 @@ class TextShapes(unittest.TestCase):
         self.assertIsNone(omitted)
         self.assertFalse(leaks(out, F, F2))
 
+    def test_superseded_named_credential_coverage(self):
+        # transcript_redact skips redact.py's first named-credential shape; its own keyword rule must cover it.
+        for i, text in enumerate(["DB_PASSWORD=" + F, "a_b_c_d_e_f_g_h_i_j_secret=" + F, "my-app-client-secret: " + F,
+                                  "x-api-key=" + F, "refresh_token_value=" + F, "id_token: '" + F + "'",
+                                  "ACCESS-KEY=" + F, "credentials=" + F, "private_key:" + F]):
+            with self.subTest(case=i):
+                out, _, omitted = run(text)
+                self.assertIsNone(omitted)
+                self.assertFalse(leaks(out, F))
+
     def test_psql_port_is_not_redacted(self):
         out, _, _ = run("psql -h db -p 5432 -U app")
         self.assertTrue(b"-p 5432" in out)

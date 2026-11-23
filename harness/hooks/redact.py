@@ -17,9 +17,16 @@ import re
 MAX_CHUNK = 256 * 1024  # inputs are processed in chunks of this size (with an overlap) to bound regex work
 OVERLAP = 4096
 
-_KEYS = (r'(?:[a-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|'
-         r'private[_-]?key|credentials?|client[_-]?secret|refresh[_-]?token|access[_-]?token|id[_-]?token)'
-         r'(?:[_-]value)?')
+_KEY_WORDS = (r'(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|'
+              r'private[_-]?key|credentials?|client[_-]?secret|refresh[_-]?token|access[_-]?token|id[_-]?token)'
+              r'(?:[_-]value)?')
+# For anchored use (ah_export fullmatches whole key names with it): any number of name segments.
+_KEYS = r'(?:[a-z0-9]+[_-])*' + _KEY_WORDS
+# For searching: the same name shape with a bounded prefix (at most 16 segments of at most 128 characters). The
+# unbounded prefix restarted at every word boundary of a hyphenated run and scanned to its end, which is
+# quadratic (GoodQA #16680); bounded, each start does constant work. Same start rule (\b) as before, so the set of
+# names matched is unchanged except names with more than 16 segments before the key word.
+_KEYS_SCAN = r'(?:[a-z0-9]{1,128}[_-]){0,16}' + _KEY_WORDS
 
 # PEM bodies are unbounded: scan them separately so chunk boundaries and regex body caps cannot expose a tail.
 PEM_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----')
@@ -27,7 +34,8 @@ PEM_END = re.compile(r'-----END [A-Z0-9 ]{0,40}-----')
 
 # (kind, compiled pattern). Order matters: specific shapes first so the kind label is the most useful one.
 PATTERNS = [
-    ('rclone-token', re.compile(r'(?im)^\s*token\s*=\s*\{[^\n]{0,8192}')),
+    # bounded whitespace: an unbounded `^\s*` rescanned every line start of a newline run (GoodQA #16680)
+    ('rclone-token', re.compile(r'(?im)^[ \t]{0,64}token\s{0,64}=\s{0,64}\{[^\n]{0,8192}')),
     ('oauth-json', re.compile(r'(?is)\{[^{}]{0,2048}?[\x22\x27](?:access_token|refresh_token|id_token)[\x22\x27]'
                               r'\s*:[^{}]{0,4096}\}')),
     ('anthropic', re.compile(r'\bsk-ant-[A-Za-z0-9_-]{8,}')),
@@ -53,7 +61,7 @@ PATTERNS = [
     ('jwt', re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
     ('bearer', re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}')),
     ('url-userinfo', re.compile(r'(?i)\b[a-z][a-z0-9+.-]{0,30}://[^\s/?#@]{1,256}@[^\s/?#]{1,256}')),
-    ('named-credential', re.compile(r'(?i)\b' + _KEYS + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
+    ('named-credential', re.compile(r'(?i)\b' + _KEYS_SCAN + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
     ('named-credential', re.compile(r'\b[a-z][a-z0-9]*(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)'
                                     r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
 ]
