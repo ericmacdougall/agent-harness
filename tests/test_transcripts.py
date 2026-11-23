@@ -1146,6 +1146,29 @@ class HoldOwnerTests(L.Base):
         self.assertFalse(r['ok'])
         self.assertEqual(self.tree(repo)[path], T.git_blob_sha(b'someone else\n'))
 
+    def test_a_run_that_visits_nothing_still_reports_the_hold(self):
+        """A receipt from a run that never visits files (a backfill deferred on load) still carries the held files
+        from state, so check stays non-ok with the count."""
+        orig = T.gate_metadata
+
+        def gate(side):
+            if side['session'] == UUID1:
+                raise T.Refused('metadata')
+            return orig(side)
+        T.gate_metadata = gate
+        self.addCleanup(setattr, T, 'gate_metadata', orig)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        self.write('claude-projects', 'p/%s.jsonl' % UUID2, lines(3))
+        self.sync('pr')
+        self.setenv(TRANSCRIPTS_IGNORE_LOAD='0')
+        with mock.patch.object(T.os, 'getloadavg', lambda: (1e6, 1e6, 1e6)):
+            code, out = self.main('backfill', '--budget-seconds', '5')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.receipt()['status'], 'deferred')
+        code, out = self.main('check', '--json')
+        self.assertNotEqual(code, 0)
+        self.assertEqual(json.loads(out)['held'], {'count': 1, 'by_reason': {'refused:metadata': 1}})
+
     def test_only_the_hold_owner_writes_hold_state(self):
         """Guard: no code path outside the owner may set, clear or pop a file's hold."""
         import ast
