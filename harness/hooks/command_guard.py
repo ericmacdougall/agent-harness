@@ -86,7 +86,9 @@ DEFAULT_POLICY = {
     # because creating one is how the protection would be replaced or reconfigured.
     'guard_files': ['{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
                     '{home}/.claude/hooks/safe_input.py', '{home}/.codex/agent-harness/command_guard*',
-                    '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py'],
+                    '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py',
+                    # the Claude CLI's own pid -> session records: takeover.derive_caller reads the caller from them
+                    '{home}/.claude/sessions/*'],
     # wal, wals, wal-*, wal_*, wal.* and *.wal.jsonl; not walker/ or wallet/
     'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[-_.][^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
     # Tier A anywhere on disk: a `wals` directory segment, main.jsonl and *.wal.jsonl files.
@@ -2229,6 +2231,20 @@ def _takeover():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def verifier_caller(path, flag, home=None):
+    """(caller, problem) for the verifier CLI. The caller is worked out from this process's ancestry
+    (takeover.resolve_caller: a Claude session record, a Codex tool shell's thread id, or the flag only when the verifier
+    was started over ssh with no agent above it). A flag that names another session than the derived one is a refusal.
+    Only a path inside a session's work directory needs a caller, so nothing is probed for any other path."""
+    if work_session_of(os.path.realpath(path), home) is None:
+        return None, None
+    try:
+        return _takeover().resolve_caller(os.path.realpath(home or os.path.expanduser('~')), flag)
+    except Exception as error:  # noqa: BLE001 - an unknown caller is foreign for every work directory, never own
+        return None, None if not flag else 'caller_mismatch: the calling session could not be worked out (%s)' % (
+            type(error).__name__)
 
 
 def foreign_session_refusal(path, caller, action='worktrees', home=None, judge=None):
@@ -9864,25 +9880,39 @@ def install_files_refusal(command, is_main, home=None):
     return None
 
 
-TAKEOVER_WORDS = ('takeover', 'remove-worktree', 'continuation', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID')
+TAKEOVER_WORDS = ('takeover', 'remove-worktree', 'continuation', 'caller-session', 'CODEX_THREAD_ID',
+                  'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'enable-takeover-cleanup')
+TAKEOVER_TOOLS = ('ah.py', 'command_guard', 'kill_guard', 'wal.py', 'takeover.py', 'ah_worktree', 'enable-takeover-cleanup')
+
+
+def _load_takeover_rules():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('takeover_rules', os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'takeover_rules.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def takeover_rules_refusal(text, session):
     """The refusal text of takeover_rules (W2 form, G2 caller binding, G3 identity, G4 continuation, G5 user script), or None.
-    Text only: accident prevention, see takeover_rules.py. A missing or broken module never blocks anything else."""
-    if not any(word in text for word in TAKEOVER_WORDS):
+    Text only: accident prevention, see takeover_rules.py. The prefilter reads quote-flattened text (remove-work""tree is
+    still the word). When the module is missing or broken, a command that names a harness tool next to a takeover word is
+    refused instead of allowed: a host with this guard but without its rules must not lose them silently."""
+    flat = re.sub(r'[\'"\\]', '', text)
+    if not any(word in flat for word in TAKEOVER_WORDS):
         return None
     try:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location('takeover_rules', os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'takeover_rules.py'))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_takeover_rules()
+    except Exception as error:  # noqa: BLE001 - FileNotFoundError, SyntaxError, anything: fail closed below
+        if any(tool in flat for tool in TAKEOVER_TOOLS):
+            return ('the takeover command rules could not be loaded (%s), so a command that names a harness tool next '
+                    'to a takeover word is refused; reinstall the hooks (scripts/repair-harness.sh)' % type(error).__name__)
+        return None
+    try:
         return module.refusal(text, session)
-    except FileNotFoundError:
-        return None
-    except Exception:  # noqa: BLE001 - the rules are an addition: their own failure must not stop an ordinary command
-        return None
+    except Exception as error:  # noqa: BLE001 - a rule that crashes is a refusal, never an allow
+        return 'the takeover command rules failed on this command (%s); it is refused' % type(error).__name__
 
 
 def _install_files_main(payload):
@@ -10282,8 +10312,12 @@ def main(argv=None):
         if args.cmd == 'verify-worktree':
             result = verify_worktree(args.path, args.remote_auth, policy)
         else:
-            result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy,
-                                     caller_session=args.caller_session)
+            caller, problem = verifier_caller(args.path, args.caller_session)
+            if problem:
+                result = {'path': args.path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION,
+                          'reason': problem}
+            else:
+                result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy, caller_session=caller)
         print(json.dumps(result))
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':

@@ -366,3 +366,27 @@ class AlertParityAndDegrade(unittest.TestCase):
         context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
         self.assertIn('WAL append failed', context); self.assertIn('EACCES', context)
         self.assertNotIn('"decision"', result.stdout)
+
+
+class ContinuationOwner(unittest.TestCase):
+    """C1 (review F1): `wal.py continuation` may change only the calling session's own checkpoint. The caller is worked
+    out from the process ancestry by takeover.caller_of; when it cannot be (no record, no WAL for that id: T2), the
+    command keeps today's behaviour and the guard rule G4 stays the binding layer."""
+
+    def load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('codex_wal_c1', str(HOOK))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_another_sessions_checkpoint_is_refused_when_the_caller_is_known(self):
+        wal = self.load()
+        path = Path('/h/.agent-harness/codex-wals/01a2012f-bca0-78b0-8fc7-162587de5ee7/main.jsonl')
+        self.assertIn('own', wal.continuation_owner_refusal(path, lambda: '6df7b63f-b062-4fa8-834a-f6bd857d0c54'))
+        self.assertIsNone(wal.continuation_owner_refusal(path, lambda: '01a2012f-bca0-78b0-8fc7-162587de5ee7'))
+        self.assertIsNone(wal.continuation_owner_refusal(path, lambda: None), 'unknown caller: G4 is the layer')
+
+        def broken():
+            raise RuntimeError('takeover.py missing')
+        self.assertIsNone(wal.continuation_owner_refusal(path, broken))

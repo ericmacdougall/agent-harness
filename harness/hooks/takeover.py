@@ -898,16 +898,198 @@ def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None):
 
 # ------------------------------------------------------------------------------------------- orchestration
 
-def caller_of(home, environ=None):
-    """The caller's session id: CLAUDE_CODE_SESSION_ID, else CODEX_THREAD_ID (CLAUDE_SESSION_ID is deliberately not read);
-    its WAL dir must exist on this host. Assumes the Codex WAL directory is named for CODEX_THREAD_ID (T2, unverified):
-    if it is not, a Codex caller is unknown and every foreign removal is refused, never allowed."""
+# ---------------------------------------------------------------------------------- who is calling (review F1)
+#
+# The caller is never taken from a flag or from the caller's own environment: a command line can set both. It is worked
+# out from the process ancestry of the running tool:
+#   * Claude: the Claude CLI writes ~/.claude/sessions/<pid>.json with its sessionId and its start time (procStart; macOS:
+#     the UTC `ps -o lstart` text, Linux: /proc/<pid>/stat field 22). The nearest ancestor with such a record, whose
+#     executable is a Claude binary and whose start time matches, names the caller. Overwriting an existing record is a
+#     protected-log overwrite and creating one is refused like a guard file (command_guard policy guard_files).
+#   * Codex: there is no app-written pid record. The nearest Codex agent host's tool shell carries CODEX_THREAD_ID in the
+#     environment it was started with; every process between it and the tool must agree. This is weaker than the Claude
+#     record (T2/T3 are unverified on a live Codex): a Codex caller is accepted only when it is consistent and its WAL
+#     exists here, otherwise it is unknown, which refuses every foreign removal.
+#   * ssh: with no agent above it and an sshd process above it, the tool was started by the caller's host (ah
+#     worktree-remove relays its own derived caller). The flag is the only identity there; the guard's text rule G2 is
+#     what keeps an agent from typing that ssh command itself. Disclosed, not closed.
+#   * none: no agent and no ssh hop (a user's terminal, or an orphan that escaped its parent): any flag is ignored.
+
+SSHD = re.compile(r"^sshd(?:-session)?\b")
+CODEX_FRESH_S = 1800  # a Codex caller's own rollout was written within this window (half the worktree quiet window)
+CLAUDE_EXE = re.compile(r"(?:^|/)[^/]*claude[^/]*(?:/|$)", re.I)
+
+
+def start_token(pid):
+    """The process start time in the form the Claude CLI records as procStart, or None."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/%d/stat" % int(pid), "rb") as handle:
+                text = handle.read(4096).decode("ascii", "replace")
+            fields = text[text.rindex(")") + 2:].split()
+            return fields[19] if len(fields) > 19 else None  # field 22 (starttime); fields here start at field 3
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=8,
+                              env={"TZ": "UTC", "LC_ALL": "C", "PATH": "/bin:/usr/bin"}, stdin=subprocess.DEVNULL)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    text = " ".join(done.stdout.split())
+    return text or None
+
+
+def exe_path(pid, info=None):
+    """The executable of a process: /proc/<pid>/exe on Linux (not settable through argv), the full comm path on macOS."""
+    if sys.platform.startswith("linux"):
+        try:
+            return os.readlink("/proc/%d/exe" % int(pid))
+        except (OSError, ValueError):
+            return ""
+    return (info or {}).get("comm") or ""
+
+
+def claude_record(home, pid, info, probe=None):
+    """The sessionId of the Claude CLI `pid` from its own ~/.claude/sessions/<pid>.json, or None. The record must be a
+    small regular file of this user, name this pid, carry a session id, match the live start time, and the process must
+    run a Claude executable."""
+    path = os.path.join(str(home), ".claude", "sessions", "%d.json" % int(pid))
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > 65536:
+        return None
+    data = _read_json_file(path, 65536)
+    if not isinstance(data, dict) or data.get("pid") != int(pid):
+        return None
+    sid = data.get("sessionId")
+    if not isinstance(sid, str) or not ID_RE.fullmatch(sid):
+        return None
+    exe = (getattr(probe, "exe_path", None) or (lambda p: exe_path(p, info)))(pid)
+    if not exe or not CLAUDE_EXE.search(exe):
+        return None
+    token = (getattr(probe, "start_token", None) or start_token)(pid)
+    recorded = " ".join(str(data.get("procStart") or "").split())
+    if not token or not recorded or recorded != " ".join(str(token).split()):
+        return None
+    return sid
+
+
+def _wal_known(home, flavor, sid):
+    parent = (".claude", "wals") if flavor == "claude" else (".agent-harness", "codex-wals")
+    name = sid if flavor == "claude" else _safe_wal_name(sid)
+    return os.path.isdir(os.path.join(str(home), *parent, name))
+
+
+def _safe_wal_name(value):
+    """codex/hooks/wal.py safe_id for an id that is already lowercase and well formed (ID_RE): the id itself."""
+    return value if ID_RE.fullmatch(value or "") and not value.startswith("z-") else ""
+
+
+def _codex_flavor(info):
+    module = ak()
+    if module.desktop_app(info):
+        exe, _rest = module._exe_and_rest(info)
+        return not re.search(r"(?:^|/)claude[^/]*\.app/", (info.get("comm") or "") + " " + exe, re.I)
+    exe, rest = module._exe_and_rest(info)
+    names = [os.path.basename(info.get("comm") or "").lower(), os.path.basename(exe).lower()]
+    names += [os.path.basename(w).lower() for w in rest[:2]]
+    return "codex" in names and "claude" not in names
+
+
+def derive_caller(home, probe=None, pid=None, environ=None):
+    """{"mode": claude|codex|ssh|none, "caller": id or None, "why": text}: who runs this process, from its ancestry.
+
+    Read only. Every failure gives caller None, which the callers treat as unknown (refused for any foreign work dir)."""
     environ = os.environ if environ is None else environ
-    for name, parent in (("CLAUDE_CODE_SESSION_ID", (".claude", "wals")), ("CODEX_THREAD_ID", (".agent-harness", "codex-wals"))):
-        value = environ.get(name, "")
-        if value and ID_RE.fullmatch(value) and os.path.isdir(os.path.join(str(home), *parent, value)):
-            return value
-    return None
+    probe = probe if probe is not None else ak().Probe()
+    start = os.getpid() if pid is None else int(pid)
+    chain, current = [], start
+    try:
+        for _ in range(64):
+            info = probe.info(current)
+            if not info:
+                break
+            if current != start:
+                sid = claude_record(home, current, info, probe)
+                if sid:
+                    claimed = environ.get("CLAUDE_CODE_SESSION_ID")
+                    if claimed and claimed != sid:
+                        return {"mode": "claude", "caller": None, "why": "the environment disagrees with the session record"}
+                    if not _wal_known(home, "claude", sid):
+                        return {"mode": "claude", "caller": None, "why": "no WAL for the recorded session on this host"}
+                    return {"mode": "claude", "caller": sid, "why": "session record of pid %d" % current}
+                if ak().is_agent_host(info):
+                    if not _codex_flavor(info):
+                        return {"mode": "claude", "caller": None, "why": "a Claude host with no valid session record"}
+                    return _codex_caller(home, probe, chain, environ, current)
+                comm = os.path.basename(info.get("comm") or "")
+                if SSHD.match(comm) or SSHD.match(info.get("command") or ""):
+                    return {"mode": "ssh", "caller": None, "why": "started over ssh with no agent above"}
+            chain.append(info)
+            if info.get("ppid", 0) <= 1:
+                break
+            current = info["ppid"]
+    except Exception as error:  # noqa: BLE001 - an ancestry that cannot be read proves nothing
+        return {"mode": "none", "caller": None, "why": "ancestry unreadable (%s)" % type(error).__name__}
+    return {"mode": "none", "caller": None, "why": "no agent and no ssh hop above this process"}
+
+
+def _codex_caller(home, probe, chain, environ, host_pid):
+    values = set()
+    claimed = environ.get("CODEX_THREAD_ID")
+    if claimed:
+        values.add(claimed)
+    for info in chain:
+        pairs = probe.session_pairs(info["pid"])
+        if pairs is None:
+            return {"mode": "codex", "caller": None, "why": "an environment on the chain could not be read"}
+        values |= {value for flavor, value in pairs if flavor == "codex"}
+    if len(values) != 1:
+        return {"mode": "codex", "caller": None, "why": "%d thread ids on the chain under pid %d" % (len(values), host_pid)}
+    sid = values.pop()
+    if not ID_RE.fullmatch(sid) or not _wal_known(home, "codex", sid):
+        return {"mode": "codex", "caller": None, "why": "no WAL for that thread on this host"}
+    # macOS hides the environment of platform shells (/bin/zsh, /bin/bash) from ps, so the chain often proves nothing
+    # beyond this process's own environment. The app appends the running thread's rollout on every tool call; a thread
+    # whose rollout has not been written for CODEX_FRESH_S is not the one calling (a stopped session claimed by id).
+    now = time.time()
+    if not any(now - _mtime(path) <= CODEX_FRESH_S for path in _transcripts(str(home), sid, "codex")):
+        return {"mode": "codex", "caller": None, "why": "the thread's rollout is not being written"}
+    return {"mode": "codex", "caller": sid, "why": "thread id of the tool shell under pid %d" % host_pid}
+
+
+def _mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+FLAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def resolve_caller(home, flag=None, probe=None, pid=None, environ=None):
+    """(caller or None, problem or None) for a tool that was handed `--caller-session flag`.
+
+    Under an agent the derived caller is the answer and a flag that names anyone else is `caller_mismatch`. Over ssh with
+    no agent above, the flag is the relayed caller (see the block comment above). Otherwise the flag is ignored."""
+    if flag and not FLAG_RE.fullmatch(str(flag)):
+        return None, "caller_mismatch: --caller-session is not a session id"
+    found = derive_caller(home, probe, pid, environ)
+    if found["mode"] in ("claude", "codex"):
+        if flag and found["caller"] and flag != found["caller"]:
+            return None, "caller_mismatch: --caller-session names another session than the calling one"
+        return found["caller"], None
+    if found["mode"] == "ssh":
+        return (flag or None), None
+    return None, None
+
+
+def caller_of(home, environ=None, probe=None):
+    """The calling session's id from the process ancestry (derive_caller), or None. Never read from the environment: a
+    command line can set CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID, it cannot change its own ancestors."""
+    found = derive_caller(home, probe=probe, environ=environ)
+    caller = found.get("caller") if found.get("mode") in ("claude", "codex") else None
+    return caller if caller and ID_RE.fullmatch(caller) else None
 
 
 def validate_ticket(ticket, lookup=None):

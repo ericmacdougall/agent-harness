@@ -7,7 +7,7 @@ from taking the shortcuts that would make those checks pointless:
 
   W2  `ah.py takeover ...` must be one literal command of the documented grammar (no variable, substitution, glob, chain,
       pipe, redirect, leading assignment or --via); over ssh only the read-only `status --evidence-only --json` exists.
-  G2  `command_guard.py remove-worktree --caller-session X` is allowed only when X is the payload's own session.
+  G2  `command_guard.py remove-worktree --caller-session X` is never typed by an agent (ah worktree-remove relays it).
   G3  A command that assigns CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID and also runs a harness tool is refused: the
       caller identity the tools read must not be set by the caller.
   G4  `wal.py continuation --wal P` may name only the caller's own session WAL.
@@ -200,6 +200,37 @@ def _flat(text):
     return re.sub(r'[\'"\\]', '', text)
 
 
+# Review F1 (BLOCK at db950737): the rules used to look for a tool only in the program slot after a fixed set of python
+# flags, so `python3 -IB`, `-X utf8`, `-W ignore`, a quoted word or a trailing `# it's` walked past them. Now:
+#   * a tool is found at ANY word position (its basename), whatever interpreter options come before it;
+#   * G3 is judged on the quote-flattened text: an assignment of a session variable anywhere next to any harness tool;
+#   * text that cannot be parsed is refused when it names a harness tool next to a word of an enabled rule;
+#   * a dynamic word ($, `) in a direct verifier call, or in a continuation WAL path, is refused.
+# This is still the second layer: the verifier works the caller out from its own ancestry (takeover.resolve_caller).
+TOOL_STEMS = ('ah.py', 'command_guard', 'kill_guard', 'wal.py', 'takeover.py', 'ah_worktree', SCRIPT)
+ID_ASSIGN = re.compile(r'(?:CLAUDE_CODE_SESSION_ID|CLAUDE_SESSION_ID|CODEX_THREAD_ID)\s*:?=')
+RULE_WORDS = {'G2': ('remove-worktree', 'caller-session'), 'G3': ('CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'CODEX_THREAD_ID'),
+              'G4': ('continuation',), 'G5': (SCRIPT,), 'W2': ('takeover',)}
+READ_ONLY = {'grep', 'rg', 'egrep', 'fgrep', 'git', 'cat', 'less', 'more', 'head', 'tail', 'sed', 'awk', 'wc', 'diff', 'ls',
+             'file', 'stat', 'shasum', 'sha256sum', 'md5', 'echo', 'printf'}
+DYNAMIC = re.compile(r'[$`]')
+
+
+def _base(word):
+    return os.path.basename(_flat(word).rstrip('/'))
+
+
+def _values(words, flag):
+    """Every value of `flag` (`--flag V` or `--flag=V`) in words."""
+    out = []
+    for index, word in enumerate(words):
+        if word == flag and index + 1 < len(words):
+            out.append(words[index + 1])
+        elif word.startswith(flag + '='):
+            out.append(word.split('=', 1)[1])
+    return out
+
+
 def refusal(command, session=None, home=None, only=None):
     """None, or the refusal text, for a command that touches the takeover tools outside the allowed forms. `only` limits the
     rules to some of G2, G3, G4, G5, W2 (kill_guard has no payload session, so it runs G3, G5 and W2 only)."""
@@ -208,65 +239,64 @@ def refusal(command, session=None, home=None, only=None):
 
     text = command if isinstance(command, str) else ' '.join(map(str, command))
     flat = _flat(text)
-    if not any(name in flat for name in TOOLS) and 'takeover' not in flat:
+    enabled = [code for code in RULE_WORDS if on(code)]
+    if not any(word in flat for code in enabled for word in RULE_WORDS[code]):
         return None
+    names_tool = any(stem in flat for stem in TOOL_STEMS)
+    # G3: the caller must not set the identity the harness tools read (any spelling: prefix, env, export, ${X:=...})
+    if on('G3') and names_tool and ID_ASSIGN.search(flat):
+        return ('the caller identity (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) is read by the harness tools and may not be '
+                'set in a command that runs them')
     try:
         tokens = _tokens(text)
         found = list(_commands(tokens))
     except ValueError:
-        return _fallback(flat)
+        return ('the command could not be parsed and names a harness tool next to a takeover word; write it as one plain '
+                'literal command') if names_tool else None
     top = [c for _p, c, via in found if via == 'top']
     chained = any(OPERATOR.fullmatch(t) for t in tokens)
-    runs_tool = any((_program(c)[0] in TOOLS) or os.path.basename(c[0]) in TOOLS for _p, c, _v in found)
-    # G3: the caller must not set the identity the harness tools read
-    assigned = any(ID_VAR.match(t) for p, c, _v in found for t in list(p) + c[1:] + c[:1]
-                   if ID_VAR.match(t)) or any(c[0] in ('export', 'declare', 'typeset') and any(ID_VAR.match(t) for t in c[1:])
-                                              for _p, c, _v in found)
-    if on('G3') and assigned and runs_tool:
-        return ('the caller identity (CLAUDE_CODE_SESSION_ID / CODEX_THREAD_ID) is read by the harness tools and may not be '
-                'set in a command that runs them')
     for prefix, cmd, via in found:
-        script, words = _program(cmd)
-        base = os.path.basename(cmd[0])
-        # G5
-        if on('G5') and SCRIPT in [os.path.basename(t) for t in cmd[:4]] and any(t in ('--apply', '--undo') or t.startswith(('--apply=', '--undo=')) for t in cmd):
+        if cmd[0] in ('ssh-unparsable', 'sh-unparsable'):
+            body = _flat(cmd[1])
+            if any(stem in body for stem in TOOL_STEMS) and any(w in body for c in enabled for w in RULE_WORDS[c]):
+                return 'a nested command that could not be parsed names a harness tool next to a takeover word'
+            continue
+        bases = [_base(w) for w in cmd]
+        head = bases[0]
+        # G5: the user's script, in any position, unless the command only reads it
+        if on('G5') and SCRIPT in bases and head not in READ_ONLY \
+                and any(t in ('--apply', '--undo') or t.startswith(('--apply=', '--undo=')) for t in cmd):
             return ('enable-takeover-cleanup.sh --apply and --undo are run by the user only; an agent may run --dry-run or '
                     '--verify')
-        # G2
-        if on('G2') and script == 'command_guard.py' and 'remove-worktree' in words:
-            given = [w.split('=', 1)[1] if w.startswith('--caller-session=') else words[i + 1]
-                     for i, w in enumerate(words) if w.startswith('--caller-session') and ('=' in w or i + 1 < len(words))]
-            if any(g != (session or '\0') for g in given):
-                return ('command_guard.py remove-worktree --caller-session may name only the caller\'s own session; use '
-                        '`ah.py worktree-remove` or `ah.py takeover`')
-        # G4
-        if on('G4') and script == 'wal.py' and 'continuation' in words:
-            wals = [w.split('=', 1)[1] if w.startswith('--wal=') else words[i + 1]
-                    for i, w in enumerate(words) if w.startswith('--wal') and ('=' in w or i + 1 < len(words))]
+        verifier = any(b.startswith('command_guard') for b in bases) and head not in READ_ONLY
+        # G2: an agent never passes --caller-session (ah worktree-remove derives and relays it); a dynamic word in a direct
+        # verifier call could spell the subcommand or the flag
+        if on('G2') and verifier and ('remove-worktree' in cmd or any(w.startswith('--caller-session') for w in cmd)):
+            if any(w.startswith('--caller-session') for w in cmd):
+                return ('command_guard.py remove-worktree --caller-session is passed by `ah.py worktree-remove` only; the '
+                        'verifier works the caller out itself. Use `ah.py worktree-remove` or `ah.py takeover`')
+        if on('G2') and verifier and any(DYNAMIC.search(w) for w in cmd) and ('remove-' in flat or 'caller' in flat):
+            return 'a direct command_guard.py call with a variable or substitution in it is refused; spell it literally'
+        # G4: only the caller's own continuation checkpoint
+        if on('G4') and 'wal.py' in bases and 'continuation' in cmd and head not in READ_ONLY:
+            wals = _values(cmd, '--wal')
             own = safe_id(session) if session else None
-            if any(os.path.basename(os.path.dirname(w)) != own for w in wals):
+            if not wals or any(DYNAMIC.search(w) or os.path.basename(os.path.dirname(w)) != own for w in wals):
                 return 'wal.py continuation may update only the caller\'s own session checkpoint'
-        # W2
-        if on('W2') and script == 'ah.py' and words[1:2] == ['takeover']:
-            if via in ('wrap', 'sh'):
-                problem = 'it may not be wrapped in another command'
-            elif prefix:
-                problem = 'a leading environment assignment is not allowed'
-            elif via == 'ssh':
-                problem = None if len(top) == 1 and not chained else 'it is not the only command on the line'
-                problem = problem or _takeover_problem(cmd, remote=True)
-            else:
-                problem = 'it is not the only command on the line' if len(top) != 1 or chained \
-                    else _takeover_problem(cmd, remote=False)
-            if problem:
-                return 'ah.py takeover: %s. Form: %s' % (problem, FORM)
-    return None
-
-
-def _fallback(flat):
-    """Unparsable text: only the two rules a regex can state safely."""
-    if re.search(r'(?:CLAUDE_CODE_SESSION_ID|CLAUDE_SESSION_ID|CODEX_THREAD_ID)=', flat) and any(name in flat for name in TOOLS):
-        return 'the caller identity may not be set in a command that runs harness tools (the command could not be parsed)'
-    if SCRIPT in flat and re.search(r'--(?:apply|undo)\b', flat) and not re.match(r'\s*(?:git|grep|rg|cat|head|tail|echo|printf)\b', flat):
-        return 'enable-takeover-cleanup.sh --apply and --undo are run by the user only'
+        # W2: `ah.py takeover` anywhere in the command must be the one literal form
+        if on('W2') and head not in READ_ONLY:
+            at = [i for i, b in enumerate(bases) if b == 'ah.py' and cmd[i + 1:i + 2] == ['takeover']]
+            if at:
+                if via in ('wrap', 'sh'):
+                    problem = 'it may not be wrapped in another command'
+                elif prefix:
+                    problem = 'a leading environment assignment is not allowed'
+                elif via == 'ssh':
+                    problem = None if len(top) == 1 and not chained else 'it is not the only command on the line'
+                    problem = problem or _takeover_problem(cmd, remote=True)
+                else:
+                    problem = 'it is not the only command on the line' if len(top) != 1 or chained \
+                        else _takeover_problem(cmd, remote=False)
+                if problem:
+                    return 'ah.py takeover: %s. Form: %s' % (problem, FORM)
     return None

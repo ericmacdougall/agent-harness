@@ -541,6 +541,8 @@ def pure_data_python(code):
 
 
 _TAKEOVER_RULES = None
+TAKEOVER_WORDS = ('takeover', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'enable-takeover-cleanup')
+TAKEOVER_TOOLS = ('ah.py', 'command_guard', 'kill_guard', 'wal.py', 'takeover.py', 'ah_worktree', 'enable-takeover-cleanup')
 
 
 def takeover_rules():
@@ -2197,11 +2199,15 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
     if policy['mode'] == 'off':
         return 'allow', '', '', ()
     raw = ' '.join(map(str, command)) if isinstance(command, (list, tuple)) else str(command)
-    if any(word in raw for word in ('takeover', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID')):
+    flat_raw = re.sub(r'[\'"\\]', '', raw)  # remove-work""tree and take''over are still the words
+    if any(word in flat_raw for word in TAKEOVER_WORDS):
         try:  # G3 (the caller sets no identity) and G5 (the user's script): the same text rules command_guard applies
             text_rule = takeover_rules().refusal(raw, session, only=('G3', 'G5', 'W2'))
-        except Exception:  # noqa: BLE001 - the rules are an addition; their own failure never blocks another command
+        except Exception as error:  # noqa: BLE001 - missing or broken rules refuse a harness tool next to these words
             text_rule = None
+            if any(tool in flat_raw for tool in TAKEOVER_TOOLS):
+                text_rule = ('the takeover command rules could not be used (%s), so a command that names a harness tool '
+                             'next to a takeover word is refused; reinstall the hooks' % type(error).__name__)
         if text_rule:
             return 'block', 'takeover-rules', block_message('takeover-rules', text_rule), ()
     analyzer = None

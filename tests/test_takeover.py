@@ -625,7 +625,10 @@ class CLI(TakeoverCase):
         env = {"AH_HOME": str(self.home), "HOME": str(self.home)}
         if caller:
             env["CLAUDE_CODE_SESSION_ID"] = caller
+        # the caller comes from the process ancestry (CallerIdentity); here it is named directly
+        derived = {"mode": "claude" if caller else "none", "caller": caller, "why": "test"}
         with mock.patch.dict(os.environ, env), mock.patch.object(tk, "HostProbe", lambda: self.probe), \
+                mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None: derived), \
                 mock.patch.object(tk, "fetch_remote_evidence", lambda old, **kw: EMPTY_REMOTE), \
                 mock.patch.object(tk, "default_tasks", lambda home: list(self.tasks)), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -676,6 +679,130 @@ class CLI(TakeoverCase):
         self.assertNotEqual(code, 0)
         self.assertIn("--expect-start", json.dumps(data))
         self.assertIsNone(sleeper.poll())
+
+
+class FakeChain:
+    """Process facts for caller derivation: info(pid), the app-written start token, the executable and the env pairs."""
+
+    def __init__(self, rows, tokens=None, exes=None, pairs=None):
+        self.rows, self.tokens, self.exes, self.pairs = rows, dict(tokens or {}), dict(exes or {}), dict(pairs or {})
+
+    def info(self, pid):
+        r = self.rows.get(pid)
+        return None if r is None else {"pid": pid, "ppid": r[0], "comm": r[1], "command": r[2], "uid": os.getuid(),
+                                       "stat": "S", "start": "Sat Nov 21 10:46:16 2026"}
+
+    def start_token(self, pid):
+        return self.tokens.get(pid)
+
+    def exe_path(self, pid):
+        return self.exes.get(pid, self.rows.get(pid, (0, ""))[1])
+
+    def session_pairs(self, pid):
+        return set(self.pairs.get(pid, ()))
+
+
+CLAUDE_EXE = "/Users/u/Library/Application Support/Claude/claude-code/2.1.330/x/claude.app/Contents/MacOS/claude"
+
+
+class CallerIdentity(TakeoverCase):
+    """F1 (review BLOCK at db950737): the caller is worked out from the process ancestry, never from a flag or from the
+    caller's own environment. A Claude CLI writes ~/.claude/sessions/<pid>.json bound to its start time; that record
+    wins over any session variable the command line set."""
+
+    def setUp(self):
+        super().setUp()
+        (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
+        (self.home / ".agent-harness" / "codex-wals" / OTHER).mkdir(parents=True)
+
+    def record(self, pid, sid=CALLER, start="Sun Nov 22 03:43:10 2026", **extra):
+        folder = self.home / ".claude" / "sessions"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / ("%d.json" % pid)).write_text(json.dumps(dict({"pid": pid, "sessionId": sid, "procStart": start}, **extra)))
+
+    def claude_chain(self, self_pairs=()):
+        rows = {500: (400, "/usr/bin/python3", "python3 -I verifier"), 400: (300, "/bin/zsh", "/bin/zsh -c x"),
+                300: (200, CLAUDE_EXE, CLAUDE_EXE + " --x"), 200: (1, "/Applications/Claude.app/Contents/Helpers/disclaimer", "d")}
+        return FakeChain(rows, tokens={300: "Sun Nov 22 03:43:10 2026"}, pairs={500: set(self_pairs)})
+
+    def derive(self, probe, environ=None):
+        return tk.derive_caller(str(self.home), probe=probe, pid=500, environ=environ or {})
+
+    def test_the_claude_session_record_of_the_nearest_cli_is_the_caller(self):
+        self.record(300)
+        self.assertEqual(self.derive(self.claude_chain(), {"CLAUDE_CODE_SESSION_ID": CALLER})["caller"], CALLER)
+        self.assertEqual(self.derive(self.claude_chain())["caller"], CALLER, "the record alone is enough")
+
+    def test_a_session_variable_set_on_the_command_line_never_becomes_the_caller(self):
+        self.record(300)
+        # the incident shape: a Claude caller claiming a Codex id, or another Claude id, through its environment
+        found = self.derive(self.claude_chain({("codex", OLD)}), {"CLAUDE_CODE_SESSION_ID": CALLER, "CODEX_THREAD_ID": OLD})
+        self.assertEqual(found["caller"], CALLER, "the Claude record overrides a claimed Codex id")
+        found = self.derive(self.claude_chain({("claude", OLD)}), {"CLAUDE_CODE_SESSION_ID": OLD})
+        self.assertIsNone(found["caller"], "an environment that disagrees with the record proves nothing")
+        self.assertEqual(found["mode"], "claude")
+
+    def test_a_stale_or_foreign_record_is_not_proof(self):
+        self.record(300, start="Mon Nov  2 01:00:00 2026")  # pid reused: the start time differs
+        self.assertIsNone(self.derive(self.claude_chain())["caller"])
+        self.record(300, sid="Not An Id")
+        self.assertIsNone(self.derive(self.claude_chain())["caller"])
+        self.record(300, sid=OLD)  # an id with no WAL on this host
+        self.assertIsNone(self.derive(self.claude_chain())["caller"])
+        # a record for an intermediate process that is not a Claude executable is ignored, however well formed
+        probe = self.claude_chain()
+        probe.tokens[400] = "Sun Nov 22 03:43:10 2026"
+        self.record(400, sid=OTHER)
+        self.record(300)
+        self.assertEqual(self.derive(probe)["caller"], CALLER)
+
+    def test_a_codex_host_reads_the_thread_id_its_tool_shell_was_started_with(self):
+        rows = {500: (400, "/usr/bin/python3", "python3 -I x"), 400: (300, "/bin/bash", "bash -lc x"),
+                300: (1, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")}
+        good = FakeChain(rows, pairs={400: {("codex", OTHER)}, 500: {("codex", OTHER)}})
+        rollout = self.home / ".codex" / "sessions" / "2026" / "11" / "22" / ("rollout-2026-11-22T01-00-00-%s.jsonl" % OTHER)
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}\n")
+        with mock.patch.object(ak, "PLATFORM", "darwin"):
+            self.assertEqual(self.derive(good, {"CODEX_THREAD_ID": OTHER})["caller"], OTHER)
+            old = __import__("time").time() - 2 * HOUR
+            os.utime(rollout, (old, old))  # a thread whose rollout is not being written is not the one calling
+            self.assertIsNone(self.derive(good, {"CODEX_THREAD_ID": OTHER})["caller"])
+            os.utime(rollout, None)
+            forged = FakeChain(rows, pairs={400: {("codex", OTHER)}, 500: {("codex", OLD)}})
+            self.assertIsNone(self.derive(forged, {"CODEX_THREAD_ID": OLD})["caller"])
+            unproven = FakeChain(rows, pairs={500: {("codex", OLD)}})
+            self.assertIsNone(self.derive(unproven, {"CODEX_THREAD_ID": OLD})["caller"], "no WAL for that id here")
+
+    def test_ssh_and_orphaned_chains(self):
+        ssh = FakeChain({500: (400, "/usr/bin/python3", "python3 x"), 400: (300, "bash", "bash -c x"),
+                         300: (1, "sshd", "sshd: eric@notty")})
+        self.assertEqual(self.derive(ssh)["mode"], "ssh")
+        self.assertEqual(tk.resolve_caller(str(self.home), CALLER, probe=ssh, pid=500), (CALLER, None))
+        orphan = FakeChain({500: (400, "/usr/bin/python3", "python3 x"), 400: (1, "bash", "bash -c x")})
+        self.assertEqual(self.derive(orphan)["mode"], "none")
+        self.assertEqual(tk.resolve_caller(str(self.home), CALLER, probe=orphan, pid=500), (None, None),
+                         "a flag with no agent and no ssh hop above it is ignored")
+
+    def test_a_flag_that_differs_from_the_derived_caller_is_a_mismatch(self):
+        self.record(300)
+        caller, problem = tk.resolve_caller(str(self.home), OLD, probe=self.claude_chain(), pid=500)
+        self.assertIsNone(caller)
+        self.assertIn("caller_mismatch", problem)
+        self.assertEqual(tk.resolve_caller(str(self.home), CALLER, probe=self.claude_chain(), pid=500), (CALLER, None))
+        self.assertEqual(tk.resolve_caller(str(self.home), None, probe=self.claude_chain(), pid=500), (CALLER, None))
+
+    def test_caller_of_uses_the_ancestry_not_the_environment(self):
+        with mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None:
+                               {"mode": "claude", "caller": None, "why": "no record"}):
+            self.assertIsNone(tk.caller_of(str(self.home), {"CLAUDE_CODE_SESSION_ID": CALLER}))
+        with mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None:
+                               {"mode": "claude", "caller": CALLER, "why": "record"}):
+            self.assertEqual(tk.caller_of(str(self.home), {"CLAUDE_CODE_SESSION_ID": OLD}), CALLER)
+
+    def test_the_start_token_of_this_process_is_readable(self):
+        token = tk.start_token(os.getpid())
+        self.assertTrue(token and isinstance(token, str), token)
 
 
 class RealProbe(unittest.TestCase):

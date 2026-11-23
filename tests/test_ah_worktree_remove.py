@@ -20,6 +20,7 @@ sys.path.insert(0, str(HOOKS))
 import ah  # noqa: E402
 import ah_worktree  # noqa: E402
 import command_guard as cg  # noqa: E402
+import takeover  # noqa: E402
 
 URL = "https://github.com/acme/widgets.git"
 GIT_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -60,6 +61,11 @@ class Repo(unittest.TestCase):
         self.addCleanup(patch.stop)
         self.policy = cg.load_policy(path=str(self.home / "missing-policy.json"))
         patch = mock.patch.object(cg, "HOOK_SESSION", "S")  # the hook's caller owns work/S (takeover: foreign sessions)
+        patch.start()
+        self.addCleanup(patch.stop)
+        # the verifier works its caller out from the process ancestry (takeover.derive_caller); here the caller owns work/S
+        patch = mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
+                                  {"mode": "claude", "caller": "S", "why": "test"})
         patch.start()
         self.addCleanup(patch.stop)
 
@@ -737,6 +743,14 @@ class ForeignSession(Repo):
     """M3: another session's work directory is removable only when that session is retired or walless. The check sits
     in the verifier, which every route reaches: the hook lone form, ah worktree-remove, a direct remove-worktree."""
 
+    def setUp(self):
+        super().setUp()
+        (self.home / ".claude" / "wals" / "S").mkdir(parents=True)  # work/S belongs to a session recorded on this host
+        patch = mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
+                                  {"mode": "none", "caller": None, "why": "test: no agent above"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def judge(self, state):
         return lambda session: {"state": state, "reasons": ["probe"] if state != "retired" else []}
 
@@ -787,6 +801,43 @@ class ForeignSession(Repo):
         self.assertTrue(self.linked.exists())
 
     run_cli = Verifier.run_cli
+
+    def derived(self, mode, caller):
+        return mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
+                                 {"mode": mode, "caller": caller, "why": "test"})
+
+    def test_the_cli_works_the_caller_out_itself_and_a_forged_flag_is_refused(self):
+        # F1: the session the flag names is not the caller; the process ancestry is (a Claude session record)
+        with self.derived("claude", "realcaller-0001"):
+            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "s-forged-1")
+        self.assertEqual((code, data["removed"]), (1, False), data)
+        self.assertIn("caller_mismatch", data["reason"])
+        self.assertTrue(self.linked.exists())
+        with self.derived("claude", "S"):  # the derived caller owns work/S: no flag is needed or trusted
+            code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
+        self.assertEqual((code, data["removed"]), (0, True), data)
+
+    def test_a_flag_counts_only_when_relayed_over_ssh(self):
+        with self.derived("none", None):
+            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "S")
+        self.assertEqual((code, data["removed"]), (1, False), "an orphaned or user-run verifier ignores the flag")
+        self.assertIn("foreign session S", data["reason"])
+        with self.derived("ssh", None):
+            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "S")
+        self.assertEqual((code, data["removed"]), (0, True), data)
+
+    def test_ah_worktree_remove_passes_the_derived_caller_not_the_environment(self):
+        (self.home / ".claude" / "wals" / "realcaller-0001").mkdir(parents=True)
+        seen = {}
+
+        def fake_remove(*args, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True, "removed": True}
+        with self.derived("claude", "realcaller-0001"), mock.patch.object(ah_worktree, "remove", fake_remove), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "S", "CODEX_THREAD_ID": "S"}):
+            ah.run(ah.build_parser().parse_args(["worktree-remove", "--host", "local", "--path", str(self.linked),
+                                                 "--reason", "r"]), self.home)
+        self.assertEqual(seen["caller_session"], "realcaller-0001")
 
     def test_the_verifier_version_is_three_and_the_delegation_passes_head_and_caller(self):
         self.assertEqual((cg.VERIFIER_VERSION, ah_worktree.VERIFIER_VERSION), (3, 3))
