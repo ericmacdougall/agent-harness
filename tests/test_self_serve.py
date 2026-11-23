@@ -30,6 +30,11 @@ def make_key():
     return key, raw
 
 
+def evidence_for(cap):
+    """The same-harness fallback always needs the changed paths (it has a built-in denylist floor); nothing else does."""
+    return {"changed_paths": ["docs/readme.md"]} if cap == "same_harness_fallback_review" else None
+
+
 def body(**over):
     out = {
         "schema": "self-serve/1", "purpose": "self-serve", "policy_id": POLICY_ID, "key_id": "",
@@ -60,8 +65,11 @@ class Env(unittest.TestCase):
         pol.mkdir(parents=True, mode=0o700)
         os.chmod(pol, 0o700)
         self.install(body(key_id=self.key_id))
-        self.main = {"kind": "claude_main", "claude_dir": str(self.claude),
-                     "payload": {"session_id": SID, "transcript_path": str(self.transcript)}}
+        # The private test seam: home, proof root and clock are fixed by the library in production and by this in tests.
+        seam = mock.patch.dict(ss._SEAM, {"home": self.home, "claude_dir": str(self.claude), "clock": True})
+        seam.start()
+        self.addCleanup(seam.stop)
+        self.main = {"kind": "claude_main", "payload": {"session_id": SID, "transcript_path": str(self.transcript)}}
 
     # --- fixtures
     def write(self, path, data, mode=0o600):
@@ -97,7 +105,7 @@ class ValidGrant(Env):
 
     def test_every_capability_grants(self):
         for cap in ss.CAPABILITIES:
-            self.assertIsNotNone(self.grant(cap), cap)
+            self.assertIsNotNone(self.grant(cap, evidence=evidence_for(cap)), cap)
 
     def test_null_expiry_is_allowed(self):
         self.install(body(key_id=self.key_id, expires_at=None))
@@ -112,16 +120,16 @@ class ValidGrant(Env):
     def test_codex_root_with_verified_origin_gets_grant(self):
         seen = SimpleNamespace(origin="openai", reason="running_code_verified")
         with mock.patch.object(ss, "_origin_probe", return_value=seen):
-            self.assertIsNotNone(self.grant(actor={"kind": "codex_root"}))
+            self.assertIsNotNone(self.grant("harness_repair", actor={"kind": "codex_root"}))  # merge class is Claude-only
 
     def test_codex_root_rejected_for_other_origins(self):
         for seen in (SimpleNamespace(origin="claude", reason="running_claude_code_verified"),
                      SimpleNamespace(origin="unknown", reason="probe_failed"),
                      SimpleNamespace(origin="openai", reason="code_identity_unverified")):
             with mock.patch.object(ss, "_origin_probe", return_value=seen):
-                self.assertIsNone(self.grant(actor={"kind": "codex_root"}), seen)
+                self.assertIsNone(self.grant("harness_repair", actor={"kind": "codex_root"}), seen)
         with mock.patch.object(ss, "_origin_probe", side_effect=RuntimeError("boom")):
-            self.assertIsNone(self.grant(actor={"kind": "codex_root"}))
+            self.assertIsNone(self.grant("harness_repair", actor={"kind": "codex_root"}))
 
 
 class ActorProof(Env):
@@ -132,7 +140,7 @@ class ActorProof(Env):
             self.assertEqual(self.why(actor=actor), "helper_actor")
         seen = SimpleNamespace(origin="openai", reason="running_code_verified")
         with mock.patch.object(ss, "_origin_probe", return_value=seen):
-            self.assertIsNone(self.grant(actor={"kind": "codex_root", "payload": {"agent_id": "x"}}))
+            self.assertIsNone(self.grant("harness_repair", actor={"kind": "codex_root", "payload": {"agent_id": "x"}}))
 
     def test_unproven_actors(self):
         for actor in (None, {}, {"kind": "main"}, {"kind": "claude_main"}, {"kind": "claude_main", "payload": "x"},
@@ -367,7 +375,7 @@ class KillSwitchAndRevoke(Env):
 
     def test_kill_switch_file_refuses_everything(self):
         for cap in ss.CAPABILITIES:
-            self.assertIsNotNone(self.grant(cap))
+            self.assertIsNotNone(self.grant(cap, evidence=evidence_for(cap)))
         Path(ss.kill_switch_path(self.home)).write_text("")
         for cap in ss.CAPABILITIES:
             self.assertEqual(self.why(cap), "kill_switch", cap)
@@ -458,12 +466,16 @@ class Scope(Env):
         for ev in (None, {}, {"changed_paths": []}, {"changed_paths": "docs/a.md"}, {"changed_paths": [1]}):
             self.assertIsNone(self.grant(evidence=ev), ev)
 
-    def test_single_use(self):
+    def test_single_use_is_spent_only_by_consume(self):  # the full matrix is in test_self_serve_repair
         self.scoped({"single_use": True})
-        self.assertIsNone(self.grant(evidence={}))
-        self.assertIsNotNone(self.grant(evidence={"use_key": "pr-1@abc"}))
-        self.assertEqual(self.why(evidence={"use_key": "pr-1@abc"}), "already_used")
-        self.assertIsNotNone(self.grant(evidence={"use_key": "pr-2@abc"}))
+        pr = {"repo": "o/r", "pr": 1, "head": "abc"}
+        self.assertEqual(self.why(evidence=pr), "single_use_requires_consume")
+        self.assertIsNone(self.grant(evidence=pr))
+        spent = lambda ev: ss.explain("merge_reviewed_pr", actor=self.main, home=self.home, now=NOW, evidence=ev, consume=True)  # noqa: E731
+        self.assertEqual(spent({})[1], "use_binding_required")
+        self.assertEqual(spent(pr)[1], "granted")
+        self.assertEqual(spent(pr)[1], "already_used")
+        self.assertEqual(spent(dict(pr, pr=2))[1], "granted")
 
     def test_evidence_must_be_a_mapping(self):
         self.assertIsNone(self.grant(evidence=["x"]))
@@ -576,7 +588,12 @@ class AuditAndStatus(Env):
         self.assertEqual(ss.policy_path("/h"), Path("/h/.agent-harness/policy/self-serve.json"))
         self.assertEqual(ss.kill_switch_path("/h"), Path("/h/.agent-harness/policy/disabled"))
         self.assertEqual(ss.private_key_path("/h"), Path("/h/.agent-harness/private/self-serve/ed25519.key"))
-        self.assertEqual(ss.policy_path(), Path(os.path.expanduser("~")) / ".agent-harness/policy/self-serve.json")
+        self.assertEqual(ss.policy_path(), Path(self.home) / ".agent-harness/policy/self-serve.json")  # the armed test home
+        account = os.path.join(self.home, "account")  # production: the account's home from the password database, not $HOME
+        entry = SimpleNamespace(pw_dir=account)
+        with mock.patch.dict(ss._SEAM, {"home": None}), mock.patch.object(ss.pwd, "getpwuid", return_value=entry), \
+                mock.patch.dict(os.environ, {"HOME": "/elsewhere"}):
+            self.assertEqual(ss.policy_path(), Path(account) / ".agent-harness/policy/self-serve.json")
 
 
 class ImportSafety(unittest.TestCase):
@@ -595,11 +612,29 @@ class ImportSafety(unittest.TestCase):
     def test_cli_status_is_read_only_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = os.path.realpath(tmp)
-            out = subprocess.run([sys.executable, "-I", os.path.join(HOOKS, "self_serve.py"), "status"], capture_output=True,
-                                 text=True, cwd=home, env={"HOME": home, "PATH": os.environ.get("PATH", "")}, timeout=60)
+            # The test seam stands in for the account home, so this stays hermetic on a machine that has a real policy.
+            code = ("import sys; sys.path.insert(0, %r); import self_serve; self_serve._SEAM['home'] = %r; "
+                    "raise SystemExit(self_serve.main(['status']))" % (HOOKS, home))
+            out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=home,
+                                 env={"HOME": home, "PATH": os.environ.get("PATH", "")}, timeout=60)
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertFalse(json.loads(out.stdout)["enabled"])
             self.assertEqual(os.listdir(home), [])
+
+    def test_the_real_cli_prints_json_and_leaves_a_foreign_home_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.realpath(tmp)
+            account = os.path.join(home, "account")  # the child's password-database home: empty, so nothing real is read
+            os.mkdir(account)
+            code = ("import pwd, runpy, sys, types; pwd.getpwuid = lambda uid: types.SimpleNamespace(pw_dir=%r); "
+                    "sys.argv = ['self_serve.py', 'status']; runpy.run_path(%r, run_name='__main__')"
+                    % (account, os.path.join(HOOKS, "self_serve.py")))
+            out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, cwd=home,
+                                 env={"HOME": home, "PATH": os.environ.get("PATH", "")}, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertFalse(json.loads(out.stdout)["enabled"])
+            self.assertEqual(os.listdir(account), [])
+            self.assertEqual(os.listdir(home), ["account"])
 
 
 class SchemaFile(unittest.TestCase):
