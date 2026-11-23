@@ -255,6 +255,21 @@ class SummaryAndItsCaches(Base):
         whole = self.summary(self.home)
         self.assertEqual(whole["events"], len(OWNERA))
 
+    def test_only_a_files_own_open_marker_is_dropped_as_wal_segments_does(self):
+        """THE marker rule (wal_segments.Snapshot._drops_marker) in the incremental reader: a marker-shaped line 1 of
+        another segment or stem is an ordinary record. Compared with the reader API on the same fixture."""
+        w = self.w
+        stray = marker("agent-ownera", 7)         # not this file's marker (the live file is segment 2)
+        put(w, "agent-ownera.0001.jsonl", OWNERA[:1])
+        put(w, "agent-ownera.jsonl", [stray] + OWNERA[1:])
+        s = self.summary(self.home)
+        api = [raw for _seg, _n, raw in ah._ws().iter_lines(w / "agent-ownera.jsonl")]
+        self.assertEqual(len(api), len(OWNERA) + 1)      # the reader API keeps the stray line as a record
+        self.assertEqual((s["events"], s["skipped"]), (len(OWNERA) + 1, 0))      # the stray line is a record, never dropped
+        put(w, "agent-ownera.jsonl", [marker("agent-ownera", 2)] + OWNERA[1:])
+        fresh = ah._summarize_agent_wal(w / "agent-ownera.jsonl", ah.state_dir(self.other_home(), "ah-index"))
+        self.assertEqual((fresh["events"], fresh["skipped"]), (len(OWNERA), 0))
+
     def test_a_partial_last_line_in_a_closed_segment_is_a_lost_line(self):
         w = self.w
         put(w, "agent-ownera.0001.jsonl", [json.dumps(OWNERA[0])])

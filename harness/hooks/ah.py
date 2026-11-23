@@ -327,6 +327,7 @@ _CHAIN_HINT: dict = {}   # str(live path) -> the chain summarize_agent_wal was h
 class _NoSegments:
     segments: list = []
     live = None
+    max_seq = 0
 
 
 class _LiveOnlySnapshot:
@@ -369,6 +370,13 @@ def _live_only_snapshot(path: Path, ch):
     return None
 
 
+def _is_own_marker(raw: bytes, stem: str, seq: int) -> bool:
+    """wal_segments' marker rule for line 1 of a file: seq >= 2, the marker's segment equals the file's seq and its stem
+    is this WAL's. test_ah_wal_segments_readers compares it with Snapshot's own rule so the two cannot drift apart."""
+    marker = _ws().parse_marker(raw)
+    return marker is not None and seq >= 2 and marker["segment"] == seq and marker["stem"] == stem
+
+
 def chain_new_lines(snap, meta: dict, torn: dict):
     """(iterator of (offset, line), rebuilt): the complete lines of a whole WAL chain not yet read, oldest first.
 
@@ -382,13 +390,13 @@ def chain_new_lines(snap, meta: dict, torn: dict):
     """
     ws = _ws()
     directory = snap.directory
-    files = [{"name": s.name, "ino": s.ino, "size": s.size, "seg": s, "fd": None, "own": True,
+    files = [{"name": s.name, "ino": s.ino, "size": s.size, "seg": s, "fd": None, "own": True, "seq": s.seq,
               "mtime": os.lstat(os.path.join(directory, s.name)).st_mtime_ns}
              for s in snap.chain.segments if s.name != snap.tail_name]
     if snap.tail_fd is not None:
         st = os.fstat(snap.tail_fd)
         files.append({"name": snap.tail_name, "ino": st.st_ino, "size": st.st_size, "seg": None, "fd": snap.tail_fd, "own": False,
-                      "mtime": st.st_mtime_ns})
+                      "mtime": st.st_mtime_ns, "seq": ws.parse_name(snap.tail_name)[1] or (snap.chain.max_seq + 1)})
     live_name = snap.stem + ".jsonl"
     for p in snap.problems:   # the live file is there but could not be opened: the newest records are unreadable
         if p["code"] in ("unreadable", "not_regular") and str(p["message"]).startswith(live_name):
@@ -435,7 +443,7 @@ def chain_new_lines(snap, meta: dict, torn: dict):
                     sub = {}
                     it, _ = read_new_lines(Path(directory) / f["name"], sub, fd=fd)
                 for off, raw in it:
-                    if off == 0 and ws.parse_marker(raw) is not None:
+                    if off == 0 and _is_own_marker(raw, snap.stem, f["seq"]):
                         continue
                     yield off, raw
                 if i < last and sub.get("offset", 0) < f["size"]:
