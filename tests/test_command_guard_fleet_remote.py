@@ -420,6 +420,12 @@ class HookRefuses(Base):
             self.assertEqual(self.verdict(cmd), 'block', cmd)
         self.assertEqual(self.verdict(self.rm()), 'allow')
 
+    def test_powershell_payload_is_not_allowed(self):
+        c = cg.Compiled(self.policy, home=str(self.home))
+        self.assertEqual(cg.decide(self.rm(), c, ps=True, marker=self.approvals(self.runner))[0], 'block')
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.verdict(self.rm()), 'allow')
+
     def test_non_matching_command_never_invokes_runner(self):
         self.verdict('ssh -F %s t2-dev rm -rf %s' % (CFG, P2))
         self.verdict('ssh t2-dev rm -rf %s' % P1)
@@ -442,10 +448,11 @@ class LocalUnchanged(Base):
         self.assertEqual(entry['kind'], cg.NO_BACKUP_REMOTE_KIND)
         # even an entry forged with the same path string and a valid MAC is skipped by the local lookup
         entries, key = cg.load_marker(str(self.home))
-        forged = dict(entries[0], path='/tmp/x')
+        forged = dict(entries[0], path=str(local), identity=list(cg._identity(str(local))),
+                      stat_sha256=cg.stat_manifest(str(local), self.policy['marker']))
         forged['mac'] = cg._mac(key, forged)
         approvals.entries = [forged]
-        self.assertFalse(approvals.covers('/tmp/x'))
+        self.assertFalse(approvals.covers(str(local)))
 
     def test_local_entry_does_not_authorize_ssh(self):
         approvals = self.approvals(FakeFleet(lambda a, d: answer(mode='recheck')))
@@ -709,6 +716,45 @@ class LinkedWorktrees(ValidatorBase):
                     dict(answer('main'), parent='/x'), dict(answer(), tips_sha256='1')):
             with self.assertRaises(ValueError, msg=str(bad)):
                 cg.run_fleet_validator('t2-dev', 'validate', P1, self.policy, str(self.home), runner=FakeFleet(bad))
+
+    def test_forged_linked_layout_with_common_dir_inside_target_refused(self):
+        """red-team C1: a .git directory whose commondir sits inside the target must not pass as a linked worktree."""
+        import shutil
+        path = self.repo.path
+        sha = sh('git', 'rev-parse', 'HEAD', cwd=path).strip()
+        moved = self.home / 'moved-git'
+        os.rename(str(path / '.git'), str(moved))
+        (path / '.git').mkdir()
+        os.rename(str(moved), str(path / '.git/common'))
+        (path / '.git/commondir').write_text('common\n')
+        (path / '.git/HEAD').write_text(sha + '\n')
+        sh('git', 'read-tree', 'HEAD', cwd=path)
+        out = self.refused()
+        self.assertTrue('inside the path' in out['reason'] or 'registered' in out['reason'], out)
+        shutil.rmtree(str(path / '.git'))
+
+    def test_per_worktree_refs_refused(self):
+        wt = self.repo.task / 'wt2'
+        sh('git', 'worktree', 'add', '-q', '--detach', str(wt), cwd=self.repo.path)
+        self.assertTrue(self.run_program(path=str(wt))['ok'])
+        sh('git', 'update-ref', 'refs/worktree/keep', 'HEAD', cwd=wt)
+        self.refused('per-worktree', path=str(wt))
+
+    def test_parent_inside_the_path_is_refused_on_the_mac_side(self):
+        with self.assertRaises(ValueError):
+            cg.run_fleet_validator('t2-dev', 'validate', P1, self.policy, str(self.home),
+                                   runner=FakeFleet(answer(parent=P1 + '/.git/common')))
+
+    def test_runner_output_is_bounded_and_timed(self):
+        with self.assertRaises(Exception):
+            cg._fleet_default_runner(['/bin/sh', '-c', 'yes'], b'', 5, cap=1000)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            cg._fleet_default_runner(['/bin/sh', '-c', 'sleep 5'], b'', 1)
+
+    def test_nested_json_answer_refuses_without_recursion_error(self):
+        with self.assertRaises(ValueError):
+            cg.run_fleet_validator('t2-dev', 'validate', P1, self.policy, str(self.home),
+                                   runner=FakeFleet(reply=(0, b'[' * 200000)))
 
 
 if __name__ == '__main__':

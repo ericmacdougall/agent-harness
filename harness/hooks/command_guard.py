@@ -8013,7 +8013,7 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
                                              'CLAUDE_CONFIG_DIR or an env wrapper, which could point it at a forged '
                                              'transcript or state', 'run command_guard.py approve-delete plainly'))
     fleet = getattr(marker, 'covers_fleet', None)
-    if fleet is not None and isinstance(command, str) and 'ssh' in command:
+    if fleet is not None and not ps and isinstance(command, str) and 'ssh' in command:
         if fleet(command):
             return 'allow', ''
         if getattr(marker, 'fleet_reason', None):
@@ -9746,10 +9746,14 @@ def repo_checks():
         if code != 0:
             refuse('refs cannot be listed')
         tips = sorted([line for line in refs.splitlines() if line] + [head + ' HEAD'])
-    return linked, head, tips, cd
+    return linked, head, tips, cd, gd
 
 
-def worktrees(cd, linked):
+def inside(path, base):
+    return path == base or path.startswith(base.rstrip('/') + '/')
+
+
+def worktrees(cd, linked, gd):
     code, out = git('worktree', 'list', '--porcelain')
     if code != 0:
         refuse('the worktree list cannot be read')
@@ -9764,16 +9768,35 @@ def worktrees(cd, linked):
             cur['prunable'] = True
     if not entries or entries[0]['bare']:
         refuse('the repository has no main working tree')
-    main = entries[0]['path']
+    main = os.path.realpath(entries[0]['path'])
+    plain = re.compile(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+')
     if linked:
-        if not re.fullmatch(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+', main):
-            refuse('the parent repository path is not a plain literal path')
+        # a linked worktree is a registered one: its git dir is <common>/worktrees/<id>, its gitdir file points back at
+        # TARGET/.git, the common dir is the parent's own .git, and neither lies inside the target
+        if not plain.fullmatch(main) or inside(main, TARGET) or inside(cd, TARGET):
+            refuse('the parent repository is missing, not plain, or inside the path')
+        if os.path.realpath(os.path.join(main, '.git')) != cd or os.path.dirname(gd) != os.path.join(cd, 'worktrees'):
+            refuse('the checkout is not a registered linked worktree of its parent')
+        try:
+            with open(os.path.join(gd, 'gitdir')) as handle:
+                back = os.path.realpath(handle.read().strip())
+        except OSError:
+            refuse('the linked worktree registration cannot be read')
+        if back != os.path.join(TARGET, '.git'):
+            refuse('the linked worktree registration does not point at this path')
+        if not any(os.path.realpath(e['path']) == TARGET for e in entries[1:]):
+            refuse('the path is not listed as a linked worktree of its parent')
+        code, per = git('for-each-ref', '--format=%(refname)', 'refs/bisect', 'refs/worktree')
+        if code != 0 or per.strip():
+            refuse('the linked worktree has per-worktree refs')
         return main, []
+    if main != TARGET or gd != cd or cd != os.path.join(TARGET, '.git'):
+        refuse('the path is not the main working tree of its repository')
     others = []
     for e in entries[1:]:
         if e['prunable'] or not os.path.lexists(e['path']):
             continue
-        if not re.fullmatch(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+', e['path']):
+        if not plain.fullmatch(e['path']):
             refuse('a linked worktree path is not a plain literal path')
         others.append(e['path'])
     return None, sorted(others)
@@ -10041,8 +10064,8 @@ def docker_check():
 def main():
     os.chdir('/')
     check_path()
-    linked, head, tips, cd = repo_checks()
-    parent, others = worktrees(cd, linked)
+    linked, head, tips, cd, gd = repo_checks()
+    parent, others = worktrees(cd, linked, gd)
     ident = dev_ino(TARGET)
     live = None
     if MODE == 'validate':
@@ -10115,14 +10138,49 @@ def build_fleet_program(mode, path, policy, _test=None):
     return 'import json\nCONFIG = json.loads(%s)\n' % json.dumps(json.dumps(cfg)) + FLEET_VALIDATOR_BODY
 
 
-def _fleet_default_runner(argv, data, timeout):
+def _fleet_default_runner(argv, data, timeout, cap=1 << 20):
+    """Run ssh with `data` on stdin; read at most cap+1 bytes of stdout (then stop it), within `timeout` seconds."""
+    import select
+    import threading
     env = {'PATH': '/usr/bin:/bin', 'HOME': _pinned_home(), 'LC_ALL': 'C'}
     sock = os.environ.get('SSH_AUTH_SOCK', '')
     if sock.startswith('/') and '\n' not in sock:
         env['SSH_AUTH_SOCK'] = sock
-    done = subprocess.run(argv, input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd='/',
-                          timeout=timeout, check=False)
-    return done.returncode, done.stdout
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                            cwd='/')
+
+    def feed():
+        try:
+            proc.stdin.write(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+    threading.Thread(target=feed, daemon=True).start()
+    deadline, out = time.monotonic() + timeout, b''
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            ready, _, _ = select.select([proc.stdout], [], [], min(left, 1.0))
+            if not ready:
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > cap:
+                raise subprocess.SubprocessError('the host answer is larger than %d bytes' % cap)
+        proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except BaseException:
+        proc.terminate()
+        proc.wait()
+        raise
+    return proc.returncode, out
 
 
 def _fleet_clean(text, limit=160):
@@ -10150,7 +10208,7 @@ def run_fleet_validator(host, mode, path, policy, home, runner=None, timeout=130
         raise ValueError('the fleet host did not answer (ssh failed or timed out)')
     try:
         data = json.loads(out.decode('utf-8'))
-    except ValueError:
+    except (ValueError, RecursionError):
         raise ValueError('the fleet validator answered something that is not JSON')
     if not isinstance(data, dict) or not isinstance(data.get('ok'), bool):
         raise ValueError('the fleet validator answer is malformed')
@@ -10168,6 +10226,8 @@ def run_fleet_validator(host, mode, path, policy, home, runner=None, timeout=130
     if (data['kind'] == 'linked') != (isinstance(parent, str)) or \
             (isinstance(parent, str) and (not FLEET_PLAIN_PATH.fullmatch(parent) or '..' in parent.split('/'))):
         raise ValueError('the fleet validator answer is malformed')
+    if isinstance(parent, str) and (parent == path or parent.startswith(path + '/')):
+        raise ValueError('the validator answer names a parent inside the path')
     if data['kind'] == 'main' and linked:
         raise ValueError('the repository still has linked worktrees on the host; delete those first')
     return data
@@ -10264,7 +10324,11 @@ def parse_fleet_command(command, home, policy):
     if '' in tokens:
         return None
     rel = str((policy['marker'].get('fleet_ssh_config')) or '~/.ssh/config_fleetops')
-    spellings = (rel, os.path.join(home, rel[2:])) if rel.startswith('~/') else ()
+    spellings = ()
+    if rel.startswith('~/'):
+        spellings = (os.path.join(home, rel[2:]),)
+        if os.path.realpath(os.environ.get('HOME') or '/nonexistent') == home:
+            spellings = (rel,) + spellings  # the shell expands ~ with its own HOME: only when it is the pinned home
     if not tokens or tokens[0] not in ('ssh', '/usr/bin/ssh'):
         return None
     i, config, batch = 1, False, False
