@@ -1496,7 +1496,7 @@ def _resolve_graphql(client, node_ids):
     return m.group(1) + "/" + m.group(2), int(m.group(3))
 
 
-def evaluate_merge(merge, client, state_dir, now, command_hash):
+def evaluate_merge(merge, client, state_dir, now, command_hash, command=None):
     """Return (allowed, text, audit_info). Never raises GateError."""
     info = {"repo": None, "pr": None, "head": None}
     hard, soft = [], []  # hard reasons cannot be waived
@@ -1530,10 +1530,15 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
     # red-team M1: `merge_gate.py check` is a read-only query; it must never spend the single-use evidence
     if not hard and info["head"] and merge.kind != "check":
         wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now,
-                             review_ok=not info.get("unsettled"))
+                             review_ok=not info.get("unsettled"), command=command)
         if wid:
             info["waiver"] = wid
             return True, "", info
+        trailer = pending_fallback_trailer(state_dir, info["repo"], info["pr"], info["head"], now,
+                                           review_ok=not info.get("unsettled")) if merge.kind != "check" else None
+        if trailer:
+            soft.append("a same-harness fallback review authorizes this merge only when the merge commit carries "
+                        f"its label and receipt id: add --body '{trailer}' (or the equivalent) to the command")
     reasons = [clean(r, 300) for r in (hard + soft)][:MAX_REASONS]
     where = f" of {clean(info['repo'])}#{info['pr']} (head {info['head'][:12]})" if info["head"] else ""
     text = f"merge-gate: BLOCKED merge{where}.\n" + "\n".join("  - " + r for r in reasons)
@@ -1623,11 +1628,38 @@ def _append_waiver_record(state_dir, record):
     return record
 
 
-def _active(records, repo, pr, head, now, review_ok=True):
+def _fallback_usable(r, now, command, review_ok):
+    """A same-harness fallback record needs, at consume time: green-enough checks (review_ok), an unexpired grant
+    window, the minting policy still live, and the merge command carrying the label plus the receipt id."""
+    if not review_ok or now >= float(r.get("expires_at") or 0):
+        return False
+    if not _fallback_live(r):
+        return False
+    trailer = r.get("merge_trailer")
+    return bool(isinstance(command, str) and isinstance(trailer, str) and trailer and trailer in command)
+
+
+def pending_fallback_trailer(state_dir, repo, pr, head, now, review_ok=True):
+    """The trailer main must add to the merge command when an otherwise usable fallback record exists, else None."""
+    try:
+        records = _read_waivers(Path(state_dir))
+        for r in records:
+            if r.get("event") == "waive" and r.get("approval_source") == FALLBACK_SOURCE:
+                trailer = r.get("merge_trailer")
+                if _active(records, repo, pr, head, now, review_ok, command=trailer) is r:
+                    return trailer
+    except (Corrupt, OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _active(records, repo, pr, head, now, review_ok=True, command=None):
     used = {r.get("waiver") for r in records if r.get("event") == "consume"}
     for r in records:
         if not review_ok and r.get("approval_source") == "settled-review":
             continue  # #134 red-team P1/B1: a review authorization never passes a failing, pending or missing check
+        if r.get("approval_source") == FALLBACK_SOURCE and not _fallback_usable(r, now, command, review_ok):
+            continue  # same rule, plus: grant window, live policy, merge command carries SAME_HARNESS_FALLBACK
         if (r.get("event") == "waive" and r.get("id") not in used and repo_key(repo) is not None
                 and repo_key(r.get("repo")) == repo_key(repo)
                 and r.get("pr") == pr and r.get("head") == head and now < float(r.get("ts", 0)) + WAIVER_TTL_SECONDS):
@@ -1664,7 +1696,7 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
-def pr_pass_evidence(evidence, *, with_base=False):
+def pr_pass_evidence(evidence, *, with_base=False, same_harness_fallback=False):
     """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
     With with_base=True it is (repo, pr, head, report_sha256, snapshot_base), where snapshot_base is the reviewer's
     validated snapshot base B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling). A receipt without snapshot_base is
@@ -1699,7 +1731,9 @@ def pr_pass_evidence(evidence, *, with_base=False):
             or subject.get('head') != review['head']
             or review.get('author_harness') not in {'claude', 'openai'}
             or reviewer_harness not in {'claude', 'openai'}
-            or reviewer_harness == review['author_harness']
+            # the default requires a different harness; only the self-serve fallback path flips this to "the same
+            # harness", and it then needs fallback_evidence() on top (same_harness_fallback is never a caller opt-out)
+            or (reviewer_harness == review['author_harness']) != bool(same_harness_fallback)
             or not expected_prefix or not isinstance(reviewer, str) or not reviewer.startswith(expected_prefix)
             or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
         raise ValueError('FINAL is not settled independent pure PR PASS evidence')
@@ -1711,6 +1745,183 @@ def pr_pass_evidence(evidence, *, with_base=False):
 
 
 _SHA40 = re.compile(r'[0-9a-f]{40}')
+
+# ------------------------------------------------------------------------ same-harness fallback (self-serve)
+# Spec self-serve section 4. A settled PASS whose reviewer harness equals the author harness is a merge
+# authorization only when ALL of: a signed self_serve grant for this capability; FINAL evidence that the other
+# harness returned NO_RESULT with QUOTA or AUTH and launched nothing; routing that tried that harness first; a
+# reviewer rung strictly above the author's; an isolated snapshot in a fresh session; no changed path on the
+# denylist. The cross-harness path above is untouched, and so is the manual waive path.
+FALLBACK_CAPABILITY = "same_harness_fallback_review"
+FALLBACK_SOURCE = "policy:self-serve-fallback"
+FALLBACK_LABEL = "SAME_HARNESS_FALLBACK"
+FALLBACK_BLOCK_KEY = "same_harness_fallback"
+FALLBACK_MAX_PATHS = 400
+FALLBACK_REASONS = {"QUOTA", "AUTH"}
+_PROVIDER_OF = {"openai": "codex", "claude": "claude"}
+FALLBACK_SCOPE_KEYS = {"repos", "deny_paths"}
+# Paths that never take a same-harness review: auth, secrets, migrations, the guards, key handling, CI, and the
+# gate/review code itself. A grant scope may add patterns (narrow) and never remove one.
+FALLBACK_DENY = re.compile(
+    r"(?:^|[/_.\-])(?:auth|authn|authz|oauth|login|signin|secrets?|credentials?|passwords?|passwd|tokens?|"
+    r"migrations?|migrate|command_guard\w*|merge_gate\w*|peer_review\w*|caller_identity|self_serve\w*|"
+    r"central_decisions|escalation|keys?|keygen|keyring|keychain|ed25519|pubkeys?|private|sudoers|"
+    r"workflows?|usage_guard)(?:$|[/_.\-])|(?:^|/)\.env|\.pem$|id_rsa|\.p12$|\.pfx$", re.I)
+
+
+def _norm_path(path):
+    import unicodedata
+    text = unicodedata.normalize("NFKC", path).replace("\\", "/")
+    return text
+
+
+def fallback_denied_paths(paths, extra_patterns=()):
+    """The subset of changed paths a same-harness review may not cover; a malformed path counts as denied."""
+    extra = [re.compile(p, re.I) for p in extra_patterns]
+    denied = []
+    for path in paths:
+        if (not isinstance(path, str) or not path or len(path) > 1024 or CTRL.search(path)
+                or path.startswith("/") or ".." in _norm_path(path).split("/")):
+            denied.append(clean(path, 120))
+            continue
+        norm = _norm_path(path)
+        if FALLBACK_DENY.search(norm) or any(p.search(norm) for p in extra):
+            denied.append(path)
+    return denied
+
+
+def fallback_paths_digest(paths):
+    return hashlib.sha256("\n".join(sorted(paths)).encode("utf-8")).hexdigest()
+
+
+def fallback_block_digest(block):
+    return hashlib.sha256(json.dumps(block, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _rung_above(author_rung, reviewer_rung):
+    import model_tiers
+    policy = model_tiers.load_policy()
+    order = model_tiers.rung_order(policy)
+    if author_rung not in order or reviewer_rung not in order:
+        raise ValueError("fallback rung is not in the tier table")
+    if order.index(reviewer_rung) <= order.index(author_rung):
+        raise ValueError("fallback reviewer is not at least one rung above the author")
+    if policy["rungs"][reviewer_rung].get("needs_user_permission"):
+        raise ValueError("fallback reviewer rung needs user permission, so it cannot be a fallback")
+
+
+def fallback_evidence(evidence, scope=None):
+    """Validate the same-harness fallback proof in a settled FINAL. Pure; returns (binding4, block) or raises
+    ValueError. `binding4` is (repo, pr, head, report_sha256) exactly as pr_pass_evidence returns it."""
+    binding = pr_pass_evidence(evidence, same_harness_fallback=True)
+    review, usage = evidence["review"], evidence.get("usage")
+    invocation = evidence.get("invocation") if isinstance(evidence.get("invocation"), dict) else {}
+    block = usage.get(FALLBACK_BLOCK_KEY) if isinstance(usage, dict) else None
+    if not isinstance(block, dict) or block.get("schema") != 1:
+        raise ValueError("fallback: the FINAL carries no same-harness fallback receipt")
+    author = review["author_harness"]
+    other = "claude" if author == "openai" else "openai"
+    primary = block.get("primary")
+    if (not isinstance(primary, dict) or primary.get("harness") != other
+            or primary.get("provider") != _PROVIDER_OF[other] or primary.get("result") != "NO_RESULT"
+            or primary.get("reason") not in FALLBACK_REASONS or type(primary.get("launches")) is not int
+            or primary["launches"] != 0):
+        raise ValueError("fallback: the other harness must show NO_RESULT with QUOTA or AUTH and zero launches")
+    routing = usage.get("review_routing") if isinstance(usage.get("review_routing"), dict) else {}
+    order, actual = routing.get("attempt_order"), routing.get("actual_reviewer")
+    if (not isinstance(order, list) or len(order) < 2 or order[0] != _PROVIDER_OF[other]
+            or actual != _PROVIDER_OF[author] or actual not in order[1:]
+            or block.get("reviewer_actual") != actual):
+        raise ValueError("fallback: routing must try the other harness first and end at the same-harness reviewer")
+    repo, pr, head, _ = binding
+    packet = invocation.get("packet_digest")
+    if (block.get("repo") != repo or block.get("pr") != pr or block.get("head") != head
+            or not isinstance(packet, str) or not re.fullmatch(r"[0-9a-f]{64}", packet)
+            or block.get("packet_sha256") != packet):
+        raise ValueError("fallback: the receipt is for another repo, PR, head or packet")
+    if block.get("author_unknown") is not False:
+        raise ValueError("fallback: the author rung is unknown")
+    _rung_above(block.get("author_rung"), block.get("reviewer_rung"))
+    if block.get("isolated_snapshot") is not True or block.get("fresh_session") is not True:
+        raise ValueError("fallback: the reviewer must run in a fresh session on an isolated snapshot")
+    paths = block.get("changed_paths")
+    if (not isinstance(paths, list) or not paths or len(paths) > FALLBACK_MAX_PATHS
+            or block.get("changed_paths_sha256") != fallback_paths_digest(paths)):
+        raise ValueError("fallback: the changed paths are missing, too many or do not match their digest")
+    extra = ()
+    if scope:
+        extra = tuple(scope.get("deny_paths") or ())
+        repos = scope.get("repos")
+        if repos is not None and (not isinstance(repos, list)
+                                  or repo_key(repo) not in {repo_key(r) for r in repos if isinstance(r, str)}):
+            raise ValueError("fallback: the grant scope does not cover this repository")
+    denied = fallback_denied_paths(paths, extra)
+    if denied:
+        raise ValueError("fallback: changed paths need a cross-harness review or a manual waive: "
+                         + ", ".join(clean(p, 60) for p in denied[:5]))
+    return binding, block
+
+
+def _grant_expiry(value):
+    """epoch seconds, None for no bound; ValueError when unreadable (fail closed)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        import datetime
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError("fallback: grant expiry is unreadable")
+        if parsed.tzinfo is None:
+            raise ValueError("fallback: grant expiry has no time zone")
+        return parsed.timestamp()
+    raise ValueError("fallback: grant expiry is unreadable")
+
+
+def fallback_grant(actor, binding, final_sha256, evidence, now=None):
+    """self_serve.grant for this capability, or ValueError. A missing module, a None grant and any exception are all
+    "no grant". The scope vocabulary here is {repos, deny_paths}; an unknown scope key refuses (fail closed)."""
+    try:
+        import self_serve
+    except ImportError:
+        raise ValueError("fallback: no self-serve policy is installed")
+    repo, pr, head, report = binding
+    try:
+        granted = self_serve.grant(
+            FALLBACK_CAPABILITY, actor=actor, now=now,
+            evidence={"repo": repo, "pr": pr, "head": head, "report_sha256": report, "final_sha256": final_sha256,
+                      "author_harness": evidence["review"]["author_harness"],
+                      "reviewer_harness": evidence["review"]["reviewer_harness"]})
+    except Exception:  # noqa: BLE001 - the contract says never raises; if it does that is no grant
+        granted = None
+    if (not isinstance(granted, dict) or not isinstance(granted.get("policy_id"), str)
+            or not isinstance(granted.get("key_id"), str) or not isinstance(granted.get("scope", {}), dict)):
+        raise ValueError("fallback: no self-serve grant for " + FALLBACK_CAPABILITY)
+    if set(granted.get("scope") or {}) - FALLBACK_SCOPE_KEYS:
+        raise ValueError("fallback: the grant scope has keys this gate does not understand")
+    return granted
+
+
+def _fallback_live(record):
+    """At consume time: the policy that minted this record is still on, unrevoked, with the capability enabled."""
+    try:
+        import self_serve
+        state = self_serve.status()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(state.get("enabled") is True and not state.get("kill_switch")
+                    and state.get("policy_id") == record.get("policy_id")
+                    and FALLBACK_CAPABILITY in (state.get("capabilities") or ())
+                    and FALLBACK_CAPABILITY not in (state.get("disabled") or ()))
+    except (AttributeError, TypeError):
+        return False
+
+
+def fallback_trailer(final_sha256):
+    return FALLBACK_LABEL + " " + final_sha256[:16]
 
 
 AHC_BASE_COMPARE = ('identical', 'ahead')
@@ -1774,22 +1985,42 @@ def _compare_readback(record, want_base, want_head, name):
     return record['status']
 
 
-def add_review_waiver(state_dir, reference, *, store=None, now=None):
+def _is_same_harness(evidence):
+    review = evidence.get('review') if isinstance(evidence, dict) else None
+    return (isinstance(review, dict) and review.get('author_harness') in {'claude', 'openai'}
+            and review.get('author_harness') == review.get('reviewer_harness'))
+
+
+def add_review_waiver(state_dir, reference, *, store=None, now=None, fallback_actor=None):
     """Authorize only a loaded, settled, independent pure PR PASS FINAL.
 
     All merge binding and reviewer identity comes from validated evidence; callers
     cannot supply hashes or override them. Deterministic replay stays idempotent.
+
+    fallback_actor (self-serve, spec section 4): a same-harness reviewer is accepted only when this is given (the
+    caller proved it is main) AND fallback_evidence() holds AND self_serve.grant() returns a grant. The record is
+    then minted with approval_source policy:self-serve-fallback. Without it a same-harness FINAL is refused as before.
     """
     import usage_guard
 
     store = store or usage_guard.UsageStore()
     evidence = store.inspect(reference)
-    repo, pr, head, report_sha256 = pr_pass_evidence(evidence)
-    reviewer = evidence['review'].get('reviewer', '')
     final_sha256 = reference['sha256']
+    fallback = None
+    if fallback_actor is not None and _is_same_harness(evidence):
+        # the grant's scope narrows what the evidence is checked against, so ask for it first
+        probe = pr_pass_evidence(evidence, same_harness_fallback=True)
+        granted = fallback_grant(fallback_actor, probe, final_sha256, evidence, now)
+        (repo, pr, head, report_sha256), block = fallback_evidence(evidence, granted.get('scope') or None)
+        fallback = (block, granted, _grant_expiry(granted.get('expires_at')))
+    else:
+        repo, pr, head, report_sha256 = pr_pass_evidence(evidence)
+    reviewer = evidence['review'].get('reviewer', '')
     state_dir = Path(state_dir)
-    wid = "mgw-review-" + hashlib.sha256(
-        f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}".encode("utf-8")).hexdigest()[:24]
+    stamp = f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}"
+    if fallback:
+        stamp += "|" + fallback_block_digest(fallback[0])
+    wid = ("mgw-fallback-" if fallback else "mgw-review-") + hashlib.sha256(stamp.encode("utf-8")).hexdigest()[:24]
     lock = _lock(state_dir)
     try:
         records = _read_waivers(state_dir)
@@ -1801,19 +2032,34 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None):
             if actual != expected:
                 raise Corrupt("review waiver id does not match its evidence")
             return existing
-        record = _append_waiver_record(state_dir, {
-            "event": "waive", "id": wid, "ts": now if now is not None else time.time(),
+        ts = now if now is not None else time.time()
+        record = {
+            "event": "waive", "id": wid, "ts": ts,
             "repo": repo.lower(), "pr": pr, "head": head,
             "ticket": "peer-review:" + report_sha256,
             "reason": "Settled independent PR PASS bound to report and FINAL bytes",
             "approved_by": "main:peer-review", "approval_source": "settled-review",
-            "reviewer": reviewer, "report_sha256": report_sha256, "final_sha256": final_sha256})
+            "reviewer": reviewer, "report_sha256": report_sha256, "final_sha256": final_sha256}
+        if fallback:
+            block, granted, expiry = fallback
+            bound = ts + WAIVER_TTL_SECONDS if expiry is None else min(ts + WAIVER_TTL_SECONDS, expiry)
+            if bound <= ts:
+                raise ValueError("fallback: the grant has already expired")
+            record.update({
+                "reason": ("Same-harness fallback: the other harness returned " + block["primary"]["reason"]
+                           + " with zero launches; settled PASS bound to report and FINAL bytes"),
+                "approval_source": FALLBACK_SOURCE, "label": FALLBACK_LABEL,
+                "fallback_receipt_sha256": fallback_block_digest(block),
+                "merge_trailer": fallback_trailer(final_sha256),
+                "policy_id": granted["policy_id"], "key_id": granted["key_id"], "expires_at": bound,
+                "followup": "cross-harness re-review when quota returns"})
+        record = _append_waiver_record(state_dir, record)
     finally:
         _unlock(lock)
     return record
 
 
-def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True):
+def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True, command=None):
     state_dir = Path(state_dir)
     try:
         lock = _lock(state_dir)
@@ -1821,7 +2067,7 @@ def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=
         return None
     try:
         records = _read_waivers(state_dir)
-        waiver = _active(records, repo, pr, head, now or time.time(), review_ok)
+        waiver = _active(records, repo, pr, head, now or time.time(), review_ok, command=command)
         if not waiver:
             return None
         _append_waiver_record(state_dir, {"event": "consume", "waiver": waiver["id"], "ts": now or time.time(),
@@ -1972,7 +2218,7 @@ def decide(payload, runner, state_dir, now=None):
     client = Client(runner, time.monotonic() + _deadline_seconds() - 2, cwd)
     blocks = []
     for merge in merges:
-        allowed, text, info = evaluate_merge(merge, client, state_dir, now, command_hash)
+        allowed, text, info = evaluate_merge(merge, client, state_dir, now, command_hash, command=command)
         outcome = "waived" if info.get("waiver") else ("allow" if allowed else "block")
         _audit(state_dir, {"ts": now, "outcome": outcome, "repo": info.get("repo"), "pr": info.get("pr"),
                            "head": info.get("head"), "kind": merge.kind, "command_sha256": command_hash,
