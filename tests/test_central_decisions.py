@@ -7,7 +7,9 @@ and a temp transcript; nothing reaches GoodQA."""
 
 import base64
 from datetime import datetime, timezone
+import email.utils
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,6 +18,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+import uuid
 
 HERE = Path(__file__).resolve().parent
 HOOKS = HERE.parent / 'harness/hooks'
@@ -887,6 +890,117 @@ class TierGateAcceptsCentral(Base):
             self.assertIsNone(gate.central_permission('k1', 'astra', facts))
         self.assertEqual(len(calls), 1)  # the second site denied without another ledger read
         self.assertEqual(facts['central'], 'ledger_timeout')
+
+
+class StrictGoodQAAdapter:
+    """The real GoodQAAdapter surface (lookup, call, last_server_date) over an in-memory ledger that rejects a
+    non-UUID operationId on a write the way live GoodQA does (MCP error -32602, invalid arguments at operationId)."""
+
+    def __init__(self):
+        self.comments, self.writes, self.fail_next = [], [], 0
+        self.last_server_date = None
+
+    def lookup(self, project, number):
+        return type('T', (), {'id': ISSUE, 'closed': False})()
+
+    def call(self, name, arguments):
+        self.last_server_date = email.utils.formatdate(time.time(), usegmt=True)
+        if name == 'get_issue_comments':
+            return {'comments': list(self.comments), 'hasMore': False}
+        self.writes.append(dict(arguments))
+        try:
+            uuid.UUID(str(arguments.get('operationId')))
+        except ValueError:
+            return {'__error__': 'MCP error -32602 (invalid arguments at operationId)'}
+        if self.fail_next:
+            self.fail_next -= 1
+            return {'__error__': 'transient'}
+        self.comments.append({'id': 'c%d' % len(self.comments), 'body': arguments['body'],
+                              'createdAt': iso_ms(time.time())})
+        return {'ok': True}
+
+
+class LedgerOperationIdsAreUuids(Base):
+    """goodqa#16747: GoodQA rejects a non-UUID operationId, so publish and every revoke failed in production."""
+
+    def setUp(self):
+        super().setUp()
+        self.adapter = StrictGoodQAAdapter()
+        self.client = cd.GoodQALedger(adapter=self.adapter)
+
+    def op_ids(self):
+        return [w['operationId'] for w in self.adapter.writes]
+
+    def test_publish_posts_with_a_uuid_operation_id(self):
+        self.grant_local('k1')
+        out = cd.publish('k1', ledger=self.ledger, store=self.mac.store, client=self.client, claude_home=self.claude,
+                         test_mode=True, host='mac')
+        self.assertTrue(out['published'])
+        self.assertEqual([str(uuid.UUID(i)) for i in self.op_ids()], self.op_ids())
+        self.assertEqual(len(self.adapter.comments), 1)
+
+    def test_withdraw_posts_the_revoke_with_a_uuid_operation_id(self):
+        out = cd.withdraw('task', 'k1', store=self.mac.store, client=self.client, now=1000.0)
+        self.assertTrue(out['posted'], out)
+        self.assertEqual(len(self.op_ids()), 1)
+        uuid.UUID(self.op_ids()[0])
+        self.assertEqual(self.adapter.comments[0]['body'], 'agent-harness-revoke task k1')
+
+    def test_retry_pending_reuses_the_same_uuid_for_the_same_queue_row(self):
+        self.adapter.fail_next = 1  # the first post is lost: the row stays queued
+        out = cd.withdraw('task', 'k1', store=self.mac.store, client=self.client, now=1000.0)
+        self.assertFalse(out['posted'])
+        self.assertEqual(cd.retry_pending(store=self.mac.store, client=self.client), ['agent-harness-revoke task k1'])
+        first, second = self.op_ids()
+        self.assertEqual(first, second)
+        uuid.UUID(second)
+        self.assertEqual(cd._read_jsonl(self.mac.store.pending), [])
+
+    def test_a_real_uuid_passes_through_and_other_ids_map_deterministically(self):
+        real = '12e88ab4-a277-4476-b32c-6e7fb292d7ce'
+        self.client.post(ISSUE, 'x', real)
+        self.client.post(ISSUE, 'x', 'central-revoke-abc')
+        self.client.post(ISSUE, 'x', 'central-revoke-abc')
+        self.client.post(ISSUE, 'x', 'central-revoke-abd')
+        ids = self.op_ids()
+        self.assertEqual(ids[0], real)
+        self.assertEqual(ids[1], ids[2])
+        self.assertNotEqual(ids[2], ids[3])
+        self.assertEqual(ids[1], str(uuid.uuid5(uuid.NAMESPACE_URL, 'central-decisions:central-revoke-abc')))
+
+
+class PinReadsStdin(Base):
+    """On Linux /dev/stdin is a symlink to /proc/self/fd/0 and the read is refused; `-` reads stdin directly."""
+
+    def setUp(self):
+        super().setUp()
+        self.fresh = cd.Store(Path(self.temp.name) / 'fresh')
+
+    def run_pin(self, data):
+        stdin = type('S', (), {'buffer': io.BytesIO(data)})()
+        out = io.StringIO()
+        with mock.patch.object(sys, 'stdin', stdin), mock.patch.object(sys, 'stdout', out), \
+                mock.patch.object(cd, 'Store', return_value=self.fresh):
+            code = cd.main(['pin', '--pubkey-file', '-'])
+        return code, out.getvalue()
+
+    def test_dash_reads_the_public_key_from_stdin(self):
+        code, out = self.run_pin(json.dumps({'public_key': self.public}).encode())
+        self.assertEqual(code, 0, out)
+        self.assertIn(cd.key_id_of(base64.urlsafe_b64decode(self.public + '=' * (-len(self.public) % 4))),
+                      cd.load_trusted_keys(self.fresh))
+
+    def test_stdin_is_bounded_and_bad_input_is_refused(self):
+        code, out = self.run_pin(b'{"public_key": "' + b'A' * 5000 + b'"}')
+        self.assertEqual(code, 2, out)
+        with self.assertRaises(cd.Denied):  # nothing was pinned
+            cd.load_trusted_keys(self.fresh)
+        self.assertEqual(self.run_pin(b'')[0], 2)
+
+    def test_installer_pins_the_worker_through_dash_not_dev_stdin(self):
+        text = (HERE.parent / 'scripts' / 'trust-central-decisions.sh').read_text()
+        self.assertIn('decision pin --pubkey-file -', text)
+        self.assertNotIn('/dev/stdin', text)
 
 
 if __name__ == '__main__':

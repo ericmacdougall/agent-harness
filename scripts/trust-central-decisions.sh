@@ -207,7 +207,7 @@ work=$(mktemp -d "$HOME/.agent-harness/work/trust-central-decisions.XXXXXX")
 python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); json.dump({"public_key": d["public_key"]}, open(sys.argv[2], "w"))' \
     "$work/keygen.json" "$work/pubkey.json"
 "${AH[@]}" decision pin --pubkey-file "$work/pubkey.json" >/dev/null || die "pinning the key on this Mac failed"
-ssh -o BatchMode=yes "$HOST" 'python3 "$HOME/.claude/hooks/ah.py" decision pin --pubkey-file /dev/stdin' < "$work/pubkey.json" >/dev/null \
+ssh -o BatchMode=yes "$HOST" 'python3 "$HOME/.claude/hooks/ah.py" decision pin --pubkey-file -' < "$work/pubkey.json" >/dev/null \
     || die "pinning the key on $HOST failed"
 "${AH[@]}" decision enable --project "$LEDGER_PROJECT" --number "$LEDGER_NUMBER" --issue-id "$LEDGER_ISSUE" >/dev/null \
     || die "enabling central decisions on this Mac failed"
