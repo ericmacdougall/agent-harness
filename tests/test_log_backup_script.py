@@ -1365,8 +1365,9 @@ class Contention(Case):
                                FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0")
         self.assertNotEqual(done.returncode, 0)
         sent = [c[-1].split("/testhost/", 1)[1] for c in self.copies()]
-        # The first copy failed throttled: nothing else is sent but the transcripts (main's ruling: never starve them).
-        self.assertEqual(sent, [".claude", ".codex/sessions", ".claude/projects"])
+        # The first copy failed throttled: nothing else is sent but the transcripts (main's ruling: never starve them)
+        # and the WALs (red-team F4, goodqa#16660: the WAL tree is tier 1 and is exempt like the transcripts).
+        self.assertEqual(sent, [".claude", ".claude/wals", ".codex/sessions", ".claude/projects"])
         log = (self.logs / "log-backup.log").read_text()
         self.assertIn("skipped ", log)
         self.assertIn("run stopped early on the Dropbox write rate limit", log)
