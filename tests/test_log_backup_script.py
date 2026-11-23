@@ -1131,7 +1131,9 @@ class Failure(Case):
             if argv[-2].endswith(".agent-harness/work"):
                 self.assertIn("--max-transfer", argv)
         for c in self.recorded():
-            if c["argv"][0] == "lsf" and c["argv"][-1].endswith(".agent-harness/work"):
+            # The pass listing carries --max-size; the upload guard's lsf calls only resolve and filter that listing.
+            if (c["argv"][0] == "lsf" and c["argv"][-1].endswith(".agent-harness/work")
+                    and "--files-from-raw" not in c["argv"] and "--filter-from" not in c["argv"]):
                 self.assertIn("--max-size", c["argv"])
 
     def test_budget_exit_codes_leave_a_partial_run_non_fresh_without_retry(self):
@@ -2001,7 +2003,7 @@ class LaneYield(BulkLane):
         wrapper.write_text(
             "#!%(py)s\nimport json, os, signal, sys, time\n"
             "argv = sys.argv[1:]\n"
-            "if '--files-from-raw' in argv and argv[-1].endswith('.agent-harness/work'):\n"
+            "if argv[:1] == ['copy'] and '--files-from-raw' in argv and argv[-1].endswith('.agent-harness/work'):\n"
             "    names = open(argv[argv.index('--files-from-raw') + 1]).read().split()\n"
             "    open(%(rec)r, 'a').write(json.dumps(names) + '\\n')\n"
             "    if not os.path.exists(%(rec)r + '.cut'):\n"
@@ -2478,7 +2480,10 @@ class TierOneCheckpoint(Case):
 
     def verified_paths(self, key):
         path = self.logs / "log-backup.live.d" / key / "verified"
-        return {l.split("\t", 1)[0] for l in path.read_text().splitlines()} if path.exists() else set()
+        if not path.exists():
+            return set()
+        text = path.read_bytes().decode("utf-8", "surrogateescape")   # a name need not be valid UTF-8 (Linux)
+        return {l.split("\t", 1)[0] for l in text.splitlines()}
 
     def real_remote_names(self, rel):
         """What real rclone prints for the remote copy of a tree (the same printed form verified holds)."""
