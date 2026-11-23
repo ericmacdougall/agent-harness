@@ -1684,6 +1684,110 @@ class ReservedPoolFallbackTests(unittest.TestCase):
         self.assertEqual(calls, ['/fixture/codex'])
         self.assertIsNotNone(error)
 
+    def test_a_quota_primary_then_reserved_fallback_is_recorded_as_no_work(self):
+        # goodqa#16725: this run must not use up the repeat budget.
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        store = self.Store({'claude': self.refusal()})
+        _, _, _, _, options, error = self.review(store, run_result=lambda command: (1, quota, ''))
+        self.assertIsNotNone(error)
+        self.assertEqual(options['attempt_summary'], [
+            {'provider': 'codex', 'launched': 1, 'reason': 'QUOTA', 'refused_before_work': True},
+            {'provider': 'claude', 'launched': 0, 'reason': 'TRANSIENT_INFRA', 'refused_before_work': False}])
+        final = {'execution': 'COMPLETED', 'reason': 'TRANSIENT_INFRA', 'usage': {
+            'provider_launches': options['launches'], 'reported': options['usage'],
+            'provider_attempts': options['attempt_summary']}}
+        self.assertTrue(self.guard.zero_launch_attempt(final))
+
+    def test_a_primary_that_answered_then_reserved_fallback_still_counts(self):
+        store = self.Store({'claude': self.refusal()})
+        unavailable = json.dumps({'type': 'turn.failed', 'error': {'code': 'model_not_found'}})
+        _, _, _, _, options, error = self.review(store, run_result=lambda command: (1, unavailable, ''))
+        self.assertTrue(options['attempt_summary'][0]['refused_before_work'])
+        garbage = lambda command: (1, 'not json', '')
+        _, _, _, _, options, error = self.review(self.Store({}), run_result=garbage)
+        self.assertIsNotNone(error)
+        self.assertFalse(options['attempt_summary'][0]['refused_before_work'])
+        final = {'execution': 'COMPLETED', 'reason': 'INVALID_OUTPUT', 'usage': {
+            'provider_launches': options['launches'], 'reported': options['usage'],
+            'provider_attempts': options['attempt_summary']}}
+        self.assertFalse(self.guard.zero_launch_attempt(final))
+
+    def summary_and_decision(self, options):
+        final = {'execution': 'COMPLETED' if options.get('launches') else 'NOT_STARTED', 'reason': 'TRANSIENT_INFRA',
+                 'usage': {'provider_launches': options.get('launches', 0), 'reported': options['usage'],
+                           'provider_attempts': options['attempt_summary']}}
+        return options['attempt_summary'], self.guard.zero_launch_attempt(final)
+
+    def test_only_a_transcript_with_no_work_is_a_refusal_before_work(self):
+        # PR 318 review F1/F2: the error code alone never proves no work was done.
+        line = lambda *records: '\n'.join(json.dumps(record) for record in records)
+        quota = {'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}}
+        work = [{'type': 'thread.started'}, {'type': 'turn.started'},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'partial'}}]
+        codex_cases = {
+            'quota-only': (line({'type': 'thread.started'}, {'type': 'turn.started'}, quota), True),
+            'work-then-quota': (line(*work, quota), False),
+            'quota-with-usage': (line({**quota, 'usage': {'input_tokens': 900, 'output_tokens': 40}}), False),
+            'rate-limited': (line({'type': 'turn.failed', 'error': {'code': 'rate_limit_error'}}), False),
+        }
+        for label, (stdout, expected) in codex_cases.items():
+            with self.subTest(label):
+                store = self.Store({'claude': self.refusal()})
+                _, _, _, _, options, error = self.review(store, run_result=lambda command, out=stdout: (1, out, ''))
+                self.assertIsNotNone(error)
+                summary, decision = self.summary_and_decision(options)
+                self.assertEqual(summary[0]['launched'], 1)
+                self.assertIs(summary[0]['refused_before_work'], expected)
+                self.assertIs(decision, expected)
+        claude_cases = {
+            'claude-quota-no-work': ({'type': 'result', 'is_error': True, 'subtype': 'error',
+                                      'error': {'code': 'insufficient_quota'}, 'num_turns': 0}, True),
+            'claude-quota-after-turns': ({'type': 'result', 'is_error': True, 'subtype': 'error',
+                                          'error': {'code': 'insufficient_quota'}, 'num_turns': 7}, False),
+            'claude-quota-with-cost': ({'type': 'result', 'is_error': True, 'subtype': 'error',
+                                        'error': {'code': 'insufficient_quota'}, 'total_cost_usd': 0.42,
+                                        'usage': {'output_tokens': 1200}}, False),
+        }
+        for label, (record, expected) in claude_cases.items():
+            with self.subTest(label):
+                store = self.Store({'codex': self.refusal()})
+                _, _, _, _, options, error = self.review(
+                    store, run_result=lambda command, out=json.dumps(record): (1, out, ''))
+                self.assertIsNotNone(error)
+                summary, _ = self.summary_and_decision(options)
+                self.assertEqual([entry['launched'] for entry in summary], [0, 1])
+                self.assertIs(summary[1]['refused_before_work'], expected)
+                if not expected and 'total_cost_usd' in record:
+                    self.assertTrue(options['usage'], 'the paid failure keeps its reported usage')
+
+    def test_a_guard_quota_refusal_is_never_a_launched_refusal(self):
+        store = self.Store({'codex': self.guard.GuardError('QUOTA', 'account cooldown')})
+        _, _, report, _, options, error = self.review(store)
+        self.assertIsNone(error)
+        self.assertEqual(options['attempt_summary'][0],
+                         {'provider': 'codex', 'launched': 0, 'reason': 'QUOTA', 'refused_before_work': False})
+
+    def test_kimi_quota_marker_is_never_a_refusal_before_work(self):
+        # Workflow verify (spend lens): kimi_attempt drops Kimi's transcript, so its refusals cannot prove no work.
+        outcome = self.module.normalize_provider('kimi', 1, '', 'Error: ACCOUNT_QUOTA_EXCEEDED')
+        self.assertEqual((outcome['reason'], outcome['provider_refused']), ('QUOTA', False))
+
+    def test_unreadable_or_zero_usage_and_last_messages_follow_one_rule(self):
+        refused = lambda provider, record, last='': self.module.normalize_provider(
+            provider, 1, json.dumps(record), '', last).get('provider_refused')
+        quota = {'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}}
+        claude = {'type': 'result', 'is_error': True, 'subtype': 'error', 'error': {'code': 'insufficient_quota'}}
+        self.assertTrue(refused('codex', {**quota, 'usage': {'input_tokens': 0}}))   # zeros: same rule both sides
+        for label, extra in {'float-usage': {'usage': {'output_tokens': 12.0}}, 'string-cost': {'total_cost_usd': '0.4'},
+                             'model-usage': {'modelUsage': {'m': {'outputTokens': 900}}},
+                             'api-time': {'duration_api_ms': 85000}, 'tool-use': {'server_tool_use': {'web': 1}}}.items():
+            with self.subTest(label):
+                self.assertFalse(refused('claude', {**claude, **extra}))
+        self.assertFalse(refused('codex', quota, last='VERDICT: PASS'))
+        warning = {'type': 'item.completed', 'item': {'id': 'w', 'type': 'error', 'message': 'deprecated key'}}
+        stream = '\n'.join(json.dumps(record) for record in ({'type': 'thread.started'}, warning, quota))
+        self.assertTrue(self.module.normalize_provider('codex', 1, stream).get('provider_refused'))
+
     def test_both_pools_reserved_launches_nothing_and_fails_with_the_holder(self):
         store = self.Store({'codex': self.refusal(), 'claude': self.refusal()})
         calls, _, _, _, options, error = self.review(store)
