@@ -618,7 +618,7 @@ class CLI(TakeoverCase):
         self.ah = ah
         ak._kill_guard().ensure_key(str(self.home))
 
-    def run_ah(self, *argv, caller=None):
+    def run_ah(self, *argv, caller=None, remote=EMPTY_REMOTE):
         import contextlib
         import io
         out = io.StringIO()
@@ -629,7 +629,7 @@ class CLI(TakeoverCase):
         derived = {"mode": "claude" if caller else "none", "caller": caller, "why": "test"}
         with mock.patch.dict(os.environ, env), mock.patch.object(tk, "HostProbe", lambda: self.probe), \
                 mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None: derived), \
-                mock.patch.object(tk, "fetch_remote_evidence", lambda old, **kw: EMPTY_REMOTE), \
+                mock.patch.object(tk, "fetch_remote_evidence", lambda old, **kw: remote), \
                 mock.patch.object(tk, "default_tasks", lambda home: list(self.tasks)), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
             code = self.ah.main(list(argv))
@@ -650,6 +650,20 @@ class CLI(TakeoverCase):
         with mock.patch.object(tk.time, "time", lambda: NOW):
             code, data = self.run_ah("takeover", "status", "--from", OLD, caller=CALLER)
         self.assertEqual((code, data["state"], data["reasons"]), (0, "retired", []), data)
+
+    def test_on_t2_dev_status_and_plan_judge_a_local_session_through_ah(self):
+        """F3 through the ah.py route an agent on t2-dev takes (fetch_remote_evidence answers LOCAL_ONLY there)."""
+        self.codex_session()
+        (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
+        work = self.home / ".agent-harness" / "work" / OLD / "T" / "a"
+        with mock.patch.object(tk.time, "time", lambda: NOW), \
+                mock.patch.object(tk, "worktree_candidates", lambda old, home, run=None: [(str(work), "/repo", "a" * 40)]):
+            code, data = self.run_ah("takeover", "status", "--from", OLD, caller=CALLER, remote=tk.LOCAL_ONLY)
+            self.assertEqual((code, data["state"], data["reasons"]), (0, "retired", []), data)
+            code, data = self.run_ah("takeover", "plan", "--from", OLD, "--action", "worktrees", caller=CALLER, remote=tk.LOCAL_ONLY)
+        self.assertEqual((code, data["targets"]), (0, [{"host": "local", "path": str(work), "head": "a" * 40}]), data)
+        code, data = self.run_ah("takeover", "status", "--from", OTHER, caller=CALLER, remote=tk.LOCAL_ONLY)
+        self.assertEqual(data["state"], "unknown", "a session whose WAL is not on t2-dev stays unknown there")
 
     def test_an_unknown_caller_or_session_is_unknown_never_retired(self):
         self.codex_session()
@@ -679,6 +693,140 @@ class CLI(TakeoverCase):
         self.assertNotEqual(code, 0)
         self.assertIn("--expect-start", json.dumps(data))
         self.assertIsNone(sleeper.poll())
+
+
+class LinuxCaller(TakeoverCase):
+    """F3 (review BLOCK at db950737): a caller on t2-dev cannot see the Mac. It judges, claims and cleans a session whose
+    WAL, transcript and work dir are on t2-dev from that host's evidence; only R4 for the Mac is unknowable (disclosed). A
+    session whose WAL is not on t2-dev stays unknown there."""
+
+    def local_only(self, old, **kw):
+        return tk.fetch_remote_evidence(old, local_is_remote=True)
+
+    def ctx(self, **kw):
+        ak._kill_guard().ensure_key(str(self.home))
+        self.removed = []
+
+        def remove(host, path, reason, expect_head=None, caller_session=""):
+            self.removed.append((host, path, caller_session))
+            return {"removed": True}
+        return tk.Context(self.home, CALLER, probe=self.probe, now=kw.pop("now", lambda: NOW), remote_fetch=self.local_only,
+                          remove=remove, tasks_fn=lambda home: [], ticket_lookup=lambda t: True, host="t2-dev", **kw)
+
+    def test_a_caller_on_linux_judges_this_host_alone(self):
+        self.assertEqual(tk.fetch_remote_evidence(OLD, local_is_remote=True), tk.LOCAL_ONLY)
+        self.codex_session()
+        self.assertEqual(self.state(remote=self.local_only(OLD))["state"], "retired")
+        state, _remote = tk.status(OLD, "worktrees", self.ctx())
+        self.assertEqual((state["state"], state["reasons"]), ("retired", []))
+
+    def test_a_session_whose_wal_is_not_here_stays_unknown(self):
+        (self.home / ".agent-harness" / "work" / OLD).mkdir(parents=True)
+        out = self.state(remote=self.local_only(OLD))
+        self.assertEqual((out["state"], out["reasons"]), ("unknown", ["origin_unreachable"]))
+
+    def test_a_claim_on_linux_is_written_here_and_satisfies_r2_after_the_quiet_window(self):
+        self.claude_session(last_event="intent")  # stopped on a usage limit without writing its own handoff row
+        self.assertIn("not_stopped", self.state(remote=self.local_only(OLD))["reasons"])
+        out = tk.claim(OLD, self.ctx(), "usage limit", "GoodQA goodqa#16441")
+        self.assertTrue(out["claimed"])
+        self.assertIsNotNone(tk.read_claim(str(self.home), OLD)[0])
+        self.assertEqual(self.state(remote=self.local_only(OLD))["reasons"], ["recent_activity"], "the claim starts the wait")
+        self.assertEqual(self.state(remote=self.local_only(OLD), now=NOW + 2 * HOUR)["state"], "retired")
+
+    def test_cleanup_on_linux_removes_the_local_worktrees(self):
+        self.codex_session()
+        work = self.home / ".agent-harness" / "work" / OLD / "T" / "a"
+        work.mkdir(parents=True)
+        with mock.patch.object(tk, "worktree_candidates", lambda old, home, run=None: [(str(work), "/repo", "a" * 40)]):
+            out = tk.cleanup(OLD, "worktrees", self.ctx(), "r", "GoodQA goodqa#16441", apply=True)
+        self.assertEqual(out["removed"], [str(work)], out)
+        self.assertEqual(self.removed, [("local", str(work), CALLER)])
+
+    def test_the_mac_still_sends_a_claim_of_a_t2_dev_session_to_that_host(self):
+        remote = dict(EMPTY_REMOTE, flavors=["codex"], cont_state="active", transcript=True, last_activity=NOW - 2 * HOUR)
+        ctx = tk.Context(self.home, CALLER, probe=self.probe, now=lambda: NOW, remote_fetch=lambda old: remote,
+                         tasks_fn=lambda home: [], ticket_lookup=lambda t: True, host="mac")
+        with self.assertRaises(tk.TakeoverError) as caught:
+            tk.claim(OLD, ctx, "r", "GoodQA goodqa#16441")
+        self.assertEqual(caught.exception.code, "origin_remote")
+
+    def test_r2_reads_the_claim_on_the_origin_host(self):
+        remote = dict(EMPTY_REMOTE, flavors=["claude"], declared_stop=False, transcript=True, last_activity=NOW - 2 * HOUR,
+                      claim={"caller": CALLER, "claimed_at": NOW - 2 * HOUR})
+        self.assertEqual(self.state(remote=remote)["state"], "retired")
+        remote["claim"] = {"caller": OTHER, "claimed_at": NOW - 2 * HOUR}
+        self.assertIn("not_stopped", self.state(remote=remote)["reasons"])
+
+
+class SessionRecordLiveness(TakeoverCase):
+    """R4 (review minor, and the t2-dev half of F3): a Claude CLI's environment carries no session marker (macOS hides it;
+    on t2-dev the CLI's comm is its version, `2.1.330`), so an idle Claude session looked dead. Its own
+    ~/.claude/sessions/<pid>.json, bound to its start time, now makes it live."""
+
+    class Probe(FakeHost):
+        tokens = {}
+
+        def start_token(self, pid):
+            return self.tokens.get(pid)
+
+        def exe_path(self, pid):
+            return self.table.get(pid, {}).get("comm", "")
+
+    def test_a_claude_cli_with_its_session_record_is_live(self):
+        self.claude_session()
+        exe = "/home/eric/.local/share/claude/versions/2.1.330"
+        probe = self.Probe(table={300: row(300, 1, command=exe + " --print", comm=exe)})
+        probe.tokens = {300: "18807376"}
+        folder = self.home / ".claude" / "sessions"
+        folder.mkdir(parents=True)
+        (folder / "300.json").write_text(json.dumps({"pid": 300, "sessionId": OLD, "procStart": "18807376"}))
+        self.probe = probe
+        out = self.state()
+        self.assertEqual((out["state"], out["reasons"]), ("live", ["session_live"]))
+        probe.tokens = {300: "99999999"}  # the pid was reused: the record is stale
+        self.assertEqual(self.state()["state"], "retired")
+
+    def test_stale_records_of_exited_clis_do_not_count_toward_the_cap(self):
+        self.claude_session()
+        exe = "/home/eric/.local/share/claude/versions/2.1.330"
+        probe = self.Probe(table={300: row(300, 1, command=exe, comm=exe)})
+        probe.tokens = {300: "18807376"}
+        folder = self.home / ".claude" / "sessions"
+        folder.mkdir(parents=True)
+        for pid in range(10000, 10000 + tk.SESSION_RECORD_CAP + 20):
+            (folder / ("%d.json" % pid)).write_text(json.dumps({"pid": pid, "sessionId": OTHER, "procStart": "1"}))
+        (folder / "300.json").write_text(json.dumps({"pid": 300, "sessionId": OLD, "procStart": "18807376"}))
+        self.probe = probe
+        self.assertEqual((self.state()["state"], self.state()["reasons"]), ("live", ["session_live"]))
+        probe.table.update({pid: row(pid, 1, command=exe, comm=exe) for pid in range(10000, 10000 + tk.SESSION_RECORD_CAP + 1)})
+        self.assertEqual(self.state()["reasons"], ["probe_failed"], "more live-pid records than the cap is unknown, never a cut")
+
+
+class TombstoneAndRemotePaths(TakeoverCase):
+    def test_a_second_takers_update_does_not_inherit_the_first_claim(self):
+        ak._kill_guard().ensure_key(str(self.home))
+        self.codex_session()
+        tk.write_claim(str(self.home), OLD, "codex", CALLER, "GoodQA goodqa#1", NOW - 3 * HOUR, "mac")
+        path = str(self.home / ".agent-harness" / "work" / OLD / "x")
+        tk.write_claim(str(self.home), OLD, "codex", OTHER, "GoodQA goodqa#2", NOW, "mac", claimed=False, removed=[path])
+        claim, _bad = tk.read_claim(str(self.home), OLD)
+        self.assertEqual((claim["caller"], claim["claimed_at"]), (OTHER, None))
+        ev =tk.collect_evidence(OLD, self.home, self.probe, NOW)
+        self.assertIsNone(ev["claim"]["claimed_at"], "the second taker holds no claim time, so R2 stays unmet for it")
+        tk.write_claim(str(self.home), OLD, "codex", OTHER, "GoodQA goodqa#2", NOW, "mac", claimed=False)
+        self.assertIsNone(tk.read_claim(str(self.home), OLD)[0]["claimed_at"])
+
+    def test_remote_worktree_paths_must_lie_under_the_sessions_work_dir(self):
+        remote = {"worktrees": [{"path": "/home/eric/.agent-harness/work/%s/T/a" % OLD, "head": "a" * 40},
+                                {"path": "/home/eric/.agent-harness/work/%s/b" % OLD, "head": "b" * 40},
+                                {"path": "/etc/passwd", "head": "c" * 40},
+                                {"path": "/home/eric/.agent-harness/work/%s/../x/y" % OLD, "head": "d" * 40},
+                                {"path": "/home/eric/.agent-harness/work/%s" % OTHER + "/T/a", "head": "e" * 40},
+                                {"path": "/home/eric/.agent-harness/work/%s/a/b/c" % OLD, "head": "f" * 40},
+                                {"path": "/home/eric/.agent-harness/work/%s/T/a" % OLD, "head": "not-a-head"}]}
+        self.assertEqual([p for p, _h in tk._remote_worktrees(remote, OLD)],
+                         ["/home/eric/.agent-harness/work/%s/T/a" % OLD, "/home/eric/.agent-harness/work/%s/b" % OLD])
 
 
 class FakeChain:

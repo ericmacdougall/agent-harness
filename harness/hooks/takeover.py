@@ -399,8 +399,11 @@ def write_claim(home, session, flavor, caller, ticket, now, host, claimed=True, 
     if not ID_RE.fullmatch(session) or not ID_RE.fullmatch(caller or "") or not TICKET_RE.fullmatch(ticket or ""):
         raise TakeoverError("bad_request", "session, caller and ticket must be well formed")
     previous, _bad = read_claim(home, session)
+    # An update keeps the claim time only for the session that made the claim: a second taker's tombstone update must not
+    # inherit the first taker's R2 standing under its own name (review minor).
+    kept = (previous or {}).get("claimed_at") if (previous or {}).get("caller") == caller else None
     data = {"v": 1, "session": session, "flavor": flavor, "caller": caller,
-            "claimed_at": _iso(now) if claimed else (previous or {}).get("claimed_at"), "updated_at": _iso(now),
+            "claimed_at": _iso(now) if claimed else kept, "updated_at": _iso(now),
             "ticket": ticket, "removed": list(((previous or {}).get("removed") or []) + list(removed))[-MAX_REMOVED_RECORDED:],
             "stopped": list(((previous or {}).get("stopped") or []) + list(stopped))[-MAX_REMOVED_RECORDED:],
             "host": re.sub(r"[^A-Za-z0-9._-]", "", host)[:64] or "host"}
@@ -609,6 +612,35 @@ def _live_markers(old, home, probe, table, cwds, ledger_spawns):
             continue
         under = _is_host(table[pid]) or any(a in hosts for a in _ancestors(table, pid))
         live.append({"pid": pid, "start": table[pid]["start"], "ids": ids, "agent_host": under})
+    seen = {proc["pid"] for proc in live}
+    live += [proc for proc in _record_live(old, home, probe, table) if proc["pid"] not in seen]
+    return live
+
+
+SESSION_RECORD_CAP = 512
+RECORD_NAME = re.compile(r"^([0-9]{1,10})\.json$")
+
+
+def _record_live(old, home, probe, table):
+    """R4 for a Claude CLI whose environment shows no marker (macOS hides it; on t2-dev the CLI's comm is its version):
+    its own ~/.claude/sessions/<pid>.json, bound to the live start time by claude_record, names `old`. Records of pids
+    that are not running are never read or counted; more live-pid records than the cap is probe_failed, never a cut."""
+    folder = os.path.join(str(home), ".claude", "sessions")
+    try:
+        with os.scandir(folder) as entries:
+            pids = [int(m.group(1)) for m in (RECORD_NAME.match(entry.name) for entry in entries) if m]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        raise ProbeFailed("the Claude session records could not be read")
+    pids = sorted(pid for pid in pids if pid in table)
+    if len(pids) > SESSION_RECORD_CAP:
+        raise ProbeFailed("more than %d Claude session records of live pids" % SESSION_RECORD_CAP)
+    live = []
+    for pid in pids:
+        row = table[pid]
+        if claude_record(home, pid, {"comm": row.get("comm", ""), "command": row.get("command", "")}, probe) == old:
+            live.append({"pid": pid, "start": row["start"], "ids": [old], "agent_host": True, "basis": "session_record"})
     return live
 
 
@@ -670,8 +702,9 @@ def session_state(old, action, home, probe, now, caller, remote=None, tasks_fn=N
     info = {"flavor": origin["flavors"][0], "origin_host": origin.get("host"), "cont_state": origin.get("cont_state"),
             "last_activity": origin.get("last_activity"), "claim_at": (origin.get("claim") or {}).get("claimed_at")}
     reasons, eligible_at = [], None
-    # R2 declared stop, or a valid claim of this caller (the claim lives on the caller's host: ev)
-    claim = ev.get("claim")
+    # R2 declared stop, or a valid claim of this caller. claim() writes a claim only on the session's origin host, so the
+    # claim is read from the origin's evidence (review F3; a claim on another host cannot count).
+    claim = origin.get("claim")
     claimed = bool(claim and claim.get("caller") == caller and claim.get("claimed_at") is not None)
     if not origin.get("declared_stop") and not claimed:
         reasons.append("not_stopped")
@@ -880,12 +913,16 @@ def process_candidates(old, home, probe, last_activity, table=None, spawns=None,
 # -------------------------------------------------------------------------------------- remote evidence (ssh)
 
 def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None):
-    """The other host's evidence, or None when it is not reachable. The caller's host orchestrates: t2-dev cannot
-    reach the Mac, so a caller on t2-dev gets None (unknown), never a guess."""
+    """The other host's evidence, or None when it is not reachable.
+
+    A caller on t2-dev cannot reach the Mac, so it gets LOCAL_ONLY (review F3): session_state then judges only a session
+    whose WAL is on t2-dev, from t2-dev's evidence, and says unknown for any other. A session runs on the host that holds
+    its WAL, so the unseen Mac can hold no live process of it; the one blind spot is a Mac process that carries the
+    t2-dev session's marker, which the Mac-side judgement would see (disclosed in docs/operations.md)."""
     if local_is_remote is None:
         local_is_remote = sys.platform.startswith("linux")
     if local_is_remote:
-        return None
+        return LOCAL_ONLY
     cmd = "python3 -I .claude/hooks/ah.py takeover status --from %s --evidence-only --json" % shlex.quote(old)
     try:
         done = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", REMOTE_HOST, cmd],
@@ -1135,9 +1172,12 @@ def claim(old, ctx, reason, ticket):
         raise TakeoverError("self_takeover" if ctx.caller else "caller_unknown", "the caller must be another known session")
     ev = collect_evidence(old, ctx.home, ctx.probe, ctx.now(), ctx.spawns_fn(old) if ctx.spawns_fn else None, ctx.tasks_fn)
     remote = ctx.remote_fetch(old)
-    if remote is None or not isinstance(remote, dict) or remote.get("version") != TAKEOVER_VERSION:
+    if remote == LOCAL_ONLY:
+        evs = [ev]  # a caller on t2-dev: only a session whose WAL is here can be claimed (checked below)
+    elif remote is None or not isinstance(remote, dict) or remote.get("version") != TAKEOVER_VERSION:
         raise TakeoverError("remote_unreachable", "the other host could not be read; a claim needs both hosts")
-    evs = [ev, remote]
+    else:
+        evs = [ev, remote]
     if any("bad_dir" in e.get("problems", []) for e in evs) or any(e.get("probe_failed") for e in evs):
         raise TakeoverError("unknown", "the session or the processes could not be read safely")
     holders = [e for e in evs if e.get("flavors")]
@@ -1155,8 +1195,26 @@ def claim(old, ctx, reason, ticket):
             "eligible_worktrees_at": _iso(ctx.now() + QUIET_WORKTREE_S), "eligible_processes_at": _iso(ctx.now() + QUIET_PROCESS_S)}
 
 
-def _remote_worktrees(remote):
-    return [(w["path"], w["head"]) for w in (remote or {}).get("worktrees", []) if isinstance(w, dict)]
+HEAD_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _remote_worktrees(remote, old):
+    """The other host's worktree proposals that lie one or two levels under its work/<old>/ dir with a full head. The
+    other host's verifier checks each again; this keeps a wrong or hostile evidence list from naming any other path."""
+    if not isinstance(remote, dict):
+        return []
+    marker = "/.agent-harness/work/%s/" % old
+    rows = []
+    for item in remote.get("worktrees", []) or []:
+        path, head = (item.get("path"), item.get("head")) if isinstance(item, dict) else (None, None)
+        if not isinstance(path, str) or not isinstance(head, str) or not HEAD_RE.fullmatch(head):
+            continue
+        if not path.startswith("/") or os.path.normpath(path) != path or path.count(marker) != 1:
+            continue
+        depth = len(path.split(marker, 1)[1].split("/"))
+        if 1 <= depth <= 2:
+            rows.append((path, head))
+    return rows
 
 
 def plan_worktrees(old, ctx, paths=()):
@@ -1165,7 +1223,7 @@ def plan_worktrees(old, ctx, paths=()):
     rows = []
     if state["state"] in ("retired", "walless"):
         rows = [("local", p, h) for p, _c, h in worktree_candidates(old, ctx.home)]
-        rows += [("t2-dev", p, h) for p, h in _remote_worktrees(remote if remote != LOCAL_ONLY else None)]
+        rows += [("t2-dev", p, h) for p, h in _remote_worktrees(remote, old)]
     return state, rows
 
 
@@ -1196,7 +1254,7 @@ def cleanup(old, action, ctx, reason, ticket, paths=(), pids=(), apply=False):
 
 def _do_worktrees(old, ctx, reason, ticket, paths, apply, result, remote):
     rows = [("local", p, h) for p, _c, h in worktree_candidates(old, ctx.home)]
-    rows += [("t2-dev", p, h) for p, h in _remote_worktrees(remote if remote != LOCAL_ONLY else None)]
+    rows += [("t2-dev", p, h) for p, h in _remote_worktrees(remote, old)]
     wanted = [os.path.realpath(p) if not p.startswith("/") else p for p in paths]
     if wanted:
         known = {path for _h, path, _hd in rows}

@@ -62,6 +62,19 @@ MUTANTS = {
                                           "        if True:\n            return name", "tests.test_command_guard_worktree_remove.TaskNamedWorkDir"),
     "F2 a recorded name stays under the rule": ("command_guard.py", "    for parent in (('.claude', 'wals'), ('.agent-harness', 'codex-wals')):",
                                                 "    for parent in ():", "tests.test_ah_worktree_remove.RealJudge"),
+    "F3 a Linux caller judges this host": ("takeover.py", "    if local_is_remote:\n        return LOCAL_ONLY",
+                                           "    if local_is_remote:\n        return None", "tests.test_takeover.LinuxCaller"),
+    "F3 a Linux caller can claim": ("takeover.py", "    if remote == LOCAL_ONLY:\n        evs = [ev]", "    if False:\n        evs = [ev]",
+                                    "tests.test_takeover.LinuxCaller"),
+    "F3 R2 reads the origin claim": ("takeover.py", '    claim = origin.get("claim")', '    claim = ev.get("claim")',
+                                     "tests.test_takeover.LinuxCaller"),
+    "F3 R4 Claude session record": ("takeover.py", "    live += [proc for proc in _record_live(old, home, probe, table) if proc[\"pid\"] not in seen]",
+                                    "    live += []", "tests.test_takeover.SessionRecordLiveness"),
+    "F3 R4 records of exited pids are not counted": ("takeover.py", "    pids = sorted(pid for pid in pids if pid in table)",
+                                                     "    pids = sorted(pids)", "tests.test_takeover.SessionRecordLiveness"),
+    "F3 remote worktree paths": ("takeover.py", "        if 1 <= depth <= 2:", "        if True:", "tests.test_takeover.TombstoneAndRemotePaths"),
+    "F3 tombstone claim time per caller": ("takeover.py", '(previous or {}).get("caller") == caller else None',
+                                           '(previous or {}).get("caller") or True else None', "tests.test_takeover.TombstoneAndRemotePaths"),
 }
 
 
