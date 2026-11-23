@@ -59,7 +59,7 @@
  "harness/hooks/deliver.py": {
   "counts": {
    "github-fine-grained:prefix": 1,
-   "redact:named-credential:prefix": 3
+   "redact:named-credential:prefix": 2
   },
   "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
  },
