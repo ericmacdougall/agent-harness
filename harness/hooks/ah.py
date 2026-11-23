@@ -253,7 +253,7 @@ def _wal_report(problems, source: str, tally=None, strict: bool = False) -> None
         for p in bad:
             tally.missed(source, _wal_say(p))
     elif strict and bad:
-        raise AhError("wal_incomplete", f"{source}: {_wal_say(bad[0])}", 3)
+        raise AhError("wal_incomplete", f"{source}: {_wal_say(bad[0])}; `ah doctor` names the chain and the recover command", 3)
 
 
 def _wal_exists(path) -> bool:
@@ -3611,6 +3611,37 @@ def note_cmd(home: Path, args) -> dict:
     return plan
 
 
+WAL_DOCTOR_SESSIONS = 200   # newest session folders scanned per WAL root
+
+
+def _wal_chain_checks(home: Path) -> list:
+    """One failing check per WAL chain with a problem (a lost or ambiguous segment, an unreadable or non-regular file),
+    with the commands that find and repair it. A healthy chain adds nothing. Fail closed is right for the readers (a
+    gap is never read past), so the operator must be able to see what is missing and how to recover it."""
+    out = []
+    ws = _ws()
+    cli = Path(ws.__file__).resolve()
+    for root in wal_roots(home):
+        try:
+            sessions = sorted((e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)),
+                              key=lambda e: e.stat().st_mtime, reverse=True)[:WAL_DOCTOR_SESSIONS]
+        except OSError:
+            continue
+        for entry in sessions:
+            try:
+                chains = ws.list_wals(entry.path)
+            except OSError:
+                continue
+            for stem, ch in chains.items():
+                for problem in _wal_bad(ch.problems):
+                    out.append({"check": f"wal chain {entry.name[:40]}/{stem}", "ok": False, "problem": _wal_say(problem),
+                                "dir": entry.path,
+                                "recover": f"python3 {cli} verify {entry.path} {stem}   # then restore the missing segment file "
+                                           f"from a git or Dropbox backup (same name), or read what is left with: "
+                                           f"python3 {cli} cat {entry.path} {stem} --allow-gaps"})
+    return out
+
+
 def doctor() -> dict:
     """Partial installs are the common failure: import every module ah needs and hash the files."""
     checks = []
@@ -3627,6 +3658,7 @@ def doctor() -> dict:
             checks.append({"check": f"file {name}", "ok": True, "sha256": hashlib.sha256(_bounded(f, 16 << 20)).hexdigest()[:16]})
         except OSError:
             checks.append({"check": f"file {name}", "ok": False})
+    checks.extend(_wal_chain_checks(home_dir()))
     running = ahd_running_check(home_dir())
     if os.environ.get("AH_EXPECT_AHD", "1") == "0":  # hosts without the daemon (and partial-install tests) only report it
         running = dict(running, ok=True, expected=False)

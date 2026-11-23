@@ -411,6 +411,30 @@ class StatusOverChains(Base):
         self.assertEqual([v["check"] for v in r["verified"]], ["PP-1"])      # what is readable is still reported
 
 
+class DoctorNamesALostSegment(Base):
+    def test_a_lost_segment_is_a_failing_check_with_the_recover_command(self):
+        chain(self.w, "main", split3(MAIN))
+        with mock.patch.dict(os.environ, {"AH_EXPECT_AHD": "0"}):
+            healthy = [c for c in ah.doctor()["checks"] if c["check"].startswith("wal chain")]
+            os.unlink(self.w / "main.0001.jsonl")
+            checks = [c for c in ah.doctor()["checks"] if c["check"].startswith("wal chain")]
+            doc_ok = ah.doctor()["ok"]
+        self.assertEqual(healthy, [])
+        self.assertEqual(len(checks), 1)
+        self.assertFalse(checks[0]["ok"])
+        self.assertIn("gap", checks[0]["problem"])
+        self.assertIn("wal_segments.py verify", checks[0]["recover"])
+        self.assertIn("--allow-gaps", checks[0]["recover"])
+        self.assertFalse(doc_ok)
+
+    def test_the_refusal_points_at_doctor(self):
+        chain(self.w, "main", split3(MAIN))
+        os.unlink(self.w / "main.0001.jsonl")
+        with self.assertRaises(ah.AhError) as c:
+            ah.ask_states(self.w / "main.jsonl")
+        self.assertIn("ah doctor", str(c.exception))
+
+
 class NoDirectOpen(unittest.TestCase):
     READERS = ("owners", "discover_agents", "summarize_agent_wal", "_summarize_agent_wal", "_summarize_cached", "ask_owners",
                "narrow_wait", "ask_states", "_wal_has", "_last_line_is", "_evidence_ok", "_session_entries",
