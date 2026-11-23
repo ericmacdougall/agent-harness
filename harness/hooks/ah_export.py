@@ -212,10 +212,14 @@ def _read(ah, sd: Path):
         elif files >= MAX_FILES:
             reason = "over the %d-file limit" % MAX_FILES
         if reason is None:
+            # the read itself is bounded too (the WAL may grow after the listing): this WAL's share of the limits,
+            # and reaching it is `truncated`, which lists the WAL as unread
+            budget = max(0, min(WAL_LIMIT * len(members), TOTAL_LIMIT - total))
             total, files = total + size, files + len(members)
             probs, lines = [], []
             try:
-                lines = [raw for _seg, _n, raw in ws.iter_lines(os.path.join(sd, name), problems=probs, chain=chain)]
+                lines = [raw for _seg, _n, raw in ws.iter_lines(os.path.join(sd, name), problems=probs, chain=chain,
+                                                                max_total_bytes=budget)]
             except (OSError, ws.SegmentProblem) as error:
                 reason = type(error).__name__
             late = [p for p in probs if p["code"] not in ("live_missing", "schema_newer", "marker_info")]

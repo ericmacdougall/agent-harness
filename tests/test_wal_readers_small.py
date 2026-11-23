@@ -413,6 +413,19 @@ class BudgetTests(Fixture):
     def records_of(self, name):
         return [json.loads(raw) for _s, _n, raw in ws.iter_lines(self.dir / name) if raw]
 
+    def test_agent_gate_cold_is_judged_against_the_given_now(self):
+        import agent_gate
+        self.append("main.jsonl", {"at": iso(), "event": "subagent", "agent_id": "a1"})
+        self.append("agent-a1.jsonl", {"at": iso(), "event": "pretool", "agent_id": "a1"})
+        for now, expect in ((time.time() + 7200, ["main"]), (time.time() - 7200, ["agent-a1", "main"]),
+                            (time.time() + 1, ["agent-a1", "main"])):
+            calls = []
+            real = agent_gate.jsonl_records
+            with patch.object(agent_gate, "jsonl_records",
+                              side_effect=lambda path, *a, **k: calls.append(os.path.basename(path)[:-6]) or real(path, *a, **k)):
+                agent_gate.live_agents(str(self.dir), now)
+            self.assertEqual(sorted(calls), expect, now - time.time())
+
     def test_ahd_wal_asks_window_keeps_the_newest_ask(self):
         import ahd
         self.append("main.jsonl", {"at": "2027-01-15T07:00:00+00:00", "event": "ask", "id": "wold", "note": "old ask"})
@@ -446,6 +459,103 @@ class BudgetTests(Fixture):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+class ListingRaceTests(Fixture):
+    """Gate findings F2 to F4 of PR 329: the pre-scanned listing (chain=) must stay correct when the WAL grows or
+    rotates between `list_wals` and the read, ah_export must bound each read, and one session costs one scan."""
+
+    def rows(self, n, start=0, pad=500):
+        for i in range(start, start + n):
+            self.append("main.jsonl", {"at": iso(), "event": "status", "id": "w%011d" % i, "n": i, "note": "x" * pad})
+
+    def after_listing(self, action):
+        """list_wals that runs `action` once, right after the directory was listed (a rotation after the listing)."""
+        real = ws.list_wals
+        done = []
+
+        def listing(directory):
+            chains = real(directory)
+            if not done:
+                done.append(True)
+                action()
+            return chains
+        return listing
+
+    def test_ah_export_rotation_after_listing_loses_and_duplicates_nothing(self):
+        import ah
+        import ah_export
+        self.rows(30)
+        self.rotated()
+        with patch.object(ws, "list_wals", self.after_listing(lambda: self.rows(12, start=30))):
+            rows, unread, _skipped, agents = ah_export._read(ah, self.dir)
+        self.assertEqual([r["n"] for _a, r in rows], list(range(42)))  # none lost, none twice, in order
+        self.assertEqual((agents, unread), (["main"], []))
+
+    def test_ah_export_a_gap_is_still_reported_when_the_chain_rotates_after_listing(self):
+        import ah
+        import ah_export
+        self.rows(30)
+        self.make_gap()
+        with patch.object(ws, "list_wals", self.after_listing(lambda: self.rows(12, start=30))):
+            _rows, unread, _skipped, _agents = ah_export._read(ah, self.dir)
+        self.assertEqual([u["wal"] for u in unread], ["main.jsonl"])
+        self.assertIn("gap", unread[0]["reason"])
+
+    def test_ah_export_bounds_each_read_by_the_limits_and_lists_a_grown_wal_as_unread(self):
+        import ah
+        import ah_export
+        self.rows(2, pad=100)  # small at listing time, under the limit
+        with patch.object(ah_export, "TOTAL_LIMIT", 3000), \
+                patch.object(ws, "list_wals", self.after_listing(lambda: self.rows(12, start=2, pad=500))):
+            rows, unread, _skipped, agents = ah_export._read(ah, self.dir)
+        self.assertEqual(agents, [])  # it grew past the limit after the listing: never exported in part
+        self.assertEqual([u["wal"] for u in unread], ["main.jsonl"])
+        self.assertIn("truncated", unread[0]["reason"])
+
+    def test_agent_gate_rotation_after_listing_keeps_every_agent_and_a_gap_is_reported(self):
+        import agent_gate
+        self.append("main.jsonl", {"at": iso(), "event": "subagent", "agent_id": "a1"})
+        self.fill("main.jsonl", n=45, pad=300, event="status")
+        self.rotated()
+        grow = lambda: [self.append("main.jsonl", {"at": iso(), "event": "pretool", "agent_id": "a1", "pad": "x" * 500})
+                        for _ in range(12)]
+        with patch.object(ws, "list_wals", self.after_listing(grow)):
+            self.assertEqual(agent_gate.live_agents(str(self.dir), time.time() + 1), ["a1"])
+        self.make_gap()
+        problems = []
+        with patch.object(ws, "list_wals", self.after_listing(grow)):
+            agent_gate.live_agents(str(self.dir), time.time() + 1, problems=problems)
+        self.assertIn("gap", [p["code"] for p in problems])
+
+    def test_one_directory_scan_per_session(self):
+        import ah
+        import agent_gate
+        import ah_export
+        for i in range(6):
+            self.append(f"agent-a{i}.jsonl", {"at": iso(), "event": "status", "id": "w%011d" % i, "n": i})
+        self.append("main.jsonl", {"at": iso(), "event": "subagent", "agent_id": "a0"})
+        for label, call in (("agent_gate", lambda: agent_gate.live_agents(str(self.dir), time.time() + 1)),
+                            ("ah_export", lambda: ah_export._read(ah, self.dir))):
+            scans = []
+            real = ws._scan
+            with patch.object(ws, "_scan", side_effect=lambda *a, **k: scans.append(a) or real(*a, **k)):
+                call()
+            self.assertEqual(len(scans), 1, f"{label} scanned the directory {len(scans)} times for 7 WALs")
+
+    def test_opens_are_counted_through_both_open_paths_on_a_rotated_chain(self):
+        import goals_view
+        self.append("main.jsonl", {"at": iso(), "event": "check", "id": "wabc00000002", "note": "REALLY_TESTED t ok"})
+        self.fill("main.jsonl")
+        self.rotated()
+        opened = []
+        real_regular, real_at = ws._open_regular, ws._open_at
+        patches = (patch.object(ws, "_open_regular", side_effect=lambda d, n, *a, **k: opened.append(n) or real_regular(d, n, *a, **k)),
+                   patch.object(ws, "_open_at", side_effect=lambda dfd, d, n, *a, **k: opened.append(n) or real_at(dfd, d, n, *a, **k)))
+        with patches[0], patches[1]:
+            goals_view.index_wals(self.home, {(SESSION, "main.jsonl"): {"wabc00000002"}}, SESSION, ["goal-x"])
+        members = sorted(self.closed()) + ["main.jsonl"]
+        self.assertEqual(sorted(opened), members, "each member of the chain is opened exactly once per report")
+
+
 MIGRATED = ("wal_note", "agent_gate", "ahd", "ahd_peek", "review_map", "mission_coverage", "ah_export", "wal_cadence",
             "workdir", "dropped_gate", "goals_view")
 # modules of this set that name WAL files but read none (reviewed, with the reason)

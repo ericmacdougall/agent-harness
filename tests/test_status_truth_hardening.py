@@ -314,7 +314,12 @@ class F5OnePassAndVisibleBudget(Base):
         def counting(directory, name, *a, **kw):
             opened.append(name)
             return real(directory, name, *a, **kw)
-        with mock.patch.object(ws, "_open_regular", side_effect=counting):
+        real_at = ws._open_at  # the pinned-directory open path of the same reader
+
+        def counting_at(dfd, directory, name, *a, **kw):
+            opened.append(name)
+            return real_at(dfd, directory, name, *a, **kw)
+        with mock.patch.object(ws, "_open_regular", side_effect=counting), mock.patch.object(ws, "_open_at", side_effect=counting_at):
             doc = gv.goals_report(self.home, session=SESSION)
         self.assertEqual(doc["state"], "ok")
         self.assertTrue(all(g["state"] == "VERIFIED" for g in doc["goals"]), [g["state"] for g in doc["goals"]])

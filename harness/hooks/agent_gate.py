@@ -99,7 +99,7 @@ def _newest_mtime(wal_dir, chain):
     try:
         return max(os.lstat(os.path.join(wal_dir, name)).st_mtime for name in names)
     except (OSError, ValueError):
-        return time.time()
+        return float("inf")
 
 
 def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S, problems=None):
@@ -108,7 +108,7 @@ def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S, problem
     import wal_segments as ws
     started, stopped, last = {}, set(), {}
     chains = ws.list_wals(wal_dir)  # ONE directory scan; each chain read below scans again, so cold WALs are skipped
-    cold_before = time.time() - max(window, LIVE_WINDOW_S) - 60
+    cold_before = now - max(window, LIVE_WINDOW_S) - 60
     for stem in sorted(chains):
         if not (stem == "main" or stem.startswith("agent-")):
             continue
