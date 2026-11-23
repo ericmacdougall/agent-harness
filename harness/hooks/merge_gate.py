@@ -1529,13 +1529,18 @@ def evaluate_merge(merge, client, state_dir, now, command_hash, command=None):
         return True, "", info
     # red-team M1: `merge_gate.py check` is a read-only query; it must never spend the single-use evidence
     if not hard and info["head"] and merge.kind != "check":
+        # a same-harness fallback record is used only against GitHub's live PR file list (finding 1); read it first,
+        # outside the state lock, and only when such a record could apply
+        live_paths = _live_paths_getter(client, state_dir, info["repo"], info["pr"], info["head"], now,
+                                        not info.get("unsettled"))
         wid = consume_waiver(state_dir, info["repo"], info["pr"], info["head"], command_hash, now=now,
-                             review_ok=not info.get("unsettled"), command=command)
+                             review_ok=not info.get("unsettled"), command=command, live_paths=live_paths)
         if wid:
             info["waiver"] = wid
             return True, "", info
         trailer = pending_fallback_trailer(state_dir, info["repo"], info["pr"], info["head"], now,
-                                           review_ok=not info.get("unsettled")) if merge.kind != "check" else None
+                                           review_ok=not info.get("unsettled"),
+                                           live_paths=live_paths) if merge.kind != "check" else None
         if trailer:
             soft.append("a same-harness fallback review authorizes this merge only when the merge commit carries "
                         f"its label and receipt id: add --body '{trailer}' (or the equivalent) to the command")
@@ -1628,37 +1633,117 @@ def _append_waiver_record(state_dir, record):
     return record
 
 
-def _fallback_usable(r, now, command, review_ok):
+_LIVE_SKIP = object()  # live_paths value: apply only the cheap checks (used to find out whether a fetch is worth making)
+
+
+def pr_changed_files(client, slug, number):
+    """GitHub's own list of the files the PR changes now, as a sorted list of unique paths (a rename counts under
+    both names). Reads the PR files endpoint page by page through `client`; raises GateError on anything unreadable
+    or too large (fail closed). This is the authority for "what does this PR touch", independent of any receipt."""
+    paths = set()
+    for page in range(1, FALLBACK_MAX_PATHS // 100 + 2):
+        rows = client.json(["api", f"repos/{slug}/pulls/{int(number)}/files?per_page=100&page={page}"],
+                           "the pull request files")
+        if not isinstance(rows, list):
+            raise GateError("the pull request file list is unreadable")
+        for row in rows:
+            name = row.get("filename") if isinstance(row, dict) else None
+            old = row.get("previous_filename") if isinstance(row, dict) else None
+            if not isinstance(name, str) or not name or (old is not None and not isinstance(old, str)):
+                raise GateError("the pull request file list has an unreadable entry")
+            paths.add(name)
+            if old:
+                paths.add(old)
+        if len(paths) > FALLBACK_MAX_PATHS:
+            raise GateError("the pull request changes too many files for a same-harness review")
+        if len(rows) < 100:
+            return sorted(paths)
+    raise GateError("the pull request file list is longer than the gate reads")
+
+
+def fallback_live_paths_ok(record, live):
+    """Merge-time recheck of a fallback record against GitHub's live PR file list: the list is exactly the one the
+    receipt reviewed (same digest, so a PR retargeted or changed after the review is refused even with the same
+    head) AND it passes the same path policy the mint applied, with the grant scope the record was minted under."""
+    if (not isinstance(live, list) or not live or len(live) > FALLBACK_MAX_PATHS
+            or not all(isinstance(p, str) for p in live)
+            or record.get("changed_paths_sha256") != fallback_paths_digest(live)):
+        return False
+    try:
+        return not fallback_denied_paths(live, record.get("deny_paths"), record.get("allow_paths"))
+    except ValueError:
+        return False
+
+
+def _fallback_usable(r, now, command, review_ok, live_paths=None):
     """A same-harness fallback record needs, at consume time: green-enough checks (review_ok), an unexpired grant
-    window, the minting policy still live, and the merge command carrying the label plus the receipt id."""
+    window, the minting policy still live, the merge command carrying the label plus the receipt id, and GitHub's
+    live PR file list equal to the reviewed one and inside the path policy. `live_paths` is a callable returning that
+    list (raising when it cannot); without one the record is not usable (fail closed)."""
     if not review_ok or now >= float(r.get("expires_at") or 0):
         return False
     if not _fallback_live(r):
         return False
     trailer = r.get("merge_trailer")
-    return bool(isinstance(command, str) and isinstance(trailer, str) and trailer and trailer in command)
+    if not (isinstance(command, str) and isinstance(trailer, str) and trailer and trailer in command):
+        return False
+    if live_paths is _LIVE_SKIP:
+        return True
+    if not callable(live_paths):
+        return False
+    try:
+        live = live_paths()
+    except Exception:  # noqa: BLE001 - GateError, a bad page, a timeout: no live list is no authorization
+        return False
+    return fallback_live_paths_ok(r, live)
 
 
-def pending_fallback_trailer(state_dir, repo, pr, head, now, review_ok=True):
+def _live_paths_getter(client, state_dir, slug, number, head, now, review_ok):
+    """A callable giving GitHub's live PR file list, fetched once and only when some fallback record could be used
+    for this PR (cheap checks pass with the record's own trailer). The fetch happens here, before any state lock is
+    taken, and a failure is kept and re-raised when asked, so it can only ever refuse."""
+    state = {}
+    try:
+        records = _read_waivers(Path(state_dir))
+        wanted = any(r.get("event") == "waive" and r.get("approval_source") == FALLBACK_SOURCE
+                     and _active(records, slug, number, head, now, review_ok=review_ok,
+                                 command=r.get("merge_trailer"), live_paths=_LIVE_SKIP) is r for r in records)
+    except (Corrupt, OSError, TypeError, ValueError):
+        wanted = False
+    if wanted:
+        try:
+            state["paths"] = pr_changed_files(client, slug, number)
+        except Exception as error:  # noqa: BLE001
+            state["error"] = error
+
+    def getter():
+        if "paths" not in state:
+            raise GateError("the pull request file list was not read")
+        return state["paths"]
+    return getter
+
+
+def pending_fallback_trailer(state_dir, repo, pr, head, now, review_ok=True, live_paths=None):
     """The trailer main must add to the merge command when an otherwise usable fallback record exists, else None."""
     try:
         records = _read_waivers(Path(state_dir))
         for r in records:
             if r.get("event") == "waive" and r.get("approval_source") == FALLBACK_SOURCE:
                 trailer = r.get("merge_trailer")
-                if _active(records, repo, pr, head, now, review_ok, command=trailer) is r:
+                if _active(records, repo, pr, head, now, review_ok, command=trailer, live_paths=live_paths) is r:
                     return trailer
     except (Corrupt, OSError, TypeError, ValueError):
         return None
     return None
 
 
-def _active(records, repo, pr, head, now, review_ok=True, command=None):
+def _active(records, repo, pr, head, now, review_ok=True, command=None, live_paths=None):
     used = {r.get("waiver") for r in records if r.get("event") == "consume"}
     for r in records:
         if not review_ok and r.get("approval_source") == "settled-review":
             continue  # #134 red-team P1/B1: a review authorization never passes a failing, pending or missing check
-        if r.get("approval_source") == FALLBACK_SOURCE and not _fallback_usable(r, now, command, review_ok):
+        if r.get("approval_source") == FALLBACK_SOURCE and not _fallback_usable(r, now, command, review_ok,
+                                                                                live_paths):
             continue  # same rule, plus: grant window, live policy, merge command carries SAME_HARNESS_FALLBACK
         if (r.get("event") == "waive" and r.get("id") not in used and repo_key(repo) is not None
                 and repo_key(r.get("repo")) == repo_key(repo)
@@ -1759,14 +1844,44 @@ FALLBACK_BLOCK_KEY = "same_harness_fallback"
 FALLBACK_MAX_PATHS = 400
 FALLBACK_REASONS = {"QUOTA", "AUTH"}
 _PROVIDER_OF = {"openai": "codex", "claude": "claude"}
-FALLBACK_SCOPE_KEYS = {"repos", "deny_paths"}
-# Paths that never take a same-harness review: auth, secrets, migrations, the guards, key handling, CI, and the
-# gate/review code itself. A grant scope may add patterns (narrow) and never remove one.
+FALLBACK_SCOPE_KEYS = {"repos", "deny_paths", "allow_paths"}
+FALLBACK_BASIS = "merge-base+github-files"
+FALLBACK_PATTERN_MAX = 500
+
+# The path policy has two layers and a path needs both (goodqa#16756 review round 1, finding 2). A denylist can only
+# enumerate, so it is the second layer, not the first.
+#
+# Layer 1, the allowlist: a same-harness review covers only path classes named here (documentation and tests) or by
+# the signed grant's `allow_paths` (the source dirs the user named for a repo). Everything else, including every path
+# nobody thought of, needs a cross-harness review or a manual waiver. A repo file never widens this: the patterns come
+# from the signed policy only.
+FALLBACK_ALLOW = re.compile(
+    r"(?:^|/)docs?/.+\.(?:md|mdx|rst|adoc|txt|png|jpe?g|gif)$"           # documentation tree
+    r"|\.(?:md|mdx|rst|adoc)$"                                          # prose anywhere (control .md files are denied below)
+    r"|^(?:readme|changelog|contributing|license|notice)[\w.\-]*$"       # top-level project prose
+    r"|(?:^|/)(?:tests?|__tests__|specs?)/.+"                           # test trees
+    r"|(?:^|/)test_[\w.\-]+\.py$|[\w.\-]+_test\.(?:py|go|rs)$"
+    r"|[\w.\-]+\.(?:test|spec)\.(?:jsx?|tsx?|mjs|cjs)$", re.I)
+# Layer 2, control files: these never take a same-harness review, even when the grant allows every path, because
+# changing them changes what authorizes what (credentials, permissions, hook wiring, review and tier policy, release
+# and install tooling, dependency manifests). Substring words have no boundary on purpose (AuthController.ts,
+# authentication.py, session.py, jwt.py); a false positive costs one cross-harness review, a miss costs a merge.
 FALLBACK_DENY = re.compile(
-    r"(?:^|[/_.\-])(?:auth|authn|authz|oauth|login|signin|secrets?|credentials?|passwords?|passwd|tokens?|"
-    r"migrations?|migrate|command_guard\w*|merge_gate\w*|peer_review\w*|caller_identity|self_serve\w*|"
-    r"central_decisions|escalation|keys?|keygen|keyring|keychain|ed25519|pubkeys?|private|sudoers|"
-    r"workflows?|usage_guard)(?:$|[/_.\-])|(?:^|/)\.env|\.pem$|id_rsa|\.p12$|\.pfx$", re.I)
+    r"auth|secret|credential|passw|token|permission|privilege|session|jwt|crypt|cipher|oauth|login|signin|signup|"
+    r"keychain|keyring|keystore|apikey|api_key|keyfile|keygen|ed25519|pubkey|private|sudo|rbac|migrat|"
+    r"guard|policy|merge_gate|peer_review|caller_identity|self_serve|central_decisions|escalation|ladder|"
+    r"provenance|wal_note|run_probe|model_tiers|spec_|deliver|install|"
+    r"(?:^|[/_.\-])(?:keys?|certs?|ssl|tls)(?:$|[/_.\-])|"
+    r"(?:^|/)(?:\.claude|\.codex|\.github|\.githooks|\.husky|\.circleci|\.gitlab|\.vscode|\.idea|hooks?|workflows?|"
+    r"deploy\w*|infra\w*|terraform|k8s|helm|ansible|ci|scripts?|bin|skills?|commands|agents|secrets?)(?:/|$)|"
+    r"(?:^|/)(?:ah\.py|claude\.md|agents\.md|skill\.md|hooks\.json|mcp[\w.\-]*\.json|\.mcp\.json|\.env[\w.\-]*|\.envrc|"
+    r"settings[\w.\-]*\.json|dockerfile[\w.\-]*|docker-compose[\w.\-]*|makefile|codeowners|\.gitattributes|"
+    r"\.gitmodules|\.pre-commit-config\.ya?ml|\.npmrc|\.pypirc|\.netrc|"
+    r"package(?:-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.ya?ml|requirements[\w.\-]*\.(?:txt|in)|"
+    r"pipfile(?:\.lock)?|poetry\.lock|pyproject\.toml|setup\.(?:py|cfg)|tox\.ini|cargo\.(?:toml|lock)|go\.(?:mod|sum)|"
+    r"gemfile(?:\.lock)?|composer\.(?:json|lock)|build\.gradle(?:\.kts)?|settings\.gradle|pom\.xml|package\.swift|"
+    r"podfile(?:\.lock)?|[\w.\-]+\.csproj)$|"
+    r"\.(?:pem|p12|pfx|key|crt|cer|jks|sh|bash|zsh|ps1|service|plist)$|id_rsa|id_ed25519", re.I)
 
 
 def _norm_path(path):
@@ -1775,17 +1890,41 @@ def _norm_path(path):
     return text
 
 
-def fallback_denied_paths(paths, extra_patterns=()):
-    """The subset of changed paths a same-harness review may not cover; a malformed path counts as denied."""
-    extra = [re.compile(p, re.I) for p in extra_patterns]
+def _scope_patterns(patterns, what):
+    """Compile grant-scope regexes; anything unreadable is a ValueError (fail closed), never a stray re.error."""
+    if patterns is None:
+        return []
+    if not isinstance(patterns, (list, tuple)):
+        raise ValueError("fallback: grant scope %s must be a list of patterns" % what)
+    compiled = []
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern or len(pattern) > FALLBACK_PATTERN_MAX:
+            raise ValueError("fallback: grant scope %s has an unusable pattern" % what)
+        try:
+            compiled.append(re.compile(pattern, re.I))
+        except re.error:
+            raise ValueError("fallback: grant scope %s has an invalid pattern" % what) from None
+    return compiled
+
+
+def fallback_denied_paths(paths, extra_patterns=(), allow_patterns=()):
+    """The subset of changed paths a same-harness review may not cover. THE one path policy: the mint, the receipt
+    check and the merge-time recheck all call it, so they cannot drift apart. A path is covered only when it is
+    well-formed, on the allowlist (docs, tests, or a grant `allow_paths` pattern anchored at the start) and not a
+    control file; a malformed path counts as denied."""
+    extra = _scope_patterns(extra_patterns, "deny_paths")
+    allow = _scope_patterns(allow_patterns, "allow_paths")
     denied = []
     for path in paths:
-        if (not isinstance(path, str) or not path or len(path) > 1024 or CTRL.search(path)
-                or path.startswith("/") or ".." in _norm_path(path).split("/")):
+        if not isinstance(path, str) or not path or len(path) > 1024 or CTRL.search(path):
             denied.append(clean(path, 120))
             continue
         norm = _norm_path(path)
-        if FALLBACK_DENY.search(norm) or any(p.search(norm) for p in extra):
+        if norm.startswith("/") or any(part in ("", ".", "..") for part in norm.split("/")):
+            denied.append(path)
+            continue
+        covered = FALLBACK_ALLOW.search(norm) or any(p.match(norm) for p in allow)
+        if not covered or FALLBACK_DENY.search(norm) or any(p.search(norm) for p in extra):
             denied.append(path)
     return denied
 
@@ -1846,16 +1985,27 @@ def fallback_evidence(evidence, scope=None):
         raise ValueError("fallback: the reviewer must run in a fresh session on an isolated snapshot")
     paths = block.get("changed_paths")
     if (not isinstance(paths, list) or not paths or len(paths) > FALLBACK_MAX_PATHS
+            or not all(isinstance(p, str) for p in paths)
             or block.get("changed_paths_sha256") != fallback_paths_digest(paths)):
         raise ValueError("fallback: the changed paths are missing, too many or do not match their digest")
-    extra = ()
+    # Finding 1: the paths must be the whole PR. peer_review records the diff from the PR merge-base (GitHub's own
+    # compare answer) and checks it equals GitHub's PR file list; the reviewer's snapshot base must be that same
+    # merge-base, so the reviewer saw every commit the policy was run over. A head^1..head view proves nothing.
+    merge_base = block.get("merge_base")
+    if (block.get("paths_basis") != FALLBACK_BASIS
+            or not all(isinstance(v, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", v)
+                       for v in (merge_base, block.get("pr_base_oid")))
+            or block.get("snapshot_base") != merge_base or review.get("snapshot_base") != merge_base):
+        raise ValueError("fallback: the changed paths are not bound to the PR merge-base that the reviewer's "
+                         "snapshot started from")
+    extra = allow = None
     if scope:
-        extra = tuple(scope.get("deny_paths") or ())
+        extra, allow = scope.get("deny_paths"), scope.get("allow_paths")
         repos = scope.get("repos")
         if repos is not None and (not isinstance(repos, list)
                                   or repo_key(repo) not in {repo_key(r) for r in repos if isinstance(r, str)}):
             raise ValueError("fallback: the grant scope does not cover this repository")
-    denied = fallback_denied_paths(paths, extra)
+    denied = fallback_denied_paths(paths, extra, allow)
     if denied:
         raise ValueError("fallback: changed paths need a cross-harness review or a manual waive: "
                          + ", ".join(clean(p, 60) for p in denied[:5]))
@@ -2050,6 +2200,10 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None, fallback_ac
                            + " with zero launches; settled PASS bound to report and FINAL bytes"),
                 "approval_source": FALLBACK_SOURCE, "label": FALLBACK_LABEL,
                 "fallback_receipt_sha256": fallback_block_digest(block),
+                # what the merge-time recheck compares GitHub's live PR file list against (finding 1)
+                "changed_paths_sha256": block["changed_paths_sha256"],
+                "deny_paths": list((granted.get("scope") or {}).get("deny_paths") or []),
+                "allow_paths": list((granted.get("scope") or {}).get("allow_paths") or []),
                 "merge_trailer": fallback_trailer(final_sha256),
                 "policy_id": granted["policy_id"], "key_id": granted["key_id"], "expires_at": bound,
                 "followup": "cross-harness re-review when quota returns"})
@@ -2059,7 +2213,7 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None, fallback_ac
     return record
 
 
-def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True, command=None):
+def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True, command=None, live_paths=None):
     state_dir = Path(state_dir)
     try:
         lock = _lock(state_dir)
@@ -2067,7 +2221,8 @@ def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=
         return None
     try:
         records = _read_waivers(state_dir)
-        waiver = _active(records, repo, pr, head, now or time.time(), review_ok, command=command)
+        waiver = _active(records, repo, pr, head, now or time.time(), review_ok, command=command,
+                         live_paths=live_paths)
         if not waiver:
             return None
         _append_waiver_record(state_dir, {"event": "consume", "waiver": waiver["id"], "ts": now or time.time(),

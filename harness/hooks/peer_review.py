@@ -1503,11 +1503,45 @@ def review_merge_eligible(args, binding, report, selection, fallback=None):
 FALLBACK_PATH_CAP = 400
 
 
+def fallback_pr_basis(repository, number, head, *, runner=None):
+    """What GitHub says the PR is, for the same-harness fallback: (PR base oid, merge-base of base and head, the PR's
+    file list). The merge-base comes from GitHub's compare endpoint, so it does not depend on which objects the local
+    clone holds. Raises OSError for anything unreadable or inconsistent (the caller records nothing)."""
+    import merge_gate
+    client = merge_gate.Client(runner or merge_gate.SubprocessGh(), time.monotonic() + 45)
+    sha = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+    try:
+        view = client.json(['pr', 'view', str(number), '-R', repository, '--json', 'baseRefOid,headRefOid,state'],
+                           'the reviewed pull request')
+        if (not isinstance(view, dict) or view.get('headRefOid') != head
+                or str(view.get('state') or '').upper() != 'OPEN'
+                or not isinstance(view.get('baseRefOid'), str) or not sha.fullmatch(view['baseRefOid'])):
+            raise OSError('the pull request differs from the reviewed head, is not open or has no base commit')
+        base_oid = view['baseRefOid']
+        compare = client.json(['api', f'repos/{repository}/compare/{base_oid}...{head}?per_page=1', '--jq',
+                               '{sha: .merge_base_commit.sha}'], 'the merge-base')
+        merge_base = compare.get('sha') if isinstance(compare, dict) else None
+        if not isinstance(merge_base, str) or not sha.fullmatch(merge_base):
+            raise OSError('GitHub returned no merge-base for the pull request')
+        return base_oid, merge_base, merge_gate.pr_changed_files(client, repository, number)
+    except merge_gate.GateError as error:
+        raise OSError(str(error)) from None
+
+
+def _fallback_not_recorded(why):
+    print('Same-harness fallback not recorded: ' + why, file=sys.stderr)
+    return None
+
+
 def build_fallback_block(args, binding, options, selection, author_rung, packet_sha256, head, base, repo):
     """The same-harness fallback receipt block recorded in the FINAL usage, or None when this run is not one.
 
     It records facts this run observed: the first-choice reviewer's NO_RESULT, the rungs, the isolated snapshot, and
-    the changed paths (git diff --no-renames against the snapshot base). It carries no secret and no free text."""
+    the changed paths. The paths are the WHOLE PR (goodqa#16756 review round 1, finding 1): the diff from the PR
+    merge-base that GitHub reports, which must be the snapshot base the reviewer worked from, and it must equal
+    GitHub's own PR file list. A snapshot base that skips an earlier commit, or a list that disagrees with GitHub,
+    records nothing. It carries no secret and no free text, and it never raises: it runs after the provider launch
+    and before the FINAL is written, so a failure here must only mean "no fallback receipt"."""
     primary = options.get('primary_attempt')
     actual = options.get('actual_reviewer')
     if (args.stage != 'pr' or not binding or not isinstance(primary, dict) or actual is None
@@ -1515,19 +1549,31 @@ def build_fallback_block(args, binding, options, selection, author_rung, packet_
             or options.get('reviewer_harness') != args.author_harness or not base or base == head):
         return None
     try:
-        raw = git(repo, 'diff', '--name-only', '--no-renames', '-z', base, head)
-    except OSError:
-        return None
-    paths = sorted({p for p in raw.split('\0') if p})
-    if not paths or len(paths) > FALLBACK_PATH_CAP:
-        paths = None
-    return {'schema': 1, 'primary': dict(primary), 'reviewer_actual': actual,
-            'repo': binding['repo'], 'pr': binding['pr'], 'head': head, 'packet_sha256': packet_sha256,
-            'author_rung': author_rung, 'reviewer_rung': selection['rung'],
-            'author_unknown': bool(selection['author_unknown']),
-            # reviewers run from a depth-1 snapshot in a one-shot process (--no-session-persistence / --ephemeral)
-            'isolated_snapshot': True, 'fresh_session': True,
-            'changed_paths': paths, 'changed_paths_sha256': hashlib.sha256('\n'.join(paths or []).encode()).hexdigest()}
+        pr_base_oid, merge_base, github_files = fallback_pr_basis(binding['repo'], binding['pr'], head)
+        if merge_base != base:
+            return _fallback_not_recorded(
+                'the review snapshot base %s is not the PR merge-base %s, so the reviewer did not see the whole PR; '
+                'rerun the review with --snapshot-base %s' % (base, merge_base, merge_base))
+        raw = git(repo, 'diff', '--name-only', '--no-renames', '-z', merge_base, head)
+        local = {p for p in raw.split('\0') if p}
+        if local != set(github_files):
+            return _fallback_not_recorded('the PR file list on GitHub differs from the local diff against the '
+                                          'merge-base (%d against %d paths)' % (len(github_files), len(local)))
+        paths = sorted(local)
+        if not paths or len(paths) > FALLBACK_PATH_CAP:
+            paths = None
+        return {'schema': 1, 'primary': dict(primary), 'reviewer_actual': actual,
+                'repo': binding['repo'], 'pr': binding['pr'], 'head': head, 'packet_sha256': packet_sha256,
+                'author_rung': author_rung, 'reviewer_rung': selection['rung'],
+                'author_unknown': bool(selection['author_unknown']),
+                # reviewers run from a depth-1 snapshot in a one-shot process (--no-session-persistence / --ephemeral)
+                'isolated_snapshot': True, 'fresh_session': True,
+                'pr_base_oid': pr_base_oid, 'merge_base': merge_base, 'snapshot_base': base,
+                'paths_basis': 'merge-base+github-files',
+                'changed_paths': paths,
+                'changed_paths_sha256': hashlib.sha256('\n'.join(paths or []).encode()).hexdigest()}
+    except Exception as error:  # noqa: BLE001 - never raises; see the docstring
+        return _fallback_not_recorded('%s (%s)' % (type(error).__name__, str(error)[:200]))
 
 
 def file_followup_ticket(binding, waiver, runner=None):
