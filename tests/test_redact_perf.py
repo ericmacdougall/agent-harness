@@ -25,6 +25,9 @@ ADVERSARIAL = {
     "underscore-run": "a_" * (SIZE // 2),
     "underscore-keyword-run": "a_password_" * (SIZE // 11),
     "long-segment-run": ("a" * 200 + "_") * (SIZE // 201),
+    # a JWT start scanned a dotless run to its end, once per start (found by the 1-2 MB archive scaling test)
+    "jwt-dense": "eyJaaaaaaaa-" * (SIZE // 12),
+    "eyJ-run": "eyJ" * (SIZE // 3),
 }
 
 # The pre-#16680 shapes, kept only as the differential baseline: every value they redacted must still be redacted.
@@ -140,6 +143,22 @@ class PatternsAreLinear(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertNotIn(VALUE.encode(), _archive(text))
 
+    def test_jwt_starts_keep_their_coverage(self):
+        """The linear JWT start keeps every realistic form: at a token start, after a quote, =, : or a space, and
+        glued after a hyphen (redact.py's old \\b) or any token character (pass 2) when the header segment is at
+        most 256 characters."""
+        import transcript_redact
+        jwt = "eyJhbGciOiJSUzI1NiIsImtpZCI6IjEyMyJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0." + VALUE
+        v2 = next(p for k, _, p in transcript_redact._V2 if k == "v2-jwt")
+        rd = next(p for k, p in redact.PATTERNS if k == "jwt")
+        for lead in ("", " ", '"', "=", ":", "Bearer ", "x-", "a.b "):
+            with self.subTest(lead=lead):
+                self.assertTrue(rd.search(lead + jwt))
+                self.assertTrue(v2.search(lead + jwt))
+        for lead in ("abc", "x_", "9"):
+            with self.subTest(glued=lead):
+                self.assertTrue(v2.search(lead + jwt))
+
     def test_find_scales_linearly_without_chunks(self):
         """find() scans the whole text since the chunking was removed (GoodQA #16680), so the 256 KiB chunk no
         longer caps a superlinear pattern: every adversarial input at 2 MB may cost at most 3x its 1 MB CPU."""
@@ -166,6 +185,9 @@ class PatternsAreLinear(unittest.TestCase):
             "jwt-dense": lambda n: ("eyJaaaaaaaa-" * (n // 12 + 1))[:n],
             "dot-joined eyJ": lambda n: ("eyJaaaaaaaa." * (n // 12 + 1))[:n],
             "underscore-keyword": lambda n: ("bb_password_" * (n // 12 + 1))[:n],
+            # not a run for pass 1 (line breaks), but pass 2's break-free copy joins it into one dotless run
+            "eyJ-lines": lambda n: ("eyJ\n" * (n // 4 + 1))[:n],
+            "jwt-dense-lines": lambda n: ("eyJaaaaaaaa-\n" * (n // 13 + 1))[:n],
         }
         for name, make in shapes.items():
             with self.subTest(shape=name):

@@ -64,7 +64,11 @@ PATTERNS = [
     ('dropbox', re.compile(r'\bsl\.[A-Za-z0-9_-]{40,}')),
     ('slack', re.compile(r'\bxox[abposr]-[A-Za-z0-9-]{6,}')),
     ('npm', re.compile(r'\bnpm_[A-Za-z0-9]{30,}')),
-    ('jwt', re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
+    # A start inside a token (after a hyphen, which \b allowed) must reach its first dot within 256 characters: an
+    # unbounded segment rescanned a dotless run to its end once per start (eyJaaaaaaaa- repeated), which is
+    # quadratic. A start at a token boundary is unbounded, and there is one per token.
+    ('jwt', re.compile(r'(?:(?<![A-Za-z0-9_-])|(?<=-)(?=eyJ[A-Za-z0-9_-]{8,253}\.))'
+                       r'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
     ('bearer', re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}')),
     ('url-userinfo', re.compile(r'(?i)\b[a-z][a-z0-9+.-]{0,30}://[^\s/?#@]{1,256}@[^\s/?#]{1,256}')),
     ('named-credential', re.compile(r'(?i)' + _KEYS_SCAN_ANY + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),

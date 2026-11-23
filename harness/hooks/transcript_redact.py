@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.23-4"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.23-5"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2; read only by _decode_nested
 _MAX_QUOTED_LAYERS = 64  # at the limit, quoted JSON-string layers unwrapped while looking for an object or array
@@ -739,7 +739,10 @@ _V2 = [
     ('v2-huggingface', ('hf_',), re.compile(r'(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}')),
     ('v2-gitlab', ('glpat-',), re.compile(r'glpat-[0-9A-Za-z_\-]{20,}')),
     ('v2-npm', ('npm_',), re.compile(r'(?<![A-Za-z0-9])npm_[A-Za-z0-9]{36,}')),
-    ('v2-jwt', ('eyj',), re.compile(r'eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}')),
+    # Any start, as before, but one glued to a token character must reach its first dot within 256 characters
+    # (an unbounded first segment is quadratic on a dotless run such as eyJ repeated).
+    ('v2-jwt', ('eyj',), re.compile(r'(?:(?<![A-Za-z0-9_\-])|(?=eyJ[A-Za-z0-9_\-]{10,253}\.))'
+                                    r'eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}')),
     ('v2-pem', ('-----begin',), re.compile(r'-----BEGIN[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----')),
     ('v2-bearer', ('bearer',), re.compile(r'(?i)bearer[ \t:=]{1,4}(?=[A-Za-z0-9._~+/\-]{0,200}[0-9])[A-Za-z0-9._~+/\-]{16,}')),
     ('v2-keyword', ('passw', 'secret', 'api', 'access', 'auth', 'private'), re.compile(
