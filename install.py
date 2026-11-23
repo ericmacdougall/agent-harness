@@ -51,6 +51,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahc_core.py", "ahc_fs.py", "ahc_packet.py", "ahc_clone.py", "ahc_runner.py", "ahc_install.py",  # ahc daemon (goodqa#16034)
          "ahc_contracts.py", "ahc_crash.py", "ahc_migrate.py", "ahc_clock.py", "ahc_scan.py", "ahc_shadow.py", "ahc_guard.py",
          "ahc_observe.py", "ahc_w21.py", "ahc_review.py",
+         "self_serve.py", "ah_ops.py", "ah_parity.py",  # self-serve policy library, `ah ops` recipes, `ah ops doctor` parity (goodqa#16757)
          "ahc_release.json")  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
