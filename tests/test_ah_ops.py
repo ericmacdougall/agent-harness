@@ -44,6 +44,9 @@ class FakeSelfServe(types.ModuleType):
         super().__init__("self_serve")
         self.allow, self.scope, self.calls = allow, scope or {}, []
 
+    def consume(self, capability, **kw):  # ah_ops asks consume(); for a non-single-use scope that is grant()
+        return self.grant(capability, **kw)
+
     def grant(self, capability, *, actor, evidence=None, now=None, home=None):
         self.calls.append((capability, actor, evidence))
         if not self.allow:

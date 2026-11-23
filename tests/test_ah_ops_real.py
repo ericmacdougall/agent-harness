@@ -62,9 +62,11 @@ class Env(unittest.TestCase):
         self.patch(env)
         for key in ("AH_AGENT_ID", "CLAUDE_AGENT_ID", "AGENT_HARNESS_USAGE_DIR", "PYTHONPATH") + tuple(k for k in os.environ if k.startswith("CODEX_")):
             os.environ.pop(key, None)
+        # The library fixes home, proof root and clock itself (a caller cannot choose them); tests arm its private seam.
+        self.patch(mock.patch.dict(ss._SEAM, {"home": str(self.home), "claude_dir": str(self.claude), "clock": True}))
         ops._PROOF.clear()
         self.addCleanup(ops._PROOF.clear)
-        self.key = ed25519.Ed25519PrivateKey.generate()
+        self.key =ed25519.Ed25519PrivateKey.generate()
         self.pub = self.key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         self.install_policy(self.capabilities)
         self.fake = Fake()
@@ -265,11 +267,13 @@ class RealGrant(Env):
         os.environ["CODEX_THREAD_ID"] = "t"
         verified = SimpleNamespace(origin="openai", reason="running_code_verified")
         with mock.patch.object(ss, "_origin_probe", return_value=verified):
-            self.assertTrue(self.run_ops(*self.merge_args(path), main=False)["ok"])
-        self.assertEqual(self.grant_rows()[-1]["actor"], "codex_root")
-        self.fake.pr[7] = Fake.pr_state(HEAD)
-        with mock.patch.object(ss, "_origin_probe", return_value=SimpleNamespace(origin="claude", reason="running_claude_code_verified")):
+            # a Codex root cannot be told from a Codex helper, so the merge class is Claude-main-only (L1 CLAUDE_MAIN_ONLY)
             self.refused(*self.merge_args(path), main=False, code="no_grant")
+            self.assertEqual(self.merged_calls(), [])
+            self.assertIsNotNone(ss.grant("harness_repair", actor=ops.actor_facts(home=self.home), home=str(self.home)))
+        self.assertEqual(self.grant_rows()[-1]["actor"], "codex_root")
+        with mock.patch.object(ss, "_origin_probe", return_value=SimpleNamespace(origin="claude", reason="running_claude_code_verified")):
+            self.assertIsNone(ss.grant("harness_repair", actor=ops.actor_facts(home=self.home), home=str(self.home)))
 
     def test_policy_denylist_is_enforced_because_the_changed_paths_are_passed(self):
         self.install_policy({"merge_reviewed_pr": {"denylist_paths": ["docs/*"]}})
@@ -279,18 +283,20 @@ class RealGrant(Env):
         self.install_policy({"merge_reviewed_pr": {"denylist_paths": ["secrets/*"]}})
         self.assertTrue(self.run_ops(*self.merge_args(path))["ok"])  # the same scope merges a PR that stays clear of it
 
-    def test_the_floor_refuses_a_gate_file_before_the_grant_is_asked(self):
+    def test_there_is_no_built_in_floor_a_gate_file_merges(self):
+        """Allow every path (answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06)."""
         self.fake.files[7] = [["docs/a.md", None], [GATE_FILE, None]]
-        path = self.receipt()
-        error = self.refused(*self.merge_args(path), code="denylisted")
-        self.assertIn(GATE_FILE, error.message)
-        self.assertEqual(self.merged_calls(), [])
-        self.assertEqual(self.grant_rows(), [])
+        self.fake.pr[7] = Fake.pr_state(HEAD, changedFiles=2)
+        self.assertTrue(self.run_ops(*self.merge_args(self.receipt()))["ok"])
+        self.assertEqual(len(self.merged_calls()), 1)
+        self.assertFalse(hasattr(ops, "DENYLIST_FLOOR"))
 
-    def test_the_floor_sees_the_old_path_of_a_rename(self):
+    def test_a_signed_denylist_sees_the_old_path_of_a_rename(self):
+        self.install_policy({"merge_reviewed_pr": {"denylist_paths": ["*command_guard*"]}})
         self.fake.files[7] = [["docs/new-name.py", "harness/hooks/command_guard.py"], ["docs/a.md", None]]
         self.fake.pr[7] = Fake.pr_state(HEAD, changedFiles=2)
-        self.refused(*self.merge_args(self.receipt()), code="denylisted")
+        self.refused(*self.merge_args(self.receipt()), code="no_grant")
+        self.assertEqual(self.merged_calls(), [])
 
     def test_an_unknown_or_short_file_list_fails_closed(self):
         path = self.receipt()
@@ -325,16 +331,16 @@ class RealGrant(Env):
         self.assertTrue(out["ok"], out)
         self.assertEqual(len(self.merged_calls()), 1)
 
-    def test_central_merges_need_the_merge_capability_and_keep_the_floor(self):
+    def test_central_merges_need_the_merge_capability_and_honour_a_signed_denylist(self):
         item = "executive-synthesis:prj_abcd:run_abcd:wrk_abcd"
         hpath = self.receipt("h.md")
         self.install_policy({"central_decisions_agent_steps": {}})  # the recipe's own capability only
         args = ("ops", "central-decisions", "--harness-pr", "7", "--harness-receipt", hpath, "--item", item, "--apply")
         self.refused(*args, code="no_grant")
         self.assertEqual(self.merged_calls(), [])
-        self.install_policy({"central_decisions_agent_steps": {}, "merge_reviewed_pr": {}})
+        self.install_policy({"central_decisions_agent_steps": {}, "merge_reviewed_pr": {"denylist_paths": ["scripts/*"]}})
         self.fake.files[7] = [["docs/a.md", None], ["scripts/trust-central-decisions.sh", None]]
-        self.refused(*args, code="denylisted")
+        self.refused(*args, code="no_grant")
         self.assertEqual(self.merged_calls(), [])
 
 
@@ -456,10 +462,10 @@ class Loader(Env):
         good = {"capability": "merge_reviewed_pr", "policy_id": "a" * 32, "key_id": "b" * 16, "expires_at": None, "scope": {}}
         for bad in (dict(good, policy_id=None), dict(good, policy_id="x"), dict(good, key_id="short"), dict(good, scope=None),
                     {"capability": "merge_reviewed_pr", "scope": {}}, "yes"):
-            stub = SimpleNamespace(grant=lambda *a, _bad=bad, **k: _bad)
+            stub = SimpleNamespace(consume=lambda *a, _bad=bad, **k: _bad)
             with mock.patch.object(ops, "policy_library", lambda s=stub: s), self.assertRaises(ops.OpsError):
                 ops.require_grant("merge_reviewed_pr", actor={"kind": "claude_main"})
-        with mock.patch.object(ops, "policy_library", lambda: SimpleNamespace(grant=lambda *a, **k: good)):
+        with mock.patch.object(ops, "policy_library", lambda: SimpleNamespace(consume=lambda *a, **k: good)):
             self.assertEqual(ops.require_grant("merge_reviewed_pr", actor={"kind": "claude_main"}), good)
 
     def test_the_installer_gate_loads_ops_from_its_own_directory_too(self):
@@ -492,7 +498,7 @@ class ManifestGate(Env):
 
     def test_manifest_single_use_key_and_resume_key_differ(self):
         import ah_install as ai
-        self.install_policy({"install_files_manifest": {"single_use": True}})
+        self.install_policy({"install_files_manifest": {"single_use": True, "single_use_bind": ["repo", "host", "ref", "attempt"]}})
         self.as_main("install-files", "--host", "t2-dev", "--from-ref", REF, "--manifest")
         ai.require_manifest_grant("t2-dev", REF, self.home)
         self.as_main("install-files", "--resume", "ins-0123456789ab")
@@ -500,6 +506,48 @@ class ManifestGate(Env):
         self.as_main("install-files", "--host", "t2-dev", "--from-ref", REF, "--manifest")
         with self.assertRaises(ai.InstallError):  # the same install again: the key is spent
             ai.require_manifest_grant("t2-dev", REF, self.home)
+
+
+class HookWiring(Env):
+    """X4: the stamp writer is wired into the PreToolUse(Bash) hook that is actually installed (mission_gate pretool)."""
+
+    def test_the_installed_pretool_hook_writes_the_stamp_the_process_claims(self):
+        import mission_gate
+        argv = ("ops", "repair", "--check", "--ref", REF)
+        payload = self.hook_payload("python3 ~/.claude/hooks/ah.py " + " ".join(argv))
+        with mock.patch.object(mission_gate, "home_dir", return_value=self.home):
+            self.assertEqual(mission_gate.cmd_pretool(payload), {})  # never denies
+        ops.claim_main(list(argv), self.home)
+        self.assertEqual(ops.actor_facts(home=self.home).get("kind"), "claude_main")
+
+    def test_a_helper_payload_and_other_commands_write_no_stamp(self):
+        import mission_gate
+        with mock.patch.object(mission_gate, "home_dir", return_value=self.home):
+            mission_gate.cmd_pretool(self.hook_payload("python3 ~/.claude/hooks/ah.py ops repair --check --ref " + REF,
+                                                       transcript_path=str(self.claude / "projects" / "-x" / SID / "subagents" / "a.jsonl")))
+            mission_gate.cmd_pretool(self.hook_payload("echo hello"))
+        ops.claim_main(["ops", "repair", "--check", "--ref", REF], self.home)
+        self.assertNotIn("kind", ops.actor_facts(home=self.home))
+
+
+class ParityDispatch(unittest.TestCase):
+    """X5: `ah ops verify-parity` is dispatched next to `ah ops doctor` (ah_parity comes from lane L7)."""
+
+    def test_doctor_and_verify_parity_reach_ah_parity(self):
+        import ah
+        seen = []
+        fake = SimpleNamespace(doctor=lambda rest, home=None: seen.append(("doctor", rest)) or {"ok": True},
+                               verify_parity=lambda rest, home=None: seen.append(("verify-parity", rest)) or {"ok": True})
+        with mock.patch.dict(sys.modules, {"ah_parity": fake}):
+            ah._ops_doctor(["--host", "mac"], None)
+            ah._ops_doctor([], None, "verify-parity")
+        self.assertEqual(seen, [("doctor", ["--host", "mac"]), ("verify-parity", [])])
+
+    def test_an_ah_parity_without_the_gate_form_says_so(self):
+        import ah
+        with mock.patch.dict(sys.modules, {"ah_parity": SimpleNamespace(doctor=lambda *a, **k: {})}):
+            with self.assertRaises(ah.AhError):
+                ah._ops_doctor([], None, "verify-parity")
 
 
 if __name__ == "__main__":
