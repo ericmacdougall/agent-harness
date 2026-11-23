@@ -663,6 +663,13 @@
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
+ "tests/test_redact_perf.py": {
+  "counts": {
+   "bearer:prefix": 1,
+   "high-entropy": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
  "tests/test_redact_shapes.py": {
   "counts": {
    "redact:named-credential:prefix": 2
@@ -671,7 +678,9 @@
  },
  "tests/test_redaction.py": {
   "counts": {
+   "bearer:prefix": 1,
    "redact:named-credential:prefix": 8,
+   "redact:oauth-json": 1,
    "redact:url-userinfo:prefix": 4
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
@@ -750,9 +759,11 @@
  },
  "tests/test_transcript_redact.py": {
   "counts": {
-   "bearer:prefix": 4,
+   "bearer:prefix": 7,
+   "github-classic:prefix": 2,
    "openai:prefix": 5,
-   "redact:named-credential:prefix": 6
+   "redact:named-credential:prefix": 6,
+   "slack:prefix": 1
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
