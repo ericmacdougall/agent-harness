@@ -93,6 +93,54 @@ def classify(home: Path, now: float | None = None, max_age: int = MAX_AGE_SECOND
     return {"state": "fresh" if age <= max_age else "stale", "age": age}
 
 
+TREES = (".claude/wals", ".codex/sessions", ".claude/projects")   # tier-1 trees with their own markers (goodqa#16660)
+SOURCES_SUMMARY = "log-backup.sources"
+
+
+def tree_key(rel: str) -> str:
+    """The script's live_key: one leading dot dropped, then / and . become _ (.claude/wals -> claude_wals)."""
+    return (rel[1:] if rel.startswith(".") else rel).replace("/", "_").replace(".", "_")
+
+
+def source_freshness(home: Path, now: float | None = None, max_age: int = MAX_AGE_SECONDS) -> list[dict]:
+    """One entry per tier-1 tree: its own last-ok (written when nothing of it is pending) and the files still pending
+    after the last run. Informational: only log-backup.last-ok makes the backup fresh."""
+    now = time.time() if now is None else now
+    logs = logs_dir(home)
+    pending = {}
+    for line in (read_small(logs / SOURCES_SUMMARY) or "").splitlines():
+        m = re.fullmatch(r"(\S+) pending=([0-9]{1,9}|unknown) ok=\S+", line.strip())
+        if m:
+            pending[m.group(1)] = None if m.group(2) == "unknown" else int(m.group(2))
+    out = []
+    for rel in TREES:
+        stamp = parse_stamp(read_small(logs / f"log-backup.source.{tree_key(rel)}.last-ok"))
+        age = None if stamp is None else now - stamp
+        if stamp is None:
+            state = "missing"
+        elif age < -FUTURE_TOLERANCE_SECONDS:
+            state = "invalid"
+        else:
+            age = max(age, 0.0)
+            state = "fresh" if age <= max_age else "stale"
+        out.append({"source": rel, "state": state, "age_seconds": None if age is None else int(age),
+                    "pending": pending.get(rel)})
+    return out
+
+
+def source_note(home: Path, max_age: int = MAX_AGE_SECONDS) -> str:
+    """Per-tree freshness for an alert about a stale tier 1, so a backlog in one tree does not hide the others."""
+    parts = []
+    for s in source_freshness(home, max_age=max_age):
+        text = f"{s['source']} {s['state']}"
+        if s["age_seconds"] is not None:
+            text += f" ({human_age(s['age_seconds'])})"
+        if s["pending"] is not None:
+            text += f", {s['pending']} files pending"
+        parts.append(text)
+    return " Per tree: " + "; ".join(parts) + "."
+
+
 def printable(text: str) -> str:
     """Control characters stripped: state files are untrusted when shown on a terminal."""
     return "".join(c if c.isprintable() or c == " " else "?" for c in text.strip())
@@ -197,7 +245,8 @@ def cmd_check(args) -> int:
     if args.json:
         print(json.dumps({**result, "bulk": bulk["state"]}))
     elif result["state"] != "fresh":
-        print(choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home))
+        print(choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home)
+              + source_note(args.home, args.max_age))
     elif bulk["state"] in ("stale", "missing", "invalid"):
         print(choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home))
     else:
@@ -217,7 +266,8 @@ def cmd_session_start(args) -> int:
         bulk = bulk_classify(args.home)
         text = ""
         if result["state"] != "fresh":
-            text = choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home)
+            text = (choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home)
+                    + throttle_note(args.home) + source_note(args.home, args.max_age))
         elif bulk["state"] in ("stale", "missing", "invalid"):
             text = choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home)
         if text:
@@ -263,6 +313,7 @@ def status_json(home: Path, max_age: int = MAX_AGE_SECONDS) -> dict:
             "last_skip": printable(read_small(logs / LAST_SKIP) or ""),
             "last_throttled": printable(read_small(logs / THROTTLED) or ""),
             "lock": lock_holder(home),
+            "sources": source_freshness(home, max_age=max_age),
             "ok": transcripts["state"] == "fresh" and bulk["state"] in ("fresh", "pending")}
 
 
@@ -281,6 +332,9 @@ def cmd_status(args) -> int:
     print(f"throttled    : {printable(read_small(logs / THROTTLED) or 'never')} (a run that stopped early on the Dropbox rate limit)")
     print(f"lock         : {lock_holder(args.home)}")
     print(f"bulk lane    : {lock_holder(args.home, LANE_LOCK_DIR)}; last lane run {printable(read_small(logs / LANE_LAST_RUN) or 'never')}")
+    for s in source_freshness(args.home, max_age=args.max_age):
+        pend = "unknown" if s["pending"] is None else str(s["pending"])
+        print(f"tree         : {s['source']} {s['state']} (age {human_age(s['age_seconds'])}), {pend} files pending after the last run")
     return 0 if result["state"] == "fresh" else 1
 
 

@@ -23,7 +23,7 @@
 #   LOG_BACKUP_DEADLINE_GRACE_SECONDS / LOG_BACKUP_KILL_GRACE_SECONDS  a copy past its share gets SIGTERM after the
 #                           first (default 10) and SIGKILL after the second more (default 10)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
-#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 300 in the lane run, 100 otherwise, 1-99999),
+#   LOG_BACKUP_BULK_CHUNK   files per checkpointed copy, bulk and tier-1 trees (default 300 in the lane run, 100 otherwise, 1-99999),
 #                           never more than fit the time left at about 2 rate-limited operations a file
 #   LOG_BACKUP_BULK_LANE    exactly 1 runs the bulk tier as its own detached run (the bulk lane), so tier 1 can no
 #                           longer use up the bulk tier's time. The lane yields to tier 1 (goodqa#15147): it never
@@ -41,7 +41,9 @@
 # (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
 # is written only after every tier-2 source copied cleanly. A run skipped because another run holds the lock writes
 # log-backup.last-skip and touches neither marker. With the lane on, the lane run writes bulk-last-ok and its own
-# log-backup.lane.last-run; the scheduled run's last-run then reads bulk=lane.
+# log-backup.lane.last-run; the scheduled run's last-run then reads bulk=lane. Each tier-1 tree also writes its own
+# log-backup.source.KEY.last-ok when nothing of it is pending, and log-backup.sources lists the pending counts
+# (goodqa#16660); neither replaces last-ok.
 set -u
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 cd / || exit 1
@@ -324,11 +326,21 @@ ok=0 found=0 primary=0 throttled=0 throttle_src=
 STAGE=${LOG_BACKUP_STAGE:-$HOME/.agent-harness/backup-stage}
 # Live sources (transcripts and WALs grow while uploaded, so Dropbox's hash check would fail) are snapshotted into a
 # local stage first and uploaded from there. Static sources upload in place, skipping files younger than 2 minutes.
-# Smallest first, .claude/projects last (goodqa#15044 N2): the single files and the WAL tree finish in seconds, and
-# the large, always-changing transcript tree then gets all the time that is left instead of a fixed early share.
-LIVE=(.claude/history.jsonl .codex/history.jsonl .agent-harness/work-assignments.json .agent-harness/work-ledger.json
+# The single files go first and finish in seconds. The three trees follow, each with an equal share of the time left
+# (a tree that finishes early leaves its time to the later ones), and the first tree rotates from run to run so no
+# tree is always the one cut short (goodqa#16660).
+LIVE_FILES=(.claude/history.jsonl .codex/history.jsonl .agent-harness/work-assignments.json .agent-harness/work-ledger.json
   .agent-harness/work-ledger.events.jsonl .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl
-  .agent-harness/work-ledger.spool.jsonl .claude/wals .codex/sessions .claude/projects)
+  .agent-harness/work-ledger.spool.jsonl)
+TREES=(.claude/wals .codex/sessions .claude/projects)
+LIVE_STATE="$LOGDIR/log-backup.live.d"   # tier 1's own checkpoints; the bulk tier's are in log-backup.bulk.d
+LIVE=("${LIVE_FILES[@]}")
+if [ "$TIER" != bulk ]; then
+  rot=$(cat "$LOGDIR/log-backup.rotate" 2>/dev/null)
+  printf '%s' "$rot" | grep -Eq '^(0|[1-9][0-9]{0,8})$' || rot=0
+  echo $(( (rot + 1) % 1000000 )) > "$LOGDIR/log-backup.rotate"
+  for i in 0 1 2; do LIVE+=("${TREES[$(( (rot + i) % 3 ))]}"); done
+fi
 DIRECT=(.codex/archived_sessions .agent-harness/work)
 if [ "$TIER" != bulk ]; then   # the stage belongs to tier 1: the lane run must never rebuild or clear it mid-snapshot
 command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
@@ -536,6 +548,75 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   fi
 }
 
+# goodqa#16660: a plain copy of a tree walks the Dropbox destination with one rate-limited list call per directory
+# (Dropbox has no ListR), so .claude/wals (5323 directories, about 2660 s at 2/s) could never finish in a 780 s run. A
+# tier-1 tree is therefore never traversed on the remote. Every run lists its local stage and sends, newest first and
+# with --no-traverse, only the lines (path, size, mtime) not in $LIVE_STATE/KEY/verified. Each chunk that copies
+# cleanly is added to verified, so a run cut short resumes and a file changed later is listed again and sent again.
+# The tree is complete when nothing is pending: verified becomes this run's listing (dropping deleted files) and the
+# source writes log-backup.source.KEY.last-ok. Copies end at the source's share (RESERVE keeps the later trees theirs).
+live_key() { printf '%s' "${1#.}" | tr '/.' '__'; }
+live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
+  local snap="$1" rel="$2" clean="$3" st key total cur=0 n size fit f0=$found p0=$primary
+  key=$(live_key "$rel"); st="$LIVE_STATE/$key"
+  printf -v "PEND_$key" '%s' unknown
+  mkdir -p "$st" && chmod 700 "$LIVE_STATE" "$st" || { say "cannot create tier-1 state for $rel"; ok=1; return; }
+  if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then   # verified belongs to one destination
+    : > "$st/verified" && printf '%s\n' "$R" > "$st/remote" || { say "cannot reset tier-1 state for $rel"; ok=1; return; }
+  fi
+  touch "$st/verified"
+  "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --exclude-from "$EXCLUDES" --ignore-case -- "$snap" \
+    </dev/null > "$st/listing.tmp" 2>> "$LOG"
+  rc=$?
+  if [ $rc -ne 0 ]; then say "listing $rel failed (rclone exit $rc)"; ok=1; rm -f "$st/listing.tmp"; return; fi
+  n=$(awk -F'\t' 'NF != 3 {bad++} END {print bad + 0}' "$st/listing.tmp")
+  [ "$n" = 0 ] || { say "$rel: $n paths with a tab or newline cannot be listed safely; not backed up, run not fresh"; ok=1; clean=0; }
+  # Names the remote refuses (goodqa#16123) are never offered, even when the exclude list lacks them: counted, not failed.
+  local refused_awk='/(^|\/)(desktop\.ini|thumbs\.db|\.ds_store|icon\r|\.dropbox|\.dropbox\.attr)$/'
+  n=$(LC_ALL=C awk -F'\t' "NF == 3 && tolower(\$1) ~ $refused_awk {r++} END {print r + 0}" "$st/listing.tmp")
+  [ "$n" = 0 ] || note_refused "$rel" "$n" "left out of the listing, refused"
+  LC_ALL=C awk -F'\t' "NF == 3 && tolower(\$1) !~ $refused_awk" "$st/listing.tmp" > "$st/listing" && rm -f "$st/listing.tmp" \
+    && awk -F'\t' 'FILENAME == ARGV[1] {v[$0] = 1; next} !($0 in v)' "$st/verified" "$st/listing" \
+       | LC_ALL=C sort -t $'\t' -k3,3r -k1,1 > "$st/pending" || { say "cannot build the $rel pending list"; ok=1; return; }
+  total=$(wc -l < "$st/pending" | tr -d ' ')
+  while [ "$cur" -lt "$total" ]; do
+    fit=$(( $(time_left) - ${RESERVE:-0} ))
+    if [ "$fit" -lt "$MIN_SLICE" ]; then
+      say "$rel: its share of the run is used up at $cur of $total pending files; the next run continues"
+      ok=1; budget_hit=1; break
+    fi
+    size=$BULK_CHUNK fit=$(( fit * TPSLIMIT / 2 ))   # about 2 rate-limited operations a file
+    [ "$fit" -ge "$size" ] || size=$fit
+    [ "$size" -ge 1 ] || size=1
+    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk" && cut -f1 "$st/chunk" > "$st/chunk.paths" \
+      || { say "cannot read the $rel chunk"; ok=1; break; }
+    n=$(wc -l < "$st/chunk" | tr -d ' ')
+    upload "$snap" "$rel" --files-from-raw "$st/chunk.paths" --no-traverse
+    [ "$copied" -eq 1 ] || break   # upload said why and marked the run
+    cat "$st/chunk" >> "$st/verified" || { say "cannot record the $rel chunk; it is sent again"; ok=1; break; }
+    cur=$((cur + n))
+  done
+  found=$f0 primary=$p0   # one source counts once, and only when it is complete
+  printf -v "PEND_$key" '%s' $(( total - cur ))
+  [ "$cur" -ge "$total" ] || return
+  mv "$st/listing" "$st/verified" || { say "cannot record the $rel listing"; ok=1; return; }
+  found=$((found + 1))
+  case "$rel" in .claude/projects|.codex/sessions)
+    [ -z "$(find "$HOME/$rel" -type f -print -quit 2>/dev/null)" ] || primary=$((primary + 1)) ;;
+  esac
+  [ "$clean" = 1 ] || return
+  echo "$STARTED pending=0" > "$LOGDIR/log-backup.source.$key.last-ok.tmp.$$" \
+    && mv "$LOGDIR/log-backup.source.$key.last-ok.tmp.$$" "$LOGDIR/log-backup.source.$key.last-ok"
+}
+live_summary() { # log-backup.sources: one line per tree, read by log_backup.py status
+  local t key p okv
+  for t in "${TREES[@]}"; do
+    key=$(live_key "$t"); p="PEND_$key"; p=${!p:-unknown}
+    okv=$(cut -d' ' -f1 "$LOGDIR/log-backup.source.$key.last-ok" 2>/dev/null); okv=${okv:-never}
+    printf '%s pending=%s ok=%s\n' "$t" "$p" "$okv"
+  done > "$LOGDIR/log-backup.sources.tmp.$$" && mv "$LOGDIR/log-backup.sources.tmp.$$" "$LOGDIR/log-backup.sources"
+}
+
 # Bulk sources are far too large for one run (Mac 2026-11-07: 620k files in the work tree, about 7 minutes of copy
 # time per run). A fresh copy re-checked the same first files every run and never got further (goodqa#15062), so
 # a bulk pass is a generation with a checkpoint under $BULK_STATE/KEY:
@@ -712,14 +793,24 @@ elif [ "$TIER" = live ] && bulk_due; then
 fi
 transcripts_ok=0
 if [ "$TIER" != bulk ]; then
-later=0
+later=0 trees_left=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
+for src in "${TREES[@]}"; do [ -d "$HOME/$src" ] && [ ! -L "$HOME/$src" ] && trees_left=$((trees_left + 1)); done
 for src in "${LIVE[@]}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   later=$((later - 1)); [ $later -ge 0 ] || later=0
   # A later copy that hangs costs its slice, both graces and about 3 s to snapshot the source first.
   RESERVE=$(( later * (MIN_SLICE + DEADLINE_GRACE + KILL_GRACE + 3) ))
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
+  is_tree=0
+  case " ${TREES[*]} " in *" $src "*) [ -d "$HOME/$src" ] && is_tree=1 ;; esac
+  if [ $is_tree -eq 1 ]; then
+    # An equal share of what is left for this tree and the trees after it (goodqa#16660), never less than the floor.
+    share_reserve=$(( $(time_left) * (trees_left - 1) / (trees_left > 0 ? trees_left : 1) ))
+    [ $share_reserve -le $RESERVE ] || RESERVE=$share_reserve
+    trees_left=$((trees_left - 1))
+  fi
+  snap_clean=1
   snap="$STAGE/$src"
   mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
   if [ -d "$HOME/$src" ]; then
@@ -733,15 +824,16 @@ for src in "${LIVE[@]}"; do
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
-      say "snapshot partial (rsync exit 23): $src"; ok=1
+      say "snapshot partial (rsync exit 23): $src"; ok=1; snap_clean=0
     elif [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
       say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
     fi
   else
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
-  upload "$snap" "$src"
+  if [ $is_tree -eq 1 ]; then live_upload "$snap" "$src" "$snap_clean"; else upload "$snap" "$src"; fi
 done
+live_summary
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
 say "transcripts exit=$ok sources=$found remote=${R%%:*}"
