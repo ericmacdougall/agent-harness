@@ -28,7 +28,9 @@ HERE = Path(__file__).resolve().parent
 REMOTE_HOSTS = ("t2-dev",)
 HOSTS = ("local",) + REMOTE_HOSTS
 MAX_REASON = 500
-VERIFIER_VERSION = 2
+VERIFIER_VERSION = 3
+HEAD_RE = re.compile(r"[0-9a-f]{40,64}")
+SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 PATH_RE = re.compile(r"/[A-Za-z0-9_@+=:,.-]+(?:/[A-Za-z0-9_@+=:,.-]+)*")
 
 
@@ -78,8 +80,12 @@ def check_path(path):
     return path
 
 
-def _argv(host, path, authenticated):
+def _argv(host, path, authenticated, expect_head=None, caller_session=""):
     tail = ["remove-worktree", "--path", path] + (["--remote-auth"] if authenticated else [])
+    if expect_head:
+        tail += ["--expect-head", expect_head]
+    if caller_session:
+        tail += ["--caller-session", caller_session]
     if host == "local":
         return [sys.executable, "-I", str(HERE / "command_guard.py"), *tail]
     cmd = "python3 -I .claude/hooks/command_guard.py " + " ".join(shlex.quote(t) for t in tail)
@@ -96,12 +102,13 @@ CALL_TIMEOUT = VERIFY_SECONDS + SCAN_SECONDS + REMOVE_SECONDS + CONNECT_SECONDS 
 UNKNOWN = "the outcome is unknown: the removal may already have happened, check the host before retrying"
 
 
-def _call(runner, host, path, authenticated):
+def _call(runner, host, path, authenticated, expect_head=None, caller_session=""):
     """Run the verifier. Once the runner has started, every failure here leaves the outcome UNKNOWN: the remote command
     keeps running after an ssh client dies and a garbled answer may still come from a verifier that removed the tree,
     so no message from here says that nothing was removed."""
     try:
-        done = runner(_argv(host, path, authenticated), capture_output=True, text=True, timeout=CALL_TIMEOUT)
+        done = runner(_argv(host, path, authenticated, expect_head, caller_session), capture_output=True, text=True,
+                      timeout=CALL_TIMEOUT)
         data = json.loads(done.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         raise WorktreeError("host_unreachable", "could not run the verifier on %s (%s)" % (host, UNKNOWN), 3)
@@ -118,9 +125,17 @@ def _call(runner, host, path, authenticated):
     return data
 
 
-def remove(host, path, reason, authenticated=False, session="", agent="", home=None, runner=subprocess.run):
+def remove(host, path, reason, authenticated=False, session="", agent="", home=None, runner=subprocess.run,
+           expect_head=None, caller_session=""):
+    """caller_session is the calling agent's own session (from its environment, never from a flag): the verifier refuses a
+    path inside another session's work directory unless that session is retired. expect_head pins the HEAD the caller
+    saw (a takeover plan), so a worktree that moved since is refused."""
     if host not in HOSTS:
         raise WorktreeError("bad_request", "--host must be one of %s" % ", ".join(HOSTS))
+    if expect_head is not None and not HEAD_RE.fullmatch(str(expect_head)):
+        raise WorktreeError("bad_request", "expect_head must be a full commit id")
+    if caller_session and not SESSION_RE.fullmatch(str(caller_session)):
+        raise WorktreeError("bad_request", "the caller session is not a valid session id")
     path = check_path(path)
     reason = (reason or "").strip()
     if not reason or len(reason) > MAX_REASON or re.search(r"[\x00-\x08\x0b-\x1f\x7f]", reason):
@@ -134,7 +149,8 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
     who = {"session": session or None, "agent": agent or None}
     try:
         audit(home, {"event": "start", "run": run_id, "host": host, "path": path, "reason": reason,
-                     "remote_auth": bool(authenticated), "caller": who})
+                     "remote_auth": bool(authenticated), "caller": who, "expect_head": expect_head,
+                     "caller_session": caller_session or None})
     except OSError:
         raise WorktreeError("audit_failed", "could not write the audit row; nothing was run, nothing was removed", 3)
     # Once the runner has been started the outcome is UNKNOWN until the verifier answers: a killed ssh client does not stop
@@ -142,7 +158,7 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
     outcome = {"event": "result", "run": run_id, "host": host, "path": path, "removed": None,
                "why": "no answer from the verifier (outcome unknown)"}
     try:
-        result = _call(runner, host, path, authenticated)
+        result = _call(runner, host, path, authenticated, expect_head, caller_session)
         # A definite outcome needs a definite answer: `removable: false` is a refusal (nothing ran); `removable: true`
         # needs a real boolean `removed`, and a null or missing one is an unknown outcome (red-team r4 F2).
         partly = False

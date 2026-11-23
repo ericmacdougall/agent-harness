@@ -126,7 +126,9 @@ class CorpusTests(Fixture):
     def test_work_tree_allows(self):
         # This lightweight fixture is not a real registered worktree. The corpus pins routing of the one safe
         # command shape; test_command_guard_worktree_remove.py proves the verifier against real repositories.
-        with mock.patch.object(cg, 'linked_worktree_remove_refusal', return_value=None):
+        # The caller owns work/S (takeover: another session's worktree is refused at the hook, see ForeignSession).
+        with mock.patch.object(cg, 'linked_worktree_remove_refusal', return_value=None), \
+                mock.patch.object(cg, 'HOOK_SESSION', 'S'):
             self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
 
     def test_heredoc_with_destructive_text_is_never_silent(self):

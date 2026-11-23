@@ -661,6 +661,10 @@ def session_state(old, action, home, probe, now, caller, remote=None, tasks_fn=N
     if any(e.get("probe_failed") for e in evs):
         return _result("unknown", ["probe_failed"], ev)
     if not holders:
+        if remote == LOCAL_ONLY:
+            # This host has no WAL for the session, and the other host was not consulted: a Mac session whose worktree
+            # sits here would look "walless". Only a two-host judgement may say walless; the verifier never does.
+            return _result("unknown", ["origin_unreachable"], ev)
         return _walless_state(old, action, evs, now, ev)
     origin = holders[0]
     info = {"flavor": origin["flavors"][0], "origin_host": origin.get("host"), "cont_state": origin.get("cont_state"),
@@ -823,15 +827,14 @@ def process_candidates(old, home, probe, last_activity, table=None, spawns=None,
     if len(readable) > ENV_READ_CAP:
         raise ProbeFailed("more than %d processes to inspect" % ENV_READ_CAP)
     pairs = probe.env_pairs(readable)
-    start_of = spawn_start or (lambda pid: None)
+    start_of = spawn_start or (lambda pid: ak().spawn_start(probe, pid) if spawns else None)
     candidates, basis = {}, {}
     for pid in readable:
         row = table[pid]
         if pid in excluded or pid <= 1 or any(a in hosts for a in _ancestors(table, pid)):
             continue
         ids = {value for _flavor, value in pairs.get(pid, ())}
-        if caller and caller in ids:
-            continue
+        # a marker of the caller or of any other session never matches `ids == {old}` or the empty set below
         if ids == {old}:
             kind = "marker"
         elif not ids and (pid, start_of(pid)) in spawns:
@@ -896,7 +899,9 @@ def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None):
 # ------------------------------------------------------------------------------------------- orchestration
 
 def caller_of(home, environ=None):
-    """The caller's session id: CLAUDE_CODE_SESSION_ID, else CODEX_THREAD_ID; its WAL dir must exist on this host."""
+    """The caller's session id: CLAUDE_CODE_SESSION_ID, else CODEX_THREAD_ID (CLAUDE_SESSION_ID is deliberately not read);
+    its WAL dir must exist on this host. Assumes the Codex WAL directory is named for CODEX_THREAD_ID (T2, unverified):
+    if it is not, a Codex caller is unknown and every foreign removal is refused, never allowed."""
     environ = os.environ if environ is None else environ
     for name, parent in (("CLAUDE_CODE_SESSION_ID", (".claude", "wals")), ("CODEX_THREAD_ID", (".agent-harness", "codex-wals"))):
         value = environ.get(name, "")

@@ -276,6 +276,16 @@ class Predicate(TakeoverCase):
         self.jsonl(self.home / ".claude" / "projects" / "-p" / (OLD + ".jsonl"), [{"timestamp": iso(NOW - 99 * HOUR)}], NOW - 99 * HOUR)
         self.assertEqual(self.state("worktrees")["state"], "unknown", "a transcript means the session existed: not walless")
 
+    def test_a_host_judging_alone_never_calls_an_unseen_session_walless(self):
+        # t2-dev holds an old work dir of a MAC session and has no WAL for it: only a two-host judgement may say walless
+        work = self.home / ".agent-harness" / "work" / OLD
+        (work / "proj").mkdir(parents=True)
+        self.touch(work / "proj", NOW - 2 * 86400)
+        self.touch(work, NOW - 2 * 86400)
+        out = self.state("worktrees", remote=tk.LOCAL_ONLY)
+        self.assertEqual((out["state"], out["reasons"]), ("unknown", ["origin_unreachable"]), out)
+        self.assertEqual(self.state("worktrees")["state"], "walless", "with the other host's evidence it still is")
+
     def test_unknown_session_has_no_state(self):
         out = self.state(old="00000000-none-0000")
         self.assertEqual((out["state"], out["reasons"]), ("unknown", ["session_unknown"]))
@@ -597,6 +607,95 @@ class Context(TakeoverCase):
         self.assertEqual(self.kills[0][1], [300])
         self.assertTrue(self.kills[0][3]["foreign"])
         self.assertTrue(out["ok"])
+
+
+class CLI(TakeoverCase):
+    """The ah.py surface: `takeover` and the audited stop's --dry-run, through ah.main with a temporary AH_HOME."""
+
+    def setUp(self):
+        super().setUp()
+        import ah
+        self.ah = ah
+        ak._kill_guard().ensure_key(str(self.home))
+
+    def run_ah(self, *argv, caller=None):
+        import contextlib
+        import io
+        out = io.StringIO()
+        env = {"AH_HOME": str(self.home), "HOME": str(self.home)}
+        if caller:
+            env["CLAUDE_CODE_SESSION_ID"] = caller
+        with mock.patch.dict(os.environ, env), mock.patch.object(tk, "HostProbe", lambda: self.probe), \
+                mock.patch.object(tk, "fetch_remote_evidence", lambda old, **kw: EMPTY_REMOTE), \
+                mock.patch.object(tk, "default_tasks", lambda home: list(self.tasks)), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = self.ah.main(list(argv))
+        text = out.getvalue()
+        return code, (json.loads(text) if text.strip().startswith("{") else text)
+
+    def test_evidence_only_is_read_only_json_that_needs_no_caller(self):
+        self.codex_session()
+        code, data = self.run_ah("takeover", "status", "--from", OLD, "--evidence-only", "--json")
+        self.assertEqual(code, 0, data)
+        self.assertEqual((data["version"], data["flavors"], data["cont_state"], data["declared_stop"]), (1, ["codex"], "handoff", True))
+        self.assertIn("process_candidates", data)
+        self.assertFalse(Path(tk.claim_path(str(self.home), OLD)).exists())
+
+    def test_status_reports_the_verdict_for_a_known_caller(self):
+        self.codex_session()
+        (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
+        with mock.patch.object(tk.time, "time", lambda: NOW):
+            code, data = self.run_ah("takeover", "status", "--from", OLD, caller=CALLER)
+        self.assertEqual((code, data["state"], data["reasons"]), (0, "retired", []), data)
+
+    def test_an_unknown_caller_or_session_is_unknown_never_retired(self):
+        self.codex_session()
+        code, data = self.run_ah("takeover", "status", "--from", OLD)
+        self.assertEqual((data["state"], data["reasons"]), ("unknown", ["caller_unknown"]))
+        (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
+        code, data = self.run_ah("takeover", "status", "--from", "00000000-none", caller=CALLER)
+        self.assertEqual((data["state"], data["reasons"]), ("unknown", ["session_unknown"]))
+
+    def test_a_bad_id_and_a_missing_ticket_are_refused(self):
+        code, data = self.run_ah("takeover", "status", "--from", "Bad/Id")
+        self.assertNotEqual(code, 0)
+        self.assertIn("bad_id", json.dumps(data))
+        (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
+        code, data = self.run_ah("takeover", "cleanup", "--from", OLD, "--action", "worktrees", "--reason", "r",
+                                 "--ticket", "nope", "--apply", caller=CALLER)
+        self.assertNotEqual(code, 0)
+
+    def test_dry_run_of_the_audited_stop_never_signals_and_takeover_of_needs_expect_start(self):
+        sleeper = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.terminate)
+        code, data = self.run_ah("kill", "--dry-run", "--foreign", "--pid", str(sleeper.pid), "--reason", "probe")
+        self.assertEqual((code, data["dry_run"], data["results"][0]["status"]), (0, True, "would-stop"), data)
+        self.assertIsNone(sleeper.poll(), "a dry run must leave the process alone")
+        code, data = self.run_ah("kill", "--dry-run", "--foreign", "--pid", str(sleeper.pid), "--reason", "probe", "--takeover-of", OLD)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--expect-start", json.dumps(data))
+        self.assertIsNone(sleeper.poll())
+
+
+class RealProbe(unittest.TestCase):
+    """HostProbe on this machine, read only, on a child this test starts (T3: does `ps eww` show an own process's marker)."""
+
+    def test_the_scans_see_a_child_its_marker_and_its_directory(self):
+        marker = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        with tempfile.TemporaryDirectory() as tmp:
+            # a Python child, not /bin/sleep: macOS hides the environment of platform binaries from `ps eww` (T3)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=tmp,
+                                     env=dict(os.environ, CLAUDE_CODE_SESSION_ID=marker))
+            self.addCleanup(child.wait)
+            self.addCleanup(child.terminate)
+            probe = tk.HostProbe()
+            table = probe.proc_table()
+            self.assertEqual(table[child.pid]["ppid"], os.getpid())
+            self.assertIsNotNone(table[child.pid]["start"])
+            self.assertIn("time.sleep", table[child.pid]["command"])
+            self.assertEqual(probe.env_pairs([child.pid])[child.pid], {("claude", marker)})
+            self.assertEqual(os.path.realpath(probe.cwd_scan()[child.pid]), os.path.realpath(tmp))
 
 
 class SecretHygiene(TakeoverCase):

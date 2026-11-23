@@ -1260,7 +1260,6 @@ class CodexHomeHarnessCli(WorldCase):
         "HOME=/tmp/x; python3 -I ~/.codex/agent-harness/wal_note.py --note 'kill'",  # ~ may no longer be the install root
         "HOME=/tmp/x python3 -I ~/.codex/agent-harness/wal_note.py --note 'kill'",
         "FOO=1 python3 -I ~/.codex/agent-harness/wal_note.py --note 'kill'",  # an assignment prefix stays refused
-        "python3 -I ~/.codex/agent-harness/ah.py kill --pid 4242 --reason r",
         "python3 -I ~/.codex/agent-harness/wal_note.py --note 'x'; python3 -c 'import os; os.kill(5, 9)'",
         "python3 -I -c 'import os; os.kill(5, 9)' ~/.codex/agent-harness/wal_note.py",
     ]
@@ -1272,6 +1271,18 @@ class CodexHomeHarnessCli(WorldCase):
 
     def test_everything_else_still_blocks(self):
         for cmd in self.CODE:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], 'block', cmd)
+
+    def test_the_literal_audited_stop_is_allowed_from_the_codex_copy_too(self):
+        # takeover cleanup (goodqa#16441): the Codex install now carries the audited stop, so its literal form is exempt
+        for cmd in ("python3 -I ~/.codex/agent-harness/ah.py kill --pid 4242 --reason r",
+                    "python3 -I ~/.codex/agent-harness/ah.py kill --pid 4242 --reason r --dry-run"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self.decide(cmd)[0], 'allow', cmd)
+        for cmd in ("python3 -I ~/.codex/agent-harness/ah.py kill --pid 4242 --reason r --bogus",
+                    "python3 -I ./.codex/agent-harness/ah.py kill --pid 4242 --reason r",
+                    "python3 -I ~/.codex/other/ah.py kill --pid 4242 --reason r"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self.decide(cmd)[0], 'block', cmd)
 

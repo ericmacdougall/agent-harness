@@ -2183,8 +2183,9 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, ba
 
 
 WORKTREE_HOME_DENY = ('.claude', '.codex', '.ssh', '.config', '.gnupg', '.aws', '.kimi-code', 'library', '.trash')
-VERIFIER_VERSION = 2  # `ah worktree-remove` refuses a verifier that does not report this (an old install on the target)
-GITHUB_REMOTE = re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
+VERIFIER_VERSION = 3  # `ah worktree-remove` refuses a verifier that does not report this (an old install on the target)
+HOOK_SESSION = None  # the PreToolUse payload's session_id (set by hook_main): the caller of a worktree removal in the hook
+GITHUB_REMOTE =re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
 
 
 def worktree_scope_refusal(path, *, _managed_copy=None):
@@ -2205,6 +2206,53 @@ def worktree_scope_refusal(path, *, _managed_copy=None):
             return None
         return 'under ~/.agent-harness only a worktree inside work/ is removable'
     return None
+
+
+def work_session_of(path, home=None):
+    """The session directory name when `path` is inside ~/.agent-harness/work/<session>/..., else None. Compared
+    case-folded (APFS is case insensitive)."""
+    base = os.path.join(os.path.realpath(home or os.path.expanduser('~')), '.agent-harness', 'work')
+    if not path.casefold().startswith((base + os.sep).casefold()):
+        return None
+    parts = path[len(base) + 1:].split(os.sep)
+    return parts[0] if parts and parts[0] else None
+
+
+def _takeover():
+    """takeover.py, loaded by path: the hooks run under python -I, so the script directory is not on sys.path."""
+    import importlib.util
+    loaded = sys.modules.get('takeover')
+    if loaded is not None and hasattr(loaded, 'session_state'):
+        return loaded
+    spec = importlib.util.spec_from_file_location('takeover', os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                           'takeover.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def foreign_session_refusal(path, caller, action='worktrees', home=None, judge=None):
+    """Why a path inside ~/.agent-harness/work/<S>/ may not be removed by `caller`, or None.
+
+    Another session's directory is removable only when that session is retired or walless (takeover.session_state, judged
+    on this host). An empty or unknown caller counts as foreign. Paths outside work/ are not this rule's business. This
+    check lives in the verifier, which every removal route reaches (the hook's lone form, `ah worktree-remove`, a direct
+    `remove-worktree`), so a policy sentence or a clever command shape cannot route around it."""
+    owner = work_session_of(os.path.realpath(path), home)
+    if owner is None or (caller and owner.casefold() == str(caller).casefold()):
+        return None
+    try:
+        takeover = _takeover()
+        verdict = (judge or (lambda s: takeover.session_state(
+            s, action, os.path.realpath(home or os.path.expanduser('~')), takeover.HostProbe(), time.time(), caller,
+            takeover.LOCAL_ONLY)))(owner)
+    except Exception as error:  # noqa: BLE001 - a judge that fails is a refusal
+        return 'foreign session %s could not be judged (%s); run ah takeover status --from %s' % (
+            owner[:40], type(error).__name__, owner[:40])
+    if verdict.get('state') in ('retired', 'walless'):
+        return None
+    return 'foreign session %s is %s (%s); run ah takeover status --from %s' % (
+        owner[:40], verdict.get('state'), ','.join(verdict.get('reasons') or ())[:80] or 'no reason', owner[:40])
 
 
 def _primary_and_urls(path):
@@ -2594,11 +2642,15 @@ def _same_worktree_directory(path, expected):
     return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == expected
 
 
-def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
-                    _managed_copy=None, _before_remove=None, _managed_lock_fds=()):
+def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *, caller_session=None,
+                    session_judge=None, _managed_copy=None, _before_remove=None, _managed_lock_fds=()):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
     compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
-    removal is audited on this host (the audit of `ah` lives on the caller's host)."""
+    removal is audited on this host (the audit of `ah` lives on the caller's host). A path inside another session's
+    work directory is refused unless that session is retired or walless (foreign_session_refusal)."""
+    foreign = foreign_session_refusal(path, caller_session, judge=session_judge) if _managed_copy is None else None
+    if foreign:
+        return {'path': path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION, 'reason': foreign}
     try:
         before = os.lstat(path)
     except OSError as error:
@@ -2683,6 +2735,11 @@ def _worktree_instead(reason):
     (ah worktree-remove runs the full verifier, on this Mac or t2-dev). None when no reason is known."""
     if not reason:
         return None
+    if str(reason).startswith('foreign session '):
+        owner = str(reason).split()[2].rstrip(':')
+        return ('%s. Run python3 -I ~/.claude/hooks/ah.py takeover status --from %s (Codex: ~/.codex/agent-harness/ah.py), '
+                'then takeover plan --from %s. Dirty or unpublished worktrees are kept: list them for their owner'
+                % (_clean_reason(reason), owner, owner))
     return ('verifier: %s. %s%s' % (_clean_reason(reason), (_worktree_next_step(reason) or '') + '; or ' if
                                     _worktree_next_step(reason) else '',
                                     'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local|t2-dev --path <abs path> '
@@ -5826,8 +5883,10 @@ class Analyzer:
             targets = _nondash(args[i + 2:])
             one_target = len(targets) == 1  # the verifier judged ONE path; with several its reason belongs to none
             for w in targets:
+                reason_here = getattr(self, '_worktree_reason', None) if rest[:1] == ['remove'] and one_target else None
                 refused = self.refuse('git worktree remove', w,
-                                      instead=_worktree_instead(getattr(self, '_worktree_reason', None) if rest[:1] == ['remove'] and one_target else None))
+                                      instead=_worktree_instead(reason_here) or (
+                                          self._worktree_shape_advice(w) if rest[:1] == ['remove'] else None))
                 if rest[:1] == ['remove'] and not refused:
                     reason = getattr(self, '_worktree_reason', None) if one_target else None
                     ctx.add(LOG_DELETE, 'linked-worktree-remove',
@@ -7190,6 +7249,30 @@ class Analyzer:
         r'^[ \t]*git[ \t]+(?:-C[ \t]+(' + _LITERAL + r')[ \t]+)?worktree[ \t]+remove[ \t]+(?:--[ \t]+)?'
         r'(' + _LITERAL + r')[ \t]*$')
 
+    def _worktree_shape_advice(self, word):
+        """W1: advice for a `git worktree remove` of a path inside a session's work directory that was blocked by the
+        shape of the command (a loop, `&&`, a variable, --force, several paths). It never turns a block into an allow;
+        it names the routes that work, instead of the Dropbox backup that only fits deleting logs."""
+        try:
+            cls, path, _literal = self.target_class(word)
+            if cls not in ('root', 'unknown') or not path or not os.path.isabs(path):
+                return None
+            path = os.path.realpath(path)
+            owner = work_session_of(path)
+            if owner is None or worktree_scope_refusal(path) is not None:
+                return None
+        except Exception:  # noqa: BLE001 - advice is optional
+            return None
+        tail = 'Dirty or unpublished worktrees are kept: list them for their owner.'
+        if HOOK_SESSION and owner.casefold() == str(HOOK_SESSION).casefold():
+            return ('run one standalone command: git -C /abs/repo worktree remove /abs/top (a single literal path: no &&, ;, '
+                    'loop, variable, quote, --force or second path), or preferably python3 -I ~/.claude/hooks/ah.py '
+                    'worktree-remove --host local|t2-dev --path <abs top> --reason <why> (Codex: '
+                    '~/.codex/agent-harness/ah.py). ' + tail)
+        return ('this worktree belongs to session %s, not to you. Run python3 -I ~/.claude/hooks/ah.py takeover status '
+                '--from %s, then takeover plan --from %s (Codex: ~/.codex/agent-harness/ah.py). ' % (owner[:40], owner[:40],
+                                                                                                    owner[:40]) + tail)
+
     def _removable_linked_worktree(self, args, cwd_words=()):
         """A standalone `git [-C /literal/repo] worktree remove /literal/top`; every other shape keeps the ordinary
         refusal."""
@@ -7214,6 +7297,12 @@ class Analyzer:
         cls, path, literal = self.target_class(word)
         if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
             self._worktree_reason = 'the path is not a literal top inside a harness work root, so the guard does not verify it'
+            return False
+        owner = work_session_of(os.path.realpath(path))
+        if owner is not None and not (HOOK_SESSION and owner.casefold() == str(HOOK_SESSION).casefold()):
+            # Another session's worktree (or a caller the hook cannot name): never from the hook, which runs no ps, lsof or
+            # ssh. `ah takeover` judges whether that session is retired; the verifier enforces the same rule again.
+            self._worktree_reason = 'foreign session %s: only its own agent, or a takeover once it is retired, may remove it' % owner[:40]
             return False
         started = time.monotonic()
         try:
@@ -8008,6 +8097,10 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         return 'block', format_block(Finding(LOG_DELETE, 'approval-env', 'runs approve-delete with HOME, '
                                              'CLAUDE_CONFIG_DIR or an env wrapper, which could point it at a forged '
                                              'transcript or state', 'run command_guard.py approve-delete plainly'))
+    rules = takeover_rules_refusal(command if isinstance(command, str) else ' '.join(map(str, command)), HOOK_SESSION)
+    if rules:
+        return 'block', format_block(Finding(LOG_DELETE, 'takeover-rules', rules, 'use the literal takeover form; a '
+                                             'refusal is final for that target'))
     try:
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
@@ -9771,6 +9864,27 @@ def install_files_refusal(command, is_main, home=None):
     return None
 
 
+TAKEOVER_WORDS = ('takeover', 'remove-worktree', 'continuation', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID')
+
+
+def takeover_rules_refusal(text, session):
+    """The refusal text of takeover_rules (W2 form, G2 caller binding, G3 identity, G4 continuation, G5 user script), or None.
+    Text only: accident prevention, see takeover_rules.py. A missing or broken module never blocks anything else."""
+    if not any(word in text for word in TAKEOVER_WORDS):
+        return None
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('takeover_rules', os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'takeover_rules.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.refusal(text, session)
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 - the rules are an addition: their own failure must not stop an ordinary command
+        return None
+
+
 def _install_files_main(payload):
     """Prove a main caller for the installed hook-file deploy command only."""
     try:
@@ -9834,6 +9948,9 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         command, ps = extract_command(payload)
         if command is None:
             return 0
+        global HOOK_SESSION
+        HOOK_SESSION = (str(payload.get('session_id') or payload.get('sessionId') or '') or None) \
+            if isinstance(payload, dict) else None
         install_text = command if isinstance(command, str) else ' '.join(map(str, command))
         if 'install' in re.sub(r'[\'"\\]', '', install_text):  # after quote removal: install-file""s is still the command
             refusal = install_files_refusal(command, lambda: _install_files_main(payload))
@@ -10053,6 +10170,7 @@ def main(argv=None):
     check.add_argument('command')
     check.add_argument('--ps', action='store_true')
     check.add_argument('--cwd')
+    check.add_argument('--session', help='judge the command as this session (what the hook payload\'s session_id is)')
     exp = sub.add_parser('explain', help='decision and every finding for a command read from a file')
     exp.add_argument('--file', required=True)
     exp.add_argument('--ps', action='store_true')
@@ -10082,6 +10200,8 @@ def main(argv=None):
                         help='read the remote with this host\'s own credentials (private repository); refs cannot be supplied')
         if name == 'remove-worktree':
             wt.add_argument('--expect-head')
+            wt.add_argument('--caller-session', help='the calling agent session (ah worktree-remove passes it); a path '
+                            'in another session\'s work directory needs that session retired or walless')
     sub.add_parser('revoke-delete')
     scan = sub.add_parser('scan-wal')
     scan.add_argument('paths', nargs='+')
@@ -10089,6 +10209,8 @@ def main(argv=None):
     if args.cmd == 'hook':
         return hook_main(args.format)
     if args.cmd == 'check':
+        global HOOK_SESSION
+        HOOK_SESSION = args.session or None
         c = Compiled(load_policy(), cwd=args.cwd)
         verdict, message = decide(args.command, c, cwd=args.cwd, ps=args.ps, marker=Approvals(compiled=c))
         print(json.dumps({'verdict': verdict, 'message': message}))
@@ -10160,7 +10282,8 @@ def main(argv=None):
         if args.cmd == 'verify-worktree':
             result = verify_worktree(args.path, args.remote_auth, policy)
         else:
-            result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy)
+            result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy,
+                                     caller_session=args.caller_session)
         print(json.dumps(result))
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':

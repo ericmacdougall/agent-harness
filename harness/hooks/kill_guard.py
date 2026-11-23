@@ -540,6 +540,22 @@ def pure_data_python(code):
     return True
 
 
+_TAKEOVER_RULES = None
+
+
+def takeover_rules():
+    """takeover_rules.py, loaded by path (the hooks run under python -I): the one grammar of `ah.py takeover` and the
+    G3/G5 text rules, shared with command_guard."""
+    global _TAKEOVER_RULES
+    if _TAKEOVER_RULES is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('takeover_rules', str(HERE / 'takeover_rules.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _TAKEOVER_RULES = module
+    return _TAKEOVER_RULES
+
+
 def hook_script_ok(raw, names, codex=False):
     """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else.
     With codex=True the Codex install copy ~/.codex/agent-harness/<name>.py counts as well (goodqa#15565)."""
@@ -1646,6 +1662,7 @@ def make_analyzer_class(cg):
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
                 if not self.is_codex_note(words, cmd, depth, pl) and not self.is_ah_kill(name, args, cmd, depth) \
+                        and not self.is_ah_takeover(name, args, cmd, depth) \
                         and not self.is_harness_cli(name, args, cmd, depth):
                     self.check_interpreter(name, texts, cmd, args)
             self.check_spawn(name, args, texts, depth, pl, idx)
@@ -1839,30 +1856,38 @@ def make_analyzer_class(cg):
             while i < len(texts) and texts[i] in ('-B', '-u'):
                 i += 1
             # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
-            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill' \
+            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',), codex=True) or texts[i + 1] != 'kill' \
                     or self.home_moved():
                 return False
             if texts[i + 2:] in (['--help'], ['-h']):
                 return True  # usage text only: ah.py prints it and exits before any process is touched
-            rest, i, seen, given_session = texts[i + 2:], 0, set(), None
+            rest, i, seen, given_session, expect_starts = texts[i + 2:], 0, set(), None, 0
             while i < len(rest):
                 t = rest[i]
                 key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
                 if key == '--session-scope' and not eq and not self.main:
                     return False  # main only: a subagent's payload carries agent_id (goodqa#15253)
-                if key in ('--tree', '--foreign', '--session-scope') and not eq:
+                if key in ('--tree', '--foreign', '--session-scope', '--dry-run') and not eq:
+                    if key in seen:
+                        return False
                     seen.add(key)
                     i += 1
                     continue
                 if key == '--approved-by' and not self.main:
                     return False  # main only: a subagent cannot spend the user's approval (goodqa#15253)
-                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session', '--approved-by'):
+                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session', '--approved-by',
+                               '--expect-start', '--takeover-of'):
                     return False
                 if not eq:
                     if i + 1 >= len(rest):
                         return False
                     val, i = rest[i + 1], i + 1
                 i += 1
+                if key == '--expect-start':  # narrowing only: the (pid, start) a takeover planned; repeatable
+                    expect_starts += 1
+                    if expect_starts > 64 or not re.fullmatch(r'[0-9]{1,7}:[0-9]{9,11}', val):
+                        return False
+                    continue
                 if key in seen:
                     return False
                 seen.add(key)
@@ -1883,6 +1908,9 @@ def make_analyzer_class(cg):
                 elif key == '--approved-by':
                     if not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', val):
                         return False
+                elif key == '--takeover-of':
+                    if not re.fullmatch(r'[a-z0-9][a-z0-9._-]{7,127}', val):
+                        return False
                 elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
                     return False
                 if key == '--session':
@@ -1891,6 +1919,29 @@ def make_analyzer_class(cg):
                     and given_session != self.session:
                 return False  # delta red-team D-F2: main may not use another session's spawns or asks
             return '--pid' in seen and '--reason' in seen
+
+        def is_ah_takeover(self, name, args, cmd, depth):
+            """True only for the literal `python3 -I <installed ah.py> takeover (status|claim|plan|cleanup) ...` of the
+            takeover_rules grammar, so a reason that happens to say "kill" is not read as interpreter code. Every flag is
+            validated there; anything else returns False and is judged by the ordinary interpreter rules."""
+            if not INTERPRETER_NAME.fullmatch(name) or not name.startswith('python') or self.remote or depth:
+                return False
+            if getattr(cmd, 'redirs', None):
+                return False
+            if any(a.dynamic or a.subs or a.glob for a in args):
+                return False
+            words = getattr(cmd, 'words', None) or []
+            if not words or words[0].raw is None or words[0].raw != name:
+                return False
+            texts = [a.text for a in args]
+            if len(texts) < 3 or texts[0] != '-I' or not hook_script_ok(args[1].raw, ('ah',), codex=True) \
+                    or texts[2] != 'takeover' or self.home_moved():
+                return False
+            try:
+                rules = takeover_rules()
+                return rules._takeover_problem([name, '-I', args[1].raw] + texts[2:]) is None
+            except Exception:  # noqa: BLE001 - an unreadable grammar keeps the ordinary rules
+                return False
 
         def check_interpreter(self, name, texts, cmd, args=None):
             if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
@@ -2146,6 +2197,13 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
     if policy['mode'] == 'off':
         return 'allow', '', '', ()
     raw = ' '.join(map(str, command)) if isinstance(command, (list, tuple)) else str(command)
+    if any(word in raw for word in ('takeover', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID')):
+        try:  # G3 (the caller sets no identity) and G5 (the user's script): the same text rules command_guard applies
+            text_rule = takeover_rules().refusal(raw, session, only=('G3', 'G5', 'W2'))
+        except Exception:  # noqa: BLE001 - the rules are an addition; their own failure never blocks another command
+            text_rule = None
+        if text_rule:
+            return 'block', 'takeover-rules', block_message('takeover-rules', text_rule), ()
     analyzer = None
     try:
         cg = _import_base()

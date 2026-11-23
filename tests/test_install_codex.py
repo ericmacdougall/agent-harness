@@ -710,3 +710,44 @@ class CodexCopiesTheDropboxBudget(unittest.TestCase):
         import install_codex
         self.assertIn('heavy_job_guard.py', install_codex.DELIVERY_HELPERS)
         self.assertIn('dropbox_budget.conf', install_codex.DELIVERY_HELPERS)
+
+
+class AhCommandImportsShip(unittest.TestCase):
+    """AC-9: the Codex copy of ah.py runs `ah.py kill --dry-run ...` and `ah.py takeover ...`, so every harness module
+    those commands load (an import in the module, or a name handed to a by-path loader) must ship there. ah.py itself is
+    judged by its module-level imports only: its other subcommands load more, and are not part of this change. `wal`,
+    `ah` and `ops_watch` are best effort or already shipped under their own checks."""
+    ROOTS = ('ah.py', 'ah_kill.py', 'takeover.py', 'takeover_rules.py', 'ah_worktree.py')
+    LOADERS = {'_sibling', '_kill_guard', '_provenance', '_takeover'}
+    OPTIONAL = {'wal.py', 'ah.py', 'ops_watch.py'}
+
+    def modules(self, name):
+        import ast
+        hooks = ROOT / 'harness' / 'hooks'
+        tree = ast.parse((hooks / name).read_text())
+        if name == 'ah.py':
+            nodes = [n for top in tree.body if not isinstance(top, (ast.FunctionDef, ast.ClassDef)) for n in ast.walk(top)]
+        else:
+            nodes = list(ast.walk(tree))
+        found = set()
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                found |= {alias.name.split('.')[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                found.add(node.module.split('.')[0])
+            elif isinstance(node, ast.Call) and getattr(node.func, 'id', None) in self.LOADERS:
+                found |= {arg.value for arg in node.args if isinstance(arg, ast.Constant) and isinstance(arg.value, str)}
+        return {m + '.py' for m in found if (hooks / (m + '.py')).exists()}
+
+    def test_every_module_the_commands_load_ships_to_the_codex_directory(self):
+        import install_codex
+        missing = {}
+        for name in self.ROOTS:
+            for module in self.modules(name) - self.OPTIONAL:
+                if module not in install_codex.DELIVERY_HELPERS:
+                    missing.setdefault(module, []).append(name)
+        self.assertEqual(missing, {})
+        for name in self.ROOTS:  # the commands themselves, ah_kill.py included (it was missing before this change)
+            self.assertIn(name, install_codex.DELIVERY_HELPERS)
+        import install
+        self.assertTrue({'takeover.py', 'takeover_rules.py'} <= set(install.HOOKS))

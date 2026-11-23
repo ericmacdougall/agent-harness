@@ -3740,6 +3740,12 @@ def build_parser():
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
     kp.add_argument("--via", help=argparse.SUPPRESS)
+    kp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="report would-stop, refused or gone for every pid, signal nothing, raise no notice (audited as dry_run)")
+    kp.add_argument("--expect-start", dest="expect_start", action="append", metavar="PID:EPOCH",
+                    help="narrowing only: a pid is stopped only when its start time is EPOCH (takeover hands over the "
+                         "(pid, start) it planned; a reused pid is refused as candidate_changed)")
+    kp.add_argument("--takeover-of", dest="takeover_of", metavar="SESSION", help=argparse.SUPPRESS)
     wp = sub.add_parser("worktree-remove", help="remove ONE verified clean, published linked worktree here or on t2-dev "
                         "(audited; see ah_worktree.py; no --force exists)")
     wp.add_argument("--host", required=True, help="local or t2-dev")
@@ -3749,7 +3755,28 @@ def build_parser():
                     help="private repository: the verifier reads the remote with the TARGET host's own credentials in a "
                          "scrubbed environment (branch refs cannot be supplied by the caller)")
     wp.add_argument("--session")
+    wp.add_argument("--expect-head", dest="expect_head", help="a full commit id: refuse when the worktree HEAD is another")
     wp.add_argument("--agent", help="calling agent id for the audit row")
+    tp = sub.add_parser("takeover", help="clean up a STOPPED session's leftovers (worktrees, processes) when it is retired: "
+                        "claim, status, plan, cleanup (see takeover.py; no flag relaxes a check)")
+    tps = tp.add_subparsers(dest="tsub", required=True)
+    for tname in ("status", "claim", "plan", "cleanup"):
+        t = tps.add_parser(tname)
+        t.add_argument("--from", dest="from_session", required=True, help="the stopped session's id")
+        if tname in ("status", "plan"):
+            t.add_argument("--action", choices=("worktrees", "processes"), default="worktrees")
+        if tname == "status":
+            t.add_argument("--evidence-only", dest="evidence_only", action="store_true",
+                           help="this host's raw evidence as JSON (read only, needs no caller; what the other host reads)")
+            t.add_argument("--json", action="store_true")
+        if tname in ("claim", "cleanup"):
+            t.add_argument("--reason", required=True)
+            t.add_argument("--ticket", required=True, help='"GoodQA <project>#<n>"')
+        if tname == "cleanup":
+            t.add_argument("--action", choices=("worktrees", "processes", "stale-helpers"), required=True)
+            t.add_argument("--path", action="append", help="narrow to this candidate worktree (never adds a target)")
+            t.add_argument("--pid", action="append", type=int, help="narrow to this candidate pid (never adds a target)")
+            t.add_argument("--apply", action="store_true", help="act; without it the command is a plan")
     ip = sub.add_parser("install-files", help="install MERGED listed hook files on a remote host (audited; see ah_install.py; "
                         "the bytes come only from a commit on the canonical main; main only)")
     ip.add_argument("--host", required=True, help="t2-dev or ah-mac-mini")
@@ -3920,23 +3947,43 @@ def run(args, home: Path) -> dict:
                     raise ah_kill.KillError("bad_request", "--session-scope and --approved-by use this session only; "
                                             "drop --session or pass this session's id")
                 session = own
+            expect = _parse_expect_start(args.expect_start)
+            predicate = None
+            if args.takeover_of:
+                expect, predicate = _takeover_candidates(args.takeover_of, expect, home)
             if args.host:
                 return ah_kill.kill_remote(args.host, pids, (args.reason or "").strip(), args.tree, args.grace,
-                                           args.session or env_session(), agent, home, foreign=args.foreign)
+                                           args.session or env_session(), agent, home, foreign=args.foreign,
+                                           dry_run=args.dry_run, expect=expect, takeover_of=args.takeover_of)
             return ah_kill.kill_local(pids, args.reason, args.tree, args.grace, home,
                                       session=session, agent=agent, wal_path=args.wal,
                                       via=args.via, foreign=args.foreign, session_scope=args.session_scope,
-                                      approved_by=args.approved_by)
+                                      approved_by=args.approved_by, dry_run=args.dry_run, expect=expect,
+                                      predicate=predicate)
         except ah_kill.KillError as e:
             raise AhError(e.code, str(e), e.exit_code)
     if cmd == "worktree-remove":
         import ah_worktree
         try:
+            # The verifier judges "own session" by the caller's environment identity (a WAL dir that exists), never by a
+            # flag the caller can set and never by the CLAUDE_SESSION_ID fallback env_session() allows.
+            import takeover
             return ah_worktree.remove(args.host, args.path, args.reason, args.remote_auth,
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
-                                      home)
+                                      home, expect_head=args.expect_head,
+                                      caller_session=takeover.caller_of(home) or "")
         except ah_worktree.WorktreeError as e:
             raise AhError(e.code, str(e), e.exit_code)
+    if cmd == "takeover":
+        import takeover
+        import ah_kill
+        import ah_worktree
+        try:
+            return _takeover_command(args, home)
+        except (takeover.TakeoverError, ah_kill.KillError, ah_worktree.WorktreeError) as e:
+            raise AhError(e.code, str(e), e.exit_code)
+        except takeover.ProbeFailed as e:
+            raise AhError("probe_failed", "a process probe failed (%s); nothing was changed" % e, 3)
     if cmd == "install-files":
         import ah_install
         session = env_session() or ""
@@ -3955,6 +4002,88 @@ def run(args, home: Path) -> dict:
                 print(json.dumps(e.data, indent=2, default=str))
             raise AhError(e.code, str(e), e.exit_code)
     raise AhError("unknown_command", cmd)
+
+
+def _parse_expect_start(values):
+    """{pid: start epoch} from repeated --expect-start PID:EPOCH, or None when it was not given."""
+    if not values:
+        return None
+    out = {}
+    for value in values:
+        m = re.fullmatch(r"([0-9]{1,7}):([0-9]{9,11})", value or "")
+        if not m or len(out) >= 64:
+            raise AhError("bad_request", "--expect-start needs PID:EPOCH (at most 64)")
+        out[int(m.group(1))] = int(m.group(2))
+    return out
+
+
+def _takeover_candidates(session, expect, home):
+    """`ah kill --takeover-of S`: the candidate rule for S, evaluated on THIS host, narrowing what --expect-start named. It
+    never adds a target and never lifts a refusal: --foreign and every ah_kill refusal still apply."""
+    import takeover
+    if not expect:
+        raise AhError("bad_request", "--takeover-of needs --expect-start for every pid it may stop")
+    if not takeover.ID_RE.fullmatch(session or ""):
+        raise AhError("bad_request", "--takeover-of needs a session id")
+    # no start-time bound here: the host that knows the session's last activity applied it before choosing the pids
+    _found, predicate, _basis = takeover.process_candidates(session, str(home), takeover.HostProbe(), None,
+                                                            caller=takeover.caller_of(home))
+    return expect, predicate
+
+
+def _takeover_context(home):
+    import ah_kill
+    import ah_worktree
+    import takeover
+    caller = takeover.caller_of(home)
+    agent = os.environ.get("AH_AGENT_ID", "")
+
+    def remove(host, path, reason, expect_head=None, caller_session=""):
+        return ah_worktree.remove(host, path, reason, False, caller or "", agent, home, expect_head=expect_head,
+                                  caller_session=caller_session or caller or "")
+
+    def kill_local(pids, reason, **kw):
+        return ah_kill.kill_local(pids, reason, home=home, session=caller or "", agent=agent, **kw)
+
+    def kill_remote(host, pids, reason, tree, grace, **kw):
+        return ah_kill.kill_remote(host, pids, reason, tree, grace, session=caller or "", agent=agent, home=home, **kw)
+
+    def spawns(old):
+        try:
+            return ah_kill.session_spawns(home, ah_kill.session_work_dir(home, old))
+        except Exception:  # noqa: BLE001 - no ledger means no ledger candidates, never a guess
+            return set()
+
+    def ticket_exists(ref):
+        return bool(ticket_get(ref).get("issue"))
+
+    return takeover.Context(home, caller, probe=takeover.HostProbe(), remove=remove, kill_local=kill_local,
+                            kill_remote=kill_remote, spawns_fn=spawns, ticket_lookup=ticket_exists,
+                            host=socket.gethostname().split(".")[0])
+
+
+def _takeover_command(args, home):
+    import takeover
+    old = args.from_session
+    if not takeover.ID_RE.fullmatch(old or ""):
+        raise takeover.TakeoverError("bad_id", "--from must be a lowercase session id (8 to 128 characters)")
+    if args.tsub == "status" and args.evidence_only:
+        import ah_kill
+        try:
+            spawns = ah_kill.session_spawns(home, ah_kill.session_work_dir(home, old))
+        except Exception:  # noqa: BLE001
+            spawns = set()
+        return takeover.collect_evidence(old, str(home), takeover.HostProbe(), time.time(), spawns, with_processes=True)
+    ctx = _takeover_context(home)
+    if args.tsub == "status":
+        state, _remote = takeover.status(old, args.action, ctx)
+        return {"ok": True, "session": old, "action": args.action, **state}
+    if args.tsub == "claim":
+        return takeover.claim(old, ctx, args.reason, args.ticket)
+    if args.tsub == "plan":
+        return takeover.cleanup(old, args.action, ctx, "plan", None, apply=False)
+    return takeover.cleanup(old, args.action, ctx, args.reason, args.ticket, paths=args.path or (), pids=args.pid or (),
+                            apply=args.apply)
 
 
 CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "

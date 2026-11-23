@@ -57,6 +57,9 @@ class WorktreeRemoveCase(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.policy = cg.load_policy(path=str(self.home / 'missing-policy.json'))
+        patch = mock.patch.object(cg, 'HOOK_SESSION', 'S')  # the hook's caller owns work/S (takeover: foreign sessions)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _restore_home(self):
         if self.old_home is None:
@@ -137,7 +140,7 @@ class WorktreeRemoveCase(unittest.TestCase):
             preview = cg.verify_worktree(str(self.linked), policy=policy)
             self.assertTrue(preview.get('removable'), preview)
             self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
         self.assertTrue(result.get('removed'), result)
         self.assertFalse(self.linked.exists())
         self.assertEqual(cg.load_marker(self.home)[0], [])
@@ -152,7 +155,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', side_effect=late_change):
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
         self.assertFalse(result['removed'])
         self.assertFalse(result['removable'])
         self.assertTrue(self.linked.exists())
@@ -168,7 +171,7 @@ class WorktreeRemoveCase(unittest.TestCase):
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', return_value=idle):
             self.assertTrue(cg.verify_worktree(str(self.linked), policy=policy)['removable'])
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
         self.assertFalse(result['removed'])
         self.assertEqual(first.read_bytes(), b'x' * info.st_size)
         self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
@@ -197,7 +200,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', side_effect=revoke_during_final_check):
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
         self.assertFalse(result['removed'])
         self.assertTrue(all(path.exists() for path in paths))
         self.assertEqual(cg.load_marker(self.home)[0], [])
@@ -211,7 +214,7 @@ class WorktreeRemoveCase(unittest.TestCase):
                 replaced = dict(actual, **changes)
                 cg._store_entry(replaced, str(paths[1]), time.time(), str(self.home))
                 with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)):
-                    result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+                    result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
                 self.assertFalse(result['removed'])
                 self.assertTrue(all(path.exists() for path in paths))
                 self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
@@ -258,7 +261,7 @@ class WorktreeRemoveCase(unittest.TestCase):
                 mock.patch.object(cg._IgnoredBackups, 'consume', late), \
                 mock.patch.object(cg.Approvals, '_recheck_backups', checked), \
                 mock.patch.object(cg, '_worktree_audit') as audit:
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
         self.assertEqual(calls, [mutation])
         self.assertFalse(result['removed'], result)
         self.assertTrue(all(path.exists() for path in paths))
@@ -291,7 +294,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         def remove():
             try:
-                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy))
+                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S'))
             except BaseException as error:
                 errors.append(error)
 
@@ -326,11 +329,11 @@ class WorktreeRemoveCase(unittest.TestCase):
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', return_value=idle), \
                 mock.patch.object(cg.subprocess, 'run', fail_remove):
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
             self.assertFalse(result['removed'], result)
             self.assertIn('injected Git removal failure', result['reason'])
             self.assertEqual(cg.load_marker(self.home)[0], [])
-            retry = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+            retry = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
         self.assertFalse(retry['removed'], retry)
         self.assertEqual(len(git_removals), 1, 'retry must not reach Git with spent approvals')
         self.assertTrue(all(path.exists() for path in paths))
@@ -366,7 +369,7 @@ class WorktreeRemoveCase(unittest.TestCase):
                     mock.patch.object(cg, 'busy_scan', return_value=idle), \
                     mock.patch.object(cg._IgnoredBackups, 'locked_scope_matches', slow_scope), \
                     mock.patch.object(cg, '_worktree_audit') as audit:
-                result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy)
+                result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
                 self.assertFalse(audit.called, 'expired authority must not reach Git intent')
         finally:
             if advanced:
@@ -402,7 +405,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         def remove():
             try:
-                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy))
+                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S'))
             except BaseException as error:
                 errors.append(error)
 
@@ -657,3 +660,83 @@ class WorktreeRemoveDashC(WorktreeRemoveCase):
         if upper.exists():  # case-insensitive volume (macOS default): the spelling differs, the directory is the same
             self.assertEqual(self.decide(ok, cwd=upper / 'node_modules' / 'a' / 'b')[0], 'block')
         self.assertEqual(self.decide(ok, cwd=deep)[0], 'block')
+
+
+class ShapeAdvice(WorktreeRemoveCase):
+    """W1: a removal blocked by its SHAPE names the routes that work (never the Dropbox text), and still blocks."""
+
+    def blocked(self, command, session='S'):
+        with mock.patch.object(cg, 'HOOK_SESSION', session):
+            verdict, text = self.decide(command)
+        self.assertEqual(verdict, 'block', command)
+        return text
+
+    def wrong_shapes(self):
+        p = str(self.linked)
+        return ['git worktree remove --force %s' % p, 'git worktree remove %s && echo ok' % p,
+                'git worktree remove %s %s' % (p, p), 'P=%s; git worktree remove $P' % p,
+                'git worktree remove "%s"' % p,
+                'W=%s; for b in linked; do git -C %s worktree remove $W/$b 2>&1 | tail -1; done' % (self.base, self.primary)]
+
+    def test_own_session_gets_the_lone_form_and_ah_worktree_remove(self):
+        for command in self.wrong_shapes():
+            with self.subTest(command=command[:60]):
+                text = self.blocked(command)
+                self.assertIn('ah.py worktree-remove --host local|t2-dev', text)
+                self.assertIn('git -C /abs/repo worktree remove /abs/top', text)
+                self.assertIn('list them for their owner', text)
+                self.assertNotIn('Dropbox', text)
+                self.assertNotIn('approve-delete', text)
+
+    def test_a_foreign_session_gets_only_the_takeover_route(self):
+        for command in self.wrong_shapes():
+            with self.subTest(command=command[:60]):
+                text = self.blocked(command, session='T')
+                self.assertIn('takeover status --from S', text)
+                self.assertNotIn('worktree-remove --host', text)
+                self.assertNotIn('Dropbox', text)
+
+    def test_the_log_and_state_targets_keep_the_dropbox_advice(self):
+        for target in ('~/.claude/wals/zz/main.jsonl', self.base / 'x.jsonl', self.home / '.agent-harness/work/S/kit.json'):
+            with self.subTest(target=str(target)):
+                with mock.patch.object(cg, 'HOOK_SESSION', 'S'):
+                    verdict, text = self.decide('rm -rf %s' % target)
+                self.assertEqual(verdict, 'block')
+                self.assertIn('Dropbox', text)
+        # outside work/ nothing changed: it is no session directory, so no takeover advice is added to the verifier's text
+        text = self.blocked('git worktree remove %s' % (self.home / '.claude' / 'x'))
+        self.assertNotIn('takeover', text)
+
+
+class ForeignSession(WorktreeRemoveCase):
+    """The hook's lone form refuses another session's worktree outright, with no ps, lsof or ssh in the hook."""
+
+    def test_the_own_session_lone_form_is_unchanged(self):
+        with mock.patch.object(cg, 'HOOK_SESSION', 'S'):
+            self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+    def test_a_foreign_or_unknown_caller_is_blocked_with_the_takeover_advice(self):
+        for session in ('T', '', None):
+            with self.subTest(session=session):
+                with mock.patch.object(cg, 'HOOK_SESSION', session):
+                    verdict, text = self.decide('git worktree remove %s' % self.linked)
+                self.assertEqual(verdict, 'block')
+                self.assertIn('foreign session S', text)
+                self.assertIn('takeover status --from S', text)
+
+    def test_the_session_name_is_compared_case_folded(self):
+        with mock.patch.object(cg, 'HOOK_SESSION', 's'):
+            self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+    def test_the_hook_reads_the_caller_from_the_payload(self):
+        import json
+        payload = lambda sid: json.dumps({'tool_name': 'Bash', 'session_id': sid, 'cwd': str(self.primary),
+                                          'tool_input': {'command': 'git worktree remove %s' % self.linked}}).encode()
+        for sid, code in (('S', 0), ('T', 2)):
+            with self.subTest(session=sid):
+                with mock.patch.object(cg, 'HOOK_SESSION', None):
+                    with mock.patch('sys.stdout', new_callable=__import__('io').StringIO), \
+                            mock.patch('sys.stderr', new_callable=__import__('io').StringIO):
+                        result = cg.hook_main(stdin_bytes=payload(sid), compiled=cg.Compiled(
+                            self.policy, home=str(self.home), cwd=str(self.primary)), marker=False)
+                self.assertEqual(result, code)
