@@ -1013,6 +1013,49 @@ def install_git_backstop(home: Path, apply: bool) -> str:
     return git_hook_status(home, GIT_HOOK_KEY, home / ".claude" / "hooks" / "commit_policy.py", apply=apply)
 
 
+ENABLER_BIN = (("scripts/enable-agent-ops.py", "ah_enable_self_serve.py", 0o755),
+               ("templates/self-serve-block.md", "self-serve-block.md", 0o644))
+
+
+def install_enabler_bin(home: Path, apply: bool) -> str:
+    """Place the user-run self-serve enabler (and its block template) in ~/.agent-harness/bin.
+
+    Copies only; running it is the user's step (it refuses without a terminal, a typed nonce and an agent-free
+    process tree). Never fails the harness install: a problem is reported as text."""
+    home = home.expanduser().resolve()
+    bin_dir = home / ".agent-harness" / "bin"
+    pins = DirectoryPins()
+    try:
+        for directory in (home, home / ".agent-harness", bin_dir):
+            pins.capture(directory)
+        if any(d.is_symlink() for d in (home / ".agent-harness", bin_dir)):
+            return "self-serve enabler: skipped (symlinked ~/.agent-harness or bin directory)"
+        wanted = []
+        for source, name, mode in ENABLER_BIN:
+            data = (ROOT / source).read_bytes()
+            target = bin_dir / name
+            current = read_regular(target, pinned_parent=pins.fd(bin_dir), retain_fd=pins.file_fds) if pins.fd(bin_dir) else None
+            wanted.append((target, data, mode, current))
+        stale = [t.name for t, data, mode, current in wanted if current is None or current[0] != data or current[1] != mode]
+        if not apply:
+            return "self-serve enabler: would %s" % (("place " + ", ".join(stale)) if stale else "stay as is")
+        if not stale:
+            return "self-serve enabler: up to date in %s" % bin_dir
+        if pins.fd(home / ".agent-harness") is None:
+            pins.create(home / ".agent-harness")
+        pins.create(bin_dir)
+        for target, data, mode, current in wanted:
+            atomic_write(target, data, mode, pinned_parent=pins.fd(bin_dir),
+                         expected_target=current[2] if current else None,
+                         expected_data=current[0] if current else None,
+                         expected_mode=current[1] if current else None)
+        return "self-serve enabler: placed %s in %s (run it yourself: it needs a terminal and a typed nonce)" % (", ".join(stale), bin_dir)
+    except Exception as error:  # noqa: BLE001
+        return "self-serve enabler: skipped (%s: %s)" % (error.__class__.__name__, error)
+    finally:
+        pins.close()
+
+
 def netwatch_status(home: Path, apply: bool, flag) -> str:
     """Optional monitor; never fails the harness install.
 
@@ -1211,6 +1254,7 @@ def main() -> None:
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    print(f"  {install_enabler_bin(args.home, args.apply)}")
     if args.hooks_only:
         print("  CLAUDE.md and settings.json: not touched (--hooks-only)")
         if not args.apply:

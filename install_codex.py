@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
+from install import (DirectoryPins, install_enabler_bin, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
                      safe_unlink)
 
 
@@ -451,6 +451,7 @@ def main() -> None:
     for path in changes:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
+    print(f'  {install_enabler_bin(args.home, args.apply)}')
     if args.hooks_only:
         print('  AGENTS.md, hooks.json and config.toml: not touched (--hooks-only)')
         return
