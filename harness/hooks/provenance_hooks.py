@@ -385,10 +385,22 @@ def quarantine_block(session: str, payload: dict, now: float | None = None) -> d
 
 
 def cmd_stop_lint(payload: dict) -> dict:
+    """The lint result is computed first and printed before the central sweep (goodqa#16651, queued messages)
+    runs, so slow central work can never cost the quarantine or lint outcome."""
+    result = _stop_lint(payload)
+    session = str(payload.get("session_id") or "")
+    if valid_session(session) and central_enabled():
+        if result:
+            print(json.dumps(result), flush=True)
+            result = {}
+        central_note(session, payload, "stop")  # never raises; the watchdog may cut it short, the queue survives
+    return result
+
+
+def _stop_lint(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
-    central_note(session, payload, "stop")  # goodqa#16651 transcript sweep (queued messages); never raises
     quarantine = quarantine_block(session, payload)  # its own policy key, independent of stop_lint (review minor)
     if quarantine.get("decision") == "block":
         return quarantine

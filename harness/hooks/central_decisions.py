@@ -787,9 +787,41 @@ def publish(task, *, ledger=None, store=None, client=None, now=None, claude_home
 
 # ------------------------------------------------------------------ revocation
 
-def withdraw(scope, value=None, *, store=None, client=None, now=None, reason='withdrawn', deadline_seconds=None):
-    """Local tombstone first (denies on this host at once), then the ledger line. A failed post is queued and
-    retried by the prompt hook; the caller hears about it."""
+class _PendingLock:
+    """An exclusive lock around every change to pending-revocations.jsonl, so a hook in one session that rewrites
+    the queue after posting cannot drop a row another session appended meanwhile."""
+
+    def __init__(self, store):
+        self.path = store.dir / 'pending-revocations.lock'
+
+    def __enter__(self):
+        import fcntl  # noqa: PLC0415
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        os.close(self.fd)  # closing releases the lock
+
+
+def _op_id(line, at):
+    return 'central-revoke-' + hashlib.sha256((line + str(at)).encode()).hexdigest()[:32]
+
+
+def _drop_pending(store, posted):
+    """Remove exactly the posted (line, at) rows, re-reading the queue under the lock."""
+    with _PendingLock(store):
+        rows = _read_jsonl(store.pending)
+        left = [r for r in rows if (r.get('line'), r.get('at')) not in posted]
+        if len(left) != len(rows):
+            _write_private(store.pending, b''.join((json.dumps(r, sort_keys=True) + '\n').encode() for r in left), 0o600)
+
+
+def withdraw(scope, value=None, *, store=None, client=None, now=None, reason='withdrawn', deadline_seconds=None,
+             post=True):
+    """Local tombstone first (denies on this host at once), then the queued ledger line, then (with `post`) the
+    post, and the queue row is removed only after the post succeeded. A process killed at any point leaves the
+    line queued, and every hook verb retries the queue. The caller hears whether it was posted."""
     store = store or Store()
     line = 'agent-harness-revoke ' + ('all' if scope == 'all' else '%s %s' % (scope, value))
     match = REVOKE.fullmatch(line)
@@ -798,35 +830,41 @@ def withdraw(scope, value=None, *, store=None, client=None, now=None, reason='wi
     now = time.time() if now is None else now
     store.ensure_dirs()
     _append_private(store.tombstones, {'scope': scope, 'value': value, 'at': now, 'origin': 'local:' + reason})
+    with _PendingLock(store):
+        _append_private(store.pending, {'line': line, 'at': now, 'error': 'not_posted_yet'})
+    if not post:
+        return {'revoked': line, 'posted': False, 'queued': True}
     try:
         config = load_config(store)
-        _client(client, deadline_seconds).post(config['ledger']['issue_id'], line, 'central-revoke-' + uuid.uuid4().hex)
-        return {'revoked': line, 'posted': True}
-    except Exception as error:  # noqa: BLE001  any failure to post (the GoodQA client raises its own types): queue it
+        _client(client, deadline_seconds).post(config['ledger']['issue_id'], line, _op_id(line, now))
+    except Exception as error:  # noqa: BLE001  any failure to post (the GoodQA client raises its own types): stays queued
         code = error.code if isinstance(error, Denied) else type(error).__name__
-        _append_private(store.pending, {'line': line, 'at': now, 'error': code})
         return {'revoked': line, 'posted': False, 'error': code, 'queued': True}
+    _drop_pending(store, {(line, now)})
+    return {'revoked': line, 'posted': True}
 
 
 def retry_pending(store=None, client=None, deadline_seconds=None):
+    """Post every queued revoke line; rows leave the queue only after their post succeeded."""
     store = store or Store()
     rows = _read_jsonl(store.pending)
     if not rows:
         return []
     config = load_config(store)
     client = _client(client, deadline_seconds)
-    left, done = [], []
+    posted, done = set(), []
     for row in rows:
         line = row.get('line')
         if not isinstance(line, str) or not REVOKE.fullmatch(line):
             continue
         try:
-            client.post(config['ledger']['issue_id'], line, 'central-revoke-' + hashlib.sha256(
-                (line + str(row.get('at'))).encode()).hexdigest()[:32])
-            done.append(line)
+            client.post(config['ledger']['issue_id'], line, _op_id(line, row.get('at')))
         except Exception:  # noqa: BLE001  stays queued whatever the client raised
-            left.append(row)
-    _write_private(store.pending, b''.join((json.dumps(r, sort_keys=True) + '\n').encode() for r in left), 0o600)
+            continue
+        posted.add((line, row.get('at')))
+        done.append(line)
+    if posted:
+        _drop_pending(store, posted)
     return done
 
 
@@ -849,53 +887,64 @@ def live_published(store, session, now):
 def on_hook_event(session, *, text=None, unreadable=False, sweep=True, claude_home=None, store=None, client=None,
                   now=None):
     """Every hook verb (prompt, question answer, stop) lands here, so every withdrawal channel the local grant path
-    honours produces a ledger revocation (PR 14 class A). In order:
-      1. retry queued revocation posts;
-      2. if this session has live published decisions: revoke all of them when `text` (a prompt or an answer) meets
-         withdrawal_signal, or when the answer could not be read (`unreadable`, fail safe);
-      3. otherwise, with `sweep`, rescan the session transcript after each decision's cited turn with
-         later_mentions (the same record extraction as the adapter: typed turns, question answers, queued mid-turn
-         messages); a transcript that cannot be read revokes too, as publish does.
-    Each revocation writes the local tombstone first, then posts; a failed post is queued. Returns a short note or
-    None. Never raises. A session without live decisions costs one small index read and no transcript read."""
+    honours produces a ledger revocation (PR 14 class A). One HOOK_DEADLINE budget covers the whole run:
+      1. if this session has live published decisions: choose to revoke all of them when `text` (a prompt or an
+         answer) meets withdrawal_signal, or when the answer could not be read (`unreadable`, fail safe); otherwise,
+         with `sweep`, rescan the session transcript after each decision's cited turn with later_mentions (the same
+         record extraction as the adapter: typed turns, question answers, queued mid-turn messages); a transcript
+         that cannot be read revokes too, as publish does;
+      2. write each chosen revocation's local tombstone and queue row (no network yet), so a process killed later
+         still leaves it queued;
+      3. post the whole queue (this run's rows and older ones) with one client inside what is left of the budget;
+         rows leave the queue only after their post succeeded.
+    Returns a short note or None. Never raises. A session without live decisions costs one small index read."""
     store = store or Store()
-    notes = []
+    end = time.monotonic() + HOOK_DEADLINE
+    notes, revoked = [], []
     try:
-        if store.pending.exists():
-            done = retry_pending(store, client, HOOK_DEADLINE)
-            if done:
-                notes.append('posted %d queued central-decision revocation(s)' % len(done))
-    except Exception:  # noqa: BLE001
-        notes.append('queued central-decision revocations still unposted; to deny everywhere now run '
-                     'python3 ~/.claude/hooks/ah.py decision withdraw --all')
-    try:
-        if not UUID.fullmatch(str(session or '')):
-            return '; '.join(notes) or None
-        now = time.time() if now is None else now
-        live = live_published(store, session, now)
-        if not live:
-            return '; '.join(notes) or None
-        targets = {}
-        if unreadable:
-            targets = dict.fromkeys(live, 'unreadable-answer')
-        elif withdrawal_signal(text):
-            targets = dict.fromkeys(live, 'later-user-turn')
-        elif sweep:
-            for turn in sorted(set(live.values())):
-                try:
-                    late, why = later_mentions(session, turn, claude_home), 'later-turn-in-transcript'
-                except Exception:  # noqa: BLE001  cannot prove no later turn: fail safe, as publish does
-                    late, why = True, 'transcript-unreadable'
-                if late:
-                    targets.update((decision_id, why) for decision_id, cited in live.items() if cited == turn)
-        for decision_id in sorted(targets):
-            result = withdraw('decision', decision_id, store=store, client=client, now=now, reason=targets[decision_id],
-                              deadline_seconds=HOOK_DEADLINE)
-            notes.append('revoked central decision %s (%s)' % (decision_id[:8], 'posted' if result['posted'] else
-                                                              'NOT posted: queued for retry; other hosts still accept it until '
-                                                              'ah decision withdraw --all succeeds'))
+        if UUID.fullmatch(str(session or '')):
+            now = time.time() if now is None else now
+            live = live_published(store, session, now)
+            targets = {}
+            if live and unreadable:
+                targets = dict.fromkeys(live, 'unreadable-answer')
+            elif live and withdrawal_signal(text):
+                targets = dict.fromkeys(live, 'later-user-turn')
+            elif live and sweep:
+                for turn in sorted(set(live.values())):
+                    try:
+                        late, why = later_mentions(session, turn, claude_home), 'later-turn-in-transcript'
+                    except Exception:  # noqa: BLE001  cannot prove no later turn: fail safe, as publish does
+                        late, why = True, 'transcript-unreadable'
+                    if late:
+                        targets.update((decision_id, why) for decision_id, cited in live.items() if cited == turn)
+            for decision_id in sorted(targets):
+                revoked.append(withdraw('decision', decision_id, store=store, now=now, reason=targets[decision_id],
+                                        post=False)['revoked'])
     except Exception as error:  # noqa: BLE001
         notes.append('central-decision revocation failed (%s)' % type(error).__name__)
+    posted = []
+    try:
+        left = end - time.monotonic()
+        if store.pending.exists() and left > 0.5:
+            posted = retry_pending(store, client, left)
+    except Exception:  # noqa: BLE001
+        pass
+    for line in revoked:
+        notes.append('revoked central decision %s (%s)' % (
+            line.rsplit(' ', 1)[-1][:8], 'posted' if line in posted else
+            'NOT posted: queued for retry by the next hook; other hosts still accept it until it is posted, or run '
+            'python3 ~/.claude/hooks/ah.py decision withdraw --all'))
+    older = len([line for line in posted if line not in revoked])
+    if older:
+        notes.append('posted %d queued central-decision revocation(s)' % older)
+    if store.pending.exists() and not revoked and not posted:
+        try:
+            if _read_jsonl(store.pending):
+                notes.append('queued central-decision revocations still unposted; to deny everywhere now run '
+                             'python3 ~/.claude/hooks/ah.py decision withdraw --all')
+        except Exception:  # noqa: BLE001
+            pass
     return '; '.join(notes) or None
 
 

@@ -610,10 +610,50 @@ class EveryWithdrawalChannelRevokes(Base):
             note = cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
         self.assertIn('NOT posted', note)
         self.assertEqual(self.revoke_lines(), [])
-        self.assertIn('Unavailable', self.mac.store.pending.read_text())
+        self.assertIn('agent-harness-revoke decision ' + self.decision, self.mac.store.pending.read_text())
         self.assertIs(self.fake.post.__func__, real_post.__func__)
         cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
         self.assert_revoked_everywhere()
+        self.assertEqual(self.mac.store.pending.read_text(), '')  # posted rows leave the queue
+
+    def test_hook_killed_during_the_post_leaves_the_revoke_queued(self):
+        # a BaseException stands for the watchdog or a kill: nothing after the post line runs in that process
+        with mock.patch.object(self.fake, 'post', side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
+        self.verify('k1')  # not on the ledger yet: the worker still accepts (the stated limit)
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_cli_withdraw_killed_during_the_post_leaves_the_revoke_queued(self):
+        with mock.patch.object(self.fake, 'post', side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                cd.withdraw('task', 'k1', store=self.mac.store, client=self.fake)
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assertEqual(self.revoke_lines(), ['agent-harness-revoke task k1'])
+        with self.assertRaises(cd.Denied):
+            self.verify('k1')
+
+    def test_spent_budget_queues_without_posting_and_the_next_hook_posts(self):
+        with mock.patch.object(cd, 'HOOK_DEADLINE', 0.0):
+            note = cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
+        self.assertIn('NOT posted', note)
+        self.assertEqual(self.revoke_lines(), [])
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_queue_rewrite_keeps_a_row_added_while_posting(self):
+        cd.withdraw('task', 'k1', store=self.mac.store, now=time.time(), post=False)
+        real_post = self.fake.post
+
+        def post_while_another_session_queues(issue_id, body, operation_id):
+            out = real_post(issue_id, body, operation_id)
+            if body.endswith('task k1'):
+                cd.withdraw('task', 'k2', store=self.mac.store, now=time.time(), post=False)
+            return out
+        with mock.patch.object(self.fake, 'post', side_effect=post_while_another_session_queues):
+            cd.retry_pending(self.mac.store, self.fake)
+        self.assertIn('agent-harness-revoke task k2', self.mac.store.pending.read_text())
 
     def test_other_session_decisions_are_untouched(self):
         other = '99999999-2222-4333-8444-555555555555'
@@ -671,6 +711,30 @@ class AnswerHookIsWired(Base):
         self.run_main('stop-lint', stop)
         with self.assertRaises(cd.Denied):
             self.verify('k1')
+
+    def test_central_enabled_checks_the_store_config_path(self):
+        import pwd
+        import provenance_hooks as ph
+        real_store = cd.Store.__init__.__globals__['Store']  # the class, unpatched
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        self.assertEqual(real_store().config, home / '.agent-harness' / 'decisions' / 'config.json')
+        with mock.patch.object(Path, 'exists', lambda p: p == real_store().config):
+            self.assertTrue(ph.central_enabled())
+        with mock.patch.object(Path, 'exists', lambda p: False):
+            self.assertFalse(ph.central_enabled())
+
+    def test_stop_lint_prints_its_own_result_before_the_central_sweep(self):
+        import io
+        import provenance_hooks as ph
+        out = io.StringIO()
+        block = {'decision': 'block', 'reason': 'Provenance quarantine: x'}
+        with mock.patch.object(ph, '_stop_lint', return_value=block), \
+                mock.patch.object(ph, 'central_enabled', return_value=True), \
+                mock.patch.object(ph, 'central_note', side_effect=SystemExit(0)), \
+                mock.patch('sys.stdout', out):
+            with self.assertRaises(SystemExit):  # the watchdog cutting the sweep short
+                ph.cmd_stop_lint({'session_id': SESSION})
+        self.assertEqual(json.loads(out.getvalue()), block)
 
     def test_installer_registers_the_answer_hook(self):
         import importlib.util
