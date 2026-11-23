@@ -168,6 +168,22 @@
    ]
   },
   {
+   "id": "provenance:answer",
+   "script": "provenance_hooks.py",
+   "arg": "answer",
+   "event": "PostToolUse",
+   "tools": [
+    "AskUserQuestion"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
    "id": "provenance:stop-lint",
    "script": "provenance_hooks.py",
    "arg": "stop-lint",

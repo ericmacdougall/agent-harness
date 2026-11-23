@@ -632,6 +632,7 @@ class AnswerHookIsWired(Base):
         out = io.StringIO()
         with mock.patch.object(ph, 'read_payload', return_value=payload), \
                 mock.patch.object(ph, 'install_limits', return_value=None), \
+                mock.patch.object(ph, 'central_enabled', return_value=True), \
                 mock.patch.object(cd, 'Store', lambda home=None: self.mac.store), \
                 mock.patch.object(cd, 'GoodQALedger', lambda adapter=None, deadline_seconds=None: self.fake), \
                 mock.patch('sys.stdout', out):
@@ -653,6 +654,12 @@ class AnswerHookIsWired(Base):
         self.assertIn('revoked central decision', printed['hookSpecificOutput']['additionalContext'])
         with self.assertRaises(cd.Denied):
             self.verify('k1')
+
+    def test_host_without_central_config_never_loads_the_module(self):
+        import provenance_hooks as ph
+        with mock.patch.object(ph, 'central_enabled', return_value=False), \
+                mock.patch.object(cd, 'on_ask_answer', side_effect=AssertionError('loaded')):
+            self.assertIsNone(ph.central_note(SESSION, {'tool_response': {'answers': {'q': 'no'}}}, 'answer'))
 
     def test_stop_lint_runs_the_sweep(self):
         self.grant_local('k1')

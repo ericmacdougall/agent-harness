@@ -420,11 +420,25 @@ def cmd_stop_lint(payload: dict) -> dict:
             + ((" " + carried) if carried else "")}
 
 
+def central_enabled() -> bool:
+    """True when this host has central decisions configured: the same path central_decisions.Store uses (the passwd
+    home, never $HOME). Checked before importing central_decisions, whose import (escalation) would otherwise add
+    about a second to every Stop, prompt and answer hook on hosts that do not use the feature."""
+    try:
+        import pwd  # noqa: PLC0415
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        home = Path.home()
+    return (home / ".agent-harness" / "decisions" / "config.json").exists()
+
+
 def central_note(session: str, payload: dict, event: str = "prompt"):
     """goodqa#16651: a later user turn naming the top rung or withdrawing (typed, answered to a question, or queued
     mid-turn) revokes this session's published central decisions. Only runs when this host has central decisions
     enabled; never raises."""
     try:
+        if not central_enabled():
+            return None
         import central_decisions as cd  # noqa: PLC0415
         store = cd.Store()
         if not store.config.exists():
