@@ -32,7 +32,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_install.py", "guard_selftest.py", "ah_ticket.py", "ah_chat.py", "liveness.py",
          "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
          "remote_delete.py", "remote_delete_agent.py",
-         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
+         "model_tiers.py", "model_tiers.json", "escalation.py", "central_decisions.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "task_recovery.py", "bg_lint.py",
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
@@ -124,6 +124,8 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
     return {
         "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-gate")]}],
+        # goodqa#16651: a withdrawing question answer revokes the session's published central decisions.
+        "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("answer")]}],
         "Stop": [{"hooks": [hook("stop-lint")]}],
         "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
     }
