@@ -434,6 +434,91 @@ class DoctorNamesALostSegment(Base):
         self.assertIn("ah doctor", str(c.exception))
 
 
+class CrashedRotationHasNoLiveFile(Base):
+    """PR 329 gate F6: closed segments and no live main.jsonl (a crashed rotation) is a session that exists, whose
+    missing live file is reported as a problem and has a recover command."""
+
+    def setUp(self):
+        super().setUp()
+        chain(self.w, "main", split3(MAIN) + [[]])      # a rotation crashed after the rename: the new live file
+        chain(self.w, "agent-ownera", split3(OWNERA) + [[]])      # was never created, so every record sits in a segment
+        os.unlink(self.w / "main.jsonl")
+        os.unlink(self.w / "agent-ownera.jsonl")
+
+    def test_the_session_exists_and_its_owners_are_read(self):
+        self.assertEqual(ah.session_dir(self.home, SID), self.w)
+        self.assertEqual([s for s, _ in ah.list_sessions(self.home)], [SID])
+        self.assertEqual(ah.newest_session(self.home), SID)
+        doc = self.owners()
+        self.assertIn("ownera", [r["agent_id"] for r in doc["owners"]])
+
+    def test_the_missing_live_file_is_a_reported_problem(self):
+        doc = self.owners()
+        self.assertNotEqual(doc["read"]["state"], "ok", doc["read"])
+        self.assertIn("live_missing", self.unread_text(doc))
+        with self.assertRaises(ah.AhError) as c:
+            ah.ask_states(self.w / "main.jsonl")
+        self.assertEqual(c.exception.code, "wal_incomplete")
+
+    def test_doctor_names_the_recover_command(self):
+        with mock.patch.dict(os.environ, {"AH_EXPECT_AHD": "0"}):
+            checks = [c for c in ah.doctor()["checks"] if c["check"].startswith("wal chain")]
+        self.assertEqual(sorted(c["check"].split("/")[-1] for c in checks), ["agent-ownera", "main"])
+        self.assertTrue(all("live_missing" in c["problem"] and " recover " in c["recover"] for c in checks), checks)
+
+    def test_the_gate_sees_the_agent_wal_without_its_live_file(self):
+        import dropped_gate
+        self.assertTrue(ah._wal_exists(self.w / "agent-ownera.jsonl"))
+        self.assertIsNone(dropped_gate.pending_work(self.home, SID, "ownera"))      # its last record is a result
+        chain(self.w, "agent-ownerc", [[{"at": iso(NOW - 50), "event": "intent", "note": "open work"}], []])
+        os.unlink(self.w / "agent-ownerc.jsonl")
+        self.assertEqual(dropped_gate.pending_work(self.home, SID, "ownerc"), "last WAL entry is an open intent")
+
+
+class GatesFailVisiblyWithoutAModule(Base):
+    """Gate review of PR 328, F2: a missing module (wal_segments, or ah itself) must never read as "no dropped owners"."""
+
+    def setUp(self):
+        super().setUp()
+        import dropped_gate
+        self.gate = dropped_gate
+        chain(self.w, "main", [MAIN[:2], MAIN[2:]])
+        for var in ("CLAUDE_CODE_ENTRYPOINT",):
+            os.environ.pop(var, None)
+
+    def run_main(self, mode, payload):
+        import io
+        with mock.patch("safe_input.read_stdin_bounded", return_value=json.dumps(payload).encode()), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.gate.main([mode])
+        return json.loads(out.getvalue().strip().splitlines()[-1]) if out.getvalue().strip() else {}
+
+    def says(self, out, module):
+        text = json.dumps(out)
+        self.assertIn("systemMessage", out, out)
+        self.assertIn(module, text)
+        self.assertIn("NOT CHECKING", text)
+
+    def test_every_entry_point_names_the_missing_wal_segments_module(self):
+        with mock.patch.dict(sys.modules, {"wal_segments": None}):
+            self.says(self.gate.cmd_stop({"session_id": SID}, now=NOW), "wal_segments")
+            self.says(self.gate.cmd_subagent_stop({"session_id": SID, "agent_id": "ownera"}, now=NOW), "wal_segments")
+            self.says(self.run_main("stop", {"session_id": SID}), "wal_segments")
+            self.says(self.run_main("subagent-stop", {"session_id": SID, "agent_id": "ownera"}), "wal_segments")
+
+    def test_every_entry_point_names_a_missing_ah(self):
+        ack = {"session_id": SID, "tool_name": "Bash", "transcript_path": "",
+               "tool_input": {"command": "python3 ah.py task dispose --agent ownera --kind waiting --ack-handoff --ref w00000000a01 --until 2999-01-01T00:00:00Z"}}
+        with mock.patch.dict(sys.modules, {"ah": None}), mock.patch("caller_identity.is_main", return_value=True):
+            self.says(self.gate.cmd_stop({"session_id": SID}, now=NOW), "ah")
+            self.says(self.gate.cmd_subagent_stop({"session_id": SID, "agent_id": "ownera"}, now=NOW), "ah")
+            self.says(self.gate.cmd_pretool(ack), "ah")
+            self.says(self.run_main("pretool", ack), "ah")
+
+    def test_the_gate_is_quiet_about_modules_when_nothing_is_missing(self):
+        self.assertNotIn("NOT CHECKING", json.dumps(self.gate.cmd_stop({"session_id": SID}, now=NOW)))
+
+
 class NoDirectOpen(unittest.TestCase):
     READERS = ("owners", "discover_agents", "summarize_agent_wal", "_summarize_agent_wal", "_summarize_cached", "ask_owners",
                "narrow_wait", "ask_states", "_wal_has", "_last_line_is", "_evidence_ok", "_session_entries",
@@ -442,10 +527,12 @@ class NoDirectOpen(unittest.TestCase):
                "_wal_fingerprint", "_wal_chain", "_segs")
     # The only functions of the WAL read path that open a file themselves, each with why (reviewer question 1).
     OPENERS = {
+        "chain_new_lines": "opens a rotated segment at an offset with Snapshot._open_closed (private, inode-checked "
+                           "against the listing); a public Snapshot.open_source(name) would remove it (TICKET_LATER)",
         "read_new_lines": "shared with the transcript indexer: reads a path (a transcript) or a descriptor the caller "
                           "pinned (a WAL chain); never a WAL by name",
     }
-    OPEN = r"(?<![\w])(?:os\.)?open\("
+    OPEN = r"(?<![\w])(?:os\.)?open\(|\._open_closed\("
 
     def test_no_wal_reader_opens_or_globs_a_wal_by_name_except_the_reviewed_helpers(self):
         """A guard that can fail: the WAL read path reaches a WAL through the wal_segments reader API, except for
@@ -482,6 +569,7 @@ class NoDirectOpen(unittest.TestCase):
         self.assertIsNotNone(re.search(self.OPEN, inspect.getsource(planted)))
         self.assertIsNotNone(re.search(self.OPEN, inspect.getsource(planted_low_level)))
         self.assertIsNone(re.search(self.OPEN, "x = _ws().open_chain(path)  # fdopen( and reopen( are not opens"))
+        self.assertIsNotNone(re.search(self.OPEN, "fd = snap._open_closed(name)"))
 
 
 if __name__ == "__main__":

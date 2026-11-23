@@ -229,7 +229,7 @@ def read_new_lines(path: Path, meta: dict, fd=None):
 # segment, a line over 8 MiB) is said, never skipped: to the tally (`ah owners`, `ah status`) or, for a caller with
 # nowhere to say it, as an AhError.
 
-_WAL_BENIGN = ("live_missing", "schema_newer", "marker_info")
+_WAL_BENIGN = ("schema_newer", "marker_info")   # live_missing is NOT benign: a crashed rotation is said, and recoverable
 WAL_STATUS_MAX = 64 << 20   # bytes of one WAL `ah status` reads, newest first
 
 
@@ -3580,11 +3580,15 @@ def _wal_chain_checks(home: Path) -> list:
                 continue
             for stem, ch in chains.items():
                 for problem in _wal_bad(ch.problems):
+                    if problem.get("code") == "live_missing":   # a crashed rotation: every record is there, the live file is not
+                        recover = (f"python3 {cli} recover {entry.path} {stem}   # dry run; add --write to create the live file "
+                                   f"with its marker (the next append also repairs it)")
+                    else:
+                        recover = (f"python3 {cli} verify {entry.path} {stem}   # then restore the missing segment file "
+                                   f"from a git or Dropbox backup (same name), or read what is left with: "
+                                   f"python3 {cli} cat {entry.path} {stem} --allow-gaps")
                     out.append({"check": f"wal chain {entry.name[:40]}/{stem}", "ok": False, "problem": _wal_say(problem),
-                                "dir": entry.path,
-                                "recover": f"python3 {cli} verify {entry.path} {stem}   # then restore the missing segment file "
-                                           f"from a git or Dropbox backup (same name), or read what is left with: "
-                                           f"python3 {cli} cat {entry.path} {stem} --allow-gaps"})
+                                "dir": entry.path, "recover": recover})
     return out
 
 

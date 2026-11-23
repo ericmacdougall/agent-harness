@@ -24,6 +24,15 @@ sys.path.insert(0, str(HERE))
 MAX_STOP_BLOCKS = 3
 
 
+def missing_module_message(exc: BaseException) -> dict:
+    """A required module (wal_segments, ah, ...) cannot be imported: the gate cannot read owners, so it must say so. A
+    silent `{}` here let a partial install look like "no dropped owners" (gate review of PR 328, F2)."""
+    name = getattr(exc, "name", None) or str(exc)[:80]
+    return {"systemMessage": f"dropped-owner gate is NOT CHECKING: required module {name} is missing from this install, "
+                             "so owners and dispositions cannot be read. Reinstall the harness hooks; `ah doctor` lists "
+                             "what is missing."}
+
+
 def state_path(session: str) -> Path:
     return Path(os.environ.get("AH_HOME") or Path.home()) / ".agent-harness" / "state" / "dropped-gate" / f"{session}.json"
 
@@ -91,6 +100,8 @@ def grandfather(session: str, data: dict, now=None) -> list:
         import ah  # noqa: PLC0415
         home = Path(os.environ.get("AH_HOME") or Path.home())
         epoch = ah.gate_epoch(home)
+    except ImportError:
+        raise   # cmd_stop and main say which module is missing
     except Exception:  # noqa: BLE001
         return []
     if not epoch:
@@ -120,13 +131,20 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     try:
         import ah  # noqa: PLC0415 - installed beside this hook
         data = ah.owners(Path(os.environ.get("AH_HOME") or Path.home()), session, now=now)
-    except Exception:  # noqa: BLE001 - no WAL, a partial install or an ah bug: fail open, never trap the turn
+    except ImportError as exc:   # a missing module is said, never a silent pass
+        return missing_module_message(exc)
+    except Exception:  # noqa: BLE001 - no WAL or an ah bug: fail open, never trap the turn
         return {}
     undisposed = list(data.get("undisposed") or [])
-    legacy = grandfather(session, data, now)
+    try:
+        legacy = grandfather(session, data, now)
+    except ImportError as exc:
+        return missing_module_message(exc)
     if legacy:
         try:
             data = ah.owners(Path(os.environ.get("AH_HOME") or Path.home()), session, now=now)
+        except ImportError as exc:
+            return missing_module_message(exc)
         except Exception:  # noqa: BLE001
             return {}
         undisposed = list(data.get("undisposed") or [])
@@ -158,18 +176,17 @@ def pending_work(home: Path, session: str, agent: str) -> str | None:
     import ah  # noqa: PLC0415
     import liveness  # noqa: PLC0415
     path = ah.session_dir(home, session) / f"agent-{agent}.jsonl"  # either WAL root
-    if not path.is_file():
+    if not ah._wal_exists(path):   # the chain has any member (segments only, after a crashed rotation, still counts)
         return None
     last = None
-    with open(path, "rb") as fh:
-        for raw in fh:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if (isinstance(rec, dict) and rec.get("event") and not rec.get("by")
-                    and rec.get("event") not in LIFECYCLE_EVENTS):  # hook metadata rows are not the owner's own entries
-                last = rec
+    for _seg, _n, raw in ah._wal_lines(path, []):   # the whole segment chain, newest record last
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if (isinstance(rec, dict) and rec.get("event") and not rec.get("by")
+                and rec.get("event") not in LIFECYCLE_EVENTS):  # hook metadata rows are not the owner's own entries
+            last = rec
     if not last:
         return None
     event, note = str(last.get("event")), str(last.get("note") or "")
@@ -211,6 +228,8 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
     home = Path(os.environ.get("AH_HOME") or Path.home())
     try:
         why = pending_work(home, session, agent)
+    except ImportError as exc:
+        return missing_module_message(exc)
     except Exception:  # noqa: BLE001
         return {}
     if not why or armed_waiter(agent, home):
@@ -231,6 +250,8 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
         ts = dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc).isoformat()  # microseconds, like wal.py
         ah.write(home, "task.pending", {"agent": agent, "session": session, "at": ts}, session,
                  f"pending:{session[:16]}:{agent}:{int((now or time.time()) // 600)}")
+    except ImportError as exc:
+        return missing_module_message(exc)
     except Exception:  # noqa: BLE001 - the marker is best effort; the message still says what happened
         pass
     return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
@@ -461,7 +482,9 @@ def _parse_dispose(rest: list):
         import ah  # noqa: PLC0415
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return ah.build_parser().parse_args([str(word) for word in rest])
-    except (SystemExit, Exception):  # noqa: BLE001 - a refusal, --help or an import problem mints nothing
+    except ImportError:
+        raise   # cmd_pretool says which module is missing; a stamp is never silently skipped
+    except (SystemExit, Exception):  # noqa: BLE001 - a refusal or --help mints nothing
         return None
 
 
@@ -502,7 +525,10 @@ def cmd_pretool(payload: dict) -> dict:
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
     import caller_identity  # noqa: PLC0415
     if caller_identity.is_main(payload):
-        _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
+        try:
+            _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
+        except ImportError as exc:
+            return missing_module_message(exc)
         return {}
     if not acknowledges(cmd):  # anything not proven main: sub-agents, Codex payloads, a payload with no transcript
         return {}
@@ -524,6 +550,8 @@ def main(argv=None) -> int:
         payload = payload if isinstance(payload, dict) else {}
         out = (cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_pretool(payload) if mode == "pretool"
                else cmd_stop(payload))
+    except ImportError as exc:
+        out = missing_module_message(exc)
     except Exception as exc:  # noqa: BLE001 - a gate crash must not block the turn silently
         out = {"systemMessage": f"dropped-owner gate failed open ({type(exc).__name__})"}
     if out:
