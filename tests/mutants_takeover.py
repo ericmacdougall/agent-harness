@@ -58,6 +58,10 @@ MUTANTS = {
     "F1 rules: a missing module fails closed": ("command_guard.py", "        if any(tool in flat for tool in TAKEOVER_TOOLS):\n            return ('the takeover command rules could not be loaded",
                                                 "        if False:\n            return ('the takeover command rules could not be loaded", RULES),
     "G5 user only script": ("takeover_rules.py", "if on('G5') and SCRIPT in", "if False and SCRIPT in", RULES),
+    "F2 owner needs a WAL of that name": ("command_guard.py", "        if os.path.lexists(os.path.join(root, *parent, name)):\n            return name",
+                                          "        if True:\n            return name", "tests.test_command_guard_worktree_remove.TaskNamedWorkDir"),
+    "F2 a recorded name stays under the rule": ("command_guard.py", "    for parent in (('.claude', 'wals'), ('.agent-harness', 'codex-wals')):",
+                                                "    for parent in ():", "tests.test_ah_worktree_remove.RealJudge"),
 }
 
 

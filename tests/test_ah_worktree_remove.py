@@ -36,6 +36,8 @@ def git(cwd, *args):
 
 
 class Repo(unittest.TestCase):
+    SESSION_DIR = "S"
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ah-wt-")
         self.addCleanup(self.temp.cleanup)
@@ -43,7 +45,7 @@ class Repo(unittest.TestCase):
         patch = mock.patch.dict(os.environ, {"HOME": str(self.home)})
         patch.start()
         self.addCleanup(patch.stop)
-        self.base = self.home / ".agent-harness/work/S/T"
+        self.base = self.home / ".agent-harness/work" / self.SESSION_DIR / "T"
         self.primary, self.linked = self.base / "primary", self.base / "linked"
         self.primary.mkdir(parents=True)
         git(self.primary, "init", "-q", "-b", "main")
@@ -845,6 +847,85 @@ class ForeignSession(Repo):
         self.assertIn("--expect-head %s" % ("a" * 40), argv[-1])
         self.assertIn("--caller-session sess-9", argv[-1])
         self.assertNotIn("--expect-head", ah_worktree._argv("t2-dev", "/Users/u/tools/wt-one", False)[-1])
+
+
+def in_process_verifier(argv, **kwargs):
+    """A runner for ah_worktree.remove that runs the local verifier CLI in this process (so the test's patches apply)."""
+    assert argv[1:3] == ["-I", str(HOOKS / "command_guard.py")], argv
+    out = io.StringIO()
+    with redirect_stdout(out):
+        code = cg.main(list(argv[3:]))
+    return subprocess.CompletedProcess(argv, code, out.getvalue(), "")
+
+
+class TaskNamedWorkDir(Repo):
+    """F2 (review BLOCK at db950737): a Codex work dir named after a task (`<task>-<thread prefix>`) has no WAL of that
+    name, so it is attributed to no session and stays outside the foreign-session rule. Its own agent removes an own
+    worktree there through all three routes: the hook's lone form (test_command_guard_worktree_remove), the verifier CLI
+    and `ah worktree-remove`."""
+    SESSION_DIR = "course-takeover-01a1c3fd"
+    THREAD = "01a1c3fd-05ef-70d0-a4fa-2cf7266e1575"
+
+    def setUp(self):
+        super().setUp()
+        (self.home / ".agent-harness" / "codex-wals" / self.THREAD).mkdir(parents=True)
+        patch = mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
+                                  {"mode": "codex", "caller": self.THREAD, "why": "test"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_the_verifier_removes_an_own_worktree(self):
+        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.THREAD)
+        self.assertTrue(report["removed"], report)
+
+    def test_the_verifier_cli_removes_an_own_worktree(self):
+        code, data = Verifier.run_cli(self, "remove-worktree", "--path", str(self.linked))
+        self.assertEqual((code, data["removed"]), (0, True), data)
+
+    def test_ah_worktree_remove_removes_an_own_worktree(self):
+        result = ah_worktree.remove("local", str(self.linked), "own cleanup", session=self.THREAD, home=self.home,
+                                    runner=in_process_verifier, caller_session=takeover.caller_of(self.home))
+        self.assertTrue(result["removed"], result)
+        self.assertFalse(self.linked.exists())
+
+
+class RealJudge(Repo):
+    """No injected judge: the verifier's foreign-session check runs the real takeover.session_state (real ids, a fixture
+    home, this machine's real process probe, read only)."""
+    SESSION_DIR = "01a2012f-bca0-78b0-8fc7-162587de5ee7"
+    CALLER = "6df7b63f-b062-4fa8-834a-f6bd857d0c54"
+
+    def codex_session(self, state, age):
+        import time as _time
+        when = _time.time() - age
+        wal = self.home / ".agent-harness" / "codex-wals" / self.SESSION_DIR
+        wal.mkdir(parents=True)
+        stamp = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime(when))
+        (wal / "main.jsonl").write_text(json.dumps({"at": stamp, "event": "PreToolUse"}) + "\n")
+        (wal / "continuation.json").write_text(json.dumps({"interrupt": None, "state": state, "used": False}))
+        rollout = self.home / ".codex/sessions/2026/11/21" / ("rollout-2026-11-21T19-57-15-%s.jsonl" % self.SESSION_DIR)
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(json.dumps({"timestamp": stamp}) + "\n")
+        for path in (wal / "main.jsonl", wal / "continuation.json", rollout):
+            os.utime(path, (when, when))
+
+    def test_a_session_that_did_not_stop_is_refused(self):
+        self.codex_session("active", 2 * 3600)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.CALLER)
+        self.assertFalse(report["removable"], report)
+        self.assertIn("foreign session %s is" % self.SESSION_DIR, report["reason"])
+        self.assertIn("not_stopped", report["reason"])
+        self.assertTrue(self.linked.exists())
+
+    def test_a_retired_session_is_removable_by_another(self):
+        self.codex_session("handoff", 2 * 3600)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.CALLER)
+        self.assertTrue(report["removed"], report)
+
+    def test_a_recent_handoff_waits_for_the_quiet_window(self):
+        self.codex_session("handoff", 600)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.CALLER)
+        self.assertIn("recent_activity", report["reason"])
 
 
 class redirect_stderr_null:

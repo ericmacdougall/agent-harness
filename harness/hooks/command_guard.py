@@ -2220,6 +2220,25 @@ def work_session_of(path, home=None):
     return parts[0] if parts and parts[0] else None
 
 
+def session_owner_of(path, home=None):
+    """The session that owns `path` for the foreign-session rule, or None (review F2).
+
+    The first segment under ~/.agent-harness/work/ names a session only when this host records a session of that exact
+    name: a Claude WAL (~/.claude/wals/<name>) or a Codex WAL (~/.agent-harness/codex-wals/<name>). A dir named after a
+    task (a Codex `<task>-<thread prefix>` dir) or a session whose WAL lives on the other host (a Mac session's work dir
+    on t2-dev) is attributed to no session here and keeps the behaviour it had before the rule: the verifier's own checks
+    only. The incident's dir is covered: its Codex WAL is on this host. A WAL that exists is never removed by an agent
+    (protected log), so a dir cannot be moved out of the rule; one created by that name only adds protection."""
+    name = work_session_of(path, home)
+    if name is None or name in ('.', '..'):
+        return None
+    root = os.path.realpath(home or os.path.expanduser('~'))
+    for parent in (('.claude', 'wals'), ('.agent-harness', 'codex-wals')):
+        if os.path.lexists(os.path.join(root, *parent, name)):
+            return name
+    return None
+
+
 def _takeover():
     """takeover.py, loaded by path: the hooks run under python -I, so the script directory is not on sys.path."""
     import importlib.util
@@ -2238,7 +2257,7 @@ def verifier_caller(path, flag, home=None):
     (takeover.resolve_caller: a Claude session record, a Codex tool shell's thread id, or the flag only when the verifier
     was started over ssh with no agent above it). A flag that names another session than the derived one is a refusal.
     Only a path inside a session's work directory needs a caller, so nothing is probed for any other path."""
-    if work_session_of(os.path.realpath(path), home) is None:
+    if session_owner_of(os.path.realpath(path), home) is None:
         return None, None
     try:
         return _takeover().resolve_caller(os.path.realpath(home or os.path.expanduser('~')), flag)
@@ -2254,7 +2273,7 @@ def foreign_session_refusal(path, caller, action='worktrees', home=None, judge=N
     on this host). An empty or unknown caller counts as foreign. Paths outside work/ are not this rule's business. This
     check lives in the verifier, which every removal route reaches (the hook's lone form, `ah worktree-remove`, a direct
     `remove-worktree`), so a policy sentence or a clever command shape cannot route around it."""
-    owner = work_session_of(os.path.realpath(path), home)
+    owner = session_owner_of(os.path.realpath(path), home)
     if owner is None or (caller and owner.casefold() == str(caller).casefold()):
         return None
     try:
@@ -7274,13 +7293,13 @@ class Analyzer:
             if cls not in ('root', 'unknown') or not path or not os.path.isabs(path):
                 return None
             path = os.path.realpath(path)
-            owner = work_session_of(path)
-            if owner is None or worktree_scope_refusal(path) is not None:
+            if work_session_of(path) is None or worktree_scope_refusal(path) is not None:
                 return None
+            owner = session_owner_of(path)  # None: a dir attributed to no session (review F2), the own route applies
         except Exception:  # noqa: BLE001 - advice is optional
             return None
         tail = 'Dirty or unpublished worktrees are kept: list them for their owner.'
-        if HOOK_SESSION and owner.casefold() == str(HOOK_SESSION).casefold():
+        if owner is None or (HOOK_SESSION and owner.casefold() == str(HOOK_SESSION).casefold()):
             return ('run one standalone command: git -C /abs/repo worktree remove /abs/top (a single literal path: no &&, ;, '
                     'loop, variable, quote, --force or second path), or preferably python3 -I ~/.claude/hooks/ah.py '
                     'worktree-remove --host local|t2-dev --path <abs top> --reason <why> (Codex: '
@@ -7314,7 +7333,7 @@ class Analyzer:
         if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
             self._worktree_reason = 'the path is not a literal top inside a harness work root, so the guard does not verify it'
             return False
-        owner = work_session_of(os.path.realpath(path))
+        owner = session_owner_of(os.path.realpath(path))
         if owner is not None and not (HOOK_SESSION and owner.casefold() == str(HOOK_SESSION).casefold()):
             # Another session's worktree (or a caller the hook cannot name): never from the hook, which runs no ps, lsof or
             # ssh. `ah takeover` judges whether that session is retired; the verifier enforces the same rule again.

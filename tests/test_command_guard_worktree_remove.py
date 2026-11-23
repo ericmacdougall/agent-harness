@@ -32,6 +32,8 @@ def git(cwd, *args, check=True):
 
 
 class WorktreeRemoveCase(unittest.TestCase):
+    SESSION_DIR = 'S'
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='cg-worktree-remove-')
         self.addCleanup(self.temp.cleanup)
@@ -39,7 +41,7 @@ class WorktreeRemoveCase(unittest.TestCase):
         self.old_home = os.environ.get('HOME')
         os.environ['HOME'] = str(self.home)
         self.addCleanup(self._restore_home)
-        self.base = self.home / '.agent-harness/work/S/T'
+        self.base = self.home / '.agent-harness/work' / self.SESSION_DIR / 'T'
         self.primary = self.base / 'primary'
         self.linked = self.base / 'linked'
         self.primary.mkdir(parents=True)
@@ -662,7 +664,15 @@ class WorktreeRemoveDashC(WorktreeRemoveCase):
         self.assertEqual(self.decide(ok, cwd=deep)[0], 'block')
 
 
-class ShapeAdvice(WorktreeRemoveCase):
+class RecordedSession(WorktreeRemoveCase):
+    """work/S belongs to a session recorded on this host (a WAL directory named S), so the foreign-session rule applies."""
+
+    def setUp(self):
+        super().setUp()
+        (self.home / '.claude' / 'wals' / self.SESSION_DIR).mkdir(parents=True)
+
+
+class ShapeAdvice(RecordedSession):
     """W1: a removal blocked by its SHAPE names the routes that work (never the Dropbox text), and still blocks."""
 
     def blocked(self, command, session='S'):
@@ -708,7 +718,41 @@ class ShapeAdvice(WorktreeRemoveCase):
         self.assertNotIn('takeover', text)
 
 
-class ForeignSession(WorktreeRemoveCase):
+class TaskNamedWorkDir(WorktreeRemoveCase):
+    """F2 (review BLOCK at db950737): a work dir named after a task (Codex `<task>-<thread prefix>`), with no WAL of that
+    name on this host, is attributed to no session. It stays outside the foreign-session rule, so its own agent removes
+    its worktrees exactly as before this branch."""
+    SESSION_DIR = 'course-takeover-01a1c3fd'
+    THREAD = '01a1c3fd-05ef-70d0-a4fa-2cf7266e1575'
+
+    def test_its_own_agent_removes_a_worktree_with_the_lone_form(self):
+        with mock.patch.object(cg, 'HOOK_SESSION', self.THREAD):
+            self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
+
+    def test_a_wrong_shape_gets_the_own_route_advice_not_the_takeover_route(self):
+        with mock.patch.object(cg, 'HOOK_SESSION', self.THREAD):
+            verdict, text = self.decide('git worktree remove --force %s' % self.linked)
+        self.assertEqual(verdict, 'block')
+        self.assertIn('ah.py worktree-remove --host local|t2-dev', text)
+        self.assertNotIn('takeover status', text)
+
+    def test_a_wal_of_that_name_brings_the_dir_under_the_rule(self):
+        (self.home / '.agent-harness' / 'codex-wals' / self.SESSION_DIR).mkdir(parents=True)
+        with mock.patch.object(cg, 'HOOK_SESSION', self.THREAD):
+            verdict, text = self.decide('git worktree remove %s' % self.linked)
+        self.assertEqual(verdict, 'block')
+        self.assertIn('foreign session %s' % self.SESSION_DIR, text)
+
+    def test_the_owner_lookup(self):
+        work = self.home / '.agent-harness' / 'work'
+        self.assertIsNone(cg.session_owner_of(str(self.linked), str(self.home)))
+        self.assertEqual(cg.work_session_of(str(self.linked), str(self.home)), self.SESSION_DIR)
+        (self.home / '.claude' / 'wals' / 'aaaaaaaa-0000').mkdir(parents=True)
+        self.assertEqual(cg.session_owner_of(str(work / 'aaaaaaaa-0000' / 'x'), str(self.home)), 'aaaaaaaa-0000')
+        self.assertIsNone(cg.session_owner_of(str(self.home / 'elsewhere' / 'x'), str(self.home)))
+
+
+class ForeignSession(RecordedSession):
     """The hook's lone form refuses another session's worktree outright, with no ps, lsof or ssh in the hook."""
 
     def test_the_own_session_lone_form_is_unchanged(self):
