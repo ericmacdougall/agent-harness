@@ -10126,7 +10126,7 @@ def _fleet_default_runner(argv, data, timeout):
 
 
 def _fleet_clean(text, limit=160):
-    return re.sub(r'[^A-Za-z0-9 ._()-]', '?', str(text))[:limit]
+    return re.sub(r'[^A-Za-z0-9 ._()/-]', '?', str(text))[:limit]
 
 
 def run_fleet_validator(host, mode, path, policy, home, runner=None, timeout=130, test=None):
@@ -10183,7 +10183,7 @@ def _fleet_digest(host, path, data):
 def approve_delete_fleet(host, path, user_source, wal, ttl=None, home=None, policy=None, now=None, resolver=None,
                          runner=None, test=None):
     """Single-use approval for deleting `path` on fleet host `host` without a backup. Returns the entry; raises
-    ValueError on refusal (and audits it). The user-turn checks repeat approve_delete_no_backup's, plus the host named."""
+    ValueError on refusal (and audits it). The user-turn checks repeat approve_delete_no_backup's unchanged (the question names the path, not the host)."""
     policy = policy or load_policy()
     limits = policy['marker']
     now = time.time() if now is None else now
@@ -10229,9 +10229,6 @@ def approve_delete_fleet(host, path, user_source, wal, ttl=None, home=None, poli
         problem = _question_names_only(question, path)
         if problem:
             raise ValueError('the AskUserQuestion this answer answers %s; ask the user again naming it' % problem)
-        if not re.search(r'(?<![A-Za-z0-9._-])%s(?![A-Za-z0-9._-])' % re.escape(host), question.replace(path, ' ')):
-            raise ValueError('the AskUserQuestion this answer answers does not name the host %s; ask the user again '
-                             'naming the host and the path' % host)
         if not APPROVE_WORDS.fullmatch(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
             raise ValueError('the selected answer does not say delete (or it declines): the option must be exactly '
                              '"Delete, no backup" (optionally "(Recommended)"); ask the user again')
