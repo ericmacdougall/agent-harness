@@ -461,6 +461,31 @@ def checkpoint_context(session: str, text: str) -> str:
     return text
 
 
+def takeover_notice(session: str, event: str, main_wal: Path) -> str:
+    """The fixed takeover notice for a session another session took over (takeover.py, shipped beside this hook).
+    SessionStart always shows it; a prompt shows it once per tombstone, recorded as a takeover-notice row in this
+    session's own WAL. Only the validated fields of an HMAC-verified tombstone are rendered. Never raises."""
+    try:
+        import takeover  # noqa: PLC0415 - shipped beside this hook by install_codex
+        text, digest = takeover.render_notice(session, str(Path.home()))
+        if not text:
+            return ""
+        if event == "UserPromptSubmit":
+            try:
+                with open(main_wal, "rb") as handle:
+                    size = handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, size - (256 << 10)))
+                    tail = handle.read()
+                if b'"takeover-notice"' in tail and digest.encode() in tail:
+                    return ""
+            except OSError:
+                pass
+            append(main_wal, {"at": datetime.now(timezone.utc).isoformat(), "event": "takeover-notice", "hash": digest})
+        return " " + text
+    except Exception:  # noqa: BLE001 - a courtesy must never fail the hook
+        return ""
+
+
 def hook() -> None:
     data = json.load(sys.stdin)
     event = data.get('hook_event_name')
@@ -484,7 +509,7 @@ def hook() -> None:
             append(main_wal, record)
         except OSError as error:
             note = degraded_note(error)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event) + takeover_notice(session, event, main_wal)}}))
     elif event == "UserPromptSubmit":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)
@@ -495,7 +520,7 @@ def hook() -> None:
             # A full or read-only disk must not block the prompt (the turn would otherwise be refused): degrade
             # to a note so the operator can run the recovery commands.
             note = degraded_note(error)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing.") + note + ops_alert_context(event)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing.") + note + ops_alert_context(event) + takeover_notice(session, event, main_wal)}}))
     elif event == "SubagentStart":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))

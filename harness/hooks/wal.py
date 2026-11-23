@@ -153,6 +153,31 @@ def work_dir_context(session_id: str, event: str, data: dict) -> str:
     return text
 
 
+def takeover_notice_context(session_id: str, event: str, main_wal: Path) -> str:
+    """The fixed takeover notice for a session another session took over (takeover.py claim or cleanup). SessionStart
+    always shows it; a prompt shows it once per tombstone (a takeover-notice row with the tombstone hash goes into this
+    session's own WAL). Only the validated fields of an HMAC-verified tombstone are rendered. Never raises."""
+    try:
+        import takeover
+        text, digest = takeover.render_notice(safe_id(session_id), str(Path.home()))
+        if not text:
+            return ""
+        if event == "prompt":
+            try:
+                with open(main_wal, "rb") as handle:
+                    size = handle.seek(0, os.SEEK_END)
+                    handle.seek(max(0, size - (256 << 10)))
+                    tail = handle.read()
+                if b'"takeover-notice"' in tail and digest.encode() in tail:
+                    return ""
+            except OSError:
+                pass
+            append(main_wal, {"at": datetime.now(timezone.utc).isoformat(), "event": "takeover-notice", "hash": digest})
+        return " " + text
+    except Exception:  # the notice is a courtesy: the WAL hook must never fail over it
+        return ""
+
+
 def ops_alert_context(event: str, session: str = "") -> str:
     """Active ops-watch alerts from ~/.agent-harness/state/alerts.jsonl (docs/ops-watch.md). Never raises."""
     try:
@@ -198,12 +223,12 @@ def main() -> None:
     if event == "session":
         record["source"] = data.get("source", "")
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data) + ops_alert_context(event, session_id)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": f"Session WAL: {main_wal}. Record task ownership, decisions, changes, checks, commits and handoffs; omit secrets and PII." + work_dir_context(session_id, event, data) + ops_alert_context(event, session_id) + takeover_notice_context(session_id, event, main_wal)}}))
     elif event == "prompt":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)
         append(main_wal, record)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII." + work_dir_context(session_id, event, data) + ops_alert_context(event, session_id)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": f"Session WAL: {main_wal}. Follow Agent Harness triage. Record a human-readable intent before edits; the hook metadata alone is insufficient. Use the fast path for small fixes. For substantive work, brief and reuse a background owner, then review, test, publish the feature branch and integrate locally. Ask about material ambiguity and keep the user updated. Never log secrets or PII." + work_dir_context(session_id, event, data) + ops_alert_context(event, session_id) + takeover_notice_context(session_id, event, main_wal)}}))
     elif event == "subagent":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
