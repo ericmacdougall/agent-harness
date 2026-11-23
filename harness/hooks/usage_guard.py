@@ -101,6 +101,56 @@ def safe_label(value):
     return value
 
 
+POOL_SLOT_MAX = 8
+POOL_SLOT = re.compile(r':slot[0-9]+\Z')
+POLICY_FILE = 'review_policy.json'
+
+
+def validate_capacity(value):
+    if type(value) is not int or not 1 <= value <= POOL_SLOT_MAX:
+        raise GuardError('INVALID_OUTPUT', 'Pool capacity must be an integer from 1 to %d' % POOL_SLOT_MAX)
+    return value
+
+
+def checked_capacity_map(raw):
+    if not isinstance(raw, dict):
+        raise GuardError('INVALID_OUTPUT', 'Pool capacity must map providers to aliases')
+    result = {}
+    for provider, aliases in raw.items():
+        safe_label(provider)
+        if not isinstance(aliases, dict):
+            raise GuardError('INVALID_OUTPUT', 'Pool capacity must map providers to aliases')
+        result[provider] = {}
+        for alias, value in aliases.items():
+            if POOL_SLOT.search(safe_label(alias)):
+                raise GuardError('INVALID_OUTPUT', 'Pool capacity names a base alias, not a slot')
+            result[provider][alias] = validate_capacity(value)
+    return result
+
+
+def load_pool_capacity(path=None):
+    """Per-pool slot counts from the checked-in review_policy.json beside this script. Never from the environment.
+    An unreadable or untrusted file means capacity 1 everywhere; a malformed or out-of-bound value is an error."""
+    path = Path(path) if path else Path(__file__).resolve().with_name(POLICY_FILE)
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022:
+            return {}
+        raw = json.loads(file_bytes(path, private=False))
+    except OSError:
+        return {}
+    except (ValueError, UnicodeError):
+        raise GuardError('INVALID_OUTPUT', 'Review policy is not valid JSON') from None
+    if not isinstance(raw, dict):
+        raise GuardError('INVALID_OUTPUT', 'Review policy must be an object')
+    return checked_capacity_map(raw.get('pool_capacity', {}))
+
+
+def slot_alias(pool, number):
+    """Slot 1 is the base alias itself (the legacy layout); slot k >= 2 is '<alias>:slot<k>'."""
+    return pool if number == 1 else safe_label('%s:slot%d' % (pool, number))
+
+
 def finite_seconds(value):
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 86400:
         raise GuardError('INVALID_OUTPUT', 'Expected a finite positive time budget')
@@ -503,7 +553,9 @@ def invocation_identity(subject, *, purpose, argv, cwd, stage=None, packet_diges
 
 class UsageStore:
     """Immutable history plus locked, digest-bound current pool indices."""
-    def __init__(self, root=None):
+    def __init__(self, root=None, pool_capacity=None):
+        # pool_capacity exists for tests; production reads the checked-in policy lazily, never the environment.
+        self._capacity = checked_capacity_map(pool_capacity) if pool_capacity is not None else None
         named = Path(root or os.environ.get('AGENT_HARNESS_USAGE_DIR', Path.home() / '.agent-harness' / 'usage'))
         if named.is_symlink():
             raise GuardError('UNKNOWN', 'Usage state cannot be a symlink')
@@ -948,20 +1000,52 @@ class UsageStore:
         if self._reconciliation(directory, run_id):
             raise GuardError('UNKNOWN', 'Run was reconciled as dead; it cannot acquire a pool or record a child')
 
+    def pool_capacity(self, provider, pool):
+        if self._capacity is None:
+            self._capacity = load_pool_capacity()
+        return self._capacity.get(provider, {}).get(pool, 1)
+
+    def _slots(self, provider, pool):
+        """Every existing slot record of a pool (always all POOL_SLOT_MAX, never just the capacity), read fail-closed.
+        Absent slots are None and are not created here."""
+        found = {}
+        for number in range(1, POOL_SLOT_MAX + 1):
+            alias = slot_alias(pool, number)
+            directory = self.root / 'pools' / digest([provider, alias])
+            found[number] = self._pool(provider, alias) if os.path.lexists(directory) else None
+        return found
+
+    @staticmethod
+    def _base_alias(pool):
+        if POOL_SLOT.search(safe_label(pool)):
+            raise GuardError('INVALID_OUTPUT', 'A pool slot cannot be addressed directly')
+        return pool
+
     def acquire_pool(self, provider, pool, run_id):
+        safe_label(provider); self._base_alias(pool)
         with self._lock():
             self._owned_start(run_id)
             self._require_open(run_id)
-            directory, state = self._pool(provider, pool)
-            if state['active'] is not None and self._auto_reconcile_locked(state['active'])['reconciled']:
-                directory, state = self._pool(provider, pool)
-            if state['active'] is not None:
+            capacity = self.pool_capacity(provider, pool)
+            slots = self._slots(provider, pool)
+            for number, held in slots.items():
+                if held is not None and held[1]['active'] is not None and self._auto_reconcile_locked(held[1]['active'])['reconciled']:
+                    slots = {**slots, number: self._pool(provider, slot_alias(pool, number))}
+            now = time.time()
+            for held in slots.values():
+                # A QUOTA or AUTH cooldown on any slot, including one above a later lower capacity, blocks the pool.
+                if held is not None and held[1]['cooldown'] and (held[1]['reset_at'] is None or now < held[1]['reset_at']):
+                    raise PoolUnavailable(held[1]['reason'],
+                                          'Provider pool requires availability evidence or its reliable reset', kind='cooldown')
+            active = [(number, held[1]) for number, held in slots.items()
+                      if held is not None and held[1]['active'] is not None]
+            if len(active) >= capacity or any(state['active'] == run_id for _, state in active):
+                state = next((state for _, state in active if state['active'] != run_id), active[0][1])
                 raise PoolUnavailable('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
                                       'Provider pool has an active or unreconciled owner; no provider was launched',
                                       holder=state['active'], kind='active')
-            if state['cooldown'] and (state['reset_at'] is None or time.time() < state['reset_at']):
-                raise PoolUnavailable(state['reason'], 'Provider pool requires availability evidence or its reliable reset',
-                                      kind='cooldown')
+            number = next(k for k in range(1, capacity + 1) if slots[k] is None or slots[k][1]['active'] is None)
+            directory, state = slots[number] or self._pool(provider, slot_alias(pool, number))
             state = {**state, 'active': run_id, 'cooldown': False, 'reason': 'NONE', 'reset_at': None}
             self._pool_event(directory, state, 'RESERVED')
 
@@ -970,10 +1054,13 @@ class UsageStore:
             raise GuardError('INVALID_OUTPUT', 'Unknown provider result reason')
         if reset_at is not None and (type(reset_at) not in (int, float) or not math.isfinite(reset_at) or reset_at <= time.time()):
             reset_at = None
+        safe_label(provider); self._base_alias(pool)
         with self._lock():
-            directory, state = self._pool(provider, pool)
-            if state['active'] != run_id:
+            owned = [held for held in self._slots(provider, pool).values()
+                     if held is not None and held[1]['active'] == run_id]
+            if not owned:
                 raise GuardError('UNKNOWN', 'Provider pool ownership changed')
+            directory, state = owned[0]
             cooldown = account_cooldown is True and reason in {'QUOTA', 'AUTH'}
             uncertain = reason in {'TIMEOUT', 'UNKNOWN'}
             state = {**state, 'active': run_id if uncertain else None, 'cooldown': cooldown,
@@ -1175,12 +1262,19 @@ class UsageStore:
 
     def ack_pool(self, provider, pool, *, actor, reason, evidence):
         for value in (actor, reason, evidence): safe_text(value)
+        safe_label(provider); self._base_alias(pool)
         with self._lock():
-            directory, state = self._pool(provider, pool)
-            if state['active'] is not None:
-                raise GuardError('UNKNOWN', 'Reconcile the active owner before acknowledging availability')
-            self._pool_event(directory, {**state, 'cooldown': False, 'reason': 'NONE', 'reset_at': None},
-                             'AVAILABILITY_ACK', actor=actor, reason=reason, evidence=evidence)
+            slots = {k: held for k, held in self._slots(provider, pool).items() if held is not None}
+            # Every slot that carries a cooldown is cleared; with none, slot 1 gets the audit event as before.
+            targets = [k for k, held in slots.items() if held[1]['cooldown']] or [1]
+            for number in targets:
+                directory, state = slots.get(number) or self._pool(provider, slot_alias(pool, number))
+                if state['active'] is not None:
+                    raise GuardError('UNKNOWN', 'Reconcile the active owner before acknowledging availability')
+            for number in targets:
+                directory, state = slots.get(number) or self._pool(provider, slot_alias(pool, number))
+                self._pool_event(directory, {**state, 'cooldown': False, 'reason': 'NONE', 'reset_at': None},
+                                 'AVAILABILITY_ACK', actor=actor, reason=reason, evidence=evidence)
 
 
 TICKETED_CATEGORIES = {'correctness', 'reliability', 'performance', 'maintainability', 'testing', 'documentation', 'ux'}

@@ -18,6 +18,7 @@
       "/usr/bin/claude"
     ]
   },
+  "pool_capacity": {"claude": {"default": 3}, "codex": {"default": 3}},
   "snapshot_timeout": {"base_seconds": 1800, "per_gib_seconds": 60, "max_seconds": 7200},
   "usage_limit_phrases": [
     "hit your usage limit",
