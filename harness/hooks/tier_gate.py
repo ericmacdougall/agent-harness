@@ -48,6 +48,29 @@ def hook_result(decision, reason=None, updated=None, context=None):
     return {'hookSpecificOutput': out}
 
 
+def central_permission(task, family, facts):
+    """A verified signed central decision (central_decisions.py, GoodQA goodqa#16651) stands in for the task's own
+    recorded permission, exactly where the local permission is read and nowhere else (the rung ceiling is unchanged).
+    Nothing is written into the escalation state; any failure, timeout or missing config means no permission."""
+    if not isinstance(task, str) or not esc.SAFE_KEY.fullmatch(task) or family not in ('fable', 'astra'):
+        return None
+    try:
+        import central_decisions as cd  # noqa: PLC0415
+        store = cd.Store()
+        if not store.config.exists():
+            return None
+        found = cd.verify(task, family, store=store, deadline_seconds=cd.HOOK_DEADLINE)
+    except Exception as error:  # noqa: BLE001  fail closed: no permission
+        facts['central'] = str(getattr(error, 'code', type(error).__name__))[:40]
+        return None
+    facts['central'] = found['decision_id']
+    return {'central': True, 'decision_id': found['decision_id'], 'task': task, 'expires_at': found['expires_at']}
+
+
+def family_of_model(model):
+    return 'astra' if 'astra' in str(model or '').lower() else 'fable'
+
+
 def requested_spec(tool_input, policy):
     """What the caller asked for, classified, or None when no model was named (inherit)."""
     model = tool_input.get('model')
@@ -116,10 +139,17 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     facts['requested'] = requested
     blocked = status['blocked_by'] if status else []
 
+    central = {}
+
     def permitted(rung):
-        """Only the task's own recorded permission. Review F1 and main's rule: there is no session-wide grant, so
-        an untagged spawn never inherits a permission the user gave for another task."""
-        return bool((status or {}).get('permission'))
+        """Only the task's own recorded permission, or a verified central decision for this exact task (family
+        fable: a Claude spawn). Review F1 and main's rule: there is no session-wide grant, so an untagged spawn never
+        inherits a permission the user gave for another task."""
+        if (status or {}).get('permission'):
+            return True
+        if 'value' not in central:
+            central['value'] = central_permission(task if not generated else None, 'fable', facts)
+        return bool(central['value'])
 
     def permission_denied(rung):
         return ('rung %s needs the user permission for task %s. Fix: %s (then add [task:%s] to the Agent description)'
@@ -437,6 +467,9 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
                 except (esc.LedgerError, tiers.TierError) as error:
                     facts['ladder_error'] = getattr(error, 'code', 'error')
             if not permission:
+                harness_family = 'astra' if selection.get('harness') == 'openai' else 'fable'
+                permission = central_permission(task, harness_family, facts)
+            if not permission:
                 return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
     if model is None:
         return 'allow', None, None, facts
@@ -451,7 +484,10 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
         except (esc.LedgerError, tiers.TierError) as error:
             facts['ladder_error'] = getattr(error, 'code', 'error')
     # Permission and review-only checks come first: no task means no recorded permission (no session grant).
-    if entry['needs_user_permission'] and not (status or {}).get('permission'):
+    granted = bool((status or {}).get('permission'))
+    if not granted and task is not None and (entry['needs_user_permission'] or (status or {}).get('needs_user_permission')):
+        granted = bool(central_permission(task, family_of_model(model), facts))
+    if entry['needs_user_permission'] and not granted:
         return 'deny', 'launch at %s needs the user permission for task %s. Fix: %s' % (
             requested['rung'], task or '(none)', esc.approve_fix(task)), None, facts
     if not entry['writable'] and 'rescue.py' in basenames:
@@ -466,7 +502,7 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
         return 'allow', 'launch without --task: lowest rung applies', None, facts
     if status is None:
         return 'allow', 'ladder state unreadable (%s): lowest rung applies' % facts.get('ladder_error', 'error'), None, facts
-    if status.get('needs_user_permission') and not status.get('permission') and 'rescue.py' not in basenames:
+    if status.get('needs_user_permission') and not granted and 'rescue.py' not in basenames:
         # The task has climbed to a permission rung: like the spawn path, nothing launches for it below
         # that rung either until approve-top records the user's answer.
         return 'deny', 'task %s is computed at %s, which needs the user permission before any launch. Fix: %s' % (

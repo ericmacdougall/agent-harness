@@ -416,10 +416,34 @@ def cmd_stop_lint(payload: dict) -> dict:
             + ((" " + carried) if carried else "")}
 
 
+def central_note(session: str, payload: dict):
+    """goodqa#16651: a later user turn naming the top rung (or withdrawing) revokes this session's published central
+    decisions. Only runs when this host has central decisions enabled; never raises."""
+    try:
+        import central_decisions as cd  # noqa: PLC0415
+        store = cd.Store()
+        if not store.config.exists():
+            return None
+        return cd.on_user_prompt(session, payload.get("prompt"), store=store)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def cmd_prompt(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
+    note = central_note(session, payload)
+    result = _reminder(session)
+    if note:
+        context = "Central decisions: " + note
+        if result:
+            context = result["hookSpecificOutput"]["additionalContext"] + "\n" + context
+        return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}
+    return result
+
+
+def _reminder(session: str) -> dict:
     path = reminder_path(session)
     claimed = path.with_name(f"{path.name}.{os.getpid()}")
     try:
