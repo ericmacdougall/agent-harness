@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -566,13 +567,17 @@ class PublisherTests(L.Base):
                     d.mkdir()
                 a = self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(6))
                 b = self.write('codex-wals', 'w.jsonl', lines(4, start=50))
+                snap = self.snapshot()
                 code, out, err = self.cli('sync', '--checkpoint', 'pr', env={'TRANSCRIPTS_CRASH_AT': point})
                 if point == 'push_timeout_landed':
                     self.assertEqual(code, 0, err[-400:])
                 else:
                     self.assertEqual(code, 97, err[-400:])
+                self.assertEqual(self.snapshot(), snap)  # copy-only holds through a hard crash
                 code, out, err = self.cli('sync', '--checkpoint', 'pr')
                 self.assertEqual(code, 0, err[-400:] + out)
+                self.assertEqual(self.snapshot(), snap)  # and through the replay
+                self.assert_one_path_per_source_range({a: 'claude-projects', b: 'codex-wals'})
                 ch = self.chunks()
                 self.assertEqual(len(ch), 2, sorted(ch))
                 self.assertEqual(sorted(os.path.basename(p).split('.')[0] for p in ch), sorted([UUID1, 'w']))
@@ -586,6 +591,28 @@ class PublisherTests(L.Base):
                 tips = {r: self.tip(r) for r in self.repos()}
                 code, out, err = self.cli('sync', '--checkpoint', 'pr')
                 self.assertEqual({r: self.tip(r) for r in self.repos()}, tips)
+
+    def assert_one_path_per_source_range(self, sources):
+        """Every chunk blob in every shard (not one per path): per source, the sidecars' src_range values tile
+        [0, size) exactly once, so a replay never published one byte range under two paths."""
+        ranges = {}
+        for repo in self.shard_repos():
+            tree = self.tree(repo)
+            for path in tree:
+                if path.endswith('.zst'):
+                    meta = json.loads(self.blob(repo, tree[path + '.meta.json']))
+                    ranges.setdefault((meta['source'], meta['relpath'], meta['gen']), []).append(
+                        (tuple(meta['src_range']), path))
+        for src_path, label in sources.items():
+            got = [k for k in ranges if k[0] == label]
+            self.assertEqual(len(got), 1, (label, sorted(ranges)))
+            spans = sorted(ranges[got[0]])
+            self.assertEqual(len({p for _, p in spans}), len(spans))
+            pos = 0
+            for (start, end), _ in spans:
+                self.assertEqual(start, pos, spans)
+                pos = end
+            self.assertEqual(pos, src_path.stat().st_size, spans)
 
     def test_catalog_race_retries_without_force(self):
         """NEG-11: the catalog tip moves under us (another host); the push refetches and keeps both."""
@@ -1138,6 +1165,108 @@ class HoldOwnerTests(L.Base):
                         and isinstance(node.args[0], ast.Constant) and node.args[0].value == 'held'):
                     writers.add(fn.name)
         self.assertEqual(writers, {'hold', 'release', 'begin_retry'})
+
+
+class DeltaGateTests(L.Base):
+    """Pre-empted delta-gate checks for PR #316: copy-only under a write trap, and visibility per run."""
+
+    def test_base_isolates_environment_between_tests(self):
+        """Guard: a setenv in one test never reaches the next (a leaked TRANSCRIPTS_TEST_NO_GH once turned 48 later
+        tests into gh-less refusals)."""
+        seen = {}
+
+        class Pair(L.Base):
+            def test_1_sets(self_):
+                self_.setenv(TRANSCRIPTS_TEST_NO_GH='1', TRANSCRIPTS_HOLD_BACKOFF_SECONDS='0')
+
+            def test_2_reads(self_):
+                seen['leaked'] = sorted(k for k in ('TRANSCRIPTS_TEST_NO_GH', 'TRANSCRIPTS_HOLD_BACKOFF_SECONDS')
+                                        if k in os.environ)
+        result = unittest.TestResult()
+        unittest.TestSuite([Pair('test_1_sets'), Pair('test_2_reads')]).run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(seen['leaked'], [])
+        self.assertNotIn('TRANSCRIPTS_TEST_NO_GH', os.environ)
+
+    def test_no_write_call_ever_targets_a_source(self):
+        """AC-7 by construction: every call that could change a source (write-mode open, unlink, rename, replace,
+        truncate, chmod, utime, rmdir, mkdir, links) is trapped while sync, verify, cat and recover run; none may
+        name a path under a source root. A control write proves the trap fires."""
+        import builtins
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(20))
+        self.write('claude-wals', '%s/main.jsonl' % UUID2, lines(2) + b'{"partial')
+        src = os.path.realpath(self.src)
+        hits = []
+
+        def under(path):
+            try:
+                return os.path.realpath(os.fspath(path)).startswith(src + os.sep)
+            except TypeError:
+                return False  # an fd
+
+        def trap(name, orig, is_write):
+            def wrapper(*a, **kw):
+                if a and under(a[0]) and is_write(a, kw):
+                    hits.append((name, os.path.relpath(os.path.realpath(os.fspath(a[0])), src)))
+                if name in ('rename', 'replace') and len(a) > 1 and under(a[1]):
+                    hits.append((name + '-target', os.fspath(a[1])))
+                return orig(*a, **kw)
+            return wrapper
+        write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+        traps = {
+            (os, 'open'): lambda a, kw: bool((a[1] if len(a) > 1 else kw.get('flags', 0)) & write_flags),
+            (builtins, 'open'): lambda a, kw: any(c in str(a[1] if len(a) > 1 else kw.get('mode', 'r'))
+                                                  for c in 'wax+'),
+        }
+        for fn in ('unlink', 'remove', 'rename', 'replace', 'truncate', 'chmod', 'utime', 'rmdir', 'mkdir',
+                   'makedirs', 'symlink', 'link'):
+            traps[(os, fn)] = lambda a, kw: True
+        for (mod, fn), is_write in traps.items():
+            orig = getattr(mod, fn)
+            setattr(mod, fn, trap(fn, orig, is_write))
+            self.addCleanup(setattr, mod, fn, orig)
+        snap = self.snapshot()
+        code, r = self.sync('pr')
+        self.assertEqual(code, 0, r)
+        self.main('verify')
+        self.main('cat', UUID1)
+        self.main('recover', UUID1, '--to', str(Path(self.tmp) / 'rec'), '--from', 'local')
+        self.main('verify', '--against-source')
+        self.assertEqual(hits, [])
+        self.assertEqual(self.snapshot(), snap)
+        with open(self.roots['claude-projects'] / ('p/%s.jsonl' % UUID1), 'ab') as f:  # control: the trap fires
+            f.write(lines(1, start=20))
+        self.assertEqual([h[0] for h in hits], ['open'])
+        hits.clear()
+        snap = self.snapshot()
+        self.sync('pr')
+        self.assertEqual(hits, [])
+        self.assertEqual(self.snapshot(), snap)
+
+    def test_visibility_is_checked_every_run_in_both_url_styles(self):
+        """The privacy check is chosen by gh availability, never by the git URL style, and a new run never reuses an
+        earlier run's pass: after a good push, a repo turned public refuses the next push in every combination."""
+        f = self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        code, r = self.sync('pr')
+        self.assertEqual(code, 0, r)
+        stubs = {'1': {'*': {'unauth_status': 200}},  # without gh: an unauthenticated read succeeds
+                 '0': {'*': {'visibility': 'PUBLIC'}}}  # with gh: the API reports public
+        n = 3
+        for style in ('https', 'ssh'):
+            for no_gh in ('0', '1'):
+                with self.subTest(style=style, no_gh=no_gh):
+                    with mock.patch.object(T.Cfg, 'url_style', property(lambda self_, s=style: s)):
+                        self.setenv(TRANSCRIPTS_TEST_NO_GH=no_gh)
+                        with open(f, 'ab') as fh:
+                            fh.write(lines(1, start=n))
+                        n += 1
+                        tips = {x: self.tip(x) for x in self.repos()}
+                        (self.remote / 'repo-checks.json').write_text(json.dumps(stubs[no_gh]))
+                        code, r = self.sync('pr')
+                        os.unlink(self.remote / 'repo-checks.json')
+                        self.assertEqual(code, 2, r)
+                        self.assertEqual(r['status'], 'refused')
+                        self.assertEqual({x: self.tip(x) for x in self.repos()}, tips)
 
 
 if __name__ == '__main__':
