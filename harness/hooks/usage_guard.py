@@ -1398,16 +1398,40 @@ class Run:
 
 
 def zero_launch_attempt(final):
-    """True only when the attempt provably launched no provider and was refused by infrastructure.
+    """True only when the attempt did no provider work and was refused by infrastructure.
 
-    Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and uncertain ones (TIMEOUT,
-    UNKNOWN) count as attempts even with zero launches.
+    That is either no launch at all (execution NOT_STARTED), or launches that each ended in the provider's own
+    terminal refusal (quota, auth, model unavailable) before any review work, recorded per provider in
+    usage.provider_attempts (goodqa#16725). Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and
+    uncertain ones (TIMEOUT, UNKNOWN) count as attempts even with zero launches.
     """
     usage = final.get('usage') if isinstance(final.get('usage'), dict) else {}
     launches = usage.get('provider_launches')
-    if type(launches) is not int or launches != 0 or usage.get('reported', []) != []:
+    if type(launches) is not int or launches < 0 or usage.get('reported', []) != []:
         return False
-    return final.get('execution') == 'NOT_STARTED' and final.get('reason') in ZERO_LAUNCH_REASONS
+    if final.get('reason') not in ZERO_LAUNCH_REASONS:
+        return False
+    if launches == 0:
+        return final.get('execution') == 'NOT_STARTED'
+    return final.get('execution') == 'COMPLETED' and refused_before_work(usage.get('provider_attempts'), launches)
+
+
+PROVIDER_ATTEMPT_KEYS = frozenset({'provider', 'launched', 'reason', 'refused_before_work'})
+
+
+def refused_before_work(attempts, launches):
+    """Every launch in the per-provider record was refused by its provider before work, and they add up."""
+    if not isinstance(attempts, list) or not 0 < len(attempts) <= 8:
+        return False
+    total = 0
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or set(attempt) != PROVIDER_ATTEMPT_KEYS:
+            return False
+        launched = attempt['launched']
+        if type(launched) is not int or launched < 0 or (launched and attempt['refused_before_work'] is not True):
+            return False
+        total += launched
+    return total == launches
 
 
 def within_window(started_at, seconds):

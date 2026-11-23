@@ -1257,9 +1257,55 @@ class CompletedUncertainPools(OwnerLiveness):
 class ZeroLaunchAttempts(StoreFixture):
     """GoodQA goodqa#14526: infrastructure refusals before any provider ran do not spend the repeat budget."""
 
-    def refuse(self, run, *, launches=0, execution='NOT_STARTED', reason='TRANSIENT_INFRA', reported=()):
-        return run.finish(execution=execution, result='NO_RESULT', reason=reason,
-                          usage={'provider_launches': launches, 'reported': list(reported)})
+    def refuse(self, run, *, launches=0, execution='NOT_STARTED', reason='TRANSIENT_INFRA', reported=(), attempts=None):
+        usage = {'provider_launches': launches, 'reported': list(reported)}
+        if attempts is not None:
+            usage['provider_attempts'] = attempts
+        return run.finish(execution=execution, result='NO_RESULT', reason=reason, usage=usage)
+
+    QUOTA_THEN_LEASE = [{'provider': 'codex', 'launched': 1, 'reason': 'QUOTA', 'refused_before_work': True},
+                        {'provider': 'claude', 'launched': 0, 'reason': 'TRANSIENT_INFRA', 'refused_before_work': False}]
+
+    def test_provider_refusal_then_pool_refusal_is_not_counted(self):
+        # goodqa#16725: the primary answered only with a quota refusal and the fallback pool was reserved,
+        # so no review work happened. It falls under the zero-launch window, not the two-attempt cap.
+        for _ in range(3):
+            self.refuse(self.begin(aggregate_timeout=60), launches=1, execution='COMPLETED',
+                        attempts=self.QUOTA_THEN_LEASE)
+        run = self.begin(aggregate_timeout=60); self.finish(run)
+        with self.assertRaises(guard.GuardError) as refused: self.begin(aggregate_timeout=60)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+
+    def test_launched_work_before_a_pool_refusal_still_counts(self):
+        worked = [{**self.QUOTA_THEN_LEASE[0], 'reason': 'INVALID_OUTPUT', 'refused_before_work': False},
+                  self.QUOTA_THEN_LEASE[1]]
+        cases = {'worked': dict(attempts=worked),
+                 'legacy-no-attempts': dict(attempts=None),
+                 'launch-mismatch': dict(launches=2),
+                 'reported-usage': dict(reported=[{'provider': 'codex', 'reported': {}}]),
+                 'extra-key': dict(attempts=[{**self.QUOTA_THEN_LEASE[0], 'note': 'x'}, self.QUOTA_THEN_LEASE[1]]),
+                 'bool-launch': dict(attempts=[{**self.QUOTA_THEN_LEASE[0], 'launched': True}, self.QUOTA_THEN_LEASE[1]]),
+                 'empty-attempts': dict(attempts=[]),
+                 'content-reason': dict(reason='CODE_FINDINGS'),
+                 'not-completed': dict(execution='INTERRUPTED', reason='TIMEOUT')}
+        for label, options in cases.items():
+            with self.subTest(label):
+                options = {'launches': 1, 'execution': 'COMPLETED', 'attempts': self.QUOTA_THEN_LEASE, **options}
+                final = {'execution': options['execution'], 'reason': options.get('reason', 'TRANSIENT_INFRA'),
+                         'usage': {'provider_launches': options['launches'], 'reported': list(options.get('reported', ()))}}
+                if options['attempts'] is not None:
+                    final['usage']['provider_attempts'] = options['attempts']
+                self.assertFalse(guard.zero_launch_attempt(final))
+        self.assertTrue(guard.zero_launch_attempt({'execution': 'COMPLETED', 'reason': 'TRANSIENT_INFRA', 'usage': {
+            'provider_launches': 1, 'reported': [], 'provider_attempts': self.QUOTA_THEN_LEASE}}))
+
+    def test_provider_refusals_stay_bounded_by_the_zero_launch_cap(self):
+        for _ in range(guard.ZERO_LAUNCH_CAP):
+            self.refuse(self.begin(aggregate_timeout=600), launches=1, execution='COMPLETED',
+                        attempts=self.QUOTA_THEN_LEASE)
+        with self.assertRaises(guard.GuardError) as refused: self.begin(aggregate_timeout=600)
+        self.assertEqual(refused.exception.reason, 'BUDGET_EXHAUSTED')
+        self.assertIn('infrastructure', refused.exception.message)
 
     def test_zero_launch_attempts_do_not_need_a_repeat_reason_or_spend_the_cap(self):
         for reason in ('TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH'):
