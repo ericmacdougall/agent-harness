@@ -36,9 +36,16 @@ SECRET_PATTERN = re.compile(
 )
 
 
-try:  # the shared segment writer ships beside this hook; in a repo checkout it lives in harness/hooks
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.append(str(Path(__file__).resolve().parents[2] / "harness" / "hooks"))
+try:  # the shared segment writer ships beside this hook; only in a real repo checkout does it live in harness/hooks
+    _here = Path(__file__).resolve().parent
+    sys.path.insert(0, str(_here))
+    _repo_hooks = _here.parents[1] / "harness" / "hooks"
+    # a real checkout: this file is <repo>/codex/hooks/wal.py, the repo has a .git and ships harness/hooks/wal_segments.py.
+    # A copy installed under ~/.codex/<dir>/ has parents[1] == ~ (which may itself be git-tracked): the layout test
+    # below rejects it, so a stray ~/harness/hooks/wal_segments.py is never imported.
+    if (_here == _here.parents[1] / "codex" / "hooks" and (_here.parents[1] / ".git").exists()
+            and (_repo_hooks / "wal_segments.py").is_file()):
+        sys.path.append(str(_repo_hooks))
     import wal_segments
 except ImportError:
     wal_segments = None

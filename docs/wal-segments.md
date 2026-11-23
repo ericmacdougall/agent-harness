@@ -40,18 +40,38 @@ derived (segment k is followed by k+1; the last closed segment by the live file)
 
 ## The rotation protocol (writers)
 
-Every append takes, in this order: the seglock (`.stem.seglock`, flock with a 2 s deadline), the live file (O_CREAT only
-under the seglock), the data flock, the target check. When `size + record > limit` (and the file is more than a marker
-long), under all locks: repair a torn tail, hash the live file, exclusive-rename it to the next segment, fsync the
-directory, create the new live file (O_EXCL), write the marker, rewrite the index, then append the record. Recovery rule:
-a live file that is missing or empty next to closed segments is finished with a fresh marker by the next append, with the
-enable file off too.
+Every append takes, in this order: the seglock (`.stem.seglock`, flock with a 2 s deadline), the live file, the data
+flock, the target check. A writer that holds the seglock may create the live file (O_CREAT). A writer that could not take
+the seglock (timeout or unusable lock file) does not create it at once: if closed segments exist it waits up to the same
+deadline for the live name to exist (a rotation may be between its two renames) and only then creates it as a last
+resort, so a record is never dropped.
+
+When `size + record > limit` (and the file is more than a marker long), under all locks: repair a torn tail, hash the live
+file, prepare the NEW live file complete (create it under a temp dot-name `.<stem>.live.<pid>.<rand>.new`, lock it, write
+the open marker, fsync), exclusive-rename the live file to the next segment, fsync the directory, exclusive-rename the
+marked temp file into the live name, fsync the directory, rewrite the index, then append the record to the new live
+file. The live name therefore never exists without its marker (a failure while preparing the temp file changes nothing on
+disk: rotation is skipped and the record still lands in the old live file). The only gap is the instant between the two
+renames, during which the live name is absent. Any writer WITHOUT the seglock can win that gap: an old install that
+never takes the seglock, and also a current writer after `seglock_timeout` or with an unusable seglock (it waits for the
+live name in `_wait_for_live`, but there is a window between its `stat` and its `O_CREAT` open). If one wins it, the
+rotator discards its temp file and retries into that file (which lacks a marker: `verify` reports `marker_missing`). If
+the second rename fails and the undo (segment back to the live name) succeeds, rotation is skipped and the record kept
+(`SKIPPED`); if the live name was recreated before the undo the outcome is `RECREATED`, every record is kept and
+`marker_missing` is reported. Each documented outcome is tagged `# outcome: <name>` in `wal_segments.py` and mapped to a
+test that provably reaches that line (`OutcomeCoverageTests`, a line-tracing guard).
+
+Recovery rule: a live file that is missing or empty next to closed segments is finished with a fresh marker by the next
+append, with the enable file off too. An orphan temp file (a crash between the steps) is marker-only and is discarded by
+the next rotation when nobody holds its flock; it is the only thing this module ever unlinks, and never a WAL.
 
 Stderr codes (hooks show nothing; the ops_watch alert on an oversize live file and on a persistent `live_missing` is part of the reader-migration PR, PENDING): `rotate_collision` (the target
 name exists; rotation skipped), `rotate_unsupported` (no exclusive rename on this platform or filesystem),
-`seq_implausible`, `seglock_timeout`, `seglock_unusable`, `rotate_create_failed` (rotation undone, record kept),
-`rotate_failed_record_not_written` (rename could not be undone: the record is NOT written into a closed segment; the next
-append repairs).
+`seq_implausible`, `seglock_timeout`, `seglock_unusable`, `rotate_create_failed` (the marked temp file could not be
+prepared or moved, rotation skipped or undone, record kept), `rotate_failed` (the live file could not be renamed,
+rotation skipped), `rotate_failed_record_not_written` (the second rename failed and the first could not be undone: the
+record is NOT written into a closed segment and the writer raises `ValueError` starting with this code; the next append
+recovers by recreating the live file with a marker).
 
 ## Switch and rollout
 
@@ -100,11 +120,28 @@ dropped), as line 1 of a live file that has closed predecessors and no open mark
 dropped by the marker rule. A live file that already holds a record is not rewritten (rotation never edits a WAL), so
 the flag stays until the next rotation closes that file.
 
+## Tail validation: a chain with a deleted tail is never complete
+
+The directory scan alone finds gaps only up to the newest closed segment still on disk, so deleting the newest closed
+segment (or all of them) used to leave a clean-looking chain. One shared rule, `tail_problems`, compares the live file's
+open marker with the newest closed segment: the marker's `segment` must equal newest + 1 (a larger number is
+`tail_missing`: newer closed segments are gone; any other number or stem is `marker_mismatch`), its `prev` must be the
+newest closed segment's name, its `prev_bytes` must equal that segment's size, and a live file without a marker is only
+valid when no closed segment exists (`marker_missing` otherwise). All of these are hard problems: `Snapshot.complete`,
+`strict` reads, `Chain.complete` (via `Chain.validate_tail()`, one cached open of the live file), `verify_chain`, `map`
+and `verify` all treat them so. `prev_sha256` is checked by `verify --deep` and by `Snapshot(..., deep_tail=True)`; the
+digest of an unchanged newest closed segment is cached per process by (name, st_dev, st_ino, size, mtime_ns), so the
+hash of up to 50 MB is paid once, and a changed file always re-hashes (a failed comparison is never cached). Open
+question for the reviewer: should approval-reading gates (`verify_ask_pair`, native proofs) pass `deep_tail=True`?
+Recommendation: yes, with that cache.
+
 ## Reader framing rules (one place: `Snapshot._frame` and `_drops_marker`)
 
 - A line longer than 8 MiB is discarded up to its newline and yielded once as `None`; it is never split into fake lines.
 - Line 1 of a source is dropped only when it is exactly that source's open marker (seq >= 2, `segment` equal to the
   source's seq, `stem` equal). Any other marker-shaped line is an ordinary record and adds a `marker_mismatch` problem.
+- Closed segments are reopened through the pinned directory fd (not by re-resolving the path) and must be the inode
+  that was listed; a replaced or swapped segment is reported as `segment_changed` and not read.
 
 ## Transcripts
 
