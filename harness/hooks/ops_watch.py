@@ -33,6 +33,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import socket
 import stat
@@ -1741,23 +1742,128 @@ def parse_ts(value):
         return None
 
 
-def _tail(path: Path, limit: int) -> bytes:
-    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return b""
-        return os.pread(fd, limit, max(0, st.st_size - limit))
-    finally:
-        os.close(fd)
+# ---------------------------------------------------------------- WAL chains (goodqa#16751)
+# A WAL is a chain: S.0001.jsonl ... S.NNNN.jsonl plus the live S.jsonl. Nothing here opens S.jsonl itself: every read goes
+# through wal_segments, so a rotated WAL reads the same as one file, a segment is never an owner of its own, and a gap is
+# reported, never skipped. ops_watch stays read-only (spec R3-3): it alerts and names the fix.
+_WAL_API = []
+SOFT_WAL_CODES = ("live_missing", "schema_newer", "marker_info")  # info only: never an alert by themselves
+LIVE_MISSING_GRACE_S = 600  # a rotation in flight has no live file for a moment; after this it is a crashed rotation
+ROTATION_SLACK = 1.10       # spec R3-3: a live file over the segment limit plus 10% means rotation is not working
 
 
-def task_wal_tail(path: Path):
-    """(last event of any kind, last owner-written event, ended) from a task WAL's tail. Any handoff, result or
-    WORKDIR_DONE ends the task, even with later notes: a resumed owner is tracked through its agent row."""
+def wal_api():
+    """The wal_segments module, or None on a watcher-only host that has not installed it."""
+    if not _WAL_API:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        try:
+            import wal_segments  # noqa: PLC0415 - installed beside this file
+        except ImportError:
+            wal_segments = None
+        _WAL_API.append(wal_segments)
+    return _WAL_API[0]
+
+
+def chain_files(ch):
+    return ([ch.live] if ch.live else []) + list(ch.segments)
+
+
+def chain_mtime(ch) -> float:
+    """Newest mtime of any file of the chain (lstat: a link is never followed); 0 when none can be read."""
+    newest = 0.0
+    for seg in chain_files(ch):
+        try:
+            newest = max(newest, os.lstat(ch.path(seg)).st_mtime)
+        except OSError:
+            continue
+    return newest
+
+
+def chain_bytes(ch) -> int:
+    return sum(seg.size for seg in chain_files(ch))
+
+
+def hard_problems(ws, ch, now, markers=True):
+    """The problems of a chain that need a person: every code but the info ones, and live_missing once it has lasted past
+    the grace. markers=True runs `verify_chain` (without its deep flag, so closed segments are NOT rehashed) to add the
+    first-line marker checks (marker_missing, marker_mismatch), which only a chain with closed segments has; markers=False
+    uses the directory-level problems of the chain only (gap, ambiguous, unreadable, not_regular, live_missing)."""
+    problems = ws.verify_chain(ch.directory, ch.stem) if (markers and ch.segments) else list(ch.problems)
+    newest = chain_mtime(ch)
+    out = []
+    for p in problems:
+        if p["code"] == "live_missing":
+            if not (newest and now - newest > LIVE_MISSING_GRACE_S):
+                continue
+        elif p["code"] in SOFT_WAL_CODES:
+            continue
+        out.append(p)
+    return out
+
+
+def problem_codes(problems):
+    return sorted({p["code"] for p in problems})
+
+
+def wals_present(roots) -> bool:
+    """True when any WAL file name sits under one of the roots (names only, never read, bounded)."""
+    budget = 20000
+    for root in roots:
+        try:
+            if os.path.islink(root) or not os.path.isdir(root):
+                continue
+        except OSError:
+            continue
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(current, d))]
+            budget -= len(files) + 1
+            if any(name.endswith(".jsonl") for name in files):
+                return True
+            if budget < 0:
+                return True  # too many to look through: assume present, so the missing reader is reported
+    return False
+
+
+def reader_unavailable(check, state, roots):
+    """wal_segments is not installed: the check cannot judge any WAL chain, and reading around the reader API would
+    misread a rotated WAL. It must not silently clear what it raised (gate F2, #330): every active alert of this check
+    is kept as it was, and, while WALs exist, wal:reader-unavailable:<check> says why nothing new is judged."""
+    kept = [{"check": check, "key": key, "severity": a.get("severity", "warning"), "message": a.get("message", ""),
+             "detail": a.get("detail") or {}}
+            for key, a in sorted((state.get("active") or {}).items())
+            if a.get("check") == check and not key.startswith("wal:reader-unavailable:")]
+    if not wals_present(roots):
+        return kept
+    return kept + [alert(check, f"wal:reader-unavailable:{check}", "warning",
+                         f"wal_segments.py is not installed beside ops_watch.py, so the {check} check cannot read WAL "
+                         "chains: its active alerts are kept and nothing new is judged until it is installed",
+                         {"fix": "reinstall the harness"})]
+
+
+def chain_head(ws, path, limit):
+    """The first `limit` bytes of the logical WAL (markers dropped), streaming."""
+    import contextlib  # noqa: PLC0415
+    out, size = [], 0
+    with contextlib.closing(ws.iter_lines(str(path))) as lines:
+        for _, _, raw in lines:
+            if raw is None:
+                continue
+            out.append(raw)
+            size += len(raw) + 1
+            if size >= limit:
+                break
+    return b"\n".join(out)
+
+
+def task_wal_tail(path: Path, problems=None):
+    """(last event of any kind, last owner-written event, ended) from a task WAL's tail, read across the whole chain
+    (newest bytes first, so a budget never drops the newest data). Any handoff, result or WORKDIR_DONE ends the task,
+    even with later notes: a resumed owner is tracked through its agent row."""
     last_any = last_note = None
     ended = False
-    for line in reversed(_tail(path, 262144).decode("utf-8", "replace").splitlines()):
+    ws = wal_api()
+    tail = ws.read_tail(str(path), 262144, problems=problems) if ws else b""
+    for line in reversed(tail.decode("utf-8", "replace").splitlines()):
         try:
             obj = json.loads(line)
         except ValueError:
@@ -1775,7 +1881,10 @@ def task_wal_tail(path: Path):
 
 
 def wal_ticket(path: Path):
-    text = (safe_read(path, 262144) + b"\n" + _tail(path, 65536)).decode("utf-8", "replace")
+    ws = wal_api()
+    if ws is None:
+        return None
+    text = (chain_head(ws, path, 262144) + b"\n" + ws.read_tail(str(path), 65536)).decode("utf-8", "replace")
     counts = {}
     for proj, num in TICKET_RE.findall(text):
         ref = f"{proj or 'goodqa'}#{num}"
@@ -1903,14 +2012,16 @@ def _owner_alerts(home, session, tickets, now):
     return out
 
 
-def _task_wal_alert(f, session, lc, tickets, now):
-    """A named task WAL has no process behind it, so silence alone is a warning, and it retires: on a handoff,
-    result or WORKDIR_DONE, a closed ticket, a named wait, or retire_h of silence without an open quiet ticket."""
-    mtime = f.stat().st_mtime
+def _task_wal_alert(stem, ch, session, lc, tickets, now):
+    """A named task WAL (a whole chain, never one segment) has no process behind it, so silence alone is a warning, and
+    it retires: on a handoff, result or WORKDIR_DONE, a closed ticket, a named wait, or retire_h of silence without an
+    open quiet ticket. A chain with a gap still alerts and says so: the missing part could hold the retiring event."""
+    mtime = chain_mtime(ch)
     if mtime < now - lc["lookback_h"] * 3600:
         return None
-    path = Path(f.path)
-    last_any, note, ended = task_wal_tail(path)
+    path = Path(ch.directory) / f"{stem}.jsonl"
+    read_problems = []
+    last_any, note, ended = task_wal_tail(path, problems=read_problems)
     if last_any is None or ended or is_waiting(note):
         return None
     ref = wal_ticket(path)
@@ -1928,12 +2039,16 @@ def _task_wal_alert(f, session, lc, tickets, now):
         sev = "high"
     if not reasons:
         return None
-    task = f.name[:-6]
+    task = stem
+    codes = problem_codes([p for p in list(ch.problems) + read_problems if p["code"] not in SOFT_WAL_CODES])
+    detail = {"session": session[:8], "task": task, "kind": "task", "ticket": ref, "silent_min": round(silent),
+              "ticket_quiet_h": quiet}
+    if codes:
+        detail["wal_problems"] = codes
+        reasons.append(f"WAL chain incomplete: {', '.join(codes)}")
     return alert("liveness", f"liveness:{session[:8]}/{task}", sev,
                  f"owner silent: {task} {('GoodQA ' + ref) if ref else 'no-ticket'} {round(silent)}m "
-                 f"({'; '.join(reasons)})",
-                 {"session": session[:8], "task": task, "kind": "task", "ticket": ref, "silent_min": round(silent),
-                  "ticket_quiet_h": quiet})
+                 f"({'; '.join(reasons)})", detail)
 
 
 def check_liveness(cfg, state, runner, now):
@@ -1952,22 +2067,26 @@ def check_liveness(cfg, state, runner, now):
     tickets = TicketLookup(lc, state, runner, gq if gq and os.path.isfile(gq) else None, now)
     alerting = {k.split(":", 1)[1].split("/", 1)[0] for k in (state.get("active") or {}) if k.startswith("liveness:")}
     out = []
+    ws = wal_api()
+    if ws is None:
+        return reader_unavailable("liveness", state, [str(root)])  # no WAL is read around the reader API
     for sess in sorted(sessions, key=lambda e: e.name):
         try:
-            files = [f for f in os.scandir(sess.path) if f.is_file(follow_symlinks=False) and f.name.endswith(".jsonl")]
-            newest = max((f.stat().st_mtime for f in files), default=0)
+            chains = {stem: ch for stem, ch in ws.list_wals(sess.path).items() if ch.live or ch.segments}
+            newest = max((chain_mtime(ch) for ch in chains.values()), default=0)
         except OSError:
             continue
         horizon = lc["lookback_active_h"] if sess.name[:8] in alerting else lc["lookback_h"]
         if newest < now - horizon * 3600:
             continue
-        if root == home / ".claude" / "wals" and any(f.name == "main.jsonl" for f in files):
+        # a crashed rotation (live file missing) is still the session: existence is the whole chain's, not one name's
+        if root == home / ".claude" / "wals" and "main" in chains:
             out += _owner_alerts(home, sess.name, tickets, now)
-        for f in sorted(files, key=lambda e: e.name):
-            if f.name == "main.jsonl" or f.name.startswith("agent-"):
+        for stem, ch in sorted(chains.items()):
+            if stem == "main" or stem.startswith("agent-"):
                 continue
             try:
-                found = _task_wal_alert(f, sess.name, lc, tickets, now)
+                found = _task_wal_alert(stem, ch, sess.name, lc, tickets, now)
             except OSError:
                 continue
             if found:
@@ -1977,13 +2096,25 @@ def check_liveness(cfg, state, runner, now):
 
 
 def check_wal_size(cfg, state, runner, now):
-    """goodqa#16650 AC-14: one high alert `wal:size:<digest>` per WAL file over wal_size.max_mib (40 MiB) under the
-    Claude and Codex WAL roots, largest first, at most max_alerts. lstat only: a symlinked file or directory is never
-    followed, so a link cannot point the watcher at another tree. Clears when the file shrinks, rotates or goes."""
+    """goodqa#16650 AC-14 and goodqa#16751 R3-3, over whole WAL chains (a segment is never a WAL of its own, AC-9).
+    Per chain under the Claude and Codex WAL roots, largest first, at most max_alerts of each kind:
+      wal:size:<digest>        high: the LIVE file is over the alarm. With rotation off that is max_mib (40 MiB, the early
+                               warning); with rotation on, or a chain that already has closed segments, it is the segment
+                               limit plus 10% (rotation is not working). Detail carries live_bytes and chain_bytes.
+      wal:chain-size:<digest>  warning: the chain total is over wal_size.chain_max_mib (default 1024).
+      wal:chain:<digest>       high: the chain has a problem that needs a person (gap, marker_mismatch, marker_missing,
+                               ambiguous, unreadable, not_regular, ... and live_missing for over 10 minutes). The text names
+                               the fix. The watcher never writes: the next append or `wal_segments.py recover --write` repairs.
+    lstat only: a symlinked file or directory is never followed. Alerts clear when the condition goes away."""
     wc = cfg.get("wal_size") or {}
     limit = int(wc.get("max_mib", 40)) * 1024 * 1024
+    chain_max = int(float(wc.get("chain_max_mib", 1024)) * 1024 * 1024)
     budget = int(wc.get("max_files", 200000))
-    found = []
+    ws = wal_api()
+    if ws is None:
+        return reader_unavailable("wal_size", state, [expand(home_of(cfg), r) for r in wc.get("roots") or []])
+    rotation_on = (home_of(cfg) / ".agent-harness" / "state" / "wal-rotation.on").is_file()
+    sized, totals, broken = [], [], []
     for raw in wc.get("roots") or []:
         root = Path(expand(home_of(cfg), raw))
         try:
@@ -1993,27 +2124,64 @@ def check_wal_size(cfg, state, runner, now):
             continue
         for current, dirs, files in os.walk(root, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(current, d)))
-            for name in files:
-                budget -= 1
-                if budget < 0:
-                    break
-                path = os.path.join(current, name)
-                try:
-                    st = os.lstat(path)
-                except OSError:
-                    continue
-                if stat.S_ISREG(st.st_mode) and st.st_size > limit:
-                    found.append((st.st_size, path, root))
+            budget -= len(files)
             if budget < 0:
                 break
+            if not any(name.endswith(".jsonl") for name in files):
+                continue
+            try:
+                chains = ws.list_wals(current)
+            except OSError:
+                continue
+            for stem, ch in chains.items():
+                live_path = os.path.join(current, f"{stem}.jsonl")
+                live_bytes = ch.live.size if ch.live else 0
+                total = chain_bytes(ch)
+                rel = os.path.relpath(live_path, root)
+                digest = hashlib.sha256(live_path.encode("utf-8", "replace")).hexdigest()[:12]
+                alarm = int(ws.segment_limit() * ROTATION_SLACK) if (rotation_on or ch.segments) else limit
+                if live_bytes > alarm:
+                    sized.append((live_bytes, live_path, root, rel, digest, alarm, total, len(ch.segments)))
+                if total > chain_max:
+                    totals.append((total, live_path, root, rel, digest, live_bytes, len(ch.segments)))
+                try:
+                    problems = hard_problems(ws, ch, now)
+                except OSError:
+                    continue
+                if problems:
+                    broken.append((live_path, root, rel, digest, ch, problems))
+        if budget < 0:
+            break
     out = []
-    for size, path, root in sorted(found, reverse=True)[: int(wc.get("max_alerts", 10))]:
-        rel = os.path.relpath(path, root)
-        digest = hashlib.sha256(path.encode("utf-8", "replace")).hexdigest()[:12]
+    cap = int(wc.get("max_alerts", 10))
+    for size, path, root, rel, digest, alarm, total, nseg in sorted(sized, reverse=True)[:cap]:
+        why = ("rotation is not working" if (rotation_on or nseg) else "early warning before WAL rotation")
         out.append(alert("wal_size", f"wal:size:{digest}", "high",
-                         f"WAL {root.name}/{rel} is {size / 1024 / 1024:.0f} MiB (over {limit // 1024 // 1024} MiB); "
-                         "early warning before WAL rotation (goodqa#16650 phase 2): report it to main; never edit, "
-                         "split or delete a WAL", {"path": path, "bytes": size}))
+                         f"WAL {root.name}/{rel} live file is {size / 1024 / 1024:.0f} MiB (over {alarm // 1024 // 1024} MiB; "
+                         f"chain {total / 1024 / 1024:.0f} MiB in {nseg + 1} part(s)); {why} (goodqa#16650): report it to "
+                         "main; never edit, split or delete a WAL",
+                         {"path": path, "bytes": size, "live_bytes": size, "chain_bytes": total, "segments": nseg}))
+    for total, path, root, rel, digest, live_bytes, nseg in sorted(totals, reverse=True)[:cap]:
+        out.append(alert("wal_size", f"wal:chain-size:{digest}", "warning",
+                         f"WAL {root.name}/{rel} chain is {total / 1024 / 1024:.0f} MiB in {nseg + 1} part(s) "
+                         f"(over {chain_max // 1024 // 1024} MiB): report it to main; never edit, split or delete a WAL",
+                         {"path": path, "chain_bytes": total, "live_bytes": live_bytes, "segments": nseg}))
+    for path, root, rel, digest, ch, problems in sorted(broken, key=lambda b: b[0])[:cap]:
+        codes = problem_codes(problems)
+        fix = ""
+        if "live_missing" in codes:
+            tool = shlex.quote(str(Path(ws.__file__).resolve()))
+            fix = (f"; a crashed rotation: the next append finishes it, or run `python3 {tool} recover "
+                   f"{shlex.quote(str(ch.directory))} {shlex.quote(ch.stem)} --write` as the harness user "
+                   "(without --write it only says what it would do)")
+        # live_missing's own wording names `reindex --write`, which never creates a live file (spec R3-3): use ours
+        shown = "; ".join(f"{p['code']}: {'no live file' if p['code'] == 'live_missing' else p['message']}"
+                          for p in problems[:3])
+        # marker_missing alone is what an old writer leaves during the rollout: a warning until rotation is switched on
+        quiet = codes == ["marker_missing"] and not rotation_on
+        out.append(alert("wal_size", f"wal:chain:{digest}", "warning" if quiet else "high",
+                         f"WAL {root.name}/{rel} chain is not clean ({shown}){fix}; report it to main; never edit, "
+                         "split or delete a WAL", {"path": path, "codes": codes, "problems": problems[:10]}))
     return out
 
 
@@ -2039,19 +2207,31 @@ def check_idle_guard(cfg, state, runner, now):
         return [alert("idle_guard", "idle-guard:unavailable", "warning",
                       f"idle_guard.py is not installed beside ops_watch.py ({type(error).__name__}); main-idle detection is off",
                       {"fix": "reinstall the harness"})]
+    ws = wal_api()
+    if ws is None:
+        return reader_unavailable("idle_guard", state, [str(root)])
     for sess in sorted(sessions, key=lambda e: e.name):
         try:
-            if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
+            main_chain = ws.chain(sess.path, "main")  # the whole chain: a crashed rotation or a rotated main still counts
+            if not (main_chain.live or main_chain.segments):
+                continue
+            if chain_mtime(main_chain) < now - ic["lookback_h"] * 3600:
                 continue
             a = idle_guard.assess(home, sess.name, now, float(ic["idle_min"]))
         except Exception:  # noqa: BLE001 - one unreadable session never hides the others
             continue
         if a["idle"]:
             names = ", ".join(s["agent"] for s in a["streams"][:6])
+            codes = problem_codes([p for p in main_chain.problems if p["code"] not in SOFT_WAL_CODES])
+            detail = {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
+                      "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}
+            note = ""
+            if codes:
+                detail["wal_problems"] = codes
+                note = f" (main WAL chain incomplete: {', '.join(codes)})"
             out.append(alert("idle_guard", f"idle-guard:{sess.name[:8]}", "high",
-                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}",
-                             {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
-                              "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}))
+                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}{note}",
+                             detail))
     return out
 
 
@@ -2095,7 +2275,7 @@ def check_mission(cfg, state, runner, now):
 
 PENDING_NOTE_RE = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
 TESTED_NOTE_RE = re.compile(r"^\s*REALLY_TESTED\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
-MAX_DEPLOY_WAL_BYTES = 32 << 20
+MAX_DEPLOY_WAL_BYTES = 256 << 20  # per WAL chain (was 32 MiB per file before rotation, goodqa#16751); over it is reported, never cut
 
 
 def check_deploys(cfg, state, runner, now):
@@ -2173,21 +2353,47 @@ def check_deploys(cfg, state, runner, now):
         sessions = [p for p in root.iterdir() if p.is_dir()]
     except OSError:
         sessions = []
+    cap = int(float(d.get("max_chain_mib")) * 1024 * 1024) if d.get("max_chain_mib") else MAX_DEPLOY_WAL_BYTES
+    ws = wal_api()
+    if ws is None:  # the drift alerts above stand; every active pending alert is kept, never cleared by a missing module
+        kept = reader_unavailable("deploys", state, [str(root)])
+        return out + [a for a in kept if a["key"].startswith(("pending-", "wal:reader-unavailable:"))]
     for session in sessions:
-        events, unscanned = {}, []  # id -> [(time, "P" pending | "T" tested)]
-        for path in session.glob("*.jsonl"):
+        events, unscanned, chain_codes = {}, [], set()  # id -> [(time, "P" pending | "T" tested)]
+        try:
+            chains = ws.list_wals(str(session)) if ws else {}
+        except OSError:
+            chains = {}
+        for stem, ch in sorted(chains.items()):
+            name = f"{stem}.jsonl"
             try:
-                if now - path.lstat().st_mtime > look:
+                # the chain's newest file decides freshness: an old closed segment of a live WAL is still in scope
+                if not (ch.live or ch.segments):
+                    # a FIFO, a device or a symlink in a WAL's place: never read, but reported, so a real alarm cannot clear
+                    bad = [q for q in ch.problems if q["code"] in ("not_regular", "unreadable", "ambiguous")]
+                    if bad and now - os.lstat(os.path.join(str(session), name)).st_mtime <= look:
+                        unscanned.append(name)
+                        chain_codes.update(q["code"] for q in bad)
                     continue
-                # regular files only, never a symlink, a FIFO or a device; over the cap RAISES instead of being cut, and the
-                # file is reported as not scanned (red-team a5: a silent skip would clear a real alert)
-                text = read_text_capped(path, MAX_DEPLOY_WAL_BYTES)
+                if now - chain_mtime(ch) > look:
+                    continue
+                # over the cap the chain is NOT read from one end: a cut chain can parse clean and clear a real alert
+                # (red-team a5), so it is reported as not scanned instead
+                if chain_bytes(ch) > cap:
+                    raise OSError(f"chain over the {cap} byte read cap")
+                read_problems = []
+                rows = []
+                for _, _, raw in ws.iter_lines(os.path.join(str(session), name), problems=read_problems):
+                    if raw is not None and b"REAL" in raw:
+                        rows.append(raw)
             except OSError:
-                unscanned.append(path.name)
+                unscanned.append(name)
                 continue
-            for raw in text.splitlines():
-                if "REAL" not in raw:
-                    continue
+            codes = problem_codes([p for p in list(ch.problems) + read_problems if p["code"] not in SOFT_WAL_CODES])
+            if codes:  # a gap or a bad marker: what was found is still used, and the chain is reported as not whole
+                unscanned.append(name)
+                chain_codes.update(codes)
+            for raw in rows:
                 try:
                     row = json.loads(raw)
                 except ValueError:
@@ -2212,9 +2418,10 @@ def check_deploys(cfg, state, runner, now):
         old.sort()
         if unscanned:
             out.append(alert("deploys", f"pending-unscanned:{session.name[:8]}", "warning",
-                             f"{len(unscanned)} log file(s) of session {session.name[:8]} could not be scanned for open "
-                             f"PENDING_REAL_TEST (over {MAX_DEPLOY_WAL_BYTES >> 20} MiB, not a regular file or unreadable)",
-                             {"session": session.name[:8], "files": unscanned[:5]}))
+                             f"{len(unscanned)} log(s) of session {session.name[:8]} could not be scanned whole for open "
+                             f"PENDING_REAL_TEST (over {cap >> 20} MiB, unreadable, or the WAL chain has a problem"
+                             f"{': ' + ', '.join(sorted(chain_codes)) if chain_codes else ''})",
+                             {"session": session.name[:8], "files": unscanned[:5], "problems": sorted(chain_codes)}))
         if old:
             out.append(alert("deploys", f"pending-open:{session.name[:8]}", "warning",
                              f"{len(old)} PENDING_REAL_TEST open for {int(pending_after // 3600)}h or more with no REALLY_TESTED "
