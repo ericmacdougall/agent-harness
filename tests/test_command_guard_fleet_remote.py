@@ -28,7 +28,7 @@ SOURCE = 'answer:sess-1/a54d2164-40ad-4be7-bcb7-7c8125c0fc87'
 P1 = '/home/eric/.agent-harness/work/S1/tester/wt'
 P2 = '/home/eric/.agent-harness/work/S1/tester/other'
 PARENT = '/home/eric/.agent-harness/work/S1/tester/repo'
-CFG = '~/.ssh/config_fleetops'
+TILDE_CFG = '~/.ssh/config_fleetops'  # refused: the executing shell expands ~ with its own HOME (T5)
 HEX = 'a' * 40
 TIPS = 'b' * 64
 
@@ -58,10 +58,13 @@ def resolver_for(path, text='Delete, no backup (Recommended)', session='sess-1',
     return resolver
 
 
-def answer(kind='linked', parent=PARENT, head=HEX, tips=TIPS, linked=(), dev=1, ino=2, mode='validate'):
+FOOT = 'c' * 64
+
+
+def answer(kind='linked', parent=PARENT, head=HEX, tips=TIPS, linked=(), dev=1, ino=2, mode='validate', foot=FOOT):
     return {'ok': True, 'mode': mode, 'kind': kind, 'parent': parent if kind == 'linked' else None, 'head': head,
             'tips_sha256': tips, 'tips_count': 1, 'linked_existing': list(linked), 'dev': dev, 'ino': ino,
-            'skipped_processes': 3, 'live_refs': 5, 'status': 'clean'}
+            'footprint_sha256': foot, 'skipped_processes': 3, 'live_refs': 5, 'status': 'clean'}
 
 
 class FakeFleet:
@@ -96,6 +99,7 @@ class Base(unittest.TestCase):
         cfg = self.home / '.ssh/config_fleetops'
         cfg.write_text('Host t2-dev\n  HostName example.invalid\n')
         os.chmod(str(cfg), 0o600)
+        self.cfg = str(cfg)  # the only accepted -F spelling: absolute
         self.policy = cg.load_policy(path=str(self.home / 'no-such-policy.json'))
         self.wal = str(self.home / '.claude/wals/sess-1/agent-f.jsonl')
         hook_wal(self.wal, time.time() - 600)
@@ -121,9 +125,8 @@ class Base(unittest.TestCase):
         c = cg.Compiled(self.policy, home=str(self.home))
         return cg.decide(command, c, marker=approvals)
 
-    @staticmethod
-    def rm(path=P1, host='t2-dev', cfg=CFG):
-        return 'ssh -F %s %s rm -rf %s' % (cfg, host, path)
+    def rm(self, path=P1, host='t2-dev', cfg=None):
+        return 'ssh -F %s %s rm -rf %s' % (cfg or self.cfg, host, path)
 
 
 class HostAllowlist(Base):
@@ -311,21 +314,21 @@ class HookAllows(Base):
     def test_variants_allowed(self):
         self.approve()
         runner = FakeFleet(lambda argv, data: answer(mode='recheck'))
-        for cmd in ('ssh -F %s -o BatchMode=yes t2-dev rm -rf %s' % (CFG, P1),
+        for cmd in ('ssh -F %s -o BatchMode=yes t2-dev rm -rf %s' % (self.cfg, P1),
                     '/usr/bin/ssh -F %s/.ssh/config_fleetops t2-dev rm -rf %s' % (self.home, P1),
-                    'ssh -o BatchMode=yes -F %s t2-dev rm -rf %s' % (CFG, P1),
-                    'ssh -F %s t2-dev git -C %s worktree remove %s' % (CFG, PARENT, P1)):
+                    'ssh -o BatchMode=yes -F %s t2-dev rm -rf %s' % (self.cfg, P1),
+                    'ssh -F %s t2-dev git -C %s worktree remove %s' % (self.cfg, PARENT, P1)):
             self.assertEqual(self.decide(cmd, self.approvals(runner))[0], 'allow', cmd)
 
     def test_worktree_remove_needs_a_linked_entry_and_its_parent(self):
         self.approve(runner=FakeFleet(answer('main')))
         runner = FakeFleet(lambda a, d: answer('main', mode='recheck'))
-        cmd = 'ssh -F %s t2-dev git -C %s worktree remove %s' % (CFG, PARENT, P1)
+        cmd = 'ssh -F %s t2-dev git -C %s worktree remove %s' % (self.cfg, PARENT, P1)
         self.assertEqual(self.decide(cmd, self.approvals(runner))[0], 'block')
         self.assertEqual(runner.calls, [])
         self.approve(path=P2)
         runner = FakeFleet(lambda a, d: answer(mode='recheck'))
-        wrong = 'ssh -F %s t2-dev git -C /home/eric/.agent-harness/work/S1/tester/x worktree remove %s' % (CFG, P2)
+        wrong = 'ssh -F %s t2-dev git -C /home/eric/.agent-harness/work/S1/tester/x worktree remove %s' % (self.cfg, P2)
         self.assertEqual(self.decide(wrong, self.approvals(runner))[0], 'block')
         self.assertEqual(runner.calls, [])
 
@@ -352,6 +355,8 @@ class HookRecheck(Base):
         self.blocked(lambda a, d: answer(tips='d' * 64, mode='recheck'))
         self.blocked(lambda a, d: answer(dev=9, mode='recheck'))
         self.blocked(lambda a, d: answer(ino=9, mode='recheck'))
+        self.blocked(lambda a, d: answer(foot='e' * 64, mode='recheck'))  # the physical store layout changed
+        self.blocked(lambda a, d: dict(answer(mode='recheck'), footprint_sha256=None))
         self.blocked(lambda a, d: {'ok': False, 'reason': 'a process has its working directory inside the path'})
         self.blocked(lambda a, d: answer('main', mode='recheck', linked=['/x/y']))
 
@@ -388,33 +393,35 @@ class HookRefuses(Base):
         bad = [
             'ssh t2-dev rm -rf %s' % P1,                                    # no -F
             'ssh -F /other/config t2-dev rm -rf %s' % P1,
-            'ssh -F %s -F %s t2-dev rm -rf %s' % (CFG, CFG, P1),
-            'ssh -F%s t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -oBatchMode=yes -F %s t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -F %s -o BatchMode=no t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -F %s -o ProxyCommand=x t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -F %s -J h t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -F %s -o LocalCommand=x t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -F %s -t t2-dev rm -rf %s' % (CFG, P1),
-            'ssh -F %s dev2 rm -rf %s' % (CFG, P1),
-            'ssh -F %s T2-DEV rm -rf %s' % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s %s' % (CFG, P1, P2),
-            'ssh -F %s t2-dev rm -rf %s/' % (CFG, P1),
-            'ssh -F %s t2-dev rm -fr %s' % (CFG, P1),
-            'ssh -F %s t2-dev rm -r -f %s' % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s' % (CFG, P2),                       # a different path, unapproved
-            'ssh -F %s t2-dev "rm -rf %s"' % (CFG, P1),
-            "ssh -F %s t2-dev rm -rf '%s'" % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s && ssh -F %s t2-dev rm -rf %s' % (CFG, P1, CFG, P2),
-            'ssh -F %s t2-dev rm -rf %s; echo' % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s $(x)' % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s | cat' % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s > f' % (CFG, P1),
-            'ssh -F %s t2-dev rm -rf %s\nls' % (CFG, P1),
-            'env ssh -F %s t2-dev rm -rf %s' % (CFG, P1),
-            "bash -c 'ssh -F %s t2-dev rm -rf %s'" % (CFG, P1),
-            'ssh -F %s t2-dev git -C %s worktree remove --force %s' % (CFG, PARENT, P1),
-            'ssh -F %s t2-dev git worktree remove %s' % (CFG, P1),
+            'ssh -F %s -F %s t2-dev rm -rf %s' % (self.cfg, self.cfg, P1),
+            'ssh -F%s t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -oBatchMode=yes -F %s t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s -o BatchMode=no t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s -o ProxyCommand=x t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s -J h t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s -o LocalCommand=x t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s -t t2-dev rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s dev2 rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s T2-DEV rm -rf %s' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s %s' % (self.cfg, P1, P2),
+            'ssh -F %s t2-dev rm -rf %s/' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -fr %s' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -r -f %s' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s' % (self.cfg, P2),                       # a different path, unapproved
+            'ssh -F %s t2-dev "rm -rf %s"' % (self.cfg, P1),
+            "ssh -F %s t2-dev rm -rf '%s'" % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s && ssh -F %s t2-dev rm -rf %s' % (self.cfg, P1, self.cfg, P2),
+            'ssh -F %s t2-dev rm -rf %s; echo' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s $(x)' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s | cat' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s > f' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s\nls' % (self.cfg, P1),
+            'env ssh -F %s t2-dev rm -rf %s' % (self.cfg, P1),
+            "bash -c 'ssh -F %s t2-dev rm -rf %s'" % (self.cfg, P1),
+            'ssh -F %s t2-dev git -C %s worktree remove --force %s' % (self.cfg, PARENT, P1),
+            'ssh -F %s t2-dev git worktree remove %s' % (self.cfg, P1),
+            'ssh -F %s t2-dev rm -rf %s' % (TILDE_CFG, P1),                 # T5: only the absolute spelling
+            'ssh -F %s -o BatchMode=yes t2-dev rm -rf %s' % (TILDE_CFG, P1),
         ]
         for cmd in bad:
             self.assertEqual(self.verdict(cmd), 'block', cmd)
@@ -427,7 +434,7 @@ class HookRefuses(Base):
         self.assertEqual(self.verdict(self.rm()), 'allow')
 
     def test_non_matching_command_never_invokes_runner(self):
-        self.verdict('ssh -F %s t2-dev rm -rf %s' % (CFG, P2))
+        self.verdict('ssh -F %s t2-dev rm -rf %s' % (self.cfg, P2))
         self.verdict('ssh t2-dev rm -rf %s' % P1)
         self.assertEqual(self.runner.calls, [])
 
@@ -713,7 +720,8 @@ class LinkedWorktrees(ValidatorBase):
     def test_malformed_answers_refuse(self):
         for bad in (dict(answer(), kind='bogus'), dict(answer(), head='zz'), dict(answer(), dev=True),
                     dict(answer(), parent='/a b'), dict(answer(), linked_existing=['/x y']),
-                    dict(answer('main'), parent='/x'), dict(answer(), tips_sha256='1')):
+                    dict(answer('main'), parent='/x'), dict(answer(), tips_sha256='1'),
+                    dict(answer(), footprint_sha256='1'), {k: v for k, v in answer().items() if k != 'footprint_sha256'}):
             with self.assertRaises(ValueError, msg=str(bad)):
                 cg.run_fleet_validator('t2-dev', 'validate', P1, self.policy, str(self.home), runner=FakeFleet(bad))
 
@@ -746,8 +754,12 @@ class LinkedWorktrees(ValidatorBase):
                                    runner=FakeFleet(answer(parent=P1 + '/.git/common')))
 
     def test_runner_output_is_bounded_and_timed(self):
-        with self.assertRaises(Exception):
+        # V1: the cap stops the read at once (a SubprocessError that is not the timeout), well inside the 5 s timeout
+        started = time.monotonic()
+        with self.assertRaises(subprocess.SubprocessError) as caught:
             cg._fleet_default_runner(['/bin/sh', '-c', 'yes'], b'', 5, cap=1000)
+        self.assertNotIsInstance(caught.exception, subprocess.TimeoutExpired)
+        self.assertLess(time.monotonic() - started, 2.0)
         with self.assertRaises(subprocess.TimeoutExpired):
             cg._fleet_default_runner(['/bin/sh', '-c', 'sleep 5'], b'', 1)
 
@@ -755,6 +767,380 @@ class LinkedWorktrees(ValidatorBase):
         with self.assertRaises(ValueError):
             cg.run_fleet_validator('t2-dev', 'validate', P1, self.policy, str(self.home),
                                    runner=FakeFleet(reply=(0, b'[' * 200000)))
+
+
+# --------------------------------------------------------------------------- physical footprint (goodqa#16699 rescue)
+#
+# Every escape found so far makes bytes another repository needs physically live inside TARGET, or hides a git store
+# under a name the old scan did not look for. Each row builds one escape; the validator must refuse it. Rows marked
+# REGRESSION were already refused at 91f289f (kept as guards); every other row is answered ok=true by 91f289f.
+
+def _move(src, dst):
+    import shutil
+    shutil.move(str(src), str(dst))
+
+
+def _loose_object(objdir):
+    for fan in sorted(os.listdir(str(objdir))):
+        if re.fullmatch(r'[0-9a-f]{2}', fan):
+            return Path(objdir) / fan / sorted(os.listdir(str(Path(objdir) / fan)))[0]
+    raise AssertionError('no loose object')
+
+
+class FootprintBase(ValidatorBase):
+    """A pushed parent P (node_modules/ ignored and pushed), a linked worktree T, and an unpushed branch `precious` in P."""
+
+    def setUp(self):
+        super().setUp()
+        P = self.repo.path
+        (P / '.gitignore').write_text('node_modules/\n')
+        sh('git', 'add', '.gitignore', cwd=P)
+        sh('git', 'commit', '-q', '-m', 'gi', cwd=P)
+        sh('git', 'push', '-q', str(self.repo.bare), 'main', cwd=P)
+        self.wt = self.repo.task / 'wt'
+        sh('git', 'worktree', 'add', '-q', '--detach', str(self.wt), cwd=P)
+        self.cd = P / '.git'
+        self.gd = self.cd / 'worktrees' / 'wt'
+        self.nm = self.wt / 'node_modules'
+
+    def precious(self):
+        P = self.repo.path
+        sh('git', 'checkout', '-q', '-b', 'precious', cwd=P)
+        (P / 'p').write_text('1\n')
+        sh('git', 'add', 'p', cwd=P)
+        sh('git', 'commit', '-q', '-m', 'p', cwd=P)
+        sh('git', 'checkout', '-q', 'main', cwd=P)
+        self.nm.mkdir(exist_ok=True)
+
+    def foreign(self):
+        """An unrelated repo R outside TARGET with one unpushed commit."""
+        r = self.repo.task / 'r'
+        sh('git', 'init', '-q', '-b', 'main', str(r))
+        (r / 'f').write_text('r\n')
+        sh('git', 'add', 'f', cwd=r)
+        sh('git', 'commit', '-q', '-m', 'r', cwd=r)
+        return r
+
+
+def _row_d1a_symlinked_objects(t):
+    t.precious()
+    _move(t.cd / 'objects', t.nm / 'o')
+    os.symlink(str(t.nm / 'o'), str(t.cd / 'objects'))
+
+
+def _alternates_into_target(t, line_for):
+    t.precious()
+    objs = t.cd / 'objects'
+    (t.nm / 'o').mkdir()
+    for e in os.listdir(str(objs)):
+        if e != 'info':
+            _move(objs / e, t.nm / 'o' / e)
+    (objs / 'pack').mkdir()
+    (objs / 'info').mkdir(exist_ok=True)
+    (objs / 'info/alternates').write_text(line_for(objs, t.nm / 'o') + '\n')
+
+
+def _row_d1b_alternates(t):
+    _alternates_into_target(t, lambda objs, o: str(o))
+
+
+def _row_relative_alternates(t):
+    _alternates_into_target(t, lambda objs, o: os.path.relpath(str(o), str(objs)))
+
+
+def _row_nested_alternates_chain(t):
+    _alternates_into_target(t, lambda objs, o: str(o))
+    hop = t.repo.task / 'hop-objects'  # a real object dir outside TARGET that itself borrows from TARGET
+    (hop / 'pack').mkdir(parents=True)
+    (hop / 'info').mkdir()
+    _move(t.cd / 'objects/info/alternates', hop / 'info/alternates')
+    (t.cd / 'objects/info/alternates').write_text(str(hop) + '\n')
+
+
+def _row_d1c_symlinked_refs(t):
+    t.precious()
+    _move(t.cd / 'refs', t.nm / 'r')
+    os.symlink(str(t.nm / 'r'), str(t.cd / 'refs'))
+
+
+def _row_symlinked_packed_refs(t):
+    t.precious()
+    sh('git', 'pack-refs', '--all', cwd=t.repo.path)
+    _move(t.cd / 'packed-refs', t.nm / 'pr')
+    os.symlink(str(t.nm / 'pr'), str(t.cd / 'packed-refs'))
+
+
+def _row_symlinked_loose_object(t):
+    t.precious()
+    obj = _loose_object(t.cd / 'objects')
+    _move(obj, t.nm / 'blob')
+    os.symlink(str(t.nm / 'blob'), str(obj))
+
+
+def _row_http_alternates(t):
+    t.precious()
+    (t.cd / 'objects/info').mkdir(exist_ok=True)
+    (t.cd / 'objects/info/http-alternates').write_text('https://example.invalid/objects\n')
+
+
+def _row_config_include(t):
+    t.precious()
+    (t.nm / 'inc.cfg').write_text('[user]\n\tname = x\n')
+    sh('git', 'config', 'include.path', str(t.nm / 'inc.cfg'), cwd=t.repo.path)
+
+
+def _row_config_include_if(t):
+    t.precious()
+    (t.nm / 'inc.cfg').write_text('[user]\n\tname = x\n')
+    sh('git', 'config', 'includeIf.gitdir:/.path', str(t.nm / 'inc.cfg'), cwd=t.repo.path)
+
+
+def _row_mount_on_parent_store(t):
+    t.precious()
+    t.repo.mountinfo.write_text('1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:2 / %s/objects rw - ext4 /d rw\n' % t.cd)
+
+
+def _row_git_dir_parked_in_node_modules(t):
+    t.precious()
+    r = t.repo.task / 'r'
+    sh('git', 'init', '-q', '--separate-git-dir', str(t.nm / 'm'), str(r))  # like a submodule store, under another name
+
+
+def _row_worktree_rebase_in_progress(t):
+    (t.gd / 'rebase-merge').mkdir()
+
+
+def _row_worktree_merge_in_progress(t):
+    (t.gd / 'MERGE_HEAD').write_text(sh('git', 'rev-parse', 'HEAD', cwd=t.wt))
+
+
+def _row_worktree_rewritten_ref(t):
+    sh('git', 'update-ref', 'refs/rewritten/label', 'HEAD', cwd=t.wt)
+
+
+def _row_worktree_ref_write_in_flight(t):
+    (t.gd / 'HEAD.lock').write_text('x\n')
+
+
+def _row_unknown_common_entry(t):
+    (t.cd / 'frobnicate').write_text('x\n')
+
+
+def _row_unknown_worktree_entry(t):
+    (t.gd / 'frobnicate').write_text('x\n')
+
+
+def _row_regression_submodule_store_in_modules(t):
+    sh('git', 'init', '-q', '--bare', str(t.cd / 'modules/sub'))
+
+
+# main-repository rows: TARGET is P itself (clean and fully pushed), something foreign is parked inside it
+def _row_bare_store_in_node_modules(t):
+    t.nm = t.repo.path / 'node_modules'
+    r = t.foreign()
+    sh('git', 'clone', '-q', '--bare', str(r), str(t.nm / 'x/store'))
+
+
+def _row_git_dir_parked_main(t):
+    t.nm = t.repo.path / 'node_modules'
+    t.nm.mkdir()
+    sh('git', 'init', '-q', '--separate-git-dir', str(t.nm / 'm'), str(t.repo.task / 'r2'))
+
+
+def _row_foreign_objects_parked(t):
+    t.nm = t.repo.path / 'node_modules'
+    t.nm.mkdir()
+    r = t.foreign()
+    _move(r / '.git/objects', t.nm / 'o')
+    os.symlink(str(t.nm / 'o'), str(r / '.git/objects'))
+
+
+def _row_foreign_refs_parked(t):
+    t.nm = t.repo.path / 'node_modules'
+    t.nm.mkdir()
+    r = t.foreign()
+    _move(r / '.git/refs', t.nm / 'r')
+    os.symlink(str(t.nm / 'r'), str(r / '.git/refs'))
+
+
+def _row_foreign_pack_parked(t):
+    t.nm = t.repo.path / 'node_modules'
+    t.nm.mkdir()
+    r = t.foreign()
+    sh('git', 'gc', '-q', cwd=r)
+    _move(r / '.git/objects/pack', t.nm / 'p')
+    os.symlink(str(t.nm / 'p'), str(r / '.git/objects/pack'))
+
+
+def _row_main_rebase_in_progress(t):
+    (t.cd / 'rebase-merge').mkdir()
+
+
+def _row_regression_c1_commondir_inside_target(t):
+    path = t.repo.path
+    sha = sh('git', 'rev-parse', 'HEAD', cwd=path).strip()
+    moved = t.home / 'moved-git'
+    _move(path / '.git', moved)
+    (path / '.git').mkdir()
+    _move(moved, path / '.git/common')
+    (path / '.git/commondir').write_text('common\n')
+    (path / '.git/HEAD').write_text(sha + '\n')
+    sh('git', 'read-tree', 'HEAD', cwd=path)
+
+
+# (name, builder, target 'linked' or 'main', regression-only)
+ESCAPES = [
+    ('d1a_symlinked_objects', _row_d1a_symlinked_objects, 'linked', False),
+    ('d1b_alternates', _row_d1b_alternates, 'linked', False),
+    ('relative_alternates', _row_relative_alternates, 'linked', False),
+    ('nested_alternates_chain', _row_nested_alternates_chain, 'linked', False),
+    ('d1c_symlinked_refs', _row_d1c_symlinked_refs, 'linked', False),
+    ('symlinked_packed_refs', _row_symlinked_packed_refs, 'linked', False),
+    ('symlinked_loose_object', _row_symlinked_loose_object, 'linked', False),
+    ('http_alternates', _row_http_alternates, 'linked', False),
+    ('config_include', _row_config_include, 'linked', False),
+    ('config_include_if', _row_config_include_if, 'linked', False),
+    ('mount_on_parent_store', _row_mount_on_parent_store, 'linked', False),
+    ('git_dir_parked_in_node_modules', _row_git_dir_parked_in_node_modules, 'linked', False),
+    ('worktree_rebase_in_progress', _row_worktree_rebase_in_progress, 'linked', False),
+    ('worktree_merge_in_progress', _row_worktree_merge_in_progress, 'linked', False),
+    ('worktree_rewritten_ref', _row_worktree_rewritten_ref, 'linked', False),
+    ('worktree_ref_write_in_flight', _row_worktree_ref_write_in_flight, 'linked', False),
+    ('unknown_common_entry', _row_unknown_common_entry, 'linked', False),
+    ('unknown_worktree_entry', _row_unknown_worktree_entry, 'linked', False),
+    ('regression_submodule_store_in_modules', _row_regression_submodule_store_in_modules, 'linked', True),
+    ('bare_store_in_node_modules', _row_bare_store_in_node_modules, 'main', False),
+    ('git_dir_parked_main', _row_git_dir_parked_main, 'main', False),
+    ('foreign_objects_parked', _row_foreign_objects_parked, 'main', False),
+    ('foreign_refs_parked', _row_foreign_refs_parked, 'main', False),
+    ('foreign_pack_parked', _row_foreign_pack_parked, 'main', False),
+    ('main_rebase_in_progress', _row_main_rebase_in_progress, 'main', False),
+    ('regression_c1_commondir_inside_target', _row_regression_c1_commondir_inside_target, 'main', True),
+]
+
+
+class FootprintEscapes(FootprintBase):
+    def check_escape(self, build, kind):
+        if kind == 'main':
+            sh('git', 'worktree', 'remove', str(self.wt), cwd=self.repo.path)
+        target = str(self.wt if kind == 'linked' else self.repo.path)
+        base = self.run_program(path=target)
+        self.assertTrue(base['ok'], base)  # the clean layout passes: the refusal below is the escape's, not the setup's
+        build(self)
+        out = self.run_program(path=target)
+        self.assertFalse(out['ok'], 'escape approved: %s' % out)
+        again = self.run_program(path=target, mode='recheck')
+        self.assertFalse(again['ok'], 'escape approved at recheck: %s' % again)
+
+
+def _escape_test(build, kind):
+    def test(self):
+        self.check_escape(build, kind)
+    return test
+
+
+for _name, _build, _kind, _reg in ESCAPES:
+    setattr(FootprintEscapes, 'test_escape_%s' % _name, _escape_test(_build, _kind))
+
+
+class FootprintRecheck(FootprintBase):
+    def test_layout_built_after_approval_fails_recheck(self):
+        first = self.run_program(path=str(self.wt))
+        self.assertTrue(first['ok'], first)
+        _row_d1a_symlinked_objects(self)
+        out = self.run_program(path=str(self.wt), mode='recheck')
+        self.assertFalse(out['ok'], out)
+
+    def test_nested_git_created_after_approval_fails_recheck(self):
+        sh('git', 'worktree', 'remove', str(self.wt), cwd=self.repo.path)
+        self.assertTrue(self.run_program()['ok'])
+        sh('git', 'init', '-q', str(self.repo.path / 'node_modules/a/nested'))
+        out = self.run_program(mode='recheck')
+        self.assertFalse(out['ok'], out)
+        self.assertIn('nested git', out['reason'])
+
+    def test_replaced_object_dir_changes_the_footprint_digest(self):
+        first = self.run_program(path=str(self.wt))
+        objs = self.cd / 'objects'
+        sh('cp', '-R', str(objs), str(self.cd / 'objects.new'))
+        sh('rm', '-rf', str(objs))
+        _move(self.cd / 'objects.new', objs)
+        again = self.run_program(path=str(self.wt), mode='recheck')
+        self.assertTrue(again['ok'], again)
+        self.assertRegex(str(first.get('footprint_sha256')), r'^[0-9a-f]{64}$')
+        self.assertNotEqual(first.get('footprint_sha256'), again.get('footprint_sha256'))
+        d1 = cg._fleet_digest('t2-dev', P1, dict(first, parent=PARENT))
+        d2 = cg._fleet_digest('t2-dev', P1, dict(again, parent=PARENT))
+        self.assertNotEqual(d1, d2)  # the hook compares this digest, so the recheck refuses
+
+    def test_pack_refs_in_the_parent_keeps_the_footprint(self):
+        first = self.run_program(path=str(self.wt))
+        sh('git', 'branch', 'side', cwd=self.repo.path)
+        sh('git', 'pack-refs', '--all', cwd=self.repo.path)
+        sh('git', 'branch', '-D', 'side', cwd=self.repo.path)  # rewrites packed-refs: a new inode
+        again = self.run_program(path=str(self.wt), mode='recheck')
+        self.assertTrue(again['ok'], again)
+        self.assertEqual(first['footprint_sha256'], again['footprint_sha256'])
+
+
+class FootprintGuards(FootprintBase):
+    def test_unknown_git_dir_entries_default_to_refused(self):
+        """A name git might add tomorrow is refused until someone allow-lists it, in each store directory."""
+        for where in (self.cd, self.gd, self.cd / 'objects', self.cd / 'objects/info'):
+            where.mkdir(exist_ok=True)
+            probe = where / 'zz-new-entry'
+            probe.write_text('x\n')
+            out = self.run_program(path=str(self.wt))
+            self.assertFalse(out['ok'], (where, out))
+            self.assertIn('unknown entry', out['reason'])
+            probe.unlink()
+        self.assertTrue(self.run_program(path=str(self.wt))['ok'])
+        for name in ('frobnicate', 'annex', 'svn', 'filter-repo'):
+            self.assertNotIn(name, cg.FLEET_VALIDATOR_BODY.split('KNOWN_STORE = ', 1)[1].split('}', 1)[0])
+
+    def test_ordinary_layouts_still_pass(self):
+        P = self.repo.path
+        sh('git', 'commit', '-q', '--allow-empty', '-m', 'e', cwd=P)
+        sh('git', 'push', '-q', str(self.repo.bare), 'main', cwd=P)
+        sh('git', 'gc', '-q', cwd=P)
+        sh('git', 'commit-graph', 'write', '--reachable', cwd=P)
+        sh('git', 'multi-pack-index', 'write', cwd=P)
+        for name in ('ORIG_HEAD', 'FETCH_HEAD', 'COMMIT_EDITMSG', 'gc.log'):
+            (self.cd / name).write_text('x\n')
+        (self.cd / 'MERGE_HEAD').write_text('x\n')  # the parent is mid-merge: it survives the worktree's removal
+        (self.gd / 'ORIG_HEAD').write_text('x\n')
+        (self.gd / 'gc.log.lock').write_text('')  # left by a killed `gc --auto` (seen live on t2-dev)
+        (self.cd / 'gc.log.lock').write_text('')
+        (self.cd / 'gc.pid').write_text('1 host\n')
+        hooks = self.cd / 'hooks'
+        hooks.mkdir(exist_ok=True)
+        (hooks / 'pre-commit').symlink_to('/bin/true')
+        nm = self.wt / 'node_modules/pkg'
+        (nm / '.cache/webpack').mkdir(parents=True)
+        (nm / '.cache/webpack/0.pack').write_bytes(b'\x00webpack cache')
+        (nm / 'REVISION').write_text('a' * 40 + '\n')
+        (nm / 'ab').mkdir()
+        (nm / 'ab' / ('c' * 38)).write_text('{"not": "zlib"}')
+        (self.wt / 'node_modules/.bin').mkdir()
+        (self.wt / 'node_modules/.bin/tool').symlink_to('../pkg/REVISION')
+        out = self.run_program(path=str(self.wt))
+        self.assertTrue(out['ok'], out)
+        self.assertGreater(out['store_entries'], 0)
+        self.assertGreater(out['tree_entries'], 0)
+
+    def test_hardlinked_pack_is_harmless_and_deleting_the_target_keeps_the_parent(self):
+        """Hardlinks are not refused (local clones hardlink packs): unlinking TARGET's name leaves the parent's."""
+        self.precious()
+        P = self.repo.path
+        sh('git', 'gc', '-q', cwd=P)
+        pack = sorted((self.cd / 'objects/pack').glob('pack-*.pack'))[0]
+        os.link(str(pack), str(self.nm / 'blob'))
+        self.assertGreater(os.stat(str(pack)).st_nlink, 1)
+        out = self.run_program(path=str(self.wt))
+        self.assertTrue(out['ok'], out)
+        sh('rm', '-rf', str(self.wt))
+        sh('git', 'fsck', '--connectivity-only', cwd=P)
+        self.assertTrue(sh('git', 'rev-parse', '--verify', 'precious', cwd=P).strip())
 
 
 if __name__ == '__main__':

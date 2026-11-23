@@ -9600,8 +9600,10 @@ import json
 import os
 import pwd
 import re
+import stat as stat_mod
 import subprocess
 import sys
+import time
 
 MODE = CONFIG['mode']  # 'validate' (approval) or 'recheck' (hook time: no network step)
 TARGET = CONFIG['path']
@@ -9616,6 +9618,29 @@ CREATED = None
 SAFE = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
         '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=/usr/bin/ssh', '-c', 'credential.helper=',
         '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null']
+# Physical footprint (goodqa#16699 rescue). Every name git may keep in a common git dir, a linked worktree's own git dir
+# and an object dir; any other name refuses (unknown defaults to refused). Names are a second layer: the universal rules
+# are that no entry of a store is a symlink and that no store location resolves inside TARGET.
+KNOWN_STORE = {'HEAD', 'config', 'config.worktree', 'description', 'hooks', 'info', 'objects', 'refs', 'packed-refs',
+               'logs', 'worktrees', 'index', 'FETCH_HEAD', 'ORIG_HEAD', 'COMMIT_EDITMSG', 'branches', 'remotes', 'shallow',
+               'lfs', 'modules', 'gitk.cache', 'gc.log', 'gc.pid', 'AUTO_MERGE', 'MERGE_MSG', 'MERGE_MODE', 'MERGE_RR',
+               'SQUASH_MSG', 'TAG_EDITMSG', 'NOTES_EDITMSG', 'EDIT_DESCRIPTION', 'BRANCH_DESCRIPTION', 'rr-cache',
+               'fsmonitor--daemon.ipc', 'fsmonitor--daemon', 'reftable', 'gc.log.lock'}
+KNOWN_WORKTREE = {'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'index', 'gitdir', 'commondir', 'logs', 'refs', 'locked',
+                  'config.worktree', 'COMMIT_EDITMSG', 'AUTO_MERGE', 'MERGE_MSG', 'MERGE_MODE', 'SQUASH_MSG', 'info',
+                  'gc.log', 'gc.log.lock'}
+# auto-gc bookkeeping, never a history write; a killed `gc --auto` leaves it behind (seen live on t2-dev). Every other
+# *.lock (index, HEAD, refs, packed-refs, config) is a git write in flight and refuses.
+GC_BOOKKEEPING_LOCKS = {'gc.log.lock'}
+IN_PROGRESS = {'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', 'sequencer',
+               'BISECT_LOG', 'BISECT_START', 'BISECT_HEAD', 'BISECT_TERMS', 'BISECT_EXPECTED_REV', 'BISECT_ANCESTORS_OK',
+               'BISECT_NAMES', 'BISECT_RUN', 'BISECT_FIRST_PARENT'}
+KNOWN_OBJECTS = {'pack', 'info'}
+KNOWN_OBJECTS_INFO = {'packs', 'alternates', 'commit-graph', 'commit-graphs'}
+FANOUT = re.compile(r'[0-9a-f]{2}')
+LOOSE = re.compile(r'[0-9a-f]{38}|[0-9a-f]{62}')
+REF_BODY = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})\n?')
+WALK_SECONDS = 60.0 if CONFIG['mode'] == 'validate' else 2.5
 
 
 class Refuse(Exception):
@@ -9694,7 +9719,6 @@ def repo_checks():
         st = os.lstat(dot_git)
     except OSError:
         refuse('the path is not a git checkout')
-    import stat as stat_mod
     if stat_mod.S_ISLNK(st.st_mode) or not (stat_mod.S_ISDIR(st.st_mode) or stat_mod.S_ISREG(st.st_mode)):
         refuse('the .git entry is not a plain directory or file')
     code, top = git('rev-parse', '--show-toplevel')
@@ -9786,7 +9810,7 @@ def worktrees(cd, linked, gd):
             refuse('the linked worktree registration does not point at this path')
         if not any(os.path.realpath(e['path']) == TARGET for e in entries[1:]):
             refuse('the path is not listed as a linked worktree of its parent')
-        code, per = git('for-each-ref', '--format=%(refname)', 'refs/bisect', 'refs/worktree')
+        code, per = git('for-each-ref', '--format=%(refname)', 'refs/bisect', 'refs/worktree', 'refs/rewritten')
         if code != 0 or per.strip():
             refuse('the linked worktree has per-worktree refs')
         return main, []
@@ -9843,11 +9867,215 @@ def check_pushed(head, tips, linked):
     return len(live)
 
 
-def nested_git(top):
-    for root, dirs, files in os.walk(top, followlinks=False):
-        if '.git' in dirs or '.git' in files:
-            return True
-    return False
+def clean(text):
+    return re.sub(r'[^A-Za-z0-9._/-]', '?', str(text))[-80:]
+
+
+def listdir_or_refuse(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        refuse('a git store directory cannot be listed (%s)' % clean(path))
+
+
+def walk_store(root, deadline, skip=()):
+    """Every entry under `root`, never following a link; any symlink refuses. Returns the entry count."""
+    stack, count = [''], 0
+    while stack:
+        rel = stack.pop()
+        try:
+            listing = os.scandir(os.path.join(root, rel) if rel else root)
+        except OSError:
+            refuse('a git store directory cannot be listed (%s)' % clean(rel or root))
+        with listing:
+            for entry in listing:
+                count += 1
+                if count % 512 == 0 and time.monotonic() > deadline:
+                    refuse('the git store is too large to inspect in time')
+                name = rel + '/' + entry.name if rel else entry.name
+                if not rel and entry.name in skip:
+                    continue
+                if entry.is_symlink():
+                    refuse('a git store entry is a symlink (%s)' % clean(name))
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(name)
+    return count
+
+
+def check_object_dir(objdir, deadline):
+    """An object dir holds only fan-out dirs, pack/ and info/ (packs, alternates, commit-graph); no symlink anywhere."""
+    try:
+        st = os.lstat(objdir)
+    except OSError:
+        refuse('the object store is missing (%s)' % clean(objdir))
+    if not stat_mod.S_ISDIR(st.st_mode):
+        refuse('the object store is not a plain directory (%s)' % clean(objdir))
+    for name in listdir_or_refuse(objdir):
+        if name not in KNOWN_OBJECTS and not FANOUT.fullmatch(name):
+            refuse('the object store has an unknown entry (%s)' % clean(name))
+    if os.path.lexists(os.path.join(objdir, 'info')):
+        for name in listdir_or_refuse(os.path.join(objdir, 'info')):
+            if name == 'http-alternates':
+                refuse('the object store borrows objects over http (http-alternates)')
+            if name not in KNOWN_OBJECTS_INFO:
+                refuse('the object store info has an unknown entry (%s)' % clean(name))
+    return walk_store(objdir, deadline)
+
+
+def alternates(objdir, depth, seen, out, deadline):
+    """Follow objects/info/alternates the way git does (relative to the object dir, at most 5 deep); every borrowed store
+    must resolve outside TARGET without a symlink and pass check_object_dir itself."""
+    path = os.path.join(objdir, 'info', 'alternates')
+    if not os.path.lexists(path):
+        return
+    if depth >= 5:
+        refuse('the alternates chain is deeper than git follows')
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read(65537)
+    except OSError:
+        refuse('an alternates file cannot be read')
+    if len(data) > 65536:
+        refuse('an alternates file is too large')
+    for line in data.decode('utf-8', 'surrogateescape').split('\n'):
+        if not line or line.startswith('#'):
+            continue
+        if line != line.strip() or line.startswith('"'):
+            refuse('an alternates entry is quoted or padded')
+        lexical = os.path.normpath(line if line.startswith('/') else os.path.join(objdir, line))
+        real = os.path.realpath(lexical)
+        if real != lexical:
+            refuse('an alternate object store is reached through a symlink')
+        if inside(real, TARGET):
+            refuse('an alternate object store is inside the path')
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(real)
+        check_object_dir(real, deadline)
+        alternates(real, depth + 1, seen, out, deadline)
+
+
+def physical_footprint(cd, gd, linked):
+    """The one choke point for where the history git reads physically lives (validate and recheck, linked and main).
+    Refuses when any store location is inside TARGET (linked), reached through a symlink, of an unknown name, mounted on,
+    borrowed over http, pulled in by a config include, or mid-operation. Returns the roots for the mount check and a
+    digest of the physical layout (path, device and inode) that the approval pins."""
+    started = time.monotonic()
+    deadline = started + WALK_SECONDS
+    dot = os.path.join(TARGET, '.git')
+    st = os.lstat(dot)
+    if linked:
+        if not stat_mod.S_ISREG(st.st_mode):
+            refuse('a linked worktree must have a .git file, not a directory')
+        if inside(cd, TARGET) or inside(gd, TARGET):
+            refuse('the parent git store is inside the path')
+    elif cd != dot or gd != cd or not stat_mod.S_ISDIR(st.st_mode):
+        refuse('the path is not the main working tree of its repository')
+    for name in listdir_or_refuse(cd):
+        if (name.endswith('.lock') and name not in GC_BOOKKEEPING_LOCKS) or (not linked and name in IN_PROGRESS):
+            refuse('a git operation is in progress (%s)' % clean(name))
+        if name not in KNOWN_STORE and name not in IN_PROGRESS and not name.startswith('sharedindex.'):
+            refuse('the git directory has an unknown entry (%s)' % clean(name))
+    if linked:
+        for name in listdir_or_refuse(gd):
+            if (name.endswith('.lock') and name not in GC_BOOKKEEPING_LOCKS) or name in IN_PROGRESS:
+                refuse('a git operation is in progress in the worktree (%s)' % clean(name))
+            if name not in KNOWN_WORKTREE and not name.startswith('sharedindex.'):
+                refuse('the worktree git directory has an unknown entry (%s)' % clean(name))
+        for root, _dirs, files in os.walk(os.path.join(gd, 'refs')):
+            if files:
+                refuse('the linked worktree has per-worktree refs')
+    # hooks are never history, and the validator runs git with core.hooksPath=/dev/null: not walked
+    entries = walk_store(cd, deadline, skip=('hooks', 'objects'))
+    objdir = os.path.join(cd, 'objects')
+    entries += check_object_dir(objdir, deadline)
+    alts = []
+    alternates(objdir, 0, {objdir}, alts, deadline)
+    for conf in (os.path.join(cd, 'config'), os.path.join(cd, 'config.worktree'), os.path.join(gd, 'config.worktree')):
+        if not os.path.lexists(conf):
+            continue
+        code, names = git('config', '--file', conf, '--no-includes', '--name-only', '--list')
+        if code != 0:
+            refuse('a repository config file cannot be read')
+        if any(n.lower().startswith(('include.', 'includeif.')) for n in names.splitlines()):
+            refuse('the repository config includes another file')
+    code, objects = git('rev-parse', '--path-format=absolute', '--git-path', 'objects')
+    if code != 0 or os.path.realpath(objects.strip()) != objdir:
+        refuse('git reads objects from somewhere other than the common git dir')
+    code, bare = git('rev-parse', '--is-bare-repository')
+    if code != 0 or bare.strip() != 'false':
+        refuse('the repository is configured as bare')
+    items = []
+    for label, path in [('common', cd), ('objects', objdir), ('refs', os.path.join(cd, 'refs')), ('git', gd)] + \
+            [('alternate', a) for a in alts]:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            refuse('a git store location is missing (%s)' % label)
+        items.append([label, path, st.st_dev, st.st_ino])
+    # packed-refs is rewritten (a new inode) by ordinary ref updates in the parent: pin its place, not its inode
+    items.append(['packed-refs', os.path.join(cd, 'packed-refs'), os.lstat(cd).st_dev])
+    digest = hashlib.sha256(json.dumps(items, sort_keys=True).encode('utf-8', 'surrogateescape')).hexdigest()
+    return {'roots': [cd] + alts, 'sha256': digest, 'entries': entries,
+            'ms': int((time.monotonic() - started) * 1000)}
+
+
+def head_bytes(path, size):
+    try:
+        with open(path, 'rb') as handle:
+            return handle.read(size)
+    except OSError:
+        refuse('a file inside the path cannot be read (%s)' % clean(path[len(TARGET):]))
+
+
+def store_scan():
+    """One walk over all of TARGET (ignored dirs included, links never followed), skipping only the checkout's own top
+    .git: refuses anything that holds git history under any name (a nested .git, a git dir or bare store look-alike, a
+    worktree admin dir, packed-refs, a pack or index by its magic, a loose object, a ref file under heads/ or tags/)."""
+    started = time.monotonic()
+    deadline = started + WALK_SECONDS
+    stack, count = [(TARGET, False)], 0
+    while stack:
+        here, refs_like = stack.pop()
+        rel = here[len(TARGET) + 1:] or '.'
+        try:
+            with os.scandir(here) as listing:
+                entries = list(listing)
+        except OSError:
+            refuse('a directory inside the path cannot be listed (%s)' % clean(rel))
+        names = {e.name: e for e in entries}
+        head = names.get('HEAD')
+        if here != TARGET and head is not None and head.is_file(follow_symlinks=False) and \
+                any(k in names for k in ('objects', 'refs', 'commondir', 'gitdir')):
+            refuse('a git store look-alike is inside the path (%s)' % clean(rel))
+        fanout = FANOUT.fullmatch(os.path.basename(here)) is not None
+        for entry in entries:
+            count += 1
+            if count % 512 == 0 and time.monotonic() > deadline:
+                refuse('the path is too large to inspect in time')
+            if entry.name == '.git':
+                if here == TARGET:
+                    continue
+                refuse('a nested git store is inside the path (%s)' % clean(rel + '/.git'))
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                stack.append((entry.path, refs_like or entry.name in ('heads', 'tags')))
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            name = entry.name
+            if name == 'packed-refs':
+                refuse('a packed-refs file is inside the path (%s)' % clean(rel))
+            if name.endswith(('.pack', '.idx')) and head_bytes(entry.path, 4) in (b'PACK', b'\xfftOc'):
+                refuse('a git pack is inside the path (%s)' % clean(rel + '/' + name))
+            if fanout and LOOSE.fullmatch(name) and head_bytes(entry.path, 1) == b'\x78':
+                refuse('a loose git object is inside the path (%s)' % clean(rel))
+            if refs_like and entry.stat(follow_symlinks=False).st_size in (40, 41, 64, 65) and \
+                    REF_BODY.fullmatch(head_bytes(entry.path, 66) or b''):
+                refuse('a git ref file is inside the path (%s)' % clean(rel + '/' + name))
+    return {'entries': count, 'ms': int((time.monotonic() - started) * 1000)}
 
 
 def check_status():
@@ -9875,8 +10103,8 @@ def check_status():
         if not ok:
             refuse('an ignored directory that is not a build or cache directory is present')
         full = os.path.join(TARGET, rel)
-        if os.path.islink(full.rstrip('/')) or (MODE == 'validate' and nested_git(full)):
-            refuse('an ignored directory holds a nested git checkout or is a link')
+        if os.path.islink(full.rstrip('/')):
+            refuse('an ignored directory is a link')
 
 
 def proc_status(pid):
@@ -10022,7 +10250,7 @@ def process_scan():
     return skipped
 
 
-def mount_check():
+def mount_check(roots=()):
     try:
         with open(MOUNTINFO) as handle:
             lines = handle.read().splitlines()
@@ -10035,6 +10263,8 @@ def mount_check():
         mp = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), fields[4])
         if mp == TARGET or mp.startswith(TARGET + '/'):
             refuse('a mount is at or under the path')
+        if any(inside(mp, root) for root in roots):
+            refuse('a mount is at or under a git store the checkout uses')
 
 
 def docker_check():
@@ -10066,18 +10296,23 @@ def main():
     check_path()
     linked, head, tips, cd, gd = repo_checks()
     parent, others = worktrees(cd, linked, gd)
+    footprint = physical_footprint(cd, gd, linked)
     ident = dev_ino(TARGET)
     live = None
     if MODE == 'validate':
         live = check_pushed(head, tips, linked)
     check_status()
+    scan = store_scan()
     skipped = process_scan()
-    mount_check()
+    mount_check(footprint['roots'])
     docker_check()
     if dev_ino(TARGET) != ident:
         refuse('the path changed while it was inspected')
     return {'ok': True, 'mode': MODE, 'kind': 'linked' if linked else 'main', 'parent': parent, 'head': head,
-            'tips_sha256': hashlib.sha256('\n'.join(tips).encode('utf-8', 'surrogateescape')).hexdigest(), 'tips_count': len(tips), 'linked_existing': others, 'dev': ident[0], 'ino': ident[1], 'skipped_processes': skipped,
+            'tips_sha256': hashlib.sha256('\n'.join(tips).encode('utf-8', 'surrogateescape')).hexdigest(),
+            'tips_count': len(tips), 'linked_existing': others, 'dev': ident[0], 'ino': ident[1],
+            'footprint_sha256': footprint['sha256'], 'store_entries': footprint['entries'],
+            'tree_entries': scan['entries'], 'inspect_ms': footprint['ms'] + scan['ms'], 'skipped_processes': skipped,
             'live_refs': live, 'status': 'clean', 'status_mode': 'porcelain-untracked-normal'}
 
 
@@ -10220,7 +10455,8 @@ def run_fleet_validator(host, mode, path, policy, home, runner=None, timeout=130
             not hexre.fullmatch(data['head']) or not re.fullmatch(r'[0-9a-f]{64}', str(data.get('tips_sha256'))) or \
             not isinstance(linked, list) or not all(isinstance(x, str) and FLEET_PLAIN_PATH.fullmatch(x) for x in linked) \
             or isinstance(data.get('dev'), bool) or not isinstance(data.get('dev'), int) or \
-            isinstance(data.get('ino'), bool) or not isinstance(data.get('ino'), int) or data.get('mode') != mode:
+            isinstance(data.get('ino'), bool) or not isinstance(data.get('ino'), int) or data.get('mode') != mode or \
+            not re.fullmatch(r'[0-9a-f]{64}', str(data.get('footprint_sha256'))):
         raise ValueError('the fleet validator answer is malformed')
     parent = data.get('parent')
     if (data['kind'] == 'linked') != (isinstance(parent, str)) or \
@@ -10235,7 +10471,8 @@ def run_fleet_validator(host, mode, path, policy, home, runner=None, timeout=130
 
 def _fleet_digest(host, path, data):
     body = json.dumps({'host': host, 'path': path, 'repo': data['kind'], 'parent': data.get('parent'),
-                       'head': data['head'], 'tips_sha256': data['tips_sha256']}, sort_keys=True,
+                       'head': data['head'], 'tips_sha256': data['tips_sha256'],
+                       'footprint_sha256': data['footprint_sha256']}, sort_keys=True,
                       separators=(',', ':'))
     return hashlib.sha256(body.encode()).hexdigest()
 
@@ -10324,11 +10561,8 @@ def parse_fleet_command(command, home, policy):
     if '' in tokens:
         return None
     rel = str((policy['marker'].get('fleet_ssh_config')) or '~/.ssh/config_fleetops')
-    spellings = ()
-    if rel.startswith('~/'):
-        spellings = (os.path.join(home, rel[2:]),)
-        if os.path.realpath(os.environ.get('HOME') or '/nonexistent') == home:
-            spellings = (rel,) + spellings  # the shell expands ~ with its own HOME: only when it is the pinned home
+    # only the absolute spelling: a `~` is expanded by the executing shell with its own HOME, which the guard cannot pin
+    spellings = (os.path.join(home, rel[2:]),) if rel.startswith('~/') else ()
     if not tokens or tokens[0] not in ('ssh', '/usr/bin/ssh'):
         return None
     i, config, batch = 1, False, False
