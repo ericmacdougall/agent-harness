@@ -253,6 +253,32 @@ class KnownBypasses(unittest.TestCase):
         out, _, _ = tr.redact_line(raw, 1)
         self.assertFalse(leaks(out, F))
 
+    def test_decoding_never_undoes_a_raw_redaction(self):
+        # A %XX or \\u escape can add a delimiter that shortens a match the raw text fully covered.
+        self.check("postgres://app:" + F + "%2Ftail@db.example.invalid/x", F)
+        self.check("password=abc%20" + F, F)
+        self.check("password=abc\\u0020" + F, F)
+
+    def test_token_wrapped_over_several_lines(self):
+        head = "sk-" + "ant-api03-" + "Z" * 12 + F
+        self.check("key " + head + "\n" + F2 + "\n" + F3 + "\nQq7Ww" + "Ee9Rr2Tt" + " end", F, F2, F3, "Qq7WwEe9Rr2Tt")
+
+    def test_argv_arrays(self):
+        for i, argv in enumerate([["tool", "--password", F], ["tool", "--api-key", F, "--verbose"],
+                                  ["curl", "-u", "admin:" + F, "https://example.invalid"],
+                                  ["mysql", "-u", "root", "-p" + F, "db1"]]):
+            with self.subTest(case=i):
+                out, _, omitted = run({"input": {"argv": argv}})
+                self.assertIsNone(omitted)
+                self.assertFalse(leaks(out, F))
+        out, _, _ = run({"argv": ["mkdir", "-p", "build", "--verbose"]})
+        self.assertEqual(json.loads(out)["argv"], ["mkdir", "-p", "build", "--verbose"])
+
+    def test_env_style_key_names(self):
+        out, _, _ = run({"env": {"APP_KEY": F, "DEPLOY_KEY": F2, "SORT_KEY_HINT": "kept"}})
+        self.assertFalse(leaks(out, F, F2))
+        self.assertTrue(b"kept" in out)
+
     def test_double_encoded_json_api_key(self):
         once = json.dumps({"api_key": F})
         twice = json.dumps(once)
@@ -327,7 +353,10 @@ class Pass2AndFailClosed(unittest.TestCase):
         def boom(line):
             raise RuntimeError("synthetic failure " + F)
         tr._pass1 = boom
-        out, _, omitted = tr.redact_line(b'{"t":"x"}', 2)
+        try:
+            out, _, omitted = tr.redact_line(b'{"t":"x"}', 2)
+        except Exception:  # never let a traceback carry the synthetic value
+            self.fail("redact_line raised instead of failing closed")
         self.assertEqual(omitted, "error")
         self.assertFalse(leaks(out, F))
         self.assertEqual(json.loads(out)["line"], 2)
@@ -336,6 +365,15 @@ class Pass2AndFailClosed(unittest.TestCase):
         tr._pass1 = lambda line: (line, {})
         out, _, _ = tr.redact_line(("x " + ANT).encode(), 1)
         self.assertFalse(any(F[i:i + 6].encode() in out for i in range(len(F) - 5)))
+
+    def test_omitted_markers_verify_clean(self):
+        tr._pass1 = lambda line: (line, {})
+        markers = [tr.redact_line(("x " + ANT).encode(), 1)[0],
+                   tr.redact_line(b'{"t":"password=[REDACTED:x]' + F.encode() + b'"}', 2)[0]]
+        tr._pass1 = self._orig
+        markers.append(tr._omitted(b"src", 3, "error"))
+        markers.append(tr._omitted(b"src", 4, "reserialize"))
+        self.assertEqual(tr.verify_bytes(b"\n".join(markers) + b"\n"), [])
 
     def test_verify_bytes_reports_kind_and_line_only(self):
         data = b'{"a":1}\nclean text\nleak ' + ANT.encode() + b"\n"
