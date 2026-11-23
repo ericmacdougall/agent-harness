@@ -806,9 +806,15 @@ def answer_text(record, ask_ids):
         return None
     if blocks[0].get("is_error"):
         return None
-    # Only the user's selections count (toolUseResult.answers: question -> answer). The rendered tool_result string
-    # embeds the agent's own question text, so it is never parsed; no structured answers means no answer.
-    answers = record["toolUseResult"].get("answers") if isinstance(record["toolUseResult"], dict) else None
+    return ask_answers_text(record["toolUseResult"])
+
+
+def ask_answers_text(result):
+    """The user's selections in an AskUserQuestion result object (the transcript's toolUseResult, which is also the
+    PostToolUse hook's tool_response): its `answers` mapping, question -> answer, joined by newlines; else None.
+    The rendered tool_result string embeds the agent's own question text, so it is never parsed; no structured
+    answers means no answer. The one extractor for the local grant path and the central revocation hook."""
+    answers = result.get("answers") if isinstance(result, dict) else None
     if not isinstance(answers, dict):
         return None
     values = [v.strip() for v in answers.values() if isinstance(v, str) and v.strip()]

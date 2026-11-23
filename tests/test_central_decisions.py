@@ -219,6 +219,8 @@ class PublishAndVerify(Base):
         with self.assertRaises(cd.Denied) as caught:
             self.publish('k1')
         self.assertEqual(caught.exception.code, 'later_turn')
+        # refused before signing: nothing was posted (the post-publish rescan is a second net, not this one)
+        self.assertFalse(any(str(i['body']).startswith(cd.DECISION_PREFIX) for i in self.fake.items))
 
     def test_turn_arriving_during_publish_withdraws_the_new_decision(self):  # NEG-14 publish window
         self.grant_local('k1')
@@ -484,6 +486,194 @@ class PromptHookRevokes(Base):
                 cd.on_user_prompt(SESSION, opener + ' run that review', store=self.mac.store, client=self.fake)
                 with self.assertRaises(cd.Denied):
                     self.verify('k1')
+
+
+class WithdrawalPredicate(unittest.TestCase):
+    """withdrawal_signal is the one trigger for every revocation path; its truth table."""
+
+    def test_truth_table(self):
+        fires = ['no', 'No, stop', '  stop the run', 'cancel', 'revoke it', 'withdraw that', 'do not run it',
+                 'do  not', "don't", 'dont', 'never mind', 'hold off for now', 'scratch that', 'forget it',
+                 'use astra instead', 'the top rung is fine', 'keep fable off', 'STOP',
+                 '<ide_selection>x</ide_selection> never mind']
+        quiet = ['looks good', 'thanks', 'yes, go on', 'knob tweak', 'notable result', 'stopwatch', '', '   ', None, 7]
+        for text in fires:
+            with self.subTest(fires=text):
+                self.assertTrue(cd.withdrawal_signal(text))
+        for text in quiet:
+            with self.subTest(quiet=text):
+                self.assertFalse(cd.withdrawal_signal(text))
+
+
+class EveryWithdrawalChannelRevokes(Base):
+    """PR 14 round-2 class A: a worker host has no transcript, so it sees a withdrawal only as a ledger revocation.
+    Every channel the T2Scan local path honours (a typed turn, a question answer, a queued mid-turn message) must
+    therefore produce one from the Mac's hooks. The other host (t2) has no transcript and no tombstone here."""
+
+    ASK_USE = 'toolu_01AskUserQuestionFixture'
+
+    def setUp(self):
+        super().setUp()
+        self.grant_local('k1')
+        self.decision = self.publish('k1')['decision_id']
+        self.verify('k1')
+        self.transcript = self.claude / 'projects' / '-proj' / (SESSION + '.jsonl')
+
+    def append(self, *rows):
+        with open(self.transcript, 'a') as handle:
+            handle.write(''.join(json.dumps(row) + '\n' for row in rows))
+
+    def answer_rows(self, answer):
+        asked = {'type': 'assistant', 'uuid': '00000000-0000-4000-8000-00000000a5c1', 'message': {'role': 'assistant',
+                 'content': [{'type': 'tool_use', 'id': self.ASK_USE, 'name': 'AskUserQuestion', 'input': {}}]}}
+        answered = {'type': 'user', 'uuid': '00000000-0000-4000-8000-00000000a5c2', 'timestamp': fx.stamp(1),
+                    'toolUseResult': {'questions': [{'question': 'Proceed with fable?'}],
+                                      'answers': {'Proceed with fable?': answer}},
+                    'message': {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': self.ASK_USE,
+                                                             'content': 'User answered'}]}}
+        return asked, answered
+
+    def revoke_lines(self):
+        return [item['body'] for item in self.fake.items if item['body'].startswith('agent-harness-revoke')]
+
+    def assert_revoked_everywhere(self):
+        with self.assertRaises(cd.Denied) as caught:
+            self.verify('k1')
+        self.assertIn('revoked', str(caught.exception))
+        self.assertEqual(self.revoke_lines(), ['agent-harness-revoke decision ' + self.decision])
+
+    def test_withdrawing_question_answer_revokes_from_the_hook_payload(self):
+        response = {'questions': [{'question': 'Proceed with fable?'}], 'answers': {'Proceed with fable?': 'Yes, go on'}}
+        self.assertIsNone(cd.on_ask_answer(SESSION, response, store=self.mac.store, client=self.fake))
+        self.verify('k1')  # a non-withdrawing answer changes nothing
+        response['answers'] = {'Proceed with fable?': 'No, stop'}
+        note = cd.on_ask_answer(SESSION, response, store=self.mac.store, client=self.fake)
+        self.assertIn('revoked central decision', note)
+        self.assert_revoked_everywhere()
+
+    def test_unreadable_question_answer_revokes(self):
+        for response in ('User declined to answer', {'answers': {}}, {'answers': 'no'}, None):
+            with self.subTest(response=response):
+                self.fake.items[:] = [i for i in self.fake.items if not i['body'].startswith('agent-harness-revoke')]
+                for store in (self.mac.store, self.t2.store):  # each subtest starts unrevoked on both hosts
+                    if store.tombstones.exists():
+                        store.tombstones.unlink()
+                self.verify('k1')
+                cd.on_ask_answer(SESSION, response, store=self.mac.store, client=self.fake)
+                self.assert_revoked_everywhere()
+
+    def test_stop_sweep_revokes_on_a_queued_mid_turn_message(self):
+        self.assertIsNone(cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude))
+        self.verify('k1')  # nothing later in the transcript yet
+        self.append({'type': 'queue-operation', 'operation': 'enqueue', 'sessionId': SESSION, 'timestamp': fx.stamp(1),
+                     'content': 'stop, hold the review'})
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_stop_sweep_revokes_on_an_answer_the_payload_path_missed(self):
+        self.append(*self.answer_rows('No, stop'))
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_prompt_hook_sweeps_too(self):
+        self.append({'type': 'queue-operation', 'operation': 'enqueue', 'sessionId': SESSION, 'timestamp': fx.stamp(1),
+                     'content': 'cancel that'})
+        cd.on_user_prompt(SESSION, 'thanks', store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_unreadable_transcript_revokes_and_a_revoked_decision_is_not_withdrawn_again(self):
+        self.transcript.rename(self.transcript.with_suffix('.gone'))
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+        for _ in range(3):
+            cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+            cd.on_user_prompt(SESSION, 'no', store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assertEqual(len(self.revoke_lines()), 1)
+
+    def test_failed_post_tombstones_first_and_any_verb_retries(self):
+        self.fake.fail_post = True
+        note = cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
+        self.assertIn('NOT posted', note)
+        with self.assertRaises(cd.Denied):
+            cd.verify('k1', 'fable', store=self.mac.store, client=self.fake)  # the Mac tombstone denies at once
+        self.verify('k1')  # the stated limit: other hosts accept until the queued post lands
+        self.fake.fail_post = False
+        self.assertIn('posted 1 queued', cd.on_stop(SESSION, store=self.mac.store, client=self.fake,
+                                                    claude_home=self.claude))
+        self.assert_revoked_everywhere()
+
+    def test_a_client_error_that_is_not_denied_is_still_queued(self):
+        class Unavailable(Exception):
+            pass
+        real_post = self.fake.post
+        with mock.patch.object(self.fake, 'post', side_effect=Unavailable('ticket system down')):
+            note = cd.on_ask_answer(SESSION, {'answers': {'q': 'no'}}, store=self.mac.store, client=self.fake)
+        self.assertIn('NOT posted', note)
+        self.assertEqual(self.revoke_lines(), [])
+        self.assertIn('Unavailable', self.mac.store.pending.read_text())
+        self.assertIs(self.fake.post.__func__, real_post.__func__)
+        cd.on_stop(SESSION, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.assert_revoked_everywhere()
+
+    def test_other_session_decisions_are_untouched(self):
+        other = '99999999-2222-4333-8444-555555555555'
+        cd.on_ask_answer(other, {'answers': {'q': 'no, stop'}}, store=self.mac.store, client=self.fake)
+        cd.on_stop(other, store=self.mac.store, client=self.fake, claude_home=self.claude)
+        self.verify('k1')
+        self.assertEqual(self.revoke_lines(), [])
+
+
+class AnswerHookIsWired(Base):
+    """The `answer` verb through provenance_hooks.main (verb allow-list and handler table) and its registration."""
+
+    def run_main(self, verb, payload):
+        import io
+        import provenance_hooks as ph
+        out = io.StringIO()
+        with mock.patch.object(ph, 'read_payload', return_value=payload), \
+                mock.patch.object(ph, 'install_limits', return_value=None), \
+                mock.patch.object(cd, 'Store', lambda home=None: self.mac.store), \
+                mock.patch.object(cd, 'GoodQALedger', lambda adapter=None, deadline_seconds=None: self.fake), \
+                mock.patch('sys.stdout', out):
+            self.assertEqual(ph.main([verb]), 0)
+        return out.getvalue()
+
+    def test_answer_verb_revokes_and_reports(self):
+        self.grant_local('k1')
+        self.publish('k1')
+        payload = {'session_id': SESSION, 'tool_name': 'AskUserQuestion', 'hook_event_name': 'PostToolUse',
+                   'tool_input': {}, 'tool_response': {'answers': {'Go?': 'Yes'}}}
+        self.assertEqual(self.run_main('answer', payload), '')
+        self.verify('k1')
+        self.assertEqual(self.run_main('answer', dict(payload, tool_name='Bash',
+                                                      tool_response={'answers': {'Go?': 'no'}})), '')
+        self.verify('k1')  # another tool's output never counts as an answer
+        printed = json.loads(self.run_main('answer', dict(payload, tool_response={'answers': {'Go?': 'No, stop'}})))
+        self.assertEqual(printed['hookSpecificOutput']['hookEventName'], 'PostToolUse')
+        self.assertIn('revoked central decision', printed['hookSpecificOutput']['additionalContext'])
+        with self.assertRaises(cd.Denied):
+            self.verify('k1')
+
+    def test_stop_lint_runs_the_sweep(self):
+        self.grant_local('k1')
+        self.publish('k1')
+        stop = {'session_id': SESSION, 'hook_event_name': 'Stop', 'stop_hook_active': False}
+        self.run_main('stop-lint', stop)
+        self.verify('k1')  # the sweep found the transcript and nothing later in it (not a fail-safe revoke)
+        fx.user_turn(self.claude, 'no, stop', uid='00000000-0000-4000-8000-0000000000f9', age_seconds=1)
+        self.run_main('stop-lint', stop)
+        with self.assertRaises(cd.Denied):
+            self.verify('k1')
+
+    def test_installer_registers_the_answer_hook(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('ah_install', HERE.parent / 'install.py')
+        install = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(install)
+        groups = install.provenance_hook_groups(Path('/x/.claude'))
+        self.assertEqual(groups['PostToolUse'], [{'matcher': 'AskUserQuestion', 'hooks': [
+            {'type': 'command', 'command': 'python3', 'args': ['/x/.claude/hooks/provenance_hooks.py', 'answer'],
+             'timeout': 10}]}])
 
 
 class CallerFreshnessLimit(Base):

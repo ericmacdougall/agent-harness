@@ -68,6 +68,22 @@ REVOKE = re.compile(r'agent-harness-revoke (?:(all)|task ([A-Za-z0-9][A-Za-z0-9.
 BARE_WITHDRAWAL = re.compile(r"\s*(?:stop|cancel|revoke|withdraw|no|do\s+not|don'?t)\b", re.I)
 
 
+def withdrawal_signal(text):
+    """THE later-turn predicate (goodqa#16651, PR 14 class A). Every revocation trigger uses it: the publish-time
+    later-turn scan, the prompt hook, the question-answer hook and the transcript sweep. True when the text names the
+    top rung, retracts, or opens with a bare withdrawal, judged on the raw text and on the text with wrapper blocks
+    removed (the T2Scan adapter judges the stripped text). It is a superset of the adapter's later_withdrawal trigger,
+    which adds only a narrowing task-name filter; the cross-repo contract test pins that relation."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    import provenance as prov  # noqa: PLC0415
+    for candidate in (text, prov.strip_blocks(text)):
+        if candidate and (esc.TOP_TERMS.search(candidate) or esc.TOP_RETRACT.search(candidate)
+                          or BARE_WITHDRAWAL.match(candidate)):
+            return True
+    return False
+
+
 class Denied(Exception):
     """No valid central decision (every failure, including an unreachable ledger, lands here: fail closed)."""
 
@@ -582,7 +598,7 @@ def later_mentions(session, turn_uuid, claude_home):
                 # The queued copy of the cited words is the same message, written next to it; not a later turn.
                 if text is not None and cited_text is not None and text.strip() == cited_text.strip():
                     continue
-            if seen and text and (esc.TOP_TERMS.search(text) or esc.TOP_RETRACT.search(text) or BARE_WITHDRAWAL.match(text)):
+            if seen and withdrawal_signal(text):
                 return True
     if not seen:
         raise Denied('transcript_unsafe', 'the cited turn is not in the session transcript')
@@ -786,9 +802,10 @@ def withdraw(scope, value=None, *, store=None, client=None, now=None, reason='wi
         config = load_config(store)
         _client(client, deadline_seconds).post(config['ledger']['issue_id'], line, 'central-revoke-' + uuid.uuid4().hex)
         return {'revoked': line, 'posted': True}
-    except Denied as error:
-        _append_private(store.pending, {'line': line, 'at': now, 'error': error.code})
-        return {'revoked': line, 'posted': False, 'error': error.code, 'queued': True}
+    except Exception as error:  # noqa: BLE001  any failure to post (the GoodQA client raises its own types): queue it
+        code = error.code if isinstance(error, Denied) else type(error).__name__
+        _append_private(store.pending, {'line': line, 'at': now, 'error': code})
+        return {'revoked': line, 'posted': False, 'error': code, 'queued': True}
 
 
 def retry_pending(store=None, client=None, deadline_seconds=None):
@@ -807,16 +824,40 @@ def retry_pending(store=None, client=None, deadline_seconds=None):
             client.post(config['ledger']['issue_id'], line, 'central-revoke-' + hashlib.sha256(
                 (line + str(row.get('at'))).encode()).hexdigest()[:32])
             done.append(line)
-        except Denied:
+        except Exception:  # noqa: BLE001  stays queued whatever the client raised
             left.append(row)
     _write_private(store.pending, b''.join((json.dumps(r, sort_keys=True) + '\n').encode() for r in left), 0o600)
     return done
 
 
-def on_user_prompt(session, text, *, store=None, client=None, now=None):
-    """Prompt hook: a later user turn in a session that published decisions, naming the top rung or withdrawing,
-    revokes those decisions by id (the later-turn scan at publish already blocks re-publishing that turn). Returns
-    a short note for the agent's context, or None. Never raises."""
+def live_published(store, session, now):
+    """{decision_id: turn_uuid} of this session's published, unexpired decisions that this host has not already
+    tombstoned (a revoked decision is not withdrawn again on every later hook)."""
+    done = {row['value'] for row in local_tombstones(store) if row['scope'] == 'decision'}
+    live = {}
+    for row in _read_jsonl(store.published):
+        try:
+            if (row.get('session') == session and HEX32.fullmatch(str(row.get('decision_id')))
+                    and UUID.fullmatch(str(row.get('turn_uuid'))) and parse_time(row.get('expires_at')) > now
+                    and row['decision_id'] not in done):
+                live[row['decision_id']] = row['turn_uuid']
+        except Denied:
+            continue
+    return live
+
+
+def on_hook_event(session, *, text=None, unreadable=False, sweep=True, claude_home=None, store=None, client=None,
+                  now=None):
+    """Every hook verb (prompt, question answer, stop) lands here, so every withdrawal channel the local grant path
+    honours produces a ledger revocation (PR 14 class A). In order:
+      1. retry queued revocation posts;
+      2. if this session has live published decisions: revoke all of them when `text` (a prompt or an answer) meets
+         withdrawal_signal, or when the answer could not be read (`unreadable`, fail safe);
+      3. otherwise, with `sweep`, rescan the session transcript after each decision's cited turn with
+         later_mentions (the same record extraction as the adapter: typed turns, question answers, queued mid-turn
+         messages); a transcript that cannot be read revokes too, as publish does.
+    Each revocation writes the local tombstone first, then posts; a failed post is queued. Returns a short note or
+    None. Never raises. A session without live decisions costs one small index read and no transcript read."""
     store = store or Store()
     notes = []
     try:
@@ -828,21 +869,27 @@ def on_user_prompt(session, text, *, store=None, client=None, now=None):
         notes.append('queued central-decision revocations still unposted; to deny everywhere now run '
                      'python3 ~/.claude/hooks/ah.py decision withdraw --all')
     try:
-        if not isinstance(text, str) or not UUID.fullmatch(str(session or '')):
-            return '; '.join(notes) or None
-        if not (esc.TOP_TERMS.search(text) or esc.TOP_RETRACT.search(text) or BARE_WITHDRAWAL.match(text)):
+        if not UUID.fullmatch(str(session or '')):
             return '; '.join(notes) or None
         now = time.time() if now is None else now
-        live = set()
-        for row in _read_jsonl(store.published):
-            try:
-                if row.get('session') == session and HEX32.fullmatch(str(row.get('decision_id'))) \
-                        and parse_time(row.get('expires_at')) > now:
-                    live.add(row['decision_id'])
-            except Denied:
-                continue
-        for decision_id in sorted(live):
-            result = withdraw('decision', decision_id, store=store, client=client, now=now, reason='later-user-turn',
+        live = live_published(store, session, now)
+        if not live:
+            return '; '.join(notes) or None
+        targets = {}
+        if unreadable:
+            targets = dict.fromkeys(live, 'unreadable-answer')
+        elif withdrawal_signal(text):
+            targets = dict.fromkeys(live, 'later-user-turn')
+        elif sweep:
+            for turn in sorted(set(live.values())):
+                try:
+                    late, why = later_mentions(session, turn, claude_home), 'later-turn-in-transcript'
+                except Exception:  # noqa: BLE001  cannot prove no later turn: fail safe, as publish does
+                    late, why = True, 'transcript-unreadable'
+                if late:
+                    targets.update((decision_id, why) for decision_id, cited in live.items() if cited == turn)
+        for decision_id in sorted(targets):
+            result = withdraw('decision', decision_id, store=store, client=client, now=now, reason=targets[decision_id],
                               deadline_seconds=HOOK_DEADLINE)
             notes.append('revoked central decision %s (%s)' % (decision_id[:8], 'posted' if result['posted'] else
                                                               'NOT posted: queued for retry; other hosts still accept it until '
@@ -850,6 +897,26 @@ def on_user_prompt(session, text, *, store=None, client=None, now=None):
     except Exception as error:  # noqa: BLE001
         notes.append('central-decision revocation failed (%s)' % type(error).__name__)
     return '; '.join(notes) or None
+
+
+def on_user_prompt(session, text, *, store=None, client=None, now=None, claude_home=None):
+    """Prompt hook: the submitted text is not in the transcript yet, so it is judged directly; then the sweep."""
+    return on_hook_event(session, text=text if isinstance(text, str) else None, claude_home=claude_home, store=store,
+                         client=client, now=now)
+
+
+def on_ask_answer(session, tool_response, *, store=None, client=None, now=None, claude_home=None):
+    """PostToolUse hook for AskUserQuestion: the user's selections, read by the same extractor the local path uses
+    (provenance.ask_answers_text). An answer that cannot be read revokes (fail safe)."""
+    import provenance as prov  # noqa: PLC0415
+    text = prov.ask_answers_text(tool_response)
+    return on_hook_event(session, text=text, unreadable=text is None, claude_home=claude_home, store=store,
+                         client=client, now=now)
+
+
+def on_stop(session, *, store=None, client=None, now=None, claude_home=None):
+    """Stop hook: the transcript sweep catches queued mid-turn messages and anything the direct paths missed."""
+    return on_hook_event(session, claude_home=claude_home, store=store, client=client, now=now)
 
 
 # ------------------------------------------------------------------ CLI

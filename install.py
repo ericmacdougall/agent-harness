@@ -124,6 +124,8 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
     return {
         "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-gate")]}],
+        # goodqa#16651: a withdrawing question answer revokes the session's published central decisions.
+        "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("answer")]}],
         "Stop": [{"hooks": [hook("stop-lint")]}],
         "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
     }

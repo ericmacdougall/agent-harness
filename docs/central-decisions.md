@@ -76,7 +76,7 @@ Scope rules:
 
 Hosts keep a sticky local copy of every revoke they have seen (`tombstones.jsonl`). Tombstones only deny. A revoke without a server time is kept as newer than every grant, so a scope revoke of that kind blocks later decisions in its scope on that host. To recover after removing such a comment from the ledger, the user moves `~/.agent-harness/decisions/tombstones.jsonl` aside on that host; the next read rebuilds it from the ledger.
 
-In the originating session, a later user turn that names the top rung or withdraws makes the provenance prompt hook revoke that session's published decisions by id. It writes a local tombstone first, then posts the revoke. A failed post is queued in `pending-revocations.jsonl`, retried on later prompts and reported in the agent's context. Until the queued post lands, other hosts still accept the decision (at most until its expiry). Publish refuses, before posting, when it cannot write the `published.jsonl` index that this hook relies on.
+In the originating session, a later user turn that names the top rung or withdraws (typed, answered to an AskUserQuestion prompt, or queued mid-turn; see "Withdrawal and the local path") makes the provenance hooks revoke that session's published decisions by id. They write a local tombstone first, then post the revoke. A failed post is queued in `pending-revocations.jsonl`, retried by every hook verb and reported in the agent's context. Until the queued post lands, other hosts still accept the decision (at most until its expiry). Publish refuses, before posting, when it cannot write the `published.jsonl` index that this hook relies on.
 
 A retraction typed in a different session does not revoke automatically; use `ah decision withdraw` there.
 
@@ -95,18 +95,30 @@ A retraction typed in a different session does not revoke automatically; use `ah
 
 ## Withdrawal and the local path
 
-A local grant is withdrawn when a later human turn in the same session names the top rung, retracts, or opens with a withdrawal word (no, stop, cancel, revoke, do not, don't) for that task or for all work. The adapter finds this by scanning the transcript.
+A local grant is withdrawn when a later human turn in the same session names the top rung, retracts, or opens with a withdrawal word (no, stop, cancel, revoke, do not, don't) for that task or for all work. The T2Scan adapter finds this by scanning the transcript, and it reads three kinds of turn there: a typed prompt, an answer to an AskUserQuestion prompt (`toolUseResult.answers`), and a message queued while the agent was working (`queue-operation`).
 
-A central decision is withdrawn by a revoke on the ledger. Revokes come from three places:
-- **The prompt hook in the originating session.** It revokes every published decision of that session on any of those words. Its trigger is a superset of the adapter's, and a test pins that.
-- **`ah decision withdraw`**, run on demand.
-- **A revoke line posted on the ledger ticket.**
+A worker host has no transcript, so a central decision there is withdrawn only by a revoke on the ledger. Every channel the local path reads therefore produces a ledger revoke from the Mac's hooks in the originating session. All of them use one predicate, `central_decisions.withdrawal_signal`, which is a superset of the adapter's trigger (the adapter adds only a task-name filter that narrows it):
 
-When the originating transcript is on the host running the adapter (the Mac), the adapter also runs its own transcript scan on the central decision's source. On a worker host the transcript is absent, so the ledger revocation is what applies there.
+| Channel | Hook (provenance_hooks.py verb) | When it revokes |
+|---|---|---|
+| Typed prompt | UserPromptSubmit (`prompt`) | at submission, on the prompt text |
+| AskUserQuestion answer | PostToolUse on AskUserQuestion (`answer`) | when the answer returns, on `tool_response.answers` (read by `provenance.ask_answers_text`, the extractor the local path uses); an answer that cannot be read revokes |
+| Queued mid-turn message, or anything the two above missed | Stop (`stop-lint`), and also `prompt` and `answer` | at the end of the turn: a transcript sweep (`later_mentions`, the same record reader as publish and the adapter) after each live decision's cited turn; a transcript that cannot be read revokes |
+| On demand | `ah decision withdraw --decision/--task/--session/--all` | at once |
+| Anyone | a revoke line posted on the ledger ticket | at once |
 
-Known gaps, both covered by `ah decision withdraw --all`:
-- A withdrawal given as an answer to an AskUserQuestion prompt is not a typed prompt, so the hook does not see it.
-- The same applies to a withdrawal typed in another session.
+Each hook revokes only decisions published from its own session, writes the local tombstone first (the Mac denies at once), then posts the revoke line. A post that fails for any reason is queued, and every hook verb retries the queue. A decision this host already tombstoned is not posted again.
+
+Guarantee, as tested (T2Scan `CentralNeverWiderTopologyContract`, harness `EveryWithdrawalChannelRevokes`): for every channel above, once the revoke line is on the ledger, the central path denies on a worker host without the transcript wherever the local path denies on the Mac. Limits:
+- **Post not landed.** Between the withdrawal and a successful post (GoodQA down, or the hook skipped because it crashed or hit its 8 s limit), worker hosts still accept the decision. The Mac's hook note says so, and `ah decision withdraw --all` closes it.
+- **Latency.** Typed prompts and answers revoke when the hook runs. Queued messages revoke at the next Stop, prompt or answer hook.
+- **Another session.** A withdrawal typed in a different session is not seen by either path; the local path also scans only the originating session.
+
+When the originating transcript is on the host running the adapter, the adapter also runs its own transcript scan on the central decision's source. On a worker host the transcript is absent ("transcript-missing"), and the ledger is what applies. Any other transcript problem denies.
+
+## Replay binding (accepted risk)
+
+A central decision is keyed by task and family only: the task is the sha256 of project, run and work item. It is not bound to a `request_id`, a `packet_sha256` or a worker host. Within its freshness window, the same decision authorizes any request for that task on any host that pins the key and reads the ledger. A local grant has the same binding, but only on its own host; the central path makes it reachable from every worker. This is recorded as an accepted risk (ASSUMPTION, inferred by the implementer: the user has not been asked). Binding to `issuer_host` would not narrow which worker accepts it, and binding to a target worker would need a new field at publish time and a product decision on which hosts may run a task. Bounds that apply: the 12 h cap and the caller's shorter cap, the exact-task match, revocation, and the 3-key per-turn cap.
 
 ## Why the hooks directory is trusted
 

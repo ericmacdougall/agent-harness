@@ -6,6 +6,9 @@
   provenance_hooks.py stop-lint   Stop: the final assistant message's "need from you" items each carry
                                   `[ask:<id>]` or an inline `[src: <source>]` that resolves
   provenance_hooks.py prompt      UserPromptSubmit: hand the agent a reminder left by a warn-mode stop-lint
+  provenance_hooks.py answer      PostToolUse on AskUserQuestion: a withdrawing answer revokes this session's
+                                  published central decisions (goodqa#16651; prompt and stop-lint do the same for
+                                  typed turns and queued messages)
   provenance_hooks.py calibrate   measure the stop-lint detector on a transcript (no hook payload)
 
 Modes come from provenance_policy.json (`ask_user_question`, `stop_lint`: off | warn | enforce). Every hook
@@ -385,6 +388,7 @@ def cmd_stop_lint(payload: dict) -> dict:
     session = str(payload.get("session_id") or "")
     if not valid_session(session):
         return {}
+    central_note(session, payload, "stop")  # goodqa#16651 transcript sweep (queued messages); never raises
     quarantine = quarantine_block(session, payload)  # its own policy key, independent of stop_lint (review minor)
     if quarantine.get("decision") == "block":
         return quarantine
@@ -416,17 +420,34 @@ def cmd_stop_lint(payload: dict) -> dict:
             + ((" " + carried) if carried else "")}
 
 
-def central_note(session: str, payload: dict):
-    """goodqa#16651: a later user turn naming the top rung (or withdrawing) revokes this session's published central
-    decisions. Only runs when this host has central decisions enabled; never raises."""
+def central_note(session: str, payload: dict, event: str = "prompt"):
+    """goodqa#16651: a later user turn naming the top rung or withdrawing (typed, answered to a question, or queued
+    mid-turn) revokes this session's published central decisions. Only runs when this host has central decisions
+    enabled; never raises."""
     try:
         import central_decisions as cd  # noqa: PLC0415
         store = cd.Store()
         if not store.config.exists():
             return None
+        if event == "answer":
+            return cd.on_ask_answer(session, payload.get("tool_response"), store=store)
+        if event == "stop":
+            return cd.on_stop(session, store=store)
         return cd.on_user_prompt(session, payload.get("prompt"), store=store)
     except Exception:  # noqa: BLE001
         return None
+
+
+def cmd_answer(payload: dict) -> dict:
+    if payload.get("tool_name") != "AskUserQuestion":
+        return {}
+    session = str(payload.get("session_id") or "")
+    if not valid_session(session):
+        return {}
+    note = central_note(session, payload, "answer")
+    if not note:
+        return {}
+    return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "Central decisions: " + note}}
 
 
 def cmd_prompt(payload: dict) -> dict:
@@ -648,7 +669,7 @@ def install_limits(rss_limit=RSS_LIMIT_BYTES, wall_limit=WALL_LIMIT_SECONDS):
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("ask-gate", "stop-lint", "prompt", "calibrate", "show-message"):
+    if not argv or argv[0] not in ("ask-gate", "stop-lint", "prompt", "answer", "calibrate", "show-message"):
         print(__doc__, file=sys.stderr)
         return 3
     command = argv[0]
@@ -672,7 +693,8 @@ def main(argv=None) -> int:
     install_limits()
     try:
         payload = read_payload()
-        handler = {"ask-gate": cmd_ask_gate, "stop-lint": cmd_stop_lint, "prompt": cmd_prompt}[command]
+        handler = {"ask-gate": cmd_ask_gate, "stop-lint": cmd_stop_lint, "prompt": cmd_prompt,
+                   "answer": cmd_answer}[command]
         result = handler(payload)
     except Exception as error:  # fail open: a lint bug must not trap the agent
         print(f"provenance_hooks {command}: skipped ({type(error).__name__})", file=sys.stderr)
