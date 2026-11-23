@@ -2609,6 +2609,234 @@ class TierOneCheckpoint(Case):
         self.assertNotIn("bulk tier deferred", log)
         self.assertTrue(any(self.is_bulk(a) for a in self.copies()), log[-1500:])
 
+    # --- gate 6c0f69b (rescue): class G, a list step drops a file and the tree still completes; F1 migrate; F3 names ---
+
+    GUARD_END = '  [ "$GUARD_GONE" -ge 0 ] || return 1\n  return 0\n}'
+
+    def guard_mutant(self, body):
+        """The script with `body` run at the very end of guard_list, after it has classified the list (a broken guard)."""
+        text = SCRIPT.read_text()
+        self.assertEqual(text.count(self.GUARD_END), 1, "the mutation anchor is the end of guard_list")
+        variant = self.tmp / "mutant" / "log-backup.sh"
+        variant.parent.mkdir(exist_ok=True)
+        variant.write_text(text.replace(self.GUARD_END, '  [ "$GUARD_GONE" -ge 0 ] || return 1\n' + body + "\n  return 0\n}"))
+        return dict(script=variant, LOG_BACKUP_EXCLUDES=str(ROOT / "harness/bin/log-backup.excludes"),
+                    LOG_BACKUP_WORK_EXCLUDES=str(ROOT / "harness/bin/log-backup.work-excludes"))
+
+    @staticmethod
+    def drop_from_guarded(path, count_as_gone):
+        """Shell for a guard that leaves `path` out of what it sends, and reports it as GONE or as nothing at all."""
+        tail = "GUARD_GONE=$((GUARD_GONE + 1))" if count_as_gone else "GUARD_GONE=0 GUARD_HELD=0"
+        return ('  if grep -qxF -- %(p)s "$out"; then grep -vxF -- %(p)s "$out" > "$out.m"; mv "$out.m" "$out"\n'
+                '    GUARD_SENT=$((GUARD_SENT - 1)); %(t)s; fi' % {"p": "'" + path + "'", "t": tail})
+
+    def test_g_invariant_a_guard_that_silently_drops_a_file_never_gets_the_tree_last_ok(self):
+        # Class G: the guard leaves s07 out of the copy and reports nothing (no GONE, no HELD). Only the completion
+        # invariant, which never asks the guard, can see it. At 6c0f69b the tree completed and wrote its last-ok.
+        mutant = self.guard_mutant(self.drop_from_guarded("s07/main.jsonl", count_as_gone=False))
+        done = self.tier1_runs(3, 100000, **mutant)
+        log = self.log_text()
+        self.assertNotIn(".claude/wals/s07/main.jsonl", self.remote_files())
+        self.assertNotIn("s07/main.jsonl", self.verified_paths("claude_wals"))
+        self.assertFalse(self.source_ok("claude_wals").exists(), "the tree's last-ok was written with a file never sent")
+        self.assertFalse(self.last_ok().exists())
+        self.assertIn(".claude/wals: 1 listed file(s) are not in verified after every pending file was offered", log)
+        self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=1 ok=never$")
+        self.assertNotIn("s07", log, "counts only, never names")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue(self.source_ok("claude_projects").exists(), "only the tree with the dropped file is held")
+
+    def test_g_gone_a_tier1_file_the_guard_calls_gone_is_held(self):
+        # The stage does not change during a run: a staged file the guard reports GONE was not sent and is held.
+        mutant = self.guard_mutant(self.drop_from_guarded("s07/main.jsonl", count_as_gone=True))
+        done = self.tier1_runs(3, 100000, **mutant)
+        log = self.log_text()
+        self.assertIn(".claude/wals: 1 file(s) held: the upload guard could not find them in the stage", log)
+        self.assertFalse(self.source_ok("claude_wals").exists())
+        self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=1 ok=never$")
+        self.assertNotEqual(done.returncode, 0)
+
+    def test_g_bulk_a_file_the_guard_drops_withholds_bulk_last_ok_and_is_never_done(self):
+        # Bulk copies from the live tree, so GONE can be real there (see the vanish test); a file still on disk that no
+        # copy was given must withhold bulk-last-ok at the pass close. At 6c0f69b the pass closed clean.
+        for i in range(6):
+            self.put(".codex/archived_sessions/v%d.jsonl" % i, b"archived %d\n" % i)
+        mutant = self.guard_mutant(self.drop_from_guarded("v2.jsonl", count_as_gone=False))
+        done = self.run_script(LOG_BACKUP_BULK_CHUNK="2", **mutant)
+        log = self.log_text()
+        st = self.logs / "log-backup.bulk.d" / ".codex_archived_sessions"
+        self.assertIn(".codex/archived_sessions: pass complete, but 1 listed file(s) still on disk were not sent", log)
+        self.assertFalse(self.bulk_ok().exists(), "bulk-last-ok written with a file never sent")
+        names = {l.split("\t", 1)[0] for l in (st / "done").read_text().splitlines()}
+        self.assertIn("v5.jsonl", names)
+        self.assertNotIn("v2.jsonl", names)
+        self.assertNotEqual(done.returncode, 0)
+
+    def test_g_recheck_a_verified_file_the_guard_proves_gone_leaves_verified(self):
+        # A re-check chunk whose guard reports a verified path as absent (LIST.gone) must not leave it "verified".
+        self.tier1_runs(4, 100000)
+        self.assertIn("s07/main.jsonl", self.verified_paths("claude_wals"))
+        body = ('  case "$list" in *claude_wals/recheck.chunk) if grep -qxF s07/main.jsonl "$out"; then\n'
+                '    grep -vxF s07/main.jsonl "$out" > "$out.m"; mv "$out.m" "$out"; echo s07/main.jsonl >> "$list.gone"\n'
+                '    GUARD_SENT=$((GUARD_SENT - 1)) GUARD_GONE=$((GUARD_GONE + 1)); fi ;; esac')
+        self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", **self.guard_mutant(body))
+        self.assertIn(".claude/wals: re-check complete", self.log_text())
+        self.assertNotIn("s07/main.jsonl", self.verified_paths("claude_wals"), "an unchecked path stayed verified")
+        self.tier1_runs(1, 100000)   # the next run lists it as pending again and sends it
+        self.assertIn("s07/main.jsonl", self.verified_paths("claude_wals"))
+        self.assertTrue(self.source_ok("claude_wals").exists())
+
+    def test_g_trailing_space_a_name_ending_in_spaces_is_sent_and_verified(self):
+        # rclone's filter-file reader trims trailing whitespace, so `+ /name ` never matched its file: at 6c0f69b such
+        # a file was held on every run and the tree never got its last-ok again. The guard writes those spaces as [ ].
+        self.need_rclone()
+        names = [".claude/wals/s94/trail.jsonl ", ".claude/wals/s94/two.jsonl  ", ".claude/wals/s94 /in-dir.jsonl"]
+        for rel in names:
+            self.put(rel, b"spaced name\n")
+        done = self.local_run(LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+        log = self.log_text()
+        arrived = self.real_remote_names(".claude/wals")
+        verified = self.verified_paths("claude_wals")
+        for rel in names:
+            self.assertIn(rel[len(".claude/wals/"):], arrived, log[-1500:])
+            self.assertIn(rel[len(".claude/wals/"):], verified)
+        self.assertNotIn("held", log)
+        self.assertTrue(self.source_ok("claude_wals").exists(), log[-1500:])
+        self.assertEqual(done.returncode, 0, log[-1500:])
+
+    def test_g_trailing_space_and_unresolvable_a_name_is_held_never_gone(self):
+        # The F2 trigger: a name rclone cannot look up again (U+201B) that also ends in a space. At 6c0f69b the rules
+        # could not find it either, so it was counted GONE: not sent, and the tree still wrote its last-ok.
+        self.need_rclone()
+        self.put(".claude/wals/s93/a‛b.jsonl ", b"quoted and spaced\n")
+        for _ in range(2):
+            done = self.local_run(LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+            log = self.log_text()
+            self.assertFalse(self.source_ok("claude_wals").exists(), "last-ok written for a tree with an unsent file")
+            self.assertFalse(self.last_ok().exists())
+            self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=1 ok=never$")
+            self.assertIn(".claude/wals: 1 file(s) held", log)
+            self.assertNotIn("s93/a‛‛b.jsonl ", self.verified_paths("claude_wals"))
+            self.assertLessEqual(self.verified_paths("claude_wals"), self.real_remote_names(".claude/wals"))
+            self.assertNotEqual(done.returncode, 0)
+
+    def test_g_other_trailing_whitespace_is_sent_or_held_never_last_ok_while_unsent(self):
+        # [ ] covers the ASCII space only. A name ending in another whitespace character (NBSP) may not be expressible
+        # as a rule; whatever rclone does with it, the tree never gets its last-ok while the file is not on the remote.
+        self.need_rclone()
+        self.put(".claude/wals/s92/nb.jsonl ", b"nbsp name\n")
+        self.local_run(LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+        sent = "s92/nb.jsonl " in self.real_remote_names(".claude/wals")
+        verified = "s92/nb.jsonl " in self.verified_paths("claude_wals")
+        self.assertLessEqual(self.verified_paths("claude_wals"), self.real_remote_names(".claude/wals"))
+        if not sent:
+            self.assertFalse(verified)
+            self.assertFalse(self.source_ok("claude_wals").exists(), "last-ok written while the file is not on the remote")
+        else:
+            self.assertTrue(verified)
+
+    def test_g_step5_a_bulk_name_neither_the_lookup_nor_the_rules_can_find_is_held_not_gone(self):
+        # Guard step 5 on its own: in bulk, GONE is believed (files vanish from the live tree). A name with U+201B that
+        # also ends in a whitespace the rule reader trims (NBSP) is found by neither the list lookup nor the rules; it
+        # is still on disk, so the guard must hold it. At 6c0f69b it was GONE and the pass closed with bulk-last-ok.
+        self.need_rclone()
+        self.put(".codex/archived_sessions/a‛b.jsonl ", b"quoted, nbsp\n")
+        done = self.local_run(LOG_BACKUP_BULK_EVERY_SECONDS="0")
+        log = self.log_text()
+        self.assertIn(".codex/archived_sessions: 1 file(s) held: rclone cannot send them by list", log)
+        self.assertIn(".codex/archived_sessions: pass complete, but 1 listed file(s) still on disk were not sent", log)
+        self.assertFalse(self.bulk_ok().exists())
+        self.assertNotEqual(done.returncode, 0)
+
+    def case_sensitive_fs(self):
+        probe = self.tmp / "case-probe"
+        probe.mkdir()
+        (probe / "a").write_bytes(b"")
+        return not (probe / "A").exists()
+
+    def test_f3_rescue_glob_characters_a_leading_dash_and_case_siblings_reach_the_remote_exactly(self):
+        # Gate 6c0f69b F3, real rclone: every name below goes through guard_rules' escaping and --ignore-case. A
+        # credential pattern added after the tree was listed must take exactly its own files out of the copy.
+        # Every exclude runs with --ignore-case, so a case-only pair always shares its exclude status: a credential
+        # cannot differ only in case from a file that is sent. The test asserts that both variants are excluded.
+        self.need_rclone()
+        ex, _ = self.real_lsf()
+        sent = ["s95/[x].jsonl", "s95/st*r.jsonl", "s95/q?.jsonl", "s95/c{u}.jsonl", "s95/back\\sl.jsonl",
+                "s95/-dash.jsonl", "s95/-/lead-dir.jsonl", "s95/Case.jsonl", "s95/[ab]/x.jsonl", "s95/a.jsonl"]
+        excluded = ["s95/cred.jsonl"]
+        if self.case_sensitive_fs():
+            sent.append("s95/case.jsonl")
+            excluded.append("s95/CRED.jsonl")
+        for rel in sent + excluded:
+            self.put(".claude/wals/" + rel, ("%s\n" % rel).encode())
+        done = self.local_run(LOG_BACKUP_BULK_EVERY_SECONDS="99999", LOG_BACKUP_EXCLUDES=str(ex),
+                              FAKE_LSF_THEN=".claude/wals|cred.jsonl|%s" % ex)
+        log = self.log_text()
+        arrived = {p for p in self.real_remote_names(".claude/wals") if p.startswith("s95/")}
+        verified = {p for p in self.verified_paths("claude_wals") if p.startswith("s95/")}
+        self.assertEqual(arrived, set(sent), log[-1500:])
+        self.assertEqual(verified, set(sent))
+        self.assertIn(".claude/wals: %d file(s) left out of the upload by the current excludes" % len(excluded), log)
+        self.assertNotIn("held", log)
+        self.assertTrue(self.source_ok("claude_wals").exists(), log[-1500:])
+        self.assertEqual(done.returncode, 0, log[-1500:])
+
+    def test_f1_rescue_a_pass_from_before_the_guard_sends_its_passed_files_again(self):
+        # Gate 6c0f69b F1: a pass started before the upload guard has a cursor and no `sent`. Its cursor was advanced by
+        # copies that could skip a name and exit 0, so none of it is trusted: the pass starts again from its first file
+        # (rclone skips what already arrived). At 6c0f69b those files were seeded into `sent` and never offered again.
+        for i in range(6):
+            self.put(".codex/archived_sessions/v%d.jsonl" % i, b"archived %d\n" % i)
+        st = self.logs / "log-backup.bulk.d" / ".codex_archived_sessions"
+        remote = dict(LOG_BACKUP_REMOTE=str(self.remote), LOG_BACKUP_ALLOW_LOCAL="1")
+        self.run_script(LOG_BACKUP_BULK_CHUNK="2", FAKE_EXIT="10", FAKE_EXIT_MATCH=str(st / "chunk.paths.guarded"), **remote)
+        passed = [l.split("\t", 1)[0] for l in (st / "pending").read_text().splitlines()[:4]]
+        self.assertEqual(len(passed), 4)
+        (st / "sent").unlink()                       # the state a pre-guard version leaves: cursor, no sent
+        (st / "cursor").write_text("4\n")
+        checked = Path(str(self.calls) + ".checked")
+        done = self.run_script(LOG_BACKUP_BULK_CHUNK="2", FAKE_OPS_MATCH=".codex/archived_sessions",
+                               FAKE_OPS_PER_RUN="100000", **remote)
+        log = self.log_text()
+        self.assertIn(".codex/archived_sessions: pass in progress from before the upload guard: it starts again from its first file", log)
+        self.assertNotIn("recorded as sent", log)
+        offered = set(checked.read_text().splitlines()) if checked.exists() else set()
+        self.assertLessEqual(set(passed), offered, "the files the old cursor passed were never offered to a copy")
+        names = {l.split("\t", 1)[0] for l in (st / "done").read_text().splitlines()}
+        self.assertEqual(names, {"v%d.jsonl" % i for i in range(6)} | {"y.jsonl"})
+        self.assertTrue(self.bulk_ok().exists(), log[-1500:])
+        self.assertEqual(done.returncode, 0, log[-1500:])
+        # The next run sees `sent` and restarts nothing.
+        (self.logs / "log-backup.log").write_text("")
+        self.run_script(LOG_BACKUP_BULK_CHUNK="2", **remote)
+        self.assertNotIn("from before the upload guard", self.log_text())
+
+    def test_f1_rescue_nothing_can_record_a_line_no_guarded_copy_was_given(self):
+        text = SCRIPT.read_text()
+        body = text[text.index("\nrecord_verified() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertNotIn("migrate", body)
+        self.assertNotIn("record_verified migrate", text)
+        ops = re.findall(r"^\s{4}([a-z]+)\)", body, re.M)
+        self.assertEqual(ops, ["add", "keep", "drop", "reset"])
+
+    def test_g_static_the_completion_checks_use_the_tree_listing_and_never_the_guard(self):
+        text = SCRIPT.read_text()
+        self.assertEqual(text.count("TZ=UTC \"$RCLONE\" lsf"), 1, "one definition of the tier-1 listing (live_list)")
+        lu = text[text.index("\nlive_upload() {"):]
+        lu = lu[:lu.index("\n}\n")]
+        self.assertIn('live_list "$snap" "$st/listing.tmp"', lu)
+        self.assertLess(lu.index("live_unverified"), lu.index("record_verified keep"))
+        self.assertLess(lu.index("live_unverified"), lu.index("last-ok.tmp"))
+        for name in ("live_unverified", "bulk_unsent"):
+            fn = text[text.index("\n%s() {" % name):]
+            fn = fn[:fn.index("\n}\n")]
+            self.assertNotIn("GUARD_", fn, "%s must not trust the guard" % name)
+            self.assertNotIn(".guarded", fn)
+        bu = text[text.index("\nbulk_upload() {"):]
+        bu = bu[:bu.index("\n}\n")]
+        self.assertLess(bu.index('record_verified keep "$st/done"'), bu.index("bulk_unsent"))
+
     def test_neg_tier1_checkpoint_state_is_its_own(self):
         # The lane owns log-backup.bulk.d; tier 1 must never write into it (two writers on one checkpoint).
         self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="99999")
