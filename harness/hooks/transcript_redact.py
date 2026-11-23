@@ -207,6 +207,7 @@ def _command_gate(text, gate):
 
 # A token-shaped hit that ends at a line break continues on the next line (tmux and terminal wraps).
 _WRAP = re.compile(r'(?:\r?\n|(?:\\r)?\\n)[A-Za-z0-9_+/=.~-]{1,1024}')
+_WRAP_LINES = 32  # continuation lines followed per hit
 _NO_WRAP = {'email', 'phone', 'pem', 'cookie-header', 'url-userinfo', 'oauth-json', 'rclone-token', 'base64'}
 
 _BASE64 = re.compile(r'(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{1000,}={0,2}')
@@ -273,8 +274,10 @@ def _find_spans(text):
             if MARKER.fullmatch(text, start, end):
                 continue  # exactly one placeholder: already redacted
             if kind not in _NO_WRAP:
-                wrap = _WRAP.match(text, end)
-                if wrap is not None:
+                for _ in range(_WRAP_LINES):
+                    wrap = _WRAP.match(text, end)
+                    if wrap is None:
+                        break
                     end = wrap.end()
             spans.append((start, end, kind))
     return spans
@@ -343,8 +346,10 @@ def _normalize1(text):
 
 
 def _redact_text(text, counts):
+    # Raw spans are applied first. Decoding can add a delimiter (%2F, \u0020) that would shorten a match the raw
+    # text fully covered, so the normalized form is only ever a second scan over already-redacted text.
     text = _collapse_base64(text, counts)
-    spans = _find_spans(text)
+    text = _apply(text, _find_spans(text), counts)
     if _NORM_TRIGGER.search(text):
         norm = _normalize1(text)
         if norm != text:
@@ -355,7 +360,7 @@ def _redact_text(text, counts):
                 for kind, n in local.items():
                     counts[kind] = counts.get(kind, 0) + n
                 return _apply(norm, norm_spans, counts)
-    return _apply(text, spans, counts)
+    return text
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -402,7 +407,8 @@ def _key_is_credential(key):
         result = (any(t in _STRONG for t in tokens) or tokens[-1] in _LAST
                   or any((a, b) in _PAIRS for a, b in zip(tokens, tokens[1:]))
                   or joined.endswith(_FUSED_SUFFIX)
-                  or (len(tokens) >= 2 and tokens[0] == 'x' and tokens[-1] in _X_HEADER_LAST))
+                  or (len(tokens) >= 2 and tokens[0] == 'x' and tokens[-1] in _X_HEADER_LAST)
+                  or (len(tokens) >= 2 and tokens[-1] == 'key' and key.isupper()))  # APP_KEY, DEPLOY_KEY
     if len(_KEY_CACHE) < 4096 and len(key) <= 256:
         _KEY_CACHE[key] = result
     return result
@@ -444,10 +450,35 @@ def _walk(value, counts, nest):
     if isinstance(value, list):
         if len(value) == 2 and isinstance(value[0], str) and _key_is_credential(value[0]):
             return [_redact_string(value[0], counts, nest), _keyed(value[1], counts)]
-        return [_walk(item, counts, nest) for item in value]
+        out = [_walk(item, counts, nest) for item in value]
+        _redact_argv(value, out, counts)
+        return out
     if isinstance(value, str):
         return _redact_string(value, counts, nest)
     return value
+
+
+_ARGV_SECRET_FLAG = re.compile(
+    r'(?i)--(?:[a-z0-9]{1,32}-){0,4}(?:password|passwd|pass|token|secret|api-?key|access-?key|auth-token)|-u|--user')
+_ARGV_MYSQL = re.compile(r'(?:^|/)(?:mysql|mysqldump|mysqladmin|mysqlimport|mysqlshow|mariadb|mariadb-dump)$')
+
+
+def _redact_argv(raw, out, counts):
+    """argv lists are scanned element by element, so a flag and its value never share a string:
+    ["tool", "--password", X], ["curl", "-u", "user:X"], ["mysql", "-pX"] or ["mysql", "-p", X]."""
+    mysql = any(isinstance(item, str) and _ARGV_MYSQL.search(item) for item in raw[:4])
+    for i, item in enumerate(raw):
+        if not isinstance(item, str):
+            continue
+        nxt = raw[i + 1] if i + 1 < len(raw) else None
+        if _ARGV_SECRET_FLAG.fullmatch(item) and isinstance(nxt, str) and not nxt.startswith('--'):
+            if item in ('-u', '--user') and ':' not in nxt:
+                continue  # a bare user name is not a secret
+            out[i + 1] = _keyed(nxt, counts)
+        elif mysql and item.startswith('-p') and len(item) > 2 and not item.startswith('--'):
+            out[i] = _keyed(item, counts)
+        elif mysql and item == '-p' and isinstance(nxt, str) and not nxt.startswith('-'):
+            out[i + 1] = _keyed(nxt, counts)
 
 
 def _redact_string(text, counts, nest):
@@ -589,8 +620,11 @@ def _v2_copies(text):
         norm = _V2_INVISIBLE.sub('', _V2_ANSI.sub('', norm))
     if '\\' in norm:
         norm = _V2_QUOTE.sub(r'\1', norm)
-    joined = _V2_BREAKS.sub('', norm)
-    return (norm,) if joined == norm else (norm, joined)
+    copies = [text]  # the raw copy: decoding can shorten a hit below a minimum length
+    for copy in (norm, _V2_BREAKS.sub('', norm)):
+        if copy not in copies:
+            copies.append(copy)
+    return copies
 
 
 def _v2_scan(text, kinds, depth):
