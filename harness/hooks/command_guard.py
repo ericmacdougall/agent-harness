@@ -87,7 +87,8 @@ DEFAULT_POLICY = {
     'guard_files': ['{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
                     '{home}/.claude/hooks/safe_input.py', '{home}/.codex/agent-harness/command_guard*',
                     '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py',
-                    # the Claude CLI's own pid -> session records: takeover.derive_caller reads the caller from them
+                    # the Claude CLI's own pid -> session records: takeover's R4 reads them as liveness evidence (a
+                    # replaced or removed record would hide a running session)
                     '{home}/.claude/sessions/*'],
     # wal, wals, wal-*, wal_*, wal.* and *.wal.jsonl; not walker/ or wallet/
     'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[-_.][^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
@@ -2185,9 +2186,12 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, ba
 
 
 WORKTREE_HOME_DENY = ('.claude', '.codex', '.ssh', '.config', '.gnupg', '.aws', '.kimi-code', 'library', '.trash')
-VERIFIER_VERSION = 3  # `ah worktree-remove` refuses a verifier that does not report this (an old install on the target)
-HOOK_SESSION = None  # the PreToolUse payload's session_id (set by hook_main): the caller of a worktree removal in the hook
-GITHUB_REMOTE =re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
+VERIFIER_VERSION = 4  # `ah worktree-remove` refuses a verifier that does not report this (an old install on the target)
+# The PreToolUse payload's session_id (set by hook_main): the only caller identity anything here trusts. The host writes
+# the payload; the agent cannot. Every other route (this file's CLI, ah, ssh, cron) has no caller (see takeover.py).
+HOOK_SESSION = None
+REMOTE_JUDGE_SECONDS = 60  # the Mac verifier's read of t2-dev's evidence for a foreign judgement (ah_worktree budgets it)
+GITHUB_REMOTE = re.compile(r'(?:https://github\.com/[\w.-]+/[\w.-]+?(?:\.git)?|git@github\.com:[\w.-]+/[\w.-]+?(?:\.git)?)')
 
 
 def worktree_scope_refusal(path, *, _managed_copy=None):
@@ -2252,35 +2256,76 @@ def _takeover():
     return module
 
 
-def verifier_caller(path, flag, home=None):
-    """(caller, problem) for the verifier CLI. The caller is worked out from this process's ancestry
-    (takeover.resolve_caller: a Claude session record, a Codex tool shell's thread id, or the flag only when the verifier
-    was started over ssh with no agent above it). A flag that names another session than the derived one is a refusal.
-    Only a path inside a session's work directory needs a caller, so nothing is probed for any other path."""
-    if session_owner_of(os.path.realpath(path), home) is None:
-        return None, None
+def own_grant(path, home=None):
+    """True when the PreToolUse hook left a valid single-use grant for `path` (takeover.take_grant): the hook saw the
+    path's owner session in its payload and the HEAD the worktree still has. The grant is consumed. This is the only way
+    the verifier CLI learns that a path is the caller's own; nothing it reads from argv, the environment or the process
+    ancestry can say so."""
+    real = os.path.realpath(path)
+    owner = session_owner_of(real, home)
+    if owner is None:
+        return False
     try:
-        return _takeover().resolve_caller(os.path.realpath(home or os.path.expanduser('~')), flag)
-    except Exception as error:  # noqa: BLE001 - an unknown caller is foreign for every work directory, never own
-        return None, None if not flag else 'caller_mismatch: the calling session could not be worked out (%s)' % (
-            type(error).__name__)
+        return bool(_takeover().take_grant(os.path.realpath(home or os.path.expanduser('~')), real, owner,
+                                           lambda p: _git_out(p, ['rev-parse', 'HEAD'], 5.0).strip()))
+    except Exception:  # noqa: BLE001 - a grant that cannot be read is no grant
+        return False
 
 
-def foreign_session_refusal(path, caller, action='worktrees', home=None, judge=None):
-    """Why a path inside ~/.agent-harness/work/<S>/ may not be removed by `caller`, or None.
+def issue_own_grants(command, home=None):
+    """In the PreToolUse hook only, after the command was allowed: for each `--path P` of a worktree-removal command
+    whose owner session is the payload's session (HOOK_SESSION), write a grant bound to that session, P and P's HEAD.
+    A grant can only make a path of the payload session's own work directory own. Never raises."""
+    try:
+        text = command if isinstance(command, str) else ' '.join(map(str, command))
+        if not HOOK_SESSION or ('worktree-remove' not in text and 'remove-worktree' not in text) or re.search(r'[$`]', text):
+            return 0
+        takeover = _takeover()
+        words = shlex.split(text)
+        paths = [words[i + 1] for i, w in enumerate(words[:-1]) if w == '--path']
+        paths += [w.split('=', 1)[1] for w in words if w.startswith('--path=')]
+        root = os.path.realpath(home or os.path.expanduser('~'))
+        issued = 0
+        for raw in paths[:takeover.GRANT_CAP]:
+            expanded = os.path.expanduser(raw)  # the shell expands a leading ~ before the tool sees it
+            if not os.path.isabs(expanded):
+                continue
+            real = os.path.realpath(expanded)
+            owner = session_owner_of(real, home)
+            if not owner or owner.casefold() != str(HOOK_SESSION).casefold():
+                continue
+            head = _git_out(real, ['rev-parse', 'HEAD'], 3.0).strip()
+            if takeover.issue_grant(root, owner, real, head):
+                issued += 1
+        return issued
+    except Exception:  # noqa: BLE001 - no grant only means the verifier judges the path as foreign
+        return 0
 
-    Another session's directory is removable only when that session is retired or walless (takeover.session_state, judged
-    on this host). An empty or unknown caller counts as foreign. Paths outside work/ are not this rule's business. This
-    check lives in the verifier, which every removal route reaches (the hook's lone form, `ah worktree-remove`, a direct
-    `remove-worktree`), so a policy sentence or a clever command shape cannot route around it."""
+
+def foreign_session_refusal(path, action='worktrees', home=None, judge=None, remote_fetch=None):
+    """Why a path inside ~/.agent-harness/work/<S>/ may not be removed, or None.
+
+    The caller is unknown here, always: an unknown caller is foreign, so a directory of a session S recorded on this host
+    is removable only when S is retired or walless by evidence (takeover.session_state), whoever asks. The caller's own
+    directory is reached through the hook (its lone form, or the grant own_grant() takes), never through this check.
+    Paths outside work/ and directories attributed to no session are not this rule's business. On the Mac the verdict
+    is the two-host one (t2-dev's evidence over ssh, read only after this host alone already says retired); on t2-dev it
+    is this host's (a session runs on the host that holds its WAL). This check lives in the verifier, which every route
+    reaches, so a policy sentence or a command shape cannot route around it."""
     owner = session_owner_of(os.path.realpath(path), home)
-    if owner is None or (caller and owner.casefold() == str(caller).casefold()):
+    if owner is None:
         return None
     try:
         takeover = _takeover()
-        verdict = (judge or (lambda s: takeover.session_state(
-            s, action, os.path.realpath(home or os.path.expanduser('~')), takeover.HostProbe(), time.time(), caller,
-            takeover.LOCAL_ONLY)))(owner)
+        root = os.path.realpath(home or os.path.expanduser('~'))
+
+        def two_host(session):
+            here = takeover.session_state(session, action, root, takeover.HostProbe(), time.time(), takeover.LOCAL_ONLY)
+            if here.get('state') not in ('retired', 'walless') or sys.platform.startswith('linux'):
+                return here
+            remote = (remote_fetch or takeover.fetch_remote_evidence)(session, timeout=REMOTE_JUDGE_SECONDS)
+            return takeover.session_state(session, action, root, takeover.HostProbe(), time.time(), remote)
+        verdict = (judge or two_host)(owner)
     except Exception as error:  # noqa: BLE001 - a judge that fails is a refusal
         return 'foreign session %s could not be judged (%s); run ah takeover status --from %s' % (
             owner[:40], type(error).__name__, owner[:40])
@@ -2677,13 +2722,14 @@ def _same_worktree_directory(path, expected):
     return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == expected
 
 
-def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *, caller_session=None,
+def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *, own=False,
                     session_judge=None, _managed_copy=None, _before_remove=None, _managed_lock_fds=()):
     """Verify, then run the plain non-forced `git worktree remove` from the primary worktree. The directory identity is
     compared before and after the verification, and an expected HEAD must still match. Every attempt that reaches the
-    removal is audited on this host (the audit of `ah` lives on the caller's host). A path inside another session's
-    work directory is refused unless that session is retired or walless (foreign_session_refusal)."""
-    foreign = foreign_session_refusal(path, caller_session, judge=session_judge) if _managed_copy is None else None
+    removal is audited on this host (the audit of `ah` lives on the caller's host). A path inside a session's work
+    directory is refused unless that session is retired or walless (foreign_session_refusal), or `own` says the hook's
+    grant for this path was taken (own_grant)."""
+    foreign = foreign_session_refusal(path, judge=session_judge) if _managed_copy is None and not own else None
     if foreign:
         return {'path': path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION, 'reason': foreign}
     try:
@@ -9899,9 +9945,8 @@ def install_files_refusal(command, is_main, home=None):
     return None
 
 
-TAKEOVER_WORDS = ('takeover', 'remove-worktree', 'continuation', 'caller-session', 'CODEX_THREAD_ID',
-                  'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'enable-takeover-cleanup')
-TAKEOVER_TOOLS = ('ah.py', 'command_guard', 'kill_guard', 'wal.py', 'takeover.py', 'ah_worktree', 'enable-takeover-cleanup')
+TAKEOVER_WORDS = ('takeover', 'enable-takeover-cleanup', 'enable_takeover_cleanup')
+TAKEOVER_TOOLS = ('ah.py', 'enable-takeover-cleanup', 'enable_takeover_cleanup')
 
 
 def _load_takeover_rules():
@@ -9914,9 +9959,8 @@ def _load_takeover_rules():
 
 
 def takeover_rules_refusal(text, session):
-    """The refusal text of takeover_rules (W2 form, G2 caller binding, G3 identity, G4 continuation, G5 user script), or None.
-    Text only: accident prevention, see takeover_rules.py. The prefilter reads quote-flattened text (remove-work""tree is
-    still the word). When the module is missing or broken, a command that names a harness tool next to a takeover word is
+    """The refusal text of takeover_rules (W2 form, G5 user script), or None. Text only: accident prevention, see
+    takeover_rules.py; no rule reads or binds a caller identity. The prefilter reads quote-flattened text. When the module is missing or broken, a command that names a harness tool next to a takeover word is
     refused instead of allowed: a host with this guard but without its rules must not lose them silently."""
     flat = re.sub(r'[\'"\\]', '', text)
     if not any(word in flat for word in TAKEOVER_WORDS):
@@ -10012,6 +10056,8 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
                                                              'already used or changed', 'approve again after a fresh '
                                                              'verified backup'))
+        if verdict != 'block':
+            issue_own_grants(command)  # the payload session's own worktree paths only; see takeover.py
         return emit(verdict, message, fmt)
     except TimeoutError:
         verdict = 'block' if raw_sensitive(raw_text) else 'warn'
@@ -10210,8 +10256,16 @@ def replay(paths, max_commands=200000):
             'samples': samples}
 
 
+class _Parser(argparse.ArgumentParser):
+    """No prefix matching anywhere (review M2: `--call` used to parse as a longer option). Subparsers inherit the class."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs['allow_abbrev'] = False
+        super().__init__(*args, **kwargs)
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = _Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
     hook = sub.add_parser('hook')
     hook.add_argument('--format', choices=('exit2', 'json'), default='exit2')
@@ -10219,7 +10273,8 @@ def main(argv=None):
     check.add_argument('command')
     check.add_argument('--ps', action='store_true')
     check.add_argument('--cwd')
-    check.add_argument('--session', help='judge the command as this session (what the hook payload\'s session_id is)')
+    check.add_argument('--session', help='judge the command as this session (what the hook payload\'s session_id is); '
+                       'check runs and writes nothing, grants included')
     exp = sub.add_parser('explain', help='decision and every finding for a command read from a file')
     exp.add_argument('--file', required=True)
     exp.add_argument('--ps', action='store_true')
@@ -10249,8 +10304,6 @@ def main(argv=None):
                         help='read the remote with this host\'s own credentials (private repository); refs cannot be supplied')
         if name == 'remove-worktree':
             wt.add_argument('--expect-head')
-            wt.add_argument('--caller-session', help='the calling agent session (ah worktree-remove passes it); a path '
-                            'in another session\'s work directory needs that session retired or walless')
     sub.add_parser('revoke-delete')
     scan = sub.add_parser('scan-wal')
     scan.add_argument('paths', nargs='+')
@@ -10331,12 +10384,7 @@ def main(argv=None):
         if args.cmd == 'verify-worktree':
             result = verify_worktree(args.path, args.remote_auth, policy)
         else:
-            caller, problem = verifier_caller(args.path, args.caller_session)
-            if problem:
-                result = {'path': args.path, 'removable': False, 'removed': False, 'verifier': VERIFIER_VERSION,
-                          'reason': problem}
-            else:
-                result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy, caller_session=caller)
+            result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy, own=own_grant(args.path))
         print(json.dumps(result))
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':

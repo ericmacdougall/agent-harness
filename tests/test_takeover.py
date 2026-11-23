@@ -111,9 +111,9 @@ class TakeoverCase(unittest.TestCase):
         (self.home / ".agent-harness" / "work" / sid).mkdir(parents=True, exist_ok=True)
         return wal
 
-    def state(self, action="worktrees", old=OLD, caller=CALLER, now=NOW, remote=EMPTY_REMOTE, **kw):
+    def state(self, action="worktrees", old=OLD, now=NOW, remote=EMPTY_REMOTE, **kw):
         kw.setdefault("tasks_fn", lambda home: list(self.tasks))
-        return tk.session_state(old, action, self.home, self.probe, now, caller, remote, **kw)
+        return tk.session_state(old, action, self.home, self.probe, now, remote, **kw)
 
 
 class Predicate(TakeoverCase):
@@ -180,7 +180,7 @@ class Predicate(TakeoverCase):
         out = self.state()
         self.assertEqual((out["state"], "clock_skew" in out["reasons"]), ("unknown", True), out)
 
-    def test_marker_process_under_an_agent_host_is_live_and_a_caller_marker_is_ignored(self):
+    def test_marker_process_under_an_agent_host_is_live_whatever_else_it_carries(self):
         self.codex_session()
         self.probe = FakeHost(
             table={50: row(50, 1, command="/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"), 51: row(51, 50, command="/bin/zsh -c x")},
@@ -189,7 +189,8 @@ class Predicate(TakeoverCase):
             out = self.state()
             self.assertEqual((out["state"], out["reasons"]), ("live", ["session_live"]), out)
             self.probe.pairs[51] = {("codex", OLD), ("claude", CALLER)}
-            self.assertEqual(self.state()["state"], "retired", "a process that also carries the caller's marker neither blocks nor qualifies")
+            self.assertEqual(self.state()["reasons"], ["session_live"],
+                             "no caller exemption: a second marker on the process does not hide the first")
 
     def test_a_cwd_inside_the_work_dir_alone_never_makes_a_session_live(self):
         self.codex_session()
@@ -207,7 +208,7 @@ class Predicate(TakeoverCase):
         self.tasks = [{"task": "t1", "session": OLD, "latest_actor": "someone"}]
         self.assertEqual(self.state()["reasons"], ["open_work"])
         self.tasks = [{"task": "t1", "session": OLD, "latest_actor": "agent of " + CALLER}]
-        self.assertEqual(self.state()["state"], "retired", "a task the caller already took over with ah task status")
+        self.assertEqual(self.state()["reasons"], ["open_work"], "an open task of the session blocks until it is disposed")
         self.tasks = [{"task": "t2", "session": OTHER, "latest_actor": None}]
         self.assertEqual(self.state()["state"], "retired")
 
@@ -237,8 +238,6 @@ class Predicate(TakeoverCase):
 
     def test_identity_rules(self):
         self.codex_session()
-        self.assertEqual(self.state(caller=OLD)["reasons"], ["self_takeover"])
-        self.assertEqual(self.state(caller=None)["reasons"], ["caller_unknown"])
         self.assertEqual(self.state(old="Upper-CASE-id-0000")["reasons"], ["bad_id"])
         self.assertEqual(self.state(old="../../etc/passwd")["reasons"], ["bad_id"])
 
@@ -300,7 +299,7 @@ class ClaimAndTombstone(TakeoverCase):
         self.kg.ensure_key(str(self.home))
 
     def write(self, **kw):
-        return tk.write_claim(str(self.home), OLD, "claude", CALLER, self.TICKET, NOW, "mac", **kw)
+        return tk.write_claim(str(self.home), OLD, "claude", self.TICKET, NOW, "mac", **kw)
 
     def test_claim_file_is_private_and_signed(self):
         self.write()
@@ -308,23 +307,36 @@ class ClaimAndTombstone(TakeoverCase):
         self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
         self.assertEqual(oct(os.stat(os.path.dirname(path)).st_mode & 0o777), "0o700")
         claim, bad = tk.read_claim(str(self.home), OLD)
-        self.assertEqual((claim["caller"], bad), (CALLER, False))
+        self.assertEqual((claim["v"], bad), (2, False))
+        self.assertNotIn("caller", claim, "a claim names no claimer: no tool knows its caller")
 
-    def test_a_valid_claim_satisfies_r2_only_for_its_caller_and_starts_the_quiet_clock(self):
+    def test_a_valid_claim_satisfies_r2_and_starts_the_quiet_clock(self):
         self.claude_session(last_event="result")
         self.assertEqual(self.state()["reasons"], ["not_stopped"])
         self.write()
         self.assertEqual(self.state()["reasons"], ["recent_activity"], "the claim time counts as activity")
         later = self.state(now=NOW + HOUR + 1)
         self.assertEqual(later["state"], "retired", later)
-        self.assertIn("not_stopped", self.state(caller=OTHER)["reasons"])
+
+    def test_a_v1_claim_with_a_claimer_is_not_valid(self):
+        self.claude_session(last_event="result")
+        data = self.write()
+        legacy = dict(data, v=1, caller=CALLER)
+        legacy.pop("hmac")
+        import hashlib
+        import hmac as _hmac
+        key = self.kg.read_key(str(self.home))
+        legacy["hmac"] = _hmac.new(key, tk._canonical(legacy).encode(), hashlib.sha256).hexdigest()
+        Path(tk.claim_path(str(self.home), OLD)).write_text(json.dumps(legacy))
+        self.assertEqual(tk.read_claim(str(self.home), OLD), (None, True))
+        self.assertEqual(self.state(now=NOW + 9 * HOUR)["reasons"], ["not_stopped"])
 
     def test_tampered_or_extra_field_claims_are_ignored(self):
         self.claude_session(last_event="result")
         self.write()
         path = tk.claim_path(str(self.home), OLD)
         data = json.loads(Path(path).read_text())
-        for change in ({"caller": OTHER}, {"extra": "x"}, {"ticket": "GoodQA x#1; rm -rf /"},
+        for change in ({"flavor": "codex"}, {"extra": "x"}, {"ticket": "GoodQA x#1; rm -rf /"},
                        {"removed": ["/etc/passwd"]}, {"hmac": "0" * 64}):
             Path(path).write_text(json.dumps(dict(data, **change)))
             claim, bad = tk.read_claim(str(self.home), OLD)
@@ -340,21 +352,22 @@ class ClaimAndTombstone(TakeoverCase):
 
     def test_bad_ticket_or_ids_are_refused(self):
         with self.assertRaises(tk.TakeoverError):
-            tk.write_claim(str(self.home), OLD, "claude", CALLER, "GoodQA x#1 $(id)", NOW, "mac")
+            tk.write_claim(str(self.home), OLD, "claude", "GoodQA x#1 $(id)", NOW, "mac")
         with self.assertRaises(tk.TakeoverError):
-            tk.write_claim(str(self.home), OLD, "claude", "Bad Caller", self.TICKET, NOW, "mac")
+            tk.write_claim(str(self.home), "Bad Session", "claude", self.TICKET, NOW, "mac")
 
     def test_notice_text_is_fixed_and_has_no_free_text(self):
         self.write(removed=[str(self.home / ".agent-harness/work" / OLD / "a" / "b")], stopped=[{"pid": 5, "start": 6}])
         text, digest = tk.render_notice(OLD, str(self.home))
-        self.assertIn("session %s took over this session's work" % CALLER, text)
+        self.assertIn("another session took over this session's work", text)
+        self.assertNotIn(CALLER, text)
         self.assertIn("Stopped pids: 1.", text)
         self.assertEqual(len(digest), 16)
         self.assertNotIn("ignore previous", text)
 
     def test_update_keeps_the_claim_time_and_appends(self):
         first = self.write()
-        later = tk.write_claim(str(self.home), OLD, "claude", CALLER, self.TICKET, NOW + 500, "mac", claimed=False,
+        later = tk.write_claim(str(self.home), OLD, "claude", self.TICKET, NOW + 500, "mac", claimed=False,
                                removed=[str(self.home / ".agent-harness/work" / OLD / "x")])
         self.assertEqual(later["claimed_at"], first["claimed_at"])
         self.assertEqual(len(later["removed"]), 1)
@@ -417,10 +430,10 @@ class ProcessCandidates(TakeoverCase):
         base.update(extra or {})
         return base
 
-    def cands(self, table, pairs, last=NOW - 2 * HOUR, spawns=None, exclude=(), caller=CALLER, spawn_start=None):
+    def cands(self, table, pairs, last=NOW - 2 * HOUR, spawns=None, exclude=(), spawn_start=None):
         self.probe = FakeHost(table=table, pairs=pairs)
         return tk.process_candidates(OLD, str(self.home), self.probe, last, table=table, spawns=spawns,
-                                     spawn_start=spawn_start, exclude_pids=exclude, caller=caller)
+                                     spawn_start=spawn_start, exclude_pids=exclude)
 
     def test_marker_match_qualifies_and_nothing_else_does(self):
         found, _pred, basis = self.cands(self.table(), {100: {("codex", OLD)}, 101: {("claude", OTHER)}, 102: set()})
@@ -430,7 +443,7 @@ class ProcessCandidates(TakeoverCase):
     def test_cwd_alone_never_qualifies(self):
         work = str(self.home / ".agent-harness" / "work" / OLD / "x")
         self.probe = FakeHost(table=self.table(), cwds={100: work})
-        found, _p, _b = tk.process_candidates(OLD, str(self.home), self.probe, NOW, table=self.table(), caller=CALLER)
+        found, _p, _b = tk.process_candidates(OLD, str(self.home), self.probe, NOW, table=self.table())
         self.assertEqual(found, {})
 
     def test_ledger_match_needs_no_other_marker(self):
@@ -486,8 +499,8 @@ class Context(TakeoverCase):
         self.codex_session()
         self.hold = {}
 
-    def remove(self, host, path, reason, expect_head=None, caller_session=""):
-        self.removed.append((host, path, reason, expect_head, caller_session))
+    def remove(self, host, path, reason, expect_head=None):
+        self.removed.append((host, path, reason, expect_head))
         if self.on_remove:
             self.on_remove(path)
         return {"removed": path not in self.hold, "reason": self.hold.get(path, "")}
@@ -495,7 +508,7 @@ class Context(TakeoverCase):
     on_remove = None
 
     def ctx(self, remote=EMPTY_REMOTE, **kw):
-        out = tk.Context(self.home, CALLER, probe=self.probe, now=lambda: NOW, remote_fetch=lambda old: remote,
+        out = tk.Context(self.home, probe=self.probe, now=lambda: NOW, remote_fetch=lambda old: remote,
                          remove=self.remove, kill_local=self.kill_local, kill_remote=self.kill_remote,
                          tasks_fn=lambda home: list(self.tasks), ticket_lookup=lambda t: True, host="mac", **kw)
         return out
@@ -516,12 +529,12 @@ class Context(TakeoverCase):
             out = tk.cleanup(OLD, "worktrees", self.ctx(), "r", "GoodQA goodqa#16441")
         self.assertEqual((out["ok"], len(out["targets"]), self.removed), (True, 3, []))
 
-    def test_apply_removes_through_the_verifier_with_expect_head_and_caller(self):
+    def test_apply_removes_through_the_verifier_with_expect_head_and_no_caller(self):
         self.hold[self.paths[1]] = "worktree is not clean"
         with self.fake_candidates():
             out = tk.cleanup(OLD, "worktrees", self.ctx(), "r", "GoodQA goodqa#16441", apply=True)
         self.assertEqual([r[1] for r in self.removed], self.paths)
-        self.assertTrue(all(r[3] == "a" * 40 and r[4] == CALLER and "takeover of %s" % OLD in r[2] for r in self.removed))
+        self.assertTrue(all(r[3] == "a" * 40 and "takeover of %s" % OLD in r[2] for r in self.removed))
         self.assertEqual(out["removed"], [self.paths[0], self.paths[2]])
         self.assertEqual(out["kept"][0]["why"], "worktree is not clean")
         claim, _bad = tk.read_claim(str(self.home), OLD)
@@ -555,7 +568,7 @@ class Context(TakeoverCase):
         self.assertEqual(len(self.removed), 1, "the second target was refused by the re-check")
         self.assertIn("re-check", out["refused"][0]["why"])
 
-    def test_apply_needs_a_ticket_that_exists_and_a_known_caller(self):
+    def test_apply_needs_a_ticket_that_exists(self):
         for ticket in ("nope", "GoodQA x#1; ls"):
             with self.assertRaises(tk.TakeoverError):
                 tk.cleanup(OLD, "worktrees", self.ctx(), "r", ticket, apply=True)
@@ -625,10 +638,8 @@ class CLI(TakeoverCase):
         env = {"AH_HOME": str(self.home), "HOME": str(self.home)}
         if caller:
             env["CLAUDE_CODE_SESSION_ID"] = caller
-        # the caller comes from the process ancestry (CallerIdentity); here it is named directly
-        derived = {"mode": "claude" if caller else "none", "caller": caller, "why": "test"}
+        # `caller` only sets a session variable: no tool reads it as an identity (test_takeover_identity)
         with mock.patch.dict(os.environ, env), mock.patch.object(tk, "HostProbe", lambda: self.probe), \
-                mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None: derived), \
                 mock.patch.object(tk, "fetch_remote_evidence", lambda old, **kw: remote), \
                 mock.patch.object(tk, "default_tasks", lambda home: list(self.tasks)), contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -665,10 +676,11 @@ class CLI(TakeoverCase):
         code, data = self.run_ah("takeover", "status", "--from", OTHER, caller=CALLER, remote=tk.LOCAL_ONLY)
         self.assertEqual(data["state"], "unknown", "a session whose WAL is not on t2-dev stays unknown there")
 
-    def test_an_unknown_caller_or_session_is_unknown_never_retired(self):
+    def test_the_verdict_needs_no_caller_and_an_unknown_session_is_unknown(self):
         self.codex_session()
-        code, data = self.run_ah("takeover", "status", "--from", OLD)
-        self.assertEqual((data["state"], data["reasons"]), ("unknown", ["caller_unknown"]))
+        with mock.patch.object(tk.time, "time", lambda: NOW):
+            code, data = self.run_ah("takeover", "status", "--from", OLD)
+        self.assertEqual((data["state"], data["reasons"]), ("retired", []), data)
         (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
         code, data = self.run_ah("takeover", "status", "--from", "00000000-none", caller=CALLER)
         self.assertEqual((data["state"], data["reasons"]), ("unknown", ["session_unknown"]))
@@ -707,10 +719,10 @@ class LinuxCaller(TakeoverCase):
         ak._kill_guard().ensure_key(str(self.home))
         self.removed = []
 
-        def remove(host, path, reason, expect_head=None, caller_session=""):
-            self.removed.append((host, path, caller_session))
+        def remove(host, path, reason, expect_head=None):
+            self.removed.append((host, path))
             return {"removed": True}
-        return tk.Context(self.home, CALLER, probe=self.probe, now=kw.pop("now", lambda: NOW), remote_fetch=self.local_only,
+        return tk.Context(self.home, probe=self.probe, now=kw.pop("now", lambda: NOW), remote_fetch=self.local_only,
                           remove=remove, tasks_fn=lambda home: [], ticket_lookup=lambda t: True, host="t2-dev", **kw)
 
     def test_a_caller_on_linux_judges_this_host_alone(self):
@@ -741,11 +753,11 @@ class LinuxCaller(TakeoverCase):
         with mock.patch.object(tk, "worktree_candidates", lambda old, home, run=None: [(str(work), "/repo", "a" * 40)]):
             out = tk.cleanup(OLD, "worktrees", self.ctx(), "r", "GoodQA goodqa#16441", apply=True)
         self.assertEqual(out["removed"], [str(work)], out)
-        self.assertEqual(self.removed, [("local", str(work), CALLER)])
+        self.assertEqual(self.removed, [("local", str(work))])
 
     def test_the_mac_still_sends_a_claim_of_a_t2_dev_session_to_that_host(self):
         remote = dict(EMPTY_REMOTE, flavors=["codex"], cont_state="active", transcript=True, last_activity=NOW - 2 * HOUR)
-        ctx = tk.Context(self.home, CALLER, probe=self.probe, now=lambda: NOW, remote_fetch=lambda old: remote,
+        ctx = tk.Context(self.home, probe=self.probe, now=lambda: NOW, remote_fetch=lambda old: remote,
                          tasks_fn=lambda home: [], ticket_lookup=lambda t: True, host="mac")
         with self.assertRaises(tk.TakeoverError) as caught:
             tk.claim(OLD, ctx, "r", "GoodQA goodqa#16441")
@@ -753,9 +765,9 @@ class LinuxCaller(TakeoverCase):
 
     def test_r2_reads_the_claim_on_the_origin_host(self):
         remote = dict(EMPTY_REMOTE, flavors=["claude"], declared_stop=False, transcript=True, last_activity=NOW - 2 * HOUR,
-                      claim={"caller": CALLER, "claimed_at": NOW - 2 * HOUR})
+                      claim={"claimed_at": NOW - 2 * HOUR})
         self.assertEqual(self.state(remote=remote)["state"], "retired")
-        remote["claim"] = {"caller": OTHER, "claimed_at": NOW - 2 * HOUR}
+        remote["claim"] = {"claimed_at": None}  # a tombstone update without a claim time is no claim
         self.assertIn("not_stopped", self.state(remote=remote)["reasons"])
 
 
@@ -802,20 +814,34 @@ class SessionRecordLiveness(TakeoverCase):
         probe.table.update({pid: row(pid, 1, command=exe, comm=exe) for pid in range(10000, 10000 + tk.SESSION_RECORD_CAP + 1)})
         self.assertEqual(self.state()["reasons"], ["probe_failed"], "more live-pid records than the cap is unknown, never a cut")
 
+    def test_a_record_of_a_process_that_is_not_a_claude_cli_proves_nothing(self):
+        self.claude_session()
+        exe = "/Users/u/.claude/hooks/claude"  # m3: a path component that contains "claude" is not the CLI
+        probe = self.Probe(table={300: row(300, 1, command=exe, comm=exe)})
+        probe.tokens = {300: "18807376"}
+        folder = self.home / ".claude" / "sessions"
+        folder.mkdir(parents=True)
+        (folder / "300.json").write_text(json.dumps({"pid": 300, "sessionId": OLD, "procStart": "18807376"}))
+        self.probe = probe
+        self.assertEqual(self.state()["state"], "retired")
+
+    def test_the_start_token_of_this_process_is_readable(self):
+        token = tk.start_token(os.getpid())
+        self.assertTrue(token and isinstance(token, str), token)
+
 
 class TombstoneAndRemotePaths(TakeoverCase):
-    def test_a_second_takers_update_does_not_inherit_the_first_claim(self):
+    def test_an_update_keeps_the_claim_time_and_a_new_claim_restarts_the_wait(self):
         ak._kill_guard().ensure_key(str(self.home))
         self.codex_session()
-        tk.write_claim(str(self.home), OLD, "codex", CALLER, "GoodQA goodqa#1", NOW - 3 * HOUR, "mac")
+        tk.write_claim(str(self.home), OLD, "codex", "GoodQA goodqa#1", NOW - 3 * HOUR, "mac")
         path = str(self.home / ".agent-harness" / "work" / OLD / "x")
-        tk.write_claim(str(self.home), OLD, "codex", OTHER, "GoodQA goodqa#2", NOW, "mac", claimed=False, removed=[path])
+        tk.write_claim(str(self.home), OLD, "codex", "GoodQA goodqa#2", NOW, "mac", claimed=False, removed=[path])
         claim, _bad = tk.read_claim(str(self.home), OLD)
-        self.assertEqual((claim["caller"], claim["claimed_at"]), (OTHER, None))
-        ev =tk.collect_evidence(OLD, self.home, self.probe, NOW)
-        self.assertIsNone(ev["claim"]["claimed_at"], "the second taker holds no claim time, so R2 stays unmet for it")
-        tk.write_claim(str(self.home), OLD, "codex", OTHER, "GoodQA goodqa#2", NOW, "mac", claimed=False)
-        self.assertIsNone(tk.read_claim(str(self.home), OLD)[0]["claimed_at"])
+        self.assertEqual((claim["claimed_at"], claim["removed"]), (iso(NOW - 3 * HOUR), [path]))
+        tk.write_claim(str(self.home), OLD, "codex", "GoodQA goodqa#2", NOW, "mac")
+        ev = tk.collect_evidence(OLD, self.home, self.probe, NOW)
+        self.assertEqual(ev["claim"]["claimed_at"], NOW, "a new claim is new activity: the quiet window starts again")
 
     def test_remote_worktree_paths_must_lie_under_the_sessions_work_dir(self):
         remote = {"worktrees": [{"path": "/home/eric/.agent-harness/work/%s/T/a" % OLD, "head": "a" * 40},
@@ -827,130 +853,6 @@ class TombstoneAndRemotePaths(TakeoverCase):
                                 {"path": "/home/eric/.agent-harness/work/%s/T/a" % OLD, "head": "not-a-head"}]}
         self.assertEqual([p for p, _h in tk._remote_worktrees(remote, OLD)],
                          ["/home/eric/.agent-harness/work/%s/T/a" % OLD, "/home/eric/.agent-harness/work/%s/b" % OLD])
-
-
-class FakeChain:
-    """Process facts for caller derivation: info(pid), the app-written start token, the executable and the env pairs."""
-
-    def __init__(self, rows, tokens=None, exes=None, pairs=None):
-        self.rows, self.tokens, self.exes, self.pairs = rows, dict(tokens or {}), dict(exes or {}), dict(pairs or {})
-
-    def info(self, pid):
-        r = self.rows.get(pid)
-        return None if r is None else {"pid": pid, "ppid": r[0], "comm": r[1], "command": r[2], "uid": os.getuid(),
-                                       "stat": "S", "start": "Sat Nov 21 10:46:16 2026"}
-
-    def start_token(self, pid):
-        return self.tokens.get(pid)
-
-    def exe_path(self, pid):
-        return self.exes.get(pid, self.rows.get(pid, (0, ""))[1])
-
-    def session_pairs(self, pid):
-        return set(self.pairs.get(pid, ()))
-
-
-CLAUDE_EXE = "/Users/u/Library/Application Support/Claude/claude-code/2.1.330/x/claude.app/Contents/MacOS/claude"
-
-
-class CallerIdentity(TakeoverCase):
-    """F1 (review BLOCK at db950737): the caller is worked out from the process ancestry, never from a flag or from the
-    caller's own environment. A Claude CLI writes ~/.claude/sessions/<pid>.json bound to its start time; that record
-    wins over any session variable the command line set."""
-
-    def setUp(self):
-        super().setUp()
-        (self.home / ".claude" / "wals" / CALLER).mkdir(parents=True)
-        (self.home / ".agent-harness" / "codex-wals" / OTHER).mkdir(parents=True)
-
-    def record(self, pid, sid=CALLER, start="Sun Nov 22 03:43:10 2026", **extra):
-        folder = self.home / ".claude" / "sessions"
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / ("%d.json" % pid)).write_text(json.dumps(dict({"pid": pid, "sessionId": sid, "procStart": start}, **extra)))
-
-    def claude_chain(self, self_pairs=()):
-        rows = {500: (400, "/usr/bin/python3", "python3 -I verifier"), 400: (300, "/bin/zsh", "/bin/zsh -c x"),
-                300: (200, CLAUDE_EXE, CLAUDE_EXE + " --x"), 200: (1, "/Applications/Claude.app/Contents/Helpers/disclaimer", "d")}
-        return FakeChain(rows, tokens={300: "Sun Nov 22 03:43:10 2026"}, pairs={500: set(self_pairs)})
-
-    def derive(self, probe, environ=None):
-        return tk.derive_caller(str(self.home), probe=probe, pid=500, environ=environ or {})
-
-    def test_the_claude_session_record_of_the_nearest_cli_is_the_caller(self):
-        self.record(300)
-        self.assertEqual(self.derive(self.claude_chain(), {"CLAUDE_CODE_SESSION_ID": CALLER})["caller"], CALLER)
-        self.assertEqual(self.derive(self.claude_chain())["caller"], CALLER, "the record alone is enough")
-
-    def test_a_session_variable_set_on_the_command_line_never_becomes_the_caller(self):
-        self.record(300)
-        # the incident shape: a Claude caller claiming a Codex id, or another Claude id, through its environment
-        found = self.derive(self.claude_chain({("codex", OLD)}), {"CLAUDE_CODE_SESSION_ID": CALLER, "CODEX_THREAD_ID": OLD})
-        self.assertEqual(found["caller"], CALLER, "the Claude record overrides a claimed Codex id")
-        found = self.derive(self.claude_chain({("claude", OLD)}), {"CLAUDE_CODE_SESSION_ID": OLD})
-        self.assertIsNone(found["caller"], "an environment that disagrees with the record proves nothing")
-        self.assertEqual(found["mode"], "claude")
-
-    def test_a_stale_or_foreign_record_is_not_proof(self):
-        self.record(300, start="Mon Nov  2 01:00:00 2026")  # pid reused: the start time differs
-        self.assertIsNone(self.derive(self.claude_chain())["caller"])
-        self.record(300, sid="Not An Id")
-        self.assertIsNone(self.derive(self.claude_chain())["caller"])
-        self.record(300, sid=OLD)  # an id with no WAL on this host
-        self.assertIsNone(self.derive(self.claude_chain())["caller"])
-        # a record for an intermediate process that is not a Claude executable is ignored, however well formed
-        probe = self.claude_chain()
-        probe.tokens[400] = "Sun Nov 22 03:43:10 2026"
-        self.record(400, sid=OTHER)
-        self.record(300)
-        self.assertEqual(self.derive(probe)["caller"], CALLER)
-
-    def test_a_codex_host_reads_the_thread_id_its_tool_shell_was_started_with(self):
-        rows = {500: (400, "/usr/bin/python3", "python3 -I x"), 400: (300, "/bin/bash", "bash -lc x"),
-                300: (1, "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")}
-        good = FakeChain(rows, pairs={400: {("codex", OTHER)}, 500: {("codex", OTHER)}})
-        rollout = self.home / ".codex" / "sessions" / "2026" / "11" / "22" / ("rollout-2026-11-22T01-00-00-%s.jsonl" % OTHER)
-        rollout.parent.mkdir(parents=True)
-        rollout.write_text("{}\n")
-        with mock.patch.object(ak, "PLATFORM", "darwin"):
-            self.assertEqual(self.derive(good, {"CODEX_THREAD_ID": OTHER})["caller"], OTHER)
-            old = __import__("time").time() - 2 * HOUR
-            os.utime(rollout, (old, old))  # a thread whose rollout is not being written is not the one calling
-            self.assertIsNone(self.derive(good, {"CODEX_THREAD_ID": OTHER})["caller"])
-            os.utime(rollout, None)
-            forged = FakeChain(rows, pairs={400: {("codex", OTHER)}, 500: {("codex", OLD)}})
-            self.assertIsNone(self.derive(forged, {"CODEX_THREAD_ID": OLD})["caller"])
-            unproven = FakeChain(rows, pairs={500: {("codex", OLD)}})
-            self.assertIsNone(self.derive(unproven, {"CODEX_THREAD_ID": OLD})["caller"], "no WAL for that id here")
-
-    def test_ssh_and_orphaned_chains(self):
-        ssh = FakeChain({500: (400, "/usr/bin/python3", "python3 x"), 400: (300, "bash", "bash -c x"),
-                         300: (1, "sshd", "sshd: eric@notty")})
-        self.assertEqual(self.derive(ssh)["mode"], "ssh")
-        self.assertEqual(tk.resolve_caller(str(self.home), CALLER, probe=ssh, pid=500), (CALLER, None))
-        orphan = FakeChain({500: (400, "/usr/bin/python3", "python3 x"), 400: (1, "bash", "bash -c x")})
-        self.assertEqual(self.derive(orphan)["mode"], "none")
-        self.assertEqual(tk.resolve_caller(str(self.home), CALLER, probe=orphan, pid=500), (None, None),
-                         "a flag with no agent and no ssh hop above it is ignored")
-
-    def test_a_flag_that_differs_from_the_derived_caller_is_a_mismatch(self):
-        self.record(300)
-        caller, problem = tk.resolve_caller(str(self.home), OLD, probe=self.claude_chain(), pid=500)
-        self.assertIsNone(caller)
-        self.assertIn("caller_mismatch", problem)
-        self.assertEqual(tk.resolve_caller(str(self.home), CALLER, probe=self.claude_chain(), pid=500), (CALLER, None))
-        self.assertEqual(tk.resolve_caller(str(self.home), None, probe=self.claude_chain(), pid=500), (CALLER, None))
-
-    def test_caller_of_uses_the_ancestry_not_the_environment(self):
-        with mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None:
-                               {"mode": "claude", "caller": None, "why": "no record"}):
-            self.assertIsNone(tk.caller_of(str(self.home), {"CLAUDE_CODE_SESSION_ID": CALLER}))
-        with mock.patch.object(tk, "derive_caller", lambda home, probe=None, pid=None, environ=None:
-                               {"mode": "claude", "caller": CALLER, "why": "record"}):
-            self.assertEqual(tk.caller_of(str(self.home), {"CLAUDE_CODE_SESSION_ID": OLD}), CALLER)
-
-    def test_the_start_token_of_this_process_is_readable(self):
-        token = tk.start_token(os.getpid())
-        self.assertTrue(token and isinstance(token, str), token)
 
 
 class RealProbe(unittest.TestCase):

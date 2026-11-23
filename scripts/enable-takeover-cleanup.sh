@@ -13,9 +13,11 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd -P)"
 
+# Any word that could be --apply or --undo, or a prefix of one, is guarded here; the Python entry refuses prefixes
+# (allow_abbrev off) and runs the same checks again (review M2 and m1).
 guarded=0
 for arg in "$@"; do
-    case "$arg" in --apply | --undo) guarded=1 ;; esac
+    case "$arg" in --a* | --u*) guarded=1 ;; esac
 done
 
 if [[ $guarded == 1 ]]; then

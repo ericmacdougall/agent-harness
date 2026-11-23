@@ -3965,13 +3965,11 @@ def run(args, home: Path) -> dict:
     if cmd == "worktree-remove":
         import ah_worktree
         try:
-            # The verifier judges "own session" by the caller's environment identity (a WAL dir that exists), never by a
-            # flag the caller can set and never by the CLAUDE_SESSION_ID fallback env_session() allows.
-            import takeover
+            # No caller is relayed: the verifier cannot be told who calls. The session and agent are audit labels only;
+            # the caller's own work dir is reached through the hook's grant (command_guard.issue_own_grants).
             return ah_worktree.remove(args.host, args.path, args.reason, args.remote_auth,
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
-                                      home, expect_head=args.expect_head,
-                                      caller_session=takeover.caller_of(home) or "")
+                                      home, expect_head=args.expect_head)
         except ah_worktree.WorktreeError as e:
             raise AhError(e.code, str(e), e.exit_code)
     if cmd == "takeover":
@@ -4026,8 +4024,7 @@ def _takeover_candidates(session, expect, home):
     if not takeover.ID_RE.fullmatch(session or ""):
         raise AhError("bad_request", "--takeover-of needs a session id")
     # no start-time bound here: the host that knows the session's last activity applied it before choosing the pids
-    _found, predicate, _basis = takeover.process_candidates(session, str(home), takeover.HostProbe(), None,
-                                                            caller=takeover.caller_of(home))
+    _found, predicate, _basis = takeover.process_candidates(session, str(home), takeover.HostProbe(), None)
     return expect, predicate
 
 
@@ -4035,18 +4032,18 @@ def _takeover_context(home):
     import ah_kill
     import ah_worktree
     import takeover
-    caller = takeover.caller_of(home)
-    agent = os.environ.get("AH_AGENT_ID", "")
+    agent = os.environ.get("AH_AGENT_ID", "")  # an audit label only
 
-    def remove(host, path, reason, expect_head=None, caller_session=""):
-        return ah_worktree.remove(host, path, reason, False, caller or "", agent, home, expect_head=expect_head,
-                                  caller_session=caller_session or caller or "")
+    # No caller anywhere: the takeover is judged by evidence alone, and the audited stop and the verifier are told no
+    # session (an empty session is the strictest: ah kill raises the high notice for a stop outside the caller's tree).
+    def remove(host, path, reason, expect_head=None):
+        return ah_worktree.remove(host, path, reason, False, "", agent, home, expect_head=expect_head)
 
     def kill_local(pids, reason, **kw):
-        return ah_kill.kill_local(pids, reason, home=home, session=caller or "", agent=agent, **kw)
+        return ah_kill.kill_local(pids, reason, home=home, session="", agent=agent, **kw)
 
     def kill_remote(host, pids, reason, tree, grace, **kw):
-        return ah_kill.kill_remote(host, pids, reason, tree, grace, session=caller or "", agent=agent, home=home, **kw)
+        return ah_kill.kill_remote(host, pids, reason, tree, grace, session="", agent=agent, home=home, **kw)
 
     def spawns(old):
         try:
@@ -4057,7 +4054,7 @@ def _takeover_context(home):
     def ticket_exists(ref):
         return bool(ticket_get(ref).get("issue"))
 
-    return takeover.Context(home, caller, probe=takeover.HostProbe(), remove=remove, kill_local=kill_local,
+    return takeover.Context(home, probe=takeover.HostProbe(), remove=remove, kill_local=kill_local,
                             kill_remote=kill_remote, spawns_fn=spawns, ticket_lookup=ticket_exists,
                             host=socket.gethostname().split(".")[0])
 

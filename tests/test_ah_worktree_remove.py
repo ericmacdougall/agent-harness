@@ -35,6 +35,10 @@ def git(cwd, *args):
     return done.stdout.strip()
 
 
+EMPTY_REMOTE = {"version": 1, "host": "t2-dev", "flavors": [], "problems": [], "live": [], "worktrees": [],
+                "walless": {"exists": False}, "transcript": False}
+
+
 class Repo(unittest.TestCase):
     SESSION_DIR = "S"
 
@@ -65,16 +69,16 @@ class Repo(unittest.TestCase):
         patch = mock.patch.object(cg, "HOOK_SESSION", "S")  # the hook's caller owns work/S (takeover: foreign sessions)
         patch.start()
         self.addCleanup(patch.stop)
-        # the verifier works its caller out from the process ancestry (takeover.derive_caller); here the caller owns work/S
-        patch = mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
-                                  {"mode": "claude", "caller": "S", "why": "test"})
+        # work/S has no WAL on this host in the base fixture, so it belongs to no session; the two-host judge never asks
+        # t2-dev for real (a fixture home): its evidence is empty
+        patch = mock.patch.object(takeover, "fetch_remote_evidence", lambda old, *a, **k: dict(EMPTY_REMOTE))
         patch.start()
         self.addCleanup(patch.stop)
 
 
 class Verifier(Repo):
     def test_a_clean_published_linked_worktree_is_removed_and_reported(self):
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertTrue(report["removed"], report)
         self.assertEqual(report["head"], self.head)
         self.assertEqual(report["verifier"], cg.VERIFIER_VERSION)
@@ -83,7 +87,7 @@ class Verifier(Repo):
         self.assertTrue(self.primary.exists())
 
     def test_the_target_host_audits_a_removal_itself(self):
-        cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+        cg.remove_worktree(str(self.linked), policy=self.policy)
         rows = [json.loads(line) for line in (self.home / ".agent-harness/worktree-audit.jsonl").read_text().splitlines()]
         self.assertEqual([row["event"] for row in rows], ["remove", "result"])
         self.assertEqual(rows[0]["path"], str(self.linked))
@@ -104,7 +108,7 @@ class Verifier(Repo):
                 seen.append(list(argv))
             return real(argv, *args, **kwargs)
         with mock.patch.object(cg.subprocess, "run", spy):
-            self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")["removed"])
+            self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy)["removed"])
         self.assertEqual(len(seen), 1)
         self.assertNotIn("--force", seen[0])
         self.assertNotIn("-f", seen[0])
@@ -112,7 +116,7 @@ class Verifier(Repo):
         self.assertEqual(seen[0][-2:], ["--", str(self.linked)])
 
     def refused(self, path, fragment, **kwargs):
-        report = cg.remove_worktree(str(path), policy=self.policy, caller_session="S", **kwargs)
+        report = cg.remove_worktree(str(path), policy=self.policy, **kwargs)
         self.assertFalse(report["removable"], report)
         self.assertFalse(report["removed"])
         self.assertIn(fragment, report["reason"])
@@ -166,7 +170,7 @@ class Verifier(Repo):
             os.mkdir(path)
             return report
         with mock.patch.object(cg, "verify_worktree", swapping):
-            report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertFalse(report["removed"])
         self.assertIn("changed while", report["reason"])
         self.assertTrue(Path(str(self.linked) + ".old").exists())
@@ -183,7 +187,7 @@ class Verifier(Repo):
         sleeper.kill()
         sleeper.wait()
         sub.rmdir()
-        self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")["removed"])
+        self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy)["removed"])
 
     def test_a_process_check_that_cannot_run_fails_closed(self):
         with mock.patch.object(cg, "busy_scan", return_value={"busy": [], "unreadable": [], "failed": True}):
@@ -210,7 +214,7 @@ class Verifier(Repo):
             with self.assertRaises(SystemExit), mock.patch.object(sys, "stderr", io.StringIO()):
                 cg.main(["remove-worktree", "--path", str(self.linked), "--heads-stdin"])
         self.assertTrue(self.linked.exists())
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")  # the real remote still lacks the commit
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)  # the real remote still lacks the commit
         self.assertFalse(report["removed"])
         self.assertIn("not present on a live", report["reason"])
 
@@ -272,7 +276,7 @@ class Verifier(Repo):
         code, data = self.run_cli("remove-worktree", "--path", str(self.primary))
         self.assertEqual((code, data["removed"]), (1, False))
         self.assertTrue(self.linked.exists())
-        code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "S")
+        code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
         self.assertEqual((code, data["removed"]), (0, True))
 
     def test_a_removal_that_deletes_the_directory_but_fails_is_reported_in_two_states(self):
@@ -284,7 +288,7 @@ class Verifier(Repo):
                 return subprocess.CompletedProcess(argv, 1, "", "error: failed to delete registry")
             return real(argv, *args, **kwargs)
         with mock.patch.object(cg.subprocess, "run", half):
-            report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertFalse(report["removed"])
         self.assertTrue(report["directory_removed"])
         self.assertTrue(report["registry_entry_left"])
@@ -300,7 +304,7 @@ class MoreVerifier(Repo):
                 return subprocess.CompletedProcess(argv, 0, "", "")
             return real(argv, *args, **kwargs)
         with mock.patch.object(cg.subprocess, "run", lying):
-            report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertFalse(report["removed"])
         self.assertFalse(report["directory_removed"])
         self.assertTrue(report["registry_entry_left"])
@@ -331,7 +335,7 @@ class RedTeamRound2(Repo):
                 raise subprocess.TimeoutExpired(argv, 900)
             return real(argv, *args, **kwargs)
         with mock.patch.object(cg.subprocess, "run", killed):
-            report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertIs(report["removed"], False)
         self.assertFalse(report["directory_removed"])  # the directory is still there, half emptied
         self.assertIs(report["registry_entry_left"], True)
@@ -350,7 +354,7 @@ class RedTeamRound2(Repo):
             return real(argv, *args, **kwargs)
         out = io.StringIO()
         with redirect_stdout(out), mock.patch.object(cg.subprocess, "run", killed):
-            code = cg.main(["remove-worktree", "--path", str(self.linked), "--caller-session", "S"])
+            code = cg.main(["remove-worktree", "--path", str(self.linked)])
         data = json.loads(out.getvalue())
         self.assertEqual(code, 1)
         self.assertTrue(data["directory_removed"])
@@ -359,7 +363,7 @@ class RedTeamRound2(Repo):
     def test_a_failing_registry_check_or_disk_probe_is_reported_unknown_not_a_crash(self):
         with mock.patch.object(cg, "registry_lists", side_effect=ValueError("git failed")), \
                 mock.patch.object(cg.shutil, "disk_usage", side_effect=OSError("no")):
-            report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="S")
+            report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertIsNone(report["registry_entry_left"])
         self.assertIs(report["removed"], False)  # an unknown registry state is never a confirmed removal
         self.assertIsNone(report["freed_bytes"])
@@ -518,7 +522,7 @@ class FakeRun:
 
 def verdict(**kw):
     base = {"removable": True, "removed": True, "head": "a" * 40, "reason": None, "urls": {"origin": [URL]},
-            "freed_bytes": 10, "verifier": 3}
+            "freed_bytes": 10, "verifier": 4}
     base.update(kw)
     return {"out": json.dumps(base)}
 
@@ -590,9 +594,9 @@ class Delegation(unittest.TestCase):
 
     def test_an_unknown_outcome_after_the_runner_started_is_recorded_as_unknown_never_as_not_removed(self):
         for answer in ({"out": ""}, {"out": "not json"}, {"out": "[]"}, {"out": json.dumps({"removed": True})},
-                       {"out": json.dumps({"removable": "yes", "verifier": 3})}, OSError("ssh failed"),
+                       {"out": json.dumps({"removable": "yes", "verifier": 4})}, OSError("ssh failed"),
                        subprocess.TimeoutExpired("ssh", 1),
-                       {"out": json.dumps({"removable": True, "removed": "maybe", "verifier": 3})}):
+                       {"out": json.dumps({"removable": True, "removed": "maybe", "verifier": 4})}):
             with self.subTest(answer=str(answer)[:40]):
                 before = len(self.audit_rows())
                 with self.assertRaises(ah_worktree.WorktreeError) as caught:
@@ -615,7 +619,7 @@ class Delegation(unittest.TestCase):
     # red-team r4 F2: a null `removed` beside removable true is not a definite answer
     def test_a_null_removed_beside_removable_true_is_an_unknown_outcome_not_a_failure(self):
         for removed in (None, "missing"):
-            body = {"removable": True, "verifier": 3, "head": "a" * 40}
+            body = {"removable": True, "verifier": 4, "head": "a" * 40}
             if removed != "missing":
                 body["removed"] = None
             with self.subTest(removed=removed):
@@ -626,7 +630,7 @@ class Delegation(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn("unknown", (row["why"] or "").lower())
         # removable false with no removed key is a definite refusal: False
-        result = self.remove(FakeRun({"out": json.dumps({"removable": False, "verifier": 3, "reason": "not clean"})}))
+        result = self.remove(FakeRun({"out": json.dumps({"removable": False, "verifier": 4, "reason": "not clean"})}))
         self.assertIs(self.audit_rows()[-1]["removed"], False)
         self.assertIs(result["removed"], False)
 
@@ -743,39 +747,33 @@ class Delegation(unittest.TestCase):
 
 class ForeignSession(Repo):
     """M3: another session's work directory is removable only when that session is retired or walless. The check sits
-    in the verifier, which every route reaches: the hook lone form, ah worktree-remove, a direct remove-worktree."""
+    in the verifier, which every route reaches: the hook lone form, ah worktree-remove, a direct remove-worktree. The
+    verifier never knows its caller: only a hook-issued grant (own=True) says a path is the caller's own."""
 
     def setUp(self):
         super().setUp()
         (self.home / ".claude" / "wals" / "S").mkdir(parents=True)  # work/S belongs to a session recorded on this host
-        patch = mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
-                                  {"mode": "none", "caller": None, "why": "test: no agent above"})
-        patch.start()
-        self.addCleanup(patch.stop)
 
     def judge(self, state):
         return lambda session: {"state": state, "reasons": ["probe"] if state != "retired" else []}
 
     def test_a_foreign_session_that_is_not_retired_is_refused_and_nothing_is_removed(self):
-        for caller in (None, "", "T", "not-the-owner"):
-            with self.subTest(caller=caller):
-                report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=caller,
-                                            session_judge=self.judge("live"))
-                self.assertFalse(report["removable"], report)
-                self.assertIn("foreign session S is live", report["reason"])
-                self.assertIn("takeover status --from S", report["reason"])
-                self.assertTrue(self.linked.exists())
-
-    def test_the_default_judge_refuses_an_unjudgeable_session_id(self):
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="T")
+        report = cg.remove_worktree(str(self.linked), policy=self.policy, session_judge=self.judge("live"))
         self.assertFalse(report["removable"], report)
-        self.assertIn("foreign session S is unknown", report["reason"])
+        self.assertIn("foreign session S is live", report["reason"])
+        self.assertIn("takeover status --from S", report["reason"])
+        self.assertTrue(self.linked.exists())
+
+    def test_the_default_judge_refuses_a_session_without_a_stop(self):
+        # a bare WAL directory: no declared stop, no claim, so R2 is unmet whoever asks
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)
+        self.assertFalse(report["removable"], report)
+        self.assertIn("foreign session S is", report["reason"])
 
     def test_a_retired_or_walless_session_may_be_cleaned_up_by_another(self):
         for state in ("retired", "walless"):
             with self.subTest(state=state):
-                report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="T",
-                                            session_judge=self.judge(state))
+                report = cg.remove_worktree(str(self.linked), policy=self.policy, session_judge=self.judge(state))
                 self.assertTrue(report["removed"], report)
                 git(self.primary, "worktree", "add", "-q", "-b", "linked" + state, str(self.linked))
                 head = git(self.linked, "rev-parse", "HEAD")
@@ -785,68 +783,67 @@ class ForeignSession(Repo):
     def test_a_judge_that_fails_is_a_refusal(self):
         def boom(session):
             raise OSError("ps failed")
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session="T", session_judge=boom)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy, session_judge=boom)
         self.assertFalse(report["removable"])
         self.assertIn("could not be judged", report["reason"])
 
-    def test_own_session_and_paths_outside_work_are_not_this_rules_business(self):
-        self.assertIsNone(cg.foreign_session_refusal(str(self.linked), "S"))
-        self.assertIsNone(cg.foreign_session_refusal(str(self.linked), "s"))
-        self.assertIsNone(cg.foreign_session_refusal(str(self.home / "elsewhere" / "w"), None))
-        self.assertIsNone(cg.foreign_session_refusal(str(self.home / ".agent-harness" / "test-copies" / "x"), None))
+    def test_the_own_route_skips_the_judge_and_paths_outside_work_are_not_this_rules_business(self):
+        def boom(session):
+            raise AssertionError("an own removal is not judged")
+        self.assertTrue(cg.remove_worktree(str(self.linked), policy=self.policy, own=True, session_judge=boom)["removed"])
+        self.assertIsNone(cg.foreign_session_refusal(str(self.home / "elsewhere" / "w")))
+        self.assertIsNone(cg.foreign_session_refusal(str(self.home / ".agent-harness" / "test-copies" / "x")))
 
-    def test_the_cli_refuses_a_missing_or_forged_caller_session(self):
-        for extra in ([], ["--caller-session", "someone-else"]):
-            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), *extra)
-            self.assertEqual((code, data["removed"]), (1, False), extra)
-            self.assertIn("foreign session S", data["reason"])
+    def test_the_cli_has_no_caller_flag_and_without_a_grant_the_path_is_foreign(self):
+        code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
+        self.assertEqual((code, data["removed"]), (1, False))
+        self.assertIn("foreign session S", data["reason"])
+        for extra in (["--caller-session", "S"], ["--caller", "S"], ["--caller-s", "S"]):
+            with self.subTest(extra=extra), self.assertRaises(SystemExit), redirect_stderr_null():
+                cg.main(["remove-worktree", "--path", str(self.linked), *extra])
         self.assertTrue(self.linked.exists())
 
     run_cli = Verifier.run_cli
 
-    def derived(self, mode, caller):
-        return mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
-                                 {"mode": mode, "caller": caller, "why": "test"})
-
-    def test_the_cli_works_the_caller_out_itself_and_a_forged_flag_is_refused(self):
-        # F1: the session the flag names is not the caller; the process ancestry is (a Claude session record)
-        with self.derived("claude", "realcaller-0001"):
-            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "s-forged-1")
-        self.assertEqual((code, data["removed"]), (1, False), data)
-        self.assertIn("caller_mismatch", data["reason"])
-        self.assertTrue(self.linked.exists())
-        with self.derived("claude", "S"):  # the derived caller owns work/S: no flag is needed or trusted
-            code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
-        self.assertEqual((code, data["removed"]), (0, True), data)
-
-    def test_a_flag_counts_only_when_relayed_over_ssh(self):
-        with self.derived("none", None):
-            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "S")
-        self.assertEqual((code, data["removed"]), (1, False), "an orphaned or user-run verifier ignores the flag")
-        self.assertIn("foreign session S", data["reason"])
-        with self.derived("ssh", None):
-            code, data = self.run_cli("remove-worktree", "--path", str(self.linked), "--caller-session", "S")
-        self.assertEqual((code, data["removed"]), (0, True), data)
-
-    def test_ah_worktree_remove_passes_the_derived_caller_not_the_environment(self):
-        (self.home / ".claude" / "wals" / "realcaller-0001").mkdir(parents=True)
+    def test_ah_worktree_remove_passes_no_caller_whatever_the_environment(self):
         seen = {}
 
         def fake_remove(*args, **kwargs):
             seen.update(kwargs)
             return {"ok": True, "removed": True}
-        with self.derived("claude", "realcaller-0001"), mock.patch.object(ah_worktree, "remove", fake_remove), \
+        with mock.patch.object(ah_worktree, "remove", fake_remove), \
                 mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "S", "CODEX_THREAD_ID": "S"}):
             ah.run(ah.build_parser().parse_args(["worktree-remove", "--host", "local", "--path", str(self.linked),
                                                  "--reason", "r"]), self.home)
-        self.assertEqual(seen["caller_session"], "realcaller-0001")
+        self.assertNotIn("caller_session", seen)
 
-    def test_the_verifier_version_is_three_and_the_delegation_passes_head_and_caller(self):
-        self.assertEqual((cg.VERIFIER_VERSION, ah_worktree.VERIFIER_VERSION), (3, 3))
-        argv = ah_worktree._argv("t2-dev", "/Users/u/tools/wt-one", False, "a" * 40, "sess-9")
+    def test_the_verifier_version_is_four_and_the_delegation_passes_head_and_no_caller(self):
+        self.assertEqual((cg.VERIFIER_VERSION, ah_worktree.VERIFIER_VERSION), (4, 4))
+        argv = ah_worktree._argv("t2-dev", "/Users/u/tools/wt-one", False, "a" * 40)
         self.assertIn("--expect-head %s" % ("a" * 40), argv[-1])
-        self.assertIn("--caller-session sess-9", argv[-1])
+        self.assertNotIn("caller", argv[-1])
         self.assertNotIn("--expect-head", ah_worktree._argv("t2-dev", "/Users/u/tools/wt-one", False)[-1])
+
+
+class OwnGrant(Repo):
+    """The own route of the verifier CLI: a grant the PreToolUse hook issued for (payload session, path, HEAD)."""
+    SESSION_DIR = "ownsess-00000001"
+
+    def setUp(self):
+        super().setUp()
+        (self.home / ".claude" / "wals" / self.SESSION_DIR).mkdir(parents=True)
+
+    run_cli = Verifier.run_cli
+
+    def test_the_cli_removes_an_own_worktree_with_the_hooks_grant_once(self):
+        self.assertTrue(takeover.issue_grant(str(self.home), self.SESSION_DIR, str(self.linked), self.head))
+        code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
+        self.assertEqual((code, data["removed"]), (0, True), data)
+
+    def test_without_a_grant_the_own_dir_is_judged_like_any_other(self):
+        code, data = self.run_cli("remove-worktree", "--path", str(self.linked))
+        self.assertEqual((code, data["removed"]), (1, False), data)
+        self.assertIn("foreign session %s" % self.SESSION_DIR, data["reason"])
 
 
 def in_process_verifier(argv, **kwargs):
@@ -869,13 +866,9 @@ class TaskNamedWorkDir(Repo):
     def setUp(self):
         super().setUp()
         (self.home / ".agent-harness" / "codex-wals" / self.THREAD).mkdir(parents=True)
-        patch = mock.patch.object(takeover, "derive_caller", lambda home, probe=None, pid=None, environ=None:
-                                  {"mode": "codex", "caller": self.THREAD, "why": "test"})
-        patch.start()
-        self.addCleanup(patch.stop)
 
     def test_the_verifier_removes_an_own_worktree(self):
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.THREAD)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertTrue(report["removed"], report)
 
     def test_the_verifier_cli_removes_an_own_worktree(self):
@@ -884,7 +877,7 @@ class TaskNamedWorkDir(Repo):
 
     def test_ah_worktree_remove_removes_an_own_worktree(self):
         result = ah_worktree.remove("local", str(self.linked), "own cleanup", session=self.THREAD, home=self.home,
-                                    runner=in_process_verifier, caller_session=takeover.caller_of(self.home))
+                                    runner=in_process_verifier)
         self.assertTrue(result["removed"], result)
         self.assertFalse(self.linked.exists())
 
@@ -893,7 +886,6 @@ class RealJudge(Repo):
     """No injected judge: the verifier's foreign-session check runs the real takeover.session_state (real ids, a fixture
     home, this machine's real process probe, read only)."""
     SESSION_DIR = "01a2012f-bca0-78b0-8fc7-162587de5ee7"
-    CALLER = "6df7b63f-b062-4fa8-834a-f6bd857d0c54"
 
     def codex_session(self, state, age):
         import time as _time
@@ -911,7 +903,7 @@ class RealJudge(Repo):
 
     def test_a_session_that_did_not_stop_is_refused(self):
         self.codex_session("active", 2 * 3600)
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.CALLER)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertFalse(report["removable"], report)
         self.assertIn("foreign session %s is" % self.SESSION_DIR, report["reason"])
         self.assertIn("not_stopped", report["reason"])
@@ -919,12 +911,12 @@ class RealJudge(Repo):
 
     def test_a_retired_session_is_removable_by_another(self):
         self.codex_session("handoff", 2 * 3600)
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.CALLER)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertTrue(report["removed"], report)
 
     def test_a_recent_handoff_waits_for_the_quiet_window(self):
         self.codex_session("handoff", 600)
-        report = cg.remove_worktree(str(self.linked), policy=self.policy, caller_session=self.CALLER)
+        report = cg.remove_worktree(str(self.linked), policy=self.policy)
         self.assertIn("recent_activity", report["reason"])
 
 

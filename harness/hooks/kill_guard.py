@@ -541,13 +541,13 @@ def pure_data_python(code):
 
 
 _TAKEOVER_RULES = None
-TAKEOVER_WORDS = ('takeover', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID', 'enable-takeover-cleanup')
-TAKEOVER_TOOLS = ('ah.py', 'command_guard', 'kill_guard', 'wal.py', 'takeover.py', 'ah_worktree', 'enable-takeover-cleanup')
+TAKEOVER_WORDS = ('takeover', 'enable-takeover-cleanup', 'enable_takeover_cleanup')
+TAKEOVER_TOOLS = ('ah.py', 'enable-takeover-cleanup', 'enable_takeover_cleanup')
 
 
 def takeover_rules():
-    """takeover_rules.py, loaded by path (the hooks run under python -I): the one grammar of `ah.py takeover` and the
-    G3/G5 text rules, shared with command_guard."""
+    """takeover_rules.py, loaded by path (the hooks run under python -I): the one grammar of `ah.py takeover` (W2) and
+    the enable-script allowlist (G5), shared with command_guard. No rule reads a caller identity."""
     global _TAKEOVER_RULES
     if _TAKEOVER_RULES is None:
         import importlib.util
@@ -2199,10 +2199,10 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
     if policy['mode'] == 'off':
         return 'allow', '', '', ()
     raw = ' '.join(map(str, command)) if isinstance(command, (list, tuple)) else str(command)
-    flat_raw = re.sub(r'[\'"\\]', '', raw)  # remove-work""tree and take''over are still the words
+    flat_raw = re.sub(r'[\'"\\]', '', raw)  # take''over is still the word
     if any(word in flat_raw for word in TAKEOVER_WORDS):
-        try:  # G3 (the caller sets no identity) and G5 (the user's script): the same text rules command_guard applies
-            text_rule = takeover_rules().refusal(raw, session, only=('G3', 'G5', 'W2'))
+        try:  # W2 (the takeover grammar) and G5 (the user's script): the same text rules command_guard applies
+            text_rule = takeover_rules().refusal(raw, session, only=('G5', 'W2'))
         except Exception as error:  # noqa: BLE001 - missing or broken rules refuse a harness tool next to these words
             text_rule = None
             if any(tool in flat_raw for tool in TAKEOVER_TOOLS):

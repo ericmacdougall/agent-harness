@@ -560,13 +560,14 @@ class Run:
             ("foreign session, lone form blocks with the takeover route", "othersession1",
              "git worktree remove ~/.agent-harness/work/%s/x" % owner, "block", "takeover status --from %s" % owner),
         ) if owner else ()) + (
-            ("an assigned session id blocks", "othersession1",
-             "CLAUDE_CODE_SESSION_ID=abc python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path %s --reason r" % path, "block", "identity"),
+            ("the enable script's python entry cannot be applied by an agent", self.PROBE,
+             "python3 scripts/enable_takeover_cleanup.py --ref x --repo y --apply", "block", "user"),
             ("ah worktree-remove is allowed", self.PROBE,
              "python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path %s --reason r" % path, "allow", ""),
             ("ah takeover status is allowed on the Codex path", self.PROBE,
              "python3 -I ~/.codex/agent-harness/ah.py takeover status --from %s" % self.PROBE, "allow", ""),
-            ("the user's script cannot be applied by an agent", self.PROBE, "bash scripts/enable-takeover-cleanup.sh --apply", "block", "user only"),
+            ("the user's script cannot be applied by an agent", self.PROBE, "bash scripts/enable-takeover-cleanup.sh --apply", "block", "user"),
+            ("a prefix of --apply is refused too", self.PROBE, "bash scripts/enable-takeover-cleanup.sh --app", "block", "user"),
         )
         for label, session, command, want, part in probes:
             code, out, _e = host.run(["python3", "-I", guard, "check", "--session", session, command])
@@ -638,8 +639,16 @@ class Run:
         return 0
 
 
+class _Parser(argparse.ArgumentParser):
+    """No prefix matching (takeover review M2): `--app` is not `--apply`, it is a usage error."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs["allow_abbrev"] = False
+        super().__init__(*args, **kwargs)
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = _Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--ref", required=True, help="a full 40-hex commit on origin/main")
     parser.add_argument("--repo", required=True, help="a checkout whose objects hold the ref (read with git cat-file only)")
     mode = parser.add_mutually_exclusive_group()

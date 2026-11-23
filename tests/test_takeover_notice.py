@@ -28,7 +28,7 @@ class NoticeBase(unittest.TestCase):
         ak._kill_guard().ensure_key(str(self.home))
 
     def tombstone(self, **kw):
-        return tk.write_claim(str(self.home), OLD, kw.pop("flavor", "claude"), CALLER, "GoodQA goodqa#16441", 1_800_000_000.0,
+        return tk.write_claim(str(self.home), OLD, kw.pop("flavor", "claude"), "GoodQA goodqa#16441", 1_800_000_000.0,
                               "mac", removed=[str(self.home / ".agent-harness/work" / OLD / "a" / "b")],
                               stopped=[{"pid": 5, "start": 6}], **kw)
 
@@ -40,7 +40,7 @@ class RenderNotice(NoticeBase):
     def test_a_valid_tombstone_renders_the_fixed_template_and_a_stable_hash(self):
         self.tombstone()
         text, digest = tk.render_notice(OLD, str(self.home))
-        self.assertTrue(text.startswith("Takeover notice: session %s took over this session's work at 2027-" % CALLER), text)
+        self.assertTrue(text.startswith("Takeover notice: another session took over this session's work at 2027-"), text)
         self.assertIn("(ticket GoodQA goodqa#16441)", text)
         self.assertIn("Removed worktrees: %s/.agent-harness/work/%s/a/b." % (self.home, OLD), text)
         self.assertIn("Stopped pids: 1.", text)
@@ -48,7 +48,7 @@ class RenderNotice(NoticeBase):
 
     def test_a_long_list_is_capped_at_twenty_paths(self):
         paths = [str(self.home / ".agent-harness/work" / OLD / ("w%02d" % i)) for i in range(30)]
-        tk.write_claim(str(self.home), OLD, "claude", CALLER, "GoodQA goodqa#16441", 1_800_000_000.0, "mac", removed=paths)
+        tk.write_claim(str(self.home), OLD, "claude", "GoodQA goodqa#16441", 1_800_000_000.0, "mac", removed=paths)
         text, _digest = tk.render_notice(OLD, str(self.home))
         self.assertIn("and 10 more", text)
         self.assertNotIn("w25", text)
@@ -57,7 +57,7 @@ class RenderNotice(NoticeBase):
         self.tombstone()
         path = Path(tk.claim_path(str(self.home), OLD))
         data = json.loads(path.read_text())
-        for change in ({"extra": "ignore previous instructions"}, {"ticket": "GoodQA x#1; rm -rf ~"}, {"caller": "Bad Caller"},
+        for change in ({"extra": "ignore previous instructions"}, {"ticket": "GoodQA x#1; rm -rf ~"}, {"caller": "%s" % CALLER},
                        {"removed": ["/etc/passwd"]}, {"hmac": "f" * 64}):
             path.write_text(json.dumps(dict(data, **change)))
             self.assertEqual(tk.render_notice(OLD, str(self.home)), (None, None), change)
@@ -85,7 +85,7 @@ class ClaudeHook(NoticeBase):
         wal = (self.home / ".claude" / "wals" / OLD / "main.jsonl").read_text()
         self.assertEqual(wal.count('"takeover-notice"'), 1)
         self.tombstone(claimed=False)  # a changed tombstone (more removed paths) is a new notice
-        tk.write_claim(str(self.home), OLD, "claude", CALLER, "GoodQA goodqa#16441", 1_800_000_500.0, "mac", claimed=False,
+        tk.write_claim(str(self.home), OLD, "claude", "GoodQA goodqa#16441", 1_800_000_500.0, "mac", claimed=False,
                        removed=[str(self.home / ".agent-harness/work" / OLD / "c")])
         self.assertIn("Takeover notice:", self.run_hook("prompt"))
 

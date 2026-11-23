@@ -142,7 +142,7 @@ class WorktreeRemoveCase(unittest.TestCase):
             preview = cg.verify_worktree(str(self.linked), policy=policy)
             self.assertTrue(preview.get('removable'), preview)
             self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
         self.assertTrue(result.get('removed'), result)
         self.assertFalse(self.linked.exists())
         self.assertEqual(cg.load_marker(self.home)[0], [])
@@ -157,7 +157,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', side_effect=late_change):
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
         self.assertFalse(result['removed'])
         self.assertFalse(result['removable'])
         self.assertTrue(self.linked.exists())
@@ -173,7 +173,7 @@ class WorktreeRemoveCase(unittest.TestCase):
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', return_value=idle):
             self.assertTrue(cg.verify_worktree(str(self.linked), policy=policy)['removable'])
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
         self.assertFalse(result['removed'])
         self.assertEqual(first.read_bytes(), b'x' * info.st_size)
         self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
@@ -202,7 +202,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', side_effect=revoke_during_final_check):
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
         self.assertFalse(result['removed'])
         self.assertTrue(all(path.exists() for path in paths))
         self.assertEqual(cg.load_marker(self.home)[0], [])
@@ -216,7 +216,7 @@ class WorktreeRemoveCase(unittest.TestCase):
                 replaced = dict(actual, **changes)
                 cg._store_entry(replaced, str(paths[1]), time.time(), str(self.home))
                 with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)):
-                    result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+                    result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
                 self.assertFalse(result['removed'])
                 self.assertTrue(all(path.exists() for path in paths))
                 self.assertEqual(len(cg.load_marker(self.home)[0]), len(paths))
@@ -263,7 +263,7 @@ class WorktreeRemoveCase(unittest.TestCase):
                 mock.patch.object(cg._IgnoredBackups, 'consume', late), \
                 mock.patch.object(cg.Approvals, '_recheck_backups', checked), \
                 mock.patch.object(cg, '_worktree_audit') as audit:
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
         self.assertEqual(calls, [mutation])
         self.assertFalse(result['removed'], result)
         self.assertTrue(all(path.exists() for path in paths))
@@ -296,7 +296,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         def remove():
             try:
-                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S'))
+                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True))
             except BaseException as error:
                 errors.append(error)
 
@@ -331,11 +331,11 @@ class WorktreeRemoveCase(unittest.TestCase):
         with mock.patch.object(cg, '_pinned_home', return_value=str(self.home)), \
                 mock.patch.object(cg, 'busy_scan', return_value=idle), \
                 mock.patch.object(cg.subprocess, 'run', fail_remove):
-            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
             self.assertFalse(result['removed'], result)
             self.assertIn('injected Git removal failure', result['reason'])
             self.assertEqual(cg.load_marker(self.home)[0], [])
-            retry = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+            retry = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
         self.assertFalse(retry['removed'], retry)
         self.assertEqual(len(git_removals), 1, 'retry must not reach Git with spent approvals')
         self.assertTrue(all(path.exists() for path in paths))
@@ -371,7 +371,7 @@ class WorktreeRemoveCase(unittest.TestCase):
                     mock.patch.object(cg, 'busy_scan', return_value=idle), \
                     mock.patch.object(cg._IgnoredBackups, 'locked_scope_matches', slow_scope), \
                     mock.patch.object(cg, '_worktree_audit') as audit:
-                result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S')
+                result = cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True)
                 self.assertFalse(audit.called, 'expired authority must not reach Git intent')
         finally:
             if advanced:
@@ -407,7 +407,7 @@ class WorktreeRemoveCase(unittest.TestCase):
 
         def remove():
             try:
-                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, caller_session='S'))
+                results.append(cg.remove_worktree(str(self.linked), expect_head=self.head, policy=policy, own=True))
             except BaseException as error:
                 errors.append(error)
 

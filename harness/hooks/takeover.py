@@ -33,6 +33,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TAKEOVER_VERSION = 1
+CLAIM_VERSION = 2  # v2: no claimer field (no tool knows its caller); a v1 claim reads as invalid, so it never counts
 QUIET_WORKTREE_S = 3600
 QUIET_PROCESS_S = 4 * 3600
 WALLESS_QUIET_S = 24 * 3600
@@ -356,13 +357,13 @@ def _key(home, create=False):
 
 def _valid_claim(data, session, home):
     """The claim dict when its fields validate and its HMAC verifies, else None."""
-    if not isinstance(data, dict) or set(data) != {"v", "session", "flavor", "caller", "claimed_at", "updated_at", "ticket",
+    if not isinstance(data, dict) or set(data) != {"v", "session", "flavor", "claimed_at", "updated_at", "ticket",
                                                    "removed", "stopped", "host", "hmac"}:
         return None
     work = os.path.realpath(os.path.join(str(home), ".agent-harness", "work", session)) + os.sep
     try:
-        ok = (data["v"] == 1 and data["session"] == session and ID_RE.fullmatch(session)
-              and data["flavor"] in ("claude", "codex") and isinstance(data["caller"], str) and ID_RE.fullmatch(data["caller"])
+        ok = (data["v"] == CLAIM_VERSION and data["session"] == session and ID_RE.fullmatch(session)
+              and data["flavor"] in ("claude", "codex")
               and (data["claimed_at"] is None or isinstance(data["claimed_at"], str) and _epoch(data["claimed_at"]) is not None)
               and isinstance(data["updated_at"], str) and _epoch(data["updated_at"]) is not None
               and isinstance(data["ticket"], str) and TICKET_RE.fullmatch(data["ticket"])
@@ -394,15 +395,17 @@ def read_claim(home, session):
     return claim, claim is None
 
 
-def write_claim(home, session, flavor, caller, ticket, now, host, claimed=True, removed=(), stopped=()):
-    """Write (or update) the HMAC'd record at ~/.agent-harness/takeover/<session>.json, 0600, from validated fields only."""
-    if not ID_RE.fullmatch(session) or not ID_RE.fullmatch(caller or "") or not TICKET_RE.fullmatch(ticket or ""):
-        raise TakeoverError("bad_request", "session, caller and ticket must be well formed")
+def write_claim(home, session, flavor, ticket, now, host, claimed=True, removed=(), stopped=()):
+    """Write (or update) the HMAC'd record at ~/.agent-harness/takeover/<session>.json, 0600, from validated fields only.
+
+    v2 records no claimer: no tool can know who calls it (see "who is calling"), and R2 is satisfied by any valid claim,
+    as it always effectively was (a claim is self-service with any existing ticket). The ticket is the accountability
+    link. An update (claimed=False) keeps the existing claim time; a new claim starts the quiet window again."""
+    if not ID_RE.fullmatch(session) or not TICKET_RE.fullmatch(ticket or ""):
+        raise TakeoverError("bad_request", "session and ticket must be well formed")
     previous, _bad = read_claim(home, session)
-    # An update keeps the claim time only for the session that made the claim: a second taker's tombstone update must not
-    # inherit the first taker's R2 standing under its own name (review minor).
-    kept = (previous or {}).get("claimed_at") if (previous or {}).get("caller") == caller else None
-    data = {"v": 1, "session": session, "flavor": flavor, "caller": caller,
+    kept = (previous or {}).get("claimed_at")
+    data = {"v": CLAIM_VERSION, "session": session, "flavor": flavor,
             "claimed_at": _iso(now) if claimed else kept, "updated_at": _iso(now),
             "ticket": ticket, "removed": list(((previous or {}).get("removed") or []) + list(removed))[-MAX_REMOVED_RECORDED:],
             "stopped": list(((previous or {}).get("stopped") or []) + list(stopped))[-MAX_REMOVED_RECORDED:],
@@ -436,9 +439,9 @@ def render_notice(session, home):
         return None, None
     paths = claim["removed"]
     shown = ", ".join(paths[:20]) + (" and %d more" % (len(paths) - 20) if len(paths) > 20 else "") if paths else "none"
-    text = ("Takeover notice: session %s took over this session's work at %s (ticket %s). Removed worktrees: %s. "
+    text = ("Takeover notice: another session took over this session's work at %s (ticket %s). Removed worktrees: %s. "
             "Stopped pids: %d. Do not continue in removed paths; re-create from the remote and coordinate on the ticket."
-            % (claim["caller"], claim["claimed_at"] or claim["updated_at"], claim["ticket"], shown, len(claim["stopped"])))
+            % (claim["claimed_at"] or claim["updated_at"], claim["ticket"], shown, len(claim["stopped"])))
     return text, hashlib.sha256(_canonical(claim).encode()).hexdigest()[:16]
 
 
@@ -526,7 +529,7 @@ def collect_evidence(old, home, probe, now, ledger_spawns=None, tasks_fn=None, w
     claim, invalid = read_claim(home, old)
     ev["claim_present"] = bool(claim or invalid)
     if claim:
-        ev["claim"] = {"caller": claim["caller"], "claimed_at": _epoch(claim["claimed_at"]) if claim["claimed_at"] else None}
+        ev["claim"] = {"claimed_at": _epoch(claim["claimed_at"]) if claim["claimed_at"] else None}
         if ev["claim"]["claimed_at"] is not None:
             stamps.append(ev["claim"]["claimed_at"])
     ev["claim_invalid"] = invalid
@@ -661,21 +664,20 @@ def _finish(reasons, ev=None, eligible_at=None, extra=None, walless=False):
     return _result("unknown" if unknown else "live", reasons, ev, eligible_at, extra)
 
 
-def session_state(old, action, home, probe, now, caller, remote=None, tasks_fn=None, ledger_spawns=None, evidence=None):
+def session_state(old, action, home, probe, now, remote=None, tasks_fn=None, ledger_spawns=None, evidence=None):
     """The verdict {state: retired|walless|live|unknown, reasons, eligible_at, evidence} for session `old`.
 
     `retired` needs R1 to R5 all true; `walless` only R7 and only for worktrees. `remote` is the other host's parsed
     `takeover status --evidence-only --json` output; None means it was not reachable (unknown), LOCAL_ONLY means judge
-    this host alone. Any probe failure, parse error or ambiguity gives unknown."""
+    this host alone. Any probe failure, parse error or ambiguity gives unknown.
+
+    Caller free: nothing here depends on who asks (see "who is calling"). A session judging itself gets the same answer
+    as anyone else, which is never retired while it runs: its own CLI or rollout is live evidence (R3, R4)."""
     home = str(home)
     if not isinstance(old, str) or not ID_RE.fullmatch(old):
         return _result("unknown", ["bad_id"])
     if action not in ACTIONS:
         return _result("unknown", ["bad_action"])
-    if not caller or not isinstance(caller, str) or not ID_RE.fullmatch(caller):
-        return _result("unknown", ["caller_unknown"])
-    if old == caller:
-        return _result("unknown", ["self_takeover"])
     ev = evidence or collect_evidence(old, home, probe, now, ledger_spawns, tasks_fn)
     evs = [ev]
     if remote is None:
@@ -702,10 +704,11 @@ def session_state(old, action, home, probe, now, caller, remote=None, tasks_fn=N
     info = {"flavor": origin["flavors"][0], "origin_host": origin.get("host"), "cont_state": origin.get("cont_state"),
             "last_activity": origin.get("last_activity"), "claim_at": (origin.get("claim") or {}).get("claimed_at")}
     reasons, eligible_at = [], None
-    # R2 declared stop, or a valid claim of this caller. claim() writes a claim only on the session's origin host, so the
-    # claim is read from the origin's evidence (review F3; a claim on another host cannot count).
+    # R2 declared stop, or a valid claim. claim() writes a claim only on the session's origin host, so the claim is read
+    # from the origin's evidence (review F3; a claim on another host cannot count). Both are self-asserted (m4): they
+    # only open the wait, and the claim time and a checkpoint write both count as activity for R3.
     claim = origin.get("claim")
-    claimed = bool(claim and claim.get("caller") == caller and claim.get("claimed_at") is not None)
+    claimed = bool(claim and claim.get("claimed_at") is not None)
     if not origin.get("declared_stop") and not claimed:
         reasons.append("not_stopped")
     # R3 quiet window, measured from app-written transcripts as well as the WALs, and from the claim itself
@@ -724,11 +727,9 @@ def session_state(old, action, home, probe, now, caller, remote=None, tasks_fn=N
     elif not future and now - last < window:
         reasons.append("recent_activity")
         eligible_at = _iso(last + window)
-    # R4 no live agent process on either host (a process of the caller's own session neither blocks nor qualifies)
+    # R4 no live agent process on either host that carries the session's marker or its session record
     for e in evs:
         for proc in e.get("live", []):
-            if caller in proc.get("ids", []):
-                continue
             if proc.get("agent_host"):
                 reasons.append("session_live")
                 break
@@ -737,7 +738,7 @@ def session_state(old, action, home, probe, now, caller, remote=None, tasks_fn=N
         reasons.append("asks_unreadable")
     if origin.get("tasks_unreadable"):
         reasons.append("tasks_unreadable")
-    open_tasks = [t for t in origin.get("open_tasks", []) if caller not in str(t.get("actor") or "")]
+    open_tasks = list(origin.get("open_tasks", []))  # every open task of the session; reassign or dispose it first
     if origin.get("open_asks") or open_tasks or origin.get("bg_live"):
         reasons.append("open_work")
         info["open_work"] = {"asks": origin.get("open_asks", [])[:10], "tasks": [t["task"] for t in open_tasks][:10],
@@ -843,15 +844,15 @@ def worktree_candidates(old, home, run=subprocess.run):
     return confirmed
 
 
-def process_candidates(old, home, probe, last_activity, table=None, spawns=None, spawn_start=None, exclude_pids=(),
-                       caller=None):
+def process_candidates(old, home, probe, last_activity, table=None, spawns=None, spawn_start=None, exclude_pids=()):
     """({pid: start_epoch}, predicate, basis) of the processes a takeover may stop.
 
     A pid qualifies only if it carries `old` as its session marker (and no other session's), or is in the spawn ledger
     of work/<old> and carries no other session's marker; it started no later than the old session's last activity; it
-    is not an agent host and has no agent-host ancestor; it is not a registered task or bg_job pid; and it carries no
-    marker of the caller. A cwd inside work/<old>/ alone never qualifies. The predicate is re-run by ah_kill on a fresh
-    snapshot, and `expect` pins the exact start time, so a reused pid is `candidate_changed`."""
+    is not an agent host and has no agent-host ancestor; and it is not a registered task or bg_job pid. A process that
+    carries any other marker (the caller's included) is never one. A cwd inside work/<old>/ alone never qualifies. The
+    predicate is re-run by ah_kill on a fresh snapshot, and `expect` pins the exact start time, so a reused pid is
+    `candidate_changed`."""
     table = table if table is not None else probe.proc_table()
     spawns = spawns if spawns is not None else set()
     excluded = set(exclude_pids)
@@ -867,7 +868,7 @@ def process_candidates(old, home, probe, last_activity, table=None, spawns=None,
         if pid in excluded or pid <= 1 or any(a in hosts for a in _ancestors(table, pid)):
             continue
         ids = {value for _flavor, value in pairs.get(pid, ())}
-        # a marker of the caller or of any other session never matches `ids == {old}` or the empty set below
+        # a marker of any other session never matches `ids == {old}` or the empty set below
         if ids == {old}:
             kind = "marker"
         elif not ids and (pid, start_of(pid)) in spawns:
@@ -889,8 +890,6 @@ def process_candidates(old, home, probe, last_activity, table=None, spawns=None,
         if started is None or (last_activity is not None and started > last_activity):
             return False
         fresh = {value for _flavor, value in ak()._owner_pairs(live_probe, pid)}
-        if caller and caller in fresh:
-            return False
         if basis[pid] == "marker" and fresh != {old}:
             return False
         if basis[pid] == "ledger" and (not fresh <= {old} or (pid, start_of(pid)) not in ledger):
@@ -912,7 +911,7 @@ def process_candidates(old, home, probe, last_activity, table=None, spawns=None,
 
 # -------------------------------------------------------------------------------------- remote evidence (ssh)
 
-def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None):
+def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None, timeout=180):
     """The other host's evidence, or None when it is not reachable.
 
     A caller on t2-dev cannot reach the Mac, so it gets LOCAL_ONLY (review F3): session_state then judges only a session
@@ -926,7 +925,7 @@ def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None):
     cmd = "python3 -I .claude/hooks/ah.py takeover status --from %s --evidence-only --json" % shlex.quote(old)
     try:
         done = runner(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", REMOTE_HOST, cmd],
-                      capture_output=True, text=True, timeout=180, stdin=subprocess.DEVNULL)
+                      capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         data = json.loads(done.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
@@ -935,26 +934,23 @@ def fetch_remote_evidence(old, runner=subprocess.run, local_is_remote=None):
 
 # ------------------------------------------------------------------------------------------- orchestration
 
-# ---------------------------------------------------------------------------------- who is calling (review F1)
+# ------------------------------------------------------------------------------- who is calling (rescue of F1/M1-M3)
 #
-# The caller is never taken from a flag or from the caller's own environment: a command line can set both. It is worked
-# out from the process ancestry of the running tool:
-#   * Claude: the Claude CLI writes ~/.claude/sessions/<pid>.json with its sessionId and its start time (procStart; macOS:
-#     the UTC `ps -o lstart` text, Linux: /proc/<pid>/stat field 22). The nearest ancestor with such a record, whose
-#     executable is a Claude binary and whose start time matches, names the caller. Overwriting an existing record is a
-#     protected-log overwrite and creating one is refused like a guard file (command_guard policy guard_files).
-#   * Codex: there is no app-written pid record. The nearest Codex agent host's tool shell carries CODEX_THREAD_ID in the
-#     environment it was started with; every process between it and the tool must agree. This is weaker than the Claude
-#     record (T2/T3 are unverified on a live Codex): a Codex caller is accepted only when it is consistent and its WAL
-#     exists here, otherwise it is unknown, which refuses every foreign removal.
-#   * ssh: with no agent above it and an sshd process above it, the tool was started by the caller's host (ah
-#     worktree-remove relays its own derived caller). The flag is the only identity there; the guard's text rule G2 is
-#     what keeps an agent from typing that ssh command itself. Disclosed, not closed.
-#   * none: no agent and no ssh hop (a user's terminal, or an orphan that escaped its parent): any flag is ignored.
+# Nothing in this module knows who is calling, and nothing needs to. Two review rounds showed that every source of a
+# caller identity the agent controls (a --caller-session flag and its argparse prefixes, CLAUDE_CODE_SESSION_ID or
+# CODEX_THREAD_ID in the tool environment, a process name such as an `exec -a sshd` shell, the ancestry it implies)
+# invites one more spelling. So the verdict is caller free: a session is retired by evidence, whoever asks, and an
+# unknown caller (every route outside the PreToolUse hook) is foreign. The one trusted identity is the session id in the
+# hook payload, which the host writes and the agent cannot; the hook uses it for the own-session worktree route and hands
+# the verifier a grant (below). A claim records the ticket, never a claimer.
 
-SSHD = re.compile(r"^sshd(?:-session)?\b")
-CODEX_FRESH_S = 1800  # a Codex caller's own rollout was written within this window (half the worktree quiet window)
-CLAUDE_EXE = re.compile(r"(?:^|/)[^/]*claude[^/]*(?:/|$)", re.I)
+# The Claude CLI executable, by exact shape (m3). Only R4 liveness reads it: a record of a running Claude CLI makes its
+# session live. Known shapes: the standalone install (~/.local/share/claude/versions/<v>, which /proc/<pid>/exe resolves
+# to on Linux), its ~/.local/bin/claude link as exec'd, the desktop app's embedded CLI, and the two Homebrew/local bins.
+CLAUDE_EXE = re.compile(
+    r"^(?:/(?:Users|home)/[^/]+/(?:\.local/share/claude/versions/[0-9][0-9A-Za-z.+_-]{0,63}|\.local/bin/claude"
+    r"|Library/Application Support/Claude/claude-code/[0-9][0-9A-Za-z.+_-]{0,63}/[0-9A-Za-z]{1,64}/claude\.app/Contents/MacOS/claude)"
+    r"|/opt/homebrew/bin/claude|/usr/local/bin/claude)$")
 
 
 def start_token(pid):
@@ -986,7 +982,7 @@ def exe_path(pid, info=None):
 def claude_record(home, pid, info, probe=None):
     """The sessionId of the Claude CLI `pid` from its own ~/.claude/sessions/<pid>.json, or None. The record must be a
     small regular file of this user, name this pid, carry a session id, match the live start time, and the process must
-    run a Claude executable."""
+    run a Claude executable of an exact known shape. R4 evidence only: it never names a caller."""
     path = os.path.join(str(home), ".claude", "sessions", "%d.json" % int(pid))
     try:
         st = os.lstat(path)
@@ -1010,123 +1006,93 @@ def claude_record(home, pid, info, probe=None):
     return sid
 
 
-def _wal_known(home, flavor, sid):
-    parent = (".claude", "wals") if flavor == "claude" else (".agent-harness", "codex-wals")
-    name = sid if flavor == "claude" else _safe_wal_name(sid)
-    return os.path.isdir(os.path.join(str(home), *parent, name))
+# ------------------------------------------------------------------------------------ the hook's own-session grant
+#
+# `ah worktree-remove` runs the verifier in a process that cannot know its session, so for a path in the caller's own
+# work directory the verifier would refuse it as "foreign session ... is live". The hook's lone `git worktree remove` form
+# keeps working without help, but it cannot read a private repository's remote and has a short time budget, so the own
+# route through `ah worktree-remove --remote-auth` needs this: the PreToolUse hook, which knows the session from its
+# payload, writes a grant for each own path the allowed command names. The verifier takes the grant (a rename, so only
+# one process can) and accepts it only when its HMAC verifies with the kill-guard ledger key (the same same-uid key the
+# spawn ledger's own-process stops already rest on), it is unexpired (GRANT_TTL_S), it names this exact path, the path's
+# owner is the grant's session, and the worktree HEAD is the one the hook saw. A grant only ever makes a path of the
+# payload session's own work directory "own"; every other check of the verifier still applies.
+
+GRANT_TTL_S = 120
+GRANT_CAP = 16  # grants one hook call may write (one per --path); more paths than this get none
+HEAD_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
-def _safe_wal_name(value):
-    """codex/hooks/wal.py safe_id for an id that is already lowercase and well formed (ID_RE): the id itself."""
-    return value if ID_RE.fullmatch(value or "") and not value.startswith("z-") else ""
+def _grant_dir(home):
+    return os.path.join(str(home), ".agent-harness", "takeover", "grants")
 
 
-def _codex_flavor(info):
-    module = ak()
-    if module.desktop_app(info):
-        exe, _rest = module._exe_and_rest(info)
-        return not re.search(r"(?:^|/)claude[^/]*\.app/", (info.get("comm") or "") + " " + exe, re.I)
-    exe, rest = module._exe_and_rest(info)
-    names = [os.path.basename(info.get("comm") or "").lower(), os.path.basename(exe).lower()]
-    names += [os.path.basename(w).lower() for w in rest[:2]]
-    return "codex" in names and "claude" not in names
+def _grant_file(home, path):
+    digest = hashlib.sha256(path.encode("utf-8", "surrogateescape")).hexdigest()[:40]
+    return os.path.join(_grant_dir(home), digest + ".json")
 
 
-def derive_caller(home, probe=None, pid=None, environ=None):
-    """{"mode": claude|codex|ssh|none, "caller": id or None, "why": text}: who runs this process, from its ancestry.
-
-    Read only. Every failure gives caller None, which the callers treat as unknown (refused for any foreign work dir)."""
-    environ = os.environ if environ is None else environ
-    probe = probe if probe is not None else ak().Probe()
-    start = os.getpid() if pid is None else int(pid)
-    chain, current = [], start
+def issue_grant(home, session, path, head, now=None):
+    """Write the single-use grant for (session, path, head). Called only by the PreToolUse hook with its payload session.
+    Returns the grant dict, or None when it cannot be written (the verifier then judges the path as foreign)."""
+    if not isinstance(session, str) or not ID_RE.fullmatch(session.lower()) or not isinstance(head, str) \
+            or not HEAD_RE.fullmatch(head) or not isinstance(path, str) or not os.path.isabs(path):
+        return None
+    key = _key(home, create=True)
+    if not key:
+        return None
+    now = time.time() if now is None else now
+    data = {"v": 1, "session": session.lower(), "path": path, "head": head, "exp": int(now) + GRANT_TTL_S,
+            "nonce": hashlib.sha256(os.urandom(32)).hexdigest()[:32]}
+    data["hmac"] = hmac.new(key, _canonical(data).encode(), hashlib.sha256).hexdigest()
+    folder = _grant_dir(home)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    target = _grant_file(home, path)
+    temp = target + ".tmp%d" % os.getpid()
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        for _ in range(64):
-            info = probe.info(current)
-            if not info:
-                break
-            if current != start:
-                sid = claude_record(home, current, info, probe)
-                if sid:
-                    claimed = environ.get("CLAUDE_CODE_SESSION_ID")
-                    if claimed and claimed != sid:
-                        return {"mode": "claude", "caller": None, "why": "the environment disagrees with the session record"}
-                    if not _wal_known(home, "claude", sid):
-                        return {"mode": "claude", "caller": None, "why": "no WAL for the recorded session on this host"}
-                    return {"mode": "claude", "caller": sid, "why": "session record of pid %d" % current}
-                if ak().is_agent_host(info):
-                    if not _codex_flavor(info):
-                        return {"mode": "claude", "caller": None, "why": "a Claude host with no valid session record"}
-                    return _codex_caller(home, probe, chain, environ, current)
-                comm = os.path.basename(info.get("comm") or "")
-                if SSHD.match(comm) or SSHD.match(info.get("command") or ""):
-                    return {"mode": "ssh", "caller": None, "why": "started over ssh with no agent above"}
-            chain.append(info)
-            if info.get("ppid", 0) <= 1:
-                break
-            current = info["ppid"]
-    except Exception as error:  # noqa: BLE001 - an ancestry that cannot be read proves nothing
-        return {"mode": "none", "caller": None, "why": "ancestry unreadable (%s)" % type(error).__name__}
-    return {"mode": "none", "caller": None, "why": "no agent and no ssh hop above this process"}
+        os.write(fd, json.dumps(data, sort_keys=True).encode())
+    finally:
+        os.close(fd)
+    os.replace(temp, target)
+    return data
 
 
-def _codex_caller(home, probe, chain, environ, host_pid):
-    values = set()
-    claimed = environ.get("CODEX_THREAD_ID")
-    if claimed:
-        values.add(claimed)
-    for info in chain:
-        pairs = probe.session_pairs(info["pid"])
-        if pairs is None:
-            return {"mode": "codex", "caller": None, "why": "an environment on the chain could not be read"}
-        values |= {value for flavor, value in pairs if flavor == "codex"}
-    if len(values) != 1:
-        return {"mode": "codex", "caller": None, "why": "%d thread ids on the chain under pid %d" % (len(values), host_pid)}
-    sid = values.pop()
-    if not ID_RE.fullmatch(sid) or not _wal_known(home, "codex", sid):
-        return {"mode": "codex", "caller": None, "why": "no WAL for that thread on this host"}
-    # macOS hides the environment of platform shells (/bin/zsh, /bin/bash) from ps, so the chain often proves nothing
-    # beyond this process's own environment. The app appends the running thread's rollout on every tool call; a thread
-    # whose rollout has not been written for CODEX_FRESH_S is not the one calling (a stopped session claimed by id).
-    now = time.time()
-    if not any(now - _mtime(path) <= CODEX_FRESH_S for path in _transcripts(str(home), sid, "codex")):
-        return {"mode": "codex", "caller": None, "why": "the thread's rollout is not being written"}
-    return {"mode": "codex", "caller": sid, "why": "thread id of the tool shell under pid %d" % host_pid}
-
-
-def _mtime(path):
+def take_grant(home, path, owner, head_of, now=None):
+    """True when a valid grant of `owner` for exactly `path` at its current HEAD existed. The grant is consumed either
+    way: it is renamed away first, so two verifiers cannot both use it. head_of(path) reads the live HEAD."""
+    target = _grant_file(home, path)
+    taken = target + ".taken%d" % os.getpid()
     try:
-        return os.stat(path).st_mtime
+        os.rename(target, taken)
     except OSError:
-        return 0.0
-
-
-FLAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-
-
-def resolve_caller(home, flag=None, probe=None, pid=None, environ=None):
-    """(caller or None, problem or None) for a tool that was handed `--caller-session flag`.
-
-    Under an agent the derived caller is the answer and a flag that names anyone else is `caller_mismatch`. Over ssh with
-    no agent above, the flag is the relayed caller (see the block comment above). Otherwise the flag is ignored."""
-    if flag and not FLAG_RE.fullmatch(str(flag)):
-        return None, "caller_mismatch: --caller-session is not a session id"
-    found = derive_caller(home, probe, pid, environ)
-    if found["mode"] in ("claude", "codex"):
-        if flag and found["caller"] and flag != found["caller"]:
-            return None, "caller_mismatch: --caller-session names another session than the calling one"
-        return found["caller"], None
-    if found["mode"] == "ssh":
-        return (flag or None), None
-    return None, None
-
-
-def caller_of(home, environ=None, probe=None):
-    """The calling session's id from the process ancestry (derive_caller), or None. Never read from the environment: a
-    command line can set CLAUDE_CODE_SESSION_ID or CODEX_THREAD_ID, it cannot change its own ancestors."""
-    found = derive_caller(home, probe=probe, environ=environ)
-    caller = found.get("caller") if found.get("mode") in ("claude", "codex") else None
-    return caller if caller and ID_RE.fullmatch(caller) else None
+        return False
+    try:
+        data = _read_json_file(taken, 4096)
+    finally:
+        try:
+            os.unlink(taken)
+        except OSError:
+            pass
+    if not isinstance(data, dict) or set(data) != {"v", "session", "path", "head", "exp", "nonce", "hmac"}:
+        return False
+    key = _key(home)
+    if not key or not isinstance(data.get("hmac"), str):
+        return False
+    good = hmac.new(key, _canonical(data).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(good, data["hmac"]):
+        return False
+    now = time.time() if now is None else now
+    if data["v"] != 1 or type(data["exp"]) is not int or not now <= data["exp"] <= now + GRANT_TTL_S + SKEW_S:
+        return False
+    if data["path"] != path or not owner or str(data["session"]).casefold() != str(owner).casefold():
+        return False
+    try:
+        live = head_of(path)
+    except Exception:  # noqa: BLE001 - a HEAD that cannot be read proves nothing
+        return False
+    return bool(live) and live == data["head"]
 
 
 def validate_ticket(ticket, lookup=None):
@@ -1146,9 +1112,9 @@ def validate_ticket(ticket, lookup=None):
 class Context:
     """Everything cleanup() depends on, so tests can replace each piece and nothing reaches ssh, ps or the real home."""
 
-    def __init__(self, home, caller, probe=None, now=time.time, remote_fetch=None, remove=None, kill_local=None,
+    def __init__(self, home, probe=None, now=time.time, remote_fetch=None, remove=None, kill_local=None,
                  kill_remote=None, tasks_fn=None, spawns_fn=None, ticket_lookup=None, host=None):
-        self.home, self.caller, self.now = str(home), caller, now
+        self.home, self.now = str(home), now
         self.probe = probe if probe is not None else HostProbe()
         self.remote_fetch = remote_fetch if remote_fetch is not None else fetch_remote_evidence
         self.remove, self.kill_local, self.kill_remote = remove, kill_local, kill_remote
@@ -1160,16 +1126,15 @@ def status(old, action, ctx):
     """The verdict from this host's point of view, judged with the other host's evidence."""
     remote = ctx.remote_fetch(old)
     spawns = ctx.spawns_fn(old) if ctx.spawns_fn else None
-    return session_state(old, action, ctx.home, ctx.probe, ctx.now(), ctx.caller, remote, ctx.tasks_fn, spawns), remote
+    return session_state(old, action, ctx.home, ctx.probe, ctx.now(), remote, ctx.tasks_fn, spawns), remote
 
 
 def claim(old, ctx, reason, ticket):
-    """Record that ctx.caller took `old` over. Needs R1 (a known session) and no live process; R2 is what this satisfies."""
+    """Record that `old` was taken over (under `ticket`). Needs R1 (a known session) and no live process; R2 is what this
+    satisfies. Nobody is named as the claimer: no tool can know its caller."""
     validate_ticket(ticket, ctx.ticket_lookup)
     if not ID_RE.fullmatch(old or ""):
         raise TakeoverError("bad_id", "--from is not a session id")
-    if old == ctx.caller or not ctx.caller:
-        raise TakeoverError("self_takeover" if ctx.caller else "caller_unknown", "the caller must be another known session")
     ev = collect_evidence(old, ctx.home, ctx.probe, ctx.now(), ctx.spawns_fn(old) if ctx.spawns_fn else None, ctx.tasks_fn)
     remote = ctx.remote_fetch(old)
     if remote == LOCAL_ONLY:
@@ -1184,18 +1149,15 @@ def claim(old, ctx, reason, ticket):
     if len(holders) != 1 or len(holders[0]["flavors"]) != 1:
         raise TakeoverError("ambiguous_session" if holders else "session_unknown", "exactly one session WAL is required")
     for e in evs:
-        if any(p.get("agent_host") and ctx.caller not in p.get("ids", []) for p in e.get("live", [])):
+        if any(p.get("agent_host") for p in e.get("live", [])):
             raise TakeoverError("session_live", "a live process still carries that session's marker")
     if holders[0] is not ev:
         raise TakeoverError("origin_remote", "the session ran on the other host: claim it from that host")
-    data = write_claim(ctx.home, old, ev["flavors"][0], ctx.caller, ticket, ctx.now(), ctx.host)
-    audit(ctx.home, {"event": "claim", "session": old, "caller": ctx.caller, "ticket": ticket, "reason": reason,
+    data = write_claim(ctx.home, old, ev["flavors"][0], ticket, ctx.now(), ctx.host)
+    audit(ctx.home, {"event": "claim", "session": old, "ticket": ticket, "reason": reason,
                      "claimed_at": data["claimed_at"]})
     return {"ok": True, "claimed": True, "session": old, "claimed_at": data["claimed_at"],
             "eligible_worktrees_at": _iso(ctx.now() + QUIET_WORKTREE_S), "eligible_processes_at": _iso(ctx.now() + QUIET_PROCESS_S)}
-
-
-HEAD_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _remote_worktrees(remote, old):
@@ -1234,9 +1196,7 @@ def cleanup(old, action, ctx, reason, ticket, paths=(), pids=(), apply=False):
         raise TakeoverError("bad_action", "--action must be worktrees, processes or stale-helpers")
     if apply:
         validate_ticket(ticket, ctx.ticket_lookup)
-        if not ctx.caller:
-            raise TakeoverError("caller_unknown", "the caller's own session could not be determined")
-    audit(ctx.home, {"event": "request", "session": old, "caller": ctx.caller, "action": action, "apply": bool(apply),
+    audit(ctx.home, {"event": "request", "session": old, "action": action, "apply": bool(apply),
                      "ticket": ticket, "reason": reason, "paths": list(paths), "pids": list(pids)})
     if action == "stale-helpers":
         return _stale_helpers(ctx, reason, apply)
@@ -1275,8 +1235,7 @@ def _do_worktrees(old, ctx, reason, ticket, paths, apply, result, remote):
             break
         audit(ctx.home, {"event": "target", "session": old, "action": "worktrees", "host": host, "path": path})
         try:
-            answer = ctx.remove(host, path, "takeover of %s: %s: %s" % (old, ticket, reason), expect_head=head,
-                                caller_session=ctx.caller)
+            answer = ctx.remove(host, path, "takeover of %s: %s: %s" % (old, ticket, reason), expect_head=head)
         except Exception as error:  # noqa: BLE001 - a failed removal is reported and the run goes on to the next
             kept.append({"path": path, "why": "%s: %s" % (getattr(error, "code", type(error).__name__), error)})
             audit(ctx.home, {"event": "result", "session": old, "path": path, "removed": None, "why": str(error)})
@@ -1297,7 +1256,7 @@ def _update_tombstone(old, ctx, ticket, removed=(), stopped=()):
     previous, _bad = read_claim(ctx.home, old)
     flavor = (previous or {}).get("flavor") or ("codex" if os.path.isdir(os.path.join(ctx.home, ".agent-harness", "codex-wals", old)) else "claude")
     try:
-        write_claim(ctx.home, old, flavor, ctx.caller, ticket, ctx.now(), ctx.host, claimed=False, removed=removed, stopped=stopped)
+        write_claim(ctx.home, old, flavor, ticket, ctx.now(), ctx.host, claimed=False, removed=removed, stopped=stopped)
     except (TakeoverError, OSError):
         pass  # the tombstone is a courtesy to the resumed session; the audit rows are the record
 
@@ -1312,7 +1271,7 @@ def _do_processes(old, ctx, reason, ticket, pids, apply, result, state, remote):
     spawns = ctx.spawns_fn(old) if ctx.spawns_fn else set()
     spawn_start = getattr(ctx.probe, "spawn_start", None)
     candidates, predicate, _basis = process_candidates(old, ctx.home, ctx.probe, last, table=table, spawns=spawns,
-                                                       spawn_start=spawn_start, exclude_pids=exclude, caller=ctx.caller)
+                                                       spawn_start=spawn_start, exclude_pids=exclude)
     if pids:
         for pid in pids:
             if pid not in candidates:
@@ -1357,17 +1316,25 @@ def _stale_helpers(ctx, reason, apply):
     module = ak()
     probe = ctx.probe
     table = probe.proc_table()
-    pids = []
+    expect = {}
     for pid, row in sorted(table.items()):
         info = {"pid": pid, "ppid": row["ppid"], "comm": row["comm"], "command": row["command"], "start": None}
-        if not module.desktop_app(info):
+        if not module.desktop_app(info) or row.get("start") is None:
             continue
         live = probe.info(pid)
         if live and module.stale_app_helper(live, probe):
-            pids.append(pid)
-    result = {"ok": True, "action": "stale-helpers", "apply": bool(apply), "targets": [{"host": "local", "pid": p} for p in pids]}
+            expect[pid] = int(row["start"])
+    pids = sorted(expect)
+    result = {"ok": True, "action": "stale-helpers", "apply": bool(apply),
+              "targets": [{"host": "local", "pid": p, "start": expect[p]} for p in pids]}
     if not apply or not pids:
         return result
-    result["local"] = ctx.kill_local(pids, "stale app helpers: %s" % reason, grace=10.0, foreign=True)
+
+    def still_stale(live_probe, info):
+        """m2: re-run on ah_kill's fresh snapshot, after `expect` pinned the start time: the pid is still that helper."""
+        return info.get("pid") in expect and ak().stale_app_helper(info, live_probe) is not None
+
+    result["local"] = ctx.kill_local(pids, "stale app helpers: %s" % reason, grace=10.0, foreign=True, expect=expect,
+                                     predicate=still_stale)
     result["ok"] = result["local"].get("ok", False)
     return result

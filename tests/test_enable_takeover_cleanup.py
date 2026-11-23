@@ -358,7 +358,8 @@ class Verify(Fixture):
         self.assertIn("PASS block in .claude/CLAUDE.md on local: 1", text)
         self.assertIn("PASS guard check on local: own session, forced remove blocks with the ah route", text)
         self.assertIn("PASS guard check on t2-dev: foreign session, lone form blocks with the takeover route", text)
-        self.assertIn("PASS guard check on local: an assigned session id blocks", text)
+        self.assertIn("PASS guard check on local: the enable script's python entry cannot be applied by an agent", text)
+        self.assertIn("PASS guard check on local: a prefix of --apply is refused too", text)
         self.assertIn("PASS takeover evidence (codex) on t2-dev: no session", text)
         self.assertIn("PASS dry-run probe (claude) on local: would-stop, nothing signalled", text)
 

@@ -562,37 +562,16 @@ def note(wal: Path, event: str, text: str) -> None:
     print(json.dumps({'status': 'WROTE', 'event': event, 'wal': str(path)}))
 
 
-def _takeover_caller():
-    """The calling session from the process ancestry (takeover.caller_of), or None when takeover.py is not installed next
-    to this hook, in ~/.claude/hooks or in this checkout."""
-    import importlib.util
-    here = Path(__file__).resolve().parent
-    for candidate in (here / 'takeover.py', Path.home() / '.claude' / 'hooks' / 'takeover.py',
-                      here.parent.parent / 'harness' / 'hooks' / 'takeover.py'):
-        if candidate.is_file():
-            spec = importlib.util.spec_from_file_location('takeover_c1', candidate)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module.caller_of(Path.home())
-    return None
+class _Parser(argparse.ArgumentParser):
+    """No prefix matching (takeover review M2): `--wa` is not `--wal`. Subparsers inherit the class."""
 
-
-def continuation_owner_refusal(path: Path, caller_fn=_takeover_caller) -> str | None:
-    """C1 (takeover review F1): a continuation change may name only the calling session's own WAL. The caller is worked
-    out from the process ancestry, never from CODEX_THREAD_ID (a command line can set that). When it cannot be worked out
-    (takeover.py missing, no session record, no WAL for that id: T2/T3 unverified for Codex), the command keeps today's
-    behaviour and the guard rule G4 is the binding layer."""
-    try:
-        caller = caller_fn()
-    except Exception:  # noqa: BLE001 - defence in depth; never break the caller's own checkpoint over a probe error
-        return None
-    if caller and safe_id(caller) != path.parent.name:
-        return 'continuation may update only the calling session\'s own checkpoint (this WAL belongs to another session)'
-    return None
+    def __init__(self, *args, **kwargs):
+        kwargs['allow_abbrev'] = False
+        super().__init__(*args, **kwargs)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _Parser(description=__doc__)
     subcommands = parser.add_subparsers(dest='command', required=True)
     subcommands.add_parser('hook')
     manual = subcommands.add_parser('start-manual')
@@ -619,10 +598,6 @@ def main() -> None:
             parser.error('continuation requires a main session WAL path')
         if args.max_continuations is not None and args.state != 'active':
             parser.error('--max-continuations requires active')
-        if args.state != 'status':
-            foreign = continuation_owner_refusal(path)
-            if foreign:
-                parser.error(foreign)
         try:
             state, _ = checkpoint(path.parent.name, args.state, max_continuations=args.max_continuations)
         except ContinuationBudgetError as error:

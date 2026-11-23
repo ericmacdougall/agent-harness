@@ -1,6 +1,7 @@
-"""takeover_rules.py and its two callers (command_guard.decide, kill_guard.decide): the literal `ah.py takeover` form (W2),
-the caller binding of the direct verifier (G2), no caller-set identity (G3), the continuation binding (G4) and the
-user-only enable script (G5). Command text is data here: nothing is run."""
+"""takeover_rules.py and its two callers (command_guard.decide, kill_guard.decide): the literal `ah.py takeover` form (W2)
+and the user-only enable entry points (G5). No rule reads an identity from command text any more (review rounds 1-2:
+every text rule invited a new spelling); identity comes from the hook payload only (test_takeover_identity). Command
+text is data here: nothing is run."""
 import os
 import sys
 import tempfile
@@ -71,69 +72,37 @@ class W2Form(unittest.TestCase):
         self.ok("ls ~/.agent-harness/takeover")
 
 
-class G3Identity(unittest.TestCase):
-    def bad(self, command):
-        text = rules.refusal(command, ME)
-        self.assertIsNotNone(text, command)
-        self.assertIn("identity", text)
+class NoIdentityTextRules(unittest.TestCase):
+    """G2, G3 and G4 are gone: the strings they matched are no longer the rules' business, because no tool reads an
+    identity from a flag, a variable or the ancestry. test_takeover_identity proves each one is harmless (foreign)."""
 
-    def test_assignments_next_to_a_harness_tool_are_refused(self):
+    def test_identity_spellings_are_not_judged_by_text(self):
         for command in ("CLAUDE_CODE_SESSION_ID=abc python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path /x --reason r",
                         "CODEX_THREAD_ID=abc python3 -I ~/.codex/agent-harness/ah.py kill --pid 5 --reason r",
-                        "env CODEX_THREAD_ID=x python3 -I ~/.claude/hooks/ah.py takeover cleanup --from %s" % OLD,
-                        "export CLAUDE_CODE_SESSION_ID=x; python3 ~/.claude/hooks/command_guard.py remove-worktree --path /x",
-                        "declare -x CLAUDE_CODE_SESSION_ID=x && python3 ~/.claude/hooks/kill_guard.py check",
-                        "ssh t2-dev 'CLAUDE_CODE_SESSION_ID=x python3 -I .claude/hooks/ah.py worktree-remove --path /x'",
-                        "CLAUDE_CODE_SESSION_ID=x python3 ~/.claude/hooks/takeover.py"):
+                        "python3 -I ~/.codex/agent-harness/wal.py continuation --wal /Users/u/.agent-harness/codex-wals/%s/main.jsonl handoff" % OLD):
             with self.subTest(command=command[:50]):
-                self.bad(command)
-
-    def test_other_variables_and_harmless_commands_pass(self):
-        self.assertIsNone(rules.refusal("FOO=1 python3 -I ~/.claude/hooks/ah.py worktree-remove --path /x", ME))
-        self.assertIsNone(rules.refusal("echo CLAUDE_CODE_SESSION_ID=x", ME))
-        self.assertIsNone(rules.refusal("CLAUDE_CODE_SESSION_ID=x pytest -q", ME))
-
-
-class G2DirectVerifier(unittest.TestCase):
-    V = "python3 -I ~/.claude/hooks/command_guard.py remove-worktree --path /Users/u/.agent-harness/work/s/t/w"
-
-    def test_an_agent_never_passes_the_caller_session_itself(self):
-        # absent: the verifier works the caller out from its own process ancestry. Agents never pass the flag (ah
-        # worktree-remove does, from that same derivation), so even the caller's own id is refused in command text.
-        self.assertIsNone(rules.refusal(self.V, ME))
-        for forged in ("--caller-session " + ME, "--caller-session=" + ME, "--caller-session " + OLD, "--caller-session=" + OLD):
-            self.assertIn("caller-session", rules.refusal(self.V + " " + forged, ME))
-        self.assertIn("caller-session", rules.refusal(self.V + " --caller-session " + ME, None), "no payload session: nothing to match")
-        ssh = "ssh t2-dev 'python3 -I .claude/hooks/command_guard.py remove-worktree --path /x --caller-session %s'" % OLD
-        self.assertIn("caller-session", rules.refusal(ssh, ME))
-
-
-class G4Continuation(unittest.TestCase):
-    C = "python3 -I ~/.codex/agent-harness/wal.py continuation --wal %s handoff"
-
-    def test_only_the_callers_own_wal_may_be_named(self):
-        own = "/Users/u/.agent-harness/codex-wals/%s/main.jsonl" % OLD
-        other = "/Users/u/.agent-harness/codex-wals/%s/main.jsonl" % ME
-        self.assertIsNone(rules.refusal(self.C % own, OLD))
-        self.assertIn("own session", rules.refusal(self.C % other, OLD))
-        self.assertIn("own session", rules.refusal(self.C % own, None))
-        self.assertIn("own session", rules.refusal("python3 wal.py continuation --wal=%s status" % other, OLD))
-
-    def test_the_directory_name_is_the_codex_safe_id(self):
-        self.assertEqual(rules.safe_id(OLD), OLD)
-        self.assertTrue(rules.safe_id("Mixed/Case").startswith("z-"))
+                self.assertIsNone(rules.refusal(command, ME))
+        self.assertFalse(hasattr(rules, "safe_id"))
+        self.assertFalse(hasattr(cg, "verifier_caller"))
 
 
 class G5EnableScript(unittest.TestCase):
     S = "scripts/enable-takeover-cleanup.sh"
 
+    P = "scripts/enable_takeover_cleanup.py"
+
     def test_apply_and_undo_are_refused_in_every_form_and_dry_run_and_verify_pass(self):
         for command in ("bash %s --apply" % self.S, "sh %s --undo --hooks" % self.S, "./%s --apply --ref abc" % self.S,
                         "/Users/u/kit/%s --apply" % self.S, "env X=1 bash %s --apply" % self.S,
                         "ssh t2-dev 'bash enable-takeover-cleanup.sh --undo'", "bash -c '%s --apply'" % self.S,
-                        "nohup bash %s --apply" % self.S, "bash %s --ref abc --repo r --apply" % self.S):
+                        "nohup bash %s --apply" % self.S, "bash %s --ref abc --repo r --apply" % self.S,
+                        # m1: the Python entry, prefixes, `env -u` and any other option outside the read-only allowlist
+                        "python3 %s --apply" % self.P, "python3 -I %s --ref x --repo y --undo" % self.P,
+                        "bash %s --app" % self.S, "bash %s --a" % self.S, "bash %s --und" % self.S,
+                        "python3 %s --appl" % self.P, "env -u CLAUDECODE bash %s --apply" % self.S,
+                        "bash %s --hooks" % self.S, "bash %s --dry-run; bash %s --apply" % (self.S, self.S)):
             with self.subTest(command=command[:50]):
-                self.assertIn("user only", rules.refusal(command, ME))
+                self.assertIn("user", rules.refusal(command, ME) or "", command)
         for command in ("bash %s --dry-run --ref abc" % self.S, "bash %s --verify" % self.S, "bash %s" % self.S,
                         "git add %s" % self.S, "git commit -m 'script %s --apply'" % self.S, "cat %s" % self.S):
             with self.subTest(command=command[:50]):
@@ -155,9 +124,10 @@ class ThroughTheGuards(unittest.TestCase):
         verdict, text = self.cg_verdict("%s cleanup --from %s --action worktrees --reason r --ticket %s --apply && echo" % (CLAUDE, OLD, TICKET))
         self.assertEqual(verdict, "block")
         self.assertIn("Form:", text)
-        self.assertEqual(self.cg_verdict("CODEX_THREAD_ID=x python3 -I ~/.claude/hooks/ah.py takeover status --from %s" % OLD)[0], "block")
+        self.assertEqual(self.cg_verdict("CODEX_THREAD_ID=x python3 -I ~/.claude/hooks/ah.py takeover status --from %s" % OLD)[0], "block",
+                         "W2: an assignment before the takeover command is not the literal form")
         self.assertEqual(self.cg_verdict("bash scripts/enable-takeover-cleanup.sh --apply")[0], "block")
-        self.assertEqual(self.cg_verdict("python3 -I ~/.claude/hooks/command_guard.py remove-worktree --path /x --caller-session " + OLD)[0], "block")
+        self.assertEqual(self.cg_verdict("python3 scripts/enable_takeover_cleanup.py --apply")[0], "block")
         self.assertEqual(self.cg_verdict("%s status --from %s" % (CLAUDE, OLD))[0], "allow")
 
     def test_kill_guard_blocks_the_identity_and_the_script_and_allows_the_literal_forms(self):
@@ -171,28 +141,17 @@ class ThroughTheGuards(unittest.TestCase):
 
 
 class ReviewBypasses(unittest.TestCase):
-    """The exact strings the review used to get past G2, G3 and G4 (BLOCK at db950737), and their ssh-wrapped forms. The
-    text rules match a tool at any word position, read quote-flattened text and refuse what they cannot parse."""
-    WT = "/Users/u/.agent-harness/work/%s/cheap-dev" % OLD
-    V = "~/.claude/hooks/command_guard.py remove-worktree --path %s --caller-session %s" % (WT, OLD)
-    WAL = "/Users/u/.agent-harness/codex-wals/%s/main.jsonl" % OLD
+    """The takeover strings the review used at db950737 still meet the W2 grammar; the identity strings it used (G2, G3,
+    G4) carry no identity any more and are covered by test_takeover_identity instead of a text rule."""
 
     def blocked(self, command, session=ME):
         self.assertIsNotNone(rules.refusal(command, session), command)
 
     def bypasses(self):
-        return ["python3 -IB " + self.V, "python3 -X utf8 -I " + self.V, "python3 -W ignore " + self.V,
-                "python3 -I " + self.V + " # it's", "python3 -I " + self.V.replace("remove-worktree", 'remove-work""tree'),
-                "python3 -I " + self.V.replace("--caller-session", "--caller-sess''ion"),
-                "CODEX_THREAD_ID=%s python3 -X utf8 ~/.codex/agent-harness/ah.py worktree-remove --host local --path %s "
-                "--reason r" % (OLD, self.WT),
-                "python3 -IB ~/.codex/agent-harness/wal.py continuation --wal %s handoff" % self.WAL,
-                "python3 -u -B ~/.codex/agent-harness/wal.py continuation --wal=%s complete" % self.WAL,
-                "/usr/bin/env python3 -s ~/.codex/agent-harness/wal.py continuation --wal %s handoff" % self.WAL,
-                "python3 -IB ~/.claude/hooks/ah.py takeover cleanup --from %s --action worktrees --reason r --ticket %s "
+        return ["python3 -IB ~/.claude/hooks/ah.py takeover cleanup --from %s --action worktrees --reason r --ticket %s "
                 "--apply" % (OLD, TICKET),
                 "export CODEX_THREAD_ID=%s && python3 -X utf8 ~/.codex/agent-harness/ah.py takeover status --from %s" % (OLD, OLD),
-                ": ${CLAUDE_CODE_SESSION_ID:=%s}; python3 -IB ~/.claude/hooks/ah.py worktree-remove --path /x" % OLD]
+                "python3 -I ~/.claude/hooks/ah.py takeover status --from %s # it's" % OLD]
 
     def test_every_review_bypass_is_refused(self):
         for command in self.bypasses():
@@ -207,22 +166,13 @@ class ReviewBypasses(unittest.TestCase):
 
     def test_an_unparsable_command_that_names_a_harness_tool_and_a_takeover_word_is_refused(self):
         self.blocked("python3 -I ~/.claude/hooks/ah.py takeover status --from %s 'unterminated" % OLD)
-        self.blocked("python3 -I ~/.codex/agent-harness/wal.py continuation --wal %s handoff \"x" % self.WAL)
         # an unparsable command that names no harness tool is not this module's business
         self.assertIsNone(rules.refusal("echo takeover it's", ME))
 
-    def test_the_callers_own_checkpoint_stays_allowed_in_any_interpreter_spelling(self):
-        own = "/Users/u/.agent-harness/codex-wals/%s/main.jsonl" % ME
-        self.assertIsNone(rules.refusal("python3 -IB ~/.codex/agent-harness/wal.py continuation --wal %s status" % own, ME))
-        self.assertIsNone(rules.refusal("python3 -X utf8 ~/.codex/agent-harness/wal.py continuation --wal %s handoff" % own, ME))
-
-    def test_a_dynamic_word_in_a_direct_verifier_call_is_refused(self):
-        self.blocked("python3 -I ~/.claude/hooks/command_guard.py remove-worktree --path $P")
-        self.blocked("python3 -I ~/.claude/hooks/command_guard.py remove-$(echo work)tree --path /x --caller-session " + ME)
-
     def test_reading_the_tools_is_not_judged(self):
         for command in ("grep -n remove-worktree harness/hooks/command_guard.py", "git diff -- harness/hooks/takeover_rules.py",
-                        "sed -n 1,20p harness/hooks/wal.py", "grep -rn continuation codex/hooks/wal.py"):
+                        "sed -n 1,20p harness/hooks/wal.py", "grep -rn continuation codex/hooks/wal.py",
+                        "grep -n apply scripts/enable-takeover-cleanup.sh"):
             self.assertIsNone(rules.refusal(command, ME), command)
 
 
@@ -246,8 +196,8 @@ class FailClosed(unittest.TestCase):
 
     def test_the_guards_prefilter_quote_flattened_text(self):
         with mock.patch.object(cg, "HOOK_SESSION", ME):
-            verdict, _text = cg.decide("python3 -I ~/.claude/hooks/command_guard.py remove-work\"\"tree --path /x "
-                                       "--caller-session " + OLD, cg.Compiled(cg.load_policy(), cwd="/tmp"), cwd="/tmp")
+            verdict, _text = cg.decide("bash scripts/enable-takeover-clean''up.sh --apply",
+                                       cg.Compiled(cg.load_policy(), cwd="/tmp"), cwd="/tmp")
         self.assertEqual(verdict, "block")
         with tempfile.TemporaryDirectory() as tmp:
             verdict = kg.decide("CLAUDE_SESSION_ID=x python3 -I ~/.claude/hooks/ah.py take''over status --from %s" % OLD,
