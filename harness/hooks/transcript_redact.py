@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.23-2"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.23-3"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2; read only by _decode_nested
 _MAX_QUOTED_LAYERS = 64  # at the limit, quoted JSON-string layers unwrapped while looking for an object or array
@@ -347,6 +347,8 @@ def _adjust_for_escapes(content, spans):
 
 
 def _apply(text, spans, counts):
+    """Replace every span, merging overlaps (the outer span swallows the tail). A 'base64' span (a long run from
+    _base64_spans) becomes [OMITTED:base64:<len>:<sha12>] over the run; every other kind is [REDACTED:<kind>]."""
     if not spans:
         return text
     spans = sorted(spans, key=lambda s: (s[0], -s[1]))
@@ -361,22 +363,39 @@ def _apply(text, spans, counts):
     cursor = 0
     for start, end, kind in merged:
         out.append(text[cursor:start])
-        out.append('[REDACTED:' + kind + ']')
+        if kind == 'base64':
+            run = text[start:end]
+            out.append('[OMITTED:base64:%d:%s]' % (
+                len(run), hashlib.sha256(run.encode('utf-8', 'surrogatepass')).hexdigest()[:12]))
+        else:
+            out.append('[REDACTED:' + kind + ']')
         counts[kind] = counts.get(kind, 0) + 1
         cursor = end
     out.append(text[cursor:])
     return ''.join(out)
 
 
-def _collapse_base64(text, counts):
+def _base64_spans(text):
     if len(text) < 1000:
-        return text
+        return []
+    return [(m.start(), m.end(), 'base64') for m in _BASE64.finditer(text)]
 
-    def repl(match):
-        run = match.group(0)
-        counts['base64'] = counts.get('base64', 0) + 1
-        return '[OMITTED:base64:%d:%s]' % (len(run), hashlib.sha256(run.encode('utf-8', 'surrogatepass')).hexdigest()[:12])
-    return _BASE64.sub(repl, text)
+
+def _keyword_spans(text):
+    """_find_spans, with every span that ends inside a long run extended to the run's end: the keyword rules run
+    before the run is collapsed, so a value cut at its rule's length limit leaves no tail of the run behind."""
+    spans = _find_spans(text)
+    runs = _base64_spans(text) if spans else []
+    if not runs:
+        return spans
+    starts = [start for start, _, _ in runs]
+    out = []
+    for start, end, kind in spans:
+        i = bisect.bisect_right(starts, end - 1) - 1
+        if i >= 0 and runs[i][0] < end < runs[i][1]:
+            end = runs[i][1]
+        out.append((start, end, kind))
+    return out
 
 
 def _normalize1(text):
@@ -393,18 +412,26 @@ def _normalize1(text):
 def _redact_text(text, counts):
     # Raw spans are applied first. Decoding can add a delimiter (%2F, \u0020) that would shorten a match the raw
     # text fully covered, so the normalized form is only ever a second scan over already-redacted text.
-    text = _collapse_base64(text, counts)
-    text = _apply(text, _find_spans(text), counts)
+    # No keyword scan runs on transformed text (triage of PR #316 at 79d55675): the raw scan, the normalized scan
+    # and a pass 2 check all see the long base64 runs intact, and the runs are collapsed last, so collapsing a
+    # run can never remove a key word that ends it, before or after normalization.
+    text = _apply(text, _keyword_spans(text), counts)
     if _NORM_TRIGGER.search(text):
         norm = _normalize1(text)
         if norm != text:
             local = {}
-            norm = _collapse_base64(norm, local)
-            norm_spans = _find_spans(norm)
-            if norm_spans or local:
+            norm = _apply(norm, _keyword_spans(norm), local)
+            if local or any(m.group(0) not in text for m in _BASE64.finditer(norm)):
                 for kind, n in local.items():
                     counts[kind] = counts.get(kind, 0) + n
-                return _apply(norm, norm_spans, counts)
+                text = norm  # as before: the normalized form is kept when it redacts or collapses more
+    runs = _base64_spans(text)
+    if runs:
+        hits = []
+        _v2_scan(text, hits, 0, decode=False)  # pass 2 over the text before its runs are collapsed
+        if hits:
+            raise _Omit(hits[0])
+        text = _apply(text, runs, counts)
     return text
 
 

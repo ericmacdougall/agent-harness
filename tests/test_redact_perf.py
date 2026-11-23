@@ -52,13 +52,6 @@ EDGES = {
 }
 
 
-# Shapes the archive path (transcript_redact) still misses, pinned by test_archive_known_gaps_are_pinned.
-ARCHIVE_KNOWN_GAPS = {
-    # its base64 collapse ([A-Za-z0-9+/_-]{1000,}) runs before the keyword rules and swallows the key word at the
-    # end of a 1000+ character name, so the value is left with no key in front of it
-    "17 long segments": "base64 collapse swallows the key word",
-}
-
 
 def _archive(text):
     import json
@@ -141,18 +134,35 @@ class PatternsAreLinear(unittest.TestCase):
 
     def test_archive_path_redacts_the_window_edges(self):
         """transcript_redact skips this shape for its own prefix-free keyword rule; the edges must still be redacted
-        on the archive path."""
+        on the archive path. Every edge is a NEG: "17 long segments" was a pinned known gap at 79d55675 (the base64
+        collapse swallowed the key word) and is now required to pass."""
         for name, text in EDGES.items():
-            if name in ARCHIVE_KNOWN_GAPS:
-                continue
             with self.subTest(case=name):
                 self.assertNotIn(VALUE.encode(), _archive(text))
 
-    def test_archive_known_gaps_are_pinned(self):
-        """A known gap is pinned, not skipped silently: when a fix lands this fails and the entry must go."""
-        for name in ARCHIVE_KNOWN_GAPS:
-            with self.subTest(case=name):
-                self.assertIn(VALUE.encode(), _archive(EDGES[name]))
+    def test_archive_scales_linearly_on_long_runs(self):
+        """The keyword rules now see long base64 runs uncollapsed (triage of PR #316 at 79d55675), so the archive
+        path must stay linear on them: 2 MB may cost at most 3x the CPU of 1 MB, and 2 MB stays under 20 s."""
+        import base64
+        rnd = random.Random(16650)
+        blob = rnd.randbytes(1_600_000)
+        shapes = {
+            "base64": lambda n: base64.b64encode(blob).decode()[:n],
+            "base64url": lambda n: base64.urlsafe_b64encode(blob).decode()[:n],
+            "jwt-dense": lambda n: ("eyJaaaaaaaa-" * (n // 12 + 1))[:n],
+            "dot-joined eyJ": lambda n: ("eyJaaaaaaaa." * (n // 12 + 1))[:n],
+            "underscore-keyword": lambda n: ("bb_password_" * (n // 12 + 1))[:n],
+        }
+        for name, make in shapes.items():
+            with self.subTest(shape=name):
+                cost = []
+                for size in (1_000_000, 2_000_000):
+                    text = make(size)
+                    start = time.process_time()
+                    _archive(text)
+                    cost.append(max(time.process_time() - start, 0.05))
+                self.assertLess(cost[1], 20.0)
+                self.assertLess(cost[1] / cost[0], 3.0)
 
     def test_archive_patterns_on_adversarial_input(self):
         """The archive's separator whitespace is bounded (256) and every such rule starts at a key word."""

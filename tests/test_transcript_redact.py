@@ -266,6 +266,59 @@ class TextShapes(unittest.TestCase):
         self.assertEqual(json.loads(out)["image"]["data"], "[OMITTED:base64:1500:%s]" % sha12)
         self.assertEqual(counts.get("base64"), 1)
 
+    def test_long_run_never_swallows_a_key_word(self):
+        """Triage of PR #316 at 79d55675 (CRITICAL): the base64 collapse ran before the keyword rules, so a 1000+
+        character name ending in a key word lost the key word and its value reached the archive. Keyword spans and
+        base64 runs are now found on the same untransformed text (raw and normalized) and applied together."""
+        jwt = ("eyJhbGciOiJIUzI1NiJ9." + base64.urlsafe_b64encode(b'{"sub":"' + b"u" * 1200 + b'"}').decode()
+               .rstrip("=") + "." + F)
+        cases = {
+            "17 long segments": "_".join(["b" * 130] * 17) + "_secret: " + F,
+            "one long segment": "b" * 1200 + "_password=" + F,
+            "hyphen key": "b" * 1200 + "-api-key: " + F,
+            "env name": "B" * 1200 + "_TOKEN=" + F,
+            # key words that only appear after normalization (the normalized scan used to run on collapsed text)
+            "percent-encoded key word": "b" * 1200 + "_api%5Fkey=" + F,
+            "percent-encoded letter": "b" * 1200 + "_pass%77ord=" + F,
+            "zero-width space": "b" * 1200 + "_pass\u200bword=" + F,
+            "escaped zero-width space": "b" * 1200 + "_pass\\u200bword=" + F,
+            "escaped quote": "b" * 1200 + "_password\\\"=" + F,
+            "jwt with a long payload": "bearer " + jwt,
+            "bare jwt with a long payload": jwt,
+        }
+        for name, text in cases.items():
+            for shape in ("text", "json"):
+                with self.subTest(case=name, shape=shape):
+                    out, _, _ = run(text if shape == "text" else {"type": "user", "content": text})
+                    self.assertFalse(leaks(out, F))
+
+    def test_long_run_before_a_pass2_only_key_word_omits_the_record(self):
+        """A key word only pass 2 joins (a line break inside it) is checked before the run is collapsed."""
+        out, counts, omitted = run({"type": "user", "content": "b" * 1200 + "_pass\nword=" + F})
+        self.assertIsNotNone(omitted)
+        self.assertFalse(leaks(out, F))
+
+    def test_long_value_leaves_no_tail(self):
+        """A value longer than its rule's limit (about 4096) inside one long run is omitted whole: the keyword span
+        is extended to the end of the run, so no tail shorter than the 1000-character collapse survives."""
+        value = "Q" * 2000 + F + "R" * 2600
+        for text in ("password=" + value, "x password: " + value, "Bearer " + value, "PGPASSWORD=" + value):
+            with self.subTest(text=text[:12]):
+                out, _, _ = run({"t": text})
+                self.assertFalse(leaks(out, F, "R" * 100, "Q" * 100))
+        # The invariant itself (pass 2 would also catch the end-to-end shape above): a span cut at its limit inside
+        # a run reaches the end of the run.
+        text = "x password: " + value
+        self.assertEqual([end for _, end, kind in tr._keyword_spans(text) if kind == "named-credential"], [len(text)])
+
+    def test_long_run_before_a_key_word_is_still_omitted(self):
+        """The fix keeps the omission: the run itself is never archived, whatever follows it."""
+        run_text = "b" * 1200
+        out, counts, omitted = run({"x": run_text + "_password=" + F})
+        self.assertIsNone(omitted)
+        self.assertFalse(leaks(out, run_text, F))
+        self.assertTrue(counts)
+
     def test_short_base64_kept(self):
         blob = base64.b64encode(b"x" * 600).decode()
         out, _, _ = run({"d": blob})
