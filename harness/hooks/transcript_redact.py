@@ -3,12 +3,19 @@
 
 One JSONL record in, one record out. Fail closed: if the independent verifier (pass 2) still sees a secret in
 pass 1's output, or anything raises, the record is replaced by an omitted marker that names only a kind, the
-line number and the sha256 of the source line. No matched value ever reaches a return value other than the
+line number and the byte length of the source line (no hash: a hash of a short record could be brute-forced). No matched value ever reaches a return value other than the
 redacted output itself, an exception message, a log or stdout.
 
 Pass 1 (redaction):
   * JSON records are walked key-aware. A value under a credential-like key is replaced whole by
-    "[REDACTED:keyed]" (containers included); booleans and null are kept because they cannot carry a secret.
+    "[REDACTED:keyed]" (containers included). Booleans and null are always kept; numbers are kept except under
+    password, pin, otp and passcode keys (spec r3).
+  * Allowlist, never redacted (spec r3, NEG-18: session mapping depends on it): session and record id keys
+    (sessionId, session_id, session, parentUuid, uuid, requestId, and the Codex session_meta fields id,
+    session_id, parent_thread_id, forked_from_id) when the value is a UUID or ULID; numeric *_tokens,
+    max_tokens, *_token_count and tokens; scalar model and type. A credential-like key whose value is not
+    UUID/ULID-shaped is still redacted. Pass 2 still verifies allowlisted values, so a secret planted there
+    omits the record instead of leaking.
     {"name"|"key": <credential-like>, "value": X} pairs, cookie objects and [header, value] pairs redact X.
   * Every string (keys included) is redacted with redact.PATTERNS, redact.PEM_BEGIN/PEM_END and the extra shapes
     below. Unlike redact.find(), a candidate is never skipped because it contains a "[REDACTED:" marker; only a
@@ -49,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.22-1"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.22-2"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2
 _MISSING = object()
@@ -399,8 +406,7 @@ def _key_is_credential(key):
     cached = _KEY_CACHE.get(key)
     if cached is not None:
         return cached
-    spaced = _CAMEL2.sub(r'\1 \2', _CAMEL1.sub(r'\1 \2', key))
-    tokens = [t for t in _SPLIT.split(spaced.lower()) if t]
+    tokens = _key_tokens(key)
     result = False
     if tokens:
         joined = ''.join(tokens)
@@ -418,17 +424,58 @@ _COOKIE_FIELDS = ('domain', 'path', 'httpOnly', 'httponly', 'expires', 'secure',
 
 
 def _pair_is_credential(d):
+    """(is a credential pair, its value is a numeric secret)"""
     if 'value' not in d:
-        return False
+        return False, False
     for field in ('name', 'key'):
         name = d.get(field)
         if isinstance(name, str) and _key_is_credential(name):
-            return True
-    return isinstance(d.get('name'), str) and any(f in d for f in _COOKIE_FIELDS)
+            return True, _numeric_secret_key(name)
+    return isinstance(d.get('name'), str) and any(f in d for f in _COOKIE_FIELDS), False
 
 
-def _keyed(value, counts):
+_NUMERIC_SECRET_ANY = {'password', 'passwd', 'passcode'}
+_NUMERIC_SECRET_LAST = {'pwd', 'pin', 'otp'}
+_ID_KEYS = {'sessionid', 'session', 'parentuuid', 'uuid', 'requestid', 'id', 'threadid', 'parentthreadid',
+            'forkedfromid', 'conversationid', 'parentsessionid'}
+_UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+_ULID = re.compile(r'[0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{26}')
+
+
+def _key_tokens(key):
+    spaced = _CAMEL2.sub(r'\1 \2', _CAMEL1.sub(r'\1 \2', key))
+    return [t for t in _SPLIT.split(spaced.lower()) if t]
+
+
+def _numeric_secret_key(key):
+    if not isinstance(key, str) or not key:
+        return False
+    tokens = _key_tokens(key)
+    return bool(tokens) and (any(t in _NUMERIC_SECRET_ANY for t in tokens) or tokens[-1] in _NUMERIC_SECRET_LAST
+                             or ''.join(tokens).endswith(('password', 'passwd', 'passcode')))
+
+
+def _allowlisted(key, value):
+    """Mapping and counter fields that are never redacted (spec r3)."""
+    if not isinstance(key, str) or not key or isinstance(value, (dict, list)):
+        return False
+    tokens = _key_tokens(key)
+    if not tokens:
+        return False
+    joined = ''.join(tokens)
+    if joined in _ID_KEYS:
+        return isinstance(value, str) and bool(_UUID.fullmatch(value) or _ULID.fullmatch(value))
+    if joined in ('model', 'type'):
+        return True
+    if tokens[-1] == 'tokens' or tokens[-2:] == ['token', 'count']:
+        return value is None or (isinstance(value, (int, float)) and not isinstance(value, bool))
+    return False
+
+
+def _keyed(value, counts, numeric_secret=False):
     if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not numeric_secret:
         return value
     if isinstance(value, str) and MARKER.fullmatch(value):
         return value
@@ -438,18 +485,24 @@ def _keyed(value, counts):
 
 def _walk(value, counts, nest):
     if isinstance(value, dict):
-        pair = _pair_is_credential(value)
+        pair, pair_numeric = _pair_is_credential(value)
         out = {}
         for key, item in value.items():
             new_key = _redact_string(key, counts, nest) if isinstance(key, str) else key
-            if _key_is_credential(key) or (pair and key == 'value'):
-                out[new_key] = _keyed(item, counts)
+            if _allowlisted(key, item):
+                out[new_key] = item
+            elif pair and key == 'value':
+                out[new_key] = _keyed(item, counts, pair_numeric)
+            elif _key_is_credential(key):
+                out[new_key] = _keyed(item, counts, _numeric_secret_key(key))
+            elif isinstance(item, (int, float)) and not isinstance(item, bool) and _numeric_secret_key(key):
+                out[new_key] = _keyed(item, counts, True)
             else:
                 out[new_key] = _walk(item, counts, nest)
         return out
     if isinstance(value, list):
         if len(value) == 2 and isinstance(value[0], str) and _key_is_credential(value[0]):
-            return [_redact_string(value[0], counts, nest), _keyed(value[1], counts)]
+            return [_redact_string(value[0], counts, nest), _keyed(value[1], counts, _numeric_secret_key(value[0]))]
         out = [_walk(item, counts, nest) for item in value]
         _redact_argv(value, out, counts)
         return out
@@ -576,7 +629,8 @@ _V2 = [
     ('v2-keyword', ('passw', 'secret', 'api', 'access', 'auth', 'private'), re.compile(
         r'(?i)(?:passw(?:or)?d|secret|api[_\-]?key|access[_\-]?token|auth[_\-]?token|client[_\-]?secret|'
         r'private[_\-]?key)["\']?[ \t]{0,4}[:=][ \t]{0,4}["\']?' + _V2_MARK + r'{0,4}'
-        r'(?!(?:true|false|null)(?![A-Za-z0-9]))[^\s"\'\[\],;{}]{4,}')),
+        r'(?!(?:true|false|null)(?![A-Za-z0-9]))(?!-?[0-9][0-9.eE+\-]{0,64}(?![^\s"\'\[\],;{}]))'
+        r'[^\s"\'\[\],;{}]{4,}')),  # a bare number is a kept JSON number; numbers under password keys are keyed
     ('v2-presigned', ('sig', 'x-amz-'), re.compile(
         r'(?i)[?&](?:x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature|sig|signature)='
         r'(?!\[)[^&\s"]{8,}')),
@@ -600,9 +654,11 @@ def _v2_key_hit(key):
     return isinstance(key, str) and _V2_ALNUM.sub('', key.lower()).endswith(_V2_KEY_SUFFIX)
 
 
-def _v2_value_hit(value):
+def _v2_value_hit(value, key=''):
     if value is None or isinstance(value, bool):
         return False
+    if isinstance(value, (int, float)):
+        return _V2_ALNUM.sub('', str(key).lower()).endswith(('password', 'passwd'))
     if isinstance(value, str):
         return bool(value) and not re.fullmatch(_V2_MARK, value)
     if isinstance(value, (dict, list)):
@@ -658,10 +714,10 @@ def _v2_scan(text, kinds, depth):
 def _v2_walk(value, kinds, depth):
     if isinstance(value, dict):
         name = value.get('name', value.get('key'))
-        if 'value' in value and _v2_key_hit(name) and _v2_value_hit(value['value']):
+        if 'value' in value and _v2_key_hit(name) and _v2_value_hit(value['value'], name):
             kinds.append('v2-keyed-pair')
         for key, item in value.items():
-            if _v2_key_hit(key) and _v2_value_hit(item):
+            if _v2_key_hit(key) and _v2_value_hit(item, key):
                 kinds.append('v2-keyed')
             if isinstance(key, str):
                 _v2_scan(key, kinds, depth)
@@ -698,8 +754,7 @@ def _pass2(data):
 # ----------------------------------------------------------------------------------------------------------
 
 def _omitted(line, line_no, kind):
-    record = {'_archive': 'omitted', 'reason': kind, 'line': int(line_no),
-              'src_sha256': hashlib.sha256(line).hexdigest()}
+    record = {'_archive': 'omitted', 'reason': kind, 'line': int(line_no), 'src_len': len(line)}
     return json.dumps(record, separators=(',', ':')).encode('ascii')
 
 
