@@ -40,14 +40,15 @@
       "additionalProperties": false,
       "required": ["scope"],
       "properties": {
-        "ttl_seconds": {"type": ["integer", "null"], "exclusiveMinimum": 0, "description": "Lifetime of each grant, clamped to the policy expiry. Null means the policy expiry."},
+        "ttl_seconds": {"type": ["integer", "null"], "exclusiveMinimum": 0, "description": "Validity of each returned grant object (now + ttl), clamped to the policy expiry. It is not a cumulative limit: a later call gets a fresh ttl. The policy expires_at is the only hard stop. Null means the policy expiry."},
         "scope": {
           "type": "object",
           "description": "Returned to the caller inside the grant. The library enforces repos, denylist_paths and single_use; other keys are enforced by the consuming guard.",
           "properties": {
             "repos": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "owner/name list; evidence.repo must be a member."},
-            "denylist_paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Globs (case-insensitive); evidence.changed_paths is required and none may match."},
-            "single_use": {"type": "boolean", "description": "Needs evidence.use_key; the same (policy, capability, use_key) is granted once."}
+            "denylist_paths": {"type": "array", "items": {"type": "string", "minLength": 1}, "description": "Globs (case-insensitive); evidence.changed_paths is required and none may match. Added to the built-in floor of same_harness_fallback_review (auth, secrets, migrations, key handling, the guards, CI), which no policy can lower."},
+            "single_use": {"type": "boolean", "description": "The capability is handed out only by consume(), which spends the object named by the evidence fields in single_use_bind. grant() refuses it. The caller cannot choose the key."},
+            "single_use_bind": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Evidence fields (strings or integers) that identify the object a single-use grant is spent on. Default: repo, pr, head."}
           }
         }
       }

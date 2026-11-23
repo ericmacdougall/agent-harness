@@ -16,7 +16,20 @@ purpose all differ, and a pinned key record must itself name the purpose "self-s
 Revocation is fail-safe: any caller may create a file under policy/revoked/ (see revoke()) and it is honoured at once.
 Nothing in this module deletes one or re-enables a policy; that takes the user's enabler or a newly signed policy.
 
-Same-user trust: file modes and the signature stop careless agents, not a malicious process running as this user.
+Same-user trust: file modes and the signature stop careless agents, not a malicious process running as this user. The
+trust anchor (policy, pins, key) is local and same-user writable, so protection rests on the command guard covering
+policy/, private/self-serve and the pins file (lane L6 is a hard dependency: never install this library without it) and on
+the independent t2-dev pin, which this library does not consult. It does what it can on its own side of that line:
+
+  * Nothing the caller passes decides who is main, where the policy lives or what time it is. The proof root is the real
+    account's ~/.claude (from the password database, never HOME or CLAUDE_CONFIG_DIR), `home=` must name the real home,
+    and `now=` is clamped to the real clock plus or minus CLOCK_SKEW_SECONDS. Tests alone reach those three through the
+    private _SEAM dictionary; no argument, environment variable or file can set it. The actor payload must come from the
+    consuming hook's own stdin, never from argv or an environment variable (consumers enforce this).
+  * A Codex root cannot be told from a Codex helper (see CLAUDE_MAIN_ONLY), so merge-class capabilities are Claude main only.
+  * single_use binds the object (default repo, PR, head), never a caller-chosen key, and is spent only by consume().
+  * ttl_seconds is the validity of one returned grant object, not a cumulative limit. The policy expires_at is the only hard stop.
+  * same_harness_fallback_review has a built-in path denylist that no policy can lower (FALLBACK_FLOOR).
 
 Importing this module has no side effects: no file access, no process probe, no cryptography import.
 """
@@ -29,10 +42,12 @@ import hashlib
 import json
 import os
 import posixpath
+import pwd
 import re
 import stat
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,6 +63,25 @@ CLOCK_SKEW_SECONDS = 300
 TOP_KEYS = {'schema', 'purpose', 'policy_id', 'key_id', 'issued_at', 'expires_at', 'capabilities', 'disabled',
             'signature'}
 ACTOR_KINDS = ('claude_main', 'codex_root')
+# A Codex root and a Codex helper share one desktop process tree and the probe is process ancestry, so a verified OpenAI
+# origin does not say which of the two is calling. Until native_context can, these stay with Claude main.
+CLAUDE_MAIN_ONLY = ('same_harness_fallback_review', 'merge_reviewed_pr', 'central_decisions_agent_steps')
+# Payload keys that only a helper (Claude subagent or Codex spawned thread) carries. Deny-only hints, never proof.
+HELPER_KEYS = ('agent_id', 'agent_type', 'agent_role', 'agent_path', 'parent_thread_id')
+FALLBACK_CAPABILITY = 'same_harness_fallback_review'
+SINGLE_USE_DEFAULT_BIND = ('repo', 'pr', 'head')
+MAX_USE_FIELD = 512
+# Paths that never take a same-harness review, whatever the signed policy says; a policy may add patterns, never remove.
+# Equal to the denylist in merge_gate (lane L2), which should call fallback_path_denied() rather than keep a copy.
+FALLBACK_FLOOR = re.compile(
+    r"(?:^|[/_.\-])(?:auth|authn|authz|oauth|login|signin|secrets?|credentials?|passwords?|passwd|tokens?|"
+    r"migrations?|migrate|command_guard\w*|merge_gate\w*|peer_review\w*|caller_identity|self_serve\w*|"
+    r"central_decisions|escalation|keys?|keygen|keyring|keychain|ed25519|pubkeys?|private|sudoers|"
+    r"workflows?|usage_guard)(?:$|[/_.\-])|(?:^|/)\.env|\.pem$|id_rsa|\.p12$|\.pfx$", re.I)
+
+# Private test seam. Production never sets it and nothing a caller can pass reaches it: 'home' is the account home tests
+# run under (and arms an explicit home=), 'claude_dir' the proof root, 'clock' lets now= be any value.
+_SEAM = {'home': None, 'claude_dir': None, 'clock': False}
 
 _HEX32 = re.compile(r'[0-9a-f]{32}')
 _HEX16 = re.compile(r'[0-9a-f]{16}')
@@ -61,8 +95,49 @@ class _Deny(Exception):
 
 # ------------------------------------------------------------------ paths
 
+def _real_home() -> str:
+    """The account's home from the password database. HOME and CLAUDE_CONFIG_DIR are the caller's, so never consulted."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        return os.path.expanduser('~')
+
+
 def _root(home=None) -> Path:
-    return Path(home) / '.agent-harness' if home else Path(os.path.expanduser('~')) / '.agent-harness'
+    return Path(home or _SEAM['home'] or _real_home()) / '.agent-harness'
+
+
+def _resolve_home(home) -> str:
+    """The one choke point for home=. Production: None or the real home, anything else is refused. Tests arm _SEAM."""
+    if _SEAM['home'] is not None:
+        return home if home is not None else _SEAM['home']
+    real = _real_home()
+    if home is None:
+        return real
+    try:
+        if os.path.realpath(home) == os.path.realpath(real):
+            return real
+    except (OSError, ValueError, TypeError):
+        pass
+    raise _Deny('home_override_refused')
+
+
+def _claude_dir() -> str:
+    """Where a main transcript must live. Never taken from the actor, a payload or the environment."""
+    return _SEAM['claude_dir'] or str(Path(_real_home()) / '.claude')
+
+
+def _clock(now) -> float:
+    """The time every check uses. A supplied now is clamped to the real clock within CLOCK_SKEW_SECONDS (tests aside), so
+    a past now cannot revive an expired policy and a future one cannot start a policy early."""
+    real = time.time()
+    if now is None:
+        return real
+    if isinstance(now, bool) or not isinstance(now, (int, float)) or now != now or now in (float('inf'), float('-inf')):
+        raise _Deny('bad_clock')
+    if _SEAM['clock']:
+        return float(now)
+    return min(max(float(now), real - CLOCK_SKEW_SECONDS), real + CLOCK_SKEW_SECONDS)
 
 
 def policy_dir(home=None) -> Path:
@@ -331,6 +406,10 @@ def _check_scope(scope: dict):
         raise _Deny('scope_denylist')
     if 'single_use' in scope and not isinstance(scope['single_use'], bool):
         raise _Deny('scope_single_use')
+    if 'single_use_bind' in scope:
+        bind = scope['single_use_bind']
+        if not _string_list(bind) or not bind or len(set(bind)) != len(bind):
+            raise _Deny('scope_single_use_bind')
 
 
 def _load_policy(home, now: float) -> dict:
@@ -374,19 +453,24 @@ def _origin_probe():
     return probe_runtime_origin()
 
 
-def _prove_actor(actor, claude_dir=None):
+def _prove_actor(actor, capability=None):
+    """Only 'kind' and 'payload' of the actor are read; every other key is ignored. In particular the actor cannot name
+    the directory its transcript is proven against: that is _claude_dir(), fixed by the library."""
     if not isinstance(actor, dict) or actor.get('kind') not in ACTOR_KINDS:
         raise _Deny('actor_unproven')
     payload = actor.get('payload')
     if payload is not None and not isinstance(payload, dict):
         raise _Deny('actor_unproven')
-    if isinstance(payload, dict) and (payload.get('agent_id') or payload.get('agent_type')):
-        raise _Deny('helper_actor')  # helper subagents never receive grants
+    if isinstance(payload, dict) and (any(payload.get(key) for key in HELPER_KEYS)
+                                      or payload.get('thread_source') == 'subagent'):
+        raise _Deny('helper_actor')  # helpers never receive grants
     if actor['kind'] == 'claude_main':
         import caller_identity  # noqa: PLC0415
-        if not caller_identity.is_main(payload, actor.get('claude_dir', claude_dir)):
+        if not caller_identity.is_main(payload, _claude_dir()):
             raise _Deny('not_main')
         return
+    if capability in CLAUDE_MAIN_ONLY:
+        raise _Deny('codex_root_not_allowed')
     seen = _origin_probe()
     if getattr(seen, 'origin', None) != 'openai' or getattr(seen, 'reason', None) != 'running_code_verified':
         raise _Deny('not_codex_root')
@@ -421,7 +505,32 @@ def _narrowing(evidence) -> dict:
     return out
 
 
-def _check_scope_against_evidence(capability, scope, evidence, policy, home, now):
+def fallback_path_denied(path) -> bool:
+    """True when a same-harness review may not cover this changed path. A malformed, absolute or traversing path counts
+    as denied. The one shared floor: consumers call this instead of keeping their own copy."""
+    if not isinstance(path, str) or not path or len(path) > 1024:
+        return True
+    text = unicodedata.normalize('NFKC', path).replace('\\', '/')
+    if text.startswith('/') or '..' in text.split('/') or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return True
+    return FALLBACK_FLOOR.search(text) is not None
+
+
+def _use_key(capability, scope, evidence, policy_id) -> str:
+    """The identity of the object a single-use grant is spent on, derived from the evidence the signed scope names
+    (default repo, PR number, head SHA). The caller cannot supply or shorten it, so one object is granted once."""
+    fields = scope.get('single_use_bind') or list(SINGLE_USE_DEFAULT_BIND)
+    parts = []
+    for name in fields:
+        value = evidence.get(name)
+        if isinstance(value, bool) or not isinstance(value, (str, int)) or value == '' \
+                or (isinstance(value, str) and len(value) > MAX_USE_FIELD):
+            raise _Deny('use_binding_required')
+        parts.append([name, value])
+    return hashlib.sha256(canonical([policy_id, capability, parts])).hexdigest()
+
+
+def _check_scope_against_evidence(capability, scope, evidence, policy, home, now, spend=False):
     if evidence is not None and not isinstance(evidence, dict):
         raise _Deny('evidence_malformed')
     evidence = evidence or {}
@@ -436,21 +545,21 @@ def _check_scope_against_evidence(capability, scope, evidence, policy, home, now
         if not isinstance(repo, str) or repo.casefold() not in {r.casefold() for r in repos}:
             raise _Deny('repo_out_of_scope')
     globs = list(scope.get('denylist_paths', [])) + list(narrow.get('denylist_paths', []))
-    if globs:
+    floor = capability == FALLBACK_CAPABILITY
+    if globs or floor:
         paths = evidence.get('changed_paths')
         if not isinstance(paths, list) or not paths or any(not isinstance(p, str) for p in paths):
             raise _Deny('changed_paths_required')
-        if _denied_path(paths, globs):
+        if (floor and any(fallback_path_denied(p) for p in paths)) or (globs and _denied_path(paths, globs)):
             raise _Deny('path_denylisted')
     if scope.get('single_use'):
-        use_key = evidence.get('use_key')
-        if not isinstance(use_key, str) or not use_key or len(use_key) > 512:
-            raise _Deny('use_key_required')
-        _spend(home, policy['policy_id'], capability, use_key)
+        if not spend:
+            raise _Deny('single_use_requires_consume')
+        key = _use_key(capability, scope, evidence, policy['policy_id'])
+        _spend(home, key)
 
 
-def _spend(home, policy_id, capability, use_key):
-    digest = hashlib.sha256(canonical([policy_id, capability, use_key])).hexdigest()
+def _spend(home, digest):
     directory = _spent_dir(home)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -474,18 +583,16 @@ def _audit(home, row: dict):
 
 # ------------------------------------------------------------------ public API
 
-def _decide(capability, actor, evidence, now, home):
+def _decide(capability, actor, evidence, now, home, spend=False):
     if not isinstance(capability, str) or capability not in CAPABILITIES:
         raise _Deny('unknown_capability')
-    if now is None:
-        now = time.time()
-    if isinstance(now, bool) or not isinstance(now, (int, float)) or now != now:
-        raise _Deny('bad_clock')
+    now = _clock(now)
+    home = _resolve_home(home)
     if kill_switch_active(home):
         raise _Deny('kill_switch')
     if _revoked(home):
         raise _Deny('revoked')
-    policy = _load_policy(home, float(now))
+    policy = _load_policy(home, now)
     if _revoked(home, policy['policy_id'], capability):
         raise _Deny('revoked')
     if capability in policy.get('disabled', []):
@@ -493,24 +600,25 @@ def _decide(capability, actor, evidence, now, home):
     entry = policy['capabilities'].get(capability)
     if entry is None:
         raise _Deny('capability_not_granted')
-    _prove_actor(actor)
+    _prove_actor(actor, capability)
     scope = copy.deepcopy(entry['scope'])
-    _check_scope_against_evidence(capability, scope, evidence, policy, home, float(now))
+    _check_scope_against_evidence(capability, scope, evidence, policy, home, now, spend)
     expires = parse_time(policy['expires_at']) if policy['expires_at'] is not None else None
-    ttl = entry.get('ttl_seconds')
+    ttl = entry.get('ttl_seconds')  # the validity of this one grant object, not a cumulative limit
     if ttl is not None:
-        expires = min(float(now) + ttl, expires) if expires is not None else float(now) + ttl
+        expires = min(now + ttl, expires) if expires is not None else now + ttl
     result = {'capability': capability, 'policy_id': policy['policy_id'], 'key_id': policy['key_id'],
               'expires_at': iso(expires) if expires is not None else None, 'scope': scope}
-    _audit(home, {'at': iso(float(now)), 'event': 'grant', 'capability': capability,
-                  'policy_id': policy['policy_id'], 'actor': actor.get('kind'), 'expires_at': result['expires_at']})
+    _audit(home, {'at': iso(now), 'event': 'consume' if spend and scope.get('single_use') else 'grant',
+                  'capability': capability, 'policy_id': policy['policy_id'], 'actor': actor.get('kind'),
+                  'expires_at': result['expires_at']})
     return result
 
 
-def explain(capability, *, actor, evidence=None, now=None, home=None):
-    """Like grant() but also returns a short reason code (never a policy value). For tests and `ah` diagnostics."""
+def explain(capability, *, actor, evidence=None, now=None, home=None, consume=False):
+    """Like grant() (or consume() when consume=True) but also returns a short reason code, never a policy value."""
     try:
-        return _decide(capability, actor, evidence, now, home), 'granted'
+        return _decide(capability, actor, evidence, now, home, spend=bool(consume)), 'granted'
     except _Deny as denied:
         return None, str(denied)
     except Exception:  # noqa: BLE001
@@ -519,9 +627,24 @@ def explain(capability, *, actor, evidence=None, now=None, home=None):
 
 def grant(capability: str, *, actor: dict, evidence: dict | None = None, now: float | None = None,
           home: str | None = None) -> dict | None:
-    """The grant for capability, or None on ANY failure. Never raises."""
+    """The grant for capability, or None on ANY failure. Never raises. A capability whose policy scope is single_use is
+    not handed out here (it needs consume()), so a consumer that has not adopted consume() gets no grant, not a free one."""
     try:
         return _decide(capability, actor, evidence, now, home)
+    except BaseException as error:  # noqa: BLE001 - a crash is never permission
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        return None
+
+
+def consume(capability: str, *, actor: dict, evidence: dict | None = None, now: float | None = None,
+            home: str | None = None) -> dict | None:
+    """grant() plus, for a single_use scope, the atomic spend of the object named by the evidence (default repo, pr, head).
+    Call it once, immediately before acting. Every other precondition is checked first, so a refused call spends
+    nothing; an actor that is not proven main or Codex root can never spend. Once spent, the object is never granted
+    again under this policy, even if the action then fails. Never raises."""
+    try:
+        return _decide(capability, actor, evidence, now, home, spend=True)
     except BaseException as error:  # noqa: BLE001 - a crash is never permission
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
             raise
@@ -533,10 +656,15 @@ def status(home: str | None = None, *, now: float | None = None) -> dict:
     out = {'enabled': False, 'policy_id': None, 'capabilities': [], 'disabled': [], 'key_id': None,
            'kill_switch': False, 'revoked': False, 'expires_at': None, 'reason': 'error'}
     try:
+        try:
+            home, now = _resolve_home(home), _clock(now)
+        except _Deny as denied:
+            out['reason'] = str(denied)
+            return out
         out['kill_switch'] = kill_switch_active(home)
         out['revoked'] = _revoked(home)
         try:
-            policy = _load_policy(home, time.time() if now is None else float(now))
+            policy = _load_policy(home, now)
         except _Deny as denied:
             out['reason'] = str(denied)
             return out
