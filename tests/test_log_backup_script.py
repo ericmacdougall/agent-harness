@@ -2779,7 +2779,13 @@ class TierOneCheckpoint(Case):
         self.assertIn(".claude/wals: %d file(s) left out of the upload by the current excludes" % len(excluded), log)
         self.assertNotIn("held", log)
         self.assertTrue(self.source_ok("claude_wals").exists(), log[-1500:])
-        self.assertEqual(done.returncode, 0, log[-1500:])
+        self.assertRegex(log, r"transcripts exit=0 ", log[-1500:])
+        # The exclude file changes mid-run, which the bulk tier is built to notice: it stops its passes (exit 1) and
+        # lists again next run. That is the only failure this run may have; tier 1 above must be clean.
+        if done.returncode != 0:
+            self.assertIn("the exclude lists changed during this run", log)
+            self.assertRegex(log, r"bulk exit=1\b")
+            self.assertNotRegex(log, r"transcripts exit=[1-9]")
 
     def test_f1_rescue_a_pass_from_before_the_guard_sends_its_passed_files_again(self):
         # Gate 6c0f69b F1: a pass started before the upload guard has a cursor and no `sent`. Its cursor was advanced by
@@ -2798,10 +2804,11 @@ class TierOneCheckpoint(Case):
         done = self.run_script(LOG_BACKUP_BULK_CHUNK="2", FAKE_OPS_MATCH=".codex/archived_sessions",
                                FAKE_OPS_PER_RUN="100000", **remote)
         log = self.log_text()
-        self.assertIn(".codex/archived_sessions: pass in progress from before the upload guard: it starts again from its first file", log)
-        self.assertNotIn("recorded as sent", log)
+        # Behaviour first (the failing-first evidence): the files the old cursor passed go to a copy again.
         offered = set(checked.read_text().splitlines()) if checked.exists() else set()
         self.assertLessEqual(set(passed), offered, "the files the old cursor passed were never offered to a copy")
+        self.assertIn(".codex/archived_sessions: pass in progress from before the upload guard: it starts again from its first file", log)
+        self.assertNotIn("recorded as sent", log)
         names = {l.split("\t", 1)[0] for l in (st / "done").read_text().splitlines()}
         self.assertEqual(names, {"v%d.jsonl" % i for i in range(6)} | {"y.jsonl"})
         self.assertTrue(self.bulk_ok().exists(), log[-1500:])
