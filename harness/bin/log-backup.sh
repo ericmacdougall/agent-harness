@@ -452,7 +452,8 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   attempt=0 copied=0 yielded=0
   # The transcripts themselves (the primary sources, copied last so the reserve protects them) still get their own
   # copy: stopping them too would let a throttled WAL or ledger copy starve the transcript backup run after run.
-  case "$rel" in .claude/projects|.codex/sessions) ;; *)
+  # The WAL tree too (goodqa#16660): the trees rotate, so a throttled transcript chunk may now run before it.
+  case "$rel" in .claude/projects|.codex/sessions|.claude/wals) ;; *)
     if [ "$throttled" = 1 ]; then
       say "skipped $rel: an earlier copy in this run failed on the Dropbox write rate limit; the next run sends it"
       ok=1; budget_hit=1; return
@@ -557,7 +558,7 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
 # source writes log-backup.source.KEY.last-ok. Copies end at the source's share (RESERVE keeps the later trees theirs).
 live_key() { printf '%s' "${1#.}" | tr '/.' '__'; }
 live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
-  local snap="$1" rel="$2" clean="$3" st key total cur=0 n size fit f0=$found p0=$primary
+  local snap="$1" rel="$2" clean="$3" st key total cur=0 held=0 n size fit f0=$found p0=$primary
   key=$(live_key "$rel"); st="$LIVE_STATE/$key"
   printf -v "PEND_$key" '%s' unknown
   mkdir -p "$st" && chmod 700 "$LIVE_STATE" "$st" || { say "cannot create tier-1 state for $rel"; ok=1; return; }
@@ -565,7 +566,8 @@ live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
     : > "$st/verified" && printf '%s\n' "$R" > "$st/remote" || { say "cannot reset tier-1 state for $rel"; ok=1; return; }
   fi
   touch "$st/verified"
-  "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --exclude-from "$EXCLUDES" --ignore-case -- "$snap" \
+  # TZ=UTC: lsf prints modification times in the local zone, and a verified line must not depend on it.
+  TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --exclude-from "$EXCLUDES" --ignore-case -- "$snap" \
     </dev/null > "$st/listing.tmp" 2>> "$LOG"
   rc=$?
   if [ $rc -ne 0 ]; then say "listing $rel failed (rclone exit $rc)"; ok=1; rm -f "$st/listing.tmp"; return; fi
@@ -591,14 +593,23 @@ live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
     sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk" && cut -f1 "$st/chunk" > "$st/chunk.paths" \
       || { say "cannot read the $rel chunk"; ok=1; break; }
     n=$(wc -l < "$st/chunk" | tr -d ' ')
+    hard_fail=0
     upload "$snap" "$rel" --files-from-raw "$st/chunk.paths" --no-traverse
-    [ "$copied" -eq 1 ] || break   # upload said why and marked the run
+    if [ "$copied" -ne 1 ]; then   # upload said why and marked the run
+      # A chunk that really failed (not the budget, not the rate limit) stays pending, and the older files after it are
+      # still offered: one file that never uploads must not hold back the rest of the tree (red-team F1).
+      if [ "${hard_fail:-0}" = 1 ] && [ "$throttled" != 1 ]; then
+        say "$rel: a chunk of $n files failed; it stays pending and the next chunk is tried"
+        held=$((held + n)) cur=$((cur + n)); continue
+      fi
+      break
+    fi
     cat "$st/chunk" >> "$st/verified" || { say "cannot record the $rel chunk; it is sent again"; ok=1; break; }
     cur=$((cur + n))
   done
   found=$f0 primary=$p0   # one source counts once, and only when it is complete
-  printf -v "PEND_$key" '%s' $(( total - cur ))
-  [ "$cur" -ge "$total" ] || return
+  printf -v "PEND_$key" '%s' $(( total - cur + held ))
+  [ "$cur" -ge "$total" ] && [ "$held" -eq 0 ] || return
   mv "$st/listing" "$st/verified" || { say "cannot record the $rel listing"; ok=1; return; }
   found=$((found + 1))
   case "$rel" in .claude/projects|.codex/sessions)

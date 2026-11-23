@@ -23,7 +23,8 @@ FAKE = """#!%(python)s
 import json, os, sys, time
 argv = sys.argv[1:]
 with open(os.environ["FAKE_LOG"], "a") as h:
-    h.write(json.dumps({"argv": argv, "rclone_env": sorted(k for k in os.environ if k.startswith("RCLONE_"))}) + "\\n")
+    h.write(json.dumps({"argv": argv, "rclone_env": sorted(k for k in os.environ if k.startswith("RCLONE_")),
+                        "tz": os.environ.get("TZ")}) + "\\n")
 if argv and argv[0] == "listremotes":
     print(os.environ.get("FAKE_REMOTES", "lessons-dropbox: dropbox"))
     sys.exit(0)
@@ -103,10 +104,13 @@ if argv and argv[0] == "copy":
                     open(counter, "w").write(str(spent))
                     sys.exit(10)
                 spent += 1
+                if name == os.environ.get("FAKE_POISON"):   # this one file fails every time; rclone carries on past it
+                    poisoned = True
+                    continue
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 shutil.copyfile(os.path.join(src, name), target)
         open(counter, "w").write(str(spent))
-        sys.exit(0)
+        sys.exit(1 if "poisoned" in dir() else 0)
     real = os.environ.get("FAKE_DELEGATE")
     if real and os.environ.get("FAKE_DISALLOW"):
         # A Dropbox-like remote (rclone's own rule in backend/dropbox): these names are refused one by one, the copy
@@ -2228,6 +2232,51 @@ class TierOneCheckpoint(Case):
         for key, names in cut.items():
             self.assertLessEqual(names, again, "%s: files of the cut chunk were checked again" % key)
         self.assertTrue(self.last_ok().exists())
+
+    def test_ac7_one_file_that_never_uploads_does_not_hold_back_the_older_files(self):
+        # red-team F1: a chunk with one file that always fails stopped the tree there, so every older pending file was
+        # never offered again (the stage keeps the bad file even after it is deleted locally).
+        now = time.time()
+        for i, rel in enumerate(self.wals):
+            os.utime(self.home / rel, (now - 7200 + i, now - 7200 + i))   # s29 newest, s00 oldest
+        bad = "s20/main.jsonl"
+        done = self.tier1_runs(1, 100000, FAKE_POISON=bad, LOG_BACKUP_BULK_CHUNK="3", LOG_BACKUP_RETRIES="0")
+        self.assertNotEqual(done.returncode, 0)
+        got = {f for f in self.remote_files() if f.startswith(".claude/wals/s")}
+        want = {r for r in self.wals if not r.endswith(bad)}
+        self.assertEqual(want - got, set(), "every other WAL, older ones included, reached the remote")
+        verified = (self.logs / "log-backup.live.d" / "claude_wals" / "verified").read_text()
+        self.assertNotIn(bad, verified)
+        self.assertIn("s00/main.jsonl", verified, "chunks after the failed one are recorded")
+        self.assertFalse(self.source_ok("claude_wals").exists(), "a tree with a held chunk is not complete")
+        self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=[1-9]")
+        done = self.tier1_runs(1, 100000, LOG_BACKUP_BULK_CHUNK="3")
+        self.assertEqual(done.returncode, 0, (self.logs / "log-backup.log").read_text()[-1500:])
+        self.assertIn(".claude/wals/" + bad, self.remote_files())
+        self.assertTrue(self.source_ok("claude_wals").exists())
+
+    def test_f3_the_stage_listing_does_not_depend_on_the_local_time_zone(self):
+        # red-team F3: lsf prints local time, so a time-zone change would make every verified line look new.
+        self.run_script(TZ="America/Edmonton", LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+        stage = str(self.home / ".agent-harness/backup-stage")
+        lists = [c for c in self.recorded() if c["argv"][0] == "lsf" and c["argv"][-1].startswith(stage)]
+        self.assertEqual(len(lists), 3, lists)
+        self.assertEqual({c["tz"] for c in lists}, {"UTC"})
+
+    def test_f4_a_throttled_tree_that_runs_first_does_not_skip_the_wal_tree(self):
+        # red-team F4: with rotation, projects can run before the WAL tree; its rate-limited failure must not make the
+        # run skip the WALs (they used to go first, before anything could be throttled).
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / "log-backup.rotate").write_text("2\n")   # order: projects, wals, sessions
+        done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                               FAKE_NOTE_MATCH="live.d/claude_projects", FAKE_EXIT_AFTER_NOTE="1",
+                               LOG_BACKUP_RETRIES="0", LOG_BACKUP_BULK_EVERY_SECONDS="99999")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertTrue((self.logs / "log-backup.throttled").exists(), "the projects copy was throttled")
+        order = [d for c in self.copies() for d in TIER1_DIRS.split(",") if c[c.index("--") + 1].endswith(d)]
+        self.assertEqual(order[0], ".claude/projects", order)
+        self.assertIn(".claude/wals", order, "the WAL tree still got its copy after the throttle")
+        self.assertNotIn("skipped .claude/wals", (self.logs / "log-backup.log").read_text())
 
     def test_neg_tier1_checkpoint_state_is_its_own(self):
         # The lane owns log-backup.bulk.d; tier 1 must never write into it (two writers on one checkpoint).
