@@ -112,12 +112,16 @@ class FakeUpstream:
 class FakeParity:
     """The seam for ah_parity.verify_gate: records exactly what the enabler asked and answers with a report."""
 
-    def __init__(self, ok=True, gate=(), error=None):
-        self.ok, self.gate, self.error, self.calls = ok, list(gate), error, []
+    def __init__(self, ok=True, gate=(), error=None, warnings=()):
+        self.ok, self.gate, self.error, self.calls, self.warnings = ok, list(gate), error, [], list(warnings)
 
     def __call__(self, layout, ref):
         self.calls.append(ref)
-        return {"ok": self.ok, "gate": list(self.gate), "error": self.error, "hosts": {}}
+        report = {"ok": self.ok, "gate": list(self.gate), "error": self.error, "hosts": {}}
+        if self.warnings:
+            report["hosts"] = {"mac": {"status": "CLEAN", "warnings": list(self.warnings)}}
+            report["warnings"] = list(self.warnings)
+        return report
 
 
 class LocalRemote:
@@ -408,6 +412,16 @@ class PinnedShaGate(Base):  # NEG-3
         before = self.all_files()
         self.assertEqual(self.apply(), 3)
         self.assertIn("differ from the pinned SHA on this Mac", self.output)
+        self.assertEqual(self.all_files(), before)
+
+    def test_an_unlisted_importable_file_warns_by_name_and_does_not_refuse(self):  # goodqa#16810
+        warning = "claude: unexpected importable file or package codex_pool.py"
+        self.assertEqual(self.apply(parity=FakeParity(ok=True, warnings=[warning])), 0, self.output)
+        self.assertIn("WARN (not a failure): " + warning, self.output)
+
+    def test_a_refusing_gate_report_still_refuses_whatever_it_warns(self):
+        before = self.all_files()
+        self.assertEqual(self.apply(parity=FakeParity(ok=False, gate=["drift"], warnings=["w"])), 3)
         self.assertEqual(self.all_files(), before)
 
     def test_a_missing_hook_on_the_mac_is_refused(self):

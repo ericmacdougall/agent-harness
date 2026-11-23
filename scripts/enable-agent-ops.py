@@ -840,6 +840,10 @@ class Enabler:
             if isinstance(report, dict) and report.get("error"):
                 reasons.append(str(report["error"]))
             raise Refused("the parity gate refused at %s: %s" % (ref[:12], "; ".join(reasons[:4]) or "no clean report"))
+        # An importable file in neither the manifest nor the repo is a named warning, never a refusal (goodqa#16810).
+        warnings = report.get("warnings")
+        for warning in (warnings if isinstance(warnings, list) else [])[:20]:
+            self.out("WARN (not a failure): %s" % str(warning)[:200])
 
     def show_plan(self, params: dict):
         for label, (old, new) in self.plan(params).items():
