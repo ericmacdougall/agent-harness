@@ -308,11 +308,12 @@ def scan_text(text, label, *, lockfile=False, deadline=None):
         import redact  # shared high-recall shape list
     except ImportError:
         raise Refused('redact.py is missing; the egress gate cannot run (failing closed)') from None
-    step = 64 * 1024  # redact.find per chunk with overlap, so the time limit is enforced between chunks
-    for base in range(0, max(len(text), 1), step):
-        for kind, start, _end in redact.find(text[base:base + step + 4096]):
-            raise Refused('egress refused: %s line %d: secret shape (%s)' % (label, _line_of(text, base + start), kind))
-        deadline.check()
+    # One pass over the whole text (at most the 1.5 MB cap): redact.find is linear, and a sliced scan missed a
+    # match longer than its overlap that crossed a step (GoodQA #16680). The time limit is checked around it.
+    deadline.check()
+    for kind, start, _end in redact.find(text):
+        raise Refused('egress refused: %s line %d: secret shape (%s)' % (label, _line_of(text, start), kind))
+    deadline.check()
     for pattern, rule in TRANSCRIPT_SHAPES + TOPIC_PATTERNS:
         match = pattern.search(text)
         if match:

@@ -407,6 +407,18 @@ class KimiReviewTests(unittest.TestCase):
             note.write_text('Pasted from somewhere:\n%s\n' % line)
             self.assertRefused(self.run_kimi('--snapshot', str(note)), label)
 
+    def test_long_secret_shape_across_a_scan_step_is_refused(self):
+        """GoodQA #16680 sweep: scan_text ran redact.find on 64 KiB steps with a 4 KiB overlap, so a JWT longer
+        than the overlap that started near a step's end matched in neither step and could reach the reviewer."""
+        jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJ' + 'u' * 9000 + '.' + 'Zq9X' + 'w2Lm8Rt4' + 'Vb7Np3Kc6'
+        for lead in (64 * 1024 - 2000, 64 * 1024 - 200):
+            with self.subTest(lead=lead):
+                body = 'Evidence.\n' + ('word ' * (lead // 5))[:lead - 10] + '\n'
+                self.packet.write_text(body + jwt + '\nmore evidence\n')
+                result = self.run_kimi()
+                self.assertRefused(result, 'long jwt at %d' % lead)
+                self.assertIn('secret shape (jwt)', result.stderr + result.stdout)
+
     def test_private_leak_denylist_is_applied_and_fails_closed(self):
         denylist = self.home / '.agent-harness' / 'leak-denylist.txt'
         denylist.write_text('# comment\n(?x)zebra\\-quartz\\-77\n')

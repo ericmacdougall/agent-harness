@@ -14,9 +14,6 @@ from __future__ import annotations
 
 import re
 
-MAX_CHUNK = 256 * 1024  # inputs are processed in chunks of this size (with an overlap) to bound regex work
-OVERLAP = 4096
-
 _KEY_WORDS = (r'(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|'
               r'private[_-]?key|credentials?|client[_-]?secret|refresh[_-]?token|access[_-]?token|id[_-]?token)'
               r'(?:[_-]value)?')
@@ -76,16 +73,6 @@ PATTERNS = [
 ]
 
 
-def _chunks(text):
-    if len(text) <= MAX_CHUNK:
-        yield 0, text
-        return
-    start = 0
-    while start < len(text):
-        yield start, text[start:start + MAX_CHUNK + OVERLAP]
-        start += MAX_CHUNK
-
-
 def _find_pem(text):
     hits = []
     cursor = 0
@@ -104,16 +91,17 @@ def find(text):
     text = str(text)
     hits = _find_pem(text)
     seen = {(start, end) for _kind, start, end in hits}
-    for base, chunk in _chunks(text):
-        for kind, pattern in PATTERNS:
-            for match in pattern.finditer(chunk):
-                if '[REDACTED:' in match.group(0):
-                    continue
-                span = (base + match.start(), base + match.end())
-                if span in seen:
-                    continue
-                seen.add(span)
-                hits.append((kind, span[0], span[1]))
+    # The whole text is scanned in one pass: every pattern is linear (tests/test_redact_perf.py guards that at
+    # 1-2 MB), and slicing it into chunks cut any match longer than the overlap at a boundary (GoodQA #16680).
+    for kind, pattern in PATTERNS:
+        for match in pattern.finditer(text):
+            if '[REDACTED:' in match.group(0):
+                continue
+            span = match.span()
+            if span in seen:
+                continue
+            seen.add(span)
+            hits.append((kind, span[0], span[1]))
     return sorted(hits, key=lambda hit: (hit[1], hit[2]))
 
 

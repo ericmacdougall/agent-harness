@@ -140,6 +140,20 @@ class PatternsAreLinear(unittest.TestCase):
             with self.subTest(case=name):
                 self.assertNotIn(VALUE.encode(), _archive(text))
 
+    def test_find_scales_linearly_without_chunks(self):
+        """find() scans the whole text since the chunking was removed (GoodQA #16680), so the 256 KiB chunk no
+        longer caps a superlinear pattern: every adversarial input at 2 MB may cost at most 3x its 1 MB CPU."""
+        for name, text in ADVERSARIAL.items():
+            with self.subTest(input=name):
+                cost = []
+                for size in (1_000_000, 2_000_000):
+                    big = (text * (size // len(text) + 1))[:size]
+                    start = time.process_time()
+                    redact.find(big)
+                    cost.append(max(time.process_time() - start, 0.05))
+                self.assertLess(cost[1], 20.0)
+                self.assertLess(cost[1] / cost[0], 3.0)
+
     def test_archive_scales_linearly_on_long_runs(self):
         """The keyword rules now see long base64 runs uncollapsed (triage of PR #316 at 79d55675), so the archive
         path must stay linear on them: 2 MB may cost at most 3x the CPU of 1 MB, and 2 MB stays under 20 s."""
