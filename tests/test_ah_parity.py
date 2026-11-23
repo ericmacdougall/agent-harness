@@ -870,6 +870,19 @@ class Cli(unittest.TestCase):
         self.assertEqual((r["ok"], r["exit_code"]), (False, 1))
         self.assertEqual(ah_parity.doctor(["--bogus"], f.home)["exit_code"], 2)
 
+    def test_verify_parity_entry_for_ah_py_is_the_gate_form(self):
+        # ah.py dispatches `ops verify-parity` to ah_parity.verify_parity(rest, home) (self-serve integration, X5).
+        f = Fixture(self)
+        orig = ah_parity.CANONICAL_URL
+        ah_parity.CANONICAL_URL = f.url
+        self.addCleanup(setattr, ah_parity, "CANONICAL_URL", orig)
+        r = ah_parity.verify_parity(["--host", "mac"], f.home)
+        self.assertEqual((r["ok"], r["exit_code"]), (True, 0))
+        f.claude(f.home, "ah.py").write_bytes(b"x")
+        r = ah_parity.verify_parity(["--host", "mac"], f.home)
+        self.assertEqual((r["ok"], r["exit_code"]), (False, 1))
+        self.assertEqual(ah_parity.verify_parity(["--ref", "a" * 40], f.home)["exit_code"], 2, "the gate form has no --ref")
+
 
 if __name__ == "__main__":
     unittest.main()
