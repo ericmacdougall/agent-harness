@@ -441,16 +441,64 @@ note_refused() { # note_refused SRC-REL COUNT WHAT
   say "$1: $2 file(s) $3 by the remote by name; not backed up, and the run is not failed for them"
 }
 
-upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
-  local p="$1" rel="$2" dst
+# goodqa#16660 gate F2: rclone refuses --files-from-raw mixed with any other filter, so a list copy carried no exclude
+# and trusted whoever built the list (a re-check snapshot from an earlier run could re-send a file a newer credential
+# exclude blocks). Every list therefore passes this one guard, called only from upload(), right before rclone:
+#   1. a path must be relative, with no empty, . or .. component; anything else is left out and counted;
+#   2. with an allow-list (the re-check passes its tree's current verified), only paths in its first column stay;
+#   3. the CURRENT credential excludes, plus the source's own exclude files, are applied by rclone's own matcher: the
+#      list is mirrored as empty files in a private directory and listed with the same filters a plain copy gets.
+# It writes LIST.guarded and sets GUARD_LEFT_OUT. It fails closed: on any error it returns 1 and nothing is sent.
+guard_list() { # guard_list LIST ALLOW-OR-EMPTY [EXCLUDE-FILE...]
+  local list="$1" allow="$2" m="$1.mirror" out="$1.guarded" x rc n kept
   shift 2
+  GUARD_LEFT_OUT=0
+  case "$list" in /*) ;; *) return 1 ;; esac
+  local ex=(--exclude-from "$EXCLUDES")
+  for x in "$@"; do ex+=(--exclude-from "$x"); done
+  rm -rf -- "$m" "$out" "$list.sane" "$list.dirs" "$list.kept" || return 1
+  awk 'length($0) == 0 || /^\// || /\/\// || /(^|\/)\.\.?(\/|$)/ {next} {print}' "$list" > "$list.sane" || return 1
+  if [ -n "$allow" ]; then
+    awk -v A="$allow" 'BEGIN {while ((getline l < A) > 0) {split(l, f, "\t"); a[f[1]] = 1}} ($0 in a)' "$list.sane" \
+      > "$list.sane.tmp" && mv "$list.sane.tmp" "$list.sane" || return 1
+  fi
+  : > "$out" || return 1
+  if [ -s "$list.sane" ]; then
+    mkdir -m 700 "$m" || return 1
+    awk 'match($0, /.*\//) {print substr($0, 1, RLENGTH - 1)}' "$list.sane" | LC_ALL=C sort -u > "$list.dirs" || return 1
+    if [ -s "$list.dirs" ]; then (cd "$m" && tr '\n' '\0' < "$list.dirs" | xargs -0 mkdir -p --) || return 1; fi
+    (cd "$m" && tr '\n' '\0' < "$list.sane" | xargs -0 touch --) || return 1
+    TZ=UTC "$RCLONE" lsf -R --files-only --format p "${ex[@]}" --ignore-case -- "$m" </dev/null > "$list.kept" 2>> "$LOG"
+    rc=$?
+    rm -rf -- "$m" "$list.dirs"
+    [ $rc -eq 0 ] || return 1
+    awk -v K="$list.kept" 'BEGIN {while ((getline l < K) > 0) k[l] = 1} ($0 in k)' "$list.sane" > "$out" || return 1
+  fi
+  n=$(wc -l < "$list" | tr -d ' ') kept=$(wc -l < "$out" | tr -d ' ')
+  rm -f "$list.sane" "$list.kept"
+  printf '%s%s' "$n" "$kept" | grep -Eq '^[0-9]+$' || return 1
+  GUARD_LEFT_OUT=$(( n - kept ))
+  return 0
+}
+
+upload() { # upload LOCAL-PATH SRC-REL [extra rclone args] [--guard-allow FILE] [--guard-exclude FILE]...
+  local p="$1" rel="$2" dst list= allow= gx=() rest=()
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --guard-allow) allow="$2"; shift 2 ;;
+      --guard-exclude) gx+=("$2"); shift 2 ;;
+      --files-from-raw) list="$2"; shift 2 ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
   if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit "$TPSLIMIT" --transfers "$TRANSFERS" --checkers 4
     --checksum --retries 3 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE)
-  # A --files-from-raw copy must carry no other filter (rclone refuses the mix): its list was made with the
-  # credential excludes and the source filters (bulk_upload). Every other copy gets the credential excludes here.
-  case " $* " in *" --files-from-raw "*) ;; *) args+=(--exclude-from "$EXCLUDES" --ignore-case) ;; esac
-  args+=("$@")
+  # A plain copy gets the credential excludes here. A list copy cannot carry a filter (rclone refuses the mix), so it
+  # sends only LIST.guarded, which guard_list builds from LIST just before the copy runs.
+  if [ -n "$list" ]; then args+=(--files-from-raw "$list.guarded"); else args+=(--exclude-from "$EXCLUDES" --ignore-case); fi
+  args+=("${rest[@]+"${rest[@]}"}")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
   local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
@@ -465,6 +513,15 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
       ok=1; budget_hit=1; return
     fi ;;
   esac
+  if [ -n "$list" ]; then
+    if ! guard_list "$list" "$allow" "${gx[@]+"${gx[@]}"}"; then
+      rm -rf -- "$list.mirror" "$list.guarded" 2>/dev/null
+      say "cannot check the $rel upload list against the current excludes; nothing of it sent"
+      ok=1; hard_fail=1; return
+    fi
+    [ "$GUARD_LEFT_OUT" -eq 0 ] || say "$rel: $GUARD_LEFT_OUT file(s) left out of the upload by the current excludes or the list checks"
+    if [ ! -s "$list.guarded" ]; then copied=1; return; fi   # nothing of this list may be sent
+  fi
   while :; do
     if [ "$TIER" = bulk ] && ! lane_gate; then
       say "lane budget (${LANE_BUDGET}s) used up waiting for tier 1 before $rel; the next lane run continues"; ok=1; budget_hit=1; return
@@ -659,7 +716,8 @@ live_recheck() { # live_recheck STAGE-PATH SRC-REL
     sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/recheck" > "$st/recheck.chunk" || break
     n=$(wc -l < "$st/recheck.chunk" | tr -d ' ')
     ok0=$ok bh0=${budget_hit:-0} f0=$found p0=$primary hard_fail=0
-    upload "$snap" "$rel" --files-from-raw "$st/recheck.chunk" --no-traverse
+    # Only paths still in the current verified (this run's listing, made with the current excludes) may go again.
+    upload "$snap" "$rel" --files-from-raw "$st/recheck.chunk" --no-traverse --guard-allow "$st/verified"
     found=$f0 primary=$p0
     if [ "$copied" -eq 1 ]; then
       ok=$ok0 cur=$((cur + n)) RECHECK_LEFT=$((RECHECK_LEFT - n))
@@ -713,6 +771,12 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   while [ $# -gt 0 ] && [ "$1" != -- ]; do list_filters+=("$1"); shift; done
   [ $# -gt 0 ] && shift
   copy_args=("$@")
+  # The source's own exclude files go to the upload guard too, so a chunk is checked against them as they are now.
+  local i=0 guard_ex=()
+  while [ $i -lt ${#list_filters[@]} ]; do
+    [ "${list_filters[$i]}" = --exclude-from ] && guard_ex+=(--guard-exclude "${list_filters[$((i + 1))]}")
+    i=$((i + 1))
+  done
   st="$BULK_STATE/$(bulk_key "$rel")"
   mkdir -p "$st" && chmod 700 "$BULK_STATE" "$st" || { say "cannot create bulk state for $rel"; ok=1; hard_fail=1; return 1; }
   # A checkpoint belongs to one destination: another remote or host starts over.
@@ -783,7 +847,8 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     if [ "$dropped" -gt 0 ]; then note_refused "$rel" "$dropped" "left out of the chunk, refused"; fi
     mv "$st/chunk.paths.tmp" "$st/chunk.paths" || { say "cannot filter the $rel chunk"; ok=1; hard_fail=1; return 1; }
     if [ -s "$st/chunk.paths" ]; then
-      upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+      upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse \
+        "${guard_ex[@]+"${guard_ex[@]}"}"
     else
       copied=1 yielded=0   # nothing left in this chunk to send
     fi
@@ -908,12 +973,18 @@ for src in "${LIVE[@]}"; do
 done
 # The weekly re-check (goodqa#16660 F2) only runs after every tree had its turn, and only for trees with nothing fresh
 # left pending, so new transcripts always go first.
-RESERVE=0 RECHECK_LEFT=$RECHECK_FILES
+# Gate F3: in a run that also copies tier 2, the re-check leaves that tier one slice when it is due, and a rate limit hit
+# by the re-check is still recorded (marker and log) without making this run skip the bulk sources it is due to copy.
+RESERVE=0 RECHECK_LEFT=$RECHECK_FILES recheck_throttle=
+[ "$TIER" = all ] && bulk_due && RESERVE=$(( MIN_SLICE + DEADLINE_GRACE + KILL_GRACE ))
+t0=$throttled ts0=$throttle_src
 for src in "${LIVE[@]}"; do
   case " ${TREES[*]} " in *" $src "*) ;; *) continue ;; esac
   key=$(live_key "$src"); p="PEND_$key"
   [ "${!p:-unknown}" = 0 ] && [ -d "$STAGE/$src" ] && live_recheck "$STAGE/$src" "$src"
 done
+if [ "$throttled" = 1 ] && [ "$t0" != 1 ]; then recheck_throttle=$throttle_src throttled=$t0 throttle_src=$ts0; fi
+RESERVE=0
 live_summary
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
@@ -1001,6 +1072,12 @@ fi
 if [ $bulk_ok -eq 0 ] && [ $bulk_ran -eq 1 ]; then
   echo "$STARTED" > "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" "$LOGDIR/log-backup.bulk-last-ok"
+fi
+if [ "$throttled" != 1 ] && [ -n "${recheck_throttle:-}" ]; then
+  # Only the re-check hit the rate limit: the bulk sources still ran, but the marker shows the account was throttled.
+  echo "$STARTED stopped at $recheck_throttle" > "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" \
+    && mv "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" "$LOGDIR/log-backup${TAG}.throttled"
+  say "the weekly re-check stopped early on the Dropbox write rate limit (log-backup${TAG}.throttled); it resumes next run"
 fi
 if [ "$throttled" = 1 ]; then
   # Read by log_backup.py status and the backup alert: the run ended early on the rate limit, not on a hang.

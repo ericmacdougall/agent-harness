@@ -29,14 +29,27 @@ if argv and argv[0] == "listremotes":
     print(os.environ.get("FAKE_REMOTES", "lessons-dropbox: dropbox"))
     sys.exit(0)
 if argv and argv[0] == "lsf":  # the bulk checkpoint lists a local source once per pass
-    if os.environ.get("FAKE_DELEGATE"):
+    then = os.environ.get("FAKE_LSF_THEN")   # "SUFFIX|PATTERN|FILE": after listing a root ending SUFFIX, exclude PATTERN
+    if os.environ.get("FAKE_DELEGATE") and not then:
         os.execv(os.environ["FAKE_DELEGATE"], [os.environ["FAKE_DELEGATE"]] + argv)
+    if os.environ.get("FAKE_DELEGATE"):
+        import subprocess
+        rc = subprocess.run([os.environ["FAKE_DELEGATE"]] + argv).returncode
+        suffix, pattern, target = then.split("|")
+        if argv[-1].rstrip("/").endswith(suffix):
+            with open(target, "a") as h:
+                h.write(pattern + "\\n")
+        sys.exit(rc)
     root = argv[-1]
+    paths_only = "--format" in argv and argv[argv.index("--format") + 1] == "p"   # the upload guard's mirror listing
     for d, _, fs in sorted(os.walk(root)):
         for f in sorted(fs):
             full = os.path.join(d, f)
             st = os.stat(full)
-            print("%%s\t%%d\t%%d" %% (os.path.relpath(full, root), st.st_size, int(st.st_mtime)))
+            if paths_only:
+                print(os.path.relpath(full, root))
+            else:
+                print("%%s\t%%d\t%%d" %% (os.path.relpath(full, root), st.st_size, int(st.st_mtime)))
     sys.exit(0)
 if argv and argv[0] == "copy":
     time.sleep(float(os.environ.get("FAKE_COPY_SLEEP", "0")))
@@ -212,6 +225,13 @@ class Case(unittest.TestCase):
         done = subprocess.run(["/bin/bash", str(script)], env=self.env(**extra), cwd=str(self.tmp),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
         self.assertEqual(self.canary.read_text(), "alive")
+        # Guard test over every run in this suite (gate F2): a list copy may only ever send the list that guard_list
+        # built just before it (LIST.guarded). A new upload path that hands rclone its own list fails here.
+        for call in self.recorded():
+            argv = call["argv"]
+            if argv and argv[0] == "copy" and "--files-from-raw" in argv:
+                self.assertTrue(argv[argv.index("--files-from-raw") + 1].endswith(".guarded"),
+                                "a list copy bypassed the upload guard: %r" % argv)
         return done
 
     def local_run(self, **extra):
@@ -960,7 +980,8 @@ class Failure(Case):
             self.assertNotIn("--min-age", argv)  # live sources are snapshots; a bulk chunk carries no filter flags
             tree = any(argv[-2].endswith(t) for t in (".claude/projects", ".claude/wals", ".codex/sessions"))
             self.assertEqual("--files-from-raw" in argv, (not live) or tree, argv)
-        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
+        # The upload guard's listing of its private mirror (gate F2) checks names, not ages: it is not a source listing.
+        lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf" and not c["argv"][-1].endswith(".mirror")]
         static = [a for a in lists if not a[-1].startswith(str(stage))]
         self.assertTrue(static and len(static) < len(lists), lists)   # tier-1 trees list their stage too
         for argv in static:
@@ -2329,6 +2350,123 @@ class TierOneCheckpoint(Case):
         self.tier1_runs(1, 20, LOG_BACKUP_RECHECK_DAYS="0")
         self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=[1-9]")
         self.assertNotIn(".claude/wals: re-check", log.read_text(), "fresh WALs come before any re-check")
+
+    # --- gate 2e2d0b7 (receipt run 17dedfaa): F1 untested re-check branches, F2 lists that bypass the excludes, F3 ---
+
+    def real_lsf(self):
+        """Real rclone does the listings (it applies --exclude-from; the fake does not). Copies stay with the fake."""
+        if not REAL_RCLONE:
+            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":
+                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
+            self.skipTest("rclone not installed")
+        ex = self.tmp / "excludes"
+        if not ex.exists():
+            ex.write_text((ROOT / "harness" / "bin" / "log-backup.excludes").read_text())
+        return ex, dict(FAKE_DELEGATE=REAL_RCLONE, LOG_BACKUP_EXCLUDES=str(ex))
+
+    def log_text(self):
+        return (self.logs / "log-backup.log").read_text()
+
+    def test_neg_f2_an_exclude_added_during_a_re_check_pass_keeps_that_file_off_the_remote(self):
+        # The pass snapshots every verified path when it starts and runs over many runs. A credential pattern added
+        # mid-pass (and the leaked copy purged from Dropbox) must never be undone by the rest of the pass.
+        ex, real = self.real_lsf()
+        leak = ".claude/wals/s05/leak.jsonl"
+        self.put(leak, b"a line that turned out to hold a secret\n")
+        self.tier1_runs(4, 100000, **real)
+        on_remote = self.remote / "testhost" / leak
+        self.assertTrue(on_remote.exists())
+        self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", LOG_BACKUP_RECHECK_FILES="0", **real)
+        self.assertIn("s05/leak.jsonl", (self.logs / "log-backup.live.d" / "claude_wals" / "recheck").read_text(),
+                      "the open pass holds the path")
+        with open(ex, "a") as h:
+            h.write("leak.jsonl\n")
+        on_remote.unlink()
+        lost = self.remote / "testhost" / self.wals[3]
+        lost.unlink()
+        done = self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", **real)
+        self.assertEqual(done.returncode, 0, self.log_text()[-1500:])
+        self.assertIn(".claude/wals: re-check complete", self.log_text())
+        self.assertTrue(lost.exists(), "the rest of the pass still ran")
+        self.assertFalse(on_remote.exists(), "an excluded file went back to the remote")
+
+    def test_neg_f2_an_exclude_added_after_a_tree_was_listed_keeps_that_file_out_of_its_chunks(self):
+        # The exclude file is read again right before every list copy, not only when the list was made.
+        ex, real = self.real_lsf()
+        leak = ".claude/wals/s05/leak.jsonl"
+        self.put(leak, b"a line that turned out to hold a secret\n")
+        done = self.tier1_runs(1, 100000, FAKE_LSF_THEN=".claude/wals|leak.jsonl|%s" % ex, **real)
+        self.assertIn(self.wals[0], self.remote_files(), done.stderr)
+        self.assertNotIn(leak, self.remote_files(), "an excluded file reached the remote")
+        self.assertIn(".claude/wals: 1 file(s) left out of the upload by the current excludes", self.log_text())
+
+    def test_guard_only_upload_runs_rclone_copy_and_it_guards_every_list(self):
+        # Static half of the guard test; the dynamic half runs after every run_script (see Case.run_script).
+        text = SCRIPT.read_text()
+        body = text[text.index("\nupload() {"):]
+        body = body[:body.index("\n}\n")]
+        call = '"$RCLONE" "${args[@]}"'
+        self.assertEqual(text.count("args=(copy "), 1)
+        self.assertIn("args=(copy ", body)
+        self.assertEqual(text.count(call), 1, "rclone copy runs only from upload()")
+        self.assertIn(call, body)
+        self.assertLess(body.index("guard_list "), body.index(call), "the guard runs before the copy")
+        self.assertIn('--files-from-raw "$list.guarded"', body)
+        self.assertEqual(text.count("--files-from-raw \"$list.guarded\""), 1)
+        for line in text.splitlines():
+            self.assertNotRegex(line, r'"\$RCLONE"\s+copy\b', "a copy outside upload()")
+
+    def test_ac11_f1_a_re_check_chunk_that_fails_leaves_verified_and_is_sent_again_before_any_re_check(self):
+        self.tier1_runs(4, 100000)
+        verified = self.logs / "log-backup.live.d" / "claude_wals" / "verified"
+        names = lambda: {l.split("\t", 1)[0] for l in verified.read_text().splitlines()}
+        before = names()
+        self.assertIn("s04/main.jsonl", before)
+        done = self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", LOG_BACKUP_RETRIES="0",
+                               FAKE_FAIL_MATCH="claude_wals/recheck.chunk")
+        self.assertNotEqual(done.returncode, 0, "a re-check copy that really failed fails the run")
+        self.assertIn(".claude/wals: a re-check chunk of", self.log_text())
+        self.assertEqual(names() & before, set(), "the failed chunk's files left verified")
+        # They are pending again: a run too short to send them all re-checks nothing in that tree.
+        (self.logs / "log-backup.log").write_text("")
+        self.tier1_runs(1, 12, LOG_BACKUP_RECHECK_DAYS="0")
+        self.assertRegex((self.logs / "log-backup.sources").read_text(), r"(?m)^\.claude/wals pending=[1-9]")
+        self.assertNotIn(".claude/wals: re-check", self.log_text())
+        checked = Path(str(self.calls) + ".checked")
+        checked.write_text("")
+        done = self.tier1_runs(3, 100000)
+        self.assertEqual(done.returncode, 0, self.log_text()[-1500:])
+        self.assertEqual(names(), before, "every dropped file was sent again and verified")
+        self.assertTrue(self.last_ok().exists())
+
+    def test_ac12_f1_a_re_check_chunk_cut_short_keeps_last_ok_and_the_pass_resumes(self):
+        self.tier1_runs(4, 100000)
+        st = self.logs / "log-backup.live.d" / "claude_wals"
+        self.last_ok().unlink()
+        done = self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", FAKE_EXIT="10",
+                               FAKE_EXIT_MATCH=str(st / "recheck.chunk.guarded"))
+        self.assertEqual(done.returncode, 0, self.log_text()[-1500:])
+        self.assertIn("budget reached for .claude/wals (rclone exit 10)", self.log_text())
+        self.assertTrue(self.last_ok().exists(), "a re-check cut short never withholds last-ok")
+        self.assertTrue((st / "recheck").exists(), "the pass stays open")
+        self.assertEqual((st / "recheck.cursor").read_text().strip(), "0", "and resumes where it stopped")
+        self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0")
+        self.assertIn(".claude/wals: re-check complete", self.log_text())
+        self.assertFalse((st / "recheck").exists())
+
+    def test_f3_gate_a_rate_limited_re_check_does_not_make_the_run_skip_the_bulk_tier(self):
+        self.tier1_runs(4, 100000)
+        self.calls.write_text("")
+        self.put(".codex/archived_sessions/new.jsonl", b"archived later\n")   # the bulk tier has something to send
+        self.tier1_runs(1, 100000, LOG_BACKUP_RECHECK_DAYS="0", LOG_BACKUP_BULK_EVERY_SECONDS="0", LOG_BACKUP_RETRIES="0",
+                        FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                        FAKE_NOTE_MATCH="recheck.chunk", FAKE_EXIT_AFTER_NOTE="1")
+        log = self.log_text()
+        self.assertIn("the weekly re-check stopped early on the Dropbox write rate limit", log)
+        self.assertRegex((self.logs / "log-backup.throttled").read_text(), r"stopped at \.(claude|codex)/")
+        self.assertTrue(any(self.is_bulk(a) for a in self.copies()), "the bulk tier still copied")
+        self.assertNotIn("skipped .codex/archived_sessions", log)
+        self.assertTrue(self.last_ok().exists())
 
     def test_neg_tier1_checkpoint_state_is_its_own(self):
         # The lane owns log-backup.bulk.d; tier 1 must never write into it (two writers on one checkpoint).
