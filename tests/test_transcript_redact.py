@@ -306,10 +306,27 @@ class TextShapes(unittest.TestCase):
             with self.subTest(text=text[:12]):
                 out, _, _ = run({"t": text})
                 self.assertFalse(leaks(out, F, "R" * 100, "Q" * 100))
-        # The invariant itself (pass 2 would also catch the end-to-end shape above): a span cut at its limit inside
-        # a run reaches the end of the run.
-        text = "x password: " + value
-        self.assertEqual([end for _, end, kind in tr._keyword_spans(text) if kind == "named-credential"], [len(text)])
+        # The invariant itself (pass 2 would also catch the end-to-end shape above): no keyword span ends strictly
+        # inside a run, so the collapse that follows never leaves a tail.
+        for text in ("x password: " + value, "Bearer " + value, "Authorization: Basic " + value):
+            runs = tr._base64_spans(text)
+            self.assertTrue(runs)
+            for _, end, kind in tr._keyword_spans(text):
+                self.assertFalse(any(rs < end < re for rs, re, _ in runs), kind)
+
+    def test_secret_shapes_inside_a_base64_run_keep_the_omitted_marker(self):
+        """Throughput run at 7a7408ff: random image data contains vendor shapes (AIza..., ghp_...). Scanning the
+        runs uncollapsed omitted whole image records (pass 2) and split runs (pass 1). A shape wholly inside a run
+        is left to the collapse: the record keeps its exact OMITTED marker."""
+        head = base64.b64encode(bytes(range(256)) * 400).decode()
+        for inner in ("AIza" + "B" * 35, "ghp_" + "c" * 36, "xoxb-" + "1" * 20, "eyJhbGciOiJIUzI1NiJ9"):
+            blob = head[:50000] + inner + head[50000:100000]
+            with self.subTest(inner=inner[:5]):
+                out, counts, omitted = run({"image": {"data": blob}, "text": "screenshot"})
+                self.assertIsNone(omitted)
+                sha12 = hashlib.sha256(blob.encode()).hexdigest()[:12]
+                self.assertEqual(json.loads(out)["image"]["data"], "[OMITTED:base64:%d:%s]" % (len(blob), sha12))
+                self.assertEqual(counts, {"base64": 1})
 
     def test_long_run_before_a_key_word_is_still_omitted(self):
         """The fix keeps the omission: the run itself is never archived, whatever follows it."""

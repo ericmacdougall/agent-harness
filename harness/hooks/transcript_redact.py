@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.23-3"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.23-4"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2; read only by _decode_nested
 _MAX_QUOTED_LAYERS = 64  # at the limit, quoted JSON-string layers unwrapped while looking for an object or array
@@ -383,7 +383,8 @@ def _base64_spans(text):
 
 def _keyword_spans(text):
     """_find_spans, with every span that ends inside a long run extended to the run's end: the keyword rules run
-    before the run is collapsed, so a value cut at its rule's length limit leaves no tail of the run behind."""
+    before the run is collapsed, so a value cut at its rule's length limit leaves no tail of the run behind. A span
+    wholly inside one run is dropped: the collapse removes it whole, and random image data holds vendor shapes."""
     spans = _find_spans(text)
     runs = _base64_spans(text) if spans else []
     if not runs:
@@ -394,8 +395,28 @@ def _keyword_spans(text):
         i = bisect.bisect_right(starts, end - 1) - 1
         if i >= 0 and runs[i][0] < end < runs[i][1]:
             end = runs[i][1]
+        if i >= 0 and runs[i][0] <= start and end <= runs[i][1]:
+            continue
         out.append((start, end, kind))
     return out
+
+
+_RUN_TAIL = 128  # what pass 2 sees of each run before the collapse: the end, where a key word can be glued on
+
+
+def _pass2_view(text, runs):
+    """text with each run's interior collapsed but its last _RUN_TAIL characters kept, for the pass 2 check. A key
+    word that ends a run (b..._pass<LF>word=V) is still seen; shapes inside random image data are not."""
+    out = []
+    cursor = 0
+    for start, end, _ in runs:
+        cut = max(start, end - _RUN_TAIL)
+        out.append(text[cursor:start])
+        out.append('[OMITTED:base64]')
+        out.append(text[cut:end])
+        cursor = end
+    out.append(text[cursor:])
+    return ''.join(out)
 
 
 def _normalize1(text):
@@ -428,7 +449,7 @@ def _redact_text(text, counts):
     runs = _base64_spans(text)
     if runs:
         hits = []
-        _v2_scan(text, hits, 0, decode=False)  # pass 2 over the text before its runs are collapsed
+        _v2_scan(_pass2_view(text, runs), hits, 0, decode=False)  # pass 2 before the runs are collapsed
         if hits:
             raise _Omit(hits[0])
         text = _apply(text, runs, counts)
