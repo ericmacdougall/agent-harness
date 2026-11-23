@@ -62,6 +62,55 @@ class PrescannedListingTests(Base):
         tail = ws.read_tail(self.dir / "main.jsonl", 10_000_000, chain=listing)
         self.assertEqual([json.loads(x)["n"] for x in tail.splitlines()], list(range(70)))
 
+    def scandirs(self):
+        calls = []
+        real = os.scandir
+        return calls, patch.object(ws.os, "scandir", lambda *a, **k: (calls.append(a), real(*a, **k))[1])
+
+    def test_a_listing_with_no_live_file_is_not_trusted_when_the_read_finds_none_either(self):  # #332 gate F1
+        d = self.dir
+        seg1 = line(rec(0)) + line(rec(1))
+        (d / "main.0001.jsonl").write_bytes(seg1)
+        seg2 = ws._marker("main", 2, "main.0001.jsonl", len(seg1), 2, hashlib.sha256(seg1).hexdigest()) + line(rec(2))
+        (d / "main.0002.jsonl").write_bytes(seg2)
+        listing = ws.list_wals(d)["main"]  # live file missing: segments 1 and 2 only
+        self.assertIsNone(listing.live)
+        m3 = ws._marker("main", 3, "main.0002.jsonl", len(seg2), 3, hashlib.sha256(seg2).hexdigest())
+        (d / "main.0003.jsonl").write_bytes(m3 + line(rec(3)))  # a later rotation completed and crashed again: still no live file
+        got = [json.loads(r)["n"] for _, _, r in ws.iter_lines(d / "main.jsonl", chain=listing)]
+        self.assertEqual(got, [0, 1, 2, 3], "a stale listing hid segment 3")
+
+    def test_a_listing_is_not_adopted_through_a_hard_link_to_the_live_file(self):  # #332 gate F1: the unreachable branch
+        self.fill(30)
+        live = self.dir / "main.jsonl"
+        os.link(live, self.dir / "main.0099.jsonl")  # a "closed segment" that is the live inode
+        aside = self.dir / "live.aside"
+        os.rename(live, aside)
+        listing = ws.list_wals(self.dir)["main"]  # live missing; segment 99 shares the inode of the file we will open
+        os.rename(aside, live)
+        calls, spy = self.scandirs()
+        with spy:
+            list(ws.iter_lines(live, chain=listing))
+        self.assertTrue(calls, "the listing must be ignored (the directory rescanned): it does not name this live file")
+
+    def test_a_valid_listing_is_still_adopted_without_a_rescan(self):
+        self.fill(30)
+        listing = ws.list_wals(self.dir)["main"]
+        calls, spy = self.scandirs()
+        with spy:
+            list(ws.iter_lines(self.dir / "main.jsonl", chain=listing))
+        self.assertEqual(calls, [])
+
+    def test_the_tail_rule_applies_to_a_pre_scanned_listing(self):  # moved here from #327: chain= exists on this branch
+        self.fill(40)
+        segs = self.closed()
+        os.rename(self.dir / segs[-1], self.dir / (segs[-1] + ".aside"))
+        listing = ws.list_wals(self.dir)["main"]
+        with ws.Snapshot(self.dir / "main.jsonl", chain=listing) as snap:
+            list(snap.lines())
+            self.assertIn("tail_missing", [p["code"] for p in snap.problems])
+            self.assertFalse(snap.complete)
+
     def test_a_listing_of_another_wal_or_directory_is_ignored(self):
         self.fill(20)
         for i in range(5):
@@ -119,6 +168,20 @@ class LatencyTests(Base):
     """2,300 WALs in one directory (the shape that made ah_export._read take 6.97 s and cold `ah owners` 8.0 s)."""
 
     N = 2300
+
+    def test_wall_clock_assertions_are_opt_in(self):  # #332 gate F5: no timing assertion in a default unit test run
+        import ast as _ast
+        tree = _ast.parse(Path(__file__).read_text())
+        fn = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)
+                  and n.name == "test_prescanned_listing_keeps_the_cost_near_a_plain_read")
+        guarded, unguarded = 0, 0
+        for node in _ast.walk(fn):
+            if isinstance(node, _ast.Call) and getattr(node.func, "attr", "") == "assertLess":
+                inside = any(isinstance(p, _ast.If) and "HARNESS_WAL_LATENCY" in _ast.dump(p.test)
+                             for p in _ast.walk(fn) if node in list(_ast.walk(p)))
+                guarded, unguarded = guarded + inside, unguarded + (not inside)
+        self.assertEqual(unguarded, 0, "a wall-clock assertLess runs by default; guard it with HARNESS_WAL_LATENCY=1")
+        self.assertGreaterEqual(guarded, 2, "the opt-in timing assertions must still exist")
 
     def test_prescanned_listing_keeps_the_cost_near_a_plain_read(self):
         d = self.dir
@@ -220,6 +283,46 @@ class RecoverCliTests(Base):
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("marker_missing", out.stderr)
 
+    def test_recover_exits_1_and_creates_nothing_when_the_previous_segment_is_unreadable(self):  # #332 gate F2
+        d = self.home / ".claude/wals/unreadable"
+        d.mkdir(parents=True)
+        (d / "main.0001.jsonl").write_bytes(line(rec(0)))
+        (d / "elsewhere.tmp").write_bytes(line(rec(1)))
+        os.symlink(d / "elsewhere.tmp", d / "main.0002.jsonl")  # the newest closed segment is a symlink: never followed
+        out = self.cli("recover", str(d), "main", "--write")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertNotIn("recovered", out.stdout)
+        self.assertIn("marker", out.stderr)
+        self.assertFalse((d / "main.jsonl").exists(), "an empty, marker-less live file must not be left behind")
+
+    def test_recover_exits_1_and_creates_nothing_when_the_top_segment_is_ambiguous(self):  # #332 gate F2
+        d = self.home / ".claude/wals/ambiguous"
+        d.mkdir(parents=True)
+        for name in ("main.0001.jsonl", "main.0002.jsonl", "main.00002.jsonl"):
+            (d / name).write_bytes(line(rec(0)))
+        out = self.cli("recover", str(d), "main", "--write")
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertFalse((d / "main.jsonl").exists())
+
+    def test_recover_live_itself_refuses_a_backup_path_when_writing(self):  # #332 gate F3: the library call, not only the CLI
+        d = self.home / "backup2" / "copy"
+        self.crashed(d)
+        code, message = ws.recover_live(str(d), "main", write=True)
+        self.assertEqual(code, 1, message)
+        self.assertFalse((d / "main.jsonl").exists())
+        self.assertIn("wals", message)
+
+    def test_recover_and_the_live_missing_problem_name_the_same_repair_command(self):  # #332 (main): ops_watch and the CLI agree
+        d = self.home / ".claude/wals/samecmd"
+        self.crashed(d)
+        expected = f"wal_segments.py recover {d} main --write"
+        problem = [p for p in ws.chain(d, "main").problems if p["code"] == "live_missing"][0]
+        self.assertIn(expected, problem["message"])
+        dry = self.cli("recover", str(d), "main")
+        self.assertIn(expected, dry.stdout)
+        done = self.cli("recover", str(d), "main", "--write")
+        self.assertIn(expected, done.stdout)
+
     def test_recover_refuses_a_symlinked_directory(self):
         d = self.home / ".claude/wals/real"
         self.crashed(d)
@@ -275,6 +378,30 @@ class MissingModuleTests(unittest.TestCase):
         out, session = self.run_append(CODEX_WAL, ".agent-harness/codex-wals", switch=True)
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("wal_segments.py is missing", out.stderr)
+
+    def test_codex_hook_fails_closed_when_segment_files_exist(self):  # #332 gate F4
+        out, session = self.run_append(CODEX_WAL, ".agent-harness/codex-wals", segment_file=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("wal_segments.py is missing", out.stderr)
+        self.assertFalse((session / "main.jsonl").exists(), "nothing was appended")
+
+    def test_require_segments_scans_the_pinned_directory_fd_not_the_path(self):  # #332 gate F4
+        import importlib.util
+        d = self.home / "pinned"
+        d.mkdir()
+        (d / "main.0001.jsonl").write_text("{}\n")
+        with patch.dict(os.environ, {"HOME": str(self.home)}):
+            for src, name in ((CLAUDE_WAL, "wal_claude_pin"), (CODEX_WAL, "wal_codex_pin")):
+                spec = importlib.util.spec_from_file_location(name, src)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.wal_segments = None  # the module is "missing"
+                fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaises(mod.WalSegmentsMissing, msg=name):
+                        mod.require_segments(self.home / "does-not-exist", dir_fd=fd)  # the path is bogus: only the fd can know
+                finally:
+                    os.close(fd)
 
     def test_the_gate_helper_is_public_for_readers_and_gates(self):
         sys.path.insert(0, str(HOOKS))
