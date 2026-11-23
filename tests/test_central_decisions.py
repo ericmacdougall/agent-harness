@@ -459,6 +459,33 @@ class TierGateAcceptsCentral(Base):
                                              source='user:%s/%s "%s"' % (SESSION, UID, sentence))))
         self.assertEqual(self.run_gate('k1')[0], 'deny')
 
+    def test_central_decision_does_not_lift_the_bash_rung_ceiling(self):  # NEG-19
+        self.fake.add(self.body(self.payload()))
+        real = cd.verify
+
+        def fake_verify(t, family, store=None, deadline_seconds=None, **kw):
+            return real(t, family, store=self.t2.store, client=self.fake)
+        ledger = esc.Ledger(self.root, self.policy)
+        with mock.patch.object(cd, 'Store', return_value=self.t2.store), mock.patch.object(cd, 'verify', side_effect=fake_verify):
+            decision, reason, _, facts = gate.decide_bash(
+                {'tool_name': 'Bash', 'tool_input': {'command': 'claude -p --model fable --task k1 x'}}, self.policy, ledger)
+        self.assertEqual(facts.get('central'), 'a' * 32, facts)  # the permission site did accept it
+        self.assertEqual(decision, 'deny')
+        self.assertIn('above task k1', reason)  # ...and the unchanged ceiling still denied the launch
+
+    def test_hook_consult_uses_the_short_deadline_and_fails_closed(self):  # NEG-20
+        seen = {}
+
+        def slow(t, family, store=None, deadline_seconds=None, **kw):
+            seen['deadline'] = deadline_seconds
+            raise cd.Denied('ledger_timeout', 'deadline exceeded')
+        with mock.patch.object(cd, 'Store', return_value=self.t2.store), mock.patch.object(cd, 'verify', side_effect=slow):
+            facts = {}
+            self.assertIsNone(gate.central_permission('k1', 'fable', facts))
+        self.assertEqual(seen['deadline'], cd.HOOK_DEADLINE)
+        self.assertLess(cd.HOOK_DEADLINE, 10)  # inside the tier_gate hook's 10 s timeout (onFailure block)
+        self.assertEqual(facts['central'], 'ledger_timeout')
+
 
 if __name__ == '__main__':
     unittest.main()
