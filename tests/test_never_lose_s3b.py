@@ -321,7 +321,7 @@ class CodexStopGate(Base):
         for name in ("wal.py",):
             (codex_home / name).write_bytes((ROOT / "codex" / "hooks" / name).read_bytes())
         for name in ("dropped_gate.py", "ah.py", "liveness.py", "safe_input.py", "redact.py", "provenance.py", "provenance_policy.json",
-                     "wal.py", "wal_note.py", "ticket_adapters.py"):
+                     "wal.py", "wal_segments.py", "wal_note.py", "ticket_adapters.py"):
             src = HOOKS / name
             if src.exists() and name != "wal.py":
                 (codex_home / name).write_bytes(src.read_bytes())

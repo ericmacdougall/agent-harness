@@ -141,8 +141,7 @@ def shrink_scan_size():
 
 
 def shrink_status_size():
-    real = ah._bounded
-    return mock.patch.object(ah, "_bounded", lambda path, limit=64 << 20: real(path, 8))
+    return mock.patch.object(ah, "WAL_STATUS_MAX", 8)
 
 
 class ProducerToCollector(unittest.TestCase):
@@ -212,8 +211,7 @@ class ProducerToCollector(unittest.TestCase):
         self.assertEqual((health.rows["asks"]["status"], health.rows["asks"]["truth"]), ("ok", "partial"))
 
     def test_producer_scan_timeout_and_oversize(self):
-        cases = [("requirements", "ah-requirements", shrink_scan_time), ("requirements", "ah-requirements", shrink_scan_size),
-                 ("status", "ah-status", shrink_status_size)]
+        cases = [("requirements", "ah-requirements", shrink_scan_time), ("requirements", "ah-requirements", shrink_scan_size)]
         for part, kind, shrink in cases:
             with self.subTest(part=part, limit=shrink.__name__, when="before any good read"):
                 home = Home(self)
@@ -229,6 +227,20 @@ class ProducerToCollector(unittest.TestCase):
                 with shrink():
                     ledger.run(1060.0)
                 self.assertEqual(part_of(hub, part), ("stale", 1))
+
+    def test_status_over_its_wal_budget_is_partial_never_current(self):
+        """goodqa#16751: `ah status` reads a WAL newest first inside WAL_STATUS_MAX and lists what it left out, so an
+        oversize WAL is a partial read (some of it is seen), not an unreadable one; it is never a current one."""
+        home = Home(self)
+        ledger, hub, _ = ledger_on(InProcess(home.home))
+        with shrink_status_size():
+            ledger.run(1000.0)
+        self.assertEqual(part_of(hub, "status")[0], "partial")
+        ledger.run(1060.0)
+        self.assertEqual(part_of(hub, "status"), ("current", 1))
+        with shrink_status_size():
+            ledger.run(1120.0)
+        self.assertEqual(part_of(hub, "status")[0], "partial")
 
     def test_asks_scan_timeout_and_oversize(self):
         for shrink in (shrink_scan_time, shrink_scan_size):

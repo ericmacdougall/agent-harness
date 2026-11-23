@@ -807,7 +807,7 @@ class IndexUpgrade(unittest.TestCase):
         with mock.patch.object(prov, "RECORD_RULE", "harness.wal-record/999"):
             calls = []
             real = ah.read_new_lines
-            with mock.patch.object(ah, "read_new_lines", side_effect=lambda path, meta: (calls.append(dict(meta)), real(path, meta))[1]):
+            with mock.patch.object(ah, "read_new_lines", side_effect=lambda path, meta, **kw: (calls.append(dict(meta)), real(path, meta, **kw))[1]):
                 ah.owners(home.home, SID)
         self.assertTrue(calls and all(not meta.get("offset") for meta in calls), calls)   # read from the start
 

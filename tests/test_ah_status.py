@@ -114,17 +114,15 @@ class StatusReport(unittest.TestCase):
 
     def test_a_wal_that_could_not_be_read_is_listed(self):
         # Review F9: an evidence report must say which WALs it did not read instead of skipping them silently.
-        jl(self.w / 'agent-big.jsonl', [{'at': iso(NOW - 100), 'event': 'status', 'note': 'big DEPLOYED'}])
-        real = ah._bounded
-
-        def bounded(path, *a, **k):
-            if Path(path).name == 'agent-big.jsonl':
-                raise OSError('too_large')
-            return real(path, *a, **k)
-        with mock.patch.object(ah, '_bounded', side_effect=bounded):
+        # goodqa#16751: a WAL over the budget is read from its END (the budget drops the oldest bytes, never the
+        # newest records) and listed as partly unread.
+        jl(self.w / 'agent-big.jsonl', [{'at': iso(NOW - 3000), 'event': 'status', 'note': 'old ' + 'x' * 20000},
+                                         {'at': iso(NOW - 100), 'event': 'blocker', 'note': 'newest BLOCKER survives the budget'}])
+        with mock.patch.object(ah, 'WAL_STATUS_MAX', 8192):
             r = self.report()
         self.assertEqual([u['wal'] for u in r['unread']], ['agent-big.jsonl'])
-        self.assertIn('too_large', r['unread'][0]['reason'])
+        self.assertIn('oldest records were not read', r['unread'][0]['reason'])
+        self.assertIn('newest BLOCKER survives the budget', json.dumps(r))
         self.assertIn('UNREAD SOURCES (1)', ah.status_text(r))  # PR 234 v11: an unread source need not be a WAL
         self.assertEqual(self.report()['unread'], [])
 
