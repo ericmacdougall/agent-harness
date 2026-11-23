@@ -2174,11 +2174,13 @@ def parse_args():
                              "without control characters")
             if args.wal is None:
                 parser.error("--transcripts-waiver requires --wal so the waiver is recorded")
+            # Decide before anything is written: a waiver that cannot be scanned is refused, never recorded unscanned.
             try:
                 import redact  # noqa: PLC0415 (sibling hook)
-                credential = redact.has_secret(waiver)
-            except ImportError:
-                credential = False
+                credential = bool(redact.has_secret(waiver))
+            except Exception:  # noqa: BLE001 - ImportError or a scanner fault: fail closed, no value in the message
+                parser.error("--transcripts-waiver could not be checked: the credential scan (redact.py) is "
+                             "unavailable; reinstall the harness hooks and retry")
             if credential:
                 parser.error("--transcripts-waiver appears to contain a credential; redact it first")
             args.transcripts_waiver = waiver

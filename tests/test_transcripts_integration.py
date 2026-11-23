@@ -313,6 +313,25 @@ class DeliverGate(Base):
                                                     "--wal", str(self.wal)]):
             self.assertEqual(self.deliver.parse_args().transcripts_waiver, "long enough reason here")
 
+    def test_waiver_refused_when_the_credential_scan_cannot_run(self):
+        """Gate F3 (PR #316): no scanner, or a scanner error, refuses the waiver; it never writes it unscanned."""
+        base = ["deliver.py", "prepare", "--task", "t", "--original", "/x", "--original-branch", "main",
+                "--transcripts-waiver", "long enough reason here", "--wal", str(self.wal)]
+
+        class Broken:
+            @staticmethod
+            def has_secret(_text):
+                raise RuntimeError("scanner broke")
+
+        for case, module in (("missing", None), ("raises", Broken)):
+            with self.subTest(case=case), mock.patch.dict(sys.modules, {"redact": module}), \
+                    mock.patch.object(sys, "argv", base), redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit):
+                self.deliver.parse_args()
+            self.assertIn("credential scan", err.getvalue())
+        with mock.patch.object(sys, "argv", base):  # the scanner is back: the same waiver passes
+            self.assertEqual(self.deliver.parse_args().transcripts_waiver, "long enough reason here")
+
     def test_prepare_runs_the_gate_before_publishing_and_skips_local_only(self):
         class Gate(Exception):
             pass
