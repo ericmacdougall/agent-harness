@@ -40,8 +40,12 @@ try:  # the shared segment writer ships beside this hook; only in a real repo ch
     _here = Path(__file__).resolve().parent
     sys.path.insert(0, str(_here))
     _repo_hooks = _here.parents[1] / "harness" / "hooks"
-    if (_here.parents[1] / ".git").exists() and (_repo_hooks / "wal_segments.py").is_file():
-        sys.path.append(str(_repo_hooks))  # never from a stray ~/harness/hooks next to an installed copy
+    # a real checkout: this file is <repo>/codex/hooks/wal.py, the repo has a .git and ships harness/hooks/wal_segments.py.
+    # A copy installed under ~/.codex/<dir>/ has parents[1] == ~ (which may itself be git-tracked): the layout test
+    # below rejects it, so a stray ~/harness/hooks/wal_segments.py is never imported.
+    if (_here == _here.parents[1] / "codex" / "hooks" and (_here.parents[1] / ".git").exists()
+            and (_repo_hooks / "wal_segments.py").is_file()):
+        sys.path.append(str(_repo_hooks))
     import wal_segments
 except ImportError:
     wal_segments = None
