@@ -1698,19 +1698,46 @@ once. Only the user brings it back: delete the file, or run `ah_enable_self_serv
 
 ```
 python3 -I ~/.claude/hooks/ah.py ops doctor [--host mac|t2-dev|all ...] [--ref SHA] [--json] [--strict-trust] [--probe [--file-ticket]]
-python3 -I ~/.claude/hooks/ah.py ops verify-parity [--host ...] [--ref SHA] [--json] [--strict-trust]
+python3 -I ~/.claude/hooks/ah.py ops verify-parity [--host ...] [--json]
 ```
 
-Both are read only. `verify-parity` is the terse exit-code form; `doctor` adds `--probe`.
+Both are read only. `doctor` is the human view: it may compare an older ancestor (`--ref`) and adds `--probe`.
+`verify-parity` is the gate form: tip of canonical main only (it has no `--ref`), and untrusted or changed Codex hooks
+also fail it. The enabler calls `ah_parity.verify_gate(pinned_sha)` (never `verify()` with a ref): it has no host
+argument and no free ref, checks every host, and compares the tip of canonical main unless `pinned_sha` is given. The
+only value the enabler may pass is the release SHA the user typed on the enabler's own command line (`--ref`); the
+enabler runs only from the user's terminal, and the SHA must be a full 40 hex ancestor of canonical main, so an
+agent-supplied or leftover ref has no path to the gate and a commit not on main is `UNKNOWN`. A report from a pinned
+run says `pinned: true`, and `ref_is_tip: false` when the pin is behind main. The doctor's own `--ref` stays a
+doctor-only comparison and is labelled "not the tip, never a gate result".
 
 1. **Canonical bytes.** It fetches canonical main (`https://github.com/ericmacdougall/agent-harness.git`) into a fresh
    temporary repository it owns, blobless, and reads tree entries only. `--ref` accepts a full 40 hex commit that is an
    ancestor of main and nothing else. A checkout the caller names is never used.
 2. **What is compared.** The git blob sha of every file in `harness/hooks/` that the commit's own `install.py` lists in
    `HOOKS` is compared with `~/.claude/hooks/`; every name in `install_codex.py` `DELIVERY_HELPERS` with
-   `~/.codex/agent-harness/`. Both lists are parsed with `ast`, never imported or run. A name that is absent, a symlink,
-   not a regular file or different bytes is drift. A host with no Codex install is not drift. Names the installers list
-   but the commit does not ship are reported as not shipped at this commit and ignored.
+   `~/.codex/agent-harness/`, plus the three files `install_codex.install()` writes there from elsewhere (the Codex
+   `wal.py` from `codex/hooks/`, `ops_watch.py`, and `watch-tests.py` from `harness/tools/`; pinned in
+   `CODEX_INSTALLED_ELSEWHERE` and by a contract test). Both lists are parsed with `ast`, never imported or run. A name that is absent, a symlink,
+   not a regular file or different bytes is drift. A host with no Codex install is not drift. A comparison that covered
+   nothing is never clean: a commit that ships no `harness/hooks/` files, an empty name list, or a listed name the
+   commit does not ship makes the result `UNKNOWN` (exit 3), and a host is `CLEAN` only when every listed name was
+   compared and matched.
+   What CLEAN covers beyond those bytes: (a) no importable file or package (`*.py`, `*.pyc`, `*.so`, a directory with
+   `__init__.py`, under an identifier name) in either hooks directory that the canonical tree does not ship, because
+   hook scripts run with their own directory first on `sys.path` and a planted `json.py` or `sitecustomize.py` would
+   load before any guard; the expected set is exactly what the real installers write, a contract test runs both
+   installers into a temp HOME and judges the result, and anything else is drift (on 2026-11-23 the Mac held
+   `native_pr_review.py`, `native_pr_dispatch.py` and `codex_pool.py`, which no installer writes: the gate refuses until
+   they are removed or shipped from canonical main); (b) each fail-closed guard
+   (`GUARD_REGISTRATIONS` in `ah_parity.py`: command guard, kill guard, merge gate, WAL prompt and pretool, tier gate,
+   commit policy, spec gate) is registered in `~/.claude/settings.json` with the installer's matcher, script path,
+   arguments and `onFailure: block`, and neither settings file sets `disableAllHooks`; (c) when Codex is installed,
+   `hooks.json` holds the command guard, kill guard, merge gate and commit policy commands. A contract test
+   (`tests/test_ah_parity.py::Contract`) compares the pinned table with what `install.py` and `install_codex.py` really
+   write, so a change to one fails CI until the other follows. Not read: project-level and managed Claude settings.
+   CLEAN is "installed bytes and user-level registrations match canonical", not proof that a given session runs every
+   guard.
 3. **Hosts.** The Mac locally. t2-dev through one constant command, `ssh -o BatchMode=yes -o ConnectTimeout=15 t2-dev
    python3 -I -`, with the module's own source on stdin and the name lists as JSON data; nothing the caller types is part
    of a shell line. An unreachable host, a failed ssh, or output that is not the expected JSON is `UNKNOWN`: never
@@ -1719,14 +1746,23 @@ Both are read only. `verify-parity` is the terse exit-code form; `doctor` adds `
    entries in `~/.codex/config.toml` it lists the hooks Codex will skip: no trust entry (`untrusted`) or a hash that no
    longer matches (`changed`). The doctor never writes `trusted_hash`; reviewing them with `/hooks` in Codex is the
    user's click (NEG-11).
-5. **Exit codes.** 0 every host CLEAN; 1 drift (or, with `--strict-trust`, untrusted hooks; or a probe limitation);
-   3 something unknown (no canonical bytes, a host unknown); 2 usage. The enabler calls `ah_parity.verify()` and refuses
-   unless `ok` is true (AC-11).
-6. **`--probe` (AC-14).** Runs `ah.py ops repair --check`, the one allow-listed recipe, in dry run exactly as a fresh
-   agent session would, and checks that `~/.claude/settings.json` holds an exact-prefix allow rule for `ah.py ops *`.
-   The result is `PASS`, or `LIMITATION` with the reason (rule missing, denied, recipe not installed, other exit) and a
-   ready P0 ticket body. A denial is a limitation, never something to retry by re-encoding or another route (hard rule
-   3); `--file-ticket` files the P0 ticket through `ah ticket create`.
+5. **Exit codes.** 0 every host CLEAN; 1 drift (or, with `--strict-trust` or on `verify-parity`, untrusted hooks; or a
+   probe limitation); 3 something unknown (no canonical bytes, a host unknown); 2 usage. The enabler calls
+   `ah_parity.verify_gate()` and refuses unless `ok` is true (AC-11, NEG-3); it never calls `verify()` with a ref.
+6. **`--probe` (AC-14).** Runs `ah.py ops doctor --host mac --json` as a subprocess: the one read-only allow-listed
+   recipe (it needs no argument and journals nothing; `ops repair --check` needs `--ref` and journals under
+   `~/.agent-harness/work/self-serve/`, so it is neither argument-free nor write-free). It first checks the user-level
+   settings (`settings.json` and `settings.local.json`): the allow rule must be exactly the one the enabler writes,
+   `Bash(python3 ~/.claude/hooks/ah.py ops *)` (a look-alike such as `Bash(echo ah.py ops *)`, a broader
+   `Bash(python3 *)` or a `-I` spelling does not count; a contract test pins the enabler's literal) and no `deny` or
+   `ask` rule may match the recipe command (a bare `Bash` deny does). The installed `ah.py` must be canonical, and the
+   recipe must print the doctor report (JSON with hosts, or the text header) with exit 0, 1 or 3; any other output is a
+   limitation.
+   The result is `PASS`, or `LIMITATION` with the reason (rule missing or shadowed, denied, recipe not installed, other
+   exit) and a ready P0 ticket body. What PASS proves is labelled `rule-present-and-recipe-runs`: a subprocess bypasses
+   the permission system, so the real fresh-session no-prompt run is the independent click-test's job. A denial is a
+   limitation, never something to retry by re-encoding or another route (hard rule 3); `--file-ticket` files the P0
+   ticket through `ah ticket create`.
 
 A drift report names the installed file. The fix is `repair-harness --apply --ref <canonical SHA>` (the user runs it the
 first time; `ah ops repair` once the policy is in force) or `ah install-files --rollback RUN_ID` for hook files.
