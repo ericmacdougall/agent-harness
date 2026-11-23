@@ -1209,6 +1209,149 @@ def scan_gate(args, source, head):
                             reason="SCAN_UNAVAILABLE", scan=lines[-1])
 
 
+# Transcript archive receipt (GoodQA #16650, spec AC-9 and NEG-10). prepare runs a bounded `pr` sync, then reads
+# `check --json`. The decision uses only the check's status and last_ok_at, never the sync's exit code: a network
+# failure during prepare refuses only when the last ok receipt is also over 24 h old.
+TRANSCRIPTS_SYNC_BUDGET = 90      # seconds the sync may spend on files (its own budget)
+TRANSCRIPTS_SYNC_TIMEOUT = 120    # hard limit; the process group is killed after it
+TRANSCRIPTS_CHECK_TIMEOUT = 30
+TRANSCRIPTS_MAX_OK_AGE = 24 * 3600
+TRANSCRIPTS_CLOCK_SKEW = 300      # a last_ok_at further in the future than this is not a receipt
+TRANSCRIPTS_WAIVER_LIMIT = 500
+TRANSCRIPTS_HINT = ("run `ah transcripts sync --checkpoint pr`, then `ah transcripts check`; when the archive cannot be "
+                    "reached, pass --transcripts-waiver \"<reason>\" with --wal (recorded in the WAL and raised as an "
+                    "ops alert)")
+
+
+def transcripts_tool():
+    override = os.environ.get("TRANSCRIPTS_BIN")
+    return Path(override) if override else Path(__file__).resolve().with_name("transcripts.py")
+
+
+def _transcripts_argv(script, *arguments):
+    return ([sys.executable, str(script)] if script.suffix == ".py" else [str(script)]) + list(arguments)
+
+
+def parse_utc(value):
+    """Epoch seconds of an ISO-8601 UTC time (a trailing Z accepted on every Python), else None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    from datetime import datetime, timezone  # noqa: PLC0415
+    text = value.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def transcripts_receipt(now=None):
+    """Run the pr sync and the check. Returns {status, last_ok_at, refuse, warnings, sync_failed}; never raises."""
+    now = time.time() if now is None else now
+    result = {"status": None, "last_ok_at": None, "refuse": None, "warnings": [], "sync_failed": False}
+    script = transcripts_tool()
+    if not script.is_file():
+        result["refuse"] = "transcripts.py is not installed beside deliver.py, so no archive receipt can exist"
+        return result
+    try:
+        code, _ = bounded(_transcripts_argv(script, "sync", "--checkpoint", "pr", "--budget-seconds",
+                                            str(TRANSCRIPTS_SYNC_BUDGET)), timeout=TRANSCRIPTS_SYNC_TIMEOUT)
+        if code:
+            result["sync_failed"] = True
+            result["warnings"].append(f"transcript sync failed (exit {code}); judging by the last receipt")
+    except (DeliveryError, OSError) as error:
+        result["sync_failed"] = True
+        what = ("timed out after %d s and was stopped" % TRANSCRIPTS_SYNC_TIMEOUT
+                if "timed out" in str(error) else "could not run (%s)" % type(error).__name__)
+        result["warnings"].append(f"transcript sync {what}; judging by the last receipt")
+    try:
+        _, output = bounded(_transcripts_argv(script, "check", "--json"), timeout=TRANSCRIPTS_CHECK_TIMEOUT)
+        data = json.loads(output)
+        if not isinstance(data, dict):
+            raise ValueError
+    except (DeliveryError, OSError, ValueError):
+        result["refuse"] = "`transcripts.py check --json` gave no readable receipt (timed out, failed or not JSON)"
+        return result
+    status = data.get("status") if isinstance(data.get("status"), str) else "unknown"
+    result.update(status=status[:40], last_ok_at=data.get("last_ok_at"))
+    reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
+    detail = "; ".join(str(r)[:120] for r in reasons[:3])
+    last = parse_utc(data.get("last_ok_at"))
+    if status == "never-ok" or last is None:
+        result["refuse"] = "this host has never had an ok transcript archive receipt"
+    elif last > now + TRANSCRIPTS_CLOCK_SKEW:
+        result["refuse"] = "the last ok transcript receipt is dated in the future; it cannot be trusted"
+    elif now - last > TRANSCRIPTS_MAX_OK_AGE:
+        result["refuse"] = "the last ok transcript archive receipt is %.0f h old (limit 24 h)" % ((now - last) / 3600)
+    elif status != "ok":
+        result["warnings"].append(f"transcript archive receipt is {status}" + (f" ({detail})" if detail else "")
+                                  + "; the last ok one is %.1f h old" % ((now - last) / 3600))
+    return result
+
+
+def _transcripts_alert(task, message, detail):
+    """Raise the waiver in the ops ring (a point event: ops_watch expires it). Returns False when it failed."""
+    try:
+        import ops_watch  # noqa: PLC0415 (sibling hook)
+        ops_watch.emit({"host": ops_watch.default_host(), "source": "deliver", "event": "raise", "severity": "high",
+                        "check": "transcripts", "key": "transcripts-waiver:" + re.sub(r"[^A-Za-z0-9_.-]", "_", task)[:64],
+                        "message": message[:300], "detail": detail})
+        return True
+    except Exception:  # noqa: BLE001 - reported to the operator below; the WAL row is the audit record
+        return False
+
+
+def transcripts_gate(args):
+    """The PR checkpoint: warn when the receipt is stale, held or capped; refuse without an ok receipt under 24 h,
+    unless an audited --transcripts-waiver is given (WAL decision row, which must be written, plus an ops alert)."""
+    verdict = transcripts_receipt()
+    wal = getattr(args, "wal", None)
+    task = str(getattr(args, "task", "") or "")[:120]
+    for warning in verdict["warnings"]:
+        print("deliver: transcripts: " + warning, file=sys.stderr)
+    if verdict["warnings"] and wal is not None and not verdict["refuse"]:
+        try:
+            wal_log.append(wal.expanduser().absolute(), {
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "event": "risk", "id": "w" + secrets.token_hex(6),
+                "note": f"deliver.py prepare for task {task}: transcript archive receipt not clean: "
+                        + "; ".join(verdict["warnings"])[:600]})
+        except (OSError, ValueError):
+            print("deliver: transcripts: the warning could not be written to the WAL", file=sys.stderr)
+    verdict["waived"] = False
+    if not verdict["refuse"]:
+        return verdict
+    waiver = getattr(args, "transcripts_waiver", None)
+    facts = {"reason": "TRANSCRIPTS_RECEIPT", "transcripts_status": verdict["status"],
+             "last_ok_at": verdict["last_ok_at"] if isinstance(verdict["last_ok_at"], str) else None}
+    if not waiver:
+        raise DeliveryError("BLOCKED_POLICY", "No ok transcript archive receipt under 24 h: " + verdict["refuse"],
+                            code=2, hint=TRANSCRIPTS_HINT, **facts)
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    record = {"at": at, "event": "decision", "id": "w" + secrets.token_hex(6),
+              "note": f"deliver.py prepare --transcripts-waiver for task {task}: proceeding without an ok transcript "
+                      f"receipt ({verdict['refuse']}); reason: {waiver}"[:4000],
+              "transcripts_waiver": {"at": at, "task": task, "reason": waiver, "status": verdict["status"],
+                                     "last_ok_at": facts["last_ok_at"], "refused_because": verdict["refuse"]}}
+    try:
+        if wal is None:
+            raise ValueError("no WAL")
+        wal_log.append(wal.expanduser().absolute(), record)
+    except (OSError, ValueError):
+        raise DeliveryError("BLOCKED_POLICY", "--transcripts-waiver could not be recorded in the WAL; nothing was done",
+                            code=2, hint="pass --wal <your session WAL under ~/.claude/wals>", **facts) from None
+    if not _transcripts_alert(task, f"transcript receipt waived for deliver prepare (task {task}): {verdict['refuse']}",
+                              {"task": task, "status": verdict["status"], "wal_row": record["id"]}):
+        print("deliver: transcripts: the waiver alert could not be raised in the ops ring; the WAL row "
+              + record["id"] + " is the record", file=sys.stderr)
+    print("deliver: transcripts: waiver recorded (WAL row %s): %s" % (record["id"], verdict["refuse"]), file=sys.stderr)
+    verdict["waived"] = True
+    return verdict
+
+
 @contextmanager
 def publication_attempt(flow, resume, url):
     """Contain known publishers; legacy absence never proves an old write failed."""
@@ -1287,6 +1430,8 @@ def prepare(args):
         if (not valid_identity_text(title) or not 1 <= len(title.strip()) <= 200
                 or any(ord(char) < 32 for char in title)):
             raise DeliveryError("BLOCKED_POLICY", "PR title is invalid", code=2)
+        # PR checkpoint (goodqa#16650): before the generation lock and before anything is published.
+        transcripts_gate(args)
     origin_error, repository, url = None, "", ""
     if not local_only:
         try:
@@ -1968,6 +2113,9 @@ def parse_args():
                            "warn is per run, needs --wal, and is recorded in the WAL, the generation and the output")
     prep.add_argument("--wal", type=Path, default=None,
                       help="Session WAL (~/.claude/wals/<session>/<name>.jsonl) that records a --target-policy warn run")
+    prep.add_argument("--transcripts-waiver", metavar="REASON", default=None,
+                      help="Proceed without an ok transcript archive receipt under 24 h (goodqa#16650); needs --wal "
+                           "and a 10+ character reason; written to the WAL as a decision row and raised as an ops alert")
     prep.add_argument("--new-generation", action="store_true", help="Supersede only a settled generation")
     prep.add_argument("--scan", choices=("trivy",), default=None,
                       help="Opt-in pinned Trivy vuln and misconfig scan of the reviewed HEAD before anything is published")
@@ -1993,6 +2141,21 @@ def parse_args():
     if args.phase == "finish" and not 1 <= args.check_timeout <= MAX_CHECK_TIMEOUT:
         parser.error(f"--check-timeout must be between 1 and {MAX_CHECK_TIMEOUT} seconds")
     if args.phase == "prepare":
+        if args.transcripts_waiver is not None:
+            waiver = args.transcripts_waiver.strip()
+            if not 10 <= len(waiver) <= TRANSCRIPTS_WAIVER_LIMIT or any(ord(char) < 32 or ord(char) == 127 for char in waiver):
+                parser.error(f"--transcripts-waiver needs a reason of 10 to {TRANSCRIPTS_WAIVER_LIMIT} characters "
+                             "without control characters")
+            if args.wal is None:
+                parser.error("--transcripts-waiver requires --wal so the waiver is recorded")
+            try:
+                import redact  # noqa: PLC0415 (sibling hook)
+                credential = redact.has_secret(waiver)
+            except ImportError:
+                credential = False
+            if credential:
+                parser.error("--transcripts-waiver appears to contain a credential; redact it first")
+            args.transcripts_waiver = waiver
         if args.resume_publication:
             if (not args.generation or args.kit_file is None or not args.expected_source_head
                     or not args.expected_original_head or args.reconcile_only or args.local_only or args.new_generation):

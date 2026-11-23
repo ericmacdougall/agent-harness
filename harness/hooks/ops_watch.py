@@ -101,10 +101,14 @@ def defaults(host: str) -> dict:
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
         "idle_guard": {"enabled": True, "idle_min": 30, "wal_root": "~/.claude/wals", "lookback_h": 12},
+        # goodqa#16650 AC-14: early warning before WAL rotation (phase 2 rotates at 50 MB)
+        "wal_size": {"enabled": True, "max_mib": 40, "roots": ["~/.claude/wals", "~/.agent-harness/codex-wals"],
+                     "max_alerts": 10, "max_files": 200000},
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
-        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
+        # transcripts-waiver: deliver.py prepare proceeded without a transcript archive receipt (goodqa#16650)
+        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:", "transcripts-waiver:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
         # goodqa#15771: read-only capacity watch of a Proxmox pool: [{"host", "storage", "mount", "watch_vms": [ids]}]
@@ -1972,6 +1976,47 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_wal_size(cfg, state, runner, now):
+    """goodqa#16650 AC-14: one high alert `wal:size:<digest>` per WAL file over wal_size.max_mib (40 MiB) under the
+    Claude and Codex WAL roots, largest first, at most max_alerts. lstat only: a symlinked file or directory is never
+    followed, so a link cannot point the watcher at another tree. Clears when the file shrinks, rotates or goes."""
+    wc = cfg.get("wal_size") or {}
+    limit = int(wc.get("max_mib", 40)) * 1024 * 1024
+    budget = int(wc.get("max_files", 200000))
+    found = []
+    for raw in wc.get("roots") or []:
+        root = Path(expand(home_of(cfg), raw))
+        try:
+            if root.is_symlink() or not root.is_dir():
+                continue
+        except OSError:
+            continue
+        for current, dirs, files in os.walk(root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(current, d)))
+            for name in files:
+                budget -= 1
+                if budget < 0:
+                    break
+                path = os.path.join(current, name)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_size > limit:
+                    found.append((st.st_size, path, root))
+            if budget < 0:
+                break
+    out = []
+    for size, path, root in sorted(found, reverse=True)[: int(wc.get("max_alerts", 10))]:
+        rel = os.path.relpath(path, root)
+        digest = hashlib.sha256(path.encode("utf-8", "replace")).hexdigest()[:12]
+        out.append(alert("wal_size", f"wal:size:{digest}", "high",
+                         f"WAL {root.name}/{rel} is {size / 1024 / 1024:.0f} MiB (over {limit // 1024 // 1024} MiB); "
+                         "it is copied to the transcript archive in chunks, but readers slow down: rotate or split it "
+                         "(never delete it)", {"path": path, "bytes": size}))
+    return out
+
+
 def check_idle_guard(cfg, state, runner, now):
     """goodqa#15943: one high alert idle-guard:<session8> per recent session whose main and owners made no progress for
     idle_min minutes while a stream holds a non-user next step (idle_guard.assess). The alert ends when progress
@@ -2195,6 +2240,7 @@ DEFAULT_CHECKS = {
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
     "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
     "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
+    "wal_size": lambda c, s, r, n: check_wal_size(c, s, r, n) if (c.get("wal_size") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers
