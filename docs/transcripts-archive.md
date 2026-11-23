@@ -62,7 +62,8 @@ transcripts.py incident --kind K [--shard R]
 - **backfill**: the same engine, resumable, at nice 10. It defers (exit 0, receipt status `deferred`) while the
   1-minute load average exceeds the core count. It never refreshes `last-ok.json` and never fails `check`.
 - **check** exit codes, in precedence order 3, then 2, then 1:
-  - `3` never-ok: there has never been an ok receipt.
+  - `3` never-ok: there has never been an ok receipt, or the last run was `unconfigured` (no source root exists,
+    or no transcript file was found under any root). An unconfigured host is never reported ok.
   - `2` failed: the last run failed, was refused (repo check), hit the omission cap or `disk-low`, or ran with the
     kill switch set. Also: a file is held, or there is backlog with no archived-byte progress in 24 h.
   - `1` stale: the last ok receipt is older than `--max-age-min`.
@@ -79,7 +80,10 @@ transcripts.py incident --kind K [--shard R]
   overwrites an existing file.
 - **verify** checks that every pushed chunk and sidecar is present in its shard tip with the expected git blob id.
   A changed blob means changed bytes, and this costs no blob download. It also counts orphans. Other modes:
-  - `--rehash` downloads generations whose `whole_sha256` is pending and fills it in.
+  - `--rehash` downloads generations whose `whole_sha256` is pending and fills it in. It is a prerequisite
+    for the `whole_sha256` check on any file over 256 MiB: such a file is archived over more than one visit, so
+    its `whole_sha256` stays pending (null) until `verify --rehash` runs. Run it before a live AC-4 recover of a
+    large file.
   - `--against-source` (weekly, from the scheduler) fully hashes each archived prefix against the sidecars'
     `src_sha256`, and schedules a new generation on any mismatch.
   - `--rescan --kind K` is the incident rescan; see the runbook below.
@@ -111,12 +115,17 @@ any of these holds:
 
 Old chunks are never touched. When in doubt, a duplicate generation is preferred over a skip.
 
+**Stale-head bound.** A mid-file rewrite that keeps the size, mtime and inode, and that misses every
+fingerprinted block, is not seen by the incremental scan. `verify --against-source` runs weekly from the
+scheduler and fully re-hashes every archived prefix against the sidecars' `src_sha256`, so such a rewrite is
+caught, and a new generation started, within 7 days.
+
 **Moves** (Codex moves sessions into `archived_sessions/`). A new path continues the old entry only when all of
 these hold:
 
 - the old path is absent;
 - the session id matches;
-- every archived source range of the new file hashes to the old chunks' `src_sha256`.
+- re-hashing the new file range by range, each archived byte range matches the old chunk's `src_sha256`.
 
 Otherwise the new path is archived as a new file.
 
@@ -152,7 +161,8 @@ into immutable chunks before the rules are tuned. The receipt status becomes `om
 stays held, and is skipped, until `RULESET_VERSION` changes; later runs are ok, and `check` exits 2 while the
 hold lasts.
 
-Note on small runs: the 0.5 % rule is literal, so a run of fewer than 200 records fails on a single omission.
+The run-level 0.5 % rule applies only when the run processed 1000 or more records. The per-file 5 % rule
+applies only to files with 100 or more records in the run.
 
 ### Failures and holds
 
@@ -314,14 +324,19 @@ The sync refuses new work while free disk space is under `min_free_gb`: 12 by de
 
 ## Incident runbook (secret found after push, AC-15)
 
-1. **Contain.** Run `ah transcripts incident --kind K [--shard R]` on every host. The kill switch is host-wide: it
-   stops every push on that host, shards and catalog alike, raises an alert, and `check` exits 2.
+1. **Contain.** Run `ah transcripts incident --kind K [--shard R]` on any host. It sets the host-wide local kill
+   switch, which stops every push on that host (shards and catalog), raises an alert and makes `check` exit 2.
+   It also pushes `incident/K.json` (`cleared: false`) to the catalog. Every host's publisher reads the
+   catalog's `incident/` files before it pushes, and refuses while any of them is not cleared (status
+   `killswitch`). An incident raised on one host therefore stops all hosts. If the catalog push fails, the
+   command exits 2 and the local kill switch still holds.
 2. **Rotate the credential first.** Assume it is compromised the moment it was pushed.
 3. **Patch the rules.** Fix `transcript_redact.py` so pass 2 detects kind K, then bump `RULESET_VERSION`. Staged
    chunks under the old ruleset are then re-redacted from source automatically.
 4. **Rescan.** Run `ah transcripts verify --rescan --kind K` on every host. It scans every shard listed in the
    catalog's ledgers for every host, plus the local ledger. Findings name the repo, path, line and kind, never the
-   value. The kill switch is cleared only by a clean rescan for its kind.
+   value. Only a clean rescan for kind K clears the local kill switch and rewrites the catalog's
+   `incident/K.json` with `cleared: true`, which lets every host push again.
 5. **Remove the bad record (only with the user's sourced OK).** Deleting a repo is a permanent deletion and needs
    the user's explicit approval in chat. With that approval:
    - delete and recreate shard R from local state minus the bad record;

@@ -279,6 +279,8 @@ class IncrementalTests(L.Base):
         self.assertEqual(len(old), 1)
         self.assertEqual(len(new), 1)
         self.assertIn('.p00002.', new[0])
+        # range by range continuation: the moved file's first chunk range was matched, never re-pushed
+        self.assertEqual(self.sidecar(new[0])['src_range'][0], self.sidecar(old[0])['src_range'][1])
         self.assertEqual(self.chunk_bytes(old[0]) + self.chunk_bytes(new[0]), dst.read_bytes())
         st = self.state()
         self.assertIn('codex-archived/' + os.path.basename(rel), st['files'])
@@ -350,6 +352,15 @@ class RedactionGateTests(L.Base):
         self.assertEqual(code, 3)  # never-ok outranks failed
         self.assertIn('omission-cap', out)
 
+    def test_omission_cap_run_rule_needs_1000_records(self):
+        L.IdentityRedact.omit_marker = b'OMITME'
+        data = b''.join(rec(i, text='OMITME' if i in (10, 200) else None) for i in range(300))  # 0.67 %, 300 records
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, data)
+        code, r = self.sync('pr')
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['omitted']['total'], 2)
+        self.assertEqual(len(self.chunks()), 1)
+
     def test_omission_cap_per_file(self):
         L.IdentityRedact.omit_marker = b'OMITME'
         bad = b''.join(rec(i, text='OMITME' if i < 6 else None) for i in range(100))
@@ -375,7 +386,8 @@ class RedactionGateTests(L.Base):
         """NEG-16: a corrupted staged chunk and an older-ruleset chunk are kept out and re-chunked."""
         self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(5))
         self.write('claude-projects', 'p/%s.jsonl' % UUID2, lines(5, start=5))
-        self.main('incident', '--kind', 'hold-for-test')
+        T.ensure_home(T.Cfg())
+        (self.home / 'killswitch.json').write_text('{"kind": "hold-for-test"}')  # local switch only
         self.sync('pr')  # stages, kill switch blocks the push
         staged = [os.path.join(dp, f) for dp, _, fs in os.walk(self.home / 'outbox') for f in fs if f.endswith('.zst')]
         self.assertEqual(len(staged), 2)
@@ -458,6 +470,22 @@ class RealGateMappingTests(L.Base):
         self.assertEqual(side['mentions']['commits'], ['ab' * 20])
         code, out = self.main('find', '--ticket', '16650')
         self.assertEqual(json.loads(out)['session'], UUID1)
+
+
+class RealGateNewlineTests(L.Base):
+    identity = False
+
+    def test_chunker_strips_newline_before_the_gate(self):
+        """redact_line gets each record WITHOUT its trailing newline: real JSONL never yields embedded-newline."""
+        body = b''.join((json.dumps({'type': 'user', 'timestamp': '2026-11-01T00:00:%02dZ' % i, 'sessionId': UUID1,
+                                     'message': {'content': 'line one\nline two %d' % i}},
+                                    separators=(',', ':')) + '\n').encode() for i in range(20))
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, body)
+        code, r = self.sync('pr')
+        self.assertEqual(code, 0, r)
+        self.assertEqual(r['omitted']['total'], 0)
+        self.assertNotIn(b'embedded-newline', b''.join(self.chunk_bytes(p) for p in self.chunks()))
+        self.assertIn(UUID1.encode(), self.chunk_bytes(next(iter(self.chunks()))))  # NEG-18 with 70060134
 
 
 class PublisherTests(L.Base):
@@ -735,8 +763,9 @@ class OperationsTests(L.Base):
         """AC-15: the host-wide kill switch stops every push (shards and catalog)."""
         p = self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
         self.sync('pr')
-        tips = {r: self.tip(r) for r in self.repos()}
         self.assertEqual(self.main('incident', '--kind', 'fakekind', '--shard', self.shard_repos()[0])[0], 0)
+        self.assertIn('incident/fakekind.json', self.tree(T.CATALOG))
+        tips = {r: self.tip(r) for r in self.repos()}
         with open(p, 'ab') as f:
             f.write(lines(3, start=3))
         code, r = self.sync('pr')
@@ -768,7 +797,45 @@ class OperationsTests(L.Base):
         code, out = self.main('verify', '--rescan', '--kind', 'canary')
         self.assertEqual(code, 0)
         self.assertTrue(json.loads(out)['killswitch_cleared'])
+        self.assertTrue(json.loads(out)['catalog_incident_cleared'])
         self.assertFalse((self.home / 'killswitch.json').exists())
+        inc = json.loads(self.blob(T.CATALOG, self.tree(T.CATALOG)['incident/canary.json']))
+        self.assertTrue(inc['cleared'])
+
+    def test_catalog_incident_from_host_a_stops_host_b(self):
+        """AC-15: incident/KIND.json in the catalog stops every host's publisher until a clean rescan clears it."""
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        self.sync('pr')
+        self.assertEqual(self.main('incident', '--kind', 'leak')[0], 0)
+        # host B: its own state dir, sources and host label, same remotes
+        b_src = Path(self.tmp) / 'srcb'
+        (b_src / 'p').mkdir(parents=True)
+        (b_src / 'p' / ('%s.jsonl' % UUID2)).write_bytes(lines(3, start=40))
+        b_env = {'TRANSCRIPTS_HOME': str(Path(self.tmp) / 'stateb'), 'TRANSCRIPTS_HOST': 'hostb',
+                 'TRANSCRIPTS_SOURCES': json.dumps({'claude-projects': str(b_src)})}
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=b_env)
+        self.assertEqual(code, 2, err[-300:])
+        rb = T.read_json(str(Path(self.tmp) / 'stateb' / 'receipts' / 'last.json'))
+        self.assertEqual(rb['status'], 'killswitch')
+        self.assertIn('leak', rb['error'])
+        self.assertFalse(any(p.startswith('hostb/') for p in self.chunks()))
+        code, out = self.main('verify', '--rescan', '--kind', 'leak')
+        self.assertEqual(code, 0)
+        code, out, err = self.cli('sync', '--checkpoint', 'pr', env=b_env)
+        self.assertEqual(code, 0, err[-300:] + out)
+        self.assertTrue(any(p.startswith('hostb/') for p in self.chunks()))
+
+    def test_unconfigured_is_never_ok(self):
+        code, r = self.sync('pr')  # roots exist but hold no transcripts
+        self.assertEqual(r['status'], 'unconfigured')
+        self.assertFalse(r['ok'])
+        code, out = self.main('check', '--json')
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(out)['status'], 'unconfigured')
+        self.setenv(TRANSCRIPTS_SOURCES=json.dumps({'claude-projects': str(Path(self.tmp) / 'absent')}))
+        code, r = self.sync('pr')
+        self.assertEqual(r['status'], 'unconfigured')
+        self.assertFalse((self.home / 'receipts' / 'last-ok.json').exists())
 
     def test_dry_run_writes_nothing(self):
         self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))

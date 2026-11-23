@@ -1324,7 +1324,7 @@ class Run:
         for key, (r, o) in self.file_counts.items():
             if r >= 100 and o * 100 > r * 5:
                 bad.add(key)
-        run_bad = total_r > 0 and total_o * 1000 > total_r * 5
+        run_bad = total_r >= 1000 and total_o * 1000 > total_r * 5  # run rule needs a 1000-record denominator
         if run_bad:
             bad |= {k for k, (r, o) in self.file_counts.items() if o}
         if not bad:
@@ -1424,14 +1424,22 @@ class Run:
                 repos.append(c['shard'])
         need_catalog = bool(todo) or bool(self.st.get('catalog_dirty')) or (
             self.st.get('catalog_commit') is None and any(c['status'] == 'pushed' for *_, c in self.all_chunks()))
+        if not todo and not need_catalog:
+            return
         try:
-            for repo in repos + ([CATALOG] if need_catalog else []):
+            for repo in repos + [CATALOG]:
                 self.remote.ensure(repo)
                 self.remote.check(repo)
         except Refused as ex:
             self.refused = str(ex)
             self.status = 'refused'
             alert(cfg, 'repo-check', str(ex))
+            return
+        kinds = open_incidents(cfg)
+        if kinds:
+            self.status = 'killswitch'
+            self.refused = 'catalog incident open kind=%s; pushes stop on every host' % ','.join(kinds)
+            alert(cfg, 'incident-open', self.refused)
             return
         for repo in repos:
             pending = [it for it in todo if it[3]['shard'] == repo]
@@ -1732,7 +1740,10 @@ def check(cfg, max_age_min=60):
     if lastok:
         t = parse_iso(lastok.get('finished_at'))
         age = (time.time() - t) / 60.0 if t else None
-    if not lastok or age is None:
+    if last and last.get('status') == 'unconfigured':
+        reasons.insert(0, 'unconfigured' + ((': ' + last['error']) if last.get('error') else ''))
+        code = 3
+    elif not lastok or age is None:
         reasons.insert(0, 'never-ok')
         code = 3
     elif age > max_age_min and code < 2:
@@ -1741,6 +1752,8 @@ def check(cfg, max_age_min=60):
     elif age > max_age_min:
         reasons.insert(0, 'stale age_min=%d' % int(age))
     status = {0: 'ok', 1: 'stale', 2: 'failed', 3: 'never-ok'}[code]
+    if code == 3 and last and last.get('status') == 'unconfigured':
+        status = 'unconfigured'
     return code, {'status': status, 'last_ok_at': lastok.get('finished_at') if lastok else None,
                   'age_min': round(age, 1) if age is not None else None, 'reasons': reasons, 'exit': code}
 
@@ -1808,9 +1821,18 @@ def sync_body(run, backfill):
     free_gb = shutil.disk_usage(cfg.home).free / 1e9
     if free_gb < cfg.min_free_gb:
         run.disk_low = 'disk-low free=%.1fGB floor=%.1fGB' % (free_gb, cfg.min_free_gb)
+    roots = [r for r in cfg.sources.values() if os.path.isdir(r) and not os.path.islink(r)]
+    if not roots:
+        run.status = 'unconfigured'
+        run.errors.append('unconfigured: no source root exists on this host')
+        return
     if run.disk_low is None:
         process_queue(run, backfill)
         run.enforce_omission_cap()
+        if run.files_scanned == 0 and not run.st['files']:
+            run.status = 'unconfigured'
+            run.errors.append('unconfigured: no transcript files found under any source root')
+            return
     run.publish()
     if run.disk_low and run.status == 'ok':
         run.status = 'disk-low'
@@ -2371,11 +2393,27 @@ def verify_rescan(cfg, kind):
             tr.close()
     ks = read_json(cfg.p('killswitch.json'))
     cleared = False
+    catalog_cleared = False
     if not findings and ks and (kind is None or ks.get('kind') == kind):
         os.unlink(cfg.p('killswitch.json'))
         cleared = True
+    ipath = incident_path(kind) if kind else None
+    if not findings and ipath and ipath in cat:
+        try:
+            rec = json.loads(cat[ipath])
+        except ValueError:
+            rec = {}
+        if not rec.get('cleared'):
+            rec.update({'cleared': True, 'cleared_at': now_iso(), 'cleared_by': cfg.host,
+                        'repos_scanned': len(repos), 'files_scanned': scanned})
+            remote = Remote(cfg)
+            remote.ensure(CATALOG)
+            remote.check(CATALOG)
+            publish_tree(cfg, CATALOG, {ipath: jdump(rec) + b'\n'}, 'incident %s cleared by clean rescan from %s'
+                         % (safe_comp(kind), cfg.host), overwrite=True)
+            catalog_cleared = True
     print(json.dumps({'rescan': True, 'kind': kind, 'repos': len(repos), 'files_scanned': scanned,
-                      'findings': findings, 'killswitch_cleared': cleared}))
+                      'findings': findings, 'killswitch_cleared': cleared, 'catalog_incident_cleared': catalog_cleared}))
     return 1 if findings else 0
 
 
@@ -2385,8 +2423,45 @@ def cmd_incident(cfg, a):
            'note': 'all pushes on this host are stopped; follow the runbook in docs/transcripts-archive.md'}
     atomic_write(cfg.p('killswitch.json'), jdump(rec) + b'\n')
     alert(cfg, 'incident', 'kill switch set kind=%s shard=%s; every push on this host is stopped' % (a.kind, a.shard))
+    # every host's publisher reads incident/KIND.json from the catalog before pushing, so all hosts stop
+    out = dict(rec, cleared=False, note='every host refuses pushes until a clean verify --rescan --kind clears this')
+    try:
+        remote = Remote(cfg)
+        remote.ensure(CATALOG)
+        remote.check(CATALOG)
+        publish_tree(cfg, CATALOG, {incident_path(a.kind): jdump(out) + b'\n'},
+                     'incident %s raised on %s' % (safe_comp(a.kind), cfg.host), overwrite=True)
+        rec['catalog'] = 'pushed'
+    except (Refused, GitError, OSError, subprocess.SubprocessError) as ex:
+        rec['catalog'] = 'failed'
+        alert(cfg, 'incident-catalog', 'incident file not pushed to the catalog (%s); the local kill switch is set'
+              % (str(ex)[:120] if isinstance(ex, (Refused, GitError)) else type(ex).__name__))
     print(json.dumps(rec))
-    return 0
+    return 0 if rec['catalog'] == 'pushed' else 2
+
+
+def incident_path(kind):
+    return 'incident/%s.json' % safe_comp(kind)[:80]
+
+
+def open_incidents(cfg):
+    """Kinds with an uncleared incident file in the catalog (raised by any host)."""
+    tr = TmpRepo(cfg, CATALOG)
+    try:
+        if not tr.fetch_tip():
+            return []
+        kinds = []
+        for path, oid in sorted(tr.entries.items()):
+            if path.startswith('incident/') and path.endswith('.json'):
+                try:
+                    rec = json.loads(tr.blob(oid))
+                except ValueError:
+                    rec = {}
+                if not rec.get('cleared'):
+                    kinds.append(str(rec.get('kind') or path[len('incident/'):-5]))
+        return kinds
+    finally:
+        tr.close()
 
 
 def cmd_status(cfg, a):
