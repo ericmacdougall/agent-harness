@@ -35,10 +35,10 @@ Pass 2 (verifier) is written separately on purpose: its own shapes, keyword rule
 normalized scan copies (ANSI and zero-width/bidi stripped, URL-decoded once, \\u escapes and escaped quotes
 decoded, nested JSON decoded up to 8 levels, and a copy with line breaks removed so wrapped tokens join).
 
-Linear time: every pattern has bounded repetition or a left anchor. redact.py's rclone-token shape (quadratic
-on runs of newlines) and its first named-credential shape (quadratic on hyphenated runs) are replaced here by
-bounded equivalents; every other redact.PATTERNS entry is used as is. Patterns run only when a cheap literal
-anchor is present.
+Linear time: every pattern has bounded repetition or a left anchor. redact.PATTERNS is used as is (its two
+formerly quadratic shapes were fixed in redact.py, GoodQA #16680, guarded by tests/test_redact_perf.py), except
+its first named-credential shape, which the module's own keyword rule supersedes.
+Patterns run only when a cheap literal anchor is present.
 
 Deliberate gaps (reported to the owner, see the hand-off): raw high-entropy strings with no keyword or vendor
 prefix (64-hex keys look like sha256 digests), free-text passwords, base64 wrapped across lines, a token split
@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.22-3"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.22-4"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2
 _MISSING = object()
@@ -81,20 +81,19 @@ _VAL = r'(?:[^\s\x22\x27,;}\\]|\\(?![\x22\x27\\]))'  # a value char; a backslash
 _KW = (r'(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|'
        r'client[_-]?secret)')
 
-# Bounded replacements for the two quadratic redact.PATTERNS entries.
-_RCLONE = re.compile(r'(?im)^[ \t]{0,64}token[ \t]{0,64}=[ \t]{0,64}\{[^\n]{0,8192}')
+# Keyword rule added beside redact.py's named-credential: it also matches escaped quotes (\"password\": \"x\"),
+# replaces only the value, and allows values up to 4096 characters.
 _NAMED = re.compile(r'(?i)' + _KW + r'(?:[_-]value)?' + _Q + r'\s{0,8}[:=]\s{0,8}' + _Q + r'(?P<v>' + _VAL + r'{3,4096})')
 
-_REPLACED_KINDS = {('rclone-token', 0), ('named-credential', 0)}  # (kind, occurrence) in redact.PATTERNS
-
-
 def _imported_patterns():
-    seen = {}
+    """redact.PATTERNS minus its first named-credential shape, which _NAMED supersedes: _NAMED covers the same key
+    words (refresh/access/id_token through "token"), the same separators and longer values, without the costly
+    name-prefix scan (0.7 s per 3 MB of prose). Its prefix only names the key, which is not secret."""
     out = []
+    skipped = False
     for kind, pattern in redact.PATTERNS:
-        index = seen.get(kind, 0)
-        seen[kind] = index + 1
-        if (kind, index) in _REPLACED_KINDS:
+        if kind == 'named-credential' and not skipped:
+            skipped = True
             continue
         out.append((kind, pattern))
     return out
@@ -235,7 +234,7 @@ _PATTERNS = None
 def _patterns():
     global _PATTERNS
     if _PATTERNS is None:
-        merged = [('rclone-token', _RCLONE)] + _imported_patterns() + _EXTRA
+        merged = _imported_patterns() + _EXTRA
         _PATTERNS = [(kind, pattern, _ANCHORS.get(kind)) for kind, pattern in merged]
     return _PATTERNS
 
