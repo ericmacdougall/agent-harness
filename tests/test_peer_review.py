@@ -1684,6 +1684,34 @@ class ReservedPoolFallbackTests(unittest.TestCase):
         self.assertEqual(calls, ['/fixture/codex'])
         self.assertIsNotNone(error)
 
+    def test_a_quota_primary_then_reserved_fallback_is_recorded_as_no_work(self):
+        # goodqa#16725: this run must not use up the repeat budget.
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        store = self.Store({'claude': self.refusal()})
+        _, _, _, _, options, error = self.review(store, run_result=lambda command: (1, quota, ''))
+        self.assertIsNotNone(error)
+        self.assertEqual(options['attempt_summary'], [
+            {'provider': 'codex', 'launched': 1, 'reason': 'QUOTA', 'refused_before_work': True},
+            {'provider': 'claude', 'launched': 0, 'reason': 'TRANSIENT_INFRA', 'refused_before_work': False}])
+        final = {'execution': 'COMPLETED', 'reason': 'TRANSIENT_INFRA', 'usage': {
+            'provider_launches': options['launches'], 'reported': options['usage'],
+            'provider_attempts': options['attempt_summary']}}
+        self.assertTrue(self.guard.zero_launch_attempt(final))
+
+    def test_a_primary_that_answered_then_reserved_fallback_still_counts(self):
+        store = self.Store({'claude': self.refusal()})
+        unavailable = json.dumps({'type': 'turn.failed', 'error': {'code': 'model_not_found'}})
+        _, _, _, _, options, error = self.review(store, run_result=lambda command: (1, unavailable, ''))
+        self.assertTrue(options['attempt_summary'][0]['refused_before_work'])
+        garbage = lambda command: (1, 'not json', '')
+        _, _, _, _, options, error = self.review(self.Store({}), run_result=garbage)
+        self.assertIsNotNone(error)
+        self.assertFalse(options['attempt_summary'][0]['refused_before_work'])
+        final = {'execution': 'COMPLETED', 'reason': 'INVALID_OUTPUT', 'usage': {
+            'provider_launches': options['launches'], 'reported': options['usage'],
+            'provider_attempts': options['attempt_summary']}}
+        self.assertFalse(self.guard.zero_launch_attempt(final))
+
     def test_both_pools_reserved_launches_nothing_and_fails_with_the_holder(self):
         store = self.Store({'codex': self.refusal(), 'claude': self.refusal()})
         calls, _, _, _, options, error = self.review(store)

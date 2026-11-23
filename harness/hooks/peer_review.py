@@ -100,7 +100,9 @@ def provider_failure(record, *, trusted=True):
     reset = reset if type(reset) in (int, float) and math.isfinite(reset) and reset > 0 else None
     return {'result': 'NO_RESULT', 'reason': reason, 'report': '',
             'account_cooldown': bool(trusted and (quota or auth)), 'reset_at': reset,
-            'fallback_allowed': bool(quota or auth or unavailable), 'usage': None}
+            'fallback_allowed': bool(quota or auth or unavailable), 'usage': None,
+            # The provider answered with a terminal refusal before doing any review work (goodqa#16725).
+            'provider_refused': bool(quota or auth or unavailable)}
 
 
 # Codex CLI retries a lost connection with `error` records like
@@ -1268,6 +1270,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
+        launches_before = options['launches']
         resolution, code, stdout, stderr, last_message = None, None, '', '', ''
         launch_state, local_detail = 'NOT_STARTED', ''
         try:
@@ -1337,6 +1340,11 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                                          launch_state=launch_state, local_detail=local_detail))
         if outcome.get('usage') is not None:
             options['usage'].append({'provider': provider, 'reported': outcome['usage']})
+        # Per-provider facts for the usage guard: a run whose every launch was refused by its provider before any
+        # review work is not a spent attempt (usage_guard.zero_launch_attempt, goodqa#16725).
+        options.setdefault('attempt_summary', []).append({
+            'provider': provider, 'launched': options['launches'] - launches_before, 'reason': outcome['reason'],
+            'refused_before_work': outcome.get('provider_refused') is True and outcome.get('usage') is None})
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
             # Unknown/timeout ownership remains reserved until explicit reconciliation.
             store.release_pool(provider, pool, run_record.run_id, reason=outcome['reason'],
@@ -2072,6 +2080,7 @@ def main() -> int:
                                            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                                                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
                                                   'review_routing': routing_evidence(options),
+                                                  'provider_attempts': options.get('attempt_summary', []),
                                                   'diagnostic': diagnosis['code']})
                 record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
