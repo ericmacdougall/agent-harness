@@ -20,6 +20,9 @@
 #
 # Rollback: `python3 ~/.claude/hooks/ah.py decision withdraw --all` (denies everywhere at once), then, if needed,
 # `~/.agent-harness/bin/repair-harness --ref <previous main> --host <host> --apply`.
+# T2Scan adapter on the worker: check out the previous trusted commit in ~/t2scan-runtime/t2scan and reinstall
+# cli/adapters/claude-assessment.py to ~/.config/t2/assessment-adapters/ (mode 0700); without a pinned key or
+# config the central path denies anyway.
 set -euo pipefail
 
 HARNESS_REPO=ericmacdougall/agent-harness
@@ -268,3 +271,4 @@ done
 
 say "Done. Central decisions are trusted on this Mac and $HOST. Receipts: $work"
 say "Revoke at any time: python3 ~/.claude/hooks/ah.py decision withdraw --all"
+say "A retraction typed in another session, or a revoke the hook could not post, needs that command too."

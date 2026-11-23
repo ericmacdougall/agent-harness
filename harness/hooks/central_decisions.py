@@ -50,6 +50,7 @@ FAMILIES = ('astra', 'fable')
 MAX_LIFETIME = esc.TOP_ASSENT_MAX_AGE  # 12 h: central never grants longer than a local grant
 SKEW = 120
 PER_TURN_CAP = 3
+UNDATED_REVOKE_AT = 253402300799.0  # 9999-12-31: a revoke without a server time counts as newer than every grant
 MAX_PAGES = 10
 PAGE_LIMIT = 200
 MAX_BODY = 8192
@@ -397,13 +398,19 @@ def read_ledger(store, client, config, trusted, crypto, with_newest=False):
         try:
             created = parse_time(_norm_server_time(item.get('createdAt')))
         except Denied:
-            continue  # a comment without a server time can neither grant nor be ordered
-        newest = created if newest is None or created > newest else newest
+            created = None
         if isinstance(body, str) and len(body) <= MAX_BODY:
             match = REVOKE.fullmatch(body.strip())
             if match:
-                revocations.append(_revoke_fact(match, created, 'ledger:' + item['id']))
+                # A revoke without a usable server time still denies: it is treated as newer than every grant.
+                revocations.append(_revoke_fact(match, created if created is not None else UNDATED_REVOKE_AT,
+                                                'ledger:' + item['id']))
+                if created is not None:
+                    newest = created if newest is None or created > newest else newest
                 continue
+        if created is None:
+            continue  # a grant without a server time cannot be ordered against revocations: not valid
+        newest = created if newest is None or created > newest else newest
         payload = _parse_decision(body, ledger['issue_id'], trusted, ed25519, InvalidSignature)
         if payload is not None and _shape_ok(payload):
             decisions.append({'payload': payload, 'created': created, 'archived': item.get('archived'),
@@ -707,7 +714,12 @@ def publish(task, *, ledger=None, store=None, client=None, now=None, claude_home
     if key_id_of(raw_public) not in trusted:
         raise Denied('key_not_pinned', 'the signing key is not pinned on this host; run the installer')
     client = _client(client)
-    decisions, revocations = read_ledger(store, client, config, trusted, crypto)
+    decisions, revocations, newest = read_ledger(store, client, config, trusted, crypto, with_newest=True)
+    # assent_at comes from this Mac's transcript clock and revoke times from the server: refuse to sign when the
+    # two disagree by more than the skew, so a scope revoke is never misordered against the user's words.
+    server_now = client.server_time() if callable(getattr(client, 'server_time', None)) else None
+    if (server_now is not None and abs(server_now - now) > SKEW) or (newest is not None and newest > now + SKEW):
+        raise Denied('clock_skew', 'this host clock differs from the ledger server by more than %d s' % SKEW)
     probe = {'decision_id': '0' * 32, 'task': task, 'session': session, 'assent_at': iso(assent_ts)}
     if any(r['scope'] != 'decision' and covers(r, probe) for r in revocations + local_tombstones(store)):
         raise Denied('revoked', 'a revocation after the cited words covers this task or session')
@@ -807,7 +819,8 @@ def on_user_prompt(session, text, *, store=None, client=None, now=None):
             if done:
                 notes.append('posted %d queued central-decision revocation(s)' % len(done))
     except Exception:  # noqa: BLE001
-        notes.append('queued central-decision revocations still unposted')
+        notes.append('queued central-decision revocations still unposted; to deny everywhere now run '
+                     'python3 ~/.claude/hooks/ah.py decision withdraw --all')
     try:
         if not isinstance(text, str) or not UUID.fullmatch(str(session or '')):
             return '; '.join(notes) or None
@@ -826,7 +839,8 @@ def on_user_prompt(session, text, *, store=None, client=None, now=None):
             result = withdraw('decision', decision_id, store=store, client=client, now=now, reason='later-user-turn',
                               deadline_seconds=HOOK_DEADLINE)
             notes.append('revoked central decision %s (%s)' % (decision_id[:8], 'posted' if result['posted'] else
-                                                              'NOT posted: queued for retry; other hosts still accept it'))
+                                                              'NOT posted: queued for retry; other hosts still accept it until '
+                                                              'ah decision withdraw --all succeeds'))
     except Exception as error:  # noqa: BLE001
         notes.append('central-decision revocation failed (%s)' % type(error).__name__)
     return '; '.join(notes) or None

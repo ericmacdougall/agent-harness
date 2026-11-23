@@ -205,6 +205,14 @@ class PublishAndVerify(Base):
         self.assertEqual(caught.exception.code, 'index_unwritable')
         self.assertFalse(any(str(i['body']).startswith(cd.DECISION_PREFIX) for i in self.fake.items))
 
+    def test_publish_refuses_when_the_mac_clock_disagrees_with_the_server(self):  # plan review 4 F2
+        self.grant_local('k1')
+        self.fake.server_time = lambda: time.time() + 600
+        with self.assertRaises(cd.Denied) as caught:
+            self.publish('k1')
+        self.assertEqual(caught.exception.code, 'clock_skew')
+        self.assertFalse(any(str(i['body']).startswith(cd.DECISION_PREFIX) for i in self.fake.items))
+
     def test_later_turn_naming_the_top_rung_blocks_publish(self):  # NEG-14
         self.grant_local('k1')
         fx.user_turn(self.claude, 'actually keep fable off', uid='00000000-0000-4000-8000-0000000000f2', age_seconds=30)
@@ -373,6 +381,17 @@ class Revocation(Base):
         super().setUp()
         self.fake.add(self.body(self.payload()), at=time.time() - 20)
 
+
+    def test_revoke_without_a_server_time_still_denies(self):  # plan review 4 F1
+        self.assertEqual(self.verify('k1')['task'], 'k1')
+        self.fake.items.append({'id': 'undated', 'body': 'agent-harness-revoke task k1', 'createdAt': None, 'archived': False})
+        with self.assertRaises(cd.Denied):
+            self.verify('k1')
+
+    def test_grant_without_a_server_time_is_not_valid(self):  # plan review 4 F1
+        self.fake.items[:] = [dict(i, createdAt='not-a-time') for i in self.fake.items]
+        with self.assertRaises(cd.Denied):
+            self.verify('k1')
     def test_each_revoke_scope_denies(self):  # NEG-3
         for line in ('agent-harness-revoke all', 'agent-harness-revoke task k1',
                      'agent-harness-revoke session %s' % SESSION, 'agent-harness-revoke decision ' + 'a' * 32):

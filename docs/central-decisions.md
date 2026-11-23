@@ -86,6 +86,7 @@ A retraction typed in a different session does not revoke automatically; use `ah
 
 - `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read: the Agent spawn (family fable), the Bash launch (fable or astra by model), and the reviewer path. The rung ceiling is unchanged, and nothing is written into the escalation state. All ledger reads of one hook run share one 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
 - The T2Scan Claude adapter (`cli/adapters/claude-assessment.py`) uses the central path only when the approval task has no local escalation record. It still requires the family word, and for `-astra-direct` tasks the direct-assent words, in the signed sentence.
+- A revoke comment without a usable server time still denies (it counts as newer than every grant); a grant without one is not valid. Publish refuses when the Mac clock is more than 120 s from the server's.
 - Every read fetches the whole ledger: archived comments included, at most 10 pages of 200. Running out of pages, an unreachable tracker, a missing or closed ticket, a missing pinned key or a missing `cryptography` package all deny.
 
 ## Commands
@@ -106,6 +107,12 @@ The user-run installer `scripts/trust-central-decisions.sh` does the following, 
 7. Checks that `decision verify` and the adapter's `authorize` pass on the worker.
 
 It never pushes to main itself.
+
+Rollback, in order of speed:
+1. `ah decision withdraw --all` (or the line `agent-harness-revoke all` on the ledger ticket) denies on every host at once.
+2. Remove `~/.agent-harness/decisions/config.json` on a host to turn the feature off there.
+3. `repair-harness --ref <previous main> --host t2-dev --apply` restores the previous hooks.
+4. On the worker, check out the previous trusted T2Scan commit in `~/t2scan-runtime/t2scan` and reinstall the adapter (mode 0700).
 
 ## Limits
 
