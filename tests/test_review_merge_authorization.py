@@ -842,5 +842,98 @@ class SubagentAuthorization(unittest.TestCase):
             self.assertEqual(mg.decide(unbound, fixture.FakeGh(fixture.SCENARIOS["red_netwatch"]), Path(d))[0], 0)
 
 
+class StampRefusalNotes(unittest.TestCase):
+    """goodqa#16811: when main's PR review mints no review-auth stamp, the agent is told why; the rule is unchanged."""
+
+    SID = "11111111-2222-3333-4444-555555555555"
+    PLAIN = "python3 ~/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
+    SEMICOLON = PLAIN + " --repeat-reason 'first run timed out; lane was held'"
+
+    def run_hook(self, home, command, **extra):
+        transcript = Path(home) / ".claude" / "projects" / "-x" / (self.SID + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("{}\n")
+        payload = dict(fixture.bash(command), session_id=self.SID, transcript_path=str(transcript), **extra)
+        stdin = __import__("io").BytesIO(json.dumps(payload).encode())
+        stdout, stderr = __import__("io").StringIO(), __import__("io").StringIO()
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            code = mg.hook_main(Path(home) / "s", fixture.FakeGh(fixture.SCENARIOS["green"]), stdin, stdout, stderr)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def context(self, stdout):
+        if not stdout.strip():
+            return None
+        return json.loads(stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def test_main_quoted_semicolon_mints_nothing_and_says_why(self):
+        import caller_identity
+        with tempfile.TemporaryDirectory() as home:
+            code, out, _ = self.run_hook(home, self.SEMICOLON)
+            self.assertEqual(code, 0)
+            self.assertIsNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))  # rule unchanged
+            note = self.context(out)
+            self.assertIsNotNone(note)
+            offset = self.SEMICOLON.index(";")
+            self.assertIn("review-auth stamp not minted", note)
+            self.assertIn("shell syntax ';' at offset %d" % offset, note)
+            self.assertNotIn("run it from the main agent)", note)
+
+    def test_plain_main_command_mints_and_emits_nothing(self):
+        import caller_identity
+        with tempfile.TemporaryDirectory() as home:
+            code, out, err = self.run_hook(home, self.PLAIN)
+            self.assertEqual((code, out, err), (0, "", ""))
+            self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
+
+    def test_not_main_is_named_as_the_reason(self):
+        import caller_identity
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.object(caller_identity, "is_main", return_value=False), \
+                    mock.patch.dict(sys.modules, {"native_main": SimpleNamespace(is_desktop_review_root=lambda p: False)}):
+                code, out, _ = self.run_hook(home, self.PLAIN)
+            self.assertEqual(code, 0)
+            self.assertIn("not the proven main agent", self.context(out))
+            self.assertIsNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
+
+    def test_mentions_without_a_launch_get_no_note_and_subagents_keep_the_block(self):
+        with tempfile.TemporaryDirectory() as home:
+            for command in ("grep -n -- --github-repo peer_review.py; echo --pr 5",
+                            "git log # peer_review --github-repo o/r --pr 5",
+                            "echo peer_review.py pr --github-repo o/r --pr 5"):
+                with self.subTest(command=command):
+                    code, out, _ = self.run_hook(home, command)
+                    self.assertEqual((code, out), (0, ""))
+            code, out, err = self.run_hook(home, self.SEMICOLON, agent_id="sub1")
+            self.assertEqual((code, out), (2, ""))
+            self.assertIn("subagent cannot run the PR review", err)
+
+    def test_reason_exists_exactly_when_the_command_is_not_plain(self):
+        corpus = [self.PLAIN, self.SEMICOLON, "python3 -I /x/peer_review.py pr --pr 5", "python3.12 peer_review.py",
+                  "python3 peer_review.py pr 'unbalanced", "true && " + self.PLAIN, self.PLAIN + " | tee x",
+                  self.PLAIN + " > out", "python3 $(which peer_review.py)", "bash peer_review.py",
+                  "python3 other.py --github-repo o/r --pr 5", self.PLAIN + " --repeat-reason 'a\nb'",
+                  "python3 -u -B peer_review.py --pr=5 --github-repo=o/r", "env python3 peer_review.py", "",
+                  "python3 peer_review.py `id`", "python3 peer_review.py --repeat-reason 'x & y'"]
+        for command in corpus:
+            with self.subTest(command=command):
+                self.assertEqual(mg._not_plain_reason(command) is None, mg._plain_peer_review(command))
+
+    def test_peer_review_note_names_the_option_and_lists_the_conditions(self):
+        argv = ["pr", "--github-repo", "o/r", "--pr", "5", "--repeat-reason", "first run timed out; lane was held"]
+        note = review.no_stamp_note(argv)
+        self.assertIn("no main-agent stamp", note)
+        self.assertIn("--repeat-reason contains ';'", note)
+        self.assertIn("single-use stamp, valid 600 s", note)
+        self.assertIn("even inside quotes", note)
+        plain = review.no_stamp_note(["pr", "--github-repo", "o/r", "--pr", "5"])
+        self.assertNotIn("Likely reason", plain)
+        self.assertIn("no main-agent stamp", review.no_stamp_note([], opted_out=True))
+
+    def test_peer_review_and_merge_gate_share_one_shell_syntax_set(self):
+        import caller_identity
+        self.assertEqual(review.STAMP_SHELL_SYNTAX.pattern, mg._SHELL_SYNTAX.pattern)
+        self.assertEqual(caller_identity.STAMP_TTL_SECONDS, 600)  # the note says "valid 600 s"
+
+
 if __name__ == "__main__":
     unittest.main()

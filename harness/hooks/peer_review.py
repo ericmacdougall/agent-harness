@@ -1812,6 +1812,32 @@ def plan_resource_gate(content):
         return 0, ''  # older install without the resource gate
 
 
+# The characters merge_gate._SHELL_SYNTAX refuses anywhere in a stamp-minting command, quoted or not (a contract test
+# keeps the two patterns identical). Explanation only: peer_review never mints or accepts a stamp from this.
+STAMP_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")
+
+
+def no_stamp_note(argv, opted_out=False):
+    """The note for a --github-repo/--pr run that took no review-auth stamp, naming the likely reason (goodqa#16811)."""
+    if opted_out:
+        return ('Note: --no-main-stamp was given, so this --github-repo/--pr review takes no main-agent stamp and '
+                'cannot authorize a merge.')
+    reason = ''
+    for index, value in enumerate(argv[:256]):
+        match = STAMP_SHELL_SYNTAX.search(str(value))
+        if match:
+            option = next((str(argv[j]) for j in range(index, -1, -1) if str(argv[j]).startswith('--')), 'an argument')
+            reason = (' Likely reason: %s contains %r (offset %d in that value), which the merge-gate hook treats as '
+                      'shell syntax even inside quotes, so it minted no stamp.' % (
+                          option.split('=', 1)[0], match.group(0), match.start()))
+            break
+    return ('Note: no main-agent stamp for this --github-repo/--pr run; this review cannot authorize a merge.%s The '
+            "main agent's merge-gate hook mints one single-use stamp, valid 600 s, only when it sees the main agent "
+            'itself run one plain `python3 [-I] .../peer_review.py ...` command with --github-repo and a numeric '
+            '--pr, with no newline, `;`, `&`, `|`, `<`, `>`, backtick or `$(` anywhere in the command, even inside '
+            'quotes. Not main, a subagent, a wrapper, an expired or already used stamp also leave none.' % reason)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -1932,8 +1958,7 @@ def main() -> int:
         if not args.no_main_stamp:
             args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
         if args.main_stamp is None:
-            print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
-                  'review cannot authorize a merge.', file=sys.stderr)
+            print(no_stamp_note(sys.argv[1:], opted_out=bool(args.no_main_stamp)), file=sys.stderr)
     if before[1]:
         target.close()
         evidence.close()

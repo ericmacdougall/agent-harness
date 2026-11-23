@@ -1932,8 +1932,9 @@ def _shell_like(name):
     return name in SHELL_TOOLS or name.startswith(("bash", "shell", "exec"))
 
 
-def decide(payload, runner, state_dir, now=None):
-    """(exit code, stderr text) for one PreToolUse payload."""
+def decide(payload, runner, state_dir, now=None, notes=None):
+    """(exit code, stderr text) for one PreToolUse payload. `notes`, when a list, collects non-blocking context for
+    the agent (goodqa#16811: why a PR review minted no review-auth stamp); it never changes the decision."""
     state_dir = Path(state_dir)
     now = now if now is not None else time.time()
     tool = str(payload.get("tool_name") or "")
@@ -1964,7 +1965,9 @@ def decide(payload, runner, state_dir, now=None):
     if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _may_record_waiver(payload):
         stamp = _stamp_waive(command, payload, state_dir)  # written only if this decision allows (red-team M1)
     if PEER_REVIEW_AUTH.search(plain):
-        _stamp_review(command, payload, now)
+        note = _stamp_review(command, payload, now)
+        if note and isinstance(notes, list):
+            notes.append(note)
     merges = find_merges(command, cwd=cwd)
     if not merges:
         return _allow(stamp, state_dir, now)
@@ -2146,21 +2149,55 @@ def _stamp_waive(command, payload, state_dir):
             "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)")
 
 
+_NOTE_PREFIX = "merge-gate: review-auth stamp not minted: "
+_NOTE_SUFFIX = ("; this review cannot authorize a merge. Rerun it from the main agent as one plain "
+                "`python3 .../peer_review.py ...` command (no newline, `;`, `&`, `|`, `<`, `>`, backtick or `$(` "
+                "anywhere, even inside quotes).")
+# An actual peer_review.py launch somewhere in the command, so a grep or a commit message that merely mentions the
+# flags gets no note (the stamp decision itself is _plain_peer_review's alone).
+_PEER_REVIEW_LAUNCH = re.compile(r"(?:^|[\s;&|(`'\"])(?:\S*/)?python3?(?:\.\d+)?\s+(?:-[IuBEs]\s+)*"
+                                 r"[\"']?\S*peer_review\.py\b")
+
+
+def _not_plain_reason(command):
+    """Why _plain_peer_review(command) is False, in words (None when it is True). Explanation only: it never decides
+    a stamp, and a contract test keeps it in step with _plain_peer_review."""
+    match = _SHELL_SYNTAX.search(command)
+    if match:
+        return "command is not a single plain peer_review call (shell syntax %r at offset %d)" % (
+            match.group(0), match.start())
+    try:
+        argv = shlex.split(command, comments=False)
+    except ValueError:
+        return "command is not a single plain peer_review call (unbalanced quoting)"
+    rest = argv[1:] if argv and _PYTHON.fullmatch(os.path.basename(argv[0])) else None
+    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+        rest = rest[1:]
+    if not rest or os.path.basename(rest[0]) != "peer_review.py":
+        return "command does not start with python3 [-I] .../peer_review.py"
+    return None
+
+
 def _stamp_review(command, payload, now):
-    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
+    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main.
+    Returns None when it minted a stamp or the command launches no peer_review.py, else a short note naming why no
+    stamp was minted (goodqa#16811); the note is output only."""
     import caller_identity  # noqa: PLC0415
+    launches = bool(_PEER_REVIEW_LAUNCH.search(command))
     if not _plain_peer_review(command):
-        return
+        reason = _not_plain_reason(command) if launches else None
+        return (_NOTE_PREFIX + reason + _NOTE_SUFFIX) if reason else None
     if not caller_identity.is_main(payload):
         # A Codex Desktop root is accepted here for the review receipt and, by the user's decision (answer
         # b6714826, goodqa#15565), for recording merge waivers (_may_record_waiver). Generic main authority still
         # controls protected Stop and owner handoffs.
+        refused = _NOTE_PREFIX + "this caller is not the proven main agent; this review cannot authorize a merge."
         try:
             from native_main import is_desktop_review_root  # noqa: PLC0415
             if is_desktop_review_root(payload) is not True:
-                return
+                return refused
         except Exception:
-            return
+            return refused
     tokens, _ = tokenize(command)
     values = {}
     for index, token in enumerate(tokens):
@@ -2172,6 +2209,8 @@ def _stamp_review(command, payload, now):
     if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
         caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
                                   session=str(payload.get("session_id") or ""), now=now)
+        return None
+    return _NOTE_PREFIX + "--github-repo and a numeric --pr were not both found; this review cannot authorize a merge."
 
 
 _SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")
@@ -2228,7 +2267,8 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
             raise ValueError("payload is not an object")
         payload = parsed
         text = json.dumps(payload.get("tool_input"), ensure_ascii=False)[:MAX_COMMAND_CHARS]
-        code, message = decide(payload, runner or SubprocessGh(), state_dir)
+        notes = []
+        code, message = decide(payload, runner or SubprocessGh(), state_dir, notes=notes)
     except (ValueError, OSError) as error:
         if payload is None:
             stderr.write("merge-gate: hook input is not usable JSON (" + type(error).__name__ + "); blocking.\n")
@@ -2240,6 +2280,10 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
         return _fault(error, text, stderr)
     if code:
         stderr.write(message.rstrip() + "\n")
+    elif notes:
+        # Exit 0 stderr is not shown to the agent; PreToolUse additionalContext is (goodqa#16811).
+        stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                        "additionalContext": " ".join(notes)[:1000]}}) + "\n")
     return code
 
 
