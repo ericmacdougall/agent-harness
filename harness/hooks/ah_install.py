@@ -761,7 +761,9 @@ def require_manifest_grant(host, ref, home, resume_of=None):
         ops = _ops_module()  # lazy: ah_ops imports this module
         ops.require_grant(MANIFEST_CAPABILITY, home=home, evidence={
             "repo": ops.HARNESS_REPO, "host": host, "ref": ref,
-            "use_key": ("manifest-resume:%s" % resume_of) if resume_of else "manifest:%s:%s" % (host, ref)})
+            # the library derives a single-use key only from fields the SIGNED scope names (single_use_bind, e.g.
+            # ["repo", "host", "ref", "attempt"]); a caller-chosen key is never used. A resume is its own attempt.
+            "attempt": ("resume:%s" % resume_of) if resume_of else "install"})
     except Exception as error:  # noqa: BLE001 - an OpsError, an ImportError or anything odd all mean: no grant, nothing changed
         raise InstallError("no_grant", str(error)[:600] or "no self-serve grant for install_files_manifest", 2)
 

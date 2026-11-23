@@ -13,7 +13,7 @@ Policy and gate code (self_serve, usage_guard, merge_gate, ah_install ...) load 
 
 Every recipe is `--check` (read only, the default) or `--apply`, journals each step under
 ~/.agent-harness/work/self-serve/<run>/journal.jsonl (counts, statuses and short redacted reasons only) and is resumable with
-`--resume RUN`. Every `--apply` first asks `self_serve.grant(<capability>, ...)` (lazy import). No grant, or any failure of the
+`--resume RUN`. Every `--apply` first asks `self_serve.consume(<capability>, ...)` (lazy import; for a scope that is not single_use that is exactly grant()). No grant, or any failure of the
 policy, means a refusal that names the user's step; nothing was changed. A grant is never cached in the journal: a resume asks again.
 
 What these recipes never do, by construction (one choke point, `Context.cmd`, refuses these words in any command it would run):
@@ -67,13 +67,9 @@ HOOK = None  # tests only: called as HOOK(step, "before"|"after"); raising from 
 FORBIDDEN = re.compile(r"approve-top|\bdecision\s+(keygen|pin|publish|withdraw)\b|\bwaive\b|--admin\b|\bgcloud\s+secrets\b|\bkeygen\b")
 PROGRAMS = ("gh", "ssh", "python3", "repair-harness", "git")
 
-# The merge floor: a PR that touches any of these is never merged by a recipe, whatever the signed policy says (the policy can only
-# add to it). They are the gate, the policy, the guards and the installer: changing them needs a person. Case-folded fnmatch over
-# the repository path; a rename's old path counts too.
-DENYLIST_FLOOR = ("*self_serve*", "*self-serve*", "*ah_ops*", "*ah_install*", "*central_decisions*", "*trust-central-decisions*",
-                  "*tier_gate*", "*command_guard*", "*merge_gate*", "*peer_review*", "*spec_policy*", "*caller_identity*",
-                  "*native_context*", "*usage_guard*", "*install.py", "*install_codex.py", "*enable-agent-ops*",
-                  ".github/workflows/*", "*.github/workflows/*")
+# There is no built-in merge floor: the user chose "Allow every path" (Source:
+# answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06). The recipe still passes the PR's changed paths
+# (a rename's old path too) so the signed policy's optional `denylist_paths` scope is enforced by the policy library.
 MAX_PR_FILES = 3000  # the GitHub files API stops here; a bigger PR cannot be shown to be clean
 # modules a fixed-path load pre-registers so that their own `import x` lines find the same files (sys.modules wins over sys.path)
 LIB_DEPS = {"self_serve": ("safe_input", "native_context", "caller_identity", "self_serve"),
@@ -284,7 +280,9 @@ def require_grant(capability, *, evidence=None, home=None, now=None, actor=None)
     if actor.get("agent_id"):  # courtesy only: a helper can drop the variable; its missing stamp is what stops it
         refuse("a helper or sub-agent (agent id %s) cannot hold a self-serve grant for %s; the main agent runs this" % (str(actor["agent_id"])[:40], capability), "no_grant")
     try:
-        granted = policy_library().grant(capability, actor=actor, evidence=evidence, now=now, home=str(home) if home else None)
+        # consume(), not grant(): the library hands a single_use scope out only through consume(), which spends the object
+        # (repo, PR, head) atomically after every other check. For any other scope it is exactly grant().
+        granted = policy_library().consume(capability, actor=actor, evidence=evidence, now=now, home=str(home) if home else None)
     except Exception:  # noqa: BLE001 - the library contract says it never raises; if it does, that is no grant
         granted = None
     if not (isinstance(granted, dict) and granted.get("capability") == capability
@@ -627,12 +625,6 @@ def pr_files(ctx, repo, pr, expected):
     return paths
 
 
-def floor_hits(paths):
-    """The paths a recipe never merges (DENYLIST_FLOOR), case-folded like the policy library's own denylist."""
-    globs = [g.casefold() for g in DENYLIST_FLOOR]
-    return sorted({p for p in paths if any(fnmatch.fnmatchcase(p.replace("\\", "/").lstrip("/").casefold(), g) for g in globs)})
-
-
 def merge_one(ctx, repo, pr, receipt_path, default_repos, apply):
     """Merge ONE PR at its reviewed head, or report what would happen. Idempotent: a PR that is already merged is only re-verified.
 
@@ -657,10 +649,7 @@ def merge_one(ctx, repo, pr, receipt_path, default_repos, apply):
         if view.get("isDraft"):
             refuse("%s#%s is a draft; mark it ready for review first (the PR author's step)" % (repo, pr), "draft")
         paths = pr_files(ctx, repo, pr, view.get("changedFiles"))
-        hits = floor_hits(paths)
-        if hits:
-            refuse("%s#%s changes %s, which no recipe merges (the gate, the policy, the guards and the installer need a person)" % (repo, pr, ", ".join(hits[:5])), "denylisted")
-        bad = checks_problems(view.get("statusCheckRollup"))
+        bad =checks_problems(view.get("statusCheckRollup"))
         if bad and bad != [NO_CHECKS]:
             refuse("%s#%s checks are not green on the reviewed head: %s" % (repo, pr, "; ".join(bad[:6])), "checks")
         if not apply:

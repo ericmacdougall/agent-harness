@@ -3961,8 +3961,8 @@ def run(args, home: Path) -> dict:
                 print(json.dumps(e.data, indent=2, default=str))
             raise AhError(e.code, str(e), e.exit_code)
     if cmd == "ops":
-        if args.rest[:1] == ["doctor"]:  # L7 (ah_parity.py) fills this in; until then it says so and changes nothing
-            return _ops_doctor(args.rest[1:], home)
+        if args.rest[:1] in (["doctor"], ["verify-parity"]):  # L7 (ah_parity.py); until it is installed this says so and changes nothing
+            return _ops_doctor(args.rest[1:], home, args.rest[0])
         import ah_ops  # noqa: PLC0415
         try:
             return ah_ops.run(args.rest, home)
@@ -3973,12 +3973,15 @@ def run(args, home: Path) -> dict:
     raise AhError("unknown_command", cmd)
 
 
-def _ops_doctor(rest, home) -> dict:
+def _ops_doctor(rest, home, sub="doctor") -> dict:
     try:
         import ah_parity  # noqa: PLC0415
     except ImportError:
-        raise AhError("not_available", "`ah ops doctor` comes with ah_parity.py (self-serve lane L7), which is not installed here; nothing was read or changed", 2)
-    return ah_parity.doctor(rest, home)
+        raise AhError("not_available", "`ah ops %s` comes with ah_parity.py (self-serve lane L7), which is not installed here; nothing was read or changed" % sub, 2)
+    runner = ah_parity.doctor if sub == "doctor" else getattr(ah_parity, "verify_parity", None)
+    if runner is None:
+        raise AhError("not_available", "this ah_parity.py has no `%s`; nothing was read or changed" % sub, 2)
+    return runner(rest, home)
 
 
 CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "
