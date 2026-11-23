@@ -29,7 +29,9 @@ the independent t2-dev pin, which this library does not consult. It does what it
   * A Codex root cannot be told from a Codex helper (see CLAUDE_MAIN_ONLY), so merge-class capabilities are Claude main only.
   * single_use binds the object (default repo, PR, head), never a caller-chosen key, and is spent only by consume().
   * ttl_seconds is the validity of one returned grant object, not a cumulative limit. The policy expires_at is the only hard stop.
-  * same_harness_fallback_review has a built-in path denylist that no policy can lower (FALLBACK_FLOOR).
+  * same_harness_fallback_review has no built-in path floor. The user chose "Allow every path"
+    (answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06), so denylist_paths is an optional
+    scope, empty by default; when a policy or repo narrowing sets one, evidence.changed_paths is then required.
 
 Importing this module has no side effects: no file access, no process probe, no cryptography import.
 """
@@ -71,13 +73,6 @@ HELPER_KEYS = ('agent_id', 'agent_type', 'agent_role', 'agent_path', 'parent_thr
 FALLBACK_CAPABILITY = 'same_harness_fallback_review'
 SINGLE_USE_DEFAULT_BIND = ('repo', 'pr', 'head')
 MAX_USE_FIELD = 512
-# Paths that never take a same-harness review, whatever the signed policy says; a policy may add patterns, never remove.
-# Equal to the denylist in merge_gate (lane L2), which should call fallback_path_denied() rather than keep a copy.
-FALLBACK_FLOOR = re.compile(
-    r"(?:^|[/_.\-])(?:auth|authn|authz|oauth|login|signin|secrets?|credentials?|passwords?|passwd|tokens?|"
-    r"migrations?|migrate|command_guard\w*|merge_gate\w*|peer_review\w*|caller_identity|self_serve\w*|"
-    r"central_decisions|escalation|keys?|keygen|keyring|keychain|ed25519|pubkeys?|private|sudoers|"
-    r"workflows?|usage_guard)(?:$|[/_.\-])|(?:^|/)\.env|\.pem$|id_rsa|\.p12$|\.pfx$", re.I)
 
 # Private test seam. Production never sets it and nothing a caller can pass reaches it: 'home' is the account home tests
 # run under (and arms an explicit home=), 'claude_dir' the proof root, 'clock' lets now= be any value.
@@ -508,15 +503,10 @@ def _narrowing(evidence) -> dict:
     return out
 
 
-def fallback_path_denied(path) -> bool:
-    """True when a same-harness review may not cover this changed path. A malformed, absolute or traversing path counts
-    as denied. The one shared floor: consumers call this instead of keeping their own copy."""
-    if not isinstance(path, str) or not path or len(path) > 1024:
-        return True
-    text = unicodedata.normalize('NFKC', path).replace('\\', '/')
-    if text.startswith('/') or '..' in text.split('/') or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
-        return True
-    return FALLBACK_FLOOR.search(text) is not None
+def paths_denied(paths, globs) -> bool:
+    """True when any path matches any glob (the same case-insensitive rule the policy's denylist_paths scope uses).
+    Public so a consumer rechecking a stored record applies exactly the grant's rule instead of keeping a copy."""
+    return _denied_path(paths, list(globs or []))
 
 
 def _use_key(capability, scope, evidence, policy_id) -> str:
@@ -548,12 +538,11 @@ def _check_scope_against_evidence(capability, scope, evidence, policy, home, now
         if not isinstance(repo, str) or repo.casefold() not in {r.casefold() for r in repos}:
             raise _Deny('repo_out_of_scope')
     globs = list(scope.get('denylist_paths', [])) + list(narrow.get('denylist_paths', []))
-    floor = capability == FALLBACK_CAPABILITY
-    if globs or floor:
+    if globs:  # optional scope, empty by default: with no denylist every path is allowed ("Allow every path")
         paths = evidence.get('changed_paths')
         if not isinstance(paths, list) or not paths or any(not isinstance(p, str) for p in paths):
             raise _Deny('changed_paths_required')
-        if (floor and any(fallback_path_denied(p) for p in paths)) or (globs and _denied_path(paths, globs)):
+        if _denied_path(paths, globs):
             raise _Deny('path_denylisted')
     if scope.get('single_use'):
         if not spend:
