@@ -42,5 +42,63 @@ class ManifestShipsSelfServeFiles(unittest.TestCase):
             self.assertIn(name, helpers, name)
 
 
+class RealLibraryAcceptsTheEnablersOutput(unittest.TestCase):
+    """X8: no stub. A real --apply writes the policy, pin file and key; the real self_serve library then decides."""
+
+    NOW = None
+
+    def setUp(self):
+        from unittest import mock
+        import caller_identity as ci
+        import self_serve as ss
+        from tests import test_enable_agent_ops as T
+        self.T, self.ss, self.sid = T, ss, "11111111-2222-3333-4444-555555555555"
+        self.base = T.Base("setUp")
+        self.base.setUp()
+        self.addCleanup(self.base.tearDown)
+        self.assertEqual(self.base.apply(), 0, self.base.output)
+        home = str(self.base.home)
+        claude = Path(home) / ".claude"
+        transcript = claude / "projects" / "-x" / (self.sid + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("{}\n")
+        patchers = [mock.patch.object(ci, "native_deny_reason", return_value=None),
+                    mock.patch.dict(ss._SEAM, {"home": home, "claude_dir": str(claude), "clock": False})]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.home = home
+        self.actor = {"kind": "claude_main", "payload": {"session_id": self.sid, "transcript_path": str(transcript)}}
+
+    def grant(self, cap, **evidence):
+        return self.ss.explain(cap, actor=self.actor, evidence=evidence or None, home=self.home)
+
+    def test_the_library_reads_the_files_where_the_enabler_wrote_them(self):
+        layout = self.T.E.Layout(self.home)
+        self.assertEqual(self.ss.policy_path(self.home), layout.policy)
+        self.assertEqual(self.ss.pubkeys_path(self.home), layout.pubkeys)
+        self.assertEqual(self.ss.private_key_path(self.home), layout.keyfile)
+
+    def test_every_capability_is_granted_to_proven_main(self):
+        for cap in self.ss.CAPABILITIES:
+            got, why = self.grant(cap, repo="ericmacdougall/agent-harness")
+            self.assertIsNotNone(got, (cap, why))
+            self.assertEqual(got["capability"], cap)
+
+    def test_the_fallback_has_no_path_restriction_by_default(self):
+        for path in ("harness/hooks/merge_gate.py", "db/migrations/1.sql", ".github/workflows/x.yml"):
+            got, why = self.grant("same_harness_fallback_review", repo="ericmacdougall/agent-harness",
+                                  changed_paths=[path])
+            self.assertIsNotNone(got, (path, why))
+
+    def test_a_helper_and_a_foreign_repo_still_get_nothing(self):
+        helper = {"kind": "claude_main", "payload": dict(self.actor["payload"], agent_id="a1")}
+        got, why = self.ss.explain("merge_reviewed_pr", actor=helper, evidence={"repo": "ericmacdougall/agent-harness"},
+                                   home=self.home)
+        self.assertIsNone(got)
+        got, why = self.grant("merge_reviewed_pr", repo="someone/else")
+        self.assertEqual(why, "repo_out_of_scope")
+
+
 if __name__ == "__main__":
     unittest.main()

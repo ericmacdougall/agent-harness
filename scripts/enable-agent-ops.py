@@ -60,7 +60,8 @@ from pathlib import Path
 
 SCHEMA = "self-serve/1"
 PURPOSE = "self-serve"
-KEYS_SCHEMA = "self-serve-keys/1"
+KEYS_SCHEMA = "self-serve-pubkeys/1"  # the file self_serve.py reads (harness/hooks/self_serve.py PUBKEYS_SCHEMA)
+SIGN_DOMAIN = b"agent-harness-self-serve-policy/1\x00"  # self_serve.DOMAIN: every signed body is domain-separated
 STATE_SCHEMA = "self-serve-enabler/1"
 JOURNAL_PURPOSE = "self-serve-journal"
 REPO = "ericmacdougall/agent-harness"
@@ -155,6 +156,12 @@ def canonical(obj) -> bytes:
 
 def key_id_of(public_raw: bytes) -> str:
     return hashlib.sha256(b"agent-harness-self-serve-key\x00" + public_raw).hexdigest()[:16]
+
+
+def signed_message(body: dict) -> bytes:
+    """The bytes that are signed and verified: the library's domain prefix plus the canonical body. The same function
+    signs the policy and the journal; their `purpose` fields differ, so neither verifies as the other."""
+    return SIGN_DOMAIN + canonical(body)
 
 
 def now_iso(now=None) -> str:
@@ -371,7 +378,7 @@ def build_policy(key_id: str, *, repos, hosts, disabled=(), expires_days=None, n
 
 def sign_policy(policy: dict, private_key) -> dict:
     body = {k: v for k, v in policy.items() if k != "signature"}
-    return {**body, "signature": b64url(private_key.sign(canonical(body)))}
+    return {**body, "signature": b64url(private_key.sign(signed_message(body)))}
 
 
 def verify_policy(policy, pinned_keys: dict) -> str | None:
@@ -385,7 +392,7 @@ def verify_policy(policy, pinned_keys: dict) -> str | None:
             return "key id is not pinned"
         body = {k: v for k, v in policy.items() if k != "signature"}
         ed25519.Ed25519PublicKey.from_public_bytes(b64url_decode(public)).verify(
-            b64url_decode(policy["signature"]), canonical(body))
+            b64url_decode(policy["signature"]), signed_message(body))
         return None
     except Exception:  # noqa: BLE001 - any failure is "not valid"
         return "signature does not verify"
@@ -909,7 +916,7 @@ class Enabler:
                 raise ValueError("schema")
             body = {k: v for k, v in journal.items() if k != "signature"}
             ed25519.Ed25519PublicKey.from_public_bytes(b64url_decode(public)).verify(
-                b64url_decode(journal["signature"]), canonical(body))
+                b64url_decode(journal["signature"]), signed_message(body))
         except Exception:  # noqa: BLE001 - any failure is "not signed by this machine's key"
             raise Refused("the journal's signature does not verify against this machine's signing key (it was changed, "
                           "or another key signed it); not trusting it") from None
@@ -1017,7 +1024,7 @@ class Enabler:
 
     def _pin_record(self, journal) -> bytes:
         _, key_id, public = self._identity()
-        return (json.dumps({"schema": KEYS_SCHEMA, "keys": [{"key_id": key_id, "public_key": public}]},
+        return (json.dumps({"schema": KEYS_SCHEMA, "keys": [{"key_id": key_id, "public_key": public, "purpose": PURPOSE}]},
                            sort_keys=True, indent=1) + "\n").encode()
 
     def step_pin_local(self, journal):
