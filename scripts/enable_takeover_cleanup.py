@@ -549,9 +549,17 @@ class Run:
         """command_guard `check` (it runs nothing) on the commands this change is about, as the hook would judge them."""
         guard = ".claude/hooks/command_guard.py"
         path = "~/.agent-harness/work/%s/x" % self.PROBE
+        owner = self.recorded_session(host)
+        if owner is None:
+            row("SKIP", "guard check on %s: foreign session, lone form blocks with the takeover route" % host.name,
+                "no session WAL recorded on this host to probe with")
         probes = (
             ("own session, forced remove blocks with the ah route", self.PROBE, "git worktree remove --force %s" % path, "block", "ah.py worktree-remove"),
-            ("foreign session, lone form blocks with the takeover route", "othersession1", "git worktree remove %s" % path, "block", "takeover status --from %s" % self.PROBE),
+        ) + ((
+            # since review F2 a work directory is a session's only when this host records a WAL of that name
+            ("foreign session, lone form blocks with the takeover route", "othersession1",
+             "git worktree remove ~/.agent-harness/work/%s/x" % owner, "block", "takeover status --from %s" % owner),
+        ) if owner else ()) + (
             ("an assigned session id blocks", "othersession1",
              "CLAUDE_CODE_SESSION_ID=abc python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path %s --reason r" % path, "block", "identity"),
             ("ah worktree-remove is allowed", self.PROBE,
@@ -568,6 +576,16 @@ class Run:
                 verdict = {}
             good = verdict.get("verdict") == want and part in verdict.get("message", "")
             row("PASS" if good else "FAIL", "guard check on %s: %s" % (host.name, label), "" if good else (out[:100].strip() or "no answer"))
+
+    SESSION_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{7,127}$")
+
+    def recorded_session(self, host):
+        """The first session WAL directory name this host records (Claude, then Codex), or None. Names only: nothing
+        inside a WAL is read. The probe only analyses command text that names that session's work directory."""
+        code, out, _e = host.run(["bash", "-c", "ls -1 .claude/wals .agent-harness/codex-wals 2>/dev/null"])
+        names = [line.strip() for line in (out or "").splitlines()]
+        names = [n for n in names if self.SESSION_NAME.fullmatch(n) and n not in ("othersession1", self.PROBE)]
+        return names[0] if names else None
 
     def dry_run_probe(self, host, flavor, ah, row):
         """ah kill --dry-run on a sleep this script starts: would-stop, and the process is still there afterwards."""

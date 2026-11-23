@@ -335,6 +335,17 @@ class Verify(Fixture):
                     if source.is_file():
                         (home / directory / source.name).write_bytes(source.read_bytes())
             (home / ".codex/agent-harness/wal.py").write_bytes((ROOT / "codex/hooks/wal.py").read_bytes())
+            # review F2: only a session this host records owns a work directory, so the foreign probe needs one
+            (home / ".claude/wals/recordedsession01").mkdir(parents=True, exist_ok=True)
+
+    def test_the_foreign_probe_needs_a_recorded_session_and_skips_without_one(self):
+        self.install_all_hooks()
+        self.run_script("--apply")
+        for home in (self.mac, self.t2):
+            (home / ".claude/wals/recordedsession01").rmdir()
+        code, text = self.run_script("--verify", tty=False)
+        self.assertNotIn("FAIL guard check", text)
+        self.assertIn("SKIP guard check on local: foreign session, lone form blocks with the takeover route", text)
 
     def test_a_healthy_install_verifies_with_exit_zero_and_every_probe_passes(self):
         self.install_all_hooks()
