@@ -33,6 +33,7 @@ def load_json_file(path):
 
 
 INFO_CODES = ("live_missing", "schema_newer", "marker_info")
+CHAIN_WINDOW_BYTES = 64 * 1024 * 1024  # the newest bytes of each WAL chain that are counted (a test may lower it)
 
 
 def jsonl_records(path, problems=None, deadline_s=5.0):
@@ -43,12 +44,13 @@ def jsonl_records(path, problems=None, deadline_s=5.0):
     import safe_input
     import wal_segments as ws
     probs = []
-    window = 64 * 1024 * 1024
+    window = CHAIN_WINDOW_BYTES
     try:
-        data = ws.read_tail(path, window, problems=probs)
-        chain = ws.chain(os.path.dirname(path) or ".", os.path.basename(path)[:-len(".jsonl")])
-        total = sum(seg.size for seg in chain.segments) + (chain.live.size if chain.live else 0)
-        if total > window:
+        with ws.open_chain(path) as snap:  # one directory scan: the snapshot lists the chain once
+            data = snap.read_tail(window)
+            total = sum(seg.size for seg in snap.chain.segments) + (snap.chain.live.size if snap.chain.live else 0)
+            probs.extend(snap.problems)
+        if total > window:  # the window did not reach the start of a longer chain: older rows were not read
             probs.append({"code": "truncated", "message": "only the newest %d of %d bytes were read" % (window, total), "seq": None})
     except (OSError, ws.SegmentProblem):
         data = b""
@@ -91,13 +93,29 @@ def _ts(text):
     return datetime.fromisoformat(text).timestamp()
 
 
+def _newest_mtime(wal_dir, chain):
+    """Newest mtime over a chain's live file and closed segments (lstat); now (never cold) when it cannot be told."""
+    names = [seg.name for seg in chain.segments] + ([chain.live.name] if chain.live else [])
+    try:
+        return max(os.lstat(os.path.join(wal_dir, name)).st_mtime for name in names)
+    except (OSError, ValueError):
+        return time.time()
+
+
 def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S, problems=None):
     """Ids of agents started, not stopped, and active within `window` seconds before `now`. Reads the whole segment
     chain of main and every agent WAL (a closed segment is never an agent of its own)."""
     import wal_segments as ws
     started, stopped, last = {}, set(), {}
-    for stem in sorted(ws.list_wals(wal_dir)):
+    chains = ws.list_wals(wal_dir)  # ONE directory scan; each chain read below scans again, so cold WALs are skipped
+    cold_before = time.time() - max(window, LIVE_WINDOW_S) - 60
+    for stem in sorted(chains):
         if not (stem == "main" or stem.startswith("agent-")):
+            continue
+        if stem != "main" and _newest_mtime(wal_dir, chains[stem]) < cold_before:
+            # An owner WAL idle for longer than the live window holds no activity inside it, and a start or stop row is
+            # also written to main (recent_starts reads them there): it cannot change the count, so it is not read.
+            # (Measured: with 2,300 owner WALs each read costs a directory scan; skipping cold ones keeps the hook fast.)
             continue
         path = os.path.join(wal_dir, stem + ".jsonl")
         for record in jsonl_records(path, problems):  # newest first

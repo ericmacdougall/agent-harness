@@ -474,16 +474,16 @@ def read_wal_tail_lines(path: str, max_bytes: int, line_max: int):
     stem, _seq = ws.parse_name(name)
     if stem is None or not ws.exists(str(path)):
         raise FileNotFoundError(str(path))
-    raw = ws.read_tail(str(path), max_bytes, problems=probs)
-    ch = ws.chain(d or ".", stem)
-    total = sum(s.size for s in ch.segments) + (ch.live.size if ch.live else 0)
+    with ws.open_chain(str(path)) as snap:  # one directory scan: the snapshot lists the chain once
+        raw = snap.read_tail(max_bytes)
+        total = sum(s.size for s in snap.chain.segments) + (snap.chain.live.size if snap.chain.live else 0)
+        probs = list(snap.problems)
     stats["problems"] = [p for p in probs if p.get("code") not in WAL_INFO_CODES]
     chunks = raw.split(b"\n")
-    if total > max_bytes and chunks:
+    if total > max_bytes and chunks:  # the window did not reach the start of a longer chain: the first line may be partial
         chunks = chunks[1:]
         stats["partial_head"] = True
-        stats["problems"].append({"code": "truncated", "seq": None,
-                                  "message": f"newest {max_bytes} of {total} bytes read"})
+        stats["problems"].append({"code": "truncated", "seq": None, "message": f"newest {max_bytes} of {total} bytes read"})
     chunks = chunks[:-1] if chunks else chunks  # the last piece is "" after a final newline, else a half line
     lines = []
     for c in chunks:

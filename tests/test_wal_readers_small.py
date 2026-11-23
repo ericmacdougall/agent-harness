@@ -368,6 +368,66 @@ class SkillScanTests(Fixture):
         self.assertEqual(scan.sessions(self.home, 3600), [SESSION])
 
 
+class BudgetTests(Fixture):
+    """R2-4: a byte budget over a chain drops the OLDEST rows, never the newest, and says so (`truncated`)."""
+
+    def test_agent_gate_window_keeps_the_newest_rows_and_reports_truncated(self):
+        import agent_gate
+        self.append("main.jsonl", {"at": iso(), "event": "subagent", "agent_id": "a-old"})
+        self.fill("main.jsonl", n=30, pad=300)  # pushes the old start far beyond a small window
+        self.append("main.jsonl", {"at": iso(), "event": "subagent", "agent_id": "a-new"})
+        self.append("main.jsonl", {"at": iso(), "event": "pretool", "agent_id": "a-new"})
+        self.rotated()
+        problems = []
+        with patch.object(agent_gate, "CHAIN_WINDOW_BYTES", 2000):
+            live = agent_gate.live_agents(str(self.dir), time.time() + 1, problems=problems)
+        self.assertEqual(live, ["a-new"])  # the newest start survives; the budget cut the oldest
+        self.assertIn("truncated", [p["code"] for p in problems])
+
+    def test_agent_gate_does_not_read_a_cold_owner_wal(self):
+        import agent_gate
+        self.append("main.jsonl", {"at": iso(), "event": "subagent", "agent_id": "a1"})
+        self.append("main.jsonl", {"at": iso(), "event": "pretool", "agent_id": "a1"})
+        self.append("agent-a1.jsonl", {"at": iso(), "event": "pretool", "agent_id": "a1"})
+        os.utime(self.dir / "agent-a1.jsonl", (1, 1))  # idle far longer than the live window
+        calls = []
+        real = agent_gate.jsonl_records
+        with patch.object(agent_gate, "jsonl_records", side_effect=lambda path, *a, **k: calls.append(path) or real(path, *a, **k)):
+            self.assertEqual(agent_gate.live_agents(str(self.dir), time.time() + 1), ["a1"])
+        self.assertEqual([os.path.basename(c) for c in calls], ["main.jsonl"])
+
+    def test_ahd_wal_asks_window_keeps_the_newest_ask(self):
+        import ahd
+        self.append("main.jsonl", {"at": "2027-01-15T07:00:00+00:00", "event": "ask", "id": "wold", "note": "old ask"})
+        self.fill("main.jsonl", n=30, pad=300)
+        self.append("main.jsonl", {"at": "2027-01-15T08:00:00+00:00", "event": "ask", "id": "wnew", "note": "new ask"})
+        self.rotated()
+        got = ahd.wal_asks({"wal_asks_max_bytes": 3000}, [SESSION])
+        self.assertEqual([a["id"] for a in got], ["wnew"])
+
+    def test_review_map_keeps_the_newest_rows_over_the_cap_and_reports_it(self):
+        import review_map
+        self.append("main.jsonl", {"at": iso(), "event": "decision", "note": "OLD decision for goodqa#1"})
+        self.fill("main.jsonl", n=30, pad=300)
+        self.append("main.jsonl", {"at": iso(), "event": "decision", "note": "NEW decision for goodqa#1"})
+        self.rotated()
+        problems = []
+        with patch.object(review_map, "MAX_WAL_BYTES", 3000):
+            rows = review_map.find_wal(["a" * 40], "feat/some-branch", ["GoodQA goodqa#1"], time.time() - 60, time.time(), problems)
+        self.assertEqual([r["note"] for r in rows], ["NEW decision for goodqa#1"])
+        self.assertTrue(any("truncated" in p for p in problems), problems)
+
+    def test_wal_cadence_window_keeps_the_newest_human_note(self):
+        import wal_cadence
+        self.append("agent-own1.jsonl", {"at": iso(900), "event": "status", "note": "older note"})
+        self.fill("agent-own1.jsonl", n=30, pad=300)
+        self.append("agent-own1.jsonl", {"at": iso(60), "event": "status", "note": "newest note"})
+        self.rotated("agent-own1.jsonl")
+        with patch.object(wal_cadence, "WAL_TAIL_BYTES", 2000):
+            age = wal_cadence.last_human_entry_age(self.path("agent-own1.jsonl"), time.time())
+        self.assertTrue(30 < age < 200, age)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 MIGRATED = ("wal_note", "agent_gate", "ahd", "ahd_peek", "review_map", "mission_coverage", "ah_export", "wal_cadence",
             "workdir", "dropped_gate", "goals_view")

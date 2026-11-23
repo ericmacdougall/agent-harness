@@ -103,16 +103,12 @@ def _chain_tail(path, window=TAIL_WINDOW):
     """(bytes, problems): the newest `window` bytes of the whole segment chain of `path`. A search that did not reach
     the start of a chain longer than the window adds a `truncated` problem, so "not found" is never a silent claim."""
     import wal_segments as ws  # noqa: PLC0415
-    probs = []
-    data = ws.read_tail(path, window, problems=probs)
-    stem = Path(path).name[:-len('.jsonl')]
-    try:
-        ch = ws.chain(str(Path(path).parent), stem)
-        total = sum(seg.size for seg in ch.segments) + (ch.live.size if ch.live else 0)
-    except OSError:
-        total = 0
-    if total > window:
-        probs.append({'code': 'truncated', 'message': f'only the newest {window} bytes of {total} were searched', 'seq': None})
+    with ws.open_chain(path) as snap:  # one directory scan: the snapshot lists the chain once
+        data = snap.read_tail(window)
+        total = sum(seg.size for seg in snap.chain.segments) + (snap.chain.live.size if snap.chain.live else 0)
+        probs = list(snap.problems)
+    if total > window:  # the window did not reach the start of a longer chain: older rows were not searched
+        probs.append({'code': 'truncated', 'message': f'only the newest {window} of {total} bytes were searched', 'seq': None})
     return data, probs
 
 
