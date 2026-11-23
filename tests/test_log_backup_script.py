@@ -2835,7 +2835,8 @@ class TierOneCheckpoint(Case):
             self.assertNotIn(".guarded", fn)
         bu = text[text.index("\nbulk_upload() {"):]
         bu = bu[:bu.index("\n}\n")]
-        self.assertLess(bu.index('record_verified keep "$st/done"'), bu.index("bulk_unsent"))
+        self.assertLess(bu.index('record_verified keep "$st/done"'), bu.index("unsent=$(bulk_unsent "))
+        self.assertLess(bu.index("unsent=$(bulk_unsent "), bu.index('say "$rel: pass complete ($total'))
 
     def test_neg_tier1_checkpoint_state_is_its_own(self):
         # The lane owns log-backup.bulk.d; tier 1 must never write into it (two writers on one checkpoint).
