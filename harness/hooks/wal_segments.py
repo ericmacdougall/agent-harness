@@ -170,8 +170,12 @@ def _scan(directory_or_fd, stem=None):
     return out
 
 
-def _build_chain(directory, stem, scan_dir):
+def _build_chain(directory, stem, scan_dir, dfd=None):
     ch = Chain(directory, stem)
+
+    def lstat_name(name):  # stat relative to the pinned directory fd when given, never the cwd
+        return os.lstat(name, dir_fd=dfd) if dfd is not None else os.lstat(os.path.join(directory, name))
+
     seqs, lives = scan_dir.get(stem, ({}, []))
     ch.max_seq = max(seqs) if seqs else 0
     for seq in sorted(seqs):
@@ -181,7 +185,7 @@ def _build_chain(directory, stem, scan_dir):
             continue
         name = names[0]
         try:
-            st = os.lstat(os.path.join(directory, name))
+            st = lstat_name(name)
         except OSError as error:
             ch.problem("unreadable", f"{name}: {type(error).__name__}", seq)
             continue
@@ -198,7 +202,7 @@ def _build_chain(directory, stem, scan_dir):
             expect = seq + 1
     if lives:
         try:
-            st = os.lstat(os.path.join(directory, lives[0]))
+            st = lstat_name(lives[0])
             if stat.S_ISREG(st.st_mode):
                 ch.live = Seg(ch.max_seq + 1, lives[0], "live", st.st_size, st.st_ino)
             else:
@@ -766,7 +770,7 @@ def _first_last_at(fd):
 
 
 def build_index(directory_fd, stem):
-    ch = _build_chain(".", stem, _scan(directory_fd, stem))
+    ch = _build_chain(".", stem, _scan(directory_fd, stem), dfd=directory_fd)
     segs = []
     names = [s.name for s in ch.segments]
     markers = {}
