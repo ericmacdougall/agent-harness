@@ -47,7 +47,7 @@ INDEX_MAX_SECONDS = 30
 INDEX_HEADER_BYTES = 9  # tag, space, six-digit mode, space
 JOURNAL_MAX_ENTRIES = 4096
 JOURNAL_SCAN_SECONDS = 30
-NONEMPTY_UNITTEST = (
+NONEMPTY_UNITTEST_RUNNER = (
     'import sys, threading, unittest\n'
     'class NonemptyResult(unittest.TextTestResult):\n'
     '    def __init__(self, *args, **kwargs):\n'
@@ -87,9 +87,41 @@ NONEMPTY_UNITTEST = (
     '                    and not self._callback_mismatch and self.wasSuccessful())\n'
     'class NonemptyRunner(unittest.TextTestRunner):\n'
     '    resultclass = NonemptyResult\n'
+)
+NONEMPTY_UNITTEST = NONEMPTY_UNITTEST_RUNNER + (
     "program = unittest.main(module=None, argv=['unittest', *sys.argv[1:]], "
     'testRunner=NonemptyRunner, exit=False)\n'
     'sys.exit(0 if program.result.merge_check_passed() else 1)\n'
+)
+NATIVE_TEST_ROOT = "native/codex"
+NONEMPTY_NATIVE_TEST = NONEMPTY_UNITTEST_RUNNER + (
+    'import importlib.util, os, stat\n'
+    'from contextlib import ExitStack\n'
+    'from pathlib import Path\n'
+    'path = Path(sys.argv[1])\n'
+    'try:\n'
+    '    with ExitStack() as stack:\n'
+    '        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW\n'
+    '        directory = os.open(".", flags)\n'
+    '        stack.callback(os.close, directory)\n'
+    '        for part in ("native", "codex"):\n'
+    '            directory = os.open(part, flags, dir_fd=directory)\n'
+    '            stack.callback(os.close, directory)\n'
+    '        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)\n'
+    '        with os.fdopen(fd, "rb") as source:\n'
+    '            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):\n'
+    '                raise OSError("Native Python check must select a regular file")\n'
+    '            code = compile(source.read(), str(path), "exec")\n'
+    '    spec = importlib.util.spec_from_file_location(path.stem, path)\n'
+    '    module = importlib.util.module_from_spec(spec)\n'
+    '    sys.modules[spec.name] = module\n'
+    '    sys.path[:0] = [str(path.parent), os.getcwd()]\n'
+    '    exec(code, vars(module))\n'
+    '    suite = unittest.defaultTestLoader.loadTestsFromModule(module)\n'
+    '    result = NonemptyRunner().run(suite)\n'
+    'except SystemExit:\n'
+    '    sys.exit(1)\n'
+    'sys.exit(0 if result.merge_check_passed() else 1)\n'
 )
 
 
@@ -206,17 +238,21 @@ def focused_node(argv):
             and all(NODE_SEGMENT.fullmatch(part) for part in path.split('/')))
 
 
-def node_file(repo, relative):
+def check_file(repo, relative, label):
     """Recheck each component in the actual scratch/original, without following links."""
     root = Path(repo).resolve(strict=True)
     path = root
     for part in relative.split('/'):
         path = path / part
         if path.is_symlink():
-            raise CheckInterpreterError('Node check path contains a symbolic link')
+            raise CheckInterpreterError(f'{label} check path contains a symbolic link')
     if not path.is_file() or not path.resolve(strict=True).is_relative_to(root):
-        raise CheckInterpreterError('Node check must name an existing regular file in the repository')
+        raise CheckInterpreterError(f'{label} check must name an existing regular file in the repository')
     return path
+
+
+def node_file(repo, relative):
+    return check_file(repo, relative, 'Node')
 
 
 def node_reporter():
@@ -514,6 +550,14 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=Non
         return run_node(repo, command, environment, timeout, sink)
     executed = command
     if command and command[0] in CHECK_PYTHON_NAMES:
+        options = command[1:]
+        if focused_unittest(options) and options[4] == NATIVE_TEST_ROOT:
+            selected = check_file(repo, f'{NATIVE_TEST_ROOT}/{options[6]}', 'Native Python')
+            interpreter = resolve_check_interpreter(command[0], environment)
+            # Use isolated stdlib and the selected source only. An ordinary
+            # discovery pass would import nested packages even with a literal -p.
+            return run_process([interpreter, '-I', '-B', '-c', NONEMPTY_NATIVE_TEST, str(selected)],
+                               cwd=selected.parents[2], timeout=timeout, env=environment, **output_options)
         executed = [resolve_check_interpreter(command[0], environment), *command[1:]]
     if (discard_output and len(command) >= 4 and command[0] in CHECK_PYTHON_NAMES
             and command[1:4] == ['-m', 'unittest', 'discover']):
@@ -578,12 +622,9 @@ FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
 
 
 def focused_unittest(options):
-    """`-m unittest discover -s tests -p <one literal test_*.py name>`: one file name, no glob, path or extra argv
-    (discovery matches that name in tests/ and its subpackages).
-
-    A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
-    all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""
-    return (len(options) == 7 and options[:6] == ["-m", "unittest", "discover", "-s", "tests", "-p"]
+    """Allow one literal test name in each known root with the same exact argv."""
+    return (len(options) == 7 and options[:4] == ["-m", "unittest", "discover", "-s"]
+            and options[4] in {"tests", NATIVE_TEST_ROOT} and options[5] == "-p"
             and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
 
 
