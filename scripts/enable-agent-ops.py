@@ -4,6 +4,11 @@
     python3 ~/.agent-harness/bin/ah_enable_self_serve.py            dry run: print the diff and the capability list
     python3 ~/.agent-harness/bin/ah_enable_self_serve.py --apply --ref <40-hex canonical-main SHA>
     ... --status | --undo | --disable <capability|all> | --resume RUN
+    ... --apply --fallback-denylist GLOB   (optional, repeatable) paths the same-harness fallback may never cover.
+        By default no denylist is written and every changed path is allowed. Source:
+        answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06 "Allow every path".
+    The preflight asks ah_parity.verify_gate(<--ref>) (every host equals canonical main; Codex hooks trusted) and
+    refuses unless it reports ok.
     ... --bootstrap --ref <SHA>      scan, repair-harness --apply on both hosts, then --apply (one command)
 
 This command is the human step. Every mutating mode refuses unless stdin and stdout are a terminal, no agent
@@ -46,6 +51,7 @@ import base64
 import difflib
 import hashlib
 import hmac
+import importlib.util
 import json
 import os
 import re
@@ -70,7 +76,7 @@ DEFAULT_HOST = "t2-dev"
 CAPABILITIES = ("same_harness_fallback_review", "merge_reviewed_pr", "harness_repair", "pool_cleanup",
                 "install_files_manifest", "central_decisions_agent_steps")
 CAPABILITY_TEXT = {
-    "same_harness_fallback_review": "accept a settled same-harness exact-HEAD PASS when the other harness is out of quota (receipt, rung and denylist limits)",
+    "same_harness_fallback_review": "accept a settled same-harness exact-HEAD PASS when the other harness is out of quota (receipt, rung, fresh worktree, label and follow-up limits; every changed path unless you pass --fallback-denylist)",
     "merge_reviewed_pr": "merge one reviewed PR through `ah ops merge`",
     "harness_repair": "run the journaled `ah ops repair` recipe on both hosts",
     "pool_cleanup": "reap this session's own dead pool reservations",
@@ -175,6 +181,27 @@ def crypto():
     except ImportError:
         raise Refused("the cryptography package is required (use /usr/bin/python3 or a Python that has it)") from None
     return ed25519, serialization
+
+
+def default_parity(layout, ref: str) -> dict:
+    """ah_parity.verify_gate(<the user's --ref>): the one parity call the enabler makes. The module is loaded by path from
+    this home's installed hooks (never by sys.path) and only when it is a plain file of this user's that group and others
+    cannot write; anything else is a refusal. The ref is the user's own, never a default or a free choice."""
+    path = layout.claude / "hooks" / "ah_parity.py"
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise Refused("ah_parity.py is not installed in %s; run repair-harness at the pinned SHA first" % path.parent) from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid not in (os.getuid(), 0) or info.st_mode & 0o022:
+        raise Refused("ah_parity.py is not a plain file of this user's that only they can write; not loading it")
+    spec = importlib.util.spec_from_file_location("ah_parity_for_enabler", str(path))
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+        gate = module.verify_gate
+    except Exception as error:  # noqa: BLE001 - a module that cannot load is a refusal, never a pass
+        raise Refused("ah_parity.py could not be loaded (%s)" % error.__class__.__name__) from None
+    return gate(ref, home=str(layout.home))
 
 
 class Layout:
@@ -363,11 +390,32 @@ def remove_codex_hook(hooks: dict, command: str):
     return result
 
 
-def build_policy(key_id: str, *, repos, hosts, disabled=(), expires_days=None, now=None, policy_id=None) -> dict:
+GLOB_MAX = 200
+
+
+def check_globs(values) -> list:
+    """The fallback denylist the user passed: a list of non-empty, printable, bounded glob strings, sorted and unique."""
+    if not isinstance(values, (list, tuple)) or len(values) > 100:
+        raise Refused("--fallback-denylist must be a short list of glob patterns")
+    out = set()
+    for value in values:
+        if not isinstance(value, str) or not value or len(value) > GLOB_MAX or any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise Refused("--fallback-denylist takes a non-empty printable glob of at most %d characters" % GLOB_MAX)
+        out.add(value)
+    return sorted(out)
+
+
+def build_policy(key_id: str, *, repos, hosts, disabled=(), expires_days=None, now=None, policy_id=None, denylist=()) -> dict:
+    """The fallback capability carries `denylist_paths` only when the user passed --fallback-denylist; by default there is
+    none and every changed path is allowed (answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06
+    "Allow every path")."""
     capabilities = {}
+    denylist = check_globs(denylist)
     for cap in CAPABILITIES:
         scope = {"repos": sorted(repos)} if cap in ("same_harness_fallback_review", "merge_reviewed_pr") \
             else {"hosts": sorted(hosts)}
+        if cap == "same_harness_fallback_review" and denylist:
+            scope["denylist_paths"] = denylist
         capabilities[cap] = {"scope": scope, "ttl_seconds": TTL_SECONDS[cap]}
     when = time.time() if now is None else now
     return {"schema": SCHEMA, "purpose": PURPOSE, "policy_id": policy_id or secrets.token_hex(16), "key_id": key_id,
@@ -416,7 +464,9 @@ def reissue_policy(policy: dict, disabled) -> dict:
     try:
         repos = policy["capabilities"]["merge_reviewed_pr"]["scope"]["repos"]
         hosts = policy["capabilities"]["harness_repair"]["scope"]["hosts"]
-    except (KeyError, TypeError):
+        denylist = policy["capabilities"]["same_harness_fallback_review"]["scope"].get("denylist_paths", [])
+        denylist = check_globs(denylist)
+    except (KeyError, TypeError, AttributeError, Refused):
         raise shape from None
     text = lambda value, pattern: isinstance(value, str) and bool(pattern.match(value))  # noqa: E731
     if not (isinstance(repos, list) and repos and all(text(r, REPO_NAME) for r in repos)
@@ -425,7 +475,8 @@ def reissue_policy(policy: dict, disabled) -> dict:
             and text(policy.get("issued_at"), ISO_TIME)
             and (policy.get("expires_at") is None or text(policy.get("expires_at"), ISO_TIME))):
         raise shape
-    rebuilt = build_policy(policy["key_id"], repos=repos, hosts=hosts, disabled=disabled, policy_id=policy["policy_id"])
+    rebuilt = build_policy(policy["key_id"], repos=repos, hosts=hosts, disabled=disabled, policy_id=policy["policy_id"],
+                           denylist=denylist)
     rebuilt["issued_at"], rebuilt["expires_at"] = policy["issued_at"], policy.get("expires_at")
     fixed = lambda d: {k: v for k, v in d.items() if k not in ("signature", "disabled")}  # noqa: E731
     if fixed(rebuilt) != fixed(policy):
@@ -676,13 +727,14 @@ def validate_params(params) -> dict:
     if days is not None and not (isinstance(days, int) and not isinstance(days, bool) and 0 < days <= 3650):
         raise Refused("the journal parameters are malformed (expires_days)")
     return {"ref": ref, "host": host, "skip_remote": bool(params.get("skip_remote")), "repos": sorted(set(repos)),
-            "expires_days": days}
+            "expires_days": days, "fallback_denylist": check_globs(params.get("fallback_denylist") or [])}
 
 
 class Enabler:
-    def __init__(self, layout: Layout, *, env=None, upstream=None, remote=None, template=None, out=print,
+    def __init__(self, layout: Layout, *, env=None, upstream=None, remote=None, parity=None, template=None, out=print,
                  on_step=None, now=None):
         self.layout = layout
+        self.parity = parity or default_parity
         self.env = env or Env()
         self.upstream = upstream or Upstream()
         self.remote = remote or Remote()
@@ -759,6 +811,7 @@ class Enabler:
         if drift:
             raise Refused("installed hooks differ from the pinned SHA on this Mac (%d, first: %s); run repair-harness "
                           "at that SHA first" % (len(drift), ", ".join(drift[:5])))
+        self.parity_gate(ref)
         if skip_remote or not host:
             return
         code, output = self.remote.run(host, remote_hash_command(), json.dumps(sorted(expected)).encode())
@@ -772,6 +825,21 @@ class Enabler:
         if drift:
             raise Refused("installed hooks differ from the pinned SHA on %s (%d, first: %s)"
                           % (host, len(drift), ", ".join(drift[:5])))
+
+    def parity_gate(self, ref: str):
+        """Every host must equal canonical main at the user's ref (ah_parity.verify_gate). Only a report whose `ok` is
+        exactly True passes; a missing module, an odd report or an exception is a refusal."""
+        try:
+            report = self.parity(self.layout, ref)
+        except Refused:
+            raise
+        except Exception as error:  # noqa: BLE001
+            raise Refused("the parity check failed (%s); not continuing" % error.__class__.__name__) from None
+        if not isinstance(report, dict) or report.get("ok") is not True:
+            reasons = [str(r) for r in (report.get("gate") or [])] if isinstance(report, dict) and isinstance(report.get("gate"), list) else []
+            if isinstance(report, dict) and report.get("error"):
+                reasons.append(str(report["error"]))
+            raise Refused("the parity gate refused at %s: %s" % (ref[:12], "; ".join(reasons[:4]) or "no clean report"))
 
     def show_plan(self, params: dict):
         for label, (old, new) in self.plan(params).items():
@@ -1080,7 +1148,8 @@ class Enabler:
         key, key_id, _ = self._identity()
         p = validate_params(journal["params"])
         policy = build_policy(key_id, repos=p["repos"], hosts=["mac"] + ([p["host"]] if not p["skip_remote"] else []),
-                              expires_days=p.get("expires_days"), now=self.clock, policy_id=journal.get("policy_id"))
+                              expires_days=p.get("expires_days"), now=self.clock, policy_id=journal.get("policy_id"),
+                              denylist=p["fallback_denylist"])
         write_atomic(self.layout.policy, (json.dumps(sign_policy(policy, key), indent=2, sort_keys=True) + "\n").encode(), 0o600)
         journal["policy_id"] = policy["policy_id"]
         self._record_file(journal, "policy")
@@ -1406,6 +1475,8 @@ def bootstrap(layout: Layout, params: dict, *, env=None, upstream=None, runner=N
         enable += ["--repo", repo]
     if params.get("expires_days"):
         enable += ["--expires-days", str(params["expires_days"])]
+    for glob in params.get("fallback_denylist") or []:
+        enable += ["--fallback-denylist", glob]
     if layout.home != Path.home():
         enable += ["--home", str(layout.home)]
     check_tree(src, manifest)
@@ -1421,6 +1492,9 @@ def parse(argv):
     parser.add_argument("--skip-remote", action="store_true", help="do not pin on the worker (recorded as a limitation)")
     parser.add_argument("--repo", action="append", help="repository a merge capability covers (default %s)" % REPO)
     parser.add_argument("--expires-days", type=int, help="policy lifetime (default: no expiry)")
+    parser.add_argument("--fallback-denylist", action="append", metavar="GLOB",
+                        help="optional: a path glob the same-harness fallback review may never cover (repeatable). "
+                             "Default: none, every changed path is allowed")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true")
     mode.add_argument("--undo", action="store_true")
@@ -1431,16 +1505,18 @@ def parse(argv):
     return parser.parse_args(argv)
 
 
-def main(argv=None, *, env=None, upstream=None, remote=None, runner=None, out=print, on_step=None) -> int:
+def main(argv=None, *, env=None, upstream=None, remote=None, runner=None, out=print, on_step=None, parity=None) -> int:
     options = parse(sys.argv[1:] if argv is None else argv)
     layout = Layout(options.home)
     if options.host and not HOST.match(options.host):
         out("refused: --host must be a plain SSH host name")
         return 3
     params = {"ref": options.ref, "host": options.host, "skip_remote": options.skip_remote,
-              "repos": sorted(set(options.repo or [REPO])), "expires_days": options.expires_days}
-    enabler = Enabler(layout, env=env, upstream=upstream, remote=remote, out=out, on_step=on_step)
+              "repos": sorted(set(options.repo or [REPO])), "expires_days": options.expires_days,
+              "fallback_denylist": options.fallback_denylist or []}
+    enabler = Enabler(layout, env=env, upstream=upstream, remote=remote, parity=parity, out=out, on_step=on_step)
     try:
+        params["fallback_denylist"] = check_globs(params["fallback_denylist"])  # refuse a bad glob before anything is read or written
         if options.status:
             out(json.dumps(enabler.status(), indent=2, sort_keys=True))
             return 0

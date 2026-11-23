@@ -109,6 +109,17 @@ class FakeUpstream:
         return dict(self.blobs)
 
 
+class FakeParity:
+    """The seam for ah_parity.verify_gate: records exactly what the enabler asked and answers with a report."""
+
+    def __init__(self, ok=True, gate=(), error=None):
+        self.ok, self.gate, self.error, self.calls = ok, list(gate), error, []
+
+    def __call__(self, layout, ref):
+        self.calls.append(ref)
+        return {"ok": self.ok, "gate": list(self.gate), "error": self.error, "hosts": {}}
+
+
 class LocalRemote:
     """Runs the exact remote command string with /bin/sh under a separate HOME, like ssh would."""
 
@@ -167,11 +178,12 @@ class Base(unittest.TestCase):
         (codex / "hooks.state").write_text('{"trusted": "keep"}\n')
         (codex / "config.toml").write_text("[model]\nname = 'x'\n")
 
-    def run_main(self, *args, env=None, upstream=None, remote=None, on_step=None):
+    def run_main(self, *args, env=None, upstream=None, remote=None, on_step=None, parity=None):
         self.lines.clear()
         argv = list(args) + ["--home", str(self.home)]
+        self.parity = parity or FakeParity()
         code = E.main(argv, env=env or FakeEnv(), upstream=upstream or FakeUpstream(self.blobs),
-                      remote=remote or self.remote, out=self.lines.append, on_step=on_step)
+                      remote=remote or self.remote, out=self.lines.append, on_step=on_step, parity=self.parity)
         return code
 
     def apply(self, **kw):
@@ -1210,7 +1222,7 @@ if pid == 0:
         "        d = os.path.join(%r, '.claude', 'hooks')\n"
         "        return {n: m.blob_sha(open(os.path.join(d, n), 'rb').read()) for n in os.listdir(d)}\n"
         "sys.exit(m.main(['--apply', '--ref', %r, '--home', %r, '--skip-remote'],\n"
-        "                env=m.Env(platform=%r, osascript=%r), upstream=Up()))\n"
+        "                env=m.Env(platform=%r, osascript=%r), upstream=Up(), parity=lambda layout, ref: {'ok': True, 'gate': []}))\n"
     ) % (script, home, ref, home, platform, stub)
     os.execve(sys.executable, [sys.executable, "-I", "-c", child], {})
 transcript = b""
