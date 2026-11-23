@@ -275,7 +275,7 @@
  "tests/data/ahc_scan_corpus_exempt.json": {
   "counts": {
    "bearer:prefix": 9,
-   "redact:named-credential:prefix": 70
+   "redact:named-credential:prefix": 74
   },
   "reason": "this exemption list names rule kinds (bearer, named-credential) in its own counts and reasons; no value"
  },
