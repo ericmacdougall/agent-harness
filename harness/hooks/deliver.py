@@ -1284,7 +1284,16 @@ def transcripts_receipt(now=None):
     reasons = data.get("reasons") if isinstance(data.get("reasons"), list) else []
     detail = "; ".join(str(r)[:120] for r in reasons[:3])
     last = parse_utc(data.get("last_ok_at"))
-    if status == "never-ok" or last is None:
+    held = data.get("held") if isinstance(data.get("held"), dict) else {}
+    held_count = held.get("count") if isinstance(held.get("count"), int) and held.get("count") > 0 else 0
+    by_reason = held.get("by_reason") if isinstance(held.get("by_reason"), dict) else {}
+    result["held"] = held_count
+    if held_count:
+        # gate F1: a held transcript file is not archived; prepare refuses (an audited waiver can proceed)
+        result["refuse"] = "%d transcript file(s) held and not archived (%s); see `ah transcripts status`" % (
+            held_count, ", ".join("%s=%d" % (str(k)[:40], v) for k, v in sorted(by_reason.items())
+                                  if isinstance(v, int))[:300] or "reason unknown")
+    elif status == "never-ok" or last is None:
         result["refuse"] = "this host has never had an ok transcript archive receipt"
     elif last > now + TRANSCRIPTS_CLOCK_SKEW:
         result["refuse"] = "the last ok transcript receipt is dated in the future; it cannot be trusted"

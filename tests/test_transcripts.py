@@ -40,7 +40,8 @@ class ContractTests(L.Base):
         code, out = self.main('check', '--json')
         self.assertEqual(code, 0)
         j = json.loads(out)
-        self.assertEqual(set(j), {'last_ok_at', 'age_min', 'status', 'reasons', 'exit'})
+        self.assertEqual(set(j), {'last_ok_at', 'age_min', 'status', 'reasons', 'exit', 'held'})
+        self.assertEqual(j['held'], {'count': 0, 'by_reason': {}})
         # stale: age the ok receipt
         for name in ('last.json', 'last-ok.json'):
             p = self.home / 'receipts' / name
@@ -175,7 +176,9 @@ class ChunkTests(L.Base):
         code, r = self.sync('pr')
         self.assertEqual(r['held'][0]['reason'], 'record-over-max')
         self.assertEqual(r['held'][0]['line'], 4)
-        self.assertEqual(self.main('check')[0], 2)
+        code, out = self.main('check', '--json')  # first run held a file, so no ok receipt yet: never-ok (3)
+        self.assertEqual(code, 3)
+        self.assertEqual(json.loads(out)['held'], {'count': 1, 'by_reason': {'record-over-max': 1}})
         self.assertEqual(b''.join(self.chunk_bytes(p) for p in sorted(self.chunks())), lines(3))
 
     def test_chunk_names_carry_timestamps(self):
@@ -372,8 +375,9 @@ class RedactionGateTests(L.Base):
         self.assertTrue(any(UUID2 in n for n in names))
         self.assertFalse(any(UUID1 in n for n in names))
         self.assertEqual(r['held'][0]['reason'], 'omission-cap')
-        code, r = self.sync('pr')  # same ruleset: the file stays held, the run itself is ok
-        self.assertTrue(r['ok'], r)
+        code, r = self.sync('pr')  # same ruleset, hold not yet due: the file stays held and the run is not ok
+        self.assertFalse(r['ok'], r)
+        self.assertEqual(r['status'], 'held')
         self.assertEqual(r['held'][0]['reason'], 'omission-cap')
         self.assertFalse(any(UUID1 in n for n in self.chunks()))
         L.IdentityRedact.RULESET_VERSION = 'test-identity-2'  # rules tuned
@@ -964,10 +968,13 @@ class OperationsTests(L.Base):
         self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
         self.write('claude-projects', 'p/%s.jsonl' % UUID2, lines(3))
         code, r = self.sync('pr')
-        self.assertTrue(r['ok'], r)
+        self.assertFalse(r['ok'], r)  # gate F1: any held file makes the run not ok; the other file still archives
+        self.assertEqual(r['status'], 'held')
         self.assertEqual([h['reason'] for h in r['held']], ['refused:metadata'])
         self.assertEqual([UUID2 in p for p in self.chunks()], [True])
-        self.assertEqual(self.main('check')[0], 2)
+        code, out = self.main('check', '--json')  # no ok receipt yet (the only run held a file): never-ok (3)
+        self.assertEqual(code, 3)
+        self.assertIn('held=1 (refused:metadata=1)', json.loads(out)['reasons'])
         self.assertNotIn(UUID1, (self.home / 'alerts.jsonl').read_text())
 
     def test_catalog_readme_missing_refuses(self):
@@ -1015,6 +1022,122 @@ class OperationsTests(L.Base):
         self.assertEqual(r['status'], 'deferred')
         self.assertFalse((self.home / 'receipts' / 'last-ok.json').exists())
         self.assertEqual(self.main('check')[0], 3)
+
+
+class HoldOwnerTests(L.Base):
+    """Gate F1 (PR #316 run 123d8933): one owner of hold state; every hold retries; a hold is never reported ok."""
+    K1 = 'claude-projects/p/%s.jsonl' % UUID1
+    K2 = 'claude-projects/p/%s.jsonl' % UUID2
+
+    def test_run_cap_holds_only_the_top_contributor(self):
+        """A small all-omitted file trips the run cap; its benign neighbour with one omission still archives."""
+        L.IdentityRedact.omit_marker = b'OMITME'
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, b''.join(rec(i, text='OMITME %d' % i) for i in range(99)))
+        self.write('claude-projects', 'p/%s.jsonl' % UUID2,
+                   b''.join(rec(i, text='OMITME' if i == 500 else None) for i in range(1000)))
+        code, r = self.sync('pr')
+        names = list(self.chunks())
+        self.assertTrue(any(UUID2 in n for n in names), names)
+        self.assertFalse(any(UUID1 in n for n in names), names)
+        self.assertEqual([h['path_sha12'] for h in r['held']], [T.sha12(self.K1)])
+        side = self.sidecar(next(n for n in names if UUID2 in n))
+        self.assertEqual(side['omitted'], [{'line': 501, 'kind': 'fakekind'}])
+        self.assertFalse(r['ok'])
+        self.assertNotEqual(code, 0)
+        self.assertNotEqual(self.main('check')[0], 0)
+
+    def test_any_hold_makes_the_run_not_ok_and_keeps_last_ok_stale(self):
+        self.write('claude-projects', 'p/%s.jsonl' % UUID2, lines(3))
+        code, r = self.sync('pr')
+        self.assertTrue(r['ok'], r)
+        ok_before = self.receipt('last-ok.json')
+        self.setenv(TRANSCRIPTS_CHUNK_MAX_BYTES=4096)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(2) + rec(2, text='z' * 5000))
+        code, r = self.sync('pr')
+        self.assertEqual(r['status'], 'held')
+        self.assertFalse(r['ok'])
+        self.assertEqual(code, 2)
+        self.assertEqual(self.receipt('last-ok.json'), ok_before)  # a held run never refreshes last-ok
+        code, out = self.main('check', '--json')
+        self.assertEqual(code, 2)
+        self.assertEqual(json.loads(out)['held'], {'count': 1, 'by_reason': {'record-over-max': 1}})
+        code, out = self.main('check')
+        self.assertIn('held=1', out)
+
+    def test_held_file_is_retried_when_due(self):
+        """A hold is not permanent: once its retry is due the file is visited again, even with no source change."""
+        self.setenv(TRANSCRIPTS_HOLD_BACKOFF_SECONDS=0)
+        L.IdentityRedact.omit_marker = b'OMITME'
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1,
+                   b''.join(rec(i, text='OMITME' if i < 6 else None) for i in range(100)))
+        code, r = self.sync('pr')
+        self.assertEqual([h['reason'] for h in r['held']], ['omission-cap'])
+        code, r = self.sync('pr')  # due again at once (backoff 0), same ruleset: retried and held again
+        self.assertEqual(self.state()['files'][self.K1]['held']['attempts'], 2)
+        L.IdentityRedact.omit_marker = None  # whatever caused the omissions is gone; the ruleset is unchanged
+        code, r = self.sync('pr')
+        self.assertEqual(r['held'], [])
+        self.assertTrue(r['ok'], r)
+        self.assertTrue(any(UUID1 in n for n in self.chunks()))
+
+    def test_backoff_grows_and_waits(self):
+        cfg = T.Cfg()
+        delays = [T.hold_delay(cfg, n) for n in range(1, 12)]
+        self.assertEqual(delays, sorted(delays))
+        self.assertGreater(delays[0], 0)
+        self.assertEqual(delays[-1], T.HOLD_BACKOFF_MAX)
+        L.IdentityRedact.omit_marker = b'OMITME'
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1,
+                   b''.join(rec(i, text='OMITME' if i < 6 else None) for i in range(100)))
+        self.sync('pr')
+        held = self.state()['files'][self.K1]['held']
+        self.assertEqual(held['attempts'], 1)
+        self.assertGreater(T.parse_iso(held['retry_at']), time.time())
+        self.sync('pr')  # not due: the file is not visited, so the attempt count stands
+        self.assertEqual(self.state()['files'][self.K1]['held']['attempts'], 1)
+        L.IdentityRedact.RULESET_VERSION = 'test-identity-2'  # a rules change makes every hold due at once
+        L.IdentityRedact.omit_marker = None
+        code, r = self.sync('pr')
+        self.assertEqual(r['held'], [])
+
+    def test_collision_stays_held_and_realerts_when_due(self):
+        self.setenv(TRANSCRIPTS_HOLD_BACKOFF_SECONDS=0)
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3))
+        cfg = T.Cfg()
+        T.ensure_home(cfg)
+        month = time.strftime('%Y-%m', time.gmtime())
+        repo = 'agent-transcripts-testhost-%s-p1' % month
+        path, _ = T.chunk_path(cfg, 'claude-projects', 'p/%s.jsonl' % UUID1, 1, 1,
+                               '2026-11-01T00-00-00Z', '2026-11-01T00-00-02Z')
+        T.Remote(cfg).ensure(repo)
+        T.publish_tree(cfg, repo, {path: b'someone else\n'}, 'pre-existing')
+        self.sync('pr')
+        self.write('claude-projects', 'p/%s.jsonl' % UUID1, lines(3, start=3), mode='ab')
+        code, r = self.sync('pr')
+        self.assertEqual([h['reason'] for h in r['held']], ['collision'])
+        self.assertEqual(self.state()['files'][self.K1]['held']['attempts'], 2)
+        self.assertFalse(r['ok'])
+        self.assertEqual(self.tree(repo)[path], T.git_blob_sha(b'someone else\n'))
+
+    def test_only_the_hold_owner_writes_hold_state(self):
+        """Guard: no code path outside the owner may set, clear or pop a file's hold."""
+        import ast
+        tree = ast.parse(Path(T.__file__).read_text(encoding='utf-8'))
+        writers = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for node in ast.walk(fn):
+                targets = node.targets if isinstance(node, ast.Assign) else (
+                    [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else [])
+                for t in targets:
+                    if isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == 'held':
+                        writers.add(fn.name)
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in ('pop', 'setdefault', 'update') and node.args
+                        and isinstance(node.args[0], ast.Constant) and node.args[0].value == 'held'):
+                    writers.add(fn.name)
+        self.assertEqual(writers, {'hold', 'release', 'begin_retry'})
 
 
 if __name__ == '__main__':

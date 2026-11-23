@@ -70,7 +70,8 @@ transcripts.py ensure-repos --host H --months YYYY-MM[,YYYY-MM] [--parts N]
   - `1` stale: the last ok receipt is older than `--max-age-min`.
   - `0` ok.
 
-  `--json` prints `{status, last_ok_at, age_min, reasons, exit}`.
+  `--json` prints `{status, last_ok_at, age_min, reasons, exit, held}`, where `held` is
+  `{count, by_reason}` from the last receipt. Any held file adds a `held=N (reason=n, ...)` reason and exit 2.
 - **find** prints one JSON line per matching source file (host, source, relpath, session, parent, project, chunks,
   first/last ts, gens). `--session` also matches subagents whose parent is that session.
 - **cat** streams the latest generation of a session from git, verifying every chunk before writing it.
@@ -157,19 +158,32 @@ run through the verifier before it is pushed: a field that trips it is dropped a
 - more than 0.5 % of all records in the run are omitted, or
 - more than 5 % of a file's records are omitted, for a file of 100+ records.
 
-The failing files' staged chunks from that run are discarded and the files held, so their gaps are never baked
-into immutable chunks before the rules are tuned. The receipt status becomes `omission-cap`. A held file
-stays held, and is skipped, until `RULESET_VERSION` changes; later runs are ok, and `check` exits 2 while the
-hold lasts.
+Files over the per-file rule are held first. If the rest of the run still trips the run rule, files are held one
+at a time, highest omission rate first, until the rest is under 0.5 %. A file whose own rate is at or under 0.5 %
+is never held for the run rule, so one hostile file cannot take benign files down with it. The held files' staged
+chunks from that run are discarded, so their gaps are never baked into immutable chunks before the rules are
+tuned; every other file archives. The receipt status becomes `omission-cap`.
 
 The run-level 0.5 % rule applies only when the run processed 1000 or more records. The per-file 5 % rule
 applies only to files with 100 or more records in the run.
 
 ### Failures and holds
 
+One set of functions in `transcripts.py` (`hold`, `hold_due`, `begin_retry`, `release`) is the only writer of a
+file's hold state; a guard test fails if anything else writes it. Every hold carries `since`, `attempts` and
+`retry_at`:
+
+- A held file is retried when `retry_at` passes, after 15 min, doubling per attempt up to 24 h; at once when
+  `RULESET_VERSION` changes; and at once when the source file is rewritten.
+- A retry that holds again keeps the first `since`; the same reason again counts as another attempt and backs
+  off further. A collision is re-checked when due and, if still present, re-held and re-alerted.
+- While any file is held the run is not ok: a run that would otherwise be ok gets status `held`, `last-ok.json`
+  is not refreshed, `check` exits 2 with the counts, and `deliver.py prepare` refuses with the counts. A
+  `--transcripts-waiver` still lets the PR through and is logged.
+
 - A file that raises during chunking (a zstd failure, a sidecar whose metadata still trips the verifier, an
   unreadable range) is held with reason `refused:<why>` or `error:<Class>`, and an alert is raised. The rest of
-  the run continues, and the file is retried when it changes.
+  the run continues, and the file is retried by the hold rules above.
 - Any other exception still writes a failed receipt naming only the exception class.
 - Every child process (git, gh, zstd) gets a timeout capped at the run's hard stop (budget + 10 s). Publishing
   re-verifies and pushes one push group at a time, and stops starting new groups at the budget. What remains
@@ -311,9 +325,9 @@ until it is pushed. The test suite injects a hard crash after each step.
   files: a served `pr`, `deploy` or `takeover` forces sealing, the changed files are rescanned first, and the
   receipt lists `served_checkpoints`.
 - `receipts/last.json` is written by every run that took the lock; `last-ok.json` only when ok. Fields: host,
-  checkpoint, served_checkpoints, started/finished, ok, status (`ok|failed|refused|omission-cap|disk-low|
+  checkpoint, served_checkpoints, started/finished, ok, status (`ok|held|failed|refused|omission-cap|disk-low|
   killswitch|deferred`), files scanned/changed, chunks staged/pushed, bytes, held (source label, path sha12,
-  reason, line), backlog, shard commits, catalog commit, omitted {total, by_kind, records_processed}, collisions,
+  reason, line, since, attempts, retry_at), backlog, shard commits, catalog commit, omitted {total, by_kind, records_processed}, collisions,
   last_progress_at, killswitch, notes and error. `sync` exits 0 when the receipt is ok and 2 otherwise.
 
   Receipts, alerts and logs never carry a source value: only kinds, counts, line numbers and path sha12.

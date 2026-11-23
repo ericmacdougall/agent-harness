@@ -110,6 +110,7 @@ class Cfg:
         self.chunk_max = _env_int('TRANSCRIPTS_CHUNK_MAX_BYTES', 48 * MiB, t)
         self.shard_cap = _env_int('TRANSCRIPTS_SHARD_CAP_BYTES', 1500 * 1000 * 1000, t)
         self.seal_min = _env_int('TRANSCRIPTS_SEAL_MIN_BYTES', 1 * MiB, t)
+        self.hold_backoff = _env_int('TRANSCRIPTS_HOLD_BACKOFF_SECONDS', 900, t)  # first retry of a held file
         self.idle_s = 1800
         self.file_delta_cap = _env_int('TRANSCRIPTS_FILE_DELTA_CAP', 256 * MiB, t)
         self.push_max = 400 * 1000 * 1000
@@ -1023,6 +1024,67 @@ def gate_metadata(sidecar):
 
 
 # ----------------------------------------------------------------------------------------------------------
+# Hold state: the one owner (gate F1, PR #316). Only hold(), begin_retry() and release() write e['held'];
+# tests.test_transcripts.HoldOwnerTests guards that. Every hold carries a retry rule (exponential backoff,
+# and at once after a ruleset change), and any held file keeps the run status off "ok".
+# ----------------------------------------------------------------------------------------------------------
+
+HOLD_BACKOFF_MAX = 86400  # a held file is retried at least daily
+
+
+def iso_of(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def hold_delay(cfg, attempts):
+    """Seconds before held attempt `attempts` (1-based) is retried: doubling from cfg.hold_backoff, capped daily."""
+    if cfg.hold_backoff <= 0:
+        return 0
+    return min(cfg.hold_backoff * (2 ** min(max(attempts - 1, 0), 32)), HOLD_BACKOFF_MAX)
+
+
+def hold(cfg, e, reason, line=None):
+    """Hold file entry `e` for `reason`. A repeat of the same reason (the previous hold, or the one this visit is
+    retrying) counts as another attempt and backs off further; `since` keeps the first hold time."""
+    prev = e.get('held') or e.get('retry_of') or {}
+    attempts = (int(prev.get('attempts') or 0) + 1) if prev.get('reason') == reason else 1
+    e['held'] = {'reason': reason, 'line': line, 'ruleset': redact_mod().RULESET_VERSION,
+                 'since': prev.get('since') or now_iso(), 'attempts': attempts,
+                 'retry_at': iso_of(time.time() + hold_delay(cfg, attempts))}
+
+
+def hold_due(held):
+    """True when a hold may be retried now: its retry time has come, the ruleset changed, or it predates retries."""
+    if not held:
+        return True
+    if held.get('ruleset') != redact_mod().RULESET_VERSION:
+        return True
+    t = parse_iso(held.get('retry_at'))
+    return t is None or time.time() >= t
+
+
+def begin_retry(e):
+    """Lift a due hold for this visit; hold() counts a repeat as another attempt, release() ends it."""
+    e['retry_of'] = e.get('held')
+    e['held'] = None
+
+
+def release(e):
+    e['held'] = None
+    e.pop('retry_of', None)
+
+
+def held_summary(st):
+    """{'count', 'by_reason'} over every held file: the one view check, status, the receipt and deliver use."""
+    by_reason = {}
+    for e in st['files'].values():
+        if e.get('held'):
+            reason = str(e['held'].get('reason') or 'unknown')
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {'count': sum(by_reason.values()), 'by_reason': by_reason}
+
+
+# ----------------------------------------------------------------------------------------------------------
 # The sync run
 # ----------------------------------------------------------------------------------------------------------
 
@@ -1236,6 +1298,8 @@ class Run:
             return True
         if e.get('force_new_gen'):
             return True
+        if e.get('held'):
+            return hold_due(e['held'])  # a held file waits for its retry, then is visited even if unchanged
         s = e.get('stat')
         sig = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino]
         if s != sig:
@@ -1313,25 +1377,30 @@ class Run:
             if rewritten:
                 e['gens'].append(new_gen(g['gen'] + 1, self.id))
                 g = cur_gen(e)
-                e['held'] = None
+                release(e)  # a new generation starts clean
                 self.mark_manifest(key)
             if g['offset'] == 0 and g['seq'] == 0:
                 g['started_run'] = self.id
             self.files_changed += 1
-            held = e.get('held') or {}
-            if held.get('reason') == 'omission-cap' and held.get('ruleset') == redact_mod().RULESET_VERSION:
-                return  # the rules must change before this file is retried
-            if held.get('reason') != 'collision':
-                e['held'] = None
-            if e.get('held'):
-                return
+            held = e.get('held')
+            if held:
+                if not hold_due(held):
+                    return
+                if held.get('reason') == 'collision':
+                    # a shard path holds different bytes: only a person (or verify) can resolve it, so the retry
+                    # re-checks and re-alerts; the file stays held and the run stays not ok
+                    hold(cfg, e, 'collision', held.get('line'))
+                    alert(cfg, 'collision', 'file %s is still held on a shard path collision' % sha12(key))
+                    self.mark_manifest(key)
+                    return
+                begin_retry(e)
             try:
                 complete = self.chunk_delta(e, g, key, f, fst)
             except (Refused, ValueError, OSError, subprocess.SubprocessError) as ex:
                 if isinstance(ex, subprocess.TimeoutExpired) and ex.cmd == 'budget':
                     raise
                 why = ('refused:' + str(ex)[:60]) if isinstance(ex, Refused) else 'error:' + type(ex).__name__
-                e['held'] = {'reason': why, 'line': None}
+                hold(cfg, e, why)
                 alert(self.cfg, 'file-held', 'file %s held (%s); the run continues' % (sha12(key), why))
                 self.mark_manifest(key)
                 complete = True
@@ -1370,7 +1439,7 @@ class Run:
                 break
             if not line.endswith(b'\n'):
                 if len(line) > cfg.chunk_max:
-                    e['held'] = {'reason': 'record-over-max', 'line': line_no + 1}
+                    hold(cfg, e, 'record-over-max', line_no + 1)
                 break  # partial last line waits for the next run (NEG-7)
             if pos + len(line) > snap:
                 break
@@ -1378,7 +1447,7 @@ class Run:
             out, cnt, kind = tr.redact_line(line[:-1], line_no)
             rec = out + b'\n'
             if len(rec) > cfg.chunk_max:
-                e['held'] = {'reason': 'record-over-max', 'line': line_no}
+                hold(cfg, e, 'record-over-max', line_no)
                 line_no -= 1
                 break
             if buf and buf_bytes + len(rec) > cfg.chunk_max:
@@ -1482,15 +1551,28 @@ class Run:
 
     # -- omission cap (AC-16)
     def enforce_omission_cap(self):
-        total_r = self.records
-        total_o = len(self.omitted)
-        bad = set()
-        for key, (r, o) in self.file_counts.items():
-            if r >= 100 and o * 100 > r * 5:
-                bad.add(key)
-        run_bad = total_r >= 1000 and total_o * 1000 > total_r * 5  # run rule needs a 1000-record denominator
-        if run_bad:
-            bad |= {k for k, (r, o) in self.file_counts.items() if o}
+        """AC-16 and gate F1. Files over the per-file rule (5 %, at 100+ records) are held. If the rest still trips
+        the run rule (0.5 %, at 1000+ records), the fewest top contributors are held, highest omission rate first,
+        until the rest is under it. A file at or under the run rate is never held for the run rule, so one hostile
+        file cannot hold its neighbours. Every hold retries (hold())."""
+        counts = self.file_counts
+        bad = {k for k, (r, o) in counts.items() if r >= 100 and o * 100 > r * 5}
+        rest_r = sum(r for k, (r, o) in counts.items() if k not in bad)
+        rest_o = sum(o for k, (r, o) in counts.items() if k not in bad)
+
+        def over(r, o):
+            return r >= 1000 and o * 1000 > r * 5  # the run rule needs a 1000-record denominator
+
+        if over(rest_r, rest_o):
+            ranked = sorted(((k, r, o) for k, (r, o) in counts.items() if k not in bad and o),
+                            key=lambda x: (-(x[2] / max(x[1], 1)), -x[2], x[0]))
+            for k, r, o in ranked:
+                if o * 1000 <= r * 5:
+                    break  # at or under the run rate: never collateral
+                bad.add(k)
+                rest_r, rest_o = rest_r - r, rest_o - o
+                if not over(rest_r, rest_o):
+                    break
         if not bad:
             return
         self.status = 'omission-cap'
@@ -1503,9 +1585,10 @@ class Run:
                        None)
             if idx is not None:
                 self.rollback(e, g, idx, 'omission-cap')
-            e['held'] = {'reason': 'omission-cap', 'line': None, 'ruleset': redact_mod().RULESET_VERSION}
+            hold(self.cfg, e, 'omission-cap')
             self.mark_manifest(key)
-        alert(self.cfg, 'omission-cap', 'omitted %d of %d records; %d file(s) held' % (total_o, total_r, len(bad)))
+        alert(self.cfg, 'omission-cap', 'omitted %d of %d records; %d file(s) held'
+              % (len(self.omitted), self.records, len(bad)))
 
     # -- publishing
     def staged(self):
@@ -1546,7 +1629,7 @@ class Run:
         e['reverify_failures'] = e.get('reverify_failures', 0) + 1
         self.rollback(e, g, i, why)
         if e['reverify_failures'] >= 3:
-            e['held'] = {'reason': 'reverify-' + why, 'line': None}
+            hold(self.cfg, e, 'reverify-' + why)
         self.mark_manifest(key)
         return None
 
@@ -1648,7 +1731,7 @@ class Run:
             if c['path'] in bad:
                 self.collisions += 1
                 c['status'] = 'collision'
-                e['held'] = {'reason': 'collision', 'line': None}
+                hold(self.cfg, e, 'collision')
                 alert(self.cfg, 'collision', 'shard path %s exists with different bytes; refusing to overwrite'
                       % sha12(c['path']))
                 self.mark_manifest(key)
@@ -1846,8 +1929,10 @@ def held_of(st):
     out = []
     for key, e in st['files'].items():
         if e.get('held'):
-            out.append({'source': e['label'], 'path_sha12': sha12(key), 'reason': e['held'].get('reason'),
-                        'line': e['held'].get('line')})
+            h = e['held']
+            out.append({'source': e['label'], 'path_sha12': sha12(key), 'reason': h.get('reason'),
+                        'line': h.get('line'), 'since': h.get('since'), 'attempts': h.get('attempts'),
+                        'retry_at': h.get('retry_at')})
     return out
 
 
@@ -1886,6 +1971,7 @@ def check(cfg, max_age_min=60):
     lastok = read_json(cfg.p('receipts', 'last-ok.json'))
     reasons = []
     code = 0
+    held = {'count': 0, 'by_reason': {}}
     ks = read_json(cfg.p('killswitch.json'))
     if ks:
         reasons.append('killswitch kind=%s' % ks.get('kind'))
@@ -1894,8 +1980,14 @@ def check(cfg, max_age_min=60):
         if last.get('status') in ('failed', 'omission-cap', 'disk-low', 'refused', 'killswitch'):
             reasons.append(last['status'] + ((': ' + last['error']) if last.get('error') else ''))
             code = 2
-        if last.get('held'):
-            reasons.append('held=%d' % len(last['held']))
+        for h in last.get('held') or []:
+            reason = str(h.get('reason') or 'unknown')
+            held['by_reason'][reason] = held['by_reason'].get(reason, 0) + 1
+        held['count'] = sum(held['by_reason'].values())
+        if held['count'] or last.get('status') == 'held':
+            # gate F1: any held file is a failed check, with the counts by reason
+            reasons.append('held=%d (%s)' % (held['count'], ', '.join(
+                '%s=%d' % kv for kv in sorted(held['by_reason'].items()))))
             code = 2
         bl = last.get('backlog') or {}
         if bl.get('files'):
@@ -1923,7 +2015,8 @@ def check(cfg, max_age_min=60):
     if code == 3 and last and last.get('status') == 'unconfigured':
         status = 'unconfigured'
     return code, {'status': status, 'last_ok_at': lastok.get('finished_at') if lastok else None,
-                  'age_min': round(age, 1) if age is not None else None, 'reasons': reasons, 'exit': code}
+                  'age_min': round(age, 1) if age is not None else None, 'reasons': reasons, 'exit': code,
+                  'held': held}
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -2009,7 +2102,15 @@ def sync_body(run, backfill):
         run.errors.append('collision on %d chunk(s)' % run.collisions)
     if run.errors and run.status == 'ok':
         run.status = 'failed'
-    # a held file is reported in the receipt (check exits 2) without failing every later run
+    for e in run.st['files'].values():
+        e.pop('retry_of', None)  # a retry that ended without a new hold released the file
+    held = held_summary(run.st)
+    if held['count'] and run.status == 'ok':
+        # gate F1: a held file is never reported ok. The run still archived every other file; the receipt is
+        # not ok, so last-ok stays stale, `check` exits 2 with the counts and deliver prepare refuses.
+        run.status = 'held'
+        run.notes.append('held files=%d %s' % (held['count'], ','.join(
+            '%s=%d' % kv for kv in sorted(held['by_reason'].items()))))
 
 
 def process_queue(run, backfill):

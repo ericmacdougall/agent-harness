@@ -92,9 +92,10 @@ class Base(unittest.TestCase):
             'PATH': os.pathsep.join([str(self.stub), ZSTD_DIR, GIT_DIR, '/usr/bin', '/bin']),
             'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1',
         }
-        saved = {k: os.environ.get(k) for k in list(self.env) + ['TRANSCRIPTS_CHUNK_MAX_BYTES',
-                                                                 'TRANSCRIPTS_SHARD_CAP_BYTES', 'TRANSCRIPTS_CRASH_AT',
-                                                                 'TRANSCRIPTS_SEAL_MIN_BYTES']}
+        # Every TRANSCRIPTS_* variable (ambient, or leaked by an earlier test) is cleared for the test and restored
+        # after it, along with the keys this base sets, so no test sees another test's environment.
+        saved = {k: os.environ.get(k) for k in set(self.env) | {k for k in os.environ if k.startswith('TRANSCRIPTS_')}}
+        self._env_saved = saved
 
         def restore():
             for k, v in saved.items():
@@ -103,10 +104,9 @@ class Base(unittest.TestCase):
                 else:
                     os.environ[k] = v
         self.addCleanup(restore)
-        os.environ.update(self.env)
-        for k in ('TRANSCRIPTS_CHUNK_MAX_BYTES', 'TRANSCRIPTS_SHARD_CAP_BYTES', 'TRANSCRIPTS_CRASH_AT',
-                  'TRANSCRIPTS_SEAL_MIN_BYTES'):
+        for k in [k for k in os.environ if k.startswith('TRANSCRIPTS_')]:
             os.environ.pop(k, None)
+        os.environ.update(self.env)
         orig = T.redact_mod
         self.addCleanup(setattr, T, 'redact_mod', orig)
         IdentityRedact.omit_marker = IdentityRedact.flag_marker = None
@@ -118,6 +118,7 @@ class Base(unittest.TestCase):
     # -- helpers
     def setenv(self, **kw):
         for k, v in kw.items():
+            self._env_saved.setdefault(k, os.environ.get(k))  # restored by setUp's cleanup
             os.environ[k] = str(v)
             self.env[k] = str(v)
 

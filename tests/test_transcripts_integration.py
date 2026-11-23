@@ -217,21 +217,37 @@ class DeliverGate(Base):
         self.assertIn("transcript", risk[0]["note"])
 
     def test_warns_on_held_and_cap_and_passes_quietly_when_fresh(self):
+        # an older check output (no "held" counts) still warns on its status
         for status in ("held", "cap"):
             with self.subTest(status=status):
                 self.check_json(status, iso(1), rc=2)
                 _, err = self.gate()
                 self.assertIn(status, err)
-        # the core's own shape: held and omission caps come back as status failed with the reason listed
         os.environ["FAKE_CHECK_JSON"] = json.dumps({"status": "failed", "last_ok_at": iso(1), "age_min": 60.0,
-                                                    "reasons": ["held=2", "omission-cap: 0.7%"], "exit": 2})
+                                                    "reasons": ["omission-cap: 0.7%"], "exit": 2,
+                                                    "held": {"count": 0, "by_reason": {}}})
         _, err = self.gate()
-        self.assertIn("held=2", err)
         self.assertIn("omission-cap", err)
         self.check_json("ok", iso(0.2, z=False), rc=0)
         _, err = self.gate()
         self.assertEqual([l for l in err.splitlines() if "TRANSCRIPTS_BIN is set" not in l], [])
         self.assertIn("TRANSCRIPTS_BIN is set", err)  # the override is never silent
+
+    def test_held_files_refuse_with_counts_even_with_a_fresh_ok(self):
+        """Gate F1 (PR #316): a held file is not archived, so prepare refuses with the counts; a waiver proceeds."""
+        os.environ["FAKE_CHECK_JSON"] = json.dumps({
+            "status": "failed", "last_ok_at": iso(0.5), "age_min": 30.0, "exit": 2,
+            "reasons": ["held=2 (collision=1, omission-cap=1)"],
+            "held": {"count": 2, "by_reason": {"omission-cap": 1, "collision": 1}}})
+        os.environ["FAKE_CHECK_RC"] = "2"
+        error, _ = self.refused()
+        self.assertIn("2 transcript file(s) held", str(error))
+        self.assertIn("collision=1, omission-cap=1", str(error))
+        result, err = self.gate(self.args(wal=self.wal, transcripts_waiver="archive incident open, tracked"))
+        self.assertTrue(result["waived"])
+        self.assertEqual(result["held"], 2)
+        rows = [r for r in self.wal_rows() if r.get("transcripts_waiver")]
+        self.assertIn("held", rows[0]["transcripts_waiver"]["refused_because"])
 
     def test_network_failure_refuses_only_when_last_ok_is_also_old(self):
         os.environ["FAKE_SYNC_RC"] = "1"
