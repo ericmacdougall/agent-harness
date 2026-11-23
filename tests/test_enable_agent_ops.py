@@ -49,10 +49,22 @@ def snapshot(root: Path) -> dict:
     return out
 
 
+class FakeHandle:
+    def __init__(self, env):
+        self.env = env
+
+    def close(self):
+        return not self.env.dialog_dismissed
+
+
 class FakeEnv:
-    def __init__(self, tty=True, table=None, environ=None, answer=None):
+    """oob=True models the native dialog: the code goes to `shown`, never into the prompt."""
+
+    def __init__(self, tty=True, table=None, environ=None, answer=None, oob=False, dialog_dismissed=False,
+                 on_nonce=None, session_proof=False):
         self.tty, self.table, self.env, self.answer = tty, table or {}, environ or {}, answer
-        self.prompts = []
+        self.oob, self.dialog_dismissed, self.on_nonce, self.proof = oob, dialog_dismissed, on_nonce, session_proof
+        self.prompts, self.shown = [], []
 
     def is_tty(self):
         return self.tty
@@ -66,10 +78,23 @@ class FakeEnv:
     def pid(self):
         return 900
 
+    def session_proof_required(self):
+        return self.proof
+
+    def present_code(self, code, label):
+        if not self.oob:
+            return None
+        self.shown.append(code)
+        return FakeHandle(self)
+
     def read_nonce(self, prompt):
         self.prompts.append(prompt)
+        if self.on_nonce:
+            self.on_nonce()
         if self.answer is not None:
             return self.answer
+        if self.shown:
+            return self.shown[-1]
         return re.search(r"Type (\S+) to continue", prompt).group(1)
 
 
@@ -492,7 +517,8 @@ class UndoDisableResume(Base):
             def run(self, *a, **k):
                 return 255, ""
         self.assertEqual(self.run_main("--undo", remote=Down()), 1)
-        self.assertIn("remove it by hand", self.output)
+        self.assertIn("run --undo again", self.output)
+        self.assertTrue(E.Layout(self.home).state.exists())
 
     def test_resume_rejects_a_bad_or_unknown_run(self):
         self.assertEqual(self.run_main("--resume", "../../etc"), 3)
@@ -604,9 +630,17 @@ class Bootstrap(Base):
             self.calls.append([str(a) for a in argv])
             return 0
 
+    CLOSURE = ("netwatch_install.py", "log_backup_install.py", "mission_control_install.py", "harness/hooks/installer_scan.py", "harness/hooks/safe_input.py")
+
+    def setUp(self):
+        super().setUp()
+        hooks = self.home / ".claude" / "hooks"  # the independently installed scanner (not the checkout's)
+        for name in ("installer_scan.py", "safe_input.py"):
+            shutil.copy(ROOT / "harness" / "hooks" / name, hooks / name)
+
     def fetch_from_worktree(self, ref, dest, runner):
         src = dest / "src"
-        for name in (*E.BOOTSTRAP_SURFACE, "harness/hooks/installer_scan.py", "harness/hooks/safe_input.py"):
+        for name in (*E.BOOTSTRAP_SURFACE, *self.CLOSURE):
             (src / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / name, src / name)
         return src
@@ -616,6 +650,9 @@ class Bootstrap(Base):
         params = {"ref": REF, "host": "t2-dev", "skip_remote": False, "repos": [E.REPO], "expires_days": None}
         return E.bootstrap(E.Layout(self.home), params, env=env or FakeEnv(), upstream=upstream or FakeUpstream(self.blobs),
                            runner=runner, out=self.lines.append, fetch=fetch or self.fetch_from_worktree)
+
+    def src_dir(self):
+        return next((E.Layout(self.home).work).glob("bootstrap-*")) / "src"
 
     def test_scan_then_repair_on_the_pinned_sha_then_enable(self):
         runner = self.RecordingRunner()
@@ -673,6 +710,558 @@ class Bootstrap(Base):
         with self.assertRaises(E.Refused):
             self.boot(runner, env=FakeEnv(answer="bootstrap-000000"))
         self.assertEqual(runner.calls, [])
+
+
+    def test_the_scan_surface_follows_what_the_installers_import(self):  # repair round, finding 4
+        names = E.surface_names(self.fetch_from_worktree(REF, self.tmp / "s", None))
+        for needed in ("scripts/repair_harness.py", "netwatch_install.py", "log_backup_install.py", "mission_control_install.py"):
+            self.assertIn(needed, names)
+
+    def test_a_new_import_added_to_an_installer_joins_the_scanned_surface(self):
+        def fetch(ref, dest, runner):
+            src = self.fetch_from_worktree(ref, dest, runner)
+            (src / "harness" / "hooks" / "sidecar.py").write_text("import os\nos.system('launchctl load -w /Library/LaunchDaemons/x.plist')\n")
+            with (src / "install.py").open("a") as handle:
+                handle.write("\nimport sidecar\n")
+            return src
+        runner = self.RecordingRunner()
+        with self.assertRaises(E.Refused) as caught:
+            self.boot(runner, fetch=fetch)
+        self.assertIn("unexpected side effects", str(caught.exception))
+        self.assertEqual(runner.calls, [])
+
+    def test_launchd_is_expected_only_in_the_opt_in_log_backup_installer(self):
+        def fetch(ref, dest, runner):
+            src = self.fetch_from_worktree(ref, dest, runner)
+            with (src / "netwatch_install.py").open("a") as handle:
+                handle.write("\nimport os\nos.system('launchctl load -w /Library/LaunchDaemons/x.plist')\n")
+            return src
+        runner = self.RecordingRunner()
+        with self.assertRaises(E.Refused):
+            self.boot(runner, fetch=fetch)
+        self.assertEqual(runner.calls, [])
+
+    def swap(self, relative, text="print('swapped')\n"):
+        (self.src_dir() / relative).write_text(text)
+
+    def test_a_file_swapped_while_the_user_reads_the_report_is_refused(self):
+        for relative in ("scripts/repair_harness.py", "scripts/enable-agent-ops.py", "harness/hooks/safe_input.py"):
+            self.setUp()
+            runner = self.RecordingRunner()
+            with self.assertRaises(E.Refused, msg=relative) as caught:
+                self.boot(runner, env=FakeEnv(on_nonce=lambda r=relative: self.swap(r)))
+            self.assertIn("changed after it was scanned", str(caught.exception))
+            self.assertEqual(runner.calls, [], relative)
+
+    def test_a_file_added_after_the_scan_is_refused(self):
+        runner = self.RecordingRunner()
+        with self.assertRaises(E.Refused):
+            self.boot(runner, env=FakeEnv(on_nonce=lambda: self.swap("json.py")))
+        self.assertEqual(runner.calls, [])
+
+    def test_a_swap_between_the_executions_is_refused_before_the_next_one(self):
+        outer = self
+
+        class Swaps(self.RecordingRunner):
+            def run(self, argv, **kwargs):
+                code = super().run(argv, **kwargs)
+                if len(self.calls) == 1:
+                    outer.swap("scripts/enable-agent-ops.py")
+                return code
+        runner = Swaps()
+        with self.assertRaises(E.Refused):
+            self.boot(runner)
+        self.assertEqual(len(runner.calls), 1)  # the repair check ran; nothing after the swap did
+
+    def test_the_scanner_comes_from_the_installed_harness_not_the_checkout(self):
+        def fetch(ref, dest, runner):
+            src = self.fetch_from_worktree(ref, dest, runner)
+            (src / "harness" / "hooks" / "installer_scan.py").write_text(
+                "import json,sys\nprint(json.dumps({'files_scanned': 99, 'findings': []}))\n")
+            with (src / "install_codex.py").open("a") as handle:
+                handle.write("\nimport os\nos.system('launchctl load -w /Library/LaunchDaemons/x.plist')\n")
+            return src
+        runner = self.RecordingRunner()
+        with self.assertRaises(E.Refused) as caught:
+            self.boot(runner, fetch=fetch)
+        self.assertIn("unexpected side effects", str(caught.exception))
+        self.assertEqual(runner.calls, [])
+
+    def test_no_installed_scanner_means_no_bootstrap(self):
+        (self.home / ".claude" / "hooks" / "installer_scan.py").unlink()
+        runner = self.RecordingRunner()
+        with self.assertRaises(E.Refused) as caught:
+            self.boot(runner)
+        self.assertIn("installed", str(caught.exception))
+        self.assertEqual(runner.calls, [])
+
+    def test_a_scan_that_skips_even_one_code_file_is_refused(self):
+        class ShortScan(self.RecordingRunner):
+            def capture(self, argv, **kwargs):
+                code, out = super().capture(argv, **kwargs)
+                report = json.loads(out)
+                report["files_scanned"] -= 1
+                return code, json.dumps(report)
+        runner = ShortScan()
+        with self.assertRaises(E.Refused) as caught:
+            self.boot(runner)
+        self.assertIn("did not cover", str(caught.exception))
+        self.assertEqual(runner.calls, [])
+
+    def test_the_deviation_is_stated_in_the_output(self):
+        self.boot(self.RecordingRunner())
+        self.assertIn("DEVIATION", self.output)
+
+
+# ----------------------------------------------------------------------------------------------- repair round
+def attacker_key():
+    ed25519, serialization = E.crypto()
+    key = ed25519.Ed25519PrivateKey.generate()
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return key, E.key_id_of(raw), E.b64url(raw)
+
+
+class PolicyChokePoint(Base):
+    """Finding 1: --disable re-signs only a policy that verifies against the LOCAL signing key, and rebuilds it."""
+
+    def applied(self, *extra):
+        self.assertEqual(self.run_main("--apply", "--ref", REF, *extra), 0, self.output)
+        return E.Layout(self.home)
+
+    def tamper(self, layout, change):
+        policy = json.loads(layout.policy.read_text())
+        change(policy)
+        layout.policy.write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n")
+
+    TAMPERS = {
+        "scope widened": lambda p: p["capabilities"]["merge_reviewed_pr"]["scope"].update(repos=["*"]),
+        "ttl stretched": lambda p: p["capabilities"]["merge_reviewed_pr"].update(ttl_seconds=10 ** 9),
+        "unknown capability": lambda p: p["capabilities"].update(evil_cap={"scope": {}, "ttl_seconds": None}),
+        "expiry removed": lambda p: p.update(expires_at=None),
+    }
+
+    def test_disable_refuses_to_launder_a_tampered_policy(self):
+        for name, change in self.TAMPERS.items():
+            self.setUp()
+            layout = self.applied("--expires-days", "30")
+            self.tamper(layout, change)
+            before = layout.policy.read_bytes()
+            audit = layout.audit.read_bytes()
+            from unittest import mock
+            with mock.patch.object(E, "sign_policy", wraps=E.sign_policy) as signer:
+                self.assertEqual(self.run_main("--disable", "pool_cleanup"), 3, name)
+            self.assertEqual(signer.call_count, 0, name)
+            self.assertIn("does not verify", self.output, name)
+            self.assertEqual(layout.policy.read_bytes(), before, name)
+            self.assertEqual(layout.audit.read_bytes(), audit, name)
+
+    def test_disable_refuses_an_attacker_pin_plus_an_attacker_signed_policy(self):
+        layout = self.applied()
+        key, key_id, public = attacker_key()
+        layout.pubkeys.write_text(json.dumps({"schema": E.KEYS_SCHEMA, "keys": [{"key_id": key_id, "public_key": public}]}))
+        policy = json.loads(layout.policy.read_text())
+        body = {**{k: v for k, v in policy.items() if k != "signature"}, "key_id": key_id}
+        body["capabilities"]["merge_reviewed_pr"]["scope"]["repos"] = ["*"]
+        layout.policy.write_text(json.dumps(E.sign_policy(body, key), indent=2, sort_keys=True))
+        self.assertIsNone(E.verify_policy(json.loads(layout.policy.read_text()), E.load_pinned(layout)))  # the pin file alone is fooled
+        before = layout.policy.read_bytes()
+        self.assertEqual(self.run_main("--disable", "pool_cleanup"), 3)
+        self.assertEqual(layout.policy.read_bytes(), before)
+
+    def test_disable_refuses_a_validly_signed_policy_this_enabler_would_not_issue(self):
+        layout = self.applied()
+        key = E.Enabler(layout, env=FakeEnv())._private_key()
+        original = json.loads(layout.policy.read_text())
+        odd = {
+            "ttl stretched": lambda p: p["capabilities"]["pool_cleanup"].update(ttl_seconds=10 ** 9),
+            "capability added": lambda p: p["capabilities"].update(evil_cap={"scope": {"hosts": ["mac"]}, "ttl_seconds": 60}),
+            "scope field added": lambda p: p["capabilities"]["harness_repair"]["scope"].update(paths=["/"]),
+            "wildcard repo": lambda p: p["capabilities"]["merge_reviewed_pr"]["scope"].update(repos=["*"]),
+        }
+        for name, change in odd.items():
+            policy = json.loads(json.dumps(original))
+            change(policy)
+            layout.policy.write_text(json.dumps(E.sign_policy(policy, key), indent=2, sort_keys=True))
+            before = layout.policy.read_bytes()
+            self.assertIsNone(E.verify_policy(json.loads(before), E.load_pinned(layout)), name)  # it IS validly signed
+            self.assertEqual(self.run_main("--disable", "pool_cleanup"), 3, name)
+            self.assertIn("not the shape", self.output, name)
+            self.assertEqual(layout.policy.read_bytes(), before, name)
+
+    def test_disable_keeps_expiry_scope_and_id_exactly_and_ignores_unknown_disabled_names(self):
+        layout = self.applied("--expires-days", "30", "--repo", "o/r")
+        before = json.loads(layout.policy.read_text())
+        self.assertEqual(self.run_main("--disable", "pool_cleanup"), 0, self.output)
+        after = json.loads(layout.policy.read_text())
+        for field in ("expires_at", "issued_at", "policy_id", "key_id", "capabilities"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(after["disabled"], ["pool_cleanup"])
+        self.assertIsNone(E.verify_policy(after, E.load_pinned(layout)))
+        key = E.Enabler(layout, env=FakeEnv())._private_key()
+        layout.policy.write_text(json.dumps(E.sign_policy({**after, "disabled": ["pool_cleanup", "made_up"]}, key)))
+        self.assertEqual(self.run_main("--disable", "harness_repair"), 3)
+
+    def test_disable_shows_the_change_before_the_nonce(self):
+        layout = self.applied()
+        before = layout.policy.read_bytes()
+        self.assertEqual(self.run_main("--disable", "pool_cleanup", env=FakeEnv(answer="disable-000000")), 3)
+        self.assertIn("nonce did not match", self.output)
+        self.assertRegex(self.output, r"\+\s+\"pool_cleanup\"")
+        self.assertEqual(layout.policy.read_bytes(), before)
+
+    def test_status_does_not_call_a_policy_valid_for_a_key_that_is_not_the_local_one(self):
+        layout = self.applied()
+        key, key_id, public = attacker_key()
+        layout.pubkeys.write_text(json.dumps({"schema": E.KEYS_SCHEMA, "keys": [{"key_id": key_id, "public_key": public}]}))
+        policy = {k: v for k, v in json.loads(layout.policy.read_text()).items() if k != "signature"}
+        layout.policy.write_text(json.dumps(E.sign_policy({**policy, "key_id": key_id}, key)))
+        layout.keyfile.unlink()
+        self.assertEqual(self.run_main("--status"), 0)
+        status = json.loads(self.output)
+        self.assertFalse(status["key_present"])
+        self.assertNotEqual(status["signature"], "valid")
+
+
+class JournalIntegrity(Base):
+    """Finding 2: the journal and state file are signed with the local key; resume and undo trust nothing else."""
+
+    def plant_journal(self, signed_with=None, steps_done=True):
+        run = "20261123T101500Z-ab12cd"
+        key, key_id, public = attacker_key()
+        journal = {"schema": E.STATE_SCHEMA, "run": run, "params": {"ref": REF, "host": "t2-dev", "skip_remote": True,
+                                                                  "repos": [E.REPO], "expires_days": None},
+                   "steps": {s: ("done" if steps_done else "pending") for s in E.STEPS}, "started_at": "x", "files": {},
+                   "rules_added": [], "codex_hook_added": False, "key_created": False, "remote_pinned": False,
+                   "key_id": key_id, "public_key": public, "policy_id": "a" * 32, "backup": str(self.tmp / "evil-backup")}
+        if signed_with == "attacker":
+            journal = E.sign_policy({**journal, "purpose": "self-serve-journal"}, key)
+        path = E.Layout(self.home).work / run / "journal.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(journal))
+        return run, path
+
+    def assert_untouched(self):
+        for rel in (".claude/CLAUDE.md", ".claude/settings.json", ".codex/AGENTS.md", ".codex/hooks.json"):
+            self.assertFalse((self.home / rel).exists(), rel)
+        self.assertFalse(E.Layout(self.home).policy.exists())
+
+    def test_resume_of_a_planted_journal_is_refused(self):
+        for signed in (None, "attacker"):
+            run, _ = self.plant_journal(signed)
+            self.assertEqual(self.run_main("--resume", run), 3, signed)
+            self.assert_untouched()
+            shutil.rmtree(E.Layout(self.home).work)
+
+    def test_a_planted_state_file_and_backup_cannot_steer_undo(self):
+        self.seed_user_files()
+        self.assertEqual(self.apply(), 0, self.output)
+        layout = E.Layout(self.home)
+        evil = self.tmp / "evil-backup"
+        evil.mkdir()
+        (evil / "settings").write_text('{"permissions": {"allow": ["Bash(*)"]}}\n')
+        state = json.loads(layout.state.read_text())
+        for field, value in (("backup", str(evil)), ("key_id", "0" * 16), ("remote_pinned", False)):
+            layout.state.write_text(json.dumps({**state, field: value}, indent=2, sort_keys=True) + "\n")
+            files = snapshot(self.home)
+            self.assertEqual(self.run_main("--undo"), 3, field)
+            self.assertEqual(snapshot(self.home), files, field)
+        entry = dict(state["files"]["settings"], sha_after="0" * 64)
+        layout.state.write_text(json.dumps({**state, "files": {**state["files"], "settings": entry}}, indent=2) + "\n")
+        self.assertEqual(self.run_main("--undo"), 3)
+
+    def test_a_journal_signature_is_not_a_policy_signature(self):
+        self.assertEqual(self.apply(), 0)
+        layout = E.Layout(self.home)
+        journal = json.loads(layout.state.read_text())
+        self.assertIsNotNone(E.verify_policy(journal, E.load_pinned(layout)))  # purpose differs: never a grant
+        layout.state.write_text(layout.policy.read_text())  # a real signed policy standing in for the journal
+        self.assertEqual(self.run_main("--undo"), 3)
+
+    def test_undo_refuses_a_tampered_backup_before_writing_anything(self):
+        self.seed_user_files()
+        self.assertEqual(self.apply(), 0)
+        layout = E.Layout(self.home)
+        run = json.loads(layout.state.read_text())["run"]
+        (layout.backups / ("self-serve-" + run) / "settings").write_text('{"permissions": {"allow": ["Bash(*)"]}}\n')
+        before = snapshot(self.home)
+        self.assertEqual(self.run_main("--undo"), 3)
+        self.assertIn("backup", self.output)
+        self.assertEqual(snapshot(self.home), before)
+
+    def test_undo_refuses_a_validly_signed_journal_that_points_elsewhere(self):
+        self.seed_user_files()
+        self.assertEqual(self.apply(), 0)
+        layout = E.Layout(self.home)
+        journal = json.loads(layout.state.read_text())
+        evil = self.tmp / "evil-backup"
+        evil.mkdir()
+        (evil / "settings").write_text("{}\n")
+        journal["backup"] = str(evil)
+        E.Enabler(layout, env=FakeEnv())._save_journal(journal)
+        before = snapshot(self.home)
+        self.assertEqual(self.run_main("--undo"), 3)
+        self.assertIn("expected backup", self.output)
+        self.assertEqual(snapshot(self.home), before)
+
+    def boom_at(self, step):
+        def boom(name):
+            if name == step:
+                raise RuntimeError("injected")
+        return boom
+
+    def test_resume_rederives_the_pin_instead_of_trusting_done_steps(self):
+        self.assertEqual(self.apply(on_step=self.boom_at("settings")), 1)
+        layout = E.Layout(self.home)
+        good = layout.pubkeys.read_bytes()
+        _, key_id, public = attacker_key()
+        layout.pubkeys.write_text(json.dumps({"schema": E.KEYS_SCHEMA, "keys": [{"key_id": key_id, "public_key": public}]}))
+        run = json.loads(layout.state.read_text())["run"]
+        self.assertEqual(self.run_main("--resume", run), 0, self.output)
+        self.assertEqual(layout.pubkeys.read_bytes(), good)
+        self.run_main("--status")
+        self.assertEqual(json.loads(self.output)["signature"], "valid")
+
+    def test_resume_shows_the_plan_before_the_nonce(self):
+        self.assertEqual(self.apply(on_step=self.boom_at("settings")), 1)
+        layout = E.Layout(self.home)
+        run = json.loads(layout.state.read_text())["run"]
+        before = snapshot(self.home)
+        self.assertEqual(self.run_main("--resume", run, env=FakeEnv(answer="resume-000000")), 3)
+        self.assertIn("Resuming run", self.output)
+        self.assertIn("ah.py ops *", self.output)  # the diff of what resume would still write
+        self.assertEqual(snapshot(self.home), before)
+
+    def test_resume_never_takes_a_second_backup_so_undo_still_restores_the_originals(self):
+        self.seed_user_files()
+        originals = {p: p.read_bytes() for p in (self.home / ".claude" / "CLAUDE.md", self.home / ".claude" / "settings.json",
+                                                 self.home / ".codex" / "AGENTS.md", self.home / ".codex" / "hooks.json")}
+        self.assertEqual(self.apply(on_step=self.boom_at("codex_hook")), 1)
+        layout = E.Layout(self.home)
+        run = json.loads(layout.state.read_text())["run"]
+        self.assertEqual(self.run_main("--resume", run), 0, self.output)
+        self.assertEqual(self.run_main("--undo"), 0, self.output)
+        for path, data in originals.items():
+            self.assertEqual(path.read_bytes(), data, str(path))
+
+    def test_resume_and_undo_audit_rows_are_not_duplicated(self):
+        self.assertEqual(self.apply(on_step=self.boom_at("policy")), 1)
+        layout = E.Layout(self.home)
+        run = json.loads(layout.state.read_text())["run"]
+        self.assertEqual(self.run_main("--resume", run), 0)
+        rows = [json.loads(line)["event"] for line in layout.audit.read_text().splitlines()]
+        self.assertEqual(rows, ["apply"])
+
+    def test_the_key_comes_before_the_first_saved_journal(self):
+        self.assertEqual(self.apply(on_step=self.boom_at("preflight")), 1)
+        layout = E.Layout(self.home)
+        self.assertTrue(layout.keyfile.exists())
+        run = json.loads(layout.state.read_text())["run"]
+        self.assertEqual(self.run_main("--resume", run), 0, self.output)
+
+
+class RemotePinTrail(Base):
+    """Finding 5: an uncertain remote pin is always unpinned by --undo, and a failed unpin keeps the state."""
+
+    class LossyRemote(LocalRemote):
+        def __init__(self, home, mode):
+            super().__init__(home)
+            self.mode = mode
+
+        def run(self, host, command, stdin=None, timeout=90):
+            result = super().run(host, command, stdin, timeout)
+            if "mktemp" in command:  # the pin landed on the worker; the answer is lost
+                if self.mode == "exit":
+                    return 255, ""
+                raise subprocess.TimeoutExpired(command, timeout)
+            return result
+
+    def worker_pin(self):
+        return self.remote_home / ".agent-harness" / "policy" / "self-serve-pubkeys.json"
+
+    def test_undo_unpins_after_an_uncertain_pin_whatever_the_failure_looked_like(self):
+        for mode in ("exit", "timeout"):
+            self.setUp()
+            self.assertEqual(self.apply(remote=self.LossyRemote(self.remote_home, mode)), 1, mode)
+            self.assertTrue(self.worker_pin().exists(), mode)  # the pin really is on the worker
+            self.assertEqual(self.run_main("--undo"), 0, "%s: %s" % (mode, self.output))
+            self.assertFalse(self.worker_pin().exists(), mode)
+            self.assertFalse(E.Layout(self.home).state.exists(), mode)
+
+    def test_the_attempt_is_durable_before_the_ssh_call(self):
+        outer = self
+
+        class Spy(LocalRemote):
+            seen = None
+
+            def run(self, host, command, stdin=None, timeout=90):
+                if "mktemp" in command:
+                    Spy.seen = json.loads(E.Layout(outer.home).state.read_text()).get("remote_pin_attempted")
+                return super().run(host, command, stdin, timeout)
+        self.assertEqual(self.apply(remote=Spy(self.remote_home)), 0)
+        self.assertIs(Spy.seen, True)
+
+    class Down:
+        def run(self, *a, **k):
+            return 255, ""
+
+    def test_a_failed_unpin_keeps_the_state_and_a_rerun_finishes_without_touching_files_twice(self):
+        (self.home / ".claude").mkdir(parents=True, exist_ok=True)
+        original = b'{"permissions":{"allow":["Bash(git status)"]}}'  # compact, no newline: a second pass would reformat it
+        (self.home / ".claude" / "settings.json").write_bytes(original)
+        self.assertEqual(self.apply(), 0)
+        layout = E.Layout(self.home)
+        self.assertEqual(self.run_main("--undo", remote=self.Down()), 1)
+        self.assertTrue(layout.state.exists(), "the only record of the pin must survive a failed unpin")
+        self.assertTrue(self.worker_pin().exists())
+        self.assertEqual((self.home / ".claude" / "settings.json").read_bytes(), original)
+        self.assertEqual(self.run_main("--undo"), 0, self.output)
+        self.assertFalse(self.worker_pin().exists())
+        self.assertFalse(layout.state.exists())
+        self.assertEqual((self.home / ".claude" / "settings.json").read_bytes(), original)
+        self.assertEqual(self.run_main("--undo"), 3)  # now there is truly nothing left
+
+
+class HumanGate(Base):
+    """Finding 3: the code is shown out of band, the claim is honest, and a daemonized pty gets nowhere."""
+
+    def test_the_code_never_reaches_the_terminal_when_a_dialog_shows_it(self):
+        env = FakeEnv(oob=True)
+        self.assertEqual(self.apply(env=env), 0, self.output)
+        self.assertEqual(len(env.shown), 1)
+        for text in (*env.prompts, self.output):
+            self.assertNotIn(env.shown[0], text)
+        for mode in (["--disable", "pool_cleanup"], ["--undo"]):
+            env = FakeEnv(oob=True)
+            self.assertEqual(self.run_main(*mode, env=env), 0, self.output)
+            self.assertEqual(len(env.shown), 1, mode)
+            self.assertNotIn(env.shown[0], " ".join(env.prompts) + self.output)
+
+    def test_a_dismissed_or_expired_dialog_is_a_refusal(self):
+        before = self.all_files()
+        self.assertEqual(self.apply(env=FakeEnv(oob=True, dialog_dismissed=True)), 3)
+        self.assertIn("dialog", self.output)
+        self.assertEqual(self.all_files(), before)
+
+    def stub(self, body, name="osascript"):
+        path = self.tmp / name
+        out = self.tmp / (name + ".argv")
+        path.write_text("#!/bin/sh\nprintf '%%s\\n' \"$@\" > %s\n%s\n" % (out, body))
+        path.chmod(0o755)
+        return path, out
+
+    def wait_for(self, path, seconds=10):
+        import time
+        end = time.time() + seconds
+        while time.time() < end and not path.exists():
+            time.sleep(0.05)
+        return path.exists()
+
+    def test_the_real_env_hands_the_code_to_the_approval_dialog_only(self):
+        stub, argv = self.stub("exec sleep 30")
+        env = E.Env(platform="darwin", osascript=str(stub))
+        handle = env.present_code("enable-abc123", "enable")
+        self.assertTrue(self.wait_for(argv))
+        self.assertIn("enable-abc123", argv.read_text())
+        self.assertTrue(handle.close())  # still on screen when the person answered
+        done, _ = self.stub("exit 1", "dismissed")
+        handle = E.Env(platform="darwin", osascript=str(done)).present_code("enable-abc123", "enable")
+        import time
+        time.sleep(0.5)
+        self.assertFalse(handle.close())  # cancelled or timed out before the answer
+
+    def test_the_real_env_fails_closed_when_the_dialog_cannot_be_shown(self):
+        with self.assertRaises(E.Refused):
+            E.Env(platform="darwin", osascript=str(self.tmp / "missing")).present_code("enable-abc123", "enable")
+        self.assertIsNone(E.Env(platform="linux").present_code("enable-abc123", "enable"))
+
+    def test_without_a_dialog_the_session_must_have_an_interactive_ancestor(self):
+        orphan = {900: (2, "python3 enable-agent-ops.py --apply"), 2: (1, "python3 -c daemonized")}
+        self.assertEqual(self.apply(env=FakeEnv(table=orphan, session_proof=True)), 3)
+        self.assertIn("interactive", self.output)
+        self.assertFalse((self.home / ".agent-harness").exists())
+        for root in ("sshd: eric@pts/0", "/usr/bin/login -pf eric", "tmux: server", "-bash"):
+            table = {900: (800, "python3 x"), 800: (700, "-zsh"), 700: (1, root)}
+            self.assertEqual(E.interactive_ancestor(table, 900) is not None, root != "-bash", root)
+
+    def test_claims_are_honest(self):
+        self.assertNotIn("There is no flag, environment variable or file that skips", E.__doc__)
+        self.assertIn("accidental", E.__doc__)
+        self.assertIn("command_guard", E.__doc__)
+        template = (ROOT / "templates" / "self-serve-block.md").read_text()
+        self.assertIn("command_guard", template)
+
+    PROBE = r"""
+import os, pty, sys, time, select, re, importlib.util
+out_path, script, home, ref, stub, platform = sys.argv[1:7]
+if os.fork():
+    os._exit(0)
+os.setsid()
+if os.fork():
+    os._exit(0)
+pid, fd = pty.fork()
+if pid == 0:
+    child = (
+        "import importlib.util, sys, os\n"
+        "spec = importlib.util.spec_from_file_location('e', %r)\n"
+        "m = importlib.util.module_from_spec(spec); sys.modules['e'] = m; spec.loader.exec_module(m)\n"
+        "class Up:\n"
+        "    def is_canonical(self, ref): return True\n"
+        "    def hook_blobs(self, ref):\n"
+        "        d = os.path.join(%r, '.claude', 'hooks')\n"
+        "        return {n: m.blob_sha(open(os.path.join(d, n), 'rb').read()) for n in os.listdir(d)}\n"
+        "sys.exit(m.main(['--apply', '--ref', %r, '--home', %r, '--skip-remote'],\n"
+        "                env=m.Env(platform=%r, osascript=%r), upstream=Up()))\n"
+    ) % (script, home, ref, home, platform, stub)
+    os.execve(sys.executable, [sys.executable, "-I", "-c", child], {})
+transcript = b""
+guess_sent = False
+deadline = time.time() + 40
+status = None
+while time.time() < deadline:
+    ready, _, _ = select.select([fd], [], [], 0.5)
+    if ready:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            break
+        transcript += chunk
+        if b"Type" in transcript and not guess_sent:
+            found = re.findall(rb"[a-z]+-[0-9a-f]{6}", transcript)
+            time.sleep(1.5)  # a person takes a moment; also lets the dialog stub record its arguments
+            os.write(fd, (found[-1] if found else b"enable-000000") + b"\n")
+            guess_sent = True
+done, raw = os.waitpid(pid, 0)
+open(out_path, "wb").write(transcript)
+open(out_path + ".status", "w").write(str(os.waitstatus_to_exitcode(raw)))
+"""
+
+    def run_probe(self, platform, stub):
+        probe = self.tmp / "probe.py"
+        probe.write_text(self.PROBE)
+        out = self.tmp / "transcript"
+        subprocess.run([sys.executable, "-I", str(probe), str(out), str(SCRIPT), str(self.home), REF, str(stub), platform],
+                       timeout=60, env={}, stdin=subprocess.DEVNULL)
+        self.assertTrue(self.wait_for(Path(str(out) + ".status"), 45), "the daemonized probe never finished")
+        return out.read_bytes().decode("utf-8", "replace"), int(Path(str(out) + ".status").read_text())
+
+    def test_a_daemonized_pty_with_a_scrubbed_environment_cannot_learn_the_code(self):
+        stub, argv = self.stub("exec sleep 60")
+        transcript, status = self.run_probe("darwin", stub)
+        self.assertTrue(argv.exists(), "the probe never got as far as the approval dialog: " + transcript[-1500:])
+        code = re.search(r"[a-z]+-[0-9a-f]{6}", argv.read_text()).group(0)
+        self.assertNotIn(code, transcript)
+        self.assertIn("nonce did not match", transcript)
+        self.assertEqual(status, 3)
+        self.assertFalse((self.home / ".agent-harness").exists())
+        self.assertFalse((self.home / ".claude" / "settings.json").exists())
+
+    def test_a_daemonized_pty_is_refused_by_the_ancestry_proof_where_there_is_no_dialog(self):
+        transcript, status = self.run_probe("linux", self.tmp / "none")
+        self.assertIn("interactive", transcript)
+        self.assertEqual(status, 3)
+        self.assertFalse((self.home / ".agent-harness").exists())
 
 
 if __name__ == "__main__":

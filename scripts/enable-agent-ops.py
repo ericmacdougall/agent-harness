@@ -7,16 +7,27 @@
     ... --bootstrap --ref <SHA>      scan, repair-harness --apply on both hosts, then --apply (one command)
 
 This command is the human step. Every mutating mode refuses unless stdin and stdout are a terminal, no agent
-process (claude, codex) is an ancestor of this process and no agent environment marker is set, and the person types
-the nonce shown over the diff. There is no flag, environment variable or file that skips those checks. An agent that
-runs it gets a refusal and writes nothing. It never creates accounts, never types or reads a password, never writes
-Codex `trusted_hash` (it lists the hooks you must trust in `/hooks`), and it never falls back to a local copy when
-the remote host step fails (the journal records the failure; use --resume or --undo).
+process (claude, codex) is an ancestor of this process, no agent environment marker is set, and the person types a
+code that is shown in a native approval dialog (macOS) and never printed to the terminal. On a host without that
+dialog the code is printed and the process must have an interactive login ancestor (sshd, login, a terminal
+emulator, tmux). These checks stop accidental self-enable by an agent that runs the command without trying to evade
+it. They are not proof of who is at the keyboard: a deliberate evasion (a daemonized pty with a scrubbed environment,
+or desktop control that reads the dialog) is a rule 3 violation that these checks cannot rule out. The enforcing
+control against an agent invoking this command is the command_guard of the same release (lane L6), which this lane
+does not rely on to be present and does not replace. It never creates accounts, never types or reads a password,
+never writes Codex `trusted_hash` (it lists the hooks you must trust in `/hooks`), and it never falls back to a local
+copy when the remote host step fails (the journal records the failure; use --resume or --undo).
+
+Integrity: the run journal and the state file are signed with the self-serve signing key, so --resume and --undo trust
+only a journal this machine's key signed, and re-derive the key id, the pins and the policy from the key itself. --undo
+checks every backup file against the signed journal before it writes anything. --disable re-signs only a policy that
+verifies against the local key, rebuilt from the fixed capability table. The signed files live under paths the L6
+command_guard protects; the signature is what this lane relies on, and merge order puts L6 before L5.
 
 What --apply does, in this order (each step is journaled under ~/.agent-harness/work/self-serve/<run>/):
+  key        create ~/.agent-harness/private/self-serve/ed25519.key (0600) or reuse it (first: it signs the journal)
   preflight  the pinned SHA is on canonical main and every installed hook equals its git blob (Mac and the worker)
   backup     existing managed files are copied to ~/.claude/agent-harness-backups/self-serve-<run>/
-  key        create ~/.agent-harness/private/self-serve/ed25519.key (0600) or reuse it
   pin_local  pin the public key in ~/.agent-harness/policy/self-serve-pubkeys.json
   pin_remote pin it on the worker through a regular temp file (never /dev/stdin)
   claude_md / agents_md  marker block self-serve:begin..end
@@ -51,6 +62,7 @@ SCHEMA = "self-serve/1"
 PURPOSE = "self-serve"
 KEYS_SCHEMA = "self-serve-keys/1"
 STATE_SCHEMA = "self-serve-enabler/1"
+JOURNAL_PURPOSE = "self-serve-journal"
 REPO = "ericmacdougall/agent-harness"
 ORIGIN = "https://github.com/%s.git" % REPO
 DEFAULT_HOST = "t2-dev"
@@ -84,11 +96,24 @@ REF = re.compile(r"^[0-9a-f]{40}$")
 HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,127}$")
 RUN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
 KEY_ID = re.compile(r"^[0-9a-f]{16}$")
+POLICY_ID = re.compile(r"^[0-9a-f]{32}$")
+REPO_NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$")
+ISO_TIME = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+# Process names that mark an interactive login session. Used only where no approval dialog exists (not macOS).
+INTERACTIVE_ROOTS = frozenset({"sshd", "sshd-session", "login", "tmux", "screen", "mosh-server", "getty", "agetty", "mingetty",
+                               "gnome-terminal-server", "konsole", "xterm", "uxterm", "alacritty", "kitty", "wezterm-gui",
+                               "tilix", "terminator", "foot", "ghostty", "xfce4-terminal", "mate-terminal", "lxterminal",
+                               "Terminal", "iTerm2", "Warp"})
+OSASCRIPT = "/usr/bin/osascript"
 # The bootstrap surface: the files that run before any trust exists. Only the agent-rules category is expected (they
 # write the user's CLAUDE.md, settings.json and AGENTS.md); any other category refuses the bootstrap.
 BOOTSTRAP_SURFACE = ("install.py", "install_codex.py", "scripts/repair-harness.sh", "scripts/repair_harness.py",
                      "scripts/enable-agent-ops.py", "templates/self-serve-block.md")
-BOOTSTRAP_OK_CATEGORIES = {"agent-rules"}
+# The surface also follows every local module those files import (transitively), because install.py imports
+# netwatch_install, log_backup_install and mission_control_install and runs them before any trust exists.
+IMPORT_DIRS = ("", "scripts", "harness/hooks")
+# category -> the flattened scan file names allowed to have it (None means any file).
+BOOTSTRAP_OK = {"agent-rules": None, "launchd": {"log_backup_install.py", "mission_control_install.py"}}
 REMOTE_HASH_CODE = (
     "import hashlib,json,os,sys\n"
     "out={}\n"
@@ -376,9 +401,62 @@ def load_pinned(layout: Layout) -> dict:
         return {}
 
 
+def reissue_policy(policy: dict, disabled) -> dict:
+    """Rebuild a verified policy from the fixed capability table (CAPABILITIES, TTL_SECONDS), carrying over only the id,
+    key id, issue and expiry times, the scope names and the disabled list. Refuses when the result differs from the
+    policy it replaces, so a validly signed but odd policy is never silently re-signed into something else."""
+    shape = Refused("the policy is not the shape this enabler issues")
+    try:
+        repos = policy["capabilities"]["merge_reviewed_pr"]["scope"]["repos"]
+        hosts = policy["capabilities"]["harness_repair"]["scope"]["hosts"]
+    except (KeyError, TypeError):
+        raise shape from None
+    text = lambda value, pattern: isinstance(value, str) and bool(pattern.match(value))  # noqa: E731
+    if not (isinstance(repos, list) and repos and all(text(r, REPO_NAME) for r in repos)
+            and isinstance(hosts, list) and hosts and all(text(h, HOST) for h in hosts)
+            and text(policy.get("policy_id"), POLICY_ID) and text(policy.get("key_id"), KEY_ID)
+            and text(policy.get("issued_at"), ISO_TIME)
+            and (policy.get("expires_at") is None or text(policy.get("expires_at"), ISO_TIME))):
+        raise shape
+    rebuilt = build_policy(policy["key_id"], repos=repos, hosts=hosts, disabled=disabled, policy_id=policy["policy_id"])
+    rebuilt["issued_at"], rebuilt["expires_at"] = policy["issued_at"], policy.get("expires_at")
+    fixed = lambda d: {k: v for k, v in d.items() if k not in ("signature", "disabled")}  # noqa: E731
+    if fixed(rebuilt) != fixed(policy):
+        raise shape
+    return rebuilt
+
+
 # --------------------------------------------------------------------------------------------- environment seams
+class DialogHandle:
+    """The approval dialog. close() says whether it was still on screen when the person answered."""
+
+    def __init__(self, proc):
+        self.proc = proc
+
+    def close(self) -> bool:
+        alive = self.proc.poll() is None
+        if alive:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        return alive
+
+
+def applescript_quote(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 class Env:
-    """Who is running this. The real implementation reads the terminal, the process table and the environment."""
+    """Who is running this. The real implementation reads the terminal, the process table and the environment.
+
+    `platform` and `osascript` are constructor seams for tests (never flags or environment variables, which an agent
+    could set)."""
+
+    def __init__(self, platform=None, osascript=OSASCRIPT):
+        self.platform = platform or sys.platform
+        self.osascript = osascript
 
     def is_tty(self) -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
@@ -398,8 +476,36 @@ class Env:
     def pid(self) -> int:
         return os.getpid()
 
+    def session_proof_required(self) -> bool:
+        """Without a native dialog, an interactive login ancestor is the only positive evidence available."""
+        return self.platform != "darwin"
+
+    def present_code(self, code: str, label: str):
+        """Show the code in a native dialog and return a handle, or None when this host has no such channel.
+        A host that should have the dialog but cannot show it fails closed."""
+        if self.platform != "darwin":
+            return None
+        message = ("Agent self-serve enabler (%s).\n\nType this code into the terminal that is running the command:\n\n%s\n\n"
+                   "Only do this if you started the command yourself and read the diff it printed." % (label, code))
+        script = ('display dialog %s with title "Approval code" buttons {"Cancel"} default button "Cancel" '
+                  'giving up after 300 with icon caution' % applescript_quote(message))
+        try:
+            proc = subprocess.Popen([self.osascript, "-e", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            raise Refused("could not show the approval dialog (%s); refusing rather than printing the code" % self.osascript) from None
+        return DialogHandle(proc)
+
     def read_nonce(self, prompt: str) -> str:
-        return input(prompt)
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            raise Refused("no answer was typed; nothing was changed") from None
+
+
+def process_name(command: str) -> str:
+    words = command.split()
+    return os.path.basename(words[0]).strip(":").lstrip("-") if words else ""
 
 
 def agent_ancestor(table: dict, pid: int):
@@ -412,6 +518,20 @@ def agent_ancestor(table: dict, pid: int):
         if any(AGENT_NAME.search(n) for n in names):
             return pid, os.path.basename(words[0])
         pid = ppid
+    return None
+
+
+def interactive_ancestor(table: dict, pid: int):
+    """The first ancestor that looks like a login session or terminal emulator, or None for an orphaned process
+    (a daemonized child is reparented to init and has none). Names can be forged: this raises the bar, it is not proof."""
+    seen = {pid}
+    while pid in table and len(seen) < 64:
+        pid = table[pid][0]
+        if pid in seen or pid not in table:
+            return None
+        seen.add(pid)
+        if process_name(table[pid][1]) in INTERACTIVE_ROOTS:
+            return pid, process_name(table[pid][1])
     return None
 
 
@@ -430,11 +550,24 @@ def require_human(env: Env):
     if found:
         raise Refused("an agent process (%s, pid %d) is an ancestor of this command; run it from your own terminal"
                       % (found[1], found[0]))
+    if env.session_proof_required() and not interactive_ancestor(table, env.pid()):
+        raise Refused("no interactive login session (sshd, login, a terminal emulator, tmux) is an ancestor of this command "
+                      "and this host has no approval dialog; run it from your own terminal session")
 
 
 def confirm(env: Env, label: str):
+    """The typed code. Where the host can show a dialog the code appears only there, so reading the terminal (a pty
+    master) does not reveal it, and a dialog that was dismissed or timed out before the answer refuses."""
     nonce = "%s-%s" % (label, secrets.token_hex(3))
-    answer = env.read_nonce("Type %s to continue (anything else cancels): " % nonce)
+    handle = env.present_code(nonce, label)
+    prompt = ("Type the code shown in the approval dialog to continue (anything else cancels): " if handle
+              else "Type %s to continue (anything else cancels): " % nonce)
+    try:
+        answer = env.read_nonce(prompt)
+    finally:
+        still_open = handle.close() if handle else True
+    if not still_open:
+        raise Refused("the approval dialog was dismissed or timed out before the code was typed; nothing was changed")
     if not hmac.compare_digest(answer.strip().encode(), nonce.encode()):
         raise Refused("the nonce did not match; nothing was changed")
 
@@ -516,8 +649,27 @@ class Runner:
 
 
 # --------------------------------------------------------------------------------------------------- the engine
-STEPS = ("preflight", "backup", "key", "pin_local", "pin_remote", "claude_md", "agents_md", "settings", "codex_hook",
+# The key comes first: it signs the journal from the first save on, so resume and undo never trust an unsigned file.
+STEPS = ("key", "preflight", "backup", "pin_local", "pin_remote", "claude_md", "agents_md", "settings", "codex_hook",
          "policy", "audit")
+# On --resume a step marked done is not trusted either: every idempotent step runs again. The backup is verified, never
+# retaken (a second backup would capture the already-modified files as the originals), and the audit row is deduplicated.
+KEEP_ON_RESUME = ("backup", "audit")
+
+
+def validate_params(params) -> dict:
+    """The apply parameters, checked field by field (they come back from a journal on --resume)."""
+    if not isinstance(params, dict):
+        raise Refused("the journal parameters are malformed")
+    ref, host, repos, days = params.get("ref"), params.get("host"), params.get("repos"), params.get("expires_days")
+    if not (isinstance(ref, str) and REF.match(ref)) or not (isinstance(host, str) and HOST.match(host)):
+        raise Refused("the journal parameters are malformed (ref or host)")
+    if not (isinstance(repos, list) and repos and all(isinstance(r, str) and REPO_NAME.match(r) for r in repos)):
+        raise Refused("the journal parameters are malformed (repos)")
+    if days is not None and not (isinstance(days, int) and not isinstance(days, bool) and 0 < days <= 3650):
+        raise Refused("the journal parameters are malformed (expires_days)")
+    return {"ref": ref, "host": host, "skip_remote": bool(params.get("skip_remote")), "repos": sorted(set(repos)),
+            "expires_days": days}
 
 
 class Enabler:
@@ -531,6 +683,17 @@ class Enabler:
         self.on_step = on_step or (lambda step: None)  # tests inject a failure here
         self.clock = now
         self.template = template if template is not None else load_template()
+
+    # ----- the local signing key: the one source of key id and public key
+    def _identity(self):
+        """(private key, key id, public key b64) derived from the key file, or None when there is no key.
+        Every key id and public key this tool uses comes from here, never from a journal or a pin file."""
+        key = self._private_key()
+        if key is None:
+            return None
+        ed25519, serialization = crypto()
+        raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        return key, key_id_of(raw), b64url(raw)
 
     # ----- planning (pure reads)
     def plan(self, params: dict) -> dict:
@@ -657,13 +820,17 @@ class Enabler:
             if layout.state.exists():
                 raise Refused("an earlier run is recorded in %s; use --status, then --resume RUN or --undo" % layout.state)
             self.preflight(params["ref"], params["host"], params["skip_remote"])  # before asking for the nonce
-            journal = {"schema": STATE_SCHEMA, "run": run_id, "params": params, "steps": {s: "pending" for s in STEPS},
-                       "started_at": now_iso(self.clock), "files": {}, "rules_added": [], "codex_hook_added": False,
-                       "key_created": False, "remote_pinned": False}
+            journal = {"schema": STATE_SCHEMA, "purpose": JOURNAL_PURPOSE, "run": run_id, "params": params,
+                       "steps": {s: "pending" for s in STEPS}, "started_at": now_iso(self.clock), "files": {},
+                       "rules_added": [], "codex_hook_added": False, "key_created": False, "remote_pinned": False,
+                       "remote_pin_attempted": False}
             self.show_plan(params)
             confirm(self.env, "enable")
+            self.step_key(journal)  # first: nothing is saved until the key can sign the journal
+            journal["steps"]["key"] = "done"
+            self._save_journal(journal)
         for step in STEPS:
-            if journal["steps"].get(step) == "done":
+            if journal["steps"].get(step) == "done" and (not resuming or step in KEEP_ON_RESUME):
                 continue
             journal["steps"][step] = "running"
             self._save_journal(journal)
@@ -688,6 +855,15 @@ class Enabler:
                 self.out("  " + line)
         return 0
 
+    def resume(self, run_id: str) -> int:
+        """Continue the current run. Trusts only a journal this machine's key signed, shows the plan, then asks."""
+        journal = self._load_journal(self.layout.state, run_id)
+        params = validate_params(journal.get("params"))
+        self.out("Resuming run %s (steps: %s)." % (run_id, ", ".join("%s=%s" % kv for kv in journal["steps"].items())))
+        self.show_plan({**params, "policy_id": journal.get("policy_id")})
+        confirm(self.env, "resume")
+        return self.apply(params, run_id, journal)
+
     def codex_untrusted(self, journal) -> list:
         if not journal.get("codex_hook_added"):
             return []
@@ -700,12 +876,76 @@ class Enabler:
         return ["pre_tool_use group %d: %s" % (i, command) for i, g in enumerate(groups)
                 if any(h.get("command") == command for h in g.get("hooks", []) if isinstance(h, dict))]
 
+    # ----- the journal: signed with the local key, loaded only through one verifier
     def _journal_path(self, run_id) -> Path:
         return self.layout.work / run_id / "journal.json"
 
     def _save_journal(self, journal: dict):
-        write_atomic(self._journal_path(journal["run"]), (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode())
-        write_atomic(self.layout.state, (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode())
+        identity = self._identity()
+        if identity is None:
+            raise Refused("cannot save the journal: this machine has no self-serve signing key")
+        key, key_id, public = identity
+        body = {k: v for k, v in journal.items() if k != "signature"}
+        body.update({"purpose": JOURNAL_PURPOSE, "key_id": key_id, "public_key": public})  # always derived, never carried
+        journal.clear()
+        journal.update(sign_policy(body, key))
+        data = (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode()
+        write_atomic(self._journal_path(journal["run"]), data)
+        write_atomic(self.layout.state, data)
+
+    def _load_journal(self, path: Path, run_id: str | None = None) -> dict:
+        """The signed journal at `path`, or a refusal. The only way --resume and --undo read a journal."""
+        raw = read_file(path)
+        if raw is None:
+            raise Refused("no current run is recorded (%s)" % path)
+        journal = json.loads(raw[0])
+        identity = self._identity()
+        if identity is None:
+            raise Refused("this journal cannot be verified: this machine has no self-serve signing key")
+        _, key_id, public = identity
+        ed25519, _ = crypto()
+        try:
+            if not isinstance(journal, dict) or journal.get("schema") != STATE_SCHEMA or journal.get("purpose") != JOURNAL_PURPOSE:
+                raise ValueError("schema")
+            body = {k: v for k, v in journal.items() if k != "signature"}
+            ed25519.Ed25519PublicKey.from_public_bytes(b64url_decode(public)).verify(
+                b64url_decode(journal["signature"]), canonical(body))
+        except Exception:  # noqa: BLE001 - any failure is "not signed by this machine's key"
+            raise Refused("the journal's signature does not verify against this machine's signing key (it was changed, "
+                          "or another key signed it); not trusting it") from None
+        if journal.get("key_id") != key_id or journal.get("public_key") != public:
+            raise Refused("the journal names a different key than this machine's signing key; not trusting it")
+        if not RUN.match(str(journal.get("run", ""))) or (run_id is not None and journal["run"] != run_id):
+            raise Refused("the journal is for a different run (%s)" % journal.get("run"))
+        steps = journal.get("steps")
+        if not (isinstance(steps, dict) and isinstance(journal.get("files"), dict)):
+            raise Refused("the journal is malformed")
+        return journal
+
+    def _expected_backup(self, journal) -> Path:
+        return self.layout.backups / ("self-serve-" + journal["run"])
+
+    def _verify_backup(self, journal):
+        """The backup directory, after every file in it matches the signed journal. None when no backup was taken.
+        The manifest.json in the directory is not consulted: it sits in the same writable place as the files."""
+        recorded = journal.get("backup")
+        if not recorded:
+            return None
+        expected = self._expected_backup(journal)
+        if recorded != str(expected):
+            raise Refused("the journal's backup is not the expected backup path %s; refusing to restore from %s"
+                          % (expected, recorded))
+        for label, entry in journal["files"].items():
+            if label not in self.layout.managed() or "existed" not in entry:
+                continue
+            saved = read_file(expected / label)
+            if entry["existed"]:
+                if saved is None or sha256(saved[0]) != entry.get("sha256"):
+                    raise Refused("the backup of %s does not match the journal (changed or missing); not restoring "
+                                  "anything" % label)
+            elif saved is not None:
+                raise Refused("the backup directory holds a %s the journal says never existed; not restoring" % label)
+        return expected
 
     def _record_file(self, journal, label):
         path = self.layout.managed()[label]
@@ -714,26 +954,37 @@ class Enabler:
 
     # ----- steps
     def step_preflight(self, journal):
-        p = journal["params"]
+        p = validate_params(journal["params"])
         self.preflight(p["ref"], p["host"], p["skip_remote"])
 
     def step_backup(self, journal):
         layout = self.layout
-        target = layout.backups / ("self-serve-" + journal["run"])
+        target = self._expected_backup(journal)
+        if target.exists():  # an earlier attempt of this run finished it: reuse only what verifies against the journal
+            journal["backup"] = str(target)
+            self._verify_backup(journal)
+            return
         ensure_dir(layout.backups)
-        ensure_dir(target)
-        manifest = {}
+        manifest, contents = {}, {}
         for label, path in layout.managed().items():
             raw = read_file(path)
-            entry = {"path": str(path), "existed": raw is not None, "sha256": sha256(raw[0]) if raw else None,
-                     "mode": raw[1] if raw else None}
-            if raw is not None:
-                write_atomic(target / label, raw[0], 0o600)
-            manifest[label] = entry
-        write_atomic(target / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
-        journal["backup"] = str(target)
+            manifest[label] = {"path": str(path), "existed": raw is not None, "sha256": sha256(raw[0]) if raw else None,
+                               "mode": raw[1] if raw else None}
+            contents[label] = raw
+        recorded = {label: e for label, e in journal["files"].items() if "sha256" in e}
+        if recorded and any(recorded.get(label, {}).get("sha256") != m["sha256"] for label, m in manifest.items()):
+            raise Refused("the managed files changed since the backup was planned and no backup exists; run --undo")
+        journal["backup"] = str(target)  # recorded (signed) before the files are written
         for label, entry in manifest.items():
             journal["files"].setdefault(label, {}).update(entry)
+        self._save_journal(journal)
+        staging = layout.backups / (".staging-%s" % secrets.token_hex(4))
+        ensure_dir(staging)
+        for label, raw in contents.items():
+            if raw is not None:
+                write_atomic(staging / label, raw[0], 0o600)
+        write_atomic(staging / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
+        os.rename(staging, target)
 
     def _private_key(self):
         ed25519, serialization = crypto()
@@ -762,12 +1013,11 @@ class Enabler:
             finally:
                 os.close(fd)
             journal["key_created"] = True
-        raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        journal["key_id"], journal["public_key"] = key_id_of(raw), b64url(raw)
+        _, journal["key_id"], journal["public_key"] = self._identity()  # re-derived from the key file every time
 
     def _pin_record(self, journal) -> bytes:
-        return (json.dumps({"schema": KEYS_SCHEMA, "keys": [{"key_id": journal["key_id"],
-                                                             "public_key": journal["public_key"]}]},
+        _, key_id, public = self._identity()
+        return (json.dumps({"schema": KEYS_SCHEMA, "keys": [{"key_id": key_id, "public_key": public}]},
                            sort_keys=True, indent=1) + "\n").encode()
 
     def step_pin_local(self, journal):
@@ -775,19 +1025,21 @@ class Enabler:
         self._record_file(journal, "pubkeys")
 
     def step_pin_remote(self, journal):
-        p = journal["params"]
+        p = validate_params(journal["params"])
         if p["skip_remote"]:
             journal["remote_pinned"] = False
             return
+        journal["remote_pin_attempted"] = True  # durable BEFORE the call: an answer lost in transit still gets unpinned
+        self._save_journal(journal)
         code, _ = self.remote.run(p["host"], remote_pin_command(), self._pin_record(journal))
         if code != 0:
-            raise Refused("pinning the key on %s failed (exit %d); REMOTE state may be uncertain, inspect it before "
-                          "retrying" % (p["host"], code))
+            raise Refused("pinning the key on %s failed (exit %d); REMOTE state may be uncertain, --undo will unpin it "
+                          "(inspect it before retrying)" % (p["host"], code))
         journal["remote_pinned"] = True
 
     def _block(self, journal) -> str:
         policy_id = journal.setdefault("policy_id", secrets.token_hex(16))
-        return render_block(self.template, CAPABILITIES, policy_id, journal["key_id"])
+        return render_block(self.template, CAPABILITIES, policy_id, self._identity()[1])
 
     def _write_block(self, journal, label):
         path = self.layout.managed()[label]
@@ -818,15 +1070,23 @@ class Enabler:
         self._record_file(journal, "hooks_json")
 
     def step_policy(self, journal):
-        key = self._private_key()
-        p = journal["params"]
-        policy = build_policy(journal["key_id"], repos=p["repos"], hosts=["mac"] + ([p["host"]] if not p["skip_remote"] else []),
+        key, key_id, _ = self._identity()
+        p = validate_params(journal["params"])
+        policy = build_policy(key_id, repos=p["repos"], hosts=["mac"] + ([p["host"]] if not p["skip_remote"] else []),
                               expires_days=p.get("expires_days"), now=self.clock, policy_id=journal.get("policy_id"))
         write_atomic(self.layout.policy, (json.dumps(sign_policy(policy, key), indent=2, sort_keys=True) + "\n").encode(), 0o600)
         journal["policy_id"] = policy["policy_id"]
         self._record_file(journal, "policy")
 
     def step_audit(self, journal):
+        existing = read_file(self.layout.audit)
+        for line in (existing[0].decode("utf-8", "replace").splitlines() if existing else []):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get("event") == "apply" and row.get("run") == journal.get("run"):
+                return  # a resumed run already wrote its row
         self.audit("apply", journal, files={k: v.get("sha_after") for k, v in journal["files"].items()})
 
     def audit(self, event, journal, **extra):
@@ -839,69 +1099,104 @@ class Enabler:
     # ----- undo, disable, status
     def undo(self) -> int:
         layout = self.layout
-        raw = read_file(layout.state)
-        if raw is None:
-            raise Refused("nothing to undo: no enabler state under %s" % layout.policy_dir)
-        journal = json.loads(raw[0])
+        journal = self._load_journal(layout.state)  # signed by this machine's key, or a refusal
+        params = journal.get("params") if isinstance(journal.get("params"), dict) else {}
+        attempted = bool(journal.get("remote_pin_attempted") or journal.get("remote_pinned"))
+        host = params.get("host") if attempted else None
+        if host and not HOST.match(str(host)):
+            raise Refused("the journal's host is not a plain SSH host name")
+        local_done = bool(journal.get("local_undone"))
+        backup = None if local_done else self._verify_backup(journal)  # every backup byte is checked before any write
+        self.out("Undo run %s: %s; %s." % (
+            journal["run"], "local files already restored" if local_done else "restore or strip the managed files",
+            "unpin the key on %s" % host if host else "no remote pin to remove"))
         confirm(self.env, "undo")
-        backup = Path(journal.get("backup", "")) if journal.get("backup") else None
-        files = journal.get("files", {})
-        for label, path in layout.managed().items():
-            entry = files.get(label)
-            if not entry:
-                continue
-            current = read_file(path)
-            current_sha = sha256(current[0]) if current else None
-            saved = read_file(backup / label) if backup and entry.get("existed") else None
-            if label in ("policy", "pubkeys"):
-                if entry.get("existed") and saved:
-                    write_atomic(path, saved[0], entry.get("mode") or 0o600)
-                else:
-                    remove_file(path)
-            elif current_sha is not None and current_sha == entry.get("sha_after"):
-                if saved:
-                    write_atomic(path, saved[0], entry.get("mode") or 0o600)  # byte-exact original
-                else:
-                    remove_file(path)
-            elif current:
-                text = current[0].decode("utf-8", "replace")
-                if label in ("claude_md", "agents_md"):
-                    new = remove_block(text)
-                elif label == "settings":
-                    new = json.dumps(strip_allow(json.loads(text), journal.get("rules_added", [])), indent=2) + "\n"
-                else:
-                    new = json.dumps(remove_codex_hook(json.loads(text), codex_hook_command(layout)), indent=2) + "\n"
-                write_atomic(path, new.encode(), current[1])
-        result = 0
-        if journal.get("remote_pinned") and journal.get("params", {}).get("host"):
-            code, _ = self.remote.run(journal["params"]["host"], remote_unpin_command(journal["key_id"]))
+        if not local_done:
+            files = journal.get("files", {})
+            for label, path in layout.managed().items():
+                entry = files.get(label)
+                if not entry:
+                    continue
+                mode = entry.get("mode") if isinstance(entry.get("mode"), int) and 0 <= entry["mode"] <= 0o777 else 0o600
+                current = read_file(path)
+                current_sha = sha256(current[0]) if current else None
+                saved = read_file(backup / label) if backup and entry.get("existed") else None
+                if label in ("policy", "pubkeys"):
+                    if entry.get("existed") and saved:
+                        write_atomic(path, saved[0], mode)
+                    else:
+                        remove_file(path)
+                elif "sha_after" not in entry:
+                    continue  # that step never ran: the file is as the user left it
+                elif current_sha is not None and current_sha == entry.get("sha_after"):
+                    if saved:
+                        write_atomic(path, saved[0], mode)  # byte-exact original
+                    else:
+                        remove_file(path)
+                elif current:
+                    text = current[0].decode("utf-8", "replace")
+                    if label in ("claude_md", "agents_md"):
+                        new = remove_block(text)
+                    elif label == "settings":
+                        new = json.dumps(strip_allow(json.loads(text), journal.get("rules_added", [])), indent=2) + "\n"
+                    else:
+                        new = json.dumps(remove_codex_hook(json.loads(text), codex_hook_command(layout)), indent=2) + "\n"
+                    write_atomic(path, new.encode(), current[1])
+            journal["local_undone"] = True  # a rerun after a failed unpin must not touch the local files again
+            self._save_journal(journal)
+        if host:
+            try:
+                code, _ = self.remote.run(host, remote_unpin_command(journal["key_id"]))
+            except (OSError, subprocess.SubprocessError):
+                code = -1
             if code != 0:
-                self.out("WARNING: could not remove the key pin on %s (exit %d); remove it by hand" % (journal["params"]["host"], code))
-                result = 1
+                journal["pending_unpin"] = True
+                self._save_journal(journal)
+                self.out("WARNING: could not remove the key pin on %s (exit %d). The state is kept: run --undo again "
+                         "once the host is reachable (or remove the pin by hand)." % (host, code))
+                return 1
         self.audit("undo", journal)
         remove_file(layout.state)
         self.out("Undone run %s. The signing key was kept for reuse. %s" % (journal["run"], "Backup: %s" % backup if backup else ""))
-        return result
+        return 0
+
+    def verified_policy(self):
+        """(policy, private key): the policy file, verified against the signing key on THIS machine. The pin file is
+        as writable as the policy, so it is not consulted; the one choke point every re-signing path goes through."""
+        raw = read_file(self.layout.policy)
+        identity = self._identity()
+        if raw is None or identity is None:
+            raise Refused("no policy or no signing key to re-sign")
+        key, key_id, public = identity
+        policy = json.loads(raw[0])
+        reason = verify_policy(policy, {key_id: public}) if isinstance(policy, dict) else "not an object"
+        if reason:
+            raise Refused("the policy on disk does not verify against your signing key (%s): it was changed or forged; "
+                          "run --undo, then apply again" % reason)
+        return policy, key
 
     def disable(self, what: str) -> int:
         layout = self.layout
         if what != "all" and what not in CAPABILITIES:
             raise Refused("unknown capability %r (known: %s, or 'all')" % (what, ", ".join(CAPABILITIES)))
-        confirm(self.env, "disable")
         if what == "all":
+            confirm(self.env, "disable")
             write_atomic(layout.kill, b"disabled by ah_enable_self_serve.py --disable all\n", 0o600)
             self.out("Kill switch written: %s (every capability refuses)" % layout.kill)
             self.audit("disable", {}, capability="all")
             return 0
-        raw = read_file(layout.policy)
-        key = self._private_key()
-        if raw is None or key is None:
-            raise Refused("no policy or no signing key to re-sign")
-        policy = json.loads(raw[0])
-        policy["disabled"] = sorted(set(policy.get("disabled", [])) | {what})
-        write_atomic(layout.policy, (json.dumps(sign_policy(policy, key), indent=2, sort_keys=True) + "\n").encode(), 0o600)
-        self.audit("disable", {"policy_id": policy.get("policy_id"), "key_id": policy.get("key_id")}, capability=what)
-        self.out("Disabled %s in policy %s" % (what, policy.get("policy_id")))
+        policy, key = self.verified_policy()
+        disabled = policy.get("disabled", [])
+        if not (isinstance(disabled, list) and set(disabled) <= set(CAPABILITIES)):
+            raise Refused("the policy is not the shape this enabler issues (disabled list)")
+        rebuilt = reissue_policy(policy, set(disabled) | {what})  # from the fixed table, never a copy of the old dict
+        old = json.dumps({k: v for k, v in policy.items() if k != "signature"}, indent=2, sort_keys=True).splitlines(True)
+        new = json.dumps(rebuilt, indent=2, sort_keys=True).splitlines(True)
+        self.out("".join(difflib.unified_diff(old, new, "a/%s" % layout.policy, "b/%s" % layout.policy)) or "(no change)")
+        confirm(self.env, "disable")
+        write_atomic(layout.policy, (json.dumps(sign_policy(rebuilt, key), indent=2, sort_keys=True) + "\n").encode(), 0o600)
+        self.audit("disable", {"policy_id": rebuilt.get("policy_id"), "key_id": rebuilt.get("key_id")}, capability=what)
+        self.out("Disabled %s in policy %s" % (what, rebuilt.get("policy_id")))
         return 0
 
     def status(self) -> dict:
@@ -909,27 +1204,42 @@ class Enabler:
         raw = read_file(layout.policy)
         policy = json.loads(raw[0]) if raw else None
         pinned = load_pinned(layout)
+        identity = self._identity()
+        signature = None
+        if policy is not None:
+            signature = verify_policy(policy, pinned)
+            if signature is None:
+                local = identity[1] if identity else None
+                signature = "valid" if policy.get("key_id") == local else \
+                    "signed by a pinned key that is not this machine's signing key (%s)" % ("absent" if not local else local)
         settings = read_file(layout.settings)
         allow = []
         if settings and settings[0].strip():
             allow = (json.loads(settings[0]).get("permissions") or {}).get("allow") or []
         has_block = lambda p: bool((lambda r: r and MARK_BEGIN in r[0].decode("utf-8", "replace"))(read_file(p)))  # noqa: E731
         hooks = read_file(layout.hooks_json)
-        state = read_file(layout.state)
+        try:
+            state = self._load_journal(layout.state)
+        except Refused as error:
+            state = None
+            journal_note = None if read_file(layout.state) is None else str(error)
+        else:
+            journal_note = None
         return {"policy_file": raw is not None,
                 "policy_id": policy.get("policy_id") if policy else None,
-                "signature": (verify_policy(policy, pinned) or "valid") if policy else None,
+                "signature": signature,
                 "key_id": policy.get("key_id") if policy else None,
                 "capabilities": sorted(policy.get("capabilities", {})) if policy else [],
                 "disabled": policy.get("disabled", []) if policy else [],
                 "kill_switch": layout.kill.exists(),
-                "key_present": read_file(layout.keyfile) is not None,
+                "key_present": identity is not None,
                 "pinned_key_ids": sorted(pinned),
                 "claude_md_block": has_block(layout.claude_md), "agents_md_block": has_block(layout.agents_md),
                 "allow_rules": {i: r in allow for i, r in ALLOW_RULES.items()},
                 "codex_hook": bool(hooks and codex_hook_command(layout) in hooks[0].decode("utf-8", "replace")),
-                "run": json.loads(state[0]).get("run") if state else None,
-                "steps": json.loads(state[0]).get("steps") if state else None}
+                "run": state.get("run") if state else None,
+                "steps": state.get("steps") if state else None,
+                "journal_unverified": journal_note}
 
 
 def load_template() -> str:
@@ -956,30 +1266,93 @@ def fetch_checkout(ref: str, dest: Path, runner: Runner) -> Path:
     return src
 
 
-def scan_surface(src: Path, work: Path, runner: Runner, python=sys.executable) -> dict:
-    """Scan the files that run before trust exists. Only the agent-rules category is expected."""
+def surface_names(src: Path) -> list:
+    """The files that run before trust exists: BOOTSTRAP_SURFACE plus every local module they import, transitively
+    (install.py imports netwatch_install and log_backup_install, and runs them). Paths are relative to `src`."""
+    for name in BOOTSTRAP_SURFACE:
+        if not (src / name).is_file() or (src / name).is_symlink():
+            raise Refused("the pinned checkout lacks %s" % name)
+    found, queue = list(BOOTSTRAP_SURFACE), list(BOOTSTRAP_SURFACE)
+    while queue:
+        relative = queue.pop()
+        if not relative.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse((src / relative).read_bytes().decode("utf-8", "replace"))
+        except (SyntaxError, ValueError):
+            raise Refused("cannot parse %s to follow its imports" % relative) from None
+        for node in ast.walk(tree):
+            modules = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                [node.module] if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module else []
+            for module in modules:
+                for folder in IMPORT_DIRS:
+                    candidate = (folder + "/" if folder else "") + module.split(".")[0] + ".py"
+                    if candidate not in found and (src / candidate).exists():
+                        if (src / candidate).is_symlink() or not (src / candidate).is_file():
+                            raise Refused("an imported module is not a regular file: %s" % candidate)
+                        found.append(candidate)
+                        queue.append(candidate)
+    return found
+
+
+def tree_manifest(src: Path) -> dict:
+    """sha256 of every file under `src` (links recorded as links, .git left out), held in memory. Nothing in the checkout
+    is trusted to describe itself, and no git command runs inside it."""
+    manifest = {}
+    for root, dirs, files in os.walk(src, followlinks=False):
+        if Path(root) == src and ".git" in dirs:
+            dirs.remove(".git")
+        for name in list(dirs):
+            if os.path.islink(os.path.join(root, name)):
+                dirs.remove(name)
+                files.append(name)
+        for name in files:
+            path = Path(root) / name
+            relative = str(path.relative_to(src))
+            if path.is_symlink():
+                manifest[relative] = "link:" + os.readlink(path)
+            else:
+                manifest[relative] = sha256(path.read_bytes())
+    return manifest
+
+
+def check_tree(src: Path, manifest: dict):
+    """Refuse unless the checkout is byte-for-byte what was scanned (changed, added or removed files all count)."""
+    now = tree_manifest(src)
+    if now != manifest:
+        changed = sorted({k for k in set(now) | set(manifest) if now.get(k) != manifest.get(k)})
+        raise Refused("the checkout changed after it was scanned (%d file(s), first: %s); refusing to run anything from it"
+                      % (len(changed), ", ".join(changed[:3])))
+
+
+def scan_surface(src: Path, work: Path, runner: Runner, scanner: Path, names, python=sys.executable) -> dict:
+    """Scan the files that run before trust exists with the scanner ALREADY INSTALLED on this machine (never the one in
+    the checkout under test). Only the categories in BOOTSTRAP_OK are expected."""
     surface = work / "surface"
     ensure_dir(surface)
-    for name in BOOTSTRAP_SURFACE:
-        source = src / name
-        if not source.is_file():
-            raise Refused("the pinned checkout lacks %s" % name)
-        write_atomic(surface / name.replace("/", "__"), source.read_bytes(), 0o600)
-    scanner = src / "harness" / "hooks" / "installer_scan.py"
+    for name in names:
+        write_atomic(surface / name.replace("/", "__"), (src / name).read_bytes(), 0o600)
     code, output = runner.capture([python, "-I", str(scanner), str(surface), "--json"])
     try:
         report = json.loads(output)
     except ValueError:
         raise Refused("installer_scan produced no report (exit %d)" % code) from None
     write_atomic(work / "installer-scan.json", (json.dumps(report, indent=2) + "\n").encode())
-    categories = sorted({f.get("category") for f in report.get("findings", [])})
-    unexpected = [c for c in categories if c not in BOOTSTRAP_OK_CATEGORIES]
-    if report.get("files_scanned", 0) < len(BOOTSTRAP_SURFACE) - 1 or report.get("skipped") or report.get("truncated"):
-        raise Refused("installer_scan did not cover the whole bootstrap surface (report: %s)" % (work / "installer-scan.json"))
+    findings = report.get("findings", [])
+    categories = sorted({f.get("category") for f in findings})
+    unexpected = sorted({"%s in %s" % (f.get("category"), os.path.basename(str(f.get("file"))))
+                         for f in findings
+                         if f.get("category") not in BOOTSTRAP_OK
+                         or (BOOTSTRAP_OK[f.get("category")] is not None
+                             and os.path.basename(str(f.get("file"))) not in BOOTSTRAP_OK[f.get("category")])})
+    code_files = [n for n in names if not n.endswith(".md")]  # the scanner reads code, not the markdown template
+    if report.get("files_scanned", 0) < len(code_files) or report.get("skipped") or report.get("truncated"):
+        raise Refused("installer_scan did not cover the whole bootstrap surface (%d of %d code files; report: %s)"
+                      % (report.get("files_scanned", 0), len(code_files), work / "installer-scan.json"))
     if unexpected:
         raise Refused("installer_scan found unexpected side effects (%s); report: %s"
                       % (", ".join(unexpected), work / "installer-scan.json"))
-    return {"findings": len(report.get("findings", [])), "categories": categories, "report": str(work / "installer-scan.json")}
+    return {"findings": len(findings), "categories": categories, "files": len(names), "report": str(work / "installer-scan.json")}
 
 
 def bootstrap(layout: Layout, params: dict, *, env=None, upstream=None, runner=None, out=print, fetch=None, python=sys.executable) -> int:
@@ -988,22 +1361,38 @@ def bootstrap(layout: Layout, params: dict, *, env=None, upstream=None, runner=N
     if not REF.match(ref or ""):
         raise Refused("--bootstrap needs --ref <40-hex SHA on canonical main>")
     require_human(env)
+    scanner = layout.claude / "hooks" / "installer_scan.py"
+    if read_file(scanner) is None:
+        raise Refused("no installer_scan is installed at %s: the bootstrap scan needs a scanner that is not part of the "
+                      "checkout under test" % scanner)
     if not upstream.is_canonical(ref):
         raise Refused("the pinned SHA %s is not on canonical main" % ref[:12])
     work = layout.work / ("bootstrap-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3))
     ensure_dir(layout.work)
     src = (fetch or fetch_checkout)(ref, work, runner)
-    scan = scan_surface(src, work, runner, python)
-    out("installer_scan on the bootstrap surface: %d expected agent-rules findings (installers write your agent rule "
-        "files); report %s. Read it." % (scan["findings"], scan["report"]))
+    names = surface_names(src)
+    manifest = tree_manifest(src)
+    scan = scan_surface(src, work, runner, scanner, names, python)
+    try:
+        canonical_scanner = upstream.hook_blobs(ref).get("installer_scan.py")
+    except Refused:
+        canonical_scanner = None
+    same = canonical_scanner is not None and canonical_scanner == blob_sha(read_file(scanner)[0])
+    out("installer_scan on %d bootstrap files (%d findings, all in expected categories: %s); report %s. Read it."
+        % (scan["files"], scan["findings"], ", ".join(scan["categories"]) or "none", scan["report"]))
+    out("DEVIATION (needs main's approval against the spec): the spec asks for installer_scan exit 0 on the checkout. This "
+        "scans only the files that run before trust exists plus their local imports, accepts agent-rules findings (and "
+        "launchd only in the opt-in log_backup_install.py and mission_control_install.py), and uses the scanner already installed on this machine (%s), not the "
+        "checkout's." % ("equal to the pinned SHA's" if same else "older than or unlisted at the pinned SHA"))
     out("Plan: repair-harness --apply %s on this Mac and %s, then the enabler --apply (which shows its own diff and "
-        "asks again)." % (ref[:12], params["host"]))
+        "asks again). Nothing runs from the checkout unless it is still byte-for-byte what was scanned." % (ref[:12], params["host"]))
     confirm(env, "bootstrap")
     repair = ["/bin/bash", str(src / "scripts" / "repair-harness.sh"), "--ref", ref, "--host", params["host"]]
     for mode in ("--check", "--apply"):
+        check_tree(src, manifest)  # before every execution, so a swap during the prompt or between runs is caught
         if runner.run(repair + [mode]) != 0:
             raise Refused("repair-harness %s failed; stopping before the enabler (inspect its log, then rerun)" % mode)
-    enable = [python, str(src / "scripts" / "enable-agent-ops.py"), "--apply", "--ref", ref, "--host", params["host"]]
+    enable = [python, "-I", str(src / "scripts" / "enable-agent-ops.py"), "--apply", "--ref", ref, "--host", params["host"]]
     if params["skip_remote"]:
         enable.append("--skip-remote")
     for repo in params["repos"]:
@@ -1012,6 +1401,7 @@ def bootstrap(layout: Layout, params: dict, *, env=None, upstream=None, runner=N
         enable += ["--expires-days", str(params["expires_days"])]
     if layout.home != Path.home():
         enable += ["--home", str(layout.home)]
+    check_tree(src, manifest)
     return runner.run(enable)
 
 
@@ -1058,12 +1448,7 @@ def main(argv=None, *, env=None, upstream=None, remote=None, runner=None, out=pr
             if options.resume:
                 if not RUN.match(options.resume):
                     raise Refused("--resume needs a run id like 20261123T101500Z-ab12cd")
-                raw = read_file(layout.work / options.resume / "journal.json")
-                if raw is None:
-                    raise Refused("no journal for run %s" % options.resume)
-                journal = json.loads(raw[0])
-                confirm(enabler.env, "resume")
-                return enabler.apply(journal["params"], options.resume, journal)
+                return enabler.resume(options.resume)
             if not options.ref:
                 raise Refused("--apply needs --ref <SHA of canonical main>")
             return enabler.apply(params)
