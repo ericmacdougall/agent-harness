@@ -31,6 +31,7 @@ SCHEMA = 1
 SEGMENT_BYTES = 50 * 1024 * 1024
 PROD_FLOOR = 1024 * 1024
 MARKER_ONLY_BYTES = 1024
+LINE_CAP = 8 * 1024 * 1024  # a longer line is one None, never split
 MAX_RETRIES = 8
 SEGMENT_RE = re.compile(r"^(?P<stem>.+)\.(?P<seq>\d{4,})\.jsonl$")
 STEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$")
@@ -337,11 +338,52 @@ class Snapshot:
             pass
 
     def _sources(self):
-        """[(name, fd_or_None)] in order; closed segments are opened lazily by name, the tail by its pinned fd."""
-        out = [(s.name, None) for s in self.chain.segments if s.name != self.tail_name]
+        """[(name, fd_or_None, seq)] in order; closed segments are opened lazily by name, the tail by its pinned fd."""
+        out = [(s.name, None, s.seq) for s in self.chain.segments if s.name != self.tail_name]
         if self.tail_fd is not None:
-            out.append((self.tail_name, self.tail_fd))
+            seq = parse_name(self.tail_name)[1] or (self.chain.max_seq + 1)
+            out.append((self.tail_name, self.tail_fd, seq))
         return out
+
+    def _marker_note(self, name, seq):
+        self.problems.append({"code": "marker_mismatch", "seq": seq,
+                              "message": f"{name} line 1 looks like an open marker but is not this file's (seq {seq}, stem {self.stem}); kept as a record"})
+
+    def _drops_marker(self, first_line, name, seq):
+        """THE marker rule, shared by every reader: line 1 is dropped only when it is exactly this source's open
+        marker (seq >= 2, segment == seq, stem equal). Any other marker-shaped line is a record plus a problem."""
+        m = parse_marker(first_line)
+        if m is None:
+            return False
+        if seq >= 2 and m["segment"] == seq and m["stem"] == self.stem:
+            return not self.include_markers
+        self._marker_note(name, seq)
+        return False
+
+    def _frame(self, handle, name, seq):
+        """THE framing rule, shared by every reader: yields (raw_without_newline_or_None, nbytes) per line. A line
+        over LINE_CAP is discarded up to its newline and yielded once as None (never split into fake lines)."""
+        first = True
+        while True:
+            raw = handle.readline(LINE_CAP + 1)
+            if not raw:
+                return
+            nbytes = len(raw)
+            if nbytes > LINE_CAP and not raw.endswith(b"\n"):
+                while True:
+                    rest = handle.readline(LINE_CAP)
+                    nbytes += len(rest)
+                    if not rest or rest.endswith(b"\n"):
+                        break
+                first = False
+                yield None, nbytes
+                continue
+            body = raw.rstrip(b"\r\n")
+            if first:
+                first = False
+                if self._drops_marker(body, name, seq):
+                    continue
+            yield body, nbytes
 
     @property
     def complete(self):
@@ -351,25 +393,17 @@ class Snapshot:
         """Yield (segment_name, logical_line_no, raw_bytes_without_newline); markers are skipped unless asked for.
         A line longer than 8 MiB is yielded as None. Budget exhaustion adds a `truncated` problem."""
         total, number = 0, 0
-        for name, fd in self._sources():
+        for name, fd, seq in self._sources():
             own = fd is None
             try:
                 if own:
                     fd = _open_regular(self.directory, name)
                 with os.fdopen(os.dup(fd), "rb") as handle:
                     handle.seek(0)
-                    first = True
-                    while True:
-                        raw = handle.readline(8 * 1024 * 1024 + 1)
-                        if not raw:
-                            break
-                        total += len(raw)
-                        if first:
-                            first = False
-                            if parse_marker(raw.rstrip(b"\r\n")) is not None and not self.include_markers:
-                                continue
+                    for raw, nbytes in self._frame(handle, name, seq):
+                        total += nbytes
                         number += 1
-                        yield name, number, (raw.rstrip(b"\r\n") if len(raw) <= 8 * 1024 * 1024 else None)
+                        yield name, number, raw
                         if self.max_total_bytes is not None and total > self.max_total_bytes:
                             self.problems.append({"code": "truncated", "message": f"read budget of {self.max_total_bytes} bytes reached in {name}", "seq": None})
                             if self.strict:
@@ -387,7 +421,7 @@ class Snapshot:
         """At most the last `window` bytes of the logical stream (markers dropped), newest segment first."""
         pieces, left = [], window
         sources = self._sources()
-        for name, fd in reversed(sources):
+        for name, fd, seq in reversed(sources):
             if left <= 0:
                 break
             own = fd is None
@@ -399,7 +433,7 @@ class Snapshot:
                 data = os.pread(fd, size - start, start)
                 if start == 0:
                     first, _, rest = data.partition(b"\n")
-                    if parse_marker(first) is not None and not self.include_markers:
+                    if self._drops_marker(first, name, seq):  # the same marker rule as lines()
                         data = rest
                 pieces.append(data)
                 left -= (size - start)
@@ -410,8 +444,6 @@ class Snapshot:
             finally:
                 if own and fd is not None:
                     os.close(fd)
-        if left > 0 and self.max_total_bytes is not None:
-            pass
         return b"".join(reversed(pieces))
 
 
@@ -554,25 +586,33 @@ def _write_all(fd, data):
         view = view[n:]
 
 
+ROTATED, SKIPPED, RECREATED = "rotated", "skipped", "recreated"
+
+
 def _rotate(dir_fd, stem, name, fd, current_target):
     """Rename the live file (fd) to the next segment, create the new live file with its open marker, rewrite the
-    index. Returns the new live fd (the old fd is closed). Raises RotateFailed when the rename could not be undone."""
+    index. Never closes `fd` and never returns a bare fd or None: it returns (status, fd) where
+      ROTATED   -> the new live fd (locked, marker written); the caller closes the old fd;
+      SKIPPED   -> the SAME fd, still the live file (collision, unsupported, implausible seq, create failed and undone);
+      RECREATED -> None: another writer recreated the live name after our rename; the caller closes the old fd and
+                   retries into that file.
+    Raises RotateFailed when the rename could not be undone (the record is then not written anywhere)."""
     sha, size, lines = _hash_fd(fd)
     _fault("after_hash")
     seq = _next_seq(dir_fd, stem, fd)
     current_max = max(_scan(dir_fd, stem).get(stem, ({}, []))[0] or {0: 0})
     if seq > current_max + 1000:
         warn("seq_implausible", f"{seq}; rotation refused")
-        return fd
+        return SKIPPED, fd
     seg = segment_name(stem, seq)
     try:
         _exclusive_rename(dir_fd, name, seg)
     except FileExistsError:
         warn("rotate_collision", f"{seg} already exists; rotation skipped")
-        return fd
+        return SKIPPED, fd
     except NotImplementedError as error:
         warn("rotate_unsupported", str(error))
-        return fd
+        return SKIPPED, fd
     os.fsync(dir_fd)
     _fault("after_rename")
     try:
@@ -583,11 +623,11 @@ def _rotate(dir_fd, stem, name, fd, current_target):
             os.fsync(dir_fd)
         except FileExistsError:  # an old writer recreated the live name: that file IS the live file (R3-8)
             warn("rotate_create_failed", f"{type(error).__name__}; live name recreated by another writer")
-            return None
+            return RECREATED, None
         except (OSError, NotImplementedError):
             raise RotateFailed(f"create of {name} failed ({type(error).__name__}) and the rename could not be undone")
         warn("rotate_create_failed", f"{type(error).__name__}; rotation undone")
-        return fd
+        return SKIPPED, fd
     try:
         os.fchmod(new_fd, 0o600)
         fcntl.flock(new_fd, fcntl.LOCK_EX)
@@ -600,12 +640,15 @@ def _rotate(dir_fd, stem, name, fd, current_target):
         os.close(new_fd)
         raise
     try:
-        write_index(dir_fd, stem)
-    except Exception as error:  # noqa: BLE001 - the index is derived and advisory: never fail an append over it
-        warn("index_failed", type(error).__name__)
-    _fault("after_index")
-    os.close(fd)
-    return new_fd
+        try:
+            write_index(dir_fd, stem)
+        except Exception as error:  # noqa: BLE001 - the index is derived and advisory: never fail an append over it
+            warn("index_failed", type(error).__name__)
+        _fault("after_index")
+    except BaseException:
+        os.close(new_fd)
+        raise
+    return ROTATED, new_fd
 
 
 def _finish_live(dir_fd, stem, fd):
@@ -700,12 +743,14 @@ def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise ValueError("WAL must be a regular file with no hard links")
 
-                def current_target(fd=fd):
+                cur = [fd]  # the fd this attempt currently owns; rebound when a rotation swaps in the new live file
+
+                def current_target():
                     if not check_dir():
                         return False
                     try:
                         named = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                        opened = os.fstat(fd)
+                        opened = os.fstat(cur[0])
                     except OSError:
                         return False
                     return (stat.S_ISREG(named.st_mode) and named.st_nlink == 1
@@ -731,22 +776,20 @@ def append_line(dir_fd, name, payload, current_directory=None, retry_sleep=0.01)
                     if end > MARKER_ONLY_BYTES and end + len(payload) > segment_limit():
                         _fault("before_rotate")
                         try:
-                            fd = _rotate(dir_fd, stem, name, fd, current_target)
+                            status, new_fd = _rotate(dir_fd, stem, name, fd, current_target)
                         except RotateFailed as error:
                             raise ValueError(f"rotate_failed_record_not_written: {error}")
-                        if fd is not None:
-                            info = os.fstat(fd)
-
-                            def current_target(fd=fd):  # noqa: F811 - the new live inode
-                                if not check_dir():
-                                    return False
-                                try:
-                                    named = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                                    opened = os.fstat(fd)
-                                except OSError:
-                                    return False
-                                return (stat.S_ISREG(named.st_mode) and named.st_nlink == 1
-                                        and (named.st_dev, named.st_ino) == (opened.st_dev, opened.st_ino))
+                        if status == ROTATED:  # swap: the old (renamed) inode is closed, the new live file is ours
+                            os.close(fd)
+                            fd = cur[0] = new_fd
+                        elif status == RECREATED:  # another writer recreated the live name: retry into that file
+                            os.close(fd)
+                            fd = None
+                            if attempt == MAX_RETRIES - 1:
+                                raise ValueError("WAL live file kept changing during rotation")
+                            time.sleep(retry_sleep)
+                            continue
+                        # SKIPPED: `fd` is unchanged and still the live file
                 _fault("before_write")
                 _write_all(fd, payload)
                 os.fsync(fd)
@@ -933,8 +976,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
     directory = _checked_dir(args.dir)
     if args.cmd == "map":
-        print(json.dumps(map_directory(directory), indent=1))
-        return 0 if all(w["complete"] for w in map_directory(directory)["wals"]) else 1
+        result = map_directory(directory)  # once: the printed map and the exit code come from the same read
+        print(json.dumps(result, indent=1))
+        return 0 if all(w["complete"] for w in result["wals"]) else 1
     if args.cmd == "verify":
         stems = [_checked_stem(args.stem)] if args.stem else list(list_wals(directory))
         bad = False
@@ -969,6 +1013,9 @@ def main(argv=None):
             else:
                 write_index(dir_fd, stem)
                 print(f"wrote {stem}.segments.json")
+            for pr in verify_chain(directory, stem):  # a reindex never hides a problem (e.g. a live file left without its marker)
+                if pr["code"] not in ("live_missing", "marker_info", "schema_newer"):
+                    print(f"problem {stem}: {pr['code']}: {pr['message']}", file=sys.stderr)
         finally:
             os.close(dir_fd)
         return 0
