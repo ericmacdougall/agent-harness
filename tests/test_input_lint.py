@@ -17,7 +17,7 @@ from pathlib import Path
 HOOKS = Path(__file__).resolve().parent.parent / "harness" / "hooks"
 ALLOW = re.compile(r"#\s*input-ok:\s*\S")
 # file -> number of unannotated unbounded reads that existed before safe_input. Only ever decrease these.
-BASELINE = {"commit_policy.py": 6, "deliver.py": 2, "peer_review.py": 2, "spec_flow.py": 3, "wal.py": 1, "workdir.py": 4}
+BASELINE = {"commit_policy.py": 6, "deliver.py": 2, "peer_review.py": 2, "spec_flow.py": 3, "wal.py": 1, "workdir.py": 3}
 # Counts are the ratchet; this also pins each baselined call by its source line so swapping an old violation for a
 # new one fails. Delete a line from here when you migrate it (fill with `python3 tests/test_input_lint.py --pins`).
 PINS = {'commit_policy.py': ['policy = json.load(handle)',
@@ -39,7 +39,6 @@ PINS = {'commit_policy.py': ['policy = json.load(handle)',
                   'payload = json.load(sys.stdin)'],
  'wal.py': ['data = json.load(sys.stdin)'],
  'workdir.py': ['config = json.loads(path.read_text())',
-                'lines = handle.read().splitlines()',
                 'recorded = json.loads(marker.read_text()).get("session_id")',
                 'state = json.loads((home() / ".agent-harness" / "install-state.json").read_text())']}
 

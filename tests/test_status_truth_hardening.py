@@ -30,6 +30,7 @@ import goals_view as gv  # noqa: E402
 import mission_coverage as mc  # noqa: E402
 import mission_gate  # noqa: E402
 import safe_input  # noqa: E402
+import wal_segments as ws  # noqa: E402
 
 SESSION = "11111111-2222-4333-8444-555555555555"
 OTHER = "99999999-2222-4333-8444-555555555555"
@@ -308,12 +309,12 @@ class F5OnePassAndVisibleBudget(Base):
     def test_each_wal_file_is_read_once_per_report(self):
         self.build()
         opened = []
-        real = safe_input.open_regular_file
+        real = ws._open_regular  # the segment reader opens every member of a WAL chain through this one function
 
-        def counting(path, *a, **kw):
-            opened.append(Path(str(path)).name)
-            return real(path, *a, **kw)
-        with mock.patch.object(safe_input, "open_regular_file", side_effect=counting):
+        def counting(directory, name, *a, **kw):
+            opened.append(name)
+            return real(directory, name, *a, **kw)
+        with mock.patch.object(ws, "_open_regular", side_effect=counting):
             doc = gv.goals_report(self.home, session=SESSION)
         self.assertEqual(doc["state"], "ok")
         self.assertTrue(all(g["state"] == "VERIFIED" for g in doc["goals"]), [g["state"] for g in doc["goals"]])
