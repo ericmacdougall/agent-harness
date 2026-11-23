@@ -9,6 +9,7 @@
     command_guard.py approve-delete --path P --remote R --wal W [--backup-verified-sha256 D] [--ttl S]
     command_guard.py approve-delete --path P --archive R:x.tar.zst --archive-sha256 R:x.tar.zst.sha256 \
         --archive-listing R:x.listing --wal W [--ttl S]
+    command_guard.py approve-delete --host H --path P --no-backup --user-source answer:S/U --wal W   (fleet host)
     command_guard.py approve-delete --path P --no-backup --user-source answer:S/U --wal W [--ttl S]
                                                    user-approved, no backup: clean pushed git tree or detached image
     command_guard.py revoke-delete                 remove every delete approval
@@ -162,7 +163,10 @@ DEFAULT_POLICY = {
                            'ignored_top_ok': ['.venv', 'venv', 'dist', 'build', 'target', '.next', '.gradle']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
-               'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
+               'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev'],
+               # goodqa#16699: fleet-host no-backup approval
+               'no_backup_fleet_hosts': ['t2-dev'], 'fleet_ssh_config': '~/.ssh/config_fleetops',
+               'no_backup_fleet_remote_hosts': ['github.com'], 'fleet_max_ttl_seconds': 1800},
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
@@ -8008,6 +8012,13 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         return 'block', format_block(Finding(LOG_DELETE, 'approval-env', 'runs approve-delete with HOME, '
                                              'CLAUDE_CONFIG_DIR or an env wrapper, which could point it at a forged '
                                              'transcript or state', 'run command_guard.py approve-delete plainly'))
+    fleet = getattr(marker, 'covers_fleet', None)
+    if fleet is not None and not ps and isinstance(command, str) and 'ssh' in command:
+        if fleet(command):
+            return 'allow', ''
+        if getattr(marker, 'fleet_reason', None):
+            return 'block', format_block(Finding(LOG_DELETE, 'fleet-approval', marker.fleet_reason,
+                                                 'approve the path again with approve-delete --host'))
     try:
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
@@ -8152,7 +8163,7 @@ def audit(event, fields, home=None, wal=None, strict=False, to_file=True):
     record.update({k: v for k, v in fields.items() if k in ('path', 'remote', 'manifest_sha256', 'files', 'reason',
                                                              'expires_at', 'nonce', 'rule', 'kind', 'target',
                                                              'user_source', 'bytes', 'archive', 'archive_sha256',
-                                                             'archive_listing')})
+                                                             'archive_listing', 'host', 'state_sha256')})
     try:
         import redact
         line = json.dumps(redact.redact_obj(record), sort_keys=True)  # values, so a span cannot eat JSON syntax
@@ -8221,8 +8232,11 @@ def stat_manifest(path, limits, deadline=None):
 class Approvals:
     """Marker callable for the analyser: covers(path) -> bool, remembering which entries a command would use."""
 
-    def __init__(self, home=None, compiled=None, now=None):
+    def __init__(self, home=None, compiled=None, now=None, fleet_runner=None):
         self.home = home
+        self.policy = compiled.policy if compiled else DEFAULT_POLICY
+        self.fleet_runner = fleet_runner  # only hook_main passes one: decide() called elsewhere never opens ssh
+        self.fleet_reason = None
         self.limits = (compiled.policy['marker'] if compiled else DEFAULT_POLICY['marker'])
         self.now = time.time() if now is None else now
         self.entries, self.key = load_marker(home)
@@ -8252,7 +8266,7 @@ class Approvals:
         except (OSError, ValueError):
             return False
         for entry in self.entries:
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get('kind') == NO_BACKUP_REMOTE_KIND:
                 continue
             if os.path.normpath(str(entry.get('path'))) != real:
                 continue
@@ -8281,6 +8295,39 @@ class Approvals:
                 self.used_archive[real] = entry.get('archive')
             if backup_only:
                 self.backup_records[real] = (entry['nonce'], entry['mac'], entry['manifest_sha256'])
+            return True
+        return False
+
+    def covers_fleet(self, command):
+        """True when `command` is exactly the one approved fleet-host delete and the host still shows the approved
+        state (one ssh re-check through fleet_runner). Sets fleet_reason when an entry exists but the check fails.
+        Without a runner, or for any other command, it is False and nothing runs."""
+        self.fleet_reason = None
+        if self.fleet_runner is None or not self.entries:
+            return False
+        home = self.home or _pinned_home()
+        parsed = parse_fleet_command(command, home, self.policy)
+        if parsed is None:
+            return False
+        for entry in self.entries:
+            if not isinstance(entry, dict) or entry.get('kind') != NO_BACKUP_REMOTE_KIND or \
+                    entry.get('host') != parsed['host'] or entry.get('remote_path') != parsed['path'] or \
+                    entry.get('path') != 'fleet:%s:%s' % (parsed['host'], parsed['path']) or not self._valid(entry):
+                continue
+            if parsed['op'] == 'worktree' and (entry.get('repo_kind') != 'linked' or
+                                               entry.get('parent') != parsed['parent']):
+                self.fleet_reason = 'the approved checkout is not a linked worktree of that -C repository'
+                return False
+            try:
+                data = run_fleet_validator(parsed['host'], 'recheck', parsed['path'], self.policy, home,
+                                           runner=self.fleet_runner, timeout=5)
+                if _fleet_digest(parsed['host'], parsed['path'], data) != entry.get('state_sha256') or \
+                        [data['dev'], data['ino']] != list(entry.get('identity') or []):
+                    raise ValueError('the checkout changed since it was approved')
+            except ValueError as error:
+                self.fleet_reason = 'the fleet-host approval cannot be used now: %s' % _fleet_clean(error, 200)
+                return False
+            self.used['fleet:%s:%s' % (parsed['host'], parsed['path'])] = entry.get('nonce')
             return True
         return False
 
@@ -9416,7 +9463,7 @@ def _uses_of_source(canonical, home=None):
             rec = json.loads(line)
         except ValueError:
             continue
-        if isinstance(rec, dict) and rec.get('event') == 'approved' and rec.get('kind') == NO_BACKUP_KIND and \
+        if isinstance(rec, dict) and rec.get('event') == 'approved' and rec.get('kind') in (NO_BACKUP_KIND, NO_BACKUP_REMOTE_KIND) and \
                 _canonical_source(rec.get('user_source')) == canonical:
             count += 1
     return count
@@ -9525,6 +9572,1028 @@ def approve_delete_no_backup(path, user_source, wal, ttl=None, home=None, policy
         raise
     audit('approved', entry, home=home, wal=wal, to_file=False)
     return entry
+
+
+# --------------------------------------------------------------------------- fleet-host no-backup approval (goodqa#16699)
+#
+# `approve-delete --host H --path P --no-backup --user-source ... --wal ...` approves ONE later command, exactly
+# `ssh -F <fleet config> [-o BatchMode=yes] H rm -rf P` or `... H git -C PARENT worktree remove P`, for a clean, fully
+# pushed git checkout on an allowlisted fleet host. The checkout is validated on the host by a fixed program sent on
+# ssh stdin (FLEET_VALIDATOR_BODY); the approval stores a digest of what was validated; the hook re-runs the program once
+# (no network step) just before allowing. The entry's `path` is `fleet:HOST:PATH`, so no local path lookup can match it,
+# and a fleet entry is used only through the whole-raw-text parser parse_fleet_command, never through the analyser.
+# Stated limit (TOCTOU): one ssh round trip (about two seconds) lies between the hook re-check and the remote delete.
+
+NO_BACKUP_REMOTE_KIND = 'no-backup-remote'
+FLEET_BUILTIN_HOSTS = ('t2-dev',)
+FLEET_MAX_TTL = 1800
+FLEET_PLAIN_PATH = re.compile(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+')
+FLEET_BAD_SEGMENTS = {'.', '..', 'wal', 'wals', 'log', 'logs', 'session', 'sessions', 'projects', '.claude', '.codex',
+                      '.git'}
+FLEET_WORK_RE = re.compile(r'/home/[a-z_][a-z0-9_-]*/\.agent-harness/work/([A-Za-z0-9._-]+)/((?:[A-Za-z0-9._-]+/)*'
+                           r'[A-Za-z0-9._-]+)')
+FLEET_VALIDATOR_BODY = r'''# Fleet-host validator (goodqa#16699). Runs on the fleet host as `python3 -I -`; the Mac guard sends this fixed text on
+# stdin after one `CONFIG = {...}` line. Read-only: it never writes, deletes or fetches. It prints one JSON object.
+import errno
+import hashlib
+import json
+import os
+import pwd
+import re
+import stat as stat_mod
+import subprocess
+import sys
+import time
+
+MODE = CONFIG['mode']  # 'validate' (approval) or 'recheck' (hook time: no network step)
+TARGET = CONFIG['path']
+GIT = CONFIG.get('git') or 'git'
+PROC = CONFIG.get('proc_root') or '/proc'
+MOUNTINFO = CONFIG.get('mountinfo') or '/proc/self/mountinfo'
+SEG = re.compile(r'[A-Za-z0-9._-]+')
+HEX = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+BAD_SEGMENTS = {'.', '..', 'wal', 'wals', 'log', 'logs', 'session', 'sessions', 'projects', '.claude', '.codex', '.git'}
+KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', ''), ('tailscaled', ' be-child '))
+CREATED = None
+SAFE = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
+        '-c', 'protocol.file.allow=never', '-c', 'core.sshCommand=/usr/bin/ssh', '-c', 'credential.helper=',
+        '-c', 'core.pager=cat', '-c', 'core.untrackedCache=false', '-c', 'core.attributesFile=/dev/null']
+# Physical footprint (goodqa#16699 rescue). Every name git may keep in a common git dir, a linked worktree's own git dir
+# and an object dir; any other name refuses (unknown defaults to refused). Names are a second layer: the universal rules
+# are that no entry of a store is a symlink and that no store location resolves inside TARGET.
+KNOWN_STORE = {'HEAD', 'config', 'config.worktree', 'description', 'hooks', 'info', 'objects', 'refs', 'packed-refs',
+               'logs', 'worktrees', 'index', 'FETCH_HEAD', 'ORIG_HEAD', 'COMMIT_EDITMSG', 'branches', 'remotes', 'shallow',
+               'lfs', 'modules', 'gitk.cache', 'gc.log', 'gc.pid', 'AUTO_MERGE', 'MERGE_MSG', 'MERGE_MODE', 'MERGE_RR',
+               'SQUASH_MSG', 'TAG_EDITMSG', 'NOTES_EDITMSG', 'EDIT_DESCRIPTION', 'BRANCH_DESCRIPTION', 'rr-cache',
+               'fsmonitor--daemon.ipc', 'fsmonitor--daemon', 'reftable', 'gc.log.lock'}
+KNOWN_WORKTREE = {'HEAD', 'ORIG_HEAD', 'FETCH_HEAD', 'index', 'gitdir', 'commondir', 'logs', 'refs', 'locked',
+                  'config.worktree', 'COMMIT_EDITMSG', 'AUTO_MERGE', 'MERGE_MSG', 'MERGE_MODE', 'SQUASH_MSG', 'info',
+                  'gc.log', 'gc.log.lock'}
+# auto-gc bookkeeping, never a history write; a killed `gc --auto` leaves it behind (seen live on t2-dev). Every other
+# *.lock (index, HEAD, refs, packed-refs, config) is a git write in flight and refuses.
+GC_BOOKKEEPING_LOCKS = {'gc.log.lock'}
+IN_PROGRESS = {'rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'REBASE_HEAD', 'sequencer',
+               'BISECT_LOG', 'BISECT_START', 'BISECT_HEAD', 'BISECT_TERMS', 'BISECT_EXPECTED_REV', 'BISECT_ANCESTORS_OK',
+               'BISECT_NAMES', 'BISECT_RUN', 'BISECT_FIRST_PARENT'}
+KNOWN_OBJECTS = {'pack', 'info'}
+KNOWN_OBJECTS_INFO = {'packs', 'alternates', 'commit-graph', 'commit-graphs'}
+FANOUT = re.compile(r'[0-9a-f]{2}')
+LOOSE = re.compile(r'[0-9a-f]{38}|[0-9a-f]{62}')
+REF_BODY = re.compile(rb'(?:[0-9a-f]{40}|[0-9a-f]{64})\n?')
+WALK_SECONDS = 60.0 if CONFIG['mode'] == 'validate' else 2.5
+
+
+class Refuse(Exception):
+    pass
+
+
+def refuse(reason):
+    raise Refuse(reason)
+
+
+def env(for_network=False):
+    e = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'LC_ALL': 'C', 'GIT_TERMINAL_PROMPT': '0', 'GIT_NO_LAZY_FETCH': '1',
+         'GIT_OPTIONAL_LOCKS': '0', 'GIT_PAGER': 'cat', 'GIT_NO_REPLACE_OBJECTS': '1'}
+    if for_network:
+        e['HOME'] = HOME
+        sock = os.environ.get('SSH_AUTH_SOCK', '')
+        if sock.startswith('/') and '\n' not in sock:
+            e['SSH_AUTH_SOCK'] = sock
+    else:
+        e.update({'HOME': '/nonexistent', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+                  'GIT_ATTR_NOSYSTEM': '1'})
+    return e
+
+
+def run(argv, timeout, stdin=None, network=False, cwd='/'):
+    try:
+        done = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              env=env(network), cwd=cwd, timeout=timeout, check=False,
+                              **({} if stdin is not None else {'stdin': subprocess.DEVNULL}))
+    except subprocess.TimeoutExpired:
+        refuse('a command timed out')
+    except OSError:
+        refuse('a required program could not be run')
+    return done.returncode, done.stdout.decode('utf-8', 'surrogateescape')
+
+
+def git(*args, timeout=120, stdin=None):
+    code, out = run([GIT] + SAFE + ['-C', TARGET] + list(args), timeout, stdin=stdin.encode() if stdin else None,
+                    cwd=TARGET)
+    return code, out
+
+
+def check_path():
+    global HOME
+    HOME = CONFIG.get('home') or os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    if os.path.realpath(HOME) != HOME:
+        refuse('the login home is not canonical')
+    if not re.fullmatch(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+', TARGET) or '//' in TARGET:
+        refuse('the path is not a plain literal path')
+    work = HOME + '/.agent-harness/work/'
+    if not TARGET.startswith(work):
+        refuse('the path is not under the login user work directory')
+    parts = TARGET[len(work):].split('/')
+    if len(parts) < 2 or any(p in BAD_SEGMENTS or not SEG.fullmatch(p) or p.endswith(('.jsonl', '.log')) for p in parts):
+        refuse('the path is not strictly inside a session work directory')
+    node = '/'
+    for part in [p for p in TARGET.split('/') if p]:
+        node = node.rstrip('/') + '/' + part
+        try:
+            if os.path.islink(node):
+                refuse('a symlink is on the path')
+        except OSError:
+            refuse('the path cannot be inspected')
+    if os.path.realpath(TARGET) != TARGET or not os.path.isdir(TARGET):
+        refuse('the path is not a real directory')
+
+
+def dev_ino(path):
+    st = os.lstat(path)
+    return [st.st_dev, st.st_ino]
+
+
+def repo_checks():
+    dot_git = os.path.join(TARGET, '.git')
+    try:
+        st = os.lstat(dot_git)
+    except OSError:
+        refuse('the path is not a git checkout')
+    if stat_mod.S_ISLNK(st.st_mode) or not (stat_mod.S_ISDIR(st.st_mode) or stat_mod.S_ISREG(st.st_mode)):
+        refuse('the .git entry is not a plain directory or file')
+    code, top = git('rev-parse', '--show-toplevel')
+    if code != 0 or os.path.realpath(top.strip()) != TARGET:
+        refuse('the path is not the top of its git working tree')
+    code, gd = git('rev-parse', '--path-format=absolute', '--git-dir')
+    code2, cd = git('rev-parse', '--path-format=absolute', '--git-common-dir')
+    if code or code2:
+        refuse('git directories cannot be read')
+    gd, cd = os.path.realpath(gd.strip()), os.path.realpath(cd.strip())
+    linked = gd != cd
+    code, filters = git('config', '--get-regexp', r'^filter\.')
+    if code not in (0, 1) or filters.strip():
+        refuse('the repository configures a filter driver')
+    code, wt = git('config', '--get', 'core.worktree')
+    if code != 1:
+        refuse('the repository sets core.worktree')
+    if os.path.lexists(os.path.join(cd, 'info', 'attributes')):
+        refuse('the repository has local attributes')
+    if os.path.lexists(os.path.join(cd, 'info', 'grafts')):
+        refuse('the repository has grafts')
+    code, replaced = git('for-each-ref', '--format=%(refname)', 'refs/replace')
+    if code != 0 or replaced.strip():
+        refuse('the repository has replace refs')
+    code, staged = git('ls-files', '-s', '-z')
+    if code != 0 or any(rec.startswith('160000 ') for rec in staged.split('\0')) or \
+            os.path.lexists(os.path.join(TARGET, '.gitmodules')) or os.path.lexists(os.path.join(cd, 'modules')):
+        refuse('the repository has submodules')
+    code, flagged = git('ls-files', '-v', '-z')
+    if code != 0:
+        refuse('the index cannot be listed')
+    for rec in flagged.split('\0'):
+        if len(rec) >= 3 and (rec[0].islower() or (rec[0] == 'S' and os.path.lexists(os.path.join(TARGET, rec[2:])))):
+            refuse('an index entry hides changes from status')
+    if not linked:
+        if os.path.lexists(os.path.join(cd, 'lfs')):
+            refuse('the repository has a git LFS store')
+        code, _ = git('rev-parse', '-q', '--verify', 'refs/stash')
+        if code == 0:
+            refuse('the repository has a stash')
+    code, head = git('rev-parse', '--verify', 'HEAD^{commit}')
+    head = head.strip()
+    if code != 0 or not HEX.fullmatch(head):
+        refuse('the working tree has no commit')
+    if linked:
+        tips = [head + ' HEAD']
+    else:
+        code, refs = git('for-each-ref', '--format=%(objectname) %(refname)')
+        if code != 0:
+            refuse('refs cannot be listed')
+        tips = sorted([line for line in refs.splitlines() if line] + [head + ' HEAD'])
+    return linked, head, tips, cd, gd
+
+
+def inside(path, base):
+    return path == base or path.startswith(base.rstrip('/') + '/')
+
+
+def worktrees(cd, linked, gd):
+    code, out = git('worktree', 'list', '--porcelain')
+    if code != 0:
+        refuse('the worktree list cannot be read')
+    entries, cur = [], None
+    for line in out.splitlines():
+        if line.startswith('worktree '):
+            cur = {'path': line[9:], 'bare': False, 'prunable': False}
+            entries.append(cur)
+        elif cur is not None and line == 'bare':
+            cur['bare'] = True
+        elif cur is not None and line.startswith('prunable'):
+            cur['prunable'] = True
+    if not entries or entries[0]['bare']:
+        refuse('the repository has no main working tree')
+    main = os.path.realpath(entries[0]['path'])
+    plain = re.compile(r'/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+')
+    if linked:
+        # a linked worktree is a registered one: its git dir is <common>/worktrees/<id>, its gitdir file points back at
+        # TARGET/.git, the common dir is the parent's own .git, and neither lies inside the target
+        if not plain.fullmatch(main) or inside(main, TARGET) or inside(cd, TARGET):
+            refuse('the parent repository is missing, not plain, or inside the path')
+        if os.path.realpath(os.path.join(main, '.git')) != cd or os.path.dirname(gd) != os.path.join(cd, 'worktrees'):
+            refuse('the checkout is not a registered linked worktree of its parent')
+        try:
+            with open(os.path.join(gd, 'gitdir')) as handle:
+                back = os.path.realpath(handle.read().strip())
+        except OSError:
+            refuse('the linked worktree registration cannot be read')
+        if back != os.path.join(TARGET, '.git'):
+            refuse('the linked worktree registration does not point at this path')
+        if not any(os.path.realpath(e['path']) == TARGET for e in entries[1:]):
+            refuse('the path is not listed as a linked worktree of its parent')
+        code, per = git('for-each-ref', '--format=%(refname)', 'refs/bisect', 'refs/worktree', 'refs/rewritten')
+        if code != 0 or per.strip():
+            refuse('the linked worktree has per-worktree refs')
+        return main, []
+    if main != TARGET or gd != cd or cd != os.path.join(TARGET, '.git'):
+        refuse('the path is not the main working tree of its repository')
+    others = []
+    for e in entries[1:]:
+        if e['prunable'] or not os.path.lexists(e['path']):
+            continue
+        if not plain.fullmatch(e['path']):
+            refuse('a linked worktree path is not a plain literal path')
+        others.append(e['path'])
+    return None, sorted(others)
+
+
+def origin_hosts():
+    code, url = git('config', '--get', 'remote.origin.url')
+    url = url.strip()
+    if code != 0 or not url or not re.fullmatch(r'[A-Za-z0-9._~:/@+-]+', url):
+        refuse('origin is missing or not a plain network URL')
+    m = re.fullmatch(r'(?:https|ssh|git\+ssh)://(?:([^@/:]+)@)?([A-Za-z0-9.-]+)(?::[0-9]+)?/\S+', url)
+    host = m.group(2) if m else None
+    if m and m.group(1) not in (None, 'git'):
+        refuse('origin carries credentials')
+    if not m:
+        m2 = re.fullmatch(r'([A-Za-z0-9._-]+)@([A-Za-z0-9.-]+):\S+', url)
+        host = m2.group(2) if m2 else None
+        if m2 and m2.group(1) != 'git':
+            refuse('origin carries credentials')
+    if not host or host.lower() not in [h.lower() for h in CONFIG['remote_hosts']]:
+        refuse('origin is not on an allowlisted remote host')
+    return url
+
+
+def check_pushed(head, tips, linked):
+    url = origin_hosts()
+    code, out = run([GIT] + SAFE[:8] + ['ls-remote', url, 'refs/heads/*', 'refs/tags/*'], 90, network=True)
+    live = sorted({line.split('\t')[0] for line in out.splitlines() if '\t' in line and HEX.fullmatch(line.split('\t')[0])})
+    if code != 0 or not live:
+        refuse('the remote did not answer a live listing')
+    code, checked = git('cat-file', '--batch-check=%(objectname) %(objecttype)', stdin='\n'.join(live) + '\n')
+    present = [l.split()[0] for l in checked.splitlines() if l.endswith((' commit', ' tag'))]
+    if not present:
+        refuse('no live remote commit exists in this clone')
+    if linked:
+        code, extra = git('rev-list', '--max-count=1', '--stdin', stdin=head + '\n' + ''.join('^' + p + '\n' for p in present))
+    else:
+        code, extra = git('rev-list', '--max-count=1', '--all', 'HEAD', '--stdin',
+                          stdin=''.join('^' + p + '\n' for p in present))
+    if code != 0:
+        refuse('a branch, tag or HEAD commit is missing from this clone')
+    if extra.strip():
+        refuse('a branch, tag or HEAD commit is on no live ref of the remote (unpushed work)')
+    return len(live)
+
+
+def clean(text):
+    return re.sub(r'[^A-Za-z0-9._/-]', '?', str(text))[-80:]
+
+
+def listdir_or_refuse(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        refuse('a git store directory cannot be listed (%s)' % clean(path))
+
+
+def walk_store(root, deadline, skip=()):
+    """Every entry under `root`, never following a link; any symlink refuses. Returns the entry count."""
+    stack, count = [''], 0
+    while stack:
+        rel = stack.pop()
+        try:
+            listing = os.scandir(os.path.join(root, rel) if rel else root)
+        except OSError:
+            refuse('a git store directory cannot be listed (%s)' % clean(rel or root))
+        with listing:
+            for entry in listing:
+                count += 1
+                if count % 512 == 0 and time.monotonic() > deadline:
+                    refuse('the git store is too large to inspect in time')
+                name = rel + '/' + entry.name if rel else entry.name
+                if not rel and entry.name in skip:
+                    continue
+                if entry.is_symlink():
+                    refuse('a git store entry is a symlink (%s)' % clean(name))
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append(name)
+    return count
+
+
+def check_object_dir(objdir, deadline):
+    """An object dir holds only fan-out dirs, pack/ and info/ (packs, alternates, commit-graph); no symlink anywhere."""
+    try:
+        st = os.lstat(objdir)
+    except OSError:
+        refuse('the object store is missing (%s)' % clean(objdir))
+    if not stat_mod.S_ISDIR(st.st_mode):
+        refuse('the object store is not a plain directory (%s)' % clean(objdir))
+    for name in listdir_or_refuse(objdir):
+        if name not in KNOWN_OBJECTS and not FANOUT.fullmatch(name):
+            refuse('the object store has an unknown entry (%s)' % clean(name))
+    if os.path.lexists(os.path.join(objdir, 'info')):
+        for name in listdir_or_refuse(os.path.join(objdir, 'info')):
+            if name == 'http-alternates':
+                refuse('the object store borrows objects over http (http-alternates)')
+            if name not in KNOWN_OBJECTS_INFO:
+                refuse('the object store info has an unknown entry (%s)' % clean(name))
+    return walk_store(objdir, deadline)
+
+
+def alternates(objdir, depth, seen, out, deadline):
+    """Follow objects/info/alternates the way git does (relative to the object dir, at most 5 deep); every borrowed store
+    must resolve outside TARGET without a symlink and pass check_object_dir itself."""
+    path = os.path.join(objdir, 'info', 'alternates')
+    if not os.path.lexists(path):
+        return
+    if depth >= 5:
+        refuse('the alternates chain is deeper than git follows')
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read(65537)
+    except OSError:
+        refuse('an alternates file cannot be read')
+    if len(data) > 65536:
+        refuse('an alternates file is too large')
+    for line in data.decode('utf-8', 'surrogateescape').split('\n'):
+        if not line or line.startswith('#'):
+            continue
+        if line != line.strip() or line.startswith('"'):
+            refuse('an alternates entry is quoted or padded')
+        lexical = os.path.normpath(line if line.startswith('/') else os.path.join(objdir, line))
+        real = os.path.realpath(lexical)
+        if real != lexical:
+            refuse('an alternate object store is reached through a symlink')
+        if inside(real, TARGET):
+            refuse('an alternate object store is inside the path')
+        if real in seen:
+            continue
+        seen.add(real)
+        out.append(real)
+        check_object_dir(real, deadline)
+        alternates(real, depth + 1, seen, out, deadline)
+
+
+def physical_footprint(cd, gd, linked):
+    """The one choke point for where the history git reads physically lives (validate and recheck, linked and main).
+    Refuses when any store location is inside TARGET (linked), reached through a symlink, of an unknown name, mounted on,
+    borrowed over http, pulled in by a config include, or mid-operation. Returns the roots for the mount check and a
+    digest of the physical layout (path, device and inode) that the approval pins."""
+    started = time.monotonic()
+    deadline = started + WALK_SECONDS
+    dot = os.path.join(TARGET, '.git')
+    st = os.lstat(dot)
+    if linked:
+        if not stat_mod.S_ISREG(st.st_mode):
+            refuse('a linked worktree must have a .git file, not a directory')
+        if inside(cd, TARGET) or inside(gd, TARGET):
+            refuse('the parent git store is inside the path')
+    elif cd != dot or gd != cd or not stat_mod.S_ISDIR(st.st_mode):
+        refuse('the path is not the main working tree of its repository')
+    for name in listdir_or_refuse(cd):
+        if (name.endswith('.lock') and name not in GC_BOOKKEEPING_LOCKS) or (not linked and name in IN_PROGRESS):
+            refuse('a git operation is in progress (%s)' % clean(name))
+        if name not in KNOWN_STORE and name not in IN_PROGRESS and not name.startswith('sharedindex.'):
+            refuse('the git directory has an unknown entry (%s)' % clean(name))
+    if linked:
+        for name in listdir_or_refuse(gd):
+            if (name.endswith('.lock') and name not in GC_BOOKKEEPING_LOCKS) or name in IN_PROGRESS:
+                refuse('a git operation is in progress in the worktree (%s)' % clean(name))
+            if name not in KNOWN_WORKTREE and not name.startswith('sharedindex.'):
+                refuse('the worktree git directory has an unknown entry (%s)' % clean(name))
+        for root, _dirs, files in os.walk(os.path.join(gd, 'refs')):
+            if files:
+                refuse('the linked worktree has per-worktree refs')
+    # hooks are never history, and the validator runs git with core.hooksPath=/dev/null: not walked
+    entries = walk_store(cd, deadline, skip=('hooks', 'objects'))
+    objdir = os.path.join(cd, 'objects')
+    entries += check_object_dir(objdir, deadline)
+    alts = []
+    alternates(objdir, 0, {objdir}, alts, deadline)
+    for conf in (os.path.join(cd, 'config'), os.path.join(cd, 'config.worktree'), os.path.join(gd, 'config.worktree')):
+        if not os.path.lexists(conf):
+            continue
+        code, names = git('config', '--file', conf, '--no-includes', '--name-only', '--list')
+        if code != 0:
+            refuse('a repository config file cannot be read')
+        if any(n.lower().startswith(('include.', 'includeif.')) for n in names.splitlines()):
+            refuse('the repository config includes another file')
+    code, objects = git('rev-parse', '--path-format=absolute', '--git-path', 'objects')
+    if code != 0 or os.path.realpath(objects.strip()) != objdir:
+        refuse('git reads objects from somewhere other than the common git dir')
+    code, bare = git('rev-parse', '--is-bare-repository')
+    if code != 0 or bare.strip() != 'false':
+        refuse('the repository is configured as bare')
+    items = []
+    for label, path in [('common', cd), ('objects', objdir), ('refs', os.path.join(cd, 'refs')), ('git', gd)] + \
+            [('alternate', a) for a in alts]:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            refuse('a git store location is missing (%s)' % label)
+        items.append([label, path, st.st_dev, st.st_ino])
+    # packed-refs is rewritten (a new inode) by ordinary ref updates in the parent: pin its place, not its inode
+    items.append(['packed-refs', os.path.join(cd, 'packed-refs'), os.lstat(cd).st_dev])
+    digest = hashlib.sha256(json.dumps(items, sort_keys=True).encode('utf-8', 'surrogateescape')).hexdigest()
+    return {'roots': [cd] + alts, 'sha256': digest, 'entries': entries,
+            'ms': int((time.monotonic() - started) * 1000)}
+
+
+def head_bytes(path, size):
+    try:
+        with open(path, 'rb') as handle:
+            return handle.read(size)
+    except OSError:
+        refuse('a file inside the path cannot be read (%s)' % clean(path[len(TARGET):]))
+
+
+def store_scan():
+    """One walk over all of TARGET (ignored dirs included, links never followed), skipping only the checkout's own top
+    .git: refuses anything that holds git history under any name (a nested .git, a git dir or bare store look-alike, a
+    worktree admin dir, packed-refs, a pack or index by its magic, a loose object, a ref file under heads/ or tags/)."""
+    started = time.monotonic()
+    deadline = started + WALK_SECONDS
+    stack, count = [(TARGET, False)], 0
+    while stack:
+        here, refs_like = stack.pop()
+        rel = here[len(TARGET) + 1:] or '.'
+        try:
+            with os.scandir(here) as listing:
+                entries = list(listing)
+        except OSError:
+            refuse('a directory inside the path cannot be listed (%s)' % clean(rel))
+        names = {e.name: e for e in entries}
+        head = names.get('HEAD')
+        if here != TARGET and head is not None and head.is_file(follow_symlinks=False) and \
+                any(k in names for k in ('objects', 'refs', 'commondir', 'gitdir')):
+            refuse('a git store look-alike is inside the path (%s)' % clean(rel))
+        for entry in entries:
+            count += 1
+            if count % 512 == 0 and time.monotonic() > deadline:
+                refuse('the path is too large to inspect in time')
+            if entry.name == '.git':
+                if here == TARGET:
+                    continue
+                refuse('a nested git store is inside the path (%s)' % clean(rel + '/.git'))
+            if entry.is_symlink():
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                stack.append((entry.path, refs_like or entry.name in ('heads', 'tags')))
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            name = entry.name
+            if name == 'packed-refs':
+                refuse('a packed-refs file is inside the path (%s)' % clean(rel))
+            if name.endswith(('.pack', '.idx')) and head_bytes(entry.path, 4) in (b'PACK', b'\xfftOc'):
+                refuse('a git pack is inside the path (%s)' % clean(rel + '/' + name))
+            # any directory name: a foreign fan-out dir (objects/ab) may be symlinked here under another name
+            if LOOSE.fullmatch(name) and head_bytes(entry.path, 1) == b'\x78':
+                refuse('a loose git object is inside the path (%s)' % clean(rel))
+            if refs_like and entry.stat(follow_symlinks=False).st_size in (40, 41, 64, 65) and \
+                    REF_BODY.fullmatch(head_bytes(entry.path, 66) or b''):
+                refuse('a git ref file is inside the path (%s)' % clean(rel + '/' + name))
+    return {'entries': count, 'ms': int((time.monotonic() - started) * 1000)}
+
+
+def check_status():
+    code, out = git('status', '--porcelain', '--untracked-files=normal', timeout=CONFIG['status_seconds'])
+    if code != 0:
+        refuse('git status failed')
+    if out:
+        refuse('the working tree has changed or untracked files')
+    code, out = git('status', '--porcelain', '--ignored=matching', '--untracked-files=normal', '-z',
+                    timeout=CONFIG['status_seconds'])
+    if code != 0:
+        refuse('git status failed')
+    anywhere = set(CONFIG['ignored_ok'])
+    top_only = set(CONFIG['ignored_top_ok'])
+    for rec in out.split('\0'):
+        if not rec:
+            continue
+        if not rec.startswith('!! '):
+            refuse('the working tree has changed or untracked files')
+        rel = rec[3:]
+        if not rel.endswith('/'):
+            refuse('an ignored file is present')
+        parts = rel.rstrip('/').split('/')
+        ok = parts[-1] in anywhere or (len(parts) == 1 and parts[0] in top_only)
+        if not ok:
+            refuse('an ignored directory that is not a build or cache directory is present')
+        full = os.path.join(TARGET, rel)
+        if os.path.islink(full.rstrip('/')):
+            refuse('an ignored directory is a link')
+
+
+def proc_status(pid):
+    try:
+        name = uid = ppid = None
+        with open('%s/%s/status' % (PROC, pid)) as handle:
+            for line in handle:
+                if line.startswith('Name:'):
+                    name = line.partition(':')[2].strip()
+                elif line.startswith('Uid:'):
+                    uid = int(line.partition(':')[2].split()[0])
+                elif line.startswith('PPid:'):
+                    ppid = int(line.partition(':')[2].split()[0])
+        return {'name': name, 'uid': uid, 'ppid': ppid} if uid is not None else None
+    except (FileNotFoundError, ProcessLookupError):
+        return 'gone'
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_args(pid):
+    try:
+        with open('%s/%s/cmdline' % (PROC, pid), 'rb') as handle:
+            return handle.read(8192).replace(b'\0', b' ').decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+def under(link):
+    link = link[:-len(' (deleted)')] if link.endswith(' (deleted)') else link
+    return link == TARGET or link.startswith(TARGET + '/')
+
+
+ALWAYS_REFUSES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'busybox', 'mksh', 'pwsh', 'powershell',
+                  'tmux', 'screen', 'vi', 'vim', 'nvim', 'nano', 'emacs', 'less', 'more', 'man', 'make', 'git', 'ssh',
+                  'xargs', 'watch', 'python', 'python2', 'python3', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun',
+                  'lua', 'java', 'go', 'cargo', 'npm', 'pnpm', 'yarn', 'pip', 'uv'}
+KNOWN_HELPERS = KNOWN_HELPERS + (('docker', '--label pgpool.tool='), ('sg', 'lanes/pgpool.py serve'),
+                                 ('sshd', 'sshd: %s@' % (pwd.getpwuid(os.getuid()).pw_name,)))
+
+
+def proc_start(pid):
+    try:
+        with open('%s/%s/stat' % (PROC, pid)) as handle:
+            fields = handle.read().rpartition(')')[2].split()
+        with open(PROC + '/stat') as handle:
+            boot = next(int(line.split()[1]) for line in handle if line.startswith('btime '))
+        return boot + int(fields[19]) / float(os.sysconf('SC_CLK_TCK'))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def in_container(pid):
+    try:
+        with open('%s/%s/cgroup' % (PROC, pid)) as handle:
+            return bool(re.search(r'(?:^|/)(?:docker[-/]|system\.slice/docker-)[0-9a-f]{12,64}', handle.read(4096), re.M))
+    except OSError:
+        return False
+
+
+def created_at():
+    stamps = []
+    try:
+        stamps.append(os.lstat(os.path.join(TARGET, '.git')).st_mtime)
+    except OSError:
+        return None
+    code, born = run(['/usr/bin/stat', '-c', '%W', TARGET], 10)
+    if code == 0 and born.strip().isdigit() and int(born.strip()) > 0:
+        stamps.append(float(born.strip()))
+    return min(stamps)
+
+
+def unreadable_verdict(pid, name, ancestors):
+    """None when an unreadable same-user process may be skipped (it could not have been started from the checkout), else a
+    reason. Same rules as command_guard.unreadable_verdict (goodqa#15870): judged from the checkout side."""
+    if int(pid) in ancestors:
+        return None
+    if in_container(pid):
+        return None  # sees only its container's files; a bind mount of the checkout is refused by docker_check
+    args = proc_args(pid)
+    if args is None:
+        return 'an unreadable process of this user has an unreadable command line'
+    if TARGET in args:
+        return 'an unreadable process of this user names the path'
+    base = (name or '').strip().lower()
+    if base in ALWAYS_REFUSES:
+        return 'an unreadable shell, interpreter or editor of this user may sit in the path'
+    for helper, mark in KNOWN_HELPERS:
+        if base == helper and mark in (' ' + args + ' ' if mark.startswith(' ') else args):
+            return None
+    started, created = proc_start(pid), CREATED
+    if started is None or created is None or started >= created:
+        return 'an unreadable process of this user started after the checkout was created'
+    return None
+
+
+def process_scan():
+    global CREATED
+    CREATED = created_at()
+    skipped = 0
+    mine = os.getpid()
+    ancestors, walk = set(), mine
+    for _ in range(64):
+        st = proc_status(str(walk))
+        if not isinstance(st, dict) or not isinstance(st.get('ppid'), int) or st['ppid'] <= 1:
+            break
+        walk = st['ppid']
+        ancestors.add(walk)
+    if not os.path.isdir(PROC + '/self') and not CONFIG.get('proc_root'):
+        refuse('the process table cannot be read')
+    for entry in os.listdir(PROC):
+        if not entry.isdigit() or int(entry) == mine:
+            continue
+        pid = int(entry)
+        try:
+            links = [os.readlink('%s/%s/%s' % (PROC, entry, n)) for n in ('cwd', 'root', 'exe')]
+            fds = []
+            fd_dir = '%s/%s/fd' % (PROC, entry)
+            for fd in os.listdir(fd_dir):
+                try:
+                    fds.append(os.readlink(fd_dir + '/' + fd))
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+            if any(under(l) for l in links + fds):
+                refuse('a process has its working directory or an open file inside the path')
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            if error.errno not in (errno.EACCES, errno.EPERM):
+                refuse('a process could not be inspected')
+            st = proc_status(entry)
+            if st == 'gone':
+                continue
+            if st is None:
+                refuse('a process identity could not be read')
+            if st['uid'] != os.getuid():
+                skipped += 1
+                continue
+            verdict = unreadable_verdict(entry, st['name'], ancestors)
+            if verdict:
+                refuse('%s (process %s)' % (verdict, re.sub(r'[^A-Za-z0-9._()-]', '?', str(st['name'] or ''))[:30]))
+            skipped += 1
+    return skipped
+
+
+def mount_check(roots=()):
+    try:
+        with open(MOUNTINFO) as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        refuse('the mount table cannot be read')
+    for line in lines:
+        fields = line.split(' ')
+        if len(fields) < 5:
+            refuse('the mount table is malformed')
+        mp = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), fields[4])
+        if mp == TARGET or mp.startswith(TARGET + '/'):
+            refuse('a mount is at or under the path')
+        if any(inside(mp, root) for root in roots):
+            refuse('a mount is at or under a git store the checkout uses')
+
+
+def docker_check():
+    docker = CONFIG.get('docker')
+    if docker is None:
+        for d in ('/usr/bin', '/usr/local/bin', '/bin'):
+            if os.access(d + '/docker', os.X_OK):
+                docker = d + '/docker'
+                break
+    if not docker:
+        return
+    code, ids = run([docker, 'ps', '-q', '--no-trunc'], 20)
+    if code != 0:
+        refuse('docker is present but its containers cannot be listed')
+    ids = [i for i in ids.split() if re.fullmatch(r'[0-9a-f]{12,64}', i)]
+    if not ids:
+        return
+    code, out = run([docker, 'inspect', '--format', '{{range .Mounts}}{{.Source}}{{"\\n"}}{{end}}'] + ids, 30)
+    if code != 0:
+        refuse('docker mounts cannot be read')
+    for src in out.splitlines():
+        src = src.strip()
+        if src and (src == TARGET or src.startswith(TARGET + '/') or TARGET.startswith(src.rstrip('/') + '/')):
+            refuse('a running docker container mounts the path or a parent or child of it')
+
+
+def main():
+    os.chdir('/')
+    check_path()
+    linked, head, tips, cd, gd = repo_checks()
+    parent, others = worktrees(cd, linked, gd)
+    footprint = physical_footprint(cd, gd, linked)
+    ident = dev_ino(TARGET)
+    live = None
+    if MODE == 'validate':
+        live = check_pushed(head, tips, linked)
+    check_status()
+    scan = store_scan()
+    skipped = process_scan()
+    mount_check(footprint['roots'])
+    docker_check()
+    if dev_ino(TARGET) != ident:
+        refuse('the path changed while it was inspected')
+    return {'ok': True, 'mode': MODE, 'kind': 'linked' if linked else 'main', 'parent': parent, 'head': head,
+            'tips_sha256': hashlib.sha256('\n'.join(tips).encode('utf-8', 'surrogateescape')).hexdigest(),
+            'tips_count': len(tips), 'linked_existing': others, 'dev': ident[0], 'ino': ident[1],
+            'footprint_sha256': footprint['sha256'], 'store_entries': footprint['entries'],
+            'tree_entries': scan['entries'], 'inspect_ms': footprint['ms'] + scan['ms'], 'skipped_processes': skipped,
+            'live_refs': live, 'status': 'clean', 'status_mode': 'porcelain-untracked-normal'}
+
+
+try:
+    result = main()
+except Refuse as why:
+    result = {'ok': False, 'reason': str(why)}
+sys.stdout.write(json.dumps(result) + '\n')
+'''
+
+
+def fleet_path_problem(path):
+    """'' for a path that may be approved on a fleet host (syntax only), else the reason."""
+    if not isinstance(path, str) or not path.startswith('/'):
+        return 'give the absolute literal path'
+    m = FLEET_WORK_RE.fullmatch(path)
+    if not m:
+        return 'a fleet path is /home/USER/.agent-harness/work/SESSION/... made of letters, digits and . _ - only, ' \
+               'strictly below a session directory'
+    parts = [m.group(1)] + m.group(2).split('/')
+    if any(p in FLEET_BAD_SEGMENTS or p.endswith(('.jsonl', '.log')) for p in parts):
+        return 'a fleet path never names a WAL, log, session or .git store'
+    return ''
+
+
+def _fleet_hosts(limits):
+    return [h for h in (limits.get('no_backup_fleet_hosts') or ()) if h in FLEET_BUILTIN_HOSTS]
+
+
+def _fleet_config(limits, home):
+    """The real path of the pinned ssh config file, or raises ValueError (symlink, other owner, group or world
+    writable, missing)."""
+    rel = str(limits.get('fleet_ssh_config') or '~/.ssh/config_fleetops')
+    if not rel.startswith('~/') or '..' in rel.split('/'):
+        raise ValueError('fleet_ssh_config must be a file below the account home')
+    path = os.path.join(home, rel[2:])
+    try:
+        st = os.lstat(path)
+    except OSError:
+        raise ValueError('the fleet ssh config %s does not exist' % rel)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+        raise ValueError('the fleet ssh config must be a regular file owned by the user and not group or world '
+                         'writable')
+    return path
+
+
+def build_fleet_program(mode, path, policy, _test=None):
+    """The fixed validator program for `path`. Production passes only the fixed key set; `_test` (tests only) may add
+    git, proc_root, mountinfo, docker and home."""
+    clone = policy.get('reproducible_clone') or {}
+    limits = policy['marker']
+    cfg = {'mode': mode, 'path': path, 'remote_hosts': list(limits.get('no_backup_fleet_remote_hosts') or
+                                                             ['github.com']),
+           'status_seconds': 110 if mode == 'validate' else 4,
+           'ignored_ok': list(clone.get('ignored_ok') or ()), 'ignored_top_ok': list(clone.get('ignored_top_ok') or ())}
+    if _test:
+        cfg.update(_test)
+    return 'import json\nCONFIG = json.loads(%s)\n' % json.dumps(json.dumps(cfg)) + FLEET_VALIDATOR_BODY
+
+
+def _fleet_default_runner(argv, data, timeout, cap=1 << 20):
+    """Run ssh with `data` on stdin; read at most cap+1 bytes of stdout (then stop it), within `timeout` seconds."""
+    import select
+    import threading
+    env = {'PATH': '/usr/bin:/bin', 'HOME': _pinned_home(), 'LC_ALL': 'C'}
+    sock = os.environ.get('SSH_AUTH_SOCK', '')
+    if sock.startswith('/') and '\n' not in sock:
+        env['SSH_AUTH_SOCK'] = sock
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                            cwd='/')
+
+    def feed():
+        try:
+            proc.stdin.write(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+    threading.Thread(target=feed, daemon=True).start()
+    deadline, out = time.monotonic() + timeout, b''
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            ready, _, _ = select.select([proc.stdout], [], [], min(left, 1.0))
+            if not ready:
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > cap:
+                raise subprocess.SubprocessError('the host answer is larger than %d bytes' % cap)
+        proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except BaseException:
+        proc.terminate()
+        proc.wait()
+        raise
+    return proc.returncode, out
+
+
+def _fleet_clean(text, limit=160):
+    return re.sub(r'[^A-Za-z0-9 ._()/-]', '?', str(text))[:limit]
+
+
+def run_fleet_validator(host, mode, path, policy, home, runner=None, timeout=130, test=None):
+    """One ssh call with a fixed argv; the program (with the path as a JSON literal) goes on stdin. Returns the
+    validated answer dict, or raises ValueError (refusal; ssh errors, timeouts and malformed answers all refuse)."""
+    limits = policy['marker']
+    if host not in _fleet_hosts(limits):
+        raise ValueError('host %s is not an allowlisted fleet host' % _fleet_clean(host, 40))
+    problem = fleet_path_problem(path)
+    if problem:
+        raise ValueError(problem)
+    cfg = _fleet_config(limits, home)
+    argv = ['/usr/bin/ssh', '-F', cfg, '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'ClearAllForwardings=yes',
+            host, '/usr/bin/python3', '-I', '-']
+    program = build_fleet_program(mode, path, policy, _test=test)
+    try:
+        code, out = (runner or _fleet_default_runner)(argv, program.encode(), timeout)
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError('the fleet host did not answer (ssh failed or timed out)')
+    if code != 0 or not isinstance(out, bytes) or len(out) > (1 << 20):
+        raise ValueError('the fleet host did not answer (ssh failed or timed out)')
+    try:
+        data = json.loads(out.decode('utf-8'))
+    except (ValueError, RecursionError):
+        raise ValueError('the fleet validator answered something that is not JSON')
+    if not isinstance(data, dict) or not isinstance(data.get('ok'), bool):
+        raise ValueError('the fleet validator answer is malformed')
+    if not data['ok']:
+        raise ValueError('the fleet host refused: %s' % _fleet_clean(data.get('reason')))
+    hexre = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+    linked = data.get('linked_existing')
+    if data.get('kind') not in ('main', 'linked') or not isinstance(data.get('head'), str) or \
+            not hexre.fullmatch(data['head']) or not re.fullmatch(r'[0-9a-f]{64}', str(data.get('tips_sha256'))) or \
+            not isinstance(linked, list) or not all(isinstance(x, str) and FLEET_PLAIN_PATH.fullmatch(x) for x in linked) \
+            or isinstance(data.get('dev'), bool) or not isinstance(data.get('dev'), int) or \
+            isinstance(data.get('ino'), bool) or not isinstance(data.get('ino'), int) or data.get('mode') != mode or \
+            not re.fullmatch(r'[0-9a-f]{64}', str(data.get('footprint_sha256'))):
+        raise ValueError('the fleet validator answer is malformed')
+    parent = data.get('parent')
+    if (data['kind'] == 'linked') != (isinstance(parent, str)) or \
+            (isinstance(parent, str) and (not FLEET_PLAIN_PATH.fullmatch(parent) or '..' in parent.split('/'))):
+        raise ValueError('the fleet validator answer is malformed')
+    if isinstance(parent, str) and (parent == path or parent.startswith(path + '/')):
+        raise ValueError('the validator answer names a parent inside the path')
+    if data['kind'] == 'main' and linked:
+        raise ValueError('the repository still has linked worktrees on the host; delete those first')
+    return data
+
+
+def _fleet_digest(host, path, data):
+    body = json.dumps({'host': host, 'path': path, 'repo': data['kind'], 'parent': data.get('parent'),
+                       'head': data['head'], 'tips_sha256': data['tips_sha256'],
+                       'footprint_sha256': data['footprint_sha256']}, sort_keys=True,
+                      separators=(',', ':'))
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def approve_delete_fleet(host, path, user_source, wal, ttl=None, home=None, policy=None, now=None, resolver=None,
+                         runner=None, test=None):
+    """Single-use approval for deleting `path` on fleet host `host` without a backup. Returns the entry; raises
+    ValueError on refusal (and audits it). The user-turn checks repeat approve_delete_no_backup's unchanged (the question names the path, not the host)."""
+    policy = policy or load_policy()
+    limits = policy['marker']
+    now = time.time() if now is None else now
+    source = str(user_source or '')[:300]
+    user_home = os.path.realpath(home) if home else _pinned_home()
+    key = 'fleet:%s:%s' % (_fleet_clean(host, 40), _fleet_clean(path, 300))
+    try:
+        if home is None:
+            problem = _environment_refusal(user_home)
+            if problem:
+                raise ValueError(problem)
+        if not wal:
+            raise ValueError('--wal is required: the approval is recorded there')
+        max_ttl = min(int(limits.get('fleet_max_ttl_seconds', FLEET_MAX_TTL)), FLEET_MAX_TTL)
+        ttl = int(ttl or min(int(limits['default_ttl_seconds']), max_ttl))
+        if ttl <= 0 or ttl > max_ttl:
+            raise ValueError('ttl must be between 1 and %d seconds' % max_ttl)
+        canonical = _canonical_source(source)
+        if not canonical:
+            raise ValueError('--user-source must be exactly answer:<session>/<uuid> (an AskUserQuestion answer that '
+                             'names the path; no excerpt)')
+        if host not in _fleet_hosts(limits):
+            raise ValueError('host %s is not an allowlisted fleet host' % _fleet_clean(host, 40))
+        problem = fleet_path_problem(path)
+        if problem:
+            raise ValueError(problem)
+        turn = (resolver or resolve_user_source)(source, now=now, max_age=int(limits.get(
+            'no_backup_max_source_age_seconds', 86400)), home=user_home)
+        wal_text = str(wal)
+        wal_real = os.path.realpath(wal_text)
+        wals_root = os.path.realpath(os.path.join(user_home, '.claude', 'wals'))
+        if os.path.dirname(wal_real) != os.path.join(wals_root, turn['session']):
+            raise ValueError('the answer is from session %s, but --wal is not a WAL of that session' % turn['session'])
+        if os.path.islink(wal_text) or wal_text != wal_real or not os.path.isfile(wal_real) or \
+                turn['session'] not in os.listdir(wals_root):
+            raise ValueError('--wal must be the existing, real WAL file of the session (no symlink, exact name)')
+        if not _hook_wal_predates(wal_real, float(turn['at'])):
+            raise ValueError('--wal has no hook-written entry that predates the answer; give the WAL of the session '
+                             'that asked (its main.jsonl)')
+        if turn.get('predefined') is not True:
+            raise ValueError('the answer is free text ("Other"), not a predefined option; ask the user again')
+        question = str(turn.get('question') or '')
+        problem = _question_names_only(question, path)
+        if problem:
+            raise ValueError('the AskUserQuestion this answer answers %s; ask the user again naming it' % problem)
+        if not APPROVE_WORDS.fullmatch(turn.get('text') or '') or DECLINE_WORDS.search(turn.get('text') or ''):
+            raise ValueError('the selected answer does not say delete (or it declines): the option must be exactly '
+                             '"Delete, no backup" (optionally "(Recommended)"); ask the user again')
+        data = run_fleet_validator(host, 'validate', path, policy, user_home, runner=runner, test=test)
+        entry = {'kind': NO_BACKUP_REMOTE_KIND, 'target': 'fleet-git', 'path': key, 'host': host, 'remote_path': path,
+                 'repo_kind': data['kind'], 'parent': data.get('parent'), 'state_sha256': _fleet_digest(host, path, data),
+                 'identity': [data['dev'], data['ino']], 'user_source': canonical,
+                 'remote': 'none: user-approved, no backup', 'files': 0, 'manifest_sha256': '', 'verified_at': now,
+                 'expires_at': now + ttl, 'nonce': _secrets.token_hex(8)}
+        cap = int(limits.get('no_backup_max_paths_per_source', 4))
+
+        def count_and_audit():
+            if _uses_of_source(canonical, home) >= cap:
+                raise ValueError('this user source already approved %d deletions; ask the user again' % cap)
+            audit('approved', entry, home=home, strict=True)
+        _store_entry(entry, key, now, home, under_lock=count_and_audit)
+    except ValueError as error:
+        wal_ok = bool(wal) and os.path.isfile(str(wal)) and not os.path.islink(str(wal))
+        audit('refused', {'path': key, 'kind': NO_BACKUP_REMOTE_KIND, 'user_source': _canonical_source(source) or
+                          'invalid', 'reason': str(error)[:200]}, home=home, wal=wal if wal_ok else None)
+        raise
+    audit('approved', entry, home=home, wal=wal, to_file=False)
+    return entry
+
+
+def parse_fleet_command(command, home, policy):
+    """{'host', 'op': 'rm'|'worktree', 'path', 'parent'} when the WHOLE command text is exactly one of
+    `ssh -F CFG [-o BatchMode=yes] HOST rm -rf PATH` and `... HOST git -C PARENT worktree remove PATH` (single spaces,
+    nothing quoted or expanded), else None."""
+    if not isinstance(command, str) or not re.fullmatch(r'[A-Za-z0-9 ._/=~-]+', command):
+        return None
+    tokens = command.split(' ')
+    if '' in tokens:
+        return None
+    rel = str((policy['marker'].get('fleet_ssh_config')) or '~/.ssh/config_fleetops')
+    # only the absolute spelling: a `~` is expanded by the executing shell with its own HOME, which the guard cannot pin
+    spellings = (os.path.join(home, rel[2:]),) if rel.startswith('~/') else ()
+    if not tokens or tokens[0] not in ('ssh', '/usr/bin/ssh'):
+        return None
+    i, config, batch = 1, False, False
+    while i < len(tokens) and tokens[i].startswith('-'):
+        if tokens[i] == '-F' and not config and i + 1 < len(tokens) and tokens[i + 1] in spellings:
+            config, i = True, i + 2
+        elif tokens[i] == '-o' and not batch and i + 1 < len(tokens) and tokens[i + 1] == 'BatchMode=yes':
+            batch, i = True, i + 2
+        else:
+            return None
+    if not config or i >= len(tokens) or tokens[i] not in _fleet_hosts(policy['marker']):
+        return None
+    host, rest = tokens[i], tokens[i + 1:]
+    if len(rest) == 3 and rest[:2] == ['rm', '-rf']:
+        op, path, parent = 'rm', rest[2], None
+    elif len(rest) == 6 and rest[0] == 'git' and rest[1] == '-C' and rest[3:5] == ['worktree', 'remove']:
+        op, path, parent = 'worktree', rest[5], rest[2]
+        if not FLEET_PLAIN_PATH.fullmatch(parent) or '..' in parent.split('/'):
+            return None
+    else:
+        return None
+    if fleet_path_problem(path):
+        return None
+    return {'host': host, 'op': op, 'path': path, 'parent': parent}
+
+
+def _hook_fleet_runner(argv, data, timeout):
+    """The hook's ssh runner: it also lengthens the hook's own wall-clock alarm (still under the wrapper's 10 s)."""
+    if hasattr(signal, 'SIGALRM'):
+        signal.alarm(8)
+    return _fleet_default_runner(argv, data, timeout)
 
 
 # --------------------------------------------------------------------------- scan-wal
@@ -9840,7 +10909,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
             if refusal:
                 return emit('block', format_block(Finding(LOG_DELETE, 'install-files', refusal.replace('ah install-files: ', ''),
                                                           INSTALL_FILES_FORM)), fmt)
-        approvals = Approvals(compiled=c) if marker else None
+        approvals = Approvals(compiled=c, fleet_runner=_hook_fleet_runner) if marker else None
         verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
@@ -10070,6 +11139,8 @@ def main(argv=None):
     appr.add_argument('--no-backup', action='store_true',
                       help='user-approved deletion without a backup: a clean, pushed git working tree or a detached '
                            'disk image under ~/.agent-harness/work only; needs --user-source (goodqa#14911)')
+    appr.add_argument('--host', help='fleet host (t2-dev): approve a clean pushed checkout on that host for ONE ssh '
+                                      'delete; needs --no-backup and --user-source (goodqa#16699)')
     appr.add_argument('--user-source', help='answer:<session>/<uuid> of the AskUserQuestion answer that names the '
                                             'path (same session as --wal)')
     appr.add_argument('--wal', required=True, help='WAL that records this approval')
@@ -10108,6 +11179,21 @@ def main(argv=None):
         return 0 if healthy else 1
     if args.cmd == 'replay':
         print(json.dumps(replay(args.paths), indent=1))
+        return 0
+    if args.cmd == 'approve-delete' and args.host:
+        if not (args.no_backup and args.user_source) or args.remote or args.digest or args.archive or \
+                args.archive_sha256 or args.archive_listing:
+            print('approve-delete refused: --host needs --no-backup and --user-source and takes no --remote, '
+                  '--archive* or --backup-verified-sha256', file=sys.stderr)
+            return 2
+        try:
+            entry = approve_delete_fleet(args.host, args.path, args.user_source, args.wal, ttl=args.ttl)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            print('approve-delete refused: %s' % error, file=sys.stderr)
+            return 2
+        print(json.dumps({'status': 'APPROVED', 'kind': NO_BACKUP_REMOTE_KIND, 'host': entry['host'],
+                          'path': entry['remote_path'], 'repo': entry['repo_kind'], 'parent': entry['parent'],
+                          'expires_at': entry['expires_at']}))
         return 0
     if args.cmd == 'approve-delete' and (args.no_backup or args.user_source) and \
             (args.archive or args.archive_sha256 or args.archive_listing):
