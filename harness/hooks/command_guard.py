@@ -77,6 +77,10 @@ DEFAULT_POLICY = {
                             '{home}/.codex/history*', '{home}/.agent-harness/state',
                             '{home}/.agent-harness/codex-wals', '{home}/.claude/.credentials.json',
                             '{home}/.codex/auth.json',
+                            # self-serve: delete and overwrite protection for the policy, keys, enabler, journals, kill-switch
+                            '{home}/.agent-harness/policy/self-serve*', '{home}/.agent-harness/policy/disabled',
+                            '{home}/.agent-harness/private/self-serve', '{home}/.agent-harness/work/self-serve',
+                            '{home}/.agent-harness/bin/ah_enable_self_serve*', '{home}/.agent-harness/bin/enable-agent-ops*',
                             # the guard itself: deleting or replacing it would switch the protection off
                             '{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
                             '{home}/.claude/hooks/safe_input.py',
@@ -117,7 +121,14 @@ DEFAULT_POLICY = {
     # path suffixes (/-separated, case-folded) of checkouts a timer or service builds from; a directory holding a
     # `.harness-owned` file is owned too. goodqa#15307
     'owned_checkouts': [],
+    # Self-serve (GoodQA goodqa#16753): the signed policy, its pinned public key, the signing key, the installed enabler
+    # and the run journals. Agents never write or delete these (patterns match a path or anything below it). The
+    # kill-switch policy/disabled is NOT here: an agent may create it (fail-safe revoke), see protected_log_roots.
+    'self_serve_files': ['{home}/.agent-harness/policy/self-serve*', '{home}/.agent-harness/private/self-serve',
+                         '{home}/.agent-harness/bin/ah_enable_self_serve*', '{home}/.agent-harness/bin/enable-agent-ops*',
+                         '{home}/.agent-harness/work/self-serve'],
     'credential_path_regexes': [
+        r'(^|/)\.agent-harness/private/self-serve(?:/|$)',
         r'(^|/)\.config/rclone/rclone\.conf$', r'(^|/)rclone\.conf$',
         r'(^|/)\.aws/credentials$', r'(^|/)\.aws/sso/cache/[^/]+$',
         r'(^|/)\.ssh/id_[^/]*$', r'(^|/)id_(?:rsa|dsa|ecdsa|ed25519)$',
@@ -179,7 +190,7 @@ ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
                   'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
                   'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_parent_dirs', 'credential_samples',
-                  'rclone_blocked_config', 'guard_files', 'owned_checkouts')
+                  'rclone_blocked_config', 'guard_files', 'owned_checkouts', 'self_serve_files')
 
 
 def _merge(base, override):
@@ -275,6 +286,7 @@ class Compiled:
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
         self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
+        self.self_serve = [self._segs(fmt(t, h)) for t in policy.get('self_serve_files', []) for h in homes]
         # session transcripts are the record of user answers (approve-delete --no-backup reads them): Bash never
         # writes there, except memory notes under projects/<dir>/memory/
         self.transcript_roots = sorted({fmt('{home}/.claude/projects', h).casefold() for h in homes})
@@ -1336,6 +1348,19 @@ def _seg_eq(p, r):
 def _prefix_match(path_segs, root_segs):
     n = min(len(path_segs), len(root_segs))
     return all(_seg_eq(path_segs[k], root_segs[k]) for k in range(n))
+
+
+SELF_SERVE_ROUTE = ('self-serve state is changed only by the user running the enabler in their own terminal; agents use '
+                    'the sanctioned routes: `ah ops` recipes, and `ah install-files` (main agent only) for hook files. An '
+                    'agent may revoke at any time by creating ~/.agent-harness/policy/disabled, and can never re-enable')
+SELF_SERVE_TEXT = re.compile(r'\.agent-harness/(?:policy/self-serve|private/self-serve|work/self-serve|'
+                             r'bin/(?:ah_enable_self_serve|enable-agent-ops))')
+
+
+def self_serve_path(c, folded):
+    """True when the case-folded path is, or is inside, a self-serve policy, key, enabler or journal path."""
+    segs = Compiled._segs(folded)
+    return any(len(segs) >= len(root) and _prefix_match(segs, root) for root in c.self_serve)
 
 
 # Raw text that names a protected location: used for unresolved variables, substitutions and fallbacks.
@@ -6726,6 +6751,11 @@ class Analyzer:
                      r'print\s+join\s*\([^)]*%env|\bkeys\s*%env\b|print[^;]*%env\b|'
                      r'for\s*\(\s*\w+\s+in\s+environ\s*\)|getenvironmentvariables\s*\(', low):
             ctx.add(SECRET_DUMP, 'interpreter-env-dump', 'script code prints the whole environment', 'print only specific non-secret names')
+        if SELF_SERVE_TEXT.search(low.replace('\\', '/')) and re.search(
+                r',\s*(?:mode\s*=\s*)?[\'"][rbt]*[wax+][rbt+]*[\'"]|write|copy|rename|replace|echo|\bdump\s*\(|unlink|'
+                r'remove|rmtree|chmod|symlink|\btee\b|\bsed\b', low):
+            ctx.add(LOG_DELETE, 'self-serve-forgery', 'script code writes the signed self-serve policy, its key, the '
+                    'enabler or its journal', SELF_SERVE_ROUTE)
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
@@ -7429,6 +7459,10 @@ class Analyzer:
         ctx = self.ctx
         for alt in word.all_alts() or word.alts[:32]:
             folded = norm_path(alt, ctx).casefold()
+            if self_serve_path(ctx.c, folded):
+                ctx.add(LOG_DELETE, 'self-serve-forgery', 'writes the signed self-serve policy, its key, the enabler or '
+                        'its journal directly', SELF_SERVE_ROUTE)
+                return True
             if folded in ctx.c.state_files:
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
                         'use command_guard.py approve-delete after the Dropbox backup is verified')
@@ -9771,6 +9805,59 @@ def install_files_refusal(command, is_main, home=None):
     return None
 
 
+ENABLER_NAME = re.compile(r'ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops')
+ENABLER_SCRIPT = re.compile(r'(?:ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops)(?:\.py)?')
+ENABLER_READ_ONLY = {'--status', '--help', '-h', '--dry-run'}
+ENABLER_CODE = re.compile(r'import|runpy|exec|spec_from|load_source|__main__|main\s*\(')
+ENABLER_WRAPPERS = INSTALL_FILES_WRAPPERS | INSTALL_FILES_SHELLS | {'python', 'pypy', 'pypy3', 'uv', 'uvx'}
+ENABLER_WHY = 'self-serve enable/undo/disable/resume is user-only: ' + SELF_SERVE_ROUTE
+
+
+def _unquoted(text):
+    return re.sub(r'[\'"\\]', '', text)
+
+
+def enabler_refusal(command, depth=0):
+    """None, or the refusal text for a command that would enable, undo, disable or resume agent self-serve.
+
+    Only the user runs the enabler, in their own terminal (no hook sees that). Any command an agent sends that runs the
+    enabler with anything beyond a read-only flag, imports it, or runs it through a wrapper is refused, for every caller
+    including main. A mention (grep, git add, cat) is not a run. ACCIDENT PREVENTION: the enabler's own TTY and typed
+    nonce are the access control; this guard sees command text only."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command))
+    if not ENABLER_NAME.search(_unquoted(text)):
+        return None
+    for tokens, segment in _install_files_segments(text):
+        if tokens is None:
+            if ENABLER_NAME.search(_unquoted(segment)):
+                return ENABLER_WHY + ' (the command could not be parsed)'
+            continue
+        for index, token in enumerate(tokens):
+            if not ENABLER_NAME.search(token):
+                continue
+            if re.search(r'\s', token):  # a nested command or code string: bash -c '...', python -c "..."
+                if ENABLER_CODE.search(token) or depth >= 4 or enabler_refusal(token, depth + 1):
+                    return ENABLER_WHY
+                continue
+            if not ENABLER_SCRIPT.fullmatch(os.path.basename(token)):
+                continue  # test_enable_agent_ops.py and the like: a different file
+            if not all(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t) or t.startswith('-')
+                       or os.path.basename(t) in ENABLER_WRAPPERS or re.fullmatch(r'python[0-9.]*', os.path.basename(t))
+                       for t in tokens[:index]):
+                continue  # grep -n x enable-agent-ops.py, git add scripts/enable-agent-ops.py, cat ...: a mention
+            args, skip = [], False
+            for arg in tokens[index + 1:]:
+                if skip:
+                    skip = False
+                elif INSTALL_FILES_REDIRECT.match(arg):
+                    skip = bool(re.fullmatch(r'[0-9]*[<>]{1,2}', arg))
+                else:
+                    args.append(arg)
+            if any(arg not in ENABLER_READ_ONLY for arg in args):
+                return ENABLER_WHY
+    return None
+
+
 def _install_files_main(payload):
     """Prove a main caller for the installed hook-file deploy command only."""
     try:
@@ -9835,6 +9922,11 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         if command is None:
             return 0
         install_text = command if isinstance(command, str) else ' '.join(map(str, command))
+        refusal = enabler_refusal(command)
+        if refusal:
+            return emit('block', format_block(Finding(LOG_DELETE, 'self-serve-enabler', refusal,
+                                                      'ask the user to run the enabler; read-only: --status or the '
+                                                      'default dry run')), fmt)
         if 'install' in re.sub(r'[\'"\\]', '', install_text):  # after quote removal: install-file""s is still the command
             refusal = install_files_refusal(command, lambda: _install_files_main(payload))
             if refusal:

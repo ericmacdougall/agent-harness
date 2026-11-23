@@ -38,6 +38,9 @@ CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+
                        r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
                        r'|\.vault-token|\.git-credentials')
 
+ENABLER_TEXT = re.compile(r'(?is)(?:ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops).*(?:--(?:apply|undo|disable|resume)\b|'
+                          r'\bimport\b|\brunpy\b|\s-m\s)')
+
 
 def guarded_text(raw):
     """(is_guarded_tool, text to probe). Unparsable input is treated as guarded, probing the whole payload."""
@@ -81,6 +84,8 @@ def payload_cwd(raw):
 
 def sensitive(text, cwd=None):
     t = text[:4_000_000]
+    if ENABLER_TEXT.search(re.sub(r'[\'"\\]', '', t)):
+        return True  # self-serve enable/undo/disable is user-only
     if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or (EXEC_TEXT.search(t) and DESTROY_TEXT.search(t)):
         return True
     if CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', t)):
