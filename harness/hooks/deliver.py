@@ -245,12 +245,12 @@ def _safe_branch(branch):
 
 
 def explicit_remote_branch(args):
-    """--remote-branch, validated; None when the operator did not name one."""
+    """--remote-branch, validated in the original checkout; None when the operator did not name one."""
     value = getattr(args, "remote_branch", None)
     if value is None:
         return None
     if (not _safe_branch(value) or len(value) > 200 or value.startswith("refs/") or value.endswith("/")
-            or git(Path.cwd(), "check-ref-format", "--branch", value)[0]):
+            or git(args.original.expanduser().absolute(), "check-ref-format", "--branch", value)[0]):
         raise DeliveryError("BLOCKED_POLICY", "Remote branch is invalid", code=2)
     return value
 
@@ -265,7 +265,29 @@ def upstream_remote_branch(original, branch):
     if code or code2 or remote.strip() != "origin" or not merge.startswith("refs/heads/"):
         return None
     name = merge[len("refs/heads/"):]
-    return name if _safe_branch(name) and not git(Path.cwd(), "check-ref-format", "--branch", name)[0] else None
+    return name if _safe_branch(name) and not git(original, "check-ref-format", "--branch", name)[0] else None
+
+
+def stored_remote_branch(args):
+    """Read-only peek at the remote base an existing generation of this task was prepared against.
+
+    Returns None when there is no generation (or a new one was requested, or anything is unreadable;
+    Workflow.load is the authority and re-validates). Lets pre-lock checks use the stored value instead of
+    re-resolving a flag or upstream that may have changed since prepare.
+    """
+    if getattr(args, "new_generation", False):
+        return None
+    try:
+        original = args.original.expanduser().absolute()
+        common, _ = git_common_directory(original, 30)
+        path = common / "agent-harness" / "delivery-workflows" / scope_key(checkout_identity(original),
+                                                                           args.original_branch)
+        path = path / hashlib.sha256(args.task.encode()).hexdigest()
+        generation = private_json(path / "journal.json")["generation"]
+        state = private_json(path / "generations" / generation / "journal.json")
+        return remote_of(state) if _safe_branch(remote_of(state)) else None
+    except (OSError, KeyError, TypeError, ValueError, AttributeError, DeliveryError):
+        return None
 
 
 def remote_of(state):
@@ -435,8 +457,9 @@ class Workflow:
             raise DeliveryError("BLOCKED_POLICY", "Original branch is invalid", code=2)
         snapshot(self.original, self.branch)
         self.explicit_remote = explicit_remote_branch(args)
-        self.remote_branch = (self.explicit_remote or upstream_remote_branch(self.original, self.branch)
-                              or self.branch)
+        derived = None if self.explicit_remote else upstream_remote_branch(self.original, self.branch)
+        self.remote_branch = self.explicit_remote or derived or self.branch
+        self.remote_source = "flag" if self.explicit_remote else ("upstream" if derived else "local")
         self.identity = checkout_identity(self.original)
         self.common, self.common_info = git_common_directory(self.original, 30)
         self.scope = scope_key(self.identity, self.branch)
@@ -572,7 +595,7 @@ class Workflow:
         if self.explicit_remote is not None and self.explicit_remote != stored:
             raise DeliveryError("BLOCKED_POLICY", "Remote branch differs from the prepared generation", code=2,
                                 reason="REMOTE_BRANCH_MISMATCH")
-        self.remote_branch = stored
+        self.remote_branch, self.remote_source = stored, "prepared"
 
     def create(self, source, source_branch, source_head, baseline, kit, repository, phase):
         if self.state is not None and self.state["phase"] not in SETTLED:
@@ -622,7 +645,11 @@ class Workflow:
 
     def facts(self):
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
-                 "checkout": str(self.original), "source_head": self.state["source_head"]}
+                 "checkout": str(self.original), "source_head": self.state["source_head"],
+                 "remote_branch": self.remote_branch, "remote_branch_source": self.remote_source}
+        if self.remote_source == "upstream":
+            facts["remote_branch_warning"] = (f"remote base {self.remote_branch} came from the upstream of "
+                                              f"{self.branch}; pass --remote-branch to choose it explicitly")
         overrides = self.target_overrides()
         if overrides:
             facts["target_policy_overrides"] = overrides
@@ -971,8 +998,7 @@ def source_inputs(args):
     if source.is_symlink() or original.is_symlink() or source.resolve() == original.resolve():
         raise DeliveryError("BLOCKED_POLICY", "Feature and original must be distinct worktrees", code=2)
     branch = git_value(source, "symbolic-ref", "--quiet", "--short", "HEAD")
-    remote = explicit_remote_branch(args) or upstream_remote_branch(original, args.original_branch)
-    if branch in {args.original_branch, remote} or snapshot(source, branch) != source_head:
+    if branch == args.original_branch or snapshot(source, branch) != source_head:
         raise DeliveryError("BLOCKED_POLICY", "Source branch or reviewed HEAD changed", code=2)
     if snapshot(original, args.original_branch) != baseline:
         raise DeliveryError("BLOCKED_LOCAL", "Original checkout changed since scope capture")
@@ -1324,8 +1350,8 @@ def prepare(args):
                                 hint="pass --wal <your session WAL under ~/.claude/wals>, or drop --target-policy warn")
         # Before any strict snapshot, so a huge dirty set gets a specific message, not a status timeout.
         original_path = args.original.expanduser().absolute()
-        preflight_remote = (explicit_remote_branch(args) or upstream_remote_branch(original_path, args.original_branch)
-                            or args.original_branch)
+        preflight_remote = (stored_remote_branch(args) or explicit_remote_branch(args)
+                            or upstream_remote_branch(original_path, args.original_branch) or args.original_branch)
         bypassed = target_preflight(original_path, preflight_remote, mode)
         if mode == "warn":
             override = record_target_override_in_wal(args, bypassed)
@@ -1350,6 +1376,9 @@ def prepare(args):
             origin_error = error
     with Workflow(args) as flow:
         state = flow.load()
+        if branch == flow.remote_branch:
+            raise DeliveryError("BLOCKED_POLICY", "Source branch is the remote base branch", code=2,
+                                reason="SOURCE_IS_BASE")
         resuming_publication = getattr(args, "resume_publication", False)
         if resuming_publication and (state is None or state["phase"] != "PUBLISHING"):
             raise DeliveryError("BLOCKED_POLICY", "Publication resume requires this generation in PUBLISHING", code=2)
@@ -1369,6 +1398,9 @@ def prepare(args):
             phase = "LOCAL_READY" if local_only else ("REMOTE_BLOCKED" if origin_error else "INITIAL")
             stage_policy_record(flow, policy_record, head, baseline)
             flow.create(source, branch, head, baseline, kit, repository, phase)
+            if flow.remote_source == "upstream":
+                print(f"WARNING: remote base {flow.remote_branch} was taken from the upstream of {flow.branch}; "
+                      "pass --remote-branch to choose it explicitly", file=sys.stderr)
             write_policy_record(flow, policy_record)
             state = flow.state
         if override is not None:
