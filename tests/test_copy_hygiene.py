@@ -365,6 +365,70 @@ class Guard(Base):
                 self.assertEqual(code, 2, cmd)
                 self.assertIn("DISK LOW", err)
 
+    def write_ssh_config(self, text):
+        (self.home / ".ssh").mkdir(exist_ok=True)
+        (self.home / ".ssh" / "config").write_text(text)
+
+    SSH_CONFIG = ("Host buildbox\n  HostName build.example.com\n  User eric\n  BatchMode yes\n"
+                  "Host selfalias\n  HostName localhost\n"
+                  "Host proxied\n  HostName far.example.com\n  ProxyCommand nc %h 22\n")
+
+    def test_copy_sent_over_ssh_to_another_host_is_allowed_below_floor(self):
+        # goodqa#16811: the clone lands on buildbox; the Mac floor must not refuse it
+        self.write_ssh_config(self.SSH_CONFIG)
+        with mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+            for cmd in ("ssh buildbox 'cd ~/w && git clone git@github.com:o/r.git r'",
+                        "ssh -o BatchMode=yes -o ConnectTimeout=10 buildbox 'cd r && git worktree add /w HEAD'",
+                        'ssh eric@far.example.com "cd r; git clone a b"',
+                        "ssh -p 2222 -i ~/.ssh/k -T buildbox git clone a b",
+                        "timeout 60 ssh -oBatchMode=yes buildbox 'cp -a a b && rsync -a c/ d/'",
+                        "cd /x && ssh buildbox 'git clone a b' && echo done",
+                        "bash -c \"ssh buildbox 'cd y && git clone a b'\""):
+                self.assertEqual(tc.pretool(self.ev(cmd), self.cfg(min_free_gb=25)), (0, ""), cmd)
+
+    def test_local_or_unprovable_ssh_keeps_the_floor(self):
+        import socket
+        self.write_ssh_config(self.SSH_CONFIG)
+        host = socket.gethostname()
+        with mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+            for cmd in ("ssh buildbox 'x' && git clone a b", "ssh buildbox 'x'; git worktree add ../w HEAD",
+                        "ssh buildbox 'x' | git clone a b", "ssh localhost 'git clone a b'",
+                        "ssh 127.0.0.1 'git clone a b'", "ssh [::1] 'git clone a b'", "ssh ::1 'git clone a b'",
+                        "ssh eric@" + host + " 'git clone a b'", "ssh " + host.split(".")[0] + " 'git clone a b'",
+                        "ssh foo.localhost 'git clone a b'", "echo ssh buildbox; git clone a b",
+                        "ssh -F /tmp/cfg buildbox 'git clone a b'", "ssh -J jump buildbox 'git clone a b'",
+                        "ssh -o ProxyCommand=x buildbox 'git clone a b'", "ssh -o HostName=localhost buildbox 'git clone a b'",
+                        "ssh -S /tmp/mux buildbox 'git clone a b'", "ssh -Z buildbox 'git clone a b'",
+                        "ssh buildbox 'git clone a b", 'ssh buildbox "$(git clone a b)"', "ssh buildbox `git clone a b`",
+                        "ssh selfalias 'git clone a b'", "ssh proxied 'git clone a b'",
+                        "bash -c \"ssh localhost 'git clone a b'\"", "bash -c 'git clone a b'",
+                        "bash -c \"ssh buildbox 'x'; git clone a b\"", "ssh buildbox <<'EOF'\ngit clone a b\nEOF",
+                        "ssh buildbox 'x' \\\n; git clone a b"):
+                code, err = tc.pretool(self.ev(cmd), self.cfg(min_free_gb=25))
+                self.assertEqual(code, 2, cmd)
+                self.assertIn("DISK LOW", err)
+
+    def test_ssh_config_that_cannot_be_read_with_certainty_keeps_the_floor(self):
+        for text in ("Match host buildbox\n  HostName localhost\n", "Include ~/.ssh/extra\nHost buildbox\n  HostName x.y\n",
+                     "Host *\n  ProxyJump bastion\n"):
+            with self.subTest(text=text):
+                self.write_ssh_config(text)
+                with mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+                    code, _ = tc.pretool(self.ev("ssh buildbox 'git clone a b'"), self.cfg(min_free_gb=25))
+                self.assertEqual(code, 2)
+
+    def test_hosts_file_loopback_alias_keeps_the_floor(self):
+        self.write_ssh_config("")
+        with mock.patch.object(tc, "_hosts_file_local", side_effect=lambda name: name == "devbox"), \
+                mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+            self.assertEqual(tc.pretool(self.ev("ssh devbox 'git clone a b'"), self.cfg(min_free_gb=25))[0], 2)
+            self.assertEqual(tc.pretool(self.ev("ssh otherbox 'git clone a b'"), self.cfg(min_free_gb=25))[0], 0)
+
+    def test_remote_analysis_error_keeps_the_strict_reading(self):
+        with mock.patch.object(tc, "without_remote_commands", side_effect=RuntimeError("boom")), \
+                mock.patch.object(tc, "free_bytes", return_value=1 * GB):
+            self.assertEqual(tc.pretool(self.ev("ssh buildbox 'git clone a b'"), self.cfg(min_free_gb=25))[0], 2)
+
     def test_fails_open_on_internal_error(self):
         with mock.patch.object(tc, "free_bytes", side_effect=OSError("boom")):
             self.assertEqual(tc.pretool(self.ev("git clone a b"), self.cfg()), (0, ""))

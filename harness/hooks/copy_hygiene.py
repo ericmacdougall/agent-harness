@@ -14,7 +14,12 @@ WHAT.
                 missing copy. --run COMMAND ... holds the lease for the command in the verified checkout. It
                 refuses to create a copy below the free-space floor (exit 3) and writes an alert.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
-                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. It always denies writing scratch INTO
+                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. A copy inside a top-level
+                `ssh <host> '...'` is not counted when the host is provably another machine (no -F/-J/-S/-W/-O,
+                only known-safe -o options, not a loopback/own name or address, ~/.ssh/config without Match,
+                Include or a proxy for it, no $( or backtick or heredoc); anything else is read as local,
+                including the remote command of an ssh to this host or through a proxy/jump/-F config.
+                Prefix options (timeout 120, nice -n 5, sudo -u x) no longer hide a copy. It always denies writing scratch INTO
                 /dev/shm (RAM); reading, copying out of and removing from /dev/shm stay allowed. Silent otherwise.
                 Fails OPEN on any internal error.
   session-start SessionStart hook: at most every 6 h starts a detached report-only `reap`, and prints one line when the
@@ -777,6 +782,241 @@ def simple_commands(cmd: str) -> list:
         if words:
             out.append(words)
     return out
+
+
+# ---------------------------------------------------------------- remote (ssh) commands
+# goodqa#16811: `ssh t2-dev 'cd x && git clone ...'` copies on t2-dev, not here, but simple_commands splits inside
+# quotes and read the clone as local. Only a provably remote ssh is exempt; anything ambiguous keeps the local check.
+SSH_FLAGS = set("46AaCfGgKkMNnqsTtVvXxYy")
+SSH_TAKES_VALUE = set("BbcDEeFIiJLlmOoPpQRSWw")
+SSH_REFUSED = set("FJOSW")       # other config file, jump host, control/mux commands, stdio forward: not provable
+SSH_SAFE_OPTIONS = frozenset(o.lower() for o in (
+    "BatchMode", "ConnectTimeout", "ConnectionAttempts", "ServerAliveInterval", "ServerAliveCountMax",
+    "StrictHostKeyChecking", "LogLevel", "IdentitiesOnly", "IdentityFile", "User", "Port", "Compression",
+    "RequestTTY", "ForwardAgent", "PasswordAuthentication", "PreferredAuthentications", "UserKnownHostsFile",
+    "TCPKeepAlive", "AddressFamily"))
+LOCAL_NAMES = frozenset(("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback", "loopback"))
+
+
+def top_level_segments(cmd: str) -> "list[str] | None":
+    """Split a shell line on ; & | newline and parentheses OUTSIDE quotes; None when it cannot be read safely
+    (unbalanced quotes, command substitution, heredocs, line continuations)."""
+    if "$(" in cmd or "`" in cmd or "<<" in cmd or "\\\n" in cmd:
+        return None
+    out, buf, quote, i = [], [], None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote == "'":
+            buf.append(ch)
+            if ch == "'":
+                quote = None
+        elif quote == '"':
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(cmd):
+                buf.append(cmd[i + 1]); i += 1
+            elif ch == '"':
+                quote = None
+        elif ch == "\\" and i + 1 < len(cmd):
+            buf.append(ch); buf.append(cmd[i + 1]); i += 1
+        elif ch in "'\"":
+            quote = ch; buf.append(ch)
+        elif ch in ";&|\n()":
+            out.append("".join(buf)); buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if quote is not None:
+        return None
+    out.append("".join(buf))
+    return [s for s in (x.strip() for x in out) if s]
+
+
+def _local_host_names() -> set:
+    names = set(LOCAL_NAMES)
+    try:
+        import socket  # noqa: PLC0415
+        for name in (socket.gethostname(), socket.getfqdn()):
+            if name:
+                names.add(name.lower()); names.add(name.lower().split(".", 1)[0])
+    except OSError:
+        pass
+    return names
+
+
+def _is_local_address(host: str) -> bool:
+    """True for a loopback/unspecified/link-local/multicast literal, or an address this host owns (or cannot route)."""
+    import ipaddress  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+    try:
+        address = ipaddress.ip_address(host.strip("[]").split("%", 1)[0])
+    except ValueError:
+        return False
+    if address.is_loopback or address.is_unspecified or address.is_link_local or address.is_multicast:
+        return True
+    # A UDP connect sends nothing; the kernel picks the source address. If that is the destination, it is ours.
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_DGRAM) as probe:
+            probe.connect((str(address), 9))
+            return probe.getsockname()[0] == str(address)
+    except OSError:
+        return True  # cannot tell: not provably remote
+
+
+def _hosts_file_local(name: str) -> bool:
+    """True when /etc/hosts maps `name` to a loopback or unspecified address (no DNS lookups from a hook)."""
+    try:
+        with open("/etc/hosts", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1024 * 1024)
+    except OSError:
+        return False
+    for line in text.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 2 and name in (f.lower() for f in fields[1:]) and _is_local_address(fields[0]):
+            return True
+    return False
+
+
+def _ssh_config_hostname(alias: str) -> "str | None":
+    """The HostName ~/.ssh/config gives `alias` (alias itself when none); None when the config cannot be read with
+    certainty (Match or Include anywhere, or a proxy for this host)."""
+    path = os.path.join(home(), ".ssh", "config")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1024 * 1024 + 1)
+    except FileNotFoundError:
+        return alias
+    except OSError:
+        return None
+    if len(text) > 1024 * 1024:
+        return None
+    hostname, matching, seen_proxy = None, True, False
+    for line in text.splitlines():
+        fields = line.strip().replace("=", " ", 1).split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        key = fields[0].lower()
+        if key in ("match", "include"):
+            return None
+        if key == "host":
+            patterns = [p.lower() for p in fields[1:]]
+            positive = [p for p in patterns if not p.startswith("!")]
+            negated = [p[1:] for p in patterns if p.startswith("!")]
+            matching = (any(fnmatch.fnmatchcase(alias, p) for p in positive)
+                        and not any(fnmatch.fnmatchcase(alias, p) for p in negated))
+        elif matching and key == "hostname" and hostname is None and len(fields) > 1:
+            hostname = fields[1].lower()
+        elif matching and key in ("proxycommand", "proxyjump", "localcommand", "permitlocalcommand"):
+            seen_proxy = True
+    if seen_proxy:
+        return None
+    return (hostname or alias).replace("%h", alias)
+
+
+def ssh_destination(words: list) -> "str | None":
+    """The destination host of an `ssh ... host [command]` argv, or None when the options are not all known safe."""
+    if not words or os.path.basename(words[0]) != "ssh":
+        return None
+    i = 1
+    while i < len(words):
+        w = words[i]
+        if w == "--":
+            i += 1
+            break
+        if not w.startswith("-") or w == "-":
+            break
+        letters = w[1:]
+        for k, ch in enumerate(letters):
+            if ch in SSH_REFUSED:
+                return None
+            if ch in SSH_TAKES_VALUE:
+                value = letters[k + 1:] or (words[i + 1] if i + 1 < len(words) else None)
+                if value is None:
+                    return None
+                if not letters[k + 1:]:
+                    i += 1
+                if ch == "o" and value.replace("=", " ", 1).split()[0].lower() not in SSH_SAFE_OPTIONS:
+                    return None
+                break
+            if ch not in SSH_FLAGS:
+                return None
+        i += 1
+    if i >= len(words) or i + 1 >= len(words):
+        return None  # no destination, or no remote command (an interactive login copies nothing locally either)
+    dest = words[i]
+    if dest.startswith("ssh://"):
+        dest = dest[len("ssh://"):]
+        dest = dest.rsplit("@", 1)[-1]
+        dest = dest[1:].split("]", 1)[0] if dest.startswith("[") else dest.split(":", 1)[0]
+    else:
+        dest = dest.rsplit("@", 1)[-1]
+    return dest.lower() or None
+
+
+def remote_host(words: list) -> "str | None":
+    """The host when `words` is an ssh to a host provably other than this one, else None."""
+    dest = ssh_destination(words)
+    if not dest or not re.fullmatch(r"[a-z0-9._:\[\]%-]{1,253}", dest):
+        return None
+    resolved = _ssh_config_hostname(dest)
+    if resolved is None:
+        return None
+    local = _local_host_names()
+    for name in {dest, resolved}:
+        if name in local or name.endswith(".localhost") or _is_local_address(name) or _hosts_file_local(name):
+            return None
+    # Known limit: a DNS name (not in /etc/hosts or ssh config) that resolves to this host is not looked up here;
+    # the hook does no DNS. Sending a copy to yourself through ssh to dodge the floor is guard evasion (rule 3).
+    return resolved
+
+
+SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh"))
+
+
+def without_remote_commands(cmd: str, depth: int = 0) -> str:
+    """`cmd` with each top-level segment that is a provably remote ssh removed; the strict reading when unreadable.
+
+    An ssh that is NOT provably remote (localhost, this host, -F/-J, a proxy, unknown options) has its arguments
+    added back as local text, so `ssh localhost 'git clone a b'` counts as the local copy it is. A `bash -c SCRIPT`
+    segment is replaced by the same analysis of SCRIPT (at most 4 levels; deeper is read strictly)."""
+    segments = top_level_segments(cmd)
+    if segments is None or depth > 4:
+        return strict_local_text(cmd)
+    kept = []
+    for segment in segments:
+        try:
+            words = _unwrap(shlex.split(segment, comments=True))
+        except ValueError:
+            return strict_local_text(cmd)
+        if remote_host(words) is not None:
+            continue
+        if (len(words) >= 3 and os.path.basename(words[0]) in SHELLS and words[1] == "-c"):
+            kept.append(without_remote_commands(words[2], depth + 1))
+            continue
+        kept.append(segment)
+        kept.extend(_ssh_suffixes(words))
+    return "\n".join(kept)
+
+
+def _ssh_suffixes(words: list) -> "list[str]":
+    """For an ssh argv, every suffix of its arguments as text: the remote command starts at one of them."""
+    if not words or os.path.basename(words[0]) != "ssh":
+        return []
+    args = words[1:65]
+    return [" ".join(args[k:]) for k in range(len(args))]
+
+
+def strict_local_text(cmd: str) -> str:
+    """The reading used when remoteness cannot be analysed: `cmd` plus the arguments of every ssh in it as local text
+    (quotes dropped), so nothing inside an ssh is exempt."""
+    extra = []
+    for seg in re.split(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)", cmd):
+        try:
+            words = shlex.split(seg, comments=True)
+        except ValueError:
+            words = seg.replace("'", " ").replace('"', " ").split()
+        extra.extend(_ssh_suffixes(_unwrap(words)))
+    return "\n".join([cmd] + extra)
 
 
 def _opts(words: list) -> "tuple[set, list]":
@@ -1542,6 +1782,17 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                            "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
                            ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
         copying = [w for w in simple_commands(cmd) if is_copy_command(w)]
+        if copying or re.search(r"\bssh\b|\b(?:ba|z|da|k)?sh\s+-c\b", cmd):
+            # a copy inside `ssh <other host> '...'` lands on that host, not this disk (goodqa#16811); an error in
+            # that analysis keeps the strict local reading instead of failing the whole hook open
+            try:
+                local_only = without_remote_commands(cmd)
+            except Exception:  # noqa: BLE001
+                try:
+                    local_only = strict_local_text(cmd)
+                except Exception:  # noqa: BLE001
+                    local_only = cmd
+            copying = [w for w in simple_commands(local_only) if is_copy_command(w)]
         if not copying:
             return 0, ""
         cfg = normalize(cfg) if cfg is not None else load_config()
