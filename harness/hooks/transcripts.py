@@ -54,7 +54,7 @@ TOOL_OF = {'claude-projects': 'claude', 'claude-wals': 'claude', 'codex-sessions
 RECOVERY_TRUTH = ('Recovery from git is byte-identical to the REDACTED archive, never to the source. '
                   'Exact-source recovery comes from the local source file or the Dropbox log backup.')
 HERE = os.path.dirname(os.path.abspath(__file__))
-README_SRC = os.path.join(os.path.dirname(HERE), 'transcripts', 'catalog-README.md')
+README_SRC = os.path.join(HERE, 'transcripts_catalog_README.md')  # shipped beside the hooks by install.py
 
 _UUID = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 _SAFE = re.compile(r'[^A-Za-z0-9._-]')
@@ -1726,7 +1726,7 @@ def catalog_files(cfg, st, _unused=None):
         with open(README_SRC, 'rb') as f:
             files['README.md'] = f.read()
     except OSError:
-        raise Refused('catalog README source missing (install harness/transcripts/catalog-README.md beside hooks)')
+        raise Refused('catalog README source missing (install harness/hooks/transcripts_catalog_README.md beside transcripts.py)')
     files['shards/%s.json' % cfg.host] = jdump({'schema': SCHEMA, 'host': cfg.host, 'shards': st['shards']}) + b'\n'
     files['index/%s.jsonl' % cfg.host] = b''.join(jdump(r) + b'\n' for r in index_rows(cfg, st))
     for key in st['manifest_dirty'] if st.get('catalog_commit') else list(st['files'].keys()):
