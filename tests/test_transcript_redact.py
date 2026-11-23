@@ -573,5 +573,86 @@ class Properties(unittest.TestCase):
                     self.assertEqual(mod.check_line(line, []), [])
 
 
+def nested_record(depth, bottom):
+    """A record whose message holds `bottom` JSON-encoded inside a string `depth` times (each layer an object)."""
+    payload = bottom
+    for _ in range(depth):
+        payload = json.dumps({"data": payload}, separators=(",", ":"))
+    return {"type": "user", "message": {"role": "user", "content": payload}}
+
+
+class NestLimitFailsClosed(unittest.TestCase):
+    """Gate F2 (PR #316 run 123d8933): past MAX_NEST both passes must omit, never fall back to text shapes."""
+    BOTTOMS = [{"apiKeys": [F]}, {"tokenString": F2}, {"passwords": [F3]}, {"login": {"user": "x", "pw": F}}]
+
+    def setUp(self):
+        self._orig = tr._pass1
+
+    def tearDown(self):
+        tr._pass1 = self._orig
+
+    def test_at_the_limit_key_aware_rules_still_apply(self):
+        for i, bottom in enumerate(self.BOTTOMS):
+            with self.subTest(case=i):
+                out, counts, omitted = run(nested_record(tr.MAX_NEST, bottom))
+                self.assertFalse(leaks(out, F, F2, F3))
+                self.assertIsNone(omitted)  # depth 8 is decoded and redacted, not omitted
+                self.assertTrue(parses(out))
+
+    def test_past_the_limit_the_record_is_omitted(self):
+        for depth in (tr.MAX_NEST + 1, 20):
+            for i, bottom in enumerate(self.BOTTOMS):
+                with self.subTest(depth=depth, case=i):
+                    out, counts, omitted = run(nested_record(depth, bottom))
+                    self.assertFalse(leaks(out, F, F2, F3))
+                    self.assertEqual(omitted, "nest-limit")
+                    self.assertEqual(counts, {})
+
+    def test_pass2_alone_bails_closed_past_the_limit(self):
+        tr._pass1 = lambda line: (line, {})
+        for depth in (tr.MAX_NEST + 1, 20):
+            with self.subTest(depth=depth):
+                out, _, omitted = run(nested_record(depth, {"apiKeys": [F]}))
+                self.assertFalse(leaks(out, F))
+                self.assertEqual(omitted, "nest-limit")
+
+    def test_verify_bytes_reports_the_kind(self):
+        line = json.dumps(nested_record(20, {"apiKeys": [F]}), separators=(",", ":")).encode()
+        self.assertEqual(tr.verify_bytes(line + b"\n"), [("nest-limit", 1)])
+
+    def test_clean_deep_json_is_omitted_too(self):
+        # fail closed: past the limit there is no key-aware judgement, so even a clean deep object is omitted
+        _, _, omitted = run(nested_record(tr.MAX_NEST + 1, {"note": "nothing secret"}))
+        self.assertEqual(omitted, "nest-limit")
+
+    def test_plain_strings_at_the_limit_keep_text_rules(self):
+        out, _, omitted = run(nested_record(tr.MAX_NEST, "just text " + ANT))
+        self.assertFalse(leaks(out, ANT_BODY))
+        self.assertIsNone(omitted)
+
+    def test_decode_nested_contract(self):
+        deep = json.dumps(json.dumps(json.dumps({"apiKeys": [F]})))  # quoted layers wrapping an object
+        with self.assertRaises(tr._Omit):
+            tr._decode_nested(deep, tr.MAX_NEST)
+        with self.assertRaises(tr._Omit):
+            tr._decode_nested('[1, 2]', tr.MAX_NEST)
+        self.assertIs(tr._decode_nested('"plain"', tr.MAX_NEST), tr._MISSING)
+        self.assertIs(tr._decode_nested("not json", 0), tr._MISSING)
+        self.assertIs(tr._decode_nested("42", 0), tr._MISSING)
+        self.assertEqual(tr._decode_nested('{"a": 1}', tr.MAX_NEST - 1), {"a": 1})
+
+    def test_max_nest_is_read_only_by_the_one_owner(self):
+        """Guard: every pass reaches the limit through _decode_nested, so no pass can fall back on its own."""
+        import ast
+        tree = ast.parse((ROOT / "harness" / "hooks" / "transcript_redact.py").read_text(encoding="utf-8"))
+        readers = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, ast.FunctionDef):
+                for node in ast.walk(fn):
+                    if isinstance(node, ast.Name) and node.id == "MAX_NEST":
+                        readers.add(fn.name)
+        self.assertEqual(readers, {"_decode_nested"})
+
+
 if __name__ == "__main__":
     unittest.main()

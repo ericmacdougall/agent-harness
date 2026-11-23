@@ -56,9 +56,10 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.22-4"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.23-1"  # bump on any rule change: staged chunks with an older version are re-redacted
 
-MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2
+MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2; read only by _decode_nested
+_MAX_QUOTED_LAYERS = 64  # at the limit, quoted JSON-string layers unwrapped while looking for an object or array
 _MISSING = object()
 
 
@@ -68,6 +69,37 @@ class _Omit(Exception):
     def __init__(self, kind):
         super().__init__(kind)
         self.kind = kind
+
+
+def _decode_nested(text, depth):
+    """The one owner of the nesting limit, for both passes (gate F2, PR #316).
+
+    Below MAX_NEST: the JSON value `text` decodes to (dict, list or str) for the caller to walk one level deeper,
+    or _MISSING when `text` is not JSON. At MAX_NEST, a text that still decodes to an object or array, directly or
+    through further quoted string layers, raises _Omit('nest-limit'): past the limit no key-aware rule can run, so
+    the record is omitted instead of falling back to text shapes. A plain string at the limit returns _MISSING and
+    keeps the text rules."""
+    if text.lstrip()[:1] not in ('{', '[', '"'):
+        return _MISSING
+    try:
+        inner = json.loads(text)
+    except ValueError:
+        return _MISSING
+    if not isinstance(inner, (dict, list, str)):
+        return _MISSING
+    if depth < MAX_NEST:
+        return inner
+    probe = inner
+    for _ in range(_MAX_QUOTED_LAYERS):
+        if isinstance(probe, (dict, list)):
+            raise _Omit('nest-limit')
+        if not isinstance(probe, str) or probe.lstrip()[:1] not in ('{', '[', '"'):
+            return _MISSING
+        try:
+            probe = json.loads(probe)
+        except ValueError:
+            return _MISSING
+    raise _Omit('nest-limit')  # more quoted layers than we unwrap: undecidable, so fail closed
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -569,21 +601,15 @@ def _redact_argv(raw, out, counts):
 
 
 def _redact_string(text, counts, nest):
-    if nest < MAX_NEST:
-        head = text.lstrip()[:1]
-        if head in ('{', '[', '"'):
-            try:
-                inner = json.loads(text)
-            except ValueError:
-                inner = _MISSING
-            if inner is not _MISSING and isinstance(inner, (dict, list, str)):
-                local = {}
-                red = _walk(inner, local, nest + 1)
-                if not local:
-                    return text  # clean nested JSON keeps its original bytes
-                for kind, n in local.items():
-                    counts[kind] = counts.get(kind, 0) + n
-                return json.dumps(red, ensure_ascii=False)
+    inner = _decode_nested(text, nest)  # raises _Omit('nest-limit') past the limit
+    if inner is not _MISSING:
+        local = {}
+        red = _walk(inner, local, nest + 1)
+        if not local:
+            return text  # clean nested JSON keeps its original bytes
+        for kind, n in local.items():
+            counts[kind] = counts.get(kind, 0) + n
+        return json.dumps(red, ensure_ascii=False)
     return _redact_text(text, counts)
 
 
@@ -720,7 +746,10 @@ def _v2_copies(text):
     return copies
 
 
-def _v2_scan(text, kinds, depth):
+def _v2_scan(text, kinds, depth, decode=True):
+    """Pass 2 shapes over each normalized copy of `text`; with decode, JSON inside a copy is walked one level
+    deeper through _decode_nested (which omits past the limit). decode=False is the serialized record, whose JSON
+    the caller already walked."""
     for copy in _v2_copies(text):
         lower = copy.lower()
         present = {}
@@ -739,12 +768,9 @@ def _v2_scan(text, kinds, depth):
                 continue
             if pattern.search(copy):
                 kinds.append(kind)
-        if depth < MAX_NEST and copy.lstrip()[:1] in ('{', '[', '"'):
-            try:
-                inner = json.loads(copy)
-            except ValueError:
-                continue
-            if isinstance(inner, (dict, list, str)) and inner != text:
+        if decode:
+            inner = _decode_nested(copy, depth)  # raises _Omit('nest-limit') past the limit
+            if inner is not _MISSING and inner != text:
                 _v2_walk(inner, kinds, depth + 1)
 
 
@@ -778,7 +804,7 @@ def _pass2(data):
             obj = _MISSING
     if obj is not _MISSING:
         _v2_walk(obj, kinds, 0)
-    _v2_scan(text, kinds, 0 if obj is _MISSING else MAX_NEST)  # the serialized copy (its JSON was walked above)
+    _v2_scan(text, kinds, 0, decode=obj is _MISSING)  # the serialized copy (its JSON was walked above)
     seen = []
     for kind in kinds:
         if kind not in seen:
@@ -826,6 +852,8 @@ def verify_bytes(data: bytes) -> list[tuple[str, int]]:
     for number, line in enumerate(lines, 1):
         try:
             kinds = _pass2(line)
+        except _Omit as failure:
+            kinds = [failure.kind]
         except Exception:  # noqa: BLE001
             kinds = ['error']
         found.extend((kind, number) for kind in kinds)
