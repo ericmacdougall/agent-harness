@@ -175,8 +175,9 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def collect_unread(session_id: str) -> list[dict]:
-    """Unread notes for this session: [{relpath, text, sha256, bytes, truncated}]."""
+def collect_unread(session_id: str, include_data: bool = True) -> list[dict]:
+    """Unread notes for this session: [{relpath, text, sha256, bytes, truncated}]. Without include_data, inbox/data-*
+    notes are left out before the file cap, so they can never crowd a decision out of a Stop block."""
     if not session_id or not str(session_id).strip():
         return []
     path = session_dir(session_id)
@@ -191,6 +192,8 @@ def collect_unread(session_id: str) -> list[dict]:
         rows = []
         total = 0
         for relpath, tag, name in _candidates(session_fd):
+            if not include_data and is_data({"relpath": relpath}):
+                continue
             if tag == "inbox":
                 if inbox_fd is None:
                     try:
@@ -292,17 +295,13 @@ def hook_output(event: dict) -> dict | None:
     # agent_type alone is not enough: a main session started with --agent also has agent_type.
     if event.get("agent_id"):
         return None
-    items = collect_unread(session)
+    # Data notes never block a Stop; they wait for the next context event.
+    items = collect_unread(session, include_data=name != STOP_EVENT)
     if not items:
         return None
     # A repeated Stop must not consume or re-block the same note.
     if name == STOP_EVENT and event.get("stop_hook_active"):
         return None
-    # Data notes never block a Stop on their own; they wait for the next context event.
-    if name == STOP_EVENT:
-        items = [i for i in items if not is_data(i)]
-        if not items:
-            return None
     text = format_items(items)
     marked = False
     try:

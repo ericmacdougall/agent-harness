@@ -67,6 +67,7 @@ GIT_TIMEOUT = 5
 STAT_TIMEOUT = 5
 PENDING_TTL = 2 * 3600
 ISO_WINDOW_NS = 300 * 10 ** 9
+ISO_RETRY_S = 60                    # a failed isolation check is not repeated on every tool call
 STOP_BUDGET = 15.0
 MAX_LINE = 8192
 MAX_FILE = 64 * 1024 * 1024
@@ -79,6 +80,18 @@ ID_RE = re.compile(r"[A-Za-z0-9_-]{1,80}")
 UNSAFE_PATH = re.compile(r"[$`*?\[\]{}\\\n\r\t\"'<>|;&]")
 UNSAFE_TEXT = re.compile(r"[^A-Za-z0-9._/@:+=, -]")
 STAT_OUT = re.compile(r"(\d+)(?:\.(\d{1,9}))?")
+
+
+HOOK_BUDGET = {"pretool": 8.0, "posttool": 8.0, "posttool-failure": 8.0, "denied": 8.0, "subagent-start": 15.0,
+               "subagent-stop": 18.0}
+_DEADLINE = None                    # monotonic time by which the running hook must be done (set by hook())
+
+
+def _left(cap: float) -> float:
+    """Seconds a subprocess may still take: at most `cap`, never past the whole-hook deadline."""
+    if _DEADLINE is None:
+        return cap
+    return min(cap, _DEADLINE - time.monotonic())
 
 
 class Unsure(Exception):
@@ -211,8 +224,11 @@ def decide(code: str, **ctx) -> None:
             return
         line = {"at": _utc(), "code": code}
         line.update({k: _safe(v) for k, v in ctx.items()})
-        _private_append(state_dir() / "decisions.jsonl", (json.dumps(line) + "\n").encode("utf-8")[:MAX_LINE],
-                        MAX_DECISIONS)
+        log = state_dir() / "decisions.jsonl"
+        with contextlib.suppress(OSError):
+            if log.lstat().st_size > MAX_DECISIONS:
+                os.replace(str(log), str(state_dir() / "decisions.1.jsonl"))   # keep one older file, never grow
+        _private_append(log, (json.dumps(line) + "\n").encode("utf-8")[:MAX_LINE])
     except OSError:
         pass
 
@@ -374,16 +390,23 @@ def _git_env() -> dict:
     return env
 
 
-def _git(path: str, *args, timeout: float = GIT_TIMEOUT) -> "str | None":
-    """git hardened against the repo it reads: no fsmonitor, no hooks, no optional locks, no GIT_* from the caller."""
+def _git(path: str, *args, timeout: float = GIT_TIMEOUT, raw: bool = False) -> "str | None":
+    """git hardened against the repo it reads: no fsmonitor, no hooks, no optional locks, no GIT_* from the caller.
+    None (unsure) once the whole-hook deadline has passed. raw keeps the output byte-exact (porcelain -z starts with
+    a significant space)."""
+    timeout = _left(timeout)
+    if timeout <= 0.2:
+        return None
     try:
         r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
                             "-c", "core.untrackedCache=false", "--no-optional-locks", "-C", path, *args],
-                           capture_output=True, text=True, timeout=max(0.5, timeout), env=_git_env(),
+                           capture_output=True, text=True, timeout=timeout, env=_git_env(),
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
-    return r.stdout.strip() if r.returncode == 0 else None
+    if r.returncode != 0:
+        return None
+    return r.stdout if raw else r.stdout.strip()
 
 
 def birth_ns(path: str) -> "int | None":
@@ -398,9 +421,12 @@ def birth_ns(path: str) -> "int | None":
             return int(ns)
         bt = getattr(st, "st_birthtime", None)
         return int(round(bt * 1e9)) if bt else None
+    limit = _left(STAT_TIMEOUT)
+    if limit <= 0.2:
+        return None
     try:
         r = subprocess.run(["/usr/bin/stat", "-c", "%.9W", "--", path], capture_output=True, text=True,
-                           timeout=STAT_TIMEOUT, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL)
+                           timeout=limit, env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"}, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
     m = STAT_OUT.fullmatch(r.stdout.strip()) if r.returncode == 0 else None
@@ -511,11 +537,35 @@ REDIR_ATTACHED = re.compile(r"\d*(?:>>|>|<>|<)[^<>&|;]+")
 MENTION = re.compile(r"\b(clone|worktree)\b")
 
 
-def _split(cmd: str) -> list:
-    """Simple commands, quote-aware (an operator inside quotes stays in its word). Redirections, leading assignments
-    and option-free wrappers are dropped. Heredocs, unclosed quotes and wrapper options are unsure."""
-    if "<<" in cmd:
+HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+
+def _strip_heredocs(cmd: str) -> str:
+    """Drop every heredoc body (it is data fed to a command, never a command line here) and its `<<WORD` operator. A
+    body that runs as a script (`bash <<EOF`) is therefore not read: a miss, which is safe. Unterminated: unsure."""
+    if "<<<" in cmd:
+        raise Unsure("here-string")
+    lines, out, i = cmd.split("\n"), [], 0
+    while i < len(lines):
+        delims = []
+        out.append(HEREDOC.sub(lambda m: delims.append((m.group(1) == "-", m.group(3))) or " ", lines[i]))
+        i += 1
+        for strip_tabs, word in delims:
+            while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]) != word:
+                i += 1
+            if i >= len(lines):
+                raise Unsure("unterminated heredoc")
+            i += 1
+    if "<<" in "\n".join(out):
         raise Unsure("heredoc")
+    return "\n".join(out)
+
+
+def _split(cmd: str) -> list:
+    """[(separator before it, words)] for each simple command, quote-aware (an operator inside quotes stays in its
+    word). Heredoc bodies, redirections, leading assignments and option-free wrappers are dropped. Unclosed quotes and
+    wrapper options are unsure."""
+    cmd = _strip_heredocs(cmd)
     lex = shlex.shlex(cmd, posix=True, punctuation_chars=OPERATOR_CHARS)
     lex.whitespace = " \t\r"
     lex.whitespace_split = True
@@ -524,7 +574,7 @@ def _split(cmd: str) -> list:
         tokens = list(lex)
     except ValueError as e:
         raise Unsure("unparsable: %s" % e) from None
-    out, cur, i = [], [], 0
+    out, cur, sep, i = [], [], "", 0
     while i < len(tokens):
         t = tokens[i]
         if REDIR_OP.fullmatch(t):
@@ -534,14 +584,14 @@ def _split(cmd: str) -> list:
             i += 1
             continue
         if t and all(c in OPERATOR_CHARS for c in t):
-            out.append(cur)
-            cur = []
+            out.append((sep, cur))
+            cur, sep = [], t
         else:
             cur.append(t)
         i += 1
-    out.append(cur)
+    out.append((sep, cur))
     cleaned = []
-    for words in out:
+    for sep, words in out:
         for j, w in enumerate(words):
             if w.startswith("#"):
                 words = words[:j]
@@ -550,8 +600,7 @@ def _split(cmd: str) -> list:
             if os.path.basename(words[0]) in WRAPPERS and len(words) > 1 and words[1].startswith("-"):
                 raise Unsure("wrapper option")
             words = words[1:]
-        if words:
-            cleaned.append(words)
+        cleaned.append((sep, words))
     return cleaned
 
 
@@ -655,11 +704,28 @@ def propose(cmd: str, cwd: str) -> "tuple[list, str | None]":
         return [], None
     out = []
     try:
-        cmds = _split(cmd)
-        moves = any(os.path.basename(w[0]) in CHDIR for w in cmds)
-        base = None if moves else (os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None)
-        for words in cmds:
+        base = os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None
+        pure = True                     # every separator so far is `&&`, so a cd before it really ran
+        moved = False
+        for sep, words in _split(cmd):
+            if sep not in ("", "&&"):
+                pure = False
+                if moved:
+                    base = None         # after `;`, `||`, `|`, `&` or a subshell a cd may not have happened
+            if not words:
+                continue
             name = os.path.basename(words[0])
+            if name in CHDIR:
+                moved = True
+                args = words[1:]
+                if not pure or name == "popd" or len(args) > 1 or (args and args[0].startswith("-")):
+                    base = None
+                else:
+                    try:
+                        base = _resolve(args[0], base) if args else str(home())
+                    except Unsure:
+                        base = None
+                continue
             if name in REMOTE_SHELLS:
                 if MENTION.search(" ".join(words[1:])):
                     raise Unsure("a remote command (remote rows are PR 2)")
@@ -1038,31 +1104,48 @@ def _seen(session: str, agent: str) -> Path:
     return state_dir() / "seen" / hashlib.sha256(("%s/%s" % (session, agent)).encode()).hexdigest()
 
 
+def _failed_recently(session: str, agent: str) -> bool:
+    p = _seen(session, agent).with_suffix(".fail")
+    try:
+        return time.time() - p.lstat().st_mtime < ISO_RETRY_S
+    except OSError:
+        return False
+
+
+def _note_failure(session: str, agent: str, code: str, **ctx) -> None:
+    decide(code, agent=agent, **ctx)
+    p = _seen(session, agent).with_suffix(".fail")
+    if _secure_dir(p.parent, create=True):
+        with contextlib.suppress(OSError):
+            p.touch(mode=0o600)
+            os.utime(str(p))
+
+
 def register_isolation(path: str, session: str, agent: str) -> "dict | None":
-    if _seen(session, agent).exists():
+    if _seen(session, agent).exists() or _failed_recently(session, agent):
         return None
     f = stat_path(path)
     if not f.get("checkout") or f.get("link") or not f.get("linked") or f.get("in_home") is not True:
-        decide("iso-not-checkout", agent=agent, path=path)
+        _note_failure(session, agent, "iso-not-checkout", path=path)
         return None
     real = f["realpath"]
     parts = real.split(os.sep)
     if parts[-1] != "agent-" + agent or parts[-2:-1] != ["worktrees"] or parts[-3:-2] != [".claude"]:
-        decide("iso-not-checkout", agent=agent, path=path)
+        _note_failure(session, agent, "iso-not-checkout", path=path)
         return None
     repo = os.sep.join(parts[:-3])
     listing = _git(repo, "worktree", "list", "--porcelain") or ""
     listed = {os.path.realpath(l[len("worktree "):]) for l in listing.splitlines() if l.startswith("worktree ")}
     if real not in listed or os.path.realpath(os.path.join(repo, ".git")) != f.get("common_dir"):
-        decide("iso-not-listed", agent=agent, path=real)
+        _note_failure(session, agent, "iso-not-listed", path=real)
         return None
     transcript = subagent_transcript(session, agent)
     t_birth = birth_ns(transcript) if transcript else None
     if not t_birth:
-        decide("iso-no-transcript", agent=agent, path=real)
+        _note_failure(session, agent, "iso-no-transcript", path=real)
         return None
     if not f.get("btime_ns") or abs(f["btime_ns"] - t_birth) > ISO_WINDOW_NS:
-        decide("iso-window", agent=agent, path=real)
+        _note_failure(session, agent, "iso-window", path=real)
         return None
     row, why = write_created(f, "isolation", session, agent, None)
     decide("iso-" + why, agent=agent, path=real)
@@ -1120,6 +1203,29 @@ def _nested(row: dict, deadline: float) -> "tuple[list, bool]":
     return sorted(found), True
 
 
+def _porcelain_counts(z: str) -> dict:
+    """Counts from `git status --porcelain=v1 -z`: each entry is `XY path`; a rename or copy (X or Y in R/C) is
+    followed by one more NUL-separated original path, which is not an entry."""
+    parts = z.split("\0")
+    out = {"changed": 0, "untracked": 0, "ignored": 0}
+    i = 0
+    while i < len(parts):
+        e = parts[i]
+        i += 1
+        if len(e) < 4 or e[2] != " ":
+            continue
+        xy = e[:2]
+        if xy == "??":
+            out["untracked"] += 1
+        elif xy == "!!":
+            out["ignored"] += 1
+        else:
+            out["changed"] += 1
+            if "R" in xy or "C" in xy:
+                i += 1
+    return out
+
+
 def verdict(row: dict, deadline: float) -> dict:
     """The facts and the verdict for one held row. Read-only; hardened git; bounded by the deadline."""
     def left():
@@ -1130,7 +1236,8 @@ def verdict(row: dict, deadline: float) -> dict:
     if identity(dict(f, host=HOST)) != identity(row) or not f.get("checkout"):
         return {"state": "replaced", "verdict": "keep: what is there now is not this row's checkout"}
     out = {"state": "present"}
-    st = _git(row["path"], "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", timeout=left())
+    st = _git(row["path"], "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", timeout=left(),
+              raw=True)
     branch = _git(row["path"], "rev-parse", "--abbrev-ref", "HEAD", timeout=left())
     head = _git(row["path"], "rev-parse", "HEAD", timeout=left())
     unpushed = _git(row["path"], "rev-list", "--count", "HEAD", "--not", "--remotes", timeout=left())
@@ -1141,10 +1248,8 @@ def verdict(row: dict, deadline: float) -> dict:
     if st is None:
         reasons.append("status unknown")
     else:
-        entries = [e for e in st.split("\0") if e]
-        out["changed"] = sum(1 for e in entries if not e.startswith(("??", "!!")) and len(e) > 3 and e[2] == " ")
-        out["untracked"] = sum(1 for e in entries if e.startswith("??"))
-        out["ignored"] = sum(1 for e in entries if e.startswith("!!"))
+        counts = _porcelain_counts(st)
+        out.update(counts)
         if out["changed"]:
             reasons.append("changes")
         if out["untracked"]:
@@ -1216,7 +1321,10 @@ def subagent_stop(payload: dict) -> "Path | None":
 
 
 def hook(event: str, stdin=None) -> int:
-    """Every hook fails open: exit 0, no output, whatever happens."""
+    """Every hook fails open: exit 0, no output, whatever happens. Each runs under a whole-hook deadline below its
+    settings timeout; past it every git call is unsure, so no row."""
+    global _DEADLINE
+    _DEADLINE = time.monotonic() + HOOK_BUDGET.get(event, 8.0)
     try:
         payload = json.loads((stdin or sys.stdin).read(1 << 20) or "{}")
         if not isinstance(payload, dict):
@@ -1233,6 +1341,8 @@ def hook(event: str, stdin=None) -> int:
             subagent_stop(payload)
     except Exception as e:  # noqa: BLE001 -- a registry bug must never block a tool call
         decide("hook-error", event=event, error=type(e).__name__)
+    finally:
+        _DEADLINE = None
     return 0
 
 

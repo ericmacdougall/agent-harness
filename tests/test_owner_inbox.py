@@ -230,6 +230,16 @@ class DataNotes(Base):
         self.assertLess(text.index("Use staging."), text.index("DATA (hook report"))
         self.assertLess(text.index("DATA (hook report"), text.index("facts"))
 
+    def test_data_notes_never_crowd_a_decision_out_of_stop(self):
+        for n in range(owner_inbox.MAX_FILES + 1):
+            self.write_inbox(name="data-checkout-a%d.md" % n, body="facts %d\n" % n)
+        self.write_inbox(name="zz-decision.md", body="Stop and fix the release.\n")
+        out = self.hook(self.event("Stop"))
+        self.assertIsNotNone(out)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("Stop and fix the release.", out["reason"])
+        self.assertNotIn("facts 0", out["reason"])
+
     def test_data_note_alone_never_blocks_stop(self):
         self.write_inbox(name="data-checkout-a1.md", body="facts\n")
         self.assertIsNone(self.hook(self.event("Stop")))

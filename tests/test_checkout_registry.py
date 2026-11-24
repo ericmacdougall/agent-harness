@@ -245,7 +245,9 @@ class Writer(Base):
     # NEG-5
     def test_unsure_commands_propose_nothing(self):
         h = self.home
-        for cmd in ("git clone --frobnicate u %s/d" % h, "cd %s && git clone u rel" % h, "git clone u $D",
+        for cmd in ("git clone --frobnicate u %s/d" % h, "cd %s; git clone u rel" % h, "git clone u $D",
+                    "(cd %s && git clone u rel)" % h, "cd %s || true && git clone u rel" % h,
+                    "git clone u %s/hd <<E\nunterminated" % h, "git clone u %s/hs <<< x" % h,
                     "git clone u %s/d%s" % (h, "`x`"), "git --git-dir=/x worktree add %s/w" % h,
                     "git clone u %s/a %s/b" % (h, h), "sudo -u other git clone u %s/d" % h,
                     "pushd %s; git worktree add w; popd" % h, "git clone u '%s/d\"e'" % h,
@@ -267,6 +269,10 @@ class Writer(Base):
             "cd %s && git clone https://x/u %s/abs" % (h, h): ("clone", h + "/abs"),
             "git worktree add .claude/worktrees/x": ("worktree", h + "/.claude/worktrees/x"),
             "ssh t2-dev uptime && git clone u %s/after" % h: ("clone", h + "/after"),
+            "cd %s && git clone u rel" % h: ("clone", h + "/rel"),
+            "cd %s && git worktree add ../wt2 -b q 2>&1 | tail -1" % self.src: ("worktree", h + "/wt2"),
+            "git clone u %s/hd && git commit -F - <<'EOF'\nbody: git clone u %s/body\nEOF" % (h, h):
+                ("clone", h + "/hd"),
         }
         for cmd, want in cases.items():
             got = R.candidates(cmd, h)
@@ -333,9 +339,12 @@ class Ownership(Base):
             self.clone(dest)()                              # git clone into an existing empty folder is allowed
             live = dict(R.stat_path(dest), host="local")
             reused = (live["dev"], live["ino"]) == (old["dev"], old["ino"])
-        sys.stderr.write("[inode reused at the same path: %s after %d tries on %s]\n" % (reused, tries, sys.platform))
-        if sys.platform.startswith("linux"):
-            self.assertTrue(reused, "on ext4 the fixture must really reuse the inode, or this test proves nothing")
+        sys.stderr.write("[inode reused at the same path: %s after %d tries on %s; %s]\n" % (
+            reused, tries, sys.platform, "real reuse" if reused else "reuse presented with the old dev and inode"))
+        if not reused:
+            # ext4 reuse depends on allocator state (10 of 10 in one probe, 0 of 20 in a later run), so the test does
+            # not rely on it: the new checkout is presented with the old dev and inode, as a reuse would show it.
+            live = dict(live, dev=old["dev"], ino=old["ino"])
         self.assertNotEqual(live["btime_ns"], old["btime_ns"])
         self.assertIsNone(R.held(live), "the old row must not own the new checkout")
         shutil.rmtree(dest)
@@ -638,6 +647,7 @@ class Isolation(Base):
         self.assertEqual(len(R.rows()[0]), 1)
 
     # NEG-10
+    @mock.patch.object(R, "ISO_RETRY_S", 0)
     def test_other_agents_folder_and_unregistered_folders_get_no_row(self):
         other = self.make_iso("a2")
         R.pretool(self.payload("ls", "t1", agent="a1", cwd=other, tool="Read"))
@@ -661,6 +671,14 @@ class Isolation(Base):
         self.assertEqual(self.codes().count("iso-not-checkout"), 2)
         self.assertIn("iso-not-listed", self.codes())
 
+    def test_a_failed_check_is_not_repeated_on_every_call(self):
+        plain = os.path.join(self.src, ".claude", "worktrees", "agent-a7")
+        os.makedirs(plain)
+        for n in range(3):
+            R.pretool(self.payload("ls", "t%d" % n, agent="a7", cwd=plain, tool="Read"))
+        self.assertEqual(self.codes().count("iso-not-checkout"), 1)
+
+    @mock.patch.object(R, "ISO_RETRY_S", 0)
     def test_no_transcript_or_outside_the_birth_window_gets_no_row(self):
         path = os.path.join(self.src, ".claude", "worktrees", "agent-a6")
         sh("git", "-C", self.src, "worktree", "add", "-q", path, "-b", "w-a6")
@@ -709,6 +727,21 @@ class Stop(Base):
             self.assertEqual(calls, [])
             self.assertTrue(os.path.isdir(iso))
             before = sh("git", "-C", iso, "status", "--porcelain", "--ignored")
+
+            Path(iso, "f.txt").write_text("edited\n")
+            text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
+            self.assertIn("keep: changes", text)
+            self.assertIn("changed 1, untracked 0", text)
+            sh("git", "-C", iso, "checkout", "-q", "--", "f.txt")
+            # The original path of a rename follows as its own NUL field; "ab c.txt" is shaped like an entry, so
+            # it would be counted as a second change if the parser did not skip it.
+            Path(iso, "ab c.txt").write_text("r\n")
+            sh("git", "-C", iso, "add", "ab c.txt")
+            sh("git", "-C", iso, "commit", "-q", "-m", "tracked")
+            sh("git", "-C", iso, "mv", "ab c.txt", "g.txt")
+            text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
+            self.assertIn("changed 1, untracked 0", text, "a rename is one change, not two")
+            sh("git", "-C", iso, "reset", "-q", "--hard", "origin/main")
 
             Path(iso, "new.txt").write_text("y\n")
             text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
@@ -776,6 +809,27 @@ class FailOpen(Base):
         with mock.patch.object(R, "propose", side_effect=RuntimeError("bug")):
             self.assertEqual(self.run_hook("pretool", json.dumps(self.payload("git clone u /x", "t"))), (0, ""))
         self.assertIn("hook-error", self.codes())
+
+
+class EntryPoint(Base):
+    """The installed command line, as Claude Code runs it: one row through pretool then posttool, silence always."""
+
+    def run_verb(self, verb, payload):
+        r = subprocess.run([sys.executable, str(HOOKS / "checkout_registry.py"), "hook", verb], input=json.dumps(payload),
+                           capture_output=True, text=True, timeout=60, env=dict(os.environ, HOME=self.home))
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), verb)
+
+    def test_every_wired_verb_runs_silently_and_a_row_is_written(self):
+        dest = os.path.join(self.home, "ep")
+        cmd = "git clone %s %s" % (self.src, dest)
+        self.record("toolu_ep", cmd)
+        p = self.payload(cmd, "toolu_ep")
+        self.run_verb("pretool", p)
+        self.clone(dest)()
+        self.run_verb("posttool", p)
+        self.assertEqual([r["path"] for r in self.held()], [dest])
+        for verb in ("posttool-failure", "denied", "subagent-start", "subagent-stop"):
+            self.run_verb(verb, p)
 
 
 class Wiring(unittest.TestCase):

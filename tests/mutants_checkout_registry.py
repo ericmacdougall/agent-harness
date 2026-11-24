@@ -56,10 +56,34 @@ MUTANTS = [
      '"-c", "core.fsmonitor=false", ',
      '',
      T + "Writer.test_repo_config_runs_nothing_when_the_registry_reads_it"),
-    ("a relative path after cd resolves against cwd",
-     'base = None if moves else (os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None)',
-     'base = os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None',
+    ("a cd before `;` still counts",
+     '                if moved:\n                    base = None',
+     '                if moved:\n                    pass',
      T + "Writer.test_unsure_commands_propose_nothing"),
+    ("a cd after a non-&& separator still counts",
+     '                if not pure or name == "popd"',
+     '                if name == "popd"',
+     T + "Writer.test_unsure_commands_propose_nothing"),
+    ("heredoc bodies are read as commands",
+     '    cmd = _strip_heredocs(cmd)\n',
+     '    cmd = cmd if "<<" not in cmd else cmd.replace("<<", " ")\n',
+     T + "Writer.test_text_that_only_mentions_git_proposes_nothing"),
+    ("a modified tracked file does not block the verdict",
+     '        if out["changed"]:\n            reasons.append("changes")',
+     '        if False:\n            pass',
+     T + "Stop.test_verdicts_and_nothing_is_removed"),
+    ("porcelain output is stripped before counting",
+     '    return r.stdout if raw else r.stdout.strip()',
+     '    return r.stdout.strip()',
+     T + "Stop.test_verdicts_and_nothing_is_removed"),
+    ("a rename is counted twice",
+     '            if "R" in xy or "C" in xy:\n                i += 1',
+     '            pass',
+     T + "Stop.test_verdicts_and_nothing_is_removed"),
+    ("a failed isolation check reruns on every call",
+     '    if _seen(session, agent).exists() or _failed_recently(session, agent):',
+     '    if _seen(session, agent).exists():',
+     T + "Isolation.test_a_failed_check_is_not_repeated_on_every_call"),
     ("a path that needs the shell is taken literally",
      '    if not raw or UNSAFE_PATH.search(raw):',
      '    if not raw:',
@@ -171,28 +195,38 @@ MUTANTS = [
 ]
 
 
+def run_tests(source: str, tests: list) -> int:
+    """Run the named tests against `source` in a fresh temporary layout; the unittest exit code."""
+    tmp = tempfile.mkdtemp(prefix="checkout-registry-mutant-")
+    try:
+        os.makedirs(os.path.join(tmp, "harness", "hooks"))
+        shutil.copytree(os.path.join(ROOT, "tests"), os.path.join(tmp, "tests"))
+        for f in ("install.py",):
+            shutil.copy(os.path.join(ROOT, f), os.path.join(tmp, f))
+        with open(os.path.join(tmp, TARGET), "w") as fh:
+            fh.write(source)
+        return subprocess.run([sys.executable, "-m", "unittest", *tests], cwd=tmp, capture_output=True, text=True,
+                              timeout=900).returncode
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     src = open(os.path.join(ROOT, TARGET)).read()
     bad = 0
+    baseline = run_tests(src, sorted({m[3] for m in MUTANTS}))
+    print("baseline (unmutated copy, every named test): %s" % ("PASS" if baseline == 0 else "FAIL"))
+    if baseline != 0:
+        print("a named test fails without any mutant, so KILLED would mean nothing")
+        return 1
     for name, old, new, test in MUTANTS:
         if src.count(old) != 1:
             print("STALE    %s" % name)
             bad += 1
             continue
-        tmp = tempfile.mkdtemp(prefix="checkout-registry-mutant-")
-        try:
-            os.makedirs(os.path.join(tmp, "harness", "hooks"))
-            shutil.copytree(os.path.join(ROOT, "tests"), os.path.join(tmp, "tests"))
-            for f in ("install.py",):
-                shutil.copy(os.path.join(ROOT, f), os.path.join(tmp, f))
-            with open(os.path.join(tmp, TARGET), "w") as fh:
-                fh.write(src.replace(old, new))
-            r = subprocess.run([sys.executable, "-m", "unittest", test], cwd=tmp, capture_output=True, text=True,
-                               timeout=900)
-            bad += r.returncode == 0
-            print("%s %s (%s)" % ("KILLED  " if r.returncode else "SURVIVED", name, test.rsplit(".", 1)[-1]))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        code = run_tests(src.replace(old, new), [test])
+        bad += code == 0
+        print("%s %s (%s)" % ("KILLED  " if code else "SURVIVED", name, test.rsplit(".", 1)[-1]))
     print("%d of %d mutants survived or were stale" % (bad, len(MUTANTS)))
     return 1 if bad else 0
 
