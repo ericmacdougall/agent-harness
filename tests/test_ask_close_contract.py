@@ -131,6 +131,11 @@ STOP_OF = {
     "wal>unsourced": "wal-unsourced", "wal>free-text": "bad-syntax", "wal>bad-wal": "bad-syntax",
     "wal>warn>no-file": "wal-missing", "wal>inf-short": "inferred-no-rationale",
 }
+# hop zero: the evidence row's own `source` field, and where its walk stops (None: the row has no source key)
+ZERO_SOURCES = {"row:no-key": None, "row:empty": "", "row:int": 12345, "row:list": ["answer"], "row:dict": {"user": 1},
+                "row:free-text": "the user said so in chat", "close:no-key": None}
+ZERO_STOP = {"row:no-key": "no-source", "row:empty": "no-source", "row:int": "bad-syntax", "row:list": "bad-syntax",
+             "row:dict": "bad-syntax", "row:free-text": "bad-syntax", "close:no-key": "no-source"}
 # the stop codes no cell above reaches: one needs a scan past its time budget, tested in process (StopCoverage); the
 # others cannot be reached, each for the reason given. StopCoverage fails when a stop code is in none of the three.
 IN_PROCESS = {"scan-timeout"}
@@ -353,6 +358,21 @@ class Contract(unittest.TestCase):
         s1_rows += [row("decision", new_id(), 21, f"Answer to ask {cls.rank['tie']}: the user answered", direct["user"]),
                     row("decision", new_id(), 22, f"Answer to ask {cls.rank['tie']}: the user answered",
                         forms["wal>no-entry"])]
+        # round 6, hop zero (R4 F1 one hop earlier): an answer row whose OWN source cannot be walked (none, as the warn
+        # policy writes one, empty, not a string, free text) next to an offerable obsolete close of the same ask; and
+        # a close elsewhere with no source of its own after an offerable one
+        cls.zero = {}
+        for key, source in ZERO_SOURCES.items():
+            ask = cls.zero[key] = new_id()
+            s1_rows.append(row("ask", ask, 1, f"hop zero: {key}"))
+            if key.startswith("row:"):
+                s1_rows.append(row("decision", new_id(), 24, f"Answer to ask {ask}: the user said no", source))
+                s2_rows.append(row("ask_resolved", new_id(), 30, "obsolete there", forms["wal>ticket"], ref=ask,
+                                   outcome="obsolete"))
+            else:
+                s2_rows += [row("ask_resolved", new_id(), 30, "obsolete there", forms["wal>ticket"], ref=ask,
+                                outcome="obsolete"),
+                            row("ask_resolved", new_id(), 40, "obsolete there", source, ref=ask, outcome="obsolete")]
         cls.s1.write_text(jsonl(s1_rows))
         cls.s2.write_text(jsonl(s2_rows))
         cls.s1_before, cls.s2_before = cls.s1.read_bytes(), cls.s2.read_bytes()
@@ -478,12 +498,15 @@ class Contract(unittest.TestCase):
         for entry in self.listing["incomplete"]:
             got.setdefault(entry["ask"], set()).update(entry["stops"])
         want = {ask for ask, (name, mode) in self.cells.items() if self.expect(name)[0] == U}
-        want |= {self.rank[k] for k in ("super", "missing", "tie")}
+        want |= {self.rank[k] for k in ("super", "missing", "tie")} | set(self.zero.values())
         self.assertEqual(set(got), want)
         for ask, (name, mode) in self.cells.items():
             if ask in want:
                 with self.subTest(form=name, mode=mode):
                     self.assertIn(STOP_OF[name], got[ask])
+        for key, ask in self.zero.items():
+            with self.subTest(hop_zero=key):
+                self.assertIn(ZERO_STOP[key], got.get(ask, ()))
         self.assertTrue(STOP_OF.keys() <= set(EXPECT) and {n for n, e in EXPECT.items() if e[0] == U} <= STOP_OF.keys())
 
     def test_a_human_answer_that_cannot_be_closed_is_never_hidden_behind_an_obsolete_close(self):
@@ -497,25 +520,44 @@ class Contract(unittest.TestCase):
         self.assertIn("human turn", item["action"])
 
     def test_an_answer_whose_walk_stopped_is_never_hidden_behind_an_obsolete_close(self):
-        # R4 F1 cell 1: the SUPERSEDES ask alone is offered (the control), but not over an untraced answer row
-        ctl = self.items[self.rank["super_ctl"]]
-        self.assertEqual((ctl["kind"], ctl["manual"], bool(ctl["close"])), ("superseded", False, True))
-        item = self.items[self.rank["super"]]
-        self.assertEqual((item["kind"], item["manual"], item["close"], item["apply"]), ("answer", True, None, None))
-        self.assertEqual([e["kind"] for e in item["evidence"]], ["answer", "superseded"])
-        self.assertIn("could not be traced to its end (wal-entry-not-found)", item["action"])
-        # R4 F1 cell 2: an untraced outcome close outranks an earlier outcome close that could be written
-        item = self.items[self.rank["missing"]]
-        self.assertEqual((item["kind"], item["manual"], item["close"]), ("resolved-elsewhere", True, None))
-        self.assertEqual(item["evidence"][0]["source"], self.forms["wal>no-entry"])
-        self.assertEqual(item["evidence"][1]["source"], self.forms["wal>ticket"])
-        # a tie of rank: the untraced answer comes before the earlier traced one, so nothing is closed
-        item = self.items[self.rank["tie"]]
-        self.assertEqual((item["kind"], item["manual"], item["close"]), ("answer", True, None))
-        self.assertEqual([e["source"] for e in item["evidence"]], [self.forms["wal>no-entry"], self.direct["user"]])
+        # each cell in its own subTest, so each shows its own failure (failing first, round 6)
+        with self.subTest(cell="super_ctl"):  # the control: the SUPERSEDES ask alone is offered
+            ctl = self.items[self.rank["super_ctl"]]
+            self.assertEqual((ctl["kind"], ctl["manual"], bool(ctl["close"])), ("superseded", False, True))
+        with self.subTest(cell="super"):  # R4 F1 cell 1: not over an untraced answer row
+            item = self.items[self.rank["super"]]
+            self.assertEqual((item["kind"], item["manual"], item["close"], item["apply"]), ("answer", True, None, None))
+            self.assertEqual([e["kind"] for e in item["evidence"]], ["answer", "superseded"])
+            self.assertIn("could not be traced to its end (wal-entry-not-found)", item["action"])
+        with self.subTest(cell="missing"):  # R4 F1 cell 2: an untraced outcome close outranks an earlier writable one
+            item = self.items[self.rank["missing"]]
+            self.assertEqual((item["kind"], item["manual"], item["close"]), ("resolved-elsewhere", True, None))
+            self.assertEqual(item["evidence"][0]["source"], self.forms["wal>no-entry"])
+            self.assertEqual(item["evidence"][1]["source"], self.forms["wal>ticket"])
+        with self.subTest(cell="tie"):  # a tie of rank: the untraced answer comes first, so nothing is closed
+            item = self.items[self.rank["tie"]]
+            self.assertEqual((item["kind"], item["manual"], item["close"]), ("answer", True, None))
+            self.assertEqual([e["source"] for e in item["evidence"]], [self.forms["wal>no-entry"], self.direct["user"]])
         # and --apply refuses each of them, writing nothing
         code, doc = self.sweep("--apply", "--only", *[self.items[self.rank[k]]["pin"] for k in ("super", "missing", "tie")])
         self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (1, [3, 3, 3]))
+        self.assertEqual(self.s1.read_bytes()[:len(self.s1_before)], self.s1_before)
+
+    def test_evidence_whose_own_source_cannot_be_walked_is_never_skipped(self):
+        # round 6, hop zero: an answer row with no source, an empty one, a non-string or free text is unknown evidence,
+        # ranked ahead of the offerable obsolete close of the same ask; so is a close elsewhere with no source
+        for key, ask in sorted(self.zero.items()):
+            with self.subTest(hop_zero=key):
+                item = self.items.get(ask)
+                self.assertIsNotNone(item, "not listed")
+                best = item["evidence"][0]
+                self.assertEqual(item["kind"], "resolved-elsewhere" if key.startswith("close:") else "answer")
+                self.assertEqual((item["manual"], item["close"], best.get("unknown"), best.get("stops")),
+                                 (True, None, True, [ZERO_STOP[key]]))
+                self.assertIn("could not be traced to its end", item["action"])
+                self.assertEqual(item["evidence"][1]["source"], self.forms["wal>ticket"])  # the close it outranks
+        code, doc = self.sweep("--apply", "--only", *[self.items[a]["pin"] for a in self.zero.values() if a in self.items])
+        self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (1, [3] * len(self.zero)))
         self.assertEqual(self.s1.read_bytes()[:len(self.s1_before)], self.s1_before)
 
     def test_an_answer_card_gets_a_close_only_when_the_writer_would_write_it(self):
@@ -719,7 +761,9 @@ class StopCoverage(unittest.TestCase):
                 verdict = ask_close.close_verdict(source, "outcome", "w00000000a02", tmp)
             finally:
                 provenance.SCAN_SECONDS, provenance.load_policy = saved
+        # the round 6 behaviour is the trace: unknown, so ask_sweep ranks it as a possible answer
         self.assertEqual((traced["state"], traced["maybe_human"], traced["stops"]), ("unknown", True, ["scan-timeout"]))
+        # the refusal here comes from the outcome check's own read of the first hop, which predates round 6
         self.assertIn("scan-timeout", verdict["problem"] or "")
 
 

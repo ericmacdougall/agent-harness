@@ -416,9 +416,11 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
             if ask_evidence.supersedes(r, ident):
                 found.append({"kind": "superseded", "ref": str(r.get("id")), "session": r["_session"], "at": when,
                               "summary": note, "source": f"wal:{r['_wal']}#{r.get('id')}", "outcome": "obsolete"})
-            elif (r.get("event") in EVIDENCE_EVENTS and r.get("by") != "ask-sweep" and source
+            elif (r.get("event") in EVIDENCE_EVENTS and r.get("by") != "ask-sweep"
                   and not still_waiting(note, ident) and walk(source)["human"]):
-                # ask-sweep's own close rows name the evidence they used (a superseding ask's id), never answer it
+                # ask-sweep's own close rows name the evidence they used (a superseding ask's id), never answer it.
+                # A row with no source of its own is not skipped: its walk stops at once (no-source), so it may be
+                # the user's answer, as the warn policy writes one (#170 round 6, hop zero)
                 found.append({"kind": "answer", "ref": str(r.get("id")), "session": r["_session"], "at": when,
                               "summary": note, "source": source, "outcome": None, **walk(source)})
         tokens = distinctive_tokens(ask["note"])

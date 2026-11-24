@@ -218,7 +218,10 @@ MUTANTS = {
     "an answer card skips the precheck": ("ask_sweep.py", '        if verdict["problem"]:\n            result["answered"].remove(item)',
                                           '        if False:\n            result["answered"].remove(item)',
                                           "tests/test_ask_close_contract.py"),
-    "a credential answer is printed": ("ask_sweep.py", "            item[\"answer\"] = CREDENTIAL", "            pass",
+    "an answer row with no source of its own is skipped": (
+        "ask_sweep.py", 'r.get("by") != "ask-sweep"\n                  and not still_waiting',
+        'r.get("by") != "ask-sweep" and source\n                  and not still_waiting', "tests/test_ask_close_contract.py"),
+    "a credential answer is printed":("ask_sweep.py", "            item[\"answer\"] = CREDENTIAL", "            pass",
                                        "tests/test_ask_close_contract.py"),
     # not listed: the "tree-too-large" stop in provenance._walk_tree cannot be reached (MAX_RESOLVES caps a tree at
     # far fewer nodes than its bound), and trace's except branch runs only when provenance cannot be imported or
