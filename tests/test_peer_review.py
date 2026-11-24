@@ -1896,6 +1896,36 @@ else:
         # Claude author, Codex present: the cross-harness reviewer is Astra high, launched only with the record.
         self.assertIn('gpt-6-astra', argv); self.assertIn('Permission: w9\n', self.output.read_text())
 
+    def test_permission_rung_reviewer_runs_on_a_live_supervisor_review_grant(self):
+        """goodqa#17156 AC-1: the recorded supervisor's reviewer grant stands in for approve-top for the reviewer only;
+        a revoked, expired, writer-scoped or other-task grant does not."""
+        import escalation as ladder
+        import model_tiers as tiers
+        grant = {'id': 'rg-0123456789ab', 'task': 'lad-6', 'scope': 'review', 'rungs': ['R5', 'R6'],
+                 'by': '1eaed05e-9884-44ca-a537-09a25d215e7c', 'at': '2026-01-01T00:00:00+00:00',
+                 'expires_at': '2099-01-01T00:00:00+00:00'}
+
+        def ledger_with(*grants):
+            state = ladder.Ledger(self.ladder, tiers.load_policy()).fresh('lad-6')
+            state['review_grants'] = list(grants)
+            (self.ladder / 'lad-6.json').write_text(json.dumps(state))
+        for bad in (dict(grant, revoked_at='2026-01-02T00:00:00+00:00'), dict(grant, expires_at='2026-01-02T00:00:00+00:00'),
+                    dict(grant, scope='writer'), dict(grant, task='lad-7')):
+            with self.subTest(bad=json.dumps({k: v for k, v in bad.items() if grant.get(k) != v})):
+                ledger_with(bad)
+                refused = self.run_review('--task', 'lad-6', '--author-rung', 'R5', '--author-harness', 'claude')
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertIn('ah grant-reviewer --task', refused.stderr)
+                self.assertFalse(self.argv_file.exists())
+        ledger_with(grant)
+        allowed = self.run_review('--task', 'lad-6', '--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(allowed.returncode, 3, allowed.stderr)
+        argv = json.loads(self.argv_file.read_text())
+        self.assertIn('gpt-6-astra', argv)  # Claude author, Codex present: the Astra reviewer runs on the grant
+        report = self.output.read_text()
+        self.assertIn('Permission: reviewer grant rg-0123456789ab by supervisor 1eaed05e-9884-44ca-a537-09a25d215e7c', report)
+        self.assertIn('(reviewer only, never writing)', report)
+
     def test_claude_fallback_carries_effort_and_budget_when_codex_is_absent(self):
         result = self.run_review('--task', 'lad-2', '--author-rung', 'R1', '--author-harness', 'claude', remove=('codex',))
         self.assertEqual(result.returncode, 3, result.stderr)

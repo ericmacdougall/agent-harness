@@ -3120,7 +3120,16 @@ def status_report(home: Path, session: str, since_s: float, now: float | None = 
         owners_summary = {"error": "owners view not included (run ah owners)" if supplied else "owners view unavailable"}
         if not supplied:
             unread.append({"source": "owners view", "reason": f"ah owners failed: {type(error).__name__}"})
+    grants = None
+    if not supplied:  # goodqa#17156: the recorded supervisor and its reviewer grants, always shown
+        try:
+            import escalation  # noqa: PLC0415
+            import supervisor as sv  # noqa: PLC0415
+            grants = sv.summary(escalation.Ledger(), at_ts=now)
+        except Exception as error:  # noqa: BLE001 - the evidence report must not fail on the grant view
+            unread.append({"source": "reviewer grants", "reason": f"supervisor summary failed: {type(error).__name__}"})
     return {"session": session, "since_s": since_s, "generated": iso(now), "entries": len(rows),
+            "reviewer_grants": grants,
             "verified": sorted(verified.values(), key=lambda e: e["at"]),
             "pending": sorted((v for k, v in pending.items() if k not in verified), key=lambda e: e["at"]),
             "live": live, "live_legacy": live_legacy,
@@ -3159,6 +3168,14 @@ def status_text(data: dict) -> str:
                      f"attention (silent, wait expired, wait not on a user ask, result untaken, or none): {', '.join(o.get('attention') or []) or 'none'}")
     else:
         lines.append("## OWNERS " + str(o.get("error", "")))
+    g = data.get("reviewer_grants")
+    if isinstance(g, dict):
+        sup = g.get("supervisor") or {}
+        lines.append("## SUPERVISOR " + (f"{sup.get('session')} (set {str(sup.get('set_at'))[:19]})" if sup else
+                                         "none recorded (ah supervisor set)"))
+        lines += block("REVIEWER GRANTS, newest 20 (top rung, " + str(g.get("scope")) + ")", (g.get("grants") or [])[-20:],
+                       lambda r: f"  {r['state']:<8} {r['id']} [task:{r['task']}] by {str(r['by'])[:8]} until "
+                                 f"{str(r['expires_at'])[:16]} {r['ticket']}: {str(r['reason'])[:70]}")
     lines.append("(" + data["rule"] + ")")
     return "\n".join(lines)
 
@@ -3259,6 +3276,78 @@ def _wal_note_id(completed, event: str) -> str:
         detail = (completed.stderr or completed.stdout or "").strip()[-400:]
         raise AhError("wal_note_refused", f"approve-top: wal_note refused the {event} entry: {detail}", 2)
     return out["id"]
+
+
+MAIN_ONLY_FIX = ("only the main agent runs this: its own PreToolUse hook (mission_gate.py pretool) stamps this exact "
+                 "command when the Bash call starts. None was found (a sub-agent, a script, a replay, a background call, "
+                 "or the hook is not installed). Nothing was written")
+
+
+def supervisor_cmd(home: Path, args) -> dict:
+    """`ah supervisor show` and `ah supervisor set --session S --source SRC` (goodqa#17156): one recorded supervisor,
+    chosen by the user's own words to that session. set is main only (bound stamp)."""
+    import caller_identity  # noqa: PLC0415
+    import escalation  # noqa: PLC0415
+    import supervisor as sv  # noqa: PLC0415
+    ledger = escalation.Ledger()
+    if args.action == "show":
+        return {"ok": True, **sv.summary(ledger)}
+    if not args.session or not args.source:
+        raise AhError("bad_request", "supervisor set needs --session and --source", 2)
+    stamp = caller_identity.take_stamp(sv.SET_STAMP, sv.stamp_parts_set(args.session, args.source), home=home, bound=True)
+    if stamp is None:
+        raise AhError("main_only", "supervisor set: " + MAIN_ONLY_FIX, 2)
+    session = str(args.session).lower()
+    try:
+        proof = sv.verify_supervise_source(ledger, session, args.source)
+        rows = user_msgs(sv.claude_home(ledger).parent, session, recent=200, full=True)["matches"]
+        later = [m.get("text") or "" for m in rows if str(m.get("timestamp") or "") > str(proof["timestamp"] or "")]
+        record = sv.set_supervisor(ledger, session, args.source, stamp.get("session") or "", later_texts=later)
+    except sv.SupervisorError as e:
+        raise AhError(e.code, "supervisor set: " + e.message, 2)
+    except AhError as e:
+        raise AhError(e.code, f"supervisor set: the session's later messages could not be read ({e}); nothing was recorded", 2)
+    return {"ok": True, "supervisor": record,
+            "next": "the recorded supervisor may now run `ah grant-reviewer`; a new `ah supervisor set` replaces it"}
+
+
+def grant_reviewer_cmd(home: Path, args) -> dict:
+    """`ah grant-reviewer` (goodqa#17156): the recorded supervisor's reviewer-only top-rung grant for one task, its
+    --list and --revoke. See supervisor.py for every rule and its limits."""
+    import caller_identity  # noqa: PLC0415
+    import escalation  # noqa: PLC0415
+    import supervisor as sv  # noqa: PLC0415
+    ledger = escalation.Ledger()
+    try:
+        if args.list_only:
+            return {"ok": True, **sv.summary(ledger)}
+        if args.revoke:
+            claimed = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+            grant = sv.revoke(ledger, args.revoke, actor=("claimed session " + claimed[:40]) if claimed else "unproven caller")
+            return {"ok": True, "revoked": grant}
+        if not (args.task and args.reason and args.ticket and args.wal):
+            raise AhError("bad_request", "grant-reviewer needs --task, --reason, --ticket and --wal (or --list, --revoke ID)", 2)
+        parts = sv.stamp_parts_grant(args.task, args.reason, args.ticket, args.wal, args.self_authored, args.hours)
+        stamp = caller_identity.take_stamp(sv.GRANT_STAMP, parts, home=home, bound=True)
+        if stamp is None:
+            raise AhError("main_only", "grant-reviewer: " + MAIN_ONLY_FIX, 2)
+        me = Path(__file__).resolve()
+
+        def write_row(note, source):
+            done = subprocess.run([sys.executable, str(me.parent / "wal_note.py"), "--wal", str(Path(args.wal).expanduser()),
+                                   "--event", "decision", "--source", source, "--ticket", args.ticket, "--note", note],
+                                  capture_output=True, text=True, timeout=60)
+            return _wal_note_id(done, "decision")
+        grant = sv.grant_review(ledger, stamp_session=stamp.get("session"), task=args.task, reason=args.reason,
+                                ticket=args.ticket, wal=args.wal, self_authored=args.self_authored, hours=args.hours,
+                                write_row=write_row)
+    except sv.SupervisorError as e:
+        raise AhError(e.code, "grant-reviewer: " + e.message, 2)
+    except escalation.LedgerError as e:
+        raise AhError(e.code, "grant-reviewer: " + e.message, 2)
+    return {"ok": True, "grant": grant,
+            "next": f"peer_review.py ... --task {args.task} now runs its R5/R6 reviewer on this grant; writing still "
+                    "needs `ah approve-top` with the user's own words"}
 
 
 def note_cmd(home: Path, args) -> dict:
@@ -3762,6 +3851,22 @@ def build_parser():
     ap.add_argument("--user-msg", required=True, help="an id printed by `ah user-msg` (uuid:, answer: or queue:)")
     ap.add_argument("--wal", required=True, help="the main session WAL (~/.claude/wals/<session>/main.jsonl)")
     ap.add_argument("--session", help="override the session id (default: the WAL directory name)")
+    sv = sub.add_parser("supervisor", help="the one recorded supervisor session (goodqa#17156): `set` (main only, on the "
+                                           "user's own words to that session) or `show`")
+    sv.add_argument("action", choices=("set", "show"))
+    sv.add_argument("--session", help="set: the session the user asked to supervise")
+    sv.add_argument("--source", help="set: that session's user message (an id line from `ah user-msg`), quoted")
+    gr = sub.add_parser("grant-reviewer", help="the recorded supervisor grants Fable or Astra as the peer_review reviewer "
+                                               "for ONE task (goodqa#17156); never a writer. --list, --revoke ID")
+    gr.add_argument("--task", help="the task key peer_review runs with (--task)")
+    gr.add_argument("--reason", help="why this task needs the top-rung reviewer (20 to 400 characters)")
+    gr.add_argument("--ticket", help="the task's ticket, e.g. 'GoodQA goodqa#17156' (the WAL row's source)")
+    gr.add_argument("--wal", help="this session's own main WAL (~/.claude/wals/<session>/main.jsonl)")
+    gr.add_argument("--hours", type=int, default=168, help="lifetime in hours, at most 168 (7 days, the default)")
+    gr.add_argument("--self-authored", action="store_true", dest="self_authored",
+                    help="required when this session dispatched the task's own work")
+    gr.add_argument("--list", action="store_true", dest="list_only", help="list every grant: live, expired and revoked")
+    gr.add_argument("--revoke", metavar="ID", help="revoke one grant (anyone may; revoking only removes power)")
     nt = sub.add_parser("note", help="write a WAL note through wal_note.py; --source auto picks the nearest sourced ancestor")
     nt.add_argument("--wal", required=True)
     nt.add_argument("--event", default="decision")
@@ -3959,6 +4064,10 @@ def run(args, home: Path) -> dict:
         return goals_view.goals_report(home, session=args.session, budget_s=goals_view.CLI_BUDGET_S)
     if cmd == "approve-top":
         return approve_top_cmd(home, args)
+    if cmd == "supervisor":
+        return supervisor_cmd(home, args)
+    if cmd == "grant-reviewer":
+        return grant_reviewer_cmd(home, args)
     if cmd == "doctor":
         return doctor()
     if cmd == "spool":

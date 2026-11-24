@@ -30,6 +30,7 @@ TASK_KEY = re.compile(r'\[task:([A-Za-z0-9][A-Za-z0-9._-]{0,63})\]')
 SAFE_KEY = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 MAX_STATE = 1 << 20
 MAX_EVENTS = 4096
+MAX_REVIEW_GRANTS = 50  # per task: newest kept; each is under 2 KiB
 
 
 def installed_home():
@@ -1162,6 +1163,8 @@ class Ledger:
             fresh = self.fresh(task, generated=state.get('generated_key', False))
             fresh['resets'] = state.get('resets', []) + [record]
             fresh['permission'] = state.get('permission')
+            if isinstance(state.get('review_grants'), list):
+                fresh['review_grants'] = state['review_grants']  # goodqa#17156: a grant (and its revoke) outlives a reset
             # goodqa#15794: live dispatches survive a reset (a running opus owner must still block an exclusion);
             # ended or stale ones are dropped so they cannot re-enter a later window. after_seq restarts at 0.
             t = epoch()
@@ -1204,6 +1207,38 @@ class Ledger:
         finally:
             os.close(fd)
         return status
+
+    def add_review_grant(self, task, grant):
+        """Append one reviewer-only top-rung grant (goodqa#17156) to the task's own `review_grants` list. It is never
+        written to `permission`, which every writer path reads as the user's grant. supervisor.py builds the record."""
+        if not isinstance(grant, dict) or grant.get('scope') != 'review' or grant.get('task') != task:
+            raise LedgerError('unclassifiable_evidence', 'a review grant must have scope "review" and name this task')
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            grants = [g for g in state.get('review_grants') or [] if isinstance(g, dict)]
+            grants.append(grant)
+            state['review_grants'] = grants[-MAX_REVIEW_GRANTS:]
+            self._write(task, state)
+        finally:
+            os.close(fd)
+        return grant
+
+    def revoke_review_grant(self, task, grant_id, actor, at=None):
+        """Mark one grant revoked (it stays listed). Revoking only removes power, so any caller may do it."""
+        fd = self._lock(task)
+        try:
+            state, _ = self._read(task)
+            for grant in state.get('review_grants') or []:
+                if isinstance(grant, dict) and grant.get('id') == grant_id:
+                    if not grant.get('revoked_at'):
+                        grant['revoked_at'] = at or now()
+                        grant['revoked_by'] = clean_str(actor, 80)
+                        self._write(task, state)
+                    return grant
+        finally:
+            os.close(fd)
+        return None
 
     def status(self, task):
         return ladder_status(self.load(task), self.policy)
@@ -1424,6 +1459,38 @@ def approve_fix(task, wal=None):
     hooks = Path(__file__).resolve().parent
     return ('python3 %s approve-top --task %s --user-msg <id from `python3 %s user-msg --recent 3`> --wal %s'
             % (hooks / 'ah.py', task or '<task>', hooks / 'ah.py', wal or '<main WAL>'))
+
+
+def _grant_time(value):
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def live_review_grant(state, rung, policy, now_ts=None):
+    """The live reviewer-only grant (goodqa#17156) that covers a reviewer at `rung` for this ledger state, else None.
+
+    It is the one reader of `review_grants` that decides anything, and only the reviewer checks call it
+    (peer_review's rung check, tier_gate's peer_review launch branch). A grant counts only when its scope is
+    "review", it names this state's task, `rung` needs user permission and is listed in the grant, it is not
+    revoked, and at <= now < expires_at. A writer path never calls this, and ladder_status never copies a grant into
+    `permission`, so a grant can never stand in for the user's own words for writing."""
+    if not isinstance(state, dict) or not isinstance(rung, str):
+        return None
+    rungs = (policy or {}).get('rungs') or {}
+    if not (rungs.get(rung) or {}).get('needs_user_permission'):
+        return None
+    t = epoch() if now_ts is None else now_ts
+    for grant in reversed(state.get('review_grants') or []):
+        if not isinstance(grant, dict) or grant.get('scope') != 'review' or grant.get('task') != state.get('task'):
+            continue
+        if not isinstance(grant.get('rungs'), list) or rung not in grant['rungs'] or grant.get('revoked_at'):
+            continue
+        start, end = _grant_time(grant.get('at')), _grant_time(grant.get('expires_at'))
+        if start is not None and end is not None and start <= t < end:
+            return grant
+    return None
 
 
 def session_key(session):

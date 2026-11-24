@@ -467,15 +467,23 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
                 facts['ladder_error'] = getattr(error, 'code', 'error')
         selection = tiers.reviewer_for(policy, author_rung, author_harness, {'openai': True, 'claude': True})
         if selection.get('rung') and policy['rungs'][selection['rung']]['needs_user_permission']:
-            permission = None
+            permission = grant = None
             if task is not None:
                 try:
                     permission = ledger.status(task).get('permission')
+                    if not permission:
+                        # goodqa#17156: the recorded supervisor's reviewer grant covers this reviewer launch only. The
+                        # model-launch checks below still read `permission` alone, so it never covers writing.
+                        grant = esc.live_review_grant(ledger.load(task), selection['rung'], policy)
                 except (esc.LedgerError, tiers.TierError) as error:
                     facts['ladder_error'] = getattr(error, 'code', 'error')
             # Central decisions do not apply to reviewers: peer_review.py itself honours only the local permission.
-            if not permission:
-                return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
+            if not permission and grant is None:
+                return 'deny', ('review at %s needs recorded user permission for task %s, or a live reviewer grant from '
+                                'the recorded supervisor (ah grant-reviewer --task %s)' % (
+                                    selection['rung'], task or '(none)', task or '<task>')), None, facts
+            if grant is not None:
+                facts['review_grant'] = str(grant.get('id'))[:40]
     if model is None:
         return 'allow', None, None, facts
     requested = tiers.classify(model, effort, policy)

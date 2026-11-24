@@ -1612,6 +1612,14 @@ def pr_base(repo, base):
     return None
 
 
+def grant_header(grant):
+    """The report line naming a supervisor review grant (goodqa#17156), or '' for the user-permission route."""
+    if not isinstance(grant, dict):
+        return ''
+    return 'Permission: reviewer grant %s by supervisor %s until %s (reviewer only, never writing)\n' % (
+        str(grant.get('id'))[:40], str(grant.get('by'))[:36], str(grant.get('expires_at'))[:25])
+
+
 def review_merge_eligible(args, binding, report, selection):
     """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
     return bool(args.stage == 'pr' and binding and getattr(args, 'main_stamp', None)
@@ -2166,19 +2174,27 @@ def main() -> int:
                                      stage=args.stage, head=before[0]), file=sys.stderr)
         return 2
     permission = None
+    review_grant = None
     if policy['rungs'][selection['rung']]['needs_user_permission']:
-        # --author-rung is a claim; the ledger permission is the only record of Fable-approved work.
+        # --author-rung is a claim; the ledger permission is the only record of Fable-approved work. A reviewer may
+        # also run on a live supervisor review grant (goodqa#17156), which covers this reviewer run and never writing.
         if args.task:
             try:
-                permission = ladder.Ledger(policy=policy).status(args.task).get('permission')
+                ledger = ladder.Ledger(policy=policy)
+                permission = ledger.status(args.task).get('permission')
+                if not isinstance(permission, dict) or not permission.get('ask_id'):
+                    review_grant = ladder.live_review_grant(ledger.load(args.task), selection['rung'], policy)
             except (ladder.LedgerError, tiers.TierError):
-                permission = None
-        if not isinstance(permission, dict) or not permission.get('ask_id'):
+                permission = review_grant = None
+        if (not isinstance(permission, dict) or not permission.get('ask_id')) and review_grant is None:
             target.close()
             evidence.close()
-            print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
-                  '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
+            print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top, or a '
+                  'live reviewer grant from the recorded supervisor (ah grant-reviewer --task); --author-rung alone is '
+                  'not a record' % selection['rung'], file=sys.stderr)
             return 2
+        if review_grant is not None:
+            permission = None
     # goodqa#16947: the per-provider deadline for this reviewer rung and effort. --timeout can only lower it; a value
     # above it is refused before any reservation, as a value above 720 always was.
     policy_seconds, policy_basis = diagnostics.provider_deadline(review_policy(), selection['rung'], selection['effort'])
@@ -2197,7 +2213,7 @@ def main() -> int:
                'review_routing': review_routing(selection, args.reviewer, args.secondary),
                'timeout': provider_seconds, 'deadline_basis': deadline_basis,
                'pool': args.pool, 'fallback_pool': args.fallback_pool,
-               'selection': selection, 'author_rung': author_rung, 'permission': permission,
+               'selection': selection, 'author_rung': author_rung, 'permission': permission, 'review_grant': review_grant,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
     try:
@@ -2368,6 +2384,7 @@ def main() -> int:
                           f"fallback {options['review_routing']['effective_fallback'] or 'none'}\n"
                           f"Reviewer-Actual: {options.get('actual_reviewer', 'unknown')}\n"
                           f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
+                          f"{grant_header(review_grant)}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
                           f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n",

@@ -203,6 +203,38 @@ def chat_allow_stamps(cmd: str) -> list:
     return out
 
 
+def supervisor_stamps(cmd: str) -> list:
+    """[(purpose, stamp parts)] for each `ah grant-reviewer ...` (not --list or --revoke) and `ah supervisor set ...`
+    this Bash line runs at command position (goodqa#17156). ah's own parser reads the words, and supervisor.py binds
+    the stamp to the exact arguments. A computed word, an unparsable line, echoed or quoted text and --help get none."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        import ah  # noqa: PLC0415
+        import supervisor as sv  # noqa: PLC0415
+    except ImportError:
+        return []
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words, "ah.py") or mission_argv(words, "ah")
+        if not argv or str(argv[0]) not in ("grant-reviewer", "supervisor") or any(getattr(w, "computed", False) for w in argv):
+            continue
+        argv = [os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w)
+                for w in argv]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                args = ah.build_parser().parse_args(argv)
+        except (SystemExit, Exception):  # noqa: BLE001 - a refusal or --help mints nothing
+            continue
+        if args.cmd == "supervisor" and args.action == "set" and args.session and args.source:
+            out.append((sv.SET_STAMP, sv.stamp_parts_set(args.session, args.source)))
+        elif (args.cmd == "grant-reviewer" and not args.list_only and not args.revoke
+              and args.task and args.reason and args.ticket and args.wal):
+            out.append((sv.GRANT_STAMP, sv.stamp_parts_grant(args.task, args.reason, args.ticket, args.wal,
+                                                             args.self_authored, args.hours)))
+    return out
+
+
 def stamps_for(cmd: str) -> list:
     """[(subcommand, argv key)] for each main-only mission_coverage.py command this Bash line runs. The key is
     mission_coverage.argv_key of the exact argument list, so the stamp covers that command and nothing else."""
@@ -233,7 +265,8 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if "mission_coverage" not in cmd and "ahc" not in cmd and "chat" not in cmd:
+    supervised = "grant-reviewer" in cmd or "supervisor" in cmd  # goodqa#17156
+    if "mission_coverage" not in cmd and "ahc" not in cmd and "chat" not in cmd and not supervised:
         return {}
     import caller_identity  # noqa: PLC0415
     if not caller_identity.is_main(payload):
@@ -254,6 +287,10 @@ def cmd_pretool(payload: dict) -> dict:
         import ah_chat_send  # noqa: PLC0415
         for parts in chat_allow_stamps(cmd)[:1]:
             caller_identity.put_stamp(ah_chat_send.ALLOW_STAMP, parts, session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if supervised:
+        for purpose, parts in supervisor_stamps(cmd)[:2]:
+            caller_identity.put_stamp(purpose, parts, session=session, home=home_dir(),
                                       tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
     if "ahc" in cmd:
         try:

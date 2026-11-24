@@ -34,6 +34,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
          "remote_delete.py", "remote_delete_agent.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "central_decisions.py", "tier_gate.py",
+         "supervisor.py",  # the recorded supervisor and its reviewer-only top-rung grants (goodqa#17156)
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "task_recovery.py", "bg_lint.py",
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
