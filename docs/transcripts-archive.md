@@ -304,8 +304,20 @@ only if the rescan registered it and its sha256 is unchanged. Any hit refuses th
 first (`egress_filter`): a chunk whose path or sidecar fails holds its file (`refused:egress`); a failing catalog
 manifest is withheld, and a JSONL index blob loses only its failing lines (`egress.catalog_withheld`, run not ok).
 A held file with nothing pushed gets no manifest. gitleaks is required: a missing binary refuses the run, and
-`TRANSCRIPTS_GITLEAKS=off` is honoured only against a local test remote. Residual: repo names are created before
-the gate from the pinned host label, not from source data.
+`TRANSCRIPTS_GITLEAKS=off` is honoured only against a local test remote.
+
+**One owner of "may this file leave" (PR #316 gate, F1/F2/F4/F5).** `entry_may_leave` answers it from the hold
+persisted on the entry in `state.json`, which covers every generation and every run. A hold, set anywhere, withdraws
+the file's staged chunks in **every** generation (`Run.withdraw`); `publish` withdraws anything still staged for a
+held file before shards are assigned and never groups one, and `push_group` refuses a group that holds one. A
+manifest dropped at the gate is kept in `state.json` (`catalog_withheld`), rebuilt by every later catalog commit and
+counted in `egress.catalog_withheld_manifests`; the run stays `held` until it passes. The gate records the git blob
+id of each outbox file as it reads it, and `publish_tree` writes only those bytes (a file changed after the check is
+a hash mismatch, nothing is pushed). `gh repo create` is the only other remote writer: it runs in `Remote.ensure`
+after the repo name passes the gate, and every `gh api` call is a read (a guard test checks both). A real-binary
+test (`RealGitleaksTest`) checks the pinned scanner accepts the exact flags, returns `[]` on clean input and maps
+line 1 and line N; it skips, and says so, where gitleaks is absent, and `TRANSCRIPTS_REQUIRE_GITLEAKS=1` makes that
+a failure.
 
 ### Hosts without gh (SSH push, e.g. t2-dev)
 

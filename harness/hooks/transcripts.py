@@ -427,6 +427,11 @@ class Remote:
     def ensure(self, repo):
         if self.exists(repo):
             return
+        # gate F5: creating a repo sends its name to GitHub, so the name passes the egress gate first. This and
+        # publish_tree are the only remote writers (the guard test lists every gh and git write site).
+        failures = egress_check(self.cfg, repo, 'refs/heads/main', {}, 'create repository')
+        if failures:
+            raise egress_refusal(failures)
         if not self.cfg.has_gh:
             what = 'catalog-repo-missing' if repo == CATALOG else 'shard-repo-missing'
             raise Refused('%s: %s; create with gh on an authenticated host (transcripts.py ensure-repos)'
@@ -651,7 +656,8 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
     The egress gate runs first, over the repo name, the ref, the message, every path and every blob; any hit
     refuses the whole commit before a tree is built (C11). This is the only function that runs commit-tree or
     push (a guard test lists every plumbing call site)."""
-    failures = egress_check(cfg, repo, 'refs/heads/main', files, message)
+    checked = {}
+    failures = egress_check(cfg, repo, 'refs/heads/main', files, message, checked)
     if failures:
         alert(cfg, 'egress-refused', '%d item(s) refused at the egress gate for %s' % (len(failures), sha12(repo)))
         raise egress_refusal(failures)
@@ -662,7 +668,8 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
             tip = tr.fetch_tip()
             write = {}
             for path, data in files.items():
-                blob = blob_of(data)
+                # an outbox file is identified by the oid of the bytes the gate read; hash-object must reproduce it
+                blob = blob_of(data) if isinstance(data, bytes) else checked[path]
                 have = tr.entries.get(path)
                 if have == blob:
                     continue
@@ -1087,11 +1094,13 @@ def _egress_items(repo, ref, files, message):
         yield 'path', path.encode('utf-8', 'surrogateescape')
 
 
-def egress_check(cfg, repo, ref, files, message):
+def egress_check(cfg, repo, ref, files, message, checked=None):
     """Scan everything a commit would publish. Returns [(where, kinds)] for each failing item; [] means clean.
 
     `where` is 'repo', 'ref', 'message', 'path:<sha12>' or 'blob:<sha12 of path>'. Bytes blobs and the names are
-    scanned in one batch per scanner, so a catalog of thousands of small files costs one gitleaks process."""
+    scanned in one batch per scanner, so a catalog of thousands of small files costs one gitleaks process.
+    `checked`, when given, receives {path: git blob oid} for each outbox file as read here, so the caller writes
+    exactly the bytes that were checked (gate F4: no second read between check and use)."""
     lines, owner = [], []  # one scanned line each; owner[i] = where it came from
     for where, b in _egress_items(repo, ref, files, message):
         b = b.replace(b'\n', b' ')
@@ -1112,11 +1121,15 @@ def egress_check(cfg, repo, ref, files, message):
         want = registered.get(os.path.abspath(data))
         try:
             with open(data, 'rb') as fh:
-                got = hashlib.sha256(fh.read()).hexdigest()
+                raw = fh.read()
+            got = hashlib.sha256(raw).hexdigest()
         except OSError:
-            got = None
+            raw = got = None
         if want is None or got != want:
             bad.setdefault(where, set()).add('unverified-blob')
+        elif checked is not None:
+            checked[path] = git_blob_sha(raw)
+        raw = None
     # pass 2 per item (it is a per-record verifier), gitleaks once over the batch (one process per commit)
     tr = redact_mod()
     start = 0
@@ -1283,6 +1296,14 @@ def begin_retry(e):
 def release(e):
     e['held'] = None
     e.pop('retry_of', None)
+
+
+def entry_may_leave(e):
+    """C11 (PR #316 gate F2): the one answer to "may this file's chunk bytes leave the host". The hold is persisted
+    in state.json on the entry and covers every generation, so a hold set by any run or generation stops them all.
+    publish consults it for every staged chunk, push_group refuses a group that breaks it, and catalog_files uses
+    it for manifests. A withheld manifest (st['catalog_withheld']) is the catalog side of the same rule."""
+    return not (e and e.get('held'))
 
 
 def held_summary(st):
@@ -1503,6 +1524,17 @@ class Run:
         e['stat'] = None
         e['fp'] = None
         self.whole.pop((self.key_of(e), g['gen']), None)
+
+    def withdraw(self, e, reason):
+        """Roll back every staged chunk of `e` in EVERY generation (gate F2: an older generation's staged chunks are
+        the same file's bytes). Returns the chunks withdrawn so callers can drop them from any ready set."""
+        gone = []
+        for g in e['gens']:
+            staged = [i for i, x in enumerate(g['chunks']) if x['status'] == 'staged']
+            if staged:
+                gone.extend(g['chunks'][staged[0]:])
+                self.rollback(e, g, staged[0], reason)
+        return gone
 
     def key_of(self, e):
         return '%s/%s' % (e['label'], e['relpath'])
@@ -1903,7 +1935,12 @@ class Run:
         if os.path.exists(cfg.p('killswitch.json')):
             self.status = 'killswitch'
             return
-        todo = [(key, e, g, c) for key, e, g, i, c in self.staged()]
+        # A held file never has a chunk published, whichever run or generation staged it (gate F2): anything still
+        # staged for one is withdrawn here, before shards are assigned.
+        for key, e in list(self.st['files'].items()):
+            if not entry_may_leave(e) and self.withdraw(e, 'held'):
+                self.mark_manifest(key)
+        todo = [(key, e, g, c) for key, e, g, i, c in self.staged() if entry_may_leave(e)]
         for key, e, g, c in todo:
             if not c.get('shard'):
                 c['shard'] = self.shard_for(c['month'], c['zbytes'])['repo']
@@ -1912,7 +1949,7 @@ class Run:
         for _, _, _, c in todo:
             if c['shard'] not in repos:
                 repos.append(c['shard'])
-        need_catalog = bool(todo) or bool(self.st.get('catalog_dirty')) or (
+        need_catalog = bool(todo) or bool(self.st.get('catalog_dirty')) or bool(self.st.get('catalog_withheld')) or (
             self.st.get('catalog_commit') is None and any(c['status'] == 'pushed' for *_, c in self.all_chunks()))
         if not todo and not need_catalog:
             return
@@ -1942,8 +1979,8 @@ class Run:
                         pending = []
                         break
                     key, e, g, c = pending.pop(0)
-                    if c['status'] != 'staged' or c not in g['chunks']:
-                        continue  # rolled back with an earlier chunk of the same file
+                    if c['status'] != 'staged' or c not in g['chunks'] or not entry_may_leave(e):
+                        continue  # rolled back with an earlier chunk of the same file, or the file is held
                     group.append((key, e, g, c, ready[id(c)]))
                     size += c['zbytes']
                 if group:
@@ -1965,13 +2002,10 @@ class Run:
             ok = self.reverify(key, e, g, g['chunks'].index(c), c)
             if ok is None:
                 failed.add(key)
-                if e.get('held'):
-                    # held: the chunks of this file already rescanned clean are withdrawn too
-                    for x in g['chunks']:
+                if not entry_may_leave(e):
+                    # held: every chunk of this file already rescanned clean is withdrawn too, in every generation
+                    for x in [x for gg in e['gens'] for x in gg['chunks']] + self.withdraw(e, 'held'):
                         ready.pop(id(x), None)
-                    staged = [i for i, x in enumerate(g['chunks']) if x['status'] == 'staged']
-                    if staged:
-                        self.rollback(e, g, staged[0], 'held')
                 continue
             ready[id(c)] = ok
         for key, e, g, c in todo:
@@ -1988,6 +2022,8 @@ class Run:
                     yield key, e, g, i, c
 
     def push_group(self, repo, group):
+        if any(not entry_may_leave(e) for _, e, _, _, _ in group):
+            raise Refused('internal: publish grouped a chunk of a held file')  # gate F2 invariant, not an assert
         files = {}
         for key, e, g, c, (zdata, meta_b) in group:
             files[c['path']] = zdata
@@ -1997,16 +2033,14 @@ class Run:
         if dropped:
             # a chunk whose path or sidecar cannot leave: hold its file locally, push the rest of the group
             gone = {w.split(':')[1] for w, _ in dropped}
-            bad = {}  # key -> (e, g, first index in this group)
+            bad = {}  # key -> e
             for key, e, g, c, _ in group:
                 if sha12(c['path']) in gone or sha12(c['path'] + '.meta.json') in gone:
-                    if key not in bad or g['chunks'].index(c) < bad[key][2]:
-                        bad[key] = (e, g, g['chunks'].index(c))
-            for key, (e, g, idx) in bad.items():
-                # the whole file is held back: every chunk of it in this group stays local
-                first = min([idx] + [g['chunks'].index(c) for k, _, gg, c, _ in group if k == key and gg is g])
-                self.rollback(e, g, first, 'egress')
+                    bad[key] = e
+            for key, e in bad.items():
+                # the whole file is held back: every staged chunk of it, in every generation, stays local
                 hold(self.cfg, e, 'refused:egress')
+                self.withdraw(e, 'egress')
                 alert(self.cfg, 'egress-held', 'file %s held: a chunk path or sidecar failed the egress gate'
                       % sha12(key))
                 self.mark_manifest(key)
@@ -2061,16 +2095,22 @@ class Run:
         if self.st.get('catalog_commit') is None:
             self.guard_lost_state(files)
         message = 'catalog update from %s' % cfg.host
+        offered = set(files)
         files, dropped = egress_filter(cfg, CATALOG, files, message)
         if dropped:
             # the entry stays local; its file is listed by path sha12 only, and nothing secret-shaped leaves
             self.catalog_withheld += len(dropped)
             alert(cfg, 'catalog-withheld', '%d catalog item(s) withheld at the egress gate' % len(dropped))
             self.notes.append('catalog items withheld at the egress gate: %d' % len(dropped))
+        mkeys = {manifest_path(cfg, k): k for k in manifest_keys(self.st)}
+        withheld = sorted({k for p, k in mkeys.items() if p in offered and p not in files})
         commit, _, _ = publish_tree(cfg, CATALOG, files, message, deadline=self.deadline, overwrite=True)
         crash_point(cfg, 'after_catalog_push')
         self.st['catalog_dirty'] = False
         self.st['manifest_dirty'] = []
+        # gate F1: a withheld manifest is persisted, retried by every later catalog commit and keeps the status off
+        # ok until it passes the gate; it is never dropped by clearing manifest_dirty
+        self.st['catalog_withheld'] = withheld
         if commit:
             self.st['catalog_commit'] = commit
             self.catalog_commit = commit
@@ -2105,6 +2145,19 @@ class Run:
         return None
 
 
+def manifest_path(cfg, key):
+    label, _, rel = key.partition('/')
+    return 'manifests/%s/%s/%s.json' % (cfg.host, safe_comp(label), '/'.join(safe_comp(p) for p in rel.split('/')))
+
+
+def manifest_keys(st):
+    """The manifests a catalog commit rebuilds: every file before the first commit, then the dirty ones plus every
+    manifest an earlier run withheld at the egress gate (gate F1: a withheld manifest is retried until it passes)."""
+    if not st.get('catalog_commit'):
+        return list(st['files'].keys()) + [k for k in st['manifest_dirty'] if k not in st['files']]
+    return list(dict.fromkeys(list(st['manifest_dirty']) + list(st.get('catalog_withheld') or [])))
+
+
 def catalog_files(cfg, st, _unused=None):
     files = {}
     try:
@@ -2114,23 +2167,18 @@ def catalog_files(cfg, st, _unused=None):
         raise Refused('catalog README source missing (install harness/hooks/transcripts_catalog_README.md beside transcripts.py)')
     files['shards/%s.json' % cfg.host] = jdump({'schema': SCHEMA, 'host': cfg.host, 'shards': st['shards']}) + b'\n'
     files['index/%s.jsonl' % cfg.host] = b''.join(jdump(r) + b'\n' for r in index_rows(cfg, st))
-    for key in st['manifest_dirty'] if st.get('catalog_commit') else list(st['files'].keys()):
+    for key in manifest_keys(st):
         e = st['files'].get(key)
-        label, _, rel = key.partition('/')
-        mpath = 'manifests/%s/%s/%s.json' % (cfg.host, safe_comp(label), '/'.join(safe_comp(p) for p in rel.split('/')))
-        if e is None:
-            continue
-        if e.get('held') and not any(c['status'] == 'pushed' for g in e['gens'] for c in g['chunks']):
-            continue  # C11: a held file with nothing archived gets no manifest; its hold shows locally only
-        files[mpath] = jdump(manifest_of(cfg, key, e)) + b'\n'
-    for key in st['manifest_dirty']:
-        e = st['files'].get(key)
+        mpath = manifest_path(cfg, key)
         if e is None:  # moved away: leave a pointer manifest
             label, _, rel = key.partition('/')
-            mpath = 'manifests/%s/%s/%s.json' % (cfg.host, safe_comp(label), '/'.join(safe_comp(p) for p in rel.split('/')))
             dest = next((k for k, v in st['files'].items() if v.get('moved_from') == key), None)
             files[mpath] = jdump({'schema': SCHEMA, 'host': cfg.host, 'source': label, 'relpath': rel,
                                   'moved_to': dest}) + b'\n'
+            continue
+        if not entry_may_leave(e) and not any(c['status'] == 'pushed' for g in e['gens'] for c in g['chunks']):
+            continue  # C11: a held file with nothing archived gets no manifest; its hold shows locally only
+        files[mpath] = jdump(manifest_of(cfg, key, e)) + b'\n'
     return files
 
 
@@ -2273,6 +2321,7 @@ def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
         'egress': {'egress_held_files': run.egress_held if run else 0,
                    'scanner_held_files': run.scanner_held if run else 0,
                    'catalog_withheld': run.catalog_withheld if run else 0,
+                   'catalog_withheld_manifests': len(st.get('catalog_withheld') or []),
                    'scanner': 'gitleaks %s + pass 2' % GITLEAKS_VERSION},
         'last_progress_at': st.get('last_progress_at') or st.get('created_at'),
         'killswitch': os.path.exists(cfg.p('killswitch.json')), 'notes': run.notes if run else [],
@@ -2428,7 +2477,7 @@ def sync_body(run, backfill):
         run.status = 'failed'
     for e in run.st['files'].values():
         e.pop('retry_of', None)  # a retry that ended without a new hold released the file
-    if run.catalog_withheld and run.status == 'ok':
+    if (run.catalog_withheld or run.st.get('catalog_withheld')) and run.status == 'ok':
         run.status = 'held'
     held = held_summary(run.st)
     if held['count'] and run.status == 'ok':
