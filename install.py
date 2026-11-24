@@ -158,8 +158,34 @@ def kill_guard_group(claude: Path) -> dict:
         "timeout": 30, "onFailure": "block"}]}
 
 
+CHECKOUT_REGISTRY_OPT_IN = Path(".agent-harness") / "state" / "checkouts" / "enabled.json"
+
+
+def checkout_registry_enabled(claude: Path) -> bool:
+    """The checkout registry's opt-in, read exactly as checkout_registry.enabled() reads it: a private regular file
+    (ours, no group or other bits, not a link, at most 4 KiB) holding a JSON object whose "enabled" is literally true.
+    The user writes it; until then the registry hooks are not wired and nothing treats a row as ownership."""
+    path = claude.parent / CHECKOUT_REGISTRY_OPT_IN
+    try:
+        folder = os.lstat(path.parent)
+        if not stat.S_ISDIR(folder.st_mode) or folder.st_uid != os.getuid() or folder.st_mode & 0o022:
+            return False
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_size > 4096:
+                return False
+            data = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        value = json.loads(data.decode("utf-8")) if len(data) <= 4096 else None
+        return isinstance(value, dict) and value.get("enabled") is True
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+
+
 def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True,
-                  log_backup: bool = True) -> dict[str, list[dict]]:
+                  log_backup: bool = True, checkout_registry: "bool | None" = None) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -327,6 +353,11 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # creates, written only from paired Pre/Post hook payloads; SubagentStop tells the parent what is still held.
     # Never blocks, never prints; fails open, so no onFailure. Each timeout is above the hook's own budget (git calls
     # 5 s each, the stop verdict 15 s in all); no hook starts an ssh (remote rows are a later PR).
+    # OPT-IN (PR 344 review F2): wired only when the user has turned the registry on (checkout_registry_enabled).
+    if checkout_registry is None:
+        checkout_registry = checkout_registry_enabled(claude)
+    if not checkout_registry:
+        return managed
     registry = str(claude / "hooks" / "checkout_registry.py")
 
     def registry_hook(event, timeout):

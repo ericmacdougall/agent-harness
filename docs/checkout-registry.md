@@ -5,6 +5,29 @@ Stream B's owner removal uses these rows to decide what an agent may delete as i
 too. The rule is simple: a missing row is safe, but a wrong row deletes someone's work. So a row is written only when a
 hook watched the checkout being born during that agent's own tool call.
 
+## Off until the user turns it on
+
+The registry is opt-in. Until `~/.agent-harness/state/checkouts/enabled.json` holds `{"enabled": true}` (a private file
+the user writes: mode 0600, in the 0700 state folder, not a link):
+
+- `install.py` does not wire its hooks, and `doctor.py` reports their manifest rows (status `opt_in`) as `OFF`, not
+  `MISSING`;
+- `held()` returns None for every identity, so no removal route can treat a row as ownership;
+- no verdict says "owner may remove"; every stop note says "keep: checkout registry opt-in is off".
+
+Recording needs no opt-in: hooks wired by hand, or by the live kit's `--settings`, still write rows, because a row alone
+lets nothing be removed. Turn it on only after the live check `ac7-bash-clone-live` has passed at the installed commit
+and is recorded as REALLY_TESTED:
+
+```
+mkdir -p -m 700 ~/.agent-harness/state/checkouts
+printf '{"enabled": true}\n' > ~/.agent-harness/state/checkouts/enabled.json
+chmod 600 ~/.agent-harness/state/checkouts/enabled.json
+python3 install.py --apply          # wires the hooks
+```
+
+To turn it off again, remove that file and run `install.py --apply`.
+
 ## What gets a row
 
 - **Clones and worktrees.** A `git clone URL DIR` or `git [-C REPO] worktree add PATH` that a Claude agent runs through Bash
@@ -32,8 +55,16 @@ Each row goes in `~/.agent-harness/state/checkouts/local.jsonl`:
   `append_removed(identity, by, route)`. A path seen gone is retired with route `observed-absent` (see Retirement).
 - **Signing.** `mac(row)` and `verify(row)` are the only signing functions. The key is
   `state/checkouts/registry.key`: 32 random bytes, mode 0600, created once.
-- **Ownership check.** `held(identity)` is the only one. It reads the host's own file. It returns None when two created
-  rows name one identity, and when the file is over 64 MB (ownership is never judged from part of the file).
+- **Ownership check.** `held(identity)` is the only one. Every read of ownership (held, the writer's duplicate check,
+  retirement, the stop note and `list`) goes through one function, `current()`. `held()` returns None for each clause of
+  contract 4, listed in `CONTRACT_4` and each covered by a test and a mutant:
+  - the opt-in is off;
+  - the host is unknown;
+  - the state folder is not on a local filesystem;
+  - there is no safe key;
+  - the file is over 64 MB, checked on the open file and again while reading, so it is never judged from a part;
+  - two or more created rows name the identity, whoever wrote them;
+  - a removed row, or a retirement, came after the created row.
 - **Kill switch.** Replacing the key voids every row.
 
 ## How a Bash row is proven
@@ -56,6 +87,11 @@ The command text only proposes a path. The row needs all of the following, as ob
    out a checkout or a `.git` moved in with `mv`, and an object dated in the future.
 6. For a clone, `remote.origin.url` is the command's URL. For a worktree, it is linked and has the named repo's common
    dir.
+7. The call's own output shows its git creating that path: `Cloning into 'DIR'...` naming the same folder for a clone,
+   `Preparing worktree` for a worktree, and no git `already exists` error for that path. This is a fact only this call's
+   git could have produced: if another process made a checkout at the path during the call, this call's git failed with
+   `already exists` and there is no row (`git-failed-here`). Output that was hidden (`-q`, `--quiet`, `>/dev/null 2>&1`)
+   gives no row either (`no-own-output`). `2>&1 | tail -3` and `>/dev/null` keep git's messages, which go to stderr.
 
 The lock is `state/checkouts/registry.lock`. Waits stop after 2 s with `lock-timeout`, and a state folder that is not on
 a local filesystem gets no rows.
@@ -87,7 +123,7 @@ The codes are:
 | Stage | Codes |
 |---|---|
 | PreToolUse | `existed-at-pre`, `unreadable-at-pre`, `repo-unknown`, `contested`, `lock-timeout`, `no-mark`, `unsure` |
-| PostToolUse | `pending-missing`, `pending-bad-mac`, `pending-foreign`, `pending-expired`, `transcript-unbound`, `no-mark`, `not-made`, `link`, `not-a-checkout`, `outside-home`, `realpath-moved`, `anchor-changed`, `other-fs`, `not-linked`, `repo-mismatch`, `no-btime`, `born-outside-call`, `origin-mismatch`, `state-not-local`, `no-generation`, `lock-timeout`, `ledger-too-large`, `second-owner`, `already-held`, `contested-identity` |
+| PostToolUse | `pending-missing`, `pending-bad-mac`, `pending-foreign`, `pending-expired`, `transcript-unbound`, `no-mark`, `git-failed-here`, `no-own-output`, `not-made`, `link`, `not-a-checkout`, `outside-home`, `realpath-moved`, `anchor-changed`, `other-fs`, `not-linked`, `repo-mismatch`, `no-btime`, `born-outside-call`, `origin-mismatch`, `state-not-local`, `no-key`, `no-generation`, `lock-timeout`, `ledger-too-large`, `second-owner`, `already-held`, `contested-identity` |
 | Other | `background`, `permission-denied`, `observed-absent`, `hook-error` |
 | Isolation | `iso-not-checkout`, `iso-not-listed`, `iso-no-transcript`, `iso-window` |
 
@@ -115,16 +151,22 @@ note. For each checkout the agent still holds, the note lists:
 - the repo's stash count;
 - any checkouts nested under its path.
 
-It also gives a verdict. "owner may remove" is given only to the agent's own isolation worktree when all of these hold:
+It also gives a verdict. One function, `may_remove(evidence)`, produces it, and the default is keep. "owner may remove"
+is given only when every item of `REMOVE_EVIDENCE` was observed as true; an item that is false, unknown or missing keeps
+the checkout and is named in "keep: reasons". The items:
 
-- nothing is changed, staged or untracked;
-- nothing is unpushed or stashed, and nothing is nested;
+- the opt-in is on;
+- it is the agent's own isolation worktree (a clone or a Bash worktree is never a removal candidate);
 - the repo configures no program;
+- no index entry is skip-worktree or assume-unchanged (`ls-files -v`), since `diff-files` does not see edits to those;
+- nothing is changed, staged or untracked;
 - its ignored content is all regenerable: `node_modules` beside a `package.json`, a virtualenv (a folder with
-  `pyvenv.cfg`), `__pycache__` and `*.pyc`.
+  `pyvenv.cfg`), `__pycache__` and `*.pyc`;
+- nothing is unpushed or stashed;
+- nothing is nested, and the nested scan finished;
+- the verdict finished within its time budget.
 
-Everything else gets "keep: reasons". Ignored files such as `.env.local`, data or build output may be someone's only copy,
-so they always mean keep.
+Ignored files such as `.env.local`, data or build output may be someone's only copy, so they always mean keep.
 
 The hook removes nothing, and a resumed agent keeps its worktree.
 

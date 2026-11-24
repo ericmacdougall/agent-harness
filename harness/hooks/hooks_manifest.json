@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
+ "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED; opt_in = wired only after the user's opt-in, reported OFF until then and never required. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
  "hooks": [
   {
    "id": "wal:session",
@@ -1008,7 +1008,7 @@
    "flavors": [
     "claude"
    ],
-   "status": "installed",
+   "status": "opt_in",
    "rules": []
   },
   {
@@ -1022,7 +1022,7 @@
    "flavors": [
     "claude"
    ],
-   "status": "installed",
+   "status": "opt_in",
    "rules": []
   },
   {
@@ -1036,7 +1036,7 @@
    "flavors": [
     "claude"
    ],
-   "status": "installed",
+   "status": "opt_in",
    "rules": []
   },
   {
@@ -1050,7 +1050,7 @@
    "flavors": [
     "claude"
    ],
-   "status": "installed",
+   "status": "opt_in",
    "rules": []
   },
   {
@@ -1062,7 +1062,7 @@
    "flavors": [
     "claude"
    ],
-   "status": "installed",
+   "status": "opt_in",
    "rules": []
   },
   {
@@ -1074,7 +1074,7 @@
    "flavors": [
     "claude"
    ],
-   "status": "installed",
+   "status": "opt_in",
    "rules": []
   },
   {

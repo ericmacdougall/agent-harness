@@ -29,6 +29,7 @@ MANIFEST = HERE / "hooks_manifest.json"
 RULES = HERE / "rules.json"
 
 WIRED, MISSING, SCRIPT_MISSING, PENDING, CANARY_FAIL = "WIRED", "MISSING", "SCRIPT_MISSING", "PENDING", "CANARY_FAIL"
+OFF = "OFF"     # status opt_in: wired only after the user's opt-in (checkout registry, goodqa#16947); not required
 
 
 MAX_JSON_BYTES = 4_000_000
@@ -139,8 +140,9 @@ def check_hooks(manifest: dict, flavor: str, live: dict, hooks_dir: Path, canary
                                                 row.get("tools", []), hooks_dir)
         script = hooks_dir / row["script"]
         if found is None:
-            state = PENDING if row["status"] == "pending" else MISSING
-            detail = "disableAllHooks is true in this settings file" if disabled else "not in live hooks (or wired to another path/interpreter)"
+            state = {"pending": PENDING, "opt_in": OFF}.get(row["status"], MISSING)
+            detail = "disableAllHooks is true in this settings file" if disabled else (
+                "opt-in hook, not enabled" if state == OFF else "not in live hooks (or wired to another path/interpreter)")
         elif not (exists(row["script"]) if exists else script.exists()):
             state, detail = SCRIPT_MISSING, f"wired but {script} does not exist (hook would exit 0 silently)"
         else:

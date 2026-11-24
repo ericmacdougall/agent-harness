@@ -34,6 +34,12 @@ def sh(*a, cwd=None):
     return subprocess.run(a, cwd=cwd, check=True, capture_output=True, env=ENV, text=True).stdout
 
 
+def git_out(*a, cwd=None):
+    """Run git as a Bash call would, and return everything it printed (stderr then stdout)."""
+    r = subprocess.run(a, cwd=cwd, check=True, capture_output=True, env=ENV, text=True)
+    return r.stderr + r.stdout
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.home = os.path.realpath(tempfile.mkdtemp(prefix="registry-home-"))
@@ -54,6 +60,21 @@ class Base(unittest.TestCase):
         sh("git", "push", "-q", "origin", "main", cwd=self.src)
         self.proj = os.path.join(self.home, ".claude", "projects", "-tmp-proj")
         self.n = 0
+        self.out = ""                       # what the last real git call printed (see clone)
+        self.opt_in(True)
+
+    def opt_in(self, on: bool):
+        """The user's opt-in file (default off; every test except the Default class runs with it on)."""
+        d = os.path.join(self.home, ".agent-harness", "state", "checkouts")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        p = os.path.join(d, "enabled.json")
+        if on:
+            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.write(fd, b'{"enabled": true}\n')
+            os.close(fd)
+        elif os.path.exists(p):
+            os.remove(p)
 
     # transcripts ---------------------------------------------------------------------------------------------
     def main_transcript(self, session="s1"):
@@ -87,25 +108,49 @@ class Base(unittest.TestCase):
     def payload(self, cmd, tid, session="s1", agent="a1", cwd=None, tool="Bash", transcript=None):
         return {"session_id": session, "agent_id": agent, "tool_name": tool, "tool_use_id": tid,
                 "cwd": cwd or self.home, "tool_input": {"command": cmd},
-                "transcript_path": transcript or self.main_transcript(session)}
+                "transcript_path": transcript or self.main_transcript(session),
+                "tool_response": {"stdout": "", "stderr": self.out, "interrupted": False}}
 
-    def bash(self, cmd, action, session="s1", agent="a1", cwd=None, record=True, post_payload=None):
-        """Transcript, PreToolUse, the command's real effect, PostToolUse: what Claude Code does for one call."""
+    def bash(self, cmd, action, session="s1", agent="a1", cwd=None, record=True, post_payload=None, shown=True,
+             output=None):
+        """Transcript, PreToolUse, the command's real effect, PostToolUse: what Claude Code does for one call. The
+        Post payload's tool_response carries what the action's real git printed (shown=False: the command hid it;
+        output=TEXT: what git printed when the action stands in for something git did not do itself)."""
         tid = self.tid()
         if record:
             self.record(tid, cmd, session, agent)
         R.pretool(self.payload(cmd, tid, session, agent, cwd))
-        if action:
-            action()
-        rows = R.posttool(post_payload(tid) if post_payload else self.payload(cmd, tid, session, agent, cwd))
+        out = action() if action else ""
+        if isinstance(out, (tuple, list)):          # lambda: (side_effect(), self.clone(d)())
+            out = next((x for x in reversed(out) if isinstance(x, str)), "")
+        if output is not None:
+            out = output
+        if post_payload:
+            post = post_payload(tid)
+        else:
+            post = self.payload(cmd, tid, session, agent, cwd)
+            post["tool_response"] = {"stdout": "", "stderr": out if shown and isinstance(out, str) else "",
+                                     "interrupted": False}
+        rows = R.posttool(post)
         self.last_tid = tid
         return rows
 
     def clone(self, dest, src=None):
-        return lambda: sh("git", "clone", "-q", src or self.src, dest)
+        """A real `git clone` (not quiet), returning what git printed; payload() then carries it as the call's
+        output, as Claude Code's Post payload does."""
+        def run():
+            self.out = git_out("git", "clone", src or self.src, dest)
+            return self.out
+        return run
+
+    def wt_add(self, repo, path, *extra):
+        return lambda: git_out("git", "-C", repo, "worktree", "add", path, *extra)
 
     def held(self):
-        return list(R.current().values())
+        try:
+            return list(R.current().values())
+        except R.NotHeld:
+            return []
 
     def codes(self, tid=None):
         p = Path(self.home) / ".agent-harness/state/checkouts/decisions.jsonl"
@@ -144,8 +189,8 @@ class Writer(Base):
 
     def test_worktree_add_gets_one_row(self):
         wt = os.path.join(self.home, "wt", "one")
-        row = self.assert_one(self.bash("git -C %s worktree add %s -b feat >/dev/null 2>&1" % (self.src, wt),
-                                        lambda: sh("git", "-C", self.src, "worktree", "add", "-q", wt, "-b", "feat")))
+        row = self.assert_one(self.bash("git -C %s worktree add %s -b feat >/dev/null" % (self.src, wt),
+                                        self.wt_add(self.src, wt, "-b", "feat")))
         self.assertEqual((row["kind"], row["path"]), ("worktree", wt))
         self.assertEqual(row["common_dir"], os.path.join(self.src, ".git"))
 
@@ -160,8 +205,8 @@ class Writer(Base):
         tid = self.tid()
         self.record(tid, cmd)
         R.pretool(self.payload(cmd, tid))
-        self.clone(dest)()
-        R.hook("posttool-failure", io.StringIO(json.dumps(self.payload(cmd, tid))))
+        out = self.clone(dest)()
+        R.hook("posttool-failure", io.StringIO(json.dumps(dict(self.payload(cmd, tid), error=out + "Exit code 1"))))
         self.assertEqual([r["path"] for r in self.held()], [dest])
 
     # NEG-1
@@ -184,7 +229,8 @@ class Writer(Base):
         time.sleep(0.05)
         q = os.path.join(self.home, "q")
         self.assert_refused("born-outside-call", self.bash("git clone %s %s || mv %s %s" % (self.src, q, old, q),
-                                                           lambda: os.rename(old, q)))
+                                                           lambda: os.rename(old, q),
+                                                           output="Cloning into '%s'...\nfatal: early EOF\n" % q))
         old2 = os.path.join(self.home, "older")                 # a new folder, but the .git inside it is moved in
         self.clone(old2)()
         time.sleep(0.05)
@@ -194,13 +240,15 @@ class Writer(Base):
             os.makedirs(r)
             os.rename(os.path.join(old2, ".git"), os.path.join(r, ".git"))
         self.assert_refused("born-outside-call", self.bash("git clone %s %s || true" % (self.src, r),
-                                                           new_folder_old_git))
+                                                           new_folder_old_git,
+                                                           output="Cloning into '%s'...\nfatal: early EOF\n" % r))
         x = os.path.join(self.home, "x")
+        prep = "Preparing worktree (new branch 'x')\nfatal: could not create leading directories\n"
         self.assert_refused("not-a-checkout", self.bash("git -C %s worktree add %s || true" % (self.src, x),
-                                                        lambda: os.makedirs(x)))
+                                                        lambda: os.makedirs(x), output=prep))
         y = os.path.join(self.home, "y")
         self.assert_refused("not-linked", self.bash("git -C %s worktree add %s || true" % (self.src, y),
-                                                    self.clone(y)))
+                                                    self.clone(y), output=prep))
         self.assertEqual(len(self.held()), 1)
 
     # NEG-16
@@ -251,7 +299,8 @@ class Writer(Base):
         def make_link():
             self.clone(other)()
             os.symlink(other, link)
-        self.assert_refused("link", self.bash("git clone %s %s" % (self.src, link), make_link))
+        self.assert_refused("link", self.bash("git clone %s %s" % (self.src, link), make_link,
+                                              output="Cloning into '%s'...\ndone.\n" % link))
         outside = os.path.realpath(tempfile.mkdtemp(prefix="registry-outside-"))
         self.addCleanup(shutil.rmtree, outside, True)
         dest = os.path.join(outside, "c")
@@ -266,7 +315,7 @@ class Writer(Base):
         def swap_then_clone():
             os.rename(parent, parent + "-old")
             os.makedirs(parent)
-            self.clone(dest)()
+            return self.clone(dest)()
         self.assert_refused("anchor-changed", self.bash("git clone %s %s" % (self.src, dest), swap_then_clone))
 
     def test_link_repointed_during_the_call_gets_no_row(self):
@@ -280,7 +329,7 @@ class Writer(Base):
         def repoint_then_clone():
             os.unlink(lnk)
             os.symlink(b, lnk)
-            self.clone(os.path.join(lnk, "c"))()
+            return self.clone(os.path.join(lnk, "c"))()
         self.assert_refused("realpath-moved", self.bash("git clone %s %s/c" % (self.src, lnk), repoint_then_clone))
 
     # NEG-5
@@ -328,13 +377,14 @@ class Writer(Base):
         wt = os.path.join(self.home, "wt-other")
         self.assert_refused("repo-mismatch", self.bash(
             "git -C %s worktree add %s -b z" % (self.src, wt),
-            lambda: sh("git", "-C", other_src, "worktree", "add", "-q", wt, "-b", "z")))
+            self.wt_add(other_src, wt, "-b", "z")))
         url = "https://example.invalid/o/r.git"
         e = os.path.join(self.home, "e")
 
         def fake_remote_clone():
-            self.clone(e)()
+            out = self.clone(e)()
             sh("git", "-C", e, "remote", "set-url", "origin", url)
+            return out
         self.assert_one(self.bash("git clone %s %s" % (url, e), fake_remote_clone))
 
     # NEG-16
@@ -406,7 +456,7 @@ class Ownership(Base):
 
         def mkdir_then_clone():                             # probe on t2-dev: this pattern reuses the inode 10 of 10
             os.mkdir(dest)
-            self.clone(dest)()
+            return self.clone(dest)()
         old = self.assert_one(self.bash("mkdir %s && git clone %s %s" % (dest, self.src, dest), mkdir_then_clone))
         reused, tries = False, 0
         while not reused and tries < 20:                    # recreated with no hook (user, Codex, a script)
@@ -675,7 +725,7 @@ class Ownership(Base):
         p = self.payload(cmd, tid, transcript=self.sub_transcript())
         R.pretool(p)
         self.clone(dest)()
-        self.assertEqual(len(R.posttool(p)), 1)
+        self.assertEqual(len(R.posttool(self.payload(cmd, tid, transcript=self.sub_transcript()))), 1)
 
 
 class Integrity(Base):
@@ -741,7 +791,7 @@ class Integrity(Base):
     # NEG-12
     def test_unsafe_state_dir_or_key_writes_nothing(self):
         state = Path(self.home) / ".agent-harness/state/checkouts"
-        state.mkdir(parents=True)
+        state.mkdir(parents=True, exist_ok=True)
         os.chmod(state, 0o770)
         d0 = os.path.join(self.home, "d0")
         self.assertEqual(self.bash("git clone %s %s" % (self.src, d0), self.clone(d0)), [])
@@ -890,8 +940,10 @@ class LivePayloads(Base):
         self.main_transcript(session)
         self.record(tid, cmd, session, agent if record_in is None else record_in)
         R.pretool(p)
-        self.clone(dest)()
-        return R.posttool(dict(p, hook_event_name="PostToolUse", tool_response={"stdout": "", "stderr": ""}))
+        out = self.clone(dest)()
+        return R.posttool(dict(p, hook_event_name="PostToolUse",
+                               tool_response={"interrupted": False, "isImage": False, "noOutputExpected": False,
+                                              "stderr": out, "stdout": ""}))
 
     def test_the_live_subagent_payload_points_at_the_main_transcript(self):
         """The live fact the binding depends on: a subagent's Bash payload names the SESSION transcript, and the
@@ -928,6 +980,196 @@ class LivePayloads(Base):
         self.assertEqual([(r["kind"], r["agent"]) for r in self.held()], [("isolation", "a15")])
         note = R.subagent_stop(self.localize(self.fix["subagent_stop"]))
         self.assertIn("owner may remove", note.read_text())
+
+
+class ContractFour(Base):
+    """PR 344 review F1, F4, F5b: every clause of contract 4 makes held() None, through the one read path current().
+    The table must name exactly R.CONTRACT_4, so a clause added to the module without a test here fails."""
+
+    def row(self, name="c4"):
+        d = os.path.join(self.home, name)
+        return self.assert_one(self.bash("git clone %s %s" % (self.src, d), self.clone(d)))
+
+    def clauses(self, row):
+        key = R.read_key()
+
+        def second_created_same_owner():
+            with R._locked():
+                R._append({k: v for k, v in row.items() if k != "mac"}, key)
+
+        def retired():
+            shutil.rmtree(row["path"])
+            self.assertEqual(R.retire_absent(row["path"], key), 1)
+        return {
+            "removed-row": (lambda: self.assertIsNotNone(R.append_removed(row, "test", "route")), None, None),
+            "retired": (retired, None, None),
+            "opt-in-off": (lambda: self.opt_in(False), lambda: self.opt_in(True), None),
+            "unknown-host": (None, None, dict(row, host="t2-dev")),
+            "state-not-local": (lambda: setattr(self, "_p", mock.patch.object(R, "state_is_local", return_value=False))
+                                or self._p.start(), lambda: self._p.stop(), None),
+            "no-key": (lambda: os.rename(self.keyp, self.keyp + ".off"), lambda: os.rename(self.keyp + ".off", self.keyp),
+                       None),
+            "ledger-too-large": (lambda: setattr(self, "_m", mock.patch.object(R, "MAX_FILE", 10)) or self._m.start(),
+                                 lambda: self._m.stop(), None),
+            "two-created-rows": (second_created_same_owner, None, None),
+        }
+
+    def test_every_clause_makes_held_none(self):
+        self.keyp = str(Path(self.home) / ".agent-harness/state/checkouts/registry.key")
+        self.assertEqual(set(self.clauses({})), set(R.CONTRACT_4), "a contract-4 clause has no test, or a test no clause")
+        for name in R.CONTRACT_4:
+            row = self.row(name)                          # a fresh checkout per clause, so no clause hides another
+            setup, undo, ident = self.clauses(row)[name]
+            with self.subTest(clause=name):
+                self.assertEqual(R.held(row), row, "positive control before %s" % name)
+                if setup:
+                    setup()
+                try:
+                    self.assertIsNone(R.held(ident or row))
+                    if name in ("unknown-host", "state-not-local", "no-key", "ledger-too-large"):
+                        with self.assertRaises(R.NotHeld) as cm:     # the whole ledger is unusable
+                            R.current((ident or row)["host"])
+                        self.assertEqual(cm.exception.clause, name)
+                    elif name != "opt-in-off":                        # this identity has no single owner
+                        self.assertNotIn(R.identity(row), R.current())
+                finally:
+                    if undo:
+                        undo()
+
+    def test_a_ledger_that_grows_during_the_read_is_refused_not_read_in_part(self):
+        p = Path(self.home) / ".agent-harness/state/checkouts/big"
+        fd = os.open(str(p), os.O_WRONLY | os.O_CREAT, 0o600)
+        os.write(fd, b"x" * 100)
+        os.close(fd)
+        self.assertEqual(R._read_secure(p, 100), b"x" * 100, "positive control: at the bound it is read whole")
+        with self.assertRaises(R.TooLarge):
+            R._read_secure(p, 99)
+        real_fstat = os.fstat
+
+        def small_fstat(fd):                             # the size check sees the old size; the read sees growth
+            st = real_fstat(fd)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid, 50,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+        with mock.patch.object(R.os, "fstat", small_fstat), self.assertRaises(R.TooLarge):
+            R._read_secure(p, 99)
+
+
+class OptInDefault(Base):
+    """PR 344 review F2: off by default. Rows may be recorded, but nothing treats them as ownership, and no verdict
+    says "owner may remove"."""
+
+    def test_off_means_no_owner_and_no_remove_verdict(self):
+        self.opt_in(False)
+        self.assertFalse(R.enabled())
+        iso = os.path.join(self.src, ".claude", "worktrees", "agent-a1")
+        sh("git", "-C", self.src, "worktree", "add", "-q", "--detach", iso, "origin/main")
+        self.sub_transcript("s1", "a1")
+        row = R.subagent_start({"session_id": "s1", "agent_id": "a1", "cwd": iso})
+        self.assertIsNotNone(row, "recording needs no opt-in")
+        self.assertIsNone(R.held(row))
+        text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
+        self.assertNotIn("owner may remove", text)
+        self.assertIn("checkout registry opt-in is off", text)
+        self.opt_in(True)                                 # positive control: the same clean worktree
+        self.assertEqual(R.held(row), row)
+        self.assertIn("owner may remove", R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text())
+
+    def test_only_a_private_literal_true_turns_it_on(self):
+        p = Path(self.home) / ".agent-harness/state/checkouts/enabled.json"
+        for body, mode, want in ((b'{"enabled": true}', 0o600, True), (b'{"enabled": "true"}', 0o600, False),
+                                 (b'{"enabled": 1}', 0o600, False), (b"true", 0o600, False),
+                                 (b'{"enabled": true}', 0o644, False), (b"{" + b" " * 5000 + b"}", 0o600, False)):
+            p.write_bytes(body)
+            os.chmod(p, mode)
+            with self.subTest(body=body[:30], mode=oct(mode)):
+                self.assertIs(R.enabled(), want)
+                import install  # noqa: PLC0415
+                self.assertIs(install.checkout_registry_enabled(Path(self.home) / ".claude"), want,
+                              "install.py and the registry read the opt-in the same way")
+
+
+class RemoveVerdict(Base):
+    """PR 344 review F2 and F5a: one choke point, may_remove(), produces the remove wording, and only when every
+    REMOVE_EVIDENCE item is literally True."""
+
+    def test_every_evidence_item_alone_keeps(self):
+        names = [n for n, _ in R.REMOVE_EVIDENCE]
+        self.assertEqual(R.may_remove({n: True for n in names}), "owner may remove", "positive control")
+        for name, why in R.REMOVE_EVIDENCE:
+            for bad in (False, None, "yes", 1):
+                with self.subTest(item=name, value=bad):
+                    ev = {n: True for n in names}
+                    ev[name] = bad
+                    self.assertEqual(R.may_remove(ev), "keep: " + why)
+            ev = {n: True for n in names if n != name}
+            self.assertEqual(R.may_remove(ev), "keep: " + why, "a missing item keeps")
+
+    def test_the_verdict_gathers_exactly_the_listed_evidence(self):
+        iso = os.path.join(self.src, ".claude", "worktrees", "agent-a1")
+        sh("git", "-C", self.src, "worktree", "add", "-q", "--detach", iso, "origin/main")
+        self.sub_transcript("s1", "a1")
+        row = R.subagent_start({"session_id": "s1", "agent_id": "a1", "cwd": iso})
+        seen = []
+        real = R.may_remove
+        with mock.patch.object(R, "may_remove", side_effect=lambda ev: seen.append(dict(ev)) or real(ev)):
+            self.assertEqual(R.verdict(row, time.monotonic() + 15)["verdict"], "owner may remove")
+        self.assertEqual(set(seen[0]), {n for n, _ in R.REMOVE_EVIDENCE})
+
+    def test_skip_worktree_or_assume_unchanged_edits_keep(self):
+        iso = os.path.join(self.src, ".claude", "worktrees", "agent-a1")
+        sh("git", "-C", self.src, "worktree", "add", "-q", "--detach", iso, "origin/main")
+        self.sub_transcript("s1", "a1")
+        row = R.subagent_start({"session_id": "s1", "agent_id": "a1", "cwd": iso})
+        self.assertEqual(R.verdict(row, time.monotonic() + 15)["verdict"], "owner may remove", "positive control")
+        for flag in ("--skip-worktree", "--assume-unchanged"):
+            with self.subTest(flag=flag):
+                sh("git", "-C", iso, "update-index", flag, "f.txt")
+                Path(iso, "f.txt").write_text("hidden edit\n")
+                v = R.verdict(row, time.monotonic() + 15)
+                self.assertEqual(v.get("changed"), 0, "diff-files really does not see it")
+                self.assertIn("skip-worktree or assume-unchanged", v["verdict"])
+                sh("git", "-C", iso, "update-index", flag.replace("--", "--no-"), "f.txt")
+                sh("git", "-C", iso, "checkout", "-q", "--", "f.txt")
+
+
+class OwnOutput(Base):
+    """PR 344 review F3: the row needs this call's own git output creating the path."""
+
+    def test_a_checkout_another_process_made_meanwhile_gets_no_row(self):
+        ok = os.path.join(self.home, "own-ok")
+        self.assert_one(self.bash("git clone %s %s 2>&1 | tail -3" % (self.src, ok), self.clone(ok)))
+        dest = os.path.join(self.home, "raced")
+        other = self.clone(dest)                          # an unhooked process clones the same URL to the same path
+
+        def ours_fails():
+            other()
+            r = subprocess.run(["git", "clone", self.src, dest], capture_output=True, text=True, env=ENV)
+            self.assertNotEqual(r.returncode, 0)
+            return r.stderr                               # git's own "already exists" for that path
+        self.assert_refused("git-failed-here", self.bash("git clone %s %s" % (self.src, dest), ours_fails))
+        wt = os.path.join(self.home, "wt-raced")
+
+        def ours_fails_wt():
+            sh("git", "-C", self.src, "worktree", "add", "-q", wt, "-b", "theirs")
+            r = subprocess.run(["git", "-C", self.src, "worktree", "add", wt, "-b", "ours"], capture_output=True,
+                               text=True, env=ENV)
+            self.assertNotEqual(r.returncode, 0)
+            return r.stderr
+        self.assert_refused("git-failed-here", self.bash("git -C %s worktree add %s -b ours" % (self.src, wt),
+                                                         ours_fails_wt))
+        self.assertEqual([r["path"] for r in self.held()], [ok])
+
+    def test_hidden_or_quiet_output_gets_no_row(self):
+        d = os.path.join(self.home, "hidden")
+        self.assert_refused("no-own-output", self.bash("git clone %s %s >/dev/null 2>&1" % (self.src, d),
+                                                       self.clone(d), shown=False))
+        q = os.path.join(self.home, "quiet")
+        self.assert_refused("no-own-output", self.bash("git clone -q %s %s" % (self.src, q),
+                                                       lambda: git_out("git", "clone", "-q", self.src, q)))
+        other = os.path.join(self.home, "named-elsewhere")
+        self.assert_refused("no-own-output", self.bash("git clone %s %s" % (self.src, other), self.clone(other),
+                                                       output="Cloning into 'something-else'...\ndone.\n"))
+        self.assertEqual(self.held(), [])
 
 
 class Retire(Base):
@@ -1096,7 +1338,7 @@ class FailOpen(Base):
 
     def test_every_hook_exits_zero_silently_on_broken_state(self):
         state = Path(self.home) / ".agent-harness/state"
-        state.mkdir(parents=True)
+        shutil.rmtree(state / "checkouts")                  # setUp made it for the opt-in; this test breaks it
         (state / "checkouts").write_text("not a folder")
         dest = os.path.join(self.home, "c")
         p = json.dumps(self.payload("git clone %s %s" % (self.src, dest), "toolu_1"))
@@ -1126,6 +1368,7 @@ class EntryPoint(Base):
         p = self.payload(cmd, "toolu_ep")
         self.run_verb("pretool", p)
         self.clone(dest)()
+        p = self.payload(cmd, "toolu_ep")
         self.run_verb("posttool", p)
         self.assertEqual([r["path"] for r in self.held()], [dest])
         for verb in ("posttool-failure", "denied", "subagent-start", "subagent-stop"):
@@ -1139,7 +1382,10 @@ class Wiring(unittest.TestCase):
         claude = Path("/h/.claude")
         script = str(claude / "hooks" / "checkout_registry.py")
         self.assertIn(script, install.managed_scripts(claude))
-        hooks = install.managed_hooks(claude, True)
+        off = install.managed_hooks(claude, True)               # no opt-in file under /h: nothing is wired
+        self.assertFalse(any(h.get("args", [None])[0] == script for groups in off.values() for g in groups
+                             for h in g["hooks"]))
+        hooks = install.managed_hooks(claude, True, checkout_registry=True)
         found = {}
         for event, groups in hooks.items():
             for g in groups:

@@ -23,8 +23,13 @@ mark and claimed the path (NFC casefolded key) under the lock with no other live
 PostToolUseFailure) carries the same tool_use_id, session, agent and command hash as the signed pending record; the
 payload's transcript is the session's own, and an agent's call is found in its own subagent file; the path is now a
 checkout top, not a link, under home, at exactly the expected realpath, the pinned folder unchanged, born inside the
-call; a clone's origin is the command's URL, a worktree is linked and shares the named repo's common dir; nothing
-holds the identity yet. Anything unsure: no row, and one reason code in state/checkouts/decisions.jsonl.
+call; a clone's origin is the command's URL, a worktree is linked and shares the named repo's common dir; the call's
+own output shows its git creating that path (own_git_output); nothing holds the identity yet. Anything unsure: no row,
+and one reason code in state/checkouts/decisions.jsonl.
+
+OPT-IN: until the user writes state/checkouts/enabled.json ({"enabled": true}), held() is None for everything and no
+verdict says "owner may remove" (install.py does not wire the hooks either). Ownership is read only through current()
+(contract 4, CONTRACT_4); the remove wording comes only from may_remove() (REMOVE_EVIDENCE, default keep).
 
 GIT: no hook runs porcelain (status, log, diff, show, stash ...); _git refuses it. A repo whose own config names a
 program (filter, textconv, fsmonitor, hooksPath, gpg program) gets "keep" before any content-reading command runs.
@@ -144,7 +149,15 @@ def _secure_dir(path: Path, create: bool) -> bool:
     return stat_mod.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o022)
 
 
+class TooLarge(OSError):
+    """A private file is larger than its bound: it is never judged from a part of it. An OSError, so every caller
+    that treats an unreadable file as unsure (claims, pending records) treats an oversized one the same way."""
+
+
 def _read_secure(path: Path, limit: int) -> "bytes | None":
+    """The whole of a private regular file (ours, mode 0600 or tighter, no link). None when missing or unsafe.
+    TooLarge when it is over `limit`, checked on the open fd and again while reading, so a file that grows between
+    the check and the read is refused, never read in part."""
     try:
         fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
@@ -154,25 +167,50 @@ def _read_secure(path: Path, limit: int) -> "bytes | None":
         if not stat_mod.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
             return None
         if st.st_size > limit:
-            os.lseek(fd, st.st_size - limit, os.SEEK_SET)
-        chunks, left = [], limit
+            raise TooLarge(str(path))
+        chunks, left = [], limit + 1
         while left > 0:
             b = os.read(fd, min(left, 1 << 20))
             if not b:
                 break
             chunks.append(b)
             left -= len(b)
-        return b"".join(chunks)
+        data = b"".join(chunks)
+        if len(data) > limit:
+            raise TooLarge(str(path))
+        return data
+    except TooLarge:
+        raise
     except OSError:
         return None
     finally:
         os.close(fd)
 
 
+OPT_IN = "enabled.json"     # state/checkouts/enabled.json: {"enabled": true}, written by the user, never by a hook
+
+
+def enabled() -> bool:
+    """The user's opt-in (goodqa#16947 PR 344 review F2): until state/checkouts/enabled.json holds a literal JSON
+    `true` under "enabled", held() is None for every identity and no verdict says "owner may remove". The installer
+    wires the hooks only when it is on. Recording rows needs no opt-in (a hook wired by hand, or the live kit, still
+    records), because a row alone lets nothing be removed."""
+    if not _secure_dir(state_dir(), create=False):
+        return False
+    try:
+        data = _read_secure(state_dir() / OPT_IN, 4096)
+        return isinstance(data, bytes) and json.loads(data.decode("utf-8")).get("enabled") is True
+    except (TooLarge, ValueError, AttributeError, UnicodeDecodeError):
+        return False
+
+
 def read_key() -> "bytes | None":
     if not _secure_dir(state_dir(), create=False):
         return None
-    data = _read_secure(state_dir() / "registry.key", 256)
+    try:
+        data = _read_secure(state_dir() / "registry.key", 256)
+    except TooLarge:
+        return None
     return data if data and len(data) == 32 else None
 
 
@@ -313,10 +351,10 @@ def rows(host: str = HOST, key: "bytes | None" = None) -> "tuple[list, int]":
     """(verified rows of this host's file, how many lines failed). The whole file is read (bounded at 64 MB). A row
     whose `host` names another host fails: a row pasted between files never counts."""
     key = key or read_key()
-    with contextlib.suppress(OSError):
-        if os.lstat(str(ledger_path(host))).st_size > MAX_FILE:
-            raise LedgerTooLarge(host)                  # never judge ownership from part of the file
-    data = _read_secure(ledger_path(host), MAX_FILE)
+    try:
+        data = _read_secure(ledger_path(host), MAX_FILE)
+    except TooLarge:
+        raise LedgerTooLarge(host)                      # never judge ownership from part of the file
     good, bad = [], 0
     for line in (data or b"").decode("utf-8", "replace").splitlines():
         if not line.strip():
@@ -337,33 +375,63 @@ def identity(row: dict) -> tuple:
     return (row.get("host"), row.get("dev"), row.get("ino"), row.get("btime_ns"), row.get("gen"))
 
 
+# Contract 4: every way held() gives None. tests/test_checkout_registry.py ContractFour walks exactly this tuple, and
+# the mutation script drops each clause in turn; a clause added here without a test fails that test.
+CONTRACT_4 = ("opt-in-off", "unknown-host", "state-not-local", "no-key", "ledger-too-large", "two-created-rows",
+              "removed-row", "retired")
+
+
+class NotHeld(Exception):
+    """A precondition of contract 4 failed for the whole ledger: no identity on it is held by anyone."""
+
+    def __init__(self, clause: str):
+        super().__init__(clause)
+        self.clause = clause
+
+
 def current(host: str = HOST, key: "bytes | None" = None) -> dict:
-    """{identity: created row} for every checkout whose rows end in exactly one owner. Two created rows for one
-    identity under different owners mean no owner, until a removed row ends both."""
-    live, contested = {}, set()
-    for row in rows(host, key)[0]:
+    """Contract 4 (spec v3.2 AC-3, Rule 13, Rule 14), the ONE read path for ownership. held(), the writer's duplicate
+    check, retirement, the stop note and `list` all go through it. {identity: created row} for every identity whose
+    verified rows on this host's own file end in exactly one created row. Raises NotHeld when a precondition fails:
+
+      unknown-host       the host is not one this machine keeps a file for
+      state-not-local    the state folder is not on a local filesystem (its lock cannot be trusted)
+      no-key             there is no safe registry key, so no row can be verified
+      ledger-too-large   the file is over MAX_FILE (checked on the open fd), never judged from a part
+
+    Per identity: no created row gives nothing; two or more created rows give nothing, whoever wrote them; a verified
+    removed row (a route's removal or a Rule 14 retirement) ends every created row before it. Rows that fail
+    verification, or name another host, never count.
+    """
+    if host not in HOSTS:
+        raise NotHeld("unknown-host")
+    if not state_is_local():
+        raise NotHeld("state-not-local")
+    key = key or read_key()
+    if not key:
+        raise NotHeld("no-key")
+    try:
+        good = rows(host, key)[0]
+    except LedgerTooLarge:
+        raise NotHeld("ledger-too-large")
+    created = {}
+    for row in good:
         ident = identity(row)
         if row.get("event") == "created":
-            held_row = live.get(ident)
-            if held_row and (held_row.get("session"), held_row.get("agent")) != (row.get("session"), row.get("agent")):
-                contested.add(ident)
-            elif not held_row:
-                live[ident] = row
+            created.setdefault(ident, []).append(row)
         elif row.get("event") == "removed":
-            live.pop(ident, None)
-            contested.discard(ident)
-    return {k: v for k, v in live.items() if k not in contested}
+            created.pop(ident, None)
+    return {ident: found[0] for ident, found in created.items() if len(found) == 1}
 
 
 def held(ident: dict) -> "dict | None":
-    """THE ownership check for stream B: the current created row for exactly (host, dev, ino, btime_ns), read from
-    that host's own file and verified; None when nothing or more than one owner holds it."""
-    host = ident.get("host")
-    if host not in HOSTS:
+    """THE ownership check for stream B and the janitor: the one current created row for exactly (host, dev, ino,
+    btime_ns, gen); None while the user's opt-in is off, or when any clause of contract 4 (see current) fails."""
+    if not isinstance(ident, dict) or not enabled():
         return None
     try:
-        return current(host).get(identity(ident))
-    except LedgerTooLarge:
+        return current(ident.get("host")).get(identity(ident))
+    except NotHeld:
         return None
 
 
@@ -414,8 +482,8 @@ def write_created(info: dict, kind: str, session: str, agent, tool_use_id) -> "t
             return _append(row, key), "written"
     except LockTimeout:
         return None, "lock-timeout"
-    except LedgerTooLarge:
-        return None, "ledger-too-large"
+    except NotHeld as e:
+        return None, e.clause
 
 
 def _removed_row(held_row: dict, by: str, route: str) -> dict:
@@ -436,7 +504,7 @@ def append_removed(ident: dict, by: str, route: str) -> "dict | None":
         with _locked():
             held_row = current(ident["host"], key).get(identity(ident))
             return _append(_removed_row(held_row, by, route), key) if held_row else None
-    except (LockTimeout, LedgerTooLarge):
+    except (LockTimeout, NotHeld):
         return None
 
 
@@ -465,8 +533,8 @@ def retire_absent(real: str, key: bytes) -> int:
                 if row.get("path") == real and _absent_on(real, row.get("dev")) and _absent_on(real, row.get("dev")):
                     _append(_removed_row(row, "checkout_registry", "observed-absent"), key)
                     n += 1
-    except (LockTimeout, LedgerTooLarge) as e:
-        decide("lock-timeout" if isinstance(e, LockTimeout) else "ledger-too-large", path=real)
+    except (LockTimeout, NotHeld) as e:
+        decide("lock-timeout" if isinstance(e, LockTimeout) else e.clause, path=real)
         return 0
     if n:
         decide("observed-absent", path=real, rows=n)
@@ -908,7 +976,10 @@ def _write_pending(record: dict, key: bytes) -> None:
 
 def _take_pending(tool_use_id: str, key: bytes) -> "tuple[dict | None, str]":
     p = _pending_path(tool_use_id)
-    data = _read_secure(p, 65536)
+    try:
+        data = _read_secure(p, 65536)
+    except TooLarge:
+        data = b"\0"                          # oversized: treated like a record that does not verify
     with contextlib.suppress(OSError):
         p.unlink()
     try:
@@ -1198,19 +1269,61 @@ def posttool(payload: dict) -> list:
             _release(c.get("expect") or "", tid)
             decide("no-mark", tool_use_id=tid, path=c.get("expect"))
             continue
-        row, why = _check_and_write(c, dict(rec, post_mark_ns=post_mark[0]), session, agent, tid)
+        row, why = _check_and_write(c, dict(rec, post_mark_ns=post_mark[0]), session, agent, tid,
+                                    _call_output(payload))
         decide(why, tool_use_id=tid, path=c.get("expect"))
         if row:
             written.append(row)
     return written
 
 
-def _check_and_write(c: dict, rec: dict, session: str, agent, tid: str) -> "tuple[dict | None, str]":
+MAX_OUTPUT = 1 << 20
+CLONE_DONE = re.compile(r"^Cloning into '([^'\n]+)'\.\.\.$", re.M)
+CLONE_EXISTS = re.compile(r"^fatal: destination path '([^'\n]+)' already exists", re.M)
+WORKTREE_DONE = re.compile(r"^Preparing (?:worktree \(|.+ \(identifier )", re.M)
+WORKTREE_EXISTS = re.compile(r"^fatal: '([^'\n]+)' already exists", re.M)
+
+
+def _call_output(payload: dict) -> str:
+    """The text the call itself printed (stdout, stderr, and a failure's error), bounded. Empty when absent."""
+    parts = []
+    resp = payload.get("tool_response")
+    if isinstance(resp, dict):
+        parts += [resp.get(k) for k in ("stdout", "stderr", "output", "error")]
+    elif isinstance(resp, str):
+        parts.append(resp)
+    parts.append(payload.get("error"))
+    return "\n".join(p for p in parts if isinstance(p, str))[:MAX_OUTPUT]
+
+
+def own_git_output(kind: str, expect: str, text: str) -> str:
+    """PR 344 review F3: a fact only this call's own git could have produced. Another process can make a checkout at
+    the expected path between Pre and Post; this call's git then fails ("already exists") and every other check would
+    pass. So the row needs this call's own output to show git creating that path (`Cloning into 'P'...` for a clone,
+    `Preparing worktree` for a worktree) and no "already exists" for it. Returns "ok", "git-failed-here" or
+    "no-own-output" (quiet or fully redirected output: no row, which is safe)."""
+    name = os.path.basename(expect.rstrip("/"))
+
+    def names(rx):
+        return {os.path.basename(m.rstrip("/")) for m in rx.findall(text)}
+    if kind == "clone":
+        if name in names(CLONE_EXISTS):
+            return "git-failed-here"
+        return "ok" if name in names(CLONE_DONE) else "no-own-output"
+    if name in names(WORKTREE_EXISTS):
+        return "git-failed-here"
+    return "ok" if WORKTREE_DONE.search(text) else "no-own-output"
+
+
+def _check_and_write(c: dict, rec: dict, session: str, agent, tid: str, output: str = "") -> "tuple[dict | None, str]":
     kind, expect = c.get("kind"), c.get("expect")
     if kind not in ("worktree", "clone") or not isinstance(expect, str):
         return None, "pending-bad-mac"
     if _release(expect, tid):
         return None, "contested"
+    own = own_git_output(kind, expect, output)
+    if own != "ok":
+        return None, own
     f = stat_path(c["path"])
     if f.get("exists") is not True:
         return None, "not-made"
@@ -1338,14 +1451,22 @@ def subagent_start(payload: dict) -> "dict | None":
 # --------------------------------------------------------------------------- SubagentStop: verdict only
 
 def held_by(session: str, agent) -> list:
-    return [r for r in current().values() if r.get("session") == session and r.get("agent") == (agent or None)]
+    """Rows one agent holds now (contract 4 through current); none when a precondition fails."""
+    try:
+        owned = current()
+    except NotHeld:
+        return []
+    return [r for r in owned.values() if r.get("session") == session and r.get("agent") == (agent or None)]
 
 
 def _nested(row: dict, deadline: float) -> "tuple[list, bool]":
     """(other checkouts under the row's path, complete?). Registered rows, the repo's own worktree list, and a bounded
     walk for `.git` entries."""
     top = row["path"].rstrip("/") + "/"
-    found = {r["path"] for r in current().values() if r["path"].startswith(top)}
+    try:
+        found = {r["path"] for r in current().values() if r["path"].startswith(top)}
+    except NotHeld:
+        return [], False                                  # the registered rows cannot be read: incomplete, so keep
     listing = _git(row["path"], "worktree", "list", "--porcelain", timeout=max(0.5, deadline - time.monotonic())) or ""
     for l in listing.splitlines():
         if l.startswith("worktree "):
@@ -1432,6 +1553,38 @@ def _regenerable_path(full: str) -> bool:
     return name.endswith(".pyc") and os.path.isfile(full)
 
 
+# The remove verdict's evidence (PR 344 review F2, F5a). "owner may remove" is produced in ONE place, may_remove(),
+# and only when every item below was positively observed as True. A missing, unknown or failed item keeps the checkout,
+# with that item's reason. New evidence is added here, never as a second way to reach the remove wording.
+REMOVE_EVIDENCE = (
+    ("opt_in", "checkout registry opt-in is off"),
+    ("isolation", "only an isolation worktree of this agent is a removal candidate"),
+    ("no_repo_programs", "repo config runs programs or is unknown"),
+    ("clean_index_flags", "skip-worktree or assume-unchanged entries, or index flags unknown"),
+    ("no_changes", "changes, or status unknown"),
+    ("no_untracked", "untracked files, or status unknown"),
+    ("only_regenerable_ignored", "ignored files, or status unknown"),
+    ("all_pushed", "unpushed commits, or unknown"),
+    ("no_stash", "stash entries, or unknown"),
+    ("no_nested", "contains another checkout, or the nested scan is incomplete"),
+    ("in_time", "unknown (out of time)"),
+)
+
+
+def may_remove(evidence: dict) -> str:
+    """THE remove verdict. Default keep: "owner may remove" only when every REMOVE_EVIDENCE item is literally True."""
+    reasons = [why for name, why in REMOVE_EVIDENCE if evidence.get(name) is not True]
+    return "keep: " + ", ".join(reasons) if reasons else "owner may remove"
+
+
+def _hidden_index_flags(z: "str | None") -> "bool | None":
+    """`ls-files -v -z`: True when any entry is skip-worktree (tag S) or assume-unchanged (a lowercase tag), which
+    diff-files does not report. None when unknown."""
+    if z is None:
+        return None
+    return any(e and (e[0] == "S" or e[0].islower()) for e in z.split("\0"))
+
+
 def verdict(row: dict, deadline: float) -> dict:
     """The facts and the verdict for one held row. Read-only. Rule 12: plumbing only, and nothing that reads file
     content runs until the repo is known to configure no program."""
@@ -1444,30 +1597,23 @@ def verdict(row: dict, deadline: float) -> dict:
         return {"state": "replaced", "verdict": "keep: what is there now is not this row's checkout"}
     top = row["path"]
     out = {"state": "present"}
-    reasons = []
+    ev = {"opt_in": enabled(), "isolation": row.get("kind") == "isolation"}
     programs = repo_programs(top, left())
-    if programs is None:
-        reasons.append("config unknown")
-    elif programs:
-        reasons.append("repo config runs programs")
-    changed = untracked = ignored = None
+    ev["no_repo_programs"] = programs == []
     if programs == []:
+        ev["clean_index_flags"] = _hidden_index_flags(
+            _git(top, "ls-files", "-v", "-z", timeout=left(), raw=True)) is False
         work = _names(_git(top, "diff-files", "--name-only", "-z", timeout=left(), raw=True))
         staged = _names(_git(top, "diff-index", "--cached", "--name-only", "-z", "HEAD", timeout=left(), raw=True))
-        changed = None if work is None or staged is None else len(work | staged)
         untracked = _names(_git(top, "ls-files", "--others", "--exclude-standard", "-z", timeout=left(), raw=True))
         ignored = _names(_git(top, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
                               timeout=left(), raw=True))
-        if changed is None or untracked is None or ignored is None:
-            reasons.append("status unknown")
-        else:
+        if None not in (work, staged, untracked, ignored):
+            changed = len(work | staged)
             out.update({"changed": changed, "untracked": len(untracked), "ignored": len(ignored)})
-            if changed:
-                reasons.append("changes")
-            if untracked:
-                reasons.append("untracked files")
-            if any(not regenerable(top, e) for e in ignored):
-                reasons.append("ignored files")
+            ev["no_changes"] = changed == 0
+            ev["no_untracked"] = not untracked
+            ev["only_regenerable_ignored"] = all(regenerable(top, e) for e in ignored)
     branch = _git(top, "rev-parse", "--abbrev-ref", "HEAD", timeout=left())
     head = _git(top, "rev-parse", "HEAD", timeout=left())
     unpushed = _git(top, "rev-list", "--count", "HEAD", "--not", "--remotes", timeout=left())
@@ -1475,23 +1621,11 @@ def verdict(row: dict, deadline: float) -> dict:
     stash = _git(top, "rev-list", "--walk-reflogs", "--count", "refs/stash", timeout=left()) if has_stash else "0"
     nested, complete = _nested(row, deadline) if left() > 1 else ([], False)
     out.update({"branch": branch, "head": head, "unpushed": unpushed, "stash": stash, "nested": nested})
-    if unpushed is None or not unpushed.isdigit():
-        reasons.append("unpushed unknown")
-    elif int(unpushed):
-        reasons.append("unpushed")
-    if stash is None or not stash.isdigit():
-        reasons.append("stash unknown")
-    elif int(stash):
-        reasons.append("stash")
-    if nested:
-        reasons.append("contains another checkout")
-    if not complete:
-        reasons.append("nested scan incomplete")
-    if row["kind"] != "isolation":
-        reasons.append("only an isolation worktree of this agent is a removal candidate")
-    if left() <= 0:
-        reasons.append("unknown (out of time)")
-    out["verdict"] = "owner may remove" if not reasons else "keep: " + ", ".join(reasons)
+    ev["all_pushed"] = unpushed == "0"
+    ev["no_stash"] = stash == "0"
+    ev["no_nested"] = complete is True and not nested
+    ev["in_time"] = left() > 0
+    out["verdict"] = may_remove(ev)
     return out
 
 
@@ -1593,8 +1727,16 @@ def main(argv=None) -> int:
         n = retire_absent(p, key) if key and anchor else 0
         print(json.dumps({"path": p, "retired": n}))
         return 0
-    good, bad = rows(HOST)
-    print(json.dumps({HOST: {"rows": good, "failed_verification": bad, "held": len(current(HOST))}}, indent=1))
+    try:
+        good, bad = rows(HOST)
+    except LedgerTooLarge:
+        good, bad = [], None
+    try:
+        held_now, why = (len(current(HOST)) if enabled() else 0), (None if enabled() else "opt-in off")
+    except NotHeld as e:
+        held_now, why = 0, e.clause
+    print(json.dumps({HOST: {"rows": good, "failed_verification": bad, "held": held_now, "held_none_because": why,
+                             "enabled": enabled()}}, indent=1))
     return 0
 
 
