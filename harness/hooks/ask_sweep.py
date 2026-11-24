@@ -20,13 +20,21 @@ A human answer always outranks other evidence: a structured card, an answer row,
 reaches the user's own words anywhere in its resolution tree (through wal: and inferred: hops, also with an outcome)
 comes before a related-session close that does not and before a SUPERSEDES ask (#170 F6, round 5 F1). Which sources
 reach the user's words, and which may close an ask in which mode, is ask_close.py's one rule, the same one wal_note.py
-enforces. Pasted text is never the user's answer.
+enforces. Pasted text is never the user's answer. "Could not tell" is never "no" (#170 round 6): evidence whose
+resolution tree could not be walked to its end (ask_close.trace state "unknown": an unreadable WAL or entry, a cycle, a
+chain too deep, an entry with no source, ...) may be the user's answer, so it is gathered and ranked with his answers,
+ahead of a traced answer of the same rank, and listed `manual` with the codes where the walk stopped; it is also listed
+under `incomplete`, and the listing exits 2.
 
 Every offered item carries `pin` (ASK=REF) and `apply`, the exact ask_sweep command that closes it, plus `close`, the exact
-wal_note.py command that command runs. A close is offered only when ask_close.close_verdict accepts it; any other item is
-listed `manual` with the reason in `action` and no close (#170 round 5). --apply refuses an ask named without its pin, or whose best evidence is no longer the
+wal_note.py command that command runs. A close is printed only when ask_close.precheck, the function wal_note.py runs
+before it writes, accepts that exact command (its note, source, ask and mode), for answer cards and WAL evidence alike;
+any other item is listed `manual` (an answer card under `short`) with the reason and no close (#170 rounds 5 and 6).
+--apply refuses an ask named without its pin, or whose best evidence is no longer the
 one that was listed (a row written after the listing), and refuses every close while anything is unread (the listing is
-incomplete). An ask that is already closed is reported as resolved, with the row that closed it, and nothing is written.
+incomplete). An `incomplete` walk does not stop --apply for other asks: it can only make the asks it is evidence for
+manual, and those are refused. An ask that is already closed is reported as resolved, with the row that closed it, and
+nothing is written.
 wal_note.py re-verifies every source. A refused close, a timeout or a wal_note that cannot start is reported with its own
 message, the JSON report is always printed, and the run exits 1; after a timeout the ledger is read again, and a close
 that was written after all is reported as written.
@@ -49,12 +57,16 @@ row wrote, so a close is offered from a source that cites the user's turn direct
 turn (whole_citation; ask_evidence.cites_whole is the one test for both paths). A source that quotes the turn in part,
 with an ellipsis or without ("Do not stop the worker now" cited as "stop the worker now"), or that cannot be checked
 against the whole turn, is listed with `manual: true`, `partial: true` and no close; --apply refuses it and writes
-nothing. Every other source is offered only when ask_close.close_verdict accepts it in the mode the close runs in
-(round 5): a wal: pointer or an inferred: chain with no outcome, pasted text, an mc: decision, a spelling wal_note does
-not write (`USER:`), and outcome evidence that reaches a chat turn are all listed manual with the reason.
+nothing. Every other source is offered only when ask_close.precheck accepts it in the mode the close runs in
+(rounds 5 and 6): a wal: pointer or an inferred: chain with no outcome, pasted text, an mc: decision, a spelling
+wal_note does not write (`USER:`), outcome evidence that reaches a chat turn or does not resolve, a walk that stopped,
+and a note or source wal_note refuses (a credential) are all listed manual with the reason.
 
-Listing exits 0 when every file was read in full, and 2 when anything is listed in `unread` (a refused file, a budget
-stop, a skipped over-long or unparseable line). ask_sweep reads every WAL and transcript through
+An answer that appears to contain a credential is never printed (`answer` says so instead) and never closed here.
+
+Listing exits 0 when every file was read in full and every evidence source was traced to its end, and 2 when anything
+is listed in `unread` (a refused file, a budget stop, a skipped over-long or unparseable line) or in `incomplete` (a
+walk that stopped). ask_sweep reads every WAL and transcript through
 ask_evidence.jsonl_records. It refuses to run when AH_HOME or CLAUDE_CONFIG_DIR names another home than the one wal_note.py
 and provenance use (Path.home()), because every printed close would then be refused (#170 F7). Stdlib only.
 """
@@ -272,9 +284,10 @@ def rank(evidence: dict) -> int:
     """Best first. The user's own words come first: a related-session close whose source reaches them anywhere in its
     resolution tree (0), then an answer row (1). Obsolete evidence comes after every answer: a related-session close
     that reaches no words of the user (2), then a SUPERSEDES ask (3). Terminal evidence, which is manual only, is last
-    (4) (#170 F6). `human` is ask_close.trace's answer, set when the evidence is gathered; a related-session outcome
-    close whose evidence reaches the user's words ranks as his answer, so it is never hidden behind an obsolete close
-    (#170 round 5 F1). Pasted text is never the user's answer (main's ruling, 2026-11-24)."""
+    (4) (#170 F6). `human` is ask_close.trace's `maybe_human`, set when the evidence is gathered: a related-session
+    outcome close whose evidence reaches the user's words, or whose walk stopped before it could tell (#170 round 6),
+    ranks as his answer, so it is never hidden behind an obsolete close (#170 round 5 F1). Pasted text is never the
+    user's answer (main's ruling, 2026-11-24)."""
     if evidence["kind"] == "resolved-elsewhere":
         return 0 if evidence.get("human") else 2
     return {"answer": 1, "superseded": 3, "terminal": 4}[evidence["kind"]]
@@ -299,6 +312,9 @@ PARTIAL_ACTION = ("manual: this evidence quotes only part of the user's turn, or
                   "turn, and leaving words out can change its meaning: read the whole turn and close the ask by hand")
 TERMINAL_ACTION = "manual: the user ran this step himself; main decides how to close the ask"
 REFUSED_ACTION = "manual: wal_note would refuse this close ({}): read the evidence and close the ask by hand"
+UNKNOWN_ACTION = ("manual: this evidence could not be traced to its end ({}), so it may be the user's answer; {}read it "
+                  "and close the ask by hand")
+CREDENTIAL = "[not shown: the answer appears to contain a credential; read it in the transcript]"
 
 
 def whole_citation(source: str, home: Path):
@@ -323,26 +339,39 @@ def whole_citation(source: str, home: Path):
     return ask_evidence.cites_whole(node.get("excerpt"), node.get("text"))
 
 
-def held_back(best: dict, ask: str, home: Path):
+def evidence_note(best: dict, ask: str) -> str:
+    """The --note of the close of one evidence item: close_argv writes it and held_back checks it."""
+    return (f"ask-sweep: {best['kind']} evidence {best['ref']} resolves [ask:{ask}]: {_clip(best['summary'], 90)} "
+            "(bookkeeping, not an approval)")
+
+
+def held_back(best: dict, ask: str, home: Path, wal: Path):
     """The `action` that lists the best evidence for manual action, or None when its close is offered. A close is
-    offered only when ask_close.close_verdict, the rule wal_note.py enforces, accepts it in the mode it would run in, so
-    the listing never prints a close the writer refuses (#170 round 5); and only for a whole citation (round 4)."""
+    offered only when ask_close.precheck, everything wal_note.py checks before it writes, accepts the exact close in
+    the mode it would run in, so the listing never prints a close the writer refuses (#170 rounds 5 and 6); only for
+    a whole citation (round 4); and never on evidence whose walk stopped, which may be the user's answer (round 6)."""
     if best.get("manual"):
         return best.get("action") or TERMINAL_ACTION
     if whole_citation(best["source"], home) is False:
         return PARTIAL_ACTION
     sys.path.insert(0, str(HERE))
     import ask_close  # noqa: PLC0415
-    verdict = ask_close.close_verdict(best["source"], "outcome" if best.get("outcome") else "answer", ask, home / ".claude")
+    verdict = ask_close.precheck(wal, ask, evidence_note(best, ask), best["source"],
+                                 "outcome" if best.get("outcome") else "answer", home=home / ".claude")
+    if best.get("unknown"):
+        refused = "wal_note would refuse this close (%s): " % verdict["problem"] if verdict["problem"] else ""
+        return UNKNOWN_ACTION.format(", ".join(best["stops"]), refused)
     return REFUSED_ACTION.format(verdict["problem"]) if verdict["problem"] else None
 
 
 def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
     """{"items": [...], "unread": [...]}: open main-WAL asks of SESSION with WAL or terminal evidence from SESSION and
-    the RELATED sessions (its successors or its coordinator). Read-only. A row is answer evidence when its source
-    reaches the user's own words anywhere in its resolution tree (ask_close.trace). When the best evidence is held back
-    (held_back: a partial citation, or a close the writer would refuse), the item is `manual` with the reason in
-    `action`: it is listed for main to read and never offered as a close (#170 rounds 4 and 5)."""
+    the RELATED sessions (its successors or its coordinator). Read-only. A row is answer evidence when its source may
+    reach the user's own words anywhere in its resolution tree (ask_close.trace's `maybe_human`: it does, or the walk
+    stopped before it could tell, #170 round 6). Evidence whose walk stopped carries `unknown` and the `stops`. When
+    the best evidence is held back (held_back: a partial citation, a close the writer would refuse, or an unknown
+    walk), the item is `manual` with the reason in `action`: it is listed for main to read and never offered as a close
+    (#170 rounds 4 to 6)."""
     unread = [] if unread is None else unread
     sessions = [session] + [s for s in related if s != session]
     rows = []
@@ -355,9 +384,13 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
     import ask_evidence  # noqa: PLC0415
     traced = {}
 
-    def human(source: str) -> bool:
+    def walk(source: str) -> dict:
+        """ask_close.trace of one source, once: `human` is its maybe_human, plus `unknown` and `stops` when the walk
+        stopped (#170 round 6)."""
         if source not in traced:
-            traced[source] = ask_close.trace(source, home / ".claude")["human"]
+            t = ask_close.trace(source, home / ".claude")
+            traced[source] = {"human": t["maybe_human"],
+                              **({"unknown": True, "stops": t["stops"]} if t["state"] == "unknown" else {})}
         return traced[source]
 
     resolutions = {}
@@ -372,7 +405,7 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
             source = str(other.get("source") or "")
             found.append({"kind": "resolved-elsewhere", "ref": str(other.get("id")), "session": other["_session"],
                           "at": parse_ts(other.get("at")) or 0.0, "summary": str(other.get("note") or ""),
-                          "source": source, "human": human(source),
+                          "source": source, **walk(source),
                           "outcome": other.get("outcome") if other.get("outcome") in CLOSE_OUTCOMES else None})
         for r in rows:
             note = str(r.get("note") or "")
@@ -384,10 +417,10 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
                 found.append({"kind": "superseded", "ref": str(r.get("id")), "session": r["_session"], "at": when,
                               "summary": note, "source": f"wal:{r['_wal']}#{r.get('id')}", "outcome": "obsolete"})
             elif (r.get("event") in EVIDENCE_EVENTS and r.get("by") != "ask-sweep" and source
-                  and not still_waiting(note, ident) and human(source)):
+                  and not still_waiting(note, ident) and walk(source)["human"]):
                 # ask-sweep's own close rows name the evidence they used (a superseding ask's id), never answer it
                 found.append({"kind": "answer", "ref": str(r.get("id")), "session": r["_session"], "at": when,
-                              "summary": note, "source": source, "outcome": None, "human": True})
+                              "summary": note, "source": source, "outcome": None, **walk(source)})
         tokens = distinctive_tokens(ask["note"])
         for s in sessions:
             for uuid, ts, command in inputs[s]:
@@ -400,10 +433,11 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
                                   "source": "", "outcome": None})
         if not found:
             continue
-        found.sort(key=lambda e: (rank(e), not ask_close.is_card(e["source"]),
+        # within a rank, evidence whose walk stopped comes first: what it may hold is not known (#170 round 6)
+        found.sort(key=lambda e: (rank(e), not e.get("unknown"), not ask_close.is_card(e["source"]),
                                   not ANSWER_WORDS.search(e["summary"]), e["at"]))
         best = found[0]
-        action = held_back(best, ident, home)
+        action = held_back(best, ident, home, main_wal)
         if action:
             best["manual"], best["action"] = True, action
             if action == PARTIAL_ACTION:
@@ -424,9 +458,7 @@ def close_argv(item: dict):
         return None
     source, outcome = best["source"], best.get("outcome")
     argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", item["wal"], "--event", "ask_resolved", "--ref", item["ask"],
-            "--by", "ask-sweep", "--source", source,
-            "--note", f"ask-sweep: {best['kind']} evidence {best['ref']} resolves [ask:{item['ask']}]: "
-                      f"{_clip(best['summary'], 90)} (bookkeeping, not an approval)"]
+            "--by", "ask-sweep", "--source", source, "--note", evidence_note(best, item["ask"])]
     if outcome:
         argv += ["--outcome", outcome]
     return argv
@@ -517,10 +549,27 @@ def main(argv=None) -> int:
             seen.add(key)
             unread.append(entry)
     result["unread"] = unread
-    for item in result["answered"]:
+    # #170 round 6: every walk that stopped before it could tell, on evidence that is listed; the listing exits 2
+    result["incomplete"] = [{"ask": i["ask"], "ref": e["ref"], "session": e["session"], "stops": e["stops"]}
+                            for i in result["evidence"] for e in i["evidence"] if e.get("unknown")]
+    import ask_close  # noqa: PLC0415 - sys.path holds HERE (find_transcript)
+    for item in list(result["answered"]):
+        # #170 round 6 F3: an answer card's close is checked exactly as wal_note will check it (ask_close.precheck)
+        argv = answered_argv(args.session, main_wal, item)
+        verdict = ask_close.precheck(main_wal, item["ask"], argv[argv.index("--note") + 1], item["source"], "answer",
+                                     home=home / ".claude")
+        if verdict["problem"]:
+            result["answered"].remove(item)
+            del item["source"]
+            item["reason"] = REFUSED_ACTION.format(verdict["problem"])
+            result["short"].append(item)
+            continue
         item["pin"] = pin_of(item)
-        item["close"] = " ".join(shlex.quote(a) for a in answered_argv(args.session, main_wal, item))
+        item["close"] = " ".join(shlex.quote(a) for a in argv)
         item["apply"] = apply_command(args.session, args.related, item["pin"])
+    for item in result["answered"] + result["short"]:
+        if ask_close.has_credential(item["answer"]):
+            item["answer"] = CREDENTIAL  # never printed: the user typed it into an answer, not into the log
     for item in result["evidence"]:
         argv = close_argv(item)
         item["pin"] = pin_of(item)
@@ -538,6 +587,7 @@ def main(argv=None) -> int:
             wanted[ask] = ref
         result["answered"] = [a for a in result["answered"] if a["ask"] in wanted]
         result["evidence"] = [i for i in result["evidence"] if i["ask"] in wanted]
+        result["incomplete"] = [i for i in result["incomplete"] if i["ask"] in wanted]
     if args.apply:
         closed, ran = [], []
         listed = {i["ask"]: i for i in result["answered"] + result["evidence"]}
@@ -587,7 +637,7 @@ def main(argv=None) -> int:
     if not args.stale:
         result.pop("stale")
     print(json.dumps(result, indent=1))
-    return 2 if result["unread"] else 0
+    return 2 if result["unread"] or result["incomplete"] else 0
 
 
 if __name__ == "__main__":

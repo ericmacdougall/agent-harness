@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "hooks"))
+import ask_close  # noqa: E402
 import ask_evidence  # noqa: E402
 import ask_sweep as sw  # noqa: E402
 import provenance  # noqa: E402
@@ -178,8 +179,14 @@ class CliBase(Base):
         (proj / f"{SESSION}.jsonl").write_text("".join(json.dumps(answer_record("u1", {
             "[ask:w00000000001] Q one?": "Answer number one", "[ask:w00000000002] Q two?": "Answer number two"})) + "\n"))
         self.calls = []
+        # the writer is stubbed here, both its run (the runner) and its checks before the write (ask_close.precheck),
+        # like provenance's answer check (verified): these tests are about pins, --only and failed runs. The real
+        # precheck runs in tests/test_ask_close_contract.py and tests/test_ask_sweep_e2e.py.
+        passed = {"problem": None, "hint": None, "word": None, "kind": None, "assumption": False, "trace": None,
+                  "ask_wal": None}
         patches = [mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)}),
                    mock.patch.object(sw, "verified", lambda *a: True),
+                   mock.patch.object(ask_close, "precheck", lambda *a, **k: dict(passed)),
                    mock.patch.object(sw, "_default_runner", lambda argv: self.calls.append(argv) or (0, "{}", ""))]
         for p in patches:
             p.start()
@@ -323,11 +330,26 @@ class WalEvidence(WalBase):
             wrow("decision", "w00000000d03", "2026-11-23T19:30:00+00:00", "an answer about something else",
                  source=f'answer:{S1}/2 "Yes"'),
             wrow("decision", "w00000000d04", "2026-11-23T19:40:00+00:00", "main thinks w00000000a02 is fine",
-                 source="inferred: main"),
+                 source=self.ticket(4)),  # traced to its end, and not the user's (an unparseable source: below)
             wrow("decision", "w00000000d05", "2026-11-23T19:50:00+00:00", "staff flows not tested pending ask w00000000a02",
                  source=f'user:{S1}/3 "get it done"'),
         ])
         self.assertEqual(self.items(), {})
+
+    def test_a_row_whose_source_cannot_be_walked_may_be_the_answer(self):
+        # #170 round 6: an inferred: that does not parse names inputs nobody walked, so it is unknown, never "not the
+        # user's": the ask is listed manual with where the walk stopped, ahead of an obsolete close
+        self.wal(S1, [wrow("ask", "w00000000a07", "2026-11-23T19:00:00+00:00", "may main delete X?"),
+                      wrow("decision", "w00000000d07", "2026-11-23T19:40:00+00:00", "main thinks w00000000a07 is fine",
+                           source="inferred: main"),
+                      wrow("ask", "w00000000a08", "2026-11-23T19:50:00+00:00", "SUPERSEDES w00000000a07: new X",
+                           source=self.ticket(8))])
+        item = self.items()["w00000000a07"]
+        self.assertEqual((item["kind"], item["manual"]), ("answer", True))
+        self.assertEqual([e["kind"] for e in item["evidence"]], ["answer", "superseded"])
+        self.assertEqual(item["evidence"][0]["stops"], ["inferred-no-inputs"])
+        self.assertIn("could not be traced to its end (inferred-no-inputs)", item["action"])
+        self.assertIsNone(sw.close_argv(item))
 
     def test_the_real_answer_outranks_an_earlier_mention(self):
         self.wal(S1, [
@@ -582,8 +604,9 @@ class Ranking(WalBase):
         self.wal(S1, [wrow("ask", "w00000000a50", "2026-11-23T19:00:00+00:00", "may main release?"),
                       wrow("decision", "w00000000d50", "2026-11-23T20:00:00+00:00", "Answer to ask w00000000a50: approved",
                            source=self.said(S1, 50, "Yes, release it"))])
+        # obsolete evidence traced to its end (#170 round 6: an unreadable pointer here would be a possible answer)
         self.wal(S2, [wrow("ask_resolved", "w00000000r50", "2026-11-23T21:00:00+00:00", "obsolete there",
-                           ref="w00000000a50", source="wal:/x/main.jsonl#w00000000b50", outcome="obsolete")])
+                           ref="w00000000a50", source=self.ticket(50), outcome="obsolete")])
         item = self.items([S2])["w00000000a50"]
         self.assertEqual([e["ref"] for e in item["evidence"]], ["w00000000d50", "w00000000r50"])
         argv = sw.close_argv(item)
@@ -593,7 +616,7 @@ class Ranking(WalBase):
     def test_a_human_close_is_not_hidden_behind_an_earlier_outcome_close(self):
         self.wal(S1, [wrow("ask", "w00000000a51", "2026-11-23T19:00:00+00:00", "q")])
         self.wal(S2, [wrow("ask_resolved", "w00000000r51", "2026-11-23T20:00:00+00:00", "obsolete there",
-                           ref="w00000000a51", source="wal:/x/main.jsonl#w00000000b51", outcome="obsolete")])
+                           ref="w00000000a51", source=self.ticket(51), outcome="obsolete")])
         self.wal(S3, [wrow("ask_resolved", "w00000000r52", "2026-11-23T21:00:00+00:00", "answered there",
                            ref="w00000000a51", source=self.said(S3, 52, "Close it, it is done"))])
         item = self.items([S2, S3])["w00000000a51"]
@@ -653,15 +676,18 @@ class OneRule(unittest.TestCase):
         self.assertFalse(names & self.READS, names)
 
     def test_outcome_evidence_is_read_through_provenance_and_matched_through_ask_evidence(self):
-        # #170 round 5: wal_note and ask_sweep both run ask_close.close_verdict; its outcome check reads the entry
-        # through provenance.wal_entry and matches SUPERSEDES through ask_evidence, and the tree through provenance
+        # #170 rounds 5 and 6: wal_note and ask_sweep both run ask_close.precheck (wal_note's argument checks, the open
+        # ask, and close_verdict); its outcome check reads the entry through provenance.wal_entry and matches
+        # SUPERSEDES through ask_evidence, and the tree (kinds and stops) through provenance
         for name in ("wal_note.py", "ask_sweep.py"):
             self.assertNotIn("SUPERSEDES\\s", (self.HOOKS / name).read_text())
-            self.assertIn("close_verdict", {n for _c, n in self.calls(self.tree(name))})
+            self.assertIn("precheck", {n for _c, n in self.calls(self.tree(name))})
         tree = self.tree("ask_close.py")
+        self.assertTrue({"argument_problem", "open_ask_exists", "close_verdict"}
+                        <= {name for _c, name in self.calls(self.function(tree, "precheck"))})
         names = {name for _c, name in self.calls(self.function(tree, "_outcome_problem"))}
         self.assertTrue({"wal_entry", "supersedes"} <= names, names)
-        self.assertIn("source_kinds", {name for _c, name in self.calls(self.function(tree, "trace"))})
+        self.assertTrue({"source_kinds", "walk_stops"} <= {name for _c, name in self.calls(self.function(tree, "trace"))})
         self.assertFalse({name for _c, name in self.calls(tree)} & self.READS)
 
     def test_no_module_swaps_a_double_quote_for_a_single_one(self):

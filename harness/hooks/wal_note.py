@@ -53,6 +53,24 @@ SECRET_PATTERN = re.compile(
     r'\b[a-z][a-z0-9+.-]*://[^\s/?#@]+@[^\s/?#]+|'
     r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 )
+REF_RE = re.compile(r'[A-Za-z0-9_-]{4,40}')
+
+
+def argument_problem(note, source=None, reason=None):
+    """Why wal_note refuses this note, source and reason for any event, or None: the note's length, the source's
+    length, and a credential in any of them. Shared with ask_close.precheck (#170 round 6 F3), so ask_sweep never
+    prints a close these checks refuse."""
+    note = (note or '').strip()
+    if not note or len(note) > 4000:
+        return 'note must be 1 to 4000 characters'
+    if SECRET_PATTERN.search(note):
+        return 'note appears to contain a credential; redact it first'
+    if source and len(source.strip()) > 2000:
+        return 'source is longer than 2000 characters; shorten the excerpts'
+    for label, value in (('source', source), ('reason', reason)):
+        if value and SECRET_PATTERN.search(value):
+            return label + ' appears to contain a credential; redact it first'
+    return None
 
 
 def provenance_check(event, source, allow_mc=False):
@@ -180,15 +198,9 @@ def main():
     if path.parent.parent != root or path.suffix != '.jsonl' or not re.fullmatch(r'[A-Za-z0-9._-]{1,120}', path.parent.name):
         parser.error('WAL path must be a per-session JSONL under ~/.claude/wals')
     note = args.note.strip()
-    if not note or len(note) > 4000:
-        parser.error('note must be 1 to 4000 characters')
-    if SECRET_PATTERN.search(note):
-        parser.error('note appears to contain a credential; redact it first')
-    if args.source and len(args.source.strip()) > 2000:
-        parser.error('source is longer than 2000 characters; shorten the excerpts')
-    for label, value in (('source', args.source), ('reason', args.reason)):
-        if value and SECRET_PATTERN.search(value):
-            parser.error(label + ' appears to contain a credential; redact it first')
+    problem = argument_problem(args.note, args.source, args.reason)
+    if problem and args.event != 'ask_resolved':  # an ask_resolved row runs these in ask_close.precheck, below
+        parser.error(problem)
     if args.goal is not None and not GOAL_RE.match(args.goal):
         parser.error('--goal: a goal id (lower-case letters, digits, - and _)')
     if args.ticket is not None and not TICKET_RE.match(args.ticket):
@@ -217,33 +229,21 @@ def main():
             parser.error('an ask needs --reason (10+ characters): why the user is being asked')
         record['reason'] = args.reason.strip()[:1000]
     if args.event == 'ask_resolved':
-        if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
-            parser.error('ask_resolved needs --ref <ask id>')
-        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
-        ask_wal = None
-        if not open_ask_exists(path, args.ref):
-            ask_wal = sibling_ask_wal(path, args.ref)
-        if not open_ask_exists(path, args.ref) and ask_wal is None:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
-                              'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
-                  file=sys.stderr)
-            return 2
-        if not args.source or not args.source.strip():
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved needs --source',
-                              'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
-                  file=sys.stderr)
-            return 2
         if args.outcome and args.decision:
             parser.error('--outcome closes an ask without an approval: do not combine it with --decision')
-        # #170 round 5: the one rule for which source closes an ask in which mode (ask_close.TABLE), the same function
-        # ask_sweep.py runs before it prints a close, so the listing never offers a close this refuses
+        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer.
+        # #170 rounds 5 and 6: every check before the write is ask_close.precheck (these argument checks, the open ask,
+        # and the one rule for which source closes an ask in which mode), the function ask_sweep.py runs before it
+        # prints a close, so the listing never offers a close this refuses
         import ask_close  # noqa: PLC0415
-        verdict = ask_close.close_verdict(args.source, 'outcome' if args.outcome else 'decision' if args.decision else 'answer',
-                                          args.ref)
+        verdict = ask_close.precheck(path, args.ref, args.note, args.source,
+                                     'outcome' if args.outcome else 'decision' if args.decision else 'answer',
+                                     reason=args.reason)
         if verdict['problem']:
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': verdict['problem'][:300],
                               'hint': verdict['hint'] or 'see ask_close.py'}), file=sys.stderr)
             return 2
+        ask_wal = verdict['ask_wal']
         assumption = verdict['assumption']
         if ask_close.TABLE[verdict['word']].get('bind'):  # a dashboard decision: bound to this session's ask as it reads now
             import provenance as _prov  # noqa: PLC0415

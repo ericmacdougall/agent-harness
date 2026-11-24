@@ -104,7 +104,9 @@ class EndToEnd(unittest.TestCase):
 
     def listed(self):
         code, doc = self.sweep()
-        self.assertEqual(code, 0, doc.get("unread"))
+        # REFUSED's evidence points at a missing entry: a walk that stopped, so the listing exits 2 and names it under
+        # `incomplete` (#170 round 6); nothing is unread
+        self.assertEqual((code, doc["unread"], [e["ask"] for e in doc["incomplete"]]), (2, [], [REFUSED]))
         return {i["ask"]: i for i in doc["answered"] + doc["evidence"]}
 
     def rows(self, path):
@@ -145,6 +147,7 @@ class EndToEnd(unittest.TestCase):
         item = self.listed()[REFUSED]
         self.assertEqual((item["manual"], item["close"], item["apply"]), (True, None, None))
         self.assertIn("wal: evidence cannot be read", item["action"])  # the writer's own reason
+        self.assertIn("could not be traced to its end (wal-entry-not-found)", item["action"])  # and why it may be his
         before = self.main.read_bytes()
         code, doc = self.sweep("--apply", "--only", item["pin"])
         self.assertEqual((code, doc["closed"][0]["rc"]), (1, 3))

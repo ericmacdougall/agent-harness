@@ -600,24 +600,67 @@ def claimed_kind(text):
     return SOURCE_WORDS.get(match.group(1).lower()) if match else None
 
 
-def source_kinds(result) -> set:
-    """Every kind in one resolve() result tree (#170 round 5): the kind each source in it claims (also one that failed
-    to parse or resolve), every chain node, every origin, recursively through `inputs` (inferred:) and the upstream
-    of each wal: hop, which resolve() carries up in `kinds`. A source traces to the user's words exactly when "user"
-    is in this set."""
-    kinds, stack, seen = set(), [result], 0
-    while stack and seen < 4 * MAX_RESOLVES:
+# #170 round 6: whether a walk reached an origin on every branch. A source of a pointer kind points to, or contains,
+# other sources: when it fails, what is behind it is not known.
+POINTER_KINDS = frozenset({"wal", "inferred"})
+# END_CODES: a source that names an origin kind (user, pasted, mc, ticket or file) failed with this code after its
+# kind was read, so the walk ended there and hid nothing. STOP_CODES: the walk stopped before it could tell what is
+# behind the source. A pointer or a source that names no kind stops the walk with any code, and a code in neither set
+# stops it too (fail closed); tests/test_ask_close_contract.py fails until every code this module reports is in one set.
+END_CODES = frozenset({
+    "bad-syntax", "unknown-kind", "no-source", "excerpt-missing", "excerpt-short", "excerpt-not-found",
+    "message-not-found", "not-user-authored", "user-session-invalid", "transcript-missing", "transcript-malformed",
+    "no-pasted-content", "ambiguous", "item-not-found", "ticket-missing", "file-path", "file-line", "file-git",
+    "file-not-found", "file-unreadable", "file-too-large", "inferred-ungrounded"})
+STOP_CODES = frozenset({
+    "too-deep", "too-many-sources", "cycle", "internal", "scan-timeout", "mc-not-allowed", "inferred-nested",
+    "inferred-no-inputs", "inferred-no-rationale", "wal-missing", "wal-entry-not-found", "wal-malformed",
+    "wal-bad-path", "wal-unsourced", "rejected", "tree-too-large"})
+
+
+def stops_walk(code, source) -> bool:
+    """True when a source that failed with `code` may hide what is behind it: the code is not an END_CODES failure of
+    a source that names an origin kind (#170 round 6)."""
+    kind = claimed_kind(source)
+    return code not in END_CODES or kind is None or kind in POINTER_KINDS
+
+
+def _walk_tree(result):
+    """(kinds, stops) of one resolve() result tree: every node's own and carried values, recursively through `inputs`.
+    A tree too large to walk within the bound is itself a stop, never a silent end (#170 round 6)."""
+    kinds, stops, stack, seen = set(), set(), [result], 0
+    while stack:
+        if seen >= 4 * MAX_RESOLVES:
+            stops.add("tree-too-large")
+            break
         node = stack.pop()
         seen += 1
         if not isinstance(node, dict):
             continue
         kinds.update(k for k in node.get("kinds") or () if isinstance(k, str))
+        stops.update(s for s in node.get("stops") or () if isinstance(s, str))
         for value in (node.get("kind"), ORIGIN_KINDS.get(node.get("origin"), node.get("origin"))):
             if isinstance(value, str):
                 kinds.add(value)
         kinds.update(n["kind"] for n in node.get("chain") or () if isinstance(n, dict) and isinstance(n.get("kind"), str))
         stack.extend(node.get("inputs") or ())
-    return kinds
+    return kinds, stops
+
+
+def source_kinds(result) -> set:
+    """Every kind in one resolve() result tree (#170 round 5): the kind each source in it claims (also one that failed
+    to parse or resolve), every chain node, every origin, recursively through `inputs` (inferred:) and the upstream
+    of each wal: hop, which resolve() carries up in `kinds`. A source traces to the user's words when "user" is in
+    this set; when it is not, walk_stops says whether the walk could tell."""
+    return _walk_tree(result)[0]
+
+
+def walk_stops(result) -> list:
+    """The codes at which the walk of one resolve() result tree stopped before it reached an origin (#170 round 6): a
+    WAL or entry that cannot be read, a bad path, a cycle, a chain too deep, too many sources, an inferred: or mc:
+    input that is not allowed, a WAL entry with no source, a source that names no kind, an internal error. Empty
+    exactly when every branch ended at a source of an origin kind, so the kinds found are all the kinds there are."""
+    return sorted(_walk_tree(result)[1])
 
 
 # --------------------------------------------------------------------------- transcripts
@@ -1113,7 +1156,7 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     ctx = ctx if ctx is not None else {}
     result = {"source": clip(source, 200), "kind": None, "ok": False, "assumption": False, "origin": None,
               "deferred": False, "weak": False, "weak_reasons": [], "backed": False, "problems": [], "chain": [], "inputs": [],
-              "kinds": []}
+              "kinds": [], "stops": []}
     ctx["_resolves"] = ctx.get("_resolves", 0) + 1
     try:
         if ctx["_resolves"] > MAX_RESOLVES:
@@ -1122,10 +1165,15 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     except Problem as problem:
         result["problems"].append({"code": problem.code, "message": problem.message})
         result["ok"] = False
+        if stops_walk(problem.code, source):
+            result["stops"].append(problem.code)
     except Exception as error:  # a resolver bug is a rejection, never a crash of the calling hook
         result["problems"].append({"code": "internal", "message": f"resolver error {type(error).__name__}"})
         result["ok"] = False
-    result["kinds"] = sorted(source_kinds(result) | ({claimed_kind(source)} - {None}))
+        result["stops"].append("internal")
+    kinds, stops = _walk_tree(result)
+    result["kinds"] = sorted(kinds | ({claimed_kind(source)} - {None}))
+    result["stops"] = sorted(stops)
     result["label"] = label_of(result)
     return result
 
@@ -1361,10 +1409,14 @@ def _resolve(source, ctx, depth, seen, result):
             result["weak_reasons"] = list(result.get("weak_reasons") or []) + ["wal entry has no Source: assumption only"]
             result["problems"].append({"code": "wal-unsourced", "message": "that WAL entry has no Source (legacy or grandfathered); "
                                                                            "cited as an assumption, not as a requirement"})
+            # #170 round 6: where its words came from is not known (a row written with no source, as the warn
+            # policy writes one), so the walk stops here
+            result["stops"].append("wal-unsourced")
             result["origin"], result["ok"], result["backed"] = "wal", True, False
             return
         sub = resolve(upstream, ctx, depth + 1, seen + (marker,))
         result["kinds"] = list(sub["kinds"])  # every kind upstream, also one that failed before it reached the chain
+        result["stops"] = list(sub["stops"])  # and every place the walk upstream stopped (#170 round 6)
         result["chain"].extend(sub["chain"])
         result["inputs"] = sub["inputs"]
         result["problems"].extend(sub["problems"])
@@ -1386,11 +1438,14 @@ def _resolve(source, ctx, depth, seen, result):
                            else problem.message)
                 result["problems"].append({"code": problem.code, "message": f"inferred input `{clip(item, 60)}` {message}"})
                 result["kinds"].append(claimed_kind(item))  # unparseable, yet it still says what it cites
+                if stops_walk(problem.code, item):  # a pointer or kindless input: what it cites is not known
+                    result["stops"].append(problem.code)
                 continue
             if item_kind in ("inferred", "mc"):
                 result["kinds"].append(item_kind)
-                result["problems"].append({"code": "inferred-nested" if item_kind == "inferred" else "mc-not-allowed",
-                                           "message": "inferred inputs must be user/ticket/file/wal sources"})
+                code = "inferred-nested" if item_kind == "inferred" else "mc-not-allowed"
+                result["problems"].append({"code": code, "message": "inferred inputs must be user/ticket/file/wal sources"})
+                result["stops"].append(code)  # never walked, so what it reaches is not known (#170 round 6)
                 continue
             sub = resolve(item, ctx, depth + 1, seen)
             result["inputs"].append(sub)
