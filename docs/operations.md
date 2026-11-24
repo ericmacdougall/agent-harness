@@ -76,33 +76,60 @@ the person who owns those guards decides when they change. An agent that wants a
 and asks the user to run the script.
 
 ```
-python3 scripts/update_installed.py --preview                          # what would change; installs nothing
-python3 scripts/update_installed.py --ticket "GoodQA goodqa#N"          # install origin/main HEAD
-python3 scripts/update_installed.py --commit <40-hex sha> --ticket "GoodQA goodqa#N"
+python3 -I scripts/update_installed.py --preview                          # what would change; installs nothing
+python3 -I scripts/update_installed.py --ticket "GoodQA goodqa#N"          # install origin/main HEAD
+python3 -I scripts/update_installed.py --commit <40-hex sha> --ticket "GoodQA goodqa#N"
 ```
+
+Run it from any checkout of the repository. It reads nothing from that checkout except itself, and `-I` is required:
+without it a file next to the script, or `PYTHONPATH`, could replace a module it imports (it exits 2 and says so).
 
 What it checks and does, in order. Any failed step stops the run, and nothing after it runs:
 
-1. **Install clone.** It works in `~/harness-install` (`--clone` sets another path). A real run creates the clone if it
-   is missing. The clone's `origin` must be the canonical repository, and the clone must be clean: no modified files and
-   no untracked files. It then runs `git fetch origin main`.
-2. **Commit.** The commit (default: `origin/main` HEAD) must be a full sha on `origin/main`.
-3. **File list.** The list is derived, never kept by hand.
-   - Mac: every file that `install.py` lists at that commit (`AGENTS`, `HOOKS`, `TOOLS`, `SKILLS`) whose copy under
-     `~/.claude` is missing, differs from the commit's bytes, or is a symlink.
-   - t2-dev: every `HOOKS` file that the remote installer's dry run does not report as `already_current` there. It asks
-     in batches of 20.
-4. **Mac install.** It checks out the commit, detached, and runs `install.py --apply --hooks-only`. `CLAUDE.md` and
+1. **Not an agent.** It stops when an agent marker is set (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`,
+   `CODEX_SANDBOX`, `AI_AGENT`, the same list as `commit_policy.py`), for `--preview` too: its t2-dev dry runs are a
+   main-only command. This is a mitigation, not a boundary: an agent can unset the variables. The command_guard rule
+   that refuses agent calls of the script is goodqa#17036.
+2. **Fresh source.** It fetches the canonical `main` into a new bare repository under
+   `~/.agent-harness/update-cache/run-<12 hex>` (created exclusively, mode 0700, deleted when the run ends). Git runs
+   hardened, the same way `ah install-files` runs it: no system or global config, no hooks, no fsmonitor, no replace
+   objects, https only, and every fetched object is fsck-checked. Grafts, shallow history and replace refs stop the run.
+   There is no persistent install clone, so nothing an agent edits between runs (config, hooks, refs, ignored files)
+   reaches the install.
+3. **Commit.** The commit (default: `main` HEAD) must be a full lowercase sha that is an ancestor of that `main`.
+4. **Export.** The commit's tree is written into the run folder from objects that are re-hashed against their ids.
+   Only regular files and folders are accepted.
+5. **File list.** The list is derived, never kept by hand.
+   - Mac: every file that `install.py` lists at that commit (`AGENTS`, `HOOKS`, `TOOLS`, `SKILLS`, literal tuples of
+     bare names) whose copy under `~/.claude` is missing, differs from the commit's bytes, or is a symlink. If `main`
+     changed one of those files after the commit, the run stops: installing it would put an older version in place
+     (the same rule `ah install-files` applies on t2-dev).
+   - t2-dev: every `HOOKS` file that the remote installer's dry run does not report as `already_current` there.
+6. **Confirmation.** A real run asks, on `/dev/tty`, for the first 12 characters of the commit. No flag skips it, and
+   without a terminal the run stops.
+7. **Mac install.** It runs `python3 -B -E -s install.py --apply --hooks-only` from the export. `CLAUDE.md` and
    `settings.json` are not touched, and every replaced file is backed up. It then compares every listed file with the
    commit.
-5. **t2-dev install.** It runs the installed `ah.py` remote installer (the audited route, with its own staging,
-   self-test and rollback) for the changed files only, with the ticket. A second dry run must then report every file
-   current.
+8. **t2-dev install.** It runs the installed `ah.py` remote installer (the audited route, with its own staging,
+   self-test and rollback) for the changed files only, with the ticket, in batches of 20 with `command_guard.py` in the
+   last batch. Each batch prints its run id. If a batch fails or times out, the message lists the batches already
+   installed and, for a run with no result yet, the exact `--resume` and `--rollback` commands. A second dry run must
+   then report every file current.
+9. **Registration.** `--hooks-only` never edits `settings.json`, so a hook the new manifest declares is not running
+   until it is registered. The script runs doctor before and after the Mac install and reports hooks that are newly
+   declared but unregistered (kept apart from ones that were already unregistered), and the `unregistered` list
+   `ah install-files` returns for t2-dev. A hook that was wired before and is not wired after stops the run.
 
-`--preview` runs steps 1 to 3 and stops. It never clones, never checks out, never installs and never writes under
-`~/.claude`. It does fetch into the install clone, and each t2-dev dry run appends the remote installer's own audit row.
-`--no-remote` updates the Mac only. Exit 0 means every listed file matches the commit. Exit 1 prints `STOP:` and the
-step that failed.
+`--preview` runs steps 1 to 5 and stops: it never installs and never writes under `~/.claude`. Each t2-dev dry run
+appends the remote installer's own audit row. `--no-remote` updates the Mac only.
+
+Exit codes: 0 installed and registered (or a clean preview); 1 `STOP:` and the step that failed; 2 not started with
+`-I`; 3 installed, but some hooks need registering with `install.py --apply` (without `--hooks-only`) from a checkout of
+that commit.
+
+Run time: a preview makes `ceil(N/20)` dry runs per host, where N is the `HOOKS` count at the commit (about 110 today,
+so 6). A real run makes those, one install per batch of changed files, then the same dry runs again. Each dry run
+fetches the canonical `main` on its own; no timing has been measured.
 
 ## Installer scan (installer_scan.py)
 
