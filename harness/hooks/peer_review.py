@@ -1836,6 +1836,29 @@ def plan_resource_gate(content):
         return 0, ''  # older install without the resource gate
 
 
+def _burn_review_stamp(argv) -> None:
+    """goodqa#16811: a run that argparse refuses (an unknown option, a bad value, --help) still consumes main's
+    review-auth stamp, so the stamp cannot outlive the run it was minted for. merge_gate mints one only for a single
+    plain command naming each binding flag once, so reading `--flag value` and `--flag=value` here finds the pair it
+    minted. Best effort: nothing here can change how the run ends."""
+    argv = [str(word) for word in argv]
+    if '--no-main-stamp' in argv:
+        return
+    found = {}
+    for index, word in enumerate(argv):
+        for flag in ('--github-repo', '--pr'):
+            if word == flag and index + 1 < len(argv):
+                found.setdefault(flag, argv[index + 1])
+            elif word.startswith(flag + '='):
+                found.setdefault(flag, word[len(flag) + 1:])
+    try:
+        repo, number = found['--github-repo'], int(found['--pr'])
+        import caller_identity
+        caller_identity.take_stamp('review-auth', [repo, number], ttl=REVIEW_STAMP_TTL_SECONDS)
+    except Exception:
+        return
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -1872,7 +1895,11 @@ def main() -> int:
     parser.add_argument('--no-main-stamp', action='store_true',
                         help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
                              'but can never mint a merge authorization (the ahc daemon always passes this)')
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        _burn_review_stamp(sys.argv[1:])  # argparse refused the run (or printed help) before the take below
+        raise
     # goodqa#16811: take main's review-auth stamp before anything else can end the run, so a run that exits early (a
     # usage error, a HEAD mismatch, a dirty worktree) leaves no stamp for a later process to take; a stamp older than
     # REVIEW_STAMP_TTL_SECONDS (the hook mints it as this very process launches) is never honoured.

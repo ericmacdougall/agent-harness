@@ -47,6 +47,22 @@ class StampLifetime(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIsNone(self.left())
 
+    def test_an_argparse_refusal_consumes_the_stamp_too(self):
+        # argparse exits inside parse_args, before the take that follows it.
+        for extra in (("--no-such-option",), ("--author-harness", "nobody"), ("--help",)):
+            with self.subTest(extra=extra):
+                self.stamp()
+                result = self.run_review(*extra)
+                self.assertIn(result.returncode, (0, 2), result.stdout + result.stderr)
+                self.assertIsNone(self.left(), extra)
+
+    def test_an_argparse_refusal_with_no_main_stamp_leaves_the_stamp(self):
+        # Control: the opt-out holds on the refusal path too.
+        self.stamp()
+        result = self.run_review("--no-main-stamp", "--no-such-option")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIsNotNone(self.left())
+
     def test_a_stamp_older_than_the_review_window_is_not_honoured(self):
         self.stamp(age=300)
         result = self.run_review("--author-harness", "claude")
