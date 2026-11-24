@@ -72,11 +72,32 @@ class LedgerMemo(unittest.TestCase):
     def test_unchanged_file_is_parsed_once(self):
         for i in range(5):
             self.add(i)
+        self.age()
         real = json.loads
         with mock.patch.object(ah.json, "loads", side_effect=real) as spy:
             for _ in range(4):
                 self.assertEqual(len(self.read()), 5)
         self.assertEqual(spy.call_count, 5)
+
+    def age(self, secs=10):
+        old = time.time() - secs
+        os.utime(self.path, (old, old))
+
+    def test_a_just_written_file_is_not_served_from_the_memo(self):
+        """Racy-timestamp control: parsed within the timestamp granularity of its last write, so re-read next time."""
+        self.add(1)
+        real = json.loads
+        with mock.patch.object(ah.json, "loads", side_effect=real) as spy:
+            self.read()
+            self.read()
+        self.assertEqual(spy.call_count, 2)
+
+    def test_same_size_rewrite_of_a_settled_file_is_not_served_stale(self):
+        self.add(1)
+        self.age()
+        self.assertEqual(self.read()[0]["args"]["n"], 1)
+        self.path.write_text(self.path.read_text().replace('"n": 1', '"n": 9'))
+        self.assertEqual(self.read()[0]["args"]["n"], 9)
 
     def test_same_size_rewrite_is_not_served_stale(self):
         self.add(1)

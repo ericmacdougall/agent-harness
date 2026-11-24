@@ -1633,7 +1633,8 @@ def _append_line(path: Path, record: dict) -> None:
         os.close(fd)
 
 
-_LEDGER_MEMO: dict = {}   # (path, include_intents) -> (stat fingerprint, rows, lost lines, skipped); goodqa#17100
+_LEDGER_MEMO: dict = {}   # (path, include_intents) -> (stat fingerprint, rows, lost lines, skipped, parse time); goodqa#17100
+LEDGER_MEMO_SETTLE_S = 2.0   # a memo is served only if the file had been still this long when it was parsed (coarse mtime granularity)
 
 
 def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None" = None) -> list:
@@ -1648,13 +1649,16 @@ def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None"
     path = store_dir(home) / "ledger.jsonl"
     key = (str(path), bool(include_intents))
     out, lost, skipped = [], [], 0
+    parsed_at = time.time()
     try:
         with open(path, "rb") as handle:
             st = os.fstat(handle.fileno())
             mtime = st.st_mtime
             fp = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
             memo = _LEDGER_MEMO.get(key) if tally is not None else None
-            if memo and memo[0] == fp:
+            # same stat triple AND settled: an in-place rewrite of the same size inside the filesystem's timestamp
+            # granularity of the parse would keep inode, size, mtime and ctime, so a memo of a just-written file is not served
+            if memo and memo[0] == fp and memo[4] - st.st_mtime >= LEDGER_MEMO_SETTLE_S:
                 for at_tail, lost_mtime in memo[2]:
                     tally.line_lost(at_tail, lost_mtime)
                 tally.skipped += memo[3]
@@ -1681,7 +1685,7 @@ def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None"
             tally.read_ok += 1
             after = os.stat(path)
             if fp == (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-                _LEDGER_MEMO[key] = (fp, out, lost, skipped)   # only a parse of a file that did not move meanwhile
+                _LEDGER_MEMO[key] = (fp, out, lost, skipped, parsed_at)   # only a parse of a file that did not move meanwhile
                 return list(out)
     except OSError as error:
         if tally is not None:
