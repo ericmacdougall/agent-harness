@@ -658,36 +658,80 @@ def decode_ansi(body):
     return ''.join(out)
 
 
-def scan_balanced(s, i, open_ch='(', close_ch=')'):
-    """Index just past the delimiter closing the one opened before s[i]; quote and nesting aware."""
+SCAN_NEST_CAP = 64  # nested $( ${ levels one scan follows; deeper text counts as unterminated (the caller takes the rest)
+_SCAN_WORD = re.compile(r'(case|in|esac)(?=[\s;&|()<>]|$)')
+_WORD_EDGE = ' \t\n;&|()'
+
+
+def scan_balanced(s, i, open_ch='(', close_ch=')', _nest=0):
+    """Index just past the delimiter closing the one opened before s[i]; quote and nesting aware.
+
+    goodqa#17060: a `$(..)` or `${..}` inside, also inside double quotes, is skipped whole, so its own `)` or `}`
+    does not end this one (`${x:-$(a }; b)}`, `$(echo ${x:-)}; b)`). Inside parentheses, the `)` that ends a case
+    pattern (`$(case a in a) b;; esac)`) does not end it either. Where the reading is unsure the scan runs longer,
+    which puts more text inside the substitution the guards judge, never less."""
     depth, n = 1, len(s)
+    if _nest > SCAN_NEST_CAP:
+        return n + 1
+    cases = []  # parentheses only: per open case statement, 'subject', 'pattern' or 'body'
+    edge = True  # s[i] starts a word
     while i < n:
         c = s[i]
         if c == '\\':
-            i += 2
+            i, edge = i + 2, False
             continue
         if c == "'":
             j = s.find("'", i + 1)
-            i = n if j < 0 else j + 1
+            i, edge = (n if j < 0 else j + 1), False
             continue
         if c == '"':
             i += 1
             while i < n and s[i] != '"':
+                if s[i] == '$' and s[i + 1:i + 2] in ('(', '{'):
+                    i = scan_balanced(s, i + 2, *(('(', ')') if s[i + 1] == '(' else ('{', '}')), _nest=_nest + 1)
+                    continue
                 i += 2 if s[i] == '\\' else 1
-            i += 1
+            i, edge = i + 1, False
             continue
         if c == '`':
             j = i + 1
             while j < n and s[j] != '`':
                 j += 2 if s[j] == '\\' else 1
-            i = j + 1
+            i, edge = j + 1, False
             continue
+        if c == '$' and s[i + 1:i + 2] in ('(', '{'):
+            i = scan_balanced(s, i + 2, *(('(', ')') if s[i + 1] == '(' else ('{', '}')), _nest=_nest + 1)
+            edge = False
+            continue
+        if open_ch == '(':
+            m = _SCAN_WORD.match(s, i) if edge else None
+            if m:
+                word = m.group(1)
+                if word == 'case':
+                    cases.append('subject')
+                elif word == 'in' and cases and cases[-1] == 'subject':
+                    cases[-1] = 'pattern'
+                elif word == 'esac' and cases and cases[-1] != 'subject':
+                    cases.pop()
+                i, edge = m.end(), False
+                continue
+            if cases and cases[-1] == 'pattern' and c in '()':
+                if c == ')':
+                    cases[-1] = 'body'  # the pattern list ends; its `)` closes nothing
+                i, edge = i + 1, True  # a `(` opening a pattern list opens nothing either
+                continue
+            if cases and cases[-1] == 'body' and c == ';' and s[i + 1:i + 2] in (';', '&'):
+                cases[-1] = 'pattern'
+                i = i + 3 if s[i + 1:i + 3] == ';&' else i + 2
+                edge = True
+                continue
         if c == open_ch:
             depth += 1
         elif c == close_ch:
             depth -= 1
             if depth == 0:
                 return i + 1
+        edge = c in _WORD_EDGE
         i += 1
     return n + 1  # unterminated: caller takes the rest
 
@@ -938,11 +982,12 @@ class Lexer:
         if nxt == '"' and not in_dq:
             return i + 1  # $"..." locale string: the quote branch handles the rest
         if nxt == '(':
-            if s[i + 2:i + 3] == '(':
-                j = scan_balanced(s, i + 3)
+            end = self._arith_end(s, i) if s[i + 2:i + 3] == '(' else None
+            if end is not None:  # `$(( ... ))`: arithmetic, whose operands may hold substitutions
+                self._record_inner_subs(s[i + 3:end - 2], w)
                 w.dynamic = True
                 buf.append(ARITH_MARK)
-                return min(j + 1, n)
+                return min(end, n)
             j = scan_balanced(s, i + 2)
             if j > n:
                 self.ctx.unterminated = True
@@ -953,6 +998,7 @@ class Lexer:
         if nxt == '{':
             j = scan_balanced(s, i + 2, '{', '}')
             body = s[i + 2:j - 1] if j <= n else s[i + 2:]
+            self._record_inner_subs(body, w)
             self._expand_braced(body, w, buf)
             return min(j, n)
         if self.ps and s[i + 1:i + 5].lower() == 'env:':
@@ -981,6 +1027,49 @@ class Lexer:
                 return i + 5 + len(m.group(0))
         buf.append('$')
         return i + 1
+
+    @staticmethod
+    def _arith_end(s, i):
+        """For the `$((` at s[i]: the index past its closing `))` when it is an arithmetic expansion, or None when the
+        inner parenthesis closes before a `)` follows (`$((cmd) )`), which bash and zsh read as a command
+        substitution holding a subshell (goodqa#17060). An unterminated one counts as arithmetic, as before."""
+        j = scan_balanced(s, i + 3)
+        if j >= len(s):
+            return j + 1
+        return j + 1 if s[j] == ')' else None
+
+    def _record_inner_subs(self, text, w):
+        """Record every command substitution in the body of a `${...}` or `$((...))` expansion (goodqa#17060).
+
+        bash, zsh and dash run a substitution in an operator's word (`${x:-$(cmd)}`), a pattern, a replacement, an
+        offset, a subscript and an arithmetic operand, so the inner script is judged like any other. Quoting inside
+        the body is ignored on purpose: a substitution the shell would not run (`${x:-'$(cmd)'}` unquoted) is recorded
+        too, which can only make a guard stricter. Nested `${...}` and `$((...))` are scanned through, not skipped."""
+        i, n = 0, len(text)
+        while i < n:
+            self.budget.tick()
+            c = text[i]
+            if c == '\\':
+                i += 2
+                continue
+            if c == '`' and not self.ps:
+                j = scan_backtick(text, i + 1)
+                w.subs.append((text[i + 1:j - 1] if j <= n else text[i + 1:]).replace('\\`', '`'))
+            elif (c == '$' and text[i + 1:i + 2] == '(' and text[i + 2:i + 3] != '(') or \
+                    (c in '<>' and text[i + 1:i + 2] == '('):
+                j = scan_balanced(text, i + 2)
+                w.subs.append(text[i + 2:j - 1] if j <= n else text[i + 2:])
+            elif c == '$' and text[i + 1:i + 3] == '((':
+                if self._arith_end(text, i) is not None:
+                    i += 3  # arithmetic: scan its operands
+                    continue
+                j = scan_balanced(text, i + 2)  # `$((cmd) ...)`: a substitution holding a subshell
+                w.subs.append(text[i + 2:j - 1] if j <= n else text[i + 2:])
+            else:
+                i += 1
+                continue
+            w.dynamic = True
+            i = min(j, n)
 
     def _expand_braced(self, body, w, buf):
         if body.startswith('#'):                    # ${#VAR}: a length, not the value
@@ -1301,8 +1390,21 @@ def _strip_case_patterns(tokens, ps=False):
     return out
 
 
+def _keep_dropped_substitutions(tokens, stripped):
+    """goodqa#17060: the shell expands a case pattern (and runs its substitutions) when it tries that pattern, but
+    the case pass drops pattern words. Every dropped word that holds a substitution is handed back as an argument of a
+    no-op `:` command at the end, so its substitutions are judged like any other."""
+    kept = {id(v) for k, v in stripped if k == 'w'}
+    dropped = [v for k, v in tokens if k == 'w' and id(v) not in kept and v.subs]
+    if not dropped:
+        return stripped
+    colon = Word()
+    colon.alts, colon.raw = [':'], ':'
+    return list(stripped) + [('op', ';'), ('w', colon)] + [('w', v) for v in dropped]
+
+
 def parse(tokens, ps=False):
-    tokens = _strip_case_patterns(tokens, ps)
+    tokens = _keep_dropped_substitutions(tokens, _strip_case_patterns(tokens, ps))
     pipelines, pl, cmd = [], Pipeline(), Cmd()
 
     def end_cmd():
