@@ -116,6 +116,18 @@ class Stamps(unittest.TestCase):
         self.assertIsNotNone(ci.take_stamp("review-auth", ["o/r", 5], home=self.home))
         self.assertIsNone(ci.take_stamp("review-auth", ["o/r", 5], home=self.home))
 
+    def test_native_binding_is_optional_bounded_and_single_use(self):
+        binding = {"call_id": "call_fixture", "offset": 9}
+        ci.put_stamp("native-pr-proof", ["o/r", 5], home=self.home, native_binding=binding)
+        taken = ci.take_stamp("native-pr-proof", ["o/r", 5], home=self.home)
+        self.assertEqual(taken["native_binding"], binding)
+        self.assertIsNone(ci.take_stamp("native-pr-proof", ["o/r", 5], home=self.home))
+        ci.put_stamp("native-pr-proof", ["o/r", 5], home=self.home)
+        self.assertNotIn("native_binding", ci.take_stamp("native-pr-proof", ["o/r", 5], home=self.home))
+        with self.assertRaisesRegex(ValueError, "read budget"):
+            ci.put_stamp("native-pr-proof", ["o/r", 5], home=self.home, native_binding={"large": "x" * 5000})
+        self.assertIsNone(ci.take_stamp("native-pr-proof", ["o/r", 5], home=self.home))
+
     def test_an_old_stamp_is_refused(self):
         ci.put_stamp("ack-handoff", ["agent-1"], home=self.home, now=time.time() - ci.STAMP_TTL_SECONDS - 5)
         self.assertIsNone(ci.take_stamp("ack-handoff", ["agent-1"], home=self.home))

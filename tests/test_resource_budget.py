@@ -35,6 +35,7 @@ GOOD_CP = "durable output under ~/.agent-harness/work/s/t/, steps idempotent, re
 # Roughly the real Mac at 16:06Z (8 GB machine under load) and dev2 (192 cores, 185 GB).
 MAC = {"host": "mac", "mem_available_gb": 5.0, "cores": 8, "load1": 3.0, "disk_free_gb": 100, "pressure_free_pct": 40}
 DEV2 = {"host": "dev2", "mem_available_gb": 134.0, "cores": 192, "load1": 4.0, "disk_free_gb": 900, "pressure_free_pct": None}
+T2_DEV = {"host": "t2-dev", "mem_available_gb": 20.0, "cores": 48, "load1": 4.0, "disk_free_gb": 45, "pressure_free_pct": None}
 
 
 def packet(host="dev2", mem="6 GB", wall="25 min", checkpoint=GOOD_CP):
@@ -42,6 +43,22 @@ def packet(host="dev2", mem="6 GB", wall="25 min", checkpoint=GOOD_CP):
 
 
 class Budget(unittest.TestCase):
+    def test_physical_t2_dev_budget_uses_existing_resource_controls(self):
+        text = packet(host="t2-dev")
+        problems, parsed = rb.lint_budget(text)
+        self.assertEqual(problems, [])
+        self.assertEqual(parsed["host"], "t2-dev")
+        self.assertIsNone(parsed["capacity"], "a physical runner must use measured capacity")
+        self.assertEqual(rb.plan_gate(text, "enforce", cap=T2_DEV), (0, ""))
+        excessive = text.replace("memory: 6 GB", "memory: 80 GB").replace("processes=8", "processes=65")
+        code, reason = rb.plan_gate(excessive, "enforce", cap=T2_DEV)
+        self.assertEqual(code, 2)
+        self.assertIn("exceeds t2-dev headroom", reason)
+        self.assertIn("exceeds the t2-dev ceiling", reason)
+        code, reason = rb.plan_gate(packet(host="t2-dev-unknown"), "enforce", cap=T2_DEV)
+        self.assertEqual(code, 2)
+        self.assertIn("Host:", reason)
+
     def test_plan_without_section_is_rejected(self):
         code, text = rb.plan_gate("# Plan\n\nTicket: GoodQA harness#1\n", "enforce", cap=DEV2)
         self.assertEqual(code, 2)
@@ -61,7 +78,7 @@ class Budget(unittest.TestCase):
             big.write_bytes(b"x" * (2 * 1024 * 1024))
             bad = Path(tmp, "bad.md")
             bad.write_bytes(b"## Resource budget\n\xff\xfe\n")
-            # A fixture capacity keeps the bad.md case (decoded with replacement, then linted) from sshing to dev2.
+            # Preserve historical capacity injection for packets decoded with replacement, then linted.
             capacity_file = Path(tmp, "dev2.json")
             capacity_file.write_text(json.dumps(DEV2))
             for packet_path in (fifo, big, bad):
@@ -72,17 +89,31 @@ class Budget(unittest.TestCase):
                 self.assertEqual(done.returncode, 2, packet_path.name + done.stdout)
                 self.assertLess(time.time() - started, 10)
 
-    def test_live_dev2_capacity_parses_ssh_output_without_a_real_ssh(self):
+    def test_live_t2_dev_capacity_probes_only_the_requested_physical_host(self):
         seen = []
 
         def fake_run(argv, timeout=15):
             seen.append(argv)
             return "134000\n192\n4.00\n943718400\n"
         with unittest.mock.patch.object(rb, "_run", fake_run):
-            cap = rb.capacity("dev2")
-        self.assertEqual(seen[0][0], "ssh")
-        self.assertEqual((cap["host"], cap["cores"], cap["load1"]), ("dev2", 192, 4.0))
+            cap = rb.capacity("t2-dev")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][:-1], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "t2-dev"])
+        self.assertEqual((cap["host"], cap["cores"], cap["load1"]), ("t2-dev", 192, 4.0))
         self.assertAlmostEqual(cap["mem_available_gb"], 130.86, places=2)
+
+    def test_retired_host_keeps_recorded_checks_without_any_live_probe(self):
+        text = packet(host="dev2")
+        self.assertEqual(rb.lint_budget(text)[0], [])
+        with unittest.mock.patch.object(rb, "_run") as run:
+            self.assertEqual(rb.check(text, cap=DEV2), [])
+            code, reason = rb.plan_gate(text, "enforce")
+            self.assertEqual(code, 2, reason)
+            self.assertIn("dev2 is retired", reason)
+            self.assertIn("recorded capacity is required", reason)
+            with self.assertRaisesRegex(ValueError, "live capacity is available only"):
+                rb.capacity("dev2")
+            run.assert_not_called()
 
     def test_agent_gate_config_fifo_keeps_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,11 +131,20 @@ class Budget(unittest.TestCase):
             Path(tmp, "p.md").write_text(packet())
             Path(tmp, "mac.json").write_text(json.dumps(MAC))
             Path(tmp, "dev2.json").write_text(json.dumps(DEV2))
-            def run(host, cap):
-                return subprocess.run([sys.executable, str(HOOKS / "resource_budget.py"), "check", "--host", host, "--packet",
-                                       str(Path(tmp, "p.md")), "--capacity-json", str(Path(tmp, cap))],
-                                      capture_output=True, text=True)
+            Path(tmp, "t2-dev.json").write_text(json.dumps(T2_DEV))
+            def run(host, cap=None):
+                args = [sys.executable, str(HOOKS / "resource_budget.py"), "check", "--host", host, "--packet",
+                        str(Path(tmp, "p.md"))]
+                if cap is not None:
+                    args.extend(["--capacity-json", str(Path(tmp, cap))])
+                return subprocess.run(args, capture_output=True, text=True, timeout=15)
             self.assertEqual(run("dev2", "dev2.json").returncode, 0)
+            missing_capacity = run("dev2")
+            self.assertEqual(missing_capacity.returncode, 2, missing_capacity.stdout)
+            self.assertIn("recorded capacity is required", missing_capacity.stdout)
+            self.assertNotIn("OK:", missing_capacity.stdout)
+            Path(tmp, "p.md").write_text(packet(host="t2-dev"))
+            self.assertEqual(run("t2-dev", "t2-dev.json").returncode, 0)
             rejected = run("mac", "mac.json")
             self.assertEqual(rejected.returncode, 2)
             self.assertIn("REJECTED", rejected.stdout)
@@ -171,7 +211,7 @@ class BudgetParsing(unittest.TestCase):
         original = rb.capacity
         rb.capacity = lambda host: (_ for _ in ()).throw(OSError("ssh down"))
         self.addCleanup(setattr, rb, "capacity", original)
-        code, text = rb.plan_gate(packet(host="dev2", mem="1 GB", wall="5 min", checkpoint="none"), "enforce")
+        code, text = rb.plan_gate(packet(host="t2-dev", mem="1 GB", wall="5 min", checkpoint="none"), "enforce")
         self.assertEqual(code, 0)
         self.assertIn("WARN", text)
 

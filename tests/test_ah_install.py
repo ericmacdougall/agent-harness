@@ -526,6 +526,41 @@ class Install(Base):
 
 
 class SelfTest(Base):
+    def exercise_nested_readonly_imports(self, suffix):
+        guard_module = f"guard_fixture_{suffix}"
+        doctor_module = f"doctor_fixture_{suffix}"
+        for helper in (guard_module, doctor_module):
+            (self.hooks / f"{helper}.py").write_text("VALUE = True\n")
+        guard = (
+            "import json, sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).parent))\n"
+            f"import {guard_module}\n"
+            f"assert {guard_module}.VALUE\n"
+            "print(json.dumps({'verdict': 'allow', 'message': ''}))\n"
+        )
+        doctor = guard.replace(guard_module, doctor_module).replace(
+            "json.dumps({'verdict': 'allow', 'message': ''})", "json.dumps({'findings': []})"
+        )
+        (self.hooks / "command_guard.py").write_text(guard)
+        (self.hooks / "doctor.py").write_text(doctor)
+        observed = ai.Remote("t2-dev", self.runner).call("selftest")
+        self.assertTrue(all(probe["verdict"] == "allow" for probe in observed["guard"].values()))
+        self.assertEqual(observed["doctor"]["failing"], [])
+        return {path.name.split(".")[0] for path in self.hooks.rglob(f"*_{suffix}.*.pyc")}
+
+    def test_nested_readonly_selftests_suppress_bytecode(self):
+        self.assertEqual(self.exercise_nested_readonly_imports("baseline"), set())
+
+    def test_bytecode_control_detects_either_missing_selftest_flag(self):
+        for name in ("guard", "doctor"):
+            with self.subTest(child=name):
+                flags = f'sys.executable, "-I", "-B", {name}'
+                self.assertEqual(ai.REMOTE_SCRIPT.count(flags), 1)
+                without = ai.REMOTE_SCRIPT.replace(flags, f'sys.executable, "-I", {name}', 1)
+                suffix = f"without_{name}"
+                with mock.patch.object(ai, "REMOTE_SCRIPT", without):
+                    self.assertEqual(self.exercise_nested_readonly_imports(suffix), {f"{name}_fixture_{suffix}"})
+
     def broken_commit(self, guard_bytes):
         side = Path(self.tmp, "broken")
         git(self.tmp, "clone", "-q", str(self.origin), str(side))

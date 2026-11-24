@@ -25,7 +25,7 @@ Review-policy: standard
 
 ## Resource budget
 
-Host: <mac or dev2>
+Host: <mac or t2-dev>
 Fan-out: agents=<n> jobs=<n> processes=<n> browser_pages=<n> test_workers=<n>
 Peak memory: <n GB> (method: <how estimated>)
 CPU: <n cores> (method: <how estimated>)

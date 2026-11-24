@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 from types import SimpleNamespace
+import unittest
 from unittest import mock
 
 from test_spec_flow import ISSUE, SPEC, SpecFlowCase, git_repo, setUpModule, sf, tearDownModule  # noqa: F401
@@ -124,6 +125,133 @@ class NativeClick(SpecFlowCase):
         self.rollout.write_text("")
         self.wal(self.rollout, *history)
         return line
+
+    def pr_owner_history(self):
+        role = "harness_owner"
+        marker = "NATIVE_PR_WITNESS_V1 "
+        line = marker + "{}"
+        meta = json.loads(self.rollout.read_text())
+        source = meta["payload"]["source"]
+        source["subagent"]["thread_spawn"]["agent_role"] = role
+        self.db.execute("UPDATE threads SET agent_role=?, source=? WHERE id=?", (role, json.dumps(source), TESTER))
+        self.db.commit()
+        meta["payload"].update(agent_role=role, subagent_history_start_ordinal=2)
+        root = {"timestamp": meta["timestamp"], "type": "session_meta", "payload": {
+            "id": PARENT, "session_id": PARENT, "source": "vscode", "thread_source": "user",
+            "originator": "Codex Desktop", "model_provider": "fixture-provider",
+        }}
+        settings = {"timestamp": meta["timestamp"], "type": "event_msg", "payload": {
+            "type": "thread_settings_applied", "thread_id": TESTER,
+        }}
+        for path in (self.main, self.child):
+            event = json.loads(path.read_text())
+            path.write_text("")
+            self.wal(path, {**event, "agent_type": role})
+        self.wal(self.child, {"at": NOTE, "event": "check", "note": line})
+        self.rollout.write_text("")
+        self.wal(self.rollout, meta, root, settings)
+        identity = sf._native_agent_source(self.main, TESTER, role, purpose="pr-review")
+        return identity, role, marker, line
+
+    def test_authenticated_pr_owner_witness_beyond_click_history_limit(self):
+        identity, role, marker, line = self.pr_owner_history()
+        with self.rollout.open("ab") as stream:
+            row = b'{"type":"fixture","payload":"' + b"x" * 3_300_000 + b'"}\n'
+            for _ in range(5):
+                stream.write(row)
+        self.message(line)
+        self.assertGreater(self.rollout.stat().st_size, sf.NATIVE_ROLLOUT_LIMIT)
+        observed = sf._native_authored_witness(identity, TESTER, role, marker, line, START, END,
+                                               require_fork_boundary=True)
+        self.assertEqual(observed, sf._native_stamp(FINAL))
+
+    def test_click_history_has_unchanged_exact_cap_and_cannot_select_pr_scope(self):
+        identity = sf._native_agent_source(self.main, TESTER, ROLE, purpose="click-test")
+        row = b"x" * 999_999 + b"\n"
+        with self.rollout.open("wb") as stream:
+            for _ in range(16):
+                stream.write(row)
+        self.assertEqual(self.rollout.stat().st_size, sf.NATIVE_ROLLOUT_LIMIT)
+        with sf._native_witness_entries(self.rollout, identity, ROLE, require_fork_boundary=False) as records:
+            self.assertEqual(sum(len(record) + 1 for record in records), sf.NATIVE_ROLLOUT_LIMIT)
+        with self.rollout.open("ab") as stream:
+            stream.write(b"\n")
+        with self.assertRaisesRegex(ValueError, "unqualified native metadata path"):
+            with sf._native_witness_entries(self.rollout, identity, ROLE, require_fork_boundary=False):
+                self.fail("click history larger than its cap was admitted")
+        with self.assertRaises(sf.SpecError):
+            sf._native_agent_source(self.main, TESTER, ROLE, purpose="pr-review")
+        forged = dict(identity, witness_purpose="pr-review", witness_role="harness_owner")
+        with self.assertRaisesRegex(ValueError, "authenticated scope"):
+            with sf._native_witness_entries(self.rollout, forged, "harness_owner", require_fork_boundary=True):
+                self.fail("unverified purpose received the PR history budget")
+
+    def test_pr_history_exact_cap_and_sparse_overflow(self):
+        identity, role, _, _ = self.pr_owner_history()
+        row = b"x" * 999_999 + b"\n"
+        with self.rollout.open("wb") as stream:
+            for _ in range(64):
+                stream.write(row)
+        self.assertEqual(self.rollout.stat().st_size, sf._NATIVE_PR_ROLLOUT_LIMIT)
+        with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as records:
+            self.assertEqual(sum(len(record) + 1 for record in records), sf._NATIVE_PR_ROLLOUT_LIMIT)
+        for mode in ("ab", "wb"):
+            with self.rollout.open(mode) as stream:
+                stream.truncate(sf._NATIVE_PR_ROLLOUT_LIMIT + 1)
+            with self.assertRaisesRegex(ValueError, "unqualified native metadata path"):
+                with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True):
+                    self.fail("PR history larger than the logical byte cap was admitted")
+
+    def test_pr_history_requires_fork_work_bounds_and_complete_consumption(self):
+        identity, role, _, _ = self.pr_owner_history()
+        with self.assertRaisesRegex(ValueError, "verified fork boundary"):
+            with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=False):
+                self.fail("PR history without the fork requirement was admitted")
+        with self.assertRaisesRegex(ValueError, "through EOF"):
+            with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                self.assertIn(b"session_meta", next(rows))
+        for key, limit in (("_NATIVE_PR_SCAN_SECONDS", 0), ("_NATIVE_PR_ROW_LIMIT", 1)):
+            with self.subTest(limit=key), mock.patch.object(sf, key, limit):
+                with self.assertRaisesRegex(ValueError, "work limit exceeded"):
+                    with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                        list(rows)
+
+    def test_pr_history_enforces_per_record_ceiling_and_refuses_malformed_tail(self):
+        identity, role, marker, line = self.pr_owner_history()
+        good = self.rollout.read_bytes()
+        with self.rollout.open("wb") as stream:
+            stream.write(b"x" * sf._NATIVE_PR_RECORD_LIMIT + b"\r\n")
+        with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+            self.assertEqual([len(row) for row in rows], [sf._NATIVE_PR_RECORD_LIMIT])
+        with self.rollout.open("wb") as stream:
+            stream.write(b"x" * (sf._NATIVE_PR_RECORD_LIMIT + 1) + b"\n")
+        with self.assertRaisesRegex(ValueError, "record limit"):
+            with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                list(rows)
+        self.rollout.write_bytes(good)
+        self.message(line)
+        with self.rollout.open("ab") as stream:
+            stream.write(b"{")
+        with self.assertRaises(ValueError):
+            sf._native_authored_witness(identity, TESTER, role, marker, line, START, END, require_fork_boundary=True)
+
+    def test_pr_history_snapshot_rejects_replacement_and_shrink(self):
+        identity, role, _, _ = self.pr_owner_history()
+        good = self.rollout.read_bytes()
+        for change in ("shrink", "replace"):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, "native file changed"):
+                    with sf._native_witness_entries(self.rollout, identity, role, require_fork_boundary=True) as rows:
+                        self.assertIn(b"session_meta", next(rows))
+                        if change == "shrink":
+                            with self.rollout.open("wb"):
+                                pass
+                        else:
+                            self.rollout.rename(self.rollout.with_suffix(".retained"))
+                            self.rollout.write_bytes(good)
+                            self.rollout.chmod(0o600)
+                        list(rows)
+                self.rollout.write_bytes(good)
 
     def test_real_shape_inherited_root_prologue_and_child_boundary_verify(self):
         line = self.inherited_prologue(inherited_witness=True)
@@ -360,6 +488,26 @@ class NativeClick(SpecFlowCase):
             _, _, problem = self.latest(records, index, spec)
             self.assertIn("does not verify", problem)
 
+    def test_historical_native_report_never_supplies_current_pass(self):
+        records, index, spec = self.order_fixture([
+            (TESTER, END, "pass", "2026-11-05T10:10:00Z"),
+            (UNRELATED, END, "pass", "2026-11-05T10:11:00Z"),
+        ])
+        historical = records[1]
+        historical.update(v=1, pass_source=sf._NATIVE_REPORT_SOURCE)
+        latest, _, problem = self.latest([historical], index, spec)
+        self.assertIsNone(latest)
+        self.assertIn("report-only", problem)
+        self.assertTrue(sf._native_click_claim(dict(historical, tester={})))
+        with mock.patch.object(sf, "_native_click_record_proof"):
+            latest, _, problem = self.latest(records, index, spec)
+            self.assertIsNone(latest, "a newer unbound receipt must not reveal an older PASS")
+            self.assertIn("does not verify", problem)
+            historical["_at"] = "2026-11-05T10:05:00Z"
+            latest, _, problem = self.latest(records, index, spec)
+            self.assertIs(latest, records[0])
+            self.assertIsNone(problem)
+
     def test_candidate_limit_stops_before_native_history_reads(self):
         records, index, spec = self.order_fixture(
             [(TESTER, END, "pass", FINAL)] * (sf.MAX_NATIVE_CLICK_CANDIDATES + 1))
@@ -388,3 +536,104 @@ class NativeClick(SpecFlowCase):
             latest, _, problem = self.latest(records, index, spec)
             self.assertIsNone(problem)
             self.assertIs(latest, records[0])
+
+import test_spec_flow_native_review as fixtures
+
+REVIEWER, OTHER = fixtures.REVIEWER, fixtures.OTHER
+
+class HistoricalNativeClick(unittest.TestCase):
+    setUp = fixtures.NativeSpecReview.setUp
+    child = fixtures.NativeSpecReview.child
+
+    def fixture(self):
+        self.child(REVIEWER, 'harness_click_tester')
+        self.db.execute('ALTER TABLE threads ADD COLUMN rollout_path TEXT')
+        self.db.execute('ALTER TABLE threads ADD COLUMN model_provider TEXT')
+        self.rollout = self.home / '.codex/sessions/2026/11/22/tester.jsonl'
+        self.rollout.parent.mkdir(parents=True)
+        for path in (self.home / '.codex/sessions', *list(self.rollout.parents)[:3]):
+            path.chmod(0o700)
+        self.sha = hashlib.sha256(self.report.read_bytes()).hexdigest()
+        self.final = {'timestamp':'2026-11-22T19:00:00Z','type':'response_item',
+                      'payload':{'type':'message','id':'owned-final','role':'assistant','channel':'final',
+                                 'content':[{'type':'output_text','text':'REPORT_SHA256 '+self.sha}]}}
+        self.write_final()
+        self.db.execute('UPDATE threads SET rollout_path=? WHERE id=?', (str(self.rollout), REVIEWER))
+        self.db.commit()
+
+    def write_final(self):
+        self.rollout.write_text(json.dumps({'type':'session_meta','payload':{'id':REVIEWER}})+'\n'+json.dumps({'type':'event_msg','payload':{'type':'item_completed','thread_id':REVIEWER,'item':{'type':'AgentMessage','phase':'final_answer','id':'owned-final'}}})+'\n'+json.dumps(self.final)+'\n')
+        self.rollout.chmod(0o600)
+
+    def get(self, sha=None):
+        return sf._native_click_tester(self.wal.parent, REVIEWER, sha or self.sha)
+
+    def test_native_report_digest_bound_to_tester_final(self):
+        self.fixture()
+        tester = self.get()
+        self.assertEqual(tester['agent_type'], 'harness_click_tester')
+        self.assertEqual(tester['family'], 'codex')
+        self.assertEqual(tester['identity'], REVIEWER)
+
+    def test_report_only_cli_verifies_authorship_but_never_posts_current_pass(self):
+        self.report.write_text('CLICK_TEST_RESULT: PASS\nOwned sandbox observation.\n')
+        self.fixture()
+        session = SimpleNamespace(ticket=SimpleNamespace(label='GoodQA harness#1'), post=mock.Mock())
+        args = SimpleNamespace(log=[],report=str(self.report),result='pass',screenshot=[],repo=str(self.root),
+                               deployed_commit='a'*40,agent_id=REVIEWER,wal_dir=str(self.wal.parent),
+                               human=None, actor='agent:main', url='http://owned.test', really_tested=None,
+                               started=None, ended=None, print_native_witness=False, verify_native_witness=False)
+        for changes in ({}, {'deployed_commit': 'c' * 40}, {'url': 'http://other.test'}):
+            with self.subTest(changes=changes), \
+                 mock.patch.object(sf, '_actor_and_spec', return_value=(session, [], {}, {'spec_core_sha': 'b' * 64})):
+                with self.assertRaisesRegex(sf.SpecError, "report authorship verified.*context-bound"):
+                    sf.cmd_click_test(SimpleNamespace(**{**vars(args), **changes}), {})
+                session.post.assert_not_called()
+
+    def test_actual_forked_rollout_final_phase_binds_only_own_completion(self):
+        self.fixture()
+        self.final['payload'].pop('channel')
+        self.final['payload']['phase'] = 'final_answer'
+        self.write_final()
+        lines = self.rollout.read_text().splitlines()
+        lines.insert(1, json.dumps({'type':'session_meta','payload':{'id':fixtures.PARENT}}))
+        self.rollout.write_text('\n'.join(lines)+'\n')
+        self.assertEqual(self.get()['identity'], REVIEWER)
+        event = json.loads(lines[2]);event['payload']['thread_id'] = fixtures.PARENT
+        lines[2] = json.dumps(event)
+        self.rollout.write_text('\n'.join(lines)+'\n')
+        with self.assertRaises(sf.SpecError):
+            self.get()
+
+    def test_wrong_role_parent_and_digest_refuse(self):
+        self.fixture()
+        with self.assertRaises(sf.SpecError):
+            self.get('a'*64)
+        self.db.execute('UPDATE threads SET agent_role=? WHERE id=?', ('harness_owner', REVIEWER));self.db.commit()
+        with self.assertRaises(sf.SpecError):
+            self.get()
+        self.db.execute('UPDATE threads SET agent_role=?,attached_thread_parent_id=? WHERE id=?',
+                        ('harness_click_tester', OTHER, REVIEWER));self.db.commit()
+        with self.assertRaises(sf.SpecError):
+            self.get()
+
+    def test_tool_user_and_nonfinal_text_cannot_bind_report(self):
+        self.fixture()
+        for role, channel in (('user','final'), ('tool','final'), ('assistant','commentary')):
+            self.final['payload']['role'], self.final['payload']['channel'] = role,channel
+            self.write_final()
+            with self.assertRaises(sf.SpecError):
+                self.get()
+
+    def test_unowned_shape_symlink_and_foreign_path_refuse(self):
+        self.fixture()
+        original = self.rollout.read_bytes()
+        self.rollout.chmod(0o666)
+        with self.assertRaises(sf.SpecError):
+            self.get()
+        self.rollout.chmod(0o600)
+        elsewhere = self.root / 'foreign.jsonl'
+        elsewhere.write_bytes(original);elsewhere.chmod(0o600)
+        self.rollout.unlink();self.rollout.symlink_to(elsewhere)
+        with self.assertRaises(sf.SpecError):
+            self.get()

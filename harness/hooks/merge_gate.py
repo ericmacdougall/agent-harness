@@ -108,7 +108,7 @@ WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "bui
 MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
 DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
-STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)|main-stamps", re.I)
+STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)|main-stamps|native-pr-releases", re.I)
 # #134 red-team P2: the peer_review run that mints a merge authorization (pr stage with a GitHub binding)
 # any option order (B2): `peer_review.py --github-repo o/r --pr 5 pr ...` binds as well
 PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?\b[^\n;&|]*\s--(?:github-repo|pr)\b")
@@ -1949,6 +1949,24 @@ def decide(payload, runner, state_dir, now=None):
         return 0, ""
     if not _shell_like(tool) and tool.lower() in WRITE_TOOLS:
         return 0, ""
+    if re.search(r"native_pr_dispatch\.py['\"]?\s+(?:authorize|merge|reconcile)\b", command):
+        try:
+            import native_pr_dispatch
+            from native_main import is_desktop_review_root
+
+            args = native_pr_dispatch.direct_args(command)
+            if subagent or args is None or is_desktop_review_root(payload) is not True:
+                return 2, "merge-gate: native PR operations need one direct installed command from the verified Desktop main."
+            binding = native_pr_dispatch.review.native_call_binding(payload, command)
+            if binding is None or not native_pr_dispatch.review.native_call_still_running(binding):
+                return 2, "merge-gate: native PR operations need a positively bound running native call."
+            import caller_identity
+            caller_identity.put_stamp(native_pr_dispatch.PURPOSE, native_pr_dispatch.stamp_parts(args),
+                                      session=str(payload.get("session_id") or ""), now=now,
+                                      native_binding=binding)
+            return 0, ""
+        except Exception:
+            return 2, "merge-gate: native PR main authority could not be verified."
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
