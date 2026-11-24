@@ -539,9 +539,12 @@ class Budget:
 
 
 class Word:
-    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw')
+    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw', 'odd_edge')
 
     def __init__(self):
+        # the lexer ended or started this word at \r, \f or \v, where bash and zsh do not split words: the shell's
+        # word is longer than this one, so it is never a reserved word (goodqa#17059)
+        self.odd_edge = False
         self.alts = ['']
         self.subs = []       # inner scripts of $(..), `..`, <(..)
         self.vars = []       # variable names expanded inside the word (for secret-print checks)
@@ -602,6 +605,7 @@ SUB_MARK, ARITH_MARK = '', ''
 VAR_OPEN, VAR_CLOSE = chr(0xE030), chr(0xE031)
 VAR_MARKER = re.compile(VAR_OPEN + '([A-Za-z_][A-Za-z0-9_]*)' + VAR_CLOSE)
 WS = ' \t\r\f\v'
+ODD_WS = ('\r', '\f', '\v')  # the lexer splits words here; bash and zsh do not
 RESERVED = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '}', '!', 'time', 'fi', 'done', 'esac',
             'function', 'coproc', ';;'}
 NONEXEC_HEADS = {'for', 'case', 'select'}
@@ -1049,6 +1053,7 @@ class Lexer:
                 i += 1
                 continue
             w.raw = s[i:j]
+            w.odd_edge = s[j:j + 1] in ODD_WS or (i > 0 and s[i - 1] in ODD_WS)
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
@@ -1168,46 +1173,112 @@ def _mktemp_base(text, cwd, env_tmp):
     return os.path.normpath(base)
 
 
+def _keyword_word(word, name):
+    """`word` is the reserved word `name` as bash and zsh read it: its source text exactly, unquoted, not a brace
+    expansion or other text that only expands to it, and not glued to a neighbour at \\r, \\f or \\v."""
+    return not word.quoted and word.raw == name and not word.odd_edge
+
+
+# goodqa#17059: where a command provably starts. Inverted: a position counts only where bash and zsh both read the
+# next word as a command (so a reserved word there is the keyword); anywhere else, the parser passes that rely on a
+# keyword (case patterns) keep the strict reading. Not after `)` (a subshell or a function's parentheses), a
+# redirection, an assignment or any other word.
+START_OPS = frozenset(('\n', ';', '&', '&&', '||', '|', '|&', '('))
+# reserved words after which a command starts, when they are themselves at a command start
+LEAD_WORDS = ('if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!', 'time')
+PIPE_OPS = ('|', '|&')
+
+
+class CommandStart:
+    """Feed the tokens a pass emits, in order; `next_is_start()` says whether the next one sits where a command
+    starts. `time` and `!` prefix a whole pipeline, so after `|` or `|&` (and any line breaks after it) they are
+    ordinary command names in bash, and no command starts after them there."""
+
+    def __init__(self):
+        self.fed = []  # (token, was at a command start)
+
+    def feed(self, token):
+        self.fed.append((token, self.next_is_start()))
+
+    def next_is_start(self):
+        if not self.fed:
+            return True
+        (kind, val), start = self.fed[-1]
+        if kind == 'op':
+            return val in START_OPS
+        if kind != 'w' or not start or not any(_keyword_word(val, w) for w in LEAD_WORDS):
+            return False
+        if val.raw in ('time', '!'):
+            k = len(self.fed) - 2
+            while k >= 0 and self.fed[k][0] == ('op', '\n'):
+                k -= 1
+            if k >= 0 and self.fed[k][0][0] == 'op' and self.fed[k][0][1] in PIPE_OPS:
+                return False
+        return True
+
+
+_ALIASED_KEYWORD = re.compile(r'(?:aliases\[)?[\'"]?(?:case|esac|in|%s)[\'"]?(?:\]\s*)?\+?=' % '|'.join(
+    re.escape(w) for w in LEAD_WORDS))
+
+
+def _aliases_a_keyword(tokens):
+    """The text defines an alias whose name is a reserved word the parser relies on (`alias case=…`, zsh
+    `aliases[case]=…`). An alias is expanded before the word is read as a keyword, so no keyword reading is safe."""
+    words = [v for k, v in tokens if k == 'w']
+    # source text as well as the expanded text: kill_guard rewrites a subscripted assignment's text before parse()
+    return any(w.text == 'alias' or w.text.startswith('aliases[') or (w.raw or '').startswith('aliases[')
+               for w in words) and \
+        any(_ALIASED_KEYWORD.match(w.text) or _ALIASED_KEYWORD.match(w.raw or '') for w in words)
+
+
 def _strip_case_patterns(tokens):
     """`case X in a|b) cmd;; *) cmd;; esac`: drop the pattern lists so `a|b` is not a pipeline and `*` is not a
-    command whose name is a glob. The bodies stay as ordinary commands."""
+    command whose name is a glob. The bodies stay as ordinary commands. Only a `case` that is provably the keyword
+    (unquoted source text at a command start, goodqa#17059) starts pattern mode; any other `case` is a word."""
+    if _aliases_a_keyword(tokens):
+        return list(tokens)
     out, stack, i, n = [], [], 0, len(tokens)
+    starts = CommandStart()
+
+    def emit(token):
+        starts.feed(token)
+        out.append(token)
+
     while i < n:
         kind, val = tokens[i]
-        at_start = not out or out[-1][0] == 'op' or (out[-1][0] == 'w' and not out[-1][1].quoted
-                                                       and out[-1][1].text in RESERVED)
-        if kind == 'w' and not val.quoted and val.text == 'case' and at_start and i + 2 < n \
-                and tokens[i + 2][0] == 'w' and tokens[i + 2][1].text == 'in':
-            out.append(tokens[i])
-            out.append(tokens[i + 1])
+        at_start = starts.next_is_start()
+        if kind == 'w' and at_start and _keyword_word(val, 'case') and i + 2 < n and tokens[i + 1][0] == 'w' \
+                and tokens[i + 2][0] == 'w' and _keyword_word(tokens[i + 2][1], 'in'):
+            emit(tokens[i])
+            emit(tokens[i + 1])
             stack.append('patterns')
             i += 3
             continue
         if stack and stack[-1] == 'patterns':
-            if kind == 'w' and not val.quoted and val.text == 'esac':
+            if kind == 'w' and _keyword_word(val, 'esac'):
                 stack.pop()
-                out.append(tokens[i])
+                emit(tokens[i])
             elif kind == 'op' and val == ')':
                 stack[-1] = 'body'
-                out.append(('op', ';'))
+                emit(('op', ';'))
             # pattern words, `|` and a leading `(` are dropped; newlines between items are kept
             elif kind == 'op' and val == '\n':
-                out.append(tokens[i])
+                emit(tokens[i])
             i += 1
             continue
         if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] == ('op', ';'):
             stack[-1] = 'patterns'
-            out.append(('op', ';'))
+            emit(('op', ';'))
             i += 2
             continue
         if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] in (('op', '&'), ('op', ';;&')):
             stack[-1] = 'patterns'
-            out.append(('op', ';'))
+            emit(('op', ';'))
             i += 2
             continue
-        if stack and kind == 'w' and not val.quoted and val.text == 'esac' and at_start:
+        if stack and kind == 'w' and _keyword_word(val, 'esac') and at_start:
             stack.pop()
-        out.append(tokens[i])
+        emit(tokens[i])
         i += 1
     return out
 
