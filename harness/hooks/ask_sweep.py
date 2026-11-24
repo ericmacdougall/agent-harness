@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -104,6 +105,189 @@ def plan(main_wal: Path, transcript: Path, now: float | None = None, check=None)
     return {"answered": answered, "short": short, "stale": stale}
 
 
+# --------------------------------------------------------------------------- WAL evidence (GoodQA goodqa#16944)
+# Most answers do not come back as a structured `[ask:<id>]` card in the same session. They land as a decision row that
+# names the ask and cites the user's own words, as an ask_resolved row in a successor session, as a later ask that
+# SUPERSEDES this one, or as the user running the step himself in a terminal. These kinds are listed for main to read;
+# a close is still bookkeeping only (no decision), and a terminal match is always marked CONFIRM.
+
+ANSWER_PREFIXES = ("answer:", "user:", "uuid:")
+EVIDENCE_EVENTS = ("decision", "ask_resolved", "result", "status", "check", "handoff")
+ANSWER_WORDS = re.compile(r"\b(answer(s|ed)?|approved|chose|decided|confirmed)\b", re.I)
+WAITING = re.compile(r"\b(pending|awaiting|awaits|waiting|waits|still open|until|blocked on|needs)\b[^.;]{0,40}$", re.I)
+TOKEN = re.compile(r"[~\w.\-/]*[/_][~\w.\-/]*")
+MIN_TOKEN = 10
+GENERIC_TOKENS = {"/home/eric", "/Users/eric", "~/.claude/hooks", "~/.agent-harness/work",
+                  "/home/eric/.agent-harness/work", "/Users/eric/.agent-harness/work"}
+MAX_LINE = 4 * 1024 * 1024
+MAX_TRANSCRIPT = 512 * 1024 * 1024
+KIND_ORDER = {"resolved-elsewhere": 0, "answer": 1, "terminal": 2, "superseded": 3}
+
+
+def _clip(text, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _rows(path: Path, unread: list) -> list:
+    try:
+        handle = open(path, "rb")
+    except OSError as error:
+        unread.append({"source": str(path), "reason": type(error).__name__})
+        return []
+    rows = []
+    with handle:
+        for raw in handle:
+            if len(raw) > MAX_LINE:
+                continue
+            try:
+                rec = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(rec, dict):
+                rows.append(rec)
+    return rows
+
+
+def session_rows(home: Path, session: str, unread: list) -> list:
+    """Every row of the session's main and agent WALs, tagged with its file and session. A missing folder is unread."""
+    folder = home / ".claude" / "wals" / session
+    try:
+        names = sorted(n for n in os.listdir(folder) if n == "main.jsonl" or (n.startswith("agent-") and n.endswith(".jsonl")))
+    except OSError as error:
+        unread.append({"source": f"{session} WAL folder", "reason": type(error).__name__})
+        return []
+    out = []
+    for name in names:
+        for rec in _rows(folder / name, unread):
+            rec["_wal"], rec["_session"] = str(folder / name), session
+            out.append(rec)
+    return out
+
+
+def bash_inputs(home: Path, session: str, unread: list) -> list:
+    """The user's own `<bash-input>` commands in the session transcript: (uuid, ts, command)."""
+    transcript = find_transcript(home, session)
+    if transcript is None:
+        unread.append({"source": f"{session} transcript", "reason": "missing"})
+        return []
+    try:
+        if transcript.stat().st_size > MAX_TRANSCRIPT:
+            unread.append({"source": f"{session} transcript", "reason": "too large to scan"})
+            return []
+        handle = open(transcript, "rb")
+    except OSError as error:
+        unread.append({"source": f"{session} transcript", "reason": type(error).__name__})
+        return []
+    found = []
+    with handle:
+        for raw in handle:
+            if b"<bash-input>" not in raw or len(raw) > MAX_LINE:
+                continue
+            try:
+                rec = json.loads(raw)
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(rec, dict) or rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta"):
+                continue
+            content = (rec.get("message") or {}).get("content")
+            if isinstance(content, list):
+                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+            if not isinstance(content, str) or not content.lstrip().startswith("<bash-input>"):
+                continue
+            m = re.search(r"<bash-input>(.*?)</bash-input>", content, re.S)
+            if m and isinstance(rec.get("uuid"), str):
+                found.append((rec["uuid"], parse_ts(rec.get("timestamp")) or 0.0, m.group(1)))
+    return found
+
+
+def distinctive_tokens(note: str) -> set:
+    tokens = set()
+    for token in TOKEN.findall(note or ""):
+        token = token.strip(".,;:()'\"`")
+        if len(token) >= MIN_TOKEN and token not in GENERIC_TOKENS and not token.endswith("/"):
+            tokens.add(token)
+    return tokens
+
+
+def still_waiting(note: str, ident: str) -> bool:
+    """True when every mention of the ask reads as still waiting ("pending ask X", "awaiting X"): not an answer."""
+    starts = [m.start() for m in re.finditer(re.escape(ident), note)]
+    return bool(starts) and all(WAITING.search(note[max(0, s - 60):s]) for s in starts)
+
+
+def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
+    """{"items": [...], "unread": [...]}: open main-WAL asks of SESSION with WAL or terminal evidence from SESSION and
+    the RELATED sessions (its successors or its coordinator). Read-only."""
+    unread = [] if unread is None else unread
+    sessions = [session] + [s for s in related if s != session]
+    rows = []
+    for s in sessions:
+        rows.extend(session_rows(home, s, unread))
+    inputs = {s: bash_inputs(home, s, unread) for s in sessions}
+    main_wal = home / ".claude" / "wals" / session / "main.jsonl"
+    resolutions = {}
+    for r in rows:
+        if r.get("event") == "ask_resolved" and isinstance(r.get("ref"), str):
+            resolutions.setdefault(r["ref"], r)
+    items = []
+    for ask in (open_asks(main_wal) if main_wal.is_file() else []):
+        ident, opened = ask["id"], float(ask["opened"] or 0)
+        found = []
+        other = resolutions.get(ident)
+        if other is not None:
+            found.append({"kind": "resolved-elsewhere", "ref": str(other.get("id")), "session": other["_session"],
+                          "at": parse_ts(other.get("at")) or 0.0, "summary": str(other.get("note") or ""),
+                          "source": str(other.get("source") or ""), "outcome": None})
+        for r in rows:
+            note = str(r.get("note") or "")
+            when = parse_ts(r.get("at")) or 0.0
+            if r.get("id") == ident or when <= opened or ident not in note:
+                continue
+            source = str(r.get("source") or "")
+            if r.get("event") == "ask" and re.search(r"\bSUPERSEDES\s+" + re.escape(ident), note):
+                found.append({"kind": "superseded", "ref": str(r.get("id")), "session": r["_session"], "at": when,
+                              "summary": note, "source": f"wal:{r['_wal']}#{r.get('id')}", "outcome": "obsolete"})
+            elif (source.startswith(ANSWER_PREFIXES) and r.get("event") in EVIDENCE_EVENTS
+                  and not still_waiting(note, ident)):
+                found.append({"kind": "answer", "ref": str(r.get("id")), "session": r["_session"], "at": when,
+                              "summary": note, "source": source, "outcome": None})
+        tokens = distinctive_tokens(ask["note"])
+        for s in sessions:
+            for uuid, ts, command in inputs[s]:
+                hit = sorted(t for t in tokens if t in command) if ts > opened else []
+                if hit:
+                    excerpt = _clip(command, 58).replace(chr(34), chr(39))
+                    found.append({"kind": "terminal", "ref": f"{s}/{uuid}", "session": s, "at": ts, "confirm": True,
+                                  "summary": f"the user ran in a terminal: {_clip(command, 70)} (matched {hit[0]})",
+                                  "source": f'user:{s}/{uuid} "{excerpt}"', "outcome": None})
+        if not found:
+            continue
+        found.sort(key=lambda e: (KIND_ORDER[e["kind"]], not e["source"].startswith("answer:"),
+                                  not ANSWER_WORDS.search(e["summary"]), e["at"]))
+        best = found[0]
+        items.append({"ask": ident, "kind": best["kind"], "confirm": bool(best.get("confirm")),
+                      "question": ask["note"][:120], "wal": str(main_wal), "evidence": found})
+    return {"items": items, "unread": unread}
+
+
+def close_argv(item: dict) -> list:
+    """The wal_note.py argv that closes one evidence item: bookkeeping, never --decision."""
+    best = item["evidence"][0]
+    argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", item["wal"], "--event", "ask_resolved", "--ref", item["ask"],
+            "--by", "ask-sweep", "--source", best["source"],
+            "--note", f"ask-sweep: {best['kind']} evidence {best['ref']} resolves [ask:{item['ask']}]: "
+                      f"{_clip(best['summary'], 90)} (bookkeeping, not an approval)"]
+    if best.get("outcome"):
+        argv += ["--outcome", best["outcome"]]
+    return argv
+
+
+def close_evidence(items: list, runner=None) -> list:
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=60).returncode)
+    return [(item["ask"], run(close_argv(item))) for item in items]
+
+
 def close_answered(session: str, main_wal: Path, items: list, runner=None) -> list:
     """ask_resolved for each answered ask, through wal_note.py (which re-verifies the answer source). Returns [(ask, rc)].
     No --decision: the close is not an approval whatever the answer was."""
@@ -125,9 +309,11 @@ def main(argv=None) -> int:
     parser.add_argument("--apply", action="store_true", help="close the asks named by --only")
     parser.add_argument("--only", nargs="+", metavar="ASK", help="the ask ids to act on")
     parser.add_argument("--stale", action="store_true", help="also list open asks older than 7 days with no answer")
+    parser.add_argument("--related", action="append", default=[], metavar="SESSION",
+                        help="also search this session's WALs and transcript for evidence (a successor or the coordinator)")
     args = parser.parse_args(argv)
-    if not SESSION_ID.match(args.session):
-        print(json.dumps({"ok": False, "problem": "--session must be a session id"}))
+    if not SESSION_ID.match(args.session) or not all(SESSION_ID.match(s) for s in args.related):
+        print(json.dumps({"ok": False, "problem": "--session and --related must be session ids"}))
         return 2
     if args.apply and not args.only:
         print(json.dumps({"ok": False, "problem": "--apply needs --only: read each answer, then name the asks to close"}))
@@ -139,14 +325,22 @@ def main(argv=None) -> int:
         print(json.dumps({"ok": False, "problem": "no main WAL or transcript for this session"}))
         return 3
     result = plan(main_wal, transcript, check=lambda u: verified(args.session, u, home))
+    structured = {a["ask"] for a in result["answered"] + result["short"]}
+    found = wal_evidence(home, args.session, args.related)
+    result["evidence"] = [i for i in found["items"] if i["ask"] not in structured]
+    result["unread"] = found["unread"]
+    for item in result["evidence"]:
+        item["close"] = " ".join(shlex.quote(a) for a in close_argv(item))
     if args.only:
         result["answered"] = [a for a in result["answered"] if a["ask"] in args.only]
+        result["evidence"] = [i for i in result["evidence"] if i["ask"] in args.only]
     if args.apply:
-        result["closed"] = [{"ask": a, "rc": rc} for a, rc in close_answered(args.session, main_wal, result["answered"])]
+        closed = close_answered(args.session, main_wal, result["answered"]) + close_evidence(result["evidence"])
+        result["closed"] = [{"ask": a, "rc": rc} for a, rc in closed]
     if not args.stale:
         result.pop("stale")
     print(json.dumps(result, indent=1))
-    return 0
+    return 2 if result["unread"] and not args.apply else 0
 
 
 if __name__ == "__main__":

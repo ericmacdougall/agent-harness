@@ -181,5 +181,141 @@ class Cli(Base):
             self.assertEqual(sw.main(["--session", "../../x"]), 2)
 
 
+S1 = "aaaaaaaa-0000-4000-8000-000000000001"   # the session that asked
+S2 = "bbbbbbbb-0000-4000-8000-000000000002"   # a successor or the coordinator
+
+
+def wrow(event, ident, at, note, source="inferred: test", **extra):
+    return {"at": at, "event": event, "id": ident, "note": note, "source": source, **extra}
+
+
+def bash_input(uuid, ts, command):
+    return {"type": "user", "uuid": uuid, "timestamp": ts,
+            "message": {"role": "user", "content": f"<bash-input>{command}</bash-input>"}}
+
+
+class WalEvidence(unittest.TestCase):
+    """GoodQA goodqa#16944: answers that arrive as decision rows, successor-session closes, SUPERSEDES asks or the user's
+    own terminal commands. Listed for main; a close is bookkeeping (no --decision) and a terminal match needs CONFIRM."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+
+    def wal(self, session, rows, name="main.jsonl"):
+        folder = self.home / ".claude" / "wals" / session
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / name, "a") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in rows))
+
+    def transcript(self, session, rows):
+        folder = self.home / ".claude" / "projects" / "-Users-x"
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / (session + ".jsonl"), "a") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in rows))
+
+    def items(self, related=()):
+        return {i["ask"]: i for i in sw.wal_evidence(self.home, S1, related)["items"]}
+
+    def test_decision_row_citing_the_users_answer_resolves_without_a_decision(self):
+        self.wal(S1, [wrow("ask", "w00000000a01", "2026-11-23T19:06:00+00:00", "U6: may reviews attempt Astra?"),
+                      wrow("decision", "w00000000d01", "2026-11-23T22:04:00+00:00",
+                           "User answers: U6 (asks w00000000a01) yes", source=f'answer:{S1}/1111 "Yes, past the limit too"')])
+        item = self.items()["w00000000a01"]
+        self.assertEqual(item["kind"], "answer")
+        argv = sw.close_argv(item)
+        self.assertNotIn("--decision", argv)
+        self.assertEqual(argv[argv.index("--source") + 1], f'answer:{S1}/1111 "Yes, past the limit too"')
+        self.assertEqual(argv[argv.index("--by") + 1], "ask-sweep")
+
+    def test_earlier_unrelated_agent_and_pending_rows_do_not_resolve(self):
+        self.wal(S1, [
+            wrow("decision", "w00000000d02", "2026-11-23T18:00:00+00:00", "about w00000000a02 before it was asked",
+                 source=f'answer:{S1}/1 "Yes"'),
+            wrow("ask", "w00000000a02", "2026-11-23T19:00:00+00:00", "may main delete X?"),
+            wrow("decision", "w00000000d03", "2026-11-23T19:30:00+00:00", "an answer about something else",
+                 source=f'answer:{S1}/2 "Yes"'),
+            wrow("decision", "w00000000d04", "2026-11-23T19:40:00+00:00", "main thinks w00000000a02 is fine",
+                 source="inferred: main"),
+            wrow("decision", "w00000000d05", "2026-11-23T19:50:00+00:00", "staff flows not tested pending ask w00000000a02",
+                 source=f'user:{S1}/3 "get it done"'),
+        ])
+        self.assertEqual(self.items(), {})
+
+    def test_the_real_answer_outranks_an_earlier_mention(self):
+        self.wal(S1, [
+            wrow("ask", "w00000000a03", "2026-11-21T21:29:00+00:00", "may the click-test sign in on staging?"),
+            wrow("status", "w00000000s03", "2026-11-21T22:00:00+00:00", "see w00000000a03 later", source=f'user:{S1}/9 "keep going"'),
+            wrow("decision", "w00000000d06", "2026-11-21T22:48:00+00:00", "Answer to ask w00000000a03: the user approved",
+                 source=f'user:{S1}/10 "Yes, use them"'),
+        ])
+        self.assertEqual(self.items()["w00000000a03"]["evidence"][0]["ref"], "w00000000d06")
+
+    def test_a_close_in_a_related_session_is_found_and_closes_the_asking_wal(self):
+        self.wal(S1, [wrow("ask", "w00000000a04", "2026-11-23T19:00:00+00:00", "q")])
+        self.wal(S2, [wrow("ask_resolved", "w00000000r04", "2026-11-23T20:00:00+00:00", "closed here",
+                           ref="w00000000a04", source=f'answer:{S2}/4 "Yes"')])
+        self.assertEqual(self.items(), {})
+        item = self.items([S2])["w00000000a04"]
+        self.assertEqual(item["kind"], "resolved-elsewhere")
+        argv = sw.close_argv(item)
+        self.assertEqual(argv[argv.index("--wal") + 1], str(self.home / ".claude" / "wals" / S1 / "main.jsonl"))
+
+    def test_terminal_match_needs_a_distinctive_token_after_the_ask_and_is_marked_confirm(self):
+        path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
+        self.wal(S1, [wrow("ask", "w00000000a05", "2026-11-23T22:47:00+00:00", f"Run on t2-dev: rm -r {path}"),
+                      wrow("ask", "w00000000a06", "2026-11-23T22:48:00+00:00", "free space under /home/eric/.agent-harness/work")])
+        self.transcript(S1, [bash_input("u-before", "2026-11-23T22:00:00.000Z", f"ssh t2-dev rm -r {path}"),
+                             bash_input("u-after", "2026-11-24T00:18:00.000Z", f"ssh t2-dev rm -r {path}"),
+                             bash_input("u-du", "2026-11-24T00:19:00.000Z", "du -sh /home/eric/.agent-harness/work")])
+        items = self.items()
+        self.assertNotIn("w00000000a06", items)   # a generic path alone is not evidence
+        item = items["w00000000a05"]
+        self.assertEqual((item["kind"], item["confirm"]), ("terminal", True))
+        self.assertEqual([e["ref"] for e in item["evidence"]], [f"{S1}/u-after"])
+        self.assertNotIn("--decision", sw.close_argv(item))
+
+    def test_a_superseded_ask_closes_as_obsolete_on_wal_evidence(self):
+        self.wal(S1, [wrow("ask", "w00000000a07", "2026-11-23T18:27:00+00:00", "run h3d.sh"),
+                      wrow("ask", "w00000000a08", "2026-11-23T22:41:00+00:00", "SUPERSEDES w00000000a07 (re-worded)")])
+        item = self.items()["w00000000a07"]
+        argv = sw.close_argv(item)
+        self.assertEqual(argv[argv.index("--outcome") + 1], "obsolete")
+        self.assertTrue(argv[argv.index("--source") + 1].startswith("wal:"))
+        self.assertTrue(argv[argv.index("--source") + 1].endswith("#w00000000a08"))
+        self.assertNotIn("--decision", argv)
+
+    def test_listing_writes_nothing_and_unreadable_sources_are_named(self):
+        self.wal(S1, [wrow("ask", "w00000000a09", "2026-11-23T19:00:00+00:00", "q")])
+        before = {str(p): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+        found = sw.wal_evidence(self.home, S1, [S2])
+        self.assertEqual({str(p): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}, before)
+        self.assertTrue(any(S2 in u["source"] for u in found["unread"]))
+
+    def test_main_lists_evidence_and_applies_only_named_asks(self):
+        self.wal(S1, [wrow("ask", "w00000000a10", "2026-11-23T19:00:00+00:00", "q one"),
+                      wrow("ask", "w00000000a11", "2026-11-23T19:00:00+00:00", "q two"),
+                      wrow("decision", "w00000000d10", "2026-11-23T20:00:00+00:00", "answered w00000000a10 and w00000000a11",
+                           source=f'answer:{S1}/5 "Yes, both"')])
+        self.transcript(S1, [])
+        calls = []
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
+                mock.patch.object(sw, "close_evidence", lambda items, runner=None: calls.extend(i["ask"] for i in items) or
+                                  [(i["ask"], 0) for i in items]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(sw.main(["--session", S1]), 0)
+            listed = json.loads(out.getvalue())
+        self.assertEqual(sorted(i["ask"] for i in listed["evidence"]), ["w00000000a10", "w00000000a11"])
+        self.assertNotIn("closed", listed)
+        self.assertEqual(calls, [])
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
+                mock.patch.object(sw, "close_evidence", lambda items, runner=None: calls.extend(i["ask"] for i in items) or
+                                  [(i["ask"], 0) for i in items]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            sw.main(["--session", S1, "--apply", "--only", "w00000000a10"])
+        self.assertEqual(calls, ["w00000000a10"])
+
+
 if __name__ == "__main__":
     unittest.main()
