@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import re
 import shlex
 import subprocess
@@ -364,7 +365,15 @@ class Repair(Base):
         self.assertEqual(out["steps"]["verify"]["equal"], out["steps"]["verify"]["compared"])
 
     def test_drift_after_apply_is_reported(self):
-        (self.home / ".claude" / "hooks" / "ah.py").write_bytes(b"edited")
+        real = self.fake.__call__
+
+        def edits_during_apply(argv, input=None, timeout=None):
+            done = real(argv, input=input, timeout=timeout)
+            if os.path.basename(argv[0]) == "repair-harness" and argv[-1] == "--apply":
+                (self.home / ".claude" / "hooks" / "ah.py").write_bytes(b"edited")
+            return done
+        self.fake = edits_during_apply
+        self.fake.words = lambda: []
         out = self.run_ops("repair", "--ref", REF, "--apply")
         self.assertFalse(out["ok"])
         self.assertEqual(out["code"], "drift")
@@ -563,6 +572,15 @@ class ManifestMode(tai.Base):
             self.addCleanup(patch.stop)
         for key in ("AH_AGENT_ID", "CLAUDE_AGENT_ID"):
             os.environ.pop(key, None)
+        # this Mac's installed hooks, as in production: the guard-file rule reads their manifest and import closure
+        shutil.copytree(HOOKS, self.mac / ".claude" / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
+
+    def non_guard_ref(self):
+        """A newest commit that changes only files that are not guard files (extra.py, doctor.py); c1 also changes command_guard.py
+        and ah.py. Made per test: once it exists, c1 is an older ref."""
+        self.write_commit({n: self.base_bytes(n) + (b"\n# c2\n" if n in ("extra.py", "doctor.py") else b"") for n in tai.NAMES}, "c2")
+        tai.git(self.work, "push", "-q", str(self.origin), "main")
+        return tai.git(self.work, "rev-parse", "HEAD")
 
     HEALTHY = {"guard": {"allow": {"exit": 0, "verdict": "allow", "rule": ""}, "deny_wal": {"exit": 0, "verdict": "block", "rule": "x"},
                          "deny_hooks_copy": {"exit": 0, "verdict": "block", "rule": "y"}}, "doctor": {"flags": True, "failing": []}}
@@ -596,12 +614,21 @@ class ManifestMode(tai.Base):
         self.assertEqual(self.calls, [])
 
     def test_real_manifest_install_with_a_grant_installs_every_listed_file(self):
-        out = self.manifest()
+        out = self.manifest(ref=self.non_guard_ref())
         self.assertEqual(out["result"], "installed", out)
         for name in tai.NAMES:
-            self.assertEqual(self.live(name), tai.sha(self.base_bytes(name) + b"\n# c1\n"))
+            self.assertEqual(self.live(name), tai.sha(self.base_bytes(name) + (b"\n# c2\n" if name in ("extra.py", "doctor.py") else b"")))
         self.assertEqual(self.ss.calls[0][0], "install_files_manifest")
         self.assertTrue(self.rows("start")[-1]["manifest"])
+
+    def test_manifest_install_never_changes_a_guard_file_even_with_a_grant(self):
+        before = {n: self.live(n) for n in tai.NAMES}
+        with self.assertRaises(ai.InstallError) as caught:
+            self.manifest()  # c1 changes command_guard.py and ah.py
+        self.assertEqual(caught.exception.code, "guard_files")
+        self.assertIn("ah.py, command_guard.py", str(caught.exception))
+        self.assertEqual({n: self.live(n) for n in tai.NAMES}, before)
+        self.assertEqual(self.rows("start"), [])
 
     def test_manifest_cannot_be_combined_with_file_resume_or_rollback(self):
         for kw in ({"files": ["ah.py"]}, {"resume": "ins-0123456789ab"}, {"rollback": "ins-0123456789ab"}):
@@ -611,7 +638,7 @@ class ManifestMode(tai.Base):
     def test_resume_of_a_manifest_run_asks_for_the_grant_again(self):
         self.inject = ("commit", 1)
         with self.assertRaises(ai.InstallError):
-            self.manifest()
+            self.manifest(ref=self.non_guard_ref())
         run = self.rows("start")[-1]["run"]
         self.inject = None
         self.ss.allow = False

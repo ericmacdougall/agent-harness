@@ -111,9 +111,8 @@ class Manifest(tai.Base):
         patcher = mock.patch.object(ai, "require_manifest_grant", lambda *a, **k: None)
         patcher.start()
         self.addCleanup(patcher.stop)
-        mac_hooks = self.mac / ".claude" / "hooks"
-        mac_hooks.mkdir(parents=True)
-        shutil.copy2(HOOKS / "hooks_manifest.json", mac_hooks / "hooks_manifest.json")
+        # this Mac's installed hooks, as in production: the rule reads their manifest and import closure
+        shutil.copytree(HOOKS, self.mac / ".claude" / "hooks", ignore=shutil.ignore_patterns("__pycache__"))
 
     def manifest_install(self, ref):
         return ai.install_files("t2-dev", ref, [], tai.TICKET, False, self.mac, "sess", "agent-x", self.runner,
@@ -130,13 +129,24 @@ class Manifest(tai.Base):
         self.assertEqual(self.rows("start"), [])
 
     def test_non_guard_change_installs(self):
-        self.write_commit({"ah.py": self.base_bytes("ah.py") + b"\n# c2\n", "extra.py": self.base_bytes("extra.py") + b"\n# c2\n",
+        self.write_commit({"ah.py": self.base_bytes("ah.py"), "extra.py": self.base_bytes("extra.py") + b"\n# c2\n",
                            "command_guard.py": self.base_bytes("command_guard.py"), "doctor.py": self.base_bytes("doctor.py")}, "c2")
         c2 = tai.git(self.work, "rev-parse", "HEAD")
         tai.git(self.work, "push", "-q", str(self.origin), "main")
         out = self.manifest_install(c2)
         self.assertTrue(out["ok"], out)
         self.assertEqual(out["result"], "installed")
+
+    def test_imported_module_counts_as_a_guard_file(self):
+        """ah.py is imported by registered guard hooks, so a ref that changes only ah.py is a guard install."""
+        self.write_commit({"ah.py": self.base_bytes("ah.py") + b"\n# c4\n", "extra.py": self.base_bytes("extra.py"),
+                           "command_guard.py": self.base_bytes("command_guard.py"), "doctor.py": self.base_bytes("doctor.py")}, "c4")
+        c4 = tai.git(self.work, "rev-parse", "HEAD")
+        tai.git(self.work, "push", "-q", str(self.origin), "main")
+        with self.assertRaises(ai.InstallError) as caught:
+            self.manifest_install(c4)
+        self.assertEqual(caught.exception.code, "guard_files")
+        self.assertIn("ah.py", str(caught.exception))
 
     def test_missing_manifest_on_the_mac_fails_closed(self):
         (self.mac / ".claude" / "hooks" / "hooks_manifest.json").unlink()
