@@ -14,7 +14,10 @@ WHAT.
                 missing copy. --run COMMAND ... holds the lease for the command in the verified checkout. It
                 refuses to create a copy below the free-space floor (exit 3) and writes an alert.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
-                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. It always denies writing scratch INTO
+                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. Wrapper options do not hide a copy
+                (`timeout 120 git clone`). The quoted remote command of a top-level `ssh host '...'` is not
+                charged to this machine (it copies on the far host); see copy_commands and the ssh gap below.
+                It always denies writing scratch INTO
                 /dev/shm (RAM); reading, copying out of and removing from /dev/shm stay allowed. Silent otherwise.
                 Fails OPEN on any internal error.
   session-start SessionStart hook: at most every 6 h starts a detached report-only `reap`, and prints one line when the
@@ -42,8 +45,20 @@ WHAT.
                 deletes nothing. `copy_hygiene.py protected [--check <path>]` lists or explains (exit 1 = protected),
                 the one choke point other cleaners should call: exit 0 is the only go-ahead, and checking children one
                 by one does not cover emptying a directory (check the directory). Known gap: a command sent with
-                `ssh host '...'` is not checked by any hook (the remote host's hook only sees agent sessions running
-                there). `rsync --delete` into a service directory and `git clean` are not treated as deletes.
+                `ssh host '...'` is not checked by any hook on the far host (the remote host's hook only sees agent
+                sessions running there). `rsync --delete` into a service directory and `git clean` are not treated
+                as deletes.
+  ssh           What is and is not checked for ssh (goodqa#16811). The protected-delete and /dev/shm checks still
+                read an ssh's quoted payload as if it ran here (over-reading, never under-reading). The disk-floor
+                copy check skips a top-level simple command whose program is ssh (after VAR=value and
+                sudo/env/timeout/... wrappers) and that carries no `$(` or backtick outside single quotes and no
+                ProxyCommand/LocalCommand/KnownHostsCommand option. Still checked against this machine's floor:
+                every other command on the line (`ssh h '...' && git clone a b`, `ssh h cd x && git clone a b`),
+                `$(...)` or backticks anywhere in the ssh outside single quotes (they run here), a `bash -c '...'`
+                wrapper around the ssh, a heredoc body (`ssh h bash -s <<'EOF'` is read as local text) and a line
+                whose quotes do not balance. Not checked: whether the host is really another machine;
+                `ssh localhost '...'` or an alias of this machine copies onto this disk uncounted (the hook does no
+                DNS or ssh-config reading). The far host's own floor is not checked from here.
   scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
                 directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
                 `export TMPDIR=$(python3 ~/.claude/hooks/copy_hygiene.py scratch)`. Refused below the disk floor; its
@@ -760,10 +775,17 @@ def protecting_tail(rel: str, prot: dict) -> "tuple[str, str] | None":
 
 
 # ---------------------------------------------------------------- command analysis
+SIMPLE_SPLIT = re.compile(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)")
+
+
 def simple_commands(cmd: str) -> list:
-    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises)."""
+    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises).
+
+    It splits inside quotes on purpose: the protected-delete and /dev/shm checks rely on reading every command a
+    quoted `bash -c '...'` or ssh payload might run. Only the disk-floor copy check reads lines through
+    copy_commands instead (goodqa#16811)."""
     out = []
-    for seg in re.split(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)", cmd):
+    for seg in SIMPLE_SPLIT.split(cmd):
         seg = seg.strip()
         if not seg:
             continue
@@ -775,6 +797,99 @@ def simple_commands(cmd: str) -> list:
             words = words[1:]
         if words:
             out.append(words)
+    return out
+
+
+# ---------------------------------------------------------------- copy check: ssh remote payloads
+# ssh options that make the LOCAL machine run a command; an ssh carrying one keeps the strict reading.
+SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand", re.I)
+
+
+def top_level_segments(cmd: str) -> "list[str] | None":
+    """The text of each top-level simple command: `cmd` split on ; & | newline ( ) outside single and double quotes.
+    A backslash escapes the next character (so `\\;` and a line continuation do not split). None when the quotes do
+    not balance."""
+    out, start, quote, i = [], 0, None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif quote == '"':
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                quote = None
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch in ";&|\n()":
+            out.append(cmd[start:i])
+            start = i + 1
+        i += 1
+    if quote is not None:
+        return None
+    out.append(cmd[start:])
+    return out
+
+
+def _remote_only_ssh(segment: str) -> bool:
+    """True when `segment` is one ssh command whose arguments run only on the far host: its program (after
+    VAR=value and sudo/env/timeout/... wrappers) is `ssh`, it has no `$(` or backtick outside single quotes (those
+    run here before ssh starts) and no ProxyCommand/LocalCommand/KnownHostsCommand option (those run here too).
+
+    Not proven: that the host is another machine. `ssh localhost '...'` or an ssh alias of this machine copies onto
+    this disk and is not counted (documented gap; the hook does no DNS or ssh-config reading)."""
+    quote, i = None, 0
+    while i < len(segment):
+        ch = segment[i]
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif ch == "\\":
+            i += 1
+        elif quote == '"' and ch == '"':
+            quote = None
+        elif ch == "`" or (ch == "$" and segment[i + 1:i + 2] == "("):
+            return False
+        elif quote is None and ch in "'\"":
+            quote = ch
+        i += 1
+    try:
+        words = _unwrap(shlex.split(segment, comments=True))
+    except ValueError:
+        return False
+    return bool(words) and os.path.basename(words[0]) == "ssh" and not any(SSH_LOCAL_COMMAND.search(w) for w in words)
+
+
+def copy_commands(cmd: str, depth: int = 0) -> list:
+    """argv lists the disk-floor copy check reads (goodqa#16811).
+
+    The same over-splitting reading as simple_commands, with two changes that apply to this check only:
+    - a top-level simple command that is a remote-only ssh (_remote_only_ssh) is dropped, so a clone inside
+      `ssh host 'cd x && git clone ...'` is not charged to this machine's floor; every other segment of the line,
+      including a command after the ssh (`ssh h '...' && git clone a b`), is still read;
+    - wrapper options are dropped too (`timeout 120 git clone`, `nice -n 5 cp -r`), not only the wrapper word;
+    - the script of `bash -c SCRIPT` (sh, zsh, dash, ksh) is read the same way, up to 4 levels deep.
+    A line whose quotes do not balance is read strictly. A heredoc body is read as local text: an unquoted
+    delimiter expands `$(...)` here, and the hook does not parse heredocs."""
+    segments = top_level_segments(cmd)
+    if segments is not None:
+        cmd = "\n".join(s for s in segments if not _remote_only_ssh(s))
+    out = []
+    for seg in SIMPLE_SPLIT.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            words = shlex.split(seg, comments=True)
+        except ValueError:
+            words = seg.split()
+        words = _unwrap(words)
+        if not words:
+            continue
+        out.append(words)
+        if (depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS and words[1] == "-c"):
+            out.extend(copy_commands(words[2], depth + 1))
     return out
 
 
@@ -1540,7 +1655,7 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                            "t2-dev's 56 GB). Use disk-backed scratch instead: `export TMPDIR=$(python3 "
                            "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
                            ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
-        copying = [w for w in simple_commands(cmd) if is_copy_command(w)]
+        copying = [w for w in copy_commands(cmd) if is_copy_command(w)]
         if not copying:
             return 0, ""
         cfg = normalize(cfg) if cfg is not None else load_config()
