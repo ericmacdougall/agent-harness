@@ -1339,6 +1339,20 @@ WAL_READERS = frozenset({
 # harness tools whose --wal is only read (spec_flow.py checks a native reviewer or a REALLY_TESTED row there); every
 # other command given --wal is judged by wal_writer_actor (tests/test_wal_write_guard.py lists each --wal tool)
 WAL_FLAG_READERS = frozenset({'spec_flow.py'})
+# the options harness tools take a WAL to write with: --wal, and escalation.py's --notify-wal (it runs wal_note.py on
+# that path); tests/test_wal_write_guard.py checks every option ending in `wal` that a hook declares is listed here or
+# only read
+WAL_OPTIONS = ('--wal', '--notify-wal')
+
+
+def wal_option(flag):
+    """`flag` is a WAL option or an argparse abbreviation of one (`--wa`, `--notify-w`)."""
+    return len(flag) >= 3 and flag.startswith('--') and any(o.startswith(flag) for o in WAL_OPTIONS)
+
+
+# environment variables a harness tool reads a WAL path from and then writes (escalation.py, and peer_review.py passing
+# it on); a sub-agent setting one is refused like a claim of the actor ah stamps
+WAL_ENV_CLAIM = re.compile(r'(?<![A-Za-z0-9_])AGENT_HARNESS_MAIN_WAL\s*\+?=')
 # the second operand is an output file (uniq IN OUT, xxd -r IN OUT)
 WAL_IN_OUT = frozenset({'uniq', 'xxd'})
 # their own handling already judges the destination (cp, rsync, scp, tee, dd, sed -i, ...) or what they run (launchers,
@@ -7584,8 +7598,8 @@ class Analyzer:
 
     def wal_writer_actor(self, name, args):
         """goodqa#17008: every harness tool that takes --wal writes rows there (wal_note.py, ah note, deliver, the
-        grant and waiver tools, through a child wal_note.py or directly), so ANY command given --wal (or an argparse
-        abbreviation of it) is judged by who runs it: a sub-agent may aim it only at its own WAL, and a caller the hook
+        grant and waiver tools, through a child wal_note.py or directly; escalation.py's --notify-wal too), so ANY
+        command given a WAL_OPTIONS option (or an argparse abbreviation of one) is judged by who runs it: a sub-agent may aim it only at its own WAL, and a caller the hook
         could not prove (neither main nor a sub-agent) never at a main.jsonl. Proven main aims it anywhere. A --wal value
         the guard cannot resolve is refused. Tools that only read --wal are WAL_FLAG_READERS. Without a hook payload (a
         direct decide() call) nothing is known about the caller and this rule does not apply."""
@@ -7607,10 +7621,10 @@ class Analyzer:
         for i, w in enumerate(args):
             prev = texts[i - 1] if i else ''
             flag, eq, value = w.text.partition('=')
-            if eq and flag in ('--w', '--wa', '--wal'):
-                exact, dynamic = flag == '--wal', w.dynamic
-            elif prev in ('--w', '--wa', '--wal'):
-                exact, dynamic, value = prev == '--wal', w.dynamic, w.text
+            if eq and wal_option(flag):
+                exact, dynamic = flag in WAL_OPTIONS, w.dynamic
+            elif wal_option(prev):
+                exact, dynamic, value = prev in WAL_OPTIONS, w.dynamic, w.text
             else:
                 continue
             if dynamic and exact:
@@ -8449,6 +8463,10 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
         analyzer._wal_actor_refusal('ah', wal_paths.own_wal(caller.get('session'), caller.get('agent')),
                                     'a sub-agent may not set the actor ah stamps on the rows it writes '
                                     '(AH_AGENT_ID, AGENT_ID)')
+    if caller.get('kind') == 'agent' and WAL_ENV_CLAIM.search(command):
+        analyzer._wal_actor_refusal('escalation.py', wal_paths.own_wal(caller.get('session'), caller.get('agent')),
+                                    'a sub-agent may not name the main WAL harness tools notify '
+                                    '(AGENT_HARNESS_MAIN_WAL)')
     try:
         findings = analyzer.run(command)
     except Exception as stop:  # noqa: BLE001 - re-raised: a budget stop, the hook's alarm or a bug

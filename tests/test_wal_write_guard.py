@@ -268,6 +268,27 @@ class Actor(Case):
             self.assertEqual(verdict, 'block', command)
             self.assertIn('wal-actor', message, command)
 
+    def test_a_sub_agent_cannot_name_the_main_wal_harness_tools_notify(self):
+        # red-team T2 (5b1b372d): escalation.py writes a LADDER decision row through wal_note.py into the WAL named by
+        # AGENT_HARNESS_MAIN_WAL or --notify-wal, and peer_review.py passes the variable on
+        esc = 'python3 ~/.claude/hooks/escalation.py reset --task t --code c --detail d'
+        for row in ('AGENT_HARNESS_MAIN_WAL={main} %s' % esc, 'export AGENT_HARNESS_MAIN_WAL={main}; %s' % esc,
+                    'env AGENT_HARNESS_MAIN_WAL={main} %s' % esc, 'declare -x AGENT_HARNESS_MAIN_WAL={main}; %s' % esc,
+                    'AGENT_HARNESS_MAIN_WAL=$(cat /tmp/w) python3 ~/.claude/hooks/peer_review.py pr',
+                    '%s --notify-wal {main}' % esc, '%s --notify-wal={main}' % esc, '%s --notify-w {other}' % esc,
+                    '%s --notify-wal "$(cat /tmp/w)"' % esc):
+            command = row.format(main=self.main, other=self.other)
+            verdict, message = self.decide(command, self.AGENT_CALLER)
+            self.assertEqual(verdict, 'block', command)
+            self.assertIn('wal-actor', message, command)
+        # main may name it; a sub-agent may aim --notify-wal at its own WAL; mentioning the name is not setting it
+        main = {'kind': 'main', 'session': SESSION}
+        self.assertEqual(self.decide('AGENT_HARNESS_MAIN_WAL=%s %s' % (self.main, esc), main)[0], 'allow')
+        own = wal_paths.own_wal(SESSION, AGENT)
+        self.assertEqual(self.decide('%s --notify-wal %s' % (esc, own), self.AGENT_CALLER)[0], 'allow')
+        self.assertEqual(self.decide('grep -n AGENT_HARNESS_MAIN_WAL ~/.claude/hooks/escalation.py',
+                                     self.AGENT_CALLER)[0], 'allow')
+
     def test_an_unproven_caller_cannot_write_main_but_may_write_an_agent_wal(self):
         unknown = {'kind': 'unknown', 'session': SESSION}
         self.assertIn('wal-actor', self.decide('%s --wal %s --event result --note x' % (NOTE, self.main), unknown)[1])
@@ -353,6 +374,26 @@ class EveryWalTool(Case):
             refused = 'wal-actor' in message
             if refused == (tool in cg.WAL_FLAG_READERS):
                 wrong.append((tool, verdict))
+        self.assertEqual(wrong, [])
+
+    def test_every_wal_option_a_hook_declares_is_judged(self):
+        # every option ending in `wal` that takes a value is a WAL_OPTIONS option, or only read (spec_flow.py's
+        # --owners-wal); a new one fails here until the guard knows it
+        import re
+        agent = {'kind': 'agent', 'agent': AGENT, 'session': SESSION}
+        found = set()
+        for p in HOOKS.glob('*.py'):
+            text = p.read_text(errors='replace')
+            for option in re.findall(r'''['"](--[a-z-]*wal)['"]''', text):
+                found.add((p.name, option))
+        self.assertIn(('escalation.py', '--notify-wal'), found)
+        wrong = []
+        for tool, option in sorted(found):
+            if option == '--no-wal' or tool in cg.WAL_FLAG_READERS:  # a switch with no value; a reader
+                continue
+            command = 'python3 ~/.claude/hooks/%s sub %s %s --note x' % (tool, option, self.main)
+            if 'wal-actor' not in self.decide(command, agent)[1]:
+                wrong.append((tool, option))
         self.assertEqual(wrong, [])
 
 
