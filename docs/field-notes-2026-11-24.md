@@ -4,11 +4,15 @@ One coordinator session supervised five project sessions, each fanning out its o
 records what the harness got wrong or made slow, what was fixed and merged, and what is still open. It is a snapshot,
 not a status page: GoodQA tickets are the status of record, and each open item names its ticket where one exists.
 
+Everything here is the coordinator's own observation. The measured numbers come from that session's log and its
+review receipts, which are not in this repository; treat them as reported, not independently verified. Open security
+defects are described by type only; their details live in the tickets and fix branches.
+
 ## Fixed and merged during the run
 
 | PR | Commit | What it fixed |
 |---|---|---|
-| 313 | 98d20350 | deliver.py and integrate_local.py delivery defects |
+| 313 | 98d20350 | Fixes in `deliver.py` and `integrate_local.py` (delivery of verified work to the original checkout) |
 | 333 | 1ff0b090 | A refused `git worktree remove` now names the route that works (`ah.py worktree-remove`) instead of a dead end |
 | 334 | 39f0735e | One shared shell-word scanner for merge_gate and copy_hygiene; quoted punctuation no longer costs a review its stamp; an ssh is exempt from the copy floor only when provably plain and remote; the review stamp is bound to main's running tool call and lives at most 120 s |
 | 337 | b8d7670c | `ah chat send` and `ah chat allow`: main can message an allow-listed person in GoodQA, proved by the user's own words and the recipient's member name at every send |
@@ -18,13 +22,13 @@ launches from two different main sessions after the install.
 
 ## Open defects
 
-Severity follows the triage rule in the user's instructions: CRITICAL and USER_EXPERIENCE block.
+Severity uses three labels: CRITICAL (security, an auth or tenant boundary, data loss, privacy, money, a broken release or rollback), USER_EXPERIENCE (a real user hits it in normal use) and ticket (everything else). The first two block a merge.
 
 | Id | Severity | Defect | Ticket / owner |
 |---|---|---|---|
-| H24 | CRITICAL | command_guard allows shell appends (`>>`, `tee -a`, an interpreter one-liner) and no hook refuses a Write or Edit to a session WAL, including a main WAL. A sub-agent can forge a row that reads as main's decision. | goodqa#17008 |
-| launcher | CRITICAL | The installed delete guard can be bypassed through launcher shapes (`unshare -c`, `script`, `flock -w`). | fix branch `fix/launcher-command-analysis` |
-| H26 | CRITICAL (boundary) | A command the guard refuses directly can still run inside a script that is sent over ssh or run remotely; seen twice (a `git clean`, then `rsync --delete` plus `git clean` and `reset --hard`). The guard should read the body of a script it is asked to run remotely, or refuse remote scripts it cannot read. | backlog |
+| H24 | CRITICAL | Session WALs, including a main WAL, are not write-protected against agents. Details are in the ticket. | goodqa#17008 |
+| launcher | CRITICAL | The installed delete guard does not analyse some launcher wrappers. The shapes are in the fix branch, not here. | fix branch `fix/launcher-command-analysis` |
+| H26 | CRITICAL (boundary) | The guard analyses the command it is given, not the body of a script that command runs on another host. Seen twice; both were an agent's own scratch clone and were stopped. The guard should read such a script or refuse it. | backlog (H26) |
 | H23 | USER_EXPERIENCE | The command analyser's budget is wall-clock seconds. With the Mac at load 80 to 110 it expired on ordinary commands and refused them as `log_delete/unanalysable`; it blocked a staging deploy, an `ah kill` and several read-only inspections. Measure it in the analyser's CPU time with a larger wall-clock backstop. | backlog |
 | H22 | USER_EXPERIENCE | peer_review's per-provider deadline is a hard 720 s. A reviewer at max effort cannot finish a real diff in that time: five consecutive timeouts on one project's release-tooling PR. Each timeout still spends one of eight launches and the rung's budget. Deadline should come from review_policy.json by rung and effort. | goodqa#16947 |
 | H25 | ticket | `ah worktree-remove` refuses a worktree whose HEAD is on a pushed branch but not at its tip. It should accept any commit reachable from a live remote ref. | backlog |
@@ -33,8 +37,8 @@ Severity follows the triage rule in the user's instructions: CRITICAL and USER_E
 | remote kill | ticket | Every `ah kill --host` needs `--foreign`, so an agent cannot stop a process its own session started on t2-dev without a user approval. The user has now given a standing approval for the five supervised projects; the tool should recognise a pid tied to the caller's own WAL row. | backlog |
 | chat send error | USER_EXPERIENCE | `ah chat send` reported a definite server refusal as `uncertain` with no reason, because the client drops the server's error code. | fix in progress |
 | GoodQA DM | product gap, P0 | A user token can open a new DM but can never reply in an existing one (`assertAiPrivateConversation`), so chat send cannot reach an existing conversation. Needs an owner-granted `chat.dm.write` ability; an auth change that needs the owner's decision and a security review. | goodqa#17013 |
-| guard false positives | ticket | The guard refuses commands whose text merely names a protected thing: a heredoc containing the installer module's name or the word `git`; a `curl -r` range flag read as a credential file; a redirect that overwrites a file the agent itself wrote in its work dir; a read-only transcript search. | H17 to H19 |
-| checkout registry | in spec | Agents cannot be allowed to delete "their own" checkouts until ownership is provable. Spec v3 found that path, device and inode are reused on ext4 (40 of 40 trials); identity must include birth time. | goodqa#16947 |
+| guard false positives | ticket | The guard refuses commands whose text merely names a protected thing: a heredoc containing the installer module's name or the word `git`; a `curl -r` range flag read as a credential file; a redirect that overwrites a file the agent itself wrote in its work dir; a read-only transcript search. | backlog (H17 to H19) |
+| checkout registry | in spec | Agents cannot be allowed to delete "their own" checkouts until ownership is provable. A spec review's probe found that path, device and inode are reused on ext4 (40 of 40 trials); identity must include birth time. | goodqa#16947 (the umbrella ticket for this run's harness work; the registry has no ticket of its own yet) |
 | supervisor power | BLOCK | PR 326 lets a qualifying agent request merge and delete power from the user. Review found that a hand-edited request file is shown to the user as the session's own, that revocation fails open, and that harness logs were not excluded. In repair. | PR 326 |
 
 ## What made the run slow, with numbers
