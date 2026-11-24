@@ -179,7 +179,7 @@ class BackfillOrderTest(Base):
 
 
 class ChokePointGuardTest(unittest.TestCase):
-    def test_only_publish_tree_runs_commit_tree_or_push(self):
+    def test_only_publish_tree_runs_git_write_plumbing(self):
         with open(T.__file__, encoding='utf-8') as f:
             src = f.read()
         tree = ast.parse(src)
@@ -187,7 +187,8 @@ class ChokePointGuardTest(unittest.TestCase):
         for fn in ast.walk(tree):
             if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for node in ast.walk(fn):
-                    if isinstance(node, ast.Constant) and node.value in ('commit-tree', 'push'):
+                    if isinstance(node, ast.Constant) and node.value in ('commit-tree', 'push', 'hash-object', 'update-index', 'write-tree', 'update-ref', 'mktree',
+                                                                       'send-pack', 'fast-import'):
                         owners.append(fn.name)
         # nested functions are walked by their parent too; every site must be inside publish_tree
         self.assertTrue(owners)
