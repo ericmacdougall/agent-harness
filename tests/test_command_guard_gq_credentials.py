@@ -49,7 +49,9 @@ DIRECTORY_NEIGHBOURS = ["grep -rc . ~/.config/goodqa", "grep -r . ~/.config/good
                         "cd ~/project && rg .", "cd /tmp && grep -r tok", "cat data.txt | rg tok", "cd ~ && rg --files", "cd ~ && echo x | rg tok","cd ~/.config/goodqa && rg -c .",
                         "cd ~/.config/goodqa && ls", "gzip -k notes.txt", "xz -9 build.log", "bsdtar tf archive.tar",
                         # a home directory or the root as a DESTINATION or an extraction target is not a read (receipt r3 F1)
-                        "scp host:file ~/", "scp host:file .", "rsync -a host:dotfiles/ ~/", "rsync -a host:x/ ~/.config/", "wget -P ~ http://example.com/x",
+                        # (goodqa#17008 R2: a remote directory's contents synced INTO the home can create ~/.claude/wals,
+                        # so the WAL guard refuses `rsync -a host:dotfiles/ ~/`; these rows sync into a subdirectory)
+                        "scp host:file ~/", "scp host:file .", "rsync -a host:dotfiles/ ~/sync/", "rsync -a host:x/ ~/.config/", "wget -P ~ http://example.com/x",
                         "wget --directory-prefix=~ http://example.com/x", "curl -o ~/x.txt http://example.com/x",
                         "tar -xzf pkg.tgz -C ~", "tar -xf x.tar -C /", "tar xzf pkg.tgz -C ~", "tar -tf pkg.tgz -C ~", "bsdtar -xf x.tar -C ~",
                         "pax -r -f x.tar", "unzip x.zip -d ~", "zip ~/out.zip project.txt"]
@@ -100,8 +102,8 @@ R4_NEIGHBOURS = ["cd ~ && ag --color-match 1 tok /tmp", "cd ~ && ack --ignore-di
                  "cd ~ && rg --sort path -i tok /tmp", "cd ~ && grep -rn --include '*.py' tok /tmp", "cd ~ && grep -rn --color=always tok /tmp",
                  "cd ~ && grep -rn --context=2 tok /tmp", "cd ~ && rg -l tok", "cd ~ && grep -c tok file.txt",
                  "tar -zxvf pkg.tgz -C ~", "tar -xzfarchive.tgz -C ~", "tar --extract -f x.tar -C ~", "tar --extr -f x.tar -C ~",
-                 "tar -x -f x.tar -C ~", "scp -P 22 host:file ~/", "rsync -avz --exclude .git host:x/ ~/", "rsync -a -e ssh host:x/ ~/",
-                 "rsync -a host:x/ ~/ --log-file /tmp/rsync.log", "rsync -a /tmp/ ~/"]
+                 "tar -x -f x.tar -C ~", "scp -P 22 host:file ~/", "rsync -avz --exclude .git host:x/ ~/sync/", "rsync -a -e ssh host:x/ ~/sync/",
+                 "rsync -a host:x/ ~/sync/ --log-file /tmp/rsync.log", "rsync -a /tmp/ ~/"]  # ~/sync/: see goodqa#17008 R2 above
 # receipt r5 F1: count-only is each tool's own letters and long names; rg -L is --follow and ag --silent only silences logs
 R5_COUNT_ONLY_PER_TOOL = ["rg -L . ~/.config/goodqa", "rg -uuL tok ~/.config/goodqa", "cd ~ && rg -L tok", "cd ~ && ag --silent tok",
                           "ag --silent tok ~/.config/goodqa", "find ~/.config/goodqa -exec rg -L . {} +",
@@ -201,8 +203,8 @@ R6_NAME_LISTS = ["cat $(find ~/.config -name user-token)", "cat `ls -d ~/.config
                  "while read -r f; do cat \"$f\"; done <<< \"$HOME/.config/goodqa/user-token\"",
                  "for f in $(find ~/.config/goodqa -type f); do cat \"$f\"; done"]
 # options with values, destinations, harmless name lists and count-only readers stay allowed
-R6_NEIGHBOURS = ["rsync -a --progress host:x/ ~/", "rsync -a --no-perms host:x/ ~/", "scp -s host:file ~/", "scp -o ProxyJump=bastion host:file ~/",
-                 "rsync -a -e 'ssh -p 2222' host:x/ ~/", "rsync -av --rsync-path='sudo rsync' host:x/ ~/y/",
+R6_NEIGHBOURS = ["rsync -a --progress host:x/ ~/sync/", "rsync -a --no-perms host:x/ ~/sync/", "scp -s host:file ~/",
+                 "scp -o ProxyJump=bastion host:file ~/", "rsync -a -e 'ssh -p 2222' host:x/ ~/sync/","rsync -av --rsync-path='sudo rsync' host:x/ ~/y/",
                  "curl -sSL -o ~/x.tgz https://example.com/x.tgz", "curl --output-dir ~ -O https://example.com/x",
                  "curl -H 'Accept: application/json' -o /tmp/x.json https://example.com/api", "curl -fsSL -T notes.txt https://example.com/",
                  "curl -fsSL -o '/tmp/{a,b}.html' 'https://example.com/{a,b}.html'", "curl --data-binary @payload.json https://example.com/api",
