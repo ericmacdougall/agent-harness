@@ -23,7 +23,7 @@ LIFECYCLE_EVENTS = ("subagent", "subagent_stop", "SubagentStart", "SubagentStop"
                     "SessionStart", "stop", "Stop", "compact", "PreCompact", "pending_stop")
 DEPLOY_RE = re.compile(r"\bDEPLOYED\b|\bdeployed to (?:live|prod)|\blive deploy\b|\bdeploy(?:ed)? (?:live|to production)\b",
                        re.I)
-TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy")
+TERMINAL = ("done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy", "retired")
 
 # ---- owner roles (goodqa#15920): the owners panel counts what the owner cap counts, nothing more.
 # These mirror tier_gate.live_owner_ids / counts_as_owner / _counts_while_idle / _slot_freed exactly (a parity test
@@ -118,7 +118,7 @@ def _slot_freed(row: dict) -> bool:
     kind = disp.get("kind")
     if kind in ("closed", "superseded", "wontdo", "legacy"):
         return True
-    return kind in ("reassigned", "waiting") and disp.get("live") is True
+    return kind in ("reassigned", "waiting", "retired") and disp.get("live") is True
 
 
 def owner_role(row: dict, policy: dict | None = None) -> str:

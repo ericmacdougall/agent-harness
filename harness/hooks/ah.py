@@ -46,7 +46,8 @@ APPLY_MAX_LINES = 200
 APPLY_MAX_BYTES = 1024 * 1024
 TASK_WAL_WINDOW_S = 48 * 3600  # a task-named WAL untouched this long is history (ahd owner_window_seconds)
 OWNERS_RECENT_S = 6 * 3600  # `ah owners` (CLI) hides terminal rows idle longer than this unless --all (2026-11-06)
-TERMINAL_STATES = frozenset({"done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy"})
+TERMINAL_STATES = frozenset({"done", "handoff", "returned", "idle-helper", "unverified-legacy", "superseded", "wontdo", "legacy",
+                             "retired"})
 WRAPPER = re.compile(r"^\s*<[A-Za-z][\w-]*[\s>/]")
 MAX_REQUEST = 256 * 1024
 SKIP_DARWIN = ("Library", "Desktop", "Documents", "Downloads", "Pictures", "Movies", "Music", "Applications")
@@ -918,6 +919,20 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             if not liveness.disposition_live(d, now, last_activity=parse_ts(r["last_activity"]) or 0.0):
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + [f"wait-target-{states.get(target, 'absent').lower()}"]
+    for r in rows:  # goodqa#17148: a retired owner is excused only while it stays quiet after the decision
+        d = r.get("disposition")
+        if not (r["owner"] and d and d.get("kind") == RETIRED):
+            continue
+        seen = max(parse_ts(r["last_activity"]) or 0.0, sub_dirs.get(r["agent_id"], 0.0))
+        if seen > float(d.get("at") or 0.0):
+            r["disposition"] = dict(d, live=False)
+            r["flags"] = list(r.get("flags") or []) + ["retired-reopened"]  # new activity: alerts again, whatever the decision said
+            continue
+        r["disposition"] = dict(d, live=True)
+        r["decision_required"], r["attention"], r["wait_on"] = False, [], None
+        r["flags"] = [f for f in (r.get("flags") or []) if not f.startswith(("wait-", "handoff-"))] + ["retired"]
+        if r["state"] not in RESULT_STATES:
+            r["state"], r["severity"] = "retired", "info"
     rows.sort(key=lambda r: (r["state"] in ("done", "handoff"), -(r["idle_s"] or 0)))
     counts = {}
     for r in rows:
@@ -1511,6 +1526,17 @@ def precheck(op: str, args: dict) -> None:
                                           "records why) is required")
         elif args["kind"] == "legacy" and (args.get("evidence") or args.get("deployed") or args.get("live_test")):
             raise AhError("bad_request", "task.dispose legacy takes no evidence: it records that nobody verified the owner")
+    elif op == "task.retire_session":
+        need("session", "ended", "at", "source")
+        if not SESSION_RE.match(args["session"]) or args["session"] == "main":
+            raise AhError("bad_request", "task.retire-session: --session must be the full id of the ended session")
+        if not parse_ts(args["ended"]):
+            raise AhError("bad_request", "task.retire-session: --ended must be an ISO date or time")
+        rb, dropped = args.get("replaced_by"), args.get("dropped")
+        if bool(rb) == bool(dropped) or dropped not in (None, True):
+            raise AhError("bad_request", "task.retire-session: give exactly one of --replaced-by <session id> or --dropped")
+        if rb and (not SESSION_RE.match(rb) or rb == args["session"]):
+            raise AhError("bad_request", "task.retire-session: --replaced-by must name a different session")
     elif op == "deadline.add":
         need("session", "at", "ref", "owner", "note")
         if parse_ts(args["at"]) is None:
@@ -1942,6 +1968,23 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             "host": ops_watch.default_host(), "source": args["source"], "event": kind,
             "severity": args.get("severity") or "info", "key": args["alert_key"], "check": args["source"],
             "message": args.get("message") or "cleared", "detail": args.get("detail") or {}}, home=home)
+    elif op == "task.retire_session":
+        main_wal = _wal_path(home, args["session"], "main")
+        if not main_wal.is_file():
+            raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
+        pinned = args["retire"]["owners"]
+        if not pinned or actor_id() in pinned:
+            raise AhError("forbidden", "task.retire-session: an owner cannot retire its own session", 3)
+        end = f"replaced by {args['replaced_by']}" if args.get("replaced_by") else "dropped"
+        rec = {"at": now, "event": "disposition", "id": wid, "agent": "session:" + args["session"], "kind": "retired_session",
+               "ended": args["ended"], "owners": pinned, "skipped": args["retire"]["skipped"], "source": args["source"][:2000],
+               "note": f"session {args['session']} ended {args['ended']} ({end}); {len(pinned)} owner(s) retired"}
+        if args.get("replaced_by"):
+            rec["replaced_by"] = args["replaced_by"]
+        _wal_append(home, main_wal, rec)  # one atomic line; the ledger row after it is what makes the decision effective
+        out["wal"] = wid
+        out["retired"] = list(pinned)
+        out["skipped"] = args["retire"]["skipped"]
     elif op == "task.dispose":
         if args["kind"] in ("resumed", "reassigned") + GUARDED_KINDS and actor_id() == args["agent"]:
             raise AhError("forbidden", f"task.dispose {args['kind']}: a sub-agent or the owner itself cannot acknowledge; "
@@ -2233,6 +2276,15 @@ def dispositions(home: Path, session: str, ledger=None) -> dict:
                 d["until"] = parse_ts(a["until"]) or 0.0
             if a["agent"] not in out or (d["seq"] or 0) >= (out[a["agent"]].get("seq") or 0):
                 out[a["agent"]] = d
+        elif r.get("op") == "task.retire_session" and a.get("session") == session:
+            # goodqa#17148: ONE decision row; each owner it pinned reads as its own disposition that cites the decision
+            for who in ((a.get("retire") or {}).get("owners") or []):
+                d = {"kind": RETIRED, "at": parse_ts(a.get("at")) or 0.0, "ref": r.get("id"), "decision": r.get("id"),
+                     "reason": f"session ended {a.get('ended')}; " + (f"replaced by {a['replaced_by']}" if a.get("replaced_by")
+                                                                       else "dropped"),
+                     "ended": a.get("ended"), "seq": r.get("seq")}
+                if isinstance(who, str) and (who not in out or (d["seq"] or 0) >= (out[who].get("seq") or 0)):
+                    out[who] = d
     return out
 
 
@@ -2634,6 +2686,215 @@ def _audit_reject(home: Path, op: str, key, session, code: str, tag: dict) -> No
                                                        "actor": actor(session), "result": "rejected", "code": code, **tag})
 
 
+# ------------------------------------------------------------------ retire-session (goodqa#17148)
+# One sourced decision retires every owner of a session that has verifiably ended. It goes through write() like
+# task.dispose, so the same store lock, intent row, idempotency key, audit and refusal rules apply; it is not a way
+# around the bulk-close guard (`dispose --kind closed` is still burst-limited) because it accepts only a session that
+# is verifiably not running.
+RETIRED = "retired"
+RETIRE_QUIET_S = 6 * 3600  # every transcript and owner must have been quiet this long. A session sitting at its
+# prompt can hold no process that names its id, so quiet time is the main evidence; 6 h is past any usage-limit pause
+# or wake-up delay the harness schedules (1 h) and still short of today's freshest ended sessions (about 8 h)
+RETIRE_PS_MAX = 100_000  # a longer process list is truncated or abnormal: refused, never half-read
+RETIRE_ENV_PROBES = 300  # `ps eww` probes of this user's claude processes; more is refused, never skipped
+RETIRE_FIELDS = ("retire",)  # set only by ah's preflight (the evidence and the pinned owner list)
+
+
+def _retire_ps_rows() -> list:
+    """Strict process table [(pid, ppid, uid, command)]: any failure, an empty table or a malformed line raises, so an
+    unreadable table can never read as "nothing is running" (the loose _ps_rows() returns [] on error)."""
+    try:
+        r = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,uid=,command="], capture_output=True, text=True, timeout=30,
+                           env=dict(os.environ, LC_ALL="C", LANG="C"))
+    except (OSError, subprocess.SubprocessError) as e:
+        raise AhError("retire_unreadable", f"task.retire-session: the process list could not be read ({type(e).__name__}); "
+                                           "liveness is unknown, so nothing is retired", 3)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    if r.returncode != 0 or not lines or len(lines) > RETIRE_PS_MAX:
+        raise AhError("retire_unreadable", "task.retire-session: the process list is empty, failed or too long; liveness "
+                                           "is unknown, so nothing is retired", 3)
+    rows = []
+    for ln in lines:
+        parts = ln.split(None, 3)
+        if len(parts) < 3 or not (parts[0].isdigit() and parts[1].isdigit() and re.fullmatch(r"-?\d+", parts[2])):  # uid -2 exists
+            raise AhError("retire_unreadable", "task.retire-session: the process list has a line ah cannot parse; "
+                                               "liveness is unknown, so nothing is retired", 3)
+        rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3] if len(parts) == 4 else ""))
+    return rows
+
+
+def _retire_env_of(pid: int):
+    """CLAUDE_CODE_SESSION_ID in one of this user's processes, None when it has none or already exited; a process
+    that exists but cannot be probed raises (it may be the session)."""
+    try:
+        r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
+                           env=dict(os.environ, LC_ALL="C"))
+    except (OSError, subprocess.SubprocessError):
+        r = None
+    if r is not None:
+        m = re.search(r"CLAUDE_CODE_SESSION_ID=([A-Za-z0-9._-]{1,128})", r.stdout)
+        if m:
+            return m.group(1)
+        if r.returncode == 0 and r.stdout.strip():
+            return None
+    try:
+        os.kill(pid, 0)  # signal 0 only tests that the pid exists
+    except ProcessLookupError:
+        return None
+    except OSError:
+        pass
+    raise AhError("retire_unreadable", f"task.retire-session: pid {pid} exists but its environment could not be read; "
+                                       "liveness is unknown, so nothing is retired", 3)
+
+
+def _retire_live_pids(session: str) -> list:
+    """Pids of processes that name the session: its id in a command line, or in the environment of one of this user's
+    claude processes. This process and its ancestors are skipped (the shell that typed this command names the id)."""
+    table = _retire_ps_rows()
+    parent = {pid: ppid for pid, ppid, _u, _c in table}
+    mine, p = set(), os.getpid()
+    while p and p not in mine:
+        mine.add(p)
+        p = parent.get(p, 0)
+    found, probes = [], 0
+    for pid, _ppid, uid, cmd in table:
+        if pid in mine:
+            continue
+        if session in cmd:
+            found.append(pid)
+        elif uid == os.getuid() and "claude" in cmd.lower():
+            probes += 1
+            if probes > RETIRE_ENV_PROBES:
+                raise AhError("retire_unreadable", f"task.retire-session: more than {RETIRE_ENV_PROBES} claude processes to "
+                                                   "probe; liveness is unknown, so nothing is retired", 3)
+            if _retire_env_of(pid) == session:
+                found.append(pid)
+    return sorted(set(found))
+
+
+def _retire_transcripts(home: Path, session: str) -> dict:
+    """The session's main transcript and every subagent transcript, across all project folders. Not found or not
+    listable raises: an ended session whose transcript cannot be read is not shown to be ended."""
+    root = home / ".claude" / "projects"
+    newest, main_at, files = 0.0, 0.0, 0
+    try:
+        with os.scandir(root) as projects:
+            listed = [pr.path for pr in projects]
+    except OSError as e:
+        raise AhError("retire_unreadable", f"task.retire-session: the transcript folder cannot be listed ({type(e).__name__}); "
+                                           "liveness is unknown, so nothing is retired", 3)
+
+    def stat(path):
+        try:
+            return os.stat(path).st_mtime
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        except OSError as e:
+            raise AhError("retire_unreadable", f"task.retire-session: a transcript cannot be read ({type(e).__name__})", 3)
+    for proj in listed:
+        m = stat(os.path.join(proj, session + ".jsonl"))
+        if m is not None:
+            main_at, newest, files = max(main_at, m), max(newest, m), files + 1
+        sub = os.path.join(proj, session, "subagents")
+        try:
+            with os.scandir(sub) as it:
+                for e in it:
+                    if e.name.endswith(".jsonl"):
+                        m = stat(e.path)
+                        if m is not None:
+                            newest, files = max(newest, m), files + 1
+        except (FileNotFoundError, NotADirectoryError):
+            pass
+        except OSError as e:
+            raise AhError("retire_unreadable", f"task.retire-session: a subagent folder cannot be listed ({type(e).__name__})", 3)
+    if not main_at:
+        raise AhError("retire_unreadable", "task.retire-session: no main transcript for this session on this host, so its end "
+                                           "cannot be shown; nothing is retired", 3)
+    return {"main_at": main_at, "newest_at": newest, "files": files}
+
+
+def retire_evidence(home: Path, session: str, now: float, ps_pids=None) -> dict:
+    """Read-only: every check that decides whether a session may be retired, and the evidence for each. Raises AhError
+    when any of them fails or cannot be read. `--dry-run` returns this; the real run pins its owner list."""
+    if not SESSION_RE.match(session or "") or session == "main":
+        raise AhError("bad_request", "task.retire-session: --session must be the full id of the ended session", 3)
+    pids = _retire_live_pids(session) if ps_pids is None else ps_pids
+    if pids:
+        raise AhError("retire_running", f"task.retire-session: {session} is running (pid {', '.join(map(str, pids[:5]))} names "
+                                        "it); a running session is never retired", 3)
+    tr = _retire_transcripts(home, session)
+    if now - tr["newest_at"] < RETIRE_QUIET_S:
+        raise AhError("retire_recent", f"task.retire-session: a transcript of {session} was written {int(now - tr['newest_at'])}s "
+                                       f"ago; it must be quiet for {RETIRE_QUIET_S // 3600} h", 3)
+    try:
+        data = owners(home, session, now=now)
+    except AhError as e:
+        raise AhError("retire_no_owners" if e.code == "session_unknown" else "retire_unreadable",
+                      f"task.retire-session: owners of {session} cannot be listed: {e}", 3)
+    if (data.get("read") or {}).get("state") == "failed" or (data.get("read") or {}).get("unread_total"):
+        raise AhError("retire_unreadable", f"task.retire-session: the owner view of {session} is incomplete (unread sources); "
+                                           "liveness is unknown, so nothing is retired", 3)
+    rows = [r for r in data["owners"] if r.get("owner")]
+    if not rows:
+        raise AhError("retire_no_owners", f"task.retire-session: {session} has no owners to retire", 3)
+    cover, skipped = [], []
+    for r in rows:
+        d = r.get("disposition") or {}
+        last = parse_ts(r.get("last_activity")) or 0.0
+        if str(r["state"]).startswith(("live", "working")) or r.get("active_1h") or (d.get("kind") in ("waiting", "resumed")
+                                                                                     and d.get("live")):
+            raise AhError("retire_live_owner", f"task.retire-session: owner {r['agent_id']} of {session} is {r['state']}"
+                                               f"{' with a live ' + d['kind'] if d.get('kind') in ('waiting', 'resumed') else ''}; "
+                                               "nothing is retired", 3)
+        if now - max(last, sub_activity(home, session, r["agent_id"])) < RETIRE_QUIET_S:
+            raise AhError("retire_recent", f"task.retire-session: owner {r['agent_id']} was active {int(now - last)}s ago; it "
+                                           f"must be quiet for {RETIRE_QUIET_S // 3600} h", 3)
+        if d.get("kind") in liveness.ENDING_DISPOSITIONS:
+            skipped.append({"agent": r["agent_id"], "kind": d["kind"]})
+        elif d.get("kind") == RETIRED and d.get("live"):
+            skipped.append({"agent": r["agent_id"], "kind": RETIRED})
+        else:
+            cover.append({"agent": r["agent_id"], "state": r["state"], "last_activity": r.get("last_activity")})
+    if not cover:
+        raise AhError("retire_no_owners", f"task.retire-session: every owner of {session} already has an ending disposition", 3)
+    return {"session": session, "live_pids": [], "quiet_s": RETIRE_QUIET_S, "owner_count": len(rows),
+            "transcript_main": iso(tr["main_at"]), "transcript_newest": iso(tr["newest_at"]), "transcript_files": tr["files"],
+            "owners": [c["agent"] for c in cover], "cover": cover, "skipped": skipped}
+
+
+def sub_activity(home: Path, session: str, agent: str) -> float:
+    """Newest transcript write of one subagent (0.0 when none)."""
+    return transcript_mtime(home, session, agent)
+
+
+def _retire_preflight(home: Path, args: dict, now: float, caller_session: str) -> dict:
+    import provenance  # noqa: PLC0415
+    session = args["session"]
+    if caller_session and caller_session == session:
+        raise AhError("forbidden", "task.retire-session: a session cannot retire itself", 3)
+    rb = args.get("replaced_by")
+    if rb and not (_wal_path(home, rb, "main")).is_file():
+        raise AhError("bad_request", f"task.retire-session: --replaced-by {rb} is not a session of this host (no main WAL)", 3)
+    try:
+        res = provenance.resolve(args["source"])
+    except Exception as e:  # a resolver crash is a rejection, never a silent pass
+        raise AhError("provenance", f"source check failed ({type(e).__name__})", 3)
+    if not res["ok"]:
+        first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
+        raise AhError("provenance", f"source rejected ({first['code']}): {first['message']}"[:300], 3)
+    if parse_ts(args["ended"]) > now:
+        raise AhError("bad_request", "task.retire-session: --ended is in the future", 3)
+    ev = retire_evidence(home, session, now)
+    return dict(args, retire={"owners": ev["owners"], "skipped": ev["skipped"], "owner_count": ev["owner_count"],
+                              "transcript_newest": ev["transcript_newest"], "quiet_s": ev["quiet_s"]})
+
+
+def retire_dry_run(home: Path, session: str) -> dict:
+    """The evidence a retire would rest on, written nowhere (no intent row, no audit line, no WAL)."""
+    ev = retire_evidence(home, session, time.time())
+    return dict(ev, ok=True, result="dry-run", would_cover=len(ev["owners"]))
+
+
 WAIT_MAX_S = 7 * 86400  # a named wait expires within a week; it is renewed, never parked for years (review M-b)
 WAIT_UNVERIFIED_MAX_S = 86400  # when GoodQA cannot confirm the ticket a wait names
 
@@ -2649,8 +2910,8 @@ def _ticket_exists(ref: str):
         return None
 
 
-SERVER_STAMPED_OPS = ("task.dispose", "task.pending")
-SERVER_STAMPED_FIELDS = ("at", "ref_unverified")
+SERVER_STAMPED_OPS = ("task.dispose", "task.pending", "task.retire_session")
+SERVER_STAMPED_FIELDS = ("at", "ref_unverified", "retire")
 
 
 def server_now() -> str:
@@ -2662,7 +2923,10 @@ def server_now() -> str:
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     if op == "task.dispose":
         args = {k: v for k, v in args.items() if k not in GUARD_FIELDS}  # only ah sets these
-    if op in ("task.dispose", "task.pending", "deadline.add"):
+    retiring = op == "task.retire_session"
+    if retiring:
+        args = {k: v for k, v in args.items() if k not in RETIRE_FIELDS}  # only ah's preflight sets these
+    if op in ("task.dispose", "task.pending", "deadline.add", "task.retire_session"):
         stamped = {k: v for k, v in args.items() if k != "ref_unverified"}  # set only here
         if op != "deadline.add":
             stamped["at"] = server_now()  # never the caller's clock (M4): a backdated disposition cannot be forged
@@ -2674,7 +2938,9 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
                 stamped["ref_unverified"] = True
         args = stamped
     tag = {"kind": args.get("kind"), "agent": args.get("agent")} if op == "task.dispose" else {}
-    guarded = op == "task.dispose" and args.get("kind") in GUARDED_KINDS
+    if retiring:
+        tag = {"kind": "retire_session", "agent": args.get("session")}
+    guarded = (op == "task.dispose" and args.get("kind") in GUARDED_KINDS) or retiring
     try:
         if op == "task.dispose" and args.get("ack_handoff"):
             import caller_identity  # noqa: PLC0415
@@ -2694,6 +2960,8 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         if guarded and args.get("kind") in liveness.CLOSING:
             _close_burst(home, args, actor(session), time.time())  # first: a burst is refused whatever its arguments
         precheck(op, args)
+        if retiring and session and session == args.get("session"):  # the caller is the target: never retire yourself
+            raise AhError("forbidden", "task.retire-session: a session cannot retire itself", 3)
     except AhError as e:
         if guarded:
             _audit_reject(home, op, key, session, e.code, tag)
@@ -2708,14 +2976,23 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             raise AhError("bad_request", "source appears to contain a credential; cite it without the secret", 2)
     args = {k: (v if k == "source" else _redact_args(v, redact.redact)) for k, v in args.items()}  # source is checked as typed
     legacy_args = {k: (v if k == "source" else _redact_args(v, redact.redact)) for k, v in legacy_args.items()}
+    if retiring:
+        stable = {k: v for k, v in args.items() if k not in SERVER_STAMPED_FIELDS}
+        k0 = key or derive_key(op, stable, session)
+        sha0 = hashlib.sha256(canonical([op, stable]).encode()).hexdigest()
+        for row in _ledger(home):  # a retry of an applied retire is a duplicate: its owners are already ended, so
+            if row.get("key") == k0 and row.get("sha") == sha0:  # preflight would refuse it as "no owners"
+                return {"ok": True, "result": "duplicate", "id": row["id"], "seq": row["seq"], "key": k0}
+            if row.get("key") == k0:
+                raise AhError("key_conflict", "that key was used with a different request", 3)
     if guarded:
         try:
-            args = _dispose_preflight(home, args)
+            args = _retire_preflight(home, args, time.time(), session) if retiring else _dispose_preflight(home, args)
         except AhError as e:
             _audit_reject(home, op, key, session, e.code, tag)
             raise
     explicit = key is not None
-    key = key or derive_key(op, args, session)
+    key = key or derive_key(op, {k: v for k, v in args.items() if k not in SERVER_STAMPED_FIELDS} if retiring else args, session)
     if not KEY_RE.match(key):
         raise AhError("bad_request", "idempotency key must be 8-128 chars of [A-Za-z0-9._:-]")
 
@@ -2764,6 +3041,10 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             "received_at": iso(time.time())})
         _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who, "result": "applied", "seq": seq,
                              **tag})
+        if retiring:  # audit stays per owner: one line each, naming the one decision
+            for who_id in args["retire"]["owners"]:
+                _append_line(audit, {"at": iso(time.time()), "op": "task.dispose", "key": key, "actor": who,
+                                     "result": "applied", "seq": seq, "kind": RETIRED, "agent": who_id, "decision": rid})
     reply = {"ok": True, "result": "applied", "id": rid, "seq": seq, "key": key}
     reply.update(out)
     if out.get("comment") == "pending":  # post now, outside the lock; on failure it stays spooled for the next drain
@@ -3657,6 +3938,16 @@ def build_parser():
     dp.add_argument("--deployed", help="closed: WAL id of the deploy, release or install record naming this owner")
     dp.add_argument("--live-test", dest="live_test", help="closed: REALLY_TESTED id run against the live target")
     dp.add_argument("--evidence", help=argparse.SUPPRESS)  # retired: closed takes --deployed and --live-test
+    rs = ks.add_parser("retire-session", help="retire every owner of a session that has verifiably ended: ONE sourced "
+                                              "decision, one disposition per owner (goodqa#17148)")
+    rs.add_argument("--session", required=True, help="the FULL id of the ended session (never defaulted)")
+    rs.add_argument("--ended", help="ISO date or time the session ended")
+    rs.add_argument("--replaced-by", dest="replaced_by", help="id of the session that took its work")
+    rs.add_argument("--dropped", action="store_true", help="nobody took the work")
+    rs.add_argument("--source", help="where the decision comes from (user:<session>/<uuid> \"words\", ticket:..., ...)")
+    rs.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="print the evidence and the owners it would cover; write nothing")
+    rs.add_argument("--key", help="idempotency key (default: derived from the request)")
     for x in (r, st, dn, cc, dp):
         x.add_argument("--session")
         x.add_argument("--key", help="idempotency key (default: derived from the request)")
@@ -3864,6 +4155,15 @@ def run(args, home: Path) -> dict:
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)
             return write(home, "task.dispose", a, s, args.key)
+        if args.sub == "retire-session":
+            if args.dry_run:
+                return retire_dry_run(home, args.session)
+            a = {"session": args.session, "ended": args.ended or "", "at": iso(time.time()), "source": args.source or ""}
+            if args.replaced_by:
+                a["replaced_by"] = args.replaced_by
+            if args.dropped:
+                a["dropped"] = True
+            return write(home, "task.retire_session", a, env_session(), args.key)
         if args.sub == "status":
             a = {"task": args.task, "stage": args.stage, "note": args.note}
             if args.ticket:

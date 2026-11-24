@@ -36,7 +36,7 @@ export function ownerKey(text) {
   return match ? match[1].toLowerCase() : null;
 }
 
-const DISPOSITION_KINDS = ['waiting', 'resumed', 'reassigned', 'closed', 'legacy', 'superseded', 'wontdo'];
+const DISPOSITION_KINDS = ['waiting', 'resumed', 'reassigned', 'closed', 'legacy', 'superseded', 'wontdo', 'retired'];
 const WAIT_NOTE = /\b(?:waiting (?:on|for)|monitor wait|own background (?:work|job|task|run)s?|background (?:job|task|run|work) (?:running|in flight|pending))\b/i;
 // ah owners decides the state; the page never rewrites it. A DROPPED/SILENT owner with a recorded disposition that is still
 // in force, or whose own last note says it is waiting, is shown as held: the label stays, the red alarm does not.

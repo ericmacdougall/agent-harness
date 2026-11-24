@@ -303,7 +303,7 @@ def _dispose_rest(seg: list):
 
 def _says(text: str) -> bool:
     """The conservative text rule: the text mentions dispose and an acknowledging kind (or `--ack-handoff`)."""
-    return "dispose" in text and bool(_KIND_WORD.search(text))
+    return "retire-session" in text or ("dispose" in text and bool(_KIND_WORD.search(text)))
 
 
 # Options of `ah task dispose` whose value cannot change what it acknowledges. A computed value of one of these, when
@@ -360,7 +360,7 @@ def _computed_acks(seg: list, i: int, ctx: str) -> bool:
             return False
         return pos_unsafe or "dispose" in ctx
     acks = bool(_KIND_WORD.search(ctx))
-    return ("dispose" in ctx and (acks or unsafe)) or (pos_unsafe and (acks or kind_flag))
+    return ("dispose" in ctx and (acks or unsafe)) or (pos_unsafe and (acks or kind_flag)) or "retire-session" in ctx
 
 
 def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
@@ -391,6 +391,8 @@ def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
         return True
     rest = list(seg[i + 1:])
     words = [t for t in rest if not t.startswith("-")]
+    if words[:2] == ["task", "retire-session"]:
+        return True  # goodqa#17148: one decision that ends every owner of a session; main records it, never a sub-agent
     if words[:2] != ["task", "dispose"]:
         return False
     for j, tok in enumerate(rest):

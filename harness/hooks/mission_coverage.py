@@ -1610,7 +1610,7 @@ def _slot_freed(row: dict) -> bool:
     if not isinstance(disp, dict) or row.get("decision_required") is True:
         return False
     kind = disp.get("kind")
-    return kind in ("closed", "superseded", "wontdo") or (kind == "reassigned" and disp.get("live") is True)
+    return kind in ("closed", "superseded", "wontdo") or (kind in ("reassigned", "retired") and disp.get("live") is True)
 
 
 def owner_type(row, pol=None) -> bool:

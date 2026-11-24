@@ -642,7 +642,7 @@ def _slot_freed(row):
         return True
     # a reassignment or a wait frees the slot only while its holder is live (`live` is ah's own verdict); this is checked
     # here, not left to liveness.row_disposed, which accepted any reassignment until never-drop 16.1 lands (red-team ad4294 B1)
-    return kind in ('reassigned', 'waiting') and disp.get('live') is True
+    return kind in ('reassigned', 'waiting', 'retired') and disp.get('live') is True
 
 
 IDLE_OWNER_MAX_S = liveness.SILENT_S  # an owner-type agent `ah` calls idle-helper holds its slot while it is merely quiet
