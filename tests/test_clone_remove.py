@@ -66,12 +66,41 @@ class Base(unittest.TestCase):
         self.seed = seed
         self.clone = self.make_clone(self.base / 'clone')
         self.refresh_live()
-        for name, value in (('REMOTE_LS', lambda url, cwd, timeout: dict(self.live)),
-                            ('busy_scan', lambda path, skip=(), created=None: dict(QUIET_SCAN)),
+        self.fake_network()
+        for name, value in (('busy_scan', lambda path, skip=(), created=None: dict(QUIET_SCAN)),
                             ('open_files_inside', lambda path, timeout=60: [])):
             patch = mock.patch.object(cg, name, value)
             patch.start()
             self.addCleanup(patch.stop)
+
+    def fake_network(self):
+        """The hosting service answers from the stand-in origin; this host's `ah owners` answers self.owners (the
+        verifier's own liveness read). By default the session is unknown here, which the verifier lets pass."""
+        self.owners = {'ok': False, 'code': 'session_unknown'}
+        self.owners_calls = []
+
+        def owners(argv, **kwargs):
+            self.owners_calls.append(argv)
+            out = self.owners if isinstance(self.owners, str) else json.dumps(self.owners)
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr='')
+        for name, value in (('REMOTE_LS', lambda url, cwd, timeout: dict(self.live)),
+                            ('REMOTE_PULLS', lambda url, cwd, timeout: {
+                                k: v for k, v in self.live.items() if k.startswith('refs/pull/')}),
+                            ('authenticated_remote_refs', mock.Mock(side_effect=ValueError('no network in tests'))),
+                            ('authenticated_pull_heads', mock.Mock(side_effect=ValueError('no network in tests'))),
+                            ('CLONE_OWNERS_RUNNER', owners)):
+            patch = mock.patch.object(cg, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def only_the_tracking_ref_holds_it(self):
+        """Leave the stale tracking ref as the commit's ONLY holder (no reflog, ORIG_HEAD or FETCH_HEAD), so the verdict
+        itself, not only its wording, depends on counting it."""
+        git(self.clone, 'reflog', 'expire', '--expire=now', '--all')
+        for name in ('ORIG_HEAD', 'FETCH_HEAD'):
+            if (self.clone / '.git' / name).exists():
+                (self.clone / '.git' / name).unlink()
+        self.assertEqual(git(self.clone, 'reflog', 'show', '--all', '--format=%H'), '')
 
     def make_clone(self, where):
         git(self.home, 'clone', '-q', str(self.origin), str(where))
@@ -208,7 +237,8 @@ class Refused(Base):
         git(self.clone, 'fetch', '-q', str(self.origin), '+refs/heads/gone:refs/remotes/origin/gone')
         git(self.origin, 'branch', '-D', 'gone')
         self.refresh_live()
-        self.assertRefused(self.verify(), "remote-tracking ref(s) the remote no longer shows")
+        self.only_the_tracking_ref_holds_it()
+        self.assertRefused(self.verify(), "1 local commit(s) are not on the remote (counting 1 remote-tracking ref(s)")
 
     def test_tracking_ref_of_a_remote_that_is_no_longer_configured(self):
         (self.clone / 'b.txt').write_text('only under a dropped remote\n')
@@ -216,8 +246,8 @@ class Refused(Base):
         git(self.clone, 'commit', '-q', '-m', 'dropped')
         git(self.clone, 'update-ref', 'refs/remotes/gone/work', 'HEAD')
         git(self.clone, 'reset', '-q', '--hard', 'origin/main')
-        git(self.clone, 'reflog', 'expire', '--expire=now', '--all')
-        self.assertRefused(self.verify(), "remote-tracking ref(s) the remote no longer shows")
+        self.only_the_tracking_ref_holds_it()
+        self.assertRefused(self.verify(), "1 local commit(s) are not on the remote (counting 1 remote-tracking ref(s)")
 
     def test_remote_branch_moved_since_the_last_fetch(self):
         other = self.make_clone(self.home / ('mover%d' % self.n))
@@ -344,15 +374,120 @@ class HookUnchanged(Base):
                          '1 local commit(s) are not on the remote')
 
 
+class PullProof(Base):
+    """A review clone of a merged pull request whose branch was deleted: GitHub still shows refs/pull/<n>/head."""
+
+    def pr_branch(self, pr_ref='refs/pull/7/head', head_moves_on=False):
+        side = self.make_clone(self.home / ('pr%d' % self.n))
+        git(side, 'remote', 'set-url', 'origin', str(self.origin))
+        git(side, 'checkout', '-q', '-b', 'feature')
+        (side / 'f.txt').write_text('reviewed change\n')
+        git(side, 'add', '.')
+        git(side, 'commit', '-q', '-m', 'feature')
+        git(side, 'push', '-q', 'origin', 'feature')
+        git(self.clone, 'fetch', '-q', str(self.origin), '+refs/heads/feature:refs/remotes/origin/feature')
+        git(self.clone, 'branch', '-q', 'feature', 'refs/remotes/origin/feature')
+        if head_moves_on:
+            (side / 'f.txt').write_text('a later push the clone never took as a ref\n')
+            git(side, 'commit', '-q', '-am', 'later')
+            git(side, 'push', '-q', 'origin', 'feature')
+            git(self.clone, 'fetch', '-q', str(self.origin), 'refs/heads/feature')  # the object only, no ref
+        git(self.origin, 'update-ref', pr_ref, 'refs/heads/feature')
+        git(self.origin, 'branch', '-q', '-D', 'feature')  # squash-merged on GitHub, branch deleted
+        self.refresh_live()
+        self.only_the_tracking_ref_holds_it()
+
+    def test_a_pr_head_the_clone_holds_proves_its_commits(self):
+        self.pr_branch()
+        report = self.verify()
+        self.assertTrue(report['removable'], report)
+        self.assertEqual(report['pull_proof_tips'], 1)
+        self.assertEqual(report['stale_tracking_refs'], 1)
+
+    def test_without_the_pr_head_the_same_clone_refuses(self):
+        self.pr_branch()
+        with mock.patch.object(cg, 'REMOTE_PULLS', lambda url, cwd, timeout: {}):
+            self.assertRefused(self.verify(), 'not on the remote')
+
+    def test_a_pr_head_the_clone_does_not_hold_as_a_tip_proves_nothing(self):
+        self.pr_branch(head_moves_on=True)  # the newer head is in the object store, not a ref, HEAD or reflog entry
+        self.assertRefused(self.verify(), 'not on the remote')
+
+    def test_only_pull_request_heads_count(self):
+        self.pr_branch(pr_ref='refs/pull/7/merge')
+        self.assertRefused(self.verify(), 'not on the remote')
+
+    def test_a_remote_off_github_is_never_asked_for_pr_heads(self):
+        self.pr_branch()
+        git(self.clone, 'remote', 'set-url', 'origin', 'https://gitlab.com/acme/widgets.git')
+        asked = []
+        with mock.patch.object(cg, 'REMOTE_PULLS', lambda url, cwd, timeout: asked.append(url) or dict(self.live)):
+            self.assertRefused(self.verify(), 'not on the remote')
+        self.assertEqual(asked, [])
+
+    def test_the_hook_form_never_uses_pr_heads(self):
+        self.pr_branch()
+        self.assertIn('not on the remote', cg.reproducible_clone_refusal(str(self.clone), self.policy))
+
+    def test_a_private_repository_reads_pr_heads_with_the_hosts_credentials(self):
+        self.pr_branch()
+        anonymous = []
+        with mock.patch.object(cg, 'authenticated_remote_refs', lambda url, cwd, timeout: dict(self.live)), \
+                mock.patch.object(cg, 'authenticated_pull_heads', lambda url, cwd, timeout: {
+                    k: v for k, v in self.live.items() if k.startswith('refs/pull/')}), \
+                mock.patch.object(cg, 'REMOTE_PULLS', lambda url, cwd, timeout: anonymous.append(url) or {}):
+            self.assertTrue(self.verify(authenticated=True)['removable'])
+        self.assertEqual(anonymous, [])
+
+
+class VerifierLiveness(Base):
+    """The verifier checks the owning session itself, so `command_guard.py remove-clone` run directly refuses too."""
+
+    def test_a_direct_removal_of_a_live_sessions_clone_refuses(self):
+        self.owners = owners_answer([{'agent_id': 'a1', 'state': 'live', 'last_activity': OLD}])
+        result = cg.remove_clone(str(self.clone), policy=self.policy)
+        self.assertFalse(result['removed'])
+        self.assertIn('session S2 is live on local', result['reason'])
+        self.assertTrue(self.clone.is_dir())
+        self.assertEqual(self.audit_rows(), [])
+        self.assertEqual(self.owners_calls[0], [sys.executable, '-I', os.path.join(str(HOOKS.resolve()), 'ah.py'),
+                                                'owners', '--session', 'S2', '--all'])
+
+    def test_recent_activity_and_a_partial_read_refuse(self):
+        recent = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - 600))
+        self.owners = owners_answer([{'agent_id': 'a1', 'state': 'DROPPED', 'last_activity': recent}])
+        self.assertRefused(self.verify(), 'was active 10 min ago')
+        self.owners = owners_answer([], {'state': 'partial'})
+        self.assertRefused(self.verify(), 'could not be read completely')
+        self.owners = 'not json'
+        self.assertRefused(self.verify(), 'ah owners did not answer')
+
+    def test_a_session_unknown_here_passes_the_verifier(self):
+        report = self.verify()
+        self.assertTrue(report['removable'], report)
+        self.assertEqual(report['session_liveness']['hosts'], {'local': 'unknown'})
+
+    def test_the_command_line_form_refuses_a_session_whose_main_wal_moved(self):
+        wal = self.home / '.claude' / 'wals' / 'S2' / 'main.jsonl'
+        wal.parent.mkdir(parents=True, exist_ok=True)
+        wal.write_text('{}\n')
+        self.addCleanup(wal.unlink)
+        out = subprocess.run([sys.executable, '-I', str(HOOKS / 'command_guard.py'), 'remove-clone', '--path',
+                              str(self.clone)], capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
+        self.assertEqual(out.returncode, 1, out.stderr)
+        data = json.loads(out.stdout)
+        self.assertFalse(data['removed'])
+        self.assertIn('its main WAL here was written 0 min ago', data['reason'])
+        self.assertTrue(self.clone.is_dir())
+
+
 class Processes(Base):
     """The real scans (lsof and, on Linux, /proc) against real processes."""
 
     def setUp(self):
         super().setUp()
         mock.patch.stopall()  # undo the fast fakes for the scans, keep a fake network
-        patch = mock.patch.object(cg, 'REMOTE_LS', lambda url, cwd, timeout: dict(self.live))
-        patch.start()
-        self.addCleanup(patch.stop)
+        self.fake_network()
 
     def spawn(self, code, cwd):
         process = subprocess.Popen([sys.executable, '-c', code], cwd=str(cwd), stdout=subprocess.PIPE)
@@ -372,6 +507,11 @@ class Processes(Base):
         report = self.verify()
         self.assertFalse(report['removable'])
         self.assertRegex(report['reason'], 'working directory|file open inside')
+
+    def test_the_working_directory_scan_alone_catches_a_process_inside(self):
+        self.spawn('import sys, time; print("ready", flush=True); time.sleep(60)', self.clone)
+        with mock.patch.object(cg, 'open_files_inside', lambda path, timeout=60: []):
+            self.assertIn('as its working directory', self.verify()['reason'])
 
     def test_a_process_with_a_file_open_inside_refuses(self):
         target = self.clone / 'a.txt'

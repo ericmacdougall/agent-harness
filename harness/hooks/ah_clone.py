@@ -6,12 +6,12 @@ audited route instead. It hands a literal path to the fixed verifier `command_gu
 with --check) ON the target host. That verifier keeps every rule of the exemption: a clean tree under the ignored-file
 policy, no stash, no linked worktree, every commit reachable from a local ref, HEAD, a reflog or a stale remote-tracking
 ref on a live remote. It adds a scope rule (strictly inside ~/.agent-harness/work/<session>/, never a WAL, log,
-transcript, state or release location), a mount check and a process check (working directories and open files), and it
-moves the clone aside and re-checks it before deleting it.
+transcript, state or release location), the owning session's liveness on its own host, a mount check and a process
+check (working directories and open files), and it moves the clone aside and re-checks it before deleting it.
 
-This side adds what only the caller can see: the owning session must not be live, as `ah owners` reports it on this
-host and, for a remote path, on the target host too. A session nobody can read refuses. It also checks the release
-tooling on this host. Nothing here relaxes a check: there is no --force, and the caller cannot supply refs.
+This side adds what the target host cannot see: the owning session must not be live on any host (command_guard's
+clone_liveness, the same rule the verifier applies on its own host), and a session no host knows refuses. It also checks
+this host's release tooling. Nothing here relaxes a check: there is no --force, and the caller cannot supply refs.
 
 The caller's audit row is written before anything runs (fail closed) and again with the outcome; the verifier writes its
 own rows on the target host.
@@ -19,7 +19,6 @@ own rows on the target host.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
 import os
 import re
@@ -33,113 +32,28 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ah_worktree  # noqa: E402
+import command_guard  # noqa: E402
 
 HOSTS, REMOTE_HOSTS, MAX_REASON = ah_worktree.HOSTS, ah_worktree.REMOTE_HOSTS, ah_worktree.MAX_REASON
 CLONE_VERIFIER_VERSION = 1
 AUDIT_NAME = "clone-audit.jsonl"
-# The verifier's own bounds: verification (120 s), the process scans (lsof up to 60 s, twice), the size walk (120 s), the
-# deletion of a large tree and the ssh connect. Run a large removal in the background.
-CALL_TIMEOUT = 120 + 2 * 60 + 120 + 900 + 10 + 50
-OWNERS_TIMEOUT = 180
-SESSION_LIVE_S = 6 * 3600  # a session whose main WAL or any owner moved in this window counts as live
-LIVE_STATES = ("live", "quiet")
-LIVE_PREFIXES = ("working", "waiting-on-")
-WORK_SEGMENT = "/.agent-harness/work/"
-SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+# The verifier's own bounds: its liveness read (180 s), verification (120 s), the process scans (lsof up to 60 s,
+# twice), the size walk (120 s), the deletion of a large tree and the ssh connect. Run a large removal in the background.
+CALL_TIMEOUT = 180 + 120 + 2 * 60 + 120 + 900 + 10 + 50
 UNKNOWN = ah_worktree.UNKNOWN
 CloneError = ah_worktree.WorktreeError
 
 
 def owning_session(path):
     """The <session> segment of ~/.agent-harness/work/<session>/<something>, or None."""
-    head, found, rest = path.partition(WORK_SEGMENT)
-    if not found or not head:
-        return None
-    session, _, below = rest.partition("/")
-    return session if SESSION_RE.match(session) and below else None
-
-
-def _owners_argv(where, session):
-    tail = ["owners", "--session", session, "--all"]
-    if where == "local":
-        return [sys.executable, "-I", str(HERE / "ah.py"), *tail]
-    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", where,
-            "python3 -I .claude/hooks/ah.py " + " ".join(shlex.quote(t) for t in tail)]
-
-
-def _parse_ts(value):
-    try:
-        return dt.datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc).timestamp()
-    except (TypeError, ValueError):
-        return None
-
-
-def _main_wal_age(home, session, now):
-    """Seconds since this host's main WAL of the session was written (either WAL root), None when it has none here, or
-    the string 'unreadable'."""
-    found = None
-    for root in (Path(home) / ".claude" / "wals", Path(home) / ".agent-harness" / "codex-wals"):
-        try:
-            mtime = (root / session / "main.jsonl").stat().st_mtime
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return "unreadable"
-        found = now - mtime if found is None else min(found, now - mtime)
-    return found
+    return command_guard.clone_owning_session(path)
 
 
 def liveness_refusal(host, session, home, runner, now):
-    """(reason or None, summary). The owning session is live when, on any host checked, its main WAL was written in
-    the last SESSION_LIVE_S, or `ah owners` shows an owner that is live, quiet, working or waiting, or one active in that
-    window. A session no checked host knows, an answer that cannot be parsed, or a partial read refuses: liveness that
-    cannot be read is never taken for "not live"."""
-    summary = {"session": session, "hosts": {}}
-    known = False
-    age = _main_wal_age(home, session, now)
-    if age == "unreadable":
-        return "the session's main WAL on this host cannot be read, so its liveness is unknown", summary
-    if age is not None:
-        known = True
-        if age < SESSION_LIVE_S:
-            return ("the owning session %s is live: its main WAL here was written %d min ago" % (session, age // 60),
-                    summary)
-    for where in ("local",) if host == "local" else ("local", host):
-        try:
-            done = runner(_owners_argv(where, session), capture_output=True, text=True, timeout=OWNERS_TIMEOUT)
-            data = json.loads(done.stdout)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            return "could not read the session's liveness on %s (ah owners did not answer)" % where, summary
-        if not isinstance(data, dict):
-            return "could not read the session's liveness on %s (unexpected answer)" % where, summary
-        if data.get("ok") is False:
-            if data.get("code") == "session_unknown":
-                summary["hosts"][where] = "unknown"
-                continue
-            return "could not read the session's liveness on %s (%s)" % (
-                where, re.sub(r"[^A-Za-z0-9_.-]", "?", str(data.get("code")))[:40]), summary
-        read, rows = data.get("read"), data.get("owners")
-        if (not isinstance(read, dict) or read.get("state") != "ok" or read.get("unread_total") or read.get("limited")
-                or not isinstance(rows, list)):
-            return "the session's liveness on %s could not be read completely" % where, summary
-        known = True
-        for row in rows:
-            if not isinstance(row, dict):
-                return "the session's liveness on %s could not be read completely" % where, summary
-            state = str(row.get("state") or "")
-            agent = re.sub(r"[^A-Za-z0-9_.-]", "?", str(row.get("agent_id")))[:40]
-            if state in LIVE_STATES or state.startswith(LIVE_PREFIXES):
-                return "the owning session %s is live on %s: owner %s is %s" % (
-                    session, where, agent, re.sub(r"[^A-Za-z0-9_.#:-]", "?", state)[:60]), summary
-            last = _parse_ts(row.get("last_activity"))
-            if last is not None and now - last < SESSION_LIVE_S:
-                return "the owning session %s is live on %s: owner %s was active %d min ago" % (
-                    session, where, agent, (now - last) // 60), summary
-        summary["hosts"][where] = "not live (%d owner rows)" % len(rows)
-    if not known:
-        return ("session %s is unknown on every host checked, so its liveness cannot be read" % session), summary
-    return None, summary
-
+    """(reason or None, summary): command_guard.clone_liveness over this host and, for a remote path, the target host,
+    with a session no host knows refused."""
+    hosts = ("local",) if host == "local" else ("local", host)
+    return command_guard.clone_liveness(session, hosts, runner=runner, home=str(home), now=now, require_known=True)
 
 def _argv(host, path, authenticated, check):
     tail = ["verify-clone" if check else "remove-clone", "--path", path] + (["--remote-auth"] if authenticated else [])
@@ -170,7 +84,8 @@ def _call(runner, host, path, authenticated, check):
 
 
 VERIFIED_KEYS = ("head", "remotes", "commits_checked", "local_refs", "local_ref_names", "stale_tracking_refs",
-                 "process_check", "bytes", "freed_bytes", "directory_removed", "quarantine")
+                 "pull_proof_tips", "session_liveness", "process_check", "bytes", "freed_bytes", "directory_removed",
+                 "quarantine")
 
 
 def remove(host, path, reason, authenticated=False, session="", agent="", home=None, runner=subprocess.run,
@@ -204,8 +119,7 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
     refusal, live = liveness_refusal(host, owner, home, runner, now)
     answer["liveness"] = live
     if refusal is None and host != "local":
-        import command_guard  # noqa: PLC0415 - only here: the caller's own release tooling, by home-relative path
-        refusal = command_guard.release_tooling_refusal(path, str(home))
+        refusal = command_guard.release_tooling_refusal(path, str(home))  # this host's tooling, home-relative
     if refusal:
         answer["reason"] = refusal
         _audit_result(home, {"event": "result", "run": run_id, "host": host, "path": path, "removed": False,

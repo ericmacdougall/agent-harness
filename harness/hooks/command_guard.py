@@ -1458,6 +1458,25 @@ def _live_remote_refs(url, repo, timeout):
 
 
 REMOTE_LS = _live_remote_refs
+PULL_HEAD_REF = re.compile(r'refs/pull/[1-9][0-9]{0,9}/head')
+
+
+def _parse_ls_remote(out):
+    refs = {}
+    for line in out.splitlines():
+        sha, _, ref = line.partition('\t')
+        if re.fullmatch(r'[0-9a-f]{40,64}', sha) and ref and not ref.endswith('^{}'):
+            refs[ref] = sha
+    return refs
+
+
+def _live_pull_heads(url, repo, timeout):
+    """refs/pull/<n>/head -> sha as GitHub reports them now (read-only ls-remote). Replaced in tests."""
+    return {ref: sha for ref, sha in _parse_ls_remote(_git_out(repo, ['ls-remote', '--', url, 'refs/pull/*/head'],
+                                                                timeout)).items() if PULL_HEAD_REF.fullmatch(ref)}
+
+
+REMOTE_PULLS = _live_pull_heads
 
 
 _TRUE_WORDS = ('true', 'yes', 'on', '1')
@@ -1612,14 +1631,18 @@ def _nested_repo(directory, limit=250000, deep=False, seconds=1.5):
     return False
 
 
-def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, delegated=False, facts=None):
+def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, pull_ls=None, delegated=False, facts=None):
     """None when `path` is provably a reproducible clone, else the reason it is not.
 
-    `delegated` is the `ah clone-remove` verifier only (goodqa#17119). It keeps every rule below and adds: step budgets
-    scaled for large clones (the policy's `scale`), `remote_ls` (the host's own credentials for a private repository), an
-    empty linked-worktree registry instead of none at all, every remote-tracking tip the live remote no longer shows
-    counted as local work (its commits must be reachable from a live ref), and `facts` filled with what was verified.
-    The hook form passes none of these and behaves exactly as before."""
+    Every commit a local ref, HEAD, a reflog, an in-progress pointer or a stale remote-tracking ref holds must be
+    reachable from a ref the live remote shows. A tracking ref is stale when its remote branch is gone or its remote is no
+    longer configured: its commits may exist only here, so it counts as local work (goodqa#17172; a merged one is fine).
+
+    `delegated` is the `ah clone-remove` verifier only (goodqa#17119). It keeps every rule and adds: step budgets scaled
+    for large clones (the policy's `scale`), `remote_ls` and `pull_ls` (the host's own credentials for a private
+    repository), an empty linked-worktree registry instead of none at all, GitHub's read-only pull-request heads
+    (refs/pull/<n>/head) as live proof tips when the clone holds that very commit, and `facts` filled with what was
+    verified. The hook form passes none of these."""
     cfg = dict(DEFAULT_POLICY['reproducible_clone'], **((policy or {}).get('reproducible_clone') or {}))
     if not cfg.get('enabled'):
         return 'the exemption is switched off'
@@ -1704,7 +1727,7 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, d
         remotes = [r for r in _git_out(path, ['remote'], step(2.0)).split() if re.fullmatch(r'[\w.-]+', r)]
         if not remotes:
             return 'it has no remote'
-        live_all, shown = {}, {}
+        live_all, shown, first_url = {}, {}, {}
         for remote in remotes:
             urls = _git_out(path, ['remote', 'get-url', '--all', remote], step(2.0)).split()
             hosts = [_remote_host(u) for u in urls]
@@ -1721,6 +1744,7 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, d
                 return 'the remote did not answer (cannot prove the commits are pushed)'
             live_all[remote] = live
             shown[remote] = [_shown_url(u) for u in urls[:4]]
+            first_url[remote] = urls[0]
         verified, stale = set(), set()
         for name, sha in refs.items():
             if not name.startswith('refs/remotes/'):
@@ -1730,14 +1754,13 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, d
             if branch == 'HEAD':
                 continue
             if live is None or not branch:
-                if delegated:
-                    stale.add(sha)  # a tracking ref of a remote that is gone: its commits may be held only here
+                stale.add(sha)  # a tracking ref of a remote that is gone: its commits may be held only here
                 continue
             if live.get('refs/heads/' + branch) == sha:
                 verified.add(sha)
             elif 'refs/heads/' + branch in live:
                 return 'the remote branch %s moved since the last fetch; run `git fetch` first so it can be verified' % branch[:40]
-            elif delegated:
+            else:
                 stale.add(sha)  # deleted on the remote: kept only if a live ref still reaches it (merged)
         for name, sha in refs.items():
             if name.startswith('refs/tags/') and any(v.get(name) == sha for v in live_all.values()):
@@ -1746,8 +1769,22 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, d
         for pointer in ('ORIG_HEAD', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
             pfile = os.path.join(gitdir, pointer)
             if os.path.isfile(pfile):
-                local |= set(re.findall(r'[0-9a-f]{40,64}', open(pfile, errors='replace').read(512)))
+                with open(pfile, errors='replace') as handle:
+                    local |= set(re.findall(r'[0-9a-f]{40,64}', handle.read(512)))
         local |= set(re.findall(r'[0-9a-f]{40,64}', _git_out(path, ['reflog', 'show', '--all', '--format=%H'], step(3.0))))
+        pull_proof = set()
+        if delegated:
+            # A pull-request head is read-only on GitHub and outlives its deleted branch. It proves a commit only when the
+            # clone holds that very commit as a tip, so the reachability check below runs on local objects.
+            for remote, url in first_url.items():
+                if not GITHUB_REMOTE.fullmatch(url):
+                    continue
+                try:
+                    pulls = (pull_ls or REMOTE_PULLS)(url, path, min(left(), float(cfg['remote_seconds'])))
+                except ValueError:
+                    pulls = {}
+                pull_proof |= {sha for ref, sha in (pulls or {}).items() if PULL_HEAD_REF.fullmatch(ref)} & local
+            verified |= pull_proof
         if not verified:
             return 'no remote-tracking branch matches the remote'
         spec = '\n'.join(sorted(local)) + '\n--not\n' + '\n'.join(sorted(verified)) + '\n'
@@ -1758,7 +1795,7 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, d
         if facts is not None:
             local_names = sorted(n for n in refs if not n.startswith('refs/remotes/'))
             facts.update(head=head, remotes=shown, commits_checked=len(local), stale_tracking_refs=len(stale),
-                         local_refs=len(local_names), local_ref_names=[_clean_reason(n)[:80] for n in local_names[:50]],
+                         pull_proof_tips=len(pull_proof), local_refs=len(local_names), local_ref_names=[_clean_reason(n)[:80] for n in local_names[:50]],
                          _status=status, _refs=listing)
         return None
     except Exception as error:  # noqa: BLE001 - any surprise means "not provably reproducible"
@@ -2268,7 +2305,7 @@ def _authenticated_env():
     return env
 
 
-def authenticated_remote_refs(url, repo, timeout):
+def authenticated_remote_refs(url, repo, timeout, _patterns=None):
     """ref -> sha like _live_remote_refs, but read with this host's own credentials (a private repository). The caller
     cannot supply the refs: only the real remote's answer counts. Only a github.com URL; cwd is `/`, the environment is
     _authenticated_env(), and the credential helper is gh's, named explicitly."""
@@ -2279,8 +2316,9 @@ def authenticated_remote_refs(url, repo, timeout):
                '-c', 'protocol.ssh.allow=always']
     if gh:
         command += ['-c', 'credential.helper=', '-c', 'credential.helper=!%s auth git-credential' % shlex.quote(gh)]
-    done = subprocess.run(command + ['ls-remote', '--heads', '--tags', '--', url], capture_output=True, cwd=os.sep,
-                          timeout=max(0.2, timeout), env=_authenticated_env())
+    listing = ['ls-remote', '--', url, *_patterns] if _patterns else ['ls-remote', '--heads', '--tags', '--', url]
+    done = subprocess.run(command + listing, capture_output=True, cwd=os.sep, timeout=max(0.2, timeout),
+                          env=_authenticated_env())
     if done.returncode != 0 or len(done.stdout) > 8 * 1024 * 1024:
         raise ValueError('git ls-remote failed')
     refs = {}
@@ -2290,6 +2328,12 @@ def authenticated_remote_refs(url, repo, timeout):
             refs[ref] = sha
     return refs
 
+
+
+def authenticated_pull_heads(url, repo, timeout):
+    """refs/pull/<n>/head -> sha read with this host's own credentials (authenticated_remote_refs' rules)."""
+    return {ref: sha for ref, sha in authenticated_remote_refs(url, repo, timeout, ('refs/pull/*/head',)).items()
+            if PULL_HEAD_REF.fullmatch(ref)}
 
 def _proc_status(pid):
     """{'name': Name, 'uid': real uid, 'ppid': parent pid} from /proc/PID/status, which any user can read whatever the process set about
@@ -2757,6 +2801,118 @@ def _clone_registry_refusal(registry):
     return None
 
 
+
+CLONE_LIVE_SECONDS = 6 * 3600  # a session whose main WAL or any owner moved in this window counts as live
+CLONE_OWNERS_SECONDS = 180
+CLONE_LIVE_STATES = ('live', 'quiet')
+CLONE_LIVE_PREFIXES = ('working', 'waiting-on-')
+CLONE_OWNERS_RUNNER = None  # subprocess.run; tests replace it
+CLONE_REMOTE_HOSTS = ('t2-dev',)
+_WORK_SEGMENT = '/.agent-harness/work/'
+
+
+def clone_owning_session(path):
+    """The <session> segment of ~/.agent-harness/work/<session>/<something>, or None."""
+    head, found, rest = str(path).partition(_WORK_SEGMENT)
+    if not found or not head:
+        return None
+    session, _, below = rest.partition('/')
+    return session if CLONE_SESSION_SEGMENT.fullmatch(session) and below else None
+
+
+def _clone_owners_argv(where, session):
+    tail = ['owners', '--session', session, '--all']
+    if where == 'local':
+        return [sys.executable, '-I', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ah.py'), *tail]
+    if where not in CLONE_REMOTE_HOSTS:
+        raise ValueError('unknown host')
+    return ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '--', where,
+            'python3 -I .claude/hooks/ah.py ' + ' '.join(shlex.quote(t) for t in tail)]
+
+
+def _clone_wal_age(home, session, now):
+    """Seconds since this host's main WAL of the session was written (either WAL root), None when it has none here, or
+    the string 'unreadable'."""
+    found = None
+    for root in (os.path.join(home, '.claude', 'wals'), os.path.join(home, '.agent-harness', 'codex-wals')):
+        try:
+            mtime = os.stat(os.path.join(root, session, 'main.jsonl')).st_mtime
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return 'unreadable'
+        found = now - mtime if found is None else min(found, now - mtime)
+    return found
+
+
+def _clone_stamp(value):
+    import calendar  # noqa: PLC0415 - only this route reads owner timestamps
+    try:
+        return calendar.timegm(time.strptime(str(value), '%Y-%m-%dT%H:%M:%SZ'))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def clone_liveness(session, hosts=('local',), *, runner=None, home=None, now=None, require_known=True):
+    """(reason or None, summary) for the session that owns a clone. It is live when this host's main WAL of it was
+    written in the last CLONE_LIVE_SECONDS, or when `ah owners` on any host in `hosts` shows an owner that is live, quiet,
+    working or waiting, or one active in that window. An answer that cannot be parsed, a partial read or an unreadable WAL
+    refuses: liveness that cannot be read is never taken for "not live". A session no host knows refuses when
+    `require_known` (the caller, which asks every host); the verifier asks only its own host and lets "unknown here"
+    pass, since a Mac session's clone on t2-dev is unknown there (the caller still asks the Mac). One rule for both
+    sides (goodqa#17119)."""
+    summary = {'session': session, 'hosts': {}}
+    if not isinstance(session, str) or not CLONE_SESSION_SEGMENT.fullmatch(session):
+        return 'the owning session cannot be read from the path', summary
+    runner = runner or CLONE_OWNERS_RUNNER or subprocess.run
+    home = home or os.path.realpath(os.path.expanduser('~'))
+    now = time.time() if now is None else now
+    known = False
+    age = _clone_wal_age(str(home), session, now)
+    if age == 'unreadable':
+        return "the session's main WAL on this host cannot be read, so its liveness is unknown", summary
+    if age is not None:
+        known = True
+        if age < CLONE_LIVE_SECONDS:
+            return ('the owning session %s is live: its main WAL here was written %d min ago' % (session, age // 60),
+                    summary)
+    for where in hosts:
+        try:
+            done = runner(_clone_owners_argv(where, session), capture_output=True, text=True,
+                          timeout=CLONE_OWNERS_SECONDS)
+            data = json.loads(done.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            return "could not read the session's liveness on %s (ah owners did not answer)" % where, summary
+        if not isinstance(data, dict):
+            return "could not read the session's liveness on %s (unexpected answer)" % where, summary
+        if data.get('ok') is False:
+            if data.get('code') == 'session_unknown':
+                summary['hosts'][where] = 'unknown'
+                continue
+            return "could not read the session's liveness on %s (%s)" % (
+                where, re.sub(r'[^A-Za-z0-9_.-]', '?', str(data.get('code')))[:40]), summary
+        read, rows = data.get('read'), data.get('owners')
+        if (not isinstance(read, dict) or read.get('state') != 'ok' or read.get('unread_total') or read.get('limited')
+                or not isinstance(rows, list)):
+            return "the session's liveness on %s could not be read completely" % where, summary
+        known = True
+        for row in rows:
+            if not isinstance(row, dict):
+                return "the session's liveness on %s could not be read completely" % where, summary
+            state = str(row.get('state') or '')
+            agent = re.sub(r'[^A-Za-z0-9_.-]', '?', str(row.get('agent_id')))[:40]
+            if state in CLONE_LIVE_STATES or state.startswith(CLONE_LIVE_PREFIXES):
+                return 'the owning session %s is live on %s: owner %s is %s' % (
+                    session, where, agent, re.sub(r'[^A-Za-z0-9_.#:-]', '?', state)[:60]), summary
+            last = _clone_stamp(row.get('last_activity'))
+            if last is not None and now - last < CLONE_LIVE_SECONDS:
+                return 'the owning session %s is live on %s: owner %s was active %d min ago' % (
+                    session, where, agent, (now - last) // 60), summary
+        summary['hosts'][where] = 'not live (%d owner rows)' % len(rows)
+    if require_known and not known:
+        return 'session %s is unknown on every host checked, so its liveness cannot be read' % session, summary
+    return None, summary
+
 def clone_scope_refusal(path):
     """Where `ah clone-remove` may act: strictly inside a session's agent work dir (~/.agent-harness/work/<session>/...),
     never the session dir itself, never a WAL, log, transcript, state or release location. Names are compared
@@ -2939,12 +3095,16 @@ def _clone_state(path, seconds=CLONE_RECHECK_SECONDS):
 def _verify_clone(path, authenticated, policy):
     report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'remotes': {}, 'commits_checked': None,
               'local_refs': None, 'local_ref_names': [], 'stale_tracking_refs': None, 'process_check': None,
-              'bytes': None, 'clone_verifier': CLONE_VERIFIER_VERSION}
+              'pull_proof_tips': None, 'session_liveness': None, 'bytes': None,
+              'clone_verifier': CLONE_VERIFIER_VERSION}
     facts = {}
     if not isinstance(path, str) or '\x00' in path or not os.path.isabs(path):
         reason = 'not a literal absolute path'
     else:
         reason = clone_scope_refusal(path) or release_tooling_refusal(path)
+    if reason is None:
+        # the session check runs here as well as in ah clone-remove, so a direct call gets the same refusal
+        reason, report['session_liveness'] = clone_liveness(clone_owning_session(path), ('local',), require_known=False)
     if reason is None:
         try:
             clear = _worktree_mount_clear(path)
@@ -2955,8 +3115,10 @@ def _verify_clone(path, authenticated, policy):
     if reason is None:
         reason = reproducible_clone_refusal(path, _clone_policy(policy),
                                             remote_ls=authenticated_remote_refs if authenticated else None,
+                                            pull_ls=authenticated_pull_heads if authenticated else None,
                                             delegated=True, facts=facts)
-        for key in ('head', 'remotes', 'commits_checked', 'local_refs', 'local_ref_names', 'stale_tracking_refs'):
+        for key in ('head', 'remotes', 'commits_checked', 'local_refs', 'local_ref_names', 'stale_tracking_refs',
+                    'pull_proof_tips'):
             if key in facts:
                 report[key] = facts[key]
     if reason is None:

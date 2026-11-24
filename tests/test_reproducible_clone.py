@@ -414,7 +414,50 @@ class RoundTwo(CloneCase):
         self.assertRefused(self.rm(), 'nested')
 
 
+class StaleTrackingRefs(CloneCase):
+    """goodqa#17172: a remote-tracking ref whose remote branch is gone, or whose remote is no longer configured, may hold
+    the only copy of a commit. It counts as local work: rm -rf is refused unless a live ref reaches it."""
 
+    def only_holder(self):
+        git(self.clone, 'reflog', 'expire', '--expire=now', '--all')
+        for name in ('ORIG_HEAD', 'FETCH_HEAD'):
+            if (self.clone / '.git' / name).exists():
+                (self.clone / '.git' / name).unlink()
+
+    def deleted_branch(self, merge=False):
+        side = self.home / ('side%d' % self.n)
+        git(self.home, 'clone', '-q', str(self.origin), str(side))
+        git(side, 'checkout', '-q', '-b', 'gone')
+        (side / 'g.txt').write_text('only on a deleted branch\n')
+        git(side, 'add', '.')
+        git(side, 'commit', '-q', '-m', 'gone')
+        git(side, 'push', '-q', 'origin', 'gone')
+        if merge:
+            git(side, 'push', '-q', 'origin', 'gone:main')
+        git(self.clone, 'fetch', '-q', str(self.origin), '+refs/heads/gone:refs/remotes/origin/gone',
+            '+refs/heads/main:refs/remotes/origin/main')
+        git(self.origin, 'branch', '-D', 'gone')
+        self.refresh_live()
+        self.only_holder()
+
+    def test_a_deleted_remote_branch_holding_the_only_copy_is_refused(self):
+        self.deleted_branch()
+        self.assertRefused(self.rm())
+        self.assertIn('remote-tracking ref(s) the remote no longer shows',
+                      cg.reproducible_clone_refusal(str(self.clone), self.policy))
+
+    def test_a_tracking_ref_of_an_unconfigured_remote_holding_the_only_copy_is_refused(self):
+        (self.clone / 'b.txt').write_text('two\n')
+        git(self.clone, 'add', '.')
+        git(self.clone, 'commit', '-q', '-m', 'dropped remote')
+        git(self.clone, 'update-ref', 'refs/remotes/gone/work', 'HEAD')
+        git(self.clone, 'reset', '-q', '--hard', 'origin/main')
+        self.only_holder()
+        self.assertRefused(self.rm())
+
+    def test_a_merged_stale_tracking_ref_stays_deletable(self):
+        self.deleted_branch(merge=True)
+        self.assertAllowed(self.rm())
 
 
 if __name__ == '__main__':

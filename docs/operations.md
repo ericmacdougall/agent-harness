@@ -746,14 +746,16 @@ The caller refuses first when the owning session (the `<session>` segment of `~/
 
 - the path is literal, has no symlink, and lies strictly inside `~/.agent-harness/work/<session>/`, never the session dir itself, and no segment names a WAL, log, transcript, session, state or memory location;
 - no segment names a release, deploy or rollback (ASSUMPTION: the repository has no other marker of a release checkout), and the path is not named by `~/.agent-harness/bin/pp-release` (read for path names only, never printed);
+- the owning session is not live on this host, by the same rule the caller uses, so running `command_guard.py remove-clone` directly is refused the same way. A session this host does not know passes here, because t2-dev cannot see a Mac session; the caller still asks every host;
 - no mount point is at or below it;
-- every rule of the guard's reproducible-clone exemption holds: clean tree (only the regenerable ignored folders), no stash, hooks, submodules, gitlinks, hidden index flags or replace refs, and every local branch, tag, HEAD, reflog entry and remote-tracking tip the remote no longer shows is reachable from a ref the remote shows live;
+- every rule of the guard's reproducible-clone exemption holds: clean tree (only the regenerable ignored folders), no stash, hooks, submodules, gitlinks, hidden index flags or replace refs, and every local branch, tag, HEAD, reflog entry and stale remote-tracking tip (its remote branch deleted, or its remote no longer configured) is reachable from a ref the remote shows live;
+- for a github.com remote, a pull-request head (`refs/pull/<n>/head`) also counts as a live ref, but only when the clone holds that very commit as a ref, HEAD or reflog entry. GitHub documents the `refs/pull/` namespace as read-only and lets a closed pull request's head branch be restored ([checking out pull requests locally](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/reviewing-changes-in-pull-requests/checking-out-pull-requests-locally), [deleting and restoring branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-branches-in-your-repository/deleting-and-restoring-branches-in-a-pull-request), read 2026-11-24). This covers a review clone of a merged pull request whose branch was deleted;
 - it has no linked worktree, present or prunable;
 - no process has its working directory or any open file inside it (`lsof`; a failed listing refuses).
 
 The removal renames the clone aside in its own directory, re-checks status, refs, HEAD, identity and processes there, moves it back on any change, and only then deletes it. Both sides append audit rows before acting: `~/.agent-harness/clone-audit.jsonl` on each host. An answer that does not arrive is recorded as an unknown outcome; check the host before retrying.
 
-Residuals, disclosed: without root, other users' processes are not listed; a writer that starts after the re-check can still race the delete; the release rule is a path-name assumption.
+Residuals, disclosed: without root, other users' processes are not listed; a writer that starts after the re-check can still race the delete; the release rule is a path-name assumption; a direct `ssh t2-dev command_guard.py remove-clone` of a Mac session's clone checks only t2-dev's view of that session (the process check still applies); GitHub's documentation does not promise to keep pull-request refs forever, though they are read-only (a live branch, which any pusher can delete, is accepted the same way).
 
 ### Removing an archive-backed tree on another host
 
