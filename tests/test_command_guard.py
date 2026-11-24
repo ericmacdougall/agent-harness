@@ -590,7 +590,8 @@ class LauncherTests(unittest.TestCase):
         d = Path(tmp.name)
         text = LAUNCHER_SRC.read_text()
         if child_timeout is not None:
-            text = text.replace('CHILD_TIMEOUT = 10.0', 'CHILD_TIMEOUT = %r' % child_timeout)
+            self.assertIn('CHILD_TIMEOUT = 25.0', text)
+            text = text.replace('CHILD_TIMEOUT = 25.0', 'CHILD_TIMEOUT = %r' % child_timeout)
         (d / 'command_guard_hook.py').write_text(text)
         if guard_source is None:
             for name in ('command_guard.py', 'redact.py', 'safe_input.py'):

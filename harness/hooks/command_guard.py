@@ -34,6 +34,7 @@ interpreter one-liners (python -c, node -e): their code text is scanned, not exe
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fnmatch
 import hashlib
@@ -67,8 +68,9 @@ POLICY_FILE = HERE / 'command_guard_policy.json'
 DEFAULT_POLICY = {
     'version': 1,
     'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn', 'bulk_staging': 'warn'},
+    # max_seconds is CPU time; max_wall_seconds is the wall-clock ceiling behind it (Budget, H23)
     'limits': {'max_command_bytes': 262144, 'max_depth': 8, 'max_nodes': 600000, 'max_seconds': 3.0,
-               'max_stdin_bytes': 4194304},
+               'max_wall_seconds': 12.0, 'max_stdin_bytes': 4194304},
     # Tier A: logs, WALs and approval state. Every destructive form is refused, including overwrites.
     'protected_log_roots': ['{home}/.claude/projects', '{home}/.claude/wals', '{home}/.claude/sessions',
                             '{home}/.claude/transcripts', '{home}/.claude/history.jsonl',
@@ -410,9 +412,11 @@ CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
 CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]*/)?' + _RCLONE_DUMP
                                     + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
 CREDENTIAL_SCRIPT_READ = 1048576
-# The check's own pass starts no new read after this long. Main's analysis (at most its 3 s limit) plus this stays under
-# the hook's 7 s alarm; a single read that stalls past the alarm ends the pass, and main's verdict stands.
+# The check's own pass starts no new read after this much CPU time, or this much wall-clock time. Main's analysis (at
+# most its wall-clock ceiling) plus this pass stays under the hook's wall-clock alarm (hook_alarm_seconds); a single
+# read that stalls past the alarm ends the pass, and main's verdict stands.
 CREDENTIAL_PASS_SECONDS = 1.5
+CREDENTIAL_PASS_WALL_SECONDS = 4.0
 CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
 CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
 CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
@@ -519,23 +523,68 @@ class Blocked(Exception):
     """Analysis could not complete inside its budget: the command is refused, not waved through."""
 
 
+# H23: the analysis is charged for the CPU time it uses (limits max_seconds), so a process a loaded machine kept waiting
+# is not refused for time it never ran. A much larger wall-clock ceiling (limits max_wall_seconds) still stops an
+# analysis that is stuck, whatever the load. Budget reads both clocks through these names, which tests replace.
+CPU_CLOCK = time.process_time
+WALL_CLOCK = time.monotonic
+WALL_CEILING_SECONDS = DEFAULT_POLICY['limits']['max_wall_seconds']  # for a policy file written before the key existed
+BUDGET_CHECK_EVERY = 256  # ticks between clock reads
+
+
 class Budget:
     def __init__(self, limits):
         self.nodes = int(limits['max_nodes'])
-        self.deadline = time.monotonic() + float(limits['max_seconds'])
         self.max_depth = int(limits['max_depth'])
         self.count = 0
+        self.checked = 0
+        self.restart(float(limits['max_seconds']), float(limits.get('max_wall_seconds', WALL_CEILING_SECONDS)))
 
-    def has_room(self, ticks, seconds):
+    def restart(self, cpu_seconds, wall_seconds):
+        """Start both clocks again with these limits (the credential pass has its own)."""
+        self.cpu_seconds, self.wall_seconds = cpu_seconds, wall_seconds
+        self.cpu_start, self.wall_start = CPU_CLOCK(), WALL_CLOCK()
+
+    def cpu_used(self):
+        return CPU_CLOCK() - self.cpu_start
+
+    def wall_used(self):
+        return WALL_CLOCK() - self.wall_start
+
+    def over(self):
+        """The limit the analysis has passed, as a refusal reason, or None."""
+        if self.cpu_used() > self.cpu_seconds:
+            return 'analysis used more than its %g s CPU-time budget' % self.cpu_seconds
+        if self.wall_used() > self.wall_seconds:
+            return ('analysis ran past its %g s wall-clock ceiling (the machine may be overloaded; retry it)'
+                    % self.wall_seconds)
+        return None
+
+    def has_room(self, ticks, cpu_seconds, wall_seconds):
         """Could about this much more work finish inside the budget?"""
-        return self.count + ticks <= self.nodes and time.monotonic() + seconds <= self.deadline
+        return (self.count + ticks <= self.nodes and self.cpu_used() + cpu_seconds <= self.cpu_seconds
+                and self.wall_used() + wall_seconds <= self.wall_seconds)
+
+    @contextlib.contextmanager
+    def excluded(self):
+        """Work that has its own time limit (git and the network for an exemption check) is not charged to either
+        clock."""
+        cpu, wall = CPU_CLOCK(), WALL_CLOCK()
+        try:
+            yield
+        finally:
+            self.cpu_start += CPU_CLOCK() - cpu
+            self.wall_start += WALL_CLOCK() - wall
 
     def tick(self, weight=1):
         self.count += weight
         if self.count > self.nodes:
-            raise Blocked('command is too large or complex to analyse safely')
-        if self.count % 256 == 0 and time.monotonic() > self.deadline:
-            raise Blocked('analysis exceeded its time budget')
+            raise Blocked('command is too large or complex to analyse safely (more than %d steps)' % self.nodes)
+        if self.count - self.checked >= BUDGET_CHECK_EVERY:
+            self.checked = self.count
+            reason = self.over()
+            if reason:
+                raise Blocked(reason)
 
 
 class Word:
@@ -4284,11 +4333,13 @@ class Analyzer:
         ctx = self.ctx
         start = ctx.state()
         mark = len(ctx.findings)
-        count, began = ctx.budget.count, time.monotonic()
+        budget = ctx.budget
+        count, cpu, wall = budget.count, budget.cpu_used(), budget.wall_used()
         self._run_tokens(zsh_tokens, depth)
         # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
         # analyze() then treats the command as unanalysable
-        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
+        if not budget.has_room(2 * (budget.count - count) + len(text), 2 * (budget.cpu_used() - cpu),
+                               2 * (budget.wall_used() - wall)):
             ctx.readings_capped = True
             return
         after_zsh = ctx.state()
@@ -5059,7 +5110,7 @@ class Analyzer:
                 self._credential_finding()
             return
         seen[(path, runner)] = False
-        if time.monotonic() > self.ctx.budget.deadline:
+        if self.ctx.budget.over():
             return  # the pass is out of time: start no new read
         try:
             if not os.path.isfile(path):
@@ -7539,13 +7590,10 @@ class Analyzer:
         if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
             self._worktree_reason = 'the path is not a literal top inside a harness work root, so the guard does not verify it'
             return False
-        started = time.monotonic()
-        try:
+        with self.ctx.budget.excluded():  # bounded by the verifier's own time limits
             reason = linked_worktree_remove_refusal(path, calling, self.c.policy)
             if reason is None and calling != self.ctx.cwd:
                 reason = self._dash_c_refusal(path, calling)
-        finally:
-            self.ctx.budget.deadline += time.monotonic() - started
         self._worktree_reason = reason
         return reason is None
 
@@ -7600,11 +7648,8 @@ class Analyzer:
         if path in cache:
             return cache[path]
         cache[path] = False
-        started = time.monotonic()
-        try:
+        with self.ctx.budget.excluded():
             reason = reproducible_clone_refusal(path, self.c.policy)
-        finally:
-            self.ctx.budget.deadline += time.monotonic() - started
         if reason is None:
             cache[path] = True
             return True
@@ -8309,8 +8354,8 @@ def credential_findings(command, compiled, cwd=None, ps=False):
     script being run."""
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=None)
     analyzer.credential_pass = True
-    budget = analyzer.ctx.budget
-    budget.deadline = time.monotonic() + min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
+    analyzer.ctx.budget.restart(min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds'])),
+                                min(CREDENTIAL_PASS_WALL_SECONDS, analyzer.ctx.budget.wall_seconds))
     try:
         analyzer.run(command)
     except Exception:  # noqa: BLE001 - a budget stop, the alarm's TimeoutError or a bug: main's verdict stands
@@ -10157,19 +10202,40 @@ def payload_cwd(payload):
     return None
 
 
+HOOK_WALL_LIMIT = 'command_guard wall-clock limit'
+HOOK_CPU_LIMIT = 'command_guard CPU-time limit'
+
+
+def hook_alarm_seconds(limits):
+    """The hook's wall-clock backstop: past the analysis ceiling and the credential pass, and under the launcher's
+    CHILD_TIMEOUT (command_guard_hook.py), which is under the host's 30 s hook timeout (install.py)."""
+    return int(float(limits.get('max_wall_seconds', WALL_CEILING_SECONDS)) + CREDENTIAL_PASS_WALL_SECONDS) + 1
+
+
+def hook_cpu_alarm_seconds(limits):
+    """The hook's CPU-time backstop, for a single call that never ticks the budget (a regex, a C loop)."""
+    return float(int(float(limits['max_seconds']) * 2) + 1)
+
+
 def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
     """PreToolUse entry point. Exit 2 + stderr blocks; exit 0 allows (warnings go to stdout as context).
 
     Always run behind command_guard_hook.py, which turns a crash or timeout of this process into a raw-text
     decision instead of the host's fail-open default."""
     limits = (compiled.limits if compiled else DEFAULT_POLICY['limits'])
-    alarm = False
+    alarm = cpu_alarm = False
     if hasattr(signal, 'SIGALRM'):
         def _timeout(_s, _f):
-            raise TimeoutError('command_guard wall-clock limit')
+            raise TimeoutError(HOOK_WALL_LIMIT)
         signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(int(float(limits['max_seconds']) * 2) + 1)
+        signal.alarm(hook_alarm_seconds(limits))
         alarm = True
+    if hasattr(signal, 'SIGPROF') and hasattr(signal, 'setitimer'):
+        def _cpu_timeout(_s, _f):
+            raise TimeoutError(HOOK_CPU_LIMIT)
+        signal.signal(signal.SIGPROF, _cpu_timeout)
+        signal.setitimer(signal.ITIMER_PROF, hook_cpu_alarm_seconds(limits))
+        cpu_alarm = True
     raw_text = ''
     try:
         import safe_input
@@ -10208,10 +10274,12 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                                                              'already used or changed', 'approve again after a fresh '
                                                              'verified backup'))
         return emit(verdict, message, fmt)
-    except TimeoutError:
+    except TimeoutError as stop:
         verdict = 'block' if raw_sensitive(raw_text) else 'warn'
+        which = ('its %g s CPU-time alarm' % hook_cpu_alarm_seconds(limits) if str(stop) == HOOK_CPU_LIMIT else
+                 'its %d s wall-clock alarm (the machine may be overloaded; retry it)' % hook_alarm_seconds(limits))
         return emit(verdict, format_block(Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',
-                                                  'analysis exceeded its wall-clock limit', 'split it into smaller '
+                                                  'analysis exceeded ' + which, 'split it into smaller '
                                                   'commands or put it in a script file'), warn=verdict == 'warn'), fmt)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
         if not raw_text and stdin_bytes is None:
@@ -10230,6 +10298,8 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
     finally:
         if alarm:
             signal.alarm(0)
+        if cpu_alarm:
+            signal.setitimer(signal.ITIMER_PROF, 0)
 
 
 def emit(verdict, message, fmt):

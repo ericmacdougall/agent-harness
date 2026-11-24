@@ -34,7 +34,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TIMEOUT = 20  # seconds, around each hook run: a hang fails the case even when the launcher's own watchdog is broken
+# seconds, around each hook run: a hang fails the case even when the launcher's own watchdog is broken. Above the
+# launcher's CHILD_TIMEOUT (25 s), so a working watchdog answers first (H23).
+TIMEOUT = 30
 PREFIX = "ah-guard-selftest-"
 GIT_CANDIDATES = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
 LAUNCHER, GUARD, POLICY = "command_guard_hook.py", "command_guard.py", "command_guard_policy.json"
