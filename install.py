@@ -37,7 +37,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "task_recovery.py", "bg_lint.py",
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
-         "dropped_gate.py", "ask_reminders.py", "ask_sweep.py", "ask_evidence.py",  # dropped-owner gate, ask reminders and ask sweep (goodqa#14791, #15565)
+         "dropped_gate.py", "ask_reminders.py", "ask_sweep.py", "ask_evidence.py", "ask_close.py",  # dropped-owner gate, ask reminders and ask sweep (goodqa#14791, #15565, #16944)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "copy_hygiene.py", "lifecycle_cleanup.py",  # reusable copies and scoped completed-task cleanup
          "backup_watch.py", "kimi_review.py", "installer_scan.py",

@@ -80,44 +80,6 @@ def provenance_check(event, source, allow_mc=False):
         return 'enforce' if event in ('requirement', 'ask') else 'warn', f'provenance check failed ({type(error).__name__})', False
 
 
-def outcome_evidence_problem(source, ref):
-    """Why `source` cannot back an --outcome close, else None (GoodQA #15565 red-team F3): the ask's own entry is not
-    evidence about it, and a source that traces back to a human turn is an answer, which closes an ask the normal way."""
-    source = (source or '').strip()
-    if re.search(r'#' + re.escape(ref) + r'\s*$', source):
-        return 'the evidence is the ask itself'
-    if re.match(r'(?i)^wal\s*:', source):
-        # Codex final gate F1/F2: read the cited entry exactly as provenance will (relative and ~ paths beneath
-        # ~/.claude/wals, regular files inside that root only, bounded line size, total bytes and scan time), so no
-        # spelling of the path names the ask's own entry unnoticed and no FIFO or huge file can stall the check.
-        try:
-            import provenance  # noqa: PLC0415
-            parsed = provenance.parse_source(source)
-            record = provenance.wal_entry(provenance.resolve_wal_path(parsed['path']), parsed['entry'])
-        except Exception as error:  # noqa: BLE001 - unparseable, outside the root, missing, not a regular file, too large
-            return f"the wal: evidence cannot be read ({getattr(error, 'code', type(error).__name__)})"
-        if not isinstance(record, dict):
-            return 'the wal: evidence cannot be read (entry missing, malformed, oversized or beyond the scan budget)'
-        if record.get('id') == ref:
-            return 'the evidence is the ask itself (by line number)' if parsed['entry'].startswith('L') else 'the evidence is the ask itself'
-        import ask_evidence  # noqa: PLC0415 - the one SUPERSEDES and human-turn rule, shared with ask_sweep.py
-        if ask_evidence.supersedes(record, ref):
-            # GoodQA goodqa#16944: a later ask that replaces this one is the evidence that it is obsolete. Its own
-            # source may be the user's words (the new ask is his), which makes it no answer to the old ask.
-            return None
-        if ask_evidence.human_traced(record.get('source')):
-            # #170 F8: a row whose source names a human turn anywhere (also `inferred: from user:...`) is an answer
-            return 'the evidence traces to a human turn: close the ask with that answer (answer:/user:), not as obsolete'
-    try:
-        import provenance
-        result = provenance.resolve(source)
-        if result.get('ok') and result.get('origin') == 'user':
-            return 'the evidence traces to a human turn: close the ask with that answer (answer:/user:), not as obsolete'
-    except Exception:  # noqa: BLE001 - provenance_check reports an unresolvable source
-        return None
-    return None
-
-
 def ask_entry(path, ref: str):
     """The last `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
     try:
@@ -271,31 +233,19 @@ def main():
                               'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
                   file=sys.stderr)
             return 2
-        if args.outcome:
-            if args.decision:
-                parser.error('--outcome closes an ask without an approval: do not combine it with --decision')
-            if not re.match(r'^(wal:|file:|ticket:)', args.source.strip()):
-                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': '--outcome needs wal:, file: or ticket: evidence',
-                                  'hint': 'cite the entry or commit that shows the ask is obsolete or not the user\'s; inferred: is not evidence'}),
-                      file=sys.stderr)
-                return 2
-        elif not re.match(r'^(user:|uuid:|answer:|queue:|mc:|ticket:)', args.source.strip()):
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
-                              'hint': 'an ask cannot be closed on an inferred: or file: source; use --outcome obsolete|not_user with wal:/file: evidence'}), file=sys.stderr)
+        if args.outcome and args.decision:
+            parser.error('--outcome closes an ask without an approval: do not combine it with --decision')
+        # #170 round 5: the one rule for which source closes an ask in which mode (ask_close.TABLE), the same function
+        # ask_sweep.py runs before it prints a close, so the listing never offers a close this refuses
+        import ask_close  # noqa: PLC0415
+        verdict = ask_close.close_verdict(args.source, 'outcome' if args.outcome else 'decision' if args.decision else 'answer',
+                                          args.ref)
+        if verdict['problem']:
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': verdict['problem'][:300],
+                              'hint': verdict['hint'] or 'see ask_close.py'}), file=sys.stderr)
             return 2
-        if args.outcome:
-            evidence = outcome_evidence_problem(args.source, args.ref)
-            if evidence:
-                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': evidence,
-                                  'hint': 'cite a different entry that shows the ask is obsolete; a user answer closes it the normal way'}),
-                      file=sys.stderr)
-                return 2
-        mode, problem, assumption = provenance_check('ask', args.source, allow_mc=True)  # the answer is sourced like an ask (M1)
-        if problem:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
-                              'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
-            return 2
-        if args.source.strip().lower().startswith('mc:'):
+        assumption = verdict['assumption']
+        if ask_close.TABLE[verdict['word']].get('bind'):  # a dashboard decision: bound to this session's ask as it reads now
             import provenance as _prov  # noqa: PLC0415
             # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
             # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).

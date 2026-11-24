@@ -28,8 +28,6 @@ MUTANTS = {
     "a symlinked WAL is followed": ("ask_evidence.py", "    if stat.S_ISLNK(info.st_mode):", "    if False:", "tests/test_ask_sweep.py"),
     # not listed: a FIFO or a directory is refused twice (ask_evidence's lstat and safe_input.open_regular_file, with the
     # same code), so removing either check alone is an equivalent variant
-    "an inferred human source is obsolete evidence": ("ask_evidence.py", "    return any(isinstance(s, str) and HUMAN_KIND.search(s) for s in sources)",
-                                                      "    return False", "tests/test_ask_close_outcome.py"),
     "resolved-elsewhere drops the outcome": ("ask_sweep.py", '"outcome": other.get("outcome") if other.get("outcome") in CLOSE_OUTCOMES else None})',
                                              '"outcome": None})', "tests/test_ask_sweep.py"),
     # round 2 F1: the provenance.py change (the L<n> entry form gets the id form's bounds)
@@ -67,15 +65,11 @@ MUTANTS = {
     # round 4 ruling (CRITICAL class): WAL evidence is closed only when it cites the user's whole turn, decided by the
     # one shared function for both paths
     "a partial WAL-evidence excerpt is closed": (
-        "ask_sweep.py", '        if best["kind"] in ("answer", "resolved-elsewhere") and whole_citation(best["source"], home) is False:',
-        "        if False:", "tests/test_ask_sweep.py"),
+        "ask_sweep.py", '    if whole_citation(best["source"], home) is False:', "    if False:", "tests/test_ask_sweep.py"),
     "cites_whole accepts any excerpt": ("ask_evidence.py", "    return bool(whole) and provenance.norm(excerpt) == whole",
                                         "    return True", "tests/test_ask_sweep.py"),
     "cites_whole compares the raw text": ("ask_evidence.py", "    return bool(whole) and provenance.norm(excerpt) == whole",
                                           "    return bool(whole) and excerpt == text", "tests/test_ask_sweep_whole_turn.py"),
-    "an inferred chain that quotes the user is offered": (
-        "ask_sweep.py", "        return False if ask_evidence.human_traced(source) else None", "        return None",
-        "tests/test_ask_sweep_whole_turn.py"),
     "a cite provenance refuses is offered": (
         "ask_sweep.py", '    return ask_evidence.cites_whole(node.get("excerpt"), node.get("text"))',
         '    return ask_evidence.cites_whole(node.get("excerpt"), node.get("text")) or not node',
@@ -95,20 +89,74 @@ MUTANTS = {
                                          '    open(wal_path, "rb").close()\n    return ask_evidence.read_asks(wal_path, parse_ts)["open"]',
                                          "tests/test_ask_sweep.py"),
     # round 2 F6: a human answer outranks an obsolete close elsewhere
-    "an outcome close outranks an answer": (
-        "ask_sweep.py", '        return 0 if ask_evidence.human_traced(evidence["source"]) and not evidence.get("outcome") else 2',
-        "        return 0", "tests/test_ask_sweep.py"),
+    "an obsolete close elsewhere outranks an answer": ("ask_sweep.py", '        return 0 if evidence.get("human") else 2',
+                                                       "        return 0", "tests/test_ask_sweep.py"),
     "only the first close of an ask is kept": ("ask_sweep.py", '            resolutions.setdefault(r["ref"], []).append(r)',
                                                '            resolutions.setdefault(r["ref"], [r])', "tests/test_ask_sweep.py"),
     # round 2 F7: one home
     "AH_HOME is not compared": ("ask_sweep.py", "    if configured and Path(configured).expanduser().resolve() != home:",
                                 "    if False:", "tests/test_ask_sweep.py"),
-    "CLAUDE_CONFIG_DIR is not compared": ("ask_sweep.py", '    if config and Path(config).expanduser().resolve() != home / ".claude":',
-                                          "    if False:", "tests/test_ask_sweep.py"),
+    "CLAUDE_CONFIG_DIR is not compared": (
+        "ask_sweep.py", '    if config and Path(config).expanduser().resolve() != (home / ".claude").resolve():', "    if False:",
+        "tests/test_ask_sweep.py"),
+    # round 5 F5: both sides resolved, so a symlinked ~/.claude is one place
+    "the .claude side is not resolved": (
+        "ask_sweep.py", '    if config and Path(config).expanduser().resolve() != (home / ".claude").resolve():',
+        '    if config and Path(config).expanduser().resolve() != home / ".claude":', "tests/test_ask_sweep.py"),
+    # round 5 F4: ops_watch reads the main logs through the safe reader's per-line cap
+    "ops_watch ignores the line cap": (
+        "ops_watch.py", "                for _number, raw in safe_input.iter_jsonl_lines(main_log, RESOLVED_LINE_MAX_BYTES,",
+        "                for _number, raw in safe_input.iter_jsonl_lines(main_log, 1 << 30,",
+        "tests/test_ops_watch_resolved_asks.py"),
+    # round 5 F1/F2 (CRITICAL class): one table and one verdict for the writer and the listing, over the whole tree.
+    # Each variant breaks one cell class of tests/test_ask_close_contract.py.
+    "an outcome close ignores a chat turn in the tree": (
+        "ask_close.py", '        if mode == "outcome" and not exempt and traced["chat"]:', "        if False:",
+        "tests/test_ask_close_contract.py"),
+    "the listing offers a close the writer refuses": (
+        "ask_sweep.py", '    return REFUSED_ACTION.format(verdict["problem"]) if verdict["problem"] else None', "    return None",
+        "tests/test_ask_close_contract.py"),
+    "an answer elsewhere ranks as obsolete": ("ask_sweep.py", '        return 0 if evidence.get("human") else 2',
+                                              "        return 2", "tests/test_ask_close_contract.py"),
+    "answer rows need a user: source": (
+        "ask_sweep.py", "                  and not still_waiting(note, ident) and human(source)):",
+        '                  and not still_waiting(note, ident) and source.startswith("user:")):',
+        "tests/test_ask_close_contract.py"),
+    "queue: is not a user turn": ("provenance.py", '"answer": "user", "queue": "user", "pasted": "pasted"',
+                                  '"answer": "user", "queue": "ticket", "pasted": "pasted"', "tests/test_ask_close_contract.py"),
+    "pasted: is the user's answer": ("ask_close.py", '"pasted":   {"kind": "pasted", "human": False, "chat": True,',
+                                     '"pasted":   {"kind": "pasted", "human": True, "chat": True,', "tests/test_ask_close_contract.py"),
+    "pasted: is not a chat turn": ("ask_close.py", '"pasted":   {"kind": "pasted", "human": False, "chat": True,',
+                                   '"pasted":   {"kind": "pasted", "human": False, "chat": False,', "tests/test_ask_close_contract.py"),
+    "any spelling of a word is accepted": (
+        "ask_close.py",
+        '    match = re.match(r"^([a-z]+):", source or "")\n    return match.group(1) if match and match.group(1) in TABLE else None',
+        '    match = re.match(r"(?i)^\\s*([a-z]+)\\s*:", source or "")\n'
+        '    return match.group(1).lower() if match and match.group(1).lower() in TABLE else None',
+        "tests/test_ask_close_contract.py"),
+    "wal: backs an answer close": ("ask_close.py", '"wal":      {"kind": "wal", "human": False, "chat": False, "answer": False,',
+                                   '"wal":      {"kind": "wal", "human": False, "chat": False, "answer": True,',
+                                   "tests/test_ask_close_contract.py"),
+    "ticket: cannot back an outcome": (
+        "ask_close.py", '"ticket":   {"kind": "ticket", "human": False, "chat": False, "answer": True, "decision": True, "outcome": True},',
+        '"ticket":   {"kind": "ticket", "human": False, "chat": False, "answer": True, "decision": True, "outcome": False},',
+        "tests/test_ask_close_contract.py"),
+    "a wal: hop drops the upstream kinds": (
+        "provenance.py", '        result["kinds"] = list(sub["kinds"])  # every kind upstream, also one that failed before it reached the chain',
+        "        pass", "tests/test_ask_close_contract.py"),
+    "the tree walk skips inferred inputs": ("provenance.py", '        stack.extend(node.get("inputs") or ())', "        pass",
+                                            "tests/test_ask_close_contract.py"),
+    "an unparseable inferred input claims no kind": (
+        "provenance.py", '                result["kinds"].append(claimed_kind(item))  # unparseable, yet it still says what it cites',
+        "                pass", "tests/test_ask_close_outcome.py"),
+    "the SUPERSEDES exemption is dropped": ("ask_close.py", "    return None, ask_evidence.supersedes(record, ref)",
+                                            "    return None, False", "tests/test_ask_sweep_e2e.py"),
+    "the ask itself is outcome evidence": ("ask_close.py", '    if re.search(r"#" + re.escape(ref) + r"\\s*$", source):',
+                                           "    if False:", "tests/test_ask_close_outcome.py"),
 }
 REAL_TESTS = ["tests/test_ask_sweep.py", "tests/test_ask_evidence.py", "tests/test_ask_sweep_quoting.py",
               "tests/test_ask_close_outcome.py", "tests/test_ask_sweep_e2e.py", "tests/test_ask_reminders.py",
-              "tests/test_ask_sweep_whole_turn.py"]
+              "tests/test_ask_sweep_whole_turn.py", "tests/test_ask_close_contract.py", "tests/test_ops_watch_resolved_asks.py"]
 
 
 def one(job):

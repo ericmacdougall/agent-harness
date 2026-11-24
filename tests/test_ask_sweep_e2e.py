@@ -1,9 +1,11 @@
 """#170 review F1/F2 (class 1): ask_sweep end to end, with NOTHING stubbed. The real ask_sweep.py runs as a subprocess,
 calls the real wal_note.py, which calls the real provenance, all under a temporary HOME that holds synthetic WALs and
 transcripts. For every close kind (answer card, answer row, superseded, resolved-elsewhere) the ask must really be closed in
-the asking WAL with no decision. Terminal evidence must be refused with nothing written. A close wal_note refuses must make
-the run exit 1 with wal_note's own message. A cite of words that are not the user's whole turn is never offered as a close
-(#170 round 4; tests/test_ask_sweep_whole_turn.py has the full table).
+the asking WAL with no decision. Terminal evidence must be refused with nothing written. A close wal_note would refuse is
+never offered: it is listed manual with wal_note's own reason, and wal_note refuses it too (#170 round 5;
+tests/test_ask_close_contract.py has every kind and spelling in every mode; a wal_note refusal at apply time still exits
+1 with its message, tests/test_ask_sweep.py Close). A cite of words that are not the user's whole turn is never
+offered as a close (#170 round 4; tests/test_ask_sweep_whole_turn.py has the full table).
 
 Run: python3 -I -m unittest tests.test_ask_sweep_e2e
 """
@@ -84,13 +86,15 @@ class EndToEnd(unittest.TestCase):
         self.other.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in [
             row("ask_resolved", "w%011x" % 0xe4, 30, "closed in the successor", ref=ELSE,
                 source='user:%s/%s "Close the fourth question, it is done"' % (S1, U5)),
-            # an outcome close that quotes no user words, so it is offered; its wal: evidence is missing, so wal_note refuses
+            # an outcome close that quotes no user words, but its wal: evidence is missing, so wal_note would refuse it:
+            # listed manual with that reason, never offered (#170 round 5)
             row("ask_resolved", "w%011x" % 0xe7, 31, "obsolete in the successor", ref=REFUSED, outcome="obsolete",
                 source="wal:%s#w%011x" % (self.other, 0xdead)),
         ]))
 
     def sweep(self, *args):
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home)}
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home),
+               "HARNESS_PROVENANCE_OFFLINE": "1"}
         p = subprocess.run([sys.executable, "-I", str(HOOKS / "ask_sweep.py"), "--session", S1, "--related", S2, *args],
                            env=env, capture_output=True, text=True, timeout=120)
         try:
@@ -136,14 +140,22 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("manual", doc["closed"][0]["refused"])
         self.assertEqual(self.main.read_bytes(), before)
 
-    def test_a_close_wal_note_refuses_exits_1_with_its_message_and_writes_nothing(self):
+    def test_a_close_wal_note_would_refuse_is_listed_manual_with_its_reason_and_writes_nothing(self):
+        # #170 round 5: the listing runs the writer's own rule (ask_close.close_verdict), so it never prints this close
         item = self.listed()[REFUSED]
-        self.assertTrue(item["close"])  # offered: it quotes no user words
+        self.assertEqual((item["manual"], item["close"], item["apply"]), (True, None, None))
+        self.assertIn("wal: evidence cannot be read", item["action"])  # the writer's own reason
         before = self.main.read_bytes()
         code, doc = self.sweep("--apply", "--only", item["pin"])
-        self.assertEqual(code, 1)
-        self.assertNotIn(doc["closed"][0]["rc"], (0, 3))  # wal_note ran and refused, not the manual refusal
-        self.assertIn("wal: evidence cannot be read", doc["closed"][0]["refused"])  # wal_note's own message
+        self.assertEqual((code, doc["closed"][0]["rc"]), (1, 3))
+        self.assertIn("wal: evidence cannot be read", doc["closed"][0]["refused"])
+        self.assertEqual(self.main.read_bytes(), before)
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "HARNESS_PROVENANCE_OFFLINE": "1"}
+        p = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.main), "--event",
+                            "ask_resolved", "--ref", REFUSED, "--note", "by hand", "--outcome", "obsolete", "--source",
+                            item["evidence"][0]["source"]], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 2, p.stderr[-300:])  # and wal_note itself refuses the same close
+        self.assertIn("wal: evidence cannot be read", p.stderr)
         self.assertEqual(self.main.read_bytes(), before)
 
     def test_a_cite_of_words_not_in_the_turn_is_never_offered_and_writes_nothing(self):

@@ -128,9 +128,17 @@ class OutcomeClose(unittest.TestCase):
             fh.write(json.dumps({"event": "decision", "id": "winf00000001", "note": "the user said so",
                                  "source": "inferred: from user:sess-1/abc \"yes do it\" -- he answered in chat",
                                  "at": "2026-11-01T00:05:00+00:00"}) + "\n")
-        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#winf00000001")
+        # #170 round 5: real provenance, nothing mocked. That user: input cannot even be parsed, yet it still claims a
+        # user turn in the resolution tree (provenance.source_kinds), so the refusal names the human turn
+        argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
+                "--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#winf00000001"]
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": ""}), mock.patch("sys.argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = wal_note.main()
         self.assertEqual(code, 2)
-        self.assertIn("human turn", err)
+        self.assertIn("human turn", err.getvalue())
+        self.assertEqual(len(self.rows()), 3)
 
     def test_evidence_must_really_resolve_unmocked(self):
         argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",

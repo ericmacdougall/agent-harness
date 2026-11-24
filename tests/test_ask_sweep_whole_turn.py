@@ -98,7 +98,9 @@ class SharedRule(unittest.TestCase):
         self.assertIn("cites_whole", calls("ask_evidence.py", "cite"))          # the card path: plan() reads cite's flag
         self.assertIn("cite", calls("ask_sweep.py", "plan"))
         self.assertIn("cites_whole", calls("ask_sweep.py", "whole_citation"))   # the WAL-evidence path
-        self.assertIn("whole_citation", calls("ask_sweep.py", "wal_evidence"))
+        self.assertIn("whole_citation", calls("ask_sweep.py", "held_back"))      # round 5: before the writer's rule
+        self.assertIn("close_verdict", calls("ask_sweep.py", "held_back"))
+        self.assertIn("held_back", calls("ask_sweep.py", "wal_evidence"))
 
 
 class WalEvidenceWholeTurn(unittest.TestCase):

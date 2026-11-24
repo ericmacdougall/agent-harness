@@ -97,6 +97,32 @@ class ResolvedAskAlerts(Base):
         self.main_log(SESS, [], raw='{"event": "ask_resolved" broken\n' + json.dumps(resolved("w00000000007")) + "\n")
         self.assertEqual(self.keys(), set())
 
+    def test_an_over_long_line_is_skipped_and_never_parsed(self):
+        # #170 round 5 F4: the safe reader's per-line cap, not a plain read of whatever the line holds
+        self.raise_ask("w00000000014")
+        self.main_log(SESS, [resolved("w00000000014", source="x" * 400)])
+        old = ow.RESOLVED_LINE_MAX_BYTES
+        self.addCleanup(setattr, ow, "RESOLVED_LINE_MAX_BYTES", old)
+        ow.RESOLVED_LINE_MAX_BYTES = 200
+        self.assertEqual(self.keys(), {"ask:w00000000014:due"})
+        ow.RESOLVED_LINE_MAX_BYTES = old
+        self.assertEqual(self.keys(), set())
+
+    def test_the_log_is_read_through_the_safe_reader_and_parser(self):
+        # #170 round 5 F4: no blocking open (a FIFO swapped in after the check), the byte cap while reading, and the
+        # bounded JSON parser (json.loads can abort Python 3.9 on deeply nested input)
+        import ast
+        import inspect
+        import textwrap
+        tree = ast.parse(textwrap.dedent(inspect.getsource(ow.resolved_ask_ids)))
+        calls = {c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", None)
+                 for c in ast.walk(tree) if isinstance(c, ast.Call)}
+        self.assertTrue({"iter_jsonl_lines", "safe_json_loads"} <= calls, calls)
+        self.assertFalse(calls & {"open", "loads", "read_bytes", "read_text"}, calls)
+        reader = next(c for c in ast.walk(tree) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "iter_jsonl_lines")
+        self.assertIn("max_total_bytes", {k.arg for k in reader.keywords})
+        self.assertIn("max_seconds", {k.arg for k in reader.keywords})
+
     def test_an_alert_without_a_session_is_never_hidden(self):
         self.raise_ask("w00000000008", session="")
         self.main_log(SESS, [resolved("w00000000008")])

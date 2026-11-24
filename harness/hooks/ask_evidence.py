@@ -14,11 +14,11 @@ lives here once, and the tools import it, so the listing can never be looser tha
   wal_note runs on it.
 - supersedes: a later `ask` row whose note says `SUPERSEDES <ref>` for exactly that id, with a word boundary on both
   sides.
-- human_traced: a source that names a human turn anywhere in its text, including `inferred: from user:...`. That is an
-  answer, and it closes an ask the normal way (answer:/user:), never as obsolete.
 
-wal_note.py reads the entry an --outcome close cites through provenance's own resolver (provenance.wal_entry), the same
-read that verifies it, not through jsonl_records.
+Which source kinds are a human turn, and which source may close an ask in which mode, is decided in one place:
+ask_close.py (its TABLE, over provenance.source_kinds), not here (#170 round 5). ask_close reads the entry an --outcome
+close cites through provenance's own resolver (provenance.wal_entry), the same read that verifies it, not through
+jsonl_records.
 """
 from __future__ import annotations
 
@@ -32,7 +32,6 @@ MAX_FILE = 512 * 1024 * 1024
 MAX_DEPTH = 200                   # provenance.MAX_JSON_DEPTH, for the same reason
 MAX_SECONDS = 20.0
 LISTED_LINES = 20                 # line numbers named per file and reason; `count` has the total
-HUMAN_KIND = re.compile(r"(?i)(?<![A-Za-z0-9_])(user|answer|uuid|pasted)\s*:")
 _clock = time.monotonic           # tests inject a clock to reach the time budget deterministically
 
 
@@ -199,9 +198,3 @@ def supersedes(record, ref: str) -> bool:
     return (isinstance(record, dict) and record.get("event") == "ask" and record.get("id") != ref
             and isinstance(record.get("note"), str) and isinstance(ref, str) and bool(ref)
             and re.search(r"\bSUPERSEDES\s+" + re.escape(ref) + r"\b", record["note"]) is not None)
-
-
-def human_traced(*sources) -> bool:
-    """True when any of these source strings names a human turn (user:, answer:, uuid:, pasted:), at its start or inside
-    an `inferred:` chain."""
-    return any(isinstance(s, str) and HUMAN_KIND.search(s) for s in sources)

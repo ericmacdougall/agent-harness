@@ -245,6 +245,20 @@ class WalBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
+        # ask_close.close_verdict resolves every offered source as wal_note would: the ticket cache lives under HOME,
+        # and no ticket lookup may leave this machine during a test
+        env = mock.patch.dict(os.environ, {"HOME": str(self.home), "HARNESS_PROVENANCE_OFFLINE": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def ticket(self, number):
+        """A ticket: source that provenance verifies from its local cache (no lookup), as non-chat outcome evidence."""
+        cache = self.home / ".agent-harness" / "provenance" / "tickets.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        data = json.loads(cache.read_text()) if cache.exists() else {}
+        data[f"goodqa#{number}"] = {"title": f"ticket {number}"}
+        cache.write_text(json.dumps(data))
+        return f"ticket:GoodQA goodqa#{number}"
 
     def wal(self, session, rows, name="main.jsonl"):
         folder = self.home / ".claude" / "wals" / session
@@ -390,14 +404,17 @@ class WalEvidence(WalBase):
 
     def test_resolved_elsewhere_keeps_the_other_close_s_outcome(self):
         self.wal(S1, [wrow("ask", "w00000000a40", "2026-11-23T19:00:00+00:00", "q")])
-        self.wal(S2, [wrow("ask_resolved", "w00000000r40", "2026-11-23T20:00:00+00:00", "obsolete there", ref="w00000000a40",
-                           source=f"wal:/x/main.jsonl#w00000000b40", outcome="obsolete")])
+        evidence = self.home / ".claude" / "wals" / S2 / "main.jsonl"
+        self.wal(S2, [wrow("decision", "w00000000b40", "2026-11-23T19:30:00+00:00", "the plan changed", source=self.ticket(40)),
+                      wrow("ask_resolved", "w00000000r40", "2026-11-23T20:00:00+00:00", "obsolete there", ref="w00000000a40",
+                           source=f"wal:{evidence}#w00000000b40", outcome="obsolete")])
         argv = sw.close_argv(self.items([S2])["w00000000a40"])
         self.assertEqual(argv[argv.index("--outcome") + 1], "obsolete")
 
     def test_a_superseded_ask_closes_as_obsolete_on_wal_evidence(self):
         self.wal(S1, [wrow("ask", "w00000000a07", "2026-11-23T18:27:00+00:00", "run h3d.sh"),
-                      wrow("ask", "w00000000a08", "2026-11-23T22:41:00+00:00", "SUPERSEDES w00000000a07 (re-worded)")])
+                      wrow("ask", "w00000000a08", "2026-11-23T22:41:00+00:00", "SUPERSEDES w00000000a07 (re-worded)",
+                           source=self.said(S1, 8, "Ask again with the new script"))])
         item = self.items()["w00000000a07"]
         argv = sw.close_argv(item)
         self.assertEqual(argv[argv.index("--outcome") + 1], "obsolete")
@@ -459,6 +476,17 @@ class Home(CliBase):
             self.assertEqual(self.run_main()[0], 0)
         with mock.patch.dict(os.environ, {"AH_HOME": "", "CLAUDE_CONFIG_DIR": ""}):
             self.assertIsNone(sw.home_problem())
+
+    def test_a_symlinked_claude_folder_named_by_its_home_path_is_accepted(self):
+        # #170 round 5 F5: CLAUDE_CONFIG_DIR=$HOME/.claude, where ~/.claude is a symlink, is the same one place
+        home, real = self.root / "home-with-link", self.root / "claude-real"
+        home.mkdir()
+        real.mkdir()
+        (home / ".claude").symlink_to(real)
+        with mock.patch.dict(os.environ, {"HOME": str(home), "AH_HOME": "", "CLAUDE_CONFIG_DIR": str(home / ".claude")}):
+            self.assertIsNone(sw.home_problem())
+        with mock.patch.dict(os.environ, {"HOME": str(home), "AH_HOME": "", "CLAUDE_CONFIG_DIR": str(self.root / "other")}):
+            self.assertIn("CLAUDE_CONFIG_DIR", sw.home_problem())
 
 
 class ApplyErrors(CliBase):
@@ -576,10 +604,11 @@ class Ranking(WalBase):
 class OneRule(unittest.TestCase):
     """Class 2 and class 4 guard (#170 round 2 F5): one reader, one fold, one quoting rule, one SUPERSEDES matcher.
 
-    - ask_sweep imports no hook module but ask_evidence and provenance, and reads no file itself;
+    - ask_sweep imports no hook module but ask_close, ask_evidence and provenance, and reads no file itself;
     - ask_evidence opens files in jsonl_records only, through safe_input.open_regular_file;
     - ask_reminders.open_asks is ask_evidence.read_asks;
-    - wal_note reads --outcome evidence through provenance.wal_entry and matches through ask_evidence;
+    - wal_note and ask_sweep both decide a close with ask_close.close_verdict, which reads --outcome evidence through
+      provenance.wal_entry and matches SUPERSEDES through ask_evidence;
     - no module swaps a double quote for a single one (the broken F3 substitution)."""
 
     HOOKS = Path(sw.__file__).resolve().parent
@@ -606,7 +635,7 @@ class OneRule(unittest.TestCase):
                 imported |= {a.name.split(".")[0] for a in node.names}
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".")[0])
-        self.assertEqual(imported & local, {"ask_evidence", "provenance"})
+        self.assertEqual(imported & local, {"ask_close", "ask_evidence", "provenance"})
         self.assertEqual(sorted(name for _call, name in self.calls(tree) if name in self.READS), [])
 
     def test_ask_evidence_opens_files_only_in_the_bounded_reader(self):
@@ -623,12 +652,17 @@ class OneRule(unittest.TestCase):
         self.assertIn("read_asks", names)
         self.assertFalse(names & self.READS, names)
 
-    def test_wal_note_reads_outcome_evidence_through_provenance_and_matches_through_ask_evidence(self):
-        text = (self.HOOKS / "wal_note.py").read_text()
-        self.assertNotIn("SUPERSEDES\\s", text)
-        names = {name for _c, name in self.calls(self.function(self.tree("wal_note.py"), "outcome_evidence_problem"))}
-        self.assertTrue({"wal_entry", "supersedes", "human_traced"} <= names, names)
-        self.assertFalse(names & self.READS, names)
+    def test_outcome_evidence_is_read_through_provenance_and_matched_through_ask_evidence(self):
+        # #170 round 5: wal_note and ask_sweep both run ask_close.close_verdict; its outcome check reads the entry
+        # through provenance.wal_entry and matches SUPERSEDES through ask_evidence, and the tree through provenance
+        for name in ("wal_note.py", "ask_sweep.py"):
+            self.assertNotIn("SUPERSEDES\\s", (self.HOOKS / name).read_text())
+            self.assertIn("close_verdict", {n for _c, n in self.calls(self.tree(name))})
+        tree = self.tree("ask_close.py")
+        names = {name for _c, name in self.calls(self.function(tree, "_outcome_problem"))}
+        self.assertTrue({"wal_entry", "supersedes"} <= names, names)
+        self.assertIn("source_kinds", {name for _c, name in self.calls(self.function(tree, "trace"))})
+        self.assertFalse({name for _c, name in self.calls(tree)} & self.READS)
 
     def test_no_module_swaps_a_double_quote_for_a_single_one(self):
         def is_char(node, char):

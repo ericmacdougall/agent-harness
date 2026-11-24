@@ -585,6 +585,41 @@ def parse_source(text: str) -> dict:
     raise Problem("unknown-kind", f"`{clip(kind, 20)}:` is not a source kind; agent memory and chat are not sources")
 
 
+# The kind each source word names, as parse_source reads it: uuid:, answer: and queue: are user turns (other record
+# kinds of the same trust class). The one map of source words to kinds; ask_close.py and its contract test rely on it.
+SOURCE_WORDS = {"user": "user", "uuid": "user", "answer": "user", "queue": "user", "pasted": "pasted", "mc": "mc",
+                "ticket": "ticket", "wal": "wal", "file": "file", "inferred": "inferred"}
+ORIGIN_KINDS = {"dashboard": "mc"}  # result["origin"] values that are not spelled as their kind
+
+
+def claimed_kind(text):
+    """The kind a Source names before anything is checked, read the way parse_source reads it (any case, spaces before
+    the colon), or None when it names no kind. A source that fails to parse or to resolve still claims its kind, so a
+    caller can refuse it for what it says it is (#170 round 5)."""
+    match = re.match(r"(?is)^\s*([A-Za-z]+)\s*:", text) if isinstance(text, str) else None
+    return SOURCE_WORDS.get(match.group(1).lower()) if match else None
+
+
+def source_kinds(result) -> set:
+    """Every kind in one resolve() result tree (#170 round 5): the kind each source in it claims (also one that failed
+    to parse or resolve), every chain node, every origin, recursively through `inputs` (inferred:) and the upstream
+    of each wal: hop, which resolve() carries up in `kinds`. A source traces to the user's words exactly when "user"
+    is in this set."""
+    kinds, stack, seen = set(), [result], 0
+    while stack and seen < 4 * MAX_RESOLVES:
+        node = stack.pop()
+        seen += 1
+        if not isinstance(node, dict):
+            continue
+        kinds.update(k for k in node.get("kinds") or () if isinstance(k, str))
+        for value in (node.get("kind"), ORIGIN_KINDS.get(node.get("origin"), node.get("origin"))):
+            if isinstance(value, str):
+                kinds.add(value)
+        kinds.update(n["kind"] for n in node.get("chain") or () if isinstance(n, dict) and isinstance(n.get("kind"), str))
+        stack.extend(node.get("inputs") or ())
+    return kinds
+
+
 # --------------------------------------------------------------------------- transcripts
 
 def claude_home(home=None) -> Path:
@@ -1077,7 +1112,8 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     """Resolve one Source. Never raises: the result says ok, why not, and the chain to the origin."""
     ctx = ctx if ctx is not None else {}
     result = {"source": clip(source, 200), "kind": None, "ok": False, "assumption": False, "origin": None,
-              "deferred": False, "weak": False, "weak_reasons": [], "backed": False, "problems": [], "chain": [], "inputs": []}
+              "deferred": False, "weak": False, "weak_reasons": [], "backed": False, "problems": [], "chain": [], "inputs": [],
+              "kinds": []}
     ctx["_resolves"] = ctx.get("_resolves", 0) + 1
     try:
         if ctx["_resolves"] > MAX_RESOLVES:
@@ -1089,6 +1125,7 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     except Exception as error:  # a resolver bug is a rejection, never a crash of the calling hook
         result["problems"].append({"code": "internal", "message": f"resolver error {type(error).__name__}"})
         result["ok"] = False
+    result["kinds"] = sorted(source_kinds(result) | ({claimed_kind(source)} - {None}))
     result["label"] = label_of(result)
     return result
 
@@ -1327,6 +1364,7 @@ def _resolve(source, ctx, depth, seen, result):
             result["origin"], result["ok"], result["backed"] = "wal", True, False
             return
         sub = resolve(upstream, ctx, depth + 1, seen + (marker,))
+        result["kinds"] = list(sub["kinds"])  # every kind upstream, also one that failed before it reached the chain
         result["chain"].extend(sub["chain"])
         result["inputs"] = sub["inputs"]
         result["problems"].extend(sub["problems"])
@@ -1347,8 +1385,10 @@ def _resolve(source, ctx, depth, seen, result):
                            if problem.code == "bad-syntax" and problem.message.startswith("Source must start with")
                            else problem.message)
                 result["problems"].append({"code": problem.code, "message": f"inferred input `{clip(item, 60)}` {message}"})
+                result["kinds"].append(claimed_kind(item))  # unparseable, yet it still says what it cites
                 continue
             if item_kind in ("inferred", "mc"):
+                result["kinds"].append(item_kind)
                 result["problems"].append({"code": "inferred-nested" if item_kind == "inferred" else "mc-not-allowed",
                                            "message": "inferred inputs must be user/ticket/file/wal sources"})
                 continue
