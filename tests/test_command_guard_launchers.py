@@ -101,7 +101,7 @@ class MustFail(GuardCase):
         'flock --conflict-exit-code 1 /tmp/l {}', 'flock -w5 /tmp/l {}', 'flock --wait=5 /tmp/l {}', 'flock -nw 5 /tmp/l {}',
         "flock /tmp/l -c '{}'", 'flock -s -w 5 /tmp/l {}',
         # other wrappers whose valued options were read as the command
-        'runuser -u eric -- {}', 'runuser -u eric {}', 'sudo -r R {}', 'sudo -t T {}', 'sudo -h host {}', 'sudo FOO=1 {}',
+        'runuser -u u -- {}', 'runuser -u u {}', 'sudo -r R {}', 'sudo -t T {}', 'sudo -h host {}', 'sudo FOO=1 {}',
         'env -P /bin {}', 'env -a NAME {}', 'strace -a 40 {}', 'time -p {}', 'xargs -i {}', 'nsenter -S 0 {}',
         'ionice -t {}', 'exec -a name {}', "watch -n 1 '{}'", "sg g '{}'",
         # programs the guard has no model of, and launchers it handled only for other subcommands
@@ -127,6 +127,32 @@ class MustFail(GuardCase):
         for command in ('D=~/.claude/projects; flock -Z x rm -rf "$D"', 'cd ~/.claude && flock -w 1 /tmp/l rm -rf projects',
                         'flock $X /tmp/l %s' % DELETE, 'flock "$X" /tmp/l %s' % DELETE):
             self.assertEqual(self.verdict(command), 'block', command)
+
+    def test_a_directory_the_launcher_moves_its_command_to_is_judged(self):
+        claude = str(self.home / '.claude')
+        for command in ('sudo -D %s rm -rf projects' % claude, 'sudo --chdir=%s rm -rf projects' % claude,
+                        'unshare -w %s rm -rf projects' % claude, 'unshare --wd=%s rm -rf projects' % claude,
+                        'nsenter --wd=%s rm -rf projects' % claude, 'env -C %s rm -rf projects' % claude,
+                        'env --chdir=%s rm -rf projects' % claude):
+            self.assertEqual(self.verdict(command), 'block', command)
+
+    def test_a_launched_cd_or_chdir_option_does_not_move_the_rest_of_the_line(self):
+        # the rest of the line still runs in ~/.claude, so its relative deletion is judged there
+        for command in ('cd ~/.claude && env -C /tmp true; rm -rf projects',
+                        'cd ~/.claude && sudo -D /tmp true; rm -rf projects',
+                        'cd ~/.claude && nohup cd /tmp; rm -rf projects',
+                        'cd ~/.claude && flock /tmp/l cd /tmp; rm -rf projects'):
+            self.assertEqual(self.verdict(command), 'block', command)
+
+    def test_nested_ambiguous_launchers_are_bounded(self):
+        # each `nohup -Z 1` doubles the readings; the analysis stays bounded and the deletion still blocks
+        for depth in (4, 10, 16):
+            command = ' '.join(['nohup -Z 1'] * depth) + ' ' + DELETE
+            self.assertEqual(self.verdict(command), 'block', depth)
+        harmless = ' '.join(['nohup -Z 1'] * 10) + ' make'
+        verdict, message = self.decide(harmless)
+        self.assertEqual(verdict, 'block')
+        self.assertIn('launcher-unparsed', message)
 
     def test_a_launcher_whose_command_cannot_be_placed_is_refused(self):
         command = 'flock %s /tmp/l make' % ' '.join('"$A%d"' % k for k in range(cg.LAUNCH_READINGS_CAP + 1))
@@ -187,11 +213,16 @@ class FalsePositives(GuardCase):
 
     ROWS = [
         'flock /tmp/l make test', 'flock -w 5 /tmp/l make', 'script -q /dev/null git status', 'unshare -r true',
-        'timeout 5 git status', 'env FOO=1 make', 'xargs -0 echo', 'watch -n 1 ls', 'sudo -u eric ls ~/.claude/projects',
+        'timeout 5 git status', 'env FOO=1 make', 'xargs -0 echo', 'watch -n 1 ls', 'sudo -u u ls ~/.claude/projects',
         'sudo grep rm ~/.claude/projects', 'nice -n 5 rm -rf /tmp/x', 'uv run pytest', 'make clean', 'python3 x.py',
         'rg rm ~/.claude/projects/p/s.jsonl', 'grep -r rm ~/.claude/projects', 'man rm', 'which rm',
         "git commit -m '%s'" % DELETE, "ah ticket comment --body 'rm is refused'", 'mytool rm /tmp/x',
         'mytool kill 123', 'jq . ~/.claude/projects/p/s.jsonl', 'wc -l ~/.claude/projects/p/s.jsonl',
+        # prose given to an unknown program is data, even when it starts with a command word or names a protected path
+        "codex exec 'move the old logs to the archive and find what changed'",
+        'kimi "find out why it can\'t start"', "ah ticket comment --body 'script `x` runs time sleep'",
+        "claude -p 'copy ~/.claude/projects notes into the report'",
+        "ah ticket comment --body '%s was refused, as expected'" % DELETE,
     ]
 
     def test_harmless_rows_are_allowed(self):

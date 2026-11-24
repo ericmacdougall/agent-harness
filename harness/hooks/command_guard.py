@@ -2820,14 +2820,16 @@ class LaunchSpec:
     joined:   the command words are joined into one shell text (`watch -n 1 'rm ...'`, `sg GROUP 'rm ...'`)
     same_shell: a shell builtin that runs the command in this shell, so its `cd` and variables carry on
     assigns:  `NAME=value` words before the command are environment settings, not the command
+    cwd:      options that run the command in another directory (`sudo -D DIR`, `env -C DIR`, `unshare -w DIR`)
 
     An option spelling in none of the sets is unknown. It is read both ways, as a flag and as taking the next word,
     and so is a word the guard cannot resolve (a variable, a substitution, a glob)."""
-    __slots__ = ('value', 'text', 'flags', 'attached', 'operands', 'permute', 'joined', 'same_shell', 'assigns')
+    __slots__ = ('value', 'text', 'flags', 'attached', 'operands', 'permute', 'joined', 'same_shell', 'assigns', 'cwd')
 
     def __init__(self, value='', text='', flags='', attached='', operands=(0,), permute=False, joined=False,
-                 same_shell=False, assigns=False):
+                 same_shell=False, assigns=False, cwd=''):
         self.value, self.text, self.flags, self.attached = (frozenset(s.split()) for s in (value, text, flags, attached))
+        self.cwd = frozenset(cwd.split())  # options that move the command to another directory (also in value/flags)
         self.operands, self.permute, self.joined, self.same_shell = tuple(operands), permute, joined, same_shell
         self.assigns = assigns  # NAME=value words before the command set its environment (env, sudo)
 
@@ -2845,7 +2847,7 @@ LAUNCHERS = {
                                 '--boottime --map-user --map-group --map-users --map-groups',
                           flags='-m -u -i -n -p -U -C -T -f -r -c -h -V --mount --uts --ipc --net --pid --user --cgroup '
                                 '--time --fork --map-root-user --map-current-user --map-auto --kill-child --mount-proc '
-                                '--keep-caps --help --version'),
+                                '--keep-caps --help --version', cwd='-w --wd'),
     # util-linux `script [options] [file]` runs -c TEXT; BSD `script [-aeFkqr] [-t time] [file [command ...]]` runs
     # the words after the file. -t takes the next word on BSD and only an attached value on util-linux: unknown here.
     'script': LaunchSpec(value='-I -O -B -T -m -E -o --log-in --log-out --log-io --log-timing --logging-format --echo '
@@ -2863,11 +2865,11 @@ LAUNCHERS = {
                        flags='-A -b -B -E -e -H -i -K -k -l -n -N -P -S -s -V -v --askpass --background --bell '
                              '--preserve-env --edit --set-home --login --remove-timestamp --reset-timestamp --list '
                              '--non-interactive --no-update --preserve-groups --stdin --shell --validate --version',
-                       assigns=True),
+                       assigns=True, cwd='-D --chdir'),
     'doas': LaunchSpec(value='-u -C', flags='-n -s -L'),
     'env': LaunchSpec(value='-u -C -P -a --unset --chdir --argv0', text='-S --split-string',
                       flags='-i -0 -v --ignore-environment --null --debug --list-signal-handling --default-signal '
-                            '--ignore-signal --block-signal --help --version', assigns=True),
+                            '--ignore-signal --block-signal --help --version', assigns=True, cwd='-C --chdir'),
     'timeout': LaunchSpec(value='-s -k --signal --kill-after', flags='-v -f -p --preserve-status --foreground --verbose',
                           operands=(1,)),
     'nice': LaunchSpec(value='-n --adjustment', flags=' '.join('-%d' % d for d in range(10))),
@@ -2897,10 +2899,11 @@ LAUNCHERS = {
     'time': LaunchSpec(value='-o -f --output --format', flags='-p -v -a -q --portability --verbose --append --quiet',
                        same_shell=True),  # the shell keyword times a command of this shell
     'chroot': LaunchSpec(value='--userspec --groups', flags='--skip-chdir --help --version', operands=(1,)),
-    'nsenter': LaunchSpec(value='-t -S -G --target --setuid --setgid --wdns', attached='-m -u -i -n -p -U -C -T -r -w',
+    'nsenter': LaunchSpec(value='-t -S -G --target --setuid --setgid --wdns',
+                          attached='-m -u -i -n -p -U -C -T -r -w --wd',
                           flags='-a -F -Z -e -c --all --no-fork --follow-context --preserve-credentials --user-parent '
                                 '--keep-caps --env --join-cgroup --mount --uts --ipc --net --pid --user --cgroup '
-                                '--time --root --wd'),
+                                '--time --root --wd', cwd='-w --wd'),
     'firejail': LaunchSpec(flags='--noprofile --quiet --private --nonewprivs --seccomp --noroot --nosound --novideo '
                                  '--debug'),
     'sandbox-exec': LaunchSpec(value='-f -p -n -D'),
@@ -2921,6 +2924,10 @@ LAUNCHERS = {
 }
 OPTION_HEAD = LaunchSpec()  # an option word in the command position: every option unknown, the command follows
 LAUNCH_READINGS_CAP = 16  # more places a command could start than this: the launcher is refused, not guessed at
+LAUNCH_WORK_CAP = 256  # readings of launched commands in one analysis, nested launchers included: past it, refused
+LAUNCH_CWD_UNKNOWN = object()  # a launcher moves its command to a directory the guard cannot know (`nsenter -w`)
+# options of a program the guard has no model of whose value is, by wide convention, shell text it runs
+UNKNOWN_TEXT_OPTIONS = frozenset(('-c', '--command', '--run', '--cmd', '--exec', '--execute', '--shell-command'))
 # the option values each launcher's first-word skip uses (`_unwrap_command`), from the same table
 WRAPPER_VALUE_OPTS = {name: tuple(sorted(spec.value)) for name, spec in LAUNCHERS.items()}
 
@@ -5274,14 +5281,8 @@ class Analyzer:
                 if t.startswith('-S') and len(t) > 2:
                     self.script(t[2:] + ' ' + ' '.join(_quote_for_rebuild(x) for x in texts[i + 1:]), depth + 1)
                     return
-                if t in ('-C', '--chdir') and i + 1 < len(args):
-                    self.chdir([args[i + 1]])
-                    i += 2
-                elif t.startswith('--chdir='):
-                    self.chdir([_literal_word(t.split('=', 1)[1])])
-                    i += 1
-                elif t in LAUNCHERS['env'].value:
-                    i += 2
+                if t in LAUNCHERS['env'].value:
+                    i += 2  # -C/--chdir is applied per reading by launch(), inside the launched command only
                 elif t.startswith('-') or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', t):
                     i += 1
                 else:
@@ -5299,39 +5300,80 @@ class Analyzer:
         if i < len(args):
             self.inner_words(args[i:], depth, pl, idx)
 
-    # what a hypothetical reading may not undo: findings, budget, and what it models on disk (a file it writes or a
-    # link it makes exists afterwards whichever reading was right)
-    READING_SHARED = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'files_read', 'unterminated',
-                      'readings_capped', 'written', 'one_sided', 'created', 'links', 'secret_seen', 'secret_files',
-                      'fs_cache', 'seen_texts', 'kill_seen', 'pending_kill', 'fork_depth')
+    # what a reading of a launched command may change and must give back: where it runs and what it has defined. Every
+    # other effect (a file it writes, a link, a secret it saw, a taint) stays, whichever reading was right.
+    READING_STATE = ('cwd', 'cwd_known', 'cwd_unknown', 'cwd_protected_unknown', 'fixed_cwd', 'vars', 'var_hints',
+                     'aliases')
 
-    def _reading(self, same_shell, run):
+    def _reading(self, same_shell, run, cwd=None, keep=()):
         """Run one reading of a launched command. The command is its own process, so its `cd`, variables and aliases
         do not carry into the rest of the line, and one reading's do not colour the next; a shell builtin
-        (`same_shell`) runs it in this shell, so they do."""
-        if same_shell:
+        (`same_shell`) runs it in this shell, so they do. `cwd` is a directory the launcher itself moves the command
+        to (`sudo -D DIR`, `env -C DIR`; LAUNCH_CWD_UNKNOWN when it is not known); `keep` names more state to give
+        back."""
+        ctx = self.ctx
+        if same_shell and cwd is None and not keep:
             run()
             return
-        ctx = self.ctx
-        keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
-                if k not in self.READING_SHARED}
+        names = self.READING_STATE + tuple(keep)
+        saved = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items() if k in names}
         try:
+            if cwd is LAUNCH_CWD_UNKNOWN:
+                ctx.cwd_unknown = True
+            elif cwd is not None:
+                self.chdir([cwd])
             run()
         finally:
-            for k, v in keep.items():
+            for k, v in saved.items():
                 setattr(ctx, k, v)
+            ctx.fs_cache.clear()
 
-    def _unparsed_launcher(self, name):
+    def _unparsed_launcher(self, name, why=None):
         self.ctx.add(LOG_DELETE, 'launcher-unparsed',
-                     '%s could start its command at more than %d places, so the guard cannot tell what it runs'
-                     % (name[:40], LAUNCH_READINGS_CAP),
+                     '%s %s, so the guard cannot tell what it runs'
+                     % (name[:40], why or 'could start its command at more than %d places' % LAUNCH_READINGS_CAP),
                      'run the command without the options the guard does not know, or put it in a script file')
+
+    def _spend_readings(self, name, count):
+        """Count readings across the whole analysis: nested ambiguous launchers multiply them. False (and a refusal)
+        when the total passes LAUNCH_WORK_CAP."""
+        ctx = self.ctx
+        ctx.launch_work = getattr(ctx, 'launch_work', 0) + count
+        if ctx.launch_work > LAUNCH_WORK_CAP:
+            self._unparsed_launcher(name, 'and the launchers around it need more than %d readings' % LAUNCH_WORK_CAP)
+            return False
+        return True
+
+    @staticmethod
+    def _launch_cwds(spec, args, end):
+        """The directories a launcher's own options move its command to, among its words before `end`: a word, or
+        LAUNCH_CWD_UNKNOWN (`nsenter -w` with no value: the target's directory)."""
+        out = []
+        for k in range(min(end, len(args))):
+            t = args[k].text
+            nxt = args[k + 1] if k + 1 < len(args) else None
+            for opt in spec.cwd:
+                if opt.startswith('--'):
+                    if t == opt:
+                        out.append(nxt if nxt is not None and opt not in spec.attached else LAUNCH_CWD_UNKNOWN)
+                    elif t.startswith(opt + '='):
+                        out.append(_literal_word(t.split('=', 1)[1]))
+                elif len(t) > 1 and t[0] == '-' and t[1] != '-' and opt[1] in t[1:]:
+                    rest = t[t.index(opt[1], 1) + 1:]
+                    if rest:
+                        out.append(_literal_word(rest))
+                    elif opt in spec.attached or nxt is None:
+                        out.append(LAUNCH_CWD_UNKNOWN)
+                    else:
+                        out.append(nxt)
+        return out
 
     def launch(self, name, args, depth, pl, idx, via_xargs=False, spec=None):
         """The command a launcher runs (LAUNCHERS), under every reading of its options. Each place the command could
         start is analysed as a command, each option value it runs as shell text as a script, and each word the row
         skipped (an option value, an operand) that names a command too: a row can be wrong about one option on some
-        version, and the command is then still judged."""
+        version, and the command is then still judged. When the launcher's options move the command to another
+        directory, every reading is judged both there and here."""
         spec = spec or LAUNCHERS[name]
         readings = launch_readings(spec, args)
         if readings is None:
@@ -5343,39 +5385,57 @@ class Analyzer:
         skipped = [k for k in range(end) if k not in starts and not _unsettled(args[k])
                    and norm_name(args[k].text) in COMMAND_VERBS]
         places = sorted(set(starts) | set(skipped))
-        if len(places) + len(texts) > LAUNCH_READINGS_CAP:
+        cwds = [None] + self._launch_cwds(spec, args, end)
+        count = (len(places) * (2 if spec.joined else 1) + len(texts)) * len(cwds)
+        if len(places) + len(texts) > LAUNCH_READINGS_CAP or len(cwds) > 4:
             self._unparsed_launcher(name)
             return
+        if not self._spend_readings(name, count):
+            return
         visible = True if name in ('flock', 'unshare', 'script') else None
-        for text in texts:
-            self._reading(spec.same_shell, lambda text=text: self.script(text, depth + 1, tail_visible=visible))
-        for k in places:
-            self._reading(spec.same_shell, lambda k=k: self.inner_words(args[k:], depth, pl, idx, via_xargs=via_xargs))
-            if spec.joined:
-                self._reading(spec.same_shell, lambda k=k: self.script(' '.join(a.text for a in args[k:]), depth + 1,
-                                                                        tail_visible=True))
+        for cwd in cwds:
+            for text in texts:
+                self._reading(spec.same_shell, lambda text=text: self.script(text, depth + 1, tail_visible=visible), cwd)
+            for k in places:
+                self._reading(spec.same_shell,
+                              lambda k=k: self.inner_words(args[k:], depth, pl, idx, via_xargs=via_xargs), cwd)
+                if spec.joined:
+                    self._reading(spec.same_shell, lambda k=k: self.script(' '.join(a.text for a in args[k:]),
+                                                                            depth + 1, tail_visible=True), cwd)
 
     def unknown_program(self, name, args, depth, pl, idx):
         """A program the guard has no model of may run its words as a command (`systemd-run`, `uv run`, a project's own
         launcher). Each word that names a command which deletes, moves or overwrites files, or that runs one, is read
-        as the start of that command, and a word of shell text that starts with one is read as a script. Only a
-        deletion, move or overwrite of a protected location found this way counts, so a tool that merely names such a
-        word as data is not refused for anything else."""
+        as the start of that command, and the value of an option that conventionally holds shell text (`--run TEXT`,
+        `-c TEXT`; the first word of `trap`) is read as a script. Only a deletion, move or overwrite of a protected
+        location found this way counts, so a tool that merely names such a word as data is not refused for anything
+        else, and prose given to any other option is never parsed as shell."""
         ctx = self.ctx
         places = [k for k, a in enumerate(args) if not _unsettled(a) and norm_name(a.text) in UNKNOWN_PROGRAM_VERBS]
-        texts = [a.text for a in args if not _unsettled(a) and len(a.text.split()) > 1
-                 and norm_name(a.text.split()[0]) in UNKNOWN_PROGRAM_VERBS]
+        texts = []
+        for k, a in enumerate(args):
+            t = a.text
+            if t.startswith('--') and '=' in t and t.split('=', 1)[0] in UNKNOWN_TEXT_OPTIONS:
+                texts.append(t.split('=', 1)[1])
+            elif t in UNKNOWN_TEXT_OPTIONS and k + 1 < len(args) and not _unsettled(args[k + 1]):
+                texts.append(args[k + 1].text)
+        if name == 'trap' and args and not args[0].text.startswith('-') and not _unsettled(args[0]):
+            texts.append(args[0].text)
         if not places and not texts:
             return
         if len(places) + len(texts) > LAUNCH_READINGS_CAP:
             self._unparsed_launcher(name)
+            return
+        if not self._spend_readings(name, len(places) + len(texts)):
             return
         before = len(ctx.findings)
         try:
             for k in places:
                 self._reading(False, lambda k=k: self.inner_words(args[k:], depth, pl, idx))
             for text in texts:
-                self._reading(False, lambda text=text: self.script(text, depth + 1, tail_visible=True))
+                # text that does not parse is not this rule's business: its unterminated quote is given back
+                self._reading(False, lambda text=text: self.script(text, depth + 1, tail_visible=True),
+                              keep=('unterminated',))
         finally:
             ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
