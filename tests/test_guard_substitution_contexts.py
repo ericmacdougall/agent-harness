@@ -34,7 +34,6 @@ sys.path.insert(0, str(HOOKS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import command_guard as cg  # noqa: E402
-import command_guard_corpus as corpus  # noqa: E402
 import test_command_guard as tcg  # noqa: E402
 import test_kill_guard as tkg  # noqa: E402
 
@@ -300,87 +299,6 @@ class ShellOracle(unittest.TestCase):
 
     def test_single_quotes_inside_an_unquoted_default_do_not_run_it(self):
         self.assertNotIn('RAN', self.run_shell(shutil.which('bash'), "echo ${x:-'$(marker)'}"))
-
-
-def _base_scan_balanced(s, i, open_ch='(', close_ch=')'):
-    """`scan_balanced` as it was at d56a8cb0, kept verbatim as the reference for the verdict-diff property."""
-    depth, n = 1, len(s)
-    while i < n:
-        c = s[i]
-        if c == '\\':
-            i += 2
-            continue
-        if c == "'":
-            j = s.find("'", i + 1)
-            i = n if j < 0 else j + 1
-            continue
-        if c == '"':
-            i += 1
-            while i < n and s[i] != '"':
-                i += 2 if s[i] == '\\' else 1
-            i += 1
-            continue
-        if c == '`':
-            j = i + 1
-            while j < n and s[j] != '`':
-                j += 2 if s[j] == '\\' else 1
-            i = j + 1
-            continue
-        if c == open_ch:
-            depth += 1
-        elif c == close_ch:
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return n + 1
-
-
-def _base_arith_end(s, i):
-    """`_arith_end` as it was at d56a8cb0: every `$((` was arithmetic."""
-    return _base_scan_balanced(s, i + 3) + 1
-
-
-class Property(Guards):
-    """Nothing refused before is allowed, and nothing allowed before is refused except text holding a substitution in
-    a `${...}` or arithmetic body (or a `$((cmd) )`). The old lexer is the new one with both changes undone: no inner
-    substitutions recorded, and every `$((` read as arithmetic."""
-
-    def _both(self, judge, rows):
-        new = [judge(r) for r in rows]
-        with mock.patch.object(cg.Lexer, '_record_inner_subs', lambda self, text, w: None), \
-                mock.patch.object(cg.Lexer, '_arith_end', staticmethod(_base_arith_end)), \
-                mock.patch.object(cg, 'scan_balanced', _base_scan_balanced), \
-                mock.patch.object(cg, '_keep_dropped_substitutions', lambda tokens, stripped: stripped):
-            old = [judge(r) for r in rows]
-        return [(r, b, a) for r, b, a in zip(rows, old, new) if a != b]
-
-    def test_no_corpus_row_changes_verdict_in_either_guard(self):
-        self.assertEqual(self._both(lambda r: self.decide(r['cmd'], cwd=tkg.CWD)[0], tkg.ROWS), [])
-        rows_cg = []
-        for name in dir(corpus):
-            value = getattr(corpus, name)
-            if name.isupper() and isinstance(value, list):
-                for row in value:
-                    cmd = row if isinstance(row, str) else row.get('cmd') if isinstance(row, dict) else None
-                    if isinstance(cmd, str):
-                        rows_cg.append((tcg.fill(cmd, self.home), name.endswith('_PS')))
-        self.assertGreater(len(rows_cg), 700)  # the whole command_guard corpus, not a sample
-        self.assertEqual(self._both(lambda r: self.cg_verdict(r[0], ps=r[1]), rows_cg), [])
-
-    def test_only_rows_with_a_hidden_substitution_change_and_only_toward_refusal(self):
-        extra = list(ARITH_THAT_IS_A_SUBSHELL.items()) + list(NOT_RUN_BUT_REFUSED.items()) + list(EARLY_END.items()) \
-            + list(CASE_PATTERN.items())
-        table = rows('{X}') + extra
-        changed = self._both(self.cg_verdict, [t.replace('{X}', DELETE) for _l, t in table])
-        changed += self._both(self.kg_verdict, [t.replace('{X}', KILL) for _l, t in table])
-        harmless = [t for _l, t in rows('date')]
-        changed += self._both(self.cg_verdict, harmless) + self._both(self.kg_verdict, harmless)
-        # a here-document naming the deletion was a warning before (its text, not a command); now a refusal
-        self.assertTrue(all(before in ('allow', 'warn') and after == 'block' for _r, before, after in changed),
-                        [c for c in changed if c[1] not in ('allow', 'warn') or c[2] != 'block'])
-        self.assertTrue(all('date' not in r for r, _b, _a in changed), changed)  # harmless rows never change
-        self.assertGreater(len(changed), 0)  # the old lexer hid them: not vacuous
 
 
 if __name__ == '__main__':

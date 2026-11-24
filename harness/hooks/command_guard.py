@@ -659,30 +659,114 @@ def decode_ansi(body):
 
 
 SCAN_NEST_CAP = 64  # nested $( ${ levels one scan follows; deeper text counts as unterminated (the caller takes the rest)
-_SCAN_WORD = re.compile(r'(case|in|esac)(?=[\s;&|()<>]|$)')
-_WORD_EDGE = ' \t\n;&|()'
+_WORD_EDGE = ' \t\n;&|()<>'
+_SCAN_PLAIN = re.compile(r'[^ \t\n;&|()<>\'"`$\\]+')
+# reserved words after which a command still starts (the scan's view of LEAD_WORDS; `time` and `!` prefix a pipeline)
+_SCAN_LEADS = frozenset(('if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!', 'time'))
+_HEREDOC_OP = re.compile(r'<<(-?)[ \t]*([^ \t\n;&|()<>]+)')
 
 
-def scan_balanced(s, i, open_ch='(', close_ch=')', _nest=0):
+def _skip_squote(s, i):
+    j = s.find("'", i + 1)
+    return len(s) if j < 0 else j + 1
+
+
+def _skip_ansi_c(s, i):
+    """s[i:i+2] is `$'`: the string ends at the first quote no backslash escapes."""
+    j, n = i + 2, len(s)
+    while j < n and s[j] != "'":
+        j += 2 if s[j] == '\\' else 1
+    return min(j + 1, n)
+
+
+def _skip_backtick(s, i):
+    j, n = i + 1, len(s)
+    while j < n and s[j] != '`':
+        j += 2 if s[j] == '\\' else 1
+    return min(j + 1, n)
+
+
+def _skip_heredoc_bodies(s, i, pending):
+    """s[i] follows the line feed that ends a line holding here-document operators: skip each body, in order, up to
+    its delimiter line (a body never closed takes the rest of the text, as in the shell)."""
+    n = len(s)
+    for strip, delim in pending:
+        while i < n:
+            j = s.find('\n', i)
+            line = s[i:] if j < 0 else s[i:j]
+            i = n if j < 0 else j + 1
+            if (line.lstrip('\t') if strip else line) == delim:
+                break
+    return i
+
+
+def scan_balanced(s, i, open_ch='(', close_ch=')', _nest=0, squote=True):
     """Index just past the delimiter closing the one opened before s[i]; quote and nesting aware.
 
     goodqa#17060: a `$(..)` or `${..}` inside, also inside double quotes, is skipped whole, so its own `)` or `}`
-    does not end this one (`${x:-$(a }; b)}`, `$(echo ${x:-)}; b)`). Inside parentheses, the `)` that ends a case
-    pattern (`$(case a in a) b;; esac)`) does not end it either. Where the reading is unsure the scan runs longer,
-    which puts more text inside the substitution the guards judge, never less."""
+    does not end this one (`${x:-$(a }; b)}`, `$(echo ${x:-)}; b)`). Inside parentheses the text is read as the
+    script it is, as the shells read it: `$'..'` strings, backticks (also inside double quotes), comments and
+    here-document bodies hide their parentheses, and a case statement's pattern `)` closes nothing. `case` opens a
+    case statement only where a command starts (the start of the text, after `; & | ( ` or a line feed, or after a
+    reserved word that leads a command), `in` only as its third word, and `esac` only where a command or a pattern
+    starts. An argument that reads `case in a)` is just words. The differential shell oracle
+    (tests/guard_shell_oracle.py) is the evidence for every rule here."""
     depth, n = 1, len(s)
     if _nest > SCAN_NEST_CAP:
         return n + 1
-    cases = []  # parentheses only: per open case statement, 'subject', 'pattern' or 'body'
+    script = open_ch == '('
+    cases = []  # per open case statement: 'subject', 'in', 'pattern' (at a pattern's start), 'pattern_word', 'body'
+    start = True  # (parentheses) a command starts at the next word
     edge = True  # s[i] starts a word
+    heredocs = []  # (strip tabs, delimiter) of here-documents whose bodies start after the next line feed
+
+    def word(w):
+        """A whole plain word (w) or any other word (None) was read at a word start."""
+        nonlocal start
+        state = cases[-1] if cases else None
+        if state == 'subject':
+            cases[-1] = 'in'
+        elif state == 'in':
+            if w == 'in':
+                cases[-1] = 'pattern'
+            else:
+                cases.pop()  # not a case statement after all
+                start = False
+        elif state in ('pattern', 'pattern_word'):
+            if state == 'pattern' and w == 'esac':
+                cases.pop()
+                start = False
+            else:
+                cases[-1] = 'pattern_word'
+        elif start and w == 'case':
+            cases.append('subject')
+            start = False
+        elif start and w == 'esac' and state == 'body':
+            cases.pop()
+            start = False
+        elif start and w in _SCAN_LEADS:
+            pass
+        else:
+            start = False
+
     while i < n:
         c = s[i]
+        if script and edge and c not in _WORD_EDGE:
+            if c == '#':  # a comment runs to the line feed
+                j = s.find('\n', i)
+                i = n if j < 0 else j
+                continue
+            m = _SCAN_PLAIN.match(s, i)
+            plain = m.group(0) if m and (m.end() == n or s[m.end()] in _WORD_EDGE) else None
+            word(plain)
         if c == '\\':
             i, edge = i + 2, False
             continue
-        if c == "'":
-            j = s.find("'", i + 1)
-            i, edge = (n if j < 0 else j + 1), False
+        if c == "'" and squote:  # `squote=False`: a double-quoted `${..}` body as dash and zsh read it
+            i, edge = _skip_squote(s, i), False
+            continue
+        if c == '$' and s[i + 1:i + 2] == "'" and script:
+            i, edge = _skip_ansi_c(s, i), False
             continue
         if c == '"':
             i += 1
@@ -690,41 +774,58 @@ def scan_balanced(s, i, open_ch='(', close_ch=')', _nest=0):
                 if s[i] == '$' and s[i + 1:i + 2] in ('(', '{'):
                     i = scan_balanced(s, i + 2, *(('(', ')') if s[i + 1] == '(' else ('{', '}')), _nest=_nest + 1)
                     continue
+                if s[i] == '`':
+                    i = _skip_backtick(s, i)
+                    continue
                 i += 2 if s[i] == '\\' else 1
             i, edge = i + 1, False
             continue
         if c == '`':
-            j = i + 1
-            while j < n and s[j] != '`':
-                j += 2 if s[j] == '\\' else 1
-            i, edge = j + 1, False
+            i, edge = _skip_backtick(s, i), False
             continue
         if c == '$' and s[i + 1:i + 2] in ('(', '{'):
             i = scan_balanced(s, i + 2, *(('(', ')') if s[i + 1] == '(' else ('{', '}')), _nest=_nest + 1)
             edge = False
             continue
-        if open_ch == '(':
-            m = _SCAN_WORD.match(s, i) if edge else None
-            if m:
-                word = m.group(1)
-                if word == 'case':
-                    cases.append('subject')
-                elif word == 'in' and cases and cases[-1] == 'subject':
-                    cases[-1] = 'pattern'
-                elif word == 'esac' and cases and cases[-1] != 'subject':
-                    cases.pop()
-                i, edge = m.end(), False
-                continue
-            if cases and cases[-1] == 'pattern' and c in '()':
+        if script:
+            state = cases[-1] if cases else None
+            if state in ('pattern', 'pattern_word') and c in '()|':
                 if c == ')':
                     cases[-1] = 'body'  # the pattern list ends; its `)` closes nothing
+                    start = True
+                elif c == '|':
+                    cases[-1] = 'pattern'
                 i, edge = i + 1, True  # a `(` opening a pattern list opens nothing either
                 continue
-            if cases and cases[-1] == 'body' and c == ';' and s[i + 1:i + 2] in (';', '&'):
+            if state == 'body' and c == ';' and s[i + 1:i + 2] in (';', '&'):
                 cases[-1] = 'pattern'
-                i = i + 3 if s[i + 1:i + 3] == ';&' else i + 2
+                i = i + 3 if s[i + 1:i + 3] == ';&' else i + 2  # `;;&` is three characters; `;;` and `;&` two
                 edge = True
                 continue
+            if c == '<' and s[i + 1:i + 2] == '<' and s[i + 2:i + 3] != '<':
+                m = _HEREDOC_OP.match(s, i)
+                if m:
+                    heredocs.append((bool(m.group(1)), re.sub(r'[\'"\\]', '', m.group(2))))
+                    i, edge = m.end(), False
+                    start = False
+                    continue
+            if c == '\n':
+                start = True
+                if heredocs:
+                    i = _skip_heredoc_bodies(s, i + 1, heredocs)
+                    heredocs = []
+                    edge = True
+                    continue
+            elif c in ';&|(':
+                start = True
+            elif c == ')':
+                # `NAME ( )` is a function header: its body's first word starts a command (`f() { case ...`)
+                j = i - 1
+                while j >= 0 and s[j] in ' \t':
+                    j -= 1
+                start = j >= 0 and s[j] == '('
+            elif c in '<>':
+                start = False
         if c == open_ch:
             depth += 1
         elif c == close_ch:
@@ -734,6 +835,18 @@ def scan_balanced(s, i, open_ch='(', close_ch=')', _nest=0):
         edge = c in _WORD_EDGE
         i += 1
     return n + 1  # unterminated: caller takes the rest
+
+
+ARRAY_ASSIGN = re.compile(r'[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=')
+_NOT_ARITH = re.compile(r'[;\n`]|[\w.\]"\']\s+[\w$"\']')
+
+
+def _maybe_not_arithmetic(body):
+    """zsh reads a `$(( .. ))` whose body is not a valid arithmetic expression as a command substitution holding a
+    subshell, and runs it (the differential oracle found this). True when the body may not be arithmetic: it has a
+    command separator, a backtick, or two operands side by side (`a b`), which arithmetic never has. Plain
+    expressions (`1 + 2`, `(a + b) * 3`, `x`, `i++`) stay arithmetic only."""
+    return bool(_NOT_ARITH.search(body))
 
 
 def scan_backtick(s, i):
@@ -852,12 +965,16 @@ class Lexer:
     `!` and w is a command word. `saw_bang` reports whether the text had such an operator, so that a caller knows a
     second reading exists (Analyzer.script)."""
 
-    def __init__(self, ctx, ps=False, bang_operators=True):
+    def __init__(self, ctx, ps=False, bang_operators=True, posix_braces=False):
         self.ctx = ctx
         self.ps = ps
         self.budget = ctx.budget
         self.bang_operators = bang_operators
         self.saw_bang = False
+        # `posix_braces`: a `'` inside a double-quoted `${..}` body is a plain character (dash, zsh, POSIX sh), not a
+        # quote (bash). `saw_sq_brace` reports such a body, so that a caller judges the other reading too.
+        self.posix_braces = posix_braces
+        self.saw_sq_brace = False
         self.blanks = WS_PS if ps else WS
 
     # ---- words
@@ -985,6 +1102,8 @@ class Lexer:
             end = self._arith_end(s, i) if s[i + 2:i + 3] == '(' else None
             if end is not None:  # `$(( ... ))`: arithmetic, whose operands may hold substitutions
                 self._record_inner_subs(s[i + 3:end - 2], w)
+                if _maybe_not_arithmetic(s[i + 3:end - 2]):
+                    w.subs.append(s[i + 2:end - 1] if end <= n else s[i + 2:])  # zsh's reading: `$( (..) )`
                 w.dynamic = True
                 buf.append(ARITH_MARK)
                 return min(end, n)
@@ -996,8 +1115,10 @@ class Lexer:
             buf.append(SUB_MARK)
             return min(j, n)
         if nxt == '{':
-            j = scan_balanced(s, i + 2, '{', '}')
+            j = scan_balanced(s, i + 2, '{', '}', squote=not (in_dq and self.posix_braces))
             body = s[i + 2:j - 1] if j <= n else s[i + 2:]
+            if in_dq and not self.ps and "'" in body:
+                self.saw_sq_brace = True
             self._record_inner_subs(body, w)
             self._expand_braced(body, w, buf)
             return min(j, n)
@@ -1060,8 +1181,13 @@ class Lexer:
                 j = scan_balanced(text, i + 2)
                 w.subs.append(text[i + 2:j - 1] if j <= n else text[i + 2:])
             elif c == '$' and text[i + 1:i + 3] == '((':
-                if self._arith_end(text, i) is not None:
-                    i += 3  # arithmetic: scan its operands
+                end = self._arith_end(text, i)
+                if end is not None:
+                    # arithmetic: scan its operands, and judge zsh's reading of it as `$( (..) )` too
+                    if _maybe_not_arithmetic(text[i + 3:end - 2]):
+                        w.subs.append(text[i + 2:end - 1] if end <= n else text[i + 2:])
+                        w.dynamic = True
+                    i += 3
                     continue
                 j = scan_balanced(text, i + 2)  # `$((cmd) ...)`: a substitution holding a subshell
                 w.subs.append(text[i + 2:j - 1] if j <= n else text[i + 2:])
@@ -1126,6 +1252,20 @@ class Lexer:
             if c == '#':
                 j = s.find('\n', i)
                 i = n if j < 0 else j
+                continue
+            if c == '(' and not self.ps and prev_end == i and tokens and tokens[-1][0] == 'w' \
+                    and ARRAY_ASSIGN.fullmatch(tokens[-1][1].raw or ''):
+                # `NAME=( .. )`: one assignment word, with any text glued after the `)` (bash reads `x=()zzz cmd` as
+                # the assignment and then runs cmd; the oracle found it). Substitutions inside are still judged.
+                w = tokens[-1][1]
+                j = scan_balanced(s, i + 1)
+                j = min(j, n)
+                while j < n and s[j] not in self.blanks and s[j] not in '\n;&|<>':
+                    j += 1
+                self._record_inner_subs(s[i:j], w)
+                w.raw += s[i:j]
+                w.alts = [a + s[i:j] for a in w.alts]
+                i = prev_end = j
                 continue
             if c in ';&|()<>' and not (c in '<>' and s[i + 1:i + 2] == '('):
                 op = self._operator(s, i)
@@ -1300,8 +1440,25 @@ class CommandStart:
     def feed(self, token):
         self.fed.append((token, self.next_is_start()))
 
+    def _function_header(self):
+        """The tokens fed end a function header, so the body's first word starts a command (PR 348 review F3):
+        `NAME ( )` with NAME at a command start (not an assignment such as `x=( )`), or `function NAME ( )`."""
+        fed = self.fed
+        if len(fed) >= 3 and fed[-1][0] == ('op', ')') and fed[-2][0] == ('op', '('):
+            (kind, w), start = fed[-3]
+            if kind == 'w' and start and w.raw and '=' not in w.raw and '[' not in w.raw:
+                return True
+            if kind == 'w' and len(fed) >= 4 and fed[-4][0][0] == 'w' and fed[-4][1] \
+                    and _keyword_word(fed[-4][0][1], 'function'):
+                return True
+        # not `function NAME` without parentheses: dash has no such keyword, runs a program named function, and the
+        # word after NAME is its argument (the oracle found `function f case y in; cmd` run by dash)
+        return False
+
     def next_is_start(self):
         if not self.fed:
+            return True
+        if self._function_header():
             return True
         (kind, val), start = self.fed[-1]
         if kind == 'op':
@@ -1317,18 +1474,23 @@ class CommandStart:
         return True
 
 
-_ALIASED_KEYWORD = re.compile(r'(?:aliases\[)?[\'"]?(?:case|esac|in|%s)[\'"]?(?:\]\s*)?\+?=' % '|'.join(
-    re.escape(w) for w in LEAD_WORDS))
+KEYWORD_CHANGERS = frozenset(('disable', 'enable', 'eval'))
 
 
 def _aliases_a_keyword(tokens):
-    """The text defines an alias whose name is a reserved word the parser relies on (`alias case=…`, zsh
-    `aliases[case]=…`). An alias is expanded before the word is read as a keyword, so no keyword reading is safe."""
-    words = [v for k, v in tokens if k == 'w']
-    # source text as well as the expanded text: kill_guard rewrites a subscripted assignment's text before parse()
-    return any(w.text == 'alias' or w.text.startswith('aliases[') or (w.raw or '').startswith('aliases[')
-               for w in words) and \
-        any(_ALIASED_KEYWORD.match(w.text) or _ALIASED_KEYWORD.match(w.raw or '') for w in words)
+    """The text may change what a reserved word means: any word that names aliases (`alias`, bash `BASH_ALIASES[..]`,
+    zsh `aliases`/`galiases`, in any case), or a `disable`, `enable` or `eval` word (zsh `disable -r case` turns the
+    keyword into a command name; `eval 'alias case=…'` defines one where the word is not `alias`). An alias is
+    expanded before a word is read as a keyword, so no keyword reading is safe, and the case pass keeps the strict
+    reading (pattern words are read as commands). Deliberately broad (PR 348 review F2): it costs only over-refusal."""
+    for k, w in tokens:
+        if k != 'w':
+            continue
+        # source text as well as the expanded text: kill_guard rewrites a subscripted assignment's text before parse()
+        for text in (w.text, w.raw or ''):
+            if 'alias' in text.lower() or text in KEYWORD_CHANGERS:
+                return True
+    return False
 
 
 def _closes_case(word):
@@ -1362,7 +1524,8 @@ def _strip_case_patterns(tokens, ps=False):
             i += 3
             continue
         if stack and stack[-1] == 'patterns':
-            if kind == 'w' and _closes_case(val):
+            # zsh also ends a case at `}` where a pattern would start (its `case w { .. }` form; the oracle found it)
+            if kind == 'w' and (_closes_case(val) or (not val.quoted and val.text == '}')):
                 stack.pop()
                 emit(tokens[i])
             elif kind == 'op' and val == ')':
@@ -1383,7 +1546,11 @@ def _strip_case_patterns(tokens, ps=False):
             emit(('op', ';'))
             i += 2
             continue
-        if stack and kind == 'w' and _closes_case(val) and at_start:
+        # where the case ends: the old, broader test (after any operator or unquoted reserved word, PR 348 review F4).
+        # Ending early leaves more words as commands, the stricter reading.
+        broad_start = not out or out[-1][0] == 'op' or (out[-1][0] == 'w' and not out[-1][1].quoted
+                                                         and out[-1][1].text in RESERVED)
+        if stack and kind == 'w' and _closes_case(val) and broad_start:
             stack.pop()
         emit(tokens[i])
         i += 1
@@ -4239,14 +4406,21 @@ class Analyzer:
         try:
             lexer = Lexer(ctx, ctx.ps)
             tokens = lexer.lex(text)
-            if lexer.saw_bang and ctx.fork_depth < MAX_READING_FORKS:
+            alternatives = []  # the other shells' readings, when they differ from the first one
+            if lexer.saw_bang:
+                alternatives.append({'bang_operators': False})  # bash and sh: `>!` is `>` then a word `!`
+            if lexer.saw_sq_brace:
+                alternatives.append({'posix_braces': True})  # zsh: `'` in a double-quoted `${..}` is a character
+                if lexer.saw_bang:
+                    alternatives.append({'bang_operators': False, 'posix_braces': True})  # dash: both
+            if alternatives and ctx.fork_depth < MAX_READING_FORKS:
                 ctx.fork_depth += 1
                 try:
-                    self._both_readings(tokens, text, depth)
+                    self._both_readings(tokens, text, depth, alternatives)
                 finally:
                     ctx.fork_depth -= 1
             else:
-                ctx.readings_capped = ctx.readings_capped or lexer.saw_bang
+                ctx.readings_capped = ctx.readings_capped or bool(alternatives)
                 self._run_tokens(tokens, depth)
         finally:
             ctx.ps, ctx.tail_visible = saved_ps, saved_tail
@@ -4258,32 +4432,37 @@ class Analyzer:
         for pipeline in pipelines:
             self.pipeline(pipeline, depth)
 
-    def _both_readings(self, zsh_tokens, text, depth):
-        """zsh and bash read `>! w` differently and the guard cannot know which shell runs the text, so judge the text
-        once per reading: anything either one refuses is refused. One shell reads every `>!` in a script the same way,
-        so two parses cover a script however many it has. This runs per script rather than per command line because a
-        nested shell can read the operator differently from its parent (`>! f bash -c '...'`). Each reading starts from
-        the same state: a `cd` or an assignment made in one did not happen in the other (GoodQA #14657)."""
+    def _both_readings(self, first_tokens, text, depth, alternatives=({'bang_operators': False},)):
+        """Shells read some text differently and the guard cannot know which shell runs it, so judge the text once per
+        reading: anything one refuses is refused. zsh and bash read `>! w` apart (GoodQA #14657); bash reads a `'` in
+        a double-quoted `${..}` body as a quote where dash and zsh read a character (PR 349 review F5). One shell reads
+        a whole script one way, so one parse per reading covers a script however many such places it has. This runs
+        per script rather than per command line because a nested shell can read it differently from its parent
+        (`>! f bash -c '...'`). Each reading starts from the same state: a `cd` or an assignment made in one did not
+        happen in another."""
         ctx = self.ctx
         start = ctx.state()
         mark = len(ctx.findings)
         count, began = ctx.budget.count, time.monotonic()
-        self._run_tokens(zsh_tokens, depth)
-        # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
-        # analyze() then treats the command as unanalysable
-        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
-            ctx.readings_capped = True
-            return
-        after_zsh = ctx.state()
-        ctx.restore(start)
-        mid = len(ctx.findings)
-        self._run_tokens(Lexer(ctx, ctx.ps, bang_operators=False).lex(text), depth)
-        seen = {(f.category, f.rule, f.reason) for f in ctx.findings[mark:mid]}
-        ctx.findings[mid:] = [f for f in ctx.findings[mid:] if (f.category, f.rule, f.reason) not in seen]
-        # at the top level each reading has already seen its own later commands; nested text has more to come
-        if depth > 0 and ctx.disputes(after_zsh):
-            ctx.readings_capped = True
-        ctx.merge(after_zsh)
+        self._run_tokens(first_tokens, depth)
+        afters = []
+        for kwargs in alternatives:
+            # a reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
+            # analyze() then treats the command as unanalysable
+            if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
+                ctx.readings_capped = True
+                break
+            afters.append(ctx.state())
+            ctx.restore(start)
+            mid = len(ctx.findings)
+            self._run_tokens(Lexer(ctx, ctx.ps, **kwargs).lex(text), depth)
+            seen = {(f.category, f.rule, f.reason) for f in ctx.findings[mark:mid]}
+            ctx.findings[mid:] = [f for f in ctx.findings[mid:] if (f.category, f.rule, f.reason) not in seen]
+        for after in afters:
+            # at the top level each reading has already seen its own later commands; nested text has more to come
+            if depth > 0 and ctx.disputes(after):
+                ctx.readings_capped = True
+            ctx.merge(after)
 
     # ---- visibility of a stage's stdout
     def consumer_class(self, cmd):
