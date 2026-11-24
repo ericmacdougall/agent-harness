@@ -70,6 +70,11 @@ LOCAL = [
     "ssh -F cfg devbox 'cd x && git clone a b'",
     "ssh -o LocalCommand=x devbox 'cd x; git clone a b'",
     "bash -c 'ssh devbox \"x\" && git clone a b'",
+    # An option word built at run time can carry -oProxyCommand=..., which runs here.
+    "ssh $OPTS devbox 'cd x && git clone a b'",
+    "ssh \"$OPTS\" devbox 'cd x; git clone a b'",
+    "ssh ${SSH_ARGS} devbox 'cd x && cp -a r s'",
+    "ssh -o* devbox 'cd x && git clone a b'",
 ]
 
 # Wrapper options used to hide the copy entirely (the wrapper word was dropped, its value read as the command).

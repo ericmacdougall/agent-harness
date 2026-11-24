@@ -823,6 +823,23 @@ def _remote_only_ssh(words: list) -> bool:
     return bool(words) and os.path.basename(words[0]) == "ssh" and not any(SSH_LOCAL_COMMAND.search(w) for w in words)
 
 
+_BUILT_WORD = frozenset("*?[]{}")
+
+
+def _ssh_words_spelled_out(segment) -> bool:
+    """True when no word of this ssh command can turn into an option at run time (goodqa#16811): no unquoted
+    expansion or glob or brace character, and no word that starts with an expansion (`ssh "$OPTS" host`). Otherwise
+    `$OPTS` could hold `-oProxyCommand=...`, which runs here. An expansion inside a double-quoted payload after other
+    text (`ssh h "cd $T && ..."`) only changes the text the far host runs."""
+    for word in segment.words:
+        if any(char in _BUILT_WORD for _, char in word.unquoted):
+            return False
+        for offset, inside, _ in word.expansions:
+            if not inside or offset <= word.start + 1:
+                return False
+    return True
+
+
 def _legacy_copy_commands(cmd: str, depth: int) -> list:
     """The strict reading: split on every separator even inside quotes (the simple_commands reading), drop
     wrappers, read `sh -c` scripts the same way. Over-reads, never under-reads."""
@@ -851,8 +868,9 @@ def copy_commands(cmd: str, depth: int = 0) -> list:
     - an ssh command that runs only on the far host (_remote_only_ssh) is dropped, so a clone inside
       `ssh host 'cd x && git clone ...'` is not charged to this machine's floor; every other command on the line,
       including one after the ssh (`ssh h '...' && git clone a b`), is still read;
-    - any other ssh (a ProxyCommand, LocalCommand, KnownHostsCommand or -F) gets the strict reading of
-      _legacy_copy_commands, which is exactly how the check read every ssh before goodqa#16811;
+    - any other ssh (a ProxyCommand, LocalCommand, KnownHostsCommand or -F, or a word the shell builds at run time,
+      _ssh_words_spelled_out) gets the strict reading of _legacy_copy_commands, which is exactly how the check read
+      every ssh before goodqa#16811;
     - wrapper words and their options are dropped (`timeout 120 git clone`, `nice -n 5 cp -r`, `sudo -u u ...`);
     - the script of `sh|bash|zsh|dash|ksh -c SCRIPT` is read the same way, up to 4 levels deep, so
       `bash -c 'ssh h "git clone a b"'` is a remote copy too.
@@ -867,7 +885,7 @@ def copy_commands(cmd: str, depth: int = 0) -> list:
         if not words:
             continue
         if os.path.basename(words[0]) == "ssh":
-            if _remote_only_ssh(words):
+            if _remote_only_ssh(words) and _ssh_words_spelled_out(segment):
                 continue
             out.extend(_legacy_copy_commands(cmd[segment.start:segment.end], depth))
             continue
