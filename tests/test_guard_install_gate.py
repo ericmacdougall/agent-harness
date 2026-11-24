@@ -77,6 +77,7 @@ class HumanProof(unittest.TestCase):
         for label, env in cases.items():
             with self.subTest(label):
                 self.assertIsInstance(human_proof.refusal(env), str)
+        self.assertIn("process table", human_proof.refusal(cases["process table unreadable"]))
 
     def test_a_surprise_fails_closed(self):
         env = FakeEnv()
@@ -95,6 +96,15 @@ class GuardSet(unittest.TestCase):
 
     def guard(self, name):
         return guard_files.is_guard_file(name) or name in self.closure
+
+    def test_files_guards_read_or_run_are_listed_without_the_closure(self):
+        """F-A4: these stay guard files even where no hooks directory is given (the static list alone)."""
+        for name in ("ahc_release.json", "dropbox_budget.conf", "run_probe.py", "run_capped.py", "bg_job.py", "deliver.py",
+                     "remote_delete.py", "remote_delete_agent.py", "installer_scan.py", "ah.py", "ah_install.py",
+                     "guard_files.py", "human_proof.py", "release_receipt.py"):
+            with self.subTest(name):
+                self.assertTrue(guard_files.is_guard_file(name))
+        self.assertFalse(guard_files.is_guard_file("ledger_reminder.py"))  # positive control
 
     def test_registered_guard_hooks_and_named_files_are_guard_files(self):
         names = ("command_guard_hook.py", "merge_gate.py", "mission_gate.py", "ah.py", "ah_install.py",
@@ -319,6 +329,16 @@ class Gate(Base):
         self.stamp(self.line(ref=self.c0))
         self.assert_refused_unchanged(self.before())  # another ref
 
+    def test_a_stamp_from_a_call_that_has_ended_is_refused(self):
+        """The stamp is bound to main's call: once the transcript holds that call's result, a later process with the
+        same argv (a copied command after main's call) finds it dead."""
+        self.stamp(self.line())
+        with self.transcript.open("a") as out:
+            out.write(json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_%08d" % self.calls_seen, "content": "done"}]}}) + "\n")
+        self.assert_refused_unchanged(self.before())
+        self.assertEqual(self.receipts, [])
+
     def test_a_stamp_is_single_use(self):
         self.stamp(self.line())
         self.assertEqual(self.install()["result"], "installed")
@@ -404,6 +424,7 @@ class Stamps(unittest.TestCase):
                 self.assertEqual(mission_gate.install_files_stamps(base + extra), [])
         for line in ("python3 -I ~/.claude/hooks/ah.py install-files --host t2-dev --resume ins-0123456789ab --ticket \"%s\"" % TICKET,
                      base.replace("ah.py --ticket", "$(echo ah.py) --ticket"),
+                     base.replace("--file ah.py", "--file $F"),
                      "echo " + base.replace("python3 -I ", "")):
             with self.subTest(line[:60]):
                 self.assertEqual(mission_gate.install_files_stamps(line), [])
