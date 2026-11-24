@@ -993,7 +993,7 @@ def _blocks_text(content):
     return ""
 
 
-TRANSCRIPT_RULE = 2  # 2: human queued_command attachments are indexed (goodqa#17101)
+TRANSCRIPT_RULE = 2  # 2: human queued_command attachments are indexed once per prompt (goodqa#17101)
 
 
 def index_transcript(home: Path, session: str) -> dict:
@@ -1042,8 +1042,11 @@ def index_transcript(home: Path, session: str) -> dict:
             content = prov.queue_user_text(rec)  # provenance.py owns the rule; wrappers are never user text
             if content is not None:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
+                if digest in queued_digests:  # the same prompt was seen first as an attachment: keep the enqueue id
+                    idx["msgs"] = [m for m in idx["msgs"] if not (m.get("via") == "attachment" and m["id"].endswith("#" + digest))]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
                                         rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
+                queued_digests.add(digest)
         elif kind == "attachment":
             # goodqa#17101: a human message picked up mid-turn behind injected blocks (origin human only).
             attached = prov.queued_attachment_text(rec)
@@ -1051,8 +1054,10 @@ def index_transcript(home: Path, session: str) -> dict:
                 digest = hashlib.sha256(attached[0].encode()).hexdigest()[:12]
                 if digest not in queued_digests:  # a plain prompt already indexed from its enqueue record
                     queued_digests.add(digest)
-                    idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
-                                            rec.get("timestamp"), attached[1], prov.QUEUE_TRUST, off))
+                    row = _msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
+                               rec.get("timestamp"), attached[1], prov.QUEUE_TRUST, off)
+                    row["via"] = "attachment"
+                    idx["msgs"].append(row)
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx

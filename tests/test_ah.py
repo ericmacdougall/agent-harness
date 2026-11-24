@@ -558,6 +558,15 @@ class MidTurnAttachmentTests(Base):
         self.assertEqual(len(after), 1)
 
 
+    def test_attachment_before_its_enqueue_leaves_one_row_with_the_enqueue_id(self):
+        content = "queued mid turn: use the cli for hooks too"
+        enq = {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-04T10:07:00.123Z", "content": content}
+        self.transcript([self.human(), self.attach(content, ts="2026-11-04T10:06:59.000Z"), enq])
+        got = [m["id"] for m in self.matches() if m["kind"] == "queued"]
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0].startswith(f"queue:{SESSION}/2026-11-04T10:07:00.123Z#"))
+
+
 class DiskTests(Base):
     def test_darwin_capacity_volume_is_data_not_root(self):
         calls = []
