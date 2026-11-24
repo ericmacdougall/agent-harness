@@ -782,6 +782,32 @@ def queue_user_text(record):
     return content
 
 
+def queued_attachment_text(record):
+    """(raw, text) of a human message picked up mid-turn, else None. Claude Code records it as an `attachment`
+    of type queued_command whose prompt is the typed text, often behind injected system-reminder blocks. Only
+    origin.kind == human counts; peer, agent, unmarked and cross-session records never do. `raw` is the prompt as
+    recorded (it keys the queue: id hash); `text` is what the user typed, with reminders and pasted blocks removed."""
+    if not isinstance(record, dict) or record.get("type") != "attachment" or record.get("isSidechain"):
+        return None
+    att = record.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "queued_command":
+        return None
+    origin = att.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None
+    prompt = att.get("prompt")
+    if isinstance(prompt, str):
+        raw = prompt
+    elif isinstance(prompt, list) and all(isinstance(b, dict) and b.get("type") in ("text", "image") for b in prompt):
+        raw = "\n".join(b["text"] for b in prompt if b.get("type") == "text" and isinstance(b.get("text"), str))
+    else:
+        return None
+    text, _ = user_authorship({"type": "user", "origin": origin, "message": {"content": prompt}})
+    if text is None or not text.replace(SENTINEL, "").strip():
+        return None  # injected or pasted only: nothing the user typed
+    return raw, text
+
+
 def askuser_use_ids(record) -> set:
     """tool_use ids of AskUserQuestion calls made by the main conversation in an assistant record."""
     out = set()
@@ -985,6 +1011,9 @@ def queue_turn(session: str, ident, home=None) -> dict:
             record = loads_line(line)
         except ValueError:
             continue
+        attached = queued_attachment_text(record)
+        if attached is not None and record.get("timestamp") == stamp and hashlib.sha256(attached[0].encode()).hexdigest()[:12] == sha:
+            return {"text": attached[1], "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
         text = queue_user_text(record)
         if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
             # B6 (step-1 red-team): like a human turn, pasted and injected blocks are not the user's words. The id

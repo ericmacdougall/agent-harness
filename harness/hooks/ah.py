@@ -993,6 +993,9 @@ def _blocks_text(content):
     return ""
 
 
+TRANSCRIPT_RULE = 2  # 2: human queued_command attachments are indexed (goodqa#17101)
+
+
 def index_transcript(home: Path, session: str) -> dict:
     """Incrementally index human turns, queued mid-turn messages and AskUserQuestion answers."""
     path = find_transcript(home, session)
@@ -1004,12 +1007,15 @@ def index_transcript(home: Path, session: str) -> dict:
     if idx.get("schema", 1) > SCHEMA:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     idx["schema"] = SCHEMA
+    if idx.get("rule") != TRANSCRIPT_RULE:  # indexing rules changed: re-read the transcript once, from the start
+        idx.update(rule=TRANSCRIPT_RULE, meta={}, msgs=[], askq=[])
     meta = idx.setdefault("meta", {})
     lines, rebuilt = read_new_lines(path, meta)
     if rebuilt or "msgs" not in idx:
         idx.update(msgs=[], askq=[])
     askq = set(idx["askq"])
     prov = _prov()
+    queued_digests = {m["id"].rsplit("#", 1)[1] for m in idx["msgs"] if m.get("kind") == "queued" and "#" in m["id"]}
     for off, raw in lines:
         if b'"type"' not in raw:
             continue
@@ -1038,6 +1044,15 @@ def index_transcript(home: Path, session: str) -> dict:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
                                         rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
+        elif kind == "attachment":
+            # goodqa#17101: a human message picked up mid-turn behind injected blocks (origin human only).
+            attached = prov.queued_attachment_text(rec)
+            if attached is not None:
+                digest = hashlib.sha256(attached[0].encode()).hexdigest()[:12]
+                if digest not in queued_digests:  # a plain prompt already indexed from its enqueue record
+                    queued_digests.add(digest)
+                    idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
+                                            rec.get("timestamp"), attached[1], prov.QUEUE_TRUST, off))
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
@@ -1079,8 +1094,13 @@ def verify_rows(path: Path, rows: list) -> list:
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
             elif m["kind"] == "queued":
                 raw = prov.queue_user_text(rec)
-                good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
-                text = prov.strip_blocks(raw) if raw is not None else None
+                attached = prov.queued_attachment_text(rec) if raw is None else None
+                if attached is not None:
+                    good = m["id"].endswith("#" + hashlib.sha256(attached[0].encode()).hexdigest()[:12])
+                    text = attached[1]
+                else:
+                    good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
+                    text = prov.strip_blocks(raw) if raw is not None else None
             else:
                 text = _answer_values_cache(rec, path)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]

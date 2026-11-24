@@ -455,6 +455,17 @@ class MidTurnAttachmentTests(Base):
         self.assertEqual(first, [m["id"] for m in self.matches()])
         self.assertEqual(len(first), len(set(first)))
 
+    def test_cache_written_by_older_rules_is_rebuilt_once_without_duplicates(self):
+        self.transcript([self.human(), self.attach(self.blocks(self.REMINDER, self.TYPED))])
+        want = [m["id"] for m in self.matches()]
+        cache = next((self.home / ".agent-harness" / "state" / "ah-index" / "transcripts").glob("*.json"))
+        old = json.loads(cache.read_text())
+        old.pop("rule")
+        old["msgs"] = [m for m in old["msgs"] if m["kind"] != "queued"]  # what the previous rules had cached
+        cache.write_text(json.dumps(old))
+        self.assertEqual([m["id"] for m in self.matches()], want)
+        self.assertEqual([m["id"] for m in self.matches()], want)
+
     def test_neg_injected_only_message_is_never_user_words(self):
         self.transcript([self.human(), self.attach(self.blocks(self.REMINDER, self.REMINDER.replace("note", "more")))])
         self.assertEqual([m for m in self.matches() if m["kind"] == "queued"], [])
