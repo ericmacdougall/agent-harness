@@ -74,14 +74,34 @@ WRITES = [
     '/usr/bin/uniq /tmp/x {w}', '/bin/chmod 666 {w}', '/usr/bin/vim -es -c wq {w}', '/usr/bin/gzip {w}',
     '/usr/bin/patch {w} /tmp/x.diff', 'cat /tmp/x | uniq - {w}', 'cat /tmp/x | xxd -r -p - {w}',
     'command uniq - {w}', 'cp -t {d} /tmp/x', 'cp --target-directory={d} /tmp/x', 'install -t {d} /tmp/x',
-    'cp -R /tmp/stage/wals {d}/../../', 'tar -xf /tmp/x.tar -C {d}/../..', 'cd {d}/../.. && tar -xf /tmp/x.tar',
-    'unzip /tmp/x.zip -d {d}/../..', "cd {d} && python3 -c \"open('{name}','a').write('x')\"",
+    # (an archive that does not exist and is not made here extracts nothing: these read stdin or fetch it first)
+    'cp -R /tmp/stage/wals {d}/../../', 'tar -xf - -C {d}/../.. < /tmp/x.tar', 'cd {d}/../.. && tar -x < /tmp/x.tar',
+    'curl -so /tmp/x.zip https://example.invalid/x && unzip /tmp/x.zip -d {d}/../..', "cd {d} && python3 -c \"open('{name}','a').write('x')\"",
     "cd {d} && perl -e 'open(F, \">>{name}\"); print F 1'",
     "cd {d} && node -e \"require('fs').appendFileSync('{name}','x')\"",
     "cd {d} && awk 'BEGIN{{print \"x\" >> \"{name}\"}}'", "cd {d} && sed -n 'w {name}' /tmp/x",
     'cd {d}; cd /tmp; cd -; echo x >> {name}',
     "python3 -c \"import sys; sys.path.insert(0, '{d}/../../hooks'); from wal import append; append('{w}', {{}})\"",
     'cat /tmp/x | less -o {w}', 'tree -o {w} /tmp',
+    # red-team round 2 (5b1b372d) R3: a relative cd looked up in CDPATH; an unknown directory whose own text or
+    # variable names the tree
+    'CDPATH={d}/.. cd {session} && echo x >> {name}', 'export CDPATH={d}/..; cd {session}; echo x >> {name}',
+    'cd "$(ls -d ~/.claude/wals/* | head -1)" && echo x >> {name}', 'W=$(dirname {w}); cd "$W" && tee -a {name} </tmp/x',
+    'pushd {d}; pushd /tmp; popd; echo x >> {name}',
+    # R4: interpreter code is refused unless proven to only read; a list of write calls is never complete
+    "python3 -c \"import logging; logging.basicConfig(filename='{w}', format='%(message)s'); logging.error('x')\"",
+    "python3 -c \"import urllib.request as u; u.urlretrieve('https://example.invalid/x', '{w}')\"",
+    "python3 -c \"import pandas as pd; pd.DataFrame([dict(event='d')]).to_json('{w}', orient='records', lines=True)\"",
+    "python3 -c \"import numpy as np; np.savetxt('{w}', ['x'], fmt='%s')\"",
+    "perl -MFile::Copy -e 'copy(\"/tmp/rows\", \"{w}\")'", "ruby -rfileutils -e 'FileUtils.cp(\"/tmp/rows\", \"{w}\")'",
+    "python3 -c \"import os; os.open('{w}', 1025)\"", "python3 -c \"from pathlib import Path; Path.replace(Path('/tmp/r'), '{w}')\"",
+    "python3 -c \"import json; json.dump({{}}, open('{w}', 'a'))\"", "python3 -c \"print('x', file=open('{w}', 'a'))\"",
+    "python3 -c \"import os; getattr(os, 'sys' + 'tem')('cp /tmp/r {w}')\"", "python3 -c \"f = open('{w}'); f.__class__\"",
+    "node -e \"require('fs').copyFileSync('/tmp/r', process.argv[1])\" {w}","cd {d} && python3 -c \"open('/tmp/x', 'w').write(open('{name}').read())\" ",
+    # R1: `..` after a link this command creates (or a component that does not exist yet) goes up from the link's
+    # future target
+    'ln -sfn {d}/../../plugins /tmp/cg-q && echo x >> /tmp/cg-q/../wals/{session}/{name}',
+    'mkdir -p /tmp/cg-r && ln -sfn {d}/../../plugins /tmp/cg-r/s && cat /tmp/x >> /tmp/cg-r/s/../wals/{session}/{name}',
 ]
 READS = [
     'cat {w}', 'tail -n 5 {w}', 'jq . {w}', 'grep -c x {w}', 'wc -l < {w}', 'ls -la {d}',
@@ -95,6 +115,18 @@ READS = [
     'while read f; do wc -l "$f"; done < <(ls {d}/*.jsonl)', 'grep -c x {w} > /tmp/count', 'xxd {w} | head',
     "cat {w} | python3 -c \"import sys; print(sum(1 for _ in sys.stdin))\"",
     'rclone copy {d} remote:b --include "*.jsonl"', 'cd {d} && ls -la && wc -l {name}',
+    # red-team round 2 U1: an unknown directory that nothing ties to the tree; the WAL is only read
+    'cd "$REPO" && cp {w} evidence/', 'cd "$WORK" && grep -c decision {w} > count.txt',
+    'cd "$(git rev-parse --show-toplevel)" && jq -c . {w} > out/wal.jsonl',
+    # R4's read-only shape: Python that only reads the tree, writing at most a literal file outside it
+    "python3 - <<'E'\nimport json, collections\nc = collections.Counter(json.loads(l).get('event') for l in open('{w}'))"
+    "\nprint(c.most_common(3))\nE",
+    "cat {w} | python3 -c \"import sys; f = open('/tmp/cg-report.txt', 'w'); f.write(str(sum(1 for _ in sys.stdin)))\"",
+    "python3 -c \"import sys, re; [print(l, end='') for l in open('{w}') if re.search('x', l)]\"",
+    "cd {d} && python3 -c \"print(sum(1 for _ in open('{name}')))\"",
+    "cat {w} | python3 -c \"import json, sys, time; json.dump({{'n': sum(1 for _ in sys.stdin), 't': time.time()}}, "
+    "open('/tmp/cg-sum.json', 'w'))\"",
+    "python3 -c \"from pathlib import Path; print(len(Path('{w}').read_text().splitlines()))\"",
 ]
 
 
@@ -350,6 +382,55 @@ class Landing(Case):
             verdict, message = self.decide(command)
             self.assertEqual(verdict, 'block', command)
             self.assertIn('wal-forgery', message, command)
+
+    def test_path_keeping_remote_and_pass_through_copies_above_the_tree_are_refused(self):
+        # red-team R2 (5b1b372d): the landing check must not compare only a basename or local contents
+        for command in ('rsync -aR {s}/./wals/{n}/main.jsonl {c}/', 'rsync -a --files-from={h}/w/list {s} {c}/',
+                        'cd {s} && cp --parents wals/{n}/main.jsonl {c}/', 'cd {s} && find wals | cpio -pdm {c}',
+                        'cd {s} && pax -rw wals {c}', 'rsync -a host:stage/ {c}/', 'scp -r host:stage/. {c}/',
+                        'rclone copy remote:stage {c}', 'ditto -x -k {h}/w/a.zip {c}',
+                        'rsync -a host:stage/ {h}/', 'rsync -a host:dotfiles/ ~/',
+                        'rsync -a host:x/ ~/ --log-file /tmp/rsync.log', 'scp -r host:.claude {h}/'):
+            command = command.format(s=self.stage, c=self.claude, h=self.home, n=SESSION)
+            verdict, message = self.decide(command)
+            self.assertEqual(verdict, 'block', command)
+            self.assertIn('wal-forgery', message, command)
+
+    def test_an_extraction_above_the_tree_is_allowed_only_for_a_listed_harmless_archive(self):
+        import tarfile
+        import zipfile
+        w = self.home / 'w'
+        good, bad = w / 'notes.tar', w / 'bad.tar'
+        with tarfile.open(good, 'w') as t:
+            t.add(self.home / 'w/notes', arcname='notes')
+        with tarfile.open(bad, 'w') as t:
+            t.add(self.stage / 'wals', arcname='wals')
+        with tarfile.open(w / 'home.tgz', 'w:gz') as t:
+            t.add(self.stage / 'wals', arcname='.claude/wals')
+        with tarfile.open(w / 'strip.tar', 'w') as t:
+            t.add(self.stage / 'wals', arcname='x/wals')
+        with tarfile.open(w / 'link.tar', 'w') as t:
+            info = tarfile.TarInfo('alias')
+            info.type, info.linkname = tarfile.SYMTYPE, '/tmp'
+            t.addfile(info)
+        with zipfile.ZipFile(w / 'bad.zip', 'w') as z:
+            z.writestr('wals/%s/main.jsonl' % SESSION, '{}\n')
+        with zipfile.ZipFile(w / 'good.zip', 'w') as z:
+            z.writestr('notes/a.txt', 'x')
+        refused = ('tar -xf {w}/bad.tar -C {c}', 'tar -xzf {w}/home.tgz -C {h}', 'cd {h} && tar xzf {w}/home.tgz',
+                   'tar -xf {w}/strip.tar --strip-components=1 -C {c}', 'tar -xf {w}/link.tar -C {c}',
+                   'unzip {w}/bad.zip -d {c}', 'tar -cf {w}/n.tar -C {s} . && tar -xf {w}/n.tar -C {c}',
+                   'curl -s https://example.invalid/x.tgz | tar -xz -C {h}', 'tar -xf - -C {c} < {w}/bad.tar',
+                   'cd {c} && cat {w}/bad.tar | bsdtar -xf -')
+        allowed = ('tar -xf {w}/notes.tar -C {c}', 'tar -xf {w}/strip.tar -C {c}', 'unzip {w}/good.zip -d {c}',
+                   'tar -xf {w}/none.tar -C {h}', 'tar -xf {w}/bad.tar -C /tmp/out')
+        for rows, want in ((refused, 'block'), (allowed, 'allow')):
+            for command in rows:
+                command = command.format(w=w, c=self.claude, h=self.home, s=self.stage)
+                verdict, message = self.decide(command)
+                self.assertEqual(verdict, want, (command, message[:200]))
+                if want == 'block':
+                    self.assertIn('wal-forgery', message, command)
 
     def test_copies_that_cannot_reach_the_tree_are_allowed(self):
         for command in ('cp -R {h}/w/notes {c}/', 'rsync -a {h}/w/notes/ /tmp/b/', 'rsync -a {c}/wals/ /tmp/b/',
