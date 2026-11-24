@@ -7,10 +7,12 @@ import ast
 import os
 import secrets
 import subprocess
+import sys
 import time
 import unittest
 
-from transcripts_testlib import Base, IdentityRedact, T, UUID1, UUID2, rec
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from transcripts_testlib import Base, IdentityRedact, T, UUID1, UUID2, rec  # noqa: E402
 
 
 def all_object_bytes(test):
