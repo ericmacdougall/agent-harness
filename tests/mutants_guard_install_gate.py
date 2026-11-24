@@ -85,7 +85,8 @@ def run(tree: Path) -> int:
 
 def copy_tree(dest: Path):
     for part in ("harness/hooks", "scripts", "tests", "templates"):
-        shutil.copytree(ROOT / part, dest / part, ignore=shutil.ignore_patterns("__pycache__"))
+        if (ROOT / part).is_dir():
+            shutil.copytree(ROOT / part, dest / part, ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(ROOT / "install.py", dest / "install.py")
 
 
