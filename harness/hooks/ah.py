@@ -993,6 +993,9 @@ def _blocks_text(content):
     return ""
 
 
+TRANSCRIPT_RULE = 3  # 3: human queued_command attachments are stored and tagged; pairing with enqueue twins happens on read (goodqa#17101)
+
+
 def index_transcript(home: Path, session: str) -> dict:
     """Incrementally index human turns, queued mid-turn messages and AskUserQuestion answers."""
     path = find_transcript(home, session)
@@ -1004,6 +1007,8 @@ def index_transcript(home: Path, session: str) -> dict:
     if idx.get("schema", 1) > SCHEMA:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     idx["schema"] = SCHEMA
+    if idx.get("rule") != TRANSCRIPT_RULE:  # indexing rules changed: re-read the transcript once, from the start
+        idx.update(rule=TRANSCRIPT_RULE, meta={}, msgs=[], askq=[])
     meta = idx.setdefault("meta", {})
     lines, rebuilt = read_new_lines(path, meta)
     if rebuilt or "msgs" not in idx:
@@ -1038,6 +1043,17 @@ def index_transcript(home: Path, session: str) -> dict:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
                                         rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
+        elif kind == "attachment":
+            # goodqa#17101: a human message picked up mid-turn behind injected blocks (origin human only).
+            # Every attachment is stored; _pair_attachments is the only place a duplicate is ever dropped.
+            attached = prov.queued_attachment_text(rec)
+            if attached is not None:
+                digest = hashlib.sha256(attached[0].encode()).hexdigest()[:12]
+                row = _msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
+                           rec.get("timestamp"), attached[1], prov.ATTACHMENT_TRUST, off)
+                row["via"] = "attachment"
+                row["plain"] = isinstance((rec.get("attachment") or {}).get("prompt"), str)
+                idx["msgs"].append(row)
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
@@ -1079,8 +1095,13 @@ def verify_rows(path: Path, rows: list) -> list:
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
             elif m["kind"] == "queued":
                 raw = prov.queue_user_text(rec)
-                good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
-                text = prov.strip_blocks(raw) if raw is not None else None
+                attached = prov.queued_attachment_text(rec) if raw is None else None
+                if attached is not None:
+                    good = m["id"].endswith("#" + hashlib.sha256(attached[0].encode()).hexdigest()[:12])
+                    text = attached[1]
+                else:
+                    good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
+                    text = prov.strip_blocks(raw) if raw is not None else None
             else:
                 text = _answer_values_cache(rec, path)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
@@ -1141,9 +1162,49 @@ def _message_source(row):
     return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
 
 
+PAIR_WINDOW_SECONDS = 5.0  # a plain prompt's enqueue and its pickup attachment are recorded within a fraction of a second
+
+
+def _stamp(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _pair_attachments(rows: list) -> list:
+    """The only place a duplicate queued row is dropped (goodqa#17101).
+
+    A plain-string prompt is recorded twice: as an enqueue record and, when picked up, as an attachment with the same
+    raw text. Each such attachment is paired one-to-one with the nearest unmatched enqueue of the same digest within
+    PAIR_WINDOW_SECONDS, and the attachment row is dropped so the enqueue id stays. Anything unpaired stays: two
+    identical replies, in any order or spacing, are two messages. Attachments are never compared with each other.
+    """
+    enqueues = {}
+    for i, row in enumerate(rows):
+        if row.get("kind") == "queued" and row.get("via") != "attachment":
+            enqueues.setdefault(row["id"].rsplit("#", 1)[-1], []).append(i)
+    drop, taken = set(), set()
+    for i, row in enumerate(rows):
+        if row.get("via") != "attachment" or not row.get("plain"):
+            continue
+        at = _stamp(row.get("timestamp"))
+        best = None
+        for j in enqueues.get(row["id"].rsplit("#", 1)[-1], []):
+            if j in taken or at is None:
+                continue
+            gap = abs(at - (_stamp(rows[j].get("timestamp")) or 1e18))
+            if gap <= PAIR_WINDOW_SECONDS and (best is None or gap < best[0]):
+                best = (gap, j)
+        if best:
+            taken.add(best[1])
+            drop.add(i)
+    return [row for i, row in enumerate(rows) if i not in drop]
+
+
 def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
     idx = index_transcript(home, session)
-    msgs = verify_rows(find_transcript(home, session), idx["msgs"])
+    msgs = _pair_attachments(verify_rows(find_transcript(home, session), idx["msgs"]))
     # A queued message that later became a human turn is the same message: point the queue id at the uuid id.
     human = [(m["id"], norm(m["text"])) for m in msgs if m["kind"] == "uuid"]
     seen, out = set(), []
