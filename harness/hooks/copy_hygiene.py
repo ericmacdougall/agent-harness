@@ -1634,6 +1634,9 @@ RSYNC_VALUE_LONG = frozenset((
     "--password-file", "--early-input", "--bwlimit", "--stop-after", "--stop-at", "--write-batch",
     "--only-write-batch", "--read-batch", "--protocol", "--iconv", "--checksum-seed"))
 RSYNC_VALUE_SHORT = frozenset("BeTfM@")
+# OpenSSH scp(1): -c cipher, -D sftp_server_path, -F ssh_config, -i identity_file, -J destination, -l limit,
+# -o ssh_option, -P port, -S program, -X sftp_option.
+SCP_VALUE_SHORT = frozenset("cDFiJloPSX")
 
 
 def _strip_redirects(words: list) -> list:
@@ -1679,6 +1682,8 @@ def _copy_destination(words: list) -> "list[str]":
         return []
     if os.path.basename(words[0]) == "rsync":
         return _operands(words, RSYNC_VALUE_SHORT, RSYNC_VALUE_LONG)[-1:]
+    if os.path.basename(words[0]) == "scp":
+        return _operands(words, SCP_VALUE_SHORT, frozenset())[-1:]
     return _dest(words)
 
 
@@ -1686,7 +1691,7 @@ def _copy_verb(words: list) -> str:
     name = os.path.basename(words[0])
     if name == "git":
         return "git worktree add" if "worktree" in words else "git clone"
-    return {"cp": "cp -r"}.get(name, name)
+    return {"cp": "cp -r", "scp": "scp -r"}.get(name, name)
 
 
 def _opts(words: list) -> "tuple[set, list]":
@@ -1727,6 +1732,11 @@ def is_copy_command(words: list) -> bool:
         operands = _operands(words, RSYNC_VALUE_SHORT, RSYNC_VALUE_LONG)
         remote = bool(operands) and _remote(operands[-1]) and not any(_remote(p) for p in operands[:-1])
         return bool(flags & {"r", "a", "--recursive", "--archive"}) and not remote
+    if name == "scp":
+        # goodqa#17106: a recursive scp onto this disk, from a host or from a local path, is a copy here; one to
+        # host:path is the far host's copy, and an scp of single files is not counted, like cp without -r.
+        operands = _operands(words, SCP_VALUE_SHORT, frozenset())
+        return "r" in flags and len(operands) >= 2 and not _remote(operands[-1])
     return name == "ditto"
 
 

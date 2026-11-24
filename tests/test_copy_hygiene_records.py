@@ -156,6 +156,24 @@ LOCAL_DESTINATIONS = [
     "rsync -a -e 'ssh -p 22' %s ./local-x/" % D,
 ]
 
+# #17106, "a remote-to-local copy is still charged": a recursive scp whose destination is on this disk. The base
+# never counted scp, so each of these filled the disk below the floor.
+SCP_LOCAL = [
+    "scp -r devbox:/srv/x ./local-x",
+    "scp -r src /w/dst",
+    "scp -rp -P 2222 devbox:/srv/x ./local-y 2>&1 | tail -1",
+    "scp -r -i ~/.ssh/k -o BatchMode=yes eric@devbox:/srv/x .",
+    "scp -r devbox:/srv/x ./local-x -P 2222",
+]
+# The far host's copy, or single files: not charged here.
+SCP_NOT_HERE = [
+    "scp -r src devbox:/srv/x",
+    "scp -r -P 2222 src eric@devbox:/srv/x 2>&1",
+    "scp -r src devbox:/srv/x -P 2222",
+    "scp a.txt devbox:/srv/x",
+    "scp devbox:/srv/a.txt ./b.txt",
+]
+
 
 def base_charges(line, rule=None):
     return any((rule or tc.is_copy_command)(words) for words in tc._legacy_copy_commands(line, 0))
@@ -286,7 +304,26 @@ class RemoteDestinations(BelowTheFloor):
                     self.assertEqual(self.pretool(line), (0, ""))
 
 
-SHELLS = [s for s in ("zsh", "bash") if shutil.which(s)]
+class ScpCopies(BelowTheFloor):
+    def test_a_recursive_scp_onto_this_disk_is_charged(self):
+        for line in SCP_LOCAL:
+            self.assert_refused(line)
+        code, err = self.pretool(SCP_LOCAL[0])
+        self.assertIn("`scp -r`", err)
+
+    def test_an_scp_to_a_host_or_of_single_files_is_not(self):
+        for line in SCP_NOT_HERE:
+            with self.subTest(line=line):
+                self.assertEqual(self.pretool(line), (0, ""))
+
+    def test_the_volume_measured_is_the_destination(self):
+        def free(path):
+            return 100 * GB if str(path).startswith("/w") else 0
+        with mock.patch.object(tc, "free_bytes", side_effect=free):
+            self.assertEqual(self.pretool("scp -r devbox:/srv/x /w/dst -P 2222 2>/dev/null"), (0, ""))
+
+
+SHELLS =[s for s in ("zsh", "bash") if shutil.which(s)]
 
 
 class ShellGroundTruth(unittest.TestCase):

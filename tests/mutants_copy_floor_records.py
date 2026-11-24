@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = "copy_hygiene.py"
 BASE = "8539e978"
-CLASSES = ["tests.test_copy_hygiene_records.%s" % c for c in ("RecordWrites", "NearMisses", "RemoteDestinations")]
+CLASSES = ["tests.test_copy_hygiene_records.%s" % c
+           for c in ("RecordWrites", "NearMisses", "RemoteDestinations", "ScpCopies")]
 
 MUTANTS = {
     "data piped into any program": (
@@ -73,6 +74,15 @@ MUTANTS = {
         "remote = bool(operands) and _remote(operands[-1]) and not any(_remote(p) for p in operands[:-1])",
         "remote = bool(operands) and _remote(operands[-1])"),
     "the volume is picked from a redirect": ("d = _copy_destination(w)", "d = _dest(w)"),
+    "scp is not a copy": ('    if name == "scp":\n        # goodqa#17106', '    if False:\n        # goodqa#17106'),
+    "an scp to a host is charged": (
+        'return "r" in flags and len(operands) >= 2 and not _remote(operands[-1])',
+        'return "r" in flags and len(operands) >= 2'),
+    "scp option values read as operands": (
+        'operands = _operands(words, SCP_VALUE_SHORT, frozenset())\n        return "r"',
+        'operands = _operands(words, frozenset(), frozenset())\n        return "r"'),
+    "the scp volume is read from its last word": (
+        "        return _operands(words, SCP_VALUE_SHORT, frozenset())[-1:]\n", "        return _dest(words)\n"),
     "the refusal does not name the copy": (
         "low_disk_message(target, gb, fl, copy=_copy_verb(copying[0]))", "low_disk_message(target, gb, fl)"),
 }
