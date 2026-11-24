@@ -12,15 +12,16 @@ clientMsgId null, so the server has no dedupe for a DM. A retry after a lost ans
 - The same body (SHA-256 of PREFIX + the canonical text: LF line breaks, none trailing) to the same person (id in lower
   case) is refused for SAME_TEXT_WINDOW seconds after ANY earlier attempt, whatever
   its outcome (sent, uncertain, or a crash that left only the pending row). The one exception: every earlier attempt was
-  answered by a definite refusal before anything was stored: the user-token approval gate (NOT_STORED: approval required,
-  pending, expired, denied or for other text) or a refusal cited line by line in REFUSED_SOURCES (`refused`). That
-  gate runs before the route handler stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 at
+  answered by the user-token approval gate before anything was stored (NOT_STORED: approval required, pending, expired,
+  denied or for other text, in the tool's own error). That gate runs before the route handler stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 at
   a70289c7). When it asks for approval the result prints the approval id; once the user approves it in the web app, the
   same command with --approval-id sends that exact body (the server binds the permit to it) and consumes the permit.
 - At most RATE_LIMIT attempts per person and GLOBAL_LIMIT to everyone per RATE_WINDOW seconds, counting every attempt.
 - Any other failure of the one request, whatever its kind, is `uncertain`, and the outcome and WAL rows are still written.
   Every outcome that is not `sent` records why: the failure class (the local error code, `no_message_id`, or
   `exception:<type>`), the server's machine code and the HTTP status, never a server message, the body or a token.
+  Recording the reason never frees the text: the client cannot verify at run time what the deployed server stored, so a
+  server code (not_found included) is a reason to report, not proof that nothing was stored (goodqa#16399, PR 341).
 - The ledger (~/.agent-harness/state/ah/store/chat-send.jsonl) gets a pending row, written completely and fsynced, BEFORE the
   request; the outcome row after it. A ledger with a malformed or unterminated record refuses every send until a person has
   looked at it: a lost pending row would let the same text go out twice.
@@ -88,33 +89,12 @@ MAX_DM_PAGES = 5
 LOCK_WAIT = 30  # seconds a send waits for another one to finish before it answers busy
 # Refusals of the user-token approval gate, which runs before the route handler and so before anything is stored
 # (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 and service.ts:1364-1412 at a70289c7). An attempt
-# answered with one of these did not deliver, so it does not hold the text back. Every other answer does.
+# answered with one of these in the tool's own error did not deliver, so it does not hold the text back. Every other
+# answer does, an HTTP-level error carrying one of these codes included.
 NOT_STORED = {"human_approval_required": "approval_required", "human_approval_pending": "approval_pending",
               "approval_expired": "approval_refused", "approval_denied": "approval_refused",
               "approval_mismatch": "approval_refused"}
-# The GoodQA server commit (bugtracker origin/main) the refusal table below was checked against, line by line. A GoodQA
-# change to send_direct_message, its route or the code it raises needs this table re-checked and this commit moved; the
-# test RefusalTable pins both, so a code cannot be added without a cited place where it is raised.
-REFUSAL_CHECKED_AT = "a70289c740da"
-# Other definite refusals, each with where it is raised before the message is stored, so status `refused` frees the text.
-# Only what is established line by line is here. send_direct_message (apps/api/src/modules/mcp/tools.ts:1891-1904) is a
-# thin call of POST /v1/orgs/:orgId/dm/:userId whose error body passes through unchanged (tools.ts:468-484 toToolResult),
-# and that route stores with appendMessage at apps/api/src/modules/dm/routes.ts:250. After that commit the route runs
-# actorForMessage, blockedCounterpartIds, createNotifications and sendEmails (dm/routes.ts:281-316), none of which
-# raises not_found (message-actor.ts, user-blocks.ts and notify.ts hold no Errors.notFound). Every other code
-# (forbidden, bad_request, the user-token gate's other codes), every HTTP status, a 5xx, a timeout, a JSON-RPC error and
-# a plain-text MCP error stays `uncertain`, with its recorded reason: none of them is cited here yet. goodqa#16399: the
-# first live send got not_found (goodqa#17013: a user token cannot reply in an existing DM) and was reported as uncertain
-# with no reason.
-REFUSED_SOURCES = {
-    "not_found": ("apps/api/src/lib/ai-invocation.ts:218 (assertAiPrivateConversation), reached from "
-                  "apps/api/src/modules/messaging/access.ts:465 (requireConversationAccess) at "
-                  "apps/api/src/modules/dm/routes.ts:187, and dm/routes.ts:190 (a scoped token opening a new DM), both "
-                  "before appendMessage at dm/routes.ts:250"),
-}
-REFUSED_CODES = frozenset(REFUSED_SOURCES)
-APPROVAL_STATUSES = frozenset(NOT_STORED.values())
-FREE_STATUSES = APPROVAL_STATUSES | {"refused"}
+APPROVAL_STATUSES = frozenset(NOT_STORED.values())  # the only statuses that free the text
 SERVER_CODE_RE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 EXCEPTION_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 # Characters never sent: every control (Cc) but the line break, every format character (Cf: bidi overrides and isolates,
@@ -307,7 +287,7 @@ def check_ledger(rows, peer, digest, now):
     attempts = list(_attempts(rows).values())
     mine = [a for a in attempts if a["peer"] == peer]
     same = [a for a in mine if a["sha"] == digest and now - a["at"] < SAME_TEXT_WINDOW]
-    if same and any(a["status"] not in FREE_STATUSES for a in same):
+    if same and any(a["status"] not in APPROVAL_STATUSES for a in same):
         raise ChatError("duplicate", "this exact text already went to this person in the last 24 hours (or its outcome is "
                                      "unknown). It is never resent automatically: check `ah chat history` first and, if it "
                                      "really did not arrive, send it reworded (for example \"Thanks!\" becomes \"Thanks, "
@@ -600,18 +580,21 @@ def allow(home, with_=None, org=None, name=None, source=None, base=None, list_on
 # ------------------------------------------------------------------ the WAL row
 
 def _shown_code(code):
-    """A server machine code fit to record: a short lower-case code and never a token piece, else "unrecognized"; None
-    stays None. A server message is never recorded (it can echo what was sent)."""
+    """A server machine code fit to record: a short lower-case code that passes the one third-party screen, else
+    "unrecognized"; None stays None. The screen is ah_chat._credential_like, the check every other third-party string takes
+    (r9 B1): a piece of either GoodQA token or any secret shape (redact.py and gq_browser.SECRET_SHAPES, lower-case
+    `gqut_` and `sk_live_` included). A server message is never recorded (it can echo what was sent)."""
     if code is None:
         return None
-    if not (isinstance(code, str) and SERVER_CODE_RE.fullmatch(code)) or chat._holds_token(code):
+    if not (isinstance(code, str) and SERVER_CODE_RE.fullmatch(code)) or chat._credential_like(code):
         return "unrecognized"
     return code
 
 
 def _outcome_of(error):
-    """(status, failure class, server code, HTTP status) for a failed request. `refused` and the approval statuses are
-    the definite answers that nothing was stored; everything else is `uncertain`."""
+    """(status, failure class, server code, HTTP status) for a failed request. Only an approval-gate code in the tool's own
+    error is a definite answer that nothing was stored; everything else, not_found and every HTTP-level error included, is
+    `uncertain` with its recorded reason."""
     if not isinstance(error, ChatError):
         name = type(error).__name__
         return "uncertain", "exception:" + (name if EXCEPTION_RE.fullmatch(name) else "unnamed"), None, None
@@ -619,10 +602,8 @@ def _outcome_of(error):
     http = getattr(error, "http_status", None)
     http = http if isinstance(http, int) and not isinstance(http, bool) else None
     status = "uncertain"
-    if error.code in ("tool_error", "not_found", "http_error") and code in NOT_STORED:
+    if error.code == "tool_error" and code in NOT_STORED:  # the tool's own error; an HTTP-level error never frees the text
         status = NOT_STORED[code]
-    elif error.code == "not_found" and code in REFUSED_CODES:  # the tool's own not_found, never an HTTP-level 404
-        status = "refused"
     return status, error.code, code, http
 
 
@@ -781,13 +762,10 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
     elif status == "approval_refused":
         result["next"] = ("GoodQA refused the approval (%s): it expired, was denied, or was given for different text. Nothing "
                           "was stored. Run the command without --approval-id to ask for a new approval" % code)
-    elif status == "refused":
-        result["next"] = ("GoodQA refused this send before storing anything (%s). Nothing was delivered, so the same text may "
-                          "go again once the cause is fixed" % (code or failure))
-        if code == "not_found":
-            result["next"] += (". For a person on the list who already has a DM with you this is goodqa#17013: GoodQA does "
-                               "not let a user token reply in an existing DM. Reply in the GoodQA app until it ships")
     elif status == "uncertain":
         result["next"] = ("the outcome is unknown (%s). Do NOT resend: read `ah chat history` to see whether it arrived. The "
                           "same text stays refused for 24 hours" % (code or failure))
+        if code == "not_found":
+            result["next"] += (". For a person on the list who already has a DM with you this is likely goodqa#17013: GoodQA "
+                               "does not let a user token reply in an existing DM. Reply in the GoodQA app until it ships")
     return chat._checked(result)

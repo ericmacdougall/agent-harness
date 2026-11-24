@@ -9,7 +9,6 @@ Run: python3 -I -m unittest tests.test_ah_chat_send
 """
 import json
 import os
-import re
 import sys
 import unittest
 from pathlib import Path
@@ -390,10 +389,12 @@ class Approval(SendBase):
         for code in ("approval_expired", "approval_denied", "approval_mismatch"):
             self.stub.tools["send_direct_message"] = self.gate(code)
             self.assertEqual(self.result(self.send())["status"], "approval_refused", code)
-        # goodqa#16399: `forbidden` is now a definite refusal (`refused`, Reasons); a code GoodQA's sources do not raise
-        # before storing stays uncertain and holds the text back
+        # any other code stays uncertain and holds the text back (Reasons), even with a permit id in its details, which
+        # is never printed for it (PR 341 review b3ea09a1 F6: the realistic case, Approval.gate with details.approvalId)
         self.stub.tools["send_direct_message"] = self.gate("internal_error")
-        self.assertEqual(self.result(self.send())["status"], "uncertain")
+        data = self.result(self.send())
+        self.assertEqual(data["status"], "uncertain")
+        self.assertNotIn("approval_id", data)
         self.assertEqual(self.result(self.send())["code"], "duplicate")
 
     def test_a_stamp_without_the_approval_id_does_not_cover_a_send_with_it(self):
@@ -643,8 +644,9 @@ class Recording(SendBase):
 class Reasons(SendBase):
     """goodqa#16399, the first live send (2026-11-24 07:20Z): GoodQA answered not_found (goodqa#17013) and the send printed
     `uncertain` with no reason anywhere. Every outcome that is not `sent` now records its failure class, the server's machine
-    code and the HTTP status in the outcome row, the WAL row and the result; a definite refusal before storage is `refused`
-    and frees the text."""
+    code and the HTTP status in the outcome row, the WAL row and the result. Recording the reason never frees the text: only
+    an approval-gate code in the tool's own error does (PR 341 review b3ea09a1 F1: the client cannot verify at run time what
+    the deployed server stored)."""
     ledger = Recording.ledger
     in_process = Recording.in_process
 
@@ -659,18 +661,19 @@ class Reasons(SendBase):
         for where, row in (("result", data), ("outcome row", self.outcome()), ("WAL row", self.wal_send())):
             self.assertEqual({k: row.get(k) for k in want}, want, where)
 
-    def test_not_found_is_refused_with_its_reason_everywhere_and_frees_the_text(self):
+    def test_not_found_stays_uncertain_with_its_reason_everywhere_and_holds_the_text(self):
         self.stub.tools["send_direct_message"] = lambda a: tool_error("not_found")
         data = self.result(self.send())
         self.assertFalse(data["ok"])
-        self.assert_reason(data, "refused", "not_found", "not_found")
+        self.assert_reason(data, "uncertain", "not_found", "not_found")
         self.assertIn("goodqa#17013", data["next"])
+        self.assertIn("Do NOT resend", data["next"])
         self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
-        self.assertEqual(self.result(self.send())["status"], "sent")  # nothing was stored, so the same text may go
-        self.assertEqual(len(self.sends()), 2)
+        self.assertEqual(self.result(self.send())["code"], "duplicate")  # a server claim never frees the text
+        self.assertEqual(len(self.sends()), 1)
 
-    def test_an_uncited_refusal_stays_uncertain_with_its_code_and_holds_the_text(self):
-        # PR 341 review F1: only a code cited line by line in REFUSED_SOURCES frees the text; the rest keep their reason
+    def test_a_refusal_code_stays_uncertain_with_its_code_and_holds_the_text(self):
+        # PR 341 review b3ea09a1 F1: no server code but the approval gate's frees the text; each keeps its reason
         for n, code in enumerate(("forbidden", "bad_request", "unauthorized", "user_token_rate_limited",
                                   "user_token_ability_missing", "commander_ceiling")):
             self.write("message %d" % n)
@@ -690,6 +693,19 @@ class Reasons(SendBase):
             self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
             self.assertEqual(self.result(self.send())["code"], "duplicate", status)
 
+    def test_an_http_error_carrying_an_approval_code_stays_uncertain_and_holds_the_text(self):
+        # PR 341 review b3ea09a1 F3: only the tool's own error can carry the approval gate's answer; an HTTP 403 whose
+        # body names an approval code is not that answer, prints no permit and frees nothing
+        permit = "0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c"
+        self.stub.tools["send_direct_message"] = lambda a: (403, {"error": {"code": "human_approval_required",
+                                                                            "details": {"approvalId": permit}}})
+        data = self.result(self.send())
+        self.assert_reason(data, "uncertain", "http_error", "human_approval_required", 403)
+        self.assertNotIn("approval_id", data)
+        self.assertNotIn(permit, json.dumps(data))
+        self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
+        self.assertEqual(self.result(self.send())["code"], "duplicate")
+
     def test_a_refusal_that_is_not_an_approval_never_prints_an_approval_id(self):
         # PR 341 review F3: a permit id is printed only for the approval statuses
         real = ah_chat_send.chat.Client.tool
@@ -701,7 +717,7 @@ class Reasons(SendBase):
             missing.server_code, missing.approval_id = "not_found", "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b"
             raise missing
         data = self.in_process(tool=(ah_chat_send.chat.Client, "tool", tool))
-        self.assertEqual(data["status"], "refused")
+        self.assertEqual(data["status"], "uncertain")
         self.assertNotIn("approval_id", data)
 
     def test_a_server_error_or_an_unknown_code_stays_uncertain_with_its_reason_and_holds_the_text(self):
@@ -730,6 +746,20 @@ class Reasons(SendBase):
         self.assert_no_token()
         self.assertNotIn(piece, self.ledger().read_text())
 
+    def test_a_credential_shaped_code_is_recorded_as_unrecognized_everywhere(self):
+        # PR 341 review b3ea09a1 F2: lower case and code-shaped, but a secret shape: the one third-party screen
+        # (ah_chat._credential_like, as r9 B1) keeps it out of the result, the ledger and the WAL
+        shapes = ("gqut_abcdefghijklmnop", "sk_live_abcdefghijkl", "ghp_" + "abcdefghij" * 2)
+        for n, code in enumerate(shapes):
+            self.write("message %d" % n)
+            self.stub.tools["send_direct_message"] = lambda a, code=code: tool_error(code)
+            data = self.result(self.send())
+            self.assert_reason(data, "uncertain", "tool_error", "unrecognized")
+            self.assertNotIn(code, json.dumps(data))
+        for code in shapes:
+            self.assertNotIn(code, self.ledger().read_text())
+            self.assertNotIn(code, json.dumps(self.wal_rows()))
+
     def test_an_exception_records_its_type(self):
         import http.client
         real = ah_chat_send.chat.Client.tool
@@ -748,27 +778,16 @@ class Reasons(SendBase):
             self.assertFalse({"failure", "server_code", "http_status"} & set(row), row)
 
 
-class RefusalTable(unittest.TestCase):
-    """PR 341 review F1 and F2: a code frees the text only with a cited place where GoodQA raises it before storing the
-    message, at the one server commit the table was checked against. Moving either forces a re-check of every line."""
-    CITED = re.compile(r"apps/api/src/[\w/.-]+\.ts:\d+")
+class ApprovalOnly(unittest.TestCase):
+    """PR 341 review b3ea09a1 F1 and F4: the approval statuses are the only ones that free the text. No refusal table,
+    status `refused` or pinned server commit remains: a definite-refusal status would need a server-reported build id or
+    an explicit not-stored field from GoodQA (a ticket on goodqa#17013)."""
 
-    def test_the_table_is_exactly_the_cited_codes(self):
-        self.assertEqual(set(ah_chat_send.REFUSED_SOURCES), {"not_found"})
-        self.assertEqual(ah_chat_send.REFUSED_CODES, frozenset(ah_chat_send.REFUSED_SOURCES))
-
-    def test_every_entry_cites_where_it_is_raised_and_where_the_message_is_stored(self):
-        for code, where in ah_chat_send.REFUSED_SOURCES.items():
-            self.assertTrue(self.CITED.search(where), code)
-            self.assertIn("before appendMessage at dm/routes.ts:250", where, code)
-
-    def test_the_table_is_pinned_to_the_server_commit_it_was_checked_against(self):
-        self.assertEqual(ah_chat_send.REFUSAL_CHECKED_AT, "a70289c740da",
-                         "GoodQA moved: re-check every cited line in REFUSED_SOURCES, then move both")
-
-    def test_only_the_approval_statuses_carry_a_permit(self):
+    def test_only_the_approval_statuses_free_the_text_or_carry_a_permit(self):
         self.assertEqual(ah_chat_send.APPROVAL_STATUSES, frozenset(ah_chat_send.NOT_STORED.values()))
         self.assertNotIn("refused", ah_chat_send.APPROVAL_STATUSES)
+        for gone in ("REFUSED_SOURCES", "REFUSED_CODES", "REFUSAL_CHECKED_AT", "FREE_STATUSES"):
+            self.assertFalse(hasattr(ah_chat_send, gone), gone)
 
 
 class Limits(unittest.TestCase):
