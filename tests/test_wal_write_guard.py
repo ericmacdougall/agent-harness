@@ -523,14 +523,39 @@ class EveryLauncher(Case):
                     missed.append((row, verdict, message[:100]))
         self.assertEqual(missed, [])
 
-    def test_a_quiet_launcher_around_a_write_is_still_refused(self):
-        for name in sorted(n for n, k in cg.WAL_LAUNCHER_CLASS.items() if k == cg.WAL_QUIET):
-            row = '%s tee -a {w} < /tmp/x' % name
-            if name in ('timeout', 'nice', 'ionice', 'chrt', 'taskset', 'su', 'sg', 'runuser', 'gosu', 'sshpass',
-                        'xargs', 'watch', 'arch', 'unbuffer', 'caffeinate', 'stdbuf'):
-                continue  # these need their own operand first; WRITES and READS hold their real shapes
-            verdict, message = self.decide(self.fill(row, self.main))
-            self.assertEqual(verdict, 'block', row)
+    # how each quiet launcher is written in front of the command it runs ({c}); the default is `name {c}`. Every quiet
+    # launcher is generated below, none skipped: a launcher added to WAL_QUIET without a form here uses the default.
+    QUIET_FORMS = {
+        'timeout': 'timeout 5 {c}', 'nice': 'nice -n 5 {c}', 'ionice': 'ionice -c 3 {c}', 'chrt': 'chrt -o 0 {c}',
+        'taskset': 'taskset -c 0 {c}', 'stdbuf': 'stdbuf -oL {c}', 'caffeinate': 'caffeinate -i {c}',
+        'watch': 'watch -n 5 {c}', 'arch': 'arch -arm64 {c}', 'xargs': 'echo x | xargs {c}',
+        'su': "su -c '{c}' nobody", 'sg': "sg staff -c '{c}'", 'runuser': "runuser -u nobody -- {c}",
+        'gosu': 'gosu nobody {c}', 'sshpass': 'sshpass -e {c}', 'env': 'env A=1 {c}', 'nohup': 'nohup {c}',
+    }
+    # Disclosed over-refusal: a user name before the command (`gosu nobody`, `runuser -u nobody`) is one of the words
+    # that could start the command, so it is judged as a program it does not model, given a WAL path, and refused
+    # (_wal_launched_readings; the fail-safe reading). A read through these two launchers is refused with a route.
+    READ_REFUSED = frozenset({'gosu', 'runuser'})
+
+    def test_every_quiet_launcher_judges_the_command_it_runs(self):
+        """For each quiet launcher, generated from WAL_LAUNCHER_CLASS: the command it runs is judged as if it ran
+        alone. A write to the WAL is refused; a read of the same file is allowed (the non-vacuous twin)."""
+        wrong = []
+        quiet = sorted(n for n, k in cg.WAL_LAUNCHER_CLASS.items() if k == cg.WAL_QUIET)
+        self.assertGreater(len(quiet), 15)
+        for name in quiet:
+            form = self.QUIET_FORMS.get(name, name + ' {c}')
+            for inner, expect in (('tee -a {w}', 'block'), ('cp /tmp/x {w}', 'block'), ('cat {w}', 'allow'),
+                                  ('wc -l {w}', 'allow')):
+                row = form.replace('{c}', inner)
+                if name == 'nohup' and expect == 'allow':
+                    row = 'cd /tmp && ' + row  # nohup.out lands in the working directory, which the rule judges
+                if name in self.READ_REFUSED:
+                    expect = 'block'
+                verdict = self.decide(self.fill(row, self.main))[0]
+                if verdict != expect:
+                    wrong.append((name, row, verdict))
+        self.assertEqual(wrong, [])
 
 
 class FileTools(Case):
