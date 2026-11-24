@@ -1645,7 +1645,15 @@ def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None"
     A read-only view (tally given) reuses the parse while the file is unchanged (inode, size, mtime and ctime), so a
     process that asks for many sessions parses the 20 MB ledger once, not once per session (goodqa#17100: ops-watch
     spent most of a 30-minute run there). The tally effects are replayed from the memo; the list is a copy. Writers
-    pass no tally and always read the file."""
+    pass no tally and always read the file.
+
+    Settle rule: a memo is served only when the file's mtime was at least LEDGER_MEMO_SETTLE_S older than the wall
+    clock at the start of its parse. Within the filesystem's timestamp granularity an in-place rewrite of the same
+    size keeps inode, size, mtime and ctime, so a parse that raced the last write must not be trusted; a file that
+    has not settled is parsed again on the next read, which then settles. Two assumptions: the file's mtime and
+    time.time() come from the same clock (a local filesystem; a remote one whose server clock runs behind this host
+    could serve a stale memo, one running ahead only costs the memo), and the timestamp granularity is 2 s or less
+    (ext4, APFS and FAT all are)."""
     path = store_dir(home) / "ledger.jsonl"
     key = (str(path), bool(include_intents))
     out, lost, skipped = [], [], 0

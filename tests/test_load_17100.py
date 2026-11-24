@@ -45,6 +45,9 @@ class NoTickets:
 # ---------------------------------------------------------------- ah._ledger memo
 
 class LedgerMemo(unittest.TestCase):
+    """Every test that depends on the memo reaches it by construction: the file is aged first (the settle rule serves
+    a memo only for a file already 2 s old when parsed) and a json.loads spy proves the second read parsed nothing."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -56,70 +59,91 @@ class LedgerMemo(unittest.TestCase):
         with open(self.path, "a") as f:
             f.write(json.dumps({"op": "task.dispose", "args": {"session": SESS, "n": n}, "state": "applied"}) + "\n")
 
+    def age(self, secs=10):
+        old = time.time() - secs
+        os.utime(self.path, (old, old))
+
     def read(self, tally=True):
-        return ah._ledger(self.home, tally=ah.ReadTally() if tally else None)
+        """(rows, tally or None, number of json.loads calls this read made)."""
+        t = ah.ReadTally() if tally else None
+        with mock.patch.object(ah.json, "loads", side_effect=json.loads) as spy:
+            rows = ah._ledger(self.home, tally=t)
+        return rows, t, spy.call_count
+
+    def prime(self):
+        """Age the file, read it once (a parse), and prove the next read is served from the memo. Returns that
+        memo-served read as (rows, tally, parses) with parses == 0 asserted."""
+        self.age()
+        _, _, parsed = self.read()
+        self.assertGreater(parsed, 0, "the first read must parse")
+        hit = self.read()
+        self.assertEqual(hit[2], 0, "the second read must come from the memo")
+        return hit
 
     def test_append_is_seen_by_the_next_read_for_readers_and_writers(self):
         self.add(1)
-        self.assertEqual(len(self.read()), 1)
-        self.add(2)  # an append between two reads of one process
-        self.assertEqual(len(self.read()), 2)
-        self.assertEqual(len(self.read(tally=False)), 2)
+        self.prime()
+        self.add(2)  # an append after the memo was built
+        rows, _, parsed = self.read()
+        self.assertEqual((len(rows), parsed > 0), (2, True))
+        self.assertEqual(len(self.read(tally=False)[0]), 2)
+        self.age()
+        self.read()
         self.add(3)
-        self.assertEqual(len(self.read(tally=False)), 3)  # a writer never reads the memo
-        self.assertEqual(len(self.read()), 3)
+        self.assertEqual(len(self.read(tally=False)[0]), 3)  # a writer never reads the memo
+        self.assertEqual(len(self.read()[0]), 3)
 
     def test_unchanged_file_is_parsed_once(self):
         for i in range(5):
             self.add(i)
         self.age()
-        real = json.loads
-        with mock.patch.object(ah.json, "loads", side_effect=real) as spy:
-            for _ in range(4):
-                self.assertEqual(len(self.read()), 5)
-        self.assertEqual(spy.call_count, 5)
-
-    def age(self, secs=10):
-        old = time.time() - secs
-        os.utime(self.path, (old, old))
+        counts = [self.read()[2] for _ in range(4)]
+        self.assertEqual(counts, [5, 0, 0, 0])
 
     def test_a_just_written_file_is_not_served_from_the_memo(self):
         """Racy-timestamp control: parsed within the timestamp granularity of its last write, so re-read next time."""
         self.add(1)
-        real = json.loads
-        with mock.patch.object(ah.json, "loads", side_effect=real) as spy:
-            self.read()
-            self.read()
-        self.assertEqual(spy.call_count, 2)
+        self.assertEqual([self.read()[2], self.read()[2]], [1, 1])
 
     def test_same_size_rewrite_of_a_settled_file_is_not_served_stale(self):
         self.add(1)
-        self.age()
-        self.assertEqual(self.read()[0]["args"]["n"], 1)
+        self.assertEqual(self.prime()[0][0]["args"]["n"], 1)
         self.path.write_text(self.path.read_text().replace('"n": 1', '"n": 9'))
-        self.assertEqual(self.read()[0]["args"]["n"], 9)
+        self.assertEqual(self.read()[0][0]["args"]["n"], 9)
 
-    def test_same_size_rewrite_is_not_served_stale(self):
-        self.add(1)
-        self.assertEqual(self.read()[0]["args"]["n"], 1)
-        data = self.path.read_text().replace('"n": 1', '"n": 9')
-        self.path.write_text(data)  # same length, new inode content and mtime
-        self.assertEqual(self.read()[0]["args"]["n"], 9)
-
-    def test_torn_line_is_replayed_into_the_tally(self):
+    def test_memo_hit_replays_the_same_tally_as_a_parse(self):
+        """A bad line that is not at the tail counts as one skipped line; a memo hit reports exactly what a parse did."""
         self.add(1)
         with open(self.path, "a") as f:
             f.write("{torn\n")
-        t1, t2 = ah.ReadTally(), ah.ReadTally()
-        ah._ledger(self.home, tally=t1)
-        ah._ledger(self.home, tally=t2)  # from the memo
-        self.assertEqual((t1.skipped, t1.read_ok), (t2.skipped, t2.read_ok))
-        self.assertGreaterEqual(t1.skipped, 0)
+        self.add(2)
+        self.age()
+        _, parsed_tally, parsed = self.read()
+        _, hit_tally, hit_parses = self.read()
+        self.assertGreater(parsed, 0)
+        self.assertEqual(hit_parses, 0)  # the second read is a memo hit
+        self.assertEqual(parsed_tally.skipped, 1)
+        self.assertEqual((hit_tally.skipped, hit_tally.read_ok), (parsed_tally.skipped, parsed_tally.read_ok))
+        self.assertEqual(hit_tally.unread, parsed_tally.unread)
+
+    def test_non_dict_row_is_replayed_as_skipped(self):
+        self.add(1)
+        with open(self.path, "a") as f:
+            f.write("[1, 2]\n")
+        self.age()
+        _, parsed_tally, _ = self.read()
+        _, hit_tally, hit_parses = self.read()
+        self.assertEqual(hit_parses, 0)
+        self.assertEqual((parsed_tally.skipped, hit_tally.skipped), (1, 1))
 
     def test_returned_list_is_a_copy(self):
         self.add(1)
-        self.read().clear()
-        self.assertEqual(len(self.read()), 1)
+        self.prime()
+        rows, _, parsed = self.read()
+        self.assertEqual(parsed, 0)  # this is a memo hit
+        rows.clear()
+        again, _, parsed = self.read()
+        self.assertEqual((len(again), parsed), (1, 0))  # still a memo hit, and still whole
 
 
 # ---------------------------------------------------------------- ops_watch
