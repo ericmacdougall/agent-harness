@@ -3558,8 +3558,15 @@ def build_parser():
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
     u.add_argument("--recent", type=int)
     u.add_argument("--full", action="store_true")
-    ch = sub.add_parser("chat", help="read your own GoodQA chat (goodqa#16396); read only: `send` is deferred to goodqa#16399")
+    ch = sub.add_parser("chat", help="read your own GoodQA chat (goodqa#16396); `send`: one short DM, main agent only (goodqa#16399)")
     chs = ch.add_subparsers(dest="sub", required=True)
+    cs = chs.add_parser("send", help="send one short direct message as the user's bot (main agent only; never retried)")
+    cs.add_argument("--base", help="API base; must be the pinned GoodQA base")
+    cs.add_argument("--conversation", help="a one-to-one DM conversation id")
+    cs.add_argument("--with", dest="with_user", help="user id, or a member's exact name")
+    cs.add_argument("--org", help="organization id (default: org in browser-defaults.json)")
+    cs.add_argument("--text-file", dest="text_file", required=True, help="absolute path to the message text (at most 600 characters)")
+    cs.add_argument("--dry-run", action="store_true", help="print exactly what would be sent; reads no token, sends nothing")
     for name in ("probe", "conversations", "history", "files"):
         c = chs.add_parser(name)
         c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
@@ -3803,6 +3810,10 @@ def run(args, home: Path) -> dict:
     if cmd == "chat":
         import ah_chat  # noqa: PLC0415
         try:
+            if args.sub == "send":
+                import ah_chat_send  # noqa: PLC0415
+                return ah_chat_send.send(home, args.conversation, args.with_user, args.org, args.text_file, args.dry_run,
+                                         args.base)
             if args.sub == "probe":
                 return ah_chat.probe(args.base, args.token)
             if args.sub == "conversations":
@@ -3957,9 +3968,6 @@ def run(args, home: Path) -> dict:
     raise AhError("unknown_command", cmd)
 
 
-CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "
-                      "deferred to goodqa#16399, which needs a server delivery contract and server-side DM dedupe first. "
-                      "Nothing was read or sent.")
 CHAT_PARSE_REFUSED = ("ah chat: the arguments were not accepted. The rejected value is not shown, because it may hold a "
                       "credential. Run `ah chat <subcommand> -h` for the accepted options. Nothing was read or sent.")
 
@@ -4009,8 +4017,6 @@ def main(argv=None) -> int:
             return 4
         return guard_selftest.cli_main(given[1:])
     if _first_word(given) == "chat":
-        if _first_word(given[given.index("chat") + 1:]) == "send":  # goodqa#16396 ships read only: nothing is parsed,
-            return _refuse_chat("not_available", CHAT_SEND_DEFERRED)  # imported, read or sent
         args, stopped = _parse_chat(given)
         if args is None:
             return stopped

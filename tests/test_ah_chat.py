@@ -1,5 +1,5 @@
-"""ah chat (goodqa#16396): read the user's own GoodQA chat through two separate tokens. Read only: `send` is deferred to
-goodqa#16399 and must be refused before anything is read or sent.
+"""ah chat (goodqa#16396): read the user's own GoodQA chat through two separate tokens. `send` (goodqa#16399) is tested in
+tests/test_ah_chat_send.py.
 
 Every test runs the real `ah.py chat ...` CLI as a subprocess with HOME and AH_HOME in a temporary directory that holds two
 sentinel tokens (the user token and the dedicated dm-read token), against a loopback stub of the GoodQA MCP endpoint. The real
@@ -562,32 +562,6 @@ class SweepTests(Base):
         self.user_file.chmod(0o600)
         self.dm_file.chmod(0o644)
         self.assertEqual(self.code(self.ah("history", "--conversation", CONV)), "refused")  # its own file still must be private
-
-
-class SendDeferredTests(Base):
-    """PR 277 ships read only (main's scope decision after five review rounds on send): `ah chat send` is goodqa#16399."""
-
-    def test_send_is_refused_with_the_follow_up_ticket_and_nothing_is_read_or_sent(self):
-        body = self.home / "body.txt"
-        body.write_text("Thanks, noted.\n")
-        for argv in ((), ("--with", PEER, "--org", ORG, "--body-file", str(body), "--client-msg-id", "send-0001-aaaa"),
-                     ("--conversation", CONV, "--body-file", str(body), "--client-msg-id", "send-0002-bbbb",
-                      "--confirm-not-delivered"), ("--help",)):
-            p = self.ah("send", *argv)
-            data = json.loads(p.stdout)
-            self.assertEqual((data["ok"], data["code"]), (False, "not_available"), argv)
-            self.assertIn("goodqa#16399", data["message"])
-            self.assertEqual(p.returncode, 2, argv)
-            self.assert_no_token(p)
-        self.assertEqual(self.stub.hits, [])
-        self.assertEqual([x for x in self.home.rglob("*") if x.is_file() and "agent-harness" in str(x)], [])
-
-    def test_send_imports_neither_the_chat_module_nor_the_token_reader(self):
-        code = ("import sys; sys.path.insert(0, %r); import ah; rc = ah.main(['chat', 'send', '--with', %r]); "
-                "print(rc, 'ah_chat' in sys.modules, 'gq_browser' in sys.modules)" % (str(HOOKS), PEER))
-        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home)}
-        p = subprocess.run([sys.executable, "-I", "-c", code], env=env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(p.stdout.strip().splitlines()[-1], "2 False False", p.stderr[-300:])
 
 
 class ParseRefusalTests(Base):
