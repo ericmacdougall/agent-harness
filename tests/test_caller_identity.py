@@ -121,5 +121,122 @@ class Stamps(unittest.TestCase):
         self.assertIsNone(ci.take_stamp("ack-handoff", ["agent-1"], home=self.home))
 
 
+CALL = "toolu_01UNITCALL00000000000001"
+
+
+def started(call=CALL, **changes):
+    result = {"stdout": "", "stderr": "", "interrupted": False, "isImage": False, "noOutputExpected": False,
+              "backgroundTaskId": "b7f3k2q9x"}
+    result.update(changes)
+    block = {"tool_use_id": call, "type": "tool_result", "content": "started", "is_error": False}
+    return {"type": "user", "message": {"role": "user", "content": [block]}, "toolUseResult": result}
+
+
+class BoundStamps(unittest.TestCase):
+    """goodqa#16811 round 2 (F2): put_stamp says whether it bound the stamp, and a background stamp accepts only the
+    one "started in the background" record (the end-to-end cases are in test_review_stamp_lifetime)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.transcript = self.home / "main.jsonl"
+        self.transcript.write_text("{}\n")
+
+    def put(self, **kw):
+        kw.setdefault("tool_use_id", CALL)
+        kw.setdefault("transcript", str(self.transcript))
+        return ci.put_stamp("review-auth", ["o/r", 5], home=self.home, **kw)
+
+    def take(self):
+        return ci.take_stamp("review-auth", ["o/r", 5], home=self.home, bound=True, ttl=120)
+
+    def append(self, *records):
+        with open(str(self.transcript), "a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write((record if isinstance(record, str) else json.dumps(record)) + "\n")
+
+    def test_put_stamp_reports_whether_it_bound(self):
+        self.assertTrue(self.put())
+        self.assertFalse(self.put(tool_use_id=None))
+        self.assertFalse(self.put(transcript=str(self.home / "missing.jsonl")))
+        self.assertTrue(self.put(transcript=self.transcript), "a path object is accepted")
+
+    def test_require_bound_writes_nothing_it_cannot_bind(self):
+        for kw in ({"tool_use_id": None}, {"tool_use_id": "bad id"}, {"transcript": None},
+                   {"transcript": str(self.home / "missing.jsonl")}, {"transcript": "a\x00b"}):
+            with self.subTest(kw=kw):
+                self.assertFalse(self.put(require_bound=True, **kw))
+                self.assertIsNone(ci.take_stamp("review-auth", ["o/r", 5], home=self.home), kw)
+
+    def test_background_is_recorded_only_on_a_bound_stamp(self):
+        self.put(background=True, tool_use_id=None)
+        self.assertNotIn("background", ci.take_stamp("review-auth", ["o/r", 5], home=self.home))
+        self.put(background=True)
+        self.assertIs(ci.take_stamp("review-auth", ["o/r", 5], home=self.home).get("background"), True)
+        self.put(background="yes")
+        self.assertNotIn("background", ci.take_stamp("review-auth", ["o/r", 5], home=self.home))
+
+    def test_a_foreground_stamp_treats_even_a_background_start_as_the_end(self):
+        # The foreground rule is unchanged: any record naming the call ends it.
+        self.put()
+        self.append(started())
+        self.assertIsNone(self.take())
+
+    def test_a_background_stamp_accepts_the_start_record_once(self):
+        self.put(background=True)
+        self.assertIsNotNone(self.take(), "control: nothing written yet")
+        self.put(background=True)
+        self.append(started())
+        self.assertIsNotNone(self.take(), "control: the start record")
+        self.assertIsNone(self.take(), "single use")
+
+    def test_neighbouring_records_end_a_background_call(self):
+        line = json.dumps(started())
+        torn = line[: line.index(CALL) + len(CALL) + 8]
+        cases = {
+            "error result": dict(started(), message={"role": "user", "content": [
+                {"tool_use_id": CALL, "type": "tool_result", "content": "denied", "is_error": True}]}),
+            "no is_error field": dict(started(), message={"role": "user", "content": [
+                {"tool_use_id": CALL, "type": "tool_result", "content": "started"}]}),
+            "a second content block": dict(started(), message={"role": "user", "content": [
+                started()["message"]["content"][0], {"type": "text", "text": "more"}]}),
+            "string result": dict(started(), toolUseResult="User rejected tool use"),
+            "empty task id": started(backgroundTaskId=""),
+            "numeric task id": started(backgroundTaskId=7),
+            "interrupted": started(interrupted=True),
+            "system record": {"type": "system", "tool_use_id": CALL},
+            "a list, not an object": json.dumps([{"tool_use_id": CALL}]),
+            "torn line": torn,
+        }
+        self.assertIn('"tool_use_id": "%s"' % CALL, torn, "fixture: the torn line names the call")
+        for name, record in cases.items():
+            with self.subTest(name):
+                self.transcript.write_text("{}\n")
+                self.put(background=True)
+                self.append(record)
+                self.assertIsNone(self.take(), name)
+
+    def test_copy_records_are_skipped_only_for_a_background_stamp(self):
+        copy = {"type": "api-request-blob", "message": {"content": [{"tool_use_id": CALL, "type": "tool_result"}]}}
+        self.put(background=True)
+        self.append(started(), copy, dict(copy, type="data-flow-records"))
+        self.assertIsNotNone(self.take())
+        self.put()
+        self.append(copy)
+        self.assertIsNone(self.take(), "a foreground stamp still ends on any record naming the call")
+
+    def test_post_tool_use_keeps_only_a_background_stamp(self):
+        for background, event, kept in ((True, "PostToolUse", True), (True, "PostToolUseFailure", False),
+                                        (True, "PermissionDenied", False), (True, None, False),
+                                        (False, "PostToolUse", False)):
+            with self.subTest(background=background, event=event):
+                self.transcript.write_text("{}\n")
+                self.put(background=background)
+                ci.drop_tool_stamps(CALL, home=self.home, event=event)
+                found = ci.take_stamp("review-auth", ["o/r", 5], home=self.home)
+                self.assertEqual(found is not None, kept)
+
+
 if __name__ == "__main__":
     unittest.main()

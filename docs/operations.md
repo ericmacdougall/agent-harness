@@ -1479,6 +1479,17 @@ bound to main's tool call) that `mission_gate.py pretool` writes only when the P
   stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
   log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
   `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
+- The `review-auth` stamp (merge_gate's hook for main's bound `peer_review.py pr --github-repo --pr`) is bound the
+  same way since goodqa#16811 round 2: a payload without `tool_use_id` or a readable `transcript_path` mints none and
+  the hook says why, and `peer_review.py` honours a stamp only while that call is still running and at most 120 s
+  old. One exception: a review started with `run_in_background` gets its "started in the background" tool_result at
+  once, so its stamp is marked `background` and accepts exactly that one record (a `user` record whose only block is
+  the call's tool_result with `is_error` false and whose `toolUseResult.backgroundTaskId` is a non-empty string);
+  any other record naming the call ends it, and PostToolUse keeps such a stamp while PostToolUseFailure and
+  PermissionDenied still delete it. Not controlled, stated: any process that runs the same bound review while main's
+  call is live or waiting at a permission prompt is taken for main; a background stamp stays takable until it is
+  taken or 120 s pass even if main's process died first; and a Codex Desktop root's rollout never names a
+  `tool_use_id`, so for it only the 120 s window and single use bound the stamp.
 
 - The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
   `--flag value`), so it covers that one command and nothing else.

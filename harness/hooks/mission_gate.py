@@ -202,11 +202,13 @@ def cmd_posttool(payload: dict) -> dict:
     """PostToolUse / PostToolUseFailure / PermissionDenied (Bash): the call is over (ran, failed, or was refused), so
     any stamp still unconsumed for its tool_use_id is deleted (goodqa#15754 red-team F1). A stamp of a call denied by
     another PreToolUse hook or rejected at the prompt gets no Post event; take_stamp(bound=True) refuses it once the
-    refusal is in main's transcript. Never denies anything; a tool_use_id of another agent matches no stamp."""
-    if payload.get("tool_name") != "Bash" or payload.get("hook_event_name", POST_EVENTS[0]) not in POST_EVENTS:
+    refusal is in main's transcript. PostToolUse of a background launch fires at once, so it keeps that call's
+    background stamp (goodqa#16811 round 2). Never denies anything; a tool_use_id of another agent matches no stamp."""
+    event = payload.get("hook_event_name", POST_EVENTS[0])
+    if payload.get("tool_name") != "Bash" or event not in POST_EVENTS:
         return {}
     import caller_identity  # noqa: PLC0415
-    caller_identity.drop_tool_stamps(payload.get("tool_use_id"), home=home_dir())
+    caller_identity.drop_tool_stamps(payload.get("tool_use_id"), home=home_dir(), event=event)
     return {}
 
 

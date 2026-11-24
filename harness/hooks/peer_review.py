@@ -1852,11 +1852,17 @@ def _burn_review_stamp(argv) -> None:
             elif word.startswith(flag + '='):
                 found.setdefault(flag, word[len(flag) + 1:])
     try:
-        repo, number = found['--github-repo'], int(found['--pr'])
-        import caller_identity
-        caller_identity.take_stamp('review-auth', [repo, number], ttl=REVIEW_STAMP_TTL_SECONDS)
+        _take_review_stamp(found['--github-repo'], int(found['--pr']))
     except Exception:
         return
+
+
+def _take_review_stamp(repo, number):
+    """Main's review-auth stamp for this repo and PR (consumed), or None. The one take both call sites use
+    (goodqa#16811 round 2, F2): the stamp must be bound to main's tool call that is still running (a call another
+    hook denied, the user rejected or that failed to launch is over) and at most REVIEW_STAMP_TTL_SECONDS old."""
+    import caller_identity
+    return caller_identity.take_stamp('review-auth', [repo, number], ttl=REVIEW_STAMP_TTL_SECONDS, bound=True)
 
 
 def main() -> int:
@@ -1902,12 +1908,11 @@ def main() -> int:
         raise
     # goodqa#16811: take main's review-auth stamp before anything else can end the run, so a run that exits early (a
     # usage error, a HEAD mismatch, a dirty worktree) leaves no stamp for a later process to take; a stamp older than
-    # REVIEW_STAMP_TTL_SECONDS (the hook mints it as this very process launches) is never honoured.
+    # REVIEW_STAMP_TTL_SECONDS (the hook mints it as this very process launches) is never honoured, and neither is one
+    # whose tool call in main's transcript is already over (_take_review_stamp).
     args.main_stamp = None
     if args.github_repo is not None and args.pr is not None and not args.no_main_stamp:
-        import caller_identity
-        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr],
-                                                     ttl=REVIEW_STAMP_TTL_SECONDS)
+        args.main_stamp = _take_review_stamp(args.github_repo, args.pr)
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
     if (args.github_repo is None) != (args.pr is None):
@@ -1994,8 +1999,11 @@ def main() -> int:
                      "The merge-gate hook's own note gives the reason when it minted none: not the proven main agent, "
                      'not the Bash tool, not one plain python3 .../peer_review.py command (an unquoted ; & | < > or #, '
                      'a newline, a backslash, or a $ or backtick even inside double quotes), or a missing or repeated '
-                     '--github-repo/--pr. A stamp is also single use and is honoured only within %d s of the '
-                     'launch. ' % REVIEW_STAMP_TTL_SECONDS)
+                     '--github-repo/--pr, or a call without a tool_use_id or transcript to bind the stamp to. A '
+                     'stamp is also single use, is honoured only within %d s of the launch, and only while the '
+                     "main agent's call that launched this run is still running (another hook denied it, the "
+                     'permission prompt was rejected or the launch failed: the call is over). '
+                     % REVIEW_STAMP_TTL_SECONDS)
                   + 'Fix the cause and rerun once with --repeat-reason in single quotes, with no apostrophe inside.',
                   file=sys.stderr)
     if before[1]:

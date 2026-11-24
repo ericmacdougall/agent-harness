@@ -21,6 +21,7 @@ import merge_gate as mg  # noqa: E402
 import test_merge_gate as fixture  # noqa: E402
 
 SID = "11111111-2222-4333-8444-555555555555"
+CALL = "toolu_01QUOTEDREVIEW00000000001"
 HEAD = "a" * 40
 PREFIX = "python3 ~/.claude/hooks/peer_review.py pr --repo /w --packet /p --expected-head " + HEAD
 BOUND = PREFIX + " --github-repo o/r --pr 5"
@@ -43,7 +44,9 @@ class MainHome(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def payload(self, command, **extra):
-        return dict(fixture.bash(command), **{"session_id": SID, "transcript_path": self.transcript, **extra})
+        # a real main call carries its tool_use_id; the stamp is bound to it (goodqa#16811 round 2)
+        return dict(fixture.bash(command), **{"session_id": SID, "transcript_path": self.transcript,
+                                              "tool_use_id": CALL, "hook_event_name": "PreToolUse", **extra})
 
     def decide(self, command, notes=None, **extra):
         # `notes` is passed only when a test reads them, so the stamp assertions fail on their own merits on a base
@@ -198,6 +201,61 @@ class NoStampNote(MainHome):
                 code, out, _ = self.hook(command)
                 self.assertEqual(code, 0)
                 self.assertEqual(out, "")
+
+
+class StampBoundToTheCall(MainHome):
+    """Round 2 (F2): the stamp names main's call (tool_use_id, transcript, offset), so a call that never ran leaves
+    nothing a later process can take. Before this change the stamp was keyed by repo and PR alone."""
+
+    def test_the_stamp_records_mains_call(self):
+        self.decide(BOUND)
+        record = self.taken()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.get("tool_use_id"), CALL)
+        self.assertEqual(record.get("transcript"), self.transcript)
+        self.assertIsInstance(record.get("offset"), int)
+        self.assertNotIn("background", record)
+
+    def test_a_call_without_a_usable_tool_use_id_mints_nothing_and_says_why(self):
+        for value in (None, "", "short", 5, "toolu bad id", "x" * 200):
+            with self.subTest(tool_use_id=value):
+                notes = []
+                code, _ = self.decide(BOUND, notes, tool_use_id=value)
+                self.assertEqual(code, 0)
+                self.assertIsNone(self.taken(), value)
+                self.assertEqual(len(notes), 1, notes)
+                self.assertIn("no usable tool_use_id", notes[0])
+
+    def test_a_codex_root_without_a_readable_transcript_mints_nothing(self):
+        # The Codex Desktop root is proven by native_main, not by its transcript, so the path can be absent.
+        adapter = type("Native", (), {"is_desktop_review_root": staticmethod(lambda payload: True)})
+        for transcript in (None, "", str(Path(self.home) / "missing.jsonl")):
+            with self.subTest(transcript=transcript), mock.patch.dict(sys.modules, {"native_main": adapter}), \
+                    mock.patch.object(self.ci, "is_main", return_value=False):
+                notes = []
+                self.decide(BOUND, notes, transcript_path=transcript)
+                self.assertIsNone(self.taken())
+                self.assertEqual(len(notes), 1, notes)
+                self.assertIn("transcript_path is missing or unreadable", notes[0])
+
+    def test_a_codex_root_with_its_transcript_still_mints_a_bound_stamp(self):
+        # Control for the case above.
+        adapter = type("Native", (), {"is_desktop_review_root": staticmethod(lambda payload: True)})
+        rollout = Path(self.home) / ".codex" / "sessions" / "rollout.jsonl"
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}\n")
+        with mock.patch.dict(sys.modules, {"native_main": adapter}), \
+                mock.patch.object(self.ci, "is_main", return_value=False):
+            self.decide(BOUND, transcript_path=str(rollout))
+        self.assertEqual((self.taken() or {}).get("tool_use_id"), CALL)
+
+    def test_only_run_in_background_true_marks_a_background_stamp(self):
+        for value, marked in ((True, True), (False, False), ("true", False), (1, False), (None, False)):
+            with self.subTest(run_in_background=value):
+                self.decide(BOUND, tool_input={"command": BOUND, "run_in_background": value})
+                record = self.taken()
+                self.assertIsNotNone(record)
+                self.assertEqual(record.get("background") is True, marked)
 
 
 PY = "python3 ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --github-repo o/r --pr 5 pr"

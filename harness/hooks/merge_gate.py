@@ -2187,8 +2187,19 @@ def _stamp_review(command, payload, now, launches=None, tool="Bash"):
                 return refused
         except Exception:
             return refused
-    caller_identity.put_stamp("review-auth", [binding["--github-repo"], int(binding["--pr"])],
-                              session=str(payload.get("session_id") or ""), now=now)
+    # goodqa#16811 round 2 (F2): the stamp is bound to this one call, so a call another hook denies, the user
+    # rejects or that fails to launch leaves nothing a later process can take (caller_identity.take_stamp(bound=True)).
+    tool_use_id, transcript = payload.get("tool_use_id"), payload.get("transcript_path")
+    if not isinstance(tool_use_id, str) or not caller_identity.TOOL_USE_ID.match(tool_use_id):
+        return _review_note("the call carries no usable tool_use_id, so a stamp cannot be bound to it")
+    tool_input = payload.get("tool_input")
+    background = isinstance(tool_input, dict) and tool_input.get("run_in_background") is True
+    if not caller_identity.put_stamp("review-auth", [binding["--github-repo"], int(binding["--pr"])],
+                                     session=str(payload.get("session_id") or ""), now=now,
+                                     tool_use_id=tool_use_id, transcript=transcript, background=background,
+                                     require_bound=True):
+        return _review_note("the calling session's transcript_path is missing or unreadable, so a stamp cannot be "
+                            "bound to this call")
     return None
 
 
