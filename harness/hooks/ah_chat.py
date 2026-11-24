@@ -1,4 +1,4 @@
-"""ah chat: read the user's own GoodQA chat through two separate tokens (goodqa#16396). READ ONLY.
+"""ah chat: read the user's own GoodQA chat through two separate tokens (goodqa#16396). This module is read only.
 
   ah chat probe [--token dm|user]                 what the endpoint says about the chat tools (names and parameter names only)
   ah chat conversations --org ID [--limit N] [--cursor C]   your direct and group-direct conversations, one page   (dm-read token)
@@ -6,8 +6,8 @@
   ah chat history --with USER_ID_OR_NAME [--org ID] [--limit N] [--no-text]    the DM with one person         (dm-read token)
   ah chat files   --conversation ID [--surface chat|issue|personal] [--offset N]   chat: the DM's files (dm-read token); issue, personal: file_list (user token)
 
-`ah chat send` is not in this build: ah.py answers it with a refusal before this module is imported, so it reads no token and
-makes no request. Sending is deferred to goodqa#16399 (it needs a server delivery contract and server-side DM dedupe).
+`ah chat send` lives in ah_chat_send.py (goodqa#16399): one short DM, main agent only, never retried. This module stays
+read only; send reuses its Client, base pin and screens.
 
 Two credentials, never mixed. Reading private messages needs the DEDICATED token in ~/.config/goodqa/dm-read-token (mode 0600;
 abilities read + chat.dm.read; minted by you in the GoodQA web app). a file_list of a non-DM surface and an explicit `probe --token user` use the user
@@ -315,7 +315,12 @@ class Client:
             code = err.get("code") if isinstance(err, dict) else None
             if code == "not_found":
                 raise ChatError("not_found", "GoodQA says not_found: no such conversation or user, or you are not a party to it", 3)
-            raise ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
+            refused = ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
+            refused.server_code = code if isinstance(code, str) and len(code) <= 64 else None  # send decides on it
+            details = err.get("details") if isinstance(err, dict) and isinstance(err.get("details"), dict) else {}
+            # the user-token approval gate names the permit it minted (an id; consuming it still needs the token)
+            refused.approval_id = details.get("approvalId") if _is_uuid(details.get("approvalId")) else None
+            raise refused
         return inner
 
 

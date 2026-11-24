@@ -41,7 +41,10 @@ DEFAULT_POLICY = {
     },
     'snapshot_timeout': {'base_seconds': 1800, 'per_gib_seconds': 60, 'max_seconds': SNAPSHOT_MAX},
     'usage_limit_phrases': ['hit your usage limit', 'usage limit reached', 'reached your usage limit',
-                            'exceeded your usage limit', "you've hit your limit"],
+                            'exceeded your usage limit', "you've hit your limit",
+                            # goodqa#16811: Claude's subscription wording ("You've hit your weekly limit · resets ...")
+                            'hit your weekly limit', 'weekly limit reached', 'hit your session limit',
+                            'session limit reached'],
 }
 
 NATIVE_EVIDENCE = ('Native evidence: if you continue without a helper receipt, record the native review as '
@@ -71,6 +74,15 @@ CONTRACT = {
                            ['Inspect the local run receipt and provider-pool reservation or cooldown. Reconcile only with the required ownership evidence; do not retry unchanged.']),
     'REVIEW_LAUNCH_UNCONFIRMED': ('UNKNOWN', 'No reviewer exit status was recorded; a provider process may have started. This does not establish a provider outage.',
                                 ['Inspect the run and child records and reconcile uncertain process ownership before any retry. Do not assume best-effort cleanup succeeded.']),
+    'REVIEW_REPEAT_REQUIRED': ('BUDGET_EXHAUSTED', 'An earlier attempt of this exact invocation (same packet, commit, '
+                               'reviewer and policy) already counts, so the usage guard refuses an unchanged rerun. '
+                               'Attempts that provably did no provider work are not counted.',
+                               ['Read the Detail line: it names the counted run and how it ended.',
+                                "If one rerun is justified, run the same command once more with --repeat-reason "
+                                "'<why, in plain words>' in single quotes (no apostrophe, $, backtick, backslash or newline); "
+                                'only one declared repeat is allowed per invocation.',
+                                'If the declared repeat is already used, change the packet (new evidence or a new '
+                                'commit) instead of rerunning; do not loop.']),
     'BUDGET_EXHAUSTED': ('BUDGET_EXHAUSTED', 'The 1440 second review budget (720 per provider) was used up.',
                          ['Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified.']),
     'PROVIDER_TIMEOUT': ('TIMEOUT', 'The provider exceeded its 720 second deadline.',
@@ -451,6 +463,7 @@ def classify_isolation_error(error):
         (r'gitlinks', 'SNAPSHOT_GITLINK'),
         (r'source changed|worktree changed during|HEAD or worktree changed', 'SNAPSHOT_SOURCE_CHANGED'),
         (r'isolated Git operation failed', 'SNAPSHOT_GIT_FAILED'),
+        (r'^Identical invocation already reserved', 'REVIEW_REPEAT_REQUIRED'),
     )
     if isinstance(error, TimeoutError) or type(error).__name__ == 'TimeoutExpired':
         return diagnostic('SNAPSHOT_TIMEOUT', detail=text)
@@ -463,6 +476,7 @@ def classify_isolation_error(error):
 PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHAUSTED': 'BUDGET_EXHAUSTED', 'QUOTA': 'PROVIDER_USAGE_LIMIT', 'AUTH': 'PROVIDER_AUTH', 'TIMEOUT': 'PROVIDER_TIMEOUT',
                          'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT',
                          'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE'}
+RESET_MARK = '; the provider says its usage limit resets '
 
 
 def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, launch_state=None, local_detail=''):
@@ -483,13 +497,31 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, lau
         return {**diagnostic(code_name, provider=provider, detail=detail), 'reason': typed_reason}
     if reason in ('NONE', 'CODE_FINDINGS'):
         return None
+    detail = 'exit code %s' % code
+    if reason == 'QUOTA' and isinstance(outcome.get('reset_hint'), str):
+        # goodqa#16811: show when the limit resets on the first failure, so owners stop instead of retrying.
+        detail += RESET_MARK + sanitize(outcome['reset_hint'], 80)
     return diagnostic(PROVIDER_REASON_CODES.get(reason, 'PROVIDER_INVALID_OUTPUT'), provider=provider,
-                      exit_code=code, detail='exit code %s' % code,
-                      excerpt=(stderr or '') + ' ' + (stdout or ''))
+                      exit_code=code, detail=detail, excerpt=(stderr or '') + ' ' + (stdout or ''))
 
 
 def final_diagnostic(attempts, error, outcome_reason=None):
-    """Pick the diagnostic to print for a failed review."""
+    """Pick the diagnostic to print for a failed review. goodqa#16811: when an earlier provider hit a usage limit
+    and named its reset time, the chosen diagnostic keeps that time on its Detail line even when a later attempt
+    failed some other way, so the owner still learns when to come back."""
+    chosen = _final_diagnostic(attempts, error, outcome_reason)
+    earlier = [attempt for attempt in (attempts or [])[:-1]
+               if attempt and RESET_MARK in (attempt.get('detail') or '')]
+    if chosen is None or not earlier:
+        return chosen
+    notes = '; '.join('earlier %s usage limit resets %s' % (attempt.get('provider') or 'provider',
+                                                             attempt['detail'].split(RESET_MARK, 1)[1])
+                      for attempt in earlier)
+    detail = chosen.get('detail') or ''
+    return {**chosen, 'detail': sanitize((detail + '; ' if detail else '') + notes, 600)}
+
+
+def _final_diagnostic(attempts, error, outcome_reason=None):
     if error is not None and not attempts:
         return classify_isolation_error(error)
     if attempts:
@@ -534,6 +566,19 @@ def usage_limit_prose(message, policy=None):
     text = message.replace('’', "'").replace('‘', "'").lower()
     phrases = (policy or DEFAULT_POLICY)['usage_limit_phrases']
     return any(phrase in text for phrase in phrases)
+
+
+_RESET = re.compile(r'\bresets?\b[ \t:]+([^\n]{1,80})', re.IGNORECASE)
+
+
+def usage_limit_reset_hint(message):
+    """The provider's own reset wording after "resets" ("Nov 29 at 6pm (America/Denver)"), sanitized and bounded, or
+    None. Display text only: nothing parses it into a time."""
+    if not isinstance(message, str) or len(message) > 4096:
+        return None
+    match = _RESET.search(message)
+    hint = sanitize(match[1].strip(), 80) if match else ''
+    return hint or None
 
 
 # ---------------------------------------------------------------- packet lint
