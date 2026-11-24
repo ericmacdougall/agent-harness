@@ -1117,13 +1117,30 @@ def egress_check(cfg, repo, ref, files, message):
             got = None
         if want is None or got != want:
             bad.setdefault(where, set()).add('unverified-blob')
-    batch = b'\n'.join(lines) + b'\n'
-    for kind, line in scan_bytes(cfg, batch):
+    # pass 2 per item (it is a per-record verifier), gitleaks once over the batch (one process per commit)
+    tr = redact_mod()
+    start = 0
+    for where, group in _runs(owner):
+        for kind, _ in tr.verify_bytes(b''.join(x + b'\n' for x in lines[start:start + group])):
+            bad.setdefault(where, set()).add(kind)
+        start += group
+    for kind, line in gitleaks_scan(cfg, b''.join(x + b'\n' for x in lines)):
         if 1 <= line <= len(owner):
             bad.setdefault(owner[line - 1], set()).add(kind)
         else:
             bad.setdefault('batch', set()).add(kind)
     return sorted((w, sorted(k)) for w, k in bad.items())
+
+
+def _runs(owner):
+    """Consecutive runs of the same owner -> [(owner, length)]."""
+    out = []
+    for w in owner:
+        if out and out[-1][0] == w:
+            out[-1][1] += 1
+        else:
+            out.append([w, 1])
+    return [tuple(x) for x in out]
 
 
 def egress_refusal(failures):
@@ -1830,7 +1847,8 @@ class Run:
                     why = 'ruleset'
                 else:
                     # the pre-push rescan: pass 2 and gitleaks over the decompressed chunk and its sidecar
-                    hits = scan_bytes(self.cfg, data + b'\n' + meta_b)
+                    data_hits = scan_bytes(self.cfg, data)
+                    hits = data_hits + scan_bytes(self.cfg, meta_b)
                     if hits:
                         why = 'scanner'
         except (OSError, ValueError):
@@ -1840,9 +1858,9 @@ class Run:
             return zp, meta_b  # pushed from the outbox file: one chunk in memory at a time
         if why == 'scanner':
             # a hit that survived redaction: the whole file is held back and listed, never pushed (goodqa#17119)
-            first = sorted(hits, key=lambda h: h[1])[0]
             rules = sorted({k for k, _ in hits})
-            line = c.get('line_start', 1) + first[1] - 1 if first[1] <= c.get('records', 0) else None  # source line
+            first = min((h[1] for h in data_hits), default=None)  # a sidecar-only hit has no source line
+            line = c.get('line_start', 1) + first - 1 if first and first <= c.get('records', 0) else None
             self.rollback(e, g, i, why)
             hold(self.cfg, e, 'scanner:' + ','.join(rules)[:80], line)
             alert(self.cfg, 'scanner-hit', 'file %s held: %d pre-push scanner hit(s) (%s)' % (
