@@ -322,6 +322,22 @@ class ScpCopies(BelowTheFloor):
         with mock.patch.object(tc, "free_bytes", side_effect=free):
             self.assertEqual(self.pretool("scp -r devbox:/srv/x /w/dst -P 2222 2>/dev/null"), (0, ""))
 
+    def test_a_refused_transfer_names_the_alternatives(self):
+        """goodqa#17106 (main's ruling): a pull refused below the floor says where it can go instead."""
+        for line in SCP_LOCAL + LOCAL_DESTINATIONS:
+            with self.subTest(line=line):
+                code, err = self.pretool(line)
+                self.assertEqual(code, 2)
+                self.assertIn("copy it to a host with room instead", err)
+                self.assertIn("t2-dev", err)
+                self.assertIn("free space on this volume", err)
+        for line in ("cp -r src /w/dst", "git clone https://example.invalid/r.git /w/r", "ditto src /w/dst",
+                     "cd . && git clone https://example.invalid/r.git /w/r && rsync -a src devbox:/srv/x"):
+            with self.subTest(line=line):
+                code, err = self.pretool(line)
+                self.assertEqual(code, 2)
+                self.assertNotIn("t2-dev", err)
+
 
 SHELLS =[s for s in ("zsh", "bash") if shutil.which(s)]
 

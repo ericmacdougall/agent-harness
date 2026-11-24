@@ -84,7 +84,14 @@ MUTANTS = {
     "the scp volume is read from its last word": (
         "        return _operands(words, SCP_VALUE_SHORT, frozenset())[-1:]\n", "        return _dest(words)\n"),
     "the refusal does not name the copy": (
-        "low_disk_message(target, gb, fl, copy=_copy_verb(copying[0]))", "low_disk_message(target, gb, fl)"),
+        "low_disk_message(target, gb, fl, copy=_copy_verb(copying[0]), ", "low_disk_message(target, gb, fl, "),
+    "a refused transfer names no alternative": (
+        'transfer = any(os.path.basename(w[0]) in ("scp", "rsync") for w in copying)', "transfer = False"),
+    "every refused copy is told to move to t2-dev": (
+        'transfer = any(os.path.basename(w[0]) in ("scp", "rsync") for w in copying)', "transfer = True"),
+    "only scp is a transfer": (
+        'transfer = any(os.path.basename(w[0]) in ("scp", "rsync") for w in copying)',
+        'transfer = any(os.path.basename(w[0]) in ("scp",) for w in copying)'),
 }
 
 

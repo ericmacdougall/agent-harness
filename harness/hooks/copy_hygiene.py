@@ -255,12 +255,17 @@ def disk_low(path: str, cfg: dict) -> "tuple[bool, float, float]":
     return gb < fl, gb, fl
 
 
-def low_disk_message(path: str, free_gb: float, fl: float, copy: "str | None" = None) -> str:
+def low_disk_message(path: str, free_gb: float, fl: float, copy: "str | None" = None, transfer: bool = False) -> str:
     text = (f"DISK LOW: {free_gb:.1f} GB free on the volume holding {path} (floor {fl:.1f} GB). The harness refuses to "
             "create another copy. Reuse your PR's test copy with `python3 ~/.claude/hooks/copy_hygiene.py acquire "
             "--repo <checkout> --key pr-<N>`, and run `python3 ~/.claude/hooks/copy_hygiene.py reap` to list idle "
             "copies (removing them needs the owner's OK). Only the owner changes the floor (min_free_gb / min_free_pct in "
             "~/.agent-harness/state/copy-hygiene.json); do not lower it to get around this.")
+    if transfer:
+        # goodqa#17106: refusing a large pull onto a disk below its floor is the floor working; say where it can go.
+        text += (" This transfer writes onto this disk. To move the data anyway, copy it to a host with room instead "
+                 "(from the Mac: t2-dev, where heavy work runs; a host:path destination is not charged here), or free "
+                 "space on this volume first.")
     if copy:
         # goodqa#17112: a hook allows or refuses the whole command, so a record write chained to a copy is refused
         # with it; on its own it passes.
@@ -2488,7 +2493,8 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
             return 0, ""
         alert("disk-low-denied-copy", {"target": target[:200], "free_gb": round(gb, 2), "floor_gb": round(fl, 2),
                                        "command": os.path.basename(copying[0][0])})
-        return 2, low_disk_message(target, gb, fl, copy=_copy_verb(copying[0])) + "\n"
+        transfer = any(os.path.basename(w[0]) in ("scp", "rsync") for w in copying)
+        return 2, low_disk_message(target, gb, fl, copy=_copy_verb(copying[0]), transfer=transfer) + "\n"
     except Exception:          # noqa: BLE001 -- fail open
         return 0, ""
 
