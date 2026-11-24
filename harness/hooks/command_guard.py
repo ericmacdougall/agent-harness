@@ -1343,7 +1343,33 @@ WAL_IN_OUT = frozenset({'uniq', 'xxd'})
 WAL_JUDGED_ELSEWHERE = frozenset({'cp', 'rsync', 'scp', 'tee', 'dd', 'install', 'mv', 'rm', 'truncate', 'ln', 'touch',
                                   'sponge', 'unzip', 'ssh', 'mosh', 'ah', 'wal_note.py', 'cd', 'pushd', 'chdir',
                                   'set-location', 'sl', 'add-content', 'ac'})
-SED_WRITE = re.compile(r'(?:^|[;{}\n])\s*(?:\d+|\$|/[^/]*/)?(?:,\s*(?:\d+|\$|/[^/]*/))?\s*!?\s*[wW]\s|/[gpIiMme0-9]*w\s')
+# programs that run a command given as text or trailing words (Analyzer.launcher), and the user switchers that
+# Analyzer.wrapper unwraps besides WRAPPERS_SIMPLE
+LAUNCHER_PROGRAMS = frozenset({'flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'})
+SWITCH_USER = frozenset({'su', 'sg', 'runuser'})
+CONTAINER_CLIS = frozenset({'docker', 'podman', 'nerdctl', 'kubectl', 'oc'})
+# goodqa#17008: every program that runs another command, classified for the WAL operand rule. Only a quiet launcher
+# leaves a WAL path among its words to the command it runs: none of its own options writes a named file or moves the
+# command to another directory or root. Any other launcher may write an output, log, trace or lock file, edit a file,
+# mount a path, or change directory or root through an option, so a WAL path anywhere in its words (or a working
+# directory in the tree) is refused. tests/test_wal_write_guard.py fails when a program that runs another command is
+# missing here.
+WAL_QUIET, WAL_MAY_WRITE = 'quiet', 'may-write'
+WAL_LAUNCHER_CLASS = dict(
+    # their own options are numbers, names, modes, signals, users, environment, or a file they only read
+    {n: WAL_QUIET for n in ('command', 'builtin', 'exec', 'noglob', 'nice', 'ionice', 'chrt', 'taskset', 'setsid',
+                            'stdbuf', 'caffeinate', 'unbuffer', 'timeout', 'watch', 'arch', 'xargs', 'su', 'sg',
+                            'runuser', 'gosu', 'sshpass',
+                            'env',     # -C/--chdir is applied as a cd, which the working-directory rule judges
+                            'nohup')},  # nohup.out lands in the working directory, judged below
+    # an output, log, trace or lock file (time -o, script, strace -o, flock), an edit mode (sudo -e), a chdir or
+    # chroot (sudo -D, nsenter, unshare, chroot), a mount or copy (containers), a scheduler or terminal multiplexer
+    **{n: WAL_MAY_WRITE for n in ('time', 'sudo', 'doas', 'chroot', 'nsenter', 'unshare', 'firejail', 'sandbox-exec',
+                                  'strace', 'ltrace', 'dtruss', 'script', 'flock', 'parallel', 'tmux', 'screen',
+                                  'osascript', 'at', 'batch', 'start-process', 'start', 'call', 'invoke-expression',
+                                  'iex', 'invoke-command', 'icm', 'pwsh', 'powershell', 'docker', 'podman',
+                                  'nerdctl', 'kubectl', 'oc')})
+SED_WRITE =re.compile(r'(?:^|[;{}\n])\s*(?:\d+|\$|/[^/]*/)?(?:,\s*(?:\d+|\$|/[^/]*/))?\s*!?\s*[wW]\s|/[gpIiMme0-9]*w\s')
 AWK_WRITE = re.compile(r'\bprintf?\b[^;}]*(?:>|\|)|\bsystem\s*\(|\|\s*getline|\bclose\s*\(')
 TAR_WRITE_MODE = re.compile(r'^-?[A-Za-z]*[xurA]|^--(?:extract|get|update|append|delete|concatenate|catenate)\b')
 COMPRESS_CMDS = frozenset({'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz', 'zstd', 'unzstd', 'lz4', 'brotli'})
@@ -4952,7 +4978,7 @@ class Analyzer:
         if '/' in name or '/' in words[0].text:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
             self.script_file(words[0], depth, require_shell=True, invocation=words, command=cmd)
-        if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
+        if name in LAUNCHER_PROGRAMS:
             if self.launcher(name, args, depth, pl, idx):
                 return
         if name == 'busybox' and args and not args[0].text.startswith('-') \
@@ -5002,7 +5028,7 @@ class Analyzer:
         if name == 'goodqa':
             self.goodqa(args, depth, pl, idx)
             return
-        if name in WRAPPERS_SIMPLE or name in ('su', 'sg', 'runuser'):
+        if name in WRAPPERS_SIMPLE or name in SWITCH_USER:
             self.wrapper(name, args, depth, pl, idx)
             return
         if name == 'find':
@@ -8181,15 +8207,26 @@ class Analyzer:
                                'them' % t)
                         return
             return
-        if name in ('docker', 'podman', 'nerdctl', 'kubectl', 'oc') and args and args[0].text == 'cp':
+        if name in CONTAINER_CLIS and args and args[0].text == 'cp':
             if len(nd) >= 3 and self._wal_hit(nd[-1]):
                 refuse('%s cp copies into the session WALs' % name)
             return
-        if name in WAL_JUDGED_ELSEWHERE or name in LAUNCHERS or name in WRAPPERS_SIMPLE or name in SHELLS \
-                or name in PS_SHELLS or name in ('docker', 'podman', 'nerdctl', 'kubectl', 'oc') \
-                or self._is_script(name, words):
-            return  # judged elsewhere, or a script on disk (an accepted limit: its source is not read)
         here = self._cwd_in_tree()  # a relative name in a program's text lands in the tree
+        launcher = WAL_LAUNCHER_CLASS.get(name)
+        if launcher == WAL_MAY_WRITE:
+            # a path inside an option's text counts too (a mount's `src=DIR`, a log option's value)
+            if here or any(self._wal_hit(a) or self._names_wal_tree(a.raw or a.text) for a in args):
+                self._wal_forgery('%s is given a path in the session WALs, or runs there, and its own options may '
+                                  'write a file or move the command into them' % name[:40],
+                                  route='run the inner command without %s; the command on its own is judged, and a '
+                                        'read of a WAL is allowed' % name[:40])
+            return
+        if launcher == WAL_QUIET:
+            if name == 'nohup' and here:
+                refuse('nohup writes nohup.out into the working directory, which is in the session WALs')
+            return  # the command it runs is judged on its own
+        if name in WAL_JUDGED_ELSEWHERE or name in SHELLS or self._is_script(name, words):
+            return  # judged elsewhere, or a script on disk (an accepted limit: its source is not read)
         if name in ('awk', 'gawk', 'mawk', 'nawk'):
             texts = [a.text for a in args]
             if '-f' in texts or any(t.startswith('--file') for t in texts):
@@ -8216,7 +8253,9 @@ class Analyzer:
             refuse('file -C writes a compiled magic file into the session WALs')
             return
         hits = [a for a in args if self._wal_hit(a)]
-        if not hits:
+        # a word that is not a path but names the tree in its text (shell text an unknown program may run, `-c '...'`)
+        # brings the program under the rule too; the branches below that prove a read still return
+        if not hits and not any(self._names_wal_tree(a.raw or a.text) for a in args):
             return
         texts = [a.text for a in args]
         if name in INTERPRETERS:
@@ -8285,16 +8324,18 @@ class Analyzer:
         self.ctx.add(LOG_DELETE, 'wal-actor', '%s aimed at a WAL this caller may not write: %s' % (tool[:40], why),
                      ('use --wal %s' % mine) if mine else 'run it from main, or record the row in your own WAL')
 
-    def _wal_forgery(self, what):
+    def _wal_forgery(self, what, route=None):
         """goodqa#17008: a row in main.jsonl is read as main's (provenance, the chat-send allow-list, grants), so no
-        shell route writes the WAL tree; the sanctioned writer is wal_note.py, aimed at the caller's own WAL."""
+        shell route writes the WAL tree; the sanctioned writer is wal_note.py, aimed at the caller's own WAL. `route`
+        names the working alternative first when the refusal has a narrower one (a launcher around a read)."""
         if any(getattr(f, 'rule', None) == 'wal-forgery' for f in self.ctx.findings):
             return  # one refusal per command: several rules may see the same write
         caller = getattr(self.c, 'caller', None) or {}
         mine = wal_paths.own_wal(caller['session'], caller['agent']) if caller.get('kind') == 'agent' else None
+        note = 'record a row with python3 ~/.claude/hooks/wal_note.py --wal %s --event <event> --note <text>' \
+            % (mine or '<your WAL>')
         self.ctx.add(LOG_DELETE, 'wal-forgery', what + ' (main reads its rows as main\'s own)',
-                     'record a row with python3 ~/.claude/hooks/wal_note.py --wal %s --event <event> --note <text>'
-                     % (mine or '<your WAL>'))
+                     route + '; to write a row, ' + note if route else note)
 
     def destructive(self, name, args, texts):
         ctx = self.ctx

@@ -102,6 +102,14 @@ WRITES = [
     # future target
     'ln -sfn {d}/../../plugins /tmp/cg-q && echo x >> /tmp/cg-q/../wals/{session}/{name}',
     'mkdir -p /tmp/cg-r && ln -sfn {d}/../../plugins /tmp/cg-r/s && cat /tmp/x >> /tmp/cg-r/s/../wals/{session}/{name}',
+    # stand-alone rebase (self-found): a launcher whose own option or operand writes a named file, edits it, or
+    # moves the command into the tree; the command it runs is harmless, so only the launcher's own words write
+    'script -q -a {w} -c true', 'script -q {w} true', 'strace -o {w} true', 'strace -e trace=none -o {w} true',
+    'ltrace -o {w} true', 'flock {d}/x.lock true', 'firejail --output={w} true', 'sudo -e {w}',
+    'sudo -D {d} tee -a {name} < /tmp/x', 'env -C {d} tee -a {name} < /tmp/x', 'command time -o {w} true',
+    '/usr/bin/time -a -o {w} true', 'parallel --joblog {w} true ::: 1', 'screen -L -Logfile {w} -dm true',
+    'docker run -v {d}:/w alpine true', 'podman run --mount type=bind,src={d},dst=/w alpine true',
+    'cd {d} && script -q -c true', 'cd {d} && nohup true',
 ]
 READS = [
     'cat {w}', 'tail -n 5 {w}', 'jq . {w}', 'grep -c x {w}', 'wc -l < {w}', 'ls -la {d}',
@@ -127,6 +135,10 @@ READS = [
     "cat {w} | python3 -c \"import json, sys, time; json.dump({{'n': sum(1 for _ in sys.stdin), 't': time.time()}}, "
     "open('/tmp/cg-sum.json', 'w'))\"",
     "python3 -c \"from pathlib import Path; print(len(Path('{w}').read_text().splitlines()))\"",
+    # a quiet launcher leaves the WAL path to the read it runs
+    'timeout 5 tail -n 5 {w}', 'nice -n 5 cat {w}', 'env LC_ALL=C grep -c x {w}', 'nohup wc -l {w}',
+    'stdbuf -oL tail -n 1 {w}', 'ionice -c 3 sha256sum {w}', 'command jq . {w}', 'exec cat {w}',
+    'docker cp {w} c:/tmp/wal.jsonl',
 ]
 
 
@@ -476,6 +488,42 @@ class EveryWalTool(Case):
             if 'wal-actor' not in self.decide(command, agent)[1]:
                 wrong.append((tool, option))
         self.assertEqual(wrong, [])
+
+
+class EveryLauncher(Case):
+    """A program that runs another command leaves a WAL path among its words to that command only when it is
+    classified quiet (WAL_LAUNCHER_CLASS); a new launcher fails here until it is classified."""
+
+    def launchers(self):
+        names = set(cg.WRAPPERS_SIMPLE) | cg.LAUNCHER_PROGRAMS | cg.SWITCH_USER | cg.CONTAINER_CLIS \
+            | set(cg.PS_SHELLS)
+        for table in ('LAUNCHERS',):  # the per-program launcher table, where one exists
+            names |= set(getattr(cg, table, None) or ())
+        return names
+
+    def test_every_launcher_is_classified(self):
+        self.assertGreater(len(self.launchers()), 40)
+        self.assertEqual(sorted(self.launchers() - set(cg.WAL_LAUNCHER_CLASS)), [])
+        self.assertEqual(set(cg.WAL_LAUNCHER_CLASS.values()), {cg.WAL_QUIET, cg.WAL_MAY_WRITE})
+
+    def test_a_launcher_that_may_write_is_refused_on_any_wal_word_and_names_the_route(self):
+        missed = []
+        for name in sorted(n for n, k in cg.WAL_LAUNCHER_CLASS.items() if k == cg.WAL_MAY_WRITE):
+            lead = 'command ' if name == 'time' else ''  # a bare `time` is the shell keyword, which takes only -p
+            for row in (lead + '%s {w}' % name, lead + '%s -x {w} true' % name, lead + '%s --opt={w} true' % name):
+                verdict, message = self.decide(self.fill(row, self.main))
+                if verdict != 'block' or 'wal-forgery' not in message or 'without %s' % name not in message:
+                    missed.append((row, verdict, message[:100]))
+        self.assertEqual(missed, [])
+
+    def test_a_quiet_launcher_around_a_write_is_still_refused(self):
+        for name in sorted(n for n, k in cg.WAL_LAUNCHER_CLASS.items() if k == cg.WAL_QUIET):
+            row = '%s tee -a {w} < /tmp/x' % name
+            if name in ('timeout', 'nice', 'ionice', 'chrt', 'taskset', 'su', 'sg', 'runuser', 'gosu', 'sshpass',
+                        'xargs', 'watch', 'arch', 'unbuffer', 'caffeinate', 'stdbuf'):
+                continue  # these need their own operand first; WRITES and READS hold their real shapes
+            verdict, message = self.decide(self.fill(row, self.main))
+            self.assertEqual(verdict, 'block', row)
 
 
 class FileTools(Case):
