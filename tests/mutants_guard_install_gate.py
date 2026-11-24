@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 AI = "harness/hooks/ah_install.py"
 GF = "harness/hooks/guard_files.py"
-HP = "harness/hooks/human_proof.py"
+LC = "harness/hooks/launch_check.py"
 RR = "harness/hooks/release_receipt.py"
 MG = "harness/hooks/mission_gate.py"
 SUITES = ("tests.test_guard_install_gate",)
@@ -22,19 +22,33 @@ SUITES = ("tests.test_guard_install_gate",)
 VARIANTS = [
     # ah_install.guard_gate
     ("gate never consulted", AI,
-     '    gate = None if dry_run else guard_gate(host, ref, list(files), ticket, home, "install", allow_older)\n',
+     '    gate = None if dry_run else guard_gate(host, ref, list(files), ticket, home, "install", allow_older, allow_remote=allow_remote)\n',
      "    gate = None\n"),
-    ("human check skipped", AI, "    why_not_human = human_proof.refusal(PROOF_ENV)\n", "    why_not_human = None\n"),
+    ("launch check skipped", AI, "    reason, facts = launch_check.check(PROOF_ENV, allow_remote)\n",
+     "    reason, facts = None, {}\n"),
     ("agent may downgrade, resume or roll back", AI, '    if kind_ != "install" or allow_older:\n', "    if False:\n"),
     ("no stamp needed", AI,
      "                                  home=home, bound=True) is None:\n", "                                  home=home, bound=True) is None and False:\n"),
     ("stamp not bound to the call", AI, "                                  home=home, bound=True) is None:\n",
      "                                  home=home, bound=False) is None:\n"),
     ("receipt failure ignored", AI,
-     '        refuse("%s. %s. The user line: %s" % (head, error, user_line), "guard_file")\n', "        receipt = {}\n"),
+     '        refuse("%s. %s. %s." % (head, error, main_route), "guard_file", data={"ok": False, "launch_facts": facts})\n',
+     "        receipt = {}\n"),
     ("rollback ungated", AI,
-     '    gate = guard_gate(host, row.get("ref"), sorted(row["files"]), ticket, home, "rollback")\n', "    gate = None\n"),
+     '    gate = guard_gate(host, row.get("ref"), sorted(row["files"]), ticket, home, "rollback", forced=recorded_guard(row),\n'
+     '                      allow_remote=allow_remote)\n', "    gate = None\n"),
+    ("resume ungated before the fetch", AI,
+     '    gate = guard_gate(row["host"], row["ref"], sorted(row["files"]), ticket, home, "resume", forced=recorded_guard(row),\n'
+     '                      allow_remote=allow_remote)\n', "    gate = None\n"),
+    ("ref tree not gated", AI, "    if not dry_run and gate is None and ref_guard:\n", "    if False:\n"),
+    ("forced names dropped", AI, "    guard = sorted(set(guard_files.guard_subset(files, HOOKS_DIR)) | set(forced))\n",
+     "    guard = sorted(set(guard_files.guard_subset(files, HOOKS_DIR)))\n"),
+    ("pre-gate rows fail open", AI, '        return sorted(row.get("files") or ())\n', "        return []\n"),
     # guard_files
+    ("static names not starting points", GF,
+     "        roots |= {name for name in present if is_guard_file(name)}  # the static names are starting points too (F2)\n", ""),
+    ("odd manifest shape fails open", GF, "    if not found:\n", "    if False:\n"),
+    ("command_guard imports unlisted", GF, '    "safe_input.py", "redact.py", "shell_words.py", "shellwords.py",\n', ""),
     ("closure not used", GF, "    return sorted(b for b in bases if is_guard_file(b) or b in closure)\n",
      "    return sorted(b for b in bases if is_guard_file(b))\n"),
     ("named files not followed", GF, "    out = {w for w in WORD.findall(text) if w in present}\n", "    out = set()\n"),
@@ -45,14 +59,16 @@ VARIANTS = [
      '            raise Unreadable("%s: %s" % (name, type(error).__name__)) from None\n', "            continue\n"),
     ("data and run-by-name files unlisted", GF, '    "dropbox_budget.conf", "domain_checklists.json",\n',
      '    "domain_checklists.json",\n'),
-    # human_proof
-    ("no terminal needed", HP, "        if not env.stdin_is_tty():\n", "        if False:\n"),
-    ("agent variables ignored", HP, "        if marker:\n", "        if False:\n"),
-    ("agent ancestor ignored", HP, "        found = agent_ancestor(table, env.pid())\n", "        found = None\n"),
-    ("detached process passes", HP, "        if not interactive_ancestor(table, env.pid()):\n", "        if False:\n"),
-    ("process table error passes", HP,
-     '            return "the process table could not be read to prove that no agent is an ancestor"\n', "            table = {}\n"),
-    ("surprise fails open", HP, '        return "the human check failed (%s)" % type(error).__name__\n', "        return None\n"),
+    # launch_check
+    ("no terminal needed", LC, '        if not facts["stdin_tty"]:\n', "        if False:\n"),
+    ("agent variables ignored", LC, "        if marker:\n", "        if False:\n"),
+    ("agent ancestor ignored", LC, "        found = agent_ancestor(table, env.pid())\n", "        found = None\n"),
+    ("detached process passes", LC, "        if not root:\n", "        if False:\n"),
+    ("ssh or multiplexer passes", LC, "        if remote and not allow_remote:\n", "        if False:\n"),
+    ("process table error passes", LC,
+     '            return "the process table could not be read to check for an agent ancestor", facts\n', "            table = {}\n"),
+    ("surprise fails open", LC, '        return "the launch check failed (%s)" % type(error).__name__, facts\n',
+     "        return None, facts\n"),
     # release_receipt
     ("any merge commit counts", RR, 'if (pr.get("merged_at") and pr.get("merge_commit_sha") == ref and base.get("ref") == "main"',
      'if (pr.get("merged_at") and base.get("ref") == "main"'),

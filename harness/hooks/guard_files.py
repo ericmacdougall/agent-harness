@@ -1,17 +1,22 @@
 """The one list of guard files: hooks that check agent commands, the files they read or trust, and the code they load.
 
 goodqa#16944, PR 326a. `ah install-files` (ah_install.guard_gate) asks this module whether a file is a guard file; a
-guard file then needs the human branch (human_proof.py) or main's reviewed-release branch (release_receipt.py and a
-stamp mission_gate puts for main's own call, INSTALL_STAMP). The installers and repair_harness.py --apply do not ask
+guard file then needs the not-agent-launched branch (launch_check.py, a speed bump, not a boundary) or main's
+reviewed-release branch (release_receipt.py and a stamp mission_gate puts for main's own call, INSTALL_STAMP). The installers and repair_harness.py --apply do not ask
 yet: goodqa#17032, after the local target goodqa#17031.
 
 A file is a guard file when any of these holds:
   * its name is listed in GUARD_NAMES, or starts with a GUARD_PREFIXES entry, or is a policy JSON (`*_policy.json`);
-  * with the hooks directory given, it is in guard_closure(): the PreToolUse and Stop hooks hooks_manifest.json
-    registers, every harness module they import there, and every file in that directory a closure module names anywhere
+  * with a hooks directory given, it is in guard_closure() of that directory: the PreToolUse and Stop hooks
+    hooks_manifest.json registers and every listed or prefix-matched guard file present there (both are starting
+    points), every harness module they import there, and every file in that directory a closure module names anywhere
     in its text ("run_probe.py", "ahc_release.json", "dropbox_budget.conf", a by-path load), followed the same way. It
     is a text scan, not a parse, so a name in a comment or a dead string counts too.
-An unreadable manifest or closure module counts every name as a guard file (fail closed).
+An unreadable manifest, a manifest of an unexpected shape (not an object with a "hooks" list holding at least one
+PreToolUse or Stop row) or an unreadable closure module counts every name as a guard file (fail closed).
+The install route checks two trees: the hooks directory of the machine running it, before the fetch, and the
+`harness/hooks` tree of the ref being installed, after the fetch and before any remote write (guard_subset_trees), so a
+file that is a guard file only at the ref (version skew between the Mac and the target) is still gated.
 
 Over-inclusion is the intended failure: a file wrongly counted as a guard file costs one gated install; a guard file
 wrongly left out lets an agent change what checks it. tests/test_guard_install_gate.py fails when a registered PreToolUse or
@@ -34,18 +39,16 @@ GUARD_NAMES = frozenset({
     "dropbox_budget.conf", "domain_checklists.json",
     "run_probe.py", "run_capped.py", "bg_job.py", "deliver.py", "remote_delete.py", "remote_delete_agent.py",
     "installer_scan.py",
+    # what command_guard loads by name inside functions (PR 345 review F9): listed so a closure failure cannot drop them
+    "safe_input.py", "redact.py", "shell_words.py", "shellwords.py",
     # the install routes and the checks they run: replacing them changes what every later install checks
-    "ah.py", "ah_install.py", "guard_files.py", "human_proof.py", "release_receipt.py",
+    "ah.py", "ah_install.py", "guard_files.py", "launch_check.py", "release_receipt.py",
     # reserved for the supervisor lanes (PR 326b), so they are guard files the day they land
     "ah_ops.py", "supervisor_grant.py", "transcript_guard.py",
 })
 GUARD_PREFIXES = ("command_guard", "kill_guard", "copy_hygiene", "merge_gate", "provenance", "self_serve", "settings")
 POLICY_JSON = re.compile(r"^[A-Za-z0-9_]+_policy(\.local)?\.json(\.example)?$")
 GUARD_EVENTS = ("PreToolUse", "Stop")
-
-USER_INSTALL = ("python3 -I ~/.claude/hooks/ah.py install-files --host {host} --from-ref {ref} --file {files} "
-                "--ticket \"GoodQA <project>#<n>\"   (in your own terminal)")
-
 
 INSTALL_STAMP = "install-files-guard"
 
@@ -70,8 +73,10 @@ def guard_closure(hooks_dir):
     manifest or a closure module cannot be read (the caller then treats every name as a guard file)."""
     try:
         hooks_dir = Path(hooks_dir)
-        roots = registered_guard_hooks(hooks_dir / "hooks_manifest.json")
-        return set(roots) | set(local_closure(hooks_dir, roots))
+        present = {p.name for p in hooks_dir.iterdir() if p.is_file()}
+        roots = set(registered_guard_hooks(hooks_dir / "hooks_manifest.json"))
+        roots |= {name for name in present if is_guard_file(name)}  # the static names are starting points too (F2)
+        return roots | set(local_closure(hooks_dir, sorted(roots)))
     except Exception:  # noqa: BLE001 - unreadable or malformed: fail closed
         return None
 
@@ -88,11 +93,26 @@ def guard_subset(names, hooks_dir=None) -> list:
     return sorted(b for b in bases if is_guard_file(b) or b in closure)
 
 
+def guard_subset_trees(names, hooks_dirs) -> list:
+    """The guard files among NAMES counted against every directory in HOOKS_DIRS (the union of their closures); an
+    unreadable directory makes every name a guard file."""
+    out = set()
+    for hooks_dir in hooks_dirs:
+        out |= set(guard_subset(names, hooks_dir))
+    return sorted(out)
+
+
 def registered_guard_hooks(manifest: Path) -> list:
-    """Scripts that hooks_manifest.json registers for a PreToolUse or Stop event."""
+    """Scripts that hooks_manifest.json registers for a PreToolUse or Stop event. Raises Unreadable for an unexpected
+    shape: a parsed manifest with no such row would otherwise give an empty closure (PR 345 review F9)."""
     data = json.loads(Path(manifest).read_text())
-    return sorted({h["script"] for h in data.get("hooks", [])
-                   if isinstance(h, dict) and h.get("event") in GUARD_EVENTS and isinstance(h.get("script"), str)})
+    if not isinstance(data, dict) or not isinstance(data.get("hooks"), list):
+        raise Unreadable("hooks_manifest.json is not an object with a hooks list")
+    found = sorted({h["script"] for h in data["hooks"]
+                    if isinstance(h, dict) and h.get("event") in GUARD_EVENTS and isinstance(h.get("script"), str)})
+    if not found:
+        raise Unreadable("hooks_manifest.json registers no PreToolUse or Stop hook")
+    return found
 
 
 WORD = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")

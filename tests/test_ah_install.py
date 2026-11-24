@@ -39,10 +39,13 @@ def sha(data):
 
 
 class PersonEnv:
-    """human_proof's process view for a person in Terminal (login -> zsh -> python3)."""
+    """launch_check's process view for a person in Terminal (login -> zsh -> python3)."""
 
     def stdin_is_tty(self):
         return True
+
+    def tty_name(self):
+        return "/dev/ttys001"
 
     def environ(self):
         return {}
@@ -98,6 +101,11 @@ class Base(unittest.TestCase):
     def write_commit(self, files, message, branch=None):
         (self.work / "install.py").write_text("HOOKS = %r\n" % (NAMES,))
         (self.work / "harness" / "hooks").mkdir(parents=True, exist_ok=True)
+        # the ref's own manifest: the gate also computes guard files over the ref's tree (PR 345 review F2); ah.py is the
+        # fixture's registered guard hook, extra.py stays an ordinary file
+        manifest = self.work / "harness" / "hooks" / "hooks_manifest.json"
+        if not manifest.exists():
+            manifest.write_text(json.dumps({"hooks": [{"event": "PreToolUse", "script": "ah.py"}]}))
         for name, data in files.items():
             (self.work / "harness" / "hooks" / name).write_bytes(data)
         git(self.work, "add", "-A")

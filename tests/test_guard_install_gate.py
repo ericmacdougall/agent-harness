@@ -1,7 +1,8 @@
-"""PR 326a (goodqa#16944): no agent route installs or downgrades a guard file, except main's reviewed-release branch.
+"""PR 326a (goodqa#16944): guard-file installs need main's reviewed-release branch, or the not-agent-launched branch,
+which is a speed bump against careless agents and not a boundary (PR 345 review F1).
 
 `ah install-files` runs here against the fixtures of tests/test_ah_install.py (a local bare repository stands in for
-the canonical URL and a fake ssh runs the real remote program against a temporary host home). The human check gets a
+the canonical URL and a fake ssh runs the real remote program against a temporary host home). The launch check gets a
 fake process view; the stamp is the real one main's mission_gate hook writes; the receipt check runs with a fake `gh`
 and a real merge-gate waiver log in a temporary state directory. Nothing here touches a real host or hooks directory."""
 import json
@@ -14,12 +15,12 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_ah_install import TICKET, Base, git, sha  # noqa: E402
+from test_ah_install import NAMES, TICKET, Base, git, sha  # noqa: E402
 
 import ah_install as ai  # noqa: E402
 import caller_identity  # noqa: E402
 import guard_files  # noqa: E402
-import human_proof  # noqa: E402
+import launch_check  # noqa: E402
 import merge_gate  # noqa: E402
 import mission_gate  # noqa: E402
 import release_receipt  # noqa: E402
@@ -29,8 +30,15 @@ HOOKS = ROOT / "harness" / "hooks"
 SESSION = "0c0c0c0c-1111-4222-8333-444455556666"
 H40 = "b" * 40
 
+# captured shapes of `ps -axo pid=,ppid=,command=` (numbers right-aligned; commands with spaces; kernel threads in brackets)
+PS_MACOS = ("    1     0 /sbin/launchd\n  100     1 /usr/libexec/logd\n  412     1 /System/Applications/Utilities/Terminal.app"
+            "/Contents/MacOS/Terminal\n  900   412 login -pf eric\n  901   900 -zsh\n  950   901 python3 -I ah.py install-files\n")
+PS_LINUX = ("      1       0 /sbin/init\n      2       0 [kthreadd]\n    700       1 sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 "
+            "startups\n   7001     700 sshd-session: eric [priv]\n   7002    7001 sshd-session: eric@pts/3\n   7003    7002 -bash\n"
+            "   7010    7003 python3 -I ah.py install-files\n")
 
-class FakeEnv(human_proof.Env):
+
+class FakeEnv(launch_check.Env):
     """A process view. The default is a person in Terminal: login -> zsh -> python3."""
 
     def __init__(self, tty=True, environ=None, table=None, pid=300, table_error=None):
@@ -40,6 +48,9 @@ class FakeEnv(human_proof.Env):
 
     def stdin_is_tty(self):
         return self.tty
+
+    def tty_name(self):
+        return "/dev/ttys009"
 
     def environ(self):
         return dict(self.env)
@@ -56,11 +67,21 @@ class FakeEnv(human_proof.Env):
 AGENT = FakeEnv(tty=False, environ={"CLAUDECODE": "1"},
                 table={300: (200, "python3 ah.py install-files"), 200: (100, "/bin/zsh -c ..."), 100: (1, "claude --resume"),
                        1: (0, "/sbin/launchd")})
+VIA_SSH = FakeEnv(environ={"SSH_CONNECTION": "10.0.0.2 5555 10.0.0.3 22"},
+                  table={300: (200, "python3 ah.py install-files"), 200: (110, "-bash"), 110: (100, "sshd-session: eric@pts/1"),
+                         100: (1, "sshd: /usr/sbin/sshd -D"), 1: (0, "/sbin/init")})
+IN_TMUX = FakeEnv(environ={"TMUX": "/tmp/tmux-1000/default,1,0"},
+                  table={300: (200, "python3 ah.py install-files"), 200: (150, "-zsh"), 150: (1, "tmux: server (/tmp/x)"),
+                         1: (0, "/sbin/launchd")})
 
 
-class HumanProof(unittest.TestCase):
-    def test_a_person_in_a_terminal_passes(self):
-        self.assertIsNone(human_proof.refusal(FakeEnv()))
+class LaunchCheck(unittest.TestCase):
+    def test_a_terminal_with_no_agent_launcher_passes_and_records_its_facts(self):
+        reason, facts = launch_check.check(FakeEnv())
+        self.assertIsNone(reason)
+        self.assertEqual(facts["qualifying_ancestor"], [100, "login"])
+        self.assertEqual((facts["tty"], facts["ssh_env"], facts["mux_env"], facts["ssh_ancestor"], facts["mux_ancestor"]),
+                         ("/dev/ttys009", [], [], [], []))
 
     def test_each_missing_fact_refuses(self):
         cases = {
@@ -69,24 +90,72 @@ class HumanProof(unittest.TestCase):
             "codex variable": FakeEnv(environ={"CODEX_THREAD_ID": "t"}),
             "agent ancestor": FakeEnv(table={300: (200, "python3 x"), 200: (150, "-zsh"), 150: (100, "/usr/local/bin/claude"),
                                              100: (1, "login"), 1: (0, "launchd")}),
-            "codex ancestor": FakeEnv(table={300: (200, "python3 x"), 200: (100, "codex exec"), 100: (1, "sshd: eric"),
+            "codex ancestor": FakeEnv(table={300: (200, "python3 x"), 200: (100, "codex exec"), 100: (1, "login"),
                                              1: (0, "init")}),
             "detached (no session ancestor)": FakeEnv(table={300: (1, "python3 x"), 1: (0, "/sbin/launchd")}),
             "process table unreadable": FakeEnv(table_error=OSError("ps")),
         }
         for label, env in cases.items():
             with self.subTest(label):
-                self.assertIsInstance(human_proof.refusal(env), str)
-        self.assertIn("process table", human_proof.refusal(cases["process table unreadable"]))
+                self.assertIsInstance(launch_check.refusal(env), str)
+        self.assertIn("process table", launch_check.refusal(cases["process table unreadable"]))
+
+    def test_ssh_or_a_multiplexer_refuses_unless_the_user_typed_the_flag(self):
+        """F1: the ordinary routes by which an agent reaches the user's terminal. Each signal alone refuses."""
+        login_chain = {300: (200, "python3 x"), 200: (100, "-zsh"), 100: (1, "login"), 1: (0, "launchd")}
+        cases = {
+            "ssh session": VIA_SSH, "tmux session": IN_TMUX,
+            "SSH_CONNECTION alone": FakeEnv(environ={"SSH_CONNECTION": "a b c d"}, table=login_chain),
+            "SSH_TTY alone": FakeEnv(environ={"SSH_TTY": "/dev/pts/1"}, table=login_chain),
+            "STY (screen) alone": FakeEnv(environ={"STY": "123.pts-1"}, table=login_chain),
+            "sshd ancestor alone": FakeEnv(table={300: (200, "python3 x"), 200: (110, "-bash"), 110: (1, "sshd-session: e"),
+                                                  1: (0, "init")}),
+            "screen ancestor alone": FakeEnv(table={300: (200, "python3 x"), 200: (150, "-zsh"), 150: (100, "screen"),
+                                                    100: (1, "login"), 1: (0, "launchd")}),
+        }
+        for label, env in cases.items():
+            with self.subTest(label):
+                reason, facts = launch_check.check(env)
+                self.assertIn("ssh connection or a terminal multiplexer", reason or "")
+                self.assertFalse(facts["allow_remote"])
+                reason, facts = launch_check.check(env, allow_remote=True)
+                self.assertIsNone(reason)
+                self.assertTrue(facts["allow_remote"])
+        self.assertEqual(launch_check.check(VIA_SSH)[1]["ssh_ancestor"], ["sshd-session", "sshd"])
+        self.assertEqual(launch_check.check(IN_TMUX)[1]["mux_env"], ["TMUX"])
+
+    def test_the_flag_never_admits_an_agent(self):
+        env = FakeEnv(environ={"SSH_CONNECTION": "a b c d", "CLAUDECODE": "1"})
+        self.assertIn("agent session variable", launch_check.refusal(env, allow_remote=True))
+
+    def test_only_the_listed_agent_variables_count(self):
+        """F6: the exact names, not every CLAUDE_CODE_* or CODEX_* variable (the user may set those in his profile)."""
+        self.assertIsNone(launch_check.refusal(FakeEnv(environ={"CLAUDE_CODE_USE_BEDROCK": "1", "CODEX_HOME": "/x"})))
+        for name in launch_check.AGENT_ENV:
+            with self.subTest(name):
+                self.assertIsNotNone(launch_check.refusal(FakeEnv(environ={name: "1"})))
 
     def test_a_surprise_fails_closed(self):
         env = FakeEnv()
         env.environ = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
-        self.assertIn("RuntimeError", human_proof.refusal(env))
+        self.assertIn("RuntimeError", launch_check.refusal(env))
 
-    def test_this_test_process_is_not_a_person(self):
-        """The real Env, here: the suite runs under an agent or a pipe, so the human branch must not hold."""
-        self.assertIsNotNone(human_proof.refusal())
+    def test_ps_output_of_both_systems_parses_into_the_chain(self):
+        """F7: the real parser, on captured macOS and Linux shapes."""
+        mac = launch_check.parse_ps(PS_MACOS)
+        self.assertEqual(mac[950], (901, "python3 -I ah.py install-files"))
+        self.assertEqual(launch_check.ancestors(mac, 950)[:3], [(901, "zsh"), (900, "login"), (412, "Terminal")])
+        self.assertEqual(launch_check.interactive_ancestor(mac, 950), (900, "login"))
+        linux = launch_check.parse_ps(PS_LINUX)
+        self.assertEqual(linux[2], (0, "[kthreadd]"))
+        self.assertEqual([n for _, n in launch_check.ancestors(linux, 7010)][:4], ["bash", "sshd-session", "sshd-session", "sshd"])
+
+    def test_this_test_process_under_a_pipe_or_an_agent_is_refused(self):
+        """The real Env. When the suite runs under a pipe or an agent, the branch must not hold; when the user runs it in
+        his own terminal the answer legitimately differs, so the assertion is skipped there (F7)."""
+        if launch_check.Env().stdin_is_tty():
+            self.skipTest("stdin is a terminal here")
+        self.assertIsNotNone(launch_check.refusal())
 
 
 class GuardSet(unittest.TestCase):
@@ -98,36 +167,47 @@ class GuardSet(unittest.TestCase):
         return guard_files.is_guard_file(name) or name in self.closure
 
     def test_files_guards_read_or_run_are_listed_without_the_closure(self):
-        """F-A4: these stay guard files even where no hooks directory is given (the static list alone)."""
+        """F-A4 and F9: these stay guard files even where no hooks directory is given (the static list alone)."""
         for name in ("ahc_release.json", "dropbox_budget.conf", "run_probe.py", "run_capped.py", "bg_job.py", "deliver.py",
                      "remote_delete.py", "remote_delete_agent.py", "installer_scan.py", "ah.py", "ah_install.py",
-                     "guard_files.py", "human_proof.py", "release_receipt.py"):
+                     "guard_files.py", "launch_check.py", "release_receipt.py", "safe_input.py", "redact.py",
+                     "shell_words.py", "shellwords.py"):
             with self.subTest(name):
                 self.assertTrue(guard_files.is_guard_file(name))
         self.assertFalse(guard_files.is_guard_file("ledger_reminder.py"))  # positive control
 
     def test_registered_guard_hooks_and_named_files_are_guard_files(self):
         names = ("command_guard_hook.py", "merge_gate.py", "mission_gate.py", "ah.py", "ah_install.py",
-                 "guard_files.py", "human_proof.py", "release_receipt.py", "run_probe.py", "run_capped.py",
+                 "guard_files.py", "launch_check.py", "release_receipt.py", "run_probe.py", "run_capped.py",
                  "ahc_release.json", "dropbox_budget.conf", "installer_scan.py", "deliver.py")
         self.assertEqual(guard_files.guard_subset(names, HOOKS), sorted(names))
         for name in ("run_probe.py", "ahc_release.json", "dropbox_budget.conf"):  # found by the closure as well as listed
             with self.subTest(name):
                 self.assertIn(name, self.closure)
 
+    def tree(self, d, manifest, files):
+        (d / "hooks_manifest.json").write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+        for name, text in files.items():
+            (d / name).write_text(text)
+
     def test_a_file_no_guard_reaches_is_not_a_guard_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            (d / "hooks_manifest.json").write_text(json.dumps({"hooks": [{"script": "g.py", "event": "PreToolUse"}]}))
-            (d / "g.py").write_text("import h\nX = 'data.conf'\n")
-            (d / "h.py").write_text("")
-            (d / "data.conf").write_text("")
-            (d / "free.py").write_text("")
+            self.tree(d, {"hooks": [{"script": "g.py", "event": "PreToolUse"}]},
+                      {"g.py": "import h\nX = 'data.conf'\n", "h.py": "", "data.conf": "", "free.py": ""})
             self.assertEqual(guard_files.guard_subset(["g.py", "h.py", "data.conf", "free.py"], d),
                              ["data.conf", "g.py", "h.py"])
 
+    def test_a_listed_guard_file_is_a_starting_point_of_the_closure(self):
+        """F2: what a statically listed guard file imports is a guard file even when no registered hook names it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.tree(d, {"hooks": [{"script": "g.py", "event": "PreToolUse"}]},
+                      {"g.py": "", "deliver.py": "import helper_x\n", "helper_x.py": "", "free.py": ""})
+            self.assertEqual(guard_files.guard_subset(["helper_x.py", "free.py"], d), ["helper_x.py"])
+
     def test_every_file_a_guard_names_in_its_source_is_a_guard_file(self):
-        """Independent of the AST walk: a plain text scan of every closure module for names of files in the hooks dir."""
+        """Independent of the closure walk: a plain text scan of every closure module for names of files in the hooks dir."""
         import re
         self.assertIsNotNone(self.closure)
         present = {p.name for p in HOOKS.iterdir() if p.is_file()}
@@ -143,13 +223,17 @@ class GuardSet(unittest.TestCase):
         self.assertGreater(checked, 50)  # the scan saw real names, so an empty result means something
         self.assertEqual(missed, set())
 
-    def test_unreadable_manifest_or_module_makes_every_name_a_guard_file(self):
+    def test_unreadable_or_oddly_shaped_manifest_or_module_makes_every_name_a_guard_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            (d / "hooks_manifest.json").write_text("{not json")
-            self.assertEqual(guard_files.guard_subset(["free.py"], d), ["free.py"])
-            (d / "hooks_manifest.json").write_text(json.dumps({"hooks": [{"script": "g.py", "event": "Stop"}]}))
             (d / "g.py").write_text("pass\n")
+            for label, manifest in {"not json": "{not json", "empty object": "{}", "hooks not a list": '{"hooks": {}}',
+                                    "no PreToolUse or Stop row": {"hooks": [{"script": "g.py", "event": "PostToolUse"}]},
+                                    "a list": "[]"}.items():
+                with self.subTest(label):
+                    self.tree(d, manifest, {})
+                    self.assertEqual(guard_files.guard_subset(["free.py"], d), ["free.py"])
+            self.tree(d, {"hooks": [{"script": "g.py", "event": "Stop"}]}, {})
             self.assertEqual(guard_files.guard_subset(["free.py"], d), [])  # positive control
             (d / "g.py").chmod(0)
             try:
@@ -158,6 +242,13 @@ class GuardSet(unittest.TestCase):
                 self.assertEqual(guard_files.guard_subset(["free.py"], d), ["free.py"])
             finally:
                 (d / "g.py").chmod(0o600)
+
+    def test_trees_are_combined(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            self.tree(Path(a), {"hooks": [{"script": "g.py", "event": "Stop"}]}, {"g.py": "", "x.py": ""})
+            self.tree(Path(b), {"hooks": [{"script": "g.py", "event": "Stop"}]}, {"g.py": "import x\n", "x.py": ""})
+            self.assertEqual(guard_files.guard_subset(["x.py"], a), [])
+            self.assertEqual(guard_files.guard_subset_trees(["x.py"], [a, b]), ["x.py"])
 
 
 class Receipt(unittest.TestCase):
@@ -289,6 +380,12 @@ class Gate(Base):
         self.assertEqual(self.before(), before)
         return err
 
+    def poster(self, ticket, text):
+        pass
+
+    def push(self):
+        git(self.tmp, "--git-dir", str(self.origin), "fetch", "-q", str(self.work), "+main:main")
+
     # --- positive controls
 
     def test_main_installs_a_reviewed_merged_commit(self):
@@ -298,12 +395,15 @@ class Gate(Base):
         self.assertEqual(self.receipts, [self.c1])
         gate = self.rows("start")[-1]["guard_gate"]
         self.assertEqual((gate["branch"], gate["guard_files"], gate["waiver"]), ("main-release", ["ah.py"], "mgw-x"))
+        self.assertEqual(gate["facts"]["stdin_tty"], False)  # the launch facts are on main's row too
 
-    def test_the_user_in_his_terminal_needs_no_stamp_or_receipt(self):
+    def test_a_run_with_no_agent_launcher_needs_no_stamp_and_records_why(self):
         with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):
             self.assertEqual(self.install()["result"], "installed")
         self.assertEqual(self.receipts, [])
-        self.assertEqual(self.rows("start")[-1]["guard_gate"]["branch"], "human")
+        gate = self.rows("start")[-1]["guard_gate"]
+        self.assertEqual(gate["branch"], "not_agent_launched")
+        self.assertEqual((gate["facts"]["qualifying_ancestor"], gate["facts"]["tty"]), ([100, "login"], "/dev/ttys009"))
 
     def test_a_non_guard_file_needs_neither(self):
         self.assertEqual(self.install(files=("extra.py",))["result"], "installed")
@@ -319,9 +419,20 @@ class Gate(Base):
         self.assert_refused_unchanged(self.before())
         self.assertEqual(self.receipts, [])
 
-    def test_no_stamp_is_refused(self):
+    def test_the_refusal_names_main_route_and_never_steers_to_a_terminal(self):
+        """F1 (2): the refusal tells an agent what is the user's and what main may do; no runnable line, no terminal."""
         err = self.assert_refused_unchanged(self.before())
-        self.assertIn("python3 -I ~/.claude/hooks/ah.py install-files --host t2-dev", str(err))
+        text = str(err)
+        self.assertIn("main's own Bash call", text)
+        self.assertNotIn("terminal", text.replace("stdin is not a terminal", ""))
+        self.assertNotIn("install-files --host", text)
+        self.assertEqual(err.data["launch_facts"]["stdin_tty"], False)
+        self.stamp(self.line(ref=self.c0, extra=" --allow-older"))
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.install_files("t2-dev", self.c0, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, self.poster,
+                             allow_older=True)
+        self.assertIn("Guard-file downgrade (--allow-older), --resume and --rollback are the user's", str(caught.exception))
+        self.assertNotIn("your own terminal", str(caught.exception))
 
     def test_a_stamp_covers_only_its_exact_command(self):
         self.stamp(self.line(files=("ah.py",)))
@@ -340,16 +451,16 @@ class Gate(Base):
         self.assertEqual(self.receipts, [])
 
     def test_a_stamp_is_single_use(self):
+        """F4: the SAME command again, with main's call still running, is refused at the gate (code guard_file), not
+        reported as already current: the first install used the stamp up."""
         self.stamp(self.line())
         self.assertEqual(self.install()["result"], "installed")
-        (self.work / "harness" / "hooks" / "ah.py").write_text("# c2\n")
-        git(self.work, "commit", "-qam", "c2")
-        c2 = git(self.work, "rev-parse", "HEAD")
-        git(self.tmp, "--git-dir", str(self.origin), "fetch", "-q", str(self.work), "+main:main")
         before = self.before()
-        with self.assertRaises(ai.InstallError):
-            self.install(ref=c2)
+        err = self.refused()
+        self.assertEqual(err.code, "guard_file")
+        self.assertIn("No stamp", str(err))
         self.assertEqual(self.before(), before)
+        self.assertEqual(self.receipts, [self.c1])
 
     def test_a_merged_ref_with_no_receipt_is_refused(self):
         self.stamp(self.line())
@@ -371,19 +482,26 @@ class Gate(Base):
         self.assertEqual(self.before(), before)
 
     def test_a_downgrade_is_refused_even_with_stamp_and_receipt(self):
-        self.stamp(self.line(ref=self.c0, extra=" --allow-older"))
+        """F4: a live bound stamp for the exact (ref, files) is put in place by hand (mission_gate makes none for
+        --allow-older), so the refusal can only come from the downgrade rule; the stamp is left unused."""
+        self.calls_seen += 1
+        parts = guard_files.install_stamp_parts("t2-dev", self.c0, ["ah.py"], TICKET)
+        self.assertTrue(caller_identity.put_stamp(guard_files.INSTALL_STAMP, parts, session=SESSION, home=self.mac,
+                                                  tool_use_id="toolu_%08d" % self.calls_seen, transcript=str(self.transcript)))
         before = self.before()
         with self.assertRaises(ai.InstallError) as caught:
-            ai.install_files("t2-dev", self.c0, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner,
-                             lambda t, x: None, allow_older=True)
+            ai.install_files("t2-dev", self.c0, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, self.poster,
+                             allow_older=True)
         self.assertEqual(caught.exception.code, "guard_file")
         self.assertIn("--allow-older", str(caught.exception))
         self.assertEqual(self.before(), before)
+        self.assertEqual(self.receipts, [])
+        self.assertIsNotNone(caller_identity.take_stamp(guard_files.INSTALL_STAMP, parts, home=self.mac, bound=True))
 
     def test_a_downgrade_without_allow_older_is_refused_by_the_fetch(self):
         self.stamp(self.line(ref=self.c0, files=("ah.py",)))
         with self.assertRaises(ai.InstallError) as caught:
-            ai.install_files("t2-dev", self.c0, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None)
+            ai.install_files("t2-dev", self.c0, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, self.poster)
         self.assertEqual(caught.exception.code, "older_ref")
 
     def test_the_source_is_the_commit_never_the_working_tree(self):
@@ -394,24 +512,92 @@ class Gate(Base):
                               capture_output=True).stdout
         self.assertEqual(self.live("ah.py"), sha(want))
 
-    def test_resume_and_rollback_of_a_guard_file_are_the_users(self):
+    def test_rollback_of_a_guard_file_is_the_users(self):
         with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):
             run = self.install()["run"]
         before = self.before()
         self.stamp(self.line())  # even a live stamp and a good receipt do not let an agent roll back
         with self.assertRaises(ai.InstallError) as caught:
-            ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
+            ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, self.poster)
         self.assertEqual(caught.exception.code, "guard_file")
         self.assertEqual(self.before(), before)
-        # a finished run cannot be resumed at all, so the resume branch of the gate is called directly
-        with self.assertRaises(ai.InstallError) as caught:
-            ai.guard_gate("t2-dev", self.c1, ["ah.py", "extra.py"], TICKET, self.mac, "resume")
-        self.assertEqual(caught.exception.code, "guard_file")
         self.assertEqual(self.receipts, [])
-        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control: the user may roll back
-            self.assertIn(ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)["result"],
+        for env in (VIA_SSH, IN_TMUX):  # F1: over ssh or in a multiplexer, only with the user's flag
+            with self.subTest(env.env), mock.patch.object(ai, "PROOF_ENV", env):
+                with self.assertRaises(ai.InstallError) as caught:
+                    ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, self.poster)
+                self.assertIn("multiplexer", str(caught.exception))
+                self.assertEqual(self.before(), before)
+        with mock.patch.object(ai, "PROOF_ENV", VIA_SSH):  # positive control: the user's own run with the flag
+            self.assertIn(ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, self.poster, allow_remote=True)["result"],
                           ("rolled_back", "restored"))
         self.assertNotEqual(self.before(), before)
+        gate = [r for r in self.rows("start") if r.get("kind") == "rollback"][-1]["guard_gate"]
+        self.assertEqual((gate["branch"], gate["facts"]["allow_remote"]), ("not_agent_launched", True))
+
+    def unknown_install(self):
+        """An install by the user whose commit ran on the host and whose answer was lost: an unfinished run."""
+        self.inject = ("commit", 1, "after")
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()), self.assertRaises(ai.InstallError) as caught:
+            self.install()
+        self.inject = None
+        return caught.exception.data["run"]
+
+    def test_resume_of_a_guard_file_is_the_users_end_to_end(self):
+        """F3: an interrupted run, then an agent with a live stamp for the same command tries --resume. Refused at the
+        gate before any fetch, the host untouched, no new start row; the user then resumes it."""
+        run = self.unknown_install()
+        self.stamp(self.line())
+        before = self.before()
+        with mock.patch.object(ai, "fetch_source", side_effect=AssertionError("fetched before the gate")):
+            with self.assertRaises(ai.InstallError) as caught:
+                ai.resume(run, TICKET, self.mac, "s", "a", self.runner, self.poster)
+        self.assertEqual(caught.exception.code, "guard_file")
+        self.assertIn("--resume", str(caught.exception))
+        self.assertEqual(self.before(), before)
+        self.assertEqual(self.receipts, [])
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control
+            self.assertEqual(ai.resume(run, TICKET, self.mac, "s", "a", self.runner, self.poster)["result"], "installed")
+
+    def test_a_run_recorded_before_the_gate_counts_every_file_as_a_guard_file(self):
+        row = {"files": {"extra.py": {}}}
+        self.assertEqual(ai.recorded_guard(row), ["extra.py"])
+        self.assertEqual(ai.recorded_guard(dict(row, guard_gate=None)), [])
+        self.assertEqual(ai.recorded_guard(dict(row, guard_gate={"guard_files": ["ah.py"]})), ["ah.py"])
+
+    def skew_commit(self):
+        """c2: the ref's guard hook ah.py now imports newcheck.py. The Mac's hooks directory (this checkout) has no
+        newcheck.py, so only the ref's own tree makes it a guard file (F2, version skew)."""
+        hooks = self.work / "harness" / "hooks"
+        (hooks / "ah.py").write_text("import newcheck\n# c2\n")
+        (hooks / "newcheck.py").write_text("# a module the guard imports\n")
+        (hooks / "freecheck.py").write_text("# nothing imports this\n")
+        (self.work / "install.py").write_text("HOOKS = %r\n" % (NAMES + ("newcheck.py", "freecheck.py"),))
+        git(self.work, "add", "-A")
+        git(self.work, "commit", "-q", "-m", "c2")
+        self.push()
+        return git(self.work, "rev-parse", "HEAD")
+
+    def test_a_file_that_is_a_guard_file_only_at_the_ref_is_gated(self):
+        c2 = self.skew_commit()
+        self.assertFalse((HOOKS / "newcheck.py").exists())
+        self.assertEqual(guard_files.guard_subset(["newcheck.py"], HOOKS), [])  # the local tree alone misses it
+        with self.assertRaises(ai.InstallError) as caught:
+            self.install(ref=c2, files=("newcheck.py",))
+        self.assertEqual(caught.exception.code, "guard_file")
+        self.assertIn("newcheck.py", str(caught.exception))
+        self.assertFalse((self.hooks / "newcheck.py").exists())
+        self.assertEqual(self.rows("start"), [])
+        # positive control: a file nothing at the ref reaches installs without a stamp
+        self.assertEqual(self.install(ref=c2, files=("freecheck.py",))["result"], "installed")
+        self.assertIsNone(self.rows("start")[-1]["guard_gate"])
+
+    def test_main_installs_a_ref_only_guard_file_with_its_stamp(self):
+        c2 = self.skew_commit()
+        self.stamp(self.line(ref=c2, files=("newcheck.py",)))
+        self.assertEqual(self.install(ref=c2, files=("newcheck.py",))["result"], "installed")
+        gate = self.rows("start")[-1]["guard_gate"]
+        self.assertEqual((gate["branch"], gate["guard_files"]), ("main-release", ["newcheck.py"]))
 
 
 class Stamps(unittest.TestCase):
