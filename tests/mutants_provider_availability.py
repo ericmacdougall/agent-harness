@@ -67,7 +67,7 @@ MUTANTS = {
     'a busy last pool is not waited for': (
         'peer_review.py', 'may_wait=provider != primary or not later_open,', 'may_wait=False,', ['BusyPool']),
     'a dead holder is waited for': (
-        'peer_review.py', "            if status is None or not status.get('busy'):\n                raise",
+        'peer_review.py', "            if kind != 'busy':\n                raise",
         "            if status is None:\n                raise", ['BusyPool']),
     'the wait ignores the run budget': (
         'peer_review.py', 'limit = max(0.0, min(POOL_WAIT_SECONDS, wait_limit))', 'limit = POOL_WAIT_SECONDS', ['BusyPool']),
