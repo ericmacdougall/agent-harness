@@ -68,6 +68,42 @@ An existing checkout can be reused at the disk floor. An advance to a different 
 
 Reaping reports by default. If enabled explicitly, it holds the managed checkout lease and checks liveness, service protection and local state. It confirms the same directory, Git registration, commit, tree and index before asking Git to remove the linked checkout without force. Keep legacy and unmanaged copies and copies with tracked protected logs or WALs for separate disposition. Tools that operate outside the managed lease must be stopped before reaping.
 
+## Updating the installed harness (user-run)
+
+`scripts/update_installed.py` brings the installed copy on this Mac and on t2-dev to one commit that is already on
+`origin/main`. The user runs it; agents do not. Installing hook files changes the guards that govern every agent, so
+the person who owns those guards decides when they change. An agent that wants a merged fix installed names the commit
+and asks the user to run the script.
+
+```
+python3 scripts/update_installed.py --preview                          # what would change; installs nothing
+python3 scripts/update_installed.py --ticket "GoodQA goodqa#N"          # install origin/main HEAD
+python3 scripts/update_installed.py --commit <40-hex sha> --ticket "GoodQA goodqa#N"
+```
+
+What it checks and does, in order. Any failed step stops the run, and nothing after it runs:
+
+1. **Install clone.** It works in `~/harness-install` (`--clone` sets another path). A real run creates the clone if it
+   is missing. The clone's `origin` must be the canonical repository, and the clone must be clean: no modified files and
+   no untracked files. It then runs `git fetch origin main`.
+2. **Commit.** The commit (default: `origin/main` HEAD) must be a full sha on `origin/main`.
+3. **File list.** The list is derived, never kept by hand.
+   - Mac: every file that `install.py` lists at that commit (`AGENTS`, `HOOKS`, `TOOLS`, `SKILLS`) whose copy under
+     `~/.claude` is missing, differs from the commit's bytes, or is a symlink.
+   - t2-dev: every `HOOKS` file that the remote installer's dry run does not report as `already_current` there. It asks
+     in batches of 20.
+4. **Mac install.** It checks out the commit, detached, and runs `install.py --apply --hooks-only`. `CLAUDE.md` and
+   `settings.json` are not touched, and every replaced file is backed up. It then compares every listed file with the
+   commit.
+5. **t2-dev install.** It runs the installed `ah.py` remote installer (the audited route, with its own staging,
+   self-test and rollback) for the changed files only, with the ticket. A second dry run must then report every file
+   current.
+
+`--preview` runs steps 1 to 3 and stops. It never clones, never checks out, never installs and never writes under
+`~/.claude`. It does fetch into the install clone, and each t2-dev dry run appends the remote installer's own audit row.
+`--no-remote` updates the Mac only. Exit 0 means every listed file matches the commit. Exit 1 prints `STOP:` and the
+step that failed.
+
 ## Installer scan (installer_scan.py)
 
 `installer_scan.py <dir-or-file> [--json]` statically scans third-party shell and Python installers (`*.sh`, `*.py`, `install*`, `setup*`, `Makefile`) before anyone runs them. It never executes or imports the target and reads each file with a 2 MB cap (larger files are listed as skipped). Findings carry a category and `file:line`: `mcp` (agent CLI `mcp add`, `[mcp_servers.`, `mcpServers`), `agent-rules` (CLAUDE.md, AGENTS.md, settings files, config.toml, permission grants), `launchd` (launchctl, LaunchAgents, systemctl, crontab, schtasks), `shell-rc` (rc files, `PATH=`), `network-exec` (`curl | sh`, wget, pip/npm -g/brew install), `credentials` (keychain, keyring, `~/.ssh`, `~/.aws`, `~/.kimi-code`) and `privileged` (sudo, setuid, writes under `/usr/local`, `/etc`, `/Library`). Exit 0 means at least one file was scanned with no findings and nothing was left unscanned. Exit 1 means findings, a skipped file (oversize or unreadable), an executable-looking file the scan does not parse (`.js`, `.mjs`, `package.json`, `.plist`, `.ps1`, `.rb`, an executable or `#!` file, listed as skipped), no file scanned, or the 5,000-file limit reached. Exit 2 means bad usage. The rule is scan, then read. A clean scan is not a safety proof: it is regex matching on source text, so obfuscated or generated commands are missed. Review the installer anyway; the scan only makes the known side effects (for example the GoodQA MCP registration in the secure-login installer) visible first.
