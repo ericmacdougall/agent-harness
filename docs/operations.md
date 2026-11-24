@@ -838,7 +838,6 @@ zsh and bash read `>!` differently, so the shared analyzer judges a script under
 |---|---|---|
 | 1 | text piped into a remote login shell with no command named (`| ssh dev2 bash` is now blocked, the goodqa#14617 incident shape) | `printf 'pkill -f x\n' \| ssh dev2` |
 | 3 | backslash-newline continuation inside a comment, after a heredoc last line, or after an escaped backslash | `# note \` then a `kill` on the next line |
-| 4 | substitutions inside `${...}`, `$((...))` and case patterns are not read | `echo ${x:-$(kill -9 4004)}` |
 | 5 | case state entered from an argument | `echo then case x in; kill -9 4004` |
 | 6 | heredoc delimiter taken from expanded text | `cat <<$x` then a `kill` after the body |
 | 9 | a variable head whose value is never visible | `read x <<< kill; $x -9 4004` |
