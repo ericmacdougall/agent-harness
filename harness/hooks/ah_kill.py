@@ -323,6 +323,10 @@ def resolve_approval(ask_id, session, home, now=None, prov=None):
     closed = ask.get("_closed") or {}
     if not closed.get("source"):
         raise KillError("approval_invalid", "ask %s has no ask_resolved entry citing the user's answer" % ask_id)
+    if closed.get("outcome") or closed.get("closed_by"):
+        # GoodQA #15565: an agent close (obsolete, not_user, or a sweep) is bookkeeping, never the user's approval to stop a process
+        raise KillError("approval_invalid", "ask %s was closed by an agent (%s), not approved by the user"
+                        % (ask_id, _clip(str(closed.get("outcome") or closed.get("closed_by")), 20)))
     result = prov.resolve(closed["source"], {"home": claude, "want_text": True})
     node = next((n for n in result.get("chain", []) if n.get("kind") == "user"), None)
     if not result.get("ok") or result.get("origin") != "user" or result.get("assumption") or result.get("weak") \

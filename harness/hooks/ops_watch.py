@@ -373,12 +373,62 @@ def latest_by_key(events: list) -> dict:
     return latest
 
 
+ASK_DUE_KEY = re.compile(r"^ask:(w[0-9a-f]{11}):due$")
+RESOLVED_SCAN_MAX_BYTES = 32 << 20
+RESOLVED_LINE_MAX_BYTES = 1 << 20    # one WAL row; a longer line is skipped, never parsed
+RESOLVED_SCAN_SECONDS = 5.0
+
+
+def resolved_ask_ids(home: Path, wanted: dict) -> set:
+    """Which asks have a sourced `ask_resolved` row in THEIR OWN session main log. `wanted` maps ask id to the 8-character
+    session prefix the alert names (GoodQA #15565: a closed ask kept alerting until the daemon's next tick, and a tick over
+    budget skipped alerts altogether). Regular files only, bounded bytes; a row without a source never hides an alert."""
+    found = set()
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import safe_input  # noqa: PLC0415 - the harness reader; a host without it has no WALs to read
+    except ImportError:
+        return found  # nothing read, so nothing is hidden: every ask alert stays active
+    for prefix in sorted({p for p in wanted.values() if re.fullmatch(r"[0-9a-f]{8}", p or "")}):
+        ids = {i for i, p in wanted.items() if p == prefix}
+        for main_log in sorted((home / ".claude" / "wals").glob(prefix + "*/main.jsonl")):
+            try:
+                if main_log.is_symlink() or not main_log.is_file() or main_log.stat().st_size > RESOLVED_SCAN_MAX_BYTES:
+                    continue
+                # #170 round 5 F4: the safe reader (no blocking open of a FIFO swapped in after the check, no final
+                # symlink, a per-line cap, the byte cap while reading, a time budget) and the bounded JSON parser
+                for _number, raw in safe_input.iter_jsonl_lines(main_log, RESOLVED_LINE_MAX_BYTES,
+                                                                max_total_bytes=RESOLVED_SCAN_MAX_BYTES,
+                                                                max_seconds=RESOLVED_SCAN_SECONDS):
+                    if raw is None or b'"ask_resolved"' not in raw:
+                        continue
+                    try:
+                        rec = safe_input.safe_json_loads(raw)
+                    except ValueError:
+                        continue
+                    if (isinstance(rec, dict) and rec.get("event") == "ask_resolved" and rec.get("ref") in ids
+                            and rec.get("source")):
+                        found.add(rec["ref"])
+            except (OSError, safe_input.InputRejected):
+                continue
+    return found
+
+
 def active_alerts(home: Path) -> list:
-    """Active = the latest event per (host, source, key) is a raise. Highest severity first."""
+    """Active = the latest event per (host, source, key) is a raise. Highest severity first. An ask alert whose ask is
+    resolved is not active, whether or not the daemon has cleared it yet."""
     act = []
     for (host, _src, _key), e in latest_by_key(read_ring(ring_path(home))).items():
         if e.get("event") == "raise":
             act.append(e if e.get("host") == host else dict(e, host=host))
+    wanted = {}
+    for e in act:
+        m = ASK_DUE_KEY.match(str(e.get("key") or ""))
+        if m:
+            wanted[m.group(1)] = str((e.get("detail") or {}).get("session") or "")[:8]
+    if wanted:
+        gone = resolved_ask_ids(home, wanted)
+        act = [e for e in act if (ASK_DUE_KEY.match(str(e.get("key") or "")) or [None, None])[1] not in gone]
     return sorted(act, key=lambda e: (-SEVERITIES.get(e.get("severity"), 0), e.get("key", "")))
 
 

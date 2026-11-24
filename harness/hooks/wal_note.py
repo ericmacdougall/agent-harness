@@ -22,7 +22,7 @@ REALLY_TESTED_RE = re.compile(r'^\s*REALLY_TESTED\s+[A-Za-z0-9._-]+')
 SHA_OR_VERSION_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b|\b\d+\.\d+\.\d+\b")  # as goals_view.SHA_OR_VERSION
 # Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
-TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
+TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run', 'ask-sweep'})  # rows these tools write on an agent's behalf (goodqa#14791)
 # provenance.py problem codes that mean the caller wrote a source that can never resolve: refused outright, nothing
 # written (goodqa#14927). Transient or environmental codes (scan-timeout, transcript-malformed, wal-missing,
 # file-unreadable, internal ...) keep the warn-mode quarantine path so a busy host does not drop a note.
@@ -53,6 +53,24 @@ SECRET_PATTERN = re.compile(
     r'\b[a-z][a-z0-9+.-]*://[^\s/?#@]+@[^\s/?#]+|'
     r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 )
+REF_RE = re.compile(r'[A-Za-z0-9_-]{4,40}')
+
+
+def argument_problem(note, source=None, reason=None):
+    """Why wal_note refuses this note, source and reason for any event, or None: the note's length, the source's
+    length, and a credential in any of them. Shared with ask_close.precheck (#170 round 6 F3), so ask_sweep never
+    prints a close these checks refuse."""
+    note = (note or '').strip()
+    if not note or len(note) > 4000:
+        return 'note must be 1 to 4000 characters'
+    if SECRET_PATTERN.search(note):
+        return 'note appears to contain a credential; redact it first'
+    if source and len(source.strip()) > 2000:
+        return 'source is longer than 2000 characters; shorten the excerpts'
+    for label, value in (('source', source), ('reason', reason)):
+        if value and SECRET_PATTERN.search(value):
+            return label + ' appears to contain a credential; redact it first'
+    return None
 
 
 def provenance_check(event, source, allow_mc=False):
@@ -165,6 +183,9 @@ def main():
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
     parser.add_argument('--decision', choices=('approved', 'declined'),
                         help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
+    parser.add_argument('--outcome', choices=('obsolete', 'not_user'),
+                        help='ask_resolved only: close an ask nobody can answer any more (obsolete) or that was never the user\'s to answer '
+                             '(not_user) on wal:/file:/ticket: evidence; never an approval (no decision field), so it cannot authorize anything')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never quarantined; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its quarantine)')
     parser.add_argument('--goal', help='mission goal id this row is evidence for (ah goals lists it as a tag candidate)')
@@ -177,15 +198,9 @@ def main():
     if path.parent.parent != root or path.suffix != '.jsonl' or not re.fullmatch(r'[A-Za-z0-9._-]{1,120}', path.parent.name):
         parser.error('WAL path must be a per-session JSONL under ~/.claude/wals')
     note = args.note.strip()
-    if not note or len(note) > 4000:
-        parser.error('note must be 1 to 4000 characters')
-    if SECRET_PATTERN.search(note):
-        parser.error('note appears to contain a credential; redact it first')
-    if args.source and len(args.source.strip()) > 2000:
-        parser.error('source is longer than 2000 characters; shorten the excerpts')
-    for label, value in (('source', args.source), ('reason', args.reason)):
-        if value and SECRET_PATTERN.search(value):
-            parser.error(label + ' appears to contain a credential; redact it first')
+    problem = argument_problem(args.note, args.source, args.reason)
+    if problem and args.event != 'ask_resolved':  # an ask_resolved row runs these in ask_close.precheck, below
+        parser.error(problem)
     if args.goal is not None and not GOAL_RE.match(args.goal):
         parser.error('--goal: a goal id (lower-case letters, digits, - and _)')
     if args.ticket is not None and not TICKET_RE.match(args.ticket):
@@ -214,32 +229,23 @@ def main():
             parser.error('an ask needs --reason (10+ characters): why the user is being asked')
         record['reason'] = args.reason.strip()[:1000]
     if args.event == 'ask_resolved':
-        if not args.ref or not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', args.ref):
-            parser.error('ask_resolved needs --ref <ask id>')
-        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer
-        ask_wal = None
-        if not open_ask_exists(path, args.ref):
-            ask_wal = sibling_ask_wal(path, args.ref)
-        if not open_ask_exists(path, args.ref) and ask_wal is None:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': f'no open ask {args.ref} in this WAL',
-                              'hint': 'ask_resolved --ref must name an ask entry of this WAL that is not already resolved'}),
-                  file=sys.stderr)
+        if args.outcome and args.decision:
+            parser.error('--outcome closes an ask without an approval: do not combine it with --decision')
+        # G5 (goodqa#14791): a resolution names an open ask of this WAL and carries the source of the answer.
+        # #170 rounds 5 and 6: every check before the write is ask_close.precheck (these argument checks, the open ask,
+        # and the one rule for which source closes an ask in which mode), the function ask_sweep.py runs before it
+        # prints a close, so the listing never offers a close this refuses
+        import ask_close  # noqa: PLC0415
+        verdict = ask_close.precheck(path, args.ref, args.note, args.source,
+                                     'outcome' if args.outcome else 'decision' if args.decision else 'answer',
+                                     reason=args.reason)
+        if verdict['problem']:
+            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': verdict['problem'][:300],
+                              'hint': verdict['hint'] or 'see ask_close.py'}), file=sys.stderr)
             return 2
-        if not args.source or not args.source.strip():
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved needs --source',
-                              'hint': 'cite the answer: user:<session>/<uuid> "words", answer:<id> or queue:<id> (ah user-msg)'}),
-                  file=sys.stderr)
-            return 2
-        if not re.match(r'^(user:|uuid:|answer:|queue:|mc:|ticket:)', args.source.strip()):
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
-                              'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
-            return 2
-        mode, problem, assumption = provenance_check('ask', args.source, allow_mc=True)  # the answer is sourced like an ask (M1)
-        if problem:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
-                              'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
-            return 2
-        if args.source.strip().lower().startswith('mc:'):
+        ask_wal = verdict['ask_wal']
+        assumption = verdict['assumption']
+        if ask_close.TABLE[verdict['word']].get('bind'):  # a dashboard decision: bound to this session's ask as it reads now
             import provenance as _prov  # noqa: PLC0415
             # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
             # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).
@@ -255,10 +261,13 @@ def main():
         record['source'] = args.source.strip()[:2000]
         if args.decision:
             record['decision'] = args.decision
+        if args.outcome:
+            record['outcome'] = args.outcome
+            record['closed_by'] = 'agent'  # an audit mark: no user words back this close
         if assumption:
             record['assumption'] = True
-    elif args.decision:
-        parser.error('--decision applies to ask_resolved only')
+    elif args.decision or args.outcome:
+        parser.error('--decision and --outcome apply to ask_resolved only')
     if args.event in SOURCED:
         mode, problem, assumption = provenance_check(args.event, args.source)
         if problem and args.source and caller_error(problem):
@@ -285,6 +294,10 @@ def main():
         if args.by.strip() not in TOOL_WRITERS:
             parser.error(f'--by must be one of {sorted(TOOL_WRITERS)}: tool-written rows are an allowlist, not a claim')
         record['by'] = args.by.strip()
+        if args.event == 'ask_resolved' and args.decision:
+            parser.error('a tool close (--by) is bookkeeping and cannot carry --decision: only a person approves')
+        if args.event == 'ask_resolved':
+            record.setdefault('closed_by', record['by'])  # a tool close is bookkeeping, not a user approval
     if args.recites:
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
