@@ -255,12 +255,18 @@ def disk_low(path: str, cfg: dict) -> "tuple[bool, float, float]":
     return gb < fl, gb, fl
 
 
-def low_disk_message(path: str, free_gb: float, fl: float) -> str:
-    return (f"DISK LOW: {free_gb:.1f} GB free on the volume holding {path} (floor {fl:.1f} GB). The harness refuses to "
+def low_disk_message(path: str, free_gb: float, fl: float, copy: "str | None" = None) -> str:
+    text = (f"DISK LOW: {free_gb:.1f} GB free on the volume holding {path} (floor {fl:.1f} GB). The harness refuses to "
             "create another copy. Reuse your PR's test copy with `python3 ~/.claude/hooks/copy_hygiene.py acquire "
             "--repo <checkout> --key pr-<N>`, and run `python3 ~/.claude/hooks/copy_hygiene.py reap` to list idle "
             "copies (removing them needs the owner's OK). Only the owner changes the floor (min_free_gb / min_free_pct in "
             "~/.agent-harness/state/copy-hygiene.json); do not lower it to get around this.")
+    if copy:
+        # goodqa#17112: a hook allows or refuses the whole command, so a record write chained to a copy is refused
+        # with it; on its own it passes.
+        text += (f" The copy read in this command: `{copy}`. A WAL, transcript or log write on its own is never "
+                 "charged: if this command also records a row, run that write as its own command.")
+    return text
 
 
 # ---------------------------------------------------------------- git helpers
@@ -1114,6 +1120,575 @@ def copy_commands(cmd: str, depth: int = 0, strict: bool = False) -> list:
     return out
 
 
+# ---------------------------------------------------------------- copy check: data text (goodqa#17112, #17099)
+# The base reading splits at every separator, even inside quotes and heredoc bodies, so a copy verb right after a
+# separator in data text was charged as a copy: an agent's WAL row ("ran `git clone ..`; cp -r .."), a note built from
+# a heredoc, a file written through `cat > f <<'EOF'`. Below the floor those rows were lost (goodqa#17112).
+#
+# data_mask(cmd) blanks, with spaces, the text this line hands as data to a closed set of programs that never run their
+# arguments, and the copy reading then reads the masked line (_outside_data). It only blanks text, never adds any, and
+# it returns None, so the line keeps the base reading, for anything it does not model. _outside_data also keeps the
+# base reading when the mask raises, or when the masked reading finds a copy the base reading did not.
+#
+# Data, and only this:
+# - quoted text (single quotes; double quotes outside the `$( )` they hold) in the arguments of echo, printf without
+#   -v, cat, tee and the installed wal_note.py (`python3 ~/.claude/hooks/wal_note.py`, `$HOME/...` or its full path);
+# - the body of a heredoc fed to one of them, when its delimiter is quoted, or when it is unquoted and the body holds
+#   no `$(`, backtick or line-ending backslash;
+# - inside a `$( )` in such an argument, the same text of the commands it runs (`--note "$(cat <<'EOF' ...)"`).
+# Code stays code: a `$( )` or backtick in double quotes, in an unquoted heredoc or anywhere else runs, so it is never
+# blanked. A data command whose text can reach a shell on this line is not masked: one piped into anything but
+# PIPE_SINKS, one writing a file that a later part of the line names, one redirecting an fd above 2, printf -v.
+# The whole line keeps the base reading when it holds a compound command or a reserved word, a subshell or a
+# parenthesis in a word, a process substitution, exec or coproc, a program redefinition (REDEFINES, also behind the
+# PRECOMMANDS that run a builtin in this shell), an assignment to
+# a lookup variable (LOOKUP_VARIABLES), $'..', $".." or zsh $[..], a `${..}` holding quotes or code, quotes inside a
+# backtick, a substitution spanning lines while a heredoc waits, two heredocs waiting on one line, an unterminated
+# quote, substitution or heredoc, a control character, or more than MASK_MAX characters. A quoted text spanning lines
+# while a heredoc waits is read as the shells read it: the body starts after the line where the quote closes (zsh 5.9,
+# bash 3.2 and 5.2, dash; checked 2026-11-24).
+#
+# Not modelled, as in the base reading: a file written here and run by a later command, or by a program on this line
+# that runs a file it does not name (make, a git hook, a shell startup file); aliases and functions a user's shell
+# startup files define. The hook reads no files.
+DATA_PROGRAMS = frozenset(("echo", "printf", "cat", "tee"))
+PIPE_SINKS = frozenset(("cat", "tee", "head", "tail", "wc", "grep", "cut", "tr", "jq"))
+PYTHONS = frozenset(("python3", "python"))
+MASK_BAIL_COMMANDS = REDEFINES | shell_words.RESERVED | frozenset(("exec", "coproc"))
+PRECOMMANDS = frozenset(("builtin", "command", "noglob", "nocorrect"))
+NULL_TARGETS = frozenset(("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"))
+MASK_MAX = 64 * 1024
+_MASK_DEPTH = 6
+_MASK_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+_MASK_CONTROL_OPS = ("&&", "||", ";;", ";&", ";|", "|&", ";", "&", "|")
+_MASK_REDIRECT = re.compile(r"(\d*)(&>>|&>|<<<|<<-|<<|<>|<&|>>|>&|>\||>!|>|<)([|!]?)")
+_MASK_ASSIGNMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
+_MASK_PARAMETER = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9?#$!@*-])")
+_MASK_VARIABLE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+_MASK_QUOTES = re.compile(r"[\"'\\]")
+
+
+def _wal_note_words() -> frozenset:
+    """The spellings of the installed wal_note.py that the mask trusts as the program."""
+    rel = "/.claude/hooks/wal_note.py"
+    full = os.path.join(os.path.expanduser("~"), ".claude", "hooks", "wal_note.py")
+    return frozenset(("~" + rel, "$HOME" + rel, "${HOME}" + rel, '"$HOME' + rel + '"', '"${HOME}' + rel + '"', full,
+                      '"%s"' % full, "'%s'" % full))
+
+
+class _NoMask(Exception):
+    """The line holds something the mask does not model: it keeps the base reading."""
+
+
+class _MaskWord:
+    """A word: (start, end) in the line and its parts, each (kind, start, end, nested). kind is "lit" (unquoted
+    text), "sq" (the inside of single quotes), "dq" (the inside of double quotes; nested holds its pieces, each
+    "lit", "code" or "sub"), "sub" (a `$( )`; nested holds its commands) or "code" (a backtick, `$((..))`, `${..}`
+    or `$NAME`, kept as written)."""
+    __slots__ = ("start", "end", "parts")
+
+    def __init__(self, start, end, parts):
+        self.start, self.end, self.parts = start, end, parts
+
+
+class _MaskSegment:
+    """A simple command: its words, the target word of each output redirect, its here-string words, its heredocs
+    ([delimiter, quoted, strip_tabs, body_start, body_end]), the control operator after it, and `bad` when it
+    redirects an fd above 2."""
+    __slots__ = ("words", "outs", "strings", "heredocs", "op", "bad")
+
+    def __init__(self):
+        self.words, self.outs, self.strings, self.heredocs, self.op, self.bad = [], [], [], [], "", False
+
+
+class _MaskLexer:
+    def __init__(self, text: str):
+        self.s, self.n = text, len(text)
+
+    @staticmethod
+    def fail(why: str):
+        raise _NoMask(why)
+
+    # ---- reading
+    def commands(self, i, depth, closer, waiting):
+        """The commands from i to the end of the line (closer None) or to the `)` that closes a `$( )`.
+        `waiting`: a heredoc of an enclosing command waits for its body, so a newline here would be ambiguous."""
+        if depth > _MASK_DEPTH:
+            self.fail("nested too deep")
+        s, n = self.s, self.n
+        segments, cur, pending = [], _MaskSegment(), []
+        while True:
+            while i < n and s[i] in " \t":
+                i += 1
+            if i >= n:
+                if closer or pending:
+                    self.fail("unterminated substitution or heredoc")
+                segments.append(cur)
+                return i, segments
+            c = s[i]
+            if c == "#":                                    # a comment, to the end of the line
+                j = s.find("\n", i)
+                i = n if j < 0 else j
+                continue
+            if c == "\n":
+                if waiting:
+                    self.fail("a newline in a substitution while a heredoc waits")
+                cur.op = "\n"
+                segments.append(cur)
+                cur = _MaskSegment()
+                i += 1
+                if len(pending) > 1:
+                    self.fail("two heredocs wait on one line")
+                if pending:
+                    i = self.body(i, pending.pop(), closer is not None)
+                continue
+            if c == ")":
+                if not closer or pending:
+                    self.fail("a ) that closes no substitution")
+                segments.append(cur)
+                return i + 1, segments
+            if c == "(":
+                self.fail("a subshell")
+            if c in "<>0123456789" or s.startswith("&>", i):
+                m = _MASK_REDIRECT.match(s, i)
+                if m:
+                    i = self.redirect(m, cur, pending, depth, waiting)
+                    continue
+            op = next((o for o in _MASK_CONTROL_OPS if s.startswith(o, i)), None)
+            if op:
+                if op in (";;", ";&", ";|"):
+                    self.fail("a case pattern")
+                cur.op = op
+                segments.append(cur)
+                cur = _MaskSegment()
+                i += len(op)
+                continue
+            word, i = self.word(i, depth, waiting or bool(pending))
+            cur.words.append(word)
+
+    def redirect(self, m, cur, pending, depth, waiting):
+        fd, op = m.group(1), m.group(2)
+        i = m.end()
+        while i < self.n and self.s[i] in " \t":
+            i += 1
+        if i >= self.n or self.s[i] in "\n;&|()<>":
+            self.fail("a redirect without a word, or a process substitution")
+        if op in ("<<", "<<-"):
+            word, i = self.word(i, depth, True)
+            raw = self.s[word.start:word.end]
+            delimiter = _MASK_QUOTES.sub("", raw)
+            if not delimiter or "$" in raw or "`" in raw:
+                self.fail("a heredoc delimiter")
+            heredoc = [delimiter, raw != delimiter, op == "<<-", -1, -1]
+            cur.heredocs.append(heredoc)
+            pending.append(heredoc)
+            return i
+        word, i = self.word(i, depth, waiting or bool(pending))
+        raw = self.s[word.start:word.end]
+        if op == "<<<":
+            cur.strings.append(word)
+            return i
+        if op in (">&", "<&") and not m.group(3) and (raw.isdigit() or raw == "-"):
+            if raw not in ("0", "1", "2", "-"):
+                cur.bad = True
+            return i
+        if fd and fd not in ("0", "1", "2"):
+            cur.bad = True
+        if ">" in op:
+            cur.outs.append(word)
+        return i
+
+    def body(self, i, heredoc, in_substitution):
+        """Read a heredoc body from i; return the index after its delimiter line."""
+        delimiter, quoted, strip_tabs = heredoc[0], heredoc[1], heredoc[2]
+        s, n, start = self.s, self.n, i
+        while True:
+            j = s.find("\n", i)
+            line = s[i:] if j < 0 else s[i:j]
+            check = line.lstrip("\t") if strip_tabs else line
+            if check == delimiter:
+                heredoc[3], heredoc[4] = start, i
+                return n if j < 0 else j + 1
+            if in_substitution and check.startswith(delimiter) and check[len(delimiter):].lstrip(" \t")[:1] == ")":
+                self.fail("a heredoc delimiter followed by )")
+            if not quoted and line.endswith("\\"):
+                self.fail("a backslash joins the lines of an unquoted heredoc")
+            if j < 0:
+                self.fail("an unterminated heredoc")
+            i = j + 1
+
+    def word(self, i, depth, waiting):
+        s, n = self.s, self.n
+        start, lit, parts = i, i, []
+        while i < n:
+            c = s[i]
+            if c in " \t\n;&|<>)":
+                break
+            if c == "(":
+                self.fail("a parenthesis in a word")
+            if c == "\\":
+                i += 2
+                continue
+            if c in "'\"`":
+                self._lit(parts, lit, i)
+                if c == "'":
+                    j = s.find("'", i + 1)
+                    if j < 0:
+                        self.fail("an unterminated single quote")
+                    parts.append(("sq", i + 1, j, None))
+                    i = lit = j + 1
+                elif c == '"':
+                    pieces, j = self.double(i + 1, depth, waiting)
+                    parts.append(("dq", i + 1, j - 1, pieces))
+                    i = lit = j
+                else:
+                    j = self.backtick(i)
+                    parts.append(("code", i, j, None))
+                    i = lit = j
+                continue
+            if c == "$":
+                kind, j, nested = self.dollar(i, depth, waiting)
+                if kind:
+                    self._lit(parts, lit, i)
+                    parts.append((kind, i, j, nested))
+                    i = lit = j
+                    continue
+            i += 1
+        i = min(i, n)
+        self._lit(parts, lit, i)
+        if i == start:
+            self.fail("an empty word")
+        return _MaskWord(start, i, parts), i
+
+    def double(self, i, depth, waiting):
+        """The pieces of a double-quoted text that starts at i; returns (pieces, index after the closing quote)."""
+        s, n = self.s, self.n
+        pieces, lit = [], i
+        while i < n:
+            c = s[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                self._lit(pieces, lit, i)
+                return pieces, i + 1
+            if c == "`":
+                self._lit(pieces, lit, i)
+                j = self.backtick(i)
+                pieces.append(("code", i, j, None))
+                i = lit = j
+                continue
+            if c == "$" and s[i + 1:i + 2] not in ("'", '"'):
+                kind, j, nested = self.dollar(i, depth, waiting)
+                if kind:
+                    self._lit(pieces, lit, i)
+                    pieces.append((kind, i, j, nested))
+                    i = lit = j
+                    continue
+            i += 1
+        self.fail("an unterminated double quote")
+
+    def dollar(self, i, depth, waiting):
+        """(kind, end, nested) for the expansion at i, or (None, i, None) for a literal `$`."""
+        s = self.s
+        nxt = s[i + 1:i + 2]
+        if s.startswith("$((", i):
+            level, j = 2, i + 3
+            while j < self.n and level:
+                level += {"(": 1, ")": -1}.get(s[j], 0)
+                j += 1
+            inside = s[i + 3:j - 2]
+            if level or re.search(r"[\"'`\\]|<<", inside) or (waiting and "\n" in inside):
+                self.fail("an arithmetic expansion the mask does not read")
+            return "code", j, None
+        if nxt == "(":
+            end, segments = self.commands(i + 2, depth + 1, ")", waiting)
+            return "sub", end, segments
+        if nxt == "{":
+            j = s.find("}", i + 2)
+            if j < 0 or re.search(r"[\"'`\\(){$\n]", s[i + 2:j]):
+                self.fail("a ${..} holding quotes or code")
+            return "code", j + 1, None
+        if nxt in ("'", '"', "["):
+            self.fail("$'..', $\"..\" or $[..]")
+        m = _MASK_PARAMETER.match(s, i)
+        if m:
+            return "code", m.end(), None
+        return None, i, None
+
+    def backtick(self, i):
+        s, j = self.s, i + 1
+        while j < self.n:
+            if s[j] == "\\":
+                j += 2
+                continue
+            if s[j] == "`":
+                if re.search(r"[\"']", s[i + 1:j]):
+                    self.fail("quotes inside a backtick")
+                return j + 1
+            j += 1
+        self.fail("an unterminated backtick")
+
+    @staticmethod
+    def _lit(parts, start, end):
+        if end > start:
+            parts.append(("lit", start, end, None))
+
+    # ---- judging
+    def raw(self, word):
+        return self.s[word.start:word.end]
+
+    def literal(self, word):
+        """The word's text when it is one unquoted literal with no backslash, else None."""
+        if len(word.parts) == 1 and word.parts[0][0] == "lit" and "\\" not in self.raw(word):
+            return self.raw(word)
+        return None
+
+    def value(self, word):
+        """The word's text with quotes and backslashes removed (an approximation used only to refuse)."""
+        return _MASK_QUOTES.sub("", self.raw(word))
+
+    def assignment(self, word):
+        first = word.parts[0]
+        return first[0] == "lit" and _MASK_ASSIGNMENT.match(self.s, first[1], first[2])
+
+    def program(self, segment):
+        """Index of the segment's program word after its assignments, or None for a segment with no program."""
+        p = 0
+        while p < len(segment.words) and self.assignment(segment.words[p]):
+            p += 1
+        return p if p < len(segment.words) else None
+
+    def check(self, segments):
+        """Refuse the whole line for a construct that can change what another command on it runs."""
+        for segment in segments:
+            for word in segment.words:
+                m = self.assignment(word)
+                if m and m.group(1) in LOOKUP_VARIABLES:
+                    self.fail("a lookup variable is assigned")
+            # The command word, after the precommands that run a builtin in this shell (`builtin eval ..`).
+            p = self.program(segment)
+            while p is not None and p < len(segment.words):
+                v = self.value(segment.words[p])
+                if v in MASK_BAIL_COMMANDS:
+                    self.fail("a reserved word, exec, coproc or a redefinition")
+                if v in PRECOMMANDS or (v.startswith("-") and p and self.value(segment.words[p - 1]) == "command"):
+                    p += 1
+                    continue
+                break
+            for word in segment.words + segment.outs + segment.strings:
+                for kind, _, _, nested in word.parts:
+                    if kind == "sub":
+                        self.check(nested)
+                    elif kind == "dq":
+                        for piece in nested:
+                            if piece[0] == "sub":
+                                self.check(piece[3])
+
+    def data_arguments(self, segment):
+        """(program name, index of the first argument) when the segment runs a data program, else None."""
+        p = self.program(segment)
+        if p is None or segment.bad:
+            return None
+        words = segment.words
+        name = self.literal(words[p])
+        if name in DATA_PROGRAMS:
+            if name == "printf" and any(self.value(w).startswith("-v") for w in words[p + 1:]):
+                return None
+            return name, p + 1
+        trusted = _wal_note_words()
+        if name in PYTHONS and p + 1 < len(words) and self.raw(words[p + 1]) in trusted:
+            return "wal_note", p + 2
+        if self.raw(words[p]) in trusted:
+            return "wal_note", p + 1
+        return None
+
+    def sink(self, segment):
+        p = self.program(segment)
+        return p is not None and not segment.bad and self.literal(segment.words[p]) in PIPE_SINKS
+
+    def file_targets(self, name, segment, first):
+        """The words naming files the data command (or a pipe sink after it) writes."""
+        out = list(segment.outs)
+        args = segment.words[first:]
+        if name == "tee":
+            out += [w for w in args if not self.value(w).startswith("-")]
+        if name == "wal_note":
+            for k, w in enumerate(args):
+                v = self.value(w)
+                if v == "--wal" and k + 1 < len(args):
+                    out.append(args[k + 1])
+                elif v.startswith("--wal="):
+                    out.append(w)
+        return out
+
+    def masks(self, segments, spans):
+        """Add the data spans of the data commands in `segments` to `spans`."""
+        for k, segment in enumerate(segments):
+            data = self.data_arguments(segment)
+            if not data:
+                continue
+            name, first = data
+            targets = self.file_targets(name, segment, first)
+            j, ok = k, True
+            while ok and segments[j].op in ("|", "|&"):
+                j += 1
+                ok = j < len(segments) and self.sink(segments[j])
+                if ok:
+                    sink = segments[j]
+                    targets += self.file_targets(self.literal(sink.words[self.program(sink)]), sink,
+                                                 self.program(sink) + 1)
+            if not ok or not all(self.target_ok(t) for t in targets):
+                continue
+            for word in segment.words[first:] + segment.strings:
+                for kind, a, b, nested in word.parts:
+                    if kind == "sq":
+                        spans.append((a, b))
+                    elif kind == "sub":
+                        self.masks(nested, spans)
+                    elif kind == "dq":
+                        for piece in nested:
+                            if piece[0] == "lit":
+                                spans.append((piece[1], piece[2]))
+                            elif piece[0] == "sub":
+                                self.masks(piece[3], spans)
+            for _, quoted, _, a, b in segment.heredocs:
+                if quoted or not re.search(r"\$\(|`", self.s[a:b]):
+                    spans.append((a, b))
+
+    def target_ok(self, word):
+        """A written file that nothing later on the line names, by its file name or by a variable in it."""
+        raw = self.raw(word)
+        if "$(" in raw or "`" in raw:
+            return False
+        value = self.value(word)
+        if value in NULL_TARGETS:
+            return True
+        names = [os.path.basename(value.rstrip("/"))] + _MASK_VARIABLE.findall(value)
+        rest = self.s[word.end:]
+        return all(name and name not in rest for name in names)
+
+
+def data_mask(cmd: str) -> "str | None":
+    """`cmd` with the data text of its data commands blanked (same length; newlines kept), or None when the line
+    holds no data text or anything the mask does not model. See the section comment above."""
+    if len(cmd) > MASK_MAX or _MASK_CONTROL_CHARS.search(cmd):
+        return None
+    lexer = _MaskLexer(cmd)
+    spans = []
+    try:
+        _, segments = lexer.commands(0, 0, None, False)
+        lexer.check(segments)
+        lexer.masks(segments, spans)
+    except _NoMask:
+        return None
+    if not spans:
+        return None
+    chars, last = list(cmd), 0
+    for a, b in sorted(spans):
+        if a < last:
+            return None                                     # overlapping spans: a lexer fault
+        for x in range(a, b):
+            if chars[x] != "\n":
+                chars[x] = " "
+        last = b
+    return "".join(chars)
+
+
+def _masked_reading(cmd: str, masked: str) -> list:
+    """The copy commands the masked line holds. The ssh rule applies only if the original line itself verifies."""
+    return [w for w in copy_commands(masked, strict=not shell_words.scan(cmd).verified) if is_copy_command(w)]
+
+
+def _outside_data(cmd: str, strict: list) -> list:
+    """The copies the disk floor charges once data text is masked (goodqa#17112): the base reading's copies when the
+    mask does not model the line, raises, or reads a copy the base reading did not."""
+    try:
+        masked = data_mask(cmd)
+        if masked is None:
+            return strict
+        left = _masked_reading(cmd, masked)
+        return left if all(w in strict for w in left) else strict
+    except Exception as e:  # noqa: BLE001 -- fail strict: the base reading stands
+        try:
+            alert("data-mask-error", {"error": type(e).__name__})
+        except Exception:  # noqa: BLE001
+            pass
+        return strict
+
+
+# ---------------------------------------------------------------- copy check: destinations (goodqa#17106)
+# The base reading keeps redirect words (`2>&1`, `2>/dev/null`, `> log` and its target) and counts every word that
+# is not an option as an operand, so a redirect or an option value after the destination was read as the destination:
+# an rsync to host:path was charged here, and a copy followed by `> /dev/null` was measured on /dev, which has no free
+# space. Redirect words are dropped, and rsync's and scp's value-taking options consume their values.
+_REDIRECT_WORD = re.compile(r"(?:\d*|&)(?:<<<|<<-|<<|<>|<&|>>|>&|>\||>!|>|<)[|!]?(.*)", re.S)
+# rsync 3.2.7 `rsync --help`: the options written --name=VALUE, their short forms and aliases.
+RSYNC_VALUE_LONG = frozenset((
+    "--info", "--debug", "--backup-dir", "--suffix", "--chmod", "--checksum-choice", "--cc", "--block-size", "--rsh",
+    "--rsync-path", "--max-delete", "--max-size", "--min-size", "--max-alloc", "--partial-dir", "--usermap",
+    "--groupmap", "--chown", "--timeout", "--contimeout", "--modify-window", "--temp-dir", "--compare-dest",
+    "--copy-dest", "--link-dest", "--compress-choice", "--zc", "--compress-level", "--zl", "--skip-compress",
+    "--filter", "--exclude", "--exclude-from", "--include", "--include-from", "--files-from", "--copy-as", "--address",
+    "--port", "--sockopts", "--outbuf", "--remote-option", "--out-format", "--log-file", "--log-file-format",
+    "--password-file", "--early-input", "--bwlimit", "--stop-after", "--stop-at", "--write-batch",
+    "--only-write-batch", "--read-batch", "--protocol", "--iconv", "--checksum-seed"))
+RSYNC_VALUE_SHORT = frozenset("BeTfM@")
+
+
+def _strip_redirects(words: list) -> list:
+    """The words without redirect words, and without the target word of a redirect written apart from it."""
+    out, i = [], 0
+    while i < len(words):
+        m = _REDIRECT_WORD.fullmatch(words[i])
+        if m:
+            i += 1 if m.group(1) else 2
+            continue
+        out.append(words[i])
+        i += 1
+    return out
+
+
+def _operands(words: list, short_values: frozenset, long_values: frozenset) -> list:
+    """The operands after the program word: no options, no option values (`--timeout 30`, `-e CMD`, `-avze CMD`)."""
+    out, i, end = [], 1, False
+    while i < len(words):
+        w = words[i]
+        if end or w == "-" or not w.startswith("-"):
+            out.append(w)
+            i += 1
+        elif w == "--":
+            end = True
+            i += 1
+        elif w.startswith("--"):
+            i += 2 if "=" not in w and w in long_values else 1
+        else:
+            letter = next((k for k, ch in enumerate(w[1:], 1) if ch in short_values), 0)
+            i += 2 if letter == len(w) - 1 else 1
+    return out
+
+
+def _remote(operand: str) -> bool:
+    return ":" in operand.split("/")[0]
+
+
+def _copy_destination(words: list) -> "list[str]":
+    """The path a copy command writes to (for the floor check's volume), best effort."""
+    words = _strip_redirects(words)
+    if not words:
+        return []
+    if os.path.basename(words[0]) == "rsync":
+        return _operands(words, RSYNC_VALUE_SHORT, RSYNC_VALUE_LONG)[-1:]
+    return _dest(words)
+
+
+def _copy_verb(words: list) -> str:
+    name = os.path.basename(words[0])
+    if name == "git":
+        return "git worktree add" if "worktree" in words else "git clone"
+    return {"cp": "cp -r"}.get(name, name)
+
+
 def _opts(words: list) -> "tuple[set, list]":
     """(short-option letters + long options, positional args) after the command name."""
     flags, pos, end = set(), [], False
@@ -1130,6 +1705,9 @@ def _opts(words: list) -> "tuple[set, list]":
 
 
 def is_copy_command(words: list) -> bool:
+    words = _strip_redirects(words)
+    if not words:
+        return False
     name = os.path.basename(words[0])
     flags, pos = _opts(words)
     if name == "git":
@@ -1144,7 +1722,11 @@ def is_copy_command(words: list) -> bool:
     if name == "cp":
         return bool(flags & {"r", "R", "a", "--recursive", "--archive"})
     if name == "rsync":
-        return bool(flags & {"r", "a", "--recursive", "--archive"}) and not any(":" in p.split("/")[0] for p in pos[-1:])
+        # A host:path destination is the far host's copy (goodqa#17106). It counts as remote only when it is the
+        # only remote operand, so a host:path option value after a local destination cannot hide a copy here.
+        operands = _operands(words, RSYNC_VALUE_SHORT, RSYNC_VALUE_LONG)
+        remote = bool(operands) and _remote(operands[-1]) and not any(_remote(p) for p in operands[:-1])
+        return bool(flags & {"r", "a", "--recursive", "--archive"}) and not remote
     return name == "ditto"
 
 
@@ -1877,12 +2459,14 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                            "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
                            ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
         copying = [w for w in copy_commands(cmd) if is_copy_command(w)]
+        if copying:
+            copying = _outside_data(cmd, copying)
         if not copying:
             return 0, ""
         cfg = normalize(cfg) if cfg is not None else load_config()
         target = home()
         for w in copying:
-            d = _dest(w)
+            d = _copy_destination(w)
             if d and d[-1].startswith("/"):
                 target = d[-1]
             elif d and d[-1].startswith("~"):
@@ -1894,7 +2478,7 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
             return 0, ""
         alert("disk-low-denied-copy", {"target": target[:200], "free_gb": round(gb, 2), "floor_gb": round(fl, 2),
                                        "command": os.path.basename(copying[0][0])})
-        return 2, low_disk_message(target, gb, fl) + "\n"
+        return 2, low_disk_message(target, gb, fl, copy=_copy_verb(copying[0])) + "\n"
     except Exception:          # noqa: BLE001 -- fail open
         return 0, ""
 
