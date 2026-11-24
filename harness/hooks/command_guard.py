@@ -5110,8 +5110,9 @@ class Analyzer:
                 self._credential_finding()
             return
         seen[(path, runner)] = False
-        if self.ctx.budget.over():
-            return  # the pass is out of time: start no new read
+        # the pass is out of time: start no new read. Reads wait on the disk, so this limit stays wall clock (H23)
+        if self.ctx.budget.over() or time.monotonic() > getattr(self, 'credential_read_deadline', float('inf')):
+            return
         try:
             if not os.path.isfile(path):
                 return
@@ -8354,8 +8355,9 @@ def credential_findings(command, compiled, cwd=None, ps=False):
     script being run."""
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=None)
     analyzer.credential_pass = True
-    analyzer.ctx.budget.restart(min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds'])),
-                                min(CREDENTIAL_PASS_WALL_SECONDS, analyzer.ctx.budget.wall_seconds))
+    cap = min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
+    analyzer.ctx.budget.restart(cap, min(CREDENTIAL_PASS_WALL_SECONDS, analyzer.ctx.budget.wall_seconds))
+    analyzer.credential_read_deadline = time.monotonic() + cap  # file reads: wall clock, as before H23
     try:
         analyzer.run(command)
     except Exception:  # noqa: BLE001 - a budget stop, the alarm's TimeoutError or a bug: main's verdict stands

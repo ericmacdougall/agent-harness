@@ -151,6 +151,29 @@ class HookAlarms(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('wall-clock alarm', text)
 
+    @unittest.skipUnless(hasattr(signal, 'setitimer') and hasattr(signal, 'SIGPROF'), 'no CPU-time timer')
+    def test_the_cpu_alarm_really_fires_on_a_call_that_never_ticks(self):
+        # a 1 s CPU alarm (max_seconds 0.2) stops a busy call that never reads the budget; a wall-clock bound
+        # keeps the test itself finite if the alarm is broken
+        compiled = cg.Compiled(cg.load_policy())
+        compiled.limits = dict(compiled.limits, max_seconds=0.2)
+        self.assertEqual(cg.hook_cpu_alarm_seconds(compiled.limits), 1.0)
+
+        def busy(*_args, **_kwargs):
+            import time
+            stop = time.monotonic() + 60
+            n = 0
+            while time.monotonic() < stop:
+                n += 1
+            raise AssertionError('the CPU alarm never fired')
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': ORDINARY}}).encode()
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.object(cg, 'decide', busy), mock.patch('sys.stderr', new=err), \
+                mock.patch('sys.stdout', new=out):
+            code = cg.hook_main(stdin_bytes=payload, compiled=compiled, marker=False)
+        self.assertEqual(code, 2)
+        self.assertIn('CPU-time alarm', err.getvalue() + out.getvalue())
+
     @unittest.skipUnless(hasattr(signal, 'setitimer'), 'no interval timers')
     def test_the_hook_clears_both_alarms(self):
         self.run_hook(TimeoutError(cg.HOOK_WALL_LIMIT))
