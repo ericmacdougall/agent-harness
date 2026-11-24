@@ -182,4 +182,23 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
               "skipped_processes": outcome.get("skipped_processes")}
     if "audit_warning" in outcome:
         answer["audit_warning"] = outcome["audit_warning"]
+    step = next_step(result)
+    if step:
+        answer["next"] = step
     return answer
+
+
+NEXT_STALE = ("run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the checkout "
+              "the worktree was added from) on the same host first, but only when every fetch refspec of that remote "
+              "writes under refs/remotes/<that remote>/ and pruneTags is not set; prune deletes local branches or tags "
+              "through any other destination (for example +refs/*:refs/* or +refs/heads/*:refs/heads/up/*). Then "
+              "repeat the same ah worktree-remove call")
+
+
+def next_step(result):
+    """The fixed next step for a stale-tracking-ref refusal (goodqa#16943), or None. The verifier keeps that rule. The
+    text names no path, host or remote: a value read from the repository can be wrong or harmful to run (#333 review
+    rounds 1 and 2), so the caller fills in the remote it knows."""
+    if result.get("removable") is not False or "stale or names a moved" not in str(result.get("reason") or ""):
+        return None
+    return NEXT_STALE
