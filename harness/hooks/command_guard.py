@@ -1349,23 +1349,6 @@ TRANSCRIPT_CODE_WRITE = re.compile(r'open\s*\([^)]*,\s*[\'"][^\'"]*[wax+]|\.writ
                                    r'fs\.(?:write|append|symlink|copy|rename)|copyfile|hardlink')
 
 
-# Code that names the WAL tree and could write a file (goodqa#17008). Wider than TRANSCRIPT_CODE_WRITE: a mode string
-# or flag that opens for writing in any language, but not a read loop that prints or appends to a list.
-WAL_CODE_WRITE = re.compile(TRANSCRIPT_CODE_WRITE.pattern
-                            + r'|\.open\s*\(\s*(?:mode\s*=\s*)?[\'"][^\'"]*[wax+]|\bmode\s*=\s*[\'"][^\'"]*[wax+]'
-                            + r'|\bo_(?:wronly|rdwr|append|creat|trunc)\b'
-                            + r'|\bopen\s*\(?[^;]{0,80}?,\s*[\'"]\s*\+?(?:>|>>|\||\+<)\s*[\'"]'
-                            + r'|\bopen\s*\(?\s*(?:my\s+)?[$\w]+\s*,\s*[\'"]\s*\+?[>|]|(?<![\w.])(?:sys(?:write|open))\b'
-                            + r'|\bfile_put_contents\b|\bfwrite\b|\bfopen\s*\([^)]*,\s*[\'"][wax+]'
-                            + r'|\b(?:append|write)file(?:sync)?\b|createwritestream|\bopensync\s*\([^)]*,\s*[\'"][wax+]'
-                            + r'|(?<!stdout\.)(?<!stderr\.)\bwrite(?:lines)?\s*\(|\bprint\s*\([^)]*\bfile\s*='
-                            + r'|\bsubprocess\b|\bos\.system\b|\bpopen\b|\bspawn|\bexec(?:sync|file)?\s*\('
-                            + r'|\brunpy\b|\bimportlib\b|__import__|\bsys\.path\b|\.claude[\\/]+hooks'
-                            + r'|\b(?:from|import)\s+(?:wal\w*|ah\w*|provenance\w*|escalation|deliver|spec_flow)\b'
-                            + r'|\brequire\s*\(\s*[\'"]child_process|\bshutil\b'
-                            + r'|\bos\.(?:replace|rename|link|symlink)')
-
-
 # goodqa#17008, the inverted rule: a command with an operand in the WAL tree is a write unless the program is proven to
 # read it. These read every operand (their output goes to stdout; a redirect is judged on its own).
 WAL_READERS = frozenset({
@@ -1413,6 +1396,163 @@ SED_WRITE = re.compile(r'(?:^|[;{}\n])\s*(?:\d+|\$|/[^/]*/)?(?:,\s*(?:\d+|\$|/[^
 AWK_WRITE = re.compile(r'\bprintf?\b[^;}]*(?:>|\|)|\bsystem\s*\(|\|\s*getline|\bclose\s*\(')
 TAR_WRITE_MODE = re.compile(r'^-?[A-Za-z]*[xurA]|^--(?:extract|get|update|append|delete|concatenate|catenate)\b')
 COMPRESS_CMDS = frozenset({'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz', 'zstd', 'unzstd', 'lz4', 'brotli'})
+
+
+# goodqa#17008, red-team R4 (5b1b372d): interpreter code that may reach the WAL tree is refused unless it is proven to
+# only read, the way the operand rule is inverted. The one shape the guard proves is Python that parses and uses only
+# the names, modules and attributes below; open() and Path.open() only to read, or to write a literal absolute path
+# outside the tree; write() and print(file=) only to stdout, stderr or such a file. A list of write calls (logging,
+# urlretrieve, pandas, File::Copy, ...) is never complete, so anything unlisted, and any other language, is a write.
+READ_ONLY_PY_MODULES = frozenset({
+    'json', 'sys', 're', 'collections', 'glob', 'itertools', 'functools', 'statistics', 'math', 'datetime', 'time',
+    'os', 'os.path', 'pathlib', 'csv', 'hashlib', 'textwrap', 'pprint', 'operator', 'string', 'heapq', 'bisect',
+    'fnmatch', 'typing', 'decimal', 'fractions', 'difflib', 'copy', 'unicodedata', 'calendar', 'zoneinfo', 'random',
+})
+READ_ONLY_PY_BUILTINS = frozenset({
+    'print', 'len', 'sum', 'sorted', 'min', 'max', 'enumerate', 'range', 'list', 'dict', 'set', 'tuple', 'str', 'int',
+    'float', 'bool', 'any', 'all', 'zip', 'map', 'filter', 'isinstance', 'repr', 'round', 'abs', 'iter', 'next',
+    'reversed', 'open', 'frozenset', 'bytes', 'divmod', 'format', 'chr', 'ord', 'hex', 'bin', 'oct', 'pow', 'hash',
+    'slice', 'object', 'Exception', 'ValueError', 'KeyError', 'OSError', 'IOError', 'StopIteration', 'TypeError',
+    'IndexError', 'UnicodeDecodeError', 'FileNotFoundError', 'AttributeError', 'RuntimeError', 'SystemExit',
+    'KeyboardInterrupt', 'BrokenPipeError', 'True', 'False', 'None',
+})
+READ_ONLY_PY_ATTRS = frozenset({
+    # parsing, strings, containers
+    'loads', 'load', 'dumps', 'dump', 'JSONDecodeError', 'read', 'readline', 'readlines', 'strip', 'lstrip', 'rstrip',
+    'split', 'rsplit', 'splitlines', 'get', 'items', 'keys', 'values', 'append', 'extend', 'insert', 'pop', 'update',
+    'add', 'sort', 'startswith', 'endswith', 'lower', 'upper', 'casefold', 'title', 'format', 'join', 'count', 'find',
+    'rfind', 'index', 'rindex', 'partition', 'rpartition', 'isdigit', 'isalpha', 'isalnum', 'isspace', 'zfill',
+    'ljust', 'rjust', 'center', 'encode', 'decode', 'setdefault', 'fromkeys', 'copy', 'deepcopy', 'discard',
+    'union', 'intersection', 'difference', 'issubset', 'issuperset',
+    # re, collections, itertools, statistics, hashing, csv on stdout
+    'compile', 'search', 'match', 'fullmatch', 'findall', 'finditer', 'sub', 'subn', 'group', 'groups', 'groupdict',
+    'span', 'start', 'end', 'escape', 'IGNORECASE', 'I', 'M', 'MULTILINE', 'S', 'DOTALL', 'X', 'VERBOSE',
+    'Counter', 'defaultdict', 'OrderedDict', 'deque', 'namedtuple', 'most_common', 'elements', 'chain', 'groupby',
+    'islice', 'product', 'combinations', 'permutations', 'accumulate', 'zip_longest', 'reduce', 'partial',
+    'itemgetter', 'attrgetter', 'mean', 'median', 'mode', 'pstdev', 'stdev', 'quantiles', 'sqrt', 'floor', 'ceil',
+    'log', 'log10', 'inf', 'nan', 'isnan', 'sha256', 'sha1', 'md5', 'blake2b', 'hexdigest', 'digest', 'reader',
+    'DictReader', 'writer', 'DictWriter', 'writerow', 'writerows', 'writeheader', 'shorten', 'wrap', 'dedent',
+    'indent', 'pformat', 'heappush', 'heappop', 'nlargest', 'nsmallest', 'bisect_left', 'bisect_right', 'fnmatch',
+    'normalize', 'Decimal', 'Fraction', 'unified_diff', 'ndiff', 'ascii_letters', 'digits', 'choice', 'seed',
+    # time
+    'date', 'datetime', 'timedelta', 'timezone', 'utc', 'now', 'utcnow', 'today', 'fromisoformat', 'isoformat',
+    'strftime', 'strptime', 'timestamp', 'fromtimestamp', 'total_seconds', 'days', 'seconds', 'year', 'month',
+    'day', 'hour', 'minute', 'second', 'tzinfo', 'astimezone', 'monotonic', 'perf_counter', 'ZoneInfo', 'time',
+    'gmtime', 'localtime',
+    # files and paths, reading
+    'path', 'environ', 'getenv', 'walk', 'listdir', 'scandir', 'getcwd', 'sep', 'linesep', 'exists', 'isfile',
+    'isdir', 'islink', 'basename', 'dirname', 'splitext', 'abspath', 'realpath', 'normpath', 'relpath', 'expanduser',
+    'expandvars', 'isabs', 'getsize', 'getmtime', 'stat', 'st_size', 'st_mtime', 'st_mode', 'Path', 'PurePath',
+    'name', 'stem', 'suffix', 'suffixes', 'parent', 'parents', 'parts', 'read_text', 'read_bytes', 'iterdir', 'glob',
+    'iglob', 'rglob', 'is_file', 'is_dir', 'is_symlink', 'resolve', 'absolute', 'as_posix', 'home', 'cwd',
+    'with_suffix', 'with_name', 'relative_to', 'is_relative_to', 'open',
+    # the process's own streams and arguments
+    'stdin', 'stdout', 'stderr', 'argv', 'exit', 'maxsize', 'flush', 'close', 'buffer', 'getpid', 'write', 'writelines',
+    'replace',
+})
+
+
+def python_reads_only(code, writable_path=None):
+    """True when `code` is Python the guard can prove only reads files (READ_ONLY_PY_*; see above). `writable_path(p)`
+    says whether a literal path may be opened for writing (outside the WAL tree)."""
+    import ast
+    if len(code) > 200000:
+        return False
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    bound, imported, writers = set(), set(), {'sys.stdout', 'sys.stderr'}
+
+    def mode_reads(call, pos):
+        mode = call.args[pos] if len(call.args) > pos else next(
+            (k.value for k in call.keywords if k.arg == 'mode'), None)
+        if mode is None:
+            return True
+        return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set('wax+')
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            inner = dotted(node.value)
+            return inner and inner + '.' + node.attr
+        return None
+
+    def writable_open(call):
+        """open(<literal absolute path outside the tree>, <write mode>)."""
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == 'open'
+                and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+                and writable_path is not None and writable_path(call.args[0].value))
+
+    def may_write(node):
+        """A file argument code may write: stdout, stderr, a name bound to a writable_open, or such an open itself."""
+        return dotted(node) in writers or writable_open(node)
+
+    try:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                base = node.module if isinstance(node, ast.ImportFrom) else None
+                if isinstance(node, ast.ImportFrom) and (node.level or base not in READ_ONLY_PY_MODULES):
+                    return False
+                for alias in node.names:
+                    if base is None and alias.name not in READ_ONLY_PY_MODULES:
+                        return False
+                    if base is not None and alias.name not in READ_ONLY_PY_ATTRS:
+                        return False
+                    local = alias.asname or alias.name.split('.')[0]
+                    bound.add(local)
+                    imported.add(local)
+                    if alias.asname is None and base is None and '.' in alias.name:
+                        imported.add(alias.name)  # `import os.path`: receiver `os.path`
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+            elif isinstance(node, ast.arg):
+                bound.add(node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                if isinstance(node, ast.FunctionDef):
+                    bound.add(node.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                bound.update(node.names)
+            elif isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.AsyncWith, ast.AsyncFor, ast.Await)):
+                return False
+            # a name bound to a file opened for writing at a literal path outside the tree may be written
+            if isinstance(node, ast.withitem) and writable_open(node.context_expr) and \
+                    isinstance(node.optional_vars, ast.Name):
+                writers.add(node.optional_vars.id)
+            if isinstance(node, ast.Assign) and writable_open(node.value):
+                writers.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id not in READ_ONLY_PY_BUILTINS and node.id not in bound:
+                    return False
+            elif isinstance(node, ast.Attribute):
+                if node.attr.startswith('_') or node.attr not in READ_ONLY_PY_ATTRS:
+                    return False
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ''
+                receiver = dotted(func.value) if isinstance(func, ast.Attribute) else None
+                if name == 'open' and (receiver in imported or not (
+                        mode_reads(node, 1 if isinstance(func, ast.Name) else 0)
+                        or isinstance(func, ast.Name) and writable_open(node))):
+                    return False  # os.open and Path.open(p, ...) take flags or a path first: never proven
+                if name in ('write', 'writelines') and receiver not in writers:
+                    return False
+                if name == 'replace' and (len(node.args) < 2 or receiver in imported):
+                    return False  # str.replace(old, new); not os.replace or Path.replace
+                for k in node.keywords:
+                    if k.arg == 'file' and not may_write(k.value):
+                        return False
+                if name in ('writer', 'DictWriter') and node.args and not may_write(node.args[0]):
+                    return False
+                if name == 'dump' and len(node.args) > 1 and not may_write(node.args[1]):
+                    return False
+    except RecursionError:
+        return False
+    return True
 
 
 # code that reads a value from the environment or stdin, or from its arguments (where a WAL path could come from)
@@ -4234,6 +4374,10 @@ class Ctx:
         self.top_commands = 0
         self.cwd_unknown = False
         self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
+        # goodqa#17008: the unknown directory may be inside the WAL tree (the cd target's own text, its variable or a
+        # CDPATH names the tree, or `cd -`/popd after a cd into it); wal_cwd_seen: a cd in this command reached it
+        self.cwd_wal = False
+        self.wal_cwd_seen = False
         self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
         self.temp_vars = {}  # NAME=$(mktemp ...): name -> (its var_hints text, directories mktemp may create in)
         self.seen_texts = []  # every script text analysed (top command, -c strings, script files): goodqa#15122
@@ -4321,6 +4465,8 @@ class Ctx:
             elif k == 'cwd' and mine != theirs:
                 self.cwd_protected_unknown = self.cwd_protected_unknown or bool(
                     PROTECTED_TEXT.search((mine or '') + ' ' + (theirs or '') + '/'))
+                self.cwd_wal = self.cwd_wal or any(
+                    isinstance(p, str) and p.startswith('/') and wal_paths.in_wal_tree(p) for p in (mine, theirs))
                 self.cwd = theirs
                 self.cwd_unknown = True
             else:
@@ -5047,6 +5193,7 @@ class Analyzer:
             return
         if name in ('popd', 'pop-location'):
             ctx.cwd_unknown = True
+            ctx.cwd_wal = ctx.cwd_wal or ctx.wal_cwd_seen  # back to a directory an earlier cd may have put in the tree
             return
         if name in ('eval', 'invoke-expression', 'iex'):
             self.eval_words(args, depth, pl, idx)
@@ -5462,8 +5609,8 @@ class Analyzer:
 
     # what a reading of a launched command may change and must give back: where it runs and what it has defined. Every
     # other effect (a file it writes, a link, a secret it saw, a taint) stays, whichever reading was right.
-    READING_STATE = ('cwd', 'cwd_known', 'cwd_unknown', 'cwd_protected_unknown', 'fixed_cwd', 'vars', 'var_hints',
-                     'aliases')
+    READING_STATE = ('cwd', 'cwd_known', 'cwd_unknown', 'cwd_protected_unknown', 'cwd_wal', 'fixed_cwd', 'vars',
+                     'var_hints', 'aliases')
 
     def _reading(self, same_shell, run, cwd=None, keep=()):
         """Run one reading of a launched command. The command is its own process, so its `cd`, variables and aliases
@@ -5480,6 +5627,7 @@ class Analyzer:
         try:
             if cwd is LAUNCH_CWD_UNKNOWN:
                 ctx.cwd_unknown = True
+                ctx.cwd_wal = ctx.cwd_wal or self._names_wal_tree()  # the launcher's directory text is not kept
             elif cwd is not None:
                 self.chdir([cwd])
             run()
@@ -5854,23 +6002,43 @@ class Analyzer:
         pos = _nondash(args)
         if not pos:
             ctx.cwd = ctx.home
-            ctx.cwd_unknown = ctx.cwd_protected_unknown = False
+            ctx.cwd_unknown = ctx.cwd_protected_unknown = ctx.cwd_wal = False
             ctx.cwd_known = True
             return
         word = pos[0]
         target = word.text
+        # goodqa#17008: whether an unknown directory may be inside the WAL tree is decided by the cd itself (its text,
+        # its variables' assignments, CDPATH, or `cd -` after a cd there), not by the command merely naming the tree
+        names_wal = self._names_wal_tree(' '.join([target, word.raw or ''] + [
+            ctx.var_hints.get(v.lstrip('!'), '') for v in word.vars]))
         if target == '-' or is_dynamic_path(target) or word.dynamic:
             ctx.cwd_unknown = True
             ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(target) or self._hint_points_at_protected(word))
+            ctx.cwd_wal = names_wal or (target == '-' and ctx.wal_cwd_seen)
             return
         if ctx.cwd_unknown and not target.startswith(('/', '~')):
             # relative to a directory the guard could not resolve: still unknown, and a protected name stays visible
             ctx.cwd_protected_unknown = ctx.cwd_protected_unknown or bool(PROTECTED_TEXT.search(target))
+            ctx.cwd_wal = ctx.cwd_wal or names_wal
+            return
+        raw = getattr(ctx, 'raw_top', '') or ''
+        if (os.environ.get('CDPATH') or 'CDPATH' in raw) and not target.startswith(('/', '~', './', '../')) \
+                and target not in ('.', '..'):
+            # bash and zsh look a relative name up in CDPATH first: where it lands is not known here
+            value = ' '.join([os.environ.get('CDPATH', ''), ctx.var_hints.get('CDPATH', ''),
+                              str(ctx.vars.get('CDPATH', '')), raw if 'CDPATH' in raw else ''])
+            ctx.cwd_unknown = True
+            ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(value + ' ' + target))
+            ctx.cwd_wal = names_wal or self._names_wal_tree(value) or any(
+                e.startswith('/') and wal_paths.in_wal_tree(posixpath.join(e, target))
+                for e in os.environ.get('CDPATH', '').split(':'))
             return
         if target.startswith(('/', '~')):
             ctx.cwd_known = True
         ctx.cwd = norm_path(target, ctx, ctx.cwd)
-        ctx.cwd_unknown = ctx.cwd_protected_unknown = False
+        ctx.cwd_unknown = ctx.cwd_protected_unknown = ctx.cwd_wal = False
+        if self._in_tree(ctx.cwd):
+            ctx.wal_cwd_seen = True
 
     # ---- find
     def find(self, args, depth, pl, idx):
@@ -7231,9 +7399,17 @@ class Analyzer:
         argv_hit = getattr(ctx, 'code_argv_hit', None)
         if (self._names_wal_tree(code) or self._cwd_in_tree() or not self.disk_depth and self._names_wal_tree() and (
                 CODE_TAKES_INPUT.search(code) or CODE_TAKES_ARGV.search(code) and argv_hit is not False)) \
-                and WAL_CODE_WRITE.search(low):
-            self._wal_forgery('interpreter code that can write a file, in a command that names the session WALs '
-                              '(write output with a shell redirect outside ~/.claude/wals instead)')
+                and not python_reads_only(code, self._code_may_write):
+            # inverted (red-team R4): only Python the guard proves reads is let through
+            self._wal_forgery('interpreter code the guard cannot show only reads, in a command that names the session '
+                              'WALs (read with plain Python open()/json and print, or cat/jq, and write output with a '
+                              'shell redirect outside ~/.claude/wals)')
+
+    def _code_may_write(self, path):
+        """A literal path interpreter code may open for writing: absolute, outside the WAL tree, not naming it, and the
+        directory is not one an unknown cd may have put in the tree (python_reads_only)."""
+        return isinstance(path, str) and path.startswith('/') and not self._in_tree(path) \
+            and not self._names_wal_tree(path)
 
     # ---- destructive
     #
@@ -7997,7 +8173,7 @@ class Analyzer:
     def _in_tree(self, text):
         """The one question every WAL rule asks (goodqa#17008): could writing `text` land in the WAL tree? The path is
         taken as the kernel takes it (`..` after a link resolves from the link's target), and a relative path while the
-        directory is unknown (`cd -`, a variable) counts when the command names the tree."""
+        directory is unknown counts when that directory may be inside the tree (ctx.cwd_wal, set by the cd itself)."""
         if not text:
             return False
         ctx = self.ctx
@@ -8007,15 +8183,39 @@ class Analyzer:
             cache[path] = wal_paths.in_wal_tree(path, self.c.session_wal_roots)
         if cache[path]:
             return True
+        if '/../' in path + '/' and self._dotdot_unresolvable(path) and self._names_wal_tree():
+            return True
         relative = not text.startswith(('/', '~')) and not re.match(r'^[A-Za-z]:[\\/]', text) \
             and '$' not in text and not text.isdigit()  # a variable is judged as a dynamic word; `>&1` is a descriptor
-        return relative and ctx.cwd_unknown and not self.disk_depth and self._names_wal_tree()
+        return relative and ctx.cwd_unknown and ctx.cwd_wal and not self.disk_depth
+
+    def _dotdot_unresolvable(self, path):
+        """red-team R1 (5b1b372d): a `..` after a component that does not exist yet, or that this command creates or
+        links, goes up from wherever that component will lead when the command runs, which the guard cannot know now
+        (`ln -s ~/.claude/x q && echo >> q/../wals/...`)."""
+        ctx = self.ctx
+        made = {p.casefold() for p in getattr(ctx, 'created', ())} | {
+            str(p).casefold() for p in (getattr(ctx, 'links', None) or {})}
+        parts = path.split('/')
+        for k, part in enumerate(parts):
+            if part != '..' or k < 2:
+                continue
+            head = '/'.join(parts[:k])
+            if head.casefold() in made or posixpath.normpath(head).casefold() in made:
+                return True
+            try:
+                if not os.path.lexists(head):
+                    return True
+            except (OSError, ValueError):
+                return True
+        return False
 
     def _cwd_in_tree(self):
-        """The directory the command is in is inside the WAL tree (or unknown, in a command that names it)."""
+        """The directory the command is in is inside the WAL tree, or unknown and possibly inside it (ctx.cwd_wal: the
+        cd's own text, its variable or CDPATH names the tree, or `cd -`/popd after a cd there)."""
         ctx = self.ctx
         if ctx.cwd_unknown:
-            return self._names_wal_tree()
+            return ctx.cwd_wal
         return bool(ctx.cwd_known and ctx.cwd and self._in_tree(ctx.cwd))
 
     def _names_wal_tree(self, text=None):
@@ -8092,6 +8292,94 @@ class Analyzer:
         except (OSError, ValueError):
             return False
 
+    ARCHIVE_LIST_BYTES = 256 << 20   # a larger archive is not listed: unprovable
+    ARCHIVE_LIST_MEMBERS = 20000
+    ARCHIVE_LIST_SECONDS = 1.0
+
+    def _archive_may_create(self, name, args, texts, nd, first):
+        """red-team R2 (5b1b372d), inverted: an extraction into a directory above the WAL tree is allowed only when the
+        archive provably cannot create the next component on the way to it (`first`: `.claude` under the home, `wals`
+        under the Claude home). Provable: a local regular tar or zip file, not made or written by this command, whose
+        members (after --strip-components) are listed within the bounds above, with no member named `first`, no
+        absolute or `..` member and no link member. An archive that does not exist and is not made here extracts
+        nothing. Anything else (stdin, a remote or computed archive, other formats, a listing past the bounds) may."""
+        archive, strip = None, 0
+        if name in ('tar', 'bsdtar', 'gtar'):
+            for k, t in enumerate(texts):
+                if t in ('-f', '--file') and k + 1 < len(args):
+                    archive = args[k + 1]
+                elif t.startswith('--file='):
+                    archive = _literal_word(t.split('=', 1)[1])
+                elif t.startswith('--strip-components'):
+                    value = t.split('=', 1)[1] if '=' in t else (texts[k + 1] if k + 1 < len(texts) else '')
+                    strip = int(value) if value.isdigit() else -1
+                elif re.fullmatch(r'-?[A-Za-z0-9]*f[A-Za-z0-9.]*', t) and (k == 0 or t.startswith('-')) \
+                        and not t.startswith('--'):
+                    rest = t[t.index('f') + 1:]
+                    archive = _literal_word(rest) if rest else (args[k + 1] if k + 1 < len(args) else None)
+        elif name == 'unzip' and nd:
+            archive = nd[0]
+        if archive is None or archive.dynamic or archive.glob or archive.text in ('-', '') or strip < 0:
+            return True
+        path = norm_path(archive.text, self.ctx)
+        raw = getattr(self.ctx, 'raw_top', '') or ''
+        if path.casefold() in self.ctx.created or path.casefold() in self.ctx.written or \
+                raw.count(posixpath.basename(archive.text)) > 1:
+            return True  # made, written or named elsewhere in this command (`tar -cf a.tar ... && tar -xf a.tar`)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False  # nothing to extract, and this command does not make it
+        except (OSError, ValueError):
+            return True
+        if not stat.S_ISREG(info.st_mode) or info.st_size > self.ARCHIVE_LIST_BYTES:
+            return True
+        deadline = time.monotonic() + self.ARCHIVE_LIST_SECONDS
+        first = first.casefold()
+
+        def lands(member, is_link):
+            parts = [p for p in member.replace('\\', '/').split('/') if p not in ('', '.')]
+            if member.startswith('/') or '..' in parts or is_link:
+                return True
+            parts = parts[strip:]
+            return bool(parts) and parts[0].casefold() == first
+
+        try:
+            import tarfile
+            import zipfile
+            if zipfile.is_zipfile(path):
+                with zipfile.ZipFile(path) as z:
+                    for n, member in enumerate(z.infolist()):
+                        if n > self.ARCHIVE_LIST_MEMBERS or time.monotonic() > deadline:
+                            return True
+                        if lands(member.filename, (member.external_attr >> 16) & 0o170000 == 0o120000):
+                            return True
+                return False
+            if name == 'unzip':
+                return True
+
+            class Bounded:
+                """The raw archive, read in tar's 10 KiB records: each read checks the deadline, so a compressed
+                stream that expands without end stops at it (stream mode never seeks)."""
+
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def read(self, size=-1):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('archive listing deadline')
+                    return self.handle.read(size if 0 <= size <= 1 << 20 else 1 << 20)
+
+            with open(path, 'rb') as raw, tarfile.open(fileobj=Bounded(raw), mode='r|*') as t:
+                for n, member in enumerate(t):
+                    if n > self.ARCHIVE_LIST_MEMBERS or time.monotonic() > deadline:
+                        return True
+                    if lands(member.name, member.issym() or member.islnk()):
+                        return True
+            return False
+        except Exception:  # noqa: BLE001 - an archive the guard cannot list is not proven harmless
+            return True
+
     COPIERS = frozenset({'cp', 'install', 'ditto', 'rsync', 'scp', 'rclone', 'copy-item', 'cpi', 'robocopy'})
     EXTRACTORS = frozenset({'tar', 'bsdtar', 'gtar', 'unzip', 'cpio', '7z', '7za', 'ar', 'pax', 'expand-archive'})
 
@@ -8115,6 +8403,19 @@ class Analyzer:
                     any(re.fullmatch(r'-?[A-Za-z]*x[A-Za-z]*', t) and (k == 0 or t.startswith('-'))
                         and not t.startswith('--') for k, t in enumerate(texts))
                     or any(t.startswith(('--extract', '--get')) for t in texts)))
+            passing = (name == 'cpio' and any(t in ('-p', '--pass-through') or re.fullmatch(r'-[A-Za-z]*p[A-Za-z]*', t)
+                                              for t in texts)) or (
+                name == 'pax' and any(re.fullmatch(r'-[A-Za-z]*r[A-Za-z]*', t) for t in texts)
+                and any(re.fullmatch(r'-[A-Za-z]*w[A-Za-z]*', t) for t in texts))
+            if passing and nd:
+                # cpio -p DIR and pax -rw ... DIR copy the paths they are given (on stdin or as operands) under DIR,
+                # keeping each path: what lands is not known here (red-team R2)
+                dest = nd[-1].text
+                if not dest or self._in_tree(dest) or nd[-1].dynamic or wal_paths.below_toward_tree(
+                        norm_path(dest, self.ctx, physical=True), roots):
+                    self._wal_forgery('%s copies paths it reads into the session WALs or a directory above them' % name)
+                    return True
+                return False
             if not extracting:
                 return False
             for k, t in enumerate(texts):
@@ -8122,16 +8423,24 @@ class Analyzer:
                     dests.append(args[k + 1].text)
                 elif t.startswith(('--directory=', '-C/', '-o/')) or name in ('7z', '7za') and t.startswith('-o'):
                     dests.append(t.split('=', 1)[1] if '=' in t else t[2:])
+            # an unknown directory counts only when the cd that made it unknown ties it to the tree (ctx.cwd_wal)
             dests = dests or [self.ctx.cwd_value() if not self.ctx.cwd_unknown else '']
-            if any(not d or self._in_tree(d) or wal_paths.below_toward_tree(norm_path(d, self.ctx, physical=True),
-                                                                            roots) for d in dests):
-                self._wal_forgery('%s extracts into the session WALs or a directory above them' % name)
+            if any(self._in_tree(d) if d else self.ctx.cwd_wal for d in dests):
+                self._wal_forgery('%s extracts into the session WALs' % name)
                 return True
+            for d in dests:
+                first = wal_paths.below_toward_tree(norm_path(d, self.ctx, physical=True), roots) if d else None
+                if first is not None and self._archive_may_create(name, args, texts, nd, first):
+                    self._wal_forgery('%s extracts into a directory above the session WALs an archive the guard cannot '
+                                      'show leaves them alone' % name)
+                    return True
             return False
         if name == 'rclone':
             if not nd or nd[0].text not in ('copy', 'copyto', 'sync', 'move', 'moveto', 'bisync'):
                 return False
             nd = nd[1:]
+        if name in ('rsync', 'scp'):
+            nd = self._copy_operands(name, args)  # an option value after the destination must not hide it
         target = None
         for k, t in enumerate(texts):
             if t in ('-t', '--target-directory') and k + 1 < len(args):
@@ -8147,6 +8456,17 @@ class Analyzer:
         else:
             return False
         contents = name in ('ditto', 'rclone') or '-T' in texts or '--no-target-directory' in texts
+        # red-team R2 (5b1b372d): sources whose landing paths the guard cannot see make every source unprovable:
+        # path-keeping copies (rsync -R/--relative and --files-from, cp --parents), ditto's archive modes, and a source
+        # on another host or remote (its contents cannot be checked from here)
+        keeps_paths = (name == 'rsync' and any(t in ('--relative', '-R') or t.startswith('--files-from')
+                                                or re.fullmatch(r'-[A-Za-z]*R[A-Za-z]*', t) for t in texts)) or (
+            name == 'cp' and any(t == '--parents' for t in texts)) or (
+            name == 'ditto' and any(re.fullmatch(r'-[A-Za-z]*[xk][A-Za-z]*', t) for t in texts))
+
+        def remote(text):
+            return name in ('rsync', 'scp', 'rclone') and bool(
+                re.match(r'^[^/]*:', text) or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', text))
         for dest in dests:
             if self._wal_hit(dest):
                 self._wal_forgery('%s copies into the session WALs' % name)
@@ -8160,15 +8480,20 @@ class Analyzer:
                 continue
             for src in sources:
                 text = src.text
-                if src.dynamic or src.glob or any(ch in text for ch in '*?['):
+                if keeps_paths or src.dynamic or src.glob or any(ch in text for ch in '*?['):
                     hit = True
-                elif contents or text.endswith('/') or text.endswith('/.'):
+                elif contents or text.endswith(('/', '/.', ':')):
+                    if remote(text):  # a remote directory's contents cannot be checked from here (`host:dotfiles/`)
+                        self._wal_forgery('%s copies the contents of a remote directory into a directory above the '
+                                          'session WALs; sync into a staging directory and copy what you need' % name)
+                        return True
                     path = norm_path(text, self.ctx, physical=True)
                     hit = os.path.lexists(posixpath.join(path, first)) or any(
                         k.startswith(path.casefold().rstrip('/') + '/') for k in self.ctx.created) or \
                         any(k.startswith(path.casefold().rstrip('/') + '/') for k in self.ctx.written)
                 else:
-                    hit = posixpath.basename(text.rstrip('/')).casefold() == first
+                    local = text.split(':', 1)[1] if remote(text) else text  # `host:.claude` lands as `.claude`
+                    hit = posixpath.basename(local.rstrip('/')).casefold() == first
                 if hit:
                     self._wal_forgery('%s copies into a directory above the session WALs what could be the WAL tree'
                                       % name)
