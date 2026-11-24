@@ -29,7 +29,7 @@ CORPUS = json.loads((ROOT / 'tests' / 'kill_guard_corpus.json').read_text(encodi
 LITERAL = 'netwatch orphans --kill --pid'
 STARTED = set()
 FILES = ('kill_guard.py', 'kill_guard_policy.json', 'command_guard.py', 'command_guard_policy.json', 'redact.py',
-         'safe_input.py')
+         'safe_input.py', 'wal_paths.py')
 
 
 def refuse(why):
