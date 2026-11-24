@@ -37,10 +37,12 @@ Steps, each of which stops the run when it fails (nothing after a failed step ru
      file is compared with the digests again, and the doctor runs again.
   8. Each remote host: `ah install-files --host H --from-ref <sha> --file ... --ticket T` in batches of 20, with
      command_guard.py in the last batch; each batch's run id is printed. A second dry run must report every file current.
+     Every ah call gets AH_HOME set to this run's home, so ah writes the audit that step 4 reads.
   9. Registration, for the Mac and for every host whether or not anything was installed there: the doctor (for a host
      `doctor.py check --ssh H`, read-only) must answer, with an exit code that agrees with its rows; otherwise the run
-     stops (registration not proven). A required hook that is unregistered (MISSING) gives exit 3; any other required
-     hook that is not WIRED (SCRIPT_MISSING, CANARY_FAIL) stops the run.
+     stops (registration not proven). A required hook that is unregistered (MISSING), or any name a host's install
+     reported `unregistered`, gives exit 3; any other required hook that is not WIRED (SCRIPT_MISSING, CANARY_FAIL)
+     stops the run.
 
 Run time: a preview makes ceil(N/20) dry runs per host, N = the HOOKS count at the commit (about 110 today, so 6);
 a real run makes those, one install per batch of changed files, and the same dry runs again.
@@ -439,9 +441,15 @@ def ah_argv(home, host, commit, names, ticket, dry_run):
     return argv + (["--dry-run"] if dry_run else ["--ticket", ticket])
 
 
-def ah_call(runner, argv, what):
+def ah_env(home):
+    """ah keeps its audit under AH_HOME (else the home directory). The updater reads that audit for its open-run check,
+    so ah is told the updater's own home: both read one file, whatever AH_HOME the caller's shell has."""
+    return dict(os.environ, AH_HOME=str(home))
+
+
+def ah_call(runner, argv, what, home):
     try:
-        r = runner(argv, capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
+        r = runner(argv, capture_output=True, text=True, timeout=INSTALL_TIMEOUT, env=ah_env(home))
     except subprocess.TimeoutExpired:
         raise Stop("%s timed out after %d s" % (what, INSTALL_TIMEOUT))
     except OSError as e:
@@ -459,7 +467,8 @@ def ah_call(runner, argv, what):
 def remote_changes(home, host, commit, hooks, runner):
     plan = {}
     for batch in batches(hooks):
-        plan.update(ah_call(runner, ah_argv(home, host, commit, batch, None, True), "the dry run on %s" % host)["files"])
+        plan.update(ah_call(runner, ah_argv(home, host, commit, batch, None, True), "the dry run on %s" % host,
+                            home)["files"])
     missing = [n for n in hooks if n not in plan]
     if missing:
         raise Stop("the dry run on %s did not report %s" % (host, ", ".join(missing[:5])))
@@ -503,7 +512,7 @@ def remote_install(home, host, commit, names, ticket, runner):
     for i, group in enumerate(groups, 1):
         try:
             data = ah_call(runner, ah_argv(home, host, commit, group, ticket, False),
-                           "the install on %s (batch %d of %d)" % (host, i, len(groups)))
+                           "the install on %s (batch %d of %d)" % (host, i, len(groups)), home)
         except Stop as e:
             raise Stop(str(e) + resume_guidance(home, host, ticket, done))
         done.append((data.get("run") or "?", group))
@@ -690,17 +699,15 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None, home=N
         print("Mac: every listed file matches %s" % commit[:12])
         gaps = [("Mac", new), ("Mac (already before this run)", old)]
         for h, names in remote.items():
-            if names:
-                reported = remote_install(home, h, commit, names, a.ticket, runner)
-                if reported:
-                    print("%s: the remote installer reports these hooks unregistered: %s" % (h, " ".join(reported)))
+            reported = remote_install(home, h, commit, names, a.ticket, runner) if names else []
             left = remote_changes(home, h, commit, lists["hooks"], runner)
             if left:
                 raise Stop("%s: these hook files still differ after the install: %s" % (h, " ".join(left)))
             print("%s: every hook file matches %s" % (h, commit[:12]))
-            # R5 F4: every host is checked, whether or not anything was installed there
+            # R5 F4: every host is checked by its doctor, whether or not anything was installed there; a name the
+            # remote installer reported unregistered counts too (two answers, either one is a gap)
             _lost, h_new, h_old = registration(None, doctor_check(runner, home, h), h)
-            gaps.append((h, sorted(set(h_new + h_old))))
+            gaps.append((h, sorted(set(reported) | set(h_new) | set(h_old))))
         gaps = [(where, ids) for where, ids in gaps if ids]
         if gaps:
             for where, ids in gaps:
@@ -708,12 +715,11 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None, home=N
             print("Commit %s: files in place, NOT fully active: register these hooks with install.py --apply (without "
                   "--hooks-only) from a checkout of that commit, on each host named." % commit)
             return EXIT_REGISTER
-        checked = "the Mac's doctor" + "".join(" and %s's" % h for h in hosts)
+        checked = "the doctor reports every required hook wired on the Mac" + "".join(" and on %s" % h for h in hosts)
         if mac or any(remote.values()):
-            print("Done. Installed commit %s; %s report every required hook wired." % (commit, checked))
+            print("Done. Installed commit %s; %s." % (commit, checked))
         else:
-            print("Nothing to install: everything listed already matches %s; %s report every required hook wired."
-                  % (commit, checked))
+            print("Nothing to install: everything listed already matches %s; %s." % (commit, checked))
         return EXIT_OK
     except Stop as e:
         print("STOP: %s" % e, file=sys.stderr)
