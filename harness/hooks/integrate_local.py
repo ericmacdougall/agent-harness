@@ -587,17 +587,42 @@ def focused_unittest(options):
             and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
 
 
+GO_PACKAGE_SEGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
+def safe_go_package(item):
+    """A relative Go package pattern: ./..., ./pkg, ./pkg/sub, ./pkg/... (no flags, no escapes)."""
+    if not isinstance(item, str) or not item.startswith("./") or len(item) > 200:
+        return False
+    parts = item[2:].split("/")
+    for index, part in enumerate(parts):
+        if part == "...":
+            if index != len(parts) - 1:
+                return False
+        elif part in {"", ".", ".."} or not GO_PACKAGE_SEGMENT.fullmatch(part):
+            return False
+    return True
+
+
+def safe_go_packages(items):
+    return bool(items) and all(safe_go_package(item) for item in items)
+
+
 def approved_check(argv):
     if not argv:
         return False
     if argv[0] == 'node':
         return focused_node(argv)
     if argv[0] == "go" and len(argv) >= 2:
-        if argv[1:] == ["vet", "./..."]:
-            return True
+        if argv[1] == "vet":
+            return safe_go_packages(argv[2:])
         if argv[1] == "test":
             options = argv[2:]
-            return options[-1:] == ["./..."] and all(item in {"-race", "-count=1", "-v"} for item in options[:-1])
+            while options and options[0].startswith("-"):
+                if options[0] not in {"-race", "-count=1", "-v"}:
+                    return False
+                options = options[1:]
+            return safe_go_packages(options)
     if argv[0] in {"npm", "pnpm", "yarn"}:
         return argv[1:] == ["test"] or (len(argv) == 3 and argv[1] == "run" and argv[2] in {"test", "typecheck", "build", "lint", "check"})
     if argv[0] in {"python", "python3"}:
