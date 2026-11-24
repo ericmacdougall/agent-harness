@@ -484,10 +484,19 @@ class Gate(Base):
         self.assertNotIn("your own terminal", str(caught.exception))
 
     def test_a_stamp_covers_only_its_exact_command(self):
+        """Each part of the stamp key: the file set, the ref, the host and the ticket. The stamp for the exact command
+        then still installs (positive control), so the refusals came from the key, not from a missing stamp."""
         self.stamp(self.line(files=("ah.py",)))
         self.assert_refused_unchanged(self.before())  # ah.py + extra.py is another command
         self.stamp(self.line(ref=self.c0))
         self.assert_refused_unchanged(self.before())  # another ref
+        self.stamp(self.line())
+        for host, ticket in (("ah-mac-mini", TICKET), ("t2-dev", "GoodQA goodqa#99999")):  # another host, another ticket
+            with self.subTest(host=host, ticket=ticket):
+                self.gated(lambda: ai.install_files(host, self.c1, ["ah.py", "extra.py"], ticket, False, self.mac, "s", "a",
+                                                    self.runner, self.poster), "ah.py", "extra.py")
+        self.assertEqual(self.receipts, [])
+        self.assertEqual(self.install()["result"], "installed")
 
     def test_a_stamp_from_a_call_that_has_ended_is_refused(self):
         """The stamp is bound to main's call: once the transcript holds that call's result, a later process with the
