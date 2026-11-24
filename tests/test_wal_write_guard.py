@@ -111,6 +111,10 @@ WRITES = [
     'docker run -v {d}:/w alpine true', 'podman run --mount type=bind,src={d},dst=/w alpine true',
     'cd {d} && script -q -c true', 'cd {d} && nohup true',
     'cd {d} && script',  # no word at all: only the working directory says it writes ./typescript in the tree
+    # a quiet launcher whose option parse is wrong moves where its command starts; env -C moves only its command
+    'ionice -t tee -a {w} < /tmp/x', 'timeout -s 5 tee -a {w} < /tmp/x', 'nice -n tee -a {w} < /tmp/x',
+    'stdbuf -o tee -a {w} < /tmp/x', "runuser root -c 'tee -a {w} < /tmp/x'", "sg grp -c 'tee -a {w} < /tmp/x'",
+    'cd {d} && env -C /tmp true; echo x >> {name}', "mytool --command 'echo x >> {w}'",
 ]
 READS = [
     'cat {w}', 'tail -n 5 {w}', 'jq . {w}', 'grep -c x {w}', 'wc -l < {w}', 'ls -la {d}',
@@ -140,6 +144,8 @@ READS = [
     'timeout 5 tail -n 5 {w}', 'nice -n 5 cat {w}', 'env LC_ALL=C grep -c x {w}', 'nohup wc -l {w}',
     'stdbuf -oL tail -n 1 {w}', 'ionice -c 3 sha256sum {w}', 'command jq . {w}', 'exec cat {w}',
     'docker cp {w} c:/tmp/wal.jsonl',
+    # an unknown program whose text only mentions the tree, outside a command option
+    "git commit -m 'guard ~/.claude/wals writes'", 'git grep -n CLAUDE_CONFIG_DIR', "gh pr create --body 'x .claude/wals'",
 ]
 
 

@@ -1369,7 +1369,12 @@ WAL_LAUNCHER_CLASS = dict(
                                   'osascript', 'at', 'batch', 'start-process', 'start', 'call', 'invoke-expression',
                                   'iex', 'invoke-command', 'icm', 'pwsh', 'powershell', 'docker', 'podman',
                                   'nerdctl', 'kubectl', 'oc')})
-SED_WRITE =re.compile(r'(?:^|[;{}\n])\s*(?:\d+|\$|/[^/]*/)?(?:,\s*(?:\d+|\$|/[^/]*/))?\s*!?\s*[wW]\s|/[gpIiMme0-9]*w\s')
+# options whose value an unknown program may run as shell text; judged as a script when it names the WAL tree
+WAL_TEXT_OPTIONS = frozenset({'-c', '--command', '--run', '--cmd', '--exec', '--execute', '--shell-command'})
+# a word that cannot be a program a launcher starts: a number or duration, or an environment assignment
+WAL_VALUE_WORD = re.compile(r'[0-9][0-9.]*[smhd]?|[A-Za-z_][A-Za-z0-9_]*=.*', re.S)
+WAL_READINGS_CAP = 8
+SED_WRITE = re.compile(r'(?:^|[;{}\n])\s*(?:\d+|\$|/[^/]*/)?(?:,\s*(?:\d+|\$|/[^/]*/))?\s*!?\s*[wW]\s|/[gpIiMme0-9]*w\s')
 AWK_WRITE = re.compile(r'\bprintf?\b[^;}]*(?:>|\|)|\bsystem\s*\(|\|\s*getline|\bclose\s*\(')
 TAR_WRITE_MODE = re.compile(r'^-?[A-Za-z]*[xurA]|^--(?:extract|get|update|append|delete|concatenate|catenate)\b')
 COMPRESS_CMDS = frozenset({'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz', 'zstd', 'unzstd', 'lz4', 'brotli'})
@@ -3090,7 +3095,12 @@ WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionic
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
                    'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start', 'sshpass'}
-RM_CMDS = {'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
+# programs the WAL operand rule (Analyzer.wal_operands) models by name; any other name is an unknown program there
+KNOWN_TO_WAL_RULE = frozenset(WAL_READERS | WAL_JUDGED_ELSEWHERE | WAL_IN_OUT | COMPRESS_CMDS | set(WAL_LAUNCHER_CLASS)
+                              | SHELLS | PS_SHELLS | INTERPRETERS
+                              | {'awk', 'gawk', 'mawk', 'nawk', 'sed', 'gsed', 'find', 'tar', 'bsdtar', 'gtar', 'zip',
+                                 'rclone', 'base64', 'iconv'})
+RM_CMDS ={'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
            'rimraf', 'gio-trash'}
 MV_CMDS = {'mv', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni'}
 OVERWRITE_CMDS = {'tee', 'set-content', 'out-file', 'sc', 'clear-content', 'clc', 'truncate', 'dd', 'cp', 'copy-item',
@@ -4945,7 +4955,7 @@ class Analyzer:
                     k, _, v = t.partition('=')
                     ctx.aliases[k] = v
             return
-        self.wal_operands(name, words, args)
+        self.wal_operands(name, words, args, depth, pl, idx)
         if name in ('cd', 'pushd', 'set-location', 'sl', 'chdir'):
             self.chdir(args)
             return
@@ -5354,7 +5364,23 @@ class Analyzer:
         return False
 
     # ---- wrappers
+    # where a command runs; `env -C DIR cmd` moves only cmd, so this is given back afterwards (goodqa#17008)
+    CWD_STATE = ('cwd', 'cwd_known', 'cwd_unknown', 'cwd_protected_unknown', 'cwd_wal', 'wal_cwd_seen', 'fixed_cwd')
+
     def wrapper(self, name, args, depth, pl, idx):
+        if name != 'env':
+            return self._wrapper(name, args, depth, pl, idx)
+        ctx = self.ctx
+        saved = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
+                 if k in self.CWD_STATE}
+        try:
+            return self._wrapper(name, args, depth, pl, idx)
+        finally:
+            for k, v in saved.items():
+                setattr(ctx, k, v)
+            ctx.fs_cache.clear()
+
+    def _wrapper(self, name, args, depth, pl, idx):
         ctx = self.ctx
         texts = [a.text for a in args]
         i = 0
@@ -8173,7 +8199,7 @@ class Analyzer:
                     return True
         return False
 
-    def wal_operands(self, name, words, args):
+    def wal_operands(self, name, words, args, depth=0, pl=None, idx=0):
         """goodqa#17008, the inverted rule: a command given an operand in the WAL tree is refused unless the program is
         proven to only read it (WAL_READERS and the source side of copies and archives). Unknown programs are refused.
         Launchers, shells and wrappers are skipped here because the command they run is judged on its own."""
@@ -8224,6 +8250,8 @@ class Analyzer:
         if launcher == WAL_QUIET:
             if name == 'nohup' and here:
                 refuse('nohup writes nohup.out into the working directory, which is in the session WALs')
+            elif here or self._names_wal_tree():
+                self._wal_launched_readings(args, depth, pl, idx)
             return  # the command it runs is judged on its own
         if name in WAL_JUDGED_ELSEWHERE or name in SHELLS or self._is_script(name, words):
             return  # judged elsewhere, or a script on disk (an accepted limit: its source is not read)
@@ -8252,10 +8280,16 @@ class Analyzer:
                 and here:
             refuse('file -C writes a compiled magic file into the session WALs')
             return
+        if name not in KNOWN_TO_WAL_RULE and self._names_wal_tree():
+            # an unknown program may run the value of a command option as shell text (`tool -c '...'`)
+            for k, a in enumerate(args):
+                t = a.text
+                value = args[k + 1].text if t in WAL_TEXT_OPTIONS and k + 1 < len(args) else \
+                    t.split('=', 1)[1] if t.split('=', 1)[0] in WAL_TEXT_OPTIONS and '=' in t else None
+                if value is not None and self._names_wal_tree(value):
+                    self.script(value, depth + 1, tail_visible=True)
         hits = [a for a in args if self._wal_hit(a)]
-        # a word that is not a path but names the tree in its text (shell text an unknown program may run, `-c '...'`)
-        # brings the program under the rule too; the branches below that prove a read still return
-        if not hits and not any(self._names_wal_tree(a.raw or a.text) for a in args):
+        if not hits:
             return
         texts = [a.text for a in args]
         if name in INTERPRETERS:
@@ -8319,6 +8353,31 @@ class Analyzer:
             refuse('rclone %s writes or removes in the session WALs' % sub[:40])
             return
         refuse('%s is given a path in the session WALs and the guard cannot show it only reads it' % name[:40])
+
+    def _wal_launched_readings(self, args, depth, pl, idx):
+        """A quiet launcher's command start comes from wrapper()'s one reading of its options, which can be wrong (a
+        flag read as taking a value, or a value option read as a flag, moves the start). In a command that names the
+        WAL tree, every word that could start the launched command, up to the first program the guard models and
+        before the first word naming the tree, is judged as the start too. Only WAL refusals are kept from these extra
+        readings, and the analysis state is given back after each one."""
+        ctx = self.ctx
+        stop = next((k for k, a in enumerate(args) if self._wal_hit(a) or self._names_wal_tree(a.raw or a.text)),
+                    len(args))
+        starts = []
+        for k in range(stop):
+            t = args[k].text
+            if not t or t.startswith('-') or WAL_VALUE_WORD.fullmatch(t):
+                continue  # an option, a number or duration, or an assignment: not a program
+            starts.append(k)
+            if norm_name(t) in KNOWN_TO_WAL_RULE or len(starts) >= WAL_READINGS_CAP:
+                break
+        for k in starts:
+            saved, before = ctx.state(), len(ctx.findings)
+            try:
+                self.inner_words(args[k:], depth, pl, idx)
+            finally:
+                ctx.findings[before:] = [f for f in ctx.findings[before:] if getattr(f, 'rule', None) == 'wal-forgery']
+                ctx.restore(saved)
 
     def _wal_actor_refusal(self, tool, mine, why):
         self.ctx.add(LOG_DELETE, 'wal-actor', '%s aimed at a WAL this caller may not write: %s' % (tool[:40], why),
