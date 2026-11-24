@@ -38,6 +38,9 @@ from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject
 
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
+# goodqa#16811: merge_gate mints the review-auth stamp as this process launches and main() takes it first thing, so a
+# stamp older than this was left by a run that never started or ended early; it is never honoured.
+REVIEW_STAMP_TTL_SECONDS = 120
 # Verdict-bearing provider output (stderr, the last-message file and every stdout record, except the exempt Codex
 # command_execution output below) is bounded at 1 MB, as before goodqa#16170.
 PROVIDER_LIMIT = 1_000_000
@@ -1870,6 +1873,14 @@ def main() -> int:
                         help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
                              'but can never mint a merge authorization (the ahc daemon always passes this)')
     args = parser.parse_args()
+    # goodqa#16811: take main's review-auth stamp before anything else can end the run, so a run that exits early (a
+    # usage error, a HEAD mismatch, a dirty worktree) leaves no stamp for a later process to take; a stamp older than
+    # REVIEW_STAMP_TTL_SECONDS (the hook mints it as this very process launches) is never honoured.
+    args.main_stamp = None
+    if args.github_repo is not None and args.pr is not None and not args.no_main_stamp:
+        import caller_identity
+        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr],
+                                                     ttl=REVIEW_STAMP_TTL_SECONDS)
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
     if (args.github_repo is None) != (args.pr is None):
@@ -1938,7 +1949,6 @@ def main() -> int:
         evidence.close()
         parser.error('repo HEAD differs from --expected-head')
     binding = None
-    args.main_stamp = None
     if args.github_repo is not None:
         try:
             binding = verify_pr_binding(args.github_repo, args.pr, before[0])
@@ -1946,22 +1956,21 @@ def main() -> int:
             target.close()
             evidence.close()
             parser.error(str(error))
-        # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization
-        import caller_identity
-        # goodqa#16049: a caller that is never the authority (the ahc daemon) opts out, so a run on a host where
-        # main has stamps can neither take main's authority nor burn main's stamp
-        if not args.no_main_stamp:
-            args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
+        # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization; the stamp was taken
+        # right after argument parsing. goodqa#16049: a caller that is never the authority (the ahc daemon) opts out
+        # with --no-main-stamp, so a run on a host where main has stamps can neither take nor burn main's stamp.
         if args.main_stamp is None:
             # goodqa#16811: the hook that decides names its reason in the agent's context; this note lists every cause
             # instead of implying the caller is not main.
             print('Note: no main-agent stamp for this --github-repo/--pr run; this review cannot authorize a merge. '
                   + ('--no-main-stamp was given. ' if args.no_main_stamp else
                      "The merge-gate hook's own note gives the reason when it minted none: not the proven main agent, "
-                     'not one plain python3 .../peer_review.py command (an unquoted ; & | < >, a newline, a backslash, '
-                     'or a $ or backtick even inside double quotes), or a missing or repeated --github-repo/--pr. A '
-                     'stamp is also single use and expires after %d s. ' % caller_identity.STAMP_TTL_SECONDS)
-                  + 'Fix the cause and rerun once with --repeat-reason in single quotes.', file=sys.stderr)
+                     'not the Bash tool, not one plain python3 .../peer_review.py command (an unquoted ; & | < > or #, '
+                     'a newline, a backslash, or a $ or backtick even inside double quotes), or a missing or repeated '
+                     '--github-repo/--pr. A stamp is also single use and is honoured only within %d s of the '
+                     'launch. ' % REVIEW_STAMP_TTL_SECONDS)
+                  + 'Fix the cause and rerun once with --repeat-reason in single quotes, with no apostrophe inside.',
+                  file=sys.stderr)
     if before[1]:
         target.close()
         evidence.close()
