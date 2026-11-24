@@ -2,7 +2,10 @@
 
 Failing first: against 39f0735e every test here fails except the three marked "guard" (they pin what already held at
 that commit: a medium reviewer keeps 720/1440/2880, a daemon-shaped call stays inside the ahc review wall, and a real
-timeout receipt is NOT_COUNTED on the ladder)."""
+timeout receipt is NOT_COUNTED on the ladder).
+
+The step-timing follow-up (the Kimi fallback step, and a step that raised after its spawn) fails first against 9822b621,
+except its guard: a step that never launched is not timed."""
 import contextlib
 import importlib.util
 import io
@@ -124,31 +127,53 @@ class DeadlineReachesTheProvider(unittest.TestCase):
     fake = tpr.PeerReviewTests.fake
     evidence = staticmethod(tpr.PeerReviewTests.evidence)
 
-    def review(self, *extra, provider_result=None):
+    def review(self, *extra, provider_result=None, kimi=None, refuse_pool=None):
+        """main() in process. provider_result(name) may return a (code, stdout, stderr) tuple or an exception to raise
+        after the spawn; kimi replaces kimi_attempt (the subscription CLI is never called); refuse_pool names a
+        provider whose pool lease is refused before any launch."""
         module = load_peer_review()
         head = subprocess.check_output(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], text=True).strip()
         if rd.lint_packet('code-inspection', self.packet.read_text(errors='replace'), head):
             with self.packet.open('a') as handle:
                 handle.write(self.evidence(head))
-        seen = {'run': [], 'begin': []}
-        real_run, real_begin = module.run, usage_guard.UsageStore.begin
+        seen = {'run': [], 'begin': [], 'kimi': []}
+        real_run, real_begin, real_acquire = module.run, usage_guard.UsageStore.begin, usage_guard.UsageStore.acquire_pool
 
         def spy_run(cmd, prompt, cwd, timeout, **keywords):
             name = Path(cmd[0]).name
             seen['run'].append((name, timeout))
             forced = provider_result(name) if provider_result else None
+            if isinstance(forced, BaseException):
+                raise forced
             return forced if forced is not None else real_run(cmd, prompt, cwd, timeout, **keywords)
 
         def spy_begin(store, *arguments, **keywords):
             seen['begin'].append((keywords['timeout'], keywords['aggregate_timeout']))
             return real_begin(store, *arguments, **keywords)
 
+        def spy_acquire(store, provider, *arguments, **keywords):
+            if provider == refuse_pool:
+                raise usage_guard.PoolUnavailable('TRANSIENT_INFRA', 'Provider pool has an active or unreconciled owner; '
+                                                  'no provider was launched')
+            return real_acquire(store, provider, *arguments, **keywords)
+
+        def spy_kimi(prompt, packet_path, timeout):
+            seen['kimi'].append(timeout)
+            if kimi is None:
+                raise AssertionError('the Kimi fallback was not expected here')
+            answer = kimi(timeout)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(sys, 'argv', ['review', 'code-inspection', '--repo', str(self.repo), '--packet', str(self.packet),
                                         '--output', str(self.output), '--expected-head', head, *extra]), \
              patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + tpr.system_path()}), \
              patch.object(module, 'run', side_effect=spy_run), \
+             patch.object(module, 'kimi_attempt', side_effect=spy_kimi), \
              patch.object(usage_guard.UsageStore, 'begin', spy_begin), \
+             patch.object(usage_guard.UsageStore, 'acquire_pool', spy_acquire), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
             try:
                 code = module.main()
@@ -244,6 +269,64 @@ class DeadlineReachesTheProvider(unittest.TestCase):
         self.assertIn('NOT_COUNTED (infrastructure or uncertain result (TIMEOUT))', ladder_line)
         self.assertIn('a timeout is not counted as a ladder failure, but it spent review launch 1 of 8', ladder_line)
         self.assertNotIn('Ladder limit:', err)
+
+    # Every started provider step is timed (PR 339 review follow-up): the Kimi fallback step too, and a step whose
+    # call raised after the spawn. Failing first against 9822b621, except the guard.
+
+    def steps(self, final):
+        return [(step['provider'], step['deadline']) for step in final['usage']['timing']['providers']]
+
+    def test_a_kimi_fallback_answer_has_its_step_in_the_advisory_receipt(self):
+        code, seen, out, err = self.review(
+            '--author-rung', 'R3', '--secondary', 'kimi', provider_result=lambda name: (1, QUOTA, ''),
+            kimi=lambda timeout: (0, 'KIMI_ADVISORY: BLOCK\nThe packet needs work.', '', 1))
+        self.assertEqual(code, 4, err)
+        self.assertEqual(([name for name, _ in seen['run']], seen['kimi']), (['codex'], [2700]))
+        run_id, final = self.final_receipt()
+        self.assertEqual(final['reason'], 'ADVISORY')
+        self.assertEqual(self.steps(final), [('codex', 2700), ('kimi', 2700)])
+        self.assertEqual(final['usage']['timing']['run_id'], run_id)
+        self.assertIsInstance(final['usage']['timing']['providers'][1]['seconds'], float)
+
+    def test_a_kimi_fallback_failure_has_its_step_in_the_timing(self):
+        code, seen, out, err = self.review(
+            '--author-rung', 'R3', '--secondary', 'kimi', provider_result=lambda name: (1, QUOTA, ''),
+            kimi=lambda timeout: (1, '', 'kimi timed out after 2700 seconds; not retried', 1))
+        self.assertEqual(code, 2, err)
+        run_id, final = self.final_receipt()
+        self.assertEqual(self.steps(final), [('codex', 2700), ('kimi', 2700)])
+
+    def test_a_kimi_step_that_raises_is_still_timed(self):
+        # NEG-1: a raise inside the Kimi step still leaves its time in the receipt.
+        code, seen, out, err = self.review(
+            '--author-rung', 'R3', '--secondary', 'kimi', provider_result=lambda name: (1, QUOTA, ''),
+            kimi=lambda timeout: OSError('kimi transport broke'))
+        self.assertEqual(code, 2, err)
+        run_id, final = self.final_receipt()
+        self.assertEqual(self.steps(final), [('codex', 2700), ('kimi', 2700)])
+
+    def test_a_raise_after_spawn_keeps_the_step_time(self):
+        # NEG-1: run() raises GuardError UNKNOWN when the child record failed and its group could not be proven
+        # stopped. That step ran; its time must reach the Timing data, and no fallback follows an UNKNOWN end.
+        def outcome(name):
+            return usage_guard.GuardError('UNKNOWN', 'The child record failed and the child could not be proven '
+                                                     'stopped: OSError')
+        code, seen, out, err = self.review('--author-rung', 'R3', provider_result=outcome)
+        self.assertEqual(code, 2, err)
+        self.assertEqual(seen['run'], [('codex', 2700)])
+        run_id, final = self.final_receipt()
+        self.assertEqual(final['reason'], 'UNKNOWN')
+        self.assertEqual(self.steps(final), [('codex', 2700)])
+
+    def test_guard_a_step_that_never_launched_is_not_timed(self):
+        # Guard (holds at base too), NEG-2: the fallback's pool lease is refused before any launch, so only the
+        # primary step is recorded, once.
+        code, seen, out, err = self.review('--author-rung', 'R3', provider_result=lambda name: (1, QUOTA, ''),
+                                           refuse_pool='claude')
+        self.assertEqual(code, 2, err)
+        self.assertEqual(seen['run'], [('codex', 2700)])
+        run_id, final = self.final_receipt()
+        self.assertEqual(self.steps(final), [('codex', 2700)])
 
 
 class TimingLine(unittest.TestCase):
