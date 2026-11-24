@@ -228,9 +228,10 @@ class Writer(Base):
         self.clone(old)()
         time.sleep(0.05)
         q = os.path.join(self.home, "q")
+        # The output has no fatal line, so the own-output rule passes and the birth check alone must refuse.
         self.assert_refused("born-outside-call", self.bash("git clone %s %s || mv %s %s" % (self.src, q, old, q),
                                                            lambda: os.rename(old, q),
-                                                           output="Cloning into '%s'...\nfatal: early EOF\n" % q))
+                                                           output="Cloning into '%s'...\n" % q))
         old2 = os.path.join(self.home, "older")                 # a new folder, but the .git inside it is moved in
         self.clone(old2)()
         time.sleep(0.05)
@@ -241,9 +242,9 @@ class Writer(Base):
             os.rename(os.path.join(old2, ".git"), os.path.join(r, ".git"))
         self.assert_refused("born-outside-call", self.bash("git clone %s %s || true" % (self.src, r),
                                                            new_folder_old_git,
-                                                           output="Cloning into '%s'...\nfatal: early EOF\n" % r))
+                                                           output="Cloning into '%s'...\n" % r))
         x = os.path.join(self.home, "x")
-        prep = "Preparing worktree (new branch 'x')\nfatal: could not create leading directories\n"
+        prep = "Preparing worktree (new branch 'x')\n"          # no fatal: the later checks alone must refuse
         self.assert_refused("not-a-checkout", self.bash("git -C %s worktree add %s || true" % (self.src, x),
                                                         lambda: os.makedirs(x), output=prep))
         y = os.path.join(self.home, "y")
@@ -1159,6 +1160,28 @@ class OwnOutput(Base):
                                                          ours_fails_wt))
         self.assertEqual([r["path"] for r in self.held()], [ok])
 
+    def test_a_git_that_started_then_failed_gets_no_row_for_a_checkout_made_meanwhile(self):
+        dest = os.path.join(self.home, "started-then-failed")
+        bad = "file://" + os.path.join(self.src, ".git", "objects")    # git starts the clone, then gives up
+
+        def ours_starts_then_fails():
+            r = subprocess.run(["git", "clone", bad, dest], capture_output=True, text=True, env=ENV)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertRegex(r.stderr, r"(?m)^Cloning into '[^']*%s'\.\.\.$" % os.path.basename(dest),
+                             "positive control: git started")
+            self.assertFalse(os.path.exists(dest), "git removed what it made")
+            self.clone(dest)()                            # then an unhooked process clones to the same path
+            return r.stderr
+        self.assert_refused("git-failed-here", self.bash("git clone %s %s" % (bad, dest), ours_starts_then_fails))
+        wt = os.path.join(self.home, "wt-started-then-failed")
+
+        def theirs_wt():
+            sh("git", "-C", self.src, "worktree", "add", "-q", wt, "-b", "theirs2")
+        self.assert_refused("git-failed-here", self.bash(
+            "git -C %s worktree add %s -b ours2" % (self.src, wt), theirs_wt,
+            output="Preparing worktree (new branch 'ours2')\nfatal: unable to checkout working tree\n"))
+        self.assertEqual(self.held(), [])
+
     def test_hidden_or_quiet_output_gets_no_row(self):
         d = os.path.join(self.home, "hidden")
         self.assert_refused("no-own-output", self.bash("git clone %s %s >/dev/null 2>&1" % (self.src, d),
@@ -1200,9 +1223,14 @@ class Retire(Base):
             self.assertIsNone(R.held(row), "never judge ownership from part of the file")
             self.assert_refused("ledger-too-large", self.bash("git clone %s %s/l2" % (self.src, self.home),
                                                               self.clone(self.home + "/l2")))
-        with mock.patch.object(R, "state_is_local", lambda: False):
+        locks = []
+        real_flock = R.fcntl.flock
+        with mock.patch.object(R, "state_is_local", lambda: False), \
+                mock.patch.object(R.fcntl, "flock", lambda fd, op: locks.append(op) or real_flock(fd, op)):
             self.assert_refused("state-not-local", self.bash("git clone %s %s/l3" % (self.src, self.home),
                                                              self.clone(self.home + "/l3")))
+            self.assertEqual(R.retire_absent(self.home + "/l3", R.ensure_key()), 0)
+        self.assertEqual(locks, [], "a state folder that is not local is never locked: its flock cannot be trusted")
         self.assertEqual(len(self.held()), 1)
 
 

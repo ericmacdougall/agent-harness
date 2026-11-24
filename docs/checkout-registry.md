@@ -88,13 +88,18 @@ The command text only proposes a path. The row needs all of the following, as ob
 6. For a clone, `remote.origin.url` is the command's URL. For a worktree, it is linked and has the named repo's common
    dir.
 7. The call's own output shows its git creating that path: `Cloning into 'DIR'...` naming the same folder for a clone,
-   `Preparing worktree` for a worktree, and no git `already exists` error for that path. This is a fact only this call's
-   git could have produced: if another process made a checkout at the path during the call, this call's git failed with
-   `already exists` and there is no row (`git-failed-here`). Output that was hidden (`-q`, `--quiet`, `>/dev/null 2>&1`)
-   gives no row either (`no-own-output`). `2>&1 | tail -3` and `>/dev/null` keep git's messages, which go to stderr.
+   `Preparing worktree` for a worktree, and no `fatal:` line anywhere in the call's output. This is a fact only this
+   call's git could have produced. If another process made a checkout at the path during the call, this call's git
+   failed, either before it started (`already exists`) or after (`Cloning into ...` then a network or auth `fatal:`,
+   after which git removes what it made), and there is no row (`git-failed-here`). A `fatal:` from any other command in
+   the same call also refuses every checkout in it; that only costs rows. Output that was hidden (`-q`, `--quiet`,
+   `>/dev/null 2>&1`) gives no row either (`no-own-output`). `2>&1 | tail -3` and `>/dev/null` keep git's messages,
+   which go to stderr. The messages are matched in English: under another locale there is no row.
 
-The lock is `state/checkouts/registry.lock`. Waits stop after 2 s with `lock-timeout`, and a state folder that is not on
-a local filesystem gets no rows.
+The lock is `state/checkouts/registry.lock`. Waits stop after 2 s with `lock-timeout`. The lock checks the state folder
+first: on a folder that is not on a local filesystem it is never taken (`state-not-local`), so no claim, row or
+retirement is recorded there and `held()` answers None. The empty claim folders and the key file may still be created
+before that check.
 
 ## How an isolation row is proven
 
@@ -122,7 +127,7 @@ The codes are:
 
 | Stage | Codes |
 |---|---|
-| PreToolUse | `existed-at-pre`, `unreadable-at-pre`, `repo-unknown`, `contested`, `lock-timeout`, `no-mark`, `unsure` |
+| PreToolUse | `existed-at-pre`, `unreadable-at-pre`, `repo-unknown`, `contested`, `state-not-local`, `lock-timeout`, `no-mark`, `unsure` |
 | PostToolUse | `pending-missing`, `pending-bad-mac`, `pending-foreign`, `pending-expired`, `transcript-unbound`, `no-mark`, `git-failed-here`, `no-own-output`, `not-made`, `link`, `not-a-checkout`, `outside-home`, `realpath-moved`, `anchor-changed`, `other-fs`, `not-linked`, `repo-mismatch`, `no-btime`, `born-outside-call`, `origin-mismatch`, `state-not-local`, `no-key`, `no-generation`, `lock-timeout`, `ledger-too-large`, `second-owner`, `already-held`, `contested-identity` |
 | Other | `background`, `permission-denied`, `observed-absent`, `hook-error` |
 | Isolation | `iso-not-checkout`, `iso-not-listed`, `iso-no-transcript`, `iso-window` |

@@ -117,6 +117,11 @@ class LockTimeout(Exception):
     """The registry lock was not free within LOCK_WAIT: no row (code lock-timeout)."""
 
 
+class StateNotLocal(LockTimeout):
+    """Rule 13: the state folder is not on a local filesystem, so its lock is never taken or trusted
+    (code state-not-local)."""
+
+
 class LedgerTooLarge(Exception):
     """The ledger is over MAX_FILE: held() is None and the writer refuses (code ledger-too-large)."""
 
@@ -299,7 +304,10 @@ def _safe(value, limit: int = 300) -> str:
 def _locked():
     """Rule 13: one exclusive lock per machine around every re-check-and-append and every claim. The wait polls
     LOCK_NB up to LOCK_WAIT (never past the hook deadline); then LockTimeout. A dead holder's flock is released by the
-    kernel."""
+    kernel. The lock is the one choke point for Rule 13: on a state folder that is not local it is never taken
+    (StateNotLocal), so no claim, row or retirement is recorded there (empty claim folders and the key may exist)."""
+    if not state_is_local():
+        raise StateNotLocal("state folder is not local")
     fd = os.open(str(state_dir() / "registry.lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         st = os.fstat(fd)
@@ -463,8 +471,6 @@ def write_created(info: dict, kind: str, session: str, agent, tool_use_id) -> "t
     key = ensure_key()
     if not key or kind not in KINDS or not session:
         return None, "no-key"
-    if not state_is_local():
-        return None, "state-not-local"
     if sys.platform != "darwin" and info.get("gen") is None:
         return None, "no-generation"
     row = {"v": VERSION, "event": "created", "kind": kind, "host": HOST, "path": info["realpath"], "dev": info["dev"],
@@ -480,6 +486,8 @@ def write_created(info: dict, kind: str, session: str, agent, tool_use_id) -> "t
             if any(identity(r) == identity(row) and r.get("event") == "created" for r in rows(HOST, key)[0]):
                 return None, "contested-identity"      # a created row exists but counts as owned by no one
             return _append(row, key), "written"
+    except StateNotLocal:
+        return None, "state-not-local"
     except LockTimeout:
         return None, "lock-timeout"
     except NotHeld as e:
@@ -534,7 +542,8 @@ def retire_absent(real: str, key: bytes) -> int:
                     _append(_removed_row(row, "checkout_registry", "observed-absent"), key)
                     n += 1
     except (LockTimeout, NotHeld) as e:
-        decide("lock-timeout" if isinstance(e, LockTimeout) else e.clause, path=real)
+        decide("state-not-local" if isinstance(e, StateNotLocal) else
+               "lock-timeout" if isinstance(e, LockTimeout) else e.clause, path=real)
         return 0
     if n:
         decide("observed-absent", path=real, rows=n)
@@ -1016,7 +1025,7 @@ def _fresh(p: Path) -> bool:
 def _claim(real: str, tool_use_id: str) -> str:
     """Under the lock: one tool call at a time may expect a path (by claim_key). A second call expecting it marks it
     contested, and then neither call writes a row. A claim file that exists but cannot be read counts as someone
-    else's live claim. Returns "ok", "contested" or "lock-timeout"."""
+    else's live claim. Returns "ok", "contested", "state-not-local" or "lock-timeout"."""
     for kind in ("claims", "contested"):
         if not _secure_dir(state_dir() / kind, create=True):
             return "contested"
@@ -1042,6 +1051,8 @@ def _claim(real: str, tool_use_id: str) -> str:
             finally:
                 os.close(fd)
             os.replace(str(tmp), str(claim))
+    except StateNotLocal:
+        return "state-not-local"
     except LockTimeout:
         return "lock-timeout"
     except OSError:
@@ -1279,9 +1290,8 @@ def posttool(payload: dict) -> list:
 
 MAX_OUTPUT = 1 << 20
 CLONE_DONE = re.compile(r"^Cloning into '([^'\n]+)'\.\.\.$", re.M)
-CLONE_EXISTS = re.compile(r"^fatal: destination path '([^'\n]+)' already exists", re.M)
 WORKTREE_DONE = re.compile(r"^Preparing (?:worktree \(|.+ \(identifier )", re.M)
-WORKTREE_EXISTS = re.compile(r"^fatal: '([^'\n]+)' already exists", re.M)
+GIT_FATAL = re.compile(r"^fatal: ", re.M)
 
 
 def _call_output(payload: dict) -> str:
@@ -1298,20 +1308,18 @@ def _call_output(payload: dict) -> str:
 
 def own_git_output(kind: str, expect: str, text: str) -> str:
     """PR 344 review F3: a fact only this call's own git could have produced. Another process can make a checkout at
-    the expected path between Pre and Post; this call's git then fails ("already exists") and every other check would
-    pass. So the row needs this call's own output to show git creating that path (`Cloning into 'P'...` for a clone,
-    `Preparing worktree` for a worktree) and no "already exists" for it. Returns "ok", "git-failed-here" or
-    "no-own-output" (quiet or fully redirected output: no row, which is safe)."""
-    name = os.path.basename(expect.rstrip("/"))
-
-    def names(rx):
-        return {os.path.basename(m.rstrip("/")) for m in rx.findall(text)}
-    if kind == "clone":
-        if name in names(CLONE_EXISTS):
-            return "git-failed-here"
-        return "ok" if name in names(CLONE_DONE) else "no-own-output"
-    if name in names(WORKTREE_EXISTS):
+    the expected path between Pre and Post; this call's git then fails and every other check would pass. That failure
+    can come before git starts ("already exists") or after (`Cloning into 'P'...`, then a network or auth `fatal:`,
+    and git removes what it made). So the row needs this call's own output to show git creating that path
+    (`Cloning into 'P'...` for a clone, `Preparing worktree` for a worktree) and no `fatal:` line at all: any fatal
+    in the call refuses every checkout in it (`git-failed-here`), even one from another command, which only costs a
+    row. Returns "ok", "git-failed-here" or "no-own-output" (quiet or fully redirected output: no row, which is
+    safe)."""
+    if GIT_FATAL.search(text):
         return "git-failed-here"
+    if kind == "clone":
+        name = os.path.basename(expect.rstrip("/"))
+        return "ok" if name in {os.path.basename(m.rstrip("/")) for m in CLONE_DONE.findall(text)} else "no-own-output"
     return "ok" if WORKTREE_DONE.search(text) else "no-own-output"
 
 

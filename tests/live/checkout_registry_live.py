@@ -185,6 +185,19 @@ def main() -> int:
     pwd_cwd = [c["payload"].get("cwd") for c in captured if c["event"] == "PreToolUse" and cmd_of(c).strip() == "pwd"
                and not c["payload"].get("agent_id")]
     denied_fired = any(c["event"] == "PermissionDenied" and "c-denied" in cmd_of(c) for c in captured)
+    # The own-output rule (PR 344 review F3) reads git's messages from the Post payload: record where they are, by
+    # key name and yes/no only, so a missing row can be told apart from output the payload does not carry.
+    post_output = {}
+    for c in captured:
+        m = re.search(re.escape(live) + r"/((?:c|wt)-[a-z]+)\b", cmd_of(c))
+        if m and c["event"].startswith("PostToolUse"):
+            resp = c["payload"].get("tool_response")
+            text = json.dumps(resp) + json.dumps(c["payload"].get("error"))
+            post_output["%s %s" % (c["event"], m.group(1))] = {
+                "tool_response keys": sorted(resp) if isinstance(resp, dict) else type(resp).__name__,
+                "payload has error": "error" in c["payload"],
+                "git start line seen": "Cloning into" in text or "Preparing worktree" in text,
+                "fatal seen": "fatal: " in text}
     iso = [k for k in by_path if k.startswith("src/.claude/worktrees/agent-")]
     checks = {
         "main clone: one row": len(by_path.get("c-main", [])) == 1,
@@ -221,7 +234,8 @@ def main() -> int:
         "codes": sorted({"%s %s" % (c, p or "") for c, p in new_codes}),
         "facts": {"event for a non-zero Bash exit": fail_events, "subagent transcript_path form": sub_forms,
                   "PreToolUse cwd after an earlier cd": [redact(x, live, {}) for x in pwd_cwd],
-                  "PermissionDenied fired for the deny rule": denied_fired},
+                  "PermissionDenied fired for the deny rule": denied_fired,
+                  "Post output per call (keys and yes/no only)": post_output},
         "checks": checks, "retired": retired,
     }
     # A check over commands that never ran proves nothing either way: report BLOCKED with the reason, never PASS/FAIL.
