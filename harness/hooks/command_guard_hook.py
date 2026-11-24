@@ -18,7 +18,9 @@ import re
 import subprocess
 import sys
 
-CHILD_TIMEOUT = 10.0
+# Above the analyser's own wall-clock alarm (command_guard.hook_alarm_seconds, 17 s by default) plus two interpreter
+# starts on a loaded machine, and under the host's 30 s hook timeout (install.py, install_codex.py). H23.
+CHILD_TIMEOUT = 25.0
 MAX_STDIN = 8 * 1024 * 1024
 GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'command_guard.py')
 GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',

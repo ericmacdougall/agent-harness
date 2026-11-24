@@ -34,6 +34,7 @@ interpreter one-liners (python -c, node -e): their code text is scanned, not exe
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fnmatch
 import hashlib
@@ -67,8 +68,9 @@ POLICY_FILE = HERE / 'command_guard_policy.json'
 DEFAULT_POLICY = {
     'version': 1,
     'modes': {'secret_dump': 'enforce', 'log_delete': 'enforce', 'broad_kill': 'warn', 'bulk_staging': 'warn'},
+    # max_seconds is CPU time; max_wall_seconds is the wall-clock ceiling behind it (Budget, H23)
     'limits': {'max_command_bytes': 262144, 'max_depth': 8, 'max_nodes': 600000, 'max_seconds': 3.0,
-               'max_stdin_bytes': 4194304},
+               'max_wall_seconds': 12.0, 'max_stdin_bytes': 4194304},
     # Tier A: logs, WALs and approval state. Every destructive form is refused, including overwrites.
     'protected_log_roots': ['{home}/.claude/projects', '{home}/.claude/wals', '{home}/.claude/sessions',
                             '{home}/.claude/transcripts', '{home}/.claude/history.jsonl',
@@ -410,9 +412,11 @@ CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
 CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]*/)?' + _RCLONE_DUMP
                                     + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
 CREDENTIAL_SCRIPT_READ = 1048576
-# The check's own pass starts no new read after this long. Main's analysis (at most its 3 s limit) plus this stays under
-# the hook's 7 s alarm; a single read that stalls past the alarm ends the pass, and main's verdict stands.
+# The check's own pass starts no new read after this much CPU time, or this much wall-clock time. Main's analysis (at
+# most its wall-clock ceiling) plus this pass stays under the hook's wall-clock alarm (hook_alarm_seconds); a single
+# read that stalls past the alarm ends the pass, and main's verdict stands.
 CREDENTIAL_PASS_SECONDS = 1.5
+CREDENTIAL_PASS_WALL_SECONDS = 4.0
 CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
 CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
 CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
@@ -519,23 +523,68 @@ class Blocked(Exception):
     """Analysis could not complete inside its budget: the command is refused, not waved through."""
 
 
+# H23: the analysis is charged for the CPU time it uses (limits max_seconds), so a process a loaded machine kept waiting
+# is not refused for time it never ran. A much larger wall-clock ceiling (limits max_wall_seconds) still stops an
+# analysis that is stuck, whatever the load. Budget reads both clocks through these names, which tests replace.
+CPU_CLOCK = time.process_time
+WALL_CLOCK = time.monotonic
+WALL_CEILING_SECONDS = DEFAULT_POLICY['limits']['max_wall_seconds']  # for a policy file written before the key existed
+BUDGET_CHECK_EVERY = 256  # ticks between clock reads
+
+
 class Budget:
     def __init__(self, limits):
         self.nodes = int(limits['max_nodes'])
-        self.deadline = time.monotonic() + float(limits['max_seconds'])
         self.max_depth = int(limits['max_depth'])
         self.count = 0
+        self.checked = 0
+        self.restart(float(limits['max_seconds']), float(limits.get('max_wall_seconds', WALL_CEILING_SECONDS)))
 
-    def has_room(self, ticks, seconds):
+    def restart(self, cpu_seconds, wall_seconds):
+        """Start both clocks again with these limits (the credential pass has its own)."""
+        self.cpu_seconds, self.wall_seconds = cpu_seconds, wall_seconds
+        self.cpu_start, self.wall_start = CPU_CLOCK(), WALL_CLOCK()
+
+    def cpu_used(self):
+        return CPU_CLOCK() - self.cpu_start
+
+    def wall_used(self):
+        return WALL_CLOCK() - self.wall_start
+
+    def over(self):
+        """The limit the analysis has passed, as a refusal reason, or None."""
+        if self.cpu_used() > self.cpu_seconds:
+            return 'analysis used more than its %g s CPU-time budget' % self.cpu_seconds
+        if self.wall_used() > self.wall_seconds:
+            return ('analysis ran past its %g s wall-clock ceiling (the machine may be overloaded; retry it)'
+                    % self.wall_seconds)
+        return None
+
+    def has_room(self, ticks, cpu_seconds, wall_seconds):
         """Could about this much more work finish inside the budget?"""
-        return self.count + ticks <= self.nodes and time.monotonic() + seconds <= self.deadline
+        return (self.count + ticks <= self.nodes and self.cpu_used() + cpu_seconds <= self.cpu_seconds
+                and self.wall_used() + wall_seconds <= self.wall_seconds)
+
+    @contextlib.contextmanager
+    def excluded(self):
+        """Work that has its own time limit (git and the network for an exemption check) is not charged to either
+        clock."""
+        cpu, wall = CPU_CLOCK(), WALL_CLOCK()
+        try:
+            yield
+        finally:
+            self.cpu_start += CPU_CLOCK() - cpu
+            self.wall_start += WALL_CLOCK() - wall
 
     def tick(self, weight=1):
         self.count += weight
         if self.count > self.nodes:
-            raise Blocked('command is too large or complex to analyse safely')
-        if self.count % 256 == 0 and time.monotonic() > self.deadline:
-            raise Blocked('analysis exceeded its time budget')
+            raise Blocked('command is too large or complex to analyse safely (more than %d steps)' % self.nodes)
+        if self.count - self.checked >= BUDGET_CHECK_EVERY:
+            self.checked = self.count
+            reason = self.over()
+            if reason:
+                raise Blocked(reason)
 
 
 class Word:
@@ -2807,16 +2856,224 @@ SHELLS = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'bus
 PS_SHELLS = {'pwsh', 'powershell'}
 INTERPRETERS = {'python', 'python3', 'python2', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'rscript',
                 'osascript', 'pypy', 'pypy3', 'tclsh', 'awk-script'}
-WRAPPER_VALUE_OPTS = {'sshpass': ('-f', '-d', '-p', '-P'), 'nice': ('-n', '--adjustment'), 'ionice': ('-c', '-n', '-p', '-t'), 'chrt': ('-p',),
-                      'stdbuf': ('-i', '-o', '-e'), 'caffeinate': ('-t', '-w'), 'watch': ('-n', '-d', '--interval'),
-                      'strace': ('-o', '-e', '-p', '-s', '-u'), 'ltrace': ('-o', '-e', '-p', '-s', '-u'),
-                      'runuser': ('-u', '-g', '-G'), 'su': ('-s', '-g', '-G'), 'sg': (), 'setsid': (),
-                      'nsenter': ('-t', '--target'), 'firejail': ('--profile',), 'sandbox-exec': ('-f', '-p', '-n'),
-                      'start-process': ('-FilePath', '-ArgumentList'), 'unbuffer': (), 'time': ('-o', '-f'),
-                      # GNU and BSD xargs options that take the next word (receipt r6 sweep: `xargs -n 1 cat`, `xargs -I {} cat {}`)
-                      'xargs': ('-n', '-I', '-J', '-L', '-P', '-R', '-S', '-s', '-d', '-E', '-a', '--max-args', '--replace',
-                                '--max-lines', '--max-procs', '--max-chars', '--delimiter', '--eof', '--arg-file',
-                                '--process-slot-var')}
+class LaunchSpec:
+    """How one program that runs another command reads its own options (one row of LAUNCHERS).
+
+    value:    option spellings that take a value, attached (`-w5`, `--wait=5`) or as the next word
+    text:     option spellings whose value is shell text the program runs (`flock -c TEXT`, `script -c TEXT`)
+    flags:    option spellings known to take no value
+    attached: short options whose optional value can only be attached (`xargs -i{}`, `nsenter -m/proc/1/ns/mnt`)
+    operands: the numbers of positional words that may come before the command (a lock file, a new root, a user, a
+              duration); every count listed is a reading
+    permute:  options may follow those operands (GNU getopt without `+`: `su USER -c TEXT`)
+    joined:   the command words are joined into one shell text (`watch -n 1 'rm ...'`, `sg GROUP 'rm ...'`)
+    same_shell: a shell builtin that runs the command in this shell, so its `cd` and variables carry on
+    assigns:  `NAME=value` words before the command are environment settings, not the command
+    cwd:      options that run the command in another directory (`sudo -D DIR`, `env -C DIR`, `unshare -w DIR`)
+
+    An option spelling in none of the sets is unknown. It is read both ways, as a flag and as taking the next word,
+    and so is a word the guard cannot resolve (a variable, a substitution, a glob)."""
+    __slots__ = ('value', 'text', 'flags', 'attached', 'operands', 'permute', 'joined', 'same_shell', 'assigns', 'cwd')
+
+    def __init__(self, value='', text='', flags='', attached='', operands=(0,), permute=False, joined=False,
+                 same_shell=False, assigns=False, cwd=''):
+        self.value, self.text, self.flags, self.attached = (frozenset(s.split()) for s in (value, text, flags, attached))
+        self.cwd = frozenset(cwd.split())  # options that move the command to another directory (also in value/flags)
+        self.operands, self.permute, self.joined, self.same_shell = tuple(operands), permute, joined, same_shell
+        self.assigns = assigns  # NAME=value words before the command set its environment (env, sudo)
+
+
+# goodqa#16943 (launcher command analysis): one table of the programs that run another command, with the options
+# each one reads (util-linux, GNU coreutils and the BSD/macOS spellings together; where they disagree on whether an
+# option takes a value, that option is left out of every set so both readings are analysed). `launch_readings` turns a
+# row into every place the command could start; the analyser judges each one.
+_SU_FLAGS = '-l -m -p -f -P -h -V - --login --preserve-environment --pty --fast --help --version'
+LAUNCHERS = {
+    'flock': LaunchSpec(value='-w -E --timeout --wait --conflict-exit-code', text='-c --command', operands=(1,),
+                        flags='-s -x -e -u -n -o -F -h -V --shared --exclusive --unlock --nonblock --nb --close '
+                              '--no-fork --verbose --help --version'),
+    'unshare': LaunchSpec(value='-R -w -S -G --root --wd --setuid --setgid --propagation --setgroups --monotonic '
+                                '--boottime --map-user --map-group --map-users --map-groups',
+                          flags='-m -u -i -n -p -U -C -T -f -r -c -h -V --mount --uts --ipc --net --pid --user --cgroup '
+                                '--time --fork --map-root-user --map-current-user --map-auto --kill-child --mount-proc '
+                                '--keep-caps --help --version', cwd='-w --wd'),
+    # util-linux `script [options] [file]` runs -c TEXT; BSD `script [-aeFkqr] [-t time] [file [command ...]]` runs
+    # the words after the file. -t takes the next word on BSD and only an attached value on util-linux: unknown here.
+    'script': LaunchSpec(value='-I -O -B -T -m -E -o --log-in --log-out --log-io --log-timing --logging-format --echo '
+                               '--output-limit', text='-c --command', operands=(1,),
+                         flags='-a -e -f -q -k -r -d -p -F -h -V --append --return --flush --force --quiet --timing '
+                               '--help --version'),
+    'runuser': LaunchSpec(value='-u -g -G -s -w --user --group --supp-group --shell --whitelist-environment',
+                          text='-c --command --session-command', flags=_SU_FLAGS, operands=(0, 1), permute=True),
+    'su': LaunchSpec(value='-s -g -G -w --shell --group --supp-group --whitelist-environment',
+                     text='-c --command --session-command', flags=_SU_FLAGS, operands=(0, 1), permute=True),
+    'sg': LaunchSpec(text='-c', operands=(1,), permute=True, joined=True),
+    # sudo -h is --help alone and --host=HOST with a value: unknown here
+    'sudo': LaunchSpec(value='-C -D -g -p -R -r -T -t -U -u --close-from --chdir --group --prompt --chroot --role '
+                             '--command-timeout --type --other-user --user --host',
+                       flags='-A -b -B -E -e -H -i -K -k -l -n -N -P -S -s -V -v --askpass --background --bell '
+                             '--preserve-env --edit --set-home --login --remove-timestamp --reset-timestamp --list '
+                             '--non-interactive --no-update --preserve-groups --stdin --shell --validate --version',
+                       assigns=True, cwd='-D --chdir'),
+    'doas': LaunchSpec(value='-u -C', flags='-n -s -L'),
+    'env': LaunchSpec(value='-u -C -P -a --unset --chdir --argv0', text='-S --split-string',
+                      flags='-i -0 -v --ignore-environment --null --debug --list-signal-handling --default-signal '
+                            '--ignore-signal --block-signal --help --version', assigns=True, cwd='-C --chdir'),
+    'timeout': LaunchSpec(value='-s -k --signal --kill-after', flags='-v -f -p --preserve-status --foreground --verbose',
+                          operands=(1,)),
+    'nice': LaunchSpec(value='-n --adjustment', flags=' '.join('-%d' % d for d in range(10))),
+    'ionice': LaunchSpec(value='-c -n -p -P -u --class --classdata --pid --pgid --uid', flags='-t --ignore'),
+    'chrt': LaunchSpec(value='-T -P -D --sched-runtime --sched-period --sched-deadline', operands=(0, 1),
+                       flags='-a -b -d -e -f -i -o -r -m -R -v -p --all-tasks --batch --deadline --ext --fifo --idle '
+                             '--other --rr --max --reset-on-fork --verbose --pid'),
+    'taskset': LaunchSpec(flags='-a -c -p --all-tasks --cpu-list --pid', operands=(1,)),
+    'stdbuf': LaunchSpec(value='-i -o -e --input --output --error'),
+    'caffeinate': LaunchSpec(value='-t -w', flags='-d -i -m -s -u'),
+    'watch': LaunchSpec(value='-n -q --interval --equexit', joined=True,
+                        flags='-b -c -d -e -g -t -x -w -p -r -C --beep --color --no-color --differences --errexit '
+                              '--chgexit --no-title --exec --no-wrap --precise --no-rerun'),
+    'strace': LaunchSpec(value='-a -b -e -E -I -o -O -p -P -s -S -u -U -X --output --trace --signal --abbrev --verbose '
+                               '--raw --read --write --inject --fault --status --env --pid --trace-path '
+                               '--string-limit --user --summary-sort-by --summary-columns',
+                         flags='-c -C -d -D -f -F -h -i -k -n -q -r -t -T -v -V -w -x -y -z -Z --follow-forks '
+                               '--output-separately --summary-only --summary --seccomp-bpf --stack-trace '
+                               '--syscall-times --instruction-pointer --no-abbrev --successful-only --failed-only'),
+    'ltrace': LaunchSpec(value='-a -A -D -e -F -l -n -o -p -s -u -w -x --align --output --library --indent',
+                         flags='-b -c -C -f -h -i -L -r -S -t -T -V --demangle --no-signals --help --version'),
+    'setsid': LaunchSpec(flags='-c -f -w --ctty --fork --wait'),
+    'arch': LaunchSpec(value='-arch -d -e', flags='-32 -64 -arm64 -arm64e -x86_64 -x86_64h -i386 -ppc -ppc64 -c -h'),
+    'nohup': LaunchSpec(),
+    'unbuffer': LaunchSpec(flags='-p'),
+    'dtruss': LaunchSpec(value='-b -n -p -t -W', flags='-a -c -d -e -f -l -L -s'),
+    'time': LaunchSpec(value='-o -f --output --format', flags='-p -v -a -q --portability --verbose --append --quiet',
+                       same_shell=True),  # the shell keyword times a command of this shell
+    'chroot': LaunchSpec(value='--userspec --groups', flags='--skip-chdir --help --version', operands=(1,)),
+    'nsenter': LaunchSpec(value='-t -S -G --target --setuid --setgid --wdns',
+                          attached='-m -u -i -n -p -U -C -T -r -w --wd',
+                          flags='-a -F -Z -e -c --all --no-fork --follow-context --preserve-credentials --user-parent '
+                                '--keep-caps --env --join-cgroup --mount --uts --ipc --net --pid --user --cgroup '
+                                '--time --root --wd', cwd='-w --wd'),
+    'firejail': LaunchSpec(flags='--noprofile --quiet --private --nonewprivs --seccomp --noroot --nosound --novideo '
+                                 '--debug'),
+    'sandbox-exec': LaunchSpec(value='-f -p -n -D'),
+    'gosu': LaunchSpec(operands=(1,)),
+    'command': LaunchSpec(flags='-p -v -V', same_shell=True),
+    'builtin': LaunchSpec(same_shell=True),
+    'exec': LaunchSpec(value='-a', flags='-c -l', same_shell=True),
+    'noglob': LaunchSpec(same_shell=True),
+    'sshpass': LaunchSpec(value='-f -d -p -P', flags='-e -v -h -V'),
+    # GNU and BSD xargs (receipt r6 sweep: `xargs -n 1 cat`, `xargs -I {} cat {}`); --replace, --max-lines and --eof
+    # take an optional attached value only, so they are unknown here
+    'xargs': LaunchSpec(value='-a -E -I -L -n -s -P -d -J -R -S --arg-file --max-args --max-chars --max-procs '
+                              '--delimiter --process-slot-var', attached='-e -i -l',
+                        flags='-0 -p -r -t -x -o --null --interactive --no-run-if-empty --verbose --exit --open-tty '
+                              '--show-limits'),
+    'start-process': LaunchSpec(value='-FilePath -ArgumentList'),
+    'start': LaunchSpec(), 'call': LaunchSpec(), 'invoke-command': LaunchSpec(), 'icm': LaunchSpec(),
+}
+OPTION_HEAD = LaunchSpec()  # an option word in the command position: every option unknown, the command follows
+LAUNCH_READINGS_CAP = 16  # more places a command could start than this: the launcher is refused, not guessed at
+LAUNCH_WORK_CAP = 256  # readings of launched commands in one analysis, nested launchers included: past it, refused
+LAUNCH_CWD_UNKNOWN = object()  # a launcher moves its command to a directory the guard cannot know (`nsenter -w`)
+# options of a program the guard has no model of whose value is, by wide convention, shell text it runs
+UNKNOWN_TEXT_OPTIONS = frozenset(('-c', '--command', '--run', '--cmd', '--exec', '--execute', '--shell-command'))
+# the option values each launcher's first-word skip uses (`_unwrap_command`), from the same table
+WRAPPER_VALUE_OPTS = {name: tuple(sorted(spec.value)) for name, spec in LAUNCHERS.items()}
+
+
+def _unsettled(word):
+    """A word whose final text the guard cannot know: it may be an option, an option's value or the command."""
+    return bool(word.dynamic or word.vars or word.subs or word.glob or len(word.alts) != 1)
+
+
+def launch_readings(spec, words, cap=LAUNCH_READINGS_CAP):
+    """Every way a launcher could read `words` (its arguments): (starts, texts). `starts` is the sorted indexes where
+    the command it runs could begin, under every arity an unknown option might have and every operand count in the
+    row; `texts` is every option value it would run as shell text. None when there are more than `cap` starts."""
+    # a reading is (index, past): `past` is True once a permuting launcher has met its first operand, so the same index
+    # is read again when another reading reaches it before any operand
+    starts, texts, seen, todo = set(), [], set(), [(0, False)]
+
+    def push(*indexes):
+        todo.extend((k, past) for k in indexes)
+
+    def end_of_options(i):
+        if spec.permute:
+            # options may follow (su USER -c TEXT): keep reading them for shell text, but the operands after the first
+            # are the command's own words, not further places it could start
+            todo.append((i + 1, True))
+            if past:
+                return
+        starts.update(i + n for n in spec.operands)
+
+    while todo:
+        i, past = todo.pop()
+        if (i, past) in seen or i >= len(words):
+            continue
+        seen.add((i, past))
+        w = words[i]
+        t = w.text
+        if _unsettled(w):
+            push(i + 1, i + 2)
+            end_of_options(i)
+            continue
+        if t == '--':
+            if not past:
+                starts.update(i + 1 + n for n in spec.operands)
+            continue
+        if spec.assigns and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t, re.S):
+            push(i + 1)
+            continue
+        if t in spec.text:
+            if i + 1 < len(words):
+                texts.append(words[i + 1].text)
+            push(i + 2)
+            continue
+        if t in spec.value:
+            push(i + 2)
+            continue
+        if t in spec.flags or t == '-':
+            push(i + 1)
+            continue
+        if t.startswith('--'):
+            name, eq, val = t.partition('=')
+            if eq:
+                if name in spec.text:
+                    texts.append(val)
+                push(i + 1)
+            else:
+                push(i + 1, i + 2)  # an unknown long option may take the next word
+            continue
+        if t.startswith('-') and len(t) > 1:
+            nxt = set()
+            for j in range(1, len(t)):
+                opt, rest = '-' + t[j], t[j + 1:]
+                if opt in spec.text:
+                    texts.append(rest or (words[i + 1].text if i + 1 < len(words) else ''))
+                    nxt.add(i + 1 if rest else i + 2)
+                    break
+                if opt in spec.value:
+                    nxt.add(i + 1 if rest else i + 2)
+                    break
+                if opt in spec.attached:
+                    nxt.add(i + 1)
+                    break
+                if opt not in spec.flags:
+                    nxt.update((i + 1, i + 2))  # an unknown letter may take the rest of the word or the next word
+            else:
+                nxt.add(i + 1)
+            push(*nxt)
+            continue
+        end_of_options(i)
+    if len(starts) > cap:
+        return None
+    starts = sorted(s for s in starts if s < len(words))
+    for s in starts:  # `flock FILE -c TEXT`: the text option where the command would start
+        if words[s].text in spec.text and s + 1 < len(words):
+            texts.append(words[s + 1].text)
+    return starts, list(dict.fromkeys(texts))
+
+
 WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'setsid', 'stdbuf', 'caffeinate',
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
@@ -4076,11 +4333,13 @@ class Analyzer:
         ctx = self.ctx
         start = ctx.state()
         mark = len(ctx.findings)
-        count, began = ctx.budget.count, time.monotonic()
+        budget = ctx.budget
+        count, cpu, wall = budget.count, budget.cpu_used(), budget.wall_used()
         self._run_tokens(zsh_tokens, depth)
         # a second reading that cannot finish would stop the analysis and lose every later command, so skip it instead;
         # analyze() then treats the command as unanalysable
-        if not ctx.budget.has_room(2 * (ctx.budget.count - count) + len(text), 2 * (time.monotonic() - began)):
+        if not budget.has_room(2 * (budget.count - count) + len(text), 2 * (budget.cpu_used() - cpu),
+                               2 * (budget.wall_used() - wall)):
             ctx.readings_capped = True
             return
         after_zsh = ctx.state()
@@ -4787,6 +5046,13 @@ class Analyzer:
             self.unlisted_cred_reader(name, args, cmd, pl, idx)
         if name in KILLERS:
             self.kill_cmd(name, args, texts)
+        if name not in KNOWN_PROGRAMS:
+            if name.startswith('-') and len(name) > 1:
+                # an option where a command name belongs (what is left of `time -p CMD`, or a launcher's words after
+                # `--`): whatever runs is among the words that follow, so they are read like a launcher's
+                self.launch(name, args, depth, pl, idx, spec=OPTION_HEAD)
+            else:
+                self.unknown_program(name, args, depth, pl, idx)
 
     def credential_entry(self, cmd, name, words, args, texts):
         """Add a refusal when this command runs an existing script that names a credential (goodqa#14518). Only ever adds a
@@ -4844,8 +5110,9 @@ class Analyzer:
                 self._credential_finding()
             return
         seen[(path, runner)] = False
-        if time.monotonic() > self.ctx.budget.deadline:
-            return  # the pass is out of time: start no new read
+        # the pass is out of time: start no new read. Reads wait on the disk, so this limit stays wall clock (H23)
+        if self.ctx.budget.over() or time.monotonic() > getattr(self, 'credential_read_deadline', float('inf')):
+            return
         try:
             if not os.path.isfile(path):
                 return
@@ -5019,29 +5286,8 @@ class Analyzer:
     def launcher(self, name, args, depth, pl, idx):
         """Commands that run another command given as text or as trailing words. True when handled."""
         texts = [a.text for a in args]
-        if name == 'flock':
-            for k, t in enumerate(texts):
-                if t in ('-c', '--command') and k + 1 < len(texts):
-                    self.script(texts[k + 1], depth + 1, tail_visible=True)
-                    return True
-            pos = [k for k, t in enumerate(texts) if not t.startswith('-')]
-            if len(pos) >= 2:
-                self.inner_words(args[pos[1]:], depth, pl, idx)
-            return True
-        if name in ('unshare', 'script'):
-            for k, t in enumerate(texts):
-                if (t in ('-c', '--command') or name == 'script' and re.fullmatch(r'-[A-Za-z]*c', t)) \
-                        and k + 1 < len(texts):
-                    self.script(texts[k + 1], depth + 1, tail_visible=True)
-                    return True
-                if t.startswith('--command='):
-                    self.script(t.split('=', 1)[1], depth + 1, tail_visible=True)
-                    return True
-            k = 0
-            while k < len(texts) and texts[k].startswith('-'):
-                k += 1
-            if name == 'unshare' and k < len(args):
-                self.inner_words(args[k:], depth, pl, idx)
+        if name in ('flock', 'unshare', 'script'):
+            self.launch(name, args, depth, pl, idx)
             return True
         if name == 'parallel':
             if ':::' in texts:
@@ -5087,63 +5333,175 @@ class Analyzer:
                 if t.startswith('-S') and len(t) > 2:
                     self.script(t[2:] + ' ' + ' '.join(_quote_for_rebuild(x) for x in texts[i + 1:]), depth + 1)
                     return
-                if t in ('-C', '--chdir') and i + 1 < len(args):
-                    self.chdir([args[i + 1]])
-                    i += 2
-                elif t.startswith('--chdir='):
-                    self.chdir([_literal_word(t.split('=', 1)[1])])
-                    i += 1
-                elif t in ('-u', '--unset'):
-                    i += 2
+                if t in LAUNCHERS['env'].value:
+                    i += 2  # -C/--chdir is applied per reading by launch(), inside the launched command only
                 elif t.startswith('-') or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', t):
                     i += 1
                 else:
                     break
             if i >= len(args):
                 self.env_dump('env', [], pl, idx)
-                return
-        elif name == 'sudo' or name == 'doas':
-            while i < len(args):
-                t = texts[i]
-                if t in ('-u', '-g', '-h', '-p', '-C', '-D', '-R', '-T', '-U', '--user', '--group', '--host', '--prompt', '--chdir'):
-                    i += 2
-                elif t in ('-s', '-i', '--shell', '--login') and i + 1 < len(args) and False:
-                    break
-                elif t.startswith('-') and t != '--':
-                    i += 1
-                else:
-                    i += 1 if t == '--' else 0
-                    break
-        elif name in ('timeout',):
-            while i < len(args) and (texts[i].startswith('-') or i == 0 and False):
-                i += 2 if texts[i] in ('-s', '-k', '--signal', '--kill-after') else 1
-            i += 1  # duration
-        elif name in ('nice', 'ionice', 'chrt', 'taskset', 'stdbuf', 'caffeinate', 'watch', 'strace', 'ltrace', 'setsid', 'arch', 'nohup', 'unbuffer', 'dtruss', 'chroot', 'nsenter', 'firejail', 'sandbox-exec', 'script', 'gosu', 'runuser', 'su', 'sg', 'time', 'noglob', 'command', 'builtin', 'exec', 'start-process', 'start', 'call', 'invoke-command', 'icm', 'sshpass'):
-            valued = WRAPPER_VALUE_OPTS.get(name, ())
-            while i < len(args) and texts[i].startswith('-'):
-                i += 2 if texts[i] in valued else 1
-            if name in ('chroot', 'gosu', 'runuser', 'sg', 'taskset', 'chrt'):
-                i += 1
-            if name == 'su':
-                for j, t in enumerate(texts):
-                    if t in ('-c', '--command') and j + 1 < len(args):
-                        self.script(texts[j + 1], depth + 1)
-                return
-            if name in ('start-process', 'start', 'call'):
-                pass
         elif name == 'xargs':
             self.xargs_input(args, pl.cmds[idx] if pl is not None and idx < len(pl.cmds) else None)
-            while i < len(args) and texts[i].startswith('-'):
-                i += 2 if texts[i] in ('-n', '-I', '-P', '-d', '-L', '-a', '-E', '-s', '-i', '-l') else 1
-            if i < len(args):
-                self.inner_words(args[i:], depth, pl, idx, via_xargs=True)
-            else:
-                pass
+        if name in LAUNCHERS:
+            self.launch(name, args, depth, pl, idx, via_xargs=name == 'xargs')
             return
-        elif name in ('watch',):
-            pass
+        # a wrapper with no row (invoke-expression, iex): its first word that is not an option is the command
+        while i < len(args) and texts[i].startswith('-'):
+            i += 1
         if i < len(args):
             self.inner_words(args[i:], depth, pl, idx)
+
+    # what a reading of a launched command may change and must give back: where it runs and what it has defined. Every
+    # other effect (a file it writes, a link, a secret it saw, a taint) stays, whichever reading was right.
+    READING_STATE = ('cwd', 'cwd_known', 'cwd_unknown', 'cwd_protected_unknown', 'fixed_cwd', 'vars', 'var_hints',
+                     'aliases')
+
+    def _reading(self, same_shell, run, cwd=None, keep=()):
+        """Run one reading of a launched command. The command is its own process, so its `cd`, variables and aliases
+        do not carry into the rest of the line, and one reading's do not colour the next; a shell builtin
+        (`same_shell`) runs it in this shell, so they do. `cwd` is a directory the launcher itself moves the command
+        to (`sudo -D DIR`, `env -C DIR`; LAUNCH_CWD_UNKNOWN when it is not known); `keep` names more state to give
+        back."""
+        ctx = self.ctx
+        if same_shell and cwd is None and not keep:
+            run()
+            return
+        names = self.READING_STATE + tuple(keep)
+        saved = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items() if k in names}
+        try:
+            if cwd is LAUNCH_CWD_UNKNOWN:
+                ctx.cwd_unknown = True
+            elif cwd is not None:
+                self.chdir([cwd])
+            run()
+        finally:
+            for k, v in saved.items():
+                setattr(ctx, k, v)
+            ctx.fs_cache.clear()
+
+    def _unparsed_launcher(self, name, why=None):
+        self.ctx.add(LOG_DELETE, 'launcher-unparsed',
+                     '%s %s, so the guard cannot tell what it runs'
+                     % (name[:40], why or 'could start its command at more than %d places' % LAUNCH_READINGS_CAP),
+                     'run the command without the options the guard does not know, or put it in a script file')
+
+    def _spend_readings(self, name, count):
+        """Count readings across the whole analysis: nested ambiguous launchers multiply them. False (and a refusal)
+        when the total passes LAUNCH_WORK_CAP."""
+        ctx = self.ctx
+        ctx.launch_work = getattr(ctx, 'launch_work', 0) + count
+        if ctx.launch_work > LAUNCH_WORK_CAP:
+            self._unparsed_launcher(name, 'and the launchers around it need more than %d readings' % LAUNCH_WORK_CAP)
+            return False
+        return True
+
+    @staticmethod
+    def _launch_cwds(spec, args, end):
+        """The directories a launcher's own options move its command to, among its words before `end`: a word, or
+        LAUNCH_CWD_UNKNOWN (`nsenter -w` with no value: the target's directory)."""
+        out = []
+        for k in range(min(end, len(args))):
+            t = args[k].text
+            nxt = args[k + 1] if k + 1 < len(args) else None
+            for opt in spec.cwd:
+                if opt.startswith('--'):
+                    if t == opt:
+                        out.append(nxt if nxt is not None and opt not in spec.attached else LAUNCH_CWD_UNKNOWN)
+                    elif t.startswith(opt + '='):
+                        out.append(_literal_word(t.split('=', 1)[1]))
+                elif len(t) > 1 and t[0] == '-' and t[1] != '-' and opt[1] in t[1:]:
+                    rest = t[t.index(opt[1], 1) + 1:]
+                    if rest:
+                        out.append(_literal_word(rest))
+                    elif opt in spec.attached or nxt is None:
+                        out.append(LAUNCH_CWD_UNKNOWN)
+                    else:
+                        out.append(nxt)
+        return out
+
+    def launch(self, name, args, depth, pl, idx, via_xargs=False, spec=None):
+        """The command a launcher runs (LAUNCHERS), under every reading of its options. Each place the command could
+        start is analysed as a command, each option value it runs as shell text as a script, and each word the row
+        skipped (an option value, an operand) that names a command too: a row can be wrong about one option on some
+        version, and the command is then still judged. When the launcher's options move the command to another
+        directory, every reading is judged both there and here."""
+        spec = spec or LAUNCHERS[name]
+        readings = launch_readings(spec, args)
+        if readings is None:
+            self._unparsed_launcher(name)
+            return
+        starts, texts = readings
+        # with no row (an option word as the command) any word may be where the command starts
+        end = len(args) if spec is OPTION_HEAD or not starts else min(max(starts), len(args))
+        skipped = [k for k in range(end) if k not in starts
+                   and _names_skipped_command(args[k], args[k - 1] if k else None)]
+        places = sorted(set(starts) | set(skipped))
+        cwds = [None] + self._launch_cwds(spec, args, end)
+        count = (len(places) * (2 if spec.joined else 1) + len(texts)) * len(cwds)
+        if len(places) + len(texts) > LAUNCH_READINGS_CAP or len(cwds) > 4:
+            self._unparsed_launcher(name)
+            return
+        if not self._spend_readings(name, count):
+            return
+        visible = True if name in ('flock', 'unshare', 'script') else None
+        before = len(self.ctx.findings)
+        try:
+            for cwd in cwds:
+                for text in texts:
+                    self._reading(spec.same_shell,
+                                  lambda text=text: self.script(text, depth + 1, tail_visible=visible), cwd)
+                for k in places:
+                    self._reading(spec.same_shell,
+                                  lambda k=k: self.inner_words(args[k:], depth, pl, idx, via_xargs=via_xargs), cwd)
+                    if spec.joined:
+                        self._reading(spec.same_shell, lambda k=k: self.script(' '.join(a.text for a in args[k:]),
+                                                                                depth + 1, tail_visible=True), cwd)
+        finally:
+            # several readings often find the same thing; the refusal names it once
+            seen, kept = set(), []
+            for f in self.ctx.findings[before:]:
+                key = (f.category, f.rule, f.reason, f.alternative)
+                if key not in seen:
+                    seen.add(key)
+                    kept.append(f)
+            self.ctx.findings[before:] = kept
+
+    def unknown_program(self, name, args, depth, pl, idx):
+        """A program the guard has no model of may run its words as a command (`systemd-run`, `uv run`, a project's own
+        launcher). Each word that names a command which deletes, moves or overwrites files, or that runs one, is read
+        as the start of that command, and the value of an option that conventionally holds shell text (`--run TEXT`,
+        `-c TEXT`; the first word of `trap`) is read as a script. Only a deletion, move or overwrite of a protected
+        location found this way counts, so a tool that merely names such a word as data is not refused for anything
+        else, and prose given to any other option is never parsed as shell."""
+        ctx = self.ctx
+        places = [k for k, a in enumerate(args) if not _unsettled(a) and norm_name(a.text) in UNKNOWN_PROGRAM_VERBS]
+        texts = []
+        for k, a in enumerate(args):
+            t = a.text
+            if t.startswith('--') and '=' in t and t.split('=', 1)[0] in UNKNOWN_TEXT_OPTIONS:
+                texts.append(t.split('=', 1)[1])
+            elif t in UNKNOWN_TEXT_OPTIONS and k + 1 < len(args) and not _unsettled(args[k + 1]):
+                texts.append(args[k + 1].text)
+        if name == 'trap' and args and not args[0].text.startswith('-') and not _unsettled(args[0]):
+            texts.append(args[0].text)
+        if not places and not texts:
+            return
+        if len(places) + len(texts) > LAUNCH_READINGS_CAP:
+            self._unparsed_launcher(name)
+            return
+        if not self._spend_readings(name, len(places) + len(texts)):
+            return
+        before = len(ctx.findings)
+        try:
+            for k in places:
+                self._reading(False, lambda k=k: self.inner_words(args[k:], depth, pl, idx))
+            for text in texts:
+                # text that does not parse is not this rule's business: its unterminated quote is given back
+                self._reading(False, lambda text=text: self.script(text, depth + 1, tail_visible=True),
+                              keep=('unterminated',))
+        finally:
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE]
 
     def xargs_input(self, args, cmd):
         """xargs deleting what its own input names: a here-string, `< <(..)` or `-a <(..)`."""
@@ -7233,13 +7591,10 @@ class Analyzer:
         if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
             self._worktree_reason = 'the path is not a literal top inside a harness work root, so the guard does not verify it'
             return False
-        started = time.monotonic()
-        try:
+        with self.ctx.budget.excluded():  # bounded by the verifier's own time limits
             reason = linked_worktree_remove_refusal(path, calling, self.c.policy)
             if reason is None and calling != self.ctx.cwd:
                 reason = self._dash_c_refusal(path, calling)
-        finally:
-            self.ctx.budget.deadline += time.monotonic() - started
         self._worktree_reason = reason
         return reason is None
 
@@ -7294,11 +7649,8 @@ class Analyzer:
         if path in cache:
             return cache[path]
         cache[path] = False
-        started = time.monotonic()
-        try:
+        with self.ctx.budget.excluded():
             reason = reproducible_clone_refusal(path, self.c.policy)
-        finally:
-            self.ctx.budget.deadline += time.monotonic() - started
         if reason is None:
             cache[path] = True
             return True
@@ -7916,6 +8268,43 @@ def _quote_for_rebuild(text):
 KNOWN_NAMES = ['rclone', 'goodqa', 'gcloud', 'security', 'printenv', 'env', 'pkill', 'killall', 'shred', 'truncate', 'unlink',
                'cat', 'head', 'tail', 'less', 'more', 'find', 'rsync', 'ssh', 'kill', 'rm', 'mv', 'git', 'gh', 'aws', 'vault']
 
+# goodqa#16943 (launcher command analysis). Words that name a command which deletes, moves or overwrites files, or
+# that runs one: a launcher word the LAUNCHERS row skipped, or a word of a program the guard has no model of, that is
+# one of these is read as the start of a command too.
+COMMAND_VERBS = frozenset(RM_CMDS | MV_CMDS | OVERWRITE_CMDS | SHELLS | PS_SHELLS | INTERPRETERS | KILLERS
+                          | WRAPPERS_SIMPLE | set(LAUNCHERS) | {'find', 'git', 'rsync', 'sed', 'perl', 'tar', 'gio',
+                                                              'rclone', 'busybox', 'parallel', 'tmux', 'screen', 'at',
+                                                              'batch', 'flock', 'unshare', 'script'})
+UNKNOWN_PROGRAM_VERBS = COMMAND_VERBS - KILLERS  # kill rules have their own analysis; a word `kill` is often data
+
+
+def _names_skipped_command(word, previous=None):
+    """A launcher word the row skipped that is read as a command too. The exact word `KILL` right after an option is
+    the signal name that option takes (`timeout -s KILL 5 CMD`), not the kill command; any other spelling (`kill`,
+    `PKILL`, which a case-insensitive filesystem still runs) is read as a command."""
+    if _unsettled(word):
+        return False
+    if word.text == 'KILL' and previous is not None and previous.text.startswith('-') and not _unsettled(previous):
+        return False
+    return norm_name(word.text) in COMMAND_VERBS
+# Programs whose words are data, or that the analyser models itself: the unknown-program reading does not apply to
+# them. tmux, screen, parallel, at and batch run commands and are left out on purpose.
+READ_ONLY_PROGRAMS = {'man', 'which', 'whatis', 'apropos', 'info', 'tldr', 'type', 'whence', 'where', 'help', 'wc',
+                      'diff', 'cmp', 'comm', 'uniq', 'cut', 'tr', 'jq', 'yq', 'file', 'stat', 'du', 'df', 'locate',
+                      'plocate', 'mlocate', 'ugrep', 'column', 'fold', 'fmt', 'strings', 'md5sum', 'sha1sum',
+                      'sha256sum', 'sha512sum', 'shasum', 'cksum', 'b2sum', 'md5', 'basename', 'dirname', 'realpath',
+                      'readlink', 'test', '[', 'true', 'false', 'sleep', 'date', 'pwd', 'id', 'whoami', 'uname'}
+KNOWN_PROGRAMS = frozenset(
+    PRINT_FILE_CMDS | ARCHIVE_CMDS | GREP_CMDS | EXFIL_CMDS | ECHO_CMDS | SHELLS | PS_SHELLS | INTERPRETERS
+    | WRAPPERS_SIMPLE | set(LAUNCHERS) | RM_CMDS | MV_CMDS | OVERWRITE_CMDS | KILLERS | set(KNOWN_NAMES)
+    | set(Analyzer.PKG_RUNNERS) | Analyzer.PKG_PASSTHROUGH | READ_ONLY_PROGRAMS
+    | {'cd', 'pushd', 'popd', 'set-location', 'sl', 'chdir', 'pop-location', 'read', 'mapfile', 'readarray', 'alias',
+       'eval', 'invoke-expression', 'iex', '.', 'source', 'gio', 'sponge', 'sort', 'fd', 'fdfind', 'ssh', 'mosh',
+       'docker', 'podman', 'nerdctl', 'kubectl', 'oc', 'goodqa', 'find', 'git', 'rclone', 'security', 'printenv', 'set',
+       'export', 'declare', 'typeset', 'readonly', 'compgen', 'get-childitem', 'ls', 'dir', 'gci', 'get-item', 'ps',
+       'launchctl', 'awk', 'gawk', 'mawk', 'nawk', 'sed', 'openssl', 'curl', 'wget', 'touch', 'mkdir', 'unzip',
+       'cross-env-shell', 'shx', 'busybox'})
+
 
 # --------------------------------------------------------------------------- decision
 
@@ -7966,8 +8355,9 @@ def credential_findings(command, compiled, cwd=None, ps=False):
     script being run."""
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=None)
     analyzer.credential_pass = True
-    budget = analyzer.ctx.budget
-    budget.deadline = time.monotonic() + min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
+    cap = min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
+    analyzer.ctx.budget.restart(cap, min(CREDENTIAL_PASS_WALL_SECONDS, analyzer.ctx.budget.wall_seconds))
+    analyzer.credential_read_deadline = time.monotonic() + cap  # file reads: wall clock, as before H23
     try:
         analyzer.run(command)
     except Exception:  # noqa: BLE001 - a budget stop, the alarm's TimeoutError or a bug: main's verdict stands
@@ -9814,19 +10204,40 @@ def payload_cwd(payload):
     return None
 
 
+HOOK_WALL_LIMIT = 'command_guard wall-clock limit'
+HOOK_CPU_LIMIT = 'command_guard CPU-time limit'
+
+
+def hook_alarm_seconds(limits):
+    """The hook's wall-clock backstop: past the analysis ceiling and the credential pass, and under the launcher's
+    CHILD_TIMEOUT (command_guard_hook.py), which is under the host's 30 s hook timeout (install.py)."""
+    return int(float(limits.get('max_wall_seconds', WALL_CEILING_SECONDS)) + CREDENTIAL_PASS_WALL_SECONDS) + 1
+
+
+def hook_cpu_alarm_seconds(limits):
+    """The hook's CPU-time backstop, for a single call that never ticks the budget (a regex, a C loop)."""
+    return float(int(float(limits['max_seconds']) * 2) + 1)
+
+
 def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
     """PreToolUse entry point. Exit 2 + stderr blocks; exit 0 allows (warnings go to stdout as context).
 
     Always run behind command_guard_hook.py, which turns a crash or timeout of this process into a raw-text
     decision instead of the host's fail-open default."""
     limits = (compiled.limits if compiled else DEFAULT_POLICY['limits'])
-    alarm = False
+    alarm = cpu_alarm = False
     if hasattr(signal, 'SIGALRM'):
         def _timeout(_s, _f):
-            raise TimeoutError('command_guard wall-clock limit')
+            raise TimeoutError(HOOK_WALL_LIMIT)
         signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(int(float(limits['max_seconds']) * 2) + 1)
+        signal.alarm(hook_alarm_seconds(limits))
         alarm = True
+    if hasattr(signal, 'SIGPROF') and hasattr(signal, 'setitimer'):
+        def _cpu_timeout(_s, _f):
+            raise TimeoutError(HOOK_CPU_LIMIT)
+        signal.signal(signal.SIGPROF, _cpu_timeout)
+        signal.setitimer(signal.ITIMER_PROF, hook_cpu_alarm_seconds(limits))
+        cpu_alarm = True
     raw_text = ''
     try:
         import safe_input
@@ -9865,10 +10276,12 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                                                              'already used or changed', 'approve again after a fresh '
                                                              'verified backup'))
         return emit(verdict, message, fmt)
-    except TimeoutError:
+    except TimeoutError as stop:
         verdict = 'block' if raw_sensitive(raw_text) else 'warn'
+        which = ('its %g s CPU-time alarm' % hook_cpu_alarm_seconds(limits) if str(stop) == HOOK_CPU_LIMIT else
+                 'its %d s wall-clock alarm (the machine may be overloaded; retry it)' % hook_alarm_seconds(limits))
         return emit(verdict, format_block(Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',
-                                                  'analysis exceeded its wall-clock limit', 'split it into smaller '
+                                                  'analysis exceeded ' + which, 'split it into smaller '
                                                   'commands or put it in a script file'), warn=verdict == 'warn'), fmt)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
         if not raw_text and stdin_bytes is None:
@@ -9887,6 +10300,8 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
     finally:
         if alarm:
             signal.alarm(0)
+        if cpu_alarm:
+            signal.setitimer(signal.ITIMER_PROF, 0)
 
 
 def emit(verdict, message, fmt):

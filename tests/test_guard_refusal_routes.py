@@ -110,7 +110,8 @@ class WorktreeRoutes(Home):
     def assert_no_concrete_value(self, message, command):
         """No path segment, host or remote of the command or the fixture appears in the advice."""
         self.assertIn(ROUTE, message, command)
-        advice = message.split('Safe alternative:', 1)[-1].replace(ROUTE, '').replace(PRUNE, '')
+        # only the route text is removed: the prune step is searched too, so a value it gained would be caught
+        advice = message.split('Safe alternative:', 1)[-1].replace(ROUTE, '')
         for value in (str(self.home), str(self.work), 'linked', 'primary', '/srv', '/home/u', 'build-box-9', 'upstream',
                       '--host local', '--host ' + REMOTE + ' ', 'fetch --prune origin', 'fetch --prune --all'):
             self.assertNotIn(value, advice, (command, value))

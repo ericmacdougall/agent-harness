@@ -567,11 +567,14 @@ class CredentialScriptTests(Base):
         self.assertLess(time.monotonic() - started, cg.CREDENTIAL_PASS_SECONDS + 1.0)
 
     def test_a_read_that_stalls_past_the_alarm_leaves_mains_verdict(self):
-        """Through the hook with its real 7 s alarm: the alarm lands in the credential check, which then adds nothing, so the
-        result is main's (an allow here) rather than the time-limit warning, and the hook still ends at the alarm."""
+        """Through the hook with its real wall-clock alarm (7 s with a 2 s ceiling): the alarm lands in the credential check,
+        which then adds nothing, so the result is main's (an allow here) rather than the time-limit warning, and the hook
+        still ends at the alarm."""
         slow = self.write('x/slow0.py', b'print("hello")\n')
         cred = self.write('x/cred.sh', SH_TEXT)
         compiled = cg.Compiled(cg.load_policy(), cwd=str(self.home))
+        compiled.limits = dict(compiled.limits, max_wall_seconds=2.0)
+        self.assertEqual(cg.hook_alarm_seconds(compiled.limits), 7)
         for command, want_rc in (('python3 %s' % slow, 0), ('python3 %s; bash %s' % (slow, cred), 0)):
             payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command},
                                   'cwd': str(self.home)}).encode()

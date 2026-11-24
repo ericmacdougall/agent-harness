@@ -266,7 +266,7 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
 NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
 OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
-              'bind_loop_var', 'names_for')
+              'bind_loop_var', 'names_for', 'unknown_program')
 
 SSH_GLOB_LINE_FIX = True  # goodqa#15365; tests/test_kill_guard_ssh_glob.py flips it in a copy to prove the tests catch a regression
 
@@ -281,7 +281,7 @@ DEFAULT_POLICY = {
     'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid|raise_signal|sigqueue|pidfd_send_signal',
     'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
     'ledger_max_lines': 2000,
-    'child_timeout_seconds': 10,
+    'child_timeout_seconds': 25,  # wall clock, under the host's 30 s hook timeout; the analysis is bounded in CPU time
 }
 
 KILLISH = re.compile(r'kill|fuser|stop-process|spps|slay|wmic')
@@ -1113,6 +1113,17 @@ def make_analyzer_class(cg):
                 return super().script(text, depth, tail_visible=tail_visible, ps=ps)
             finally:
                 self.xargs = saved
+
+        def unknown_program(self, name, args, depth, pl, idx):
+            # The base reads an unknown program's words as commands for protected-path deletions only, and drops
+            # every other finding of those readings. Kill findings are dropped the same way: a word of such a program
+            # is data far more often than a command (SQL in `wrangler d1 execute --command`), and the kill rules
+            # judge the program's own line as before.
+            mark = len(self.kf)
+            try:
+                return super().unknown_program(name, args, depth, pl, idx)
+            finally:
+                del self.kf[mark:]
 
         def names_kill(self, text):
             # norm_raw deletes a backslash so k\\ill still reads kill; a printf escape in front of a verb must split instead.
@@ -2186,6 +2197,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
             return ('block' if policy['mode'] == 'enforce' else 'warn'), rule, block_message(rule, reason), ()
     if not findings:
         return 'allow', '', '', ()
+    findings = list(dict.fromkeys(findings))  # a launcher judged under several readings finds the same kill each time
     rule, reason, pids = findings[0]
     message = block_message(rule, reason)
     if len(findings) > 1:  # name every finding, so the blocked command can be fixed in one pass
@@ -2245,11 +2257,20 @@ def analyze_main(data=None):
     """Child process: judge one payload. Exit 0 allow/warn, 2 block."""
     policy = load_policy()
     limit = int(policy['child_timeout_seconds'])
+    # H23: the wall-clock alarm is a backstop under the launcher's timeout; the analysis itself is bounded by CPU time
+    # (command_guard.Budget, and the CPU alarm below for a call that never ticks it), so a loaded machine does not
+    # refuse ordinary commands.
     if hasattr(signal, 'SIGALRM'):
         def _timeout(_s, _f):
-            raise TimeoutError('kill_guard wall-clock limit')
+            raise TimeoutError(WALL_LIMIT)
         signal.signal(signal.SIGALRM, _timeout)
         signal.alarm(max(2, limit - 2))
+    cpu_alarm = hasattr(signal, 'SIGPROF') and hasattr(signal, 'setitimer')
+    if cpu_alarm:
+        def _cpu_timeout(_s, _f):
+            raise TimeoutError(CPU_LIMIT)
+        signal.signal(signal.SIGPROF, _cpu_timeout)
+        signal.setitimer(signal.ITIMER_PROF, CPU_ALARM_SECONDS)
     raw = ''
     try:
         data = data if data is not None else sys.stdin.buffer.read(MAX_STDIN + 1)
@@ -2278,10 +2299,12 @@ def analyze_main(data=None):
         session = str(payload.get("session_id") or "") if main else ""
         verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy, main=main, session=session)
         return emit(verdict, message)
-    except TimeoutError:
+    except TimeoutError as stop:
         if fallback_blocks(raw):
-            return emit('block', block_message('timeout', 'analysis exceeded its time limit and the input mentions a '
-                                               'kill verb or indirection'))
+            which = ('its %g s CPU-time alarm' % CPU_ALARM_SECONDS if str(stop) == CPU_LIMIT else
+                     'its %d s wall-clock alarm (the machine may be overloaded; retry it)' % max(2, limit - 2))
+            return emit('block', block_message('timeout', 'analysis exceeded %s and the input mentions a '
+                                               'kill verb or indirection' % which))
         return 0
     except Exception as error:  # noqa: BLE001
         if fallback_blocks(raw):
@@ -2293,6 +2316,13 @@ def analyze_main(data=None):
     finally:
         if hasattr(signal, 'SIGALRM'):
             signal.alarm(0)
+        if cpu_alarm:
+            signal.setitimer(signal.ITIMER_PROF, 0)
+
+
+WALL_LIMIT = 'kill_guard wall-clock limit'
+CPU_LIMIT = 'kill_guard CPU-time limit'
+CPU_ALARM_SECONDS = 8.0  # the CPU time one analysis may use (the old wall-clock alarm, now charged only for running)
 
 
 def hook_main():
