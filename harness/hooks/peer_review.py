@@ -1395,6 +1395,8 @@ def attempt_line(provider, pool, outcome, launched, diag):
             text += ', refused before work'
         if outcome.get('busy'):
             text += ', pool busy with a live run'
+        elif outcome.get('holder_unknown'):
+            text += ', pool held by a run whose state is unknown'
         elif outcome.get('lease_refused'):
             text += ', pool lease refused'
     if diag and diagnostics.RESET_MARK in (diag.get('detail') or ''):
@@ -1467,19 +1469,43 @@ def holder_context(run_id):
 
 
 def holder_status(store, run_id):
-    """The holder's liveness facts plus its context, or None when they cannot be read (then the old reconcile
-    advice stands). Only a usage store offers holder_status."""
+    """The holder's liveness facts plus its context. None only when there is no holder to ask about (a store without
+    holder_status, or no valid holder id). A probe that fails, for example on store-lock contention, gives an
+    `unreadable` status: that holder may be live, so it must never get reconcile advice (main's ruling on PR 353)."""
     probe = getattr(store, 'holder_status', None)
     if probe is None or not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
         return None
     try:
         status = probe(run_id)
-    except Exception:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001
+        status = {'run_id': run_id, 'busy': False, 'unreadable': True,
+                  'why': 'holder status could not be read (%s)' % type(error).__name__}
+    if not isinstance(status, dict):
+        status = {'run_id': run_id, 'busy': False, 'unreadable': True, 'why': 'holder status could not be read'}
+    return {**status, **holder_context(run_id)}
+
+
+def holder_kind(status):
+    """'busy' (live: wait or fall back, no advice), 'stale' (provably dead, past its deadline or finished: the
+    reconcile advice), 'unknown' (state not established: no advice and no wait) or None (no holder facts)."""
+    if status is None:
         return None
-    return {**status, **holder_context(run_id)} if isinstance(status, dict) else None
+    if status.get('busy') is True and not status.get('unreadable'):
+        return 'busy'
+    if not status.get('unreadable') and (status.get('finished') is True or status.get('state') == 'DEAD'
+                                         or status.get('past_deadline') is True):
+        return 'stale'
+    return 'unknown'
 
 
-def busy_text(provider, pool, status):
+def unknown_text(provider, pool, status):
+    return diagnostics.sanitize(
+        'pool held: %s/%s by run %s (%s); holder state unknown: %s. Not waiting and giving no reconcile advice, '
+        'because that run may still be live' % (provider, pool, status['run_id'], ', '.join(holder_parts(status)),
+                                                status.get('why')), 500)
+
+
+def holder_parts(status):
     parts = []
     if status.get('repo'):
         parts.append(status['repo'] + (' PR %d' % status['pr'] if status.get('pr') else ''))
@@ -1489,6 +1515,11 @@ def busy_text(provider, pool, status):
         parts.append('task ' + status['task'])
     parts.append('started %s' % (status.get('started_at') or 'unknown'))
     parts.append('deadline %s' % (status.get('deadline') or 'unknown'))
+    return parts
+
+
+def busy_text(provider, pool, status):
+    parts = holder_parts(status)
     if status.get('state') != 'ALIVE':
         parts.append('liveness %s: %s' % (str(status.get('state')).lower(), status.get('why')))
     return diagnostics.sanitize('pool busy: %s/%s held by run %s (%s)' % (provider, pool, status['run_id'],
@@ -1512,7 +1543,14 @@ def acquire_lease(store, provider, pool, run_id, *, may_wait, wait_limit):
             if error.kind != 'active':
                 raise
             status = holder_status(store, error.holder)
-            if status is None or not status.get('busy'):
+            kind = holder_kind(status)
+            if kind == 'unknown':
+                # It may be live: never advise reconciling it, and never wait on facts that cannot end a wait.
+                error.unknown_status = status
+                if not may_wait:
+                    raise
+                raise PoolBusy(unknown_text(provider, pool, status)) from None
+            if kind != 'busy':
                 raise
             error.busy_status = status
             if not may_wait:
@@ -1692,10 +1730,15 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                 holder = error.holder if isinstance(error.holder, str) and RUN_ID.fullmatch(error.holder) else None
                 outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary)
                 busy = getattr(error, 'busy_status', None)
+                unknown = getattr(error, 'unknown_status', None)
                 if busy:
                     # A live holder: say who holds the pool and give no reconcile advice (goodqa#17108).
                     outcome['busy'] = True
                     local_detail = busy_text(provider, pool, busy)
+                elif unknown:
+                    # A holder whose state is unknown may be live: no reconcile advice either (main, PR 353).
+                    outcome['holder_unknown'] = True
+                    local_detail = unknown_text(provider, pool, unknown)
                 elif holder:
                     base = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
                     local_detail = diagnostics.sanitize(
@@ -1736,6 +1779,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         if outcome.get('busy'):
             failure = ('Primary reviewer pool is busy with live run %s (no provider was launched); used authorized '
                        'independent fallback.' % outcome.get('holder'))
+        elif outcome.get('holder_unknown'):
+            failure = ('Primary reviewer pool is held by run %s whose state is unknown (no provider was launched); used '
+                       'authorized independent fallback.' % outcome.get('holder'))
         elif outcome.get('lease_refused'):
             failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
                        'fallback.' % (' by run ' + outcome['holder'] if outcome.get('holder') else ''))

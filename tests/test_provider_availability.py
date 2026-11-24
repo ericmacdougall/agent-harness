@@ -481,6 +481,50 @@ class BusyPool(LoopFixture):
         self.assertIn('usage_guard.py reconcile --run ' + self.HOLDER, rd.render(options['attempts'][-1]))
         self.assertNotEqual(error.outcome['reason'], 'POOL_BUSY')
 
+    def assert_neutral(self, options, error, stderr, sleeps):
+        """Main's ruling on PR 353: a holder whose state is unknown may be live, so no reconcile advice and no wait."""
+        self.assertEqual((sleeps, self.calls), ([], []))
+        diag = options['attempts'][-1]
+        rendered = rd.render(diag, stage='pr', head='a' * 40)
+        self.assertEqual(diag['code'], 'POOL_BUSY')
+        self.assertIn('holder state unknown', rendered)
+        self.assertIn(self.HOLDER, rendered)
+        self.assertNotIn('reconcile --run', rendered + stderr)
+        self.assertNotIn('Reconcile:', rendered + stderr)
+        self.assertEqual(error.outcome['reason'], 'POOL_BUSY')
+
+    def test_a_holder_without_a_parseable_deadline_gets_the_neutral_line_and_no_wait(self):
+        sleeps = []
+        status = self.busy(busy=False, state='UNCERTAIN', why='owner facts missing or malformed', deadline=None)
+        store = self.store({'codex': self.held()}, status)
+        options = self.options(store, reviewer='codex-only')
+        with mock.patch.object(pr, '_pool_sleep', side_effect=sleeps.append):
+            _, error, stderr = self.review(options)
+        self.assert_neutral(options, error, stderr, sleeps)
+
+    def test_a_holder_whose_status_cannot_be_read_gets_the_neutral_line_and_no_wait(self):
+        sleeps = []
+        store = self.Store({'codex': self.held()})
+
+        def contended(run_id):  # the usage store lock is held elsewhere (red-team F10)
+            raise guard.GuardError('UNKNOWN', 'Usage store lock is busy')
+        store.holder_status = contended
+        options = self.options(store, reviewer='codex-only')
+        with mock.patch.object(pr, '_pool_sleep', side_effect=sleeps.append):
+            _, error, stderr = self.review(options)
+        self.assert_neutral(options, error, stderr, sleeps)
+        self.assertIn('could not be read', rd.render(options['attempts'][-1]))
+
+    def test_an_unknown_primary_holder_falls_back_without_reconcile_advice(self):
+        status = self.busy(busy=False, state='UNCERTAIN', why='owner facts missing or malformed', deadline=None)
+        store = self.store({'codex': self.held()}, status)
+        options = self.options(store)
+        result, error, stderr = self.review(options)
+        self.assertIsNone(error)
+        self.assertEqual(self.calls, ['claude'])
+        self.assertIn('holder state unknown', rd.render(options['attempts'][0]))
+        self.assertNotIn('reconcile --run', rd.render(options['attempts'][0]) + result[2])
+
     def test_a_busy_primary_with_an_open_fallback_falls_back_at_once_without_reconcile_advice(self):
         sleeps = []
         store = self.store({'codex': self.held()}, self.busy())

@@ -20,7 +20,7 @@
  "helpers": {
   "ah": "4573cf19aad2f04088a1c7bbf95001d7b8df48d24e95ac878be22cfc1b649c27",
   "ops_watch": "94d0d1ee5d0f990145e01c70df78ffeef914582073b51ab4a0e87ff0db5f5b6f",
-  "peer_review": "cc96e21b19b89d4a9e8d4d047a0cf65d99aa92664db632a001f9a0d56e2ae5e2"
+  "peer_review": "165858e69e781e70db41b34cf459708bf95c3cde28f60b9ae2de652b926ad82f"
  },
  "note": "v5 entry-point and legacy-helper sha256 list; regenerate with scripts/ahc_release_hashes.py"
 }

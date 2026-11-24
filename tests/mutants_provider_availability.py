@@ -98,6 +98,16 @@ MUTANTS = {
         'ahc_runner.py', 'if code == "POOL_BUSY":', 'if False:', ['AhcDaemonClasses']),
     'the skip line has no reset time ahc can read': (
         'peer_review.py', "skipped until it resets at %s (%s)'", "skipped until %s (%s)'", ['AhcDaemonClasses']),
+    'a holder of unknown state gets reconcile advice': (
+        'peer_review.py', "        return 'stale'\n    return 'unknown'", "        return 'stale'\n    return 'stale'",
+        ['BusyPool']),
+    'an unreadable holder status keeps the old reconcile advice': (
+        'peer_review.py', "    except Exception as error:  # noqa: BLE001\n        status = {'run_id': run_id, 'busy': False, 'unreadable': True,",
+        "    except Exception as error:  # noqa: BLE001\n        return None\n        status = {'run_id': run_id, 'busy': False, 'unreadable': True,",
+        ['BusyPool']),
+    'a holder of unknown state is waited on': (
+        'peer_review.py', "        return 'stale'\n    return 'unknown'", "        return 'stale'\n    return 'busy'",
+        ['BusyPool']),
     'a busy run spends a repeat': (
         'usage_guard.py', "ZERO_LAUNCH_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH', 'POOL_BUSY'}",
         "ZERO_LAUNCH_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH'}", ['BusyPool']),
