@@ -993,7 +993,7 @@ def _blocks_text(content):
     return ""
 
 
-TRANSCRIPT_RULE = 2  # 2: human queued_command attachments are stored; pairing with enqueue twins happens on read (goodqa#17101)
+TRANSCRIPT_RULE = 3  # 3: human queued_command attachments are stored and tagged; pairing with enqueue twins happens on read (goodqa#17101)
 
 
 def index_transcript(home: Path, session: str) -> dict:

@@ -586,6 +586,35 @@ class MidTurnAttachmentTests(Base):
                          self.attach("yes go ahead", ts="2026-11-04T10:00:01.000Z")])
         self.assertEqual(len([m for m in self.matches() if m["kind"] == "queued"]), 2)
 
+    def test_f4_cache_built_by_rule_two_is_rebuilt_and_stale_rows_replaced(self):
+        self.transcript([self.human(), self.attach(self.blocks(self.REMINDER, self.TYPED))])
+        want = [m["id"] for m in self.matches() if m["kind"] == "queued"]
+        cache = next((self.home / ".agent-harness" / "state" / "ah-index" / "transcripts").glob("*.json"))
+        old = json.loads(cache.read_text())
+        self.assertEqual(old["rule"], 3)
+        old["rule"] = 2  # what an earlier build of this branch wrote
+        for m in old["msgs"]:
+            if m["kind"] == "queued":
+                m.pop("via", None)  # the earlier build did not tag attachment rows
+        old["msgs"].append(dict(old["msgs"][-1], id=f"queue:{SESSION}/2026-11-04T10:00:00.000Z#000000000000"))  # stale row
+        cache.write_text(json.dumps(old))
+        got = [m for m in self.matches() if m["kind"] == "queued"]
+        self.assertEqual([m["id"] for m in got], want)
+        self.assertEqual(got[0]["trust"], __import__("provenance").ATTACHMENT_TRUST)
+        self.assertEqual(json.loads(cache.read_text())["rule"], 3)
+
+    def test_f6_queue_turn_prefers_the_enqueue_record_when_both_match(self):
+        import provenance
+        content = "queued mid turn: use the cli for hooks too"
+        ts = "2026-11-04T10:07:00.123Z"
+        enq = {"type": "queue-operation", "operation": "enqueue", "timestamp": ts, "content": content}
+        for rows in ([self.attach(content, ts=ts), enq], [enq, self.attach(content, ts=ts)]):
+            self.transcript([self.human()] + rows)
+            sha = hashlib.sha256(content.encode()).hexdigest()[:12]
+            res = provenance.resolve(f'queue:{SESSION}/{ts}#{sha} "use the cli for hooks"')
+            self.assertTrue(res["ok"], res.get("problems"))
+            self.assertEqual(res["chain"][0]["trust"], provenance.QUEUE_TRUST)
+
     def test_f2_attachment_rows_and_resolution_name_the_human_origin_marker(self):
         import provenance
         self.transcript([self.human(), self.attach(self.blocks(self.REMINDER, self.TYPED))])

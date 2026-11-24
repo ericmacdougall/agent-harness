@@ -1006,6 +1006,7 @@ def queue_turn(session: str, ident, home=None) -> dict:
     path = find_transcript(session, home)
     if not _has_human_turn(path):
         raise Problem("message-not-found", "that transcript has no human-origin turn (a helper session): queue records are not user text")
+    fallback = None
     for line in _lines_containing(path, stamp.encode()):
         if line is None:
             continue
@@ -1015,13 +1016,17 @@ def queue_turn(session: str, ident, home=None) -> dict:
             continue
         attached = queued_attachment_text(record)
         if attached is not None and record.get("timestamp") == stamp and hashlib.sha256(attached[0].encode()).hexdigest()[:12] == sha:
-            return {"text": attached[1], "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session,
-                    "trust": ATTACHMENT_TRUST}
+            # An enqueue record with the same timestamp and digest wins whatever the file order (ah keeps that row).
+            fallback = fallback or {"text": attached[1], "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session,
+                                    "trust": ATTACHMENT_TRUST}
+            continue
         text = queue_user_text(record)
         if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
             # B6 (step-1 red-team): like a human turn, pasted and injected blocks are not the user's words. The id
             # still hashes the raw content, so `ah user-msg` ids stay stable.
             return {"text": strip_blocks(text), "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
+    if fallback:
+        return fallback
     raise Problem("message-not-found", f"no queued user message {stamp}#{sha} in session {clip(session, 40)}")
 
 
