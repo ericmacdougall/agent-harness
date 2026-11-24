@@ -604,8 +604,15 @@ UNQ = {v: k for k, v in Q.items()}
 SUB_MARK, ARITH_MARK = '', ''
 VAR_OPEN, VAR_CLOSE = chr(0xE030), chr(0xE031)
 VAR_MARKER = re.compile(VAR_OPEN + '([A-Za-z_][A-Za-z0-9_]*)' + VAR_CLOSE)
-WS = ' \t\r\f\v'
-ODD_WS = ('\r', '\f', '\v')  # the lexer splits words here; bash and zsh do not
+# The one model of blanks and line joins (goodqa#17059, goodqa#17073). In bash, zsh and dash only space and tab
+# separate words; \r, \f and \v are ordinary word characters (the familiar `$'\r': command not found`), and only a
+# backslash directly before a line feed joins lines (before \r\n it quotes the \r, and the line feed still ends the
+# command). PowerShell treats them all as blanks and joins lines with a backtick.
+WS = ' \t'
+WS_PS = ' \t\r\f\v'
+LINE_JOIN = re.compile(r'\\\n')
+LINE_JOIN_PS = re.compile(r'`\r?\n')
+ODD_WS = ('\r', '\f', '\v')
 RESERVED = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '}', '!', 'time', 'fi', 'done', 'esac',
             'function', 'coproc', ';;'}
 NONEXEC_HEADS = {'for', 'case', 'select'}
@@ -807,6 +814,7 @@ class Lexer:
         self.budget = ctx.budget
         self.bang_operators = bang_operators
         self.saw_bang = False
+        self.blanks = WS_PS if ps else WS
 
     # ---- words
     def read_word(self, s, i, at_start=True):
@@ -818,7 +826,7 @@ class Lexer:
         while i < n:
             self.budget.tick()
             c = s[i]
-            if c in WS or c == '\n' or c in ';&|()' or (c in '<>' and not (c in '<>' and i + 1 < n and s[i + 1] == '(' and i == started)):
+            if c in self.blanks or c == '\n' or c in ';&|()' or (c in '<>' and not (c in '<>' and i + 1 < n and s[i + 1] == '(' and i == started)):
                 break
             any_char = True
             if (not self.ps and c == '\\') or (self.ps and c == '`'):
@@ -863,7 +871,7 @@ class Lexer:
                 continue
             if c == '~' and i == started and not self.ps or (c == '~' and i == started and self.ps):
                 nxt = s[i + 1] if i + 1 < n else ''
-                if nxt in ('', '/', '\\') or nxt in WS:
+                if nxt in ('', '/', '\\') or nxt in self.blanks:
                     buf.append(self.ctx.home.replace(' ', Q[' ']))
                     i += 1
                     continue
@@ -1008,7 +1016,7 @@ class Lexer:
     # ---- tokens
     def lex(self, text):
         s = text.replace('\x00', '')
-        s = re.sub(r'`\r?\n' if self.ps else r'\\\r?\n', '', s)
+        s = (LINE_JOIN_PS if self.ps else LINE_JOIN).sub('', s)
         n, i = len(s), 0
         tokens, pending = [], []
         prev_end = -1
@@ -1016,7 +1024,7 @@ class Lexer:
         while i < n:
             self.budget.tick()
             c = s[i]
-            if c in WS:
+            if c in self.blanks:
                 i += 1
                 continue
             if c == '\n':
@@ -1086,7 +1094,9 @@ class Lexer:
             line = s[i:] if j < 0 else s[i:j]
             i = n if j < 0 else j + 1
             check = line.lstrip('\t') if rd.strip else line
-            if check.rstrip('\r') == delim:
+            # the shell ends the body only at the exact delimiter; ignoring trailing \r on both sides ends it at least as
+            # early, which leaves more text to be judged as commands (the stricter reading)
+            if check.rstrip('\r') == delim.rstrip('\r'):
                 break
             size += len(line) + 1
             if size > 1 << 20:

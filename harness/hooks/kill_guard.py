@@ -287,7 +287,9 @@ DEFAULT_POLICY = {
 KILLISH = re.compile(r'kill|fuser|stop-process|spps|slay|wmic')
 INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b", re.I)
 CLOBBER_TEXT = re.compile(r'>&?!')  # >!, >>!, &>!, &>>!, >&!, >>&!: zsh and bash read these apart (GoodQA #14657)
-LINE_JOIN = re.compile(r'\\\r?\n')  # a backslash-newline the shell removes, so `>\` then `!` is still `>!`
+# a backslash-newline the shell removes, so `>\` then `!` is still `>!`. Only before a line feed: before \r\n the
+# backslash quotes the \r and the line still ends (goodqa#17073; the same rule as command_guard.LINE_JOIN)
+LINE_JOIN = re.compile(r'\\\n')
 LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
 # The closed grammar of a kill command line. Each pattern is matched against text that word_text() has first tied to the
 # word's exact source, so a form the lexer does not understand (zsh ${=x}, $=x, ${(z)x}, =(cmd), a glob qualifier, the

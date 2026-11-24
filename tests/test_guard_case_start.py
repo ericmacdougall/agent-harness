@@ -75,8 +75,9 @@ NOT_THE_KEYWORD = {
 # pattern mode at any unquoted word whose text is esac, which is stricter, so {X} stays visible
 NOT_THE_CLOSER = {
     'brace-expanded esac': 'case a in a) true ;; {esac,}; {X}',
-    'esac glued at a carriage return': 'case a in a) true ;; esac\r; {X}',
 }
+# Not a row: 'case a in a) true ;; esac\r; {X}'. `esac\r` is one word to bash, dash and zsh, so the case never
+# closes and no shell runs {X} (checked under each); with \r a word character the guards agree.
 
 # PowerShell has no case statement: the word is a command name there, and the command after `;` runs
 POWERSHELL = {
