@@ -65,7 +65,8 @@ MUTANTS = {
     "a timeout raises": ("ask_sweep.py", "    except subprocess.TimeoutExpired:", "    except ZeroDivisionError:", "tests/test_ask_sweep.py"),
     "a closed ask is reported as not listed": ("ask_sweep.py", "            if ask in resolved:", "            if False:",
                                                "tests/test_ask_sweep.py"),
-    "the ledger is not read again after a failed run": ("ask_sweep.py", '        failed = [entry for entry in ran if entry["rc"]]',
+    "the ledger is not read again after a failed run": ("ask_sweep.py",
+                                                        '        failed = [(entry, source) for entry, source in ran if entry["rc"]]',
                                                         "        failed = []", "tests/test_ask_sweep.py"),
     # round 2 F5: the guard over the modules ask_sweep depends on can fail
     "ask_sweep reads the main WAL itself": ("ask_sweep.py", "    return ask_evidence.read_asks(main_wal, parse_ts, unread)",

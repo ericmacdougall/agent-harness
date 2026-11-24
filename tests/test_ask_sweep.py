@@ -449,6 +449,19 @@ class ApplyErrors(CliBase):
             code, doc = self.run_main("--apply", "--only", "w00000000001=u1")
         self.assertEqual((code, doc["closed"][0]["rc"], doc["closed"][0]["written"]), (0, 0, "w0000000c001"))
 
+    def test_a_close_another_row_wrote_meanwhile_is_reported_as_that_row(self):
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+
+        def refused_but_closed_elsewhere(argv):
+            with open(wal, "a") as fh:
+                fh.write(json.dumps({"event": "ask_resolved", "id": "w0000000c003", "ref": "w00000000001",
+                                     "source": "ticket:GoodQA x#1", "closed_by": "agent"}) + "\n")
+            return 2, "", '{"status": "REFUSED"}'
+        with mock.patch.object(sw, "_default_runner", refused_but_closed_elsewhere):
+            code, doc = self.run_main("--apply", "--only", "w00000000001=u1")
+        self.assertEqual((code, doc["closed"][0].get("already_resolved"), "written" in doc["closed"][0]),
+                         (0, "w0000000c003", False))
+
     def test_a_rerun_reports_an_already_closed_ask_as_resolved_and_writes_nothing(self):
         wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
         with open(wal, "a") as fh:

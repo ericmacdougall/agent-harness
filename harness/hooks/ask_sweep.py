@@ -452,7 +452,7 @@ def main(argv=None) -> int:
         result["evidence"] = [i for i in result["evidence"] if i["ask"] in wanted]
     if args.apply:
         closed, ran = [], []
-        listed ={i["ask"]: i for i in result["answered"] + result["evidence"]}
+        listed = {i["ask"]: i for i in result["answered"] + result["evidence"]}
         for ask, ref in wanted.items():
             item = listed.get(ask)
             if ask in resolved:
@@ -476,16 +476,21 @@ def main(argv=None) -> int:
                         else close_argv(item))
                 closed.append(run_close(ask, argv))
                 if argv is not None:
-                    ran.append(closed[-1])
-        failed = [entry for entry in ran if entry["rc"]]
+                    ran.append((closed[-1], argv[argv.index("--source") + 1]))
+        failed = [(entry, source) for entry, source in ran if entry["rc"]]
         if failed:
             # a timeout can fire after wal_note wrote the row: report what the ledger shows, not only the rc
             after = read_asks(main_wal)["resolved"]
-            for entry in failed:
+            for entry, source in failed:
                 row = after.get(entry["ask"])
-                if row is not None:
+                if row is None:
+                    continue
+                if row.get("source") == source and row.get("by") == "ask-sweep":
                     entry.update({"rc": 0, "written": str(row.get("id")),
                                   "note": "wal_note reported rc %d, but the ledger now holds this close" % entry["rc"]})
+                else:
+                    entry.update({"rc": 0, "already_resolved": str(row.get("id")), "closed_by": row.get("closed_by"),
+                                  "note": "wal_note reported rc %d; another row closed the ask meanwhile" % entry["rc"]})
         result["closed"] = closed
         if not args.stale:
             result.pop("stale")
