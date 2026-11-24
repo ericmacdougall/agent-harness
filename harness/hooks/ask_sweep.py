@@ -34,9 +34,12 @@ user-sourced close copied from a related session) also gets `closed_by=ask-sweep
 outcome close copied from a related session) passes `--outcome`, so wal_note writes `outcome=obsolete|not_user` and
 `closed_by=agent` (#170 F8).
 
-The cited answer is quoted exactly as provenance reads it back (ask_evidence.cite): an inner `"` is written `\\"`, a literal
-ellipsis is kept as an elision, and a piece too short to cite is elided (`elided: true`: read the whole `answer`). An
-answer that provenance would accept in no form is listed under `short` for a manual close, with no printed close.
+The cited answer is quoted exactly as provenance reads it back (ask_evidence.cite): an inner `"` is written `\\"`, and a
+literal ellipsis is kept as an elision. Only an answer cited whole (the excerpt equals the normalized answer) gets a
+close. An answer that can be cited only with words left out (a piece too short to cite, more pieces than provenance
+takes, or an over-long answer) is listed under `short` with `elided: true` and no printed close, because leaving words
+out can invert it ("Don't... stop the worker"; #170 triage, CRITICAL). An answer that provenance would accept in no form
+is listed under `short` too. Every `short` item is closed by hand, after reading the whole `answer`.
 
 Listing exits 0 when every file was read in full, and 2 when anything is listed in `unread` (a refused file, a budget
 stop, a skipped over-long or unparseable line). ask_sweep reads every WAL and transcript through
@@ -141,8 +144,8 @@ def verified(session: str, uuid: str, home: Path):
 def plan(main_wal: Path, transcript: Path, now: float | None = None, check=None, session: str | None = None) -> dict:
     """{"answered", "short", "stale", "unread", "resolved"} for the open asks of one session. `check(uuid)` is the
     provenance check of the answer turn: the turn's text (or True) when provenance accepts it, else falsy. An answered
-    item's `source` is the cited answer (ask_evidence.cite), checked against that text. An answer that cannot be cited in
-    a form provenance accepts goes to `short` with the reason, for a manual close."""
+    item's `source` is the whole answer, cited (ask_evidence.cite) and checked against that text. An answer that can be
+    cited only elided, or not at all in a form provenance accepts, goes to `short` with the reason, for a manual close."""
     sys.path.insert(0, str(HERE))
     import ask_evidence  # noqa: PLC0415
     now = time.time() if now is None else now
@@ -165,9 +168,15 @@ def plan(main_wal: Path, transcript: Path, now: float | None = None, check=None,
                 row["reason"] = ("too short to cite" if len(turn["answer"]) < MIN_EXCERPT
                                  else "provenance would accept no excerpt of this answer") + ": close it by hand"
                 short.append(row)
+            elif cited[1]:
+                # #170 triage (CRITICAL): an excerpt that leaves words out can invert the answer ("Don't... stop the
+                # worker" would be cited as "...stop the worker"), so the tool never closes an elided answer
+                row["elided"] = True
+                row["reason"] = ("only an excerpt that leaves part of the answer out can be cited, and that can change "
+                                 "its meaning: read the whole answer and close it by hand")
+                short.append(row)
             else:
                 row["source"] = f'answer:{session}/{turn["uuid"]} {cited[0]}'
-                row["elided"] = cited[1]
                 answered.append(row)
         elif opened and now - opened >= STALE_S:
             stale.append({"ask": ask["id"], "age_days": int((now - opened) // 86400), "question": ask["note"][:120]})

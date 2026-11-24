@@ -140,7 +140,8 @@ def cite(answer: str, turn_text: str):
     or None when provenance would accept no excerpt of it. provenance reads `...` in an excerpt as an elision and needs
     each piece to be EXCERPT_MIN+ characters, at most EXCERPT_SEGMENTS pieces and EXCERPT_MAX in all; so a literal
     ellipsis (`...` or `…`) is kept as an elision, a piece too short to cite is elided, and an over-long answer is cut
-    with a closing `...`. `elided` says the excerpt is not the whole answer: read the answer in the listing."""
+    with a closing `...`. `elided` says the excerpt is not the whole answer; ask_sweep never closes an elided answer
+    (#170 triage: leaving words out can invert it)."""
     import provenance  # noqa: PLC0415
     body = provenance.norm(answer or "")
     pieces = [piece.strip() for piece in body.split("...")]

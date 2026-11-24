@@ -123,13 +123,30 @@ class Close(Base):
         self.assertNotIn("--outcome", argv)
 
     def test_an_answer_provenance_would_not_accept_goes_to_short_with_no_close(self):
-        wal, tr = self.files([ask("w00000000001"), ask("w00000000002")],
-                             [answer_record("u1", {"[ask:w00000000001] Q?": "Okay... sure... fine by me",
-                                                   "[ask:w00000000002] R?": "Yes... ship it to staging now"})])
+        wal, tr = self.files([ask("w00000000001")],
+                             [answer_record("u1", {"[ask:w00000000001] Q?": "Okay... sure... fine by me"})])
         got = sw.plan(wal, tr, NOW, session=SESSION)
-        self.assertEqual([(s["ask"], "by hand" in s["reason"]) for s in got["short"]], [("w00000000001", True)])
-        self.assertEqual([(a["ask"], a["elided"], a["source"].split(" ", 1)[1]) for a in got["answered"]],
-                         [("w00000000002", True, '"...ship it to staging now"')])
+        self.assertEqual([(s["ask"], "by hand" in s["reason"], "source" in s) for s in got["short"]],
+                         [("w00000000001", True, False)])
+        self.assertEqual(got["answered"], [])
+
+    def test_an_elided_answer_is_never_closed_and_its_excerpt_is_never_offered(self):
+        # #170 triage (CRITICAL): "Don't... stop the worker" cited as "...stop the worker" inverts the user's answer
+        wal, tr = self.files([ask("w00000000001"), ask("w00000000002"), ask("w00000000003")],
+                             [answer_record("u1", {"[ask:w00000000001] Stop it?": "Don't... stop the worker",
+                                                   "[ask:w00000000002] Ship?": "Yes... ship it to staging now",
+                                                   # the positive control: the same words, said whole, still close
+                                                   "[ask:w00000000003] Stop it?": "Please stop the worker now"})])
+        got = sw.plan(wal, tr, NOW, session=SESSION)
+        self.assertEqual([(s["ask"], s.get("elided"), "by hand" in s["reason"]) for s in got["short"]],
+                         [("w00000000001", True, True), ("w00000000002", True, True)])
+        for row in got["short"]:
+            self.assertFalse({"source", "close", "apply", "pin"} & set(row), row)
+        listing = json.dumps(got)
+        self.assertNotIn("...stop the worker", listing)
+        self.assertNotIn("...ship it to staging now", listing)
+        self.assertEqual([(a["ask"], a["source"]) for a in got["answered"]],
+                         [("w00000000003", 'answer:%s/u1 "Please stop the worker now"' % SESSION)])
 
     def test_a_refused_close_carries_wal_note_s_message(self):
         got = sw.run_close("w00000000001", ["x"], runner=lambda a: (2, "", '{"status": "REFUSED", "problem": "nope"}'))

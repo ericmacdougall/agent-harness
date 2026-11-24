@@ -61,6 +61,9 @@ MUTANTS = {
         "ask_evidence.py",
         '        if provenance.parse_excerpt(quoted) != excerpt or provenance.excerpt_in(turn_text or "", excerpt) is not None:',
         "        if False:", "tests/test_ask_sweep_quoting.py"),
+    # round 3 triage (CRITICAL): an elided answer is never closed by the tool
+    "an elided answer is closed by the tool": ("ask_sweep.py", "            elif cited[1]:", "            elif False:",
+                                               "tests/test_ask_sweep.py"),
     # round 2 F4: a failed run never loses the report, and a rerun names closed asks
     "a timeout raises": ("ask_sweep.py", "    except subprocess.TimeoutExpired:", "    except ZeroDivisionError:", "tests/test_ask_sweep.py"),
     "a closed ask is reported as not listed": ("ask_sweep.py", "            if ask in resolved:", "            if False:",

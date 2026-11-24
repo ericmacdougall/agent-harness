@@ -8,8 +8,9 @@ temporary HOME. The real ask_sweep.py lists them, and then:
 - in another copy, one `--apply --only <every pin>` run closes them.
 
 Every printed close must be accepted (rc 0), must write exactly one ask_resolved row with that source and no decision,
-and the row's source must resolve in provenance as the user's words. An answer that provenance would accept in no form
-must be listed under `short` with no printed close. Nothing is stubbed.
+and the row's source must resolve in provenance as the user's words. An answer that can be cited only with words left
+out (#170 triage, CRITICAL) or that provenance would accept in no form must be listed under `short` with no printed
+close, and --apply must refuse it and write nothing. Nothing is stubbed.
 
 Run: python3 -m unittest tests.test_ask_sweep_quoting
 """
@@ -29,26 +30,30 @@ import provenance  # noqa: E402
 S1 = "aaaaaaaa-3333-4333-8333-000000000001"
 BACKSLASH = "\\"
 
-# (answer, citable, elided)
+# (answer, expected): "close" = cited whole and closed; "elided" = only citable with words left out, so short and never
+# closed (#170 triage); "uncitable" = provenance would accept no excerpt, so short
 CORPUS = [
-    ('Use the "fast" path for this', True, False),
-    ("Use the “fast” path for this one", True, False),
-    ("It’s fine, go ahead with it", True, False),
-    ("Yes... but only on staging today", True, True),
-    ("Wait… then release it to staging", True, True),
-    ("Keep C:" + BACKSLASH + "temp" + BACKSLASH + "build as the folder", True, False),
-    ("A backslash then a quote " + BACKSLASH + '" stays as typed', True, False),
-    ("Line one of it\nLine two of the answer", True, False),
-    ("Déployer en production, s’il vous plaît ✓", True, False),
-    ("Café is open for the whole team now", True, False),
-    (" ".join(["word%d" % n for n in range(80)]), True, True),
-    ("first piece is long... second piece is long... third piece is long... fourth piece is long", True, True),
-    ("Ends with a backslash " + BACKSLASH, True, False),
-    ('Quote at the very end "done"', True, False),
-    ("...leading ellipsis then the words", True, False),
-    ("Say “yes”... and \"no\" when asked twice", True, True),
-    ("Okay... sure... fine by me", False, None),
-    ("Run <bash-input>rm x</bash-input> for me", False, None),
+    ('Use the "fast" path for this', "close"),
+    ("Use the “fast” path for this one", "close"),
+    ("It’s fine, go ahead with it", "close"),
+    ("Yes... but only on staging today", "elided"),
+    ("Wait… then release it to staging", "elided"),
+    ("Keep C:" + BACKSLASH + "temp" + BACKSLASH + "build as the folder", "close"),
+    ("A backslash then a quote " + BACKSLASH + '" stays as typed', "close"),
+    ("Line one of it\nLine two of the answer", "close"),
+    ("Déployer en production, s’il vous plaît ✓", "close"),
+    ("Café is open for the whole team now", "close"),
+    (" ".join(["word%d" % n for n in range(80)]), "elided"),
+    ("first piece is long... second piece is long... third piece is long... fourth piece is long", "elided"),
+    ("Ends with a backslash " + BACKSLASH, "close"),
+    ('Quote at the very end "done"', "close"),
+    ("...leading ellipsis then the words", "close"),
+    ("Release the build now…then tell the team", "close"),
+    ("Say “yes”... and \"no\" when asked twice", "elided"),
+    ("Don't... stop the worker", "elided"),
+    ("Please stop the worker now", "close"),  # the positive control for the line above
+    ("Okay... sure... fine by me", "uncitable"),
+    ("Run <bash-input>rm x</bash-input> for me", "uncitable"),
 ]
 
 
@@ -71,7 +76,7 @@ class QuotingContract(unittest.TestCase):
         wal.parent.mkdir(parents=True)
         self.asks = ["w%011x" % (0xc00 + n) for n in range(len(CORPUS))]
         transcript, rows = [], []
-        for n, (answer, _citable, _elided) in enumerate(CORPUS):
+        for n, (answer, _expected) in enumerate(CORPUS):
             use = "toolu_Q%05d" % n
             rows.append({"at": at(1).replace("Z", "+00:00"), "event": "ask", "id": self.asks[n], "note": "question %d" % n})
             transcript.append({"type": "assistant", "uuid": uid(n, 1), "timestamp": at(2), "sessionId": S1,
@@ -115,16 +120,21 @@ class QuotingContract(unittest.TestCase):
         self.assertEqual(code, 0, doc.get("unread"))
         listed = {a["ask"]: a for a in doc["answered"]}
         short = {s["ask"]: s for s in doc["short"]}
-        for n, (answer, citable, elided) in enumerate(CORPUS):
+        for n, (answer, expected) in enumerate(CORPUS):
             with self.subTest(answer=answer):
                 ask = self.asks[n]
-                if citable:
+                if expected == "close":
                     self.assertIn(ask, listed)
-                    self.assertEqual(listed[ask]["elided"], elided)
+                    # the whole answer, nothing left out (#170 triage)
+                    self.assertEqual(provenance.parse_excerpt(listed[ask]["source"].split(" ", 1)[1]),
+                                     provenance.norm(" ".join(answer.split())))
                     self.assertIn("'", listed[ask]["close"])  # printed for a shell, quoted
                 else:
                     self.assertNotIn(ask, listed)
+                    self.assertFalse({"source", "close", "apply", "pin"} & set(short[ask]), short[ask])
+                    self.assertEqual(short[ask].get("elided", False), expected == "elided")
                     self.assertIn("by hand", short[ask]["reason"])
+        self.assertEqual(len(listed), sum(e == "close" for _, e in CORPUS))
         # the printed close commands, run as printed through a shell
         for ask, item in listed.items():
             p = subprocess.run(["/bin/sh", "-c", item["close"]], env=self.env(self.home), capture_output=True,
@@ -137,6 +147,30 @@ class QuotingContract(unittest.TestCase):
         code, doc = self.sweep(self.copy, "--apply", "--only", *pins)
         self.assertEqual((code, sorted({c["rc"] for c in doc["closed"]})), (0, [0]), json.dumps(doc["closed"])[:600])
         self.check_written(self.copy, {a["ask"]: a for a in doc["answered"]})
+
+    def test_an_elided_answer_is_never_closed_or_written_even_when_named_and_the_whole_one_is(self):
+        # #170 triage (CRITICAL): "Don't... stop the worker" must never be recorded as "...stop the worker"
+        answers = [answer for answer, _ in CORPUS]
+        elided = self.asks[answers.index("Don't... stop the worker")]
+        control = self.asks[answers.index("Please stop the worker now")]
+        code, doc = self.sweep(self.home)
+        self.assertEqual(code, 0, doc.get("unread"))
+        self.assertNotIn(elided, {a["ask"] for a in doc["answered"] + doc.get("evidence", [])})
+        self.assertNotIn("...stop the worker", json.dumps(doc))
+        pin = {a["ask"]: a["pin"] for a in doc["answered"]}[control]
+        turn = uid(answers.index("Don't... stop the worker"), 2)
+        code, doc = self.sweep(self.home, "--apply", "--only", "%s=%s" % (elided, turn), pin)
+        self.assertEqual(code, 1)  # the elided ask is refused, and that is reported
+        self.assertEqual(sorted((c["ask"], c["rc"]) for c in doc["closed"]), sorted([(elided, 3), (control, 0)]))
+        written = self.closes(self.home)
+        self.assertNotIn(elided, written)
+        self.assertEqual(sorted(written), [control])
+        wal_text = (self.home / ".claude" / "wals" / S1 / "main.jsonl").read_text()
+        self.assertNotIn("...stop the worker", wal_text)
+        self.assertEqual(written[control]["source"], 'answer:%s/%s "Please stop the worker now"'
+                         % (S1, uid(answers.index("Please stop the worker now"), 2)))
+        result = provenance.resolve(written[control]["source"], {"home": self.home / ".claude"})
+        self.assertEqual((result.get("ok"), result.get("origin")), (True, "user"), result.get("problem"))
 
 
 if __name__ == "__main__":
