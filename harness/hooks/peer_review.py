@@ -1320,6 +1320,13 @@ def review_timing(options, run_record):
             'snapshot_seconds': options.get('snapshot_seconds'), 'snapshot_deadline': options.get('snapshot_deadline')}
 
 
+def record_provider_step(options, provider, started_at, deadline):
+    """Record one started provider step (Codex, Claude or the Kimi fallback) against its deadline. Callers run it in
+    a `finally` block, so a step that raised after its child was spawned still has its time in the receipt."""
+    options.setdefault('provider_seconds', []).append(
+        {'provider': provider, 'seconds': round(time.monotonic() - started_at, 1), 'deadline': round(deadline, 1)})
+
+
 def verdict_instruction(stage):
     """The reviewer's verdict instruction. Reviewers that wrote a preface before the verdict lost real receipts
     (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
@@ -1391,9 +1398,13 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             if provider == 'kimi':
                 resolution = {'path': 'kimi_review.py'}
                 launch_state = 'UNCONFIRMED'
-                code, stdout, stderr, launched = kimi_attempt(
-                    prompt.replace(verdict, 'Begin exactly KIMI_ADVISORY: ACCEPT or KIMI_ADVISORY: BLOCK.'),
-                    options.get('packet_path'), timeout)
+                launched_at = time.monotonic()
+                try:
+                    code, stdout, stderr, launched = kimi_attempt(
+                        prompt.replace(verdict, 'Begin exactly KIMI_ADVISORY: ACCEPT or KIMI_ADVISORY: BLOCK.'),
+                        options.get('packet_path'), timeout)
+                finally:
+                    record_provider_step(options, provider, launched_at, timeout)
                 options['launches'] += launched  # a refused call never started the CLI, so it is not a launch
                 if code == 0 and KIMI_VERDICT.match(stdout.strip()):
                     raise AdvisoryOnly(stdout.strip(), source, failure)
@@ -1428,13 +1439,13 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             launch_state = 'UNCONFIRMED'
                             options['launches'] += 1
                             # The child is recorded for the usage guard's liveness rule when a run record exists.
-                            code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
-                                                       **({'on_spawn': run_record.note_child} if run_record else {}))
-                            # goodqa#16947: how long this provider step took against its deadline, for the timeout
-                            # diagnostic and the FINAL receipt.
-                            options.setdefault('provider_seconds', []).append(
-                                {'provider': provider, 'seconds': round(time.monotonic() - launched_at, 1),
-                                 'deadline': round(timeout, 1)})
+                            # goodqa#16947: the step's time against its deadline goes to the timeout diagnostic and
+                            # the FINAL receipt, also when run() raises after the spawn (an unproven cleanup).
+                            try:
+                                code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
+                                                           **({'on_spawn': run_record.note_child} if run_record else {}))
+                            finally:
+                                record_provider_step(options, provider, launched_at, timeout)
                             last_message = read_bounded(last, PROVIDER_LIMIT + 1)
                             outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
@@ -2308,7 +2319,8 @@ def main() -> int:
             target.verify_current()
             run_record.finish(execution='COMPLETED', result='NO_RESULT', reason='ADVISORY', exit_code=4,
                               usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
-                                     'review_routing': routing_evidence(options)})
+                                     'review_routing': routing_evidence(options),
+                                     'timing': review_timing(options, run_record)})
         except (OSError, subprocess.TimeoutExpired, GuardError) as error:
             print(f'Advisory publication failed: {diagnostics.sanitize(error)}; nothing published.', file=sys.stderr)
             target.close()
