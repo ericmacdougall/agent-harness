@@ -477,6 +477,39 @@ class Check(Env):
         self.assertEqual(self.code(self.check(tid, transcript=rogue)), "bad_input")
 
 
+class PresentedElsewhere(Env):
+    """Main's asks: a grant held by one session is refused when presented with another session's payload, or by a
+    sub-agent that runs a non-qualifying model; a revoked or expired grant is refused by check() itself."""
+
+    def test_grant_of_one_session_refused_for_another_sessions_payload(self):
+        grant = self.grant()
+        self.assertTrue(self.check(self.call())["ok"])
+        tid = self.call(OPUS, transcript=self.other_transcript)
+        result = self.check(tid, session=OTHER, transcript=self.other_transcript)
+        self.assertEqual(self.code(result), "wrong_session")
+        # another session's payload naming this session's transcript is not proof either
+        self.assertEqual(self.code(self.check(self.call(), session=OTHER)), "bad_input")
+        self.assertNotIn(grant["gid"], json.dumps(result))
+
+    def test_sub_agent_on_a_non_qualifying_model_is_refused_even_when_included(self):
+        req = self.request(["--project", REPO + ":mac", "--power", "merge", "--include-subagents", "--reason", "x"])
+        self.grant(req, subagents=True)
+        for model, code in MODELS_BAD.items():
+            with self.subTest(model=model):
+                tid = self.call(model, transcript=self.sub_transcript)
+                self.assertEqual(self.code(self.check(tid, agent=AID)), code)
+
+    def test_revoked_or_expired_is_refused_at_check_time(self):
+        grant = self.grant()
+        tid = self.call()
+        self.assertTrue(self.check(tid, now=NOW + 60)["ok"])
+        self.assertEqual(self.code(self.check(self.call(), now=NOW + 8 * 3600 + 1)), "expired")
+        self.assertTrue(self.check(self.call(), now=NOW + 120)["ok"])
+        sg.revoke(grant["gid"])
+        self.assertEqual(self.code(self.check(self.call(), now=NOW + 120)), "revoked")
+        self.assertEqual(sg.status(now=NOW + 120)["grants"][0]["state"], "revoked")
+
+
 class NeverCovered(Env):
     def setUp(self):
         super().setUp()
