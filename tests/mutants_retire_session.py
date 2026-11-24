@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MUTANTS = {
     "an unreadable process list reads as nothing running": (
         "ah.py", [("    if r.returncode != 0 or not lines or len(lines) > RETIRE_PS_MAX:", "    if False:")]),
-    "a session named in a command line is not running": ("ah.py", [("        if session in cmd:\n            found.append(pid)", "        if False:\n            found.append(pid)")]),
+    "a session named in a command line is not running": ("ah.py", [("        if named.search(cmd):\n            found.append(pid)", "        if False:\n            found.append(pid)")]),
+    "any path that holds the id counts as the session": ("ah.py", [("        if named.search(cmd):", "        if session in cmd:")]),
     "a process environment is not probed": ("ah.py", [("            if _retire_env_of(pid) == session:", "            if False:")]),
     "an env probe that fails reads as not running": (
         "ah.py", [("    raise AhError(\"retire_unreadable\", f\"task.retire-session: pid {pid} exists", "    return None\n    raise AhError(\"retire_unreadable\", f\"task.retire-session: pid {pid} exists")]),

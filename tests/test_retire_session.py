@@ -177,6 +177,26 @@ class Accepted(Base):
         self.assertFalse(list((ah.store_dir(self.home)).glob("ledger.jsonl")) and
                          any(r.get("state") == "intent" for r in ah._ledger(self.home, include_intents=True)))
 
+    def test_a_live_wait_on_a_dead_session_is_overridden_and_reported(self):
+        view = self.owners()
+        view["owners"][1]["disposition"] = {"kind": "waiting", "live": True, "at": NOW, "until": NOW + 3600}
+        with mock.patch.object(ah, "owners", return_value=view):
+            ev = ah.retire_dry_run(self.home, SESSION)
+        self.assertEqual(ev["overrides"], [{"agent": view["owners"][1]["agent_id"], "kind": "waiting"}])
+        self.assertEqual(ev["would_cover"], self.N)
+
+    def test_a_path_that_holds_the_session_id_is_not_the_session(self):
+        for cmd in (f"gpg-agent --homedir /Users/x/.agent-harness/work/{SESSION}/gnupg --daemon",
+                    f"Google Chrome --user-data-dir=/tmp/profiles/{SESSION}", f"tail -f /w/{SESSION}/log"):
+            self.table.append((801, 1, 0, cmd))
+        self.assertEqual(self.retire()["result"], "applied")
+
+    def test_an_argument_that_is_the_session_id_is_the_session(self):
+        for cmd in (f"claude --resume {SESSION}", f"claude --session-id={SESSION} -p", f"x CLAUDE_CODE_SESSION_ID={SESSION}"):
+            with self.subTest(cmd=cmd):
+                self.table = list(QUIET_TABLE) + [(802, 1, 0, cmd)]
+                self.refused("retire_running")
+
     def test_a_retry_is_a_duplicate_not_a_second_decision(self):
         first = self.retire()
         self.clock += 30
@@ -292,12 +312,6 @@ class Refused(Base):
     def test_live_owner(self):
         view = self.owners()
         view["owners"][0]["state"] = "live"
-        with mock.patch.object(ah, "owners", return_value=view):
-            self.refused("retire_live_owner")
-
-    def test_live_wait_disposition(self):
-        view = self.owners()
-        view["owners"][1]["disposition"] = {"kind": "waiting", "live": True, "at": NOW, "until": NOW + 3600}
         with mock.patch.object(ah, "owners", return_value=view):
             self.refused("retire_live_owner")
 

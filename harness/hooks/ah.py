@@ -2756,11 +2756,12 @@ def _retire_live_pids(session: str) -> list:
     while p and p not in mine:
         mine.add(p)
         p = parent.get(p, 0)
+    named = re.compile(r"(?<![\w/.-])" + re.escape(session) + r"(?![\w/.-])")  # an argument, not a path piece
     found, probes = [], 0
     for pid, _ppid, uid, cmd in table:
         if pid in mine:
             continue
-        if session in cmd:
+        if named.search(cmd):
             found.append(pid)
         elif uid == os.getuid() and "claude" in cmd.lower():
             probes += 1
@@ -2841,10 +2842,8 @@ def retire_evidence(home: Path, session: str, now: float, ps_pids=None) -> dict:
     for r in rows:
         d = r.get("disposition") or {}
         last = parse_ts(r.get("last_activity")) or 0.0
-        if str(r["state"]).startswith(("live", "working")) or r.get("active_1h") or (d.get("kind") in ("waiting", "resumed")
-                                                                                     and d.get("live")):
-            raise AhError("retire_live_owner", f"task.retire-session: owner {r['agent_id']} of {session} is {r['state']}"
-                                               f"{' with a live ' + d['kind'] if d.get('kind') in ('waiting', 'resumed') else ''}; "
+        if str(r["state"]).startswith(("live", "working")) or r.get("active_1h"):
+            raise AhError("retire_live_owner", f"task.retire-session: owner {r['agent_id']} of {session} is {r['state']}; "
                                                "nothing is retired", 3)
         if now - max(last, sub_activity(home, session, r["agent_id"])) < RETIRE_QUIET_S:
             raise AhError("retire_recent", f"task.retire-session: owner {r['agent_id']} was active {int(now - last)}s ago; it "
@@ -2853,13 +2852,15 @@ def retire_evidence(home: Path, session: str, now: float, ps_pids=None) -> dict:
             skipped.append({"agent": r["agent_id"], "kind": d["kind"]})
         elif d.get("kind") == RETIRED and d.get("live"):
             skipped.append({"agent": r["agent_id"], "kind": RETIRED})
-        else:
-            cover.append({"agent": r["agent_id"], "state": r["state"], "last_activity": r.get("last_activity")})
+        else:  # a wait or resume that is still "live" on a session that is not running cannot be kept: it is overridden
+            cover.append({"agent": r["agent_id"], "state": r["state"], "last_activity": r.get("last_activity"),
+                          "overrides": d["kind"] if d.get("kind") in ("waiting", "resumed") and d.get("live") else None})
     if not cover:
         raise AhError("retire_no_owners", f"task.retire-session: every owner of {session} already has an ending disposition", 3)
     return {"session": session, "live_pids": [], "quiet_s": RETIRE_QUIET_S, "owner_count": len(rows),
             "transcript_main": iso(tr["main_at"]), "transcript_newest": iso(tr["newest_at"]), "transcript_files": tr["files"],
-            "owners": [c["agent"] for c in cover], "cover": cover, "skipped": skipped}
+            "owners": [c["agent"] for c in cover], "cover": cover, "skipped": skipped,
+            "overrides": [{"agent": c["agent"], "kind": c["overrides"]} for c in cover if c["overrides"]]}
 
 
 def sub_activity(home: Path, session: str, agent: str) -> float:
