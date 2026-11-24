@@ -5,6 +5,11 @@ sub-agent's. Provenance, the chat-send allow-list and other grants read a row of
 sanctioned writers may add one: the harness hooks themselves (wal.py) and wal_note.py, which a guard lets a sub-agent
 aim only at its own WAL. This module is the one predicate for "this path is in the WAL tree" that every guard uses:
 command_guard.py for shell writes and wal.py's PreToolUse hook for the Write, Edit, MultiEdit and NotebookEdit tools.
+
+These guards are best-effort defence in depth, not the guarantee (main's ruling of 2026-11-24). Sub-agents run as the
+same OS user, so a route the guards cannot judge statically (a script already on disk, a decoded path) can still append
+a row. The guarantee that a sub-agent cannot forge a row main reads as its own belongs to a non-guard mechanism
+(goodqa#17019: rows authenticated with a key only main's hook can read, or WALs written by a separate process).
 """
 import hashlib
 import os
