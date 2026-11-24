@@ -214,8 +214,8 @@ class AgentsAndConfirmation(Fixture):
         marker = os.path.join(d, "json-ran")
         Path(d, "json.py").write_text("open(%r, 'w').write('x')\nfrom _json import *\n" % marker)
         env = {k: v for k, v in CLEAN_ENV.items() if not k.startswith("PYTHON")}
-        r = subprocess.run([sys.executable, os.path.join(d, "update_installed.py"), "--help"], capture_output=True,
-                           text=True, env=env)
+        r = subprocess.run([sys.executable, "-S", os.path.join(d, "update_installed.py"), "--help"],
+                           capture_output=True, text=True, env=env)  # -S alone: only the -I check can stop it
         self.assertEqual(r.returncode, U.EXIT_USAGE)
         self.assertIn("python3 -I -S", r.stderr)
         self.assertFalse(os.path.exists(marker))
@@ -595,6 +595,19 @@ class Registration(Fixture):
         rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
         self.assertEqual(rc, U.EXIT_STOP, "no answer stops even when nothing was installed")
 
+    def test_a_hook_wired_before_and_not_after_stops(self):
+        Path(self.home, ".claude", "hooks", "doctor.py").write_text("# fake\n")
+        answers = [[{"id": "a", "state": "WIRED"}], [{"id": "a", "state": "MISSING"}]]
+
+        def with_doctor(argv, **kw):
+            if any(str(x).endswith("doctor.py") for x in argv):
+                self.doctor = answers.pop(0)
+            return self.runner(argv, **kw)
+        rc, _, err = self.run_main("--ticket", "GoodQA goodqa#1", runner=with_doctor)
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("not wired now: a", err)
+        self.assertFalse([a for a, _ in self.calls if "install-files" in a and "--dry-run" not in a])
+
 
 class Contracts(unittest.TestCase):
     """The class behind PR 336 review R4: every test ran on a fixture the author built. These run the updater's
@@ -846,19 +859,6 @@ class RealTree(unittest.TestCase):
         self.assertIn("Mac: every listed file matches %s" % self.head[:12], out.getvalue())
         self.assertEqual(rc, U.EXIT_REGISTER, "a home with no settings.json has every declared hook unregistered")
         self.assertIn("NOT fully active", out.getvalue())
-
-    def test_a_hook_wired_before_and_not_after_stops(self):
-        Path(self.home, ".claude", "hooks", "doctor.py").write_text("# fake\n")
-        answers = [[{"id": "a", "state": "WIRED"}], [{"id": "a", "state": "MISSING"}]]
-
-        def with_doctor(argv, **kw):
-            if any(str(x).endswith("doctor.py") for x in argv):
-                self.doctor = answers.pop(0)
-            return self.runner(argv, **kw)
-        rc, _, err = self.run_main("--ticket", "GoodQA goodqa#1", runner=with_doctor)
-        self.assertEqual(rc, U.EXIT_STOP)
-        self.assertIn("not wired now: a", err)
-        self.assertFalse([a for a, _ in self.calls if "install-files" in a and "--dry-run" not in a])
 
 
 if __name__ == "__main__":
