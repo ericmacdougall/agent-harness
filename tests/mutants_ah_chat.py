@@ -19,7 +19,7 @@ MUTANTS = {
     "the credential backstop is off": ("    if _holds_token(json.dumps(result, ensure_ascii=False)):", "    if False:"),
     "server error codes are printed raw": ('    shown = gq.shown_code(code) if isinstance(code, str) else None\n    return shown or "unrecognized_error"',
                                            "    return str(code)"),
-    "not_found is a traceback": ('raise ChatError("not_found", "GoodQA says not_found', 'raise KeyError("not_found", "GoodQA says not_found'),
+    "not_found is a traceback": ('missing = ChatError("not_found", "GoodQA says not_found', 'missing = KeyError("not_found", "GoodQA says not_found'),
     "the membership id is used as the user id": ('uid = row.get("userId") or user.get("userId") or (user.get("id") if user is not row else None)',
                                                  'uid = user.get("id") or user.get("userId")'),
     "a paged member list is trusted for a name": ('    if isinstance(data, dict) and (data.get("nextCursor") or data.get("hasMore")):', "    if False:"),
