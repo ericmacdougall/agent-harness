@@ -27,6 +27,10 @@ resolves), the two ranking cells the R4 review named, a tie of a traced and an u
 an installed policy file with `"ask": "off"` (a real copy of the hooks, since the environment can only tighten the
 policy); its positive control, a file: line cited without an excerpt, is refused under enforce and written under off.
 
+Round 7 (main's rulings: option a, then its wide reading for pr170-r7-scope): evidence whose walk stopped, with any stop
+code, holds back every obsolete and not-user close of its ask, but not the answer close of the user's own traced
+answer; and it never yields an approval. Cells for each stop code pin both, with controls.
+
 The AST guards at the end keep every private list of source kinds out of the modules that decide ask closes (only
 ask_close.TABLE, over provenance.SOURCE_WORDS, holds one), and keep every problem code provenance can report
 classified as an end of the walk or a stop.
@@ -383,6 +387,35 @@ class Contract(unittest.TestCase):
         # controls, with no unknown evidence: the partial cite alone (manual, partial); the ticket close alone (offered)
         s1_rows.append(row("decision", new_id(), 21, f"Answer to ask {cls.keep_ctl['partial']}: the user answered", partial))
         s2_rows.append(row("ask_resolved", new_id(), 30, "closed there", direct["ticket"], ref=cls.keep_ctl["ticket"]))
+        # round 7, main's ruling on pr170-r7-scope (the wide reading, with two conditions), for EVERY place a walk stops:
+        # an answer row whose walk stopped holds back an offerable obsolete close and an offerable not-user close of
+        # its ask (held), and beside the user's own traced answer it lets through that answer close and nothing else
+        # (kept). wal>no-entry also gets the related-session shape: the stopped evidence is a close elsewhere
+        cls.stopped = {name: forms[name] for name in sorted(STOP_OF)}
+        cls.stopped.update({key: source for key, source in ZERO_SOURCES.items() if key.startswith("row:")})
+        cls.held, cls.kept, cls.held_ctl = {}, {}, {}
+        for name, source in cls.stopped.items():
+            for outcome in ("obsolete", "not_user"):
+                ask = cls.held[name, outcome] = new_id()
+                s1_rows += [row("ask", ask, 1, f"stopped {name}: {outcome} held"),
+                            row("decision", new_id(), 24, f"Answer to ask {ask}: the user said no", source)]
+                s2_rows.append(row("ask_resolved", new_id(), 30, f"{outcome} there", forms["wal>ticket"], ref=ask,
+                                   outcome=outcome))
+            ask = cls.kept[name] = new_id()
+            s1_rows += [row("ask", ask, 1, f"stopped {name}: traced answer kept"),
+                        row("decision", new_id(), 21, f"Answer to ask {ask}: the user answered", direct["user"]),
+                        row("decision", new_id(), 24, f"Answer to ask {ask}: the user said no", source)]
+            s2_rows += [row("ask_resolved", new_id(), 30, "obsolete there", forms["wal>ticket"], ref=ask, outcome="obsolete"),
+                        row("ask_resolved", new_id(), 31, "not_user there", forms["wal>ticket"], ref=ask, outcome="not_user")]
+        for outcome in ("obsolete", "not_user"):
+            ask = cls.held["close:wal>no-entry", outcome] = new_id()  # a stopped close elsewhere, after an offerable one
+            s1_rows.append(row("ask", ask, 1, f"stopped close: {outcome} held"))
+            s2_rows += [row("ask_resolved", new_id(), 30, f"{outcome} there", forms["wal>ticket"], ref=ask, outcome=outcome),
+                        row("ask_resolved", new_id(), 40, f"{outcome} there", forms["wal>no-entry"], ref=ask,
+                            outcome=outcome)]
+            ask = cls.held_ctl[outcome] = new_id()  # the control: the same close alone is offered, so `held` is not vacuous
+            s1_rows.append(row("ask", ask, 1, f"control: {outcome} alone"))
+            s2_rows.append(row("ask_resolved", new_id(), 30, f"{outcome} there", forms["wal>ticket"], ref=ask, outcome=outcome))
         # round 6, hop zero (R4 F1 one hop earlier): an answer row whose OWN source cannot be walked (none, as the warn
         # policy writes one, empty, not a string, free text) next to an offerable obsolete close of the same ask; and
         # a close elsewhere with no source of its own after an offerable one
@@ -422,9 +455,11 @@ class Contract(unittest.TestCase):
             raise AssertionError("not JSON: %r %r" % (p.stdout[-400:], p.stderr[-400:]))
 
     def write(self, ask, source, mode):
-        """(rc, the writer's JSON refusal or None): one close run by hand through this policy's wal_note.py."""
+        """(rc, the writer's JSON refusal or None): one close run by hand through this policy's wal_note.py, in the
+        answer mode, the outcome mode (--outcome obsolete) or the decision mode (--decision approved)."""
         argv = [sys.executable, str(self.hooks / "wal_note.py"), "--wal", str(self.s1), "--event", "ask_resolved",
-                "--ref", ask, "--note", "by hand", "--source", source] + (["--outcome", "obsolete"] if mode == "outcome" else [])
+                "--ref", ask, "--note", "by hand", "--source", source] + {
+                    "outcome": ["--outcome", "obsolete"], "decision": ["--decision", "approved"]}.get(mode, [])
         p = subprocess.run(argv, env=self.env, capture_output=True, text=True, timeout=120)
         try:
             doc = json.loads(p.stderr.strip().splitlines()[-1])
@@ -528,6 +563,7 @@ class Contract(unittest.TestCase):
             got.setdefault(entry["ask"], set()).update(entry["stops"])
         want = {ask for ask, (name, mode) in self.cells.items() if self.expect(name)[0] == U}
         want |= {self.rank[k] for k in ("super", "missing", "tie")} | set(self.zero.values()) | set(self.keep.values())
+        want |= set(self.held.values()) | set(self.kept.values())
         self.assertEqual(set(got), want)
         for ask, (name, mode) in self.cells.items():
             if ask in want:
@@ -621,6 +657,72 @@ class Contract(unittest.TestCase):
                 self.assertEqual((r["event"], r["source"], r.get("outcome"), r.get("closed_by")),
                                  ("ask_resolved", self.direct["user"], None, "ask-sweep"))
                 self.assertNotIn("decision", r)
+
+    def test_a_walk_that_stopped_with_any_stop_code_lets_through_only_the_answer_close_of_a_traced_answer(self):
+        # round 7, main's ruling on pr170-r7-scope (wal row w9dd8a988d1d), for every stop code, wal>no-entry included:
+        # (1) a walk that stopped never yields an approval. Beside the user's traced answer only his answer close is
+        # offered and written: no outcome, no decision, closed_by ask-sweep (escalation's approval ledger refuses a
+        # row with closed_by or outcome, or without decision=approved), and the writer refuses a --decision approved
+        # close on the stopped source itself. (2) It holds back every obsolete and not-user close of its ask
+        start = self.s1.read_bytes()
+        incomplete = {}
+        for entry in self.listing["incomplete"]:
+            incomplete.setdefault(entry["ask"], set()).update(entry["stops"])
+
+        def stop_of(name):
+            return STOP_OF.get(name.split(":", 1)[-1]) or ZERO_STOP[name]
+
+        self.assertEqual(set(STOP_OF.values()) | set(ZERO_STOP.values()), {stop_of(name) for name in self.stopped})
+        for outcome, ask in self.held_ctl.items():
+            with self.subTest(control=outcome):  # the outcome close alone is offered
+                item = self.items[ask]
+                self.assertEqual((item["kind"], item["manual"], bool(item["close"])), ("resolved-elsewhere", False, True))
+                self.assertIn("--outcome " + outcome, item["close"])
+        for (name, outcome), ask in sorted(self.held.items()):
+            with self.subTest(held=name, outcome=outcome):
+                item = self.items[ask]
+                best = item["evidence"][0]
+                self.assertEqual((item["manual"], item["close"], item["apply"]), (True, None, None))
+                self.assertEqual((best.get("unknown"), stop_of(name) in best.get("stops", ())), (True, True))
+                self.assertIn(outcome, [e.get("outcome") for e in item["evidence"][1:] if not e.get("unknown")])
+                self.assertIn("could not be traced to its end", item["action"])
+                self.assertIn(stop_of(name), incomplete.get(ask, ()))
+        for name, ask in sorted(self.kept.items()):
+            with self.subTest(kept=name):
+                item = self.items[ask]
+                best = item["evidence"][0]
+                self.assertEqual((item["kind"], item["manual"], bool(item["close"]), bool(item["apply"])),
+                                 ("answer", False, True, True))
+                self.assertEqual((best["source"], best.get("unknown"), best.get("outcome")), (self.direct["user"], None, None))
+                for flag in ("--outcome", "--decision"):
+                    self.assertNotIn(flag, item["close"])
+                self.assertEqual(sorted(e.get("outcome") for e in item["evidence"] if e.get("outcome")), ["not_user", "obsolete"])
+                self.assertIn(stop_of(name), incomplete.get(ask, ()))
+        # the writer refuses an approval on each stopped source that is a string, whatever the policy
+        jobs = [(name, source) for name, source in sorted(self.stopped.items()) if isinstance(source, str) and source]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            done = list(pool.map(lambda j: (j[0], self.write(self.kept[j[0]], j[1], "decision")), jobs))
+        for name, (rc, doc) in done:
+            with self.subTest(decision=name):
+                self.assertEqual((rc, (doc or {}).get("status")), (2, "REFUSED"), doc)
+        self.assertEqual(self.s1.read_bytes(), start)
+        # --apply refuses every held ask and writes exactly the answer close of every kept one
+        held, kept = list(self.held.values()), list(self.kept.values())
+        code, doc = self.sweep("--apply", "--only", *[self.items[a]["pin"] for a in held + kept])
+        self.assertEqual({c["ask"]: c["rc"] for c in doc["closed"]}, {**{a: 3 for a in held}, **{a: 0 for a in kept}},
+                         json.dumps(doc["closed"])[:2000])
+        for entry in doc["closed"]:
+            if entry["ask"] in held:
+                self.assertTrue(entry["refused"].startswith("manual:"), entry)
+        self.assertEqual(code, 1)  # a refused close makes the run exit 1
+        new = [json.loads(x) for x in self.s1.read_bytes()[len(start):].decode().splitlines()]
+        self.assertEqual(sorted(r["ref"] for r in new), sorted(kept))
+        for r in new:
+            with self.subTest(written=r["ref"]):
+                self.assertEqual((r["event"], r["source"], r.get("outcome"), r.get("closed_by")),
+                                 ("ask_resolved", self.direct["user"], None, "ask-sweep"))
+                self.assertNotIn("decision", r)
+        self.assertEqual(self.s2.read_bytes(), self.s2_before)
 
     def test_evidence_whose_own_source_cannot_be_walked_is_never_skipped(self):
         # round 6, hop zero: an answer row with no source, an empty one, a non-string or free text is unknown evidence,

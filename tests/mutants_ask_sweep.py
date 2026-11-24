@@ -236,6 +236,10 @@ MUTANTS = {
         "tests/test_ask_close_contract.py"),
     "another unknown walk is kept beside unknown evidence": (
         "ask_sweep.py", ' and not evidence.get("unknown") and ', " and ", "tests/test_ask_close_contract.py"),
+    # main's ruling on pr170-r7-scope: the held cells, for every stop code, fail when any completed walk is kept
+    "any close whose walk completed is kept beside unknown evidence": (
+        "ask_sweep.py", 'return evidence.get("outcome") is None and not evidence.get("unknown") and bool(evidence.get("human"))',
+        'return not evidence.get("unknown")', "tests/test_ask_close_contract.py"),
     # not listed: the "tree-too-large" stop in provenance._walk_tree cannot be reached (MAX_RESOLVES caps a tree at
     # far fewer nodes than its bound), and trace's except branch runs only when provenance cannot be imported or
     # resolve() raises, which it never does; both fail closed by construction
