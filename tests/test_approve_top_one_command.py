@@ -211,8 +211,15 @@ class OneCommand(Fixture):
                                  'message': {'role': 'user', 'content': words}}) + '\n')
 
     def run_ah(self, *argv):
+        """Every refusal of every test here must leave the WAL as it found it: the guard lives in the one runner, so a
+        new refusal test cannot skip it (PR 357 review F1: a refusal path wrote an approved ask pair first)."""
+        before = self.wal.read_text()
         args = self.ah.build_parser().parse_args(list(argv))
-        return self.ah.run(args, self.home)
+        try:
+            return self.ah.run(args, self.home)
+        except BaseException:
+            self.assertEqual(self.wal.read_text(), before, 'a refused approve-top wrote to the WAL')
+            raise
 
     def test_one_command_records_the_task_grant_citing_the_assenting_sentence(self):
         rows = self.run_ah('user-msg', '--session', SESSION, '--recent', '3')['matches']
@@ -258,6 +265,52 @@ class OneCommand(Fixture):
         self.assertTrue(out['ok'])
         self.assertIn('use fable for the harness', out['source'])
         self.assertNotIn('ghp_', self.wal.read_text())
+
+    def queued_approval(self, words, age):
+        """A mid-turn approval recorded as a human queued_command attachment behind a reminder block (goodqa#17101)."""
+        import hashlib  # noqa: PLC0415
+        stamp = fx.stamp(age)
+        prompt = [{'type': 'text', 'text': '<system-reminder>injected harness note</system-reminder>'}, {'type': 'text', 'text': words}]
+        raw = '\n'.join(b['text'] for b in prompt)
+        with open(self.transcript, 'a') as fh:
+            fh.write(json.dumps({'type': 'attachment', 'timestamp': stamp, 'attachment': {
+                'type': 'queued_command', 'commandMode': 'prompt', 'origin': {'kind': 'human'}, 'prompt': prompt}}) + '\n')
+        return 'queue:%s/%s#%s' % (SESSION, stamp, hashlib.sha256(raw.encode()).hexdigest()[:12])
+
+    def test_goodqa_17164_an_approval_followed_by_many_later_messages_is_found(self):
+        ident = self.queued_approval('I approve ' + ASKS, 600)
+        for n in range(25):
+            self.add_turn('00000000-0000-4000-8000-00000000b%03d' % n, 'unrelated later message number %d about the site' % n, age=300 - n)
+        out = self.run_ah('approve-top', '--task', 't17164', '--user-msg', ident, '--wal', str(self.wal))
+        self.assertTrue(out['ok'])
+        self.assertTrue(out['source'].startswith(ident))
+
+    def test_goodqa_17164_an_id_from_another_session_is_still_refused(self):
+        ident = self.queued_approval('I approve ' + ASKS, 600).replace(SESSION, '99999999-aaaa-bbbb-cccc-dddddddddddd')
+        with self.assertRaises(self.ah.AhError) as caught:
+            self.run_ah('approve-top', '--task', 't17164', '--user-msg', ident, '--wal', str(self.wal))
+        self.assertEqual(caught.exception.code, 'user_msg_not_found')
+        self.assertEqual(self.wal.read_text(), '')
+
+    def test_goodqa_17164_an_approval_older_than_twelve_hours_is_still_refused(self):
+        ident = self.queued_approval('I approve ' + ASKS, 13 * 3600)
+        for n in range(25):
+            self.add_turn('00000000-0000-4000-8000-00000000c%03d' % n, 'unrelated later message number %d about the site' % n, age=300 - n)
+        with self.assertRaises(Exception) as caught:
+            self.run_ah('approve-top', '--task', 't17164', '--user-msg', ident, '--wal', str(self.wal))
+        self.assertEqual(getattr(caught.exception, 'code', ''), 'no_assent')
+        self.assertIn('h old; top-rung permission needs words from the last 12 h', str(caught.exception))  # age, not the window
+        self.assertIsNone(self.ledger.status('t17164')['permission'])
+
+    def test_goodqa_17164_a_top_rung_mention_far_after_the_approval_still_refuses(self):
+        ident = self.queued_approval('I approve ' + ASKS, 900)
+        for n in range(30):
+            self.add_turn('00000000-0000-4000-8000-00000000d%03d' % n, 'unrelated later message number %d about the site' % n, age=600 - n)
+        self.add_turn('00000000-0000-4000-8000-00000000dfff', 'actually keep fable off for that one', age=30)
+        with self.assertRaises(self.ah.AhError) as caught:
+            self.run_ah('approve-top', '--task', 't17164', '--user-msg', ident, '--wal', str(self.wal))
+        self.assertIn('mentioned the top rung again later', str(caught.exception))
+        self.assertIsNone(self.ledger.status('t17164')['permission'])
 
     def test_non_user_ids_and_unknown_ids_are_refused_with_the_fix(self):
         for bad in ('uuid:%s/00000000-0000-4000-8000-0000000000e1' % SESSION, 'uuid:%s/00000000-0000-4000-8000-0000000000e2' % SESSION, 'nope'):
