@@ -81,8 +81,40 @@ def _idle_s(repo: str, now: float) -> float:
     return now - max(S.newest_activity(repo), used_at)
 
 
+def regenerable_dirs(root: str, repos: list) -> list:
+    """Folders under root, outside every checkout in repos, that can be rebuilt from a manifest beside or inside them:
+    `node_modules` whose parent holds a regular `package.json`, and `.venv`/`venv` holding a regular `pyvenv.cfg`.
+    Nothing else counts outside a checkout (`build`, `dist`, `out`, `target` and caches are build output only inside a
+    checkout, where git says they are ignored; outside one they may be the only copy of something). Never a symlink,
+    never a folder that holds a nested repository. Not descended into."""
+    def regular(p: str) -> bool:
+        try:
+            return stat.S_ISREG(os.lstat(p).st_mode)
+        except OSError:
+            return False
+    inside = tuple(r.rstrip("/") + "/" for r in repos)
+    out = []
+    for dp, dn, _fn in os.walk(root):
+        keep = []
+        for d in dn:
+            full = os.path.join(dp, d)
+            if (full + "/").startswith(inside) or d == ".git" or os.path.islink(full):
+                continue
+            if d == "node_modules" and regular(os.path.join(dp, "package.json")):
+                if not S._has_nested_repo(full):
+                    out.append(full)
+                continue
+            if d in (".venv", "venv") and regular(os.path.join(full, "pyvenv.cfg")):
+                if not S._has_nested_repo(full):
+                    out.append(full)
+                continue
+            keep.append(d)
+        dn[:] = keep
+    return sorted(out)
+
+
 def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "float | None" = None,
-            min_idle_s: "float | None" = None, now: "float | None" = None) -> dict:
+            min_idle_s: "float | None" = None, now: "float | None" = None, regenerable: bool = False) -> dict:
     """min_idle_s is the sweep's TTL: it is re-checked per checkout with the lock held (an acquire may have touched the
     checkout since the sweep looked). The in-use and service probes are repeated right before every removal.
     With deletion off nothing is removed: the result says mode "report-only" and lists `would_remove` /
@@ -159,6 +191,36 @@ def release(path: str, apply: bool, used=None, refs=None, cfg=None, deadline: "f
         finally:
             if lk:
                 lk.close()
+    if regenerable and S.within_allowed(path) and os.path.dirname(os.path.realpath(path)) == os.path.realpath(S.ah("work")):
+        # Only a whole session folder (never checkouts/ or test-copies/), and only when the caller judged the session
+        # retired or its own: logs and every other file stay, so the folder itself usually stays too.
+        repos = [r for r in S.find_repos(path)]
+        for d in regenerable_dirs(path, repos):
+            if deadline is not None and time.time() > deadline:
+                res["kept"].append({"path": d, "why": "time budget exhausted"})
+                kept_paths.append(d)
+                continue
+            why = S.protected_name(d, cfg) or S.busy(d, used, refs) or ("mount point inside" if S.mounts_under(d) else "")
+            if not why and deleting:
+                try:
+                    used, refs = S.in_use_paths(), S.service_refs()
+                except S.ProbeError as e:
+                    why = "liveness probe failed: %s" % e
+                else:
+                    why = S.busy(d, used, refs)
+            if why:
+                res["kept"].append({"path": d, "why": why})
+                continue
+            size = S.du(d)
+            if deleting:
+                done, err = C.safe_remove(d, "tree", cfg)
+                if not done:
+                    res["kept"].append({"path": d, "why": "remove failed: " + err})
+                    continue
+                audit("remove-regenerable", {"path": d, "bytes": size})
+            gone.append(d)
+            gone_bytes += size
+            res.setdefault("regenerable", []).append(d)
     if os.path.isdir(path) and not kept_paths and not _remaining_files(path, gone) and not S.busy(path, used, refs):
         size = S.du(path)
         if deleting:
@@ -203,23 +265,205 @@ def _process_blob() -> "str | None":
 
 
 def live_sessions(names: list, ttl_s: float, now: float) -> set:
-    """Session folders whose Claude process is alive (the id is on a command line) or whose WAL is newer than the TTL.
-    Without any process list at all, every session counts as alive (nothing is released on a guess)."""
-    blob = _process_blob()
-    if blob is None:
-        return set(names)
-    live = set()
-    for n in names:
-        if len(n) >= 8 and n in blob:
-            live.add(n)
-            continue
-        wal = os.path.join(S.home(), ".claude", "wals", n)
+    """Session folders that are not retired (session_verdicts gives the reasons). Without any process list at all, every
+    session counts as alive (nothing is released on a guess)."""
+    return {n for n, why in session_verdicts(names, ttl_s, now).items() if why}
+
+
+# ------------------------------------------------------------------ session ownership (stream D, goodqa#16947)
+# The rules of feat/takeover-cleanup's takeover.session_state that a janitor can check on its own host, without the
+# claim file: R1 identity (one WAL flavor, real folders this user owns), R3 quiet past the TTL across WALs (file time AND
+# last row stamp, so a backdated touch does not hide a fresh row), app transcripts and Codex rollouts, R4 no process that
+# names the session, R5 no open ask, no open ah task, no live bg_job. takeover's R2 (a declared stop or a claim) is NOT
+# required here: the janitor removes only recoverable checkouts and regenerable folders, so the worst case of releasing
+# a quiet-but-live session is a re-clone, never lost work. Any input that cannot be read keeps the session (not retired).
+SKEW_S = 300
+TAIL_BYTES = 65536
+ASK_SCAN_MAX = 16 << 20
+
+
+def _wal_dirs(sid: str) -> dict:
+    return {"claude": os.path.join(S.home(), ".claude", "wals", sid),
+            "codex": os.path.join(S.home(), ".agent-harness", "codex-wals", sid)}
+
+
+def _dir_state(path: str) -> "tuple[bool, bool]":
+    """(exists, ok): ok means a real directory this user owns (not a symlink)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False, True
+    except OSError:
+        return True, False
+    return True, stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
+
+
+def _row_epoch(value) -> "float | None":
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        import datetime as dt
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _jsonl_stamps(path: str) -> list:
+    """[mtime, last row stamp] of a JSONL file (either may be missing). Raises OSError when it cannot be read."""
+    st = os.stat(path)
+    out = [st.st_mtime]
+    with open(path, "rb") as fh:
+        fh.seek(max(0, st.st_size - TAIL_BYTES))
+        lines = fh.read(TAIL_BYTES).decode("utf-8", "replace").splitlines()
+    for line in reversed(lines):
         try:
-            if os.path.isdir(wal) and now - S.newest_activity(wal) < ttl_s:
-                live.add(n)
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            stamp = _row_epoch(row.get("at") or row.get("timestamp"))
+            if stamp is not None:
+                out.append(stamp)
+                break
+    return out
+
+
+def _transcripts(sid: str) -> list:
+    """Claude project transcripts (and their subagent files) and Codex rollouts of exactly this session id."""
+    h = S.home()
+    import glob
+    found = (glob.glob(os.path.join(h, ".claude", "projects", "*", sid + ".jsonl"))[:512]
+             + glob.glob(os.path.join(h, ".claude", "projects", "*", sid, "subagents", "*.jsonl"))[:512])
+    found += [p for p in glob.glob(os.path.join(h, ".codex", "sessions", "*", "*", "*", "rollout-*-%s.jsonl" % sid))[:512]
+              if p.endswith("-" + sid + ".jsonl")]
+    return found
+
+
+def _open_asks(wal_dir: str) -> "tuple[list, bool]":
+    """(ask ids no ask_resolved row closes, unreadable)."""
+    asks, closed = set(), set()
+    try:
+        names = [n for n in os.listdir(wal_dir) if n == "main.jsonl" or (n.startswith("agent-") and n.endswith(".jsonl"))]
+    except OSError:
+        return [], True
+    for name in names:
+        p = os.path.join(wal_dir, name)
+        try:
+            if os.stat(p).st_size > ASK_SCAN_MAX:
+                return [], True
+            with open(p, "rb") as fh:
+                for raw in fh:
+                    if b'"ask' not in raw:
+                        continue
+                    try:
+                        row = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and row.get("event") == "ask" and isinstance(row.get("id"), str):
+                        asks.add(row["id"])
+                    elif isinstance(row, dict) and row.get("event") == "ask_resolved" and isinstance(row.get("ref"), str):
+                        closed.add(row["ref"])
         except OSError:
-            pass
+            return [], True
+    return sorted(asks - closed), False
+
+
+_TASKS: "dict | None" = None
+
+
+def _open_task_sessions() -> "set | None":
+    """Session ids that hold an open ah task, or None when the task ledger exists but cannot be read (or ah is missing).
+    Read once per process. A missing ledger means no tasks."""
+    global _TASKS
+    if _TASKS is not None:
+        return _TASKS.get("sessions")
+    try:
+        from pathlib import Path
+        import ah  # sibling module in the hooks folder
+        path = ah.store_dir(Path(S.home())) / "ledger.jsonl"
+        if not path.exists():
+            _TASKS = {"sessions": set()}
+        else:
+            with open(path, "rb"):
+                pass                                          # readable (ah._ledger hides an OSError as "no rows")
+            rows = ah.task_list(Path(S.home()), open_only=True)["tasks"]
+            _TASKS = {"sessions": {str(t.get("session")) for t in rows if t.get("session")}}
+    except Exception:  # noqa: BLE001 -- an unreadable ledger is unknown, never "no tasks"
+        _TASKS = {"sessions": None}
+    return _TASKS["sessions"]
+
+
+def _bg_jobs_live(sid: str, blob: str) -> list:
+    import glob
+    base = S.ah("work", sid)
+    live = []
+    for rec in (glob.glob(os.path.join(base, "*", "bg-jobs", "*.json"))[:256] + glob.glob(os.path.join(base, "bg-jobs", "*.json"))[:256]):
+        try:
+            with open(rec, "rb") as fh:
+                data = json.loads(fh.read(65536))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("pid"), int) and isinstance(data.get("nonce"), str) \
+                and data["nonce"] and data["nonce"] in blob:
+            live.append(os.path.basename(rec))
     return live
+
+
+def session_verdict(sid: str, ttl_s: float, now: float, blob: "str | None") -> list:
+    """[] when the session is retired (its work folder may be released), else the reasons it is not."""
+    if blob is None:
+        return ["no_process_list"]
+    reasons = []
+    if len(sid) >= 8 and sid in blob:
+        reasons.append("session_live")
+    flavors, bad = [], False
+    for flavor, d in _wal_dirs(sid).items():
+        exists, ok = _dir_state(d)
+        bad = bad or not ok
+        if exists and ok and os.path.isfile(os.path.join(d, "main.jsonl")):
+            flavors.append(flavor)
+    if bad:
+        reasons.append("bad_dir")
+    if len(flavors) > 1:
+        reasons.append("ambiguous_session")
+    stamps = []
+    try:
+        for flavor in flavors:
+            d = _wal_dirs(sid)[flavor]
+            for n in os.listdir(d):
+                if n == "main.jsonl" or (n.startswith("agent-") and n.endswith(".jsonl")) or n == "continuation.json":
+                    stamps += _jsonl_stamps(os.path.join(d, n)) if n.endswith(".jsonl") else [os.stat(os.path.join(d, n)).st_mtime]
+            asks, unreadable = _open_asks(d)
+            if unreadable:
+                reasons.append("asks_unreadable")
+            elif asks:
+                reasons.append("open_work")
+        for t in _transcripts(sid):
+            stamps += _jsonl_stamps(t)
+    except OSError:
+        reasons.append("activity_unreadable")
+    if stamps:
+        newest = max(stamps)
+        if newest > now + SKEW_S:
+            reasons.append("clock_skew")
+        elif now - newest < ttl_s:
+            reasons.append("recent_activity")
+    tasks = _open_task_sessions()
+    if tasks is None:
+        reasons.append("tasks_unreadable")
+    elif sid in tasks:
+        reasons.append("open_work")
+    if _bg_jobs_live(sid, blob):
+        reasons.append("open_work")
+    return list(dict.fromkeys(reasons))
+
+
+def session_verdicts(names: list, ttl_s: float, now: float) -> dict:
+    """{name: reasons} for each session folder name; one process scan for all."""
+    blob = _process_blob()
+    return {n: session_verdict(n, ttl_s, now, blob) for n in names}
 
 
 def shm_sweep(apply: bool, cfg: dict, now: float) -> list:
@@ -444,15 +688,16 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
                           dedupe="root-ignored")
     for root in roots:
         names = [e for e in sorted(S._ls(root)) if os.path.isdir(os.path.join(root, e)) and not os.path.islink(os.path.join(root, e))]
-        alive = live_sessions(names, ttl, now)
+        verdicts = session_verdicts(names, ttl, now)
         for e in names:
             p = os.path.join(root, e)
-            if e in alive:
+            why = verdicts.get(e) or []
+            if why:
                 res["released"].append({"path": p, "mode": "apply" if deleting else "report-only", "removed": [], "freed_bytes": 0,
-                                        "would_remove": [], "would_free_bytes": 0,
-                                        "kept": [{"path": p, "why": "session is alive or recent"}]})
+                                        "would_remove": [], "would_free_bytes": 0, "session_reasons": why,
+                                        "kept": [{"path": p, "why": "session is alive or recent (%s)" % ", ".join(why)}]})
             elif now - S.newest_activity(p) >= ttl:
-                res["released"].append(release(p, apply, used, refs, cfg, min_idle_s=ttl, now=now))
+                res["released"].append(release(p, apply, used, refs, cfg, min_idle_s=ttl, now=now, regenerable=True))
     co = S.ah("checkouts")
     for e in sorted(S._ls(co)):
         for k in sorted(S._ls(os.path.join(co, e))):
@@ -468,6 +713,49 @@ def sweep(apply: bool, cfg=None, now=None) -> dict:
     audit("sweep", {"mode": res["mode"], "freed_gb": res["freed_gb"], "would_free_gb": res["would_free_gb"],
                     "uncapped": len(res["uncapped_containers"])})
     return res
+
+
+# ------------------------------------------------------------------ report (S6: who holds the space)
+SESSION_BUDGET_GB = 15.0
+
+
+def _session_budget_gb() -> float:
+    """session_budget_gb from copy-hygiene.json (read raw: copy_hygiene's normalize keeps only its own keys)."""
+    try:
+        with open(C.config_path()) as fh:
+            v = float(json.load(fh).get("session_budget_gb"))
+        return v if v > 0 else SESSION_BUDGET_GB
+    except (OSError, ValueError, TypeError, AttributeError):
+        return SESSION_BUDGET_GB
+
+
+def report(cfg=None, now=None) -> dict:
+    """Read only. One row per session folder of each work root: the ownership verdict and its reasons, total bytes,
+    regenerable bytes (what release would rebuild-free once the session is retired), checkouts, and whether the folder
+    is over session_budget_gb. Rows are sorted by size; each names the sanctioned command for it."""
+    cfg = cfg or C.load_config()
+    now = now or time.time()
+    ttl = cfg["max_age_hours"] * 3600
+    budget = _session_budget_gb()
+    rows = []
+    for root in cfg["roots"]:
+        if not S.within_allowed(root, strictly_inside=False):
+            continue
+        names = [e for e in sorted(S._ls(root)) if os.path.isdir(os.path.join(root, e)) and not os.path.islink(os.path.join(root, e))]
+        verdicts = session_verdicts(names, ttl, now)
+        for e in names:
+            p = os.path.join(root, e)
+            repos = S.find_repos(p)
+            regen = regenerable_dirs(p, repos)
+            size = S.du(p)
+            why = verdicts.get(e) or []
+            rows.append({"session": e, "path": p, "state": "retired" if not why else "kept", "reasons": why,
+                         "bytes": size, "regenerable_bytes": sum(S.du(d) for d in regen), "checkouts": len(repos),
+                         "over_budget": size > budget * GB,
+                         "command": "python3 -I %s release --path %s" % (os.path.abspath(__file__), p)})
+    rows.sort(key=lambda r: -r["bytes"])
+    return {"budget_gb": budget, "sessions": rows, "total_gb": round(sum(r["bytes"] for r in rows) / GB, 2),
+            "retired_gb": round(sum(r["bytes"] for r in rows if r["state"] == "retired") / GB, 2)}
 
 
 # ------------------------------------------------------------------ pretool: container memory caps
@@ -621,6 +909,19 @@ def pretool(event: dict, cfg=None) -> "tuple[int, str]":
 
 
 # ------------------------------------------------------------------ CLI
+SESSION_END_ENV = "HARNESS_JANITOR_SESSION_END"   # set only by session-end for its own session (accident prevention,
+# not a boundary: an agent could set it, and then gains only what `release` did before this check existed)
+
+
+def session_of(path: str) -> str:
+    """The session folder name when path is ~/.agent-harness/work/<id> or inside it, else ''."""
+    work = os.path.realpath(S.ah("work")).rstrip("/") + "/"
+    rp = os.path.realpath(path)
+    if not (rp + "/").startswith(work) or rp + "/" == work:
+        return ""
+    return rp[len(work):].split("/")[0]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -629,7 +930,11 @@ def main(argv=None) -> int:
     sub.add_parser("session-end")
     s = sub.add_parser("sweep"); s.add_argument("--apply", action="store_true"); s.add_argument("--json", action="store_true")
     sub.add_parser("pretool")
+    sub.add_parser("report", help="read only: session folders by size, ownership verdict, regenerable bytes, budget")
     a = ap.parse_args(argv)
+    if a.cmd == "report":
+        print(json.dumps(report(), indent=1))
+        return 0
     if a.cmd == "release":
         if not (a.session or a.path):
             ap.error("--session or --path")
@@ -639,7 +944,18 @@ def main(argv=None) -> int:
             ap.error(str(e))
         if not S.within_allowed(p):
             ap.error("path must be inside ~/.agent-harness/{work,checkouts,test-copies}")
-        r = release(p, a.apply, deadline=time.time() + a.budget if a.budget else None)
+        sid = session_of(p)
+        own = bool(sid) and os.environ.get(SESSION_END_ENV) == sid
+        if sid and not own:
+            cfg = C.load_config()
+            why = session_verdict(sid, cfg["max_age_hours"] * 3600, time.time(), _process_blob())
+            if why:
+                print(json.dumps({"path": p, "mode": "report-only", "removed": [], "freed_bytes": 0, "would_remove": [],
+                                  "would_free_bytes": 0, "session_reasons": why,
+                                  "kept": [{"path": p, "why": "session %s is not retired (%s)" % (sid, ", ".join(why))}]},
+                                 indent=1))
+                return 0
+        r = release(p, a.apply, deadline=time.time() + a.budget if a.budget else None, regenerable=bool(sid))
         print(json.dumps(r, indent=1))
         return 0
     if a.cmd == "session-end":
@@ -651,7 +967,8 @@ def main(argv=None) -> int:
             if C.deletion_enabled(C.load_config()) and os.path.isdir(S.ah("work", sid)):
                 subprocess.Popen([sys.executable, "-B", os.path.abspath(__file__), "release", "--session", sid, "--apply",
                                   "--budget", "600"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+                                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+                                 env=dict(os.environ, **{SESSION_END_ENV: sid}))
         except Exception:  # noqa: BLE001
             pass
         return 0

@@ -507,11 +507,11 @@ class Sweep(Base):
         sid = "5cbde717-82cc-47bc-8dc9-2f15ea122398"
         c = self.clone(sid + "/c")
         with mock.patch.object(S, "newest_activity", return_value=OLD), \
-                mock.patch.object(wj, "live_sessions", return_value={sid}):
+                mock.patch.object(wj, "session_verdicts", return_value={sid: ["session_live"]}):
             r = wj.sweep(apply=True)
         self.assertTrue(os.path.exists(c))
         row = r["released"][0]
-        self.assertEqual(row["kept"][0]["why"], "session is alive or recent")
+        self.assertEqual(row["kept"][0]["why"], "session is alive or recent (session_live)")
         self.assertEqual((row["mode"], row["would_remove"], row["would_free_bytes"]), ("apply", [], 0))
 
     def test_live_sessions_reads_command_lines_and_the_wal(self):
@@ -1075,6 +1075,257 @@ class SessionEnd(Base):
             code, po = self.run_hook(payload)
             self.assertEqual(code, 0, payload)
             po.assert_not_called()
+
+
+SID = "aaaaaaaa-1111-4222-8333-444444444444"
+OLD_ISO = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(OLD))
+
+
+class Ownership(Base):
+    """Stream D (goodqa#16947): a session folder is released only when its session is retired: Claude and Codex WALs
+    (file time and last row stamp), transcripts and rollouts, open asks, open ah tasks, live bg jobs. Each test here
+    keeps a session that the previous liveness check (Claude WAL mtime or a command line only) released."""
+
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(S, "in_use_paths", return_value=set()).start()
+        mock.patch.object(S, "service_refs", return_value=set()).start()
+        mock.patch.object(wj, "uncapped_containers", return_value=[]).start()
+        mock.patch.object(wj, "shm_sweep", return_value=[]).start()
+        mock.patch.object(wj, "_process_blob", return_value="/bin/zsh\n").start()
+        wj._TASKS = None
+        self.addCleanup(setattr, wj, "_TASKS", None)
+
+    def wal(self, flavor="claude", rows=None, when=OLD):
+        d = (os.path.join(self.home, ".claude", "wals", SID) if flavor == "claude"
+             else os.path.join(self.home, ".agent-harness", "codex-wals", SID))
+        os.makedirs(d, exist_ok=True)
+        p = Path(d, "main.jsonl")
+        p.write_text("".join(json.dumps(r) + "\n" for r in (rows or [{"at": OLD_ISO, "event": "intent"}])))
+        os.utime(p, (when, when))
+        return d
+
+    def session(self):
+        c = self.clone(SID + "/c")
+        age(os.path.join(self.work, SID))
+        return c
+
+    def sweep(self):
+        real = S.newest_activity
+        with mock.patch.object(S, "newest_activity", side_effect=lambda p: OLD if SID in p else real(p)):
+            return wj.sweep(apply=True)
+
+    def test_retired_session_is_released(self):
+        c = self.session()
+        self.wal()
+        self.sweep()
+        self.assertFalse(os.path.exists(c))
+
+    def test_codex_session_with_a_fresh_codex_wal_is_kept(self):
+        c = self.session()
+        self.wal("codex", rows=[{"at": OLD_ISO}], when=time.time())
+        r = self.sweep()
+        self.assertTrue(os.path.exists(c))
+        self.assertIn("recent_activity", r["released"][0]["session_reasons"])
+
+    def test_fresh_transcript_keeps_a_session_whose_wal_is_old(self):
+        c = self.session()
+        self.wal()
+        d = os.path.join(self.home, ".claude", "projects", "-Users-x")
+        os.makedirs(d)
+        Path(d, SID + ".jsonl").write_text(json.dumps({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n")
+        self.sweep()
+        self.assertTrue(os.path.exists(c))
+
+    def test_backdated_wal_with_a_fresh_row_stamp_is_kept(self):
+        c = self.session()
+        self.wal(rows=[{"at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()), "event": "intent"}], when=OLD)
+        self.sweep()
+        self.assertTrue(os.path.exists(c))
+
+    def test_open_ask_keeps_and_a_resolved_ask_does_not(self):
+        c = self.session()
+        self.wal(rows=[{"at": OLD_ISO, "event": "ask", "id": "w1"}])
+        r = self.sweep()
+        self.assertTrue(os.path.exists(c))
+        self.assertIn("open_work", r["released"][0]["session_reasons"])
+        self.wal(rows=[{"at": OLD_ISO, "event": "ask", "id": "w1"}, {"at": OLD_ISO, "event": "ask_resolved", "ref": "w1"}])
+        self.sweep()
+        self.assertFalse(os.path.exists(c))
+
+    def test_open_task_keeps_and_an_unreadable_task_ledger_keeps_everything(self):
+        c = self.session()
+        self.wal()
+        with mock.patch.object(wj, "_open_task_sessions", return_value={SID}):
+            self.sweep()
+        self.assertTrue(os.path.exists(c))
+        with mock.patch.object(wj, "_open_task_sessions", return_value=None):
+            r = self.sweep()
+        self.assertTrue(os.path.exists(c))
+        self.assertIn("tasks_unreadable", r["released"][0]["session_reasons"])
+
+    def test_session_in_both_wal_flavors_is_ambiguous_and_kept(self):
+        c = self.session()
+        self.wal("claude")
+        self.wal("codex")
+        r = self.sweep()
+        self.assertTrue(os.path.exists(c))
+        self.assertIn("ambiguous_session", r["released"][0]["session_reasons"])
+
+    def test_live_bg_job_keeps(self):
+        c = self.session()
+        self.wal()
+        jobs = os.path.join(self.work, SID, "bg-jobs")
+        os.makedirs(jobs)
+        Path(jobs, "j.json").write_text(json.dumps({"pid": 1, "nonce": "nonce-xyz"}))
+        with mock.patch.object(wj, "_process_blob", return_value="python3 bg_job.py nonce-xyz\n"):
+            self.sweep()
+        self.assertTrue(os.path.exists(c))
+
+    def test_release_cli_refuses_a_session_that_is_not_retired_and_session_end_may_release_its_own(self):
+        c = self.session()
+        self.wal(when=time.time())
+        with mock.patch("sys.stdout") as out:
+            self.assertEqual(wj.main(["release", "--session", SID, "--apply"]), 0)
+        self.assertTrue(os.path.exists(c))
+        self.assertIn("is not retired", "".join(x.args[0] for x in out.write.call_args_list))
+        with mock.patch.dict(os.environ, {wj.SESSION_END_ENV: SID}), mock.patch("sys.stdout"):
+            wj.main(["release", "--session", SID, "--apply"])
+        self.assertFalse(os.path.exists(c))
+
+    def test_no_process_list_keeps_every_session(self):
+        c = self.session()
+        self.wal()
+        with mock.patch.object(wj, "_process_blob", return_value=None):
+            self.sweep()
+        self.assertTrue(os.path.exists(c))
+
+
+class Regenerable(Base):
+    """Stream D: in a retired session folder, node_modules beside a package.json and a venv with pyvenv.cfg are removed
+    even though the folder also holds logs; nothing else outside a checkout is treated as regenerable."""
+
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(S, "in_use_paths", return_value=set()).start()
+        mock.patch.object(S, "service_refs", return_value=set()).start()
+        self.s = os.path.join(self.work, SID)
+        os.makedirs(self.s)
+        Path(self.s, "notes.jsonl").write_text("{}\n")
+        Path(self.s, "run.log").write_text("log\n")
+
+    def tree(self, *parts, files=("x.js",)):
+        d = os.path.join(self.s, *parts)
+        os.makedirs(d, exist_ok=True)
+        for f in files:
+            Path(d, f).write_text("x")
+        return d
+
+    def test_node_modules_and_venv_go_logs_and_the_folder_stay(self):
+        self.tree("app", files=("package.json",))
+        nm = self.tree("app", "node_modules", "left-pad")
+        venv = self.tree("py", ".venv", files=("pyvenv.cfg",))
+        r = wj.release(self.s, apply=True, regenerable=True)
+        self.assertFalse(os.path.exists(os.path.dirname(nm)))
+        self.assertFalse(os.path.exists(venv))
+        self.assertTrue(os.path.exists(os.path.join(self.s, "notes.jsonl")))
+        self.assertTrue(os.path.exists(os.path.join(self.s, "run.log")))
+        self.assertTrue(os.path.exists(os.path.join(self.s, "app", "package.json")))
+        self.assertEqual(len(r["regenerable"]), 2)
+
+    def test_build_output_outside_a_checkout_is_kept(self):
+        # the 4e8fba1c case: built firmware images in a build/ folder of a non-git work dir are not regenerable
+        b = self.tree("gfx", "build", files=("final14.bin", "final14.json"))
+        for name in ("dist", "out", "target", ".cache", "__pycache__"):
+            self.tree("gfx", name, files=("a.bin",))
+        wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.exists(os.path.join(b, "final14.bin")))
+        for name in ("dist", "out", "target", ".cache", "__pycache__"):
+            self.assertTrue(os.path.exists(os.path.join(self.s, "gfx", name, "a.bin")), name)
+
+    def test_node_modules_without_a_package_json_and_venv_without_pyvenv_cfg_are_kept(self):
+        nm = self.tree("lone", "node_modules", "pkg")
+        venv = self.tree("lone", "venv", files=("bin",))
+        wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.exists(nm))
+        self.assertTrue(os.path.exists(venv))
+
+    def test_symlinked_node_modules_is_not_followed(self):
+        target = os.path.join(self.t, "shared-nm")
+        os.makedirs(os.path.join(target, "pkg"))
+        self.tree("app", files=("package.json",))
+        os.symlink(target, os.path.join(self.s, "app", "node_modules"))
+        wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.islink(os.path.join(self.s, "app", "node_modules")))
+        self.assertTrue(os.path.exists(os.path.join(target, "pkg")))
+
+    def test_node_modules_holding_a_repository_is_kept(self):
+        self.tree("app", files=("package.json",))
+        nested = os.path.join(self.s, "app", "node_modules", "linked")
+        os.makedirs(nested)
+        sh("git", "init", "-q", nested)
+        wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.exists(os.path.join(nested, ".git")))
+
+    def test_in_use_node_modules_is_kept(self):
+        self.tree("app", files=("package.json",))
+        nm = self.tree("app", "node_modules", "pkg")
+        with mock.patch.object(S, "in_use_paths", return_value={nm}):
+            r = wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.exists(nm))
+        self.assertTrue(any("in use" in k["why"] or "used" in k["why"] for k in r["kept"]), r["kept"])
+
+    def test_report_only_lists_and_removes_nothing(self):
+        os.remove(os.path.join(self.home, ".agent-harness", "state", "copy-hygiene.json"))
+        self.tree("app", files=("package.json",))
+        nm = self.tree("app", "node_modules", "pkg")
+        r = wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.exists(nm))
+        self.assertIn(os.path.join(self.s, "app", "node_modules"), r["would_remove"])
+        self.assertEqual(r["removed"], [])
+
+    def test_without_the_regenerable_flag_nothing_outside_checkouts_is_touched(self):
+        self.tree("app", files=("package.json",))
+        nm = self.tree("app", "node_modules", "pkg")
+        wj.release(self.s, apply=True)
+        self.assertTrue(os.path.exists(nm))
+
+    def test_node_modules_inside_a_checkout_is_left_to_the_checkout_rules(self):
+        c = self.clone(SID + "/repo")
+        Path(c, "package.json").write_text("{}")
+        Path(c, "x").write_text("dirty")              # a dirty checkout is kept, and so is its node_modules
+        os.makedirs(os.path.join(c, "node_modules", "p"))
+        wj.release(self.s, apply=True, regenerable=True)
+        self.assertTrue(os.path.exists(os.path.join(c, "node_modules", "p")))
+
+
+class Report(Base):
+    def setUp(self):
+        super().setUp()
+        mock.patch.object(wj, "_process_blob", return_value="/bin/zsh\n").start()
+        wj._TASKS = None
+        self.addCleanup(setattr, wj, "_TASKS", None)
+
+    def test_report_lists_sessions_by_size_with_verdict_and_regenerable_bytes(self):
+        s = os.path.join(self.work, SID)
+        os.makedirs(os.path.join(s, "app", "node_modules", "p"))
+        Path(s, "app", "package.json").write_text("{}")
+        Path(s, "app", "node_modules", "p", "big").write_bytes(b"x" * 200000)
+        live = "bbbbbbbb-1111-4222-8333-444444444444"
+        os.makedirs(os.path.join(self.work, live))
+        wal = os.path.join(self.home, ".claude", "wals", live)
+        os.makedirs(wal)
+        Path(wal, "main.jsonl").write_text("{}\n")
+        self.write_config(reaper_delete_enabled=True, session_budget_gb=0.0001)
+        r = wj.report()
+        rows = {x["session"]: x for x in r["sessions"]}
+        self.assertEqual(rows[SID]["state"], "retired")
+        self.assertGreater(rows[SID]["regenerable_bytes"], 100000)
+        self.assertTrue(rows[SID]["over_budget"])
+        self.assertEqual(rows[live]["state"], "kept")
+        self.assertIn("recent_activity", rows[live]["reasons"])
+        self.assertEqual(r["sessions"][0]["session"], SID)
+        self.assertTrue(os.path.exists(os.path.join(s, "app", "node_modules", "p", "big")))   # read only
 
 
 class InstallTimer(unittest.TestCase):
