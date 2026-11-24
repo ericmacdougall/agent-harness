@@ -19,8 +19,7 @@ TESTS = ('test_guard_double_bracket.py', 'test_command_guard.py', 'test_kill_gua
 MUTANTS = {
     'the fold is not called': ('        tokens = _fold_conditionals(tokens)', '        pass'),
     'PowerShell text is folded': ('    if not ps:  # PowerShell', '    if True:  # PowerShell'),
-    'a bracket anywhere is folded': ('end = _conditional_end(tokens, i + 1) if kind == \'w\' and at_start and _plain(',
-                                     'end = _conditional_end(tokens, i + 1) if kind == \'w\' and _plain('),
+    'a bracket anywhere is folded': ("if kind == 'w' and at_start and _plain(val, '[[')", "if kind == 'w' and _plain(val, '[[')"),
     'any reserved word leads, in any position': (
         'at_start = at_start and kind == \'w\' and not val.quoted and val.text in _LEAD_WORDS',
         'at_start = kind == \'w\' and not val.quoted and val.text in RESERVED'),
@@ -29,9 +28,8 @@ MUTANTS = {
     'a redirection keeps the position': ("                at_start = at_start and kind == 'w' and",
                                          "                at_start = at_start and kind in ('w', 'redir') and"),
     'a quoted bracket is folded': ('    return not word.quoted and word.raw == text', '    return word.text == text'),
-    'an unterminated bracket is folded': ('            return None\n    return None\n\n\n# reserved words after',
-                                          '            return None\n    return len(tokens) - 1 if len(tokens) > i else None'
-                                          '\n\n\n# reserved words after'),
+    'an unterminated bracket is folded': ('    return len(tokens), False',
+                                          '    return (len(tokens) - 1, True) if len(tokens) > i else (len(tokens), False)'),
     'a separator inside is accepted': ("        elif val not in ('(', ')', '\\n') and not (val == '|' and pattern):",
                                        "        elif val in ('|&',):"),
     'a pipe is accepted outside a pattern': ("and not (val == '|' and pattern):", "and not (val == '|'):"),
@@ -45,8 +43,9 @@ MUTANTS = {
                                        "            else:\n                out.append(('op', inner))"),
     'operators inside are dropped': ("            elif inner != '\\n':\n                out.append(('w', _operator_word(inner)))",
                                      "            elif False:\n                pass"),
-    'the first closing word is skipped': ("            if _plain(val, ']]'):\n                return j",
-                                          "            if _plain(val, ']]') and j > i + 2:\n                return j"),
+    'the first closing word is skipped': ("            if _plain(val, ']]'):\n                return j, True",
+                                          "            if _plain(val, ']]') and j > i + 2:\n                return j, True"),
+    'a failed scan is repeated': ("and _plain(val, '[[') and i >= dead_until:", "and _plain(val, '[['):"),
 }
 
 

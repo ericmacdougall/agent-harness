@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,6 +112,17 @@ class Allowed(tkg.WorldCase):
         pipelines = cg.parse(cg.Lexer(ctx).lex('[[ ( a || b ) && ! c < d ]] || e'))
         heads = [[w.text for w in c.words] for p in pipelines for c in p.cmds]
         self.assertEqual(heads, [['[[', '(', 'a', '||', 'b', ')', '&&', '!', 'c', '<', 'd', ']]'], ['e']])
+
+
+class Linear(unittest.TestCase):
+    def test_many_unclosed_brackets_are_one_pass(self):
+        # each `[[` here reaches the end of the text without a closing `]]`; rescanning from every one is quadratic
+        ctx = cg.Ctx(cg.Compiled(cg.load_policy(), cwd='/tmp'), cwd='/tmp')
+        tokens = cg.Lexer(ctx).lex('[[ a\n' * 5000)
+        start = time.process_time()
+        folded = cg._fold_conditionals(tokens)
+        self.assertLess(time.process_time() - start, 1.0)
+        self.assertEqual(len(folded), len(tokens))
 
 
 class Refused(tkg.WorldCase):

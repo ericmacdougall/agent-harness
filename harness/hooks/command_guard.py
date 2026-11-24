@@ -1217,27 +1217,27 @@ def _plain(word, text):
 
 
 def _conditional_end(tokens, i):
-    """Index of the `]]` that closes a `[[` whose first operand token is tokens[i], or None when the shell would
-    reject the text inside (it then runs nothing there) or no `]]` closes it. Inside `[[ ]]` bash and zsh accept
-    operand words, `&&`, `||`, `(`, `)`, line breaks, `<` and `>` as string comparisons, and `|` only within a `=~`
-    pattern. Anything else (`;`, `&`, `|&`, a here-document or another redirection, an fd prefix) is refused here, so
-    the caller keeps the old split reading of the text."""
+    """(index, True) for the `]]` that closes a `[[` whose first operand token is tokens[i]. (index, False) when the
+    shell would reject the token at that index inside `[[ ]]` (it then runs nothing there), or (len(tokens), False)
+    when no `]]` closes it; the caller then keeps the old split reading. Inside `[[ ]]` bash and zsh accept operand
+    words, `&&`, `||`, `(`, `)`, line breaks, `<` and `>` as string comparisons, and `|` only within a `=~` pattern.
+    Anything else (`;`, `&`, `|&`, a here-document or another redirection, an fd prefix) is refused."""
     pattern = False  # inside the operand after `=~`, until the next `&&` or `||`
     for j in range(i, len(tokens)):
         kind, val = tokens[j]
         if kind == 'w':
             if _plain(val, ']]'):
-                return j
+                return j, True
             if _plain(val, '=~'):
                 pattern = True
         elif kind == 'redir':
             if val.op not in ('<', '>') or val.fd is not None or val.target is None:
-                return None
+                return j, False
         elif val in ('&&', '||'):
             pattern = False
         elif val not in ('(', ')', '\n') and not (val == '|' and pattern):
-            return None
-    return None
+            return j, False
+    return len(tokens), False
 
 
 # reserved words after which the next word is again in command position, when they are themselves in command position
@@ -1254,9 +1254,16 @@ def _fold_conditionals(tokens):
     or one `_conditional_end` cannot close, leaves the tokens unchanged."""
     out, i, n = [], 0, len(tokens)
     at_start = True
+    # A scan that gave up at index k gives up at or before k from any later start below k (the same tokens), so
+    # it is not repeated: `[[ a` on 20000 lines stays one pass instead of 20000.
+    dead_until = -1
     while i < n:
         kind, val = tokens[i]
-        end = _conditional_end(tokens, i + 1) if kind == 'w' and at_start and _plain(val, '[[') else None
+        end = None
+        if kind == 'w' and at_start and _plain(val, '[[') and i >= dead_until:
+            end, closed = _conditional_end(tokens, i + 1)
+            if not closed:
+                dead_until, end = end, None
         if end is None:
             out.append(tokens[i])
             if kind == 'op':  # `)` ends a subshell, except the `()` of `name() { ... }`, whose body follows
