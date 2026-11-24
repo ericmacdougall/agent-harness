@@ -1240,22 +1240,32 @@ def _conditional_end(tokens, i):
     return None
 
 
+# reserved words after which the next word is again in command position, when they are themselves in command position
+_LEAD_WORDS = frozenset(('if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'time'))
+
+
 def _fold_conditionals(tokens):
     """`[[ a || b ]]`: bash and zsh read everything up to the closing `]]` as one conditional expression whose words are
     operands, never commands, so the operators inside it do not end a command (goodqa#17044). Each operator inside
     becomes an operand word of the `[[` command; `<` and `>` keep their right-hand word. A substitution inside an
-    operand stays on its word and is analysed as before. A `[[` that is not a command word (an argument, after an
-    assignment, quoted), or one `_conditional_end` cannot close, leaves the tokens unchanged."""
+    operand stays on its word and is analysed as before. Only an unquoted `[[` in command position is the keyword:
+    at the start, after a list or pipe operator or `(`, or after a reserved word that is itself in command position
+    (`echo done [[ a || b ]]` runs b). Any other `[[` (an argument, after an assignment, a redirection or `)`, quoted),
+    or one `_conditional_end` cannot close, leaves the tokens unchanged."""
     out, i, n = [], 0, len(tokens)
+    at_start = True
     while i < n:
         kind, val = tokens[i]
-        at_start = not out or out[-1][0] == 'op' or (out[-1][0] == 'w' and not out[-1][1].quoted
-                                                       and out[-1][1].text in RESERVED)
         end = _conditional_end(tokens, i + 1) if kind == 'w' and at_start and _plain(val, '[[') else None
         if end is None:
             out.append(tokens[i])
+            if kind == 'op':  # `)` ends a subshell, except the `()` of `name() { ... }`, whose body follows
+                at_start = val != ')' or (len(out) >= 3 and out[-2] == ('op', '(') and out[-3][0] == 'w')
+            else:
+                at_start = at_start and kind == 'w' and not val.quoted and val.text in _LEAD_WORDS
             i += 1
             continue
+        at_start = False
         out.append(tokens[i])
         for inner_kind, inner in tokens[i + 1:end]:
             if inner_kind == 'w':
@@ -1277,8 +1287,10 @@ def _operator_word(text):
     return word
 
 
-def parse(tokens):
-    tokens = _fold_conditionals(_strip_case_patterns(tokens))
+def parse(tokens, ps=False):
+    tokens = _strip_case_patterns(tokens)
+    if not ps:  # PowerShell has no `[[` keyword, and its `||` and `&&` chain commands
+        tokens = _fold_conditionals(tokens)
     pipelines, pl, cmd = [], Pipeline(), Cmd()
 
     def end_cmd():
@@ -4127,7 +4139,7 @@ class Analyzer:
 
     def _run_tokens(self, tokens, depth):
         self.check_tokens(tokens)
-        pipelines = parse(tokens)
+        pipelines = parse(tokens, self.ctx.ps)
         self._prebind_loop_input(pipelines)
         for pipeline in pipelines:
             self.pipeline(pipeline, depth)
@@ -6442,7 +6454,7 @@ class Analyzer:
         if not text or len(text) > 200000:
             return None
         try:
-            pipelines = parse(Lexer(ctx, ctx.ps).lex(text))
+            pipelines = parse(Lexer(ctx, ctx.ps).lex(text), ctx.ps)
         except (Blocked, ValueError, IndexError, RecursionError):
             return None  # the substitution itself is judged (and refused when unreadable) where it runs
         for pl in pipelines[:64]:

@@ -17,14 +17,21 @@ TESTS = ('test_guard_double_bracket.py', 'test_command_guard.py', 'test_kill_gua
          'kill_guard_corpus.json')
 
 MUTANTS = {
-    'the fold is not called': ('    tokens = _fold_conditionals(_strip_case_patterns(tokens))',
-                               '    tokens = _strip_case_patterns(tokens)'),
+    'the fold is not called': ('        tokens = _fold_conditionals(tokens)', '        pass'),
+    'PowerShell text is folded': ('    if not ps:  # PowerShell', '    if True:  # PowerShell'),
     'a bracket anywhere is folded': ('end = _conditional_end(tokens, i + 1) if kind == \'w\' and at_start and _plain(',
                                      'end = _conditional_end(tokens, i + 1) if kind == \'w\' and _plain('),
+    'any reserved word leads, in any position': (
+        'at_start = at_start and kind == \'w\' and not val.quoted and val.text in _LEAD_WORDS',
+        'at_start = kind == \'w\' and not val.quoted and val.text in RESERVED'),
+    'a closing parenthesis leads': ("at_start = val != ')' or (", "at_start = True or ("),
+    'a function body does not lead': ("at_start = val != ')' or (len(out) >= 3", "at_start = val != ')' or (False"),
+    'a redirection keeps the position': ("                at_start = at_start and kind == 'w' and",
+                                         "                at_start = at_start and kind in ('w', 'redir') and"),
     'a quoted bracket is folded': ('    return not word.quoted and word.raw == text', '    return word.text == text'),
-    'an unterminated bracket is folded': ('            return None\n    return None\n\n\ndef _fold_conditionals',
+    'an unterminated bracket is folded': ('            return None\n    return None\n\n\n# reserved words after',
                                           '            return None\n    return len(tokens) - 1 if len(tokens) > i else None'
-                                          '\n\n\ndef _fold_conditionals'),
+                                          '\n\n\n# reserved words after'),
     'a separator inside is accepted': ("        elif val not in ('(', ')', '\\n') and not (val == '|' and pattern):",
                                        "        elif val in ('|&',):"),
     'a pipe is accepted outside a pattern': ("and not (val == '|' and pattern):", "and not (val == '|'):"),

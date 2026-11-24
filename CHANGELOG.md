@@ -18,7 +18,7 @@ group by pull request.
 
 ### Fixed
 - `[[ ... ]]` conditionals (goodqa#17044). The guards' shared shell parser split `[[ a || b ]]` at the inner `||` (and at `&&`, a line break or `(`), so an operand became a command. When that operand was a variable, kill_guard read it as a command name built at run time and refused project scripts that kill nothing.
-  - The parser now reads `[[` to its closing `]]` as one command whose operators are operand words, the same way bash and zsh read it.
+  - The parser now reads `[[` to its closing `]]` as one command whose operators are operand words, the same way bash and zsh read it. This applies only to an unquoted `[[` in command position, and never to PowerShell text.
   - Substitutions inside it are still analysed, and anything after the closing `]]` is judged as before.
   - Text a shell would reject inside `[[ ]]` keeps the old split reading: `;`, `&`, a pipe outside a `=~` pattern, a here-document, an fd redirection, or no closing `]]`.
 - Review step timing (goodqa#16947, a follow-up from the PR 339 review):

@@ -74,9 +74,17 @@ TWINS = {
     'a pipe outside a regex': '[[ x == y | %s ]]',
     'a background operator inside': '[[ x == y & %s ]]',
     'an & in a regex': '[[ x =~ a&%s ]]',
+    'a pipe after the pattern ended': '[[ "$v" =~ a || x | %s ]]',
+    'a second conditional later on the line': '[[ -n x ]] || %s && [[ -n y ]]',
     'a semicolon inside': '[[ x == y ; %s ]]',
     'bracket as an argument, not a command': 'echo [[ a || %s ]]',
     'bracket after an assignment': 'X=1 [[ a || %s ]]',
+    'a reserved word as an argument before it': 'echo done [[ a || %s ]]',
+    'then as an argument before it': 'echo then [[ a || %s ]]',
+    'after a command word': 'command [[ a || %s ]]',
+    'after a subshell': '( true ) [[ a || %s ]]',
+    'after a redirection': '>/dev/null [[ a || %s ]]',
+    'inside a substitution as a comparison target': '[[ a < "$(%s)" ]]',
     'quoted bracket is a command name': '"[[" a || %s ]]',
     'quoted closing bracket is an operand': '[[ "$v" == "]]" || -n x ]] && %s',
     'a here-document inside': '[[ x <<EOF\nbody\nEOF\n|| %s ]]',
@@ -118,6 +126,17 @@ class Refused(tkg.WorldCase):
             wrong = [label for label, form in TWINS.items()
                      if cg.decide(PRE + form % DELETE, compiled, cwd=str(home / 'repo'))[0] != 'block']
         self.assertEqual(wrong, [])
+
+    def test_powershell_text_is_never_folded(self):
+        # PowerShell 7 chains commands with || and &&, and has no [[ keyword
+        self.assertEqual(self.decide('[[ a || Stop-Process -Name python -Force ]]', ps=True)[0], 'block')
+        home = tcg.make_fixture(tempfile.mkdtemp(prefix='dbl-cg-'))
+        self.addCleanup(shutil.rmtree, str(home), True)
+        compiled = cg.Compiled(cg.load_policy(path=str(home / 'none.json')), home=str(home), cwd=str(home / 'repo'))
+        with mock.patch.dict(os.environ, {'HOME': str(home)}):
+            verdict = cg.decide('[[ a || Remove-Item -Recurse -Force ~/.claude/projects ]]', compiled,
+                                cwd=str(home / 'repo'), ps=True)[0]
+        self.assertEqual(verdict, 'block')
 
 
 class OnlyInsideAClosedConditional(tkg.WorldCase):
