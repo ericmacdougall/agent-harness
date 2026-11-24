@@ -228,6 +228,20 @@ class Recorded(unittest.TestCase):
         self.assertEqual(self.subs('echo $((date) )'), ['(date) '])
         self.assertEqual(self.subs('echo $(( 1 + 2 ))'), [])
 
+    def test_the_scan_ends_a_substitution_where_the_shell_does(self):
+        """scan_balanced from just after `$(` or `${`: each text below is one whole substitution, so the scan must
+        end at its last character (bash 5 and dash agree; see ShellOracle)."""
+        for text, (open_ch, close_ch) in (
+                ('$(echo "$(echo ")")"; b)', '()'),
+                ('$(case a in a) b;; esac)', '()'),
+                ('$(case a in (a) b;; esac)', '()'),
+                ('$(case a in b) c;& a) d;; esac)', '()'),
+                ('$(echo ${x:-)}; b)', '()'),
+                ('${x:-$(a }; b)}', '{}'),
+                ('${x:-"$(a }; b)"}', '{}'),
+                ('$(( (1 + 2) * 3 ))', '()')):
+            self.assertEqual(cg.scan_balanced(text, 2, open_ch, close_ch), len(text), text)
+
 
 @unittest.skipUnless(shutil.which('bash'), 'needs bash')
 class ShellOracle(unittest.TestCase):
