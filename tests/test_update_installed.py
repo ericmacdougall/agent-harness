@@ -24,13 +24,14 @@ GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "
 CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in U.AGENT_MARKERS}
 
 INSTALL_PY = ("import json, os, sys\n"
-              "AGENTS = ('x.md',)\nHOOKS = %r\nTOOLS = ()\nSKILLS = ()\n"
+              "AGENTS = ('x.md',)\nHOOKS = %r\nTOOLS = ()\nSKILLS = %r\n"
               "if __name__ == '__main__':\n"
               "    home = sys.argv[sys.argv.index('--home') + 1]\n"
-              "    for folder in ('hooks', 'agents'):\n"
-              "        src = os.path.join('harness', folder)\n"
-              "        for f in os.listdir(src):\n"
-              "            with open(os.path.join(src, f), 'rb') as a, open(os.path.join(home, '.claude', folder, f), 'wb') as b:\n"
+              "    for folder, names in (('hooks', HOOKS), ('agents', AGENTS), ('skills', SKILLS)):\n"
+              "        for f in names:\n"
+              "            dest = os.path.join(home, '.claude', folder, f)\n"
+              "            os.makedirs(os.path.dirname(dest), exist_ok=True)\n"
+              "            with open(os.path.join('harness', folder, f), 'rb') as a, open(dest, 'wb') as b:\n"
               "                b.write(a.read())\n")
 
 
@@ -40,6 +41,7 @@ def sh(cwd, *args):
 
 class Fixture(unittest.TestCase):
     HOOKS = ("a.py", "b.py", "c.py")
+    SKILLS = ()
 
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix="update-installed-")
@@ -48,11 +50,15 @@ class Fixture(unittest.TestCase):
         self.seed = seed = os.path.join(self.t, "seed")
         sh(self.t, "init", "-q", "--bare", self.origin)
         sh(self.t, "init", "-q", seed)
-        Path(seed, "install.py").write_text(INSTALL_PY % (self.HOOKS,))
-        for d in ("hooks", "agents"):
-            os.makedirs(os.path.join(seed, "harness", d))
+        Path(seed, "install.py").write_text(INSTALL_PY % (self.HOOKS, self.SKILLS))
+        for d in ("hooks", "agents", "scripts"):
+            os.makedirs(os.path.join(seed, "harness", d) if d != "scripts" else os.path.join(seed, d))
+        Path(seed, U.SELF_REL).write_bytes(U.SELF_BYTES)     # main's copy of the updater is the running one (F4)
         for n in self.HOOKS:
             Path(seed, "harness", "hooks", n).write_text("print(%r)\n" % n)
+        for n in self.SKILLS:
+            Path(seed, "harness", "skills", n).parent.mkdir(parents=True, exist_ok=True)
+            Path(seed, "harness", "skills", n).write_text("skill %s\n" % n)
         Path(seed, "harness", "agents", "x.md").write_text("agent\n")
         self.main_sha = self.commit_main("seed")
         sh(seed, "checkout", "-qb", "side")
@@ -69,13 +75,14 @@ class Fixture(unittest.TestCase):
         (hooks / "a.py").write_text("print('a.py')\n")       # current
         (hooks / "b.py").write_text("print('old')\n")        # differs; c.py is missing
         (agents / "x.md").write_text("agent\n")              # current
+        (hooks / "doctor.py").write_text("# fake: the runner answers for it\n")
         mock.patch.object(U, "CANONICAL_URL", self.origin).start()
         mock.patch.object(U, "ALLOW_FILE", True).start()
         self.addCleanup(mock.patch.stopall)
         self.calls = []
         self.remote = {"a.py": "already_current", "b.py": "replaced", "c.py": "new"}
         self.unregistered = []
-        self.doctor = None                                  # [findings] the fake doctor answers, or None: no doctor
+        self.doctor = []                                    # [findings] the fake doctor answers; None: it does not answer
         self.typed = []
 
     def commit_main(self, msg, files=None):
@@ -101,7 +108,9 @@ class Fixture(unittest.TestCase):
                 out["unregistered"] = self.unregistered
             return subprocess.CompletedProcess(argv, 0, json.dumps(out), "")
         if any(str(x).endswith("doctor.py") for x in argv):
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.doctor or []), "")
+            if self.doctor is None:
+                return subprocess.CompletedProcess(argv, 2, "Traceback: doctor crashed", "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(self.doctor), "")
         if any(str(x).endswith("install.py") for x in argv):
             return subprocess.run(argv, **kw)              # the fixture installer, for real
         raise AssertionError("unexpected command %r" % (argv,))
@@ -208,9 +217,9 @@ class AgentsAndConfirmation(Fixture):
         r = subprocess.run([sys.executable, os.path.join(d, "update_installed.py"), "--help"], capture_output=True,
                            text=True, env=env)
         self.assertEqual(r.returncode, U.EXIT_USAGE)
-        self.assertIn("python3 -I", r.stderr)
+        self.assertIn("python3 -I -S", r.stderr)
         self.assertFalse(os.path.exists(marker))
-        r = subprocess.run([sys.executable, "-I", os.path.join(d, "update_installed.py"), "--help"],
+        r = subprocess.run([sys.executable, "-I", "-S", os.path.join(d, "update_installed.py"), "--help"],
                            capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(os.path.exists(marker), "with -I the folder of the script is not on sys.path")
@@ -328,25 +337,32 @@ class FileList(Fixture):
     def export(self, commit):
         d = os.path.join(self.t, "exp-" + commit[:7])
         repo, _ = U.fetch_main(Path(self.t), self.home)
-        U.export_commit(repo, self.home, commit, Path(d))
-        return repo, d
+        _, digests = U.export_commit(repo, self.home, commit, Path(d))
+        return repo, d, digests
 
     def test_file_list_is_derived_from_the_installed_files(self):
-        repo, d = self.export(self.main_sha)
+        repo, d, digests = self.export(self.main_sha)
         lists = U.installer_lists(d)
         self.assertEqual(lists["hooks"], list(self.HOOKS))
-        self.assertEqual(U.local_changes(d, self.home, lists), ["hooks/b.py", "hooks/c.py"])
+        self.assertEqual(U.local_changes(digests, self.home, lists), ["hooks/b.py", "hooks/c.py"])
         self.assertEqual(U.remote_changes(self.home, "t2-dev", self.main_sha, lists["hooks"], self.runner),
                          ["b.py", "c.py"])
         Path(self.home, ".claude", "agents", "x.md").write_text("edited\n")
         os.remove(os.path.join(self.home, ".claude", "hooks", "a.py"))
         os.symlink(os.path.join(d, "harness", "hooks", "a.py"), os.path.join(self.home, ".claude", "hooks", "a.py"))
-        self.assertEqual(U.local_changes(d, self.home, lists),
+        self.assertEqual(U.local_changes(digests, self.home, lists),
                          ["agents/x.md", "hooks/a.py", "hooks/b.py", "hooks/c.py"])   # a symlink is never "current"
+
+    def test_the_digests_are_kept_in_memory_not_reread_from_the_export(self):
+        repo, d, digests = self.export(self.main_sha)
+        lists = U.installer_lists(d)
+        Path(self.home, ".claude", "hooks", "b.py").write_text("print('b.py')\n")
+        Path(d, "harness", "hooks", "b.py").write_text("tampered\n")   # the export changes after it was verified
+        self.assertEqual(U.local_changes(digests, self.home, lists), ["hooks/c.py"])
 
     def test_the_lists_and_bytes_are_the_commits_not_mains(self):
         first = self.main_sha
-        self.commit_main("add d", {"install.py": INSTALL_PY % (self.HOOKS + ("d.py",),), "harness/hooks/d.py": "d\n"})
+        self.commit_main("add d", {"install.py": INSTALL_PY % (self.HOOKS + ("d.py",), ()), "harness/hooks/d.py": "d\n"})
         Path(self.home, ".claude", "hooks", "b.py").write_text("print('b.py')\n")
         rc, out, err = self.run_main("--commit", first, "--preview")
         self.assertEqual(rc, U.EXIT_OK, err)
@@ -363,6 +379,27 @@ class FileList(Fixture):
         self.assertIn("older versions", err)
         self.assertIn("hooks/b.py", err)
         self.assertEqual(Path(self.home, ".claude", "hooks", "b.py").read_text(), "print('b v2')\n")
+
+    def test_an_older_commit_stops_a_remote_run_when_main_changed_any_hook_after_it(self):
+        """F7: ah_install refuses an older commit for a hook main changed later, even one the host already has."""
+        first = self.main_sha
+        self.commit_main("a v2", {"harness/hooks/a.py": "print('a v2')\n"})
+        rc, _, err = self.run_main("--commit", first, "--preview")
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("remote installer refuses an older commit", err)
+        self.assertIn("hooks/a.py", err)
+        self.assertEqual(self.calls, [], "no dry run is sent")
+        rc, _, err = self.run_main("--commit", first, "--preview", "--no-remote")
+        self.assertEqual(rc, U.EXIT_OK, err)
+
+    def test_skills_in_folders_are_listed_like_install_py_lists_them(self):
+        """F1: install.py's SKILLS are <folder>/<file>; HOOKS, AGENTS and TOOLS stay bare names."""
+        for folder, name, ok in (("skills", "sk/SKILL.md", True), ("skills", "sk/scan.py", True),
+                                 ("skills", "SKILL.md", True), ("skills", "sk/../x", False),
+                                 ("skills", "../x", False), ("skills", "a/b/c", False), ("skills", "/abs", False),
+                                 ("skills", ".hidden/x", False), ("hooks", "sk/x.py", False),
+                                 ("hooks", "x.py", True), ("agents", "a/b.md", False), ("tools", "", False)):
+            self.assertEqual(bool(U.valid_name(folder, name)), ok, (folder, name))
 
     def test_remote_batches_hold_at_most_twenty_files_with_the_guard_last(self):
         names = ["command_guard.py"] + ["h%02d.py" % i for i in range(44)]
@@ -422,7 +459,6 @@ class RealRun(Fixture):
         names = ["h%02d.py" % i for i in range(25)]
         audit = Path(self.home, ".agent-harness", "install-audit.jsonl")
         audit.parent.mkdir(parents=True, exist_ok=True)
-        since = "2000-01-01T00:00:00Z"
         n = {"real": 0}
 
         def second_fails(argv, **kw):
@@ -437,13 +473,34 @@ class RealRun(Fixture):
         out = io.StringIO()
         with redirect_stdout(out):
             with self.assertRaises(U.Stop) as cm:
-                U.remote_install(self.home, "t2-dev", self.main_sha, names, "GoodQA goodqa#1", second_fails, since)
+                U.remote_install(self.home, "t2-dev", self.main_sha, names, "GoodQA goodqa#1", second_fails)
         msg = str(cm.exception)
         self.assertIn("timed out", msg)
         self.assertIn("Batches already installed on t2-dev: run ins-", msg)
         self.assertIn("--resume ins-0123456789ab", msg)
         self.assertIn("--rollback ins-0123456789ab", msg)
         self.assertIn("batch 1 of 2 installed", out.getvalue())
+
+    def test_a_run_that_ended_unknown_gets_resume_and_rollback_guidance(self):
+        """F3: a batch that exits 5 leaves `result: unknown`, which keeps the run open; the guidance must say so."""
+        audit = Path(self.home, ".agent-harness", "install-audit.jsonl")
+        audit.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{"event": "start", "run": "ins-00000000000u", "host": "t2-dev", "kind": "install"},
+                {"event": "result", "run": "ins-00000000000u", "host": "t2-dev", "kind": "install", "result": "unknown"},
+                {"event": "start", "run": "ins-00000000000d", "host": "t2-dev", "kind": "install"},
+                {"event": "result", "run": "ins-00000000000d", "host": "t2-dev", "kind": "install", "result": "installed"}]
+        audit.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+        def fails(argv, **kw):
+            if "install-files" in argv and "--dry-run" not in argv:
+                return subprocess.CompletedProcess(argv, 5, json.dumps({"result": "unknown"}), "")
+            return self.runner(argv, **kw)
+        with self.assertRaises(U.Stop) as cm:
+            U.remote_install(self.home, "t2-dev", self.main_sha, ["b.py"], "GoodQA goodqa#1", fails)
+        msg = str(cm.exception)
+        self.assertIn("--resume ins-00000000000u", msg)
+        self.assertIn("--rollback ins-00000000000u", msg)
+        self.assertNotIn("ins-00000000000d", msg, "a run with a definite result is finished")
 
     def test_timeouts_and_odd_answers_stop_cleanly(self):
         def hang(argv, **kw):
@@ -492,9 +549,303 @@ class Registration(Fixture):
         self.assertEqual(rc, U.EXIT_REGISTER, err)
         self.assertIn("Mac: declared but not registered in settings.json, so not running yet: new", out)
         self.assertIn("t2-dev: declared but not registered in settings.json, so not running yet: remote-new", out)
-        self.assertIn("already unregistered before this run: old", out)
+        self.assertIn("Mac (already before this run): declared but not registered in settings.json, so not running "
+                      "yet: old", out)
         self.assertIn("NOT fully active", out)
         self.assertNotIn("Done.", out)
+
+    def test_a_doctor_that_does_not_answer_after_the_install_stops(self):
+        """F2a: no answer after the install means registration is not proven: never "Done" with exit 0."""
+        answers = [[{"id": "a", "state": "WIRED"}], None]
+
+        def with_doctor(argv, **kw):
+            if any(str(x).endswith("doctor.py") for x in argv):
+                self.doctor = answers.pop(0)
+            return self.runner(argv, **kw)
+        rc, out, err = self.run_main("--no-remote", runner=with_doctor)
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("registration is not proven", err)
+        self.assertNotIn("Done.", out)
+
+    def test_hooks_already_unregistered_before_the_run_still_give_exit_3(self):
+        """F2b: exit 0 means every declared hook is registered, whether or not it was missing before this run."""
+        self.doctor = [{"id": "a", "state": "WIRED"}, {"id": "old", "state": "MISSING"}]
+        rc, out, err = self.run_main("--no-remote")
+        self.assertEqual(rc, U.EXIT_REGISTER, err)
+        self.assertIn("already before this run", out)
+        self.assertNotIn("Done.", out)
+
+    def test_nothing_to_install_still_runs_the_doctor(self):
+        """F2c: a plain rerun after an exit 3 must not print Done while a hook is still unregistered."""
+        for n in ("b.py", "c.py"):
+            Path(self.home, ".claude", "hooks", n).write_text("print(%r)\n" % n)
+        self.remote = {n: "already_current" for n in self.HOOKS}
+        self.doctor = [{"id": "new", "state": "MISSING"}]
+        rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
+        self.assertEqual(rc, U.EXIT_REGISTER, err)
+        self.assertEqual(self.typed, [], "nothing to install asks nothing")
+        self.assertTrue([a for a, _ in self.calls if str(a[2]).endswith("doctor.py")], "the doctor ran")
+        self.assertIn("t2-dev: nothing was installed, so its hook registration was not re-checked", out)
+        self.doctor = [{"id": "new", "state": "WIRED"}]
+        rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
+        self.assertEqual(rc, U.EXIT_OK, err)
+        self.assertIn("Nothing to install", out)
+        self.assertNotIn("Done. Installed", out)
+        self.doctor = None
+        rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
+        self.assertEqual(rc, U.EXIT_STOP, "no answer stops even when nothing was installed")
+
+
+class Contracts(unittest.TestCase):
+    """The class behind PR 336 review R4: every test ran on a fixture the author built. These run the updater's
+    parsers and rules against the repository's own files and the remote installer's own functions on the same inputs,
+    so the two cannot drift."""
+
+    def test_installer_lists_equal_install_pys_own_lists(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import install
+        finally:
+            sys.path.remove(str(ROOT))
+        want = {folder: list(getattr(install, var)) for folder, var in U.FOLDERS}
+        self.assertEqual(U.installer_lists(ROOT), want)
+        for folder, names in want.items():
+            for name in names:
+                self.assertTrue((ROOT / "harness" / folder / name).is_file(), "%s/%s" % (folder, name))
+        self.assertTrue(want["skills"], "the repository ships skills, so the skills layout is exercised")
+
+    def test_unfinished_runs_equal_the_remote_installers_rule_on_the_same_audit(self):
+        import ah_install
+        self.assertEqual(U.CLEARING, ah_install.CLEARING)
+        self.assertEqual(U.UNREGISTERED, ah_install.UNREGISTERED)
+        self.assertEqual(U.NOT_REGISTERED_BEFORE, ah_install.NOT_REGISTERED_BEFORE)
+        h = "t2-dev"
+        cases = {
+            "open start": [{"event": "start", "run": "r1", "host": h, "kind": "install"}],
+            "unknown": [{"event": "start", "run": "r1", "host": h, "kind": "install"},
+                        {"event": "result", "run": "r1", "host": h, "kind": "install", "result": "unknown"}],
+            "installed": [{"event": "start", "run": "r1", "host": h, "kind": "install"},
+                          {"event": "result", "run": "r1", "host": h, "kind": "install", "result": "installed"}],
+            "failed resume": [{"event": "start", "run": "r1", "host": h, "kind": "install"},
+                              {"event": "result", "run": "r1", "host": h, "kind": "install", "result": "unknown"},
+                              {"event": "start", "run": "r1", "host": h, "kind": "resume"},
+                              {"event": "result", "run": "r1", "host": h, "kind": "resume", "result": "attempt_refused"}],
+            "rolled back": [{"event": "start", "run": "r1", "host": h, "kind": "install"},
+                            {"event": "result", "run": "r1", "host": h, "kind": "install", "result": "unknown"},
+                            {"event": "start", "run": "r1", "host": h, "kind": "rollback"},
+                            {"event": "result", "run": "r1", "host": h, "kind": "rollback", "result": "rolled_back"}],
+            "restored": [{"event": "start", "run": "r1", "host": h, "kind": "rollback"},
+                         {"event": "result", "run": "r1", "host": h, "kind": "rollback", "result": "restored"}],
+            "other host": [{"event": "start", "run": "r1", "host": "dev2", "kind": "install"}],
+            "refused": [{"event": "start", "run": "r1", "host": h, "kind": "install"},
+                        {"event": "result", "run": "r1", "host": h, "kind": "install", "result": "refused"}],
+            "garbage": ["not json", {"event": "start", "host": h, "kind": "install"}, []],
+        }
+        for name, rows in cases.items():
+            home = tempfile.mkdtemp(prefix="update-installed-audit-")
+            self.addCleanup(shutil.rmtree, home, True)
+            Path(home, ".agent-harness").mkdir()
+            Path(home, ".agent-harness", "install-audit.jsonl").write_text(
+                "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in rows))
+            self.assertEqual(U.unfinished_runs(home, h), ah_install.unfinished_runs(home, h), name)
+        self.assertEqual(U.unfinished_runs(tempfile.gettempdir() + "/no-such-home", h), [])
+
+    def test_exit_codes_match_the_docs_and_the_docstring(self):
+        codes = {U.EXIT_OK, U.EXIT_STOP, U.EXIT_USAGE, U.EXIT_REGISTER}
+        self.assertEqual(codes, {0, 1, 2, 3})
+        docs = (ROOT / "docs" / "operations.md").read_text()
+        section = docs.split("## Updating the installed harness (user-run)", 1)[1].split("\n## ", 1)[0]
+        line = section.split("Exit codes:", 1)[1].split("\n\n", 1)[0]
+        import re
+        self.assertEqual({int(c) for c in re.findall(r"(?:^|; )\s*(\d) ", line.replace("\n", " "))}, codes, line)
+        doc = U.__doc__.split("Exit:", 1)[1]
+        self.assertEqual({int(c) for c in re.findall(r"(?:^|; |\n)\s*(\d) ", doc)}, codes, doc)
+        self.assertIn("-I -S", section)
+
+
+class SelfCheck(Fixture):
+    """F4: the updater that enforces the checks must be main's own copy."""
+
+    def test_a_copy_that_is_not_mains_stops_before_the_commit_is_read(self):
+        self.commit_main("edit updater", {U.SELF_REL: "# a different updater\n"})
+        rc, _, err = self.run_main("--preview")
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("is not main's scripts/update_installed.py", err)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.cache_runs(), [])
+
+    def test_main_without_the_updater_stops(self):
+        os.remove(os.path.join(self.seed, U.SELF_REL))
+        self.commit_main("drop updater")
+        rc, _, err = self.run_main("--preview")
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("main has no scripts/update_installed.py", err)
+
+    def test_blob_id_is_gits(self):
+        p = os.path.join(self.seed, U.SELF_REL)
+        self.assertEqual(U.blob_id(Path(p).read_bytes()), sh(self.seed, "hash-object", p))
+
+    def test_without_no_site_the_script_stops(self):
+        d = tempfile.mkdtemp(prefix="update-installed-nosite-")
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.copy(ROOT / "scripts" / "update_installed.py", d)
+        env = {k: v for k, v in CLEAN_ENV.items() if not k.startswith("PYTHON")}
+        r = subprocess.run([sys.executable, "-I", os.path.join(d, "update_installed.py"), "--help"],
+                           capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, U.EXIT_USAGE)
+        self.assertIn("-I -S", r.stderr)
+
+
+class Export(Fixture):
+    """F6: the export accepts only regular files and folders, and every object is re-hashed on the real call path."""
+
+    def fetch(self):
+        d = Path(tempfile.mkdtemp(prefix="fetch-", dir=self.t))
+        repo, _ = U.fetch_main(d, self.home)
+        return repo
+
+    def test_a_symlink_or_gitlink_in_the_tree_stops_the_export(self):
+        os.symlink("a.py", os.path.join(self.seed, "harness", "hooks", "link.py"))
+        sym = self.commit_main("symlink")
+        repo = self.fetch()
+        with self.assertRaises(U.Stop) as cm:
+            U.export_commit(repo, self.home, sym, Path(self.t, "exp-sym"))
+        self.assertIn("not a regular file or folder", str(cm.exception))
+        os.remove(os.path.join(self.seed, "harness", "hooks", "link.py"))
+        sh(self.seed, "add", "-A")
+        sh(self.seed, "update-index", "--add", "--cacheinfo", "160000,%s,sub" % self.main_sha)
+        sh(self.seed, "commit", "-qm", "gitlink")
+        sh(self.seed, "push", "-q", self.origin, "HEAD:refs/heads/main")
+        gl = sh(self.seed, "rev-parse", "HEAD")
+        repo = self.fetch()
+        with self.assertRaises(U.Stop) as cm:
+            U.export_commit(repo, self.home, gl, Path(self.t, "exp-gl"))
+        self.assertIn("mode 160000", str(cm.exception))
+
+    def test_an_unsafe_name_in_a_tree_stops_the_export(self):
+        repo = self.fetch()
+        blob = U.git(repo, ["hash-object", "-w", "--stdin"], self.home, data=b"x\n").stdout.decode().strip()
+        bad = b"100644 ..\0" + bytes.fromhex(blob)
+        tree = U.git(repo, ["hash-object", "-t", "tree", "-w", "--literally", "--stdin"], self.home,
+                     data=bad).stdout.decode().strip()
+        commit_body = ("tree %s\nauthor t <t@x> 0 +0000\ncommitter t <t@x> 0 +0000\n\nbad\n" % tree).encode()
+        commit = U.git(repo, ["hash-object", "-t", "commit", "-w", "--stdin"], self.home,
+                       data=commit_body).stdout.decode().strip()
+        with self.assertRaises(U.Stop) as cm:
+            U.export_commit(repo, self.home, commit, Path(self.t, "exp-bad"))
+        self.assertIn("unsafe path entry", str(cm.exception))
+
+    def test_a_corrupt_object_on_the_real_read_path_stops_the_export(self):
+        repo = self.fetch()
+        real = U.git
+
+        def corrupt(repo_, args, home, **kw):
+            done = real(repo_, args, home, **kw)
+            if args[:2] == ["cat-file", "--batch"]:
+                done = subprocess.CompletedProcess(done.args, 0, done.stdout.replace(b"print(", b"PRINT("), b"")
+            return done
+        with mock.patch.object(U, "git", corrupt):
+            with self.assertRaises(U.Stop) as cm:
+                U.export_commit(repo, self.home, self.main_sha, Path(self.t, "exp-blob"))
+        self.assertIn("does not hash to its own id", str(cm.exception))
+
+        def corrupt_tree(repo_, args, home, **kw):
+            done = real(repo_, args, home, **kw)
+            if args[:2] == ["cat-file", "tree"]:
+                done = subprocess.CompletedProcess(done.args, 0, done.stdout.replace(b"install.py", b"instalx.py"), b"")
+            return done
+        with mock.patch.object(U, "git", corrupt_tree):
+            with self.assertRaises(U.Stop) as cm:
+                U.export_commit(repo, self.home, self.main_sha, Path(self.t, "exp-tree"))
+        self.assertIn("does not hash to its own id", str(cm.exception))
+
+
+class SkillsInFolders(Fixture):
+    """F1: a nested skill goes through the whole flow, preview and real run."""
+    SKILLS = ("sk/SKILL.md", "sk/scan.py")
+
+    def test_a_nested_skill_is_previewed_installed_and_verified(self):
+        rc, out, err = self.run_main("--preview", "--no-remote")
+        self.assertEqual(rc, U.EXIT_OK, err)
+        self.assertIn("skills/sk/SKILL.md", out)
+        self.assertIn("skills/sk/scan.py", out)
+        rc, out, err = self.run_main("--no-remote")
+        self.assertEqual(rc, U.EXIT_OK, err)
+        self.assertEqual(Path(self.home, ".claude", "skills", "sk", "SKILL.md").read_text(), "skill sk/SKILL.md\n")
+
+
+class TamperedExport(Fixture):
+    """F5: bytes verified at export are not trusted again after the wait at the prompt."""
+
+    def export_dir(self):
+        runs = list(Path(self.home, ".agent-harness", "update-cache").glob("run-*"))
+        self.assertEqual(len(runs), 1)
+        return runs[0] / "export"
+
+    def test_install_py_changed_during_the_prompt_is_never_run(self):
+        marker = os.path.join(self.t, "tampered-ran")
+
+        def reader(prompt):
+            Path(self.export_dir(), "install.py").write_text("open(%r, 'w').write('x')\n" % marker)
+            return self.main_sha[:12]
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = U.main(["--home", self.home, "--no-remote"], runner=self.runner, reader=reader, environ=CLEAN_ENV)
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("changed after it was verified", err.getvalue())
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_harness_file_changed_during_the_prompt_is_caught_after_the_install(self):
+        def reader(prompt):
+            Path(self.export_dir(), "harness", "hooks", "c.py").write_text("tampered\n")
+            return self.main_sha[:12]
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = U.main(["--home", self.home, "--no-remote"], runner=self.runner, reader=reader, environ=CLEAN_ENV)
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("still differ from the commit: hooks/c.py", err.getvalue())
+
+
+@unittest.skipUnless((ROOT / ".git").exists(), "needs a git checkout of the repository (run from a clone or worktree)")
+class RealTree(unittest.TestCase):
+    """End to end against the repository's own tree: its HEAD stands in for main (a local bare repository), a
+    temporary home stands in for ~, and the repository's own install.py and doctor.py run for real. No remote host and
+    no real home is touched. The packet carries this test's printed output."""
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp(prefix="update-installed-real-")
+        self.addCleanup(shutil.rmtree, self.t, True)
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", "--",
+                                "scripts", "harness", "install.py"], capture_output=True, text=True, check=True).stdout
+        self.assertEqual(dirty, "", "the end-to-end test runs the checkout's HEAD; commit first")
+        self.origin = os.path.join(self.t, "main.git")
+        subprocess.run(["git", "init", "-q", "--bare", self.origin], check=True)
+        subprocess.run(["git", "-C", str(ROOT), "push", "-q", self.origin, "%s:refs/heads/main" % head], check=True,
+                       capture_output=True)
+        self.head = head
+        self.home = os.path.join(self.t, "home")
+        os.makedirs(self.home)
+        mock.patch.object(U, "CANONICAL_URL", self.origin).start()
+        mock.patch.object(U, "ALLOW_FILE", True).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def test_preview_then_real_run_into_a_temporary_home(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = U.main(["--home", self.home, "--preview", "--no-remote"], environ=CLEAN_ENV)
+        print("\n--- real-tree preview (temp home) ---\n" + out.getvalue() + err.getvalue())
+        self.assertEqual(rc, U.EXIT_OK, err.getvalue())
+        self.assertIn("Commit %s" % self.head, out.getvalue())
+        self.assertIn("skills/check-dropped-workstreams/SKILL.md", out.getvalue())
+        self.assertFalse(Path(self.home, ".claude").exists(), "a preview writes nothing under ~/.claude")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = U.main(["--home", self.home, "--no-remote"], reader=lambda p: self.head[:12], environ=CLEAN_ENV)
+        print("--- real-tree run (temp home, no settings.json) ---\n" + out.getvalue()[-1500:] + err.getvalue()[-1500:])
+        self.assertIn(rc, (U.EXIT_OK, U.EXIT_REGISTER), err.getvalue())
+        self.assertIn("Mac: every listed file matches %s" % self.head[:12], out.getvalue())
+        self.assertEqual(rc, U.EXIT_REGISTER, "a home with no settings.json has every declared hook unregistered")
+        self.assertIn("NOT fully active", out.getvalue())
 
     def test_a_hook_wired_before_and_not_after_stops(self):
         Path(self.home, ".claude", "hooks", "doctor.py").write_text("# fake\n")
