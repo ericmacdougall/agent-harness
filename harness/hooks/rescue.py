@@ -236,8 +236,7 @@ def rescue_rung(policy, task, override):
         status = ladder.Ledger(policy=policy).status(task)
         permission = status.get("permission")
         if status.get("blocked_by"):
-            raise ladder.LedgerError("unclassifiable_evidence", "task %s is blocked by its ladder limits (%s); human sign-off needed"
-                                     % (task, ", ".join(status["blocked_by"])))
+            raise ladder.LedgerError("unclassifiable_evidence", ladder.limit_note(status, policy))
         if override is None:
             return status["rung"], permission, "ledger rung for task " + task
     if override is not None:

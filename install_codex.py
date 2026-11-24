@@ -45,6 +45,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py', 'task_recovery.py',
                     'copy_hygiene.py', 'lifecycle_cleanup.py',
+                    'shell_words.py',  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
                     'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
                     'self_serve.py', 'ah_ops.py', 'ah_parity.py',  # self-serve policy, recipes and parity (goodqa#16757)

@@ -14,7 +14,11 @@ WHAT.
                 missing copy. --run COMMAND ... holds the lease for the command in the verified checkout. It
                 refuses to create a copy below the free-space floor (exit 3) and writes an alert.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
-                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. It always denies writing scratch INTO
+                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. Wrapper options do not hide a copy
+                (`timeout 120 git clone`). The quoted remote command of a plain `ssh host '...'` is not charged
+                to this machine (it copies on the far host); every other command keeps the base reading. See
+                copy_commands and the ssh section below.
+                It always denies writing scratch INTO
                 /dev/shm (RAM); reading, copying out of and removing from /dev/shm stay allowed. Silent otherwise.
                 Fails OPEN on any internal error.
   session-start SessionStart hook: at most every 6 h starts a detached report-only `reap`, and prints one line when the
@@ -42,8 +46,33 @@ WHAT.
                 deletes nothing. `copy_hygiene.py protected [--check <path>]` lists or explains (exit 1 = protected),
                 the one choke point other cleaners should call: exit 0 is the only go-ahead, and checking children one
                 by one does not cover emptying a directory (check the directory). Known gap: a command sent with
-                `ssh host '...'` is not checked by any hook (the remote host's hook only sees agent sessions running
-                there). `rsync --delete` into a service directory and `git clean` are not treated as deletes.
+                `ssh host '...'` is not checked by any hook on the far host (the remote host's hook only sees agent
+                sessions running there). `rsync --delete` into a service directory and `git clean` are not treated
+                as deletes.
+  ssh           What is and is not checked for ssh (goodqa#16811). The protected-delete and /dev/shm checks still
+                read an ssh's quoted payload as if it ran here (over-reading, never under-reading). The disk-floor
+                copy check reads every command the base way and drops exactly one shape: a plain remote ssh
+                (_plain_remote_ssh). It must be on a line shell_words.scan verifies (bash and zsh read it as known
+                commands), with nothing on the line that may change what `ssh` runs (alias, eval, source, `.`,
+                hash, export, a PATH-like assignment, `env -S`, a program word built at run time). Its program word
+                is `ssh` or the system ssh by an absolute path, with sudo/timeout/nice-style wrappers allowed but no
+                assignment, and no ProxyCommand/LocalCommand/KnownHostsCommand/Include/Match option and no -F or -I.
+                Every option, option value and the host are spelled out: no expansion, glob, brace or tilde.
+                OpenSSH also parses options after the host, so the first word after it must start with literal
+                text other than `-`. The same rule applies inside `bash -c '...'`. Anything else gets the base
+                reading. That covers every other command on the line (`ssh h '...' && git clone a b`) and the whole
+                line whenever shell_words cannot verify it: `$(...)` or backticks outside single quotes, a comment,
+                a backslash, ANSI-C quoting, a heredoc or unbalanced quotes.
+                The code that eval, alias, trap and `env -S` carry in their words is read as a command line too.
+                Not checked (not before goodqa#16811 either):
+                  - a command hidden in a variable's value or a file: `C='git clone u d'; $C`, a sourced file, or
+                    `X='-oProxyCommand=git clone ...'; ssh "$X" h`. That ssh gets the base reading, and the base
+                    reading cannot see inside $X;
+                  - whether the host is really another machine: `ssh localhost '...'` or an alias of this machine
+                    copies onto this disk uncounted (the hook does no DNS or ssh-config reading);
+                  - a redirect of the remote output onto this disk: `ssh devbox 'tar c dir' > local.tar` writes
+                    remote data here and is not counted;
+                  - the far host's own floor.
   scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
                 directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
                 `export TMPDIR=$(python3 ~/.claude/hooks/copy_hygiene.py scratch)`. Refused below the disk floor; its
@@ -77,6 +106,10 @@ import subprocess
 import sys
 import tempfile
 import time
+
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shell_words  # noqa: E402  (goodqa#16811: the one shell reader shared with merge_gate)
 
 
 GB = 1024 ** 3
@@ -760,10 +793,17 @@ def protecting_tail(rel: str, prot: dict) -> "tuple[str, str] | None":
 
 
 # ---------------------------------------------------------------- command analysis
+SIMPLE_SPLIT = re.compile(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)")
+
+
 def simple_commands(cmd: str) -> list:
-    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises)."""
+    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises).
+
+    It splits inside quotes on purpose: the protected-delete and /dev/shm checks rely on reading every command a
+    quoted `bash -c '...'` or ssh payload might run. Only the disk-floor copy check reads lines through
+    copy_commands instead (goodqa#16811)."""
     out = []
-    for seg in re.split(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)", cmd):
+    for seg in SIMPLE_SPLIT.split(cmd):
         seg = seg.strip()
         if not seg:
             continue
@@ -775,6 +815,302 @@ def simple_commands(cmd: str) -> list:
             words = words[1:]
         if words:
             out.append(words)
+    return out
+
+
+# ---------------------------------------------------------------- copy check: ssh remote payloads
+# The disk-floor copy check reads every command the base way (_legacy_copy_commands) except ONE shape it can prove
+# from the text alone: an ssh that runs only on the far host (_plain_remote_ssh). Nothing is relaxed by listing bad
+# shapes; a shape this section does not recognise keeps the base reading (goodqa#16811 round 2).
+
+# ssh options that make the LOCAL machine run or load something; an ssh carrying one keeps the strict reading. `-F`
+# names a config file that may hold one, and the hook reads no ssh config. PKCS11Provider and SecurityKeyProvider load a
+# local library; they are matched here as well as in SSH_LOCAL_KEYWORDS, so a quoted keyword cannot slip past.
+SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand|pkcs11provider|securitykeyprovider|^-F", re.I)
+# The program words trusted to be the system ssh: `ssh` looked up on PATH (see LOOKUP_VARIABLES) or its usual
+# absolute paths. `./ssh`, `bin/ssh` or `~/bin/ssh` may be any local script.
+SSH_PROGRAMS = frozenset(("ssh", "/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh", "/opt/homebrew/bin/ssh"))
+# ssh(1) option letters (OpenSSH 9.x and 10.x). Any other letter, and -F (a config file) or -I (a PKCS#11 library),
+# is something this rule does not model: the base reading.
+SSH_VALUE_LETTERS = frozenset("BbcDEeiJLlmOopPQRSWw")
+SSH_FLAG_LETTERS = frozenset("246AaCfGgKkMNnqsTtVvXxYy")
+# -o keywords that run or load something on this machine (an Include or Match may pull in any of them).
+SSH_LOCAL_KEYWORDS = frozenset(("proxycommand", "localcommand", "permitlocalcommand", "knownhostscommand", "include",
+                                "match", "pkcs11provider", "securitykeyprovider"))
+# Commands that can change what a later program name on the line runs, or run text as code in this shell
+# (`alias ssh=...`, `eval 'ssh(){ ...; }'`, `hash -p ./x ssh`, `. ./defs`, `export PATH=...`). With one on the line,
+# `ssh` may not be ssh, so the ssh rule is off for the line.
+REDEFINES = frozenset(("alias", "eval", "source", ".", "hash", "enable", "autoload", "functions", "zmodload", "emulate",
+                       "trap", "typeset", "declare", "export", "local", "readonly", "integer", "float", "setopt",
+                       "unsetopt", "shopt", "fc", "r", "disable", "unhash", "unfunction"))
+# Variables that change where a program is found, what a child shell reads first, or what ssh loads or runs.
+LOOKUP_VARIABLES = frozenset(("PATH", "path", "FPATH", "fpath", "BASH_ENV", "ENV", "ZDOTDIR", "HOME", "LD_PRELOAD",
+                              "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "SSH_ASKPASS",
+                              "SSH_ASKPASS_REQUIRE"))
+_SET_FLAGS = re.compile(r"[-+][euxvo]+")
+_SET_OPTIONS = frozenset(("pipefail", "errexit", "nounset", "xtrace", "verbose"))
+# Unquoted characters that let the shell build a word (bash, and zsh with EXTENDED_GLOB): glob, brace, tilde, `^`
+# and `#`. An unquoted `=` at the start of a word is zsh's command-path expansion.
+_BUILT_WORD = frozenset("*?[]{}~^#")
+
+
+def _spelled_out(word) -> bool:
+    """True when the shell passes `word` exactly as written: no parameter expansion and no unquoted glob, brace,
+    tilde, `^`, `#` or leading `=`."""
+    if word.expansions:
+        return False
+    return not any(char in _BUILT_WORD or (char == "=" and at == word.start) for at, char in word.unquoted)
+
+
+def _not_an_option(word) -> bool:
+    """True when ssh's option parser stops at `word` whatever the shell makes of it: its first character is written
+    as literal text and is not `-`, so an expansion or glob later in the word cannot change it. Judged on the value
+    (Word.lead), not on offsets: `''"$X"` starts with an expansion. An empty word is not an option either."""
+    if word.lead == "quoted":
+        return not word.value.startswith("-")
+    if word.lead == "unquoted":
+        return word.value[:1] not in _BUILT_WORD and word.value[:1] not in "-="
+    return word.lead == ""
+
+
+def _command_words(segment):
+    """(prefix, rest) as Word lists: the assignments and wrapper words _unwrap drops, then the program and its
+    arguments. _unwrap only ever drops leading words, so the split is by count."""
+    kept = len(_unwrap(list(segment.argv)))
+    cut = len(segment.words) - kept
+    return segment.words[:cut], segment.words[cut:]
+
+
+def _ssh_option(value):
+    """(ok, letter, inline value or None) for one ssh option word. ok is False for a letter this rule does not
+    model, and for -F and -I."""
+    for index in range(1, len(value)):
+        letter = value[index]
+        if letter in SSH_VALUE_LETTERS:
+            return True, letter, value[index + 1:] or None
+        if letter not in SSH_FLAG_LETTERS:
+            return False, letter, None
+    return True, "", None
+
+
+def _ssh_value_ok(letter, value) -> bool:
+    if letter != "o":
+        return True
+    # OpenSSH strips double quotes from a -o keyword (`-o '"PKCS11Provider" x.so'` sets PKCS11Provider; `ssh -G`
+    # on 9.6 shows it), so they are dropped before the lookup. A keyword ssh would reject is refused here too.
+    keyword = re.split(r"[=\s]", value.replace('"', "").strip(), maxsplit=1)[0].lower()
+    return keyword not in SSH_LOCAL_KEYWORDS and "\n" not in value and "\r" not in value
+
+
+def _ssh_runs_remotely(words) -> bool:
+    """True when ssh(1) reads `words` (the Word objects after the program word) as options, a host and a remote
+    command, with every option, option value and the host spelled out. OpenSSH parses options before the host and
+    again after it, up to the first word that is not an option (OpenSSH 9.6 does; `ssh -G` shows it); that word
+    starts the remote command, and nothing after it is parsed here. So the first word after the host must be
+    _not_an_option, and the words after it are the far host's text."""
+    host = False
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if host and _not_an_option(word):
+            return True
+        if not _spelled_out(word):
+            return False
+        value = word.value
+        if value.startswith("-") and value != "-":
+            ok, letter, inline = _ssh_option(value)
+            if not ok:
+                return False
+            if letter and inline is None:
+                index += 1
+                if index >= len(words) or not _spelled_out(words[index]):
+                    return False
+                inline = words[index].value
+            if letter and not _ssh_value_ok(letter, inline):
+                return False
+            index += 1
+            continue
+        if host:
+            return True  # a bare `-` after the host: not an option, the remote command starts here
+        host = True
+        index += 1
+    return host
+
+
+def _env_split_strings(words):
+    """[(value, words after it)] for every `env -S VALUE` among a command's wrapper words: GNU env splits VALUE into
+    more arguments, a program included. Short clusters (`-iS...`, `-S...`) and long abbreviations (`--s`,
+    `--split-string=...`) count."""
+    found, index = [], 0
+    while index < len(words):
+        if os.path.basename(words[index]) != "env":
+            index += 1
+            continue
+        index += 1
+        while index < len(words) and words[index].startswith("-") and words[index] != "-":
+            word, value = words[index], None
+            if word.startswith("--"):
+                name, eq, inline = word.partition("=")
+                if len(name) > 2 and "--split-string".startswith(name):
+                    value = inline if eq else None
+                    if not eq:
+                        index += 1
+                        value = words[index] if index < len(words) else ""
+            elif "S" in word[1:]:
+                value = word[word.index("S", 1) + 1:]
+                if not value:
+                    index += 1
+                    value = words[index] if index < len(words) else ""
+            elif word in ("-u", "-C") and index + 1 < len(words):
+                index += 1
+            index += 1
+            if value is not None:
+                found.append((value, words[index:]))
+    return found
+
+
+_ZSH_CODE_ARRAY = re.compile(r"(?:functions|aliases|galiases|saliases)\[[^\]]*\]=(.*)", re.S)
+
+
+def _hidden_code(argv):
+    """Shell code a command runs that its words carry as plain text, besides the `sh -c` script read separately:
+    env's -S string with the words after it, eval's arguments, an alias value (also zsh's `aliases[x]=...` and
+    `functions[x]=...`), a trap action. Each is read as a command line, so `eval 'git clone a b'` and
+    `alias ssh='cp -a r c'` are charged like the copies they run."""
+    out = [value + (" " + shlex.join(after) if after else "") for value, after in _env_split_strings(list(argv))]
+    words = _unwrap(list(argv))
+    if words:
+        name, args = words[0], words[1:]
+        array = _ZSH_CODE_ARRAY.fullmatch(name)
+        if array:
+            out.append(array[1])
+        if name == "eval":
+            out.append(" ".join(args))
+        elif name == "alias":
+            out.extend(arg.split("=", 1)[1] for arg in args if "=" in arg and not arg.startswith("-"))
+        elif name == "trap":
+            rest = [arg for arg in args if arg != "--"]
+            if len(rest) >= 2 and not rest[0].startswith("-"):
+                out.append(rest[0])
+    return [code for code in out if code.strip()]
+
+
+def _line_redefines(scan) -> bool:
+    """True when a command on this verified line may change what a later `ssh` runs: a REDEFINES command, a `set`
+    beyond -e/-u/-x/-v/-o pipefail, an assignment to a LOOKUP_VARIABLES name (`PATH=./bin ssh`, `PATH=x;`), an
+    `env -S`, or a program or wrapper word the text does not spell out (`$CMD`, zsh `functions[ssh]=...`)."""
+    for segment in scan.segments:
+        prefix, rest = _command_words(segment)
+        for word in prefix:
+            assigned = ASSIGN.match(word.value)
+            if assigned and assigned[0][:-1] in LOOKUP_VARIABLES:
+                return True
+            if not assigned and not _spelled_out(word):
+                return True
+        if not rest:
+            continue
+        if not _spelled_out(rest[0]) or _env_split_strings([word.value for word in prefix]):
+            return True
+        name = rest[0].value
+        if name in REDEFINES:
+            return True
+        if name == "set" and not all(_SET_FLAGS.fullmatch(word.value) or word.value in _SET_OPTIONS
+                                     for word in rest[1:]):
+            return True
+    return False
+
+
+def _plain_remote_ssh(segment) -> bool:
+    """True for the one shape the disk-floor check does not charge here (goodqa#16811): an ssh whose arguments run
+    only on the far host, proven from the text alone.
+    - The program word is spelled out and is `ssh` or the system ssh by an absolute path (SSH_PROGRAMS).
+    - No assignment on the command (`PATH=./bin ssh`, `LD_PRELOAD=x ssh`, `env A=1 ssh`), no `env -S`, and every
+      wrapper word before it is spelled out (`env "$X" ssh` could be `env -S ...`).
+    - No ProxyCommand, LocalCommand or KnownHostsCommand anywhere, and no -F config (SSH_LOCAL_COMMAND).
+    - Every option, option value and the host are spelled out, and the first word after the host is plainly not an
+      option (_ssh_runs_remotely).
+    The caller also requires a verified line on which nothing redefines a program (_line_redefines).
+
+    Not proven: that the host is another machine. `ssh localhost '...'` or an ssh alias of this machine copies onto
+    this disk and is not counted (documented gap; the hook does no DNS or ssh-config reading). Not counted either:
+    a redirect of the remote output onto this disk, `ssh devbox 'tar c dir' > local.tar` (documented gap)."""
+    prefix, rest = _command_words(segment)
+    if not rest or not _spelled_out(rest[0]) or rest[0].value not in SSH_PROGRAMS:
+        return False
+    values = [word.value for word in prefix]
+    if any(word.assignment or ASSIGN.match(word.value) or not _spelled_out(word) for word in prefix):
+        return False
+    if _env_split_strings(values) or any(SSH_LOCAL_COMMAND.search(word.value) for word in rest):
+        return False
+    return _ssh_runs_remotely(rest[1:])
+
+
+def _legacy_copy_commands(cmd: str, depth: int) -> list:
+    """The strict (base) reading: split on every separator even inside quotes (the simple_commands reading), drop
+    wrappers, read `sh -c` scripts and _hidden_code the same way, strictly. Over-reads, never under-reads."""
+    out = []
+    for seg in SIMPLE_SPLIT.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            words = shlex.split(seg, comments=True)
+        except ValueError:
+            words = seg.split()
+        if depth < 4:
+            for code in _hidden_code(words):
+                out.extend(copy_commands(code, depth + 1, strict=True))
+        words = _unwrap(words)
+        if not words:
+            continue
+        out.append(words)
+        if depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS and words[1] == "-c":
+            out.extend(copy_commands(words[2], depth + 1, strict=True))
+    return out
+
+
+def copy_commands(cmd: str, depth: int = 0, strict: bool = False) -> list:
+    """argv lists the disk-floor copy check reads (goodqa#16811).
+
+    Every command gets the base reading (_legacy_copy_commands: split at every separator, even inside quotes), plus
+    the script of `sh|bash|zsh|dash|ksh -c SCRIPT` and the code _hidden_code finds, up to 4 levels deep. The one
+    exception: on a line shell_words.scan verifies, a segment _plain_remote_ssh proves to be an ssh that runs only on
+    the far host is dropped, so `ssh host 'cd x && git clone ...'` is not charged to this machine; every other
+    command on the line, one after the ssh included, is still read.
+
+    The exception is off (strict) for the whole line, and inside its `sh -c` scripts and hidden code, when the line
+    cannot be verified (a comment, a backslash, `$(` or a backtick outside single quotes, ANSI-C quoting, a heredoc,
+    unbalanced quotes, ...) or when something on it may change what `ssh` runs (_line_redefines). A `sh -c` script
+    is read with the ssh rule (R1-D1: `bash -c 'ssh h "git clone a b"'` is remote) only when the script word holds
+    no expansion; otherwise its text may gain code at run time and it is read strictly too."""
+    scan = shell_words.scan(cmd)
+    if not scan.verified:
+        return _legacy_copy_commands(cmd, depth)
+    strict = strict or _line_redefines(scan)
+    out = []
+    for segment in scan.segments:
+        _, rest = _command_words(segment)
+        if not rest:
+            continue
+        if depth < 4:
+            for code in _hidden_code(segment.argv):
+                out.extend(copy_commands(code, depth + 1, strict=True))
+        if not strict and _plain_remote_ssh(segment):
+            continue
+        words = [word.value for word in rest]
+        out.append(words)
+        if (depth < 4 and len(rest) >= 3 and os.path.basename(words[0]) in SHELLS
+                and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", words[1])):
+            script = rest[2]
+            literal = _spelled_out(script)
+            out.extend(copy_commands(script.value, depth + 1, strict=strict or not literal))
+            if literal:
+                # The script was read just above, with the ssh rule; the words around it (wrappers, the positional
+                # arguments a script may run as "$@") keep the base reading.
+                out.extend(_legacy_copy_commands(
+                    cmd[segment.start:script.start] + "true" + cmd[script.end:segment.end], depth))
+                continue
+        out.extend(_legacy_copy_commands(cmd[segment.start:segment.end], depth))
     return out
 
 
@@ -1540,7 +1876,7 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                            "t2-dev's 56 GB). Use disk-backed scratch instead: `export TMPDIR=$(python3 "
                            "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
                            ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
-        copying = [w for w in simple_commands(cmd) if is_copy_command(w)]
+        copying = [w for w in copy_commands(cmd) if is_copy_command(w)]
         if not copying:
             return 0, ""
         cfg = normalize(cfg) if cfg is not None else load_config()
