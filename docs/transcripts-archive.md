@@ -44,7 +44,7 @@ A checkpoint without a fresh receipt is incomplete. If Codex hooks are untrusted
 
 ```
 transcripts.py sync --checkpoint {start,recovery,takeover,pr,deploy,manual} [--budget-seconds N] [--background] [--dry-run]
-transcripts.py backfill [--budget-seconds 1800]
+transcripts.py backfill [--budget-seconds 1800] [--max-load L]
 transcripts.py check [--max-age-min 60] [--json]
 transcripts.py status
 transcripts.py find --session S | --ticket N | --project P | --since T | --host H
@@ -60,8 +60,10 @@ transcripts.py ensure-repos --host H --months YYYY-MM[,YYYY-MM] [--parts N]
   `--background` it double-forks a detached child (setsid, stdio to `logs/sync.log`) and returns in under a second.
   If the lock is held it drops a request file and exits 0 with `skipped: locked`. `--dry-run` lists what would be
   archived and writes nothing.
-- **backfill**: the same engine, resumable, at nice 10. It defers (exit 0, receipt status `deferred`) while the
-  1-minute load average exceeds the core count. It never refreshes `last-ok.json` and never fails `check`.
+- **backfill**: the same engine, resumable, at nice 10. It visits files **oldest mtime first**, so the transcripts
+  closest to Claude Code's 30-day retention cleanup are archived first (goodqa#17119); a checkpoint `sync` stays
+  newest first. It defers (exit 0, receipt status `deferred`) while the 1-minute load average exceeds
+  `--max-load` (default: the core count). It never refreshes `last-ok.json` and never fails `check`.
 - **check** exit codes, in precedence order 3, then 2, then 1:
   - `3` never-ok: there has never been an ok receipt, or the last run was `unconfigured` (no source root exists,
     or no transcript file was found under any root). An unconfigured host is never reported ok.
@@ -284,10 +286,26 @@ becomes `refused` and an alert is raised.
 - zsha256 must match;
 - it must decompress, and the sha256 must match;
 - `ruleset_version` must be current;
-- pass 2 must be clean over the chunk and its sidecar.
+- pass 2 and gitleaks (the independent third gate, pinned at 8.30.1) must be clean over the chunk and,
+  separately, its sidecar.
 
-On any failure the chunk and every later staged chunk of that file are dropped, the generation is rewound and the
-range is re-chunked from source. A file that fails three times is held.
+The rescan is file-atomic: every staged chunk of a file is rescanned before any chunk of that file is pushed. A
+scanner hit holds the **whole file** (reason `scanner:<rules>`, with the source line when the hit is in the chunk);
+none of its staged chunks leave, and the receipt counts it in `egress.scanner_held_files`. A record that pass 1 or
+pass 2 caught while chunking is already an omitted marker; only a hit that survives redaction holds a file. On any
+other failure (zsha256, sha256, ruleset, unreadable) the chunk and every later staged chunk of that file are dropped,
+the generation is rewound and the range is re-chunked from source; a file that fails three times is held. A file
+the budget cuts off during the rescan waits whole.
+
+**Egress gate (click-test F1, class C11).** `publish_tree` is the only function that runs git write plumbing
+(a guard test lists every site). Before it builds a tree it scans the repo name, the ref, the commit message, every
+tree path and every blob: bytes blobs with pass 2 per item and gitleaks once per commit; an outbox chunk may leave
+only if the rescan registered it and its sha256 is unchanged. Any hit refuses the whole commit. Producers filter
+first (`egress_filter`): a chunk whose path or sidecar fails holds its file (`refused:egress`); a failing catalog
+manifest is withheld, and a JSONL index blob loses only its failing lines (`egress.catalog_withheld`, run not ok).
+A held file with nothing pushed gets no manifest. gitleaks is required: a missing binary refuses the run, and
+`TRANSCRIPTS_GITLEAKS=off` is honoured only against a local test remote. Residual: repo names are created before
+the gate from the pinned host label, not from source data.
 
 ### Hosts without gh (SSH push, e.g. t2-dev)
 
