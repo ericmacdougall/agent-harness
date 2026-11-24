@@ -378,6 +378,7 @@ class Contract(unittest.TestCase):
         cls.s1_before, cls.s2_before = cls.s1.read_bytes(), cls.s2.read_bytes()
 
         cls.code, cls.listing = cls.sweep()
+        cls.s1_after_listing = cls.s1.read_bytes()  # checked in the four-way test: the listing writes nothing
         assert not cls.listing.get("unread") and not cls.listing.get("problem"), (cls.listing.get("unread"),
                                                                                  cls.listing.get("problem"))
         cls.items = {i["ask"]: i for i in cls.listing["evidence"]}
@@ -441,7 +442,10 @@ class Contract(unittest.TestCase):
                         self.assertIn(reason, item["action"], f"{name} {mode}")
                     if self.expect(name)[0] == U:
                         self.assertIn("could not be traced to its end", item["action"], f"{name} {mode}")
-        self.assertEqual(self.s1.read_bytes(), self.s1_before)  # the listing writes nothing
+        self.assertEqual(self.s1_after_listing, self.s1_before)  # the listing writes nothing
+        # every later byte check is against this test's own start, so a close another test's --apply wrote (on a
+        # broken variant) cannot hide this test's own findings
+        start = self.s1.read_bytes()
 
         # 2. the writer refuses each expected-manual close run by hand (once per source and mode), whatever was
         # listed: status REFUSED, and its problem is the one the listing quotes for that cell (R4 F4)
@@ -463,7 +467,7 @@ class Contract(unittest.TestCase):
                     self.assertIn(doc["problem"], item["action"])
                 if mode == "outcome" and name in WRITER_OUTCOME:
                     self.assertIn(WRITER_OUTCOME[name], doc["problem"])
-        self.assertEqual(self.s1.read_bytes(), self.s1_before)
+        self.assertEqual(self.s1.read_bytes(), start)
 
         # 3. --apply refuses every manual cell (rc 3, the manual reason) and writes nothing
         code, doc = self.sweep("--apply", "--only", *[i["pin"] for _a, i in manual])
@@ -473,14 +477,14 @@ class Contract(unittest.TestCase):
                 self.assertEqual(entry["rc"], 3, entry)
                 self.assertTrue(entry["refused"].startswith("manual:"), entry)  # not an unread refusal
         self.assertEqual((code, len(doc["closed"])), (1, len(manual)))
-        self.assertEqual(self.s1.read_bytes(), self.s1_before)
+        self.assertEqual(self.s1.read_bytes(), start)
 
         # 4. every offered cell is written by the real wal_note through ask_sweep --apply, although some walks of
         # other asks stopped (an incomplete walk makes only the asks it is evidence for manual)
         self.assertTrue(offered)
         code, doc = self.sweep("--apply", "--only", *[i["pin"] for _a, i in offered])
         self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (0, [0] * len(offered)), json.dumps(doc["closed"])[:2000])
-        new = [json.loads(x) for x in self.s1.read_bytes()[len(self.s1_before):].decode().splitlines()]
+        new = [json.loads(x) for x in self.s1.read_bytes()[len(start):].decode().splitlines()]
         self.assertEqual(sorted(r["ref"] for r in new), sorted(a for a, _i in offered))
         for r in new:
             name, mode = self.cells[r["ref"]]
@@ -521,6 +525,7 @@ class Contract(unittest.TestCase):
 
     def test_an_answer_whose_walk_stopped_is_never_hidden_behind_an_obsolete_close(self):
         # each cell in its own subTest, so each shows its own failure (failing first, round 6)
+        start = self.s1.read_bytes()
         with self.subTest(cell="super_ctl"):  # the control: the SUPERSEDES ask alone is offered
             ctl = self.items[self.rank["super_ctl"]]
             self.assertEqual((ctl["kind"], ctl["manual"], bool(ctl["close"])), ("superseded", False, True))
@@ -541,11 +546,12 @@ class Contract(unittest.TestCase):
         # and --apply refuses each of them, writing nothing
         code, doc = self.sweep("--apply", "--only", *[self.items[self.rank[k]]["pin"] for k in ("super", "missing", "tie")])
         self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (1, [3, 3, 3]))
-        self.assertEqual(self.s1.read_bytes()[:len(self.s1_before)], self.s1_before)
+        self.assertEqual(self.s1.read_bytes(), start)
 
     def test_evidence_whose_own_source_cannot_be_walked_is_never_skipped(self):
         # round 6, hop zero: an answer row with no source, an empty one, a non-string or free text is unknown evidence,
         # ranked ahead of the offerable obsolete close of the same ask; so is a close elsewhere with no source
+        start = self.s1.read_bytes()
         for key, ask in sorted(self.zero.items()):
             with self.subTest(hop_zero=key):
                 item = self.items.get(ask)
@@ -558,7 +564,7 @@ class Contract(unittest.TestCase):
                 self.assertEqual(item["evidence"][1]["source"], self.forms["wal>ticket"])  # the close it outranks
         code, doc = self.sweep("--apply", "--only", *[self.items[a]["pin"] for a in self.zero.values() if a in self.items])
         self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (1, [3] * len(self.zero)))
-        self.assertEqual(self.s1.read_bytes()[:len(self.s1_before)], self.s1_before)
+        self.assertEqual(self.s1.read_bytes(), start)
 
     def test_an_answer_card_gets_a_close_only_when_the_writer_would_write_it(self):
         # R4 F3: a card is checked by the same precheck as WAL evidence; one holding a credential is never printed
