@@ -6,6 +6,7 @@ here). The base is a fixed commit, not origin/main, so the check stays meaningfu
 
 Not a mutant: dropping `not word.quoted` from _keyword_word alone. A quoted word's source text keeps its quotes, so
 `raw == name` already rejects it; the mutant 'the expanded text is read' removes both checks together."""
+import re
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST = 'tests.test_guard_case_start'
 GUARD = 'command_guard.py'
 BASE = 'd56a8cb0'  # main before the rule
-TESTS = ('test_guard_case_start.py', 'test_command_guard.py', 'test_kill_guard.py', 'command_guard_corpus.py')
 
 # each mutant is a list of (old, new) replacements in command_guard.py
 MUTANTS = {
@@ -57,33 +57,50 @@ MUTANTS = {
 }
 
 
-def run(tmp, label):
+def unittest_run(tmp):
     done = subprocess.run([sys.executable, '-B', '-m', 'unittest', TEST], cwd=str(tmp), capture_output=True, text=True)
-    killed = done.returncode != 0
-    tail = [ln for ln in done.stderr.splitlines() if ln.startswith(('FAIL:', 'ERROR:', 'Ran ', 'OK', 'FAILED'))]
-    print('%-56s %s' % (label, 'FAILS (good)' if killed else 'PASSES (test is vacuous)'))
-    for line in tail:
+    ran = re.search(r'^Ran (\d+) test', done.stderr, re.M)
+    failed = [ln for ln in done.stderr.splitlines() if ln.startswith(('FAIL:', 'ERROR:'))]
+    return done.returncode, int(ran.group(1)) if ran else 0, failed
+
+
+def run(tmp, label, expect_ran):
+    """A mutant counts as killed only when the whole module loaded (the same number of tests ran as in the control)
+    and a test failed: an import error or a missing fixture is not a kill."""
+    rc, ran, failed = unittest_run(tmp)
+    killed = rc != 0 and ran == expect_ran and failed
+    verdict = 'FAILS (good)' if killed else 'PASSES (test is vacuous)' if rc == 0 else 'BROKEN TREE (ran %d)' % ran
+    print('%-56s %s' % (label, verdict))
+    for line in failed:
         print('    ' + line)
-    return killed
+    return bool(killed)
 
 
 def tree():
     tmp = Path(tempfile.mkdtemp(prefix='mutant-'))
     shutil.copytree(ROOT / 'harness' / 'hooks', tmp / 'harness' / 'hooks', ignore=shutil.ignore_patterns('__pycache__'))
-    (tmp / 'tests').mkdir()
-    for name in TESTS:
-        shutil.copy(ROOT / 'tests' / name, tmp / 'tests')
+    shutil.copytree(ROOT / 'tests', tmp / 'tests', ignore=shutil.ignore_patterns('__pycache__'))
     return tmp
 
 
 def main():
+    tmp = tree()
+    try:  # control: the unmutated tree must pass, so a kill below means the mutant, not the copy
+        rc, expect_ran, failed = unittest_run(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('%-56s %s' % ('control: unmutated copy', 'PASSES, %d tests' % expect_ran if rc == 0 else 'FAILS'))
+    if rc != 0 or expect_ran == 0:
+        for line in failed:
+            print('    ' + line)
+        return 1
     bad = 0
     tmp = tree()
     try:
         base = subprocess.run(['git', '-C', str(ROOT), 'show', BASE + ':harness/hooks/' + GUARD], capture_output=True,
                               check=True).stdout
         (tmp / 'harness' / 'hooks' / GUARD).write_bytes(base)
-        bad += 0 if run(tmp, 'base %s (pattern mode after any reserved word)' % BASE) else 1
+        bad += 0 if run(tmp, 'base %s (pattern mode after any reserved word)' % BASE, expect_ran) else 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     for name, edits in MUTANTS.items():
@@ -99,7 +116,7 @@ def main():
             for old, new in edits:
                 text = text.replace(old, new, 1)
             path.write_text(text)
-            bad += 0 if run(tmp, name) else 1
+            bad += 0 if run(tmp, name, expect_ran) else 1
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
     print('mutants not killed or not applied:', bad)
