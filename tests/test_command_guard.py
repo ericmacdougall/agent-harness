@@ -928,7 +928,9 @@ class OverwriteExistingTests(Fixture):
             self.assertIn('[log_delete/log-delete]', message, text)
         self.assertEqual(self.decide("eval '>! plain.sh echo hi'; bash plain.sh", cwd='@HOME@/proj')[0], 'allow')
         # Known limit: a disk read that stops the analysis costs the recorded text its reading, so that text goes only to
-        # the raw-text check, which sees no protected location in this glob inside $(..). This warns; 60cf346 blocked it.
+        # the raw-text check, which sees no protected location in this glob inside $(..). This warned; 60cf346 blocked it.
+        # Since goodqa#16943 it blocks again: in the bash reading `big.sh` is a program the guard has no model of, and
+        # its words from `rm` on are judged as a command.
         # In a child: parsing this file adds about 70 MiB, and tests that bound their own children's peak inherit this
         # process's high-water mark on Linux.
         import subprocess
@@ -941,11 +943,12 @@ class OverwriteExistingTests(Fixture):
                                env=dict(os.environ, HOME=str(self.home)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                timeout=60, check=False)
         self.assertEqual(child.returncode, 0, child.stderr.decode('utf-8', 'replace')[-400:])
-        self.assertEqual(child.stdout.decode().strip(), 'warn', text)
-        # a small file does it too: this one stops on the nesting limit, with budget left to read the recorded text
+        self.assertEqual(child.stdout.decode().strip(), 'block', text)
+        # a small file does it too: this one stops on the nesting limit, with budget left to read the recorded text (it
+        # blocks for the same goodqa#16943 reason)
         (proj / 'self.sh').write_text('bash self.sh\n')
         text = 'x=$(>! self.sh echo rm -rf ~/.c*/projects); bash self.sh'
-        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'warn', text)
+        self.assertEqual(self.decide(text, cwd='@HOME@/proj')[0], 'block', text)
 
     def test_known_limits_worse_than_the_base_are_pinned(self):
         # Each of these blocks at cbfc4da and runs with no refusal here, so each is a regression accepted for now, listed in
