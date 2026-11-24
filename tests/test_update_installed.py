@@ -455,9 +455,12 @@ class RealRun(Fixture):
             with self.assertRaises(U.Stop):
                 U.git(self.t, ["status"], self.home)
 
-        def odd(argv, **kw):
+        def odd(argv, **kw):                               # every name answered, one entry not a dict
             if "install-files" in argv:
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"files": {"a.py": None}}), "")
+                names = [argv[i + 1] for i, x in enumerate(argv) if x == "--file"]
+                files = {n: {"action": "replaced"} for n in names}
+                files[names[0]] = None
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"files": files}), "")
             return self.runner(argv, **kw)
         rc, _, err = self.run_main("--preview", runner=odd)
         self.assertEqual(rc, U.EXIT_STOP)
