@@ -35,6 +35,16 @@ def age(p):
             os.utime(os.path.join(dp, f), (OLD, OLD), follow_symlinks=False)
 
 
+def quiet_record(home, sid):
+    """An old Claude WAL for `sid`: the local record a session needs before it can count as retired."""
+    d = os.path.join(home, ".claude", "wals", sid)
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "main.jsonl")
+    with open(p, "w") as fh:
+        fh.write(json.dumps({"event": "intent", "at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(OLD))}) + "\n")
+    os.utime(p, (OLD, OLD))
+
+
 class Base(unittest.TestCase):
     """Hermetic janitor fixture: a temp home, a bare origin and a seed repo. setUp stubs S.in_use_paths for the whole suite
     (the real probe is slow); only the /proc test uses the real one."""
@@ -481,6 +491,8 @@ class Sweep(Base):
     def test_sweep_respects_ttl(self):
         fresh = self.clone("s7/fresh")
         old = self.clone("s8/old")
+        quiet_record(self.home, "s7")
+        quiet_record(self.home, "s8")
         real = S.newest_activity
         with mock.patch.object(S, "newest_activity", side_effect=lambda p: (OLD if "/s8" in p else real(p))):
             r = wj.sweep(apply=True)
@@ -519,6 +531,7 @@ class Sweep(Base):
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--session-id", sid])
         try:
             time.sleep(0.3)
+            quiet_record(self.home, "99999999-aaaa")
             self.assertEqual(wj.live_sessions([sid, "99999999-aaaa"], 3600, time.time()), {sid})
         finally:
             p.kill()
@@ -543,6 +556,7 @@ class Sweep(Base):
     def test_report_only_sweep_says_would_free_and_never_freed(self):
         os.remove(os.path.join(self.home, ".agent-harness", "state", "copy-hygiene.json"))
         self.clone("wd/c")
+        quiet_record(self.home, "wd")
         with mock.patch.object(S, "newest_activity", return_value=OLD):
             r = wj.sweep(apply=True)
             self.assertEqual(r["freed_gb"], 0)
@@ -558,6 +572,7 @@ class Sweep(Base):
     def test_live_sessions_without_proc_uses_ps_and_without_any_process_list_everything_is_alive(self):
         sid = "33333333-4444-4555-8666-777777777777"
         other = "44444444-5555-4666-8777-888888888888"
+        quiet_record(self.home, other)
         with mock.patch.object(wj, "PROC", os.path.join(self.t, "no-proc")):
             with mock.patch.object(S, "probe", return_value=(0, "/usr/bin/claude --session-id %s\n/bin/zsh\n" % sid, "")) as pr:
                 self.assertEqual(wj.live_sessions([sid, other], 3600, time.time()), {sid})
@@ -1121,6 +1136,15 @@ class Ownership(Base):
         self.sweep()
         self.assertFalse(os.path.exists(c))
 
+    def test_session_with_no_record_on_this_host_is_kept(self):
+        # t2-dev report, 2026-11-23: live Mac owner sessions cb331f0e and 5709c047 have work folders on t2-dev but no
+        # WAL or transcript there, and were reported "retired".
+        c = self.session()
+        r = self.sweep()
+        self.assertTrue(os.path.exists(c))
+        self.assertIn("no_local_record", r["released"][0]["session_reasons"])
+        self.assertEqual(wj.session_verdict(SID, 3600, time.time(), "/bin/zsh\n"), ["no_local_record"])
+
     def test_codex_session_with_a_fresh_codex_wal_is_kept(self):
         c = self.session()
         self.wal("codex", rows=[{"at": OLD_ISO}], when=time.time())
@@ -1311,7 +1335,8 @@ class Report(Base):
         os.makedirs(os.path.join(s, "app", "node_modules", "p"))
         Path(s, "app", "package.json").write_text("{}")
         Path(s, "app", "node_modules", "p", "big").write_bytes(b"x" * 200000)
-        live = "bbbbbbbb-1111-4222-8333-444444444444"
+        quiet_record(self.home, SID)
+        live ="bbbbbbbb-1111-4222-8333-444444444444"
         os.makedirs(os.path.join(self.work, live))
         wal = os.path.join(self.home, ".claude", "wals", live)
         os.makedirs(wal)

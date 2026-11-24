@@ -450,6 +450,11 @@ def session_verdict(sid: str, ttl_s: float, now: float, blob: "str | None") -> l
             reasons.append("clock_skew")
         elif now - newest < ttl_s:
             reasons.append("recent_activity")
+    elif "activity_unreadable" not in reasons:
+        # No WAL and no transcript of this session on THIS host: it may be a session of another machine (a Mac session
+        # whose agents work on t2-dev) or a folder an agent named itself. Silence here is not retirement (takeover R1:
+        # identity first), so the folder is kept and listed in `report` for its owner to release.
+        reasons.append("no_local_record")
     tasks = _open_task_sessions()
     if tasks is None:
         reasons.append("tasks_unreadable")
