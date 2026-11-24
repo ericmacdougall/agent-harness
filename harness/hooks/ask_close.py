@@ -27,7 +27,8 @@ check of their own (goodqa#17058).
 - "Could not tell" is never "no" (#170 round 6). trace() has three states: human, not-human, and unknown, which is a
   walk that stopped before it reached an origin on some branch (provenance.walk_stops). Unknown counts as possibly
   the user's everywhere: no close of any mode is written on it, under any policy, and ask_sweep ranks it with the
-  user's answers. An outcome close also needs evidence that resolves and no mc: decision anywhere in its tree, again
+  user's answers. It holds back every obsolete and not-user close of the ask it names, but not the answer close of a
+  traced answer of the user's (round 7; ask_sweep.traced_answer_close). An outcome close also needs evidence that resolves and no mc: decision anywhere in its tree, again
   under any policy.
 - Then provenance must resolve the source as an ask's source must (ok, not weak, tracker reachable), unless the
   installed policy turns the ask check off.

@@ -24,7 +24,10 @@ enforces. Pasted text is never the user's answer. "Could not tell" is never "no"
 resolution tree could not be walked to its end (ask_close.trace state "unknown": an unreadable WAL or entry, a cycle, a
 chain too deep, an entry with no source, ...) may be the user's answer, so it is gathered and ranked with his answers,
 ahead of a traced answer of the same rank, and listed `manual` with the codes where the walk stopped; it is also listed
-under `incomplete`, and the listing exits 2.
+under `incomplete`, and the listing exits 2. It holds back every obsolete and not-user close of its ask. It does not
+hold back the answer close of an answer of the user's that was traced to its end (round 7, main's ruling): that close
+records only that he answered, so when the writer accepts it, it is offered first and the unknown evidence is listed
+beside it.
 
 Every offered item carries `pin` (ASK=REF) and `apply`, the exact ask_sweep command that closes it, plus `close`, the exact
 wal_note.py command that command runs. A close is printed only when ask_close.precheck, the function wal_note.py runs
@@ -33,7 +36,7 @@ any other item is listed `manual` (an answer card under `short`) with the reason
 --apply refuses an ask named without its pin, or whose best evidence is no longer the
 one that was listed (a row written after the listing), and refuses every close while anything is unread (the listing is
 incomplete). An `incomplete` walk does not stop --apply for other asks: it can only make the asks it is evidence for
-manual, and those are refused. An ask that is already closed is reported as resolved, with the row that closed it, and
+manual (unless a traced answer of the user's backs an answer close, as above), and those are refused. An ask that is already closed is reported as resolved, with the row that closed it, and
 nothing is written.
 wal_note.py re-verifies every source. A refused close, a timeout or a wal_note that cannot start is reported with its own
 message, the JSON report is always printed, and the run exits 1; after a timeout the ledger is read again, and a close
@@ -364,6 +367,15 @@ def held_back(best: dict, ask: str, home: Path, wal: Path):
     return REFUSED_ACTION.format(verdict["problem"]) if verdict["problem"] else None
 
 
+def traced_answer_close(evidence: dict) -> bool:
+    """True when the close of this evidence is an answer close that rests on the user's own words, traced to the end:
+    an answer row, or a related-session close with no outcome (rank 0 or 1: the user's answers), whose walk completed
+    (not `unknown`) and reached a human turn. Only such a close is offered over evidence whose walk stopped (#170 round 7, main's ruling, option a); an
+    obsolete or not-user close never is."""
+    return (rank(evidence) <= 1 and evidence.get("outcome") is None and not evidence.get("unknown")
+            and bool(evidence.get("human")))
+
+
 def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
     """{"items": [...], "unread": [...]}: open main-WAL asks of SESSION with WAL or terminal evidence from SESSION and
     the RELATED sessions (its successors or its coordinator). Read-only. A row is answer evidence when its source may
@@ -371,7 +383,9 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
     stopped before it could tell, #170 round 6). Evidence whose walk stopped carries `unknown` and the `stops`. When
     the best evidence is held back (held_back: a partial citation, a close the writer would refuse, or an unknown
     walk), the item is `manual` with the reason in `action`: it is listed for main to read and never offered as a close
-    (#170 rounds 4 to 6)."""
+    (#170 rounds 4 to 6). One exception (round 7): when the best evidence is unknown and the ask also has a traced
+    answer of the user's (traced_answer_close) whose close held_back accepts, that answer comes first and its answer
+    close is offered; the unknown evidence stays in `evidence`."""
     unread = [] if unread is None else unread
     sessions = [session] + [s for s in related if s != session]
     rows = []
@@ -440,6 +454,16 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
                                   not ANSWER_WORDS.search(e["summary"]), e["at"]))
         best = found[0]
         action = held_back(best, ident, home, main_wal)
+        if found[0].get("unknown"):
+            # #170 round 7 (main's ruling, option a): evidence whose walk stopped holds back every obsolete and not-user
+            # close of its ask, but not the answer close of the user's own traced answer. That close records only that
+            # he answered (no decision), so it is offered when the writer accepts it; the unknown evidence stays listed
+            # beside it and under `incomplete`, and the listing still exits 2
+            keeper = next((e for e in found if traced_answer_close(e)), None)
+            if keeper is not None and held_back(keeper, ident, home, main_wal) is None:
+                found.remove(keeper)
+                found.insert(0, keeper)
+                best, action = keeper, None
         if action:
             best["manual"], best["action"] = True, action
             if action == PARTIAL_ACTION:

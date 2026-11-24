@@ -358,6 +358,31 @@ class Contract(unittest.TestCase):
         s1_rows += [row("decision", new_id(), 21, f"Answer to ask {cls.rank['tie']}: the user answered", direct["user"]),
                     row("decision", new_id(), 22, f"Answer to ask {cls.rank['tie']}: the user answered",
                         forms["wal>no-entry"])]
+        # round 7 (main's ruling, option a): unknown evidence never holds back the answer close of the user's own traced
+        # answer, and still holds back every other close. Each cell is one ask; the unknown rows are written as agents
+        # write status rows (no source key at all), the commonest stop on the real WALs
+        cls.keep = {key: new_id() for key in ("zero+user", "close+user", "zero+partial", "zero+ticket")}
+        cls.keep_ctl = {key: new_id() for key in ("partial", "ticket")}
+        k, partial = cls.keep, f'user:{S1}/{U1} "{T1.split(" ", 1)[1]}"'  # part of the user's turn: never offered
+        s1_rows += [row("ask", ident, 1, f"traced answer: {key}") for key, ident in {**k, **cls.keep_ctl}.items()]
+        # zero+user: an unsourced status row, the user's whole turn, and an offerable obsolete close elsewhere
+        s1_rows += [row("decision", new_id(), 21, f"Answer to ask {k['zero+user']}: the user answered", direct["user"]),
+                    row("status", new_id(), 23, f"handoff: ask {k['zero+user']} is answered")]
+        s2_rows.append(row("ask_resolved", new_id(), 30, "obsolete there", forms["wal>ticket"], ref=k["zero+user"],
+                           outcome="obsolete"))
+        # close+user: a related-session close with no source (unknown, rank 0) above the user's answer row (rank 1)
+        s1_rows.append(row("decision", new_id(), 21, f"Answer to ask {k['close+user']}: the user answered", direct["user"]))
+        s2_rows.append(row("ask_resolved", new_id(), 40, "closed there", ref=k["close+user"]))
+        # zero+partial: the user's answer is cited only in part, so it backs no close, and the unknown row stays first
+        s1_rows += [row("decision", new_id(), 21, f"Answer to ask {k['zero+partial']}: the user answered", partial),
+                    row("status", new_id(), 23, f"handoff: ask {k['zero+partial']} is answered")]
+        # zero+ticket: an answer close elsewhere on a ticket is offerable alone (the four-way cell `ticket` answer),
+        # but it is not the user's answer, so the unknown row holds it back
+        s1_rows.append(row("status", new_id(), 23, f"handoff: ask {k['zero+ticket']} is answered"))
+        s2_rows.append(row("ask_resolved", new_id(), 30, "closed there", direct["ticket"], ref=k["zero+ticket"]))
+        # controls, with no unknown evidence: the partial cite alone (manual, partial); the ticket close alone (offered)
+        s1_rows.append(row("decision", new_id(), 21, f"Answer to ask {cls.keep_ctl['partial']}: the user answered", partial))
+        s2_rows.append(row("ask_resolved", new_id(), 30, "closed there", direct["ticket"], ref=cls.keep_ctl["ticket"]))
         # round 6, hop zero (R4 F1 one hop earlier): an answer row whose OWN source cannot be walked (none, as the warn
         # policy writes one, empty, not a string, free text) next to an offerable obsolete close of the same ask; and
         # a close elsewhere with no source of its own after an offerable one
@@ -502,7 +527,7 @@ class Contract(unittest.TestCase):
         for entry in self.listing["incomplete"]:
             got.setdefault(entry["ask"], set()).update(entry["stops"])
         want = {ask for ask, (name, mode) in self.cells.items() if self.expect(name)[0] == U}
-        want |= {self.rank[k] for k in ("super", "missing", "tie")} | set(self.zero.values())
+        want |= {self.rank[k] for k in ("super", "missing", "tie")} | set(self.zero.values()) | set(self.keep.values())
         self.assertEqual(set(got), want)
         for ask, (name, mode) in self.cells.items():
             if ask in want:
@@ -539,14 +564,63 @@ class Contract(unittest.TestCase):
             self.assertEqual((item["kind"], item["manual"], item["close"]), ("resolved-elsewhere", True, None))
             self.assertEqual(item["evidence"][0]["source"], self.forms["wal>no-entry"])
             self.assertEqual(item["evidence"][1]["source"], self.forms["wal>ticket"])
-        with self.subTest(cell="tie"):  # a tie of rank: the untraced answer comes first, so nothing is closed
+        with self.subTest(cell="tie"):  # a tie of rank (round 7): the traced answer keeps its answer close
             item = self.items[self.rank["tie"]]
-            self.assertEqual((item["kind"], item["manual"], item["close"]), ("answer", True, None))
-            self.assertEqual([e["source"] for e in item["evidence"]], [self.forms["wal>no-entry"], self.direct["user"]])
-        # and --apply refuses each of them, writing nothing
-        code, doc = self.sweep("--apply", "--only", *[self.items[self.rank[k]]["pin"] for k in ("super", "missing", "tie")])
-        self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (1, [3, 3, 3]))
+            self.assertEqual((item["kind"], item["manual"], bool(item["close"])), ("answer", False, True))
+            self.assertEqual([e["source"] for e in item["evidence"]], [self.direct["user"], self.forms["wal>no-entry"]])
+        # and --apply refuses the two R4 cells, writing nothing
+        code, doc = self.sweep("--apply", "--only", *[self.items[self.rank[k]]["pin"] for k in ("super", "missing")])
+        self.assertEqual((code, sorted(c["rc"] for c in doc["closed"])), (1, [3, 3]))
         self.assertEqual(self.s1.read_bytes(), start)
+
+    def test_a_traced_answer_keeps_its_answer_close_beside_evidence_whose_walk_stopped(self):
+        # round 7 (main's ruling on the real-WAL cost, option a): an answer close records only that the user answered,
+        # so evidence whose walk stopped never holds back the one that rests on his own traced words; it still holds
+        # back every other close of the ask, and it stays listed
+        start = self.s1.read_bytes()
+        incomplete = {e["ask"] for e in self.listing["incomplete"]}
+        offered = {"zero+user": "answer", "close+user": "answer"}
+        for key, kind in offered.items():
+            with self.subTest(cell=key):
+                item = self.items[self.keep[key]]
+                best = item["evidence"][0]
+                self.assertEqual((item["kind"], item["manual"], bool(item["close"]), bool(item["apply"])),
+                                 (kind, False, True, True))
+                self.assertEqual((best["source"], best.get("unknown"), best.get("outcome")), (self.direct["user"], None, None))
+                self.assertTrue(any(e.get("unknown") for e in item["evidence"][1:]))  # still listed beside it
+                self.assertIn(self.keep[key], incomplete)
+                self.assertNotIn("--outcome", item["close"])
+        with self.subTest(cell="zero+user", detail="the obsolete close it outranks is never the one offered"):
+            self.assertEqual([e["kind"] for e in self.items[self.keep["zero+user"]]["evidence"]],
+                             ["answer", "answer", "resolved-elsewhere"])
+        for key in ("zero+partial", "zero+ticket"):
+            with self.subTest(cell=key):
+                item = self.items[self.keep[key]]
+                self.assertEqual((item["manual"], item["close"], item["apply"]), (True, None, None))
+                self.assertTrue(item["evidence"][0].get("unknown"))
+                self.assertIn("could not be traced to its end (no-source)", item["action"])
+                self.assertIn(self.keep[key], incomplete)
+        with self.subTest(control="partial"):  # the partial cite alone is manual for its own reason
+            item = self.items[self.keep_ctl["partial"]]
+            self.assertEqual((item["manual"], item.get("partial"), item["close"]), (True, True, None))
+        with self.subTest(control="ticket"):  # the ticket close alone is offered, so zero+ticket is not vacuous
+            item = self.items[self.keep_ctl["ticket"]]
+            self.assertEqual((item["kind"], item["manual"], bool(item["close"])), ("resolved-elsewhere", False, True))
+        # --apply writes exactly the two answer closes (and the tie's), with no outcome, and refuses the held ones
+        pins = [self.items[self.keep[k]]["pin"] for k in ("zero+user", "close+user", "zero+partial", "zero+ticket")]
+        code, doc = self.sweep("--apply", "--only", *pins, self.items[self.rank["tie"]]["pin"])
+        rcs = {c["ask"]: c["rc"] for c in doc["closed"]}
+        self.assertEqual(rcs, {self.keep["zero+user"]: 0, self.keep["close+user"]: 0, self.keep["zero+partial"]: 3,
+                               self.keep["zero+ticket"]: 3, self.rank["tie"]: 0}, json.dumps(doc["closed"])[:2000])
+        self.assertEqual(code, 1)  # a refused close makes the run exit 1
+        new = [json.loads(x) for x in self.s1.read_bytes()[len(start):].decode().splitlines()]
+        self.assertEqual(sorted(r["ref"] for r in new),
+                         sorted([self.keep["zero+user"], self.keep["close+user"], self.rank["tie"]]))
+        for r in new:
+            with self.subTest(written=r["ref"]):
+                self.assertEqual((r["event"], r["source"], r.get("outcome"), r.get("closed_by")),
+                                 ("ask_resolved", self.direct["user"], None, "ask-sweep"))
+                self.assertNotIn("decision", r)
 
     def test_evidence_whose_own_source_cannot_be_walked_is_never_skipped(self):
         # round 6, hop zero: an answer row with no source, an empty one, a non-string or free text is unknown evidence,
@@ -736,6 +810,28 @@ class EveryCodeIsClassified(unittest.TestCase):
         self.assertFalse(provenance.stops_walk("ticket-missing", "ticket:GoodQA goodqa#1"))  # an origin that failed
         self.assertTrue(provenance.stops_walk("bad-syntax", "wal:no-entry-named"))  # a pointer: what it names is unknown
         self.assertTrue(provenance.stops_walk("bad-syntax", "the user said so"))  # a source that names no kind
+
+
+class TracedAnswerClose(unittest.TestCase):
+    """#170 round 7: which evidence keeps its close beside evidence whose walk stopped. Only an answer close (no
+    outcome) on a walk that completed at a human turn; never an obsolete close, a close no user words back, or another
+    unknown walk. The cells above check it end to end; this table pins each clause of the one predicate."""
+
+    def test_only_an_answer_close_on_the_users_traced_words_qualifies(self):
+        import ask_sweep  # noqa: PLC0415
+        cases = [
+            ({"kind": "answer", "outcome": None, "human": True}, True),
+            ({"kind": "resolved-elsewhere", "outcome": None, "human": True}, True),
+            ({"kind": "resolved-elsewhere", "outcome": "obsolete", "human": True}, False),
+            ({"kind": "resolved-elsewhere", "outcome": "not_user", "human": True}, False),
+            ({"kind": "resolved-elsewhere", "outcome": None, "human": False}, False),
+            ({"kind": "answer", "outcome": None, "human": True, "unknown": True, "stops": ["no-source"]}, False),
+            ({"kind": "superseded", "outcome": "obsolete"}, False),
+            ({"kind": "terminal", "outcome": None, "manual": True}, False),
+        ]
+        for evidence, want in cases:
+            with self.subTest(evidence=evidence):
+                self.assertIs(ask_sweep.traced_answer_close(evidence), want)
 
 
 class StopCoverage(unittest.TestCase):
