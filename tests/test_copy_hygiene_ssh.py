@@ -32,6 +32,9 @@ REMOTE = [
     "(ssh devbox 'cd x && git clone a b')",
     "sudo -u ops ssh devbox 'cd x; git clone a b'",
     "ssh devbox 'echo $(date) && git clone a b'",
+    # F4 (round 1): the clone in an ssh payload inside `bash -c` runs on the far host too; base refused it.
+    "bash -c 'ssh devbox \"cd x && git clone a b\"'",
+    "sh -c \"ssh devbox 'cd x; cp -a r s'\"",
 ]
 
 # Every local form the base test file refuses, which must stay refused after an ssh on the same line.
@@ -51,6 +54,22 @@ LOCAL = [
     "ssh devbox bash -s <<'EOF'\ncd x && git clone a b\nEOF",
     "ssh devbox 'cd x && git clone a b",
     "bash -c 'cd x && git clone a b'",
+    # F1 (round 1): a comment holding an apostrophe on the ssh line, or an ANSI-C word with an escaped quote, must
+    # not join the next lines into the quoted ssh payload; bash runs those lines here. 1330c1a allowed the first
+    # five below the floor.
+    "ssh devbox 'cd ~/w && git clone u d'   # remote, doesn't touch this disk\n"
+    "git clone u ~/local-copy               # here's the local one",
+    "ssh devbox 'x' # it's\ngit clone u d\n# that's",
+    "ssh devbox 'cd x && git status' # it's remote\ncp -a repo copy\n# done, that's all",
+    "ssh devbox echo $'don\\'t'\ngit clone u d\n# that's all",
+    "ssh devbox echo $'don\\'t'\ncp -a repo copy\necho 'that'\\''s all'",
+    "ssh devbox 'cd ~/w && git clone u d'   # remote; doesn't touch this disk\n"
+    "git clone u ~/local-copy               # here's the local one",
+    "ssh devbox $'a\\'b' true\ngit clone u d\necho $'c\\'d'",
+    # An ssh shell_words cannot clear (a config file or a local-command option) gets the base reading.
+    "ssh -F cfg devbox 'cd x && git clone a b'",
+    "ssh -o LocalCommand=x devbox 'cd x; git clone a b'",
+    "bash -c 'ssh devbox \"x\" && git clone a b'",
 ]
 
 # Wrapper options used to hide the copy entirely (the wrapper word was dropped, its value read as the command).

@@ -15,8 +15,9 @@ WHAT.
                 refuses to create a copy below the free-space floor (exit 3) and writes an alert.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
                 add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. Wrapper options do not hide a copy
-                (`timeout 120 git clone`). The quoted remote command of a top-level `ssh host '...'` is not
-                charged to this machine (it copies on the far host); see copy_commands and the ssh gap below.
+                (`timeout 120 git clone`). The quoted remote command of an `ssh host '...'` is not charged to
+                this machine (it copies on the far host) when shell_words verifies the whole line; see
+                copy_commands and the ssh section below.
                 It always denies writing scratch INTO
                 /dev/shm (RAM); reading, copying out of and removing from /dev/shm stay allowed. Silent otherwise.
                 Fails OPEN on any internal error.
@@ -50,15 +51,16 @@ WHAT.
                 as deletes.
   ssh           What is and is not checked for ssh (goodqa#16811). The protected-delete and /dev/shm checks still
                 read an ssh's quoted payload as if it ran here (over-reading, never under-reading). The disk-floor
-                copy check skips a top-level simple command whose program is ssh (after VAR=value and
-                sudo/env/timeout/... wrappers) and that carries no `$(` or backtick outside single quotes and no
-                ProxyCommand/LocalCommand/KnownHostsCommand option. Still checked against this machine's floor:
-                every other command on the line (`ssh h '...' && git clone a b`, `ssh h cd x && git clone a b`),
-                `$(...)` or backticks anywhere in the ssh outside single quotes (they run here), a `bash -c '...'`
-                wrapper around the ssh, a heredoc body (`ssh h bash -s <<'EOF'` is read as local text) and a line
-                whose quotes do not balance. Not checked: whether the host is really another machine;
-                `ssh localhost '...'` or an alias of this machine copies onto this disk uncounted (the hook does no
-                DNS or ssh-config reading). The far host's own floor is not checked from here.
+                copy check first asks shell_words.scan whether bash and zsh read the whole line as known commands.
+                Only then does it skip a command whose program is ssh (after VAR=value and sudo/env/timeout/...
+                wrappers, also inside `bash -c '...'`) with no ProxyCommand/LocalCommand/KnownHostsCommand option
+                and no -F config. Still checked against this machine's floor: every other command on the line
+                (`ssh h '...' && git clone a b`, `ssh h cd x && git clone a b`), and the whole line, strictly,
+                whenever shell_words cannot verify it: `$(...)` or backticks outside single quotes (they run here), a
+                comment, a backslash, ANSI-C quoting, a heredoc (`ssh h bash -s <<'EOF'` is read as local text) or
+                unbalanced quotes. Not checked: whether the host is really another machine; `ssh localhost '...'`
+                or an alias of this machine copies onto this disk uncounted (the hook does no DNS or ssh-config
+                reading). The far host's own floor is not checked from here.
   scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
                 directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
                 `export TMPDIR=$(python3 ~/.claude/hooks/copy_hygiene.py scratch)`. Refused below the disk floor; its
@@ -92,6 +94,10 @@ import subprocess
 import sys
 import tempfile
 import time
+
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shell_words  # noqa: E402  (goodqa#16811: the one shell reader shared with merge_gate)
 
 
 GB = 1024 ** 3
@@ -801,80 +807,25 @@ def simple_commands(cmd: str) -> list:
 
 
 # ---------------------------------------------------------------- copy check: ssh remote payloads
-# ssh options that make the LOCAL machine run a command; an ssh carrying one keeps the strict reading.
-SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand", re.I)
+# ssh options that make the LOCAL machine run a command; an ssh carrying one keeps the strict reading. `-F` names a
+# config file that may hold one, and the hook reads no ssh config.
+SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand|^-F", re.I)
 
 
-def top_level_segments(cmd: str) -> "list[str] | None":
-    """The text of each top-level simple command: `cmd` split on ; & | newline ( ) outside single and double quotes.
-    A backslash escapes the next character (so `\\;` and a line continuation do not split). None when the quotes do
-    not balance."""
-    out, start, quote, i = [], 0, None, 0
-    while i < len(cmd):
-        ch = cmd[i]
-        if quote == "'":
-            quote = None if ch == "'" else quote
-        elif quote == '"':
-            if ch == "\\":
-                i += 1
-            elif ch == '"':
-                quote = None
-        elif ch == "\\":
-            i += 1
-        elif ch in "'\"":
-            quote = ch
-        elif ch in ";&|\n()":
-            out.append(cmd[start:i])
-            start = i + 1
-        i += 1
-    if quote is not None:
-        return None
-    out.append(cmd[start:])
-    return out
-
-
-def _remote_only_ssh(segment: str) -> bool:
-    """True when `segment` is one ssh command whose arguments run only on the far host: its program (after
-    VAR=value and sudo/env/timeout/... wrappers) is `ssh`, it has no `$(` or backtick outside single quotes (those
-    run here before ssh starts) and no ProxyCommand/LocalCommand/KnownHostsCommand option (those run here too).
+def _remote_only_ssh(words: list) -> bool:
+    """True when `words` (one verified shell_words command, wrappers dropped) is an ssh whose arguments run only on
+    the far host: its program is `ssh` and it has no ProxyCommand/LocalCommand/KnownHostsCommand option and no -F
+    config. shell_words already refused any `$(`, backtick, heredoc or comment on the line, so nothing in it runs
+    here before ssh starts.
 
     Not proven: that the host is another machine. `ssh localhost '...'` or an ssh alias of this machine copies onto
     this disk and is not counted (documented gap; the hook does no DNS or ssh-config reading)."""
-    quote, i = None, 0
-    while i < len(segment):
-        ch = segment[i]
-        if quote == "'":
-            quote = None if ch == "'" else quote
-        elif ch == "\\":
-            i += 1
-        elif quote == '"' and ch == '"':
-            quote = None
-        elif ch == "`" or (ch == "$" and segment[i + 1:i + 2] == "("):
-            return False
-        elif quote is None and ch in "'\"":
-            quote = ch
-        i += 1
-    try:
-        words = _unwrap(shlex.split(segment, comments=True))
-    except ValueError:
-        return False
     return bool(words) and os.path.basename(words[0]) == "ssh" and not any(SSH_LOCAL_COMMAND.search(w) for w in words)
 
 
-def copy_commands(cmd: str, depth: int = 0) -> list:
-    """argv lists the disk-floor copy check reads (goodqa#16811).
-
-    The same over-splitting reading as simple_commands, with two changes that apply to this check only:
-    - a top-level simple command that is a remote-only ssh (_remote_only_ssh) is dropped, so a clone inside
-      `ssh host 'cd x && git clone ...'` is not charged to this machine's floor; every other segment of the line,
-      including a command after the ssh (`ssh h '...' && git clone a b`), is still read;
-    - wrapper options are dropped too (`timeout 120 git clone`, `nice -n 5 cp -r`), not only the wrapper word;
-    - the script of `bash -c SCRIPT` (sh, zsh, dash, ksh) is read the same way, up to 4 levels deep.
-    A line whose quotes do not balance is read strictly. A heredoc body is read as local text: an unquoted
-    delimiter expands `$(...)` here, and the hook does not parse heredocs."""
-    segments = top_level_segments(cmd)
-    if segments is not None:
-        cmd = "\n".join(s for s in segments if not _remote_only_ssh(s))
+def _legacy_copy_commands(cmd: str, depth: int) -> list:
+    """The strict reading: split on every separator even inside quotes (the simple_commands reading), drop
+    wrappers, read `sh -c` scripts the same way. Over-reads, never under-reads."""
     out = []
     for seg in SIMPLE_SPLIT.split(cmd):
         seg = seg.strip()
@@ -888,7 +839,41 @@ def copy_commands(cmd: str, depth: int = 0) -> list:
         if not words:
             continue
         out.append(words)
-        if (depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS and words[1] == "-c"):
+        if depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS and words[1] == "-c":
+            out.extend(copy_commands(words[2], depth + 1))
+    return out
+
+
+def copy_commands(cmd: str, depth: int = 0) -> list:
+    """argv lists the disk-floor copy check reads (goodqa#16811).
+
+    A line shell_words.scan verifies (bash and zsh read it as exactly those commands) is read command by command:
+    - an ssh command that runs only on the far host (_remote_only_ssh) is dropped, so a clone inside
+      `ssh host 'cd x && git clone ...'` is not charged to this machine's floor; every other command on the line,
+      including one after the ssh (`ssh h '...' && git clone a b`), is still read;
+    - any other ssh (a ProxyCommand, LocalCommand, KnownHostsCommand or -F) gets the strict reading of
+      _legacy_copy_commands, which is exactly how the check read every ssh before goodqa#16811;
+    - wrapper words and their options are dropped (`timeout 120 git clone`, `nice -n 5 cp -r`, `sudo -u u ...`);
+    - the script of `sh|bash|zsh|dash|ksh -c SCRIPT` is read the same way, up to 4 levels deep, so
+      `bash -c 'ssh h "git clone a b"'` is a remote copy too.
+    Every line shell_words cannot verify (a comment, a backslash, `$(` or a backtick outside single quotes, ANSI-C
+    quoting, a heredoc, unbalanced quotes, ...) gets the strict reading of _legacy_copy_commands instead."""
+    scan = shell_words.scan(cmd)
+    if not scan.verified:
+        return _legacy_copy_commands(cmd, depth)
+    out = []
+    for segment in scan.segments:
+        words = _unwrap(segment.argv)
+        if not words:
+            continue
+        if os.path.basename(words[0]) == "ssh":
+            if _remote_only_ssh(words):
+                continue
+            out.extend(_legacy_copy_commands(cmd[segment.start:segment.end], depth))
+            continue
+        out.append(words)
+        if (depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS
+                and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", words[1])):
             out.extend(copy_commands(words[2], depth + 1))
     return out
 
