@@ -1,6 +1,6 @@
 """goodqa#16396 failing-first evidence for `ah chat`: tests.test_ah_chat must fail against each controlled broken variant of
 harness/hooks/ah_chat.py, or of ah.py where a variant names it (each variant removes one control), and pass against the
-real files. ah chat is read only (PR 277 r6); the send variants left with send and are kept in the goodqa#16399 patch.
+real files. The send variants are in tests/mutants_ah_chat_send.py (goodqa#16399).
 
 Run: python3 -B tests/mutants_ah_chat.py   (copies the hooks and the test into a temporary tree; changes nothing here).
 Variants run four at a time and stop at the first failing test (a killed variant is a failure, so this is quick)."""
@@ -19,7 +19,7 @@ MUTANTS = {
     "the credential backstop is off": ("    if _holds_token(json.dumps(result, ensure_ascii=False)):", "    if False:"),
     "server error codes are printed raw": ('    shown = gq.shown_code(code) if isinstance(code, str) else None\n    return shown or "unrecognized_error"',
                                            "    return str(code)"),
-    "not_found is a traceback": ('raise ChatError("not_found", "GoodQA says not_found', 'raise KeyError("not_found", "GoodQA says not_found'),
+    "not_found is a traceback": ('missing = ChatError("not_found", "GoodQA says not_found', 'missing = KeyError("not_found", "GoodQA says not_found'),
     "the membership id is used as the user id": ('uid = row.get("userId") or user.get("userId") or (user.get("id") if user is not row else None)',
                                                  'uid = user.get("id") or user.get("userId")'),
     "a paged member list is trusted for a name": ('    if isinstance(data, dict) and (data.get("nextCursor") or data.get("hasMore")):', "    if False:"),
@@ -45,12 +45,6 @@ MUTANTS = {
     "a fixed refusal is screened (reads the DM token)": ("        if not fixed and _credential_like(message):", "        if _credential_like(message):"),
     "history screens its ids before the base": (
         "    _pinned_base(base)  # PR 277 r11 F2: first, before any id screen can read the DM token\n", ""),
-    # PR 277 r6: `ah chat send` is deferred to goodqa#16399; ah.py refuses it before anything is parsed, imported or read
-    "send reaches the parser": ("ah.py", '        if _first_word(given[given.index("chat") + 1:]) == "send":', "        if False:"),
-    "the send refusal exits zero": ("ah.py", '    sys.stdout.write("\\n")\n    return 2\n\n\ndef _parse_chat',
-                                    '    sys.stdout.write("\\n")\n    return 0\n\n\ndef _parse_chat'),
-    "the send refusal names no follow-up": ("ah.py", "deferred to goodqa#16399, which", "deferred to a follow-up, which"),
-    "send imports the chat module first": ("ah.py", '== "send":  # goodqa#16396', '== "send" and __import__("ah_chat"):  # goodqa#16396'),
     # PR 277 r7 F1: a chat parse failure is one fixed refusal on stdout; nothing reaches stderr
     "chat parse errors reach stderr": ("ah.py", "        with contextlib.redirect_stderr(io.StringIO()):  # the usage",
                                        "        if True:  # the usage"),

@@ -142,6 +142,67 @@ def ahc_dispose_stamps(cmd: str) -> list:
     return out
 
 
+def chat_send_stamps(cmd: str) -> list:
+    """[stamp parts] for each `ah chat send ...` (not --dry-run) this Bash line runs at command position (goodqa#16399).
+    ah's own parser reads the words; ah_chat_send.stamp_parts binds the stamp to the target, org, the text file's real
+    path and the SHA-256 of its bytes, so a file edited after this hook ran finds no stamp. A word only the shell can
+    compute, an unparsable line, echoed or quoted text and --help get none."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        import ah  # noqa: PLC0415
+        import ah_chat_send  # noqa: PLC0415
+    except ImportError:
+        return []
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words, "ah.py") or mission_argv(words, "ah")
+        if not argv or [str(w) for w in argv[:2]] != ["chat", "send"] or any(getattr(w, "computed", False) for w in argv):
+            continue
+        argv = [os.path.expanduser(w) if getattr(w, "tilde", False) and (w == "~" or w.startswith("~/")) else str(w)
+                for w in argv]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                args = ah.build_parser().parse_args(argv)
+        except (SystemExit, Exception):  # noqa: BLE001 - a refusal or --help mints nothing
+            continue
+        if getattr(args, "dry_run", True):
+            continue
+        parts = ah_chat_send.stamp_parts(args.conversation, args.with_user, args.org, args.text_file,
+                                         getattr(args, "approval_id", None))
+        if parts:
+            out.append(parts)
+    return out
+
+
+def chat_allow_stamps(cmd: str) -> list:
+    """[stamp parts] for each `ah chat allow --with ID --org ID --name N --source S` this Bash line runs at command position
+    (goodqa#16399): bound to the id, the org, the name and the SHA-256 of the exact source text. --list, a computed word and an unparsable line get none."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        import ah  # noqa: PLC0415
+        import ah_chat_send  # noqa: PLC0415
+    except ImportError:
+        return []
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words, "ah.py") or mission_argv(words, "ah")
+        if not argv or [str(w) for w in argv[:2]] != ["chat", "allow"] or any(getattr(w, "computed", False) for w in argv):
+            continue
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                args = ah.build_parser().parse_args([str(w) for w in argv])
+        except (SystemExit, Exception):  # noqa: BLE001 - a refusal or --help mints nothing
+            continue
+        if getattr(args, "list_only", True):
+            continue
+        parts = ah_chat_send.allow_parts(args.with_user, args.org, args.name, args.source)
+        if parts:
+            out.append(parts)
+    return out
+
+
 def stamps_for(cmd: str) -> list:
     """[(subcommand, argv key)] for each main-only mission_coverage.py command this Bash line runs. The key is
     mission_coverage.argv_key of the exact argument list, so the stamp covers that command and nothing else."""
@@ -172,7 +233,7 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if "mission_coverage" not in cmd and "ahc" not in cmd:
+    if "mission_coverage" not in cmd and "ahc" not in cmd and "chat" not in cmd:
         return {}
     import caller_identity  # noqa: PLC0415
     if not caller_identity.is_main(payload):
@@ -184,6 +245,16 @@ def cmd_pretool(payload: dict) -> dict:
     for sub, key in (stamps_for(cmd)[:10] if "mission_coverage" in cmd else []):
         caller_identity.put_stamp(STAMP_PURPOSE, [sub, key], session=session, home=home_dir(),
                                   tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if "chat" in cmd and "send" in cmd:
+        import ah_chat_send  # noqa: PLC0415
+        for parts in chat_send_stamps(cmd)[:3]:
+            caller_identity.put_stamp(ah_chat_send.STAMP, parts, session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if "chat" in cmd and "allow" in cmd:
+        import ah_chat_send  # noqa: PLC0415
+        for parts in chat_allow_stamps(cmd)[:1]:
+            caller_identity.put_stamp(ah_chat_send.ALLOW_STAMP, parts, session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
     if "ahc" in cmd:
         try:
             import ahc_core  # noqa: PLC0415
@@ -202,11 +273,13 @@ def cmd_posttool(payload: dict) -> dict:
     """PostToolUse / PostToolUseFailure / PermissionDenied (Bash): the call is over (ran, failed, or was refused), so
     any stamp still unconsumed for its tool_use_id is deleted (goodqa#15754 red-team F1). A stamp of a call denied by
     another PreToolUse hook or rejected at the prompt gets no Post event; take_stamp(bound=True) refuses it once the
-    refusal is in main's transcript. Never denies anything; a tool_use_id of another agent matches no stamp."""
-    if payload.get("tool_name") != "Bash" or payload.get("hook_event_name", POST_EVENTS[0]) not in POST_EVENTS:
+    refusal is in main's transcript. PostToolUse of a background launch fires at once, so it keeps that call's
+    background stamp (goodqa#16811 round 2). Never denies anything; a tool_use_id of another agent matches no stamp."""
+    event = payload.get("hook_event_name", POST_EVENTS[0])
+    if payload.get("tool_name") != "Bash" or event not in POST_EVENTS:
         return {}
     import caller_identity  # noqa: PLC0415
-    caller_identity.drop_tool_stamps(payload.get("tool_use_id"), home=home_dir())
+    caller_identity.drop_tool_stamps(payload.get("tool_use_id"), home=home_dir(), event=event)
     return {}
 
 

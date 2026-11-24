@@ -244,6 +244,57 @@ def _safe_branch(branch):
     return valid_identity_text(branch) and not branch.startswith("-")
 
 
+def explicit_remote_branch(args):
+    """--remote-branch, validated in the original checkout; None when the operator did not name one."""
+    value = getattr(args, "remote_branch", None)
+    if value is None:
+        return None
+    if (not _safe_branch(value) or len(value) > 200 or value.startswith("refs/") or value.endswith("/")
+            or git(args.original.expanduser().absolute(), "check-ref-format", "--branch", value)[0]):
+        raise DeliveryError("BLOCKED_POLICY", "Remote branch is invalid", code=2)
+    return value
+
+
+def upstream_remote_branch(original, branch):
+    """The branch's configured upstream on origin (branch.<b>.remote/merge), else None."""
+    if not _safe_branch(branch):
+        return None
+    code, remote = git(original, "config", "--get", f"branch.{branch}.remote")
+    code2, merge = git(original, "config", "--get", f"branch.{branch}.merge")
+    merge = merge.strip()
+    if code or code2 or remote.strip() != "origin" or not merge.startswith("refs/heads/"):
+        return None
+    name = merge[len("refs/heads/"):]
+    return name if _safe_branch(name) and not git(original, "check-ref-format", "--branch", name)[0] else None
+
+
+def stored_remote_branch(args):
+    """Read-only peek at the remote base an existing generation of this task was prepared against.
+
+    Returns None when there is no generation (or a new one was requested, or anything is unreadable;
+    Workflow.load is the authority and re-validates). Lets pre-lock checks use the stored value instead of
+    re-resolving a flag or upstream that may have changed since prepare.
+    """
+    if getattr(args, "new_generation", False):
+        return None
+    try:
+        original = args.original.expanduser().absolute()
+        common, _ = git_common_directory(original, 30)
+        path = common / "agent-harness" / "delivery-workflows" / scope_key(checkout_identity(original),
+                                                                           args.original_branch)
+        path = path / hashlib.sha256(args.task.encode()).hexdigest()
+        generation = private_json(path / "journal.json")["generation"]
+        state = private_json(path / "generations" / generation / "journal.json")
+        return remote_of(state) if _safe_branch(remote_of(state)) else None
+    except (OSError, KeyError, TypeError, ValueError, AttributeError, DeliveryError):
+        return None
+
+
+def remote_of(state):
+    """The remote base branch a generation targets (the local branch name unless one was recorded)."""
+    return state.get("remote_branch", state["branch"])
+
+
 def ancestry(repo, older, newer):
     code, _ = git(repo, "merge-base", "--is-ancestor", valid_oid(older), valid_oid(newer))
     if code not in (0, 1):
@@ -405,6 +456,10 @@ class Workflow:
         if not valid_identity_text(self.branch):
             raise DeliveryError("BLOCKED_POLICY", "Original branch is invalid", code=2)
         snapshot(self.original, self.branch)
+        self.explicit_remote = explicit_remote_branch(args)
+        derived = None if self.explicit_remote else upstream_remote_branch(self.original, self.branch)
+        self.remote_branch = self.explicit_remote or derived or self.branch
+        self.remote_source = "flag" if self.explicit_remote else ("upstream" if derived else "local")
         self.identity = checkout_identity(self.original)
         self.common, self.common_info = git_common_directory(self.original, 30)
         self.scope = scope_key(self.identity, self.branch)
@@ -481,6 +536,7 @@ class Workflow:
         private_directory(self.directory)
         self.state = private_json(self.directory / "journal.json")
         self.validate_state(self.state)
+        self.bind_remote()
         replacing = getattr(self.args, "new_generation", False) and self.state["phase"] in SETTLED
         if not replacing:
             self.snapshot()
@@ -492,6 +548,10 @@ class Workflow:
                   "phase", "pr_number", "target", "merge_head", "guard_key", "local_key", "checks_digest", "apply_base"}
         strings = ("kind", "task", "scope", "generation", "original", "branch", "source", "source_branch",
                    "source_head", "baseline", "kit_digest", "repository", "phase")
+        if "remote_branch" in value:
+            fields.add("remote_branch")
+            if (not _safe_branch(value["remote_branch"]) or value["remote_branch"] == value.get("branch")):
+                raise DeliveryError("RECOVERY_REQUIRED", "Workflow remote branch metadata is invalid")
         if value.get("schema") == 2:
             fields |= {"source_layout", "original_layout"}
             for name in ("source_layout", "original_layout"):
@@ -527,6 +587,16 @@ class Workflow:
         if number is not None and (type(number) is not int or not 1 <= number <= 2**53):
             raise DeliveryError("RECOVERY_REQUIRED", "Workflow PR metadata is invalid")
 
+    def bind_remote(self):
+        """A generation keeps the remote base it was prepared against; an explicit different one is refused."""
+        stored = remote_of(self.state)
+        if getattr(self.args, "new_generation", False) and self.state["phase"] in SETTLED:
+            return  # the new generation chooses its own base (explicit flag, upstream, or local name)
+        if self.explicit_remote is not None and self.explicit_remote != stored:
+            raise DeliveryError("BLOCKED_POLICY", "Remote branch differs from the prepared generation", code=2,
+                                reason="REMOTE_BRANCH_MISMATCH")
+        self.remote_branch, self.remote_source = stored, "prepared"
+
     def create(self, source, source_branch, source_head, baseline, kit, repository, phase):
         if self.state is not None and self.state["phase"] not in SETTLED:
             raise DeliveryError("RECOVERY_REQUIRED", "Previous generation has an uncertain or unresolved outcome")
@@ -546,6 +616,8 @@ class Workflow:
                       "baseline": baseline, "kit_digest": kit, "repository": repository, "phase": phase,
                       "pr_number": None, "target": None, "merge_head": None, "guard_key": None,
                       "local_key": None, "checks_digest": None, "apply_base": None}
+        if self.remote_branch != self.branch:
+            self.state["remote_branch"] = self.remote_branch
         self.validate_state(self.state)
         write_journal(self.directory, self.state, first=True)
         self.assert_context()
@@ -573,7 +645,11 @@ class Workflow:
 
     def facts(self):
         facts = {"generation": self.generation, "state": str(self.directory / "journal.json"),
-                 "checkout": str(self.original), "source_head": self.state["source_head"]}
+                 "checkout": str(self.original), "source_head": self.state["source_head"],
+                 "remote_branch": self.remote_branch, "remote_branch_source": self.remote_source}
+        if self.remote_source == "upstream":
+            facts["remote_branch_warning"] = (f"remote base {self.remote_branch} came from the upstream of "
+                                              f"{self.branch}; pass --remote-branch to choose it explicitly")
         overrides = self.target_overrides()
         if overrides:
             facts["target_policy_overrides"] = overrides
@@ -791,7 +867,7 @@ def matching_pr(state, timeout):
             raise DeliveryError("BLOCKED_POLICY", "Feature branch PR identity is ambiguous", code=2)
         if pr["state"] == "CLOSED":
             continue
-        exact = pr.get("headRefOid") == state["source_head"] and pr.get("baseRefName") == state["branch"]
+        exact = pr.get("headRefOid") == state["source_head"] and pr.get("baseRefName") == remote_of(state)
         if exact:
             matches.append(pr)
         elif pr["state"] == "OPEN" or pr.get("headRefOid") == state["source_head"]:
@@ -890,7 +966,7 @@ def published_ref(original, url, state, timeout):
 
 def require_remote_base(flow, url):
     """The PR base must exist on the remote; fail before any push or PR create when it does not."""
-    ref = "refs/heads/" + flow.branch
+    ref = "refs/heads/" + flow.remote_branch
     try:
         code, output = transport(flow.original, url, flow.state["repository"], ["ls-remote", ref], flow.args.timeout)
     except DeliveryError as error:
@@ -909,7 +985,7 @@ def require_remote_base(flow, url):
     found = [row.split("\t")[-1] for row in output.splitlines() if row.strip()]
     if ref not in found:
         raise DeliveryError("BLOCKED_POLICY", "The base branch does not exist on the remote; nothing was pushed",
-                            code=2, reason="BASE_BRANCH_MISSING", base_branch=flow.branch[:200],
+                            code=2, reason="BASE_BRANCH_MISSING", base_branch=flow.remote_branch[:200],
                             hint="Push the base branch (git push origin <branch>) or pass the correct "
                                  "--original-branch, then re-run prepare", **flow.facts())
 
@@ -976,7 +1052,7 @@ def prepare_pr(flow, title, body):
         flow.save(phase="PR_CREATING")
         try:
             code, _, error_text = gh("pr", "create", "-R", flow.state["repository"],
-                                     "--head", flow.state["source_branch"], "--base", flow.branch, "--draft",
+                                     "--head", flow.state["source_branch"], "--base", flow.remote_branch, "--draft",
                                      "--title", title, "--body-file", str(staged),
                                      timeout=flow.args.timeout, stderr_limit=GH_STDERR_LIMIT)
         except (FileNotFoundError, PermissionError) as launch:
@@ -1451,7 +1527,10 @@ def prepare(args):
                                 code=2, reason="TARGET_OVERRIDE_UNRECORDED",
                                 hint="pass --wal <your session WAL under ~/.claude/wals>, or drop --target-policy warn")
         # Before any strict snapshot, so a huge dirty set gets a specific message, not a status timeout.
-        bypassed = target_preflight(args.original.expanduser().absolute(), args.original_branch, mode)
+        original_path = args.original.expanduser().absolute()
+        preflight_remote = (stored_remote_branch(args) or explicit_remote_branch(args)
+                            or upstream_remote_branch(original_path, args.original_branch) or args.original_branch)
+        bypassed = target_preflight(original_path, preflight_remote, mode)
         if mode == "warn":
             override = record_target_override_in_wal(args, bypassed)
     source, branch, head, baseline, kit = source_inputs(args)
@@ -1477,6 +1556,9 @@ def prepare(args):
             origin_error = error
     with Workflow(args) as flow:
         state = flow.load()
+        if branch == flow.remote_branch:
+            raise DeliveryError("BLOCKED_POLICY", "Source branch is the remote base branch", code=2,
+                                reason="SOURCE_IS_BASE")
         resuming_publication = getattr(args, "resume_publication", False)
         if resuming_publication and (state is None or state["phase"] != "PUBLISHING"):
             raise DeliveryError("BLOCKED_POLICY", "Publication resume requires this generation in PUBLISHING", code=2)
@@ -1491,11 +1573,14 @@ def prepare(args):
             # legitimately finish after the source worktree has been retired.
             verify_source(flow)
         else:
-            policy_record = commit_policy_gate(source, args.original_branch, branch, head, baseline,
+            policy_record = commit_policy_gate(source, flow.remote_branch, branch, head, baseline,
                                                title, body, local_only)
             phase = "LOCAL_READY" if local_only else ("REMOTE_BLOCKED" if origin_error else "INITIAL")
             stage_policy_record(flow, policy_record, head, baseline)
             flow.create(source, branch, head, baseline, kit, repository, phase)
+            if flow.remote_source == "upstream":
+                print(f"WARNING: remote base {flow.remote_branch} was taken from the upstream of {flow.branch}; "
+                      "pass --remote-branch to choose it explicitly", file=sys.stderr)
             write_policy_record(flow, policy_record)
             state = flow.state
         if override is not None:
@@ -1597,7 +1682,7 @@ def verify_remote_pr(flow):
                  timeout=flow.args.timeout)
     if (not pr_identity(pr, state["repository"], state["source_branch"])
             or pr.get("number") != state["pr_number"] or pr.get("headRefOid") != state["source_head"]
-            or pr.get("baseRefName") != flow.branch or not isinstance(pr.get("state"), str)
+            or pr.get("baseRefName") != flow.remote_branch or not isinstance(pr.get("state"), str)
             or pr["state"] not in {"OPEN", "MERGED", "CLOSED"}):
         raise DeliveryError("BLOCKED_POLICY", "GitHub PR no longer matches the reviewed scope", code=2)
     return pr
@@ -1661,7 +1746,7 @@ def external_guard(flow, scope):
 
 def verify_remote_descendant(flow, url, target, *, observed=None):
     """Prove a later advertised tip without applying its unrelated work."""
-    observed = observed or github_target(flow.state["repository"], flow.branch, flow.args.timeout)
+    observed = observed or github_target(flow.state["repository"], flow.remote_branch, flow.args.timeout)
     if observed != target:
         fetch_target(flow, url, observed)
         if not ancestry(flow.original, target, observed):
@@ -1821,7 +1906,7 @@ def remote_finish(flow, preparations, checks):
     if not isinstance(merge, dict):
         raise DeliveryError("REMOTE_BLOCKED", "Merged PR has no verifiable merge commit", code=4)
     merge_head = valid_oid(merge.get("oid"))
-    current_target = github_target(state["repository"], flow.branch, args.timeout)
+    current_target = github_target(state["repository"], flow.remote_branch, args.timeout)
     if state["phase"] == "REMOTE_APPLYING":
         target = state["target"]
         if state["merge_head"] != merge_head:
@@ -2127,6 +2212,9 @@ def parse_args():
         part.add_argument("--task", required=True, help="Stable owner task name; state is checkout-scoped")
         part.add_argument("--original", type=Path, required=True)
         part.add_argument("--original-branch", required=True)
+        part.add_argument("--remote-branch", default=None,
+                          help="Branch on origin that PRs target and finish applies, when it is not named like "
+                               "--original-branch (default: the original branch's origin upstream, else its own name)")
         part.add_argument("--generation", help="Require this exact current generation")
         part.add_argument("--kit-file", type=Path,
                           help="mode-0600 run kit, e.g. ~/.agent-harness/work/<session-id>/<task>/kit.json (not /tmp)")

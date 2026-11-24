@@ -993,6 +993,9 @@ def _blocks_text(content):
     return ""
 
 
+TRANSCRIPT_RULE = 3  # 3: human queued_command attachments are stored and tagged; pairing with enqueue twins happens on read (goodqa#17101)
+
+
 def index_transcript(home: Path, session: str) -> dict:
     """Incrementally index human turns, queued mid-turn messages and AskUserQuestion answers."""
     path = find_transcript(home, session)
@@ -1004,6 +1007,8 @@ def index_transcript(home: Path, session: str) -> dict:
     if idx.get("schema", 1) > SCHEMA:
         raise AhError("schema_newer", "index written by a newer ah; update this install", 4)
     idx["schema"] = SCHEMA
+    if idx.get("rule") != TRANSCRIPT_RULE:  # indexing rules changed: re-read the transcript once, from the start
+        idx.update(rule=TRANSCRIPT_RULE, meta={}, msgs=[], askq=[])
     meta = idx.setdefault("meta", {})
     lines, rebuilt = read_new_lines(path, meta)
     if rebuilt or "msgs" not in idx:
@@ -1038,6 +1043,17 @@ def index_transcript(home: Path, session: str) -> dict:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
                                         rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
+        elif kind == "attachment":
+            # goodqa#17101: a human message picked up mid-turn behind injected blocks (origin human only).
+            # Every attachment is stored; _pair_attachments is the only place a duplicate is ever dropped.
+            attached = prov.queued_attachment_text(rec)
+            if attached is not None:
+                digest = hashlib.sha256(attached[0].encode()).hexdigest()[:12]
+                row = _msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
+                           rec.get("timestamp"), attached[1], prov.ATTACHMENT_TRUST, off)
+                row["via"] = "attachment"
+                row["plain"] = isinstance((rec.get("attachment") or {}).get("prompt"), str)
+                idx["msgs"].append(row)
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
@@ -1079,8 +1095,13 @@ def verify_rows(path: Path, rows: list) -> list:
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
             elif m["kind"] == "queued":
                 raw = prov.queue_user_text(rec)
-                good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
-                text = prov.strip_blocks(raw) if raw is not None else None
+                attached = prov.queued_attachment_text(rec) if raw is None else None
+                if attached is not None:
+                    good = m["id"].endswith("#" + hashlib.sha256(attached[0].encode()).hexdigest()[:12])
+                    text = attached[1]
+                else:
+                    good = raw is not None and m["id"].endswith("#" + hashlib.sha256(raw.encode()).hexdigest()[:12])
+                    text = prov.strip_blocks(raw) if raw is not None else None
             else:
                 text = _answer_values_cache(rec, path)
                 good = text is not None and rec.get("uuid") == m["id"].split("/", 1)[1]
@@ -1141,9 +1162,49 @@ def _message_source(row):
     return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
 
 
+PAIR_WINDOW_SECONDS = 5.0  # a plain prompt's enqueue and its pickup attachment are recorded within a fraction of a second
+
+
+def _stamp(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _pair_attachments(rows: list) -> list:
+    """The only place a duplicate queued row is dropped (goodqa#17101).
+
+    A plain-string prompt is recorded twice: as an enqueue record and, when picked up, as an attachment with the same
+    raw text. Each such attachment is paired one-to-one with the nearest unmatched enqueue of the same digest within
+    PAIR_WINDOW_SECONDS, and the attachment row is dropped so the enqueue id stays. Anything unpaired stays: two
+    identical replies, in any order or spacing, are two messages. Attachments are never compared with each other.
+    """
+    enqueues = {}
+    for i, row in enumerate(rows):
+        if row.get("kind") == "queued" and row.get("via") != "attachment":
+            enqueues.setdefault(row["id"].rsplit("#", 1)[-1], []).append(i)
+    drop, taken = set(), set()
+    for i, row in enumerate(rows):
+        if row.get("via") != "attachment" or not row.get("plain"):
+            continue
+        at = _stamp(row.get("timestamp"))
+        best = None
+        for j in enqueues.get(row["id"].rsplit("#", 1)[-1], []):
+            if j in taken or at is None:
+                continue
+            gap = abs(at - (_stamp(rows[j].get("timestamp")) or 1e18))
+            if gap <= PAIR_WINDOW_SECONDS and (best is None or gap < best[0]):
+                best = (gap, j)
+        if best:
+            taken.add(best[1])
+            drop.add(i)
+    return [row for i, row in enumerate(rows) if i not in drop]
+
+
 def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
     idx = index_transcript(home, session)
-    msgs = verify_rows(find_transcript(home, session), idx["msgs"])
+    msgs = _pair_attachments(verify_rows(find_transcript(home, session), idx["msgs"]))
     # A queued message that later became a human turn is the same message: point the queue id at the uuid id.
     human = [(m["id"], norm(m["text"])) for m in msgs if m["kind"] == "uuid"]
     seen, out = set(), []
@@ -3558,8 +3619,23 @@ def build_parser():
     u.add_argument("--text-match", "--search", dest="search", help="words to find in a real human turn")
     u.add_argument("--recent", type=int)
     u.add_argument("--full", action="store_true")
-    ch = sub.add_parser("chat", help="read your own GoodQA chat (goodqa#16396); read only: `send` is deferred to goodqa#16399")
+    ch = sub.add_parser("chat", help="read your own GoodQA chat (goodqa#16396); `send`: one short DM, main agent only (goodqa#16399)")
     chs = ch.add_subparsers(dest="sub", required=True)
+    cs = chs.add_parser("send", help="send one short direct message as the user's bot (main agent only; never retried)")
+    cs.add_argument("--base", help="API base; must be the pinned GoodQA base")
+    cs.add_argument("--conversation", help="a one-to-one DM conversation id")
+    cs.add_argument("--with", dest="with_user", help="the person's user id (never a name)")
+    cs.add_argument("--org", help="organization id (required; the defaults file is not used for a send)")
+    cs.add_argument("--text-file", dest="text_file", required=True, help="absolute path to the message text (at most 600 characters)")
+    cs.add_argument("--approval-id", dest="approval_id", help="the approval id an earlier send printed, after the user approved it")
+    cs.add_argument("--dry-run", action="store_true", help="print exactly what would be sent; reads no token, sends nothing")
+    ca = chs.add_parser("allow", help="add a person to the send allow-list on the user's own words (main agent only), or --list it")
+    ca.add_argument("--with", dest="with_user", help="the person's user id (never a name)")
+    ca.add_argument("--org", help="organization id (required): the entry holds for this org only")
+    ca.add_argument("--name", help="the one word the user's quoted words call this person, e.g. Tisha; the member name must contain it")
+    ca.add_argument("--source", help="user:/uuid:, queue: or answer: source whose verbatim excerpt names the person")
+    ca.add_argument("--list", dest="list_only", action="store_true", help="print the listed user ids; changes nothing")
+    ca.add_argument("--base", help="API base; must be the pinned GoodQA base")
     for name in ("probe", "conversations", "history", "files"):
         c = chs.add_parser(name)
         c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
@@ -3806,6 +3882,13 @@ def run(args, home: Path) -> dict:
     if cmd == "chat":
         import ah_chat  # noqa: PLC0415
         try:
+            if args.sub == "send":
+                import ah_chat_send  # noqa: PLC0415
+                return ah_chat_send.send(home, args.conversation, args.with_user, args.org, args.text_file, args.dry_run,
+                                         args.base, approval=args.approval_id)
+            if args.sub == "allow":
+                import ah_chat_send  # noqa: PLC0415
+                return ah_chat_send.allow(home, args.with_user, args.org, args.name, args.source, args.base, args.list_only)
             if args.sub == "probe":
                 return ah_chat.probe(args.base, args.token)
             if args.sub == "conversations":
@@ -3960,9 +4043,6 @@ def run(args, home: Path) -> dict:
     raise AhError("unknown_command", cmd)
 
 
-CHAT_SEND_DEFERRED = ("`ah chat send` is not available in this build: ah chat is read only (goodqa#16396). Sending is "
-                      "deferred to goodqa#16399, which needs a server delivery contract and server-side DM dedupe first. "
-                      "Nothing was read or sent.")
 CHAT_PARSE_REFUSED = ("ah chat: the arguments were not accepted. The rejected value is not shown, because it may hold a "
                       "credential. Run `ah chat <subcommand> -h` for the accepted options. Nothing was read or sent.")
 
@@ -4035,6 +4115,9 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
+        import central_decisions  # noqa: PLC0415
+        return central_decisions.main(given[1:])
     if given[:1] == ["transcripts"]:  # goodqa#16650: the archive tool's own CLI, exit code passed through
         return transcripts_passthrough(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
@@ -4047,8 +4130,6 @@ def main(argv=None) -> int:
             return 4
         return guard_selftest.cli_main(given[1:])
     if _first_word(given) == "chat":
-        if _first_word(given[given.index("chat") + 1:]) == "send":  # goodqa#16396 ships read only: nothing is parsed,
-            return _refuse_chat("not_available", CHAT_SEND_DEFERRED)  # imported, read or sent
         args, stopped = _parse_chat(given)
         if args is None:
             return stopped

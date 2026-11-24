@@ -35,7 +35,8 @@ MAX_JSON = 65536
 MAX_MANIFEST = 32768
 MAX_FILE = 2 * 1024 * 1024
 LOCK_SECONDS = 2
-# A dead owner is reconciled automatically only after its own timeout plus this grace (seconds).
+# A dead owner is reconciled automatically after its own timeout plus this grace (seconds), or at once when its
+# death is probed on the same host, kernel boot and pid namespace (owner_liveness 'same_instance', goodqa#16811).
 # AGENT_HARNESS_DEADLINE_GRACE (0..3600) shortens it for live tests; death is still required.
 DEADLINE_GRACE = 60
 # Attempts that never launched a provider do not spend the two-launch repeat budget, but they are
@@ -214,6 +215,47 @@ def same_scheme(recorded, current):
     return recorded.split(':', 1)[0] == current.split(':', 1)[0]
 
 
+BOOT_UUID = re.compile(r'(procboot|bootsession):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                       r'[0-9a-fA-F]{12})')
+
+
+def pid_namespace(pid=None):
+    """The pid namespace `pid` (default: this process) lives in, or None when it cannot be named.
+
+    kill(pid, 0) answers only inside the caller's own pid namespace, so a pid probed from another namespace (a
+    container sharing the host name and boot id) can look gone while it runs. Linux names the namespace by the inode
+    of /proc/<pid>/ns/pid; macOS has a single pid namespace per boot.
+    """
+    try:
+        link = os.readlink('/proc/%s/ns/pid' % ('self' if pid is None else int(pid)))
+    except (OSError, ValueError, TypeError):
+        link = None
+    if link is not None:
+        match = re.fullmatch(r'pid:\[(\d{1,20})\]', link)
+        return 'linuxns:' + match[1] if match else None
+    if sys.platform == 'darwin' and not os.path.exists('/proc'):
+        return 'darwin:single'
+    return None
+
+
+def same_instance(owner):
+    """True only when `owner` was recorded on this host, in this kernel boot and in this pid namespace.
+
+    Every field must be present, well formed and equal: a missing or malformed field, another scheme, another boot
+    (which may also be another machine with the same host name) or another namespace is False.
+    """
+    if not isinstance(owner, dict) or owner.get('host') != host_identity():
+        return False
+    recorded, current = owner.get('boot_id'), boot_identity()
+    if not isinstance(recorded, str) or not isinstance(current, str):
+        return False
+    # Exact equality: incarnation_state reads any byte difference as a reboot, which is inferred, not probed.
+    if BOOT_UUID.fullmatch(current) is None or recorded != current:
+        return False
+    namespace = owner.get('pid_ns')
+    return isinstance(namespace, str) and 0 < len(namespace) <= 64 and namespace == pid_namespace()
+
+
 def process_start_token(pid):
     """A token naming one incarnation of `pid`, or None when the platform cannot say."""
     try:
@@ -279,7 +321,7 @@ def owner_process_facts(pid=None):
     """Who holds a reservation: enough to prove death on the same host, never to prove success."""
     pid = os.getpid() if pid is None else pid
     return {'pid': pid, 'host': host_identity(), 'boot_id': boot_identity(),
-            'process_started': process_start_token(pid)}
+            'process_started': process_start_token(pid), 'pid_ns': pid_namespace(pid)}
 
 
 def owner_liveness(start, children=()):
@@ -287,9 +329,12 @@ def owner_liveness(start, children=()):
 
     ALIVE when the same incarnation answers; anything else (other host, malformed facts, a probe
     that cannot answer, a live or unknown child) is UNCERTAIN and leaves state untouched.
+    `same_instance` is True only when the facts were recorded on this host, boot and pid namespace, so a DEAD
+    verdict rests on kill/start-token probes alone (never an inferred reboot) and needs no deadline.
     """
     owner = start.get('owner_process') if isinstance(start, dict) else None
-    facts = {'state': 'UNCERTAIN', 'past_deadline': False, 'why': 'owner facts missing or malformed'}
+    facts = {'state': 'UNCERTAIN', 'past_deadline': False, 'same_instance': False,
+             'why': 'owner facts missing or malformed'}
     if (not isinstance(owner, dict) or not valid_pid(owner.get('pid'))
             or not isinstance(owner.get('host'), str) or not 1 <= len(owner['host']) <= 255
             or not isinstance(owner.get('deadline'), str) or len(owner['deadline']) > 64):
@@ -307,6 +352,7 @@ def owner_liveness(start, children=()):
     if owner['host'] != host_identity():
         facts['why'] = 'other host'
         return facts
+    facts['same_instance'] = same_instance(owner)
     current_boot = boot_identity()
     state, why = incarnation_state(owner['pid'], owner.get('process_started'), owner.get('boot_id'), current_boot)
     facts.update(state=state, why=why)
@@ -808,6 +854,7 @@ class UsageStore:
         with self._lock():
             purpose = self._directory(self.root / 'purposes' / invocation['fingerprint'])
             previous, counted, zero_launch, spent = [], [], [], 0
+            counted_why = []  # goodqa#16811: the refusal names what was counted, not only that something was
             for number in range(1, MAX_ATTEMPTS + 1):
                 path = purpose / ('attempt-' + str(number) + '.json')
                 if not os.path.lexists(path): break
@@ -830,6 +877,7 @@ class UsageStore:
                         raise GuardError('UNKNOWN', 'Prior reservation has no final receipt; reconcile before retry', entry['start'])
                     # Launches are unknown for a run without a final, so it counts as a launch.
                     spent += started['timeout']; counted.append(entry)
+                    counted_why.append('run %s has no final receipt (reconciled)' % entry['run_id'][:8])
                 else:
                     completed = read_json(completion)
                     if set(completed) != {'schema', 'reference'} or completed.get('schema') != SCHEMA:
@@ -851,8 +899,14 @@ class UsageStore:
                         zero_launch.append((entry, started.get('started_at')))
                     else:
                         counted.append(entry)
+                        counted_why.append('run %s ended %s' % (entry['run_id'][:8], record.get('reason')))
             if counted and (repeat_reason is None or len(counted) >= 2):
-                raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; use evidence or one justified repeat', counted[-1]['start'])
+                spent_repeat = len(counted) >= 2  # the first attempt plus the one declared repeat
+                raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; %s (counted attempts: %d; '
+                                 'last: %s)' % (
+                                     'the one declared repeat is already used, so change the packet instead'
+                                     if spent_repeat else 'use evidence or one justified repeat (--repeat-reason)',
+                                     len(counted), counted_why[-1]), counted[-1]['start'])
             recent = [entry for entry, at in zero_launch if within_window(at, ZERO_LAUNCH_WINDOW)]
             if len(recent) >= ZERO_LAUNCH_CAP:
                 raise GuardError('BUDGET_EXHAUSTED', 'Repeated infrastructure refusals before any provider launch '
@@ -1080,7 +1134,8 @@ class UsageStore:
         return removed
 
     def _auto_reconcile_locked(self, run_id):
-        """Reconcile one reservation only when its owner is provably dead on this host past its deadline.
+        """Reconcile one reservation only when its owner is provably dead on this host past its deadline, or, for a
+        completed run with complete child evidence, probed dead on this host, boot and pid namespace before it.
 
         Never writes a FINAL or completion: the run stays UNKNOWN / NO_RESULT, exactly like a manual
         reconciliation, with the liveness facts as evidence. Cross-host owners stay uncertain.
@@ -1113,7 +1168,12 @@ class UsageStore:
         if liveness['state'] != 'DEAD':
             report['why'] = 'owner ' + liveness['state'].lower() + ': ' + liveness['why']
             return report
-        if not liveness['past_deadline']:
+        # goodqa#16811: the deadline is waived only for a completed run (FINAL-bound, complete child evidence below)
+        # whose owner and children were probed dead on this host, boot and pid namespace. A reboot-inferred death,
+        # another boot (possibly another machine with the same name), a legacy record without a namespace and every
+        # incomplete run keep the deadline.
+        early = final is not None and liveness['same_instance'] is True
+        if not liveness['past_deadline'] and not early:
             report['why'] = 'dead owner before deadline'
             return report
         if final is None and not incomplete_reboot_proven(start):
@@ -1122,12 +1182,17 @@ class UsageStore:
         if final is not None and not self._completed_children_proven(start, final, children):
             report['why'] = 'completed uncertain launch/child evidence is incomplete'
             return report
-        evidence = ('pid %d on host %s: %s; deadline %s; checked %s' % (
-            liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat()))[:500]
-        reason = 'Owner process provably dead on this host past its deadline'
+        evidence = ('pid %d on host %s: %s; deadline %s; checked %s%s' % (
+            liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat(),
+            '' if liveness['past_deadline'] else '; same host, boot and pid namespace'))[:500]
+        if liveness['past_deadline']:
+            reason, why = 'Owner process provably dead on this host past its deadline', 'owner dead past deadline'
+        else:
+            reason = 'Owner process and children probed dead on this host, boot and pid namespace before the deadline'
+            why = 'owner probed dead before deadline'
         report['pools'] = self._publish_reconciliation(run_id, kind='automatic_reconciliation', actor=AUTO_ACTOR,
                                                        reason=reason, evidence=evidence)
-        report.update(reconciled=True, why='owner dead past deadline')
+        report.update(reconciled=True, why=why)
         return report
 
     def auto_reconcile(self, run_id):
@@ -1304,16 +1369,40 @@ class Run:
 
 
 def zero_launch_attempt(final):
-    """True only when the attempt provably launched no provider and was refused by infrastructure.
+    """True only when the attempt did no provider work and was refused by infrastructure.
 
-    Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and uncertain ones (TIMEOUT,
-    UNKNOWN) count as attempts even with zero launches.
+    That is either no launch at all (execution NOT_STARTED), or launches that each ended in the provider's own
+    terminal refusal (quota, auth, model unavailable) before any review work, recorded per provider in
+    usage.provider_attempts (goodqa#16725). Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and
+    uncertain ones (TIMEOUT, UNKNOWN) count as attempts even with zero launches.
     """
     usage = final.get('usage') if isinstance(final.get('usage'), dict) else {}
     launches = usage.get('provider_launches')
-    if type(launches) is not int or launches != 0 or usage.get('reported', []) != []:
+    if type(launches) is not int or launches < 0 or usage.get('reported', []) != []:
         return False
-    return final.get('execution') == 'NOT_STARTED' and final.get('reason') in ZERO_LAUNCH_REASONS
+    if final.get('reason') not in ZERO_LAUNCH_REASONS:
+        return False
+    if launches == 0:
+        return final.get('execution') == 'NOT_STARTED'
+    return final.get('execution') == 'COMPLETED' and refused_before_work(usage.get('provider_attempts'), launches)
+
+
+PROVIDER_ATTEMPT_KEYS = frozenset({'provider', 'launched', 'reason', 'refused_before_work'})
+
+
+def refused_before_work(attempts, launches):
+    """Every launch in the per-provider record was refused by its provider before work, and they add up."""
+    if not isinstance(attempts, list) or not 0 < len(attempts) <= 8:
+        return False
+    total = 0
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or set(attempt) != PROVIDER_ATTEMPT_KEYS:
+            return False
+        launched = attempt['launched']
+        if type(launched) is not int or launched < 0 or (launched and attempt['refused_before_work'] is not True):
+            return False
+        total += launched
+    return total == launches
 
 
 def within_window(started_at, seconds):
