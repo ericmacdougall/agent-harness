@@ -192,6 +192,16 @@ def rung_of(events, policy):
     return {'rung': rung, 'failures_at_rung': fails, 'fingerprint': current, 'climbs': climbs}
 
 
+TIMEOUT_WHY = re.compile(r'\((?:TIMEOUT|BUDGET_EXHAUSTED)\)$')
+
+
+def is_timeout_event(event):
+    """A launched review that ended on a reviewer timeout or an exhausted run budget (goodqa#16947). classify() makes
+    it NOT_COUNTED, so it never climbs the ladder, but record() still charges it to the launch and spend ceilings."""
+    return (isinstance(event, dict) and event.get('kind') == 'review' and event.get('class') == 'NOT_COUNTED'
+            and bool(TIMEOUT_WHY.search(str(event.get('why') or ''))))
+
+
 def ladder_status(state, policy):
     """What the ladder allows now: the computed rung, whether a climb limit or cost ceiling blocks."""
     computed = rung_of(state['events'], policy)
@@ -206,7 +216,52 @@ def ladder_status(state, policy):
     needs_permission = policy['rungs'][computed['rung']]['needs_user_permission']
     return {**computed, 'blocked_by': blocked, 'needs_user_permission': needs_permission,
             'permission': state.get('permission'), 'task': state['task'],
+            'launches': state.get('launches', 0), 'spend_usd': state.get('spend_usd', 0),
+            'timeout_launches': sum(1 for event in state['events'] if is_timeout_event(event)),
             **dispatch_summary(state, computed['rung'], policy)}
+
+
+def limit_note(status, policy):
+    """Why a task is at a ladder limit and the one way on, or '' (goodqa#16947).
+
+    Timeouts are named because they spend the launch and spend ceilings without counting as ladder failures, so an
+    owner can tell a reviewer that ran out of time from repeated findings. The ledger has no waiver or reset for a
+    ceiling: its reset codes cover unreadable state only, so the note never points at one."""
+    blocked = list(status.get('blocked_by') or [])
+    if not blocked:
+        return ''
+    limits = policy['ladder_limits']
+    spent = []
+    if 'max_review_launches' in blocked:
+        spent.append('%d of %d review launches spent' % (status.get('launches', 0), limits['max_review_launches']))
+    if 'max_total_review_usd' in blocked:
+        spent.append('$%g of $%g review budget spent' % (status.get('spend_usd', 0), limits['max_total_review_usd']))
+    if 'max_rung_climbs' in blocked:
+        spent.append('%d automatic climbs, more than the %d allowed' % (status.get('climbs', 0), limits['max_rung_climbs']))
+    text = 'ladder limit reached for task %s (%s): %s' % (status.get('task'), ', '.join(blocked), '; '.join(spent))
+    timeouts = status.get('timeout_launches', 0)
+    if timeouts and ('max_review_launches' in blocked or 'max_total_review_usd' in blocked):
+        text += ('. %d of the %d spent launches were reviewer timeouts: they are not counted as ladder failures, but '
+                 'each still spent a launch and its rung review budget' % (timeouts, status.get('launches', 0)))
+    return text + ('. Way on: human sign-off needed. The ledger has no waiver or reset for a ladder limit (its reset '
+                   'codes are for unreadable state), so take it to main for the user rather than resetting or renaming '
+                   'the task')
+
+
+def event_note(status, policy):
+    """How the receipt just recorded counted on the ladder, in words (goodqa#16947), or ''."""
+    if status.get('replayed'):
+        return 'this receipt was already recorded'
+    event = status.get('event')
+    if not isinstance(event, dict):
+        return ''
+    text = 'this review %s (%s)' % (event.get('class'), event.get('why'))
+    if is_timeout_event(event):
+        limits = policy['ladder_limits']
+        text += (': a timeout is not counted as a ladder failure, but it spent review launch %d of %d and the rung '
+                 'review budget ($%g of $%g)' % (status.get('launches', 0), limits['max_review_launches'],
+                                                 status.get('spend_usd', 0), limits['max_total_review_usd']))
+    return text
 
 
 # ---- Dispatch records (goodqa#15794, spec h17 r6): which model a spawn actually ran on --------------------------

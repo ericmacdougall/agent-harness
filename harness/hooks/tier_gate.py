@@ -169,7 +169,8 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     if subagent_type == 'fork' and policy['rungs'][target_rung]['writable'] and target_rung != policy['lowest_rung']:
         return 'deny', 'fork inherits the parent model, which the ladder cannot verify for task %s at rung %s; spawn a typed agent' % (task, target_rung), None, facts
     if blocked and not is_reviewer:
-        return 'deny', 'ladder limit reached for task %s (%s): human sign-off needed' % (task, ', '.join(blocked)), None, facts
+        # goodqa#16947: the shared wording names timeouts that spent the ceilings and the one way on.
+        return 'deny', esc.limit_note(status, policy), None, facts
     if requested is None:
         updated = {**tool_input, 'model': target['model'], 'effort': target['effort']}
         return 'allow', 'rung %s applied (no model named)' % target_rung, updated, facts
