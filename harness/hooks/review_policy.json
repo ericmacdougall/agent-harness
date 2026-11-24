@@ -19,6 +19,13 @@
     ]
   },
   "snapshot_timeout": {"base_seconds": 1800, "per_gib_seconds": 60, "max_seconds": 7200},
+  "provider_timeout": {
+    "_comment": "goodqa#16947: per-provider review deadline in seconds, by reviewer rung (by_rung wins) then effort. The run budget is twice the deadline (the primary plus one fallback). The code ceiling is 3600; a malformed entry falls back to 720. The larger budgets are an assumption: finished R2-R4 durations before this change were cut off at the old 720 second cap.",
+    "by_effort": {"low": 720, "medium": 720, "high": 1200, "xhigh": 1800, "max": 2700},
+    "by_rung": {},
+    "default_seconds": 720,
+    "ceiling_seconds": 3600
+  },
   "usage_limit_phrases": [
     "hit your usage limit",
     "usage limit reached",

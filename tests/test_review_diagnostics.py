@@ -206,11 +206,16 @@ class SnapshotTimeoutTests(unittest.TestCase):
             self.assertEqual(rd.scaled_snapshot_timeout(size, policy), 1800, garbage)
         self.assertEqual(rd.parse_pack_bytes('count: 1\nsize: 4\nsize-pack: 6\nsize-garbage: 99\n'), 10 * 1024)
 
-    def test_provider_budget_constants_are_unchanged(self):
+    def test_provider_budget_comes_from_the_policy_and_medium_is_unchanged(self):
+        # goodqa#16947 replaced the fixed 720/1440/2880 caps with provider_timeout in review_policy.json; the snapshot
+        # deadline stays separate from it, and a medium reviewer keeps 720 per provider (1440 per run, 2880 in all).
+        policy = rd.load_policy()
+        self.assertEqual(rd.provider_deadline(policy, 'R1', 'medium')[0], 720)
+        self.assertEqual(rd.scaled_snapshot_timeout(0, policy), 1800)
         source = (HOOKS / 'peer_review.py').read_text()
-        self.assertIn("min(1440, run_record.timeout if run_record else 1440)", source)
-        self.assertIn("timeout = min(720, options.get('timeout', 720), remaining)", source)
-        self.assertIn("timeout=1440, aggregate_timeout=2880", source)
+        self.assertNotIn('min(720', source)
+        self.assertNotIn('timeout=1440', source)
+        self.assertIn('timeout=2 * provider_seconds, aggregate_timeout=4 * provider_seconds', source)
 
 
 class ExecutableTrustTests(unittest.TestCase):
