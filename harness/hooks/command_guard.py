@@ -2674,29 +2674,44 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
 
 
 def _clean_reason(reason):
-    """A verifier reason made safe to print: printable ASCII only, 160 characters, no path."""
+    """A verifier reason made safe to print: printable ASCII only, 160 characters. Its text is the verifier's own, so it
+    may name a remote or up to five ignored files of the worktree, as it did before goodqa#16943."""
     return re.sub(r'[^\x20-\x7e]', '?', str(reason))[:160]
+
+
+WORKTREE_ROUTE_HOSTS = ('t2-dev',)  # the remote hosts `ah worktree-remove` serves (ah_worktree.REMOTE_HOSTS)
+# goodqa#16943, #333 review rounds 1 to 3: the route advice and the prune step are constant text with placeholders. The
+# guard fills in no path, host or remote of its own, because any value it resolves can differ from what the kernel or git
+# resolves (symlinked parents with `..`, a stale working directory, another host's ~, a container's filesystem); the
+# verifier the route runs decides the real path. The verifier reason printed before them is unchanged by this and may
+# still name a remote, ignored files or the target's basename, as it did before.
+WORKTREE_ROUTE = ('python3 -I ~/.claude/hooks/ah.py worktree-remove --host <local|%s> --path <absolute path of the '
+                  'worktree> --reason "<why>" [--remote-auth] (one worktree per call, no --force, audited; add '
+                  '--remote-auth when the repository is private, so the host reads its remote with its own credentials)'
+                  % '|'.join(WORKTREE_ROUTE_HOSTS))
+WORKTREE_PRUNE_STEP = ('run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the '
+                       'checkout the worktree was added from) first, but only when every fetch refspec of that remote '
+                       'writes under refs/remotes/<that remote>/ and pruneTags is not set; prune deletes local branches '
+                       'or tags through any other destination (for example +refs/*:refs/* or '
+                       '+refs/heads/*:refs/heads/up/*)')
 
 
 def _worktree_instead(reason):
     """The advice for a refused `git worktree remove`: the verifier's reason, its next step, and the delegated route
-    (ah worktree-remove runs the full verifier, on this Mac or t2-dev). None when no reason is known."""
+    (ah worktree-remove runs the full verifier, on this Mac or t2-dev), all in fixed text. None when no reason is known."""
     if not reason:
         return None
-    return ('verifier: %s. %s%s' % (_clean_reason(reason), (_worktree_next_step(reason) or '') + '; or ' if
-                                    _worktree_next_step(reason) else '',
-                                    'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local|t2-dev --path <abs path> '
-                                    '--reason <why> (no --force; audited)'))
+    step = _worktree_next_step(reason)
+    return 'verifier: %s. %s%s' % (_clean_reason(reason), step + '; then ' if step else '', WORKTREE_ROUTE)
 
 
 def _worktree_next_step(reason):
     """What to do about a verifier reason (None when there is nothing specific to say). Never advises discarding work."""
     reason = str(reason or '')
     if 'stale or names a moved' in reason:
-        return 'run git fetch --prune <remote> in the repository, then repeat the removal'
+        return WORKTREE_PRUNE_STEP
     if 'did not answer' in reason:
-        return ('the guard reads the remote without credentials; for a private repository use '
-                'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path <abs path> --reason <why> '
+        return ('the guard reads the remote without credentials; for a private repository use the route below with '
                 '--remote-auth')
     if 'not clean' in reason or 'ignored' in reason:
         return ('if the worktree is yours, commit and push what you need and move out any ignored files you want to keep; '
@@ -5826,16 +5841,19 @@ class Analyzer:
             targets = _nondash(args[i + 2:])
             one_target = len(targets) == 1  # the verifier judged ONE path; with several its reason belongs to none
             for w in targets:
-                refused = self.refuse('git worktree remove', w,
-                                      instead=_worktree_instead(getattr(self, '_worktree_reason', None) if rest[:1] == ['remove'] and one_target else None))
-                if rest[:1] == ['remove'] and not refused:
-                    reason = getattr(self, '_worktree_reason', None) if one_target else None
+                if rest[:1] != ['remove']:
+                    self.refuse('git worktree remove', w)
+                    continue
+                # goodqa#16943: every refused removal names the sanctioned route, in fixed text with placeholders only
+                reason = getattr(self, '_worktree_reason', None) if one_target else None
+                refused = self.refuse('git worktree remove', w, instead=_worktree_instead(reason) or WORKTREE_ROUTE)
+                if not refused:
+                    step = _worktree_next_step(reason)
                     ctx.add(LOG_DELETE, 'linked-worktree-remove',
                             'git worktree remove is allowed only for one verified clean, published, registered linked '
                             'worktree top; this target or command shape is not verified'
                             + (' (verifier: %s)' % _clean_reason(reason) if reason else ''),
-                            _worktree_next_step(reason) or
-                            'use the standalone literal non-forced form after cleaning and publishing the worktree')
+                            (step + '; then ' if step else '') + WORKTREE_ROUTE)
         if sub == 'init' and rest:
             for w in _nondash(args[i + 1:])[-1:]:
                 self.note_created(_join_word(w, '.git'))
