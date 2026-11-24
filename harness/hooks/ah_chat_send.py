@@ -13,7 +13,7 @@ clientMsgId null, so the server has no dedupe for a DM. A retry after a lost ans
   case) is refused for SAME_TEXT_WINDOW seconds after ANY earlier attempt, whatever
   its outcome (sent, uncertain, or a crash that left only the pending row). The one exception: every earlier attempt was
   answered by a definite refusal before anything was stored: the user-token approval gate (NOT_STORED: approval required,
-  pending, expired, denied or for other text) or another gate or route refusal (REFUSED_CODES, REFUSED_HTTP: `refused`). That
+  pending, expired, denied or for other text) or a refusal cited line by line in REFUSED_SOURCES (`refused`). That
   gate runs before the route handler stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 at
   a70289c7). When it asks for approval the result prints the approval id; once the user approves it in the web app, the
   same command with --approval-id sends that exact body (the server binds the permit to it) and consumes the permit.
@@ -92,18 +92,29 @@ LOCK_WAIT = 30  # seconds a send waits for another one to finish before it answe
 NOT_STORED = {"human_approval_required": "approval_required", "human_approval_pending": "approval_pending",
               "approval_expired": "approval_refused", "approval_denied": "approval_refused",
               "approval_mismatch": "approval_refused"}
-# Other definite refusals, answered before anything is stored (bugtracker at a70289c7), so status `refused` frees the text:
-# - the DM route's own 4xx (dm/routes.ts POST /orgs/:orgId/dm/:userId, messaging/access.ts): every one is raised before
-#   appendMessage commits or inside its transaction (rolled back); the steps after the commit raise no 4xx;
-# - the user-token gate (user-tokens/auth-gate.ts), which runs before the route.
-# goodqa#16399: the first live send got not_found here (goodqa#17013: a user token cannot reply in an existing DM) and was
-# reported as uncertain with no reason. Every other code, a 5xx, a timeout, a JSON-RPC error or a plain-text MCP error stays
-# uncertain: none of those proves that nothing was stored.
-REFUSED_CODES = frozenset(("not_found", "forbidden", "bad_request", "unauthorized", "user_token_non_delegable",
-                           "user_token_ability_missing", "user_token_rate_limited", "user_token_locked_out",
-                           "desktop_token_session_scope", "commander_ceiling"))
-REFUSED_HTTP = frozenset((401, 403, 429))  # the MCP endpoint refused the request itself, so no tool ran
-FREE_STATUSES = frozenset(NOT_STORED.values()) | {"refused"}
+# The GoodQA server commit (bugtracker origin/main) the refusal table below was checked against, line by line. A GoodQA
+# change to send_direct_message, its route or the code it raises needs this table re-checked and this commit moved; the
+# test RefusalTable pins both, so a code cannot be added without a cited place where it is raised.
+REFUSAL_CHECKED_AT = "a70289c740da"
+# Other definite refusals, each with where it is raised before the message is stored, so status `refused` frees the text.
+# Only what is established line by line is here. send_direct_message (apps/api/src/modules/mcp/tools.ts:1891-1904) is a
+# thin call of POST /v1/orgs/:orgId/dm/:userId whose error body passes through unchanged (tools.ts:468-484 toToolResult),
+# and that route stores with appendMessage at apps/api/src/modules/dm/routes.ts:250. After that commit the route runs
+# actorForMessage, blockedCounterpartIds, createNotifications and sendEmails (dm/routes.ts:281-316), none of which
+# raises not_found (message-actor.ts, user-blocks.ts and notify.ts hold no Errors.notFound). Every other code
+# (forbidden, bad_request, the user-token gate's other codes), every HTTP status, a 5xx, a timeout, a JSON-RPC error and
+# a plain-text MCP error stays `uncertain`, with its recorded reason: none of them is cited here yet. goodqa#16399: the
+# first live send got not_found (goodqa#17013: a user token cannot reply in an existing DM) and was reported as uncertain
+# with no reason.
+REFUSED_SOURCES = {
+    "not_found": ("apps/api/src/lib/ai-invocation.ts:218 (assertAiPrivateConversation), reached from "
+                  "apps/api/src/modules/messaging/access.ts:465 (requireConversationAccess) at "
+                  "apps/api/src/modules/dm/routes.ts:187, and dm/routes.ts:190 (a scoped token opening a new DM), both "
+                  "before appendMessage at dm/routes.ts:250"),
+}
+REFUSED_CODES = frozenset(REFUSED_SOURCES)
+APPROVAL_STATUSES = frozenset(NOT_STORED.values())
+FREE_STATUSES = APPROVAL_STATUSES | {"refused"}
 SERVER_CODE_RE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
 EXCEPTION_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 # Characters never sent: every control (Cc) but the line break, every format character (Cf: bidi overrides and isolates,
@@ -610,9 +621,7 @@ def _outcome_of(error):
     status = "uncertain"
     if error.code in ("tool_error", "not_found", "http_error") and code in NOT_STORED:
         status = NOT_STORED[code]
-    elif error.code in ("tool_error", "not_found") and code in REFUSED_CODES:
-        status = "refused"
-    elif error.code == "http_error" and http in REFUSED_HTTP:
+    elif error.code == "not_found" and code in REFUSED_CODES:  # the tool's own not_found, never an HTTP-level 404
         status = "refused"
     return status, error.code, code, http
 
@@ -736,7 +745,7 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
             failure = None if message_id else "no_message_id"
         except ChatError as error:
             status, failure, code, http = _outcome_of(error)
-            approval_id = getattr(error, "approval_id", None) if status in FREE_STATUSES else None
+            approval_id = getattr(error, "approval_id", None) if status in APPROVAL_STATUSES else None
         except Exception as error:  # noqa: BLE001 - PR 337 F2: any other failure of the one request (an http.client error
             status, failure, code, http = _outcome_of(error)  # such as IncompleteRead, a bug) is uncertain; rows still run
         why = {"failure": failure, "server_code": code, "http_status": http} if failure else {}

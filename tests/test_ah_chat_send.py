@@ -9,6 +9,7 @@ Run: python3 -I -m unittest tests.test_ah_chat_send
 """
 import json
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -668,18 +669,40 @@ class Reasons(SendBase):
         self.assertEqual(self.result(self.send())["status"], "sent")  # nothing was stored, so the same text may go
         self.assertEqual(len(self.sends()), 2)
 
-    def test_each_gate_or_route_refusal_is_refused_with_its_code(self):
-        for code in ("forbidden", "bad_request", "user_token_rate_limited", "user_token_ability_missing", "commander_ceiling"):
+    def test_an_uncited_refusal_stays_uncertain_with_its_code_and_holds_the_text(self):
+        # PR 341 review F1: only a code cited line by line in REFUSED_SOURCES frees the text; the rest keep their reason
+        for n, code in enumerate(("forbidden", "bad_request", "unauthorized", "user_token_rate_limited",
+                                  "user_token_ability_missing", "commander_ceiling")):
+            self.write("message %d" % n)
             self.stub.tools["send_direct_message"] = lambda a, code=code: tool_error(code)
             data = self.result(self.send())
-            self.assert_reason(data, "refused", "tool_error", code)
+            self.assert_reason(data, "uncertain", "tool_error", code)
             self.assertNotIn("goodqa#17013", data["next"])
+            self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
+            self.assertEqual(self.result(self.send())["code"], "duplicate", code)
 
-    def test_the_mcp_endpoint_refusing_the_request_is_refused_with_its_http_status(self):
-        self.stub.tools["send_direct_message"] = lambda a: (429, {"error": {"code": "user_token_rate_limited"}})
-        self.assert_reason(self.result(self.send()), "refused", "http_error", "user_token_rate_limited", 429)
-        self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
-        self.assertEqual(self.result(self.send())["status"], "sent")
+    def test_an_http_refusal_stays_uncertain_with_its_status_and_holds_the_text(self):
+        for n, (status, code) in enumerate(((429, "user_token_rate_limited"), (403, "forbidden"), (401, "unauthorized"),
+                                            (404, "not_found"))):  # an HTTP-level 404 is not the tool's own not_found
+            self.write("message %d" % n)
+            self.stub.tools["send_direct_message"] = lambda a, status=status, code=code: (status, {"error": {"code": code}})
+            self.assert_reason(self.result(self.send()), "uncertain", "http_error", code, status)
+            self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
+            self.assertEqual(self.result(self.send())["code"], "duplicate", status)
+
+    def test_a_refusal_that_is_not_an_approval_never_prints_an_approval_id(self):
+        # PR 341 review F3: a permit id is printed only for the approval statuses
+        real = ah_chat_send.chat.Client.tool
+
+        def tool(client, name, arguments):
+            if name != "send_direct_message":
+                return real(client, name, arguments)
+            missing = ah_chat_send.ChatError("not_found", "GoodQA says not_found", 3)
+            missing.server_code, missing.approval_id = "not_found", "0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b"
+            raise missing
+        data = self.in_process(tool=(ah_chat_send.chat.Client, "tool", tool))
+        self.assertEqual(data["status"], "refused")
+        self.assertNotIn("approval_id", data)
 
     def test_a_server_error_or_an_unknown_code_stays_uncertain_with_its_reason_and_holds_the_text(self):
         for n, (answer, failure, code, http) in enumerate((
@@ -723,6 +746,29 @@ class Reasons(SendBase):
         self.assertEqual(data["status"], "sent")
         for row in (data, self.outcome(), self.wal_send()):
             self.assertFalse({"failure", "server_code", "http_status"} & set(row), row)
+
+
+class RefusalTable(unittest.TestCase):
+    """PR 341 review F1 and F2: a code frees the text only with a cited place where GoodQA raises it before storing the
+    message, at the one server commit the table was checked against. Moving either forces a re-check of every line."""
+    CITED = re.compile(r"apps/api/src/[\w/.-]+\.ts:\d+")
+
+    def test_the_table_is_exactly_the_cited_codes(self):
+        self.assertEqual(set(ah_chat_send.REFUSED_SOURCES), {"not_found"})
+        self.assertEqual(ah_chat_send.REFUSED_CODES, frozenset(ah_chat_send.REFUSED_SOURCES))
+
+    def test_every_entry_cites_where_it_is_raised_and_where_the_message_is_stored(self):
+        for code, where in ah_chat_send.REFUSED_SOURCES.items():
+            self.assertTrue(self.CITED.search(where), code)
+            self.assertIn("before appendMessage at dm/routes.ts:250", where, code)
+
+    def test_the_table_is_pinned_to_the_server_commit_it_was_checked_against(self):
+        self.assertEqual(ah_chat_send.REFUSAL_CHECKED_AT, "a70289c740da",
+                         "GoodQA moved: re-check every cited line in REFUSED_SOURCES, then move both")
+
+    def test_only_the_approval_statuses_carry_a_permit(self):
+        self.assertEqual(ah_chat_send.APPROVAL_STATUSES, frozenset(ah_chat_send.NOT_STORED.values()))
+        self.assertNotIn("refused", ah_chat_send.APPROVAL_STATUSES)
 
 
 class Limits(unittest.TestCase):
