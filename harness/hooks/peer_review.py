@@ -1932,8 +1932,15 @@ def main() -> int:
         if not args.no_main_stamp:
             args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
         if args.main_stamp is None:
-            print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
-                  'review cannot authorize a merge.', file=sys.stderr)
+            # goodqa#16811: the hook that decides names its reason in the agent's context; this note lists every cause
+            # instead of implying the caller is not main.
+            print('Note: no main-agent stamp for this --github-repo/--pr run; this review cannot authorize a merge. '
+                  + ('--no-main-stamp was given. ' if args.no_main_stamp else
+                     "The merge-gate hook's own note gives the reason when it minted none: not the proven main agent, "
+                     'not one plain python3 .../peer_review.py command (an unquoted ; & | < >, a newline, a backslash, '
+                     'or a $ or backtick even inside double quotes), or a missing or repeated --github-repo/--pr. A '
+                     'stamp is also single use and expires after %d s. ' % caller_identity.STAMP_TTL_SECONDS)
+                  + 'Fix the cause and rerun once with --repeat-reason in single quotes.', file=sys.stderr)
     if before[1]:
         target.close()
         evidence.close()

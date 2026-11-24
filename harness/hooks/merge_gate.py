@@ -1932,8 +1932,9 @@ def _shell_like(name):
     return name in SHELL_TOOLS or name.startswith(("bash", "shell", "exec"))
 
 
-def decide(payload, runner, state_dir, now=None):
-    """(exit code, stderr text) for one PreToolUse payload."""
+def decide(payload, runner, state_dir, now=None, notes=None):
+    """(exit code, stderr text) for one PreToolUse payload. `notes`, when a list, collects non-blocking context for
+    the agent (goodqa#16811: why a PR review minted no review-auth stamp); it never changes the decision."""
     state_dir = Path(state_dir)
     now = now if now is not None else time.time()
     tool = str(payload.get("tool_name") or "")
@@ -1952,7 +1953,9 @@ def decide(payload, runner, state_dir, now=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
-    if subagent and PEER_REVIEW_AUTH.search(plain):
+    # A quoted `;` before the binding flags hides them from PEER_REVIEW_AUTH; the token scan still sees them.
+    bound_review = _launches_bound_review(command)
+    if subagent and (PEER_REVIEW_AUTH.search(plain) or bound_review):
         return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
                    "--pr); run it without the GitHub binding, or ask the main agent.")
     # goodqa#15684: a missing agent_id is not proof of main (Codex hook payloads never carry one), so the waiver path
@@ -1963,8 +1966,10 @@ def decide(payload, runner, state_dir, now=None):
     stamp = None
     if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _may_record_waiver(payload):
         stamp = _stamp_waive(command, payload, state_dir)  # written only if this decision allows (red-team M1)
-    if PEER_REVIEW_AUTH.search(plain):
-        _stamp_review(command, payload, now)
+    if PEER_REVIEW_AUTH.search(plain) or bound_review:
+        note = _stamp_review(command, payload, now, launches=bound_review)
+        if note and isinstance(notes, list):
+            notes.append(note)
     merges = find_merges(command, cwd=cwd)
     if not merges:
         return _allow(stamp, state_dir, now)
@@ -2012,8 +2017,8 @@ def _may_record_waiver(payload):
 
 def _plain_waive(command):
     """Only ONE plain `python3 [-I] .../merge_gate.py waive ...` command mints the stamp: no newline, `;`, `&`, `|`,
-    backtick, `<`, `>` or `$(` anywhere (so no echo, printf, pipe, redirect, wrapper or quoted separator), the same
-    rule `_plain_peer_review` applies to the review stamp."""
+    backtick, `<`, `>` or `$(` anywhere (so no echo, printf, pipe, redirect, wrapper or quoted separator). This stays
+    stricter than the review stamp's quote-aware `_review_binding` (goodqa#16811 changed only the review stamp)."""
     if _SHELL_SYNTAX.search(command):
         return False
     try:
@@ -2146,53 +2151,164 @@ def _stamp_waive(command, payload, state_dir):
             "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)")
 
 
-def _stamp_review(command, payload, now):
-    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
+def _stamp_review(command, payload, now, launches=None):
+    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main.
+
+    The repo and PR are read from the argv _review_binding validated, never from a second tokenizer, so text inside a
+    quoted --repeat-reason cannot rebind the stamp. Returns None when it minted a stamp or the command does not launch
+    a bound peer_review.py; otherwise a short note naming why no stamp was minted (goodqa#16811). The note is output
+    only and never changes the decision."""
     import caller_identity  # noqa: PLC0415
-    if not _plain_peer_review(command):
-        return
+    launches = _launches_bound_review(command) if launches is None else launches
+    binding, cause = _review_binding(command)
+    if binding is None:
+        return _review_note(cause) if launches else None
     if not caller_identity.is_main(payload):
         # A Codex Desktop root is accepted here for the review receipt and, by the user's decision (answer
         # b6714826, goodqa#15565), for recording merge waivers (_may_record_waiver). Generic main authority still
         # controls protected Stop and owner handoffs.
+        refused = _review_note("this caller is not the proven main agent (a subagent, a spawned child or an "
+                               "unverified session never mints one)")
         try:
             from native_main import is_desktop_review_root  # noqa: PLC0415
             if is_desktop_review_root(payload) is not True:
-                return
+                return refused
         except Exception:
-            return
-    tokens, _ = tokenize(command)
-    values = {}
-    for index, token in enumerate(tokens):
-        for name in ("--github-repo", "--pr"):
-            if token == name and index + 1 < len(tokens):
-                values[name] = tokens[index + 1]
-            elif token.startswith(name + "="):
-                values[name] = token.split("=", 1)[1]
-    if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
-        caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
-                                  session=str(payload.get("session_id") or ""), now=now)
+            return refused
+    caller_identity.put_stamp("review-auth", [binding["--github-repo"], int(binding["--pr"])],
+                              session=str(payload.get("session_id") or ""), now=now)
+    return None
 
 
-_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")
+_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")  # _plain_waive's rule (unchanged): refused anywhere, even quoted
 _PYTHON = re.compile(r"python3?(?:\.\d+)?")
+_PYTHON_FLAGS = ("-I", "-u", "-B", "-E", "-s")
+_REVIEW_BINDING = ("--github-repo", "--pr")
+# Outside quotes these make the line more than one plain command, or let the shell rewrite its words.
+_REVIEW_UNQUOTED = {";": "a compound command", "&": "a compound or background command", "|": "a pipe",
+                    "<": "a redirect", ">": "a redirect", "`": "a command substitution", "\\": "a backslash escape"}
+_REVIEW_NOTE_LIMIT = 900
 
 
-def _plain_peer_review(command):
-    """Delta red-team D-F6: only a single plain `python3 [-I] .../peer_review.py ...` command mints the stamp, not an
-    echo, a heredoc, a comment or a compound command that merely mentions its options."""
-    if _SHELL_SYNTAX.search(command):
-        return False
+def _review_note(cause):
+    note = ("merge-gate: no review-auth stamp was minted: " + cause + ". This review cannot authorize a merge. To "
+            "mint one, the main agent runs exactly one plain `python3 ~/.claude/hooks/peer_review.py ... "
+            "--github-repo OWNER/REPO --pr N ... pr` command: punctuation is fine inside quotes, but no unquoted "
+            "`;` `&` `|` `<` `>`, no newline, no backslash and no `$` or backtick even inside double quotes (put "
+            "free text such as --repeat-reason in single quotes).")
+    return note[:_REVIEW_NOTE_LIMIT]
+
+
+def _review_lexical_cause(command):
+    """None when bash, zsh and shlex.split read `command` as the same words of one simple command; otherwise the
+    first reason they might not, with its offset.
+
+    Single-quoted text is opaque. Inside double quotes `$` (any expansion: `"$@"` and `"${a[@]}"` can expand to
+    several words), a backtick, a backslash and `!` are refused. Outside quotes every operator, `$`, backslash and the
+    comment, glob, brace, history and tilde characters of _STAMP_UNSAFE_UNQUOTED are refused (a leading `~/` and an
+    `=` inside a word are allowed). Control characters (newline, CR, tab, NUL, DEL, C1) are refused anywhere:
+    shlex treats CR and tab as spaces where a shell may not."""
+    quote, word_start = None, True
+    for index, char in enumerate(command):
+        at = " at offset %d" % index
+        if char < " " or "\x7f" <= char <= "\x9f":
+            return ("a newline (a second command or a heredoc)" if char == "\n" else
+                    "a control character %r" % char) + at
+        if quote == "'":
+            quote = None if char == "'" else quote
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            elif char == "$" or char == "`":
+                return ("a shell expansion inside double quotes (%r%s); double quotes still expand `$` and "
+                        "backticks" % (char, at))
+            elif char in "\\!":
+                return "%r inside double quotes%s" % (char, at)
+            continue
+        if char == " ":
+            word_start = True
+            continue
+        if char in "'\"":
+            quote = char
+        elif char == "$":
+            nxt = command[index + 1:index + 2]
+            return ("a command substitution (`$(`%s)" % at if nxt == "(" else
+                    "ANSI-C quoting (`$'`%s)" % at if nxt == "'" else "an unquoted shell expansion (`$`%s)" % at)
+        elif char in _REVIEW_UNQUOTED:
+            pair = command[index:index + 2]
+            shown = pair if pair in ("&&", "||", ">>", "<<", "&>", ">&", "|&") else char
+            cause = "a compound command" if shown in ("&&", "||") else _REVIEW_UNQUOTED[char]
+            return "%s (`%s`%s)" % (cause, shown, at)
+        elif char == "~" and word_start and command[index + 1:index + 2] == "/":
+            pass
+        elif char in _STAMP_UNSAFE_UNQUOTED or (char == "=" and word_start):
+            return "an unquoted comment, glob, brace, history or tilde character (%r%s)" % (char, at)
+        word_start = False
+    return "unbalanced quotes" if quote is not None else None
+
+
+def _review_binding(command):
+    """({'--github-repo': repo, '--pr': n}, None) when `command` is exactly one plain `python3 [-I] .../peer_review.py
+    ...` invocation that names each binding flag once with a valid value; otherwise (None, cause).
+
+    Delta red-team D-F6 and goodqa#16811: an echo, a heredoc, a comment, a pipe, a redirect or a compound command
+    that merely mentions the options mints nothing, while `;`, `&`, `|`, `<` and `>` inside a quoted argument (a
+    --repeat-reason) are plain text. The binding comes from this same argv, so a reason holding `--pr 999` is one
+    word and binds nothing; a repeated binding flag mints nothing (argparse keeps the last, the stamp would be ours
+    to guess)."""
+    cause = _review_lexical_cause(command)
+    if cause:
+        return None, "the command is not one plain peer_review.py call: it contains " + cause
     try:
         argv = shlex.split(command, comments=False)
     except ValueError:
-        return False
+        return None, "the command is not one plain peer_review.py call: unbalanced quotes"
     if not argv or not _PYTHON.fullmatch(os.path.basename(argv[0])):
-        return False
+        return None, "the command does not start with python3 (it runs %r)" % (argv[0][:60] if argv else "")
     rest = argv[1:]
-    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+    while rest and rest[0] in _PYTHON_FLAGS:
         rest = rest[1:]
-    return bool(rest) and os.path.basename(rest[0]) == "peer_review.py"
+    if not rest or os.path.basename(rest[0]) != "peer_review.py":
+        return None, "python3 runs %r, not peer_review.py" % (rest[0][:60] if rest else "")
+    binding = {}
+    for index, word in enumerate(rest[1:], start=1):
+        for name in _REVIEW_BINDING:
+            if word == name:
+                value = rest[index + 1] if index + 1 < len(rest) else ""
+            elif word.startswith(name + "="):
+                value = word[len(name) + 1:]
+            else:
+                continue
+            if name in binding:
+                return None, "%s is given more than once" % name
+            binding[name] = value
+    repo, pr = binding.get("--github-repo", ""), binding.get("--pr", "")
+    if not REPO_NAME.fullmatch(repo) or not (pr.isascii() and pr.isdigit() and int(pr) > 0):
+        return None, "it does not name --github-repo OWNER/REPO and a numeric --pr exactly once"
+    return binding, None
+
+
+def _launches_bound_review(command):
+    """True when the command's own words run `python3 [-I] .../peer_review.py` with a --github-repo or --pr flag before
+    the next shell separator. Quoted text stays one word, so a grep pattern, an echo of the command or a commit message
+    that mentions the flags is not a launch. Used to block subagents and to decide whether a no-stamp note is due;
+    _review_binding alone decides a stamp."""
+    tokens, _ = tokenize(command)
+    for index, token in enumerate(tokens):
+        if os.path.basename(token) != "peer_review.py":
+            continue
+        before = index - 1
+        while before >= 0 and tokens[before] in _PYTHON_FLAGS:
+            before -= 1
+        if before < 0 or not _PYTHON.fullmatch(os.path.basename(tokens[before])):
+            continue
+        for word in tokens[index + 1:]:
+            if word in (";", "&&", "||", "|", "&", "|&", "(", ")"):
+                break
+            if word in _REVIEW_BINDING or word.startswith(("--github-repo=", "--pr=")):
+                return True
+    return False
 
 
 def _deadline_seconds():
@@ -2228,7 +2344,8 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
             raise ValueError("payload is not an object")
         payload = parsed
         text = json.dumps(payload.get("tool_input"), ensure_ascii=False)[:MAX_COMMAND_CHARS]
-        code, message = decide(payload, runner or SubprocessGh(), state_dir)
+        notes = []
+        code, message = decide(payload, runner or SubprocessGh(), state_dir, notes=notes)
     except (ValueError, OSError) as error:
         if payload is None:
             stderr.write("merge-gate: hook input is not usable JSON (" + type(error).__name__ + "); blocking.\n")
@@ -2240,6 +2357,10 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
         return _fault(error, text, stderr)
     if code:
         stderr.write(message.rstrip() + "\n")
+    elif notes:
+        # Exit-0 stderr is not shown to the agent; PreToolUse additionalContext is (goodqa#16811, like bg_lint).
+        stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                        "additionalContext": " ".join(notes)[:1000]}}) + "\n")
     return code
 
 
