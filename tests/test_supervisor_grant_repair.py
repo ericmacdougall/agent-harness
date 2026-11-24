@@ -266,7 +266,9 @@ class ProtectedRoots(Env):
         self.grant()
 
     def refused(self, path, kind="scratch"):
-        return self.code(self.check(self.call(), power="delete", target={"kind": kind, "path": path})) == "never_covered"
+        """True when the delete is refused as never covered; False when it is allowed (no assertion either way)."""
+        result = self.check(self.call(), power="delete", target={"kind": kind, "path": path})
+        return not result["ok"] and result["code"] == "never_covered"
 
     def roots(self, home):
         """Every root a log, WAL, transcript or session lives in: the delete guard's Tier A list plus the harness's own
@@ -300,10 +302,28 @@ class ProtectedRoots(Env):
                         self.assertTrue(self.refused(path), path)
 
     def test_harness_logs_root_is_refused(self):
-        """F3, the reviewer's case."""
+        """F3, the reviewer's case. The reason names the log list, not only the general harness-tree rule, so the
+        listed root is what refuses it (the harness-tree rule is a second layer)."""
         for path in ("/.agent-harness/logs", "/.agent-harness/logs/ahd.log", "/.agent-harness"):
             with self.subTest(path=path):
-                self.assertTrue(self.refused(self.home + path))
+                result = self.check(self.call(), power="delete", target={"kind": "scratch", "path": self.home + path})
+                self.assertEqual(self.code(result), "never_covered")
+                self.assertIn("protected log, WAL, transcript, session, policy or guard location", result["message"])
+
+    def test_other_host_paths_are_checked_as_written(self):
+        """macOS resolves /home to /System/Volumes/Data/home, so a t2-dev path is recognisable only as written. The
+        resolution is emulated here so the case is tested on every host."""
+        real = os.path.realpath
+
+        def mac_realpath(path):
+            text = os.fspath(path)
+            return "/System/Volumes/Data" + text if text == "/home" or text.startswith("/home/") else real(text)
+
+        with mock.patch.object(sg.os.path, "realpath", side_effect=mac_realpath):
+            for path in ("/home/eric/.agent-harness/logs", "/home/eric/.claude/projects/-x/s.jsonl",
+                         "/home/eric/.agent-harness/work/S/wals"):
+                with self.subTest(path=path):
+                    self.assertTrue(self.refused(path))
 
     def test_every_log_folder_the_hooks_write_is_refused(self):
         """Guard test: any `.agent-harness/<name>` folder named in the hooks that holds logs, WALs, state or sessions is
@@ -333,11 +353,12 @@ class ProtectedRoots(Env):
         self.assertTrue(self.refused("/home/eric/.agent-harness/work/S/T"))  # another host: contents unknown
 
     def test_the_list_is_the_delete_guards_own(self):
-        extra = "{home}/.agent-harness/new-log-root"
+        """A root added to the delete guard's own policy (outside every harness tree) is refused here too."""
+        extra = "{home}/new-log-root"
         policy = cg.load_policy(path=str(Path(self.home) / "none.json"))
         policy["protected_log_roots"].append(extra)
-        target = self.home + "/.agent-harness/new-log-root/a"
-        self.assertFalse(self.refused(target, kind="build") and False)
+        target = self.home + "/new-log-root/a"
+        self.assertFalse(self.refused(target, kind="build"))  # positive control: not protected before
         with mock.patch.object(cg, "load_policy", return_value=policy):
             self.assertTrue(self.refused(target, kind="build"))
         with mock.patch.object(cg, "load_policy", side_effect=OSError("gone")):
