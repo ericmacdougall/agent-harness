@@ -32,6 +32,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_install.py", "guard_selftest.py", "ah_ticket.py", "ah_chat.py", "ah_chat_send.py", "liveness.py",
          "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
+         "guard_files.py", "launch_check.py", "release_receipt.py",  # ah_install's guard-file gate (goodqa#16944, PR 326a)
          "remote_delete.py", "remote_delete_agent.py",
          "model_tiers.py", "model_tiers.json", "escalation.py", "central_decisions.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",

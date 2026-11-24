@@ -45,6 +45,47 @@ Progress and diagnostics remain in private work directories. An error after appl
 
 The tool repairs installation drift. Codex hook review uses the native `/hooks` command or Settings > Hooks. An audit's model approval still requires its supported consent source, and a verified model result still requires provider execution evidence. Keep application-specific approvals, deployment gates, and enabled or disabled integrations in their established configuration.
 
-For a release that updates the remote hook-file deployment guard itself, use this normal repair flow with the reviewed merged commit. After the refreshed guard is active, the installed `ah.py install-files` command accepts a proven Claude Code main or Codex Desktop root. It checks the existing command form and applies the same remote host, merged source, allowlist, backup, and audit requirements. A Desktop root qualifies through the actual signed runtime and supported GUI ancestry plus the current root metadata. Children and standalone CLI sessions do not inherit that authority.
+For a release that updates the remote hook-file deployment guard itself, use this normal repair flow with the reviewed merged commit. After the refreshed guard is active, the installed `ah.py install-files` command accepts a proven Claude Code main or Codex Desktop root for files that are not guard files (for guard files, see the next section: a Codex main has no guard-file route until goodqa#17054). It checks the existing command form and applies the same remote host, merged source, allowlist, backup, and audit requirements. A Desktop root qualifies through the actual signed runtime and supported GUI ancestry plus the current root metadata. Children and standalone CLI sessions do not inherit that authority.
+
+Guard files have one more gate (goodqa#16944, PR 326a). `harness/hooks/guard_files.py` decides which hook files are
+guard files: the registered PreToolUse and Stop hooks, the listed guard files, everything those import or name, the
+files they read, and the install routes themselves (most of the installed names). The command checks two trees: this
+machine's hooks directory before anything is fetched, and the ref's own `harness/hooks` tree after the fetch and before
+any remote write, so a file that is a guard file only at the ref is still gated. `--resume` and `--rollback` also use the
+run's recorded gate: the start row lists every guard file of the run by either tree, and a row written before PR 326a
+counts every file. The record only adds guard files; it never removes one this machine's tree counts. When a run names
+a guard file, it goes ahead only in one of two ways, and the audit row records which and the launch facts the check saw
+(tty, the qualifying ancestor, any ssh connection or multiplexer):
+
+- **Not launched by a recognised agent process.** `launch_check.py` looks for a terminal on stdin, none of the listed
+  agent variables, no agent-named ancestor, a login session or terminal emulator as an ancestor, and no ssh connection
+  or multiplexer (tmux, screen) unless you type `--from-ssh-or-multiplexer`. The refusal points here and does not name
+  the flag, so an agent that reached your terminal is not handed it (it is still in `--help`). stdout may be piped.
+  **This is a speed bump against careless agents, not a boundary.** An agent can meet it without forging anything, by starting the command in
+  Terminal (`open` of a `.command` file, osascript `do script`), or over ssh or in your tmux server once the flag is
+  typed (PR 345 review, F1). The control that closes those routes is the command guard refusing the install command
+  inside ssh, multiplexer and script-launch bodies for every caller (goodqa#17065, guard lane). Until it lands, F1 is
+  open.
+- **As Claude Code main,** for a new install that is not a downgrade, under four conditions:
+  - mission_gate stamped that exact command in main's own Bash call;
+  - `release_receipt.py` proves the `--from-ref` is the merge commit of one PR into canonical main;
+  - that PR's head has a `settled-review` or `hook` row in the merge-gate waiver log;
+  - the fresh fetch proves the ref is on main.
+
+`--allow-older`, `--resume` and `--rollback` of a guard file are the user's: the main branch does not cover them.
+Whether they should need something only you hold (a password or Touch ID) is the same question as the supervisor
+trust root (PR 326b) and is put to you there.
+
+Limits:
+- The launch check is a speed bump (above). The waiver log and the stamps are same-user files, which a deliberate agent
+  could forge (goodqa#17019).
+- The receipt covers the commit being installed, not each file's history: a guard file last changed by an unreviewed
+  merge or a direct push to main still installs through any later reviewed merge that contains it.
+- An interrupted install by main leaves the host refusing every later install until you resume or roll it back.
+- A terminal panel inside the Claude or Codex desktop app has the app as an ancestor and is refused; use Terminal or
+  iTerm.
+- A Codex main has no guard-file route until goodqa#17054; it hands guard-file installs to a Claude main session.
+- The route covers t2-dev and ah-mac-mini only. A Mac target is goodqa#17031, and refusing agent `--apply` runs of the
+  installers and repair is goodqa#17032.
 
 Git versions below 2.54 cannot activate the installer's global commit-msg backstop. The host's installer reports that limitation. Review it alongside the other install results.

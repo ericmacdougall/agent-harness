@@ -16,6 +16,22 @@ around a guard. This command is the sanctioned route:
   * an audit row on the Mac before the first remote write and after the run, one on the host; an unknown outcome is never
     reported as installed or refused; a host with an unfinished run refuses new runs until it is resumed or rolled back.
 
+Guard files (goodqa#16944, PR 326a; guard_gate below). A run that names a guard file needs one of two branches, and
+the audit start row records which, with the launch facts the check saw. A guard file is one by the hooks directory of
+this machine (checked before the fetch), by the ref's own `harness/hooks` tree (checked after the fetch, before any
+remote write), or, for --resume and --rollback, by the run's recorded gate (a row from before PR 326a counts every file):
+  * not_agent_launched: launch_check.check() finds no recognised agent launcher (a terminal on stdin, none of the listed
+    agent variables, no agent-named ancestor, a login session or terminal emulator as an ancestor, and no ssh connection
+    or multiplexer unless the user typed --from-ssh-or-multiplexer). This is a SPEED BUMP against careless agents, not a
+    boundary: an agent can satisfy it through Terminal (`open x.command`, osascript `do script`) or, with the flag,
+    through ssh or a multiplexer (PR 345 review F1; the command-guard refusal that closes those routes is goodqa#17065). It is the only branch for --allow-older, --resume and --rollback, which are the user's;
+  * main's reviewed release (main's ruling, an interpretation of the user's 2026-11-24 request to stop needing him for
+    commands): a new install, not a downgrade, whose exact argv main's own Bash call stamped (mission_gate, bound to
+    that call, so a sub-agent or a copied script finds no stamp), from a REF that release_receipt.verify() proves is the
+    merge commit of one PR into canonical main with a review receipt of record in the merge-gate log. The fresh fetch
+    below separately proves REF is on canonical main, and the downgrade check refuses a file with a newer merged version.
+A dry run changes nothing and needs neither.
+
 Threat model: careless or hurried agents, not one that edits this module or the audit file.
 """
 from __future__ import annotations
@@ -512,6 +528,7 @@ def fetch_source(ref, names, home, allow_older=False):
                 refuse("%s is not a regular file in the commit (mode %s)" % (path, mode))
             return verified_object(repo, home, "blob", oid), oid, mode
 
+        ref_guard = _ref_guard_subset(repo, home, node, names)
         install_py = blob_at("install.py")[0]
         listed = None
         for stmt in ast.parse(install_py.decode()).body:
@@ -535,9 +552,29 @@ def fetch_source(ref, names, home, allow_older=False):
             if len(data) > MAX_BLOB:
                 refuse("%s is larger than %d bytes" % (name, MAX_BLOB))
             out[name] = (data, oid, mode)
-        return out, listed, main
+        return out, listed, main, ref_guard
     finally:
         shutil.rmtree(repo, ignore_errors=True)
+
+
+def _ref_guard_subset(repo, home, node, names):
+    """The guard files among NAMES as the REF's own `harness/hooks` tree defines them (guard_files.guard_subset over a copy
+    of that tree: Python files and the manifest with their verified bytes, other files as empty placeholders, which is
+    all the closure reads). A ref without that tree makes every name a guard file (PR 345 review F2)."""
+    import guard_files  # noqa: PLC0415 - guard files beside this one
+    cur = node
+    for part in ("harness", "hooks"):
+        if part not in cur or cur[part][0] != "40000":
+            return sorted(set(names))
+        cur = tree_entries(verified_object(repo, home, "tree", cur[part][1]))
+    copy = Path(repo) / "ref-hooks"
+    os.mkdir(copy, 0o700)
+    for name, (mode, oid) in cur.items():
+        if mode not in ("100644", "100755") or not NAME_RE.fullmatch(name):
+            continue
+        wanted = name.endswith(".py") or name == "hooks_manifest.json"
+        (copy / name).write_bytes(verified_object(repo, home, "blob", oid) if wanted else b"")
+    return guard_files.guard_subset(names, copy)
 
 
 HOOK = None
@@ -720,12 +757,65 @@ def results_of(home, run):
     return [r.get("result") for r in audit_rows(home) if r.get("run") == run and r.get("event") == "result"]
 
 
-def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None, allow_older=False):
+HOOKS_DIR = Path(__file__).resolve().parent  # the installed hooks whose guard closure decides what a guard file is
+PROOF_ENV = None  # tests only: a launch_check.Env stand-in (never a flag or a variable an agent could set)
+RECEIPT = None  # tests only: a stand-in for release_receipt.verify
+OPS = {"install": "this install", "resume": "--resume", "rollback": "--rollback"}
+
+
+def guard_gate(host, ref, files, ticket, home, kind_, allow_older=False, forced=(), allow_remote=False):
+    """None when FILES holds no guard file (by the local hooks directory, plus FORCED: the names another tree or the run's
+    record makes guard files); otherwise the branch that allows this run ({"branch": "not_agent_launched", "facts": ...}
+    or {"branch": "main-release", ...receipt}), or InstallError("guard_file", ...). Runs before any remote write."""
+    import guard_files  # noqa: PLC0415 - guard files beside this one
+    guard = sorted(set(guard_files.guard_subset(files, HOOKS_DIR)) | set(forced))
+    if not guard:
+        return None
+    import launch_check  # noqa: PLC0415
+    reason, facts = launch_check.check(PROOF_ENV, allow_remote)
+    if reason is None:
+        return {"branch": launch_check.BRANCH, "guard_files": guard, "facts": facts}
+    head = "%s names guard file(s) %s" % (OPS[kind_], ", ".join(guard))
+    main_route = ("An agent's only route is main's new install: main's own Bash call of the exact command, from the merge "
+                  "commit of a reviewed PR on canonical main")
+    if kind_ != "install" or allow_older:
+        refuse("%s. Guard-file downgrade (--allow-older), --resume and --rollback are the user's. %s. (Launch check: %s.)"
+               % (head, main_route, reason), "guard_file", data={"ok": False, "launch_facts": facts})
+    import caller_identity  # noqa: PLC0415
+    if caller_identity.take_stamp(guard_files.INSTALL_STAMP, guard_files.install_stamp_parts(host, ref, files, ticket),
+                                  home=home, bound=True) is None:
+        refuse("%s. No stamp from main's own call covers this exact command (a sub-agent, a script or a copied command "
+               "gets none). %s. (Launch check: %s.)" % (head, main_route, reason), "guard_file",
+               data={"ok": False, "launch_facts": facts})
+    try:
+        if RECEIPT is not None:
+            receipt = RECEIPT(ref)
+        else:
+            import release_receipt  # noqa: PLC0415
+            receipt = release_receipt.verify(ref)
+    except Exception as error:  # noqa: BLE001 - ReceiptError or anything else: no receipt, no install
+        refuse("%s. %s. %s." % (head, error, main_route), "guard_file", data={"ok": False, "launch_facts": facts})
+    return dict(receipt, branch="main-release", guard_files=guard, facts=facts)
+
+
+def recorded_guard(row):
+    """The files a run's start row recorded as guard files. A row without the guard_gate key (written before PR 326a)
+    is unknown, so every file of it counts (fail closed)."""
+    if "guard_gate" not in row:
+        return sorted(row.get("files") or ())
+    return sorted((row.get("guard_gate") or {}).get("guard_files") or ())
+
+
+def install_files(host, ref, files, ticket, dry_run=False, home=None, session="", agent="", runner=subprocess.run, poster=None,
+                  allow_older=False, allow_remote=False):
     check_inputs(host, ref, files, ticket, dry_run, None, None, (), allow_older)
-    return _run(host, ref, list(files), ticket, dry_run, Path(home or Path.home()), session, agent, runner, poster, None, None, "install", allow_older)
+    home = Path(home or Path.home())
+    gate = None if dry_run else guard_gate(host, ref, list(files), ticket, home, "install", allow_older, allow_remote=allow_remote)
+    return _run(host, ref, list(files), ticket, dry_run, home, session, agent, runner, poster, None, None, "install", allow_older,
+                gate=gate, allow_remote=allow_remote)
 
 
-def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.run, poster=None):
+def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.run, poster=None, allow_remote=False):
     home = Path(home or Path.home())
     if not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id):
         refuse("--resume takes a run id like ins-0123456789ab")
@@ -735,8 +825,10 @@ def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.ru
     if ("installed" in results_of(home, run_id)) or ("rolled_back" in results_of(home, run_id)) or ("restored" in results_of(home, run_id)):
         refuse("run %s already finished" % run_id)
     check_inputs(row["host"], None, None, ticket, False, run_id, None, ())
+    gate = guard_gate(row["host"], row["ref"], sorted(row["files"]), ticket, home, "resume", forced=recorded_guard(row),
+                      allow_remote=allow_remote)
     return _run(row["host"], row["ref"], sorted(row["files"], key=lambda n: n), ticket, False, home, session, agent, runner, poster, run_id,
-                row.get("baseline"), "resume")
+                row.get("baseline"), "resume", gate=gate, allow_remote=allow_remote)
 
 
 def _plan_for(names, sources, state, run):
@@ -750,8 +842,15 @@ def _plan_for(names, sources, state, run):
     return plan
 
 
-def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False):
-    sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of))
+def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False,
+         gate=None, allow_remote=False):
+    sources, listed, main, ref_guard = fetch_source(ref, files, home, allow_older or bool(resume_of))
+    if not dry_run and gate is None and ref_guard:
+        # a guard file only at the ref (the Mac's hooks are older or newer than the ref): gate it now, still before any
+        # remote write. A gate already decided covers the whole file set, so it is not asked twice (one stamp, one call).
+        gate = guard_gate(host, ref, files, ticket, home, kind_, allow_older, forced=ref_guard, allow_remote=allow_remote)
+    elif gate is not None and ref_guard:  # the record lists the ref's guard files too, for a later --resume or --rollback (N1)
+        gate = dict(gate, guard_files=sorted(set(gate["guard_files"]) | set(ref_guard)))
     remote = Remote(host, runner)
     run = resume_of or new_run_id()
     names = order(files)
@@ -788,7 +887,7 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
     todo = [n for n in applied if not plan[n].get("resumed_already_applied")]
     start = {"event": "start", "kind": kind_, "run": run, "host": host, "url": CANONICAL_URL, "main": main, "ref": ref, "files": plan,
              "baseline": before, "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket,
-             "allow_older": bool(allow_older)}
+             "allow_older": bool(allow_older), "guard_gate": gate}
     try:
         audit(home, start)  # fail closed: nothing is written remotely when this row cannot be written and fsynced
     except OSError:
@@ -928,7 +1027,8 @@ def _roll_back(home, run, host, plan, todo, remote, cause, ticket, poster, kind_
     return finish(home, run, host, "rolled_back", 4, {"ref": ref, "files": plan, "reason": str(cause)[:300], "selftest_after_rollback": again}, ticket, poster, kind_)
 
 
-def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", runner=subprocess.run, poster=None):
+def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", runner=subprocess.run, poster=None,
+             allow_remote=False):
     home = Path(home or Path.home())
     if not isinstance(run_id, str) or not RUN_RE.fullmatch(run_id):
         refuse("--rollback takes a run id like ins-0123456789ab")
@@ -937,6 +1037,8 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
         refuse("no such run on this machine: %s" % run_id)
     host = row["host"]
     check_inputs(host, None, None, ticket, False, None, run_id, tuple(force_files))
+    gate = guard_gate(host, row.get("ref"), sorted(row["files"]), ticket, home, "rollback", forced=recorded_guard(row),
+                      allow_remote=allow_remote)
     for name in force_files:
         if name not in row["files"]:
             refuse("--force-file %s is not a file of run %s" % (name, run_id))
@@ -963,7 +1065,8 @@ def rollback(run_id, ticket, force_files=(), home=None, session="", agent="", ru
         to_restore.append(name)
     items, payload = _restore_items(home, remote, run_id, plan, to_restore, None) if to_restore else ([], b"")  # a plain refusal BEFORE the start row: unusable backups must not open an attempt
     start = {"event": "start", "kind": "rollback", "run": run_id, "host": host, "files": {n: plan[n] for n in to_restore}, "forced": sorted(force_files),
-             "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket}
+             "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket,
+             "guard_gate": gate}
     try:
         audit(home, start)
     except OSError:

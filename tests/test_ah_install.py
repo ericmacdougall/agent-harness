@@ -38,6 +38,25 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+class PersonEnv:
+    """launch_check's process view for a person in Terminal (login -> zsh -> python3)."""
+
+    def stdin_is_tty(self):
+        return True
+
+    def tty_name(self):
+        return "/dev/ttys001"
+
+    def environ(self):
+        return {}
+
+    def process_table(self):
+        return {3: (2, "python3 ah.py"), 2: (1, "-zsh"), 1: (0, "login -pf user")}
+
+    def pid(self):
+        return 3
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ah-inst-")
@@ -67,7 +86,9 @@ class Base(unittest.TestCase):
         git(self.tmp, "clone", "-q", "--bare", str(self.work), str(self.origin))
         for n in NAMES:  # the host holds the c0 bytes
             (self.hooks / n).write_bytes(self.base_bytes(n))
-        self.patches = [mock.patch.object(ai, "CANONICAL_URL", "file://" + str(self.origin)), mock.patch.object(ai, "ALLOW_FILE", True)]
+        # the guard-file gate (PR 326a) is tested in test_guard_install_gate.py; here the user runs every command
+        self.patches = [mock.patch.object(ai, "CANONICAL_URL", "file://" + str(self.origin)), mock.patch.object(ai, "ALLOW_FILE", True),
+                        mock.patch.object(ai, "PROOF_ENV", PersonEnv())]
         for p in self.patches:
             p.start()
             self.addCleanup(p.stop)
@@ -80,6 +101,11 @@ class Base(unittest.TestCase):
     def write_commit(self, files, message, branch=None):
         (self.work / "install.py").write_text("HOOKS = %r\n" % (NAMES,))
         (self.work / "harness" / "hooks").mkdir(parents=True, exist_ok=True)
+        # the ref's own manifest: the gate also computes guard files over the ref's tree (PR 345 review F2); ah.py is the
+        # fixture's registered guard hook, extra.py stays an ordinary file
+        manifest = self.work / "harness" / "hooks" / "hooks_manifest.json"
+        if not manifest.exists():
+            manifest.write_text(json.dumps({"hooks": [{"event": "PreToolUse", "script": "ah.py"}]}))
         for name, data in files.items():
             (self.work / "harness" / "hooks" / name).write_bytes(data)
         git(self.work, "add", "-A")
