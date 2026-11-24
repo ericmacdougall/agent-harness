@@ -230,6 +230,20 @@ class Request(Env):
             sg.load_request(req["rid"], now=NOW + 25 * 3600)
         self.assertEqual(caught.exception.code, "expired")
 
+    def test_user_source_must_verify_as_the_users_words(self):
+        import provenance
+        argv = ["--project", REPO + ":mac", "--power", "merge", "--reason", "x", "--user-source",
+                'user:%s/u1 "you are allowed to merge things"' % SID]
+        good = {"ok": True, "origin": "user", "weak": False, "kind": "user", "problems": []}
+        with mock.patch.object(provenance, "resolve", return_value=good):
+            self.assertEqual(self.request(argv)["user_excerpt"], "you are allowed to merge things")
+        for bad in (dict(good, ok=False, problems=[{"code": "excerpt-not-found"}]), dict(good, origin="agent"),
+                    dict(good, weak=True), dict(good, kind="pasted")):
+            with self.subTest(bad=bad), mock.patch.object(provenance, "resolve", return_value=bad), \
+                    self.assertRaises(sg.Refusal) as caught:
+                self.request(argv)
+            self.assertIn("does not verify", caught.exception.message)
+
     def test_hook_stamps_supervisor_commands(self):
         import ah_ops
         self.assertIn("supervisor", ah_ops.STAMPED_COMMANDS)

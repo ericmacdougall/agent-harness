@@ -116,6 +116,36 @@ Mechanics live in `docs/operations.md`, "Agent self-serve"; this is the rule set
 - `ah ops doctor --probe` runs one allow-listed recipe in dry run after checking for the exact allow rule and for deny or ask rules that shadow it; PASS means "rule present and recipe runs" and the fresh-session no-prompt check is the click-test's. A denial is reported as a limitation plus a P0 ticket and is never retried by another route.
 - Rollback: `ah_enable_self_serve.py --undo`, or the kill-switch file `~/.agent-harness/policy/disabled`, which refuses every capability at once.
 
+### Supervisor power
+
+Source: the user, relayed by main on 2026-11-24 (goodqa#16944): "make a way for an agent to request supervisor power from me, record i granted it, and then its able to do these things", and "a supervisor agent must be sol,opus,fable or astra". Code: `harness/hooks/supervisor_grant.py`.
+
+- **Two powers only.** `merge` and `delete` are the only powers there are.
+  - A merge ok means only that the user need not be asked each time. merge_gate still requires the review of record.
+  - `delete` covers worktrees, clones and branches the session or its agents created, build output and scratch. Uncommitted and unpushed work in those worktrees can be lost.
+- **Request.** Main asks with one plain foreground command:
+
+  `ah supervisor request --project owner/repo:host[,host] --power merge|delete --reason TEXT [--include-subagents] [--user-source SRC]`
+
+  - Main's hook stamps that exact command. A sub-agent's call gets no stamp, so it cannot request.
+  - The session and the model come from the transcript record of that one call.
+  - Projects are named one by one; a wildcard is refused. Each project must appear in the session's own WAL or brief.
+  - A request grants nothing.
+- **Grant.** The user runs `ah_enable_self_serve.py --grant-supervisor <rid>` in his own terminal.
+  - It runs the enabler's human checks.
+  - He can only remove what was requested.
+  - The expiry is 8 hours by default. "until revoked" applies only when he types those words.
+  - He then reads the summary and types the dialog code.
+  - The grant is signed with the self-serve key under its own domain.
+- **Check at every use.** Consuming guards call `supervisor_grant.check(payload, power, project, host=, target=)` with their own hook payload. It re-verifies:
+  - the signature, the session, the sub-agent rule, the project, the host and the power;
+  - the expiry, revocation and the kill switch;
+  - the model of the call being checked, read from its own transcript record. Only Sol, Opus, Fable and Astra qualify. An unknown model, or a duplicated record, is refused.
+
+  Delete targets under logs, WALs, policy, private keys, hooks or `~/.codex`, guard files, the default, release and tag refs, and yates, apex_app_pos and OptinRouter are never covered.
+- **Revoke and status.** `ah supervisor revoke <gid>|all` works for anyone; nothing deletes a revocation. `ah supervisor status` shows every grant, and the session-start line says when a grant is live.
+- **What it never touches.** Rules 1 to 4, permission prompts and modes, guard installs, and the separate Fable and Astra per-task approval are unaffected.
+
 ## Completion
 
 For fast-path fixes, finish after the direct edit, focused verification, diff self-review, and WAL result. Report the changed file and check. For substantive work, do not tell me it is done until the owner reports, peer review is signed off or explicitly unavailable, relevant tests and click testing pass or limitations are disclosed, the main agent has checked the diff against scope, WAL and docs are current, and verified work is integrated into the original checkout or a concrete local blocker is reported. A draft PR awaiting authorized remote merge is `PR_READY`, not delivered. Report what changed, exact verification, original-checkout HEAD, feature push/PR status, how to run and watch it, and remaining risks. A remote publication failure does not stop local verification or guarded local-only delivery.
