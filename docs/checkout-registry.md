@@ -145,6 +145,26 @@ If the repo's own config, or a file it includes, sets `filter.*`, `diff.*.textco
 `core.hooksPath` or `gpg.*program`, the verdict is "keep: repo config runs programs" and no content-reading command runs.
 The user's global config is trusted.
 
+## Live check
+
+`bash tests/live/checkout_registry_live.sh RECEIPT_DIR` runs three short `claude -p` sessions (main, subagent,
+isolation) with these hooks added through `--settings`, in a `mktemp -d ~/streamd-live.XXXXXX` folder it removes
+afterwards; it then retires the rows it made and checks that none is held. Exit 0 PASS, 1 FAIL, 2 BLOCKED (a session
+did not run, or the user's own guards refused a clone before it ran). It writes `live-receipt.json` and redacted
+payloads to RECEIPT_DIR. `tests/fixtures/checkout_registry_live_payloads.json` is a trimmed copy of those payloads,
+and `LivePayloads` in the unit tests replays it.
+
+What the live run showed (Claude Code 2.1.330, 2026-11-24):
+
+- A subagent's Bash PreToolUse and PostToolUse payloads carry `agent_id`, but `transcript_path` names the session's
+  main transcript; the agent's calls are in `projects/P/SESSION/subagents/agent-ID.jsonl`, which SubagentStop names
+  as `agent_transcript_path`. The binding follows that path.
+- An isolation subagent's SubagentStart `cwd` is the worktree itself.
+- A Bash call that another PreToolUse hook refuses gets neither PostToolUse nor PostToolUseFailure, so it gets no row.
+- In that run, a `cd` to the parent folder in one Bash call did not carry into the next call's `cwd` or `pwd`.
+- Not yet observed live: a Bash clone that completes. The Mac run's clones were refused by copy_hygiene's free-disk
+  floor (18.1 GB free, floor 20 GB), and the t2-dev run could not start because the account's weekly limit was reached.
+
 ## Not covered (disclosed)
 
 - **Codex.** Codex has no PostToolUse hook, so Codex checkouts get no rows. The manifest row

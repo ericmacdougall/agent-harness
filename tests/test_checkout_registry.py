@@ -863,6 +863,73 @@ class Isolation(Base):
         self.assertEqual([r["agent"] for r in self.held()], ["a8"])
 
 
+LIVE_FIXTURE = ROOT / "tests" / "fixtures" / "checkout_registry_live_payloads.json"
+
+
+class LivePayloads(Base):
+    """AC-7 replay: payloads exactly as Claude Code sent them in the live run (tests/live/checkout_registry_live.py,
+    redacted and trimmed), with only paths, ids and the command localized to this test's HOME. Every other key the
+    real hook received (effort, prompt_id, scratchpad_dir, agent_type, permission_mode, description) is kept."""
+
+    def setUp(self):
+        super().setUp()
+        self.fix = json.loads(LIVE_FIXTURE.read_text())
+        self.proj = os.path.join(self.home, ".claude", "projects", "-HOME-live-src")
+        os.makedirs(os.path.join(self.home, "live"), exist_ok=True)
+
+    def localize(self, p: dict, **override) -> dict:
+        text = json.dumps(p).replace("/HOME/live/src", self.src).replace("/HOME", self.home)
+        return dict(json.loads(text), **override)
+
+    def replay_clone(self, key, record_in=None):
+        p = self.localize(self.fix[key])
+        session, agent = p["session_id"], p.get("agent_id")
+        tid = self.last_tid = self.tid()
+        p["tool_use_id"] = tid
+        cmd, dest = p["tool_input"]["command"], p["tool_input"]["command"].split()[-1]
+        self.main_transcript(session)
+        self.record(tid, cmd, session, agent if record_in is None else record_in)
+        R.pretool(p)
+        self.clone(dest)()
+        return R.posttool(dict(p, hook_event_name="PostToolUse", tool_response={"stdout": "", "stderr": ""}))
+
+    def test_the_live_subagent_payload_points_at_the_main_transcript(self):
+        """The live fact the binding depends on: a subagent's Bash payload names the SESSION transcript, and the
+        agent's calls are found in projects/P/SESSION/subagents/agent-ID.jsonl."""
+        p = self.fix["subagent_pretool_clone"]
+        self.assertTrue(p["agent_id"])
+        self.assertTrue(p["transcript_path"].endswith("/%s.jsonl" % p["session_id"]))
+        self.assertNotIn("/subagents/", p["transcript_path"])
+        stop = self.fix["subagent_stop"]
+        self.assertTrue(stop["agent_transcript_path"].endswith(
+            "/%s/subagents/agent-%s.jsonl" % (stop["session_id"], stop["agent_id"])))
+
+    def test_live_subagent_clone_payload_gives_one_row_with_its_agent(self):
+        row = self.assert_one(self.replay_clone("subagent_pretool_clone"))
+        self.assertEqual((row["session"], row["agent"], row["kind"]), ("session-8", "a10", "clone"))
+
+    def test_live_subagent_payload_without_the_call_in_its_own_transcript_gets_no_row(self):
+        """The same real payload, but the tool call is only in the session's main transcript: unbound."""
+        self.assert_refused("transcript-unbound", self.replay_clone("subagent_pretool_clone", record_in=""))
+
+    def test_live_main_clone_payload_gives_one_row_without_an_agent(self):
+        row = self.assert_one(self.replay_clone("main_pretool_clone"))
+        self.assertEqual((row["session"], row["agent"]), ("session-1", None))
+
+    def test_live_isolation_payloads_give_one_row_and_a_stop_note(self):
+        start = self.localize(self.fix["subagent_start"])
+        path = start["cwd"]                                   # live: SubagentStart's cwd is the worktree itself
+        sh("git", "-C", self.src, "worktree", "add", "-q", path, "-b", "w-a15")
+        self.sub_transcript(start["session_id"], start["agent_id"])
+        self.assertEqual(R.subagent_start(start)["path"], os.path.realpath(path))
+        call = self.localize(self.fix["subagent_posttool"], hook_event_name="PreToolUse")
+        call.pop("tool_response")
+        R.pretool(call)
+        self.assertEqual([(r["kind"], r["agent"]) for r in self.held()], [("isolation", "a15")])
+        note = R.subagent_stop(self.localize(self.fix["subagent_stop"]))
+        self.assertIn("owner may remove", note.read_text())
+
+
 class Retire(Base):
     # Rule 14
     def test_retire_needs_absence_on_the_rows_own_filesystem(self):
