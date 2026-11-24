@@ -267,7 +267,11 @@ class Client:
             note = " (%s)" % _code_text(code) if code else ""
             if error.code in (301, 302, 303, 307, 308):
                 raise ChatError("redirect_refused", "GoodQA answered with a redirect (HTTP %s); redirects are never followed" % status, 3) from None
-            raise ChatError("http_error", "GoodQA HTTP %s%s" % (status, note), 3) from None
+            refused = ChatError("http_error", "GoodQA HTTP %s%s" % (status, note), 3)
+            # goodqa#16399 (the uncertain live send): send records why, so the machine code and the HTTP number travel on
+            refused.server_code = code if isinstance(code, str) else None
+            refused.http_status = error.code if isinstance(error.code, int) and 100 <= error.code <= 599 else None
+            raise refused from None
         except (urllib.error.URLError, socket.timeout, ConnectionError, OSError):
             raise ChatError("unreachable", "GoodQA did not answer (connection failed or timed out)", 3) from None
         if len(raw) > MAX_RESPONSE:
@@ -314,9 +318,11 @@ class Client:
             err = inner.get("error") if isinstance(inner, dict) else None
             code = err.get("code") if isinstance(err, dict) else None
             if code == "not_found":
-                raise ChatError("not_found", "GoodQA says not_found: no such conversation or user, or you are not a party to it", 3)
+                missing = ChatError("not_found", "GoodQA says not_found: no such conversation or user, or you are not a party to it", 3)
+                missing.server_code = code  # goodqa#16399: send records it (the 07:20Z send lost it here)
+                raise missing
             refused = ChatError("tool_error", "GoodQA refused %s (%s)" % (name, _code_text(code)), 3)
-            refused.server_code = code if isinstance(code, str) and len(code) <= 64 else None  # send decides on it
+            refused.server_code = code if isinstance(code, str) else None  # send decides on it and screens it (_shown_code)
             details = err.get("details") if isinstance(err, dict) and isinstance(err.get("details"), dict) else {}
             # the user-token approval gate names the permit it minted (an id; consuming it still needs the token)
             refused.approval_id = details.get("approvalId") if _is_uuid(details.get("approvalId")) else None

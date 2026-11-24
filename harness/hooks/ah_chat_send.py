@@ -12,12 +12,16 @@ clientMsgId null, so the server has no dedupe for a DM. A retry after a lost ans
 - The same body (SHA-256 of PREFIX + the canonical text: LF line breaks, none trailing) to the same person (id in lower
   case) is refused for SAME_TEXT_WINDOW seconds after ANY earlier attempt, whatever
   its outcome (sent, uncertain, or a crash that left only the pending row). The one exception: every earlier attempt was
-  refused by the user-token approval gate (NOT_STORED: approval required, pending, expired, denied or for other text). That
-  gate runs before the route handler stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 at
+  answered by the user-token approval gate before anything was stored (NOT_STORED: approval required, pending, expired,
+  denied or for other text, in the tool's own error). That gate runs before the route handler stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 at
   a70289c7). When it asks for approval the result prints the approval id; once the user approves it in the web app, the
   same command with --approval-id sends that exact body (the server binds the permit to it) and consumes the permit.
 - At most RATE_LIMIT attempts per person and GLOBAL_LIMIT to everyone per RATE_WINDOW seconds, counting every attempt.
-- Any failure of the one request, whatever its kind, is `uncertain`, and the outcome and WAL rows are still written.
+- Any other failure of the one request, whatever its kind, is `uncertain`, and the outcome and WAL rows are still written.
+  Every outcome that is not `sent` records why: the failure class (the local error code, `no_message_id`, or
+  `exception:<type>`), the server's machine code and the HTTP status, never a server message, the body or a token.
+  Recording the reason never frees the text: the client cannot verify at run time what the deployed server stored, so a
+  server code (not_found included) is a reason to report, not proof that nothing was stored (goodqa#16399, PR 341).
 - The ledger (~/.agent-harness/state/ah/store/chat-send.jsonl) gets a pending row, written completely and fsynced, BEFORE the
   request; the outcome row after it. A ledger with a malformed or unterminated record refuses every send until a person has
   looked at it: a lost pending row would let the same text go out twice.
@@ -85,11 +89,14 @@ MAX_DM_PAGES = 5
 LOCK_WAIT = 30  # seconds a send waits for another one to finish before it answers busy
 # Refusals of the user-token approval gate, which runs before the route handler and so before anything is stored
 # (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 and service.ts:1364-1412 at a70289c7). An attempt
-# answered with one of these did not deliver, so it does not hold the text back. Every other answer does.
+# answered with one of these in the tool's own error did not deliver, so it does not hold the text back. Every other
+# answer does, an HTTP-level error carrying one of these codes included.
 NOT_STORED = {"human_approval_required": "approval_required", "human_approval_pending": "approval_pending",
               "approval_expired": "approval_refused", "approval_denied": "approval_refused",
               "approval_mismatch": "approval_refused"}
-FREE_STATUSES = frozenset(NOT_STORED.values())
+APPROVAL_STATUSES = frozenset(NOT_STORED.values())  # the only statuses that free the text
+SERVER_CODE_RE = re.compile(r"[a-z][a-z0-9_.]{0,63}")
+EXCEPTION_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 # Characters never sent: every control (Cc) but the line break, every format character (Cf: bidi overrides and isolates,
 # zero-width characters, the BOM), line and paragraph separators, surrogates and private use. A format character can hide a
 # token piece from the screens or make the message display differently from what was written.
@@ -280,7 +287,7 @@ def check_ledger(rows, peer, digest, now):
     attempts = list(_attempts(rows).values())
     mine = [a for a in attempts if a["peer"] == peer]
     same = [a for a in mine if a["sha"] == digest and now - a["at"] < SAME_TEXT_WINDOW]
-    if same and any(a["status"] not in FREE_STATUSES for a in same):
+    if same and any(a["status"] not in APPROVAL_STATUSES for a in same):
         raise ChatError("duplicate", "this exact text already went to this person in the last 24 hours (or its outcome is "
                                      "unknown). It is never resent automatically: check `ah chat history` first and, if it "
                                      "really did not arrive, send it reworded (for example \"Thanks!\" becomes \"Thanks, "
@@ -572,6 +579,34 @@ def allow(home, with_=None, org=None, name=None, source=None, base=None, list_on
 
 # ------------------------------------------------------------------ the WAL row
 
+def _shown_code(code):
+    """A server machine code fit to record: a short lower-case code that passes the one third-party screen, else
+    "unrecognized"; None stays None. The screen is ah_chat._credential_like, the check every other third-party string takes
+    (r9 B1): a piece of either GoodQA token or any secret shape (redact.py and gq_browser.SECRET_SHAPES, lower-case
+    `gqut_` and `sk_live_` included). A server message is never recorded (it can echo what was sent)."""
+    if code is None:
+        return None
+    if not (isinstance(code, str) and SERVER_CODE_RE.fullmatch(code)) or chat._credential_like(code):
+        return "unrecognized"
+    return code
+
+
+def _outcome_of(error):
+    """(status, failure class, server code, HTTP status) for a failed request. Only an approval-gate code in the tool's own
+    error is a definite answer that nothing was stored; everything else, not_found and every HTTP-level error included, is
+    `uncertain` with its recorded reason."""
+    if not isinstance(error, ChatError):
+        name = type(error).__name__
+        return "uncertain", "exception:" + (name if EXCEPTION_RE.fullmatch(name) else "unnamed"), None, None
+    code = _shown_code(getattr(error, "server_code", None))
+    http = getattr(error, "http_status", None)
+    http = http if isinstance(http, int) and not isinstance(http, bool) else None
+    status = "uncertain"
+    if error.code == "tool_error" and code in NOT_STORED:  # the tool's own error; an HTTP-level error never frees the text
+        status = NOT_STORED[code]
+    return status, error.code, code, http
+
+
 def _wal(home, session, row):
     """The main session's WAL gets a chat_send row: ids, the text's SHA-256 and the outcome, never the text."""
     import ah  # noqa: PLC0415
@@ -677,7 +712,8 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
         except OSError:
             raise ChatError("ledger_damaged", "the pending record could not be written completely; nothing was sent. Check "
                                               "the chat-send ledger before sending again", 3, fixed=True) from None
-        status, message_id, sent_conv, code, approval_id = "uncertain", None, None, None, None
+        status, message_id, sent_conv, approval_id = "uncertain", None, None, None
+        failure, code, http = None, None, None  # why it was not sent: recorded in the outcome row, the WAL row and the result
         arguments = {"orgId": org, "userId": peer, "body": body}
         if approval:
             arguments["approvalId"] = approval
@@ -687,20 +723,21 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
             message_id = message.get("id") if chat._is_uuid(message.get("id")) else None
             sent_conv = data.get("conversationId") if isinstance(data, dict) and chat._is_uuid(data.get("conversationId")) else None
             status = "sent" if message_id else "uncertain"
+            failure = None if message_id else "no_message_id"
         except ChatError as error:
-            code = getattr(error, "server_code", None)
-            status = NOT_STORED.get(code, "uncertain")
-            approval_id = getattr(error, "approval_id", None) if status in FREE_STATUSES else None
-        except Exception:  # noqa: BLE001 - PR 337 F2: any other failure of the one request (an http.client error such as
-            status = "uncertain"  # IncompleteRead, a bug) is an unknown outcome; the outcome and WAL rows below still run
-        outcome = {"id": uuid.uuid4().hex, "kind": "outcome", "ref": attempt, "status": status, "message": message_id,
-                   "at": time.time()}
+            status, failure, code, http = _outcome_of(error)
+            approval_id = getattr(error, "approval_id", None) if status in APPROVAL_STATUSES else None
+        except Exception as error:  # noqa: BLE001 - PR 337 F2: any other failure of the one request (an http.client error
+            status, failure, code, http = _outcome_of(error)  # such as IncompleteRead, a bug) is uncertain; rows still run
+        why = {"failure": failure, "server_code": code, "http_status": http} if failure else {}
+        outcome = dict({"id": uuid.uuid4().hex, "kind": "outcome", "ref": attempt, "status": status, "message": message_id,
+                        "at": time.time()}, **why)
         try:
             _append(path, outcome)
         except OSError:
             pass  # the pending row already counts as an attempt: the same text stays refused
         try:
-            wal_id = _wal(home, session, dict(record, status=status, message=message_id, attempt=attempt))
+            wal_id = _wal(home, session, dict(record, status=status, message=message_id, attempt=attempt, **why))
         except Exception:  # noqa: BLE001 - the request already happened: report it, never let a traceback hide it
             wal_id = None
     result = {"ok": status == "sent", "status": status, **target, "peer": peer, "org": org, "chars": len(body),
@@ -715,10 +752,9 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
         result["sent_conversation"] = sent_conv
         if conversation and sent_conv.lower() != conversation.lower():
             result["warning"] = "GoodQA delivered into a different conversation than the one named"
-    if status in FREE_STATUSES:
-        result["server_code"] = code
-        if approval_id:
-            result["approval_id"] = approval_id
+    result.update((k, v) for k, v in why.items() if v is not None)
+    if approval_id:
+        result["approval_id"] = approval_id
     if status in ("approval_required", "approval_pending"):
         result["next"] = ("GoodQA holds this send for the user's approval (his user token's approval setting). Nothing was "
                           "stored. He approves it in the GoodQA web app under Account > User tokens; then run the same "
@@ -727,6 +763,9 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
         result["next"] = ("GoodQA refused the approval (%s): it expired, was denied, or was given for different text. Nothing "
                           "was stored. Run the command without --approval-id to ask for a new approval" % code)
     elif status == "uncertain":
-        result["next"] = ("the outcome is unknown. Do NOT resend: read `ah chat history` to see whether it arrived. The same "
-                          "text stays refused for 24 hours")
+        result["next"] = ("the outcome is unknown (%s). Do NOT resend: read `ah chat history` to see whether it arrived. The "
+                          "same text stays refused for 24 hours" % (code or failure))
+        if code == "not_found":
+            result["next"] += (". For a person on the list who already has a DM with you this is likely goodqa#17013: GoodQA "
+                               "does not let a user token reply in an existing DM. Reply in the GoodQA app until it ships")
     return chat._checked(result)
