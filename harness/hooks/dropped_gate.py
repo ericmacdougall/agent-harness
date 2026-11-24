@@ -492,6 +492,41 @@ def _stamp_ack(cmd: str, payload: dict) -> None:
             caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
 
 
+def _retire_rest(seg: list):
+    """The words after `ah` when this simple command directly runs `ah ... task retire-session` (as _dispose_rest)."""
+    i = _skip_wrappers(seg)
+    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
+        if "-c" in seg[i + 1:]:
+            return None
+        i = _after_python(seg, i)
+    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
+        return None
+    rest = list(seg[i + 1:])
+    return rest if [t for t in rest if not t.startswith("-")][:2] == ["task", "retire-session"] else None
+
+
+def _stamp_retire(cmd: str, payload: dict) -> None:
+    """One stamp per `--session ID` of a main command that really runs `ah task retire-session` (goodqa#17148, as
+    `--ack-handoff`): only ah's own parser's reading of a simple command counts, and --dry-run mints nothing."""
+    if "retire-session" not in cmd:
+        return
+    import caller_identity  # noqa: PLC0415
+    segments = _segments(cmd)
+    if segments is None:
+        return
+    for seg in segments:
+        rest = _retire_rest(seg)
+        if rest is None:
+            continue
+        args = _parse_dispose(rest)
+        if args is None or getattr(args, "cmd", None) != "task" or getattr(args, "sub", None) != "retire-session" \
+                or getattr(args, "dry_run", False):
+            continue
+        session = getattr(args, "session", None)
+        if isinstance(session, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", session):
+            caller_identity.put_stamp("retire-session", [session], session=str(payload.get("session_id") or ""))
+
+
 def cmd_pretool(payload: dict) -> dict:
     """PreToolUse(Bash): a sub-agent (the payload carries its agent_id) may not resume, reassign or close an owner;
     main records those. A wait (`--kind waiting`) stays open to everyone, but not one that acknowledges a handoff
@@ -505,6 +540,7 @@ def cmd_pretool(payload: dict) -> dict:
     import caller_identity  # noqa: PLC0415
     if caller_identity.is_main(payload):
         _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
+        _stamp_retire(cmd, payload)  # goodqa#17148: `ah task retire-session` needs this stamp
         return {}
     if not acknowledges(cmd):  # anything not proven main: sub-agents, Codex payloads, a payload with no transcript
         return {}

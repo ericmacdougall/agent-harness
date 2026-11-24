@@ -676,6 +676,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     cache = _load_owners_cache(cache_path)
     _cleanup_stale_tmp(index_dir, now)
     spawned, stopped, named, stop_at = {}, set(), [], {}
+    main_last = 0.0  # newest time on the main WAL other than ah's own retire lines (a resumed session writes it)
     tally = ReadTally()   # PR 234 v8: what this view actually read; the read block is built from it alone
     tally.window = _prov().LostWindow(now - OWNERS_RECENT_S)   # the default view's window (shown_owner)
     with open(main, "rb") as handle:
@@ -690,6 +691,8 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             if _prov().wal_record_problem(rec):   # receipt v10 F2: e.g. a subagent_stop with no event or a bad time
                 tally.skipped += 1
                 continue
+            if isinstance(rec, dict) and rec.get("kind") not in ("retired_session", "retire_revoked"):
+                main_last = max(main_last, parse_ts(rec.get("at")) or 0.0)
             if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
                     and isinstance(rec.get("note"), str):
                 named.append(rec["note"])
@@ -919,14 +922,19 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             if not liveness.disposition_live(d, now, last_activity=parse_ts(r["last_activity"]) or 0.0):
                 r["decision_required"] = True
                 r["flags"] = list(r.get("flags") or []) + [f"wait-target-{states.get(target, 'absent').lower()}"]
-    for r in rows:  # goodqa#17148: a retired owner is excused only while it stays quiet after the decision
+    session_seen = None  # read lazily: only a session that holds a retire decision pays for the transcript scan
+    for r in rows:  # goodqa#17148: a retired owner is excused only while its SESSION stays quiet after the decision
         d = r.get("disposition")
         if not (r["owner"] and d and d.get("kind") == RETIRED):
             continue
-        seen = max(parse_ts(r["last_activity"]) or 0.0, sub_dirs.get(r["agent_id"], 0.0))
+        if session_seen is None:
+            session_seen = max(main_last, main_transcript_at(home, session))
+        seen = max(parse_ts(r["last_activity"]) or 0.0, sub_dirs.get(r["agent_id"], 0.0), session_seen)
         if seen > float(d.get("at") or 0.0):
-            r["disposition"] = dict(d, live=False)
-            r["flags"] = list(r.get("flags") or []) + ["retired-reopened"]  # new activity: alerts again, whatever the decision said
+            r["disposition"] = dict(d, live=False)  # new activity anywhere in the session: every retired owner alerts again
+            r["flags"] = list(r.get("flags") or []) + ["retired-reopened"]
+            if str(r["state"]).startswith("SILENT") and not r["attention"]:
+                r["attention"] = ["silent-undisposed"]  # the branch above needed d is None; this owner has a stale decision
             continue
         r["disposition"] = dict(d, live=True)
         r["decision_required"], r["attention"], r["wait_on"] = False, [], None
@@ -1530,13 +1538,20 @@ def precheck(op: str, args: dict) -> None:
         need("session", "ended", "at", "source")
         if not SESSION_RE.match(args["session"]) or args["session"] == "main":
             raise AhError("bad_request", "task.retire-session: --session must be the full id of the ended session")
-        if not parse_ts(args["ended"]):
-            raise AhError("bad_request", "task.retire-session: --ended must be an ISO date or time")
         rb, dropped = args.get("replaced_by"), args.get("dropped")
         if bool(rb) == bool(dropped) or dropped not in (None, True):
             raise AhError("bad_request", "task.retire-session: give exactly one of --replaced-by <session id> or --dropped")
         if rb and (not SESSION_RE.match(rb) or rb == args["session"]):
             raise AhError("bad_request", "task.retire-session: --replaced-by must name a different session")
+        if dropped and not TICKET_RE.match(args.get("ticket") or ""):
+            raise AhError("bad_request", "task.retire-session: --dropped needs --ticket 'GoodQA <project>#N', the ticket that "
+                                         "holds the dropped work (a stream nobody works on is a defect)")
+        if args.get("expect") is not None and not re.fullmatch(r"[0-9a-f]{16}", str(args["expect"])):
+            raise AhError("bad_request", "task.retire-session: --expect is the owners_sha a --dry-run printed")
+    elif op == "task.retire_revoke":
+        need("session", "decision", "source", "at")
+        if not SESSION_RE.match(args["session"]) or not re.fullmatch(r"ah[0-9a-f]{10}", args["decision"]):
+            raise AhError("bad_request", "task.retire-session --revoke: a full session id and a decision id (ah + 10 hex)")
     elif op == "deadline.add":
         need("session", "at", "ref", "owner", "note")
         if parse_ts(args["at"]) is None:
@@ -1972,19 +1987,30 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         main_wal = _wal_path(home, args["session"], "main")
         if not main_wal.is_file():
             raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
+        _retire_pin(home, args)  # under the store lock: the owner list is what the ledger says now
         pinned = args["retire"]["owners"]
-        if not pinned or actor_id() in pinned:
+        if actor_id() in pinned:
             raise AhError("forbidden", "task.retire-session: an owner cannot retire its own session", 3)
-        end = f"replaced by {args['replaced_by']}" if args.get("replaced_by") else "dropped"
+        end = f"replaced by {args['replaced_by']}" if args.get("replaced_by") else f"dropped, work on {args['ticket']}"
         rec = {"at": now, "event": "disposition", "id": wid, "agent": "session:" + args["session"], "kind": "retired_session",
-               "ended": args["ended"], "owners": pinned, "skipped": args["retire"]["skipped"], "source": args["source"][:2000],
-               "note": f"session {args['session']} ended {args['ended']} ({end}); {len(pinned)} owner(s) retired"}
+               "ended": args["ended_utc"], "owners": pinned, "skipped": args["retire"]["skipped"],
+               "unacked_handoffs": args["retire"]["unacked_handoffs"], "source": args["source"][:2000],
+               "note": f"session {args['session']} ended {args['ended_utc']} ({end}); {len(pinned)} owner(s) retired"}
         if args.get("replaced_by"):
             rec["replaced_by"] = args["replaced_by"]
         _wal_append(home, main_wal, rec)  # one atomic line; the ledger row after it is what makes the decision effective
         out["wal"] = wid
         out["retired"] = list(pinned)
         out["skipped"] = args["retire"]["skipped"]
+        out["unacked_handoffs"] = args["retire"]["unacked_handoffs"]
+    elif op == "task.retire_revoke":
+        main_wal = _wal_path(home, args["session"], "main")
+        if not main_wal.is_file():
+            raise AhError("session_unknown", f"no main WAL for session {args['session']!r}", 3)
+        _wal_append(home, main_wal, {"at": now, "event": "disposition", "id": wid, "agent": "session:" + args["session"],
+                                     "kind": "retire_revoked", "decision": args["decision"], "source": args["source"][:2000],
+                                     "note": f"retire decision {args['decision']} of {args['session']} revoked"})
+        out["wal"] = wid
     elif op == "task.dispose":
         if args["kind"] in ("resumed", "reassigned") + GUARDED_KINDS and actor_id() == args["agent"]:
             raise AhError("forbidden", f"task.dispose {args['kind']}: a sub-agent or the owner itself cannot acknowledge; "
@@ -2264,7 +2290,9 @@ def pending_stops(home: Path, session: str, ledger=None) -> dict:
 def dispositions(home: Path, session: str, ledger=None) -> dict:
     """agent id -> latest applied disposition row for that session (from the ah ledger, the only writer)."""
     out = {}
-    for r in (ledger if ledger is not None else _ledger(home)):
+    rows = ledger if ledger is not None else _ledger(home)
+    revoked = {(r.get("args") or {}).get("decision") for r in rows if r.get("op") == "task.retire_revoke"}
+    for r in rows:
         a = r.get("args") or {}
         if r.get("op") == "task.dispose" and a.get("session") == session:
             d = {"kind": a.get("kind"), "at": parse_ts(a.get("at")) or 0.0, "ref": a.get("ref"),
@@ -2276,13 +2304,13 @@ def dispositions(home: Path, session: str, ledger=None) -> dict:
                 d["until"] = parse_ts(a["until"]) or 0.0
             if a["agent"] not in out or (d["seq"] or 0) >= (out[a["agent"]].get("seq") or 0):
                 out[a["agent"]] = d
-        elif r.get("op") == "task.retire_session" and a.get("session") == session:
+        elif r.get("op") == "task.retire_session" and a.get("session") == session and r.get("id") not in revoked:
             # goodqa#17148: ONE decision row; each owner it pinned reads as its own disposition that cites the decision
             for who in ((a.get("retire") or {}).get("owners") or []):
                 d = {"kind": RETIRED, "at": parse_ts(a.get("at")) or 0.0, "ref": r.get("id"), "decision": r.get("id"),
                      "reason": f"session ended {a.get('ended')}; " + (f"replaced by {a['replaced_by']}" if a.get("replaced_by")
                                                                        else "dropped"),
-                     "ended": a.get("ended"), "seq": r.get("seq")}
+                     "ended": a.get("ended_utc") or a.get("ended"), "seq": r.get("seq")}
                 if isinstance(who, str) and (who not in out or (d["seq"] or 0) >= (out[who].get("seq") or 0)):
                     out[who] = d
     return out
@@ -2689,15 +2717,21 @@ def _audit_reject(home: Path, op: str, key, session, code: str, tag: dict) -> No
 # ------------------------------------------------------------------ retire-session (goodqa#17148)
 # One sourced decision retires every owner of a session that has verifiably ended. It goes through write() like
 # task.dispose, so the same store lock, intent row, idempotency key, audit and refusal rules apply; it is not a way
-# around the bulk-close guard (`dispose --kind closed` is still burst-limited) because it accepts only a session that
-# is verifiably not running.
+# around the bulk-close guard because (1) only main's hook stamp lets it run, (2) it accepts only a session that is
+# verifiably not running, (3) the owner list is computed under the store lock and (4) it has its own burst limit.
 RETIRED = "retired"
-RETIRE_QUIET_S = 6 * 3600  # every transcript and owner must have been quiet this long. A session sitting at its
-# prompt can hold no process that names its id, so quiet time is the main evidence; 6 h is past any usage-limit pause
-# or wake-up delay the harness schedules (1 h) and still short of today's freshest ended sessions (about 8 h)
+RETIRE_QUIET_S = 6 * 3600  # every transcript and owner must have been quiet this long (a decision of the supervisor,
+# goodqa#17148: the first spec said 3 h; 6 h keeps a session that waits out a multi-hour usage limit off the list, and
+# today's freshest ended sessions are still 8 h quiet). Quiet time is the SECOND signal; the first is the registry.
 RETIRE_PS_MAX = 100_000  # a longer process list is truncated or abnormal: refused, never half-read
-RETIRE_ENV_PROBES = 300  # `ps eww` probes of this user's claude processes; more is refused, never skipped
-RETIRE_FIELDS = ("retire",)  # set only by ah's preflight (the evidence and the pinned owner list)
+RETIRE_BURST_MAX = 10  # sessions one caller may retire ...
+RETIRE_BURST_WINDOW_S = 600  # ... within this window; the next one is refused and alerted
+RETIRE_ENDED_SLACK_S = 3600  # --ended may not be earlier than the newest transcript by more than this
+RETIRE_REPLACER_S = 24 * 3600  # a --replaced-by session must have run within this long (or be live now)
+RETIRE_FIELDS = ("retire", "ended_utc")  # set only by ah's preflight and apply, never taken from the caller
+RETIRE_ENDED_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$")
+REGISTRY_FILE_RE = re.compile(r"^\d{1,10}\.json$")  # Claude Code's pid registry; the .key files beside it are never opened
+REGISTRY_FILE_MAX = 65536
 
 
 def _retire_ps_rows() -> list:
@@ -2723,54 +2757,82 @@ def _retire_ps_rows() -> list:
     return rows
 
 
-def _retire_env_of(pid: int):
-    """CLAUDE_CODE_SESSION_ID in one of this user's processes, None when it has none or already exited; a process
-    that exists but cannot be probed raises (it may be the session)."""
-    try:
-        r = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
-                           env=dict(os.environ, LC_ALL="C"))
-    except (OSError, subprocess.SubprocessError):
-        r = None
-    if r is not None:
-        m = re.search(r"CLAUDE_CODE_SESSION_ID=([A-Za-z0-9._-]{1,128})", r.stdout)
-        if m:
-            return m.group(1)
-        if r.returncode == 0 and r.stdout.strip():
-            return None
+def _retire_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)  # signal 0 only tests that the pid exists
     except ProcessLookupError:
-        return None
+        return False
     except OSError:
-        pass
-    raise AhError("retire_unreadable", f"task.retire-session: pid {pid} exists but its environment could not be read; "
-                                       "liveness is unknown, so nothing is retired", 3)
+        return True  # exists, but not ours to signal
+    return True
 
 
-def _retire_live_pids(session: str) -> list:
-    """Pids of processes that name the session: its id in a command line, or in the environment of one of this user's
-    claude processes. This process and its ancestors are skipped (the shell that typed this command names the id)."""
+def _retire_proc_start(pid: int):
+    """The process start time ps prints, whitespace-normalized; None when ps cannot say (the caller fails closed)."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
+                           env=dict(os.environ, LC_ALL="C", LANG="C"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = " ".join(r.stdout.split())
+    return text if r.returncode == 0 and text else None
+
+
+def _retire_registry_live(home: Path, session: str) -> list:
+    """Pids that Claude Code's own registry (~/.claude/sessions/<pid>.json: sessionId, hostSessionId, pid, procStart)
+    names for this session and that are alive now with the recorded start time. The registry is the signal for a
+    session sitting idle at its prompt, which no command line names. A missing or unreadable registry, or an entry that
+    does not parse, refuses; only those four keys are read (the .key files beside the entries are never opened)."""
+    folder = home / ".claude" / "sessions"
+    try:
+        with os.scandir(folder) as it:
+            names = sorted(e.name for e in it if REGISTRY_FILE_RE.match(e.name))
+    except OSError as e:
+        raise AhError("retire_unreadable", f"task.retire-session: the Claude Code session registry cannot be listed "
+                                           f"({type(e).__name__}); liveness is unknown, so nothing is retired", 3)
+    live = []
+    for name in names:
+        try:
+            with open(folder / name, "rb") as handle:
+                raw = handle.read(REGISTRY_FILE_MAX + 1)  # input-ok: bounded, regular file named <pid>.json
+            if len(raw) > REGISTRY_FILE_MAX:
+                raise ValueError("too large")
+            entry = json.loads(raw)
+            if not isinstance(entry, dict):
+                raise ValueError("not an object")
+        except FileNotFoundError:
+            continue  # the session ended between the listing and the read
+        except (OSError, ValueError) as e:
+            raise AhError("retire_unreadable", f"task.retire-session: registry entry {name} cannot be read "
+                                               f"({type(e).__name__}); liveness is unknown, so nothing is retired", 3)
+        if session not in (entry.get("sessionId"), entry.get("hostSessionId")):
+            continue
+        pid = entry.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise AhError("retire_unreadable", f"task.retire-session: registry entry {name} names this session with no "
+                                               "usable pid; liveness is unknown, so nothing is retired", 3)
+        if not _retire_pid_alive(pid):
+            continue
+        started, recorded = _retire_proc_start(pid), " ".join(str(entry.get("procStart") or "").split())
+        if started is not None and recorded and started != recorded:
+            continue  # the pid was reused by another process: the session's own process is gone
+        live.append(pid)  # alive and the start time matches, or it cannot be compared: fail closed
+    return live
+
+
+def _retire_live_pids(home: Path, session: str) -> list:
+    """Pids that hold the session: its registry entry with a live process, or a command line that carries its id as a
+    standalone argument (`--resume ID`). A path that merely contains the id (a work dir, a browser profile) is not the
+    session. This process and its ancestors are skipped: the shell that typed this command names the id."""
+    live = _retire_registry_live(home, session)
     table = _retire_ps_rows()
     parent = {pid: ppid for pid, ppid, _u, _c in table}
     mine, p = set(), os.getpid()
     while p and p not in mine:
         mine.add(p)
         p = parent.get(p, 0)
-    named = re.compile(r"(?<![\w/.-])" + re.escape(session) + r"(?![\w/.-])")  # an argument, not a path piece
-    found, probes = [], 0
-    for pid, _ppid, uid, cmd in table:
-        if pid in mine:
-            continue
-        if named.search(cmd):
-            found.append(pid)
-        elif uid == os.getuid() and "claude" in cmd.lower():
-            probes += 1
-            if probes > RETIRE_ENV_PROBES:
-                raise AhError("retire_unreadable", f"task.retire-session: more than {RETIRE_ENV_PROBES} claude processes to "
-                                                   "probe; liveness is unknown, so nothing is retired", 3)
-            if _retire_env_of(pid) == session:
-                found.append(pid)
-    return sorted(set(found))
+    named = re.compile(r"(?<![\w/.-])" + re.escape(session) + r"(?![\w/.-])")
+    return sorted(set(live) | {pid for pid, _pp, _u, cmd in table if pid not in mine and named.search(cmd)})
 
 
 def _retire_transcripts(home: Path, session: str) -> dict:
@@ -2814,14 +2876,30 @@ def _retire_transcripts(home: Path, session: str) -> dict:
     return {"main_at": main_at, "newest_at": newest, "files": files}
 
 
-def retire_evidence(home: Path, session: str, now: float, ps_pids=None) -> dict:
+def main_transcript_at(home: Path, session: str) -> float:
+    """Newest mtime of the session's main transcript (0.0 when there is none): a resumed session writes it."""
+    best = 0.0
+    try:
+        with os.scandir(home / ".claude" / "projects") as projects:
+            for proj in projects:
+                try:
+                    best = max(best, os.stat(os.path.join(proj.path, session + ".jsonl")).st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return best
+
+
+def retire_evidence(home: Path, session: str, now: float, live_pids=None) -> dict:
     """Read-only: every check that decides whether a session may be retired, and the evidence for each. Raises AhError
-    when any of them fails or cannot be read. `--dry-run` returns this; the real run pins its owner list."""
+    when any of them fails or cannot be read. `--dry-run` returns this; the real run recomputes it under the store lock
+    and pins the owner list it finds there."""
     if not SESSION_RE.match(session or "") or session == "main":
         raise AhError("bad_request", "task.retire-session: --session must be the full id of the ended session", 3)
-    pids = _retire_live_pids(session) if ps_pids is None else ps_pids
+    pids = _retire_live_pids(home, session) if live_pids is None else live_pids
     if pids:
-        raise AhError("retire_running", f"task.retire-session: {session} is running (pid {', '.join(map(str, pids[:5]))} names "
+        raise AhError("retire_running", f"task.retire-session: {session} is running (pid {', '.join(map(str, pids[:5]))} holds "
                                         "it); a running session is never retired", 3)
     tr = _retire_transcripts(home, session)
     if now - tr["newest_at"] < RETIRE_QUIET_S:
@@ -2838,44 +2916,88 @@ def retire_evidence(home: Path, session: str, now: float, ps_pids=None) -> dict:
     rows = [r for r in data["owners"] if r.get("owner")]
     if not rows:
         raise AhError("retire_no_owners", f"task.retire-session: {session} has no owners to retire", 3)
-    cover, skipped = [], []
+    cover, skipped, handoffs = [], [], []
     for r in rows:
         d = r.get("disposition") or {}
         last = parse_ts(r.get("last_activity")) or 0.0
         if str(r["state"]).startswith(("live", "working")) or r.get("active_1h"):
             raise AhError("retire_live_owner", f"task.retire-session: owner {r['agent_id']} of {session} is {r['state']}; "
                                                "nothing is retired", 3)
-        if now - max(last, sub_activity(home, session, r["agent_id"])) < RETIRE_QUIET_S:
+        held = d.get("kind") in ("waiting", "resumed", "reassigned") and d.get("live") is True
+        if held or ASK_ID_RE.match(str(r.get("wait_on") or "")):
+            raise AhError("retire_live_wait", f"task.retire-session: owner {r['agent_id']} of {session} has a live "
+                                              f"{d.get('kind') or 'wait'}{' on ' + str(r['wait_on']) if r.get('wait_on') else ''}; "
+                                              "main's recorded wait is never overridden. Resolve it (ah task dispose) first", 3)
+        if now - max(last, transcript_mtime(home, session, r["agent_id"])) < RETIRE_QUIET_S:
             raise AhError("retire_recent", f"task.retire-session: owner {r['agent_id']} was active {int(now - last)}s ago; it "
                                            f"must be quiet for {RETIRE_QUIET_S // 3600} h", 3)
         if d.get("kind") in liveness.ENDING_DISPOSITIONS:
             skipped.append({"agent": r["agent_id"], "kind": d["kind"]})
         elif d.get("kind") == RETIRED and d.get("live"):
             skipped.append({"agent": r["agent_id"], "kind": RETIRED})
-        else:  # a wait or resume that is still "live" on a session that is not running cannot be kept: it is overridden
-            cover.append({"agent": r["agent_id"], "state": r["state"], "last_activity": r.get("last_activity"),
-                          "overrides": d["kind"] if d.get("kind") in ("waiting", "resumed") and d.get("live") else None})
+        else:
+            cover.append({"agent": r["agent_id"], "state": r["state"], "last_activity": r.get("last_activity")})
+            if "handoff-unacked" in (r.get("flags") or []) or "result-unacked" in (r.get("attention") or []):
+                handoffs.append(r["agent_id"])  # retiring ends it; the audit names it so the handoff is not lost silently
     if not cover:
         raise AhError("retire_no_owners", f"task.retire-session: every owner of {session} already has an ending disposition", 3)
+    names = sorted(c["agent"] for c in cover)
     return {"session": session, "live_pids": [], "quiet_s": RETIRE_QUIET_S, "owner_count": len(rows),
-            "transcript_main": iso(tr["main_at"]), "transcript_newest": iso(tr["newest_at"]), "transcript_files": tr["files"],
-            "owners": [c["agent"] for c in cover], "cover": cover, "skipped": skipped,
-            "overrides": [{"agent": c["agent"], "kind": c["overrides"]} for c in cover if c["overrides"]]}
+            "transcript_main": iso(tr["main_at"]), "transcript_newest": iso(tr["newest_at"]),
+            "transcript_newest_at": tr["newest_at"], "transcript_files": tr["files"],
+            "owners": names, "owners_sha": hashlib.sha256(",".join(names).encode()).hexdigest()[:16],
+            "cover": cover, "skipped": skipped, "unacked_handoffs": sorted(handoffs)}
 
 
-def sub_activity(home: Path, session: str, agent: str) -> float:
-    """Newest transcript write of one subagent (0.0 when none)."""
-    return transcript_mtime(home, session, agent)
+def _retire_ended(args: dict, newest_at: float, now: float) -> str:
+    """--ended as an explicit-offset instant, normalized to UTC; refused when it is in the future or earlier than the
+    newest transcript write (an unchecked --ended would record a false end time as fact)."""
+    text = args["ended"]
+    if not RETIRE_ENDED_RE.match(text):
+        raise AhError("bad_request", "task.retire-session: --ended needs a date, a time and an explicit offset "
+                                     "(2026-11-24T10:00:00Z or +01:00); a time with no offset is ambiguous", 3)
+    at = parse_ts(text)
+    if not at:
+        raise AhError("bad_request", "task.retire-session: --ended is not a valid time", 3)
+    if at > now:
+        raise AhError("bad_request", "task.retire-session: --ended is in the future", 3)
+    if at < newest_at - RETIRE_ENDED_SLACK_S:
+        raise AhError("bad_request", f"task.retire-session: --ended {text} is earlier than the session's last transcript write "
+                                     f"({iso(newest_at)}); a session that was active later had not ended", 3)
+    return iso(at)
+
+
+def _retire_burst(home: Path, caller: str, now: float) -> None:
+    """One caller may retire only RETIRE_BURST_MAX sessions within RETIRE_BURST_WINDOW_S (the 19-owner loop, at session
+    granularity). The next one is refused and alerted; the source of a retire is not enough to bound a loop."""
+    n = sum(1 for row in _audit_tail(home) if row.get("op") == "task.retire_session" and row.get("result") == "applied"
+            and (row.get("actor") or {}).get("session") == caller and now - (parse_ts(row.get("at")) or 0.0) < RETIRE_BURST_WINDOW_S)
+    if n < RETIRE_BURST_MAX:
+        return
+    _ring_alert(home, f"bulk-retire:{(caller or 'unknown')[:8]}", "high",
+                f"possible bulk retire: {n + 1} sessions within {RETIRE_BURST_WINDOW_S // 60} min from session "
+                f"{(caller or 'unknown')[:8]}; refused (goodqa#17148)", {"session": caller, "sessions": n + 1})
+    raise AhError("bulk_close", f"task.retire-session: {n} sessions were retired within {RETIRE_BURST_WINDOW_S // 60} min; "
+                                "retiring in bulk is refused. Wait, or retire the rest later", 3)
+
+
+def _retire_stamp(home: Path, session: str) -> None:
+    """Only main may retire: main's hook stamps a command it can read (dropped_gate, as --ack-handoff). No stamp, no
+    retire, whatever the sub-agent or script that typed it can compute."""
+    import caller_identity  # noqa: PLC0415
+    if caller_identity.take_stamp("retire-session", [session], home=home) is None:
+        raise AhError("forbidden", "task.retire-session: only the main agent retires a session (its hook stamps the "
+                                   f"call); none was found for {session}. Run ONE plain `ah task retire-session ...` "
+                                   "command with a literal --session (no $(...), no wrapper that hides ah)", 3)
 
 
 def _retire_preflight(home: Path, args: dict, now: float, caller_session: str) -> dict:
+    """Checks that need no lock: authority, source, ticket, --ended, burst; then a first evidence run to fail fast. The
+    owner list itself is computed again under the store lock (_apply)."""
     import provenance  # noqa: PLC0415
     session = args["session"]
     if caller_session and caller_session == session:
         raise AhError("forbidden", "task.retire-session: a session cannot retire itself", 3)
-    rb = args.get("replaced_by")
-    if rb and not (_wal_path(home, rb, "main")).is_file():
-        raise AhError("bad_request", f"task.retire-session: --replaced-by {rb} is not a session of this host (no main WAL)", 3)
     try:
         res = provenance.resolve(args["source"])
     except Exception as e:  # a resolver crash is a rejection, never a silent pass
@@ -2883,17 +3005,61 @@ def _retire_preflight(home: Path, args: dict, now: float, caller_session: str) -
     if not res["ok"]:
         first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
         raise AhError("provenance", f"source rejected ({first['code']}): {first['message']}"[:300], 3)
-    if parse_ts(args["ended"]) > now:
-        raise AhError("bad_request", "task.retire-session: --ended is in the future", 3)
+    rb = args.get("replaced_by")
+    if rb:
+        if not _wal_path(home, rb, "main").is_file():
+            raise AhError("bad_request", f"task.retire-session: --replaced-by {rb} is not a session of this host (no main WAL)", 3)
+        if not (_retire_registry_live(home, rb) or now - main_transcript_at(home, rb) < RETIRE_REPLACER_S):
+            raise AhError("bad_request", f"task.retire-session: --replaced-by {rb} is neither live nor active in the last "
+                                         f"{RETIRE_REPLACER_S // 3600} h, so it holds no work", 3)
+    else:  # --dropped: the dropped work must be on a ticket, which must exist
+        found = _ticket_exists(args["ticket"])
+        if found is False:
+            raise AhError("evidence", f"task.retire-session: {args['ticket']} does not exist", 3)
+        if found is None:
+            raise AhError("evidence_unverifiable", f"task.retire-session: GoodQA could not confirm {args['ticket']}; retry", 3)
     ev = retire_evidence(home, session, now)
-    return dict(args, retire={"owners": ev["owners"], "skipped": ev["skipped"], "owner_count": ev["owner_count"],
-                              "transcript_newest": ev["transcript_newest"], "quiet_s": ev["quiet_s"]})
+    ended = _retire_ended(args, ev["transcript_newest_at"], now)
+    _retire_burst(home, caller_session, now)
+    _retire_stamp(home, session)  # last: a refusal above never burns main's stamp
+    return dict(args, ended_utc=ended)
+
+
+def _retire_pin(home: Path, args: dict) -> None:
+    """Under the store lock: the owner list this decision covers, computed from the state the ledger has NOW (a
+    disposition recorded since the preflight is seen, never overwritten), and refused when it is not the list main
+    previewed (--expect)."""
+    ev = retire_evidence(home, args["session"], time.time())
+    if args.get("expect") and args["expect"] != ev["owners_sha"]:
+        raise AhError("retire_stale", f"task.retire-session: the owners of {args['session']} are not the list that was "
+                                      f"previewed (now {ev['owners_sha']}, expected {args['expect']}); run --dry-run again", 3)
+    args["retire"] = {"owners": ev["owners"], "skipped": ev["skipped"], "owner_count": ev["owner_count"],
+                      "unacked_handoffs": ev["unacked_handoffs"], "transcript_newest": ev["transcript_newest"],
+                      "quiet_s": ev["quiet_s"], "owners_sha": ev["owners_sha"]}
 
 
 def retire_dry_run(home: Path, session: str) -> dict:
-    """The evidence a retire would rest on, written nowhere (no intent row, no audit line, no WAL)."""
+    """The evidence a retire would rest on, written nowhere (no intent row, no audit line, no WAL, no stamp)."""
     ev = retire_evidence(home, session, time.time())
+    ev.pop("transcript_newest_at", None)
     return dict(ev, ok=True, result="dry-run", would_cover=len(ev["owners"]))
+
+
+def _retire_revoke_preflight(home: Path, args: dict, caller_session: str) -> dict:
+    """The way back: a revoke makes the decision's owners read as they did before it (alerts return)."""
+    import provenance  # noqa: PLC0415
+    res = provenance.resolve(args["source"])
+    if not res["ok"]:
+        raise AhError("provenance", "source rejected", 3)
+    rows = _ledger(home)
+    target = next((r for r in rows if r.get("op") == "task.retire_session" and r.get("id") == args["decision"]
+                   and (r.get("args") or {}).get("session") == args["session"]), None)
+    if target is None:
+        raise AhError("bad_request", f"task.retire-session: {args['decision']} is not a retire decision of {args['session']}", 3)
+    if any(r.get("op") == "task.retire_revoke" and (r.get("args") or {}).get("decision") == args["decision"] for r in rows):
+        raise AhError("bad_request", f"task.retire-session: {args['decision']} was already revoked", 3)
+    _retire_stamp(home, args["session"])
+    return args
 
 
 WAIT_MAX_S = 7 * 86400  # a named wait expires within a week; it is renewed, never parked for years (review M-b)
@@ -2911,8 +3077,8 @@ def _ticket_exists(ref: str):
         return None
 
 
-SERVER_STAMPED_OPS = ("task.dispose", "task.pending", "task.retire_session")
-SERVER_STAMPED_FIELDS = ("at", "ref_unverified", "retire")
+SERVER_STAMPED_OPS = ("task.dispose", "task.pending", "task.retire_session", "task.retire_revoke")
+SERVER_STAMPED_FIELDS = ("at", "ref_unverified", "retire", "ended_utc")
 
 
 def server_now() -> str:
@@ -2924,10 +3090,10 @@ def server_now() -> str:
 def write(home: Path, op: str, args: dict, session: str, key: str | None = None) -> dict:
     if op == "task.dispose":
         args = {k: v for k, v in args.items() if k not in GUARD_FIELDS}  # only ah sets these
-    retiring = op == "task.retire_session"
+    retiring = op in ("task.retire_session", "task.retire_revoke")
     if retiring:
         args = {k: v for k, v in args.items() if k not in RETIRE_FIELDS}  # only ah's preflight sets these
-    if op in ("task.dispose", "task.pending", "deadline.add", "task.retire_session"):
+    if op in ("task.dispose", "task.pending", "deadline.add", "task.retire_session", "task.retire_revoke"):
         stamped = {k: v for k, v in args.items() if k != "ref_unverified"}  # set only here
         if op != "deadline.add":
             stamped["at"] = server_now()  # never the caller's clock (M4): a backdated disposition cannot be forged
@@ -2940,7 +3106,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         args = stamped
     tag = {"kind": args.get("kind"), "agent": args.get("agent")} if op == "task.dispose" else {}
     if retiring:
-        tag = {"kind": "retire_session", "agent": args.get("session")}
+        tag = {"kind": "retire_session" if op == "task.retire_session" else "retire_revoke", "agent": args.get("session")}
     guarded = (op == "task.dispose" and args.get("kind") in GUARDED_KINDS) or retiring
     try:
         if op == "task.dispose" and args.get("ack_handoff"):
@@ -2961,7 +3127,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         if guarded and args.get("kind") in liveness.CLOSING:
             _close_burst(home, args, actor(session), time.time())  # first: a burst is refused whatever its arguments
         precheck(op, args)
-        if retiring and session and session == args.get("session"):  # the caller is the target: never retire yourself
+        if op == "task.retire_session" and session and session == args.get("session"):  # never retire yourself
             raise AhError("forbidden", "task.retire-session: a session cannot retire itself", 3)
     except AhError as e:
         if guarded:
@@ -2988,7 +3154,12 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
                 raise AhError("key_conflict", "that key was used with a different request", 3)
     if guarded:
         try:
-            args = _retire_preflight(home, args, time.time(), session) if retiring else _dispose_preflight(home, args)
+            if op == "task.retire_session":
+                args = _retire_preflight(home, args, time.time(), session)
+            elif op == "task.retire_revoke":
+                args = _retire_revoke_preflight(home, args, session)
+            else:
+                args = _dispose_preflight(home, args)
         except AhError as e:
             _audit_reject(home, op, key, session, e.code, tag)
             raise
@@ -3042,7 +3213,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
             "received_at": iso(time.time())})
         _append_line(audit, {"at": iso(time.time()), "op": op, "key": key, "actor": who, "result": "applied", "seq": seq,
                              **tag})
-        if retiring:  # audit stays per owner: one line each, naming the one decision
+        if op == "task.retire_session":  # audit stays per owner: one line each, naming the one decision
             for who_id in args["retire"]["owners"]:
                 _append_line(audit, {"at": iso(time.time()), "op": "task.dispose", "key": key, "actor": who,
                                      "result": "applied", "seq": seq, "kind": RETIRED, "agent": who_id, "decision": rid})
@@ -3942,10 +4113,13 @@ def build_parser():
     rs = ks.add_parser("retire-session", help="retire every owner of a session that has verifiably ended: ONE sourced "
                                               "decision, one disposition per owner (goodqa#17148)")
     rs.add_argument("--session", required=True, help="the FULL id of the ended session (never defaulted)")
-    rs.add_argument("--ended", help="ISO date or time the session ended")
-    rs.add_argument("--replaced-by", dest="replaced_by", help="id of the session that took its work")
-    rs.add_argument("--dropped", action="store_true", help="nobody took the work")
+    rs.add_argument("--ended", help="when the session ended, with an explicit offset (2026-11-24T10:00:00Z)")
+    rs.add_argument("--replaced-by", dest="replaced_by", help="id of the live session that took its work")
+    rs.add_argument("--dropped", action="store_true", help="nobody took the work (needs --ticket)")
+    rs.add_argument("--ticket", help="--dropped: 'GoodQA <project>#N', the ticket that holds the dropped work")
     rs.add_argument("--source", help="where the decision comes from (user:<session>/<uuid> \"words\", ticket:..., ...)")
+    rs.add_argument("--expect", help="the owners_sha a --dry-run printed: the retire is refused if the owners changed")
+    rs.add_argument("--revoke", metavar="DECISION", help="undo a retire decision (ah + 10 hex): its owners alert again")
     rs.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="print the evidence and the owners it would cover; write nothing")
     rs.add_argument("--key", help="idempotency key (default: derived from the request)")
@@ -4159,9 +4333,13 @@ def run(args, home: Path) -> dict:
         if args.sub == "retire-session":
             if args.dry_run:
                 return retire_dry_run(home, args.session)
+            if args.revoke:
+                return write(home, "task.retire_revoke", {"session": args.session, "decision": args.revoke, "at": iso(time.time()),
+                                                          "source": args.source or ""}, env_session(), args.key)
             a = {"session": args.session, "ended": args.ended or "", "at": iso(time.time()), "source": args.source or ""}
-            if args.replaced_by:
-                a["replaced_by"] = args.replaced_by
+            for opt in ("replaced_by", "ticket", "expect"):
+                if getattr(args, opt):
+                    a[opt] = getattr(args, opt)
             if args.dropped:
                 a["dropped"] = True
             return write(home, "task.retire_session", a, env_session(), args.key)
